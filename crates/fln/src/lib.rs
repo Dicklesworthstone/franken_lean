@@ -7351,6 +7351,10 @@ impl Engine {
                 at: Some(at),
             }
         };
+        // Nested `… in` commands inherit already-active stream captures. A
+        // local false cannot undo an enclosing capture; a local true can add
+        // one. Keep that ownership separate from the innermost option map.
+        let mut command_stderr_capture: Option<(usize, bool)> = None;
         while let Some(step) = queue.pop_front() {
             let (command_index, original_offset, command_source) = match step {
                 Step::Command(index, offset, source) => (index, offset, source),
@@ -7392,6 +7396,20 @@ impl Engine {
                 )?;
                 grammar.extend_scopes(&mut scopes);
             }
+            let local_stderr_capture = scopes.current.options.get_bool(
+                &Name::from_components(["stderrAsMessages"]),
+                options.get_bool(&Name::from_components(["stderrAsMessages"]), true),
+            );
+            let isolate_stderr = match command_stderr_capture.as_mut() {
+                Some((index, active)) if *index == command_index => {
+                    *active |= local_stderr_capture;
+                    *active
+                }
+                _ => {
+                    command_stderr_capture = Some((command_index, local_stderr_capture));
+                    local_stderr_capture
+                }
+            };
             let control = grammar
                 .enter(|| fln_parse::command_scope::parse(command_source))
                 .map_err(|error| error.with_original_offset(original_offset))
@@ -8337,10 +8355,23 @@ impl Engine {
                 let remaining = limits
                     .max_evaluation_output_bytes
                     .saturating_sub(evaluation_output_bytes);
-                let isolate_stderr = scoped_options
+                let local_stderr_capture = scoped_options
                     .as_ref()
                     .unwrap_or(options)
                     .get_bool(&Name::from_components(["stderrAsMessages"]), true);
+                if isolate_stderr != local_stderr_capture
+                    && guards
+                        .iter()
+                        .any(|guard| guard.command_index == command_index)
+                {
+                    return Err(EngineExecutionError::BatchCommand {
+                        index: command_index,
+                        error: Box::new(EngineExecutionError::NotImplemented {
+                            feature: "nested scoped stderr capture outside a message guard",
+                        }),
+                        at: Some(original_offset),
+                    });
+                }
                 match StdoutCapture::begin_isolated(remaining, isolate_stderr) {
                     Ok(capture) => Some(capture),
                     Err(error) => return Ok(source_evaluation::capture_failure(error)),

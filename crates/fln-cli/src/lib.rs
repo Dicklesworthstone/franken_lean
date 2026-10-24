@@ -11976,7 +11976,7 @@ fn io_guard_refusal(command_index: usize) -> MultiplexerOutput {
         "capability",
         &format!(
             "evaluation command {command_index}: `#guard_msgs` over an IO \
-             action is not implemented; its output is written while it runs"
+             action requires a retained isolated command-output transcript"
         ),
         false,
         SourcePresentation::Lean,
@@ -12277,9 +12277,14 @@ fn render_lean_source_commands(
                     Err(error) => return error.failure(command_index, SourcePresentation::Lean),
                 };
                 if let Some(guard) = guarded.get_mut(&command_index) {
-                    // An IO action's output was written while it ran, not returned here.
+                    // PreferRaw projects IO Unit without a formatted result.
+                    // Its retained transcript was already added to this guard;
+                    // Unit contributes no separate message of its own.
                     if matches!(value, SourceFinalValue::IoUnit) {
-                        return io_guard_refusal(command_index);
+                        if execution.evaluation_output().is_none() {
+                            return io_guard_refusal(command_index);
+                        }
+                        continue;
                     }
                     match lean_evaluation_line(command_index, &value) {
                         Ok(line) => guard.info(&line, false, &mut stdout),

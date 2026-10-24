@@ -198,9 +198,8 @@ fn presented_evaluations_do_not_escape_their_command_streams() {
     );
     assert_eq!(engine.logical_root(&KVMap::new()), root);
 
-    // The command-local option selects direct stderr without changing the
-    // following command's default. An enclosing owner observes only that one
-    // direct write; neither presented command leaks into process streams.
+    // The outer command's capture is already active when its scoped option
+    // changes. The pin therefore retains both lines as command messages.
     let capture = StdoutCapture::begin_isolated(4096, true).unwrap();
     let scoped = engine
         .execute_source_commands_with_presentation(
@@ -212,14 +211,85 @@ fn presented_evaluations_do_not_escape_their_command_streams() {
         .unwrap()
         .into_complete()
         .unwrap();
-    assert_eq!(scoped.batch.executions[0].evaluation_output(), Some(""));
+    assert_eq!(
+        scoped.batch.executions[0].evaluation_output(),
+        Some("direct\n")
+    );
     assert_eq!(
         scoped.batch.executions[1].evaluation_output(),
         Some("isolated\n")
     );
     let captured = capture.finish();
     assert_eq!(captured.error, None);
+    assert!(captured.bytes.is_empty());
+    assert_eq!(engine.logical_root(&KVMap::new()), root);
+
+    // A global option changes the next command's entry state, so this write
+    // really does bypass capture. Restoring true affects the next command.
+    let capture = StdoutCapture::begin_isolated(4096, true).unwrap();
+    let global = engine
+        .execute_source_commands_with_presentation(
+            b"set_option stderrAsMessages false\n#eval IO.eprintln \"direct\"\nset_option stderrAsMessages true\n#eval IO.eprintln \"isolated\"",
+            &KVMap::new(),
+            EngineExecutionLimits::new(Budget::for_stack_bytes(STACK)),
+            crate::EvaluationPresentation::PreferRaw,
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!(global.batch.executions[0].evaluation_output(), Some(""));
+    assert_eq!(
+        global.batch.executions[1].evaluation_output(),
+        Some("isolated\n")
+    );
+    let captured = capture.finish();
+    assert_eq!(captured.error, None);
     assert_eq!(captured.bytes, b"direct\n");
+    assert_eq!(engine.logical_root(&KVMap::new()), root);
+
+    // An inner true can add capture even when the outer command entered with
+    // false. Its temporary scope cannot change the following command.
+    let capture = StdoutCapture::begin_isolated(4096, true).unwrap();
+    let enabled = engine
+        .execute_source_commands_with_presentation(
+            b"set_option stderrAsMessages false\nset_option stderrAsMessages true in\n#eval IO.eprintln \"inside\"\n#eval IO.eprintln \"outside\"",
+            &KVMap::new(),
+            EngineExecutionLimits::new(Budget::for_stack_bytes(STACK)),
+            crate::EvaluationPresentation::PreferRaw,
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!(
+        enabled.batch.executions[0].evaluation_output(),
+        Some("inside\n")
+    );
+    assert_eq!(enabled.batch.executions[1].evaluation_output(), Some(""));
+    let captured = capture.finish();
+    assert_eq!(captured.error, None);
+    assert_eq!(captured.bytes, b"outside\n");
+    assert_eq!(engine.logical_root(&KVMap::new()), root);
+
+    // Here the pin's outer capture owns the stderr message, outside the
+    // guard's message collection. Until that separate ownership is retained,
+    // refuse the composition before the IO action can run.
+    let capture = StdoutCapture::begin_isolated(4096, true).unwrap();
+    let guarded = engine.execute_source_commands_with_presentation(
+        b"#guard_msgs in\nset_option stderrAsMessages false in\n#eval IO.eprintln \"direct\"",
+        &KVMap::new(),
+        EngineExecutionLimits::new(Budget::for_stack_bytes(STACK)),
+        crate::EvaluationPresentation::PreferRaw,
+    );
+    assert!(matches!(
+        guarded,
+        Err(EngineExecutionError::BatchCommand { error, .. })
+            if matches!(*error, EngineExecutionError::NotImplemented {
+                feature: "nested scoped stderr capture outside a message guard"
+            })
+    ));
+    let captured = capture.finish();
+    assert_eq!(captured.error, None);
+    assert!(captured.bytes.is_empty());
     assert_eq!(engine.logical_root(&KVMap::new()), root);
 }
 

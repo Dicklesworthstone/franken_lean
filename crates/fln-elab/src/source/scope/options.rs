@@ -138,6 +138,13 @@ pub const ROWS: &[Row] = &[
     ),
     // Read by the elaborator's monad-lift coercion (`coercions/monad.rs`).
     row("autoLift", Bool(true), "Lean/Meta/Coe.lean:72", Honored),
+    // Read at command entry when isolating the presented evaluation's streams.
+    row(
+        "stderrAsMessages",
+        Bool(true),
+        "Lean/CoreM.lean:581",
+        Honored,
+    ),
     // Read by Golem at command entry for `#eval`. Elaboration does not count the pin's
     // heartbeats, so a ceiling below the default is refused rather than half honored.
     row(

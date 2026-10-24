@@ -166,6 +166,34 @@ fn checked_io_results_print_once_and_guard_isolated_effects() {
         assert!(checked.stdout.is_empty(), "{checked:?}");
         assert!(checked.stderr.is_empty(), "{checked:?}");
         assert_eq!(std::fs::read(&sentinel).unwrap(), b"guard ran");
+        if type_ == "Unit" {
+            // FLBC publication validates guards on the PreferRaw route too.
+            // A retained isolated transcript authorizes judging silent Unit;
+            // it must not be mistaken for a Raw batch without that transcript.
+            let artifact = workspace.0.join("guarded-unit.flbc");
+            workspace
+                .run(
+                    &guarded,
+                    Some(&lib),
+                    &["--emit-flbc", artifact.to_str().unwrap()],
+                )
+                .complete();
+            assert!(artifact.is_file());
+
+            let wrong = workspace.write(
+                "WrongGuardUnit.lean",
+                format!("{DEFINITIONS}/-- info: different -/\n#guard_msgs in\n#eval IO.println \"guard-effect\"\n"),
+            );
+            let refused_artifact = workspace.0.join("wrong-guard-unit.flbc");
+            workspace
+                .run(
+                    &wrong,
+                    Some(&lib),
+                    &["--emit-flbc", refused_artifact.to_str().unwrap()],
+                )
+                .refused("guard-msgs", 1);
+            assert!(!refused_artifact.exists());
+        }
     }
 
     let streams = workspace.write(
