@@ -210,12 +210,12 @@ manifest_prefix_max_id_bytes_file() {
 manifest_first_id_over_limit_record() {
   local path="$1"
   local limit="$2"
+  # Drain sed after the first match; an early awk exit can SIGPIPE it under pipefail.
   sed -n 's/^{"id":"\([^"]*\)"}$/\1/p' "$path" \
     | awk -v limit="$limit" '
-        length($0) > limit {
+        !found && length($0) > limit {
           print NR
           found = 1
-          exit
         }
         END {
           if (!found) {
