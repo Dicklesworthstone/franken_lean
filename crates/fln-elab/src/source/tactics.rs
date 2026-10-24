@@ -14,6 +14,7 @@ mod constructor_transport;
 mod constructors;
 mod context;
 mod control;
+mod conv;
 mod decision;
 pub(in crate::source) mod eliminate;
 mod empty;
@@ -185,6 +186,21 @@ pub enum TacticError {
     /// `case t => …` with no goal tagged `t` (`getCaseGoals`, vendored
     /// src/Lean/Elab/Tactic/BuiltinTactic.lean).
     CaseTagNotFound(Name),
+    /// A conv tactic on a goal that is not an equation (the pin's "Internal error:
+    /// Conversion-mode tactic found an invalid `conv` goal", vendored
+    /// src/Lean/Elab/Tactic/Conv/Basic.lean).
+    ConvInvalidGoal,
+    /// `conv`'s end left goals that reflexivity and instance synthesis do not close
+    /// (`convert`, vendored src/Lean/Elab/Tactic/Conv/Basic.lean).
+    ConvUnsolvedGoals {
+        count: usize,
+    },
+    /// A conv tactic's own failure, in the pin's words (`arg`, `congr`, `ext`, `pattern`, …,
+    /// vendored src/Lean/Elab/Tactic/Conv/*.lean), without the expressions it appends.
+    ConvFailure(String),
+    /// A conv-mode case this engine does not build, named. Never caught by `first`/`try`: the
+    /// pin may succeed there.
+    ConvUnsupported(&'static str),
     ConstructorEquality,
     NoContradiction,
     ArithmeticUnsupported,
@@ -466,6 +482,18 @@ impl std::fmt::Display for TacticError {
                 f,
                 "'specialize' requires a term of the form `h x_1 .. x_n` where `h` appears in the local context"
             ),
+            Self::ConvInvalidGoal => write!(
+                f,
+                "Internal error: Conversion-mode tactic found an invalid `conv` goal"
+            ),
+            // The pin's words, without the goals it lists after them.
+            Self::ConvUnsolvedGoals { .. } => {
+                write!(f, "Tactic `conv` failed: There are unsolved goals")
+            }
+            Self::ConvFailure(message) => write!(f, "{message}"),
+            Self::ConvUnsupported(what) => {
+                write!(f, "conv mode does not support {what} here")
+            }
             Self::ConstructorEquality => write!(
                 f,
                 "constructor equality has no supported injective fields or contradiction"
@@ -998,6 +1026,7 @@ impl Context {
                 if let Some(&instruction) = proof.instructions.get(proof.cursor) {
                     if instruction.kind() == Some(&parser_kind(&["Tactic", "traceState"]))
                         || instruction.kind() == Some(&parser_kind(&["Tactic", "traceMessage"]))
+                        || instruction.kind() == Some(&conv::conv_kind("convTrace_state"))
                     {
                         self.trace_proof_state(proof, instruction)?;
                         proof.cursor += 1;
@@ -1016,6 +1045,8 @@ impl Context {
                     // `Lean/Elab/Tactic/BuiltinTactic.lean`).
                     if instruction.kind() == Some(&parser_kind(&["Tactic", "skip"]))
                         || instruction.kind() == Some(&parser_kind(&["Tactic", "done"]))
+                        || instruction.kind() == Some(&conv::conv_kind("skip"))
+                        || instruction.kind() == Some(&conv::conv_kind("convDone"))
                     {
                         proof.cursor += 1;
                         continue;
@@ -1157,6 +1188,8 @@ impl Context {
             if let Some(spec) = self.backtrack_instruction(instruction)? {
                 proof.work.push(Work::Goal(goal));
                 return Ok(ProofAction::Attempt(spec));
+            } else if conv::is_conv_kind(kind) {
+                self.conv_instruction(proof, goal, instruction)?;
             } else if kind == &parser_kind(&["Tactic", "skip"]) {
                 proof.work.push(Work::Goal(goal));
             } else if kind == &parser_kind(&["Tactic", "traceState"])

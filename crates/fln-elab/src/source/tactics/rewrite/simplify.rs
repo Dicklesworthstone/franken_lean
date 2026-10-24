@@ -1344,6 +1344,120 @@ impl Context {
         }
     }
 
+    /// Conversion mode's `simp` (`Conv.evalSimp`, vendored src/Lean/Elab/Tactic/Conv/Simp.lean):
+    /// `expr` rewritten by the rules a `simp` tactic's six slots `args` select, step by step as
+    /// [`Self::simplify_goal_with_rules`] rewrites a goal, but closing nothing. Returns the
+    /// result and its equation `expr = result`, `None` when every step was definitional (the
+    /// pin's `applySimpResult` then only changes `lhs`). Making no progress is no failure here:
+    /// conv's `simp` calls `Simp.main` directly, without the goal's "no progress" check.
+    pub(in crate::source) fn simp_expression_with(
+        &mut self,
+        args: &[Syntax],
+        expr: &Expr,
+    ) -> Result<(Expr, Option<Expr>), NatDefinitionElabError> {
+        let rules = self.simp_rules(args)?;
+        let original = self.instantiate(expr)?;
+        let mut current = original.clone();
+        let mut proof: Option<Expr> = None;
+        let mut history = vec![current.clone()];
+        let mut steps = 0usize;
+        loop {
+            self.tick()?;
+            let next = if let Some(normalized) = self.simp_normalize(&current)? {
+                Some((normalized, None))
+            } else {
+                let index = self.simp_target_index(&current)?;
+                let mut found = None;
+                for rule in &rules {
+                    if !self.simp_rule_admitted(rule, index.as_ref(), SimpKeySide::Rewrite)
+                        || self.simp_definition_absent(rule, index.as_ref())
+                    {
+                        continue;
+                    }
+                    self.tick()?;
+                    let trial = self.rewrite_trial();
+                    if !self.simp_rule_may_rewrite(rule, &current)? {
+                        self.restore_simp_trial(trial);
+                        continue;
+                    }
+                    match self.unfold_simp_rule(rule, &current)? {
+                        UnfoldResult::Unchanged => self.restore_simp_trial(trial),
+                        UnfoldResult::Changed(next) => {
+                            found = Some((next, None));
+                            break;
+                        }
+                        UnfoldResult::NotDefinition => {
+                            let Some((evidence, occurrence, reverse)) =
+                                self.simp_rule_evidence(&current, rule, &rules)?
+                            else {
+                                self.restore_simp_trial(trial);
+                                continue;
+                            };
+                            let (next, step) = self.conv_congr_arg_step(
+                                &current,
+                                evidence,
+                                &occurrence,
+                                reverse,
+                                false,
+                            )?;
+                            found = Some((next, Some(step)));
+                            break;
+                        }
+                    }
+                }
+                found
+            };
+            let Some((next, step)) = next else {
+                break;
+            };
+            if steps >= MAX_SIMPLIFICATION_STEPS {
+                return Err(failure(SourceInferenceError::ResourceLimit));
+            }
+            for previous in &history {
+                self.tick()?;
+                if self.rewrite_same(previous, &next)? {
+                    return Err(error(TacticError::SimplificationCycle));
+                }
+            }
+            history.push(next.clone());
+            steps += 1;
+            if let Some(step) = step {
+                proof = Some(match proof {
+                    None => step,
+                    Some(previous) => {
+                        let alpha = self
+                            .known_type(&original)?
+                            .ok_or_else(|| failure(SourceInferenceError::ExpectedType))?;
+                        let alpha = self.instantiate(&alpha)?;
+                        let sort = self
+                            .known_type(&alpha)?
+                            .ok_or_else(|| failure(SourceInferenceError::ExpectedType))?;
+                        let level = self.sort_level(&Typed {
+                            value: alpha.clone(),
+                            type_: sort,
+                        })?;
+                        let trans = Name::from_components(["Eq", "trans"]);
+                        if !self.txn.env.contains(&trans) {
+                            return Err(failure(SourceInferenceError::UnknownConstant(trans)));
+                        }
+                        [
+                            alpha,
+                            original.clone(),
+                            current.clone(),
+                            next.clone(),
+                            previous,
+                            step,
+                        ]
+                        .into_iter()
+                        .fold(Expr::const_(trans, vec![level]), Expr::app)
+                    }
+                });
+            }
+            current = next;
+        }
+        Ok((current, proof))
+    }
+
     pub(in crate::source) fn simplify_proof_goal(
         &mut self,
         proof: &mut ProofState<'_>,

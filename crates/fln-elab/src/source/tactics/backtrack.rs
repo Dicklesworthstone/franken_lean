@@ -128,6 +128,7 @@ pub(in crate::source) fn recoverable(problem: &NatDefinitionElabError) -> bool {
                 reason,
                 TacticError::MalformedScript
                     | TacticError::UnsupportedTactic(_)
+                    | TacticError::ConvUnsupported(_)
                     | TacticError::UnfoldStuckMatch(_)
                     | TacticError::SplitMatchUnsupported
                     | TacticError::SplitBoundDecision
@@ -227,6 +228,9 @@ impl Context {
         let Syntax::Node { kind, args, .. } = syntax else {
             return Ok(None);
         };
+        if let Some(spec) = self.conv_backtrack_instruction(kind, args)? {
+            return Ok(Some(spec));
+        }
         let mode = if kind == &parser_kind(&["Tactic", "first"]) {
             Mode::First
         } else if kind == &parser_kind(&["Tactic", "tacticTry_"]) {
@@ -275,6 +279,54 @@ impl Context {
         }
         if branches.iter().any(Vec::is_empty) {
             return Err(error(TacticError::MalformedScript));
+        }
+        Ok(Some(Spec { mode, branches }))
+    }
+
+    /// The conv alternatives (`Init/Conv.lean`): `first | … | …` (`Conv.first`, which the pin
+    /// evaluates as the tactic's `evalFirst`), `try s` (`first | s | skip`), `repeat s`
+    /// (`first | (s); repeat s | skip`) and `fail_if_success s`, each over a conv sequence.
+    fn conv_backtrack_instruction<'a>(
+        &mut self,
+        kind: &Name,
+        args: &'a [Syntax],
+    ) -> Result<Option<Spec<'a>>, NatDefinitionElabError> {
+        let conv = |name: &str| parser_kind(&["Tactic", "Conv", name]);
+        let (mode, keyword) = if kind == &conv("first") {
+            (Mode::First, "first")
+        } else if kind == &conv("convTry_") {
+            (Mode::Try, "try")
+        } else if kind == &conv("convRepeat_") {
+            (Mode::Repeat, "repeat")
+        } else if kind == &conv("failIfSuccess") {
+            (Mode::FailIfSuccess, "fail_if_success")
+        } else {
+            return Ok(None);
+        };
+        self.require_declared_tactic(&["Lean", "Parser", "Tactic", "Conv", "conv"])?;
+        let [atom, body] = args else {
+            return Err(error(TacticError::MalformedScript));
+        };
+        expect_atom(atom, keyword, "conv alternative keyword")?;
+        let mut branches = Vec::new();
+        if mode == Mode::First {
+            let rows = expect_null_args(body, "conv alternatives")?;
+            if rows.is_empty() {
+                return Err(error(TacticError::MalformedScript));
+            }
+            for row in rows {
+                self.tick()?;
+                let pair = expect_node(
+                    row,
+                    &Name::str(Name::anonymous(), "group"),
+                    2,
+                    "conv alternative",
+                )?;
+                expect_atom(&pair[0], "|", "conv alternative separator")?;
+                branches.push(self.conv_instructions(&pair[1])?);
+            }
+        } else {
+            branches.push(self.conv_instructions(body)?);
         }
         Ok(Some(Spec { mode, branches }))
     }

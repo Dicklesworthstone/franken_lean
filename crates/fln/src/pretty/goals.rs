@@ -21,6 +21,33 @@ fn close(expr: &Expr, locals: &[LocalDecl]) -> Result<Expr, Unsupported> {
     Ok(closed)
 }
 
+/// The left-hand side of a conv goal's annotated target `@Eq α lhs rhs`
+/// (`fln_elab::source::trace::LHS_GOAL_KEY`).
+fn conv_lhs(target: &Expr) -> Option<&Expr> {
+    let ExprNode::MData { data, expr } = target.node() else {
+        return None;
+    };
+    let key = fln_core::name::Name::from_components([fln_elab::source::trace::LHS_GOAL_KEY]);
+    if !matches!(
+        data.find(&key),
+        Some(fln_core::options::DataValue::OfBool(true))
+    ) {
+        return None;
+    }
+    let ExprNode::App { f, .. } = expr.node() else {
+        return None;
+    };
+    let ExprNode::App { f, a: lhs } = f.node() else {
+        return None;
+    };
+    let ExprNode::App { f, .. } = f.node() else {
+        return None;
+    };
+    matches!(f.node(), ExprNode::Const { name, .. }
+        if name == &fln_core::name::Name::from_components(["Eq"]))
+    .then_some(lhs)
+}
+
 /// The names a goal display shows for `locals`, outermost first: a hygienic or
 /// shadowed name gains `✝` and a superscript index, as the pin's `ppGoal` shows it.
 fn shown_names(locals: &[LocalDecl]) -> Result<Vec<String>, Unsupported> {
@@ -211,8 +238,14 @@ pub fn render(env: &Environment, event: &SourceTrace) -> Result<String, Unsuppor
                     .group(),
             );
         }
-        let target = close(&goal.target, locals)?;
-        lines.push(Format::text("⊢ ").then(printer.doc(&target, 0)?.nest(2)));
+        // A conv goal `lhs = ?rhs`, annotated (`isLHSGoal?`), shows as `| lhs` (the pin's
+        // `getGoalPrefix` and the annotation's delaborator).
+        let (prefix, target) = match conv_lhs(&goal.target) {
+            Some(lhs) => ("| ", lhs),
+            None => ("⊢ ", &goal.target),
+        };
+        let target = close(target, locals)?;
+        lines.push(Format::text(prefix).then(printer.doc(&target, 0)?.nest(2)));
         let document = lines
             .into_iter()
             .reduce(|all, line| all.then(Format::text("\n")).then(line))

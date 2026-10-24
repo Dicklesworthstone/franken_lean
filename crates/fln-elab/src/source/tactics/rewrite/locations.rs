@@ -240,7 +240,7 @@ impl Context {
     /// `at_end` asserts the replacement after every local, as the pin's `simpGoal` asserts a
     /// hypothesis whose simplification needs a proof; otherwise it goes right after the old
     /// local and the locals its new type reads, as `replaceLocalDecl` places it for `rw`.
-    pub(super) fn replace_rewritten_hypothesis(
+    pub(in crate::source) fn replace_rewritten_hypothesis(
         &mut self,
         mut parent: ProofGoal,
         local: &LocalDecl,

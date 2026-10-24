@@ -5,6 +5,10 @@
 use super::*;
 use std::sync::{Arc, Mutex};
 
+/// The metadata key of a conv goal's target in a trace (`mkLHSGoalRaw e = mkAnnotation
+/// `_lhsGoal e`, vendored src/Lean/Elab/Tactic/Conv/Basic.lean): a display shows the goal's
+/// left-hand side, as `| lhs`.
+pub const LHS_GOAL_KEY: &str = "_lhsGoal";
 const MAX_EVENTS: usize = 4096;
 const MAX_GOALS: usize = 256;
 const MAX_LOCALS: usize = 4096;
@@ -269,13 +273,16 @@ impl Context {
         instruction: &Syntax,
         goals: &[tactics::ProofGoal],
     ) -> Result<(), NatDefinitionElabError> {
-        self.require_declared_tactic(&["Lean", "Parser", "Tactic", "traceState"])?;
-        let args = expect_node(
-            instruction,
-            &parser_kind(&["Tactic", "traceState"]),
-            1,
-            "trace_state",
-        )?;
+        // `macro "trace_state" : conv => `(conv| tactic' => trace_state)` (`Init/Conv.lean`).
+        let conv = instruction.kind() == Some(&parser_kind(&["Tactic", "Conv", "convTrace_state"]));
+        let kind = if conv {
+            self.require_declared_tactic(&["Lean", "Parser", "Tactic", "Conv", "convTrace_state"])?;
+            parser_kind(&["Tactic", "Conv", "convTrace_state"])
+        } else {
+            self.require_declared_tactic(&["Lean", "Parser", "Tactic", "traceState"])?;
+            parser_kind(&["Tactic", "traceState"])
+        };
+        let args = expect_node(instruction, &kind, 1, "trace_state")?;
         expect_atom(&args[0], "trace_state", "trace_state keyword")?;
         if goals.len() > MAX_GOALS {
             return Err(failure(SourceInferenceError::ResourceLimit));
@@ -305,13 +312,24 @@ impl Context {
                     locals.add_param(local.id.clone(), user_name, type_, local.binder_info);
                 }
             }
+            let mut target = self.instantiate(&goal.target)?;
+            if self.conv_goals.contains(&goal.id) {
+                // The pin's conv goal annotation (`mkLHSGoalRaw`): a display shows `| lhs`.
+                target = Expr::mdata(
+                    KVMap::from_entries(vec![(
+                        Name::from_components([LHS_GOAL_KEY]),
+                        fln_core::options::DataValue::OfBool(true),
+                    )]),
+                    target,
+                );
+            }
             observed.push(TraceGoal {
                 tag: self
                     .goal_tags
                     .get(&goal.id)
                     .cloned()
                     .unwrap_or_else(Name::anonymous),
-                target: self.instantiate(&goal.target)?,
+                target,
                 locals,
             });
         }
@@ -330,6 +348,7 @@ pub fn contains_trace(syntax: &Syntax) -> bool {
         if let Syntax::Node { kind, args, .. } = syntax {
             if kind == &parser_kind(&["Tactic", "traceState"])
                 || kind == &parser_kind(&["Tactic", "traceMessage"])
+                || kind == &parser_kind(&["Tactic", "Conv", "convTrace_state"])
                 // An information message's producers report through the same channel.
                 || kind == &parser_kind(&["Tactic", "simpTrace"])
                 || kind == &parser_kind(&["Tactic", "simpAllTrace"])

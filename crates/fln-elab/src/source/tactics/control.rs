@@ -68,6 +68,8 @@ pub(super) struct Frame<'a> {
     // A sequencing frame first isolates its left operand, then maps this
     // continuation only over the resulting frontier, not over old siblings.
     after: Option<Vec<&'a Syntax>>,
+    // A conversion-mode frame: what its sequence's end does with the goals it leaves.
+    conv: Option<Box<super::conv::Finish>>,
 }
 impl Context {
     /// The goal `case tag` selects (`getCaseGoals` and `findTag?`, vendored
@@ -306,11 +308,39 @@ impl Context {
             waiting: std::mem::take(&mut proof.work),
             deferred: Vec::new(),
             after,
+            conv: None,
         };
         let index = proof.controls.len();
         proof.controls.push(frame);
         proof.work.push(Work::EndControl(index));
         proof.work.push(Work::Goal(goal));
+        Ok(())
+    }
+
+    /// A conversion-mode frame over `goals` (the main one first), whose sequence `body` runs
+    /// with every other goal suspended, as `focus` runs it. When the sequence ends, `finish`
+    /// receives the goals it leaves ([`Self::finish_conv`]).
+    pub(super) fn start_conv_frame<'a>(
+        &mut self,
+        proof: &mut ProofState<'a>,
+        goals: Vec<Work<'a>>,
+        body: Vec<&'a Syntax>,
+        finish: super::conv::Finish,
+    ) -> Result<(), NatDefinitionElabError> {
+        let frame = Frame {
+            mode: Mode::Focus,
+            body: body.clone(),
+            instructions: std::mem::replace(&mut proof.instructions, body),
+            cursor: std::mem::replace(&mut proof.cursor, 0),
+            waiting: std::mem::take(&mut proof.work),
+            deferred: Vec::new(),
+            after: None,
+            conv: Some(Box::new(finish)),
+        };
+        let index = proof.controls.len();
+        proof.controls.push(frame);
+        proof.work.push(Work::EndControl(index));
+        proof.work.extend(goals.into_iter().rev());
         Ok(())
     }
 
@@ -362,6 +392,12 @@ impl Context {
             return Err(error(TacticError::NoGoals));
         }
         let mut frame = proof.controls.pop().expect("validated control depth");
+        if let Some(finish) = frame.conv.take() {
+            proof.instructions = frame.instructions;
+            proof.cursor = frame.cursor;
+            proof.work = frame.waiting;
+            return self.finish_conv(proof, *finish, pending);
+        }
         if let Some(body) = frame.after.take()
             && !pending.is_empty()
         {

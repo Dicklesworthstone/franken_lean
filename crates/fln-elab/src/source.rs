@@ -577,6 +577,9 @@ struct Context {
     // Information messages (`trace::Context::log_info`): elaboration state, restored with it.
     infos: Vec<trace::SourceTrace>,
     goal_tags: std::collections::HashMap<MVarId, Name>,
+    // Conversion goals `lhs = ?rhs`, which the pin annotates as `lhs` (`mkLHSGoalRaw`, vendored
+    // Lean/Elab/Tactic/Conv/Basic.lean) and a goal display shows as `| lhs`.
+    conv_goals: std::collections::HashSet<MVarId>,
     // Rewritten hypotheses: the pin asserts each and applies the new goal to its proof, which
     // `instantiateMVars` beta-reduces away when nothing reads it, so such a binding nothing
     // reads leaves the term (and with it every use of the hypothesis it rewrote).
@@ -766,6 +769,7 @@ impl Context {
             traces: trace::TraceLog::default(),
             infos: Vec::new(),
             goal_tags: std::collections::HashMap::new(),
+            conv_goals: std::collections::HashSet::new(),
             discarded_lets: std::collections::HashSet::new(),
             trace_local_names: std::collections::HashMap::new(),
             unnamed_fields: std::collections::HashSet::new(),
@@ -1916,6 +1920,8 @@ impl Context {
             CalcNext(calc::Build<'a>),
             CalcRelation(calc::Build<'a>),
             CalcProof(calc::Build<'a>, Expr),
+            /// A first calculation step without a proof: the term it starts from.
+            CalcStart(calc::Build<'a>),
             MatrixScope(Vec<Name>),
             CaptureRecursiveContext,
             MatchDiscriminant(matching::MatchParts<'a>, Option<Expr>),
@@ -2179,8 +2185,12 @@ impl Context {
                             ));
                         }
                         Task::CalcNext(build) => {
-                            if let Some(step) = build.steps.get(build.cursor) {
-                                let relation = step.0;
+                            if let Some(&(relation, proof)) = build.steps.get(build.cursor) {
+                                if proof.is_none() {
+                                    tasks.push(Task::CalcStart(build));
+                                    tasks.push(Task::Visit(relation, None, true));
+                                    continue;
+                                }
                                 // The pin elaborates a calc relation with
                                 // `elabType`; its result may inhabit any Sort.
                                 let expected = self.type_expected()?;
@@ -2190,10 +2200,19 @@ impl Context {
                                 values.push(self.finish_calculation(build)?);
                             }
                         }
+                        Task::CalcStart(mut build) => {
+                            let start = values.pop().expect("calculation start visit");
+                            let (relation, proof) = self.calculation_start(start)?;
+                            let relation = self.prepare_calculation_step(&mut build, relation)?;
+                            self.add_calculation_step(&mut build, relation, proof)?;
+                            tasks.push(Task::CalcNext(build));
+                        }
                         Task::CalcRelation(mut build) => {
                             let relation = values.pop().expect("calculation relation visit");
                             let relation = self.prepare_calculation_step(&mut build, relation)?;
-                            let proof = build.steps[build.cursor].1;
+                            let proof = build.steps[build.cursor]
+                                .1
+                                .ok_or_else(|| failure(SourceInferenceError::Scope))?;
                             tasks.push(Task::CalcProof(build, relation.clone()));
                             tasks.push(Task::Visit(proof, Some(relation), true));
                         }

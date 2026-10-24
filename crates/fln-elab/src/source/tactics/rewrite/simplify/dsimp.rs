@@ -78,6 +78,23 @@ impl Context {
         Ok(())
     }
 
+    /// Conversion mode's `dsimp` (`Conv.evalDSimp`, vendored
+    /// src/Lean/Elab/Tactic/Conv/Simp.lean): `expression` definitionally simplified by the set a
+    /// `dsimp` tactic's six slots `args` select. No progress is no failure here.
+    pub(in crate::source) fn dsimp_expression_with(
+        &mut self,
+        args: &[Syntax],
+        expression: &Expr,
+    ) -> Result<Expr, NatDefinitionElabError> {
+        let [keyword, ..] = args else {
+            return Err(error(TacticError::MalformedScript));
+        };
+        expect_atom(keyword, "dsimp", "definitional simplification")?;
+        let set = self.dsimp_set(args)?;
+        let original = self.instantiate(expression)?;
+        self.dsimp_expression(&original, &set)
+    }
+
     fn dsimp_goal(
         &mut self,
         mut goal: ProofGoal,

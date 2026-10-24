@@ -2241,7 +2241,12 @@ fn calc_step(
             tasks.push(Task::Calc(plan));
         }
         Task::Calc(plan) => {
-            let proofs: Vec<_> = plan.steps.iter().map(|step| step.proof.clone()).collect();
+            let proofs: Vec<_> = plan
+                .steps
+                .iter()
+                .filter(|step| step.assign.is_some())
+                .map(|step| step.proof.clone())
+                .collect();
             tasks.push(Task::FinishCalc(plan));
             tasks.extend(proofs.into_iter().rev().map(Task::CalcProof));
         }
@@ -2264,18 +2269,31 @@ fn calc_step(
             // `calcFirstStep := term (" := " term)?`, `calcStep := term " := " term`
             // (`Lean/Parser/Term.lean`, kinds in namespace `Lean`).
             let lean = |kind: &str| Name::from_components(["Lean", kind]);
-            let proofs = values.split_off(values.len() - plan.steps.len());
+            let proved = plan
+                .steps
+                .iter()
+                .filter(|step| step.assign.is_some())
+                .count();
+            let mut proofs = values.split_off(values.len() - proved).into_iter();
             let mut first = None;
             let mut steps = Vec::new();
-            for (step, proof) in plan.steps.into_iter().zip(proofs) {
+            for step in plan.steps {
                 let relation = binding_term(leaves, view, tokens, step.relation)?;
-                let assign = leaves.leaf(step.assign)?;
+                let proof = match step.assign {
+                    Some(assign) => Some((
+                        leaves.leaf(assign)?,
+                        proofs.next().expect("calculation step proof"),
+                    )),
+                    None => None,
+                };
                 if first.is_none() {
-                    first = Some(Syntax::node(
-                        lean("calcFirstStep"),
-                        vec![relation, null_node(vec![assign, proof])],
-                    ));
+                    let slot = match proof {
+                        Some((assign, proof)) => null_node(vec![assign, proof]),
+                        None => null_node(Vec::new()),
+                    };
+                    first = Some(Syntax::node(lean("calcFirstStep"), vec![relation, slot]));
                 } else {
+                    let (assign, proof) = proof.ok_or_else(|| refusal(view, tokens, plan.start))?;
                     steps.push(Syntax::node(
                         lean("calcStep"),
                         vec![relation, assign, proof],

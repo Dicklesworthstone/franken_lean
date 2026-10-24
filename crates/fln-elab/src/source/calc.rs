@@ -5,8 +5,9 @@
 use super::*;
 
 pub(super) struct Build<'a> {
-    /// Each step's relation and proof.
-    pub steps: Vec<(&'a Syntax, &'a Syntax)>,
+    /// Each step's relation and proof; the first step's proof may be absent, its "relation"
+    /// then the term the calculation starts from.
+    pub steps: Vec<(&'a Syntax, Option<&'a Syntax>)>,
     pub cursor: usize,
     expected: Option<Expr>,
     saved: LocalContext,
@@ -75,18 +76,22 @@ impl Context {
             2,
             "first calculation step",
         )?;
-        // A first step without a proof (`calc a` then `_ = b := p`) starts at `a = a`, which
-        // is not read here.
-        let [assign, proof] = expect_null_args(&first[1], "first calculation step proof")? else {
-            return Err(invalid());
+        // A first step without a proof (`calc a` then `_ = b := p`) is `a = _ := rfl`
+        // (`mkCalcFirstStepView`, vendored src/Lean/Elab/Calc.lean:85-89).
+        let first_proof = match expect_null_args(&first[1], "first calculation step proof")? {
+            [] => None,
+            [assign, proof] => {
+                expect_atom(assign, ":=", "calculation proof separator")?;
+                Some(proof)
+            }
+            _ => return Err(invalid()),
         };
-        expect_atom(assign, ":=", "calculation proof separator")?;
-        let mut steps = vec![(&first[0], proof)];
+        let mut steps = vec![(&first[0], first_proof)];
         for step in expect_null_args(&parts[1], "calculation steps")? {
             self.tick()?;
             let parts = expect_node(step, &lean("calcStep"), 3, "calculation step")?;
             expect_atom(&parts[1], ":=", "calculation proof separator")?;
-            steps.push((&parts[0], &parts[2]));
+            steps.push((&parts[0], Some(&parts[2])));
         }
         Ok(Build {
             steps,
@@ -96,6 +101,46 @@ impl Context {
             bindings: Vec::new(),
             chain: None,
         })
+    }
+
+    /// A first step `a` without a proof, as the pin reads it (`a = _ := rfl`, the hole then
+    /// `a`; `mkCalcFirstStepView`): the relation `a = a` and its proof `Eq.refl a`.
+    pub(super) fn calculation_start(
+        &mut self,
+        start: Typed,
+    ) -> Result<(Typed, Typed), NatDefinitionElabError> {
+        let alpha = self.instantiate(&start.type_)?;
+        let sort = self
+            .known_type(&alpha)?
+            .ok_or_else(|| failure(SourceInferenceError::ExpectedType))?;
+        let level = self.sort_level(&Typed {
+            value: alpha.clone(),
+            type_: sort,
+        })?;
+        let relation = equation(
+            level.clone(),
+            alpha.clone(),
+            start.value.clone(),
+            start.value.clone(),
+        );
+        let refl = Name::from_components(["Eq", "refl"]);
+        if !self.txn.env.contains(&refl) {
+            return Err(failure(SourceInferenceError::UnknownConstant(refl)));
+        }
+        let proof = Expr::app(
+            Expr::app(Expr::const_(refl, vec![level]), alpha),
+            start.value,
+        );
+        Ok((
+            Typed {
+                value: relation.clone(),
+                type_: Expr::sort(Level::zero()),
+            },
+            Typed {
+                value: proof,
+                type_: relation,
+            },
+        ))
     }
 
     // Preserve the written relation head: unfolding it can erase its endpoints

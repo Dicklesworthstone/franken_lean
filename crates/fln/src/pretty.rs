@@ -1507,9 +1507,19 @@ impl<'a> Printer<'a> {
                 let lhs = self
                     .with_trailing(true, |printer| printer.doc(&args[args.len() - 2], lhs_prec))?;
                 let trailing = self.trailing && infix.precedence >= outer;
-                let rhs = self.with_trailing(trailing, |printer| {
-                    printer.doc(&args[args.len() - 1], rhs_prec)
-                })?;
+                // A `fun` operand that nothing follows is left bare, as an application's last
+                // argument is (`argument`): the pin prints `(fun x => x) = fun x => x`.
+                let mut bare = &args[args.len() - 1];
+                while let ExprNode::MData { expr, .. } = bare.node() {
+                    bare = expr;
+                }
+                let rhs = if !trailing && matches!(bare.node(), ExprNode::Lam { .. }) {
+                    self.with_trailing(false, |printer| printer.doc(&args[args.len() - 1], 0))?
+                } else {
+                    self.with_trailing(trailing, |printer| {
+                        printer.doc(&args[args.len() - 1], rhs_prec)
+                    })?
+                };
                 return Ok(paren_doc(
                     node(
                         lhs.then(Format::text(format!(" {}", infix.symbol)))
