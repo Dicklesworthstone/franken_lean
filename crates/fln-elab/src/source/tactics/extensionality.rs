@@ -142,11 +142,16 @@ impl Context {
             type_: sort,
         })?;
         self.txn.lctx = goal.lctx.clone();
+        // The pin's `apply funext` assigns `?f := fun …` and its `instantiateMVars` reduces
+        // `?f x` at the head, so the new goal reads `y + x + 0`, not `(fun y x => …) x`: `rw`
+        // abstracts occurrences of that literal term (`kabstract`).
+        let pointwise_left = self.head_beta(Expr::app(left.clone(), x.clone()))?;
+        let pointwise_right = self.head_beta(Expr::app(right.clone(), x))?;
         let pointwise = equality::equation(
             result_level.clone(),
             codomain.clone(),
-            Expr::app(left.clone(), x.clone()),
-            Expr::app(right.clone(), x),
+            pointwise_left,
+            pointwise_right,
         );
         let pointwise = self.close_equality_binder(&argument, pointwise, false)?;
         let (witness, child) = self.proof_goal(pointwise)?;

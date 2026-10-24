@@ -426,8 +426,19 @@ fn check(
     name: &str,
     program: &str,
 ) -> (i32, String, Option<(i32, String)>) {
+    check_under(HEADER, lib, root, name, program)
+}
+
+/// [`check`] with another header.
+fn check_under(
+    header: &str,
+    lib: &Path,
+    root: &Path,
+    name: &str,
+    program: &str,
+) -> (i32, String, Option<(i32, String)>) {
     let entry = root.join(format!("{name}.lean"));
-    std::fs::write(&entry, format!("{HEADER}{program}")).unwrap();
+    std::fs::write(&entry, format!("{header}{program}")).unwrap();
     let ours = Command::new(env!("CARGO_BIN_EXE_fln"))
         .arg("check-source")
         .arg(&entry)
@@ -502,6 +513,45 @@ fn rw_abstracts_and_closes_as_the_pin() {
                 output.contains(expected),
                 "{name}: the pinned lean does not report `{expected}`\n{output}"
             );
+        }
+    }
+}
+
+/// `funext` (`Init.NotationExtra`'s syntax) leaves the pointwise goal head-reduced, as the pin's
+/// `apply funext` does through `instantiateMVars`, so `rw` finds `y + x + 0` in it (upstream
+/// `elab/funext`). Both programs are accepted by the pinned v4.32.0 under this header
+/// (2026-10-24).
+#[test]
+fn funext_goals_are_head_reduced_for_rw() {
+    let Some(lib) = pinned_lib() else {
+        return;
+    };
+    let root = std::env::temp_dir().join(format!(
+        "fln-rewrite-funext-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    ));
+    std::fs::create_dir(&root).unwrap();
+    let header = "prelude\nimport Init.SimpLemmas\nimport Init.NotationExtra\n";
+    for (name, program) in [
+        (
+            "funext_named",
+            "theorem ex2 : (fun y x : Nat => y + x + 0) = (fun x y : Nat => y + x) := by\n  \
+             funext x y\n  rw [Nat.add_zero, Nat.add_comm]\n",
+        ),
+        (
+            "funext_bare",
+            "theorem ex6 : (fun (x : Nat) y z => x + y + z) = (fun x y z => x + (y + z)) := by\n  \
+             funext\n  rw [Nat.add_assoc]\n",
+        ),
+    ] {
+        let (code, stderr, pinned) = check_under(header, &lib, &root, name, program);
+        assert_eq!(code, 0, "{name}: {program}\n{stderr}");
+        if let Some((pinned, output)) = pinned {
+            assert_eq!(pinned, 0, "{name}: the pinned lean rejects it\n{output}");
         }
     }
 }
