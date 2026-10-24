@@ -80,6 +80,15 @@ fn pinned_lean() -> Option<std::path::PathBuf> {
 }
 
 pub(super) fn reference_import(built: &SourceModuleBuild, source: &str, accepted: bool) {
+    reference_import_stdout(built, source, accepted, None);
+}
+
+pub(super) fn reference_import_stdout(
+    built: &SourceModuleBuild,
+    source: &str,
+    accepted: bool,
+    stdout: Option<&str>,
+) {
     use std::sync::atomic::{AtomicUsize, Ordering};
     static NEXT: AtomicUsize = AtomicUsize::new(0);
     let Some(pin) = pinned_lean() else {
@@ -107,12 +116,30 @@ pub(super) fn reference_import(built: &SourceModuleBuild, source: &str, accepted
     }
     let probe = directory.join("Probe.lean");
     std::fs::write(&probe, source).unwrap();
-    let output = std::process::Command::new(pin)
+    let mut child = std::process::Command::new(pin)
         .arg(&probe)
         .current_dir(&directory)
         .env("LEAN_PATH", &directory)
-        .output()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .unwrap();
+    // A lost macro-inline tag can turn an untaken argument into an infinite
+    // computation. Bound the oracle rather than hanging the regression suite.
+    let started = std::time::Instant::now();
+    while child.try_wait().unwrap().is_none() {
+        if started.elapsed() > std::time::Duration::from_secs(30) {
+            child.kill().unwrap();
+            let output = child.wait_with_output().unwrap();
+            panic!(
+                "pinned artifact consumer timed out: {source}\n{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let output = child.wait_with_output().unwrap();
     assert_eq!(
         output.status.success(),
         accepted,
@@ -120,6 +147,14 @@ pub(super) fn reference_import(built: &SourceModuleBuild, source: &str, accepted
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    if let Some(expected) = stdout {
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            expected,
+            "{source}"
+        );
+        assert!(output.stderr.is_empty(), "{:?}", output.stderr);
+    }
 }
 
 #[test]

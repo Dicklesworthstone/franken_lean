@@ -21,6 +21,8 @@ use fln_env::extensions::{
 };
 use std::collections::BTreeSet;
 
+pub mod export;
+
 const MAGIC: &[u8] = b"FLNMACROINL\x01";
 /// Native tag journal row capacity.
 pub const MAX_ROWS: usize = 65_536;

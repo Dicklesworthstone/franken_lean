@@ -11,6 +11,8 @@ mod aliases;
 mod defaults;
 #[path = "instances.rs"]
 mod instances;
+#[path = "macro_inline.rs"]
+mod macro_inline;
 #[path = "structures.rs"]
 mod structures;
 
