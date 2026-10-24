@@ -148,7 +148,9 @@ pub fn term_in_locals(
 pub fn render(env: &Environment, event: &SourceTrace) -> Result<String, Unsupported> {
     let goals = match &event.content {
         TraceContent::Goals(goals) => goals,
-        TraceContent::Message(message) => return Ok(message.clone()),
+        TraceContent::Message(message) | TraceContent::Info(message) => {
+            return Ok(message.clone());
+        }
     };
     let mut displayed = Vec::new();
     let mut total = 0usize;

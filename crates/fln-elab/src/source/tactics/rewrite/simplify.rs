@@ -8,6 +8,7 @@ mod binders;
 mod dsimp;
 mod locations;
 mod simpa;
+mod suggest;
 mod unfold;
 
 use super::matching::RigidTypeHead;

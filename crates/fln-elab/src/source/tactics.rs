@@ -190,11 +190,20 @@ pub enum TacticError {
     ArithmeticUnsupported,
     ArithmeticNoContradiction,
     ArithmeticInvalidCertificate,
+    /// `simp?`, `simp_all?` or `dsimp?` whose run this engine performed, but whose
+    /// suggestion it cannot reproduce exactly: the pin's `simp only` call depends on the
+    /// order the pin's simplifier visits terms and selects rules, which is modeled here only
+    /// for the named fragment. Never caught by `first`/`try`: the pin's tactic succeeds.
+    SimpSuggestionUnsupported(&'static str),
 }
 impl std::fmt::Display for TacticError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::ExplicitFailure => write!(f, "explicit tactic failure"),
+            Self::SimpSuggestionUnsupported(reason) => write!(
+                f,
+                "simp suggestion outside the fragment this engine reproduces: {reason}"
+            ),
             Self::UnsupportedTactic(kind) => {
                 write!(f, "unsupported tactic `{}`", kind.to_display_string())
             }
@@ -1445,6 +1454,11 @@ impl Context {
                 self.dsimplify_proof_goal(proof, goal, args)?;
             } else if kind == &parser_kind(&["Tactic", "simp"]) {
                 self.simplify_proof_goal(proof, goal, args)?;
+            } else if kind == &parser_kind(&["Tactic", "simpTrace"])
+                || kind == &parser_kind(&["Tactic", "simpAllTrace"])
+                || kind == &parser_kind(&["Tactic", "dsimpTrace"])
+            {
+                self.simp_trace_proof_goal(proof, goal, kind, args)?;
             } else if kind == &parser_kind(&["Tactic", "simpa"]) {
                 let [keyword, _, _, rest] = args.as_slice() else {
                     return Err(error(TacticError::MalformedScript));

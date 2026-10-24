@@ -322,6 +322,10 @@ pub(crate) fn tactic(
             "simp",
             "simp_all",
             "simpa",
+            // An identifier may end in `?` (`isIdRest`), so these lex as names.
+            "simp?",
+            "simp_all?",
+            "dsimp?",
             "subst",
             "injection",
             "contradiction",
@@ -392,6 +396,13 @@ pub(crate) fn tactic(
         // `macro "sorry" : tactic => `(tactic| exact sorry)` (`Init/Tactics.lean:459`).
         TokenKind::Symbol(symbol) if symbol == "sorry" => Some("sorry"),
         TokenKind::Symbol(symbol) if symbol == "admit" => Some("admit"),
+        // `"simp?" "!"? simpTraceArgsRest`, `"simp_all?" "!"? simpAllTraceArgsRest` and
+        // `"dsimp?" "!"? dsimpTraceArgsRest` (`Init/Tactics.lean:728-746`), should an imported
+        // token table classify them as symbols; their elaboration requires the declaring
+        // syntax (`require_declared_tactic`).
+        TokenKind::Symbol(symbol) if symbol == "simp?" => Some("simp?"),
+        TokenKind::Symbol(symbol) if symbol == "simp_all?" => Some("simp_all?"),
+        TokenKind::Symbol(symbol) if symbol == "dsimp?" => Some("dsimp?"),
         _ => None,
     };
     let Some(keyword) = keyword else {
@@ -410,6 +421,7 @@ pub(crate) fn tactic(
         "simp" | "dsimp" => simplify(leaves, view, tokens, range, atom, keyword),
         "simp_all" => simplify_all(leaves, view, tokens, range, atom),
         "simpa" => simpa(leaves, view, tokens, range, atom),
+        "simp?" | "simp_all?" | "dsimp?" => simplify_trace(leaves, view, tokens, range, atom),
         "rw" | "rewrite" | "rwa" | "erw" | "rw_mod_cast" => {
             rewrite(leaves, view, tokens, range, atom, keyword)
         }
@@ -1615,6 +1627,93 @@ fn simpa(
         ),
     ];
     Ok(parsed)
+}
+
+/// `simp?`, `simp_all?` and `dsimp?` (`Init/Tactics.lean:714-746`): the keyword, an optional
+/// `!`, and the arguments of `simp`, `simp_all` and `dsimp` as one `…TraceArgsRest` node, whose
+/// rule list is its own `simpArgs` (`dsimpArgs`, without `*`) node, as the pin's trees have it.
+#[inline(never)]
+fn simplify_trace(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    range: Range<usize>,
+    keyword: Syntax,
+) -> Result<Syntax, NatDefinitionParseError> {
+    let Syntax::Atom { val: word, .. } = &keyword else {
+        unreachable!("a tactic keyword is an atom");
+    };
+    let word = word.clone();
+    let start = range.start;
+    let bang = matches!(tokens.get(start + 1).map(|t| &t.kind),
+        Some(TokenKind::Symbol(s)) if s == "!")
+        && start + 1 < range.end;
+    let bang_slot = if bang {
+        null_node(vec![leaves.leaf(start + 1)?])
+    } else {
+        null_node(Vec::new())
+    };
+    // The shared grammar reads its configuration after the token at its range's start.
+    let rest = if bang { start + 1 } else { start }..range.end;
+    let grammar = if word == "simp?" { "simp" } else { "dsimp" };
+    let mut parsed = simplify(leaves, view, tokens, rest, keyword.clone(), grammar)?;
+    let Syntax::Node { args, .. } = &mut parsed else {
+        unreachable!("simplify builds a tactic node");
+    };
+    let [_, config, discharger, only, mut arguments, location]: [Syntax; 6] = std::mem::take(args)
+        .try_into()
+        .expect("simplify builds six slots");
+    let list_kind = if word == "simp?" {
+        "simpArgs"
+    } else {
+        "dsimpArgs"
+    };
+    if let Syntax::Node { args, .. } = &mut arguments
+        && args.len() == 3
+    {
+        let inline = std::mem::take(args);
+        arguments = null_node(vec![Syntax::node(
+            parser_kind(&["Tactic", list_kind]),
+            inline,
+        )]);
+    }
+    let empty = |slot: &Syntax| matches!(slot, Syntax::Node { args, .. } if args.is_empty());
+    let (kind, rest_kind, rest) = match word.as_str() {
+        "simp?" => (
+            "simpTrace",
+            "simpTraceArgsRest",
+            vec![config, discharger, only, arguments, location],
+        ),
+        "simp_all?" => {
+            if !empty(&location) {
+                return Err(refusal(view, tokens, range.end));
+            }
+            (
+                "simpAllTrace",
+                "simpAllTraceArgsRest",
+                vec![config, discharger, only, arguments],
+            )
+        }
+        _ => {
+            // `dsimpTraceArgsRest := optConfig (&" only")? (dsimpArgs)? (ppSpace location)?`.
+            if !empty(&discharger) {
+                return Err(refusal(view, tokens, start + 1));
+            }
+            (
+                "dsimpTrace",
+                "dsimpTraceArgsRest",
+                vec![config, only, arguments, location],
+            )
+        }
+    };
+    Ok(Syntax::node(
+        parser_kind(&["Tactic", kind]),
+        vec![
+            keyword,
+            bang_slot,
+            Syntax::node(parser_kind(&["Tactic", rest_kind]), rest),
+        ],
+    ))
 }
 
 /// `(discharger)?` at `at` (`Init/Tactics.lean`): `"(" patternIgnore("discharger" <|> "disch") " := "

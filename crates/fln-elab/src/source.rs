@@ -574,6 +574,8 @@ impl SourceEquation {
 struct Context {
     inspection: Option<inspect::Probe>,
     traces: trace::TraceLog,
+    // Information messages (`trace::Context::log_info`): elaboration state, restored with it.
+    infos: Vec<trace::SourceTrace>,
     goal_tags: std::collections::HashMap<MVarId, Name>,
     // Rewritten hypotheses: the pin asserts each and applies the new goal to its proof, which
     // `instantiateMVars` beta-reduces away when nothing reads it, so such a binding nothing
@@ -762,6 +764,7 @@ impl Context {
         Self {
             inspection: None,
             traces: trace::TraceLog::default(),
+            infos: Vec::new(),
             goal_tags: std::collections::HashMap::new(),
             discarded_lets: std::collections::HashSet::new(),
             trace_local_names: std::collections::HashMap::new(),

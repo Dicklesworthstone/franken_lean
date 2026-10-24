@@ -15,6 +15,10 @@ enum Occurrences<'a> {
     Root,
     /// Every subterm whose own key the rule's key admits (simp's per-node retrieval).
     Admitted(&'a super::simplify::SimpKey),
+    /// The target itself only, leaving the rule's propositional premises undischarged and
+    /// returned (`simp?`'s model of the pin's `tryTheoremCore`, which discharges after
+    /// unification with its own simplifier).
+    RootDeferred,
 }
 
 /// The pin's `HeadIndex` (vendored Lean/HeadIndex.lean:28-36).
@@ -421,6 +425,25 @@ impl Context {
         )
     }
 
+    /// Match a simp rule at `target`'s root only, returning its instantiation with its
+    /// propositional premises open (`RewriteMatch::premises`) and without the no-change test:
+    /// the caller discharges them as the pin's simplifier does and judges the result itself.
+    pub(super) fn instantiate_simp_rule_at_root(
+        &mut self,
+        rule: Typed,
+        target: &Expr,
+        reverse: bool,
+    ) -> Result<Option<RewriteMatch>, NatDefinitionElabError> {
+        self.instantiate_rewrite_rule_with_scope(
+            rule,
+            target,
+            reverse,
+            true,
+            &[],
+            Occurrences::RootDeferred,
+        )
+    }
+
     pub(in crate::source) fn instantiate_dsimp_rule(
         &mut self,
         rule: Typed,
@@ -446,7 +469,8 @@ impl Context {
         selected_rules: &[SimpRule<'_>],
         occurrences: Occurrences<'_>,
     ) -> Result<Option<RewriteMatch>, NatDefinitionElabError> {
-        let root_only = matches!(occurrences, Occurrences::Root);
+        let root_only = matches!(occurrences, Occurrences::Root | Occurrences::RootDeferred);
+        let deferred = matches!(occurrences, Occurrences::RootDeferred);
         self.flush(false)?;
         let mut template = self.rewrite_trial();
         // Preparing a rule is speculative too. Charge its private context on
@@ -709,19 +733,22 @@ impl Context {
                 {
                     return Ok(None);
                 }
-                if inside_out && !trial.discharge_rewrite_premises(&holes, selected_rules)? {
+                if inside_out
+                    && !deferred
+                    && !trial.discharge_rewrite_premises(&holes, selected_rules)?
+                {
                     return Ok(None);
                 }
                 let value = trial.instantiate(&rule.value)?;
                 let type_ = trial.instantiate(&rule.type_)?;
                 if value.has_level_mvar()
                     || type_.has_level_mvar()
-                    || inside_out && (value.has_expr_mvar() || type_.has_expr_mvar())
+                    || inside_out && !deferred && (value.has_expr_mvar() || type_.has_expr_mvar())
                 {
                     return Ok(None);
                 }
                 let occurrence = trial.instantiate(term)?;
-                if inside_out {
+                if inside_out && !deferred {
                     let (_, _, from, to) =
                         equality_target(&type_).expect("instantiated equality retains its shape");
                     let replacement = if reverse { from } else { to };
@@ -730,7 +757,51 @@ impl Context {
                     }
                 }
                 let mut premises = Vec::new();
-                if !inside_out {
+                if deferred {
+                    let mut open_data = false;
+                    for id in &holes {
+                        trial.tick()?;
+                        if trial.txn.mvars.is_assigned(id) {
+                            continue;
+                        }
+                        let declaration = trial
+                            .txn
+                            .mvars
+                            .get_decl(id)
+                            .expect("rule parameter was declared")
+                            .clone();
+                        let target = trial.instantiate(&declaration.type_)?;
+                        let proposition = match trial.known_type(&target)? {
+                            Some(universe) => matches!(trial.whnf(&universe)?.node(),
+                                ExprNode::Sort { level } if level.normalize().is_zero()),
+                            None => false,
+                        };
+                        if !proposition {
+                            open_data = true;
+                            continue;
+                        }
+                        premises.push(ProofGoal {
+                            id: id.clone(),
+                            target,
+                            lctx: declaration.lctx,
+                            introduced: Vec::new(),
+                        });
+                    }
+                    // The pin's `synthesizeArgs` leaves a data argument to unification alone:
+                    // one unification did not fix makes the proof `hasAssignableMVar`, and the
+                    // rule fails, unless discharging a premise that mentions it assigns it.
+                    if premises
+                        .iter()
+                        .any(|premise| premise.target.has_expr_mvar())
+                    {
+                        return Err(error(TacticError::SimpSuggestionUnsupported(
+                            "a rule whose premise its matching leaves open",
+                        )));
+                    }
+                    if open_data || type_.has_expr_mvar() {
+                        return Ok(None);
+                    }
+                } else if !inside_out {
                     for id in &holes {
                         trial.tick()?;
                         if trial.txn.mvars.is_assigned(id) {
