@@ -18,6 +18,7 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -26,8 +27,59 @@ env:
   FLN_UBS_SCOPE: all-tracked
 
 jobs:
+  workflow-yaml:
+    name: workflow YAML syntax
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      # Engineering tooling only: parse syntax trees without constructing Ruby
+      # objects or interpreting GitHub's event/expression schema (waaq).
+      - name: parse every workflow and exercise the indentation regression
+        shell: bash
+        run: |
+          if ! command -v ruby >/dev/null 2>&1; then
+            echo 'workflow YAML syntax: required Ruby/Psych parser is unavailable' >&2
+            exit 2
+          fi
+          ruby -rpsych - <<'RUBY'
+          valid = "name: probe\non: push\njobs:\n  probe:\n    steps:\n      - run: |\n          code = '''\n          retained\n          '''\n"
+          broken = valid.sub("          '''\n", "'''\n")
+          trailing = valid + "---\nbroken: [\n"
+          [broken, trailing].each do |plant|
+            refused = false
+            begin
+              Psych.parse_stream(plant)
+            rescue Psych::SyntaxError
+              refused = true
+            end
+            abort 'workflow YAML syntax: invalid control was accepted' unless refused
+          end
+          Psych.parse_stream(valid)
+
+          files = Dir.glob('.github/workflows/*.{yml,yaml}', File::FNM_DOTMATCH).sort
+          abort 'workflow YAML syntax: no workflow files found' if files.empty?
+          parsed = 0
+          errors = []
+          files.each do |file|
+            begin
+              # parse_stream consumes the entire file, including later documents.
+              Psych.parse_stream(File.read(file, encoding: 'bom|utf-8'))
+              parsed += 1
+            rescue Psych::SyntaxError => error
+              errors << "#{file}: #{error.message}"
+            end
+          end
+          abort errors.join("\n") unless errors.empty?
+          abort 'workflow YAML syntax: incomplete scan' unless parsed == files.length
+          puts "workflow YAML syntax: #{parsed} files parsed; indentation and trailing-document controls refused"
+          RUBY
+
   gate:
     name: quality gate (check.sh + e2e smokes)
+    needs: workflow-yaml
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
