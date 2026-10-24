@@ -61,6 +61,14 @@ const ACCEPTED: &[(&str, &str)] = &[
         "def h (b : Bool) : Except String Unit := do\n  if b then\n    return\n  throw \"late\"\nexample : h true = Except.ok () := rfl\nexample : h false = Except.error \"late\" := rfl\n",
     ),
     ("return_bare_parenthesized", "def b : IO Unit := (return)\n"),
+    (
+        "do_pure_lets_at_id",
+        "def v (x : Nat) : Id Nat := do\n  let y := x + x\n  pure (y * 2)\n",
+    ),
+    (
+        "do_pure_lets_under_run",
+        "def w (x : Nat) : Nat := Id.run do\n  let y := x + x\n  pure (y * 2)\n",
+    ),
 ];
 
 const REFUSED: &[(&str, &str)] = &[
@@ -107,6 +115,17 @@ const REFUSED: &[(&str, &str)] = &[
     (
         "return_bare_at_nat",
         "def bad : Except String Nat := return\n",
+    ),
+    // `extractMonadInfo` (vendored `Lean/Elab/Do/Basic.lean:741-760`): "invalid `do` notation,
+    // expected type is not a monad application", even when every statement is a pure `let`
+    // (upstream `elab_fail/770`).
+    (
+        "do_pure_lets_at_nat",
+        "def u (x : Nat) : Nat := do\n  let y := x + x\n  y * (if y > 100 then 1 else (5 : Nat))\n",
+    ),
+    (
+        "do_pure_let_at_bool",
+        "def b : Bool := do\n  let y := true\n  y\n",
     ),
 ];
 

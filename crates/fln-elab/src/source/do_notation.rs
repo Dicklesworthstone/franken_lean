@@ -512,7 +512,38 @@ impl Context {
         let mut parts = node(syntax, "do", 2)?;
         let sequence = parts.pop().expect("do sequence");
         expect_atom(&parts[0], "do", "do keyword")?;
-        self.expand_do_sequence(sequence, None)
+        // The block keeps a marker so its expected type is checked as the pin's
+        // `extractMonadInfo` checks it, even when every statement is a pure `let`.
+        Ok(Syntax::node(
+            parser_kind(&["Term", "nativeDoBlock"]),
+            vec![self.expand_do_sequence(sequence, None)?],
+        ))
+    }
+
+    /// Whether `type_`, a `do` block's expected type, can name a monad: it reduces to an
+    /// application, or is still unknown (a metavariable). The pin's `extractMonadInfo` refuses a
+    /// type that reaches neither by `whnfCore` and definition unfolding
+    /// (`Lean/Elab/Do/Basic.lean:741-760`). Whether the head is a monad is left to the binds.
+    pub(super) fn do_expected_type_applies(
+        &mut self,
+        type_: &Expr,
+    ) -> Result<bool, NatDefinitionElabError> {
+        let mut type_ = self.instantiate(type_)?;
+        loop {
+            self.tick()?;
+            match type_.node() {
+                ExprNode::App { .. } | ExprNode::MVar { .. } => return Ok(true),
+                ExprNode::MData { expr, .. } => type_ = expr.clone(),
+                ExprNode::LetE { body, value, .. } => type_ = self.substitute(body, value)?,
+                _ => {
+                    let reduced = self.whnf(&type_)?;
+                    if reduced == type_ {
+                        return Ok(false);
+                    }
+                    type_ = reduced;
+                }
+            }
+        }
     }
 
     // The top-level sequence and conditional branches share the same statement

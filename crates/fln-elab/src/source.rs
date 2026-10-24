@@ -188,6 +188,9 @@ pub enum SourceInferenceError {
     DottedIdent(DottedIdentError),
     /// A `·` that no parentheses, tuple or ascription scopes (the pin's `elabCDot`).
     CdotOutsideParentheses,
+    /// A `do` block whose known expected type reduces to no application, so it names no monad
+    /// (`extractMonadInfo`, vendored `Lean/Elab/Do/Basic.lean:741-760`).
+    DoExpectedTypeNotMonad,
     /// A term whose type is rigidly not its expected type, with no coercion between them: the
     /// pin's `Type mismatch` (`throwTypeMismatchError`). Only rigid mismatches are reported
     /// here; an undecided one still reaches the kernel (`coercions::rigid_type_mismatch`).
@@ -456,6 +459,9 @@ impl std::fmt::Display for SourceInferenceError {
             // The pin's words.
             Self::CdotOutsideParentheses => f.write_str(
                 "invalid occurrence of `·` notation, it must be surrounded by parentheses (e.g. `(· + 1)`)",
+            ),
+            Self::DoExpectedTypeNotMonad => f.write_str(
+                "invalid `do` notation, expected type is not a monad application",
             ),
             Self::TypeMismatch { actual, expected } => write!(
                 f,
@@ -2211,6 +2217,24 @@ impl Context {
                                         return Err(failure(SourceInferenceError::Scope));
                                     };
                                     tasks.push(Task::CaptureRecursiveContext);
+                                    tasks.push(Task::Visit(body, expected, finish));
+                                    continue;
+                                }
+                                // A whole `do` block (`do_notation::expand_do_node`): a known
+                                // expected type must reduce to an application, the pin's
+                                // `extractMonadInfo` (`Lean/Elab/Do/Basic.lean:741-760`); an
+                                // unknown one, or a metavariable head, is left to its binds.
+                                if kind == &parser_kind(&["Term", "nativeDoBlock"]) {
+                                    let [body] = args.as_slice() else {
+                                        return Err(failure(SourceInferenceError::Scope));
+                                    };
+                                    if let Some(type_) = &expected
+                                        && !self.do_expected_type_applies(type_)?
+                                    {
+                                        return Err(failure(
+                                            SourceInferenceError::DoExpectedTypeNotMonad,
+                                        ));
+                                    }
                                     tasks.push(Task::Visit(body, expected, finish));
                                     continue;
                                 }

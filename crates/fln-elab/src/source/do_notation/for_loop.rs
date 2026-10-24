@@ -304,7 +304,16 @@ mod tests {
     }
     fn expanded(sequence: Syntax) -> Result<Syntax, NatDefinitionElabError> {
         let syntax = term("do", vec![atom("do"), sequence]);
-        Ok(context().lower_pattern_matrices(&syntax)?.into_owned())
+        // A whole block keeps its `nativeDoBlock` marker (`expand_do_node`); these tests read
+        // the expansion inside it.
+        match &context().lower_pattern_matrices(&syntax)?.into_owned() {
+            Syntax::Node { kind, args, .. }
+                if *kind == parser_kind(&["Term", "nativeDoBlock"]) && args.len() == 1 =>
+            {
+                Ok(args[0].clone())
+            }
+            other => panic!("a do block keeps its marker: {other:?}"),
+        }
     }
 
     #[test]

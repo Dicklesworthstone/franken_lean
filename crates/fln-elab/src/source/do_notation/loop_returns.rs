@@ -576,10 +576,20 @@ mod tests {
         n
     }
     fn expanded(body: Syntax) -> Syntax {
-        context()
+        // A whole block keeps its `nativeDoBlock` marker (`expand_do_node`); these tests read
+        // the expansion inside it.
+        match &context()
             .lower_pattern_matrices(&term("do", vec![atom("do"), body]))
             .unwrap()
             .into_owned()
+        {
+            Syntax::Node { kind, args, .. }
+                if *kind == parser_kind(&["Term", "nativeDoBlock"]) && args.len() == 1 =>
+            {
+                args[0].clone()
+            }
+            other => panic!("a do block keeps its marker: {other:?}"),
+        }
     }
     #[test]
     fn returns_store_the_original_value_once_in_a_checked_some_payload() {
