@@ -462,6 +462,7 @@ impl Engine {
                     fln_elab::source::ElaboratedDeclaration {
                         declaration: candidate,
                         native_axioms: Vec::new(),
+                        equation_info: None,
                         local_functions,
                         irreducible: false,
                         noncomputable: inferred_noncomputable,
@@ -483,6 +484,7 @@ impl Engine {
                     parsed.syntax(),
                     candidate,
                     false,
+                    None,
                     inferred_noncomputable,
                     local_functions,
                     options,
@@ -565,6 +567,7 @@ impl Engine {
                 parsed.syntax(),
                 interface,
                 false,
+                None,
                 false,
                 Vec::new(),
                 options,
@@ -625,6 +628,7 @@ impl Engine {
         syntax: &fln_syntax::tree::Syntax,
         declaration: Declaration,
         irreducible: bool,
+        equation_info: Option<fln_elab::source::equation_theorems::journal::Record>,
         inferred_noncomputable: bool,
         local_functions: Vec<Declaration>,
         options: &KVMap,
@@ -676,7 +680,7 @@ impl Engine {
             .map_err(EngineExecutionError::from)?;
         Ok(match result {
             Outcome::Complete(mut batch) => {
-                apply_batch_effects(&mut batch, irreducible, options)?;
+                apply_batch_effects(&mut batch, irreducible, equation_info.as_ref(), options)?;
                 if fln_elab::source::scope::simp::defeq::direct_rfl(syntax) {
                     for admitted in &batch.admissions {
                         let name = match &admitted.declaration {
@@ -1057,6 +1061,7 @@ impl Engine {
                     parsed.syntax(),
                     elaborated.declaration,
                     elaborated.irreducible,
+                    elaborated.equation_info,
                     elaborated.noncomputable,
                     elaborated.local_functions,
                     options,

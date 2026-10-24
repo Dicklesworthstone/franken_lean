@@ -6866,6 +6866,7 @@ impl Engine {
                 source_records::apply_admission_effects(
                     &mut admitted,
                     elaborated.irreducible,
+                    elaborated.equation_info.as_ref(),
                     options,
                 )?;
                 if fln_elab::source::scope::simp::defeq::direct_rfl(parsed.syntax()) {
@@ -8382,6 +8383,7 @@ impl Engine {
                             fln_elab::source::ElaboratedDeclaration {
                                 declaration,
                                 native_axioms: Vec::new(),
+                                equation_info: None,
                                 local_functions: Vec::new(),
                                 irreducible: false,
                                 noncomputable: false,
@@ -8447,6 +8449,7 @@ impl Engine {
             let fln_elab::source::ElaboratedDeclaration {
                 declaration,
                 native_axioms,
+                equation_info,
                 local_functions,
                 irreducible,
                 noncomputable,
@@ -8604,13 +8607,17 @@ impl Engine {
                     Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
                     Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
                 };
-                source_records::apply_batch_effects(&mut admission, irreducible, options).map_err(
-                    |error| EngineExecutionError::BatchCommand {
-                        index: command_index,
-                        error: Box::new(error),
-                        at: Some(original_offset),
-                    },
-                )?;
+                source_records::apply_batch_effects(
+                    &mut admission,
+                    irreducible,
+                    equation_info.as_ref(),
+                    options,
+                )
+                .map_err(|error| EngineExecutionError::BatchCommand {
+                    index: command_index,
+                    error: Box::new(error),
+                    at: Some(original_offset),
+                })?;
                 if let Some(name) = &protected {
                     admission.engine.environment =
                         source_records::tag_protected(&admission.engine, name).map_err(
@@ -8790,6 +8797,7 @@ impl Engine {
             source_records::apply_execution_effects(
                 &mut execution,
                 irreducible,
+                equation_info.as_ref(),
                 scoped_options.as_ref().unwrap_or(options),
             )
             .map_err(|error| EngineExecutionError::BatchCommand {
@@ -9679,6 +9687,7 @@ impl Engine {
                     source_records::apply_execution_effects(
                         &mut execution,
                         elaborated.irreducible,
+                        elaborated.equation_info.as_ref(),
                         options,
                     )?;
                     Outcome::Complete(execution)

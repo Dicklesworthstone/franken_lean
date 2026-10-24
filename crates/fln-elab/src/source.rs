@@ -747,6 +747,9 @@ struct Context {
     native_axioms: Vec<Declaration>,
     // The pin's `DeclNameGenerator` for the declaration being elaborated (`mkAuxDeclName`).
     aux_names: Option<tactics::AuxNames>,
+    /// The definition's root `match`, read for its equation theorems
+    /// (`equation_theorems::capture`), once the definition is elaborated.
+    equation_info: Option<equation_theorems::journal::Record>,
 }
 
 fn failure(reason: SourceInferenceError) -> NatDefinitionElabError {
@@ -841,6 +844,7 @@ impl Context {
             native: None,
             native_axioms: Vec::new(),
             aux_names: None,
+            equation_info: None,
         }
     }
 
@@ -5025,6 +5029,7 @@ pub fn elaborate_public_theorem(
     Ok(ElaboratedDeclaration {
         declaration,
         native_axioms: Vec::new(),
+        equation_info: None,
         local_functions,
         irreducible: false,
         noncomputable: context.noncomputable_definition,
@@ -5150,6 +5155,9 @@ pub struct ElaboratedDeclaration {
     /// (`crate::native`). The declaration cites them, so callers must admit every one,
     /// through both checkers, before it.
     pub native_axioms: Vec<Declaration>,
+    /// The root `match` of a definition by pattern matching, for its equation theorems: the
+    /// caller records it with the admitted definition (`equation_theorems::journal::push`).
+    pub equation_info: Option<equation_theorems::journal::Record>,
     /// Closed local recursive helpers. They grant no authority: callers must
     /// admit every helper and the owner atomically through both checkers.
     pub local_functions: Vec<Declaration>,
@@ -5199,6 +5207,7 @@ fn definition_scoped_elaboration(
     Ok(ElaboratedDeclaration {
         declaration,
         native_axioms: std::mem::take(&mut context.native_axioms),
+        equation_info: context.equation_info.take(),
         local_functions,
         irreducible: context.well_founded_definition,
         noncomputable: context.noncomputable_definition,
@@ -6031,7 +6040,7 @@ fn definition_elaboration(
             safety: DefinitionSafety::Partial,
         }]))
     } else {
-        Ok(Declaration::Defn(DefinitionVal {
+        let definition = DefinitionVal {
             base,
             value: term.value,
             hints: if is_abbrev {
@@ -6041,7 +6050,10 @@ fn definition_elaboration(
             },
             safety: DefinitionSafety::Safe,
             all: vec![name.clone()],
-        }))
+        };
+        context.equation_info =
+            context.capture_equation_info(&definition, body, partial_captures.len());
+        Ok(Declaration::Defn(definition))
     }
 }
 

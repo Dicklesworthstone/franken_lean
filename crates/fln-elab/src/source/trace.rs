@@ -66,6 +66,7 @@ pub fn elaborate_definition(
         candidate: ElaboratedDeclaration {
             declaration,
             native_axioms: Vec::new(),
+            equation_info: context.equation_info.take(),
             local_functions,
             irreducible: context.well_founded_definition,
             noncomputable: context.noncomputable_definition,

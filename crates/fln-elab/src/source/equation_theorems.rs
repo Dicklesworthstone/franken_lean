@@ -22,6 +22,9 @@
 //! definition's matcher (`splitMatch?`) and print `match` in `eq_def`; neither exists here.
 use super::*;
 use fln_env::constants::{ConstantInfo, ConstantVal, DefinitionVal, TheoremVal};
+mod capture;
+pub mod journal;
+mod matched;
 
 /// Which equation-like name was asked for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,6 +51,15 @@ pub enum Unsupported {
     LocalFunction(Name),
     /// Nothing generated the equations before this reference was elaborated.
     NotRequested,
+    /// The definition is by pattern matching and its `match` was not recorded.
+    UnrecordedMatch,
+    /// The statement would contain a `match`, which the pin prints through its matcher.
+    MatchInStatement,
+    /// The equation's proof was not found here.
+    Unproved,
+    /// The definition is by well-founded recursion: the pin's unfolding theorem rewrites with
+    /// `WellFounded.fix_eq` (vendored Lean/Elab/PreDefinition/WF/Unfold.lean:32-48, 211).
+    WellFounded,
 }
 
 /// A name the pin generates on demand that this engine did not.
@@ -79,6 +91,19 @@ impl std::fmt::Display for NotGenerated {
             ),
             Unsupported::NotRequested => {
                 "no equation theorems were generated for this reference".to_string()
+            }
+            Unsupported::UnrecordedMatch => {
+                "its `match` is not one whose alternatives this engine records".to_string()
+            }
+            Unsupported::MatchInStatement => {
+                "the statement contains a `match`, which the pin states with its matcher"
+                    .to_string()
+            }
+            Unsupported::Unproved => "its proof was not found here".to_string(),
+            Unsupported::WellFounded => {
+                "it is defined by well-founded recursion, whose equations the pin proves \
+                 from `WellFounded.fix_eq`"
+                    .to_string()
             }
         };
         write!(
@@ -248,6 +273,96 @@ fn unsupported_reason(env: &Environment, declaration: &Name, value: &Expr) -> Op
         }
     }
     None
+}
+
+/// Whether `expr` keeps a compiled `match` or recursion: a recursor, an auxiliary eliminator
+/// or one of this engine's internal names.
+pub(super) fn compiled_match(env: &Environment, expr: &Expr) -> bool {
+    let mut pending = vec![expr];
+    let mut seen = std::collections::HashSet::new();
+    while let Some(expr) = pending.pop() {
+        if !seen.insert(expr.allocation_identity()) {
+            continue;
+        }
+        let internal = |name: &Name| name.to_display_string().starts_with("_fln");
+        match expr.node() {
+            ExprNode::Const { name, .. } => {
+                if internal(name)
+                    || matches!(env.find(name), Some(ConstantInfo::Rec(_)))
+                    || is_matcher_name(name)
+                    || matches!(
+                        name.leaf_view(),
+                        LeafView::Str("casesOn" | "recOn" | "brecOn" | "binductionOn")
+                    )
+                {
+                    return true;
+                }
+            }
+            ExprNode::App { f, a } => pending.extend([f, a]),
+            ExprNode::Lam {
+                binder_name,
+                binder_type,
+                body,
+                ..
+            }
+            | ExprNode::ForallE {
+                binder_name,
+                binder_type,
+                body,
+                ..
+            } => {
+                if internal(binder_name) {
+                    return true;
+                }
+                pending.extend([binder_type, body]);
+            }
+            ExprNode::LetE {
+                decl_name,
+                type_,
+                value,
+                body,
+                ..
+            } => {
+                if internal(decl_name) {
+                    return true;
+                }
+                pending.extend([type_, value, body]);
+            }
+            ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => pending.push(expr),
+            _ => {}
+        }
+    }
+    false
+}
+
+fn mentions_well_founded(expr: &Expr) -> bool {
+    let mut pending = vec![expr];
+    let mut seen = std::collections::HashSet::new();
+    while let Some(expr) = pending.pop() {
+        if !seen.insert(expr.allocation_identity()) {
+            continue;
+        }
+        match expr.node() {
+            ExprNode::Const { name, .. } => {
+                if name.to_display_string().starts_with("WellFounded.") {
+                    return true;
+                }
+            }
+            ExprNode::App { f, a } => pending.extend([f, a]),
+            ExprNode::Lam {
+                binder_type, body, ..
+            }
+            | ExprNode::ForallE {
+                binder_type, body, ..
+            } => pending.extend([binder_type, body]),
+            ExprNode::LetE {
+                type_, value, body, ..
+            } => pending.extend([type_, value, body]),
+            ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => pending.push(expr),
+            _ => {}
+        }
+    }
+    false
 }
 
 /// Why `declaration`'s equation theorems would not be generated here, if they would not.
@@ -796,15 +911,22 @@ impl Context {
         if self.proposition_typed(&definition)? {
             return Ok(unknown);
         }
-        let reason = unsupported_reason(&self.txn.env, &declaration, &definition.value)
-            .unwrap_or(Unsupported::NotRequested);
-        Ok(failure(SourceInferenceError::EquationTheorem(Box::new(
-            NotGenerated {
-                name: name.clone(),
-                declaration,
-                reason,
-            },
-        ))))
+        // The reason realizing it here gives, when it fails; otherwise nothing generated it.
+        match realize(&self.txn.env, &Request::Name(name.clone()), self.kernel) {
+            Err(
+                refusal @ NatDefinitionElabError::Inference(SourceInferenceError::EquationTheorem(
+                    _,
+                )),
+            ) => Ok(refusal),
+            Err(other) => Err(other),
+            Ok(_) => Ok(failure(SourceInferenceError::EquationTheorem(Box::new(
+                NotGenerated {
+                    name: name.clone(),
+                    declaration,
+                    reason: Unsupported::NotRequested,
+                },
+            )))),
+        }
     }
 
     /// The equation theorems `rw [f]` rewrites with, when `syntax` names a global definition
@@ -970,7 +1092,25 @@ pub fn realize(
     if context.proposition_typed(&definition)? {
         return Ok(Vec::new());
     }
-    if let Some(reason) = unsupported_reason(env, &declaration, &definition.value) {
+    if let Some(mut reason) = unsupported_reason(env, &declaration, &definition.value) {
+        // A definition by pattern matching, non-recursive or structural: its equations from
+        // its recorded `match`.
+        let well_founded = mentions_well_founded(&definition.value);
+        if matches!(reason, Unsupported::CompiledMatch | Unsupported::Recursive) && well_founded {
+            reason = Unsupported::WellFounded;
+        }
+        if matches!(reason, Unsupported::CompiledMatch | Unsupported::Recursive) {
+            match journal::find(env, &declaration)? {
+                Some(record) if suffix == Suffix::Equation => {
+                    return context.matched_equations(&definition, &record);
+                }
+                Some(_) => reason = Unsupported::MatchInStatement,
+                None if reason == Unsupported::CompiledMatch => {
+                    reason = Unsupported::UnrecordedMatch;
+                }
+                None => {}
+            }
+        }
         return Err(failure(SourceInferenceError::EquationTheorem(Box::new(
             NotGenerated {
                 name,

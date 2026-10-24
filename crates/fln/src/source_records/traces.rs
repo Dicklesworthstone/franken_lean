@@ -120,6 +120,7 @@ impl Engine {
                 parsed.syntax(),
                 elaborated.declaration,
                 elaborated.irreducible,
+                elaborated.equation_info,
                 elaborated.noncomputable,
                 elaborated.local_functions,
                 options,

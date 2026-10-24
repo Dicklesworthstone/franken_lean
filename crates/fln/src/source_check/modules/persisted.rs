@@ -372,6 +372,7 @@ impl SourceModuleRecord {
             fln_elab::source::scope::simp::defeq::journal_name(),
             fln_elab::macro_inline::journal_name(),
             fln_elab::records::imported::export::journal_name(),
+            fln_elab::source::equation_theorems::journal::journal_name(),
         ]
         .map(|name| {
             let bytes = name.to_canonical_bytes();

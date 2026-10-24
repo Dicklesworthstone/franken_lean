@@ -95,16 +95,77 @@ fn an_equation_beyond_the_generated_ones_is_an_unknown_identifier() {
     assert!(!refused.starts_with("capability"), "{refused}");
 }
 
+const MATCHING: &str = "def pred' : Nat → Nat\n  | 0 => 0\n  | n+1 => n
+def fib : Nat → Nat\n  | 0 => 0\n  | 1 => 1\n  | n+2 => fib n + fib (n+1)
+def pr : Nat → Nat → Nat\n  | 0, _ => 0\n  | k+1, m => pr k m + m
+def bool2 : Bool → Bool → Bool\n  | true, true => true\n  | _, _ => false
+def nested : Nat → Nat → Nat\n  | 0, m => match m with | 0 => 0 | m => m\n  | n+1, m => nested n m
+section\nvariable (k : Nat)\ndef addk : Nat → Nat\n  | 0 => k\n  | n+1 => addk n + 1\nend
+def k2 : Nat → Nat := fun n => match n with\n  | 0 => 1\n  | m+1 => m";
+
 #[test]
-fn a_definition_whose_equations_are_not_generated_is_refused_typed() {
-    let base = check(&engine(), "def pred' : Nat → Nat\n  | 0 => 0\n  | n+1 => n");
+fn the_equations_of_a_definition_by_matching_are_proved_and_admitted() {
+    let base = check(&engine(), MATCHING);
+    for (generated, source) in [
+        (
+            "pred'.eq_2",
+            "theorem t (n : Nat) : pred' (n + 1) = n := pred'.eq_2 n",
+        ),
+        (
+            "fib.eq_3",
+            "theorem t (n : Nat) : fib (n + 2) = fib n + fib (n + 1) := fib.eq_3 n",
+        ),
+        (
+            "pr.eq_2",
+            "theorem t (n m : Nat) : pr (n + 1) m = pr n m + m := pr.eq_2 m n",
+        ),
+        (
+            "bool2.eq_2",
+            "theorem t (a b : Bool) (h : a = true → b = true → False) : bool2 a b = false :=
+  bool2.eq_2 a b h",
+        ),
+        (
+            "fib.eq_2",
+            "theorem t : fib 0 + fib 1 = 1 := by rw [fib, fib]",
+        ),
+        (
+            "addk.eq_2",
+            "theorem t (k n : Nat) : addk k (n + 1) = addk k n + 1 := addk.eq_2 k n",
+        ),
+        (
+            "k2.eq_2",
+            "theorem t (n : Nat) : k2 (n + 1) = n := k2.eq_2 n",
+        ),
+    ] {
+        let after = check(&base, source);
+        let Some(ConstantInfo::Thm(theorem)) = after.environment().find(&name(generated)) else {
+            panic!("{generated} is not an admitted theorem");
+        };
+        assert!(theorem.base.level_params.is_empty(), "{generated}");
+    }
+    // A wrong statement is still refused by the kernel, and an equation past the alternatives
+    // is no name the pin reserves.
+    reject(
+        &base,
+        "theorem bad (n : Nat) : pred' (n + 1) = n + 1 := pred'.eq_2 n",
+    );
+    let refused = reject(
+        &base,
+        "theorem bad : True := (fun _ => True.intro) pred'.eq_3",
+    );
+    assert!(refused.contains("UnknownConstant"), "{refused}");
+}
+
+#[test]
+fn an_equation_the_pin_states_with_its_matcher_is_refused_typed() {
+    let base = check(&engine(), MATCHING);
     for source in [
-        "theorem bad (n : Nat) : pred' (n + 1) = n := pred'.eq_2 n",
-        "theorem bad (n : Nat) : pred' (n + 1) = n := by rw [pred']",
+        "theorem bad : True := (fun _ => True.intro) fib.eq_def",
+        "theorem bad : True := (fun _ => True.intro) fib.eq_unfold",
+        "theorem bad : True := (fun _ => True.intro) nested.eq_1",
     ] {
         let refused = reject(&base, source);
         assert!(refused.starts_with("capability"), "{source}: {refused}");
-        assert!(refused.contains("EquationTheorem"), "{source}: {refused}");
+        assert!(refused.contains("MatchInStatement"), "{source}: {refused}");
     }
-    assert!(!base.environment().contains(&name("pred'.eq_1")));
 }

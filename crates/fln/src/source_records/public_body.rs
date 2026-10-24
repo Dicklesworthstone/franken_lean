@@ -51,7 +51,12 @@ impl Engine {
             Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
         };
-        apply_batch_effects(&mut private_implementation, candidate.irreducible, options)?;
+        apply_batch_effects(
+            &mut private_implementation,
+            candidate.irreducible,
+            None,
+            options,
+        )?;
         // PublicWorld replays the public owner's attributes exactly once into
         // this private successor. Installing them here as well would duplicate
         // instance and noncomputable journal entries. Helpers still inherit the
@@ -103,6 +108,7 @@ impl Engine {
                 syntax,
                 interface,
                 false,
+                None,
                 candidate.noncomputable,
                 Vec::new(),
                 options,
