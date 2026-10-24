@@ -232,6 +232,9 @@ impl Context {
                     && !state.ellipsis
                     && !codomain.has_loose_bvar(0)
                     && let Some(expected) = &state.result_expected
+                    && self
+                        .application_result_out_param(&state.function, state.explicit)?
+                        .is_none()
                 {
                     self.do_operation_result_hint(&state.function, &codomain, expected)?;
                     self.constrain_result_hint(&codomain, expected)?;
@@ -311,6 +314,7 @@ impl Context {
             let mut term = if state.explicit {
                 self.finish_explicit_term(state.function, state.result_expected.as_ref())?
             } else {
+                self.settle_result_out_param(&state.function, state.explicit)?;
                 self.finish_application_implicits(state.function, state.result_expected.as_ref())?
             };
             term.value = self.instantiate(&term.value)?;
@@ -550,6 +554,158 @@ impl Context {
             }
         }
         Ok(false)
+    }
+
+    /// The pin's `resultIsOutParamSupport` (vendored `Lean/Elab/App.lean`,
+    /// `isNextOutParamOfLocalInstanceAndResult` in `addImplicitArg`): the hole an application
+    /// inserted for one of its implicit parameters when the application's result type is that
+    /// parameter and it is an `outParam` of a later instance-implicit parameter, as `{Elem}` of
+    /// `getElem : {Cont} → {Idx} → {Elem : outParam _} → [GetElem Cont Idx Elem] → Cont →
+    /// Idx → Elem`. Such an application does not propagate its expected type into the result
+    /// (`propagateExpected := false`): the instance determines it, and only then is the result
+    /// compared with or coerced to the expected type. `getElem bs n : Option Bool` unified
+    /// `?Elem := Option Bool` first and then asked for `GetElem (Array Bool) Nat (Option Bool)`,
+    /// which no instance provides; the pin selects `Elem := Bool` and coerces. Off under `@`
+    /// and when `Lean.Internal.coeM` is not declared, as at the pin (`elabAppArgs`).
+    pub(super) fn application_result_out_param(
+        &mut self,
+        function: &Typed,
+        explicit: bool,
+    ) -> Result<Option<MVarId>, NatDefinitionElabError> {
+        if explicit
+            || !self
+                .txn
+                .env
+                .contains(&Name::from_components(["Lean", "Internal", "coeM"]))
+        {
+            return Ok(None);
+        }
+        // `isResultType`: the result, under every remaining binder, is the parameter itself.
+        let mut result = self.instantiate(&function.type_)?;
+        while let ExprNode::ForallE { body, .. } = result.node() {
+            self.tick()?;
+            result = body.clone();
+        }
+        let ExprNode::MVar { id: hole } = result.node() else {
+            return Ok(None);
+        };
+        let hole = hole.clone();
+        let (head, arguments) = operators::spine(&self.instantiate(&function.value)?);
+        let Some(position) = arguments
+            .iter()
+            .position(|argument| matches!(argument.node(), ExprNode::MVar { id } if id == &hole))
+        else {
+            return Ok(None);
+        };
+        let Some(mut telescope) = self.known_type(&head)? else {
+            return Ok(None);
+        };
+        for (index, argument) in arguments.iter().enumerate() {
+            self.tick()?;
+            if !matches!(telescope.node(), ExprNode::ForallE { .. }) {
+                telescope = self.whnf(&telescope)?;
+            }
+            let ExprNode::ForallE {
+                binder_type,
+                body,
+                binder_info,
+                ..
+            } = telescope.node()
+            else {
+                return Ok(None);
+            };
+            // Only `addImplicitArg` asks: an explicit `_` is not this parameter's hole.
+            if index == position
+                && !matches!(
+                    binder_info,
+                    BinderInfo::Implicit | BinderInfo::StrictImplicit
+                )
+            {
+                return Ok(None);
+            }
+            if index > position
+                && *binder_info == BinderInfo::InstImplicit
+                && self.is_out_param_argument(binder_type, &hole)?
+            {
+                return Ok(Some(hole));
+            }
+            telescope = self.substitute(body, argument)?;
+        }
+        // `isOutParamOfLocalInstance` reads the remaining binders as they are written.
+        while let ExprNode::ForallE {
+            binder_type,
+            body,
+            binder_info,
+            ..
+        } = telescope.node()
+        {
+            self.tick()?;
+            if *binder_info == BinderInfo::InstImplicit
+                && self.is_out_param_argument(binder_type, &hole)?
+            {
+                return Ok(Some(hole));
+            }
+            telescope = body.clone();
+        }
+        Ok(None)
+    }
+
+    /// `isOutParamOf`: `class` is a class applied to `hole` at a parameter its declared type
+    /// marks `outParam`.
+    fn is_out_param_argument(
+        &mut self,
+        class: &Expr,
+        hole: &MVarId,
+    ) -> Result<bool, NatDefinitionElabError> {
+        let (head, arguments) = operators::spine(class);
+        let ExprNode::Const { name, .. } = head.node() else {
+            return Ok(false);
+        };
+        if !self.instance_registry()?.is_class(name) {
+            return Ok(false);
+        }
+        let Some(info) = self.txn.env.find(name) else {
+            return Ok(false);
+        };
+        let out_param = Name::from_components(["outParam"]);
+        let mut telescope = info.constant_val().type_.clone();
+        for argument in &arguments {
+            self.tick()?;
+            let ExprNode::ForallE {
+                binder_type, body, ..
+            } = telescope.node()
+            else {
+                return Ok(false);
+            };
+            let marked = matches!(binder_type.node(), ExprNode::App { f, .. }
+                if matches!(f.node(), ExprNode::Const { name, .. } if name == &out_param));
+            if marked && matches!(argument.node(), ExprNode::MVar { id } if id == hole) {
+                return Ok(true);
+            }
+            telescope = body.clone();
+        }
+        Ok(false)
+    }
+
+    /// `ElabAppArgs.finalize` for an application whose result is such an output: synthesize
+    /// its pending instances, and when the result is still that unknown output, apply default
+    /// instances (`synthesizeSyntheticMVarsUsingDefault`) before the caller compares the result
+    /// with the expected type or coerces it. `let x := getElem xs 0` then has type `Bool` once
+    /// `0` defaults to `Nat`.
+    pub(super) fn settle_result_out_param(
+        &mut self,
+        function: &Typed,
+        explicit: bool,
+    ) -> Result<(), NatDefinitionElabError> {
+        let Some(hole) = self.application_result_out_param(function, explicit)? else {
+            return Ok(());
+        };
+        self.resolve_instances(false)?;
+        let result = self.instantiate(&function.type_)?;
+        if matches!(result.node(), ExprNode::MVar { id } if id == &hole) {
+            self.resolve_instances_with_defaults()?;
+        }
+        Ok(())
     }
 }
 

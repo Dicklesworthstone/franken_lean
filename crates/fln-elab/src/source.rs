@@ -3749,10 +3749,15 @@ impl Context {
                                 let codomain = body.clone();
                                 // Propagate a known result before checking the last
                                 // explicit argument when the codomain does not depend
-                                // on that argument (e.g. Inhabited.mk (fun x => ...)).
+                                // on that argument (e.g. Inhabited.mk (fun x => ...)),
+                                // unless it is an instance's output, which the pin
+                                // leaves to the instance (`resultIsOutParamSupport`).
                                 if rest.is_empty()
                                     && !codomain.has_loose_bvar(0)
                                     && let Some(expected) = &expected
+                                    && self
+                                        .application_result_out_param(&function, explicit)?
+                                        .is_none()
                                 {
                                     self.do_operation_result_hint(&function, &codomain, expected)?;
                                     self.constrain_result_hint(&codomain, expected)?;
@@ -3765,6 +3770,7 @@ impl Context {
                                 values.push(if explicit {
                                     self.finish_explicit_term(function, expected.as_ref())?
                                 } else {
+                                    self.settle_result_out_param(&function, explicit)?;
                                     self.finish_application(function, expected.as_ref())?
                                 });
                             }
