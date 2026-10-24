@@ -886,6 +886,13 @@ jobs:
           cargo test --locked -p fln \
             --test source_instance_index --test source_import_aliases \
             --test source_instance_transparency --test olean_frontier --no-fail-fast || rc=1
+          # The physical-module target has fresh native and pinned consumers for
+          # aliases, namespaces and strict record/macro-inline initialization.
+          # Ordinary CI can skip those Reference bodies; here the installed pin
+          # is required. Keep the complete runtime and alias controls beside it.
+          cargo test --locked -p fln \
+            --test runtime_existential_records --test source_alias_members \
+            --test source_module_artifacts --no-fail-fast -- --nocapture || rc=1
           cargo test --locked -p fln-cli \
             --test lake_module_build --test check_olean_progress_crash \
             --test olean_header_pin --no-fail-fast || rc=1
