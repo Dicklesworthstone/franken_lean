@@ -189,6 +189,40 @@ fn failed_recursive_candidate_tries_the_next_global_without_state_leaks() {
         "theorem fallback : default = 0 := by rfl",
     );
 }
+
+#[test]
+fn generic_type_constructor_instances_check_the_whole_noninjective_candidate() {
+    let base = checked(
+        &engine(),
+        "class Choice (A B : Type) where\n  value : Nat\ndef Erase (_ : Type) : Type := Nat\ninstance (priority := 2000) nonlinear {m : Type -> Type} {A : Type} : Choice (m A) (m A) := { value := 9 }",
+    );
+    let before = base.logical_root(&KVMap::new());
+    // First-order approximation can choose m := Erase and A := Nat, but its
+    // second result argument must still match at instance transparency. Erase
+    // is not an injective type constructor, nor a reducible instance alias.
+    assert!(
+        base.check_source_files(
+            &[b"def refused : Choice (Erase Nat) (Erase Bool) := inferInstance".as_slice()],
+            &KVMap::new(),
+            limits(),
+        )
+        .is_err()
+    );
+    assert_eq!(before, base.logical_root(&KVMap::new()));
+    checked(
+        &base,
+        "def agreed : Choice (Erase Nat) (Erase Nat) := inferInstance\ntheorem selected : agreed.value = 9 := by rfl",
+    );
+    let fallback = checked(
+        &base,
+        "instance (priority := 1000) fallback : Choice (Erase Nat) (Erase Bool) := { value := 7 }",
+    );
+    checked(
+        &fallback,
+        "def recovered : Choice (Erase Nat) (Erase Bool) := inferInstance\ntheorem fallbackSelected : recovered.value = 7 := by rfl",
+    );
+    assert_eq!(before, base.logical_root(&KVMap::new()));
+}
 #[test]
 fn recursive_instance_dependencies_are_synthesized() {
     let base = checked(
