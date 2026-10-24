@@ -480,6 +480,26 @@ impl PendingArtifact {
                 fln_olean::source_extensions::AliasEntry { alias, declaration }
             }));
         let remaining = meter.limits.max_work.saturating_sub(meter.work);
+        let namespaces =
+            fln_elab::namespaces::registrations(base, checked, remaining).map_err(|error| {
+                match error {
+                    fln_elab::instances::InstanceRegistryError::Limit => {
+                        SourceModuleCheckError::Limit {
+                            resource: "module work",
+                            limit: meter.limits.max_work,
+                        }
+                    }
+                    _ => SourceModuleCheckError::Extension {
+                        module: name.clone(),
+                        extension: fln_elab::namespaces::journal_name(),
+                        reason: "invalid namespace metadata export",
+                    },
+                }
+            })?;
+        meter.work(namespaces.work)?;
+        meter.bytes(namespaces.bytes_examined)?;
+        metadata.namespaces.extend(namespaces.names);
+        let remaining = meter.limits.max_work.saturating_sub(meter.work);
         let structures = fln_elab::records::imported::export::registrations(
             base, checked, remaining,
         )

@@ -105,7 +105,8 @@ impl Scopes {
                 return self.transition_open(names, false, env, public_env);
             }
             ScopeCommand::OpenExplicit { namespace, names } => {
-                self.observe_aliases(env).map_err(TransitionError::Scope)?;
+                self.observe_namespaces(env)
+                    .map_err(TransitionError::Registry)?;
                 let resolved = self
                     .explicit_opens(env, &namespace, &names)
                     .map_err(TransitionError::Scope)?;
@@ -132,7 +133,8 @@ impl Scopes {
         public_env: Option<&Environment>,
     ) -> Result<(), TransitionError> {
         let mut next = self.current.clone();
-        self.observe_aliases(env).map_err(TransitionError::Scope)?;
+        self.observe_namespaces(env)
+            .map_err(TransitionError::Registry)?;
         let mut public_instances = self.public_instances.clone();
         let registry =
             fln_elab::instances::InstanceRegistry::read(env).map_err(TransitionError::Registry)?;
@@ -210,20 +212,26 @@ impl Scopes {
         env: &Environment,
         namespace: &Name,
         names: &[Name],
-    ) -> Result<Vec<(Name, Name)>, String> {
-        self.observe_aliases(env)?;
-        let namespaces = self.resolve_open_in(&self.current, namespace)?;
+    ) -> Result<Vec<(Name, Name)>, TransitionError> {
+        self.observe_namespaces(env)
+            .map_err(TransitionError::Registry)?;
+        let namespaces = self
+            .resolve_open_in(&self.current, namespace)
+            .map_err(TransitionError::Scope)?;
         if namespaces.is_empty() {
-            return Err(format!(
+            return Err(TransitionError::Scope(format!(
                 "unknown namespace `{}`",
                 namespace.to_display_string()
-            ));
+            )));
         }
         if namespaces == [self.current.namespace.clone()] {
-            return Err("invalid 'export', self export".into());
+            return Err(TransitionError::Scope(
+                "invalid 'export', self export".into(),
+            ));
         }
         Ok(self
-            .namespace_members(env, &namespaces, names)?
+            .namespace_members(env, &namespaces, names)
+            .map_err(TransitionError::Scope)?
             .into_iter()
             .map(|(name, declaration)| (self.current.namespace.append_core(&name), declaration))
             .collect())
@@ -392,14 +400,13 @@ impl Scopes {
         Ok(scopes)
     }
 
-    /// A re-export-only namespace has no constant from which to discover its
-    /// name. The validated alias journal provides its own proper prefixes;
-    /// target names must never manufacture namespaces in this module.
-    fn observe_aliases(&mut self, env: &Environment) -> Result<(), String> {
-        let table = fln_elab::aliases::AliasTable::read(env).map_err(|error| error.to_string())?;
-        for (alias, _) in table.entries() {
-            self.observe(alias);
-        }
+    /// Empty and re-export-only namespaces have their own registrations. A
+    /// dotted alias cannot manufacture one of its own proper prefixes.
+    fn observe_namespaces(
+        &mut self,
+        env: &Environment,
+    ) -> Result<(), fln_elab::instances::InstanceRegistryError> {
+        self.namespaces.extend(fln_elab::namespaces::read(env)?);
         Ok(())
     }
 

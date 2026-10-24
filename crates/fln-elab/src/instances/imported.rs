@@ -580,6 +580,12 @@ impl ImportActivation {
         Ok(self)
     }
 
+    /// Retain actual namespace registrations independently of export aliases.
+    pub fn register_namespaces(mut self, names: &[Name]) -> Result<Self, InstanceRegistryError> {
+        self.env = crate::namespaces::register_module(&self.env, names)?;
+        Ok(self)
+    }
+
     /// Record one imported module's `protected` declarations in the environment
     /// being activated. Like the alias journal, it is not one this activation
     /// keeps or reads.

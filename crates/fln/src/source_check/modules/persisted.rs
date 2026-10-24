@@ -362,11 +362,15 @@ impl SourceModuleRecord {
         let journals = [
             fln_elab::instances::export::journal_name(),
             fln_elab::instances::defaults::journal_name(),
+            fln_elab::aliases::export::journal_name(),
+            fln_elab::namespaces::journal_name(),
             fln_elab::protected_names::journal_name(),
             fln_elab::aux_recursors::journal_name(),
             fln_elab::reducibility::export::journal_name(),
             fln_elab::noncomputable::journal_name(),
             fln_elab::source::scope::simp::defeq::journal_name(),
+            fln_elab::macro_inline::journal_name(),
+            fln_elab::records::imported::export::journal_name(),
         ]
         .map(|name| {
             let bytes = name.to_canonical_bytes();
@@ -947,6 +951,45 @@ mod tests {
         assert!(
             format!("{refusal:?}").contains("UnsupportedRecursor"),
             "{refusal:?}"
+        );
+    }
+
+    #[test]
+    fn artifact_journals_replay_structures_aliases_and_macro_inline_across_sessions() {
+        let graph = [
+            (
+                "Base",
+                "prelude\nnamespace Original\ninductive Token where | mk\ndef identity (x : Token) : Token := x\nend Original\nnamespace Public\nexport Original (Token identity)\nend Public\nstructure Box where\n  value : Original.Token\n@[macro_inline] def choose (x : Original.Token) : Original.Token := x",
+            ),
+            (
+                "Main",
+                "prelude\nimport Base\ndef pick (b : Box) : Public.Token := choose (Public.identity b.value)",
+            ),
+        ];
+        let store = Memory::default();
+        let identity = checker(b"artifact-journal-replay");
+        let run = || {
+            compile(&store, identity, fln_core::mode::Mode::DEFAULT, &graph)
+                .unwrap()
+                .into_complete()
+                .unwrap()
+        };
+        let cold = run();
+        assert_eq!((cold.elaborated_modules, cold.persisted_modules), (2, 0));
+        let warm = run();
+        assert_eq!(
+            (warm.elaborated_modules, warm.persisted_modules),
+            (0, 2),
+            "{:?}",
+            rows(&warm)
+        );
+        assert!(warm.modules.iter().all(|row| {
+            row.decision == ModuleDecision::Cached && row.record == ModuleRecordLookup::Hit
+        }));
+        assert_eq!(products(&warm), products(&cold));
+        assert_eq!(
+            warm.checked.checked.result_logical_root,
+            cold.checked.checked.result_logical_root
         );
     }
 

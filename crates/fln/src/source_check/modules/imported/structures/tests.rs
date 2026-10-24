@@ -1,5 +1,6 @@
 //! Synthetic ownership graphs around declarations admitted through the ordinary
 //! source checker. Artifact decoding and actual receipts are tested separately.
+#![cfg(test)]
 use super::*;
 
 fn n(value: &str) -> Name {
@@ -214,6 +215,12 @@ fn structure_parent_targets_require_the_declared_closure_or_exact_original_envir
 fn structure_interface_ownership_is_exact_and_failure_does_not_publish_a_prefix() {
     let engine = admitted();
     let before = engine.logical_root(&KVMap::new());
+    let structures_before =
+        fln_elab::records::imported::ImportedStructures::read(&engine.environment).unwrap();
+    assert!(
+        structures_before.get(&n("Child")).is_some(),
+        "the ordinary source checker must publish its structure metadata"
+    );
     let checked = graph(&engine, true);
     let row = row(&engine);
     let mut scopes = Scopes::new(&checked, std::slice::from_ref(&row), 100_000).unwrap();
@@ -294,11 +301,9 @@ fn structure_interface_ownership_is_exact_and_failure_does_not_publish_a_prefix(
         .is_err()
     );
     assert_eq!(engine.logical_root(&KVMap::new()), before);
-    assert!(
-        fln_elab::records::imported::ImportedStructures::read(&engine.environment)
-            .unwrap()
-            .get(&n("Child"))
-            .is_none()
+    assert_eq!(
+        fln_elab::records::imported::ImportedStructures::read(&engine.environment).unwrap(),
+        structures_before,
     );
 }
 

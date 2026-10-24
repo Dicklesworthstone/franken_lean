@@ -12,7 +12,6 @@ use fln_olean::source_extensions::{self as metadata, DecodeLimits};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 #[path = "imported/implemented_by.rs"]
 mod implemented_by;
-#[path = "imported/simp.rs"]
 mod simp;
 #[path = "imported/structures.rs"]
 mod structures;
@@ -73,6 +72,8 @@ pub struct SourceMetadataReport {
     pub scoped_instances: usize,
     /// `export` aliases (the pin's `aliasExtension`), activated for name resolution.
     pub aliases: usize,
+    /// Explicit namespace registrations, independent of aliases.
+    pub namespaces: usize,
     /// `protected` declarations (the pin's `protectedExt`), activated so that an
     /// atomic identifier does not resolve to one.
     pub protected: usize,
@@ -353,6 +354,7 @@ impl Engine {
                 Name::from_components(metadata::PP_NODOT_EXTENSION.split('.')),
                 Name::from_components(metadata::APP_UNEXPANDER_EXTENSION.split('.')),
                 Name::from_components(metadata::INLINE_EXTENSION.split('.')),
+                metadata::namespace_extension_name(),
             ])
             .collect();
         let mut blocks: Vec<_> = selected
@@ -384,6 +386,7 @@ impl Engine {
                 defaults: 0,
                 scoped_instances: 0,
                 aliases: 0,
+                namespaces: 0,
                 protected: 0,
                 aux_recursors: 0,
                 noncomputable: 0,
@@ -449,6 +452,7 @@ impl Engine {
                         16 => report.pp_nodot = entries.len(),
                         17 => report.app_unexpanders = entries.len(),
                         18 => report.inline = entries.len(),
+                        19 => report.namespaces = entries.len(),
                         _ => {
                             return Err(SourceOleanImportError::Internal(
                                 "unknown selected metadata kind",
@@ -480,6 +484,7 @@ impl Engine {
         let mut instances = decoded.instances.into_iter();
         let mut defaults = decoded.defaults.into_iter();
         let mut aliases = decoded.aliases.into_iter();
+        let mut namespaces = decoded.namespaces.into_iter();
         let mut protected = decoded.protected.into_iter();
         let mut aux_recursors = decoded.aux_recursors.into_iter();
         let mut noncomputable = decoded.noncomputable.into_iter();
@@ -630,6 +635,16 @@ impl Engine {
                         },
                     })?;
             }
+            cancelled!("source-olean/namespaces");
+            let names: Vec<Name> = namespaces.by_ref().take(report.namespaces).collect();
+            if names.len() != report.namespaces {
+                return Err(SourceOleanImportError::Internal(
+                    "namespace count changed during decode",
+                ));
+            }
+            activation = activation.register_namespaces(&names).map_err(|error| {
+                registry_error(&report.module, &metadata::namespace_extension_name(), error)
+            })?;
             // One module's tags, recorded together inside its own journal window.
             cancelled!("source-olean/protected");
             let tagged: Vec<Name> = protected.by_ref().take(report.protected).collect();
@@ -981,6 +996,13 @@ impl Engine {
                 reason: "the delaborator tag journal cannot be read back",
             }
         })?;
+        fln_elab::namespaces::read(&engine.environment).map_err(|error| {
+            registry_error(
+                &roots.first().cloned().unwrap_or_default(),
+                &metadata::namespace_extension_name(),
+                error,
+            )
+        })?;
         fln_elab::records::imported::ImportedStructures::read(&engine.environment).map_err(
             |problem| {
                 structures::error(
@@ -995,6 +1017,7 @@ impl Engine {
             || instances.next().is_some()
             || defaults.next().is_some()
             || aliases.next().is_some()
+            || namespaces.next().is_some()
             || protected.next().is_some()
             || aux_recursors.next().is_some()
             || noncomputable.next().is_some()
@@ -1139,6 +1162,10 @@ trait Registrar: Sized {
         alias: &Name,
         declaration: &Name,
     ) -> std::result::Result<Self, fln_elab::aliases::AliasError>;
+    fn register_namespaces(
+        self,
+        names: &[Name],
+    ) -> std::result::Result<Self, InstanceRegistryError>;
     fn register_protected(
         self,
         declarations: &[Name],
@@ -1225,6 +1252,12 @@ impl Registrar for instances::imported::ImportActivation {
         declarations: &[Name],
     ) -> std::result::Result<Self, fln_elab::protected_names::ProtectedError> {
         self.register_protected(declarations)
+    }
+    fn register_namespaces(
+        self,
+        names: &[Name],
+    ) -> std::result::Result<Self, InstanceRegistryError> {
+        self.register_namespaces(names)
     }
     fn register_aux_recursors(
         self,
@@ -1922,6 +1955,12 @@ pub(super) mod tests {
             declarations: &[Name],
         ) -> std::result::Result<Self, fln_elab::protected_names::ProtectedError> {
             fln_elab::protected_names::register_module(&self.0, declarations).map(Sequential)
+        }
+        fn register_namespaces(
+            self,
+            names: &[Name],
+        ) -> std::result::Result<Self, InstanceRegistryError> {
+            fln_elab::namespaces::register_module(&self.0, names).map(Sequential)
         }
         fn register_aux_recursors(
             self,

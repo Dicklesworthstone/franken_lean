@@ -21,6 +21,8 @@ mod structures;
 
 #[derive(Debug, Clone, Default)]
 pub struct SourceMetadata {
+    /// Explicit module-owned namespace registrations, independent of aliases.
+    pub namespaces: Vec<Name>,
     pub classes: Vec<ClassEntry>,
     /// Chronological global/scoped entries, retaining repeated priority updates.
     pub instances: Vec<InstanceEntry>,

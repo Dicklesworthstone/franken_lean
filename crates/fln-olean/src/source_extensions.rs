@@ -40,6 +40,15 @@ pub fn structure_extension_name() -> Name {
     )
 }
 
+/// Pin-extracted private identity; the numeric component is a Lean `Name.num`.
+pub fn namespace_extension_name() -> Name {
+    let module = Name::from_components(format::NAMESPACE_EXTENSION_MODULE.split('.'));
+    let prefix = Name::from_components([format::STRUCTURE_PRIVATE_HEADER]).append_core(&module);
+    Name::num(prefix, format::NAMESPACE_EXTENSION_PRIVATE_INDEX).append_core(
+        &Name::from_components(format::NAMESPACE_EXTENSION_DECLARATION.split('.')),
+    )
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClassEntry {
     pub name: Name,
@@ -154,6 +163,9 @@ pub struct InlineEntry {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SourceExtensions {
+    /// Actual namespace registrations, including empty and re-export-only ones.
+    /// These are independent of alias names and grant no declaration authority.
+    pub namespaces: Vec<Name>,
     pub classes: Vec<ClassEntry>,
     pub instances: Vec<InstanceEntry>,
     pub defaults: Vec<DefaultEntry>,
@@ -551,6 +563,7 @@ pub fn decode(
         name(format::PP_NODOT_EXTENSION),
         name(format::APP_UNEXPANDER_EXTENSION),
         name(format::INLINE_EXTENSION),
+        namespace_extension_name(),
     ];
     let mut seen = BTreeSet::new();
     let mut bytes_left = limits.max_bytes;
@@ -692,7 +705,18 @@ pub fn decode(
                     }
                     out.inline.push(row);
                 }
-                _ => unreachable!("twenty selected extension families"),
+                20 => {
+                    // Unlike declaration names, Name.anonymous is a valid
+                    // namespace: the pin registers the root namespace too.
+                    let namespace = reader
+                        .conversion
+                        .project_name(&obj)
+                        .map_err(DecodeError::Conversion)?;
+                    // Several modules may register the same namespace. Keep
+                    // module windows intact; activation performs set lookup.
+                    out.namespaces.push(namespace);
+                }
+                _ => unreachable!("twenty-one selected extension families"),
             }
         }
     }
