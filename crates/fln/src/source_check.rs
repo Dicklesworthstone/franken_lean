@@ -158,7 +158,8 @@ pub(crate) fn classify(error: &EngineExecutionError) -> (&'static str, bool, u8)
                 fln_elab::native::NativeEvaluationError::Fault(_),
             ) => ("internal-fault", false, 4),
             SourceInferenceError::NativeEvaluation(_) => ("capability", false, 5),
-            SourceInferenceError::EvaluationPrinting(_) => ("capability", false, 5),
+            SourceInferenceError::EvaluationPrinting(_)
+            | SourceInferenceError::EquationTheorem(_) => ("capability", false, 5),
             SourceInferenceError::SimpSet(
                 fln_elab::source::scope::simp::SimpSetError::Malformed,
             )

@@ -95,6 +95,13 @@ pub enum TacticError {
     MalformedScript,
     ExpectedEquality,
     RewriteNoMatch,
+    /// No equation theorem of the definition `rw [f]` names rewrites the goal (the pin's
+    /// "Failed to rewrite using equation theorems for `f`", with its hint when there are
+    /// several).
+    RewriteEquations {
+        declaration: Name,
+        hint: bool,
+    },
     UnfoldFailed(Name),
     /// `unfold f` at an occurrence whose match the argument does not reduce. The pin rewrites
     /// it by `f`'s unfold equation to a `match` (vendored `Lean/Meta/Tactic/Unfold.lean`), which
@@ -303,6 +310,21 @@ impl std::fmt::Display for TacticError {
                 "rewrite location must name an available local hypothesis"
             ),
             Self::RewriteNoMatch => write!(f, "rewrite found no matching occurrence in the goal"),
+            Self::RewriteEquations { declaration, hint } => {
+                write!(
+                    f,
+                    "Failed to rewrite using equation theorems for `{}`",
+                    declaration.to_display_string()
+                )?;
+                if *hint {
+                    write!(
+                        f,
+                        "\n\nHint: Try rewriting with `{}`",
+                        Name::str(declaration.clone(), "eq_def").to_display_string()
+                    )?;
+                }
+                Ok(())
+            }
             Self::UnfoldFailed(name) => write!(
                 f,
                 "unfold failed for `{}` in the selected location",

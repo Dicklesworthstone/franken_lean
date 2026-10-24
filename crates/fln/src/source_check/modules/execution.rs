@@ -144,6 +144,17 @@ fn declarations(
     meter: &mut Meter,
 ) -> Result<Vec<Declaration>, SourceModuleCheckError> {
     let mut ordered = BTreeMap::<usize, Vec<Declaration>>::new();
+    // A command's admissions precede its executions: the equation theorems it names are
+    // admitted before it (`source_records::equation_theorems`), and replay re-admits in order.
+    for admission in &completed.batch.source_admissions {
+        for checked in &admission.admission.admissions {
+            meter.work(1)?;
+            ordered
+                .entry(admission.command_index)
+                .or_default()
+                .push(checked.declaration.clone());
+        }
+    }
     let evaluations: std::collections::BTreeSet<_> = completed
         .batch
         .source_evaluation_indices
@@ -169,15 +180,6 @@ fn declarations(
                     .or_default()
                     .push(helper.declaration.clone());
             }
-        }
-    }
-    for admission in &completed.batch.source_admissions {
-        for checked in &admission.admission.admissions {
-            meter.work(1)?;
-            ordered
-                .entry(admission.command_index)
-                .or_default()
-                .push(checked.declaration.clone());
         }
     }
     Ok(ordered.into_values().flatten().collect())

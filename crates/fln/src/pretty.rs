@@ -252,6 +252,13 @@ fn let_keyword(non_dep: bool) -> &'static str {
     if non_dep { "have" } else { "let" }
 }
 
+fn strip_mdata(mut e: &Expr) -> &Expr {
+    while let ExprNode::MData { expr, .. } = e.node() {
+        e = expr;
+    }
+    e
+}
+
 fn node(content: Format) -> Format {
     content.nest(2).fill()
 }
@@ -1249,7 +1256,10 @@ impl<'a> Printer<'a> {
                     .then(node(binders.then(Format::text(" =>"))))
                     .then(Format::Line)
                     .then(printed?);
-                Ok(if outer > 0 {
+                // `fun` parses at `maxPrec`: the parenthesizer brackets it as an argument and
+                // where a token follows it, never merely for an operator's precedence
+                // (`id = fun x => x`, `(fun x => x) = id`).
+                Ok(if outer >= MAX_PREC || self.trailing {
                     node(Format::text("(").then(fun).then(Format::text(")")))
                 } else {
                     fun
@@ -1316,6 +1326,16 @@ impl<'a> Printer<'a> {
                 self.bind(shown.clone(), type_);
                 let printed = self.doc(body, 0);
                 self.unbind_to(depth);
+                if outer < MAX_PREC {
+                    // Unbracketed, the term is its own node, `fill (nest 2 …)`, with the body
+                    // under `ppDedent` (`nest (-2)`): its hard line is inside a group, so an
+                    // enclosing `fill` breaks before it (`n =⏎  have k := …;⏎  k * k`).
+                    return Ok(node(
+                        Format::text(format!("{} {shown} := ", let_keyword(*non_dep)))
+                            .then(value)
+                            .then(Format::text(";\n").then(printed?).nest(-2)),
+                    ));
+                }
                 let doc = Format::text(format!("{} {shown} := ", let_keyword(*non_dep)))
                     .then(value)
                     .then(Format::text(";\n"))
@@ -1506,29 +1526,34 @@ impl<'a> Printer<'a> {
                 // `infixl:65 " + "`: the token's trailing space is a line.
                 let lhs = self
                     .with_trailing(true, |printer| printer.doc(&args[args.len() - 2], lhs_prec))?;
-                let trailing = self.trailing && infix.precedence >= outer;
-                // A `fun` operand that nothing follows is left bare, as an application's last
-                // argument is (`argument`): the pin prints `(fun x => x) = fun x => x`.
-                let mut bare = &args[args.len() - 1];
-                while let ExprNode::MData { expr, .. } = bare.node() {
-                    bare = expr;
-                }
-                let rhs = if !trailing && matches!(bare.node(), ExprNode::Lam { .. }) {
+                // A right operand that is a bare `fun` would absorb a token after the
+                // operation: the parenthesizer brackets the operation whole there,
+                // `(id = fun x => x) ∧ True`, as it does an application ending so. A `fun`
+                // operand that nothing follows is left bare, as an application's last argument
+                // is (`argument`): the pin prints `(fun x => x) = fun x => x`.
+                let bare_fun = matches!(
+                    strip_mdata(&args[args.len() - 1]).node(),
+                    ExprNode::Lam { .. }
+                );
+                let open = self.trailing && infix.precedence >= outer && bare_fun;
+                let trailing = self.trailing && infix.precedence >= outer && !open;
+                let rhs = if !trailing && bare_fun {
                     self.with_trailing(false, |printer| printer.doc(&args[args.len() - 1], 0))?
                 } else {
                     self.with_trailing(trailing, |printer| {
                         printer.doc(&args[args.len() - 1], rhs_prec)
                     })?
                 };
-                return Ok(paren_doc(
-                    node(
-                        lhs.then(Format::text(format!(" {}", infix.symbol)))
-                            .then(Format::Line)
-                            .then(rhs),
-                    ),
-                    infix.precedence,
-                    outer,
-                ));
+                let doc = node(
+                    lhs.then(Format::text(format!(" {}", infix.symbol)))
+                        .then(Format::Line)
+                        .then(rhs),
+                );
+                return Ok(if open {
+                    paren_doc(doc, 0, 1)
+                } else {
+                    paren_doc(doc, infix.precedence, outer)
+                });
             }
             // `coeDelaborator` (vendored `PrettyPrinter/Delaborator/Builtins.lean:1230-1260`): a
             // function the `coe` attribute registers is `↑x` of its first explicit argument

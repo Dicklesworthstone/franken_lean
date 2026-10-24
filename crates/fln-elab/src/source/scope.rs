@@ -4,6 +4,7 @@ use super::*;
 pub mod executable;
 pub mod options;
 mod reserved;
+pub(in crate::source) use reserved::structurally_recursive;
 pub mod simp;
 pub mod variables;
 pub(super) mod visibility;
@@ -664,7 +665,13 @@ impl Context {
         }
         match self.source_scope.resolve_with_aliases(
             name,
-            |candidate| self.txn.env.contains(candidate) || local(candidate),
+            // The pin's `containsDeclOrReserved`: an equation-like name of a definition
+            // resolves before it is generated (`equation_theorems`).
+            |candidate| {
+                self.txn.env.contains(candidate)
+                    || local(candidate)
+                    || super::equation_theorems::target(&self.txn.env, candidate).is_some()
+            },
             &aliases,
             &protected,
         ) {

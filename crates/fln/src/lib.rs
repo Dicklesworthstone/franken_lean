@@ -7814,6 +7814,59 @@ impl Engine {
             } else {
                 scopes.current.clone()
             };
+            // The equation theorems this command names, generated and admitted before it, as
+            // the pin's reserved-name action adds them when it resolves the name.
+            if public.is_none() && source_records::may_name_equation_theorems(command_source) {
+                let parsed = grammar.enter(|| {
+                    fln_parse::parse_source_command(command_source)
+                        .and_then(fln_parse::ParsedSourceCommand::expanded)
+                });
+                let members = match &parsed {
+                    Ok(_) => None,
+                    Err(_) => grammar
+                        .enter(|| fln_parse::command_scope::mutual::parse(command_source))
+                        .ok()
+                        .flatten(),
+                };
+                let syntaxes: Vec<&fln_syntax::tree::Syntax> = match (&parsed, &members) {
+                    (Ok(parsed), _) => vec![parsed.syntax()],
+                    (Err(_), Some(members)) => members.iter().collect(),
+                    (Err(_), None) => Vec::new(),
+                };
+                if !syntaxes.is_empty() {
+                    let realized = grammar
+                        .enter(|| {
+                            engine.realize_equation_theorems(
+                                &syntaxes,
+                                &scope,
+                                options,
+                                limits.admission(),
+                            )
+                        })
+                        .map_err(|error| EngineExecutionError::BatchCommand {
+                            index: command_index,
+                            error: Box::new(error),
+                            at: Some(original_offset),
+                        })?;
+                    match realized {
+                        Outcome::Complete(Some(admission)) => {
+                            scopes
+                                .admitted_batch(&admission, admission.engine.environment(), None)
+                                .map_err(|error| {
+                                    scope_error(command_index, original_offset, error.message())
+                                })?;
+                            engine = admission.engine.clone();
+                            source_admissions.push(SourceCommandAdmission {
+                                command_index,
+                                admission,
+                            });
+                        }
+                        Outcome::Complete(None) => {}
+                        Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                        Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                    }
+                }
+            }
             let warn_sorry = scope
                 .options
                 .get_bool(&Name::from_components(["warn", "sorry"]), true);
@@ -7904,10 +7957,13 @@ impl Engine {
                     .map_err(|error| {
                         scope_error(command_index, original_offset, error.message())
                     })?;
-                source_admissions.push(SourceCommandAdmission {
-                    command_index,
-                    admission,
-                });
+                source_records::push_command_admission(
+                    &mut source_admissions,
+                    SourceCommandAdmission {
+                        command_index,
+                        admission,
+                    },
+                );
                 continue;
             }
             if grammar
@@ -7948,10 +8004,13 @@ impl Engine {
                         scope_error(command_index, original_offset, error.message())
                     })?;
                 engine = admission.engine.clone();
-                source_admissions.push(SourceCommandAdmission {
-                    command_index,
-                    admission,
-                });
+                source_records::push_command_admission(
+                    &mut source_admissions,
+                    SourceCommandAdmission {
+                        command_index,
+                        admission,
+                    },
+                );
                 continue;
             }
             let parsed = grammar
@@ -8253,10 +8312,13 @@ impl Engine {
                         scope_error(command_index, original_offset, error.message())
                     })?;
                 engine = admission.engine.clone();
-                source_admissions.push(SourceCommandAdmission {
-                    command_index,
-                    admission,
-                });
+                source_records::push_command_admission(
+                    &mut source_admissions,
+                    SourceCommandAdmission {
+                        command_index,
+                        admission,
+                    },
+                );
                 if let Some(message) = guarded_compile_error.take() {
                     guarded_errors.push(SourceWarning {
                         command_index,
@@ -8602,10 +8664,13 @@ impl Engine {
                         scope_error(command_index, original_offset, error.message())
                     })?;
                 engine = admission.engine.clone();
-                source_admissions.push(SourceCommandAdmission {
-                    command_index,
-                    admission,
-                });
+                source_records::push_command_admission(
+                    &mut source_admissions,
+                    SourceCommandAdmission {
+                        command_index,
+                        admission,
+                    },
+                );
                 continue;
             }
             if !native_axioms.is_empty() {

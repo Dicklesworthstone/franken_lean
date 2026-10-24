@@ -5,6 +5,8 @@ use fln_kernel::verdict::Verdict;
 
 mod auxiliaries;
 mod elaboration;
+mod equation_theorems;
+pub(crate) use equation_theorems::{may_name_equation_theorems, push_command_admission};
 mod library;
 mod local_functions;
 mod public_body;
@@ -226,12 +228,40 @@ impl Engine {
         if scope.source_site.is_none() {
             scope.source_site = Some(source_check::source_site(source)?);
         }
-        self.admit_parsed_command_in_scope(
-            source,
-            parse_scoped_command(source)?,
-            options,
-            limits,
-            &scope,
+        let parsed = parse_scoped_command(source)?;
+        // Equation theorems the command names are generated and admitted first; the
+        // command's own admissions follow them in one batch.
+        let realized = if may_name_equation_theorems(source) {
+            let syntaxes: Vec<&fln_syntax::tree::Syntax> = match &parsed {
+                ScopedCommandSyntax::Mutual(members) => members.iter().collect(),
+                ScopedCommandSyntax::Example(parsed) => vec![parsed.syntax()],
+                ScopedCommandSyntax::Definition(parsed) => vec![parsed.syntax()],
+            };
+            match self.realize_equation_theorems(&syntaxes, &scope, options, limits)? {
+                Outcome::Complete(realized) => realized,
+                Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+            }
+        } else {
+            None
+        };
+        let Some(realized) = realized else {
+            return self.admit_parsed_command_in_scope(source, parsed, options, limits, &scope);
+        };
+        Ok(
+            match realized
+                .engine
+                .admit_parsed_command_in_scope(source, parsed, options, limits, &scope)?
+            {
+                Outcome::Complete(mut batch) => {
+                    let mut admissions = realized.admissions;
+                    admissions.append(&mut batch.admissions);
+                    batch.admissions = admissions;
+                    batch.base_logical_root = realized.base_logical_root;
+                    Outcome::Complete(batch)
+                }
+                other => other,
+            },
         )
     }
 

@@ -29,6 +29,7 @@ mod subst;
 pub use subst::SubstError;
 pub mod scope;
 use scope::SourceScope;
+pub mod equation_theorems;
 mod equations;
 pub mod evaluation;
 mod inductive;
@@ -206,6 +207,9 @@ pub enum SourceInferenceError {
     },
     /// A `mutual` block whose members' headers the pin refuses to combine.
     MutualHeader(MutualHeaderError),
+    /// An equation theorem the pin generates on demand that this engine does not
+    /// (`equation_theorems`): a capability refusal, not a verdict on the source.
+    EquationTheorem(Box<equation_theorems::NotGenerated>),
 }
 
 /// The pin's header checks across the members of a `mutual` inductive block
@@ -475,6 +479,7 @@ impl std::fmt::Display for SourceInferenceError {
                 "Type mismatch: a term of type `{actual}` is expected to have type `{expected}`"
             ),
             Self::MutualHeader(error) => write!(f, "{error}"),
+            Self::EquationTheorem(refusal) => write!(f, "{refusal}"),
         }
     }
 }
@@ -935,12 +940,9 @@ impl Context {
         if let Some(term) = self.partial_group_reference(name)? {
             return Ok(term);
         }
-        let info = self
-            .txn
-            .env
-            .find(name)
-            .cloned()
-            .ok_or_else(|| failure(SourceInferenceError::UnknownConstant(name.clone())))?;
+        let Some(info) = self.txn.env.find(name).cloned() else {
+            return Err(self.missing_equation_theorem(name)?);
+        };
         self.note_resolved_recursor(name, &info)?;
         let base = info.constant_val();
         let mut levels = Vec::new();
@@ -3446,14 +3448,29 @@ impl Context {
                                 close,
                             } => {
                                 self.txn.lctx = goal.lctx.clone();
-                                tasks.push(Task::RewriteTerm(
-                                    proof,
-                                    goal,
-                                    rule.reverse,
-                                    remaining,
-                                    close,
-                                ));
-                                tasks.push(Task::Visit(rule.syntax, None, true));
+                                if let Some((declaration, equations)) =
+                                    self.rewrite_rule_equations(rule.syntax)?
+                                {
+                                    self.rewrite_with_equations(
+                                        &mut proof,
+                                        goal,
+                                        &declaration,
+                                        &equations,
+                                        rule.reverse,
+                                        remaining,
+                                        close,
+                                    )?;
+                                    tasks.push(Task::Proof(proof));
+                                } else {
+                                    tasks.push(Task::RewriteTerm(
+                                        proof,
+                                        goal,
+                                        rule.reverse,
+                                        remaining,
+                                        close,
+                                    ));
+                                    tasks.push(Task::Visit(rule.syntax, None, true));
+                                }
                             }
                             tactics::ProofAction::Term {
                                 syntax,

@@ -458,6 +458,54 @@ impl Context {
         Ok((next, proof))
     }
 
+    /// `rw [f]` for a definition `f`: its equation theorems in order, the first that
+    /// rewrites the goal (`withRWRulesSeq`, vendored Lean/Elab/Tactic/Rewrite.lean:84-100).
+    /// Each is tried from the same state, which a failed attempt leaves untouched.
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::source) fn rewrite_with_equations<'a>(
+        &mut self,
+        proof: &mut ProofState<'a>,
+        goal: ProofGoal,
+        declaration: &Name,
+        equations: &[Name],
+        reverse: bool,
+        remaining: VecDeque<RewriteRule<'a>>,
+        close: bool,
+    ) -> Result<(), NatDefinitionElabError> {
+        for equation in equations {
+            self.tick()?;
+            let mut trial = self.rewrite_trial();
+            let mut trial_proof = proof.clone();
+            let attempt = trial.constant(equation).and_then(|rule| {
+                trial.rewrite_proof_term(
+                    &mut trial_proof,
+                    goal.clone(),
+                    rule,
+                    reverse,
+                    remaining.clone(),
+                    close,
+                )
+            });
+            match attempt {
+                Ok(()) => {
+                    *self = trial;
+                    *proof = trial_proof;
+                    return Ok(());
+                }
+                Err(problem)
+                    if backtrack::recoverable(&problem) || Self::rewrite_nonmatch(&problem) =>
+                {
+                    self.charge_rewrite_trial(&trial);
+                }
+                Err(problem) => return Err(problem),
+            }
+        }
+        Err(error(TacticError::RewriteEquations {
+            declaration: declaration.clone(),
+            hint: equations.len() != 1,
+        }))
+    }
+
     /// Build one ordinary conversion/equality transport. The caller owns the
     /// continuation and must close introduced binders only after its child.
     /// `kabstract` abstracts every instance of the occurrence as `rw` does

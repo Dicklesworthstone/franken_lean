@@ -53,7 +53,7 @@ fn safe_definition(env: &Environment, name: &Name) -> bool {
 
 /// Structural recursion leaves its obligation `let` (`recursion::structural_obligation_name`)
 /// directly under the definition's lambdas: the pin's `Structural.eqnInfoExt` entry.
-fn structurally_recursive(env: &Environment, name: &Name) -> bool {
+pub(in crate::source) fn structurally_recursive(env: &Environment, name: &Name) -> bool {
     let Some(ConstantInfo::Defn(definition)) = env.find(name) else {
         return false;
     };
