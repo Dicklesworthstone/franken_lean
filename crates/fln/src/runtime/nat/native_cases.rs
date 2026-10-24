@@ -298,12 +298,20 @@ fn source_declarations_cannot_impersonate_the_private_nat_case() {
             all: vec![collision],
         }),
     );
-    let error = engine
-        .execute_source_definitions(
-            &[b"#eval @Nat.rec (fun _ => Nat) 42 (fun n ih => 99) 0"],
-            &KVMap::new(),
-            limits(),
-        )
-        .expect_err("a checked same-named declaration does not grant compiler authority");
-    assert!(format!("{error:?}").contains("runtime case name collision"));
+    // Literal-zero iota keeps its existing minor without allocating a private
+    // case. The source declaration neither selects nor changes that result.
+    execute(
+        &engine,
+        "#eval @Nat.rec (fun _ => Nat) 42 (fun n ih => 99) 0",
+        "42",
+    );
+    for source in [
+        "#eval @Nat.rec (fun _ => Nat) 42 (fun n ih => 99) 1",
+        "def select (n : Nat) := @Nat.rec (fun _ => Nat) 42 (fun n ih => 99) n\n#eval select 1",
+    ] {
+        let error = engine
+            .execute_source_definitions(&[source.as_bytes()], &KVMap::new(), limits())
+            .expect_err("a checked same-named declaration does not grant compiler authority");
+        assert!(format!("{error:?}").contains("runtime case name collision"));
+    }
 }

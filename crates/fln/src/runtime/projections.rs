@@ -165,8 +165,30 @@ impl Preparation<'_> {
         {
             return Ok(Some(value.clone()));
         }
-        let Some(field) = self.static_projection(family, index, receiver)? else {
-            return Ok(None);
+        let field = if let Some(field) = self.static_projection(family, index, receiver)? {
+            field
+        } else {
+            // Index refinement can expose a zero Nat history under an
+            // existing projection. Select it before its constructor and
+            // callbacks acquire compiler-private identities. Every discarded
+            // field must still pass the ordinary inert projection check.
+            if !specialize::closed(receiver) {
+                return Ok(None);
+            }
+            let (head, args) = self.spine(receiver)?;
+            let ExprNode::Const { name, levels } = head.node() else {
+                return Ok(None);
+            };
+            if name != &super::name("Nat.rec") || levels.len() != 1 {
+                return Ok(None);
+            }
+            let Some(zero) = self.zero_nat_recursion(&args)? else {
+                return Ok(None);
+            };
+            let Some(field) = self.static_projection(family, index, &zero)? else {
+                return Ok(None);
+            };
+            field
         };
         // The selected field can come from an unfolded logical definition,
         // not from the already-erased input tree. Reapply the representation
