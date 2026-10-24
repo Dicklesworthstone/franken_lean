@@ -688,6 +688,10 @@ impl<'a> Preparation<'a> {
                             if n == &name("Nat.rec") && levels.len() == 1)
                             && args.len() >= 4
                         {
+                            if let Some(zero) = self.zero_nat_recursion(&args)? {
+                                tasks.push(Task::Visit(zero));
+                                continue;
+                            }
                             let recursion = self.nat_recursion(&args)?;
                             let required = args.len().saturating_add(1);
                             if tasks.len().saturating_add(required) > limit {

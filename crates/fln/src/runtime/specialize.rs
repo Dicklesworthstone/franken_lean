@@ -823,7 +823,7 @@ impl Preparation<'_> {
             expr,
         } = head.node()
         {
-            let Some(field) = self.static_projection(struct_name, *idx, expr)? else {
+            let Some(field) = self.executable_projection(struct_name, *idx, expr)? else {
                 return Ok(None);
             };
             head = field;

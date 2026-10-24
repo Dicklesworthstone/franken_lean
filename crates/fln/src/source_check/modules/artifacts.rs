@@ -259,6 +259,35 @@ impl PendingArtifact {
                 });
         }
         let remaining = meter.limits.max_work.saturating_sub(meter.work);
+        let exported = fln_elab::macro_inline::export::registrations(base, checked, remaining)
+            .map_err(|error| match error {
+                fln_elab::macro_inline::MacroInlineError::Limit => SourceModuleCheckError::Limit {
+                    resource: "module work",
+                    limit: meter.limits.max_work,
+                },
+                _ => SourceModuleCheckError::Extension {
+                    module: name.clone(),
+                    extension: fln_elab::macro_inline::journal_name(),
+                    reason: "invalid macro-inline metadata export",
+                },
+            })?;
+        let inline = exported.ok_or_else(|| SourceModuleCheckError::Extension {
+            module: name.clone(),
+            extension: fln_elab::macro_inline::journal_name(),
+            reason: "inlining attributes must belong to declarations defined in this module",
+        })?;
+        meter.work(inline.work)?;
+        meter.bytes(inline.bytes_examined)?;
+        for declaration in inline.declarations {
+            meter.work(1)?;
+            metadata
+                .inline
+                .push(fln_olean::source_extensions::InlineEntry {
+                    declaration,
+                    kind: fln_olean::source_extensions::InlineKind::MacroInline,
+                });
+        }
+        let remaining = meter.limits.max_work.saturating_sub(meter.work);
         let exported = fln_elab::reducibility::export::statuses(base, checked, remaining).map_err(
             |error| match error {
                 fln_elab::reducibility::ReducibilityError::Limit => SourceModuleCheckError::Limit {

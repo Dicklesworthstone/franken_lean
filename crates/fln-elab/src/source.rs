@@ -600,6 +600,11 @@ struct Context {
     inaccessible_columns: std::collections::HashSet<Name>,
     // Only compiler-generated aliases may expose their already checked referent.
     matrix_aliases: std::collections::HashMap<FVarId, Expr>,
+    // Distinct symbolic columns can select one constructor field. Only the typed matcher
+    // creates these aliases, and both names are unspellable generated column identities.
+    matrix_field_aliases: std::collections::HashMap<Name, Name>,
+    // Constructor columns shared by named/positional layouts, including their descendants.
+    matrix_shared_columns: std::collections::HashSet<Name>,
     // A written match the pattern-matrix compiler lowered, by its last input's binder: the
     // inputs in order and the alternatives' patterns, typed as the pin types them once that
     // binder is in scope (`pattern_typing`).
@@ -729,6 +734,8 @@ impl Context {
             matrix_rows: std::collections::HashSet::new(),
             inaccessible_columns: std::collections::HashSet::new(),
             matrix_aliases: std::collections::HashMap::new(),
+            matrix_field_aliases: std::collections::HashMap::new(),
+            matrix_shared_columns: std::collections::HashSet::new(),
             pattern_typing_checks: std::collections::HashMap::new(),
             registry_cache: crate::instances::RegistryCache::default(),
             alias_cache: crate::aliases::AliasCache::default(),
@@ -1064,6 +1071,8 @@ impl Context {
             if name.is_anonymous() {
                 return Err(NatDefinitionElabError::AnonymousReferenceName);
             }
+            let column = self.matrix_field_aliases.get(name).cloned();
+            let name = column.as_ref().unwrap_or(name);
             if let Some(local) = self
                 .txn
                 .lctx

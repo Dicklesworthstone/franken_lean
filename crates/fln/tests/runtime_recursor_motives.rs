@@ -16,7 +16,10 @@ fn engine() -> Engine {
         .unwrap()
 }
 fn execute(source: &str, expected: &str) {
-    let run = engine()
+    execute_in(engine(), source, expected);
+}
+fn execute_in(engine: Engine, source: &str, expected: &str) {
+    let run = engine
         .execute_source_definitions(&[source.as_bytes()], &KVMap::new(), limits())
         .unwrap_or_else(|error| panic!("{source}\n{error:?}"))
         .into_complete()
@@ -29,6 +32,54 @@ fn execute(source: &str, expected: &str) {
         Some(expected),
         "{source}"
     );
+}
+
+#[test]
+fn constructor_index_arithmetic_does_not_require_an_executable_history_layout() {
+    let engine = Engine::with_source_seed(EngineAdmissionLimits::new(limits().kernel))
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    execute_in(
+        engine,
+        "inductive Vec (α : Type) : Nat → Type\n\
+         | nil : Vec α 0\n\
+         | cons : α → {n : Nat} → Vec α n → Vec α (n+1)\n\
+         open Vec\n\
+         def h1 : Vec Nat (n+1) → Nat\n\
+         | cons b bv => b\n\
+         #eval h1 (cons 42 nil)",
+        "42",
+    );
+}
+
+#[test]
+fn dynamic_and_nonzero_motives_with_different_runtime_families_still_refuse() {
+    let definitions = "def Vary : Nat → Type\n\
+        | 0 => Nat\n\
+        | n+1 => Bool\n";
+    let base = engine();
+    let options = KVMap::new();
+    let root = base.logical_root(&options);
+    for declaration in [
+        "def choose (n : Nat) : Vary n := @Nat.rec Vary (42 : Nat) (fun n ih => (true : Bool)) n",
+        "def choose : Vary 1 := @Nat.rec Vary (42 : Nat) (fun n ih => (true : Bool)) 1",
+    ] {
+        let source = format!("{definitions}{declaration}");
+        base.check_source_files(
+            &[source.as_bytes()],
+            &options,
+            fln::SourceCheckLimits::new(EngineAdmissionLimits::new(limits().kernel)),
+        )
+        .unwrap_or_else(|error| panic!("the refusal control must be checked source: {error:?}"))
+        .into_complete()
+        .unwrap();
+        let error = base
+            .execute_source_definitions(&[source.as_bytes()], &options, limits())
+            .expect_err("an unknown or nonzero major must still require a uniform runtime family");
+        assert!(format!("{error:?}").contains("dependent Nat recursor motive"));
+        assert_eq!(base.logical_root(&options), root);
+    }
 }
 
 #[test]

@@ -6,13 +6,14 @@
 use super::*;
 use crate::source_extension_format as layout;
 use crate::source_extensions::{
-    AliasEntry, ClassEntry, DefaultEntry, InstanceEntry, InstanceKey, ReducibilityEntry,
-    StructureEntry, StructureField, StructureParent,
+    AliasEntry, ClassEntry, DefaultEntry, InlineEntry, InstanceEntry, InstanceKey,
+    ReducibilityEntry, StructureEntry, StructureField, StructureParent,
 };
 use std::collections::HashSet;
 
 mod aliases;
 mod defaults;
+mod inlining;
 mod instances;
 mod namespaces;
 mod reducibility;
@@ -45,6 +46,9 @@ pub struct SourceMetadata {
     /// This module's final status for each owned declaration. The writer sorts
     /// these by Name.quickLt for the pin's per-module binary search.
     pub reducibility: Vec<ReducibilityEntry>,
+    /// Final inlining kind for each module-owned declaration, written as the
+    /// pin's `inlineAttrs` enum map in `Name.quickLt` order.
+    pub inline: Vec<InlineEntry>,
     /// Module-owned structure interfaces, including physical parent subobjects.
     /// The writer preserves field/parent order and sorts only the pin's indexes.
     pub structures: Vec<StructureEntry>,
@@ -138,6 +142,9 @@ impl Encoder {
         }
         if !metadata.reducibility.is_empty() {
             blocks.push(self.reducibility_block(&metadata.reducibility)?);
+        }
+        if !metadata.inline.is_empty() {
+            blocks.push(self.inline_block(&metadata.inline)?);
         }
         if !metadata.noncomputable.is_empty() {
             blocks.push(self.tagged_names_block(

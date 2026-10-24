@@ -104,6 +104,7 @@ struct Branch<'a> {
 struct DirectMatch<'a> {
     syntax: Option<&'a Syntax>,
     whole: Option<Name>,
+    fields: Vec<(Name, Typed)>,
 }
 pub(super) struct MatchBuild<'a> {
     direct: Option<DirectMatch<'a>>,
@@ -161,58 +162,6 @@ pub(super) fn pattern_name(syntax: &Syntax) -> Result<Option<Name>, NatDefinitio
     Ok(None)
 }
 impl Context {
-    /// How many of `constructor`'s parameter binders are explicit. Parameters
-    /// the family declared are implicit in its constructors; a promoted index
-    /// keeps the binder its constructor wrote, which may be explicit.
-    fn explicit_parameter_binders(
-        &mut self,
-        constructor: &fln_env::constants::ConstructorVal,
-    ) -> Result<usize, NatDefinitionElabError> {
-        let mut type_ = &constructor.base.type_;
-        let mut explicit = 0;
-        for _ in 0..constructor.num_params {
-            self.tick()?;
-            let ExprNode::ForallE {
-                binder_info, body, ..
-            } = type_.node()
-            else {
-                return Err(error(MatchError::UnsupportedFamily));
-            };
-            if *binder_info == BinderInfo::Default {
-                explicit += 1;
-            }
-            type_ = body;
-        }
-        Ok(explicit)
-    }
-
-    /// How many of `constructor`'s fields are explicit: the arguments a pattern writes after its
-    /// explicit parameters.
-    fn explicit_field_binders(
-        &mut self,
-        constructor: &fln_env::constants::ConstructorVal,
-    ) -> Result<usize, NatDefinitionElabError> {
-        let mut type_ = &constructor.base.type_;
-        let mut explicit = 0;
-        for index in 0..constructor
-            .num_params
-            .saturating_add(constructor.num_fields)
-        {
-            self.tick()?;
-            let ExprNode::ForallE {
-                binder_info, body, ..
-            } = type_.node()
-            else {
-                return Err(error(MatchError::UnsupportedFamily));
-            };
-            if index >= constructor.num_params && *binder_info == BinderInfo::Default {
-                explicit += 1;
-            }
-            type_ = body;
-        }
-        Ok(explicit)
-    }
-
     /// Independent local indices can be generalized without inventing index
     /// equalities. Repeated, fixed and let-bound indices need an equation
     /// refinement compiler, so they are not silently treated as independent.
@@ -525,6 +474,9 @@ impl Context {
                 parts.alternatives,
             )?;
         }
+        if let Some(state) = self.repeated_matrix_field(parts, &major, expected.as_ref())? {
+            return Ok(MatchStart::Regular(Box::new(state)));
+        }
         // Keep the existing direct/index-polymorphic path, including recursive
         // call lowering. Only the precise index-shape refusal selects the
         // equation-refining backend; typing faults and resource stops propagate.
@@ -658,6 +610,7 @@ impl Context {
                     direct: Some(DirectMatch {
                         syntax: Some(&alt[3]),
                         whole,
+                        fields: Vec::new(),
                     }),
                     recursive,
                     unrefined_capture: false,
@@ -883,6 +836,128 @@ impl Context {
         })
     }
 
+    /// Different named/positional layouts can select one physical field. After the first
+    /// split, the ordinary eliminator reintroduces that field as its checked constructor.
+    /// Reuse that branch fact for a later generated alias, retaining checked lets and every
+    /// original row's matrixScope witness. This never evaluates an arbitrary discriminant or
+    /// supplies a missing source case: it is limited to aliases made by `match_patterns`.
+    fn repeated_matrix_field<'a>(
+        &mut self,
+        parts: MatchParts<'a>,
+        major: &Typed,
+        expected: Option<&Expr>,
+    ) -> Result<Option<MatchBuild<'a>>, NatDefinitionElabError> {
+        if !parts.generated || parts.equation.is_some() || parts.conditional.is_some() {
+            return Ok(None);
+        }
+        let Syntax::Ident { val, .. } = parts.discriminant else {
+            return Ok(None);
+        };
+        if !self.matrix_shared_columns.contains(val) {
+            return Ok(None);
+        }
+        let ExprNode::FVar { id } = major.value.node() else {
+            return Ok(None);
+        };
+        let Some(mut value) = self.txn.lctx.find(id).and_then(|local| local.value.clone()) else {
+            return Ok(None);
+        };
+        let mut visited = HashSet::new();
+        while let ExprNode::FVar { id } = value.node() {
+            self.tick()?;
+            if !visited.insert(id.clone()) {
+                return Err(error(MatchError::InvalidPattern));
+            }
+            let Some(next) = self.txn.lctx.find(id).and_then(|local| local.value.clone()) else {
+                return Ok(None);
+            };
+            value = next;
+        }
+        // Read the constructor the earlier checked branch installed, without whnf or delta.
+        let mut head = &value;
+        let mut arguments = Vec::new();
+        while let ExprNode::App { f, a } = head.node() {
+            self.tick()?;
+            arguments.push(a.clone());
+            head = f;
+        }
+        arguments.reverse();
+        let ExprNode::Const { name, .. } = head.node() else {
+            return Ok(None);
+        };
+        let Some(ConstantInfo::Ctor(constructor)) = self.txn.env.find(name).cloned() else {
+            return Ok(None);
+        };
+        let Some(ConstantInfo::Induct(family)) = self.txn.env.find(&constructor.induct).cloned()
+        else {
+            return Err(error(MatchError::UnsupportedFamily));
+        };
+        let patterns = self.match_patterns(parts, &constructor.induct, &family.ctors)?;
+        let (names, whole, syntax) = match patterns.constructors.get(name) {
+            Some((names, syntax)) => (Some(names), None, *syntax),
+            None => match patterns.fallback {
+                Some((whole, syntax)) => (None, whole, syntax),
+                None => return Err(error(MatchError::MissingConstructor)),
+            },
+        };
+        if arguments.len() != constructor.num_params as usize + constructor.num_fields as usize {
+            return Err(error(MatchError::WrongArity));
+        }
+        let mut applied = Typed {
+            value: head.clone(),
+            type_: self
+                .known_type(head)?
+                .ok_or_else(|| error(MatchError::UnsupportedFamily))?,
+        };
+        let mut fields = Vec::new();
+        for (index, value) in arguments.into_iter().enumerate() {
+            self.tick()?;
+            let argument = Typed {
+                type_: self
+                    .known_type(&value)?
+                    .ok_or_else(|| error(MatchError::UnsupportedFamily))?,
+                value,
+            };
+            if index >= constructor.num_params as usize {
+                let name = names
+                    .and_then(|names| names.get(index - constructor.num_params as usize))
+                    .and_then(Clone::clone)
+                    .unwrap_or_else(Name::anonymous);
+                fields.push((name, argument.clone()));
+            }
+            applied = self.match_apply(applied, argument)?;
+        }
+        self.constrain_type(&applied.type_, &major.type_)?;
+        let target = match expected {
+            Some(expected) => expected.clone(),
+            None => {
+                let sort = self.type_expected()?;
+                self.hole(sort)?
+            }
+        };
+        Ok(Some(MatchBuild {
+            direct: Some(DirectMatch {
+                syntax: Some(syntax),
+                whole,
+                fields,
+            }),
+            recursive: false,
+            unrefined_capture: false,
+            saved: self.txn.lctx.clone(),
+            target,
+            major: major.clone(),
+            family: constructor.induct,
+            parameters: Vec::new(),
+            indices: Vec::new(),
+            generalized: Vec::new(),
+            motive_obligation: None,
+            levels: Vec::new(),
+            recursor: major.clone(),
+            branches: std::collections::VecDeque::new(),
+            conditional_order: None,
+        }))
+    }
+
     /// One pattern parser serves ordinary and equation-refining matches. Syntax
     /// is borrowed from the original source; no generated tactic script or
     /// reparsing can erase a branch's annotations, references, or provenance.
@@ -976,19 +1051,30 @@ impl Context {
             let [pattern] = expect_null_args(sequence, "single pattern")? else {
                 return Err(error(MatchError::InvalidPattern));
             };
-            let (head, arguments) = if let Syntax::Node { kind, args, .. } = pattern
+            let (head, arguments, layouts) = if let Syntax::Node { kind, args, .. } = pattern
+                && kind == &parser_kind(&["Term", "matrixCtorPattern"])
+            {
+                if !parts.generated {
+                    return Err(error(MatchError::InvalidPattern));
+                }
+                let [head, layouts] = args.as_slice() else {
+                    return Err(error(MatchError::InvalidPattern));
+                };
+                (
+                    head,
+                    &[][..],
+                    Some(expect_null_args(layouts, "constructor row layouts")?),
+                )
+            } else if let Syntax::Node { kind, args, .. } = pattern
                 && kind == &parser_kind(&["Term", "app"])
             {
                 let [head, args] = args.as_slice() else {
                     return Err(error(MatchError::InvalidPattern));
                 };
-                (head, expect_null_args(args, "pattern fields")?)
+                (head, expect_null_args(args, "pattern fields")?, None)
             } else {
-                (pattern, &[][..])
+                (pattern, &[][..], None)
             };
-            // `c a ..`: every remaining argument is `_` (vendored `Lean/Elab/PatternVar.lean:
-            // 360-366`, and `App.lean:810-825` for a relative head); only the last may be `..`.
-            let (arguments, ellipsis) = application::split_ellipsis(arguments)?;
             let constructor_name = if head == &patterns::anonymous_head() {
                 // `⟨…⟩` names the family's only constructor (`elabAnonymousCtor`).
                 match constructors {
@@ -1034,10 +1120,6 @@ impl Context {
                 if !constructors.contains(&constructor_name) {
                     return Err(error(MatchError::InvalidPattern));
                 }
-                let mut fields = arguments
-                    .iter()
-                    .map(pattern_name)
-                    .collect::<Result<Vec<_>, _>>()?;
                 // Explicit constructor parameters, which only a promoted index has,
                 // take a written argument each; the pin makes them inaccessible
                 // (`isNextArgAccessible`, vendored Lean/Elab/PatternVar.lean:178-188),
@@ -1050,16 +1132,71 @@ impl Context {
                 else {
                     return Err(error(MatchError::UnsupportedFamily));
                 };
-                let parameters = self.explicit_parameter_binders(&constructor)?;
-                if ellipsis {
-                    let explicit = parameters + self.explicit_field_binders(&constructor)?;
-                    if fields.len() > explicit {
-                        return Err(error(MatchError::WrongArity));
+                let parameters = constructor.num_params as usize;
+                let mut fields = Vec::new();
+                let shared = layouts.is_some()
+                    || parts.generated
+                        && matches!(parts.discriminant, Syntax::Ident { val, .. }
+                            if self.matrix_shared_columns.contains(val));
+                let layouts = match layouts {
+                    Some(layouts) => {
+                        if layouts.is_empty() {
+                            return Err(error(MatchError::InvalidPattern));
+                        }
+                        layouts
+                            .iter()
+                            .map(|layout| expect_null_args(layout, "constructor row layout"))
+                            .collect::<Result<Vec<_>, _>>()?
                     }
-                    fields.resize(explicit, None);
-                }
-                if fields.len() < parameters {
-                    return Err(error(MatchError::WrongArity));
+                    None => vec![arguments],
+                };
+                for layout in layouts {
+                    self.tick()?;
+                    let arguments: Vec<_> = layout.iter().collect();
+                    let normalized =
+                        patterns::arguments::normalize(self, &arguments, &constructor)?;
+                    // Allocate only after walking the actual, budgeted telescope. Imported
+                    // constructor metadata alone is not an allocation bound.
+                    if fields.is_empty() {
+                        fields.resize(normalized.len(), None);
+                    }
+                    for (index, argument) in normalized.into_iter().enumerate() {
+                        self.tick()?;
+                        let Some(name) = argument.map(pattern_name).transpose()?.flatten() else {
+                            continue;
+                        };
+                        if shared
+                            && name.parent().is_anonymous()
+                            && matches!(name.leaf_view(), LeafView::Num(_))
+                        {
+                            self.matrix_shared_columns.insert(name.clone());
+                        }
+                        if index < parameters && parts.generated {
+                            self.inaccessible_columns.insert(name.clone());
+                        }
+                        match &fields[index] {
+                            None => fields[index] = Some(name),
+                            Some(previous) if previous == &name => {}
+                            Some(previous) if parts.generated => {
+                                // Symbolic columns from different row layouts select this
+                                // same checked field. A user identifier never enters this map.
+                                let generated = |name: &Name| {
+                                    name.parent().is_anonymous()
+                                        && matches!(name.leaf_view(), LeafView::Num(_))
+                                };
+                                if !generated(previous) || !generated(&name) {
+                                    return Err(error(MatchError::InvalidPattern));
+                                }
+                                if let Some(old) =
+                                    self.matrix_field_aliases.insert(name, previous.clone())
+                                    && old != *previous
+                                {
+                                    return Err(error(MatchError::InvalidPattern));
+                                }
+                            }
+                            Some(_) => return Err(error(MatchError::DuplicateVariable)),
+                        }
+                    }
                 }
                 let inaccessible = |field: &Option<Name>| match field {
                     None => true,
@@ -1093,6 +1230,7 @@ impl Context {
                 }
             } else {
                 if !arguments.is_empty()
+                    || layouts.is_some()
                     || index + 1 != parts.alternatives.len()
                     || fallback.is_some()
                 {
@@ -1232,13 +1370,34 @@ impl Context {
                 state.major.type_.clone(),
                 state.major.value.clone(),
             );
+            let mut locals = vec![self.txn.lctx.find(&id).expect("whole-match binder").clone()];
+            for (name, field) in &direct.fields {
+                self.tick()?;
+                let id = FVarId(self.fresh_name()?);
+                self.txn.lctx.add_let(
+                    id.clone(),
+                    name.clone(),
+                    field.type_.clone(),
+                    field.value.clone(),
+                );
+                if matches!(field.value.node(), ExprNode::FVar { .. }) {
+                    self.matrix_aliases.insert(id.clone(), field.value.clone());
+                }
+                locals.push(
+                    self.txn
+                        .lctx
+                        .find(&id)
+                        .expect("repeated matrix field")
+                        .clone(),
+                );
+            }
             return Ok(MatchStep::Branch {
                 syntax,
                 expected: state.target.clone(),
                 binders: BranchBinders {
                     unrefined: HashSet::new(),
                     hypotheses: Vec::new(),
-                    locals: vec![self.txn.lctx.find(&id).expect("whole-match binder").clone()],
+                    locals,
                     type_: state.target.clone(),
                 },
             });
@@ -1335,16 +1494,12 @@ impl Context {
             else {
                 return Err(error(MatchError::UnsupportedFamily));
             };
-            let name = if *binder_info == BinderInfo::Default {
-                if let Some(fields) = &branch.fields {
-                    let field = fields
-                        .get(consumed)
-                        .ok_or_else(|| error(MatchError::WrongArity))?;
-                    consumed += 1;
-                    field.clone().unwrap_or_else(Name::anonymous)
-                } else {
-                    Name::anonymous()
-                }
+            let name = if let Some(fields) = &branch.fields {
+                let field = fields
+                    .get(consumed)
+                    .ok_or_else(|| error(MatchError::WrongArity))?;
+                consumed += 1;
+                field.clone().unwrap_or_else(Name::anonymous)
             } else {
                 Name::anonymous()
             };

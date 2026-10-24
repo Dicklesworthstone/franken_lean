@@ -284,6 +284,112 @@ fn nat_history_refuses_opaque_consumers_and_preserves_strict_work() {
             source
         );
     }
+
+    // Selecting a known zero must not let its enclosing projection erase a
+    // different field's strict work before the record is constructed.
+    let pair_type = application(
+        constant("PProd", vec![Level::one(); 2]),
+        [natural(), natural()],
+    );
+    let pair = application(
+        constant("PProd.mk", vec![Level::one(); 2]),
+        [
+            natural(),
+            natural(),
+            nat(7),
+            Expr::app(constant("work", vec![]), nat(42)),
+        ],
+    );
+    let zero_pair = application(
+        constant("Nat.rec", vec![Level::one()]),
+        [
+            Expr::lam(
+                Name::anonymous(),
+                natural(),
+                pair_type.clone(),
+                BinderInfo::Default,
+            ),
+            pair,
+            Expr::lam(
+                Name::anonymous(),
+                natural(),
+                Expr::lam(
+                    Name::anonymous(),
+                    pair_type,
+                    Expr::bvar(0).unwrap(),
+                    BinderInfo::Default,
+                ),
+                BinderInfo::Default,
+            ),
+            nat(0),
+        ],
+    );
+    assert!(
+        Preparation::new(engine.environment(), IngressLimits::default())
+            .executable_projection(&named("PProd"), 0, &zero_pair)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn history_reduction_keeps_explicit_implementations_and_extern_contracts() {
+    let engine = admitted_scaffold(None);
+    let source = named("Nat.add._f");
+    let Some(ConstantInfo::Defn(original)) = engine.environment().find(&source) else {
+        panic!("the actual checked arithmetic functional is present");
+    };
+    let mut replacement = original.clone();
+    replacement.base.name = named("replacementHistory");
+    replacement.all = vec![replacement.base.name.clone()];
+    let target = replacement.base.name.clone();
+    let engine = engine
+        .admit_declaration(
+            Declaration::Defn(replacement),
+            &KVMap::new(),
+            EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024)),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap()
+        .engine;
+    let environment =
+        fln_elab::implemented_by::register(engine.environment(), &source, &target).unwrap();
+    let helper = constant("Nat.add._f", vec![]);
+    let marker = FVarId(named("history_marker"));
+    let mut preparation = Preparation::new(&environment, IngressLimits::default());
+    assert!(!preparation.nat_history_inert(&helper).unwrap());
+    assert!(
+        preparation
+            .nat_history_step(&helper, &marker)
+            .unwrap()
+            .is_none()
+    );
+
+    for label in ["Nat.add._f", "Nat.brecOn", "Nat.rec"] {
+        let environment = fln_elab::externs::register(
+            engine.environment(),
+            &named(label),
+            vec![fln_elab::externs::ExternEntry::Opaque],
+        )
+        .unwrap();
+        let helper = constant(
+            label,
+            if label == "Nat.add._f" {
+                vec![]
+            } else {
+                vec![Level::one()]
+            },
+        );
+        let mut preparation = Preparation::new(&environment, IngressLimits::default());
+        assert!(matches!(
+            preparation.nat_history_step(&helper, &marker),
+            Err(IngressError::UnsupportedNode {
+                kind: "native extern attribute does not match the supported ABI"
+            })
+        ));
+        assert!(preparation.nat_history_inert(&helper).is_err());
+    }
 }
 
 #[test]
@@ -386,6 +492,29 @@ fn actual_prelude_modulo_and_bitvector_words_execute_at_default_budgets() {
                     "{label}"
                 );
             }
+            // The arithmetic history exposed by source index refinement must
+            // also disappear with the pin's actual imported declarations and
+            // executable metadata, not only with the small source seed.
+            let indexed = imported
+                .engine
+                .execute_source_definitions(
+                    &[b"inductive Vec (A : Type) : Nat -> Type\n\
+                       | nil : Vec A 0\n\
+                       | cons : A -> {n : Nat} -> Vec A n -> Vec A (n+1)\n\
+                       open Vec\n\
+                       def head : Vec Nat (n+1) -> Nat\n\
+                       | cons b bv => b\n\
+                       #eval head (cons 42 nil)"],
+                    &options,
+                    EngineExecutionLimits::new(Budget::for_stack_bytes(STACK)),
+                )
+                .unwrap()
+                .into_complete()
+                .unwrap();
+            assert_eq!(
+                closed_vm_value(&indexed.executions.last().unwrap().exit).unwrap(),
+                Some(ClosedVmValue::Scalar(42))
+            );
         })
         .unwrap()
         .join()

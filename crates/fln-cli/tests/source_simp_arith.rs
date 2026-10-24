@@ -7,6 +7,9 @@
 //! the pinned binary again when it is present. The normal forms are the pin's: each
 //! `guard_target =ₛ` and `guard_hyp … :ₛ` below holds there.
 #![forbid(unsafe_code)]
+#[path = "source_simp_arith/int.rs"]
+mod int;
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -92,19 +95,12 @@ const REJECTED: &[(&str, &str)] = &[
     ),
 ];
 
-/// Refused here as unsupported: configuration other than `arith`, and `Int` arithmetic.
-const REFUSED: &[(&str, &str, &str)] = &[
-    (
-        "other_configuration",
-        "example (x : Nat) : x + 0 = x := by simp (config := { decide := true })\n",
-        "expected default simplification configuration",
-    ),
-    (
-        "integers",
-        "example (x : Int) : x + 1 = 1 + x := by simp +arith\n",
-        "Int and divisibility normalization is not implemented",
-    ),
-];
+/// Refused here as unsupported: configuration other than `arith`.
+const REFUSED: &[(&str, &str, &str)] = &[(
+    "other_configuration",
+    "example (x : Nat) : x + 0 = x := by simp (config := { decide := true })\n",
+    "expected default simplification configuration",
+)];
 
 fn pinned_lib() -> Option<PathBuf> {
     let lib = std::env::var_os("FLN_REFERENCE_LIB")
@@ -143,15 +139,18 @@ fn workspace() -> PathBuf {
 
 /// `fln check-source` on `HEADER` + `program`, and the pinned binary's exit code when present.
 fn check(lib: &Path, root: &Path, name: &str, program: &str) -> (i32, String, Option<i32>) {
+    check_with_header(lib, root, name, HEADER, program)
+}
+
+fn check_with_header(
+    lib: &Path,
+    root: &Path,
+    name: &str,
+    header: &str,
+    program: &str,
+) -> (i32, String, Option<i32>) {
     let entry = root.join(format!("{name}.lean"));
-    std::fs::write(&entry, format!("{HEADER}{program}")).unwrap();
-    let ours = Command::new(env!("CARGO_BIN_EXE_fln"))
-        .arg("check-source")
-        .arg(&entry)
-        .env("LEAN_PATH", lib)
-        .env("FLN_IMPORT_REUSE_DIR", root.join("records"))
-        .output()
-        .expect("run the installed CLI");
+    std::fs::write(&entry, format!("{header}{program}")).unwrap();
     let theirs = lib
         .parent()
         .and_then(Path::parent)
@@ -167,6 +166,13 @@ fn check(lib: &Path, root: &Path, name: &str, program: &str) -> (i32, String, Op
                 .code()
                 .expect("normal pinned exit")
         });
+    let ours = Command::new(env!("CARGO_BIN_EXE_fln"))
+        .arg("check-source")
+        .arg(&entry)
+        .env("LEAN_PATH", lib)
+        .env("FLN_IMPORT_REUSE_DIR", root.join("records"))
+        .output()
+        .expect("run the installed CLI");
     (
         ours.status.code().expect("normal process exit"),
         String::from_utf8_lossy(&ours.stderr).into_owned(),

@@ -155,6 +155,54 @@ impl Preparation<'_> {
         })
     }
 
+    /// A literal zero already selects the checked recursor's first minor. Its
+    /// result needs only the layout at zero, not a layout for every index.
+    /// Index refinement can expose this form inside an unfolded Nat.add
+    /// history dictionary, whose Nat.below component has no uniform layout.
+    /// Keep the selected minor as executable code and discard the other minor
+    /// only when it is already a lambda value. No runtime argument is reduced.
+    /// Leave additional function arguments on the ordinary path so their
+    /// evaluation order cannot move across the selected minor.
+    pub(super) fn zero_nat_recursion(
+        &mut self,
+        args: &[Expr],
+    ) -> Result<Option<Expr>, IngressError> {
+        self.tick()?;
+        if args.len() != 4
+            || !matches!(args[3].node(), ExprNode::Lit { literal: Literal::Nat(n) }
+                if n.limbs_le().is_empty())
+        {
+            return Ok(None);
+        }
+        let mut successor = &args[2];
+        while let ExprNode::MData { expr, .. } = successor.node() {
+            self.tick()?;
+            successor = expr;
+        }
+        if !matches!(successor.node(), ExprNode::Lam { .. }) {
+            return Ok(None);
+        }
+        self.check_nat_family()?;
+        if !self.nat_history_logical_constant(&name("Nat.rec"))? {
+            return Ok(None);
+        }
+        let zero = self
+            .zero_nat_history_minor(&args[0], &args[1])?
+            .unwrap_or_else(|| args[1].clone());
+        if !self.has_literal_callable_tail(&zero)? {
+            return Ok(Some(zero));
+        }
+        let result_type = self.erase_runtime_type(&Expr::app(args[0].clone(), args[3].clone()))?;
+        let Some(result) = self.value_type(&result_type)? else {
+            // Iota selection is already justified by the checked recursor.
+            // A type-level history redex need not have a runtime layout; the
+            // surviving minor retains its own constructor/callee annotations.
+            return Ok(Some(zero));
+        };
+        self.typed_callable_result(zero, result_type, result)
+            .map(Some)
+    }
+
     /// Apply generated branch arguments without evaluating or substituting a
     /// strict local initializer. Beta still removes an unused symbolic IH, but
     /// a let before that lambda remains a real, once-only runtime computation.
@@ -443,6 +491,165 @@ mod tests {
             assert_eq!(motive.result, ValueType::Nat);
             assert_eq!(motive.result_type, family);
         }
+    }
+
+    fn zero_arguments() -> Vec<Expr> {
+        let natural = scalar(ValueType::Nat).unwrap();
+        let lambda = |body| {
+            Expr::lam(
+                Name::anonymous(),
+                natural.clone(),
+                body,
+                BinderInfo::Default,
+            )
+        };
+        vec![
+            lambda(natural.clone()),
+            literal(42),
+            lambda(lambda(variable(0).unwrap())),
+            literal(0),
+        ]
+    }
+
+    fn seeded_engine() -> Engine {
+        Engine::with_source_seed(EngineAdmissionLimits::new(Budget::for_stack_bytes(
+            2 * 1024 * 1024,
+        )))
+        .unwrap()
+        .into_complete()
+        .unwrap()
+    }
+
+    #[test]
+    fn literal_zero_keeps_the_selected_minors_strict_initializer() {
+        let engine = seeded_engine();
+        let mut args = zero_arguments();
+        args[1] = Expr::let_e(
+            name("selectedInitializer"),
+            scalar(ValueType::Nat).unwrap(),
+            call("observableInitializer", []),
+            literal(42),
+            false,
+        );
+        assert_eq!(
+            Preparation::new(engine.environment(), IngressLimits::default())
+                .zero_nat_recursion(&args)
+                .unwrap(),
+            Some(args[1].clone())
+        );
+    }
+
+    #[test]
+    fn literal_zero_keeps_a_function_valued_minor_typed() {
+        let engine = seeded_engine();
+        let mut args = zero_arguments();
+        let natural = scalar(ValueType::Nat).unwrap();
+        let function = Expr::forall_e(
+            Name::anonymous(),
+            natural.clone(),
+            natural.clone(),
+            BinderInfo::Default,
+        );
+        args[0] = Expr::lam(
+            Name::anonymous(),
+            natural.clone(),
+            function.clone(),
+            BinderInfo::Default,
+        );
+        args[1] = Expr::lam(
+            Name::anonymous(),
+            natural.clone(),
+            variable(0).unwrap(),
+            BinderInfo::Default,
+        );
+        args[2] = Expr::lam(
+            Name::anonymous(),
+            natural,
+            Expr::lam(
+                Name::anonymous(),
+                function.clone(),
+                variable(0).unwrap(),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        );
+        let result = Preparation::new(engine.environment(), IngressLimits::default())
+            .zero_nat_recursion(&args)
+            .unwrap()
+            .unwrap();
+        let ExprNode::LetE {
+            type_, value, body, ..
+        } = result.node()
+        else {
+            panic!("a selected closure retains its checked result type");
+        };
+        assert_eq!(type_, &function);
+        assert_eq!(value, &args[1]);
+        assert_eq!(body, &variable(0).unwrap());
+    }
+
+    #[test]
+    fn zero_iota_never_discards_a_strict_minor_producer_or_evaluates_a_major() {
+        let engine = seeded_engine();
+        let baseline = zero_arguments();
+        let mut strict = baseline.clone();
+        strict[2] = Expr::let_e(
+            name("strictMinorProducer"),
+            scalar(ValueType::Nat).unwrap(),
+            call("observableInitializer", []),
+            strict[2].clone(),
+            false,
+        );
+        let mut computed = baseline.clone();
+        computed[3] = call("observableZero", []);
+        let mut dynamic = baseline.clone();
+        dynamic[3] = variable(0).unwrap();
+        let mut nonzero = baseline.clone();
+        nonzero[3] = literal(1);
+        let mut applied = baseline;
+        applied.push(literal(7));
+        for args in [strict, computed, dynamic, nonzero, applied] {
+            assert!(
+                Preparation::new(engine.environment(), IngressLimits::default())
+                    .zero_nat_recursion(&args)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn zero_iota_requires_the_admitted_nat_family_and_available_work() {
+        let args = zero_arguments();
+        assert!(matches!(
+            Preparation::new(&Environment::new(), IngressLimits::default())
+                .zero_nat_recursion(&args),
+            Err(IngressError::UnsupportedNode {
+                kind: "noncanonical Nat family"
+            })
+        ));
+        let engine = seeded_engine();
+        let externally_implemented = fln_elab::externs::register(
+            engine.environment(),
+            &name("Nat.rec"),
+            vec![fln_elab::externs::ExternEntry::Opaque],
+        )
+        .unwrap();
+        assert!(matches!(
+            Preparation::new(&externally_implemented, IngressLimits::default())
+                .zero_nat_recursion(&args),
+            Err(IngressError::UnsupportedNode {
+                kind: "native extern attribute does not match the supported ABI"
+            })
+        ));
+        let limits = IngressLimits {
+            max_nodes: 0,
+            ..IngressLimits::default()
+        };
+        assert!(matches!(
+            Preparation::new(engine.environment(), limits).zero_nat_recursion(&args),
+            Err(IngressError::ResourceLimit { .. })
+        ));
     }
 }
 

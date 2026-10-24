@@ -31,6 +31,65 @@ fn variable(index: u32) -> Result<Expr, IngressError> {
 }
 
 impl Preparation<'_> {
+    fn nat_history_model(&mut self) -> Result<bool, IngressError> {
+        if !self.specializations.nat_recursion_checked {
+            if !crate::source_intrinsics::imported_nat_recursion_matches(
+                self.environment,
+                &mut self.visited,
+                self.limits,
+            )? {
+                return Ok(false);
+            }
+            self.specializations.nat_recursion_checked = true;
+        }
+        Ok(true)
+    }
+
+    /// A known-zero recursor can expose an inert history dictionary without
+    /// ever constructing a runtime history. Reduce only the checked scaffold,
+    /// and keep the actual helper bodies and their execution contracts.
+    pub(in crate::runtime) fn zero_nat_history_minor(
+        &mut self,
+        motive: &Expr,
+        minor: &Expr,
+    ) -> Result<Option<Expr>, IngressError> {
+        if !closed(minor) || !self.nat_history_type(motive)? || !self.nat_history_model()? {
+            return Ok(None);
+        }
+        let marker = FVarId(named("_fln_runtime_unobserved_zero_nat_history"));
+        let reduced = self.nat_history_reduce(minor, &marker)?;
+        if reduced.has_fvar() {
+            return Ok(None);
+        }
+        // Delta reduction can expose fresh proofs and logical projections.
+        // This closed minor supplies their complete lexical context before
+        // constructor and closure identities are registered by preparation.
+        let erased = self.erase_proofs(&reduced, None)?;
+        self.lower_projections(&erased).map(Some)
+    }
+
+    /// An executable replacement or extern must not become evidence that a
+    /// logical value is inert, nor be unfolded away by history reduction.
+    pub(in crate::runtime) fn nat_history_logical_constant(
+        &mut self,
+        name: &Name,
+    ) -> Result<bool, IngressError> {
+        if self.has_implementation(name)? {
+            return Ok(false);
+        }
+        crate::source_intrinsics::check_selected_extern_attribute(
+            self.environment,
+            name,
+            &mut self.externs,
+            &mut self.visited,
+            self.limits,
+        )?;
+        Ok(!self
+            .externs
+            .as_ref()
+            .is_some_and(|table| table.get(name).is_some()))
+    }
+
     pub(in crate::runtime) fn imported_nat_recursion(
         &mut self,
         head: &Expr,
@@ -50,15 +109,11 @@ impl Preparation<'_> {
         {
             return Ok(None);
         }
-        if !self.specializations.nat_recursion_checked {
-            if !crate::source_intrinsics::imported_nat_recursion_matches(
-                self.environment,
-                &mut self.visited,
-                self.limits,
-            )? {
-                return Ok(None);
-            }
-            self.specializations.nat_recursion_checked = true;
+        if !self.nat_history_logical_constant(name)? {
+            return Ok(None);
+        }
+        if !self.nat_history_model()? {
+            return Ok(None);
         }
         let family = constant("Nat", vec![]);
         let Some(result_type) = self.indexed_motive(&args[0], &[], &family)? else {
@@ -139,6 +194,19 @@ impl Preparation<'_> {
         while let Some(expression) = work.pop() {
             self.tick()?;
             let (head, args) = self.spine(&expression)?;
+            if let ExprNode::Const { name, .. } = head.node()
+                && !self.nat_history_logical_constant(name)?
+            {
+                // A verified primitive function is an inert reference, but
+                // must remain a reference to its selected native contract.
+                if args.is_empty()
+                    && !self.has_implementation(name)?
+                    && self.inert_native_function(&head)?
+                {
+                    continue;
+                }
+                return Ok(false);
+            }
             match head.node() {
                 ExprNode::BVar { .. }
                 | ExprNode::FVar { .. }
@@ -269,6 +337,9 @@ impl Preparation<'_> {
         let ExprNode::Const { name, levels } = head.node() else {
             return Ok(None);
         };
+        if !self.nat_history_logical_constant(name)? {
+            return Ok(None);
+        }
         if name == &named("Nat.rec") && levels.len() == 1 && args.len() >= 4 {
             // Static branch selection may discard the other minor. Both
             // operands must already be values; a strict producer of a minor
