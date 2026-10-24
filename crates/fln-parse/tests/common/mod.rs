@@ -6,6 +6,7 @@
 //! constraint is the right one anyway, because a fuzz failure nobody can reproduce is a rumour.
 
 #![forbid(unsafe_code)]
+#![cfg(test)]
 #![allow(dead_code)] // each suite uses a different subset
 
 use fln_syntax::source::SourceText;
@@ -107,4 +108,94 @@ pub fn generate(rng: &mut Rng) -> String {
 
 pub fn text_of(raw: &str) -> Option<SourceText> {
     SourceText::from_utf8(raw.as_bytes()).ok()
+}
+
+/// The complete member tree equals its standalone parse in group coordinates.
+/// The caller supplies the known normalized prefix length independently of the
+/// mutual parser. Keep every position, trivia span and raw identifier range.
+pub fn assert_member_in_group(
+    member: &fln_syntax::tree::Syntax,
+    standalone: &[u8],
+    normalized_offset: usize,
+) {
+    use fln_syntax::source::SourceInfo;
+    use fln_syntax::tree::Syntax;
+
+    fn coordinates(info: SourceInfo) -> (u8, bool, Vec<usize>) {
+        match info {
+            SourceInfo::None => (0, false, vec![]),
+            SourceInfo::Original {
+                leading,
+                pos,
+                trailing,
+                end_pos,
+            } => (
+                1,
+                false,
+                vec![
+                    leading.start().0,
+                    leading.end().0,
+                    pos.0,
+                    trailing.start().0,
+                    trailing.end().0,
+                    end_pos.0,
+                ],
+            ),
+            SourceInfo::Synthetic {
+                pos,
+                end_pos,
+                canonical,
+            } => (2, canonical, vec![pos.0, end_pos.0]),
+        }
+    }
+
+    let parsed = fln_parse::parse_definition(standalone).unwrap();
+    let mut pending = vec![(member, parsed.syntax())];
+    while let Some((actual, expected)) = pending.pop() {
+        let (actual_kind, actual_canonical, actual_positions) = coordinates(actual.info());
+        let (expected_kind, expected_canonical, expected_positions) = coordinates(expected.info());
+        assert_eq!(
+            (actual_kind, actual_canonical),
+            (expected_kind, expected_canonical)
+        );
+        assert_eq!(actual_positions.len(), expected_positions.len());
+        for (actual, expected) in actual_positions.iter().zip(expected_positions) {
+            assert_eq!(*actual, expected + normalized_offset);
+        }
+        match (actual, expected) {
+            (Syntax::Missing, Syntax::Missing) => {}
+            (
+                Syntax::Node {
+                    kind: a, args: aa, ..
+                },
+                Syntax::Node {
+                    kind: b, args: ba, ..
+                },
+            ) => {
+                assert_eq!(a, b);
+                assert_eq!(aa.len(), ba.len());
+                pending.extend(aa.iter().zip(ba));
+            }
+            (Syntax::Atom { val: a, .. }, Syntax::Atom { val: b, .. }) => assert_eq!(a, b),
+            (
+                Syntax::Ident {
+                    raw_val: ar,
+                    val: a,
+                    preresolved: ap,
+                    ..
+                },
+                Syntax::Ident {
+                    raw_val: br,
+                    val: b,
+                    preresolved: bp,
+                    ..
+                },
+            ) => {
+                assert_eq!((a, ap), (b, bp));
+                assert_eq!(ar.start().0, br.start().0 + normalized_offset);
+                assert_eq!(ar.end().0, br.end().0 + normalized_offset);
+            }
+            _ => panic!("member and standalone syntax shapes differ: {actual:?} / {expected:?}"),
+        }
+    }
 }

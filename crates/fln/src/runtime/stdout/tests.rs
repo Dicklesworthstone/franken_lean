@@ -1,12 +1,14 @@
 //! Fast adapter probes over actual pinned metadata. Raw dependency loading is
 //! not a module-admission claim. Source examples pass both declaration checkers;
 //! the transport fixtures separately test post-admission representation code.
+#![cfg(test)]
 
 use super::*;
 use fln_comp::flbc::{self, Instruction};
 use fln_olean::source_extensions as metadata;
 use fln_rt::obj::Obj;
 
+#[cfg(test)]
 mod input;
 
 const STACK: usize = 256 * 1024 * 1024;

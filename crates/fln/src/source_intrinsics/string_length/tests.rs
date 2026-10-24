@@ -1,3 +1,4 @@
+#![cfg(test)]
 use super::*;
 use fln_elab::externs::{self, ExternEntry};
 
@@ -277,4 +278,5 @@ fn binder_labels_are_not_part_of_the_native_string_contract() {
     assert!(matches(&renamed).unwrap());
 }
 
+#[cfg(test)]
 mod native_tests;

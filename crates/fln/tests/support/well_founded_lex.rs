@@ -2,8 +2,9 @@
 //! search and the checked arithmetic prover. Without `termination_by`, GuessLex's
 //! search infers the product over Nat parameters.
 #![forbid(unsafe_code)]
-use fln::{ClosedVmValue, Engine, EngineExecutionLimits, KVMap, Name, SourceCheckLimits};
-use fln_core::outcome::{InconclusiveCause, Outcome};
+#![cfg(test)]
+use fln::{ClosedVmValue, Engine, EngineExecutionLimits, KVMap, Name, Outcome, SourceCheckLimits};
+use fln_core::outcome::InconclusiveCause;
 
 // Independently evaluated by the pin with prelude, Init.WFComputable and
 // Init.Omega. Init.Data.Repr serves only the oracle's #eval output.

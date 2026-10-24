@@ -1,9 +1,7 @@
 //! Mutual inductive grouping delegates member boundaries to the ordinary parser.
 #![forbid(unsafe_code)]
-use fln_parse::{
-    command_scope::{mutual, partition},
-    parse_definition,
-};
+mod common;
+use fln_parse::command_scope::{mutual, partition};
 
 #[test]
 fn private_documented_inductives_keep_complete_ordinary_member_syntax() {
@@ -18,8 +16,9 @@ fn private_documented_inductives_keep_complete_ordinary_member_syntax() {
         let ordinary = partition(body.as_bytes()).unwrap();
         assert_eq!(parsed.len(), 2);
         assert_eq!(ordinary.len(), 2);
-        for (member, (_, bytes)) in parsed.iter().zip(&ordinary) {
-            assert_eq!(member, parse_definition(bytes).unwrap().syntax());
+        for (member, (offset, bytes)) in parsed.iter().zip(&ordinary) {
+            let normalized_offset = 6 + body[..offset.0].replace("\r\n", "\n").len();
+            common::assert_member_in_group(member, bytes, normalized_offset);
         }
     }
 }

@@ -1,5 +1,6 @@
 //! Checked-source and retained bytecode probes over actual pinned metadata.
 //! Loading this small raw fixture is not admission of its library modules.
+#![cfg(test)]
 
 use super::*;
 use fln_comp::flbc::{self, Instruction};
@@ -62,6 +63,20 @@ fn raw_pin_environment() -> Option<Environment> {
             );
         }
     }
+    // Raw declaration decoding does not activate the module's extern journal.
+    // Char.ofNat's validity decisions use Nat.ble. Select its existing checked
+    // native model rather than its logical recursive companion, without
+    // changing the VM's execution step budget.
+    // Use the same pin-generated entries as the explicit String.push fixture.
+    let environment = register(&environment, "Nat.ble", false);
+    let mut preparation = Preparation::new(&environment, IngressLimits::default());
+    assert!(
+        preparation
+            .native_intrinsic_binding(&name("Nat.ble"))
+            .unwrap()
+            .is_some(),
+        "the raw fixture must activate the exact pinned Nat.ble contract"
+    );
     Some(environment)
 }
 
@@ -153,7 +168,7 @@ fn run(engine: &Engine, source: &str) -> SourceCommandBatchExecution {
         )
         .unwrap_or_else(|error| panic!("{source}\n{error:?}"))
         .into_complete()
-        .unwrap()
+        .unwrap_or_else(|stop| panic!("{source}\n{stop:?}"))
 }
 
 fn assert_result(exit: &VmExit, expected: &str) {

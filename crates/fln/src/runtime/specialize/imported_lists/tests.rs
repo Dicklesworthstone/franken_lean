@@ -756,18 +756,20 @@ fn decoded_list_length_has_a_ground_character_signature() {
                 .into_iter()
                 .fold(Environment::new(), |env, info| env.add_decl(info).unwrap());
             let mut preparation = Preparation::new(&environment, IngressLimits::default());
+            // `implemented_by` can select an intermediate companion. Exercise
+            // the ordinary repeated preparation path before inspecting the
+            // final callable's ground signature.
             let replacement = preparation
-                .specialize_call(
-                    &Expr::const_(name("List.length"), vec![Level::zero()]),
-                    &[
+                .expression(&application(
+                    Expr::const_(name("List.length"), vec![Level::zero()]),
+                    [
                         constant("Char"),
                         Expr::app(
                             Expr::const_(name("List.nil"), vec![Level::zero()]),
                             constant("Char"),
                         ),
                     ],
-                )
-                .unwrap()
+                ))
                 .unwrap();
             let (head, _) = preparation.spine(&replacement).unwrap();
             let ExprNode::Const { name, .. } = head.node() else {

@@ -1,11 +1,9 @@
 //! Mutual partial declarations retain the ordinary parser's complete modifiers.
 #![forbid(unsafe_code)]
+mod common;
 
 use fln_core::name::Name;
-use fln_parse::{
-    command_scope::{mutual, partition},
-    parse_definition,
-};
+use fln_parse::command_scope::{mutual, partition};
 use fln_syntax::tree::Syntax;
 
 fn args(syntax: &Syntax) -> &[Syntax] {
@@ -23,9 +21,9 @@ fn documented_private_members_keep_exact_declaration_trees() {
     let commands = partition(body.as_bytes()).unwrap();
     assert_eq!(members.len(), 2);
     assert_eq!(commands.len(), 2);
-    for (member, (_, bytes)) in members.iter().zip(&commands) {
-        // Equality includes all source spans, atoms, identifiers and modifiers.
-        assert_eq!(member, parse_definition(bytes).unwrap().syntax());
+    for (member, (offset, bytes)) in members.iter().zip(&commands) {
+        let normalized_offset = 6 + body[..offset.0].replace("\r\n", "\n").len();
+        common::assert_member_in_group(member, bytes, normalized_offset);
         let modifiers = args(&args(member)[0]);
         assert_eq!(modifiers.len(), 7);
         assert_eq!(
@@ -51,10 +49,8 @@ fn effect_modifiers_are_preserved_for_elaboration_not_erased() {
         let members = mutual::parse(source.as_bytes()).unwrap().unwrap();
         let commands = partition(body.as_bytes()).unwrap();
         assert_eq!(members.len(), 1);
-        assert_eq!(
-            members[0],
-            *parse_definition(commands[0].1).unwrap().syntax()
-        );
+        let normalized_offset = 6 + body[..commands[0].0.0].replace("\r\n", "\n").len();
+        common::assert_member_in_group(&members[0], commands[0].1, normalized_offset);
     }
 }
 

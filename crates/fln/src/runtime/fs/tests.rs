@@ -3,6 +3,7 @@
 //! Raw dependency loading is not full module admission. Every source example
 //! below still passes both ordinary declaration checkers before execution.
 //! The Reference is used only for fixture/contract comparison, never runtime.
+#![cfg(test)]
 
 use super::*;
 use fln_comp::flbc::{self, Instruction};
@@ -10,8 +11,11 @@ use fln_olean::source_extensions as metadata;
 use fln_rt::obj::Obj;
 use std::path::{Path, PathBuf};
 
+#[cfg(test)]
 mod bytes;
+#[cfg(test)]
 mod read;
+#[cfg(test)]
 mod read_dir;
 
 const STACK: usize = 256 * 1024 * 1024;
@@ -497,6 +501,7 @@ fn checked_same_type_equality_change_cannot_relabel_native_io_errors() {
 }
 
 fn directory(label: &str) -> PathBuf {
+    // ubs:ignore[rust.security.non-crypto-random] — test-directory collision suffix; create_dir refuses existing paths and no secret is generated.
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
