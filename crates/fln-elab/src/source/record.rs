@@ -135,6 +135,7 @@ pub(super) fn elaborate_record_scoped(
         6,
         "structure command",
     )?;
+    // ubs:ignore[rust.security.constant-time-compare] — this is a public parser-node kind, not a secret.
     let is_class = matches!(&parts[0], Syntax::Node { kind, .. } if kind == &parser_kind(&["Command", "classTk"]));
     let keyword = expect_node(
         &parts[0],
@@ -231,6 +232,7 @@ pub(super) fn elaborate_record_scoped(
     // A copied field's default is its parent's, over this record's fields before it.
     for inherited in &inheritance.defaults {
         context.tick()?;
+        // ubs:ignore[rust.security.constant-time-compare] — FVarId equality selects a public constructor field.
         let Some(position) = output.iter().position(|field| field.id == inherited.field) else {
             return Err(failure(SourceInferenceError::Scope));
         };
@@ -466,6 +468,7 @@ pub(super) fn elaborate_record_scoped(
                 .clone(),
         );
     }
+    let inferred_result_level = explicit.is_none();
     let result_level = match explicit {
         Some(value) => {
             let sort = context.whnf(&value)?;
@@ -559,6 +562,9 @@ pub(super) fn elaborate_record_scoped(
         local.type_ = context.instantiate(&local.type_)?;
     }
     let result_level = match context.instantiate(&Expr::sort(result_level))?.node() {
+        // As for inductives, normalize the inferred universe after resolving
+        // its metavariables. Explicit sorts retain their authored form.
+        ExprNode::Sort { level } if inferred_result_level => level.normalize(),
         ExprNode::Sort { level } => level.clone(),
         _ => return Err(failure(SourceInferenceError::ExpectedType)),
     };
@@ -643,6 +649,7 @@ pub(super) fn elaborate_record_scoped(
         let projection = spec.name.append_core(label);
         if *subobject
             && !fields.iter().any(|field| {
+                // ubs:ignore[rust.security.constant-time-compare] — projection and subobject are public declaration names.
                 field.projection == projection && field.subobject.as_ref() == Some(parent)
             })
         {

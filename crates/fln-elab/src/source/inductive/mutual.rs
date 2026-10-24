@@ -320,8 +320,12 @@ pub(in crate::source) fn elaborate_mutual(
             for index in &mut h.indices {
                 index.type_ = rename(&mut h.context, index.type_.clone(), &to_lead)?;
             }
-            *own_binders =
-                promote_constructors(&mut h.context, &lead, &mut body.constructors, None)?;
+            *own_binders = promote_constructors(
+                &mut h.context,
+                &lead,
+                &mut body.constructors,
+                Some(&mut body.field_universes),
+            )?;
             // A member keeps its own binder name in its own type; the identity,
             // domain and binder style are the first member's, as the block shares them.
             h.parameters
@@ -333,7 +337,25 @@ pub(in crate::source) fn elaborate_mutual(
                 }));
         }
     }
-    let result_level = explicit.unwrap_or(inferred);
+    let result_level = if let Some(explicit) = explicit {
+        explicit
+    } else if prop_candidate(
+        &mut headers[0].context,
+        &all_bodies
+            .iter()
+            .map(|body| {
+                (
+                    body.constructors.as_slice(),
+                    body.field_universes.as_slice(),
+                )
+            })
+            .collect::<Vec<_>>(),
+        &ids,
+    )? {
+        Level::zero()
+    } else {
+        inferred.normalize()
+    };
     let final_types = headers
         .iter()
         .map(|h| family_type(h, &result_level, budget))

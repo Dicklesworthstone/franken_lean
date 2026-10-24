@@ -402,7 +402,24 @@ impl Context {
         }
         let field = state.fields.get(index).ok_or_else(malformed)?;
         self.constrain(&value.type_, &field.type_)?;
-        self.constrain(&field.hole, &value.value)?;
+        if let ExprNode::MVar { id } = field.hole.node()
+            && !self.txn.mvars.is_assigned(id)
+        {
+            // The supplied term is already checked against this field's type.
+            // Assign it verbatim: defeq may zeta-reduce an unused strict let
+            // before assigning the hole, erasing executable initialization.
+            let awakened = self
+                .txn
+                .assign_mvar(id.clone(), value.value, AssignmentJustification::UserGiven)
+                .map_err(|error| {
+                    failure(SourceInferenceError::Unification(Box::new(
+                        UnificationError::Metavariable(error),
+                    )))
+                })?;
+            assert!(awakened.is_empty(), "private source queue");
+        } else {
+            self.constrain(&field.hole, &value.value)?;
+        }
         state.cursor += 1;
         Ok(())
     }
