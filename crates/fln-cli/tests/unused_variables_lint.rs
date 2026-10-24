@@ -598,6 +598,32 @@ def s : Nat → Nat
         2,
         "{ours}"
     );
+    // A well-founded command's equation pattern variables are bound after its body is
+    // elaborated, so the pin still warns about them (upstream `elab/issue2925`, a mutual block).
+    let program = "def FunType := Nat → Nat
+def Fun2Type := Nat → Nat → Nat
+mutual
+def foo : FunType
+  | .zero => 0
+  | .succ n => bar n
+termination_by n => n
+def bar : Nat → Nat
+  | .zero => 0
+  | .succ n => baz n 0
+termination_by n => n
+def baz : Fun2Type
+  | .zero, m => 0
+  | .succ n, m => foo n
+termination_by n _ => n
+end
+";
+    let (ours, pinned) = outputs_under(&lib, &root, "well_founded_patterns", header, program);
+    assert_eq!(ours, pinned, "{program}");
+    assert_eq!(
+        ours.matches("is not explicitly referenced").count(),
+        2,
+        "{ours}"
+    );
     let program = "def g9 (n : Nat) (u : Nat) : Nat := if n = 0 then 0 else g9 (n - 1) 0
 def g14 (n : Nat) : Nat :=
   match n with

@@ -8884,13 +8884,19 @@ impl Engine {
                         },
                     );
                     let mut unused = Vec::new();
-                    if !body_ran_tactics && !well_founded {
+                    if !body_ran_tactics {
+                        // An equation's or alternative's pattern variables are bound once the
+                        // body is elaborated, over no pending metavariable, so the pin still
+                        // warns about them in a well-founded command (upstream
+                        // `elab/issue2925`, a mutual block, warns about its unused `m`).
                         unused.extend(unused_variables::unused_pattern_variables(
                             syntax,
                             options,
                             &constructors,
                             declared.map(|(_, type_, _, _)| type_),
                         ));
+                    }
+                    if !body_ran_tactics && !well_founded {
                         unused.extend(unused_variables::unused_fun_binders(
                             syntax,
                             options,

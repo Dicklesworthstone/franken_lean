@@ -19,8 +19,9 @@
 //! A command this increment cannot decide is not linted, exactly as before this
 //! module existed: the pin's warning is missing, never invented. That covers `sorry`
 //! (the pin skips the whole command); a tactic body of a recursive declaration or one with
-//! `where` helpers; every local binder whose scope holds a tactic block; every local binder of
-//! a command compiled by well-founded recursion ([`applies_well_founded_fixpoint`]); and every
+//! `where` helpers; every local binder whose scope holds a tactic block; every `fun`, `let`,
+//! `have` and `if h :` binder of a command compiled by well-founded recursion
+//! ([`applies_well_founded_fixpoint`]), whose pattern variables are still read; and every
 //! binder form other than those read here.
 use fln_core::expr::{BinderInfo, Expr, ExprNode};
 use fln_core::name::{LeafView, Name};
@@ -212,8 +213,10 @@ pub(crate) fn omits_tactic_field(
 /// (`Lean/MetavarContext.lean:1207-1214`). Which binders that reaches depends on the pin's
 /// metavariables, measured 2026-10-23: `if h : n < 99 then 0 else foo (n - 99)` warns about
 /// nothing, nor does an unused `(fun (y : Nat) => 0) 1` far from the call, while
-/// `(fun (w : Nat) => g14 k) 3` (no metavariable under `w`) warns. So no binder of such a body
-/// is read here; its signature binders still are.
+/// `(fun (w : Nat) => g14 k) 3` (no metavariable under `w`) warns. So no `fun`, `let`, `have` or
+/// `if h :` binder of such a body is read here; its signature binders still are, and so are its
+/// equations' pattern variables, which are bound after the body is elaborated (upstream
+/// `elab/issue2925` warns about an unused `m` in a mutual well-founded block).
 pub(crate) fn applies_well_founded_fixpoint(value: &Expr) -> bool {
     let fixpoints = [
         Name::from_components(["WellFounded", "fix"]),
