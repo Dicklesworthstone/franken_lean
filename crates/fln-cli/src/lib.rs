@@ -12242,7 +12242,7 @@ fn render_lean_source_commands(
                 {
                     return io_guard_refusal(command_index);
                 }
-                let mut owned_capture_text = None;
+                let owned_capture_text: String;
                 let text = if let Some(text) = execution
                     .evaluation_output()
                     .filter(|text| !text.is_empty())
@@ -12258,8 +12258,8 @@ fn render_lean_source_commands(
                             4,
                         );
                     };
-                    owned_capture_text = Some(decoded.to_string());
-                    owned_capture_text.as_deref()
+                    owned_capture_text = decoded.to_string();
+                    Some(owned_capture_text.as_str())
                 } else {
                     None
                 };

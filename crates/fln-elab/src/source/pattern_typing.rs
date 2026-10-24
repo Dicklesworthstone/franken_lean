@@ -369,7 +369,7 @@ impl Model<'_> {
         &mut self,
         row: &[&Syntax],
     ) -> Result<HashMap<Name, usize>, NatDefinitionElabError> {
-        let mut scan: Vec<_> = row.iter().copied().collect();
+        let mut scan: Vec<_> = row.to_vec();
         let mut named = false;
         while let Some(syntax) = scan.pop() {
             self.cx.tick()?;

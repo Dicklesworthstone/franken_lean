@@ -273,7 +273,11 @@ impl Frame {
                 escaped_length(chunk).and_then(|extra| length.checked_add(extra))
             });
         });
-        let budget = if self.count_raw { raw_bytes } else { escaped_bytes };
+        let budget = if self.count_raw {
+            raw_bytes
+        } else {
+            escaped_bytes
+        };
         let requested = self.reserve_write(raw_bytes, budget)?;
         lossy_chunks(message, |chunk| self.bytes.extend_from_slice(chunk));
         self.bytes.push(b'\n');
