@@ -217,10 +217,11 @@ mod tests {
             let decoded = source_extensions::decode(&blocks, DecodeLimits::default()).unwrap();
             assert_eq!(decoded.instances, rows);
             assert_eq!(
-                decoded.uninterpreted,
-                [super::super::namespaces::extension_name()],
+                decoded.namespaces,
+                [n("Scope")],
                 "the scoped row also registers its namespace for the pinned reader"
             );
+            assert!(decoded.uninterpreted.is_empty());
         }
     }
 
