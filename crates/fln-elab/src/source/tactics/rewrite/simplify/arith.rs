@@ -1,15 +1,15 @@
-//! `simp +arith` over `Nat`: the pinned simp's `simpArith` post step (vendored
-//! `Lean/Meta/Tactic/Simp/Rewrite.lean:303-329`) for `Nat` linear constraints and terms
-//! (`Lean/Meta/Tactic/Simp/Arith/Nat/{Basic,Simp}.lean`). Every rewrite is a reflection proof
-//! over `Init/Data/Nat/Linear.lean` (`Nat.Linear.ExprCnstr.eq_of_toNormPoly_eq` and its
+//! `simp +arith` over `Nat` and `Int`: the pinned simp's `simpArith` post step (vendored
+//! `Lean/Meta/Tactic/Simp/Rewrite.lean:303-329`) for linear constraints and terms, and integer
+//! divisibility (`Lean/Meta/Tactic/Simp/Arith/{Nat,Int}/{Basic,Simp}.lean`). Every rewrite is a
+//! reflection proof over `Init/Data/{Nat,Int}/Linear.lean` (the normalization lemmas and their
 //! siblings, closed by `eagerReduce (Eq.refl true)`), which only the kernel decides: the
 //! normalizer here is untrusted and a wrong normal form is a kernel rejection, never a proof.
 //!
-//! What this does not do, and refuses instead: the `Int` normalizer (`Arith/Int/*.lean`) and
-//! `Int` divisibility. A goal on which the pin would run either is refused as unsupported, not
-//! left unchanged. Atoms are identified structurally, where the pin's `KExprMap` also accepts a
-//! definitionally equal atom, and a `Nat` operator is recognized only by its canonical instance
+//! Atoms are identified structurally, where the pin's `KExprMap` also accepts a
+//! definitionally equal atom, and an operator is recognized only by its canonical instance
 //! term (the pin's `Structural` testers), not by the pin's `isDefEqI` fallback.
+mod int;
+
 use super::*;
 use fln_bignum::nat::BigNat;
 use fln_core::expr::NatLit;
@@ -752,12 +752,6 @@ pub(super) struct ArithStep {
     pub prop: bool,
 }
 
-fn unsupported() -> NatDefinitionElabError {
-    NatDefinitionElabError::UnexpectedSyntax {
-        expected: "`simp +arith` over Nat (its Int and divisibility normalization is not implemented)",
-    }
-}
-
 impl Context {
     /// `simp`'s configuration slot. Only `+arith`, `(arith := true)` and
     /// `(config := { arith := true })` are read; every other item stays the typed refusal it
@@ -873,6 +867,8 @@ impl Context {
             }
             let type_ = if step.prop {
                 prop_eq(term.clone(), step.replacement)
+            } else if linear_term(term) == Some(false) {
+                equation(int::integer_type(), term.clone(), step.replacement)
             } else {
                 nat_eq(term.clone(), step.replacement)
             };
@@ -1045,7 +1041,7 @@ impl Context {
     ) -> Result<Option<ArithStep>, NatDefinitionElabError> {
         if let Some(natural) = linear_constraint(term) {
             if !natural {
-                return Err(unsupported());
+                return self.simp_arith_int_constraint(term);
             }
             return self.simp_arith_constraint(term);
         }
@@ -1054,12 +1050,12 @@ impl Context {
                 return Ok(None);
             }
             if !natural {
-                return Err(unsupported());
+                return self.simp_arith_int_expression(term);
             }
             return self.simp_arith_expression(term);
         }
         if divisibility(term) == Some(false) {
-            return Err(unsupported());
+            return self.simp_arith_int_divisibility(term);
         }
         Ok(None)
     }
