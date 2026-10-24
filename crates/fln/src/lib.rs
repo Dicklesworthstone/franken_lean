@@ -6803,12 +6803,14 @@ impl Engine {
             .and_then(fln_parse::ParsedDefinition::expanded)
             .map_err(DefinitionFrontendError::Parse)
             .map_err(EngineExecutionError::Frontend)?;
+        let mut scope = self.base_source_scope();
+        scope.source_site = Some(source_check::source_site(source)?);
         let elaborated = match source_records::elaboration_outcome(
             fln_elab::elaborate_definition_with_effects_in_scope_with_budget(
                 parsed.syntax(),
                 self.environment(),
                 limits.kernel,
-                &self.base_source_scope(),
+                &scope,
             ),
         )? {
             Outcome::Complete(declaration) => declaration,
@@ -6832,6 +6834,9 @@ impl Engine {
             .map_err(DefinitionFrontendError::Elaborate)
             .map_err(EngineExecutionError::Frontend)?;
         let reducibility = fln_elab::source::scope::simp::reducibility(parsed.syntax())
+            .map_err(DefinitionFrontendError::Elaborate)
+            .map_err(EngineExecutionError::Frontend)?;
+        let macro_inline = fln_elab::source::scope::simp::macro_inline(parsed.syntax())
             .map_err(DefinitionFrontendError::Elaborate)
             .map_err(EngineExecutionError::Frontend)?;
         let noncomputable = fln_elab::source::noncomputable_registration(parsed.syntax())
@@ -6974,6 +6979,11 @@ impl Engine {
                         source_records::tag_protected(&admitted.engine, &name)?;
                     admitted.result_logical_root = admitted.engine.logical_root(options);
                 }
+                if macro_inline {
+                    admitted.engine.environment =
+                        source_records::tag_macro_inline(&admitted.engine, &admitted.declaration)?;
+                    admitted.result_logical_root = admitted.engine.logical_root(options);
+                }
                 return self.finish_local_function_admission(
                     admitted,
                     &elaborated.local_functions,
@@ -7088,6 +7098,11 @@ impl Engine {
         command_index: usize,
         scope: &fln_elab::source::scope::SourceScope,
     ) -> Result<Outcome<SourceCheck>, EngineExecutionError> {
+        let mut scope = scope.clone();
+        if scope.source_site.is_none() {
+            scope.source_site = Some(source_check::source_site(&parsed.reconstruct_original())?);
+        }
+        let scope = &scope;
         let name = fresh_generated_command_name(self.environment(), command_index)?;
         let declaration = source_records::elaboration_outcome(match parsed.kind() {
             SourceCommandKind::Example => fln_elab::source::scope::elaborate_example(
@@ -7141,6 +7156,7 @@ impl Engine {
                     checker: admission.checker,
                     scope: scope.clone(),
                     section_variables,
+                    notations: Default::default(),
                 }),
                 Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
                 Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
@@ -7212,6 +7228,7 @@ impl Engine {
             None,
             None,
             presentation,
+            &[(source, None)],
         )
     }
 
@@ -7251,12 +7268,23 @@ impl Engine {
         source_module: Option<&Name>,
         mut public: Option<&mut source_check::modules::visibility::PublicWorld<'_>>,
         presentation: EvaluationPresentation,
+        source_files: &[(&[u8], Option<&Name>)],
     ) -> Result<Outcome<SourceCommandBatchExecution>, EngineExecutionError> {
         if commands.is_empty() {
             return Err(EngineExecutionError::EmptyBatch);
         }
 
         let command_count = commands.len();
+        let sites = source_files
+            .iter()
+            .map(|(source, module)| source_check::source_site(source).map(|site| (site, *module)))
+            .collect::<Result<Vec<_>, _>>()?;
+        if sites.len() != file_starts.len() + 1 {
+            return Err(EngineExecutionError::UnexpectedPublication {
+                detail: "source command locations disagree with the file boundaries",
+            });
+        }
+        let mut source_file = 0usize;
         let mut executions = Vec::new();
         executions.try_reserve_exact(command_count).map_err(|_| {
             EngineExecutionError::AllocationFailure {
@@ -7294,13 +7322,13 @@ impl Engine {
         // command revisited as an `… in` body keeps the body's entry, which is the declaration's.
         let mut warning_sites: BTreeMap<usize, (fln_parse::BytePos, &[u8], bool)> = BTreeMap::new();
         // Each declaration's own syntax, offset and options, for the unused-variables linter, by
-        // command and, within a `mutual` block, by member.
-        let mut lint_sites: BTreeMap<
-            (usize, usize),
-            (fln_parse::BytePos, fln_syntax::tree::Syntax, KVMap),
-        > = BTreeMap::new();
+        // command and, within a `mutual` block, by member, with the block's `mutual` keyword.
+        let mut lint_sites: BTreeMap<(usize, usize), LintSite> = BTreeMap::new();
         // `#exit`'s warning (`elabExit`); the partition made it the last command.
         let mut exit_warning: Option<SourceWarning> = None;
+        // The pin's warning for each definition an `attribute [instance]` command adds while it
+        // is neither `@[reducible]` nor `@[implicit_reducible]` (`Lean/Meta/Instances.lean:288`).
+        let mut instance_attribute_warnings: Vec<SourceWarning> = Vec::new();
         let mut evaluation_indices = Vec::new();
         let mut evaluation_output_bytes = 0usize;
         evaluation_indices
@@ -7385,6 +7413,7 @@ impl Engine {
             // scope expansion revisits its original command index.
             if file_starts.peek() == Some(&command_index) {
                 file_starts.next();
+                source_file += 1;
                 file_base = engine.environment.clone();
                 scopes = source_check::scopes::Scopes::new(&engine);
                 scopes.current.private_module = private_module.cloned();
@@ -7410,6 +7439,11 @@ impl Engine {
                     local_stderr_capture
                 }
             };
+            let (site, module) = &sites[source_file];
+            scopes.current.source_site = Some(site.at_offset(original_offset));
+            if let Some(module) = module {
+                scopes.current.source_module = Some((*module).clone());
+            }
             let control = grammar
                 .enter(|| fln_parse::command_scope::parse(command_source))
                 .map_err(|error| error.with_original_offset(original_offset))
@@ -7433,6 +7467,7 @@ impl Engine {
                             ),
                             message: "using 'exit' to interrupt Lean".to_owned(),
                             severity: SourceSeverity::Warning,
+                            follows_output: false,
                         });
                     }
                     ScopeCommand::OpenIn {
@@ -7575,8 +7610,8 @@ impl Engine {
                         }
                         // The pin passes such a guard by capturing the command's errors or
                         // warnings, whose text this engine does not reproduce. Running the command
-                        // here would turn the pin's pass into a rejection. The one warning it does
-                        // reproduce, "declaration uses `sorry`", is judged. Expected `trace:`
+                        // here would turn the pin's pass into a rejection. The warnings it does
+                        // reproduce ([`reproduced_warning`]) are judged. Expected `trace:`
                         // lines run: goal traces are reproduced and routed at trace severity, and
                         // the `lean` front door makes any mismatch against an expected trace a
                         // non-answer rather than a rejection (fln-guard-msgs-trace-severity-iss2).
@@ -7585,8 +7620,7 @@ impl Engine {
                         // compared as the pin's (below). Other commands keep this refusal.
                         if expected.lines().any(|line| {
                             let line = line.trim_start();
-                            line != "warning: declaration uses `sorry`"
-                                && line.starts_with("warning:")
+                            line.starts_with("warning:") && !reproduced_warning(line)
                         }) {
                             return Err(not_implemented(
                                 "`#guard_msgs` expecting an error or warning message",
@@ -7620,6 +7654,21 @@ impl Engine {
                     | ScopeCommand::Export { .. }
                     | ScopeCommand::Reducibility(_) => {
                         grammar.observe(&control);
+                        // Read before the attribute applies: the status it finds is the
+                        // declaration's own.
+                        let unmarked: Vec<(fln_parse::BytePos, Name)> = match &control {
+                            ScopeCommand::Instance(attribute) => {
+                                source_check::instance_attributes::unmarked_definitions(
+                                    engine.environment(),
+                                    &scopes.current,
+                                    attribute,
+                                )
+                                .into_iter()
+                                .map(|name| (attribute.at, name))
+                                .collect()
+                            }
+                            _ => Vec::new(),
+                        };
                         match source_check::apply_module_control_command(
                             &mut engine,
                             &mut scopes,
@@ -7645,6 +7694,15 @@ impl Engine {
                                 return Ok(Outcome::InternalFault(fault));
                             }
                         }
+                        instance_attribute_warnings.extend(unmarked.into_iter().map(
+                            |(at, name)| SourceWarning {
+                                command_index,
+                                at: fln_parse::BytePos(original_offset.0 + at.0),
+                                message: linters::unmarked_instance_message(&name),
+                                severity: SourceSeverity::Warning,
+                                follows_output: false,
+                            },
+                        ));
                     }
                 }
                 continue;
@@ -7681,19 +7739,30 @@ impl Engine {
             warning_sites.insert(command_index, (original_offset, command_source, warn_sorry));
             // A command this parse does not read is not linted; its own path reports it. A
             // `mutual` block is linted member by member, each at its own offset in the block.
-            let members = match grammar.enter(|| fln_parse::parse_source_command(command_source)) {
-                Ok(parsed)
-                    if parsed.syntax().kind()
-                        == Some(&unused_variables::parser_kind(&["Command", "declaration"])) =>
-                {
-                    vec![(fln_parse::BytePos(0), parsed.syntax().clone())]
-                }
-                _ => grammar
-                    .enter(|| fln_parse::command_scope::mutual::parse_with_offsets(command_source))
-                    .ok()
-                    .flatten()
-                    .unwrap_or_default(),
-            };
+            let (members, block) =
+                match grammar.enter(|| fln_parse::parse_source_command(command_source)) {
+                    // The pin lints every command; a query's term (`#check`, `#eval`, `#reduce`)
+                    // binds variables as a declaration does.
+                    Ok(parsed)
+                        if ["declaration", "check", "eval"].iter().any(|kind| {
+                            parsed.syntax().kind()
+                                == Some(&unused_variables::parser_kind(&["Command", kind]))
+                        }) || unused_variables::is_reduce(parsed.syntax()) =>
+                    {
+                        (vec![(fln_parse::BytePos(0), parsed.syntax().clone())], None)
+                    }
+                    _ => (
+                        grammar
+                            .enter(|| {
+                                fln_parse::command_scope::mutual::parse_with_offsets(command_source)
+                            })
+                            .ok()
+                            .flatten()
+                            .unwrap_or_default(),
+                        fln_parse::command_scope::mutual::keyword_offset(command_source)
+                            .map(|at| fln_parse::BytePos(original_offset.0 + at.0)),
+                    ),
+                };
             for (member, (at, syntax)) in members.into_iter().enumerate() {
                 lint_sites.insert(
                     (command_index, member),
@@ -7701,6 +7770,7 @@ impl Engine {
                         fln_parse::BytePos(original_offset.0 + at.0),
                         syntax,
                         scope.options.clone(),
+                        block,
                     ),
                 );
             }
@@ -7925,7 +7995,7 @@ impl Engine {
                             )
                             .map(|outcome| outcome.map_complete(|check| (check, Vec::new())))
                     };
-                let (checked, traces) = match observed {
+                let (mut checked, traces) = match observed {
                     Ok(Outcome::Complete(checked)) => checked,
                     Ok(Outcome::Inconclusive(reason)) => {
                         return Ok(Outcome::Inconclusive(reason));
@@ -7950,6 +8020,7 @@ impl Engine {
                                 at: original_offset,
                                 message,
                                 severity: SourceSeverity::Error,
+                                follows_output: false,
                             });
                             continue;
                         }
@@ -7969,6 +8040,10 @@ impl Engine {
                     command_index,
                     original_offset,
                 )?;
+                // A `#check` line prints through the notations active at its command.
+                if !is_example {
+                    checked.notations = grammar.notations();
+                }
                 let check_index = checks.len();
                 checks.push(checked);
                 outputs.push(if is_example {
@@ -8006,12 +8081,23 @@ impl Engine {
                         at: Some(original_offset),
                     })?
                     .is_some();
+            // A `@[macro_inline]` tag is recorded only by the admission path below.
+            let has_macro_inline = parsed.kind() == fln_parse::SourceCommandKind::Definition
+                && fln_elab::source::scope::simp::macro_inline(parsed.syntax())
+                    .map_err(DefinitionFrontendError::Elaborate)
+                    .map_err(EngineExecutionError::Frontend)
+                    .map_err(|error| EngineExecutionError::BatchCommand {
+                        index: command_index,
+                        error: Box::new(error),
+                        at: Some(original_offset),
+                    })?;
             if fln_elab::source::is_record(parsed.syntax())
                 || fln_elab::source::is_inductive(parsed.syntax())
                 || fln_elab::source::partial::is_partial(parsed.syntax())
                 || is_instance
                 || has_inline_simp
                 || has_inline_default
+                || has_macro_inline
                 || is_noncomputable
                 || (scope.noncomputable_section
                     && parsed.kind() == fln_parse::SourceCommandKind::Definition)
@@ -8078,6 +8164,7 @@ impl Engine {
                         at: original_offset,
                         message,
                         severity: SourceSeverity::Error,
+                        follows_output: false,
                     });
                 }
                 continue;
@@ -8211,6 +8298,26 @@ impl Engine {
                     detail: "a noncomputable section declaration escaped its admission-only route",
                 });
             }
+            // `#eval` refuses an expression that depends on `sorry` before compiling or running it.
+            // `#guard` evaluates through `evalExpr`, which has no such check
+            // (vendored `Lean/Meta/Eval.lean`).
+            if is_evaluation
+                && !matches!(
+                    evaluation_presentation,
+                    Some(EvaluationResultPresentation::Guard)
+                )
+                && source_execution::evaluation_depends_on_sorry(
+                    &engine,
+                    std::iter::once(&declaration).chain(&local_functions),
+                )?
+            {
+                // Under a `#guard_msgs` expecting an error, an `#eval` was refused before here.
+                return Err(EngineExecutionError::BatchCommand {
+                    index: command_index,
+                    error: Box::new(EngineExecutionError::EvaluationDependsOnSorry),
+                    at: Some(original_offset),
+                });
+            }
             // A `protected` declaration is tagged once admitted, as the admitted route tags it, so
             // a later command's atomic name does not reach it through its namespace, an `open` or
             // an `export` alias (the pin's `resolveQualifiedName` and `getAliases`).
@@ -8235,6 +8342,29 @@ impl Engine {
             } else {
                 None
             };
+            if presentation != EvaluationPresentation::Lean
+                && matches!(
+                    evaluation_presentation,
+                    Some(
+                        EvaluationResultPresentation::IoFormat { .. }
+                            | EvaluationResultPresentation::IoUnit
+                    )
+                )
+                && guards
+                    .last()
+                    .is_some_and(|guard| guard.command_index == command_index)
+            {
+                // Only the `lean` presentation isolates an action's stdout into its messages.
+                // Elsewhere refuse before executing the action, never after its stdout or
+                // filesystem effects have already escaped the guard.
+                return Err(EngineExecutionError::BatchCommand {
+                    index: command_index,
+                    error: Box::new(EngineExecutionError::NotImplemented {
+                        feature: "`#guard_msgs` over an IO action",
+                    }),
+                    at: Some(original_offset),
+                });
+            }
             // Parametric definitions are checked templates, not standalone VM
             // entry points. Compile concrete uses on demand; never use a failed
             // compilation as a reason to silently admit an executable command.
@@ -8351,10 +8481,24 @@ impl Engine {
                 }
                 merged
             });
-            let capture = if is_evaluation && presentation != EvaluationPresentation::Raw {
-                let remaining = limits
-                    .max_evaluation_output_bytes
-                    .saturating_sub(evaluation_output_bytes);
+            let remaining = limits
+                .max_evaluation_output_bytes
+                .saturating_sub(evaluation_output_bytes);
+            // The pin's `#eval` collects stdout and stderr, including native
+            // panic and trace diagnostics, and accounts escaped JSON bytes.
+            // Other non-raw evaluations isolate raw bytes and can leave stderr
+            // on the process stream when `stderrAsMessages` is false.
+            let lean_pin_capture = presentation == EvaluationPresentation::Lean
+                && matches!(
+                    evaluation_presentation,
+                    Some(
+                        EvaluationResultPresentation::Format { .. }
+                            | EvaluationResultPresentation::IoFormat { .. }
+                            | EvaluationResultPresentation::IoUnit
+                    )
+                );
+            let isolate_non_raw = is_evaluation && presentation != EvaluationPresentation::Raw;
+            if isolate_non_raw {
                 let local_stderr_capture = scoped_options
                     .as_ref()
                     .unwrap_or(options)
@@ -8372,6 +8516,14 @@ impl Engine {
                         at: Some(original_offset),
                     });
                 }
+            }
+            let capture = if lean_pin_capture && isolate_stderr {
+                let allowance = remaining.min(LEAN_EVALUATION_STDOUT_LIMIT);
+                match StdoutCapture::begin_evaluation(allowance) {
+                    Ok(capture) => Some(capture),
+                    Err(error) => return Ok(source_evaluation::capture_failure(error)),
+                }
+            } else if lean_pin_capture || isolate_non_raw {
                 match StdoutCapture::begin_isolated(remaining, isolate_stderr) {
                     Ok(capture) => Some(capture),
                     Err(error) => return Ok(source_evaluation::capture_failure(error)),
@@ -8404,18 +8556,20 @@ impl Engine {
                     });
                 }
             };
-            if let Some(captured) = captured {
+            if let Some(finished) = captured {
                 evaluation_output_bytes = evaluation_output_bytes
-                    .checked_add(captured.bytes.len())
+                    .checked_add(finished.bytes.len())
                     .ok_or(EngineExecutionError::UnexpectedPublication {
                         detail: "evaluation output accounting overflow",
                     })?;
-                execution.evaluation_output =
-                    Some(String::from_utf8(captured.bytes).map_err(|_| {
-                        EngineExecutionError::UnexpectedPublication {
-                            detail: "evaluation capture violated its UTF-8 contract",
-                        }
-                    })?);
+                let bytes = finished.bytes;
+                let text = String::from_utf8(bytes.clone()).map_err(|_| {
+                    EngineExecutionError::UnexpectedPublication {
+                        detail: "evaluation capture violated its UTF-8 contract",
+                    }
+                })?;
+                execution.evaluation_output = Some(text);
+                execution.io_stdout = Some(bytes);
             }
             source_records::apply_execution_effects(
                 &mut execution,
@@ -8518,72 +8672,105 @@ impl Engine {
                 sorry_commands.insert(command);
             }
         }
-        let mut warnings: Vec<SourceWarning> = sorry_commands
-            .iter()
-            .copied()
-            .filter_map(|command| {
-                let &(offset, source, warn) = warning_sites.get(&command)?;
-                warn.then(|| SourceWarning {
-                    command_index: command,
-                    at: fln_parse::BytePos(
-                        offset.0
-                            + fln_parse::command_scope::declaration_warning_offset(source)
-                                .unwrap_or(0),
-                    ),
-                    message: "declaration uses `sorry`".to_owned(),
-                    severity: SourceSeverity::Warning,
-                })
-            })
-            .collect();
-        // The pin's `linter.unusedVariables` runs after each command that logged no error and
-        // contains no `sorry`. A seed world (no `sorryAx`) is this engine's own, not the pin's,
-        // and its renderings admit no warning.
-        if engine
+        // A seed world (no `sorryAx`) is this engine's own, not the pin's, and its renderings
+        // admit no warning but `sorry`'s.
+        let pin_world = engine
             .environment()
             .find(&Name::from_components(["sorryAx"]))
-            .is_some()
-        {
-            // A definition the stream compiled and published is an execution, not an admission
-            // row; an evaluation's execution declares nothing the user wrote.
-            let evaluated: BTreeSet<usize> = evaluation_indices.iter().copied().collect();
-            let linted: Vec<(usize, &Declaration)> = declarations
-                .iter()
-                .copied()
-                .chain(
-                    executions
-                        .iter()
-                        .zip(&execution_command_indices)
-                        .enumerate()
-                        .filter(|(index, _)| !evaluated.contains(index))
-                        .map(|(_, (execution, &command))| (command, &execution.declaration)),
-                )
-                .collect();
+            .is_some();
+        // A definition the stream compiled and published is an execution, not an admission
+        // row; an evaluation's execution declares nothing the user wrote.
+        let evaluated: BTreeSet<usize> = evaluation_indices.iter().copied().collect();
+        let linted: Vec<(usize, &Declaration)> = declarations
+            .iter()
+            .copied()
+            .chain(
+                executions
+                    .iter()
+                    .zip(&execution_command_indices)
+                    .enumerate()
+                    .filter(|(index, _)| !evaluated.contains(index))
+                    .map(|(_, (execution, &command))| (command, &execution.declaration)),
+            )
+            .collect();
+        // The pin's reducibility warnings are logged while a command elaborates, ahead of its
+        // `sorry` warning (reported with the kernel's check) and its linters.
+        let mut warnings: Vec<SourceWarning> = Vec::new();
+        if pin_world {
+            warnings.extend(instance_attribute_warnings);
+            warnings.extend(declaration_reducibility_warnings(
+                &lint_sites,
+                &linted,
+                engine.environment(),
+            ));
+        }
+        warnings.extend(sorry_commands.iter().copied().filter_map(|command| {
+            let &(offset, source, warn) = warning_sites.get(&command)?;
+            warn.then(|| SourceWarning {
+                command_index: command,
+                at: fln_parse::BytePos(
+                    offset.0
+                        + fln_parse::command_scope::declaration_warning_offset(source).unwrap_or(0),
+                ),
+                message: "declaration uses `sorry`".to_owned(),
+                severity: SourceSeverity::Warning,
+                follows_output: false,
+            })
+        }));
+        // The pin's `linter.unusedVariables` runs after each command that logged no error and
+        // contains no `sorry`.
+        if pin_world {
             // Every constructor spelling, for telling a pattern variable from a constructor, and
-            // the spellings of indexed families' constructors.
+            // the indexed families' constructors with the fields a pattern leaves unread.
             let spelling = |name: &Name| match name.leaf_view() {
                 fln_core::name::LeafView::Str(text) => Some(text.to_owned()),
                 _ => None,
             };
+            let environment = engine.environment();
+            let indexed_family = |name: &Name| {
+                matches!(environment.find(name),
+                    Some(ConstantInfo::Induct(family)) if family.num_indices > 0)
+            };
+            // A constant this source declared is absent from the imported environment.
+            let local = |name: &Name| {
+                engine
+                    .imported_environment()
+                    .is_none_or(|imported| !imported.contains(name))
+            };
             let constructors = unused_variables::Constructors {
-                names: engine
-                    .environment()
+                names: environment
                     .constants()
                     .filter(|(_, info)| matches!(info, ConstantInfo::Ctor(_)))
                     .filter_map(|(name, _)| spelling(name))
                     .collect(),
-                indexed: engine
-                    .environment()
+                local: environment
                     .constants()
-                    .filter_map(|(_, info)| match info {
-                        ConstantInfo::Induct(family) if family.num_indices > 0 => {
-                            Some(family.ctors.iter().filter_map(spelling).collect::<Vec<_>>())
-                        }
+                    .filter(|(name, info)| matches!(info, ConstantInfo::Ctor(_)) && local(name))
+                    .filter_map(|(name, _)| spelling(name))
+                    .collect(),
+                indexed: environment
+                    .constants()
+                    .filter_map(|(name, info)| match info {
+                        ConstantInfo::Ctor(ctor) => match environment.find(&ctor.induct) {
+                            Some(ConstantInfo::Induct(family)) if family.num_indices > 0 => {
+                                Some(unused_variables::IndexedConstructor {
+                                    name: name.clone(),
+                                    local: local(name),
+                                    unread: unused_variables::unread_fields(
+                                        &ctor.base.type_,
+                                        ctor.num_params,
+                                        family.num_indices,
+                                        indexed_family,
+                                    ),
+                                })
+                            }
+                            _ => None,
+                        },
                         _ => None,
                     })
-                    .flatten()
                     .collect(),
             };
-            for (&(command, _), (offset, syntax, options)) in &lint_sites {
+            for (&(command, _), (offset, syntax, options, _)) in &lint_sites {
                 // In the pin's order: the `:=` note while the command elaborates (`sorry` does
                 // not suppress it), then the unused-variables linter (skipped with `sorry`),
                 // then `linter.defProp`.
@@ -8592,15 +8779,35 @@ impl Engine {
                     linters::deprecated_assignment_syntax(syntax, options)
                         .into_iter()
                         .collect();
-                if !sorry_commands.contains(&command) {
-                    let mut unused =
-                        unused_variables::unused_pattern_variables(syntax, options, &constructors);
-                    unused.extend(unused_variables::unused_fun_binders(
-                        syntax,
-                        options,
-                        &constructors,
-                    ));
-                    unused.extend(unused_variables::unused_type_binders(syntax, options));
+                // The `:=` note is logged while the command elaborates; the linters after it.
+                let elaboration_notes = lints.len();
+                // The pin runs no linter after a command that logged an error.
+                let errored = guarded_errors
+                    .iter()
+                    .any(|error| error.command_index == command);
+                if !errored
+                    && !sorry_commands.contains(&command)
+                    && !unused_variables::has_sorry(syntax)
+                {
+                    // A field filled by its tactic ran one inside the body, so the pin reads
+                    // the body's binders only through its elaborated term.
+                    let body_ran_tactics = declared.is_some_and(|(_, _, value, _)| {
+                        unused_variables::omits_tactic_field(syntax, value, engine.environment())
+                    });
+                    let mut unused = Vec::new();
+                    if !body_ran_tactics {
+                        unused.extend(unused_variables::unused_pattern_variables(
+                            syntax,
+                            options,
+                            &constructors,
+                        ));
+                        unused.extend(unused_variables::unused_fun_binders(
+                            syntax,
+                            options,
+                            &constructors,
+                        ));
+                        unused.extend(unused_variables::unused_type_binders(syntax, options));
+                    }
                     if let Some((_, type_, value, _)) = declared {
                         unused.extend(unused_variables::unused_signature_binders(
                             syntax, type_, value, options,
@@ -8622,12 +8829,13 @@ impl Engine {
                         options,
                     ));
                 }
-                for lint in lints {
+                for (index, lint) in lints.into_iter().enumerate() {
                     warnings.push(SourceWarning {
                         command_index: command,
                         at: fln_parse::BytePos(offset.0 + lint.at),
                         message: lint.message,
                         severity: SourceSeverity::Warning,
+                        follows_output: index >= elaboration_notes,
                     });
                 }
             }
@@ -8725,7 +8933,7 @@ impl Engine {
         let definition_prefix = if commands.is_empty() {
             None
         } else {
-            match self.execute_source_commands(commands, options, limits, &[])? {
+            match self.execute_source_commands(commands, options, limits, &[], &[(source, None)])? {
                 Outcome::Complete(completed) => Some(completed),
                 Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
                 Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
@@ -8734,13 +8942,22 @@ impl Engine {
         let query_engine = definition_prefix
             .as_ref()
             .map_or(self, |completed| &completed.engine);
+        let mut query_scope = query_engine.base_source_scope();
+        query_scope.source_site =
+            Some(source_check::source_site(source)?.at_offset(terminal_offset));
         let checked = grammar
             .enter(|| {
                 let terminal = terminal
                     .expanded()
                     .map_err(DefinitionFrontendError::Parse)
                     .map_err(EngineExecutionError::Frontend)?;
-                query_engine.check_parsed_source_command(terminal, options, limits.admission(), 0)
+                query_engine.check_parsed_source_command_in_scope(
+                    terminal,
+                    options,
+                    limits.admission(),
+                    0,
+                    &query_scope,
+                )
             })
             .map_err(|error| EngineExecutionError::BatchCommand {
                 index: terminal_index,
@@ -8832,7 +9049,7 @@ impl Engine {
                 if terminal.kind() != fln_parse::SourceCommandKind::Check {
                     return Err(EngineExecutionError::TerminalCheckRequired);
                 }
-                query_source = Some((terminal_offset, terminal_source));
+                query_source = Some((terminal_offset, terminal, module.source));
                 terminal_index
             } else {
                 partitioned.commands.len()
@@ -8877,7 +9094,7 @@ impl Engine {
                 source,
             });
         }
-        let (query_offset, query_source) =
+        let (query_offset, query, original_source) =
             query_source.ok_or(EngineExecutionError::TerminalCheckRequired)?;
         let completed = match self.execute_source_modules_internal(
             &rewritten,
@@ -8891,9 +9108,19 @@ impl Engine {
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
         };
         let query_index = completed.executions.len() + completed.source_admissions.len();
+        let mut query_scope = completed.engine.base_source_scope();
+        query_scope.source_module = Some(entry.clone());
+        query_scope.source_site =
+            Some(source_check::source_site(original_source)?.at_offset(query_offset));
         let checked = completed
             .engine
-            .check_source_command(query_source, options, limits.admission())
+            .check_parsed_source_command_in_scope(
+                query,
+                options,
+                limits.admission(),
+                0,
+                &query_scope,
+            )
             .map_err(|error| EngineExecutionError::BatchCommand {
                 index: query_index,
                 error: Box::new(error),
@@ -9034,6 +9261,14 @@ impl Engine {
                 None,
                 None,
                 EvaluationPresentation::Raw,
+                &[(
+                    modules
+                        .iter()
+                        .find(|module| module.name == entry)
+                        .expect("validated entry module")
+                        .source,
+                    Some(entry),
+                )],
             )? {
                 Outcome::Complete(completed) => completed,
                 Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
@@ -9063,6 +9298,8 @@ impl Engine {
         options: &KVMap,
         limits: EngineExecutionLimits,
     ) -> Result<Outcome<DefinitionExecution>, EngineExecutionError> {
+        let mut scope = self.base_source_scope();
+        scope.source_site = Some(source_check::source_site(&parsed.reconstruct_original())?);
         if fln_elab::source::scope::simp::registration(parsed.syntax())
             .map_err(DefinitionFrontendError::Elaborate)
             .map_err(EngineExecutionError::Frontend)?
@@ -9071,6 +9308,9 @@ impl Engine {
                 .map_err(DefinitionFrontendError::Elaborate)
                 .map_err(EngineExecutionError::Frontend)?
                 .is_some()
+            || fln_elab::source::scope::simp::macro_inline(parsed.syntax())
+                .map_err(DefinitionFrontendError::Elaborate)
+                .map_err(EngineExecutionError::Frontend)?
         {
             return Err(EngineExecutionError::Frontend(
                 DefinitionFrontendError::Elaborate(
@@ -9102,7 +9342,7 @@ impl Engine {
                 parsed.syntax(),
                 self.environment(),
                 limits.kernel,
-                &self.base_source_scope(),
+                &scope,
             ),
         )? {
             Outcome::Complete(declaration) => declaration,
@@ -9224,6 +9464,7 @@ impl Engine {
         limits: EngineExecutionLimits,
     ) -> Result<Outcome<DefinitionBatchExecution>, EngineExecutionError> {
         let mut commands = Vec::new();
+        let mut source_files = Vec::new();
         let mut file_starts = Vec::new();
         file_starts.try_reserve_exact(sources.len()).map_err(|_| {
             EngineExecutionError::AllocationFailure {
@@ -9263,9 +9504,12 @@ impl Engine {
             if !commands.is_empty() && !partitioned.commands.is_empty() {
                 file_starts.push(commands.len());
             }
+            if !partitioned.commands.is_empty() {
+                source_files.push((*source, None));
+            }
             commands.extend(partitioned.commands);
         }
-        self.execute_source_commands(commands, options, limits, &file_starts)
+        self.execute_source_commands(commands, options, limits, &file_starts, &source_files)
     }
 
     /// Execute an exact, caller-named closed source-module import graph.
@@ -9527,6 +9771,11 @@ impl Engine {
                 None,
                 None,
                 EvaluationPresentation::Raw,
+                &order
+                    .iter()
+                    .filter(|index| !parsed[**index].commands.is_empty())
+                    .map(|index| (modules[*index].source, Some(modules[*index].name)))
+                    .collect::<Vec<_>>(),
             )? {
                 Outcome::Complete(completed) => completed,
                 Outcome::Inconclusive(inconclusive) => {
@@ -9642,6 +9891,7 @@ impl Engine {
         options: &KVMap,
         limits: EngineExecutionLimits,
         file_starts: &[usize],
+        source_files: &[(&[u8], Option<&Name>)],
     ) -> Result<Outcome<DefinitionBatchExecution>, EngineExecutionError> {
         Ok(
             match self.execute_source_command_stream(
@@ -9654,6 +9904,7 @@ impl Engine {
                 None,
                 None,
                 EvaluationPresentation::Raw,
+                source_files,
             )? {
                 // This door returns no per-command outputs, so nothing could judge a guard:
                 // refuse rather than run the guarded command unjudged.
@@ -9952,6 +10203,7 @@ impl Engine {
             io_result_types,
             evaluation_presentation: None,
             evaluation_output: None,
+            io_stdout: None,
             base_logical_root: admission.base_logical_root,
             result_logical_root: admission.result_logical_root,
             flbc_artifact,
@@ -9990,6 +10242,10 @@ pub fn execute_golem_with_options(
 /// The cache is direct-mapped by call site and holds only immutable validation
 /// metadata, so this bounds its memory, not what can execute.
 const ENGINE_INLINE_CACHE_SLOTS: usize = 4096;
+
+/// What one `#eval` action may write under the `lean` presentation, which holds the bytes
+/// until the door prints them at the command's position: that door's own output bound.
+const LEAN_EVALUATION_STDOUT_LIMIT: usize = 16 * 1024 * 1024;
 
 /// Execute an engine-compiled program through Golem's inline caches.
 ///
@@ -12176,9 +12432,12 @@ pub struct DefinitionExecution {
     /// Set only by the opt-in source command adapter after executing a checked
     /// printer or a checked silent Unit action. Raw APIs never set this marker.
     evaluation_presentation: Option<EvaluationResultPresentation>,
-    /// Isolated stdout/stderr for an explicitly presented source evaluation.
+    /// Isolated stdout/stderr text for an explicitly presented source evaluation.
     /// None keeps the raw API's ordinary native stream behavior.
     evaluation_output: Option<String>,
+    /// The same capture's original bytes, including lean-presentation stderr and
+    /// native diagnostics. None means this execution did not install a capture.
+    io_stdout: Option<Vec<u8>>,
     /// The exact base-environment identity under the caller's options.
     pub base_logical_root: LogicalRoot,
     /// The exact successor-environment identity under the same options.
@@ -12220,6 +12479,9 @@ pub struct SourceCheck {
     /// `variable` list, outermost first: `declaration`'s value and `checked_type` begin with
     /// one binder for each. The pin prints the term with these variables free.
     pub section_variables: Vec<usize>,
+    /// The notations active at the command: the pin's delaborator prints an application of a
+    /// notation's constant through the notation.
+    pub notations: fln_parse::extensions::Notations,
 }
 
 /// One completed definition-only source prefix followed by a terminal check.
@@ -12294,6 +12556,9 @@ pub struct SourceWarning {
     pub at: fln_parse::BytePos,
     pub message: String,
     pub severity: SourceSeverity,
+    /// Logged by a linter after the command ran, so after any output the command printed
+    /// (`withLogging` runs the linters once the command's elaboration logged its messages).
+    pub follows_output: bool,
 }
 
 /// The severity a [`SourceWarning`] is logged at. An error is logged only for a command
@@ -12371,6 +12636,24 @@ fn field_receiver_message(
     ))
 }
 
+/// Whether a `#guard_msgs` docstring line is a warning this engine prints with the pin's text, so
+/// the guard over it is judged rather than refused: "declaration uses `sorry`", and the two
+/// reducibility warnings of [`linters`] (`warn.classDefReducibility`, vendored
+/// `Lean/Elab/MutualDef.lean:1246-1256`, and `addInstance`'s, `Lean/Meta/Instances.lean:281-289`).
+/// `addInstance`'s `@[expose]` warning is not reproduced, and its text does not match here.
+fn reproduced_warning(line: &str) -> bool {
+    const MARKED: &str = " must be marked with `@[reducible]` or `@[implicit_reducible]`";
+    line == "warning: declaration uses `sorry`"
+        || line
+            .strip_prefix("warning: Definition `")
+            .and_then(|rest| rest.strip_suffix(MARKED))
+            .is_some_and(|name| name.ends_with("` of class type"))
+        || line
+            .strip_prefix("warning: instance `")
+            .and_then(|rest| rest.strip_suffix(MARKED))
+            .is_some_and(|name| name.ends_with('`'))
+}
+
 /// Whether `guard` is the `#guard_msgs` of `command_index`, checks errors, and expects one.
 fn guard_checks_expected_error(guard: Option<&SourceGuard>, command_index: usize) -> bool {
     use fln_parse::command_scope::guard_spec::{Action, Severity};
@@ -12382,6 +12665,81 @@ fn guard_checks_expected_error(guard: Option<&SourceGuard>, command_index: usize
                 .lines()
                 .any(|line| line.trim_start().starts_with("error:"))
     })
+}
+
+/// A declaration the linters read: its offset in the file, its syntax, the options in force,
+/// and the offset of the `mutual` keyword of a block it is a member of.
+type LintSite = (
+    fln_parse::BytePos,
+    fln_syntax::tree::Syntax,
+    KVMap,
+    Option<fln_parse::BytePos>,
+);
+
+/// The pin's reducibility warnings for each declaration command, in command order: the
+/// `instance` attributes of its members' own lists that find a definition unmarked
+/// ([`linters::unmarked_instance_attributes`]), then its members' class-typed `def`s
+/// ([`linters::class_definition_reducibility`]), which the pin checks once every member is
+/// elaborated, at a `mutual` block's keyword.
+fn declaration_reducibility_warnings(
+    lint_sites: &BTreeMap<(usize, usize), LintSite>,
+    linted: &[(usize, &Declaration)],
+    environment: &Environment,
+) -> Vec<SourceWarning> {
+    let mut registry: Option<Option<fln_elab::instances::InstanceRegistry>> = None;
+    let warning = |command_index, at, message| SourceWarning {
+        command_index,
+        at,
+        message,
+        severity: SourceSeverity::Warning,
+        follows_output: false,
+    };
+    let mut warnings = Vec::new();
+    // The current command's class-typed definitions, which follow all its members' attributes.
+    let mut classes = Vec::new();
+    let mut current = None;
+    for (&(command, _), (offset, syntax, options, block)) in lint_sites {
+        if current != Some(command) {
+            warnings.append(&mut classes);
+            current = Some(command);
+        }
+        let Some((name, type_, _, _)) = linted_declaration(syntax, linted, command) else {
+            continue;
+        };
+        if matches!(environment.find(name), Some(ConstantInfo::Defn(_))) {
+            for at in linters::unmarked_instance_attributes(syntax) {
+                warnings.push(warning(
+                    command,
+                    fln_parse::BytePos(offset.0 + at),
+                    linters::unmarked_instance_message(name),
+                ));
+            }
+        }
+        let is_class = |class: &Name| {
+            registry
+                .get_or_insert_with(|| {
+                    fln_elab::instances::InstanceRegistry::read(environment).ok()
+                })
+                .as_ref()
+                .is_some_and(|registry| registry.is_class(class))
+        };
+        if let Some(lint) = linters::class_definition_reducibility(
+            syntax,
+            name,
+            type_,
+            environment,
+            is_class,
+            options,
+        ) {
+            classes.push(warning(
+                command,
+                block.unwrap_or(fln_parse::BytePos(offset.0 + lint.at)),
+                lint.message,
+            ));
+        }
+    }
+    warnings.append(&mut classes);
+    warnings
 }
 
 /// The admitted type and value `command` declares: the declaration named by its `declId`
@@ -13101,6 +13459,9 @@ pub enum EngineExecutionError {
     NotImplemented {
         feature: &'static str,
     },
+    /// `#eval` of an expression that depends on `sorryAx`, which the pin refuses before running it
+    /// (`addAndCompileExprForEval`, vendored `Lean/Elab/BuiltinEvalCommand.lean:104-113`).
+    EvaluationDependsOnSorry,
     /// A `namespace`/`section`/`end`/`open` command the scope stack refused (an
     /// unmatched `end`, an unknown namespace), in the pin's words where it has them.
     ScopeTransition {
@@ -13174,6 +13535,13 @@ impl fmt::Display for EngineExecutionError {
         match self {
             Self::EmptyBatch => write!(formatter, "definition batch must not be empty"),
             Self::NotImplemented { feature } => write!(formatter, "not implemented: {feature}"),
+            // The pin's words (`addAndCompileExprForEval`, vendored
+            // `Lean/Elab/BuiltinEvalCommand.lean:110-113`).
+            Self::EvaluationDependsOnSorry => formatter.write_str(
+                "Aborting evaluation since the expression depends on the 'sorry' axiom, which can \
+                 lead to runtime instability and crashes.\n\nTo attempt to evaluate anyway \
+                 despite the risks, use the '#eval!' command.",
+            ),
             Self::ScopeTransition { message } => formatter.write_str(message),
             Self::SourceScopeLimit { resource, limit } => {
                 write!(formatter, "source command exceeds {resource} limit {limit}")

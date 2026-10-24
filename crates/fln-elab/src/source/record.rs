@@ -80,6 +80,28 @@ fn simple_fields(fields: &[Syntax]) -> Result<Vec<Syntax>, NatDefinitionElabErro
     Ok(output)
 }
 
+impl Context {
+    /// Whether every field's type is a proposition.
+    fn record_fields_are_proofs(
+        &mut self,
+        fields: &[LocalDecl],
+    ) -> Result<bool, NatDefinitionElabError> {
+        for field in fields {
+            self.tick()?;
+            let domain = self.instantiate(&field.type_)?;
+            let Some(sort) = self.known_type(&domain)? else {
+                return Ok(false);
+            };
+            if !matches!(self.whnf(&sort)?.node(), ExprNode::Sort { level }
+                if level.normalize_fixpoint().is_zero())
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+}
+
 /// Elaborate a nonrecursive structure/class with named fields. Prop-valued
 /// records require proof fields, as in the pin's projection generator.
 /// Registration is intentionally absent here: only checked successors can own it.
@@ -157,7 +179,7 @@ pub(super) fn elaborate_record_scoped(
     context.declare_levels(&id[1])?;
     context.infer_level_params = true;
     // Auto-bound implicits become leading parameters, as at the pin (`@Box : {α : Sort u_1} → α →
-    // Type` for `structure Box (x : α)`, 2026-10-11). A field never auto-binds: the pin refuses one.
+    // Type` for `structure Box (x : α)`, 2026-10-11). A field's stay in that field's type (below).
     let (autos, (mut parameters, explicit)) =
         context.with_auto_bound_implicits(&own, |context| {
             let parameters = context.bind_parameters(&signature[0])?;
@@ -206,6 +228,58 @@ pub(super) fn elaborate_record_scoped(
     let parent_count = output.len();
     let mut defaults = Vec::new();
     let mut helpers = Vec::new();
+    // A copied field's default is its parent's, over this record's fields before it.
+    for inherited in &inheritance.defaults {
+        context.tick()?;
+        let Some(position) = output.iter().position(|field| field.id == inherited.field) else {
+            return Err(failure(SourceInferenceError::Scope));
+        };
+        let field = output[position].clone();
+        let mut value =
+            context.expand_record_aliases(inherited.value.clone(), &inheritance.aliases)?;
+        let mut type_ = context.expand_record_aliases(field.type_.clone(), &inheritance.aliases)?;
+        let locals = parameters
+            .iter()
+            .chain(&output[..position])
+            .cloned()
+            .collect::<Vec<_>>();
+        for (index, local) in locals.iter().enumerate().rev() {
+            context.tick()?;
+            let local_type = context.instantiate(&local.type_)?;
+            let local_type = context.expand_record_aliases(local_type, &inheritance.aliases)?;
+            let style = if index < parameters.len() && local.binder_info == BinderInfo::Default {
+                BinderInfo::Implicit
+            } else {
+                local.binder_info
+            };
+            value = value
+                .abstract_fvar(&local.id, 0)
+                .map_err(|_| failure(SourceInferenceError::Scope))?;
+            type_ = type_
+                .abstract_fvar(&local.id, 0)
+                .map_err(|_| failure(SourceInferenceError::Scope))?;
+            value = Expr::lam(local.user_name.clone(), local_type.clone(), value, style);
+            type_ = Expr::forall_e(local.user_name.clone(), local_type, type_, style);
+        }
+        let helper = helper_name(name, &field.user_name);
+        helpers.push(Declaration::Defn(DefinitionVal {
+            base: ConstantVal {
+                name: helper.clone(),
+                level_params: Vec::new(),
+                type_,
+            },
+            value,
+            hints: ReducibilityHints::Abbrev,
+            safety: DefinitionSafety::Safe,
+            all: vec![helper.clone()],
+        }));
+        defaults.push(RecordDefault {
+            record: name.clone(),
+            field: u32::try_from(position)
+                .map_err(|_| failure(SourceInferenceError::ResourceLimit))?,
+            helper,
+        });
+    }
     for field in fields {
         context.tick()?;
         let parts = expect_node(
@@ -271,10 +345,18 @@ pub(super) fn elaborate_record_scoped(
             "field signature",
         )?;
         let saved = context.txn.lctx.clone();
-        let arguments = context.bind_parameters(&sig[0])?;
-        let annotation = optional_type_syntax(&sig[1])?
-            .ok_or_else(|| failure(SourceInferenceError::ExpectedType))?;
-        let domain = context.type_term(annotation)?;
+        // A field's own signature auto-binds as a declaration's header does: `l : x → foo x`
+        // is `l : {x : Prop} → x → foo x` (`withAutoBoundImplicit` around the field).
+        let (autos, (arguments, domain)) = context.with_auto_bound_implicits(&own, |context| {
+            let arguments = context.bind_parameters(&sig[0])?;
+            let annotation = optional_type_syntax(&sig[1])?
+                .ok_or_else(|| failure(SourceInferenceError::ExpectedType))?;
+            let domain = context.type_term(annotation)?;
+            Ok((arguments, domain))
+        })?;
+        context.refuse_auto_bound_dependencies(&autos, &arguments)?;
+        let mut arguments = arguments;
+        arguments.splice(0..0, autos);
         let mut domain = context.expand_record_aliases(domain, &inheritance.aliases)?;
         if let Some(syntax) = default {
             context.infer_level_params = false;
@@ -392,6 +474,10 @@ pub(super) fn elaborate_record_scoped(
             };
             level.clone()
         }
+        // `isPropCandidate` (vendored `Lean/Elab/MutualInductive.lean:903-924`): with no
+        // resulting sort written, a structure with at least one field, every field a proof, is a
+        // `Prop` (`structure G where m (n : Nat) : n = n` is `G : Prop`).
+        None if !output.is_empty() && context.record_fields_are_proofs(&output)? => Level::zero(),
         None => inferred,
     };
     if result_level.normalize_fixpoint().is_zero() {
@@ -524,8 +610,16 @@ pub(super) fn elaborate_record_scoped(
     let mut declarations =
         record_declarations(&spec, budget).map_err(|e| failure(SourceInferenceError::Record(e)))?;
     declarations.push(context.record_flat_constructor(&spec, &inheritance.parents, budget)?);
+    let (copied, copied_instances) = context.copied_parent_projections(
+        &spec,
+        inheritance.copied,
+        &inheritance.aliases,
+        budget,
+    )?;
+    declarations.extend(copied);
     declarations.extend(helpers);
-    let parent_instances = context.record_parent_instances(&spec, &inheritance.parents)?;
+    let mut parent_instances = context.record_parent_instances(&spec, &inheritance.parents)?;
+    parent_instances.extend(copied_instances);
     let subobjects: std::collections::BTreeMap<_, _> = inheritance
         .parents
         .iter()
@@ -541,18 +635,25 @@ pub(super) fn elaborate_record_scoped(
             binder_info: field.binder_info,
         });
     }
-    let mut parents = Vec::with_capacity(inheritance.parents.len());
-    for parent in &inheritance.parents {
+    // The pin's `parentInfo`: the `extends` clause's parents only. A copied parent's projection
+    // is a definition, and an ancestor promoted out of it is a subobject field, not a parent.
+    let mut parents = Vec::with_capacity(inheritance.direct.len());
+    for (parent, label, subobject) in &inheritance.direct {
         context.tick()?;
-        let field = fields.get(parent.field as usize).ok_or_else(|| {
-            failure(SourceInferenceError::Record(
+        let projection = spec.name.append_core(label);
+        if *subobject
+            && !fields.iter().any(|field| {
+                field.projection == projection && field.subobject.as_ref() == Some(parent)
+            })
+        {
+            return Err(failure(SourceInferenceError::Record(
                 crate::records::RecordError::InvalidTelescope,
-            ))
-        })?;
+            )));
+        }
         parents.push(StructureParent {
-            name: parent.parent.clone(),
-            subobject: true,
-            projection: field.projection.clone(),
+            name: parent.clone(),
+            subobject: *subobject,
+            projection,
         });
     }
     let structure = StructureEntry {

@@ -171,6 +171,7 @@ impl Engine {
                         checker: admission.checker,
                         scope: scope.clone(),
                         section_variables: Vec::new(),
+                        notations: Default::default(),
                     },
                     traces,
                 )

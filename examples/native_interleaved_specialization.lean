@@ -15,4 +15,4 @@ def step (ignored : Nat) {M : Type -> Type} [Pure M] [Bind M]
   let x ← action
   return (x + 1)
 
-#eval keep 9 (step 0 (M := Id) 41 : Id Nat)
+#eval keep 9 (step 0 (M := Id) (41 : Nat) : Id Nat)

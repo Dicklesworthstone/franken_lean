@@ -328,6 +328,7 @@ pub fn elaborate_group(
     Ok(ElaboratedPartial {
         declarations,
         noncomputable,
+        irreducible: BTreeSet::new(),
         scope: scope.clone(),
         budget: meter.txn.budget,
         kernel,

@@ -39,6 +39,7 @@ fn fixture() -> (ElaboratedPartial, Environment) {
         ElaboratedPartial {
             declarations,
             noncomputable: BTreeSet::from([n("provider")]),
+            irreducible: BTreeSet::new(),
             scope: SourceScope {
                 noncomputable_section: true,
                 ..SourceScope::default()

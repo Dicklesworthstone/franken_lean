@@ -145,3 +145,20 @@ def applied := use boxed
 theorem works : applied = 12 := by rfl"#,
     );
 }
+
+/// `↑e` (`coeNotation`) elaborates `e` with no expected type and coerces it to the expected type,
+/// including as an operator's leaf, which waits for the type the other leaves give it.
+#[test]
+fn the_coercion_arrow_coerces_to_the_expected_type() {
+    checked(
+        &seed(),
+        r#"structure Box where
+  value : Nat
+instance boxToNat : Coe Box Nat := Coe.mk (fun b => b.value)
+def value : Box := Box.mk 17
+def unboxed : Nat := ↑value
+def bumped : Nat := ↑value + 1
+theorem unboxed_ok : unboxed = 17 := by rfl
+theorem bumped_ok : bumped = 18 := by rfl"#,
+    );
+}

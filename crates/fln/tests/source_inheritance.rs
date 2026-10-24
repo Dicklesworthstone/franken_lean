@@ -136,9 +136,10 @@ fn overlapping_or_invalid_parent_declarations_do_not_publish_any_successor() {
         "structure Base where\n  x : Nat\nstructure Other where\n  x : Nat\nstructure Left extends Base\nstructure Right extends Base",
     );
     let before = base.logical_root(&KVMap::new());
+    // Parents sharing a field of one type are a diamond, which the pin accepts by copying the
+    // later parent (measured at v4.32.0, 2026-10-22). `Base, Base` the pin also accepts, with a
+    // "Duplicate parent structure" warning; it stays refused here, which invents nothing.
     for text in [
-        "structure Bad extends Base, Other",
-        "structure Bad extends Left, Right",
         "structure Bad extends Base, Base",
         "structure Bad extends Base where\n  x : Nat",
         "structure Bad extends Base where\n  toBase : Nat",
@@ -169,4 +170,10 @@ fn overlapping_or_invalid_parent_declarations_do_not_publish_any_successor() {
         &base,
         "structure Good extends Base where\n  y : Nat\ndef recovered : Good := { x := 7, y := 9 }",
     );
+    for text in [
+        "structure Shared extends Base, Other\ndef shared : Shared := { x := 1 }",
+        "structure Diamond extends Left, Right\ndef diamond : Diamond := { x := 2 }",
+    ] {
+        checked(&base, text);
+    }
 }

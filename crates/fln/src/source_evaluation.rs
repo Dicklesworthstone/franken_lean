@@ -104,6 +104,13 @@ impl DefinitionExecution {
         self.evaluation_presentation
     }
 
+    /// Ordered stdout and stderr from a pure or IO `#eval`, including native
+    /// panic and trace diagnostics, when the `lean` presentation captured it.
+    /// Other presentations retain ordinary native writes and return `None`.
+    pub fn captured_stdout(&self) -> Option<&[u8]> {
+        self.io_stdout.as_deref()
+    }
+
     /// Read the typed result of explicit `#eval` IO execution. Ordinary
     /// definitions and pure evaluations return `None`; this never runs a
     /// deferred action or changes the retained environment.

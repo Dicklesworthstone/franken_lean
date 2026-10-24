@@ -11749,8 +11749,12 @@ fn render_lean_source_check_line(
         ),
         _ => None,
     };
-    // `#synth C` prints the instance it found and nothing else (`logInfo val`).
-    if kind.as_deref() == Some("Lean.Parser.Command.synth") {
+    // `#synth C` prints the instance it found and nothing else (`logInfo val`), and `#reduce e`
+    // its normal form (`logInfoAt tk e`).
+    if matches!(
+        kind.as_deref(),
+        Some("Lean.Parser.Command.synth" | "Lean.reduceCmd")
+    ) {
         let Some((value, _)) = &opened else {
             return Err(source_failure(
                 "internal-fault",
@@ -11778,10 +11782,11 @@ fn render_lean_source_check_line(
     {
         return render_lean_print(form, checked, engine, printer);
     }
-    // `#check c` for a constant prints its signature (`delabConstWithSignature`);
-    // any other term prints as `term : type`.
+    // `#check c` for an identifier naming a constant prints its signature
+    // (`delabConstWithSignature`); any other term, a notation's use among them, prints as
+    // `term : type`.
     let constant = match &opened {
-        Some((value, _)) if !term.starts_with('@') => match value.node() {
+        Some((value, _)) if checked.parsed.query_is_identifier() => match value.node() {
             fln::ExprNode::Const { name, .. } => environment
                 .find(name)
                 .map(|info| (name.clone(), info.constant_val().type_.clone())),
@@ -12160,7 +12165,12 @@ fn render_lean_source_commands(
             | fln::SourceCommandOutput::Check { command_index, .. }
             | fln::SourceCommandOutput::Example { command_index, .. } => *command_index,
         };
-        while let Some(message) = messages.next_if(|message| message.command() <= command_index) {
+        // A command's linter warnings follow its output; they go out with the next output's
+        // messages, or after the last output.
+        while let Some(message) = messages.next_if(|message| {
+            message.command() < command_index
+                || (message.command() == command_index && !message.follows_output())
+        }) {
             if let Err(failure) =
                 message.emit(sink, &mut guarded, &mut stdout, &mut formatted_output)
             {
@@ -12213,9 +12223,14 @@ fn render_lean_source_commands(
                     );
                 }
                 evaluation_output_position += 1;
+                let captured = execution.captured_stdout();
                 // Raw retained batches have no isolated effect transcript.
                 // A formatted IO value alone cannot authorize guard messages.
+                // The pin also logs ordered stdout, stderr, and native diagnostics
+                // ahead of the result. An uncaptured action was already written
+                // while it ran, so it cannot be guarded here.
                 if guarded.contains_key(&command_index)
+                    && captured.is_none()
                     && execution.evaluation_output().is_none()
                     && matches!(
                         execution.evaluation_presentation(),
@@ -12227,10 +12242,28 @@ fn render_lean_source_commands(
                 {
                     return io_guard_refusal(command_index);
                 }
-                if let Some(text) = execution
+                let mut owned_capture_text = None;
+                let text = if let Some(text) = execution
                     .evaluation_output()
                     .filter(|text| !text.is_empty())
                 {
+                    Some(text)
+                } else if let Some(bytes) = captured.filter(|bytes| !bytes.is_empty()) {
+                    let Ok(decoded) = std::str::from_utf8(bytes) else {
+                        return source_failure(
+                            "internal-fault",
+                            "an evaluation's captured output was not UTF-8",
+                            false,
+                            SourcePresentation::Lean,
+                            4,
+                        );
+                    };
+                    owned_capture_text = Some(decoded.to_string());
+                    owned_capture_text.as_deref()
+                } else {
+                    None
+                };
+                if let Some(text) = text {
                     let mut discarded = Vec::new();
                     let messages = match guarded.get_mut(&command_index) {
                         Some(guard) => guard.evaluation_target(&mut discarded),
@@ -12242,7 +12275,15 @@ fn render_lean_source_commands(
                 }
                 let formatted = match source_evaluation::formatted(execution) {
                     Ok(formatted) => formatted,
-                    Err(error) => return error.failure(command_index, SourcePresentation::Lean),
+                    Err(error) => {
+                        let mut failed = error.failure(command_index, SourcePresentation::Lean);
+                        // A captured action that then raised keeps what was printed before it,
+                        // its own output included, as the pin's earlier messages stay printed.
+                        if captured.is_some() {
+                            failed.stdout.insert_str(0, &stdout);
+                        }
+                        return failed;
+                    }
                 };
                 match formatted {
                     Some(source_evaluation::PresentedEvaluation::Text(text)) => {
@@ -12278,10 +12319,10 @@ fn render_lean_source_commands(
                 };
                 if let Some(guard) = guarded.get_mut(&command_index) {
                     // PreferRaw projects IO Unit without a formatted result.
-                    // Its retained transcript was already added to this guard;
-                    // Unit contributes no separate message of its own.
+                    // A retained isolated transcript or lean capture authorizes
+                    // judging silent Unit; Unit contributes no separate message.
                     if matches!(value, SourceFinalValue::IoUnit) {
-                        if execution.evaluation_output().is_none() {
+                        if execution.evaluation_output().is_none() && captured.is_none() {
                             return io_guard_refusal(command_index);
                         }
                         continue;
@@ -12338,7 +12379,8 @@ fn render_lean_source_commands(
                     &mut fln::pretty::Printer::in_scope(
                         completed.batch.engine.environment(),
                         &check.scope,
-                    ),
+                    )
+                    .with_notations(&check.notations),
                 ) {
                     Ok(line) => line,
                     Err(error) => return error,

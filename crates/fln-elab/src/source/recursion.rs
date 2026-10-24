@@ -19,6 +19,7 @@ mod well_founded;
 pub(super) use constrained::ConstrainedBranch;
 use std::collections::{HashMap, HashSet};
 pub(super) use well_founded::State as WellFounded;
+pub(in crate::source) use well_founded::mutual::{MemberHint, MutualMember, strongly_connected};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecursionError {
@@ -49,6 +50,15 @@ pub enum RecursionError {
         bound: usize,
         available: usize,
     },
+    /// `checkCodomains` (Lean/Elab/PreDefinition/WF/Rel.lean): every member of a
+    /// mutual well-founded group needs a measure of one common type.
+    MutualMeasureTypeMismatch {
+        first: Name,
+        other: Name,
+    },
+    /// A mutual well-founded group outside the supported slice: Nat measures on
+    /// every member, fixed parameters as one common unreordered prefix.
+    MutualWellFoundedUnsupported(&'static str),
 }
 impl std::fmt::Display for RecursionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -58,6 +68,17 @@ impl std::fmt::Display for RecursionError {
                     f,
                     "{bound} parameters bound in `termination_by`, but the function body only binds {available} parameters"
                 );
+            }
+            Self::MutualMeasureTypeMismatch { first, other } => {
+                return write!(
+                    f,
+                    "The termination measures of mutually recursive functions must have the same return type, but the termination measures of {} and {} differ",
+                    first.to_display_string(),
+                    other.to_display_string()
+                );
+            }
+            Self::MutualWellFoundedUnsupported(shape) => {
+                return write!(f, "mutual well-founded recursion is not supported here: {shape}");
             }
             Self::ResultTypeRequired => "recursive definition requires an explicit result type",
             Self::RootMatchRequired => {
@@ -664,6 +685,33 @@ impl Context {
         header_parameters: usize,
     ) -> Result<Typed, NatDefinitionElabError> {
         self.defining = Some(name.clone());
+        if self.mutual_member.is_some() {
+            // A member of a mutual well-founded group, after the group's pass
+            // found its component and built the shared fixpoint plan.
+            return self.mutual_well_founded_body(
+                name,
+                parameters,
+                syntax,
+                expected,
+                hint,
+                header_parameters,
+            );
+        }
+        if self
+            .partial
+            .as_ref()
+            .is_some_and(|state| state.ordinary && state.group.is_some())
+        {
+            // The ordinary group's body pass: record this member's hint before
+            // its recursive references are known to form a component.
+            self.record_mutual_member_hint(
+                parameters,
+                syntax,
+                expected.clone(),
+                hint,
+                header_parameters,
+            )?;
+        }
         let snapshot = self.clone();
         if self
             .partial
@@ -720,6 +768,9 @@ impl Context {
         let spent = self.txn.budget.heartbeats_consumed;
         *self = snapshot.clone();
         self.txn.budget.heartbeats_consumed = spent;
+        // The body refers to the definition itself: whichever lowering follows,
+        // this is a recursive definition.
+        self.recursive_definition = true;
         if self.partial.is_some() {
             let result = self.partial_definition_body(name, parameters, syntax, expected);
             if result.is_err() {

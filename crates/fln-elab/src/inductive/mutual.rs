@@ -12,6 +12,7 @@ struct Child {
 struct Minor<'a> {
     family: usize,
     constructor: &'a ConstructorSpec,
+    fields: Vec<LocalDecl>,
     children: Vec<Option<Child>>,
 }
 
@@ -40,6 +41,7 @@ fn child(
     let mut arguments = Vec::new();
     loop {
         builder.tick()?;
+        body = builder.recursor_type(&body)?;
         match body.node() {
             ExprNode::MData { expr, .. } => body = expr.clone(),
             ExprNode::ForallE {
@@ -50,8 +52,9 @@ fn child(
             } => {
                 // Negative cross-family occurrences are as invalid as negative
                 // self occurrences, including in dependent function domains.
-                scan(builder, binder_type, &scope, specs)?;
-                let mut argument = fresh(used, "arg", binder_type.clone(), *binder_info);
+                let domain = builder.recursor_type(binder_type)?;
+                scan(builder, &domain, &scope, specs)?;
+                let mut argument = fresh(used, "arg", domain, *binder_info);
                 argument.user_name = binder_name.clone();
                 body = result
                     .subst_loose(0, &[fv(&argument)])
@@ -87,7 +90,7 @@ pub fn mutual_inductive_declaration(
     specs: &[InductiveSpec],
     budget: RecordBudget,
 ) -> Result<Declaration, InductiveError> {
-    build_mutual(specs, budget, None)
+    build_mutual(specs, budget, None, 8)
 }
 
 /// [`mutual_inductive_declaration`] for a block whose trailing parameters were
@@ -101,15 +104,26 @@ pub(crate) fn mutual_inductive_with_promoted_parameters(
     budget: RecordBudget,
     promoted: &[Vec<Vec<LocalDecl>>],
 ) -> Result<Declaration, InductiveError> {
-    build_mutual(specs, budget, Some(promoted))
+    build_mutual(specs, budget, Some(promoted), 8)
+}
+
+/// A nested block translated to its main and auxiliary families. The pin bounds neither, so
+/// only the work budget does.
+pub(super) fn build_nested_block(
+    specs: &[InductiveSpec],
+    budget: RecordBudget,
+    promoted: &[Vec<Vec<LocalDecl>>],
+) -> Result<Declaration, InductiveError> {
+    build_mutual(specs, budget, Some(promoted), budget.max_binders)
 }
 
 fn build_mutual(
     specs: &[InductiveSpec],
     budget: RecordBudget,
     promoted: Option<&[Vec<Vec<LocalDecl>>]>,
+    max_families: usize,
 ) -> Result<Declaration, InductiveError> {
-    if !(2..=8).contains(&specs.len()) {
+    if specs.len() < 2 || specs.len() > max_families {
         return Err(InductiveError::InvalidTelescope);
     }
     let first = &specs[0];
@@ -211,6 +225,11 @@ fn build_mutual(
         .cloned()
         .map(Level::param)
         .collect();
+    let rec_parameters = builder.recursor_locals(&first.parameters)?;
+    let rec_indices: Vec<_> = specs
+        .iter()
+        .map(|spec| builder.recursor_locals(&spec.indices))
+        .collect::<Result<_, _>>()?;
     let mut entries = Vec::new();
     let mut constructor_names = Vec::new();
     let mut family_constructors = vec![Vec::new(); specs.len()];
@@ -241,7 +260,8 @@ fn build_mutual(
             constructor_names.push(name);
             let mut scope: HashSet<_> = first.parameters.iter().map(|p| p.id.clone()).collect();
             let mut children = Vec::new();
-            for field in &ctor.fields {
+            let fields = builder.recursor_locals(&ctor.fields)?;
+            for field in &fields {
                 builder.tick()?;
                 if field.is_let() || scope.contains(&field.id) {
                     return Err(InductiveError::InvalidTelescope);
@@ -265,6 +285,7 @@ fn build_mutual(
             entries.push(Minor {
                 family,
                 constructor: ctor,
+                fields,
                 children,
             });
         }
@@ -314,7 +335,7 @@ fn build_mutual(
             false,
             false,
         )?;
-        let ty = builder.close(&spec.indices, ty, false, false)?;
+        let ty = builder.close(&rec_indices[family], ty, false, false)?;
         motives.push(fresh(
             &mut used,
             &format!("motive_{}", family + 1),
@@ -357,7 +378,7 @@ fn build_mutual(
             constructed,
         );
         let ty = builder.close(&hypotheses, ty, false, false)?;
-        let ty = builder.close(&ctor.fields, ty, false, false)?;
+        let ty = builder.close(&entry.fields, ty, false, false)?;
         let mut minor = fresh(&mut used, "minor", ty, BinderInfo::Default);
         minor.user_name = ctor.name.clone();
         minors.push(minor);
@@ -421,10 +442,10 @@ fn build_mutual(
                 rhs = Expr::app(rhs, call);
             }
         }
-        rhs = builder.close(&ctor.fields, rhs, true, false)?;
+        rhs = builder.close(&entry.fields, rhs, true, false)?;
         rhs = builder.close(&minors, rhs, true, false)?;
         rhs = builder.close(&motives, rhs, true, false)?;
-        rhs = builder.close(&first.parameters, rhs, true, false)?;
+        rhs = builder.close(&rec_parameters, rhs, true, false)?;
         rules[entry.family].push(RecursorRule {
             ctor: constructor_names[index].clone(),
             nfields: constructors[index].num_fields,
@@ -490,10 +511,10 @@ fn build_mutual(
             fv(major),
         );
         let ty = builder.close(std::slice::from_ref(major), ty, false, false)?;
-        let ty = builder.close(&spec.indices, ty, false, true)?;
+        let ty = builder.close(&rec_indices[family], ty, false, true)?;
         let ty = builder.close(&minors, ty, false, false)?;
         let ty = builder.close(&typed_motives, ty, false, false)?;
-        let ty = builder.close(&first.parameters, ty, false, true)?;
+        let ty = builder.close(&rec_parameters, ty, false, true)?;
         recursors.push(RecursorVal {
             base: ConstantVal {
                 name: rec_names[family].clone(),

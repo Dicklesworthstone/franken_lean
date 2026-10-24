@@ -270,9 +270,9 @@ fn ordinary_source_course_of_values_proves_results_using_recursive_history() {
         &checked(&engine(), PROD),
         &format!(
             "{CHAIN}\
-             def sumStep (c : Chain) : @Chain.below (fun _ => Nat) c -> Nat :=\n\
-               Chain.casesOn (motive := fun c => @Chain.below (fun _ => Nat) c -> Nat) c\n\
-                 (fun _ => 0) (fun head tail history => match history with\n\
+             def sumStep (c : Chain) : @Chain.below (fun _ => Nat) c -> Nat :=\n  \
+               Chain.casesOn (motive := fun c => @Chain.below (fun _ => Nat) c -> Nat) c\n    \
+                 (fun _ => 0) (fun head tail history => match history with\n      \
                    | PProd.mk previous _ => head + previous)\n\
              theorem total_ok : Chain.brecOn (Chain.cons 20 (Chain.cons 22 Chain.nil)) sumStep = 42 := by rfl"
         ),
@@ -282,7 +282,7 @@ fn ordinary_source_course_of_values_proves_results_using_recursive_history() {
         "mutual\n\
          inductive Tree where | node (forest : Forest)\n\
          inductive Forest where | nil | cons (tree : Tree) (rest : Forest)\nend\n\
-         theorem tree_ok : @Tree.brecOn (fun _ => Nat) (fun _ => Nat)\n\
+         theorem tree_ok : @Tree.brecOn (fun _ => Nat) (fun _ => Nat)\n  \
            (Tree.node Forest.nil) (fun _ _ => 42) (fun _ _ => 0) = 42 := rfl",
     );
 }

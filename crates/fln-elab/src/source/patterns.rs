@@ -24,6 +24,8 @@ struct Constructor<'a> {
     head: Head,
     syntax: Cow<'a, Syntax>,
     fields: Vec<usize>,
+    /// Written with a trailing `..`: `fields` is a prefix, the rest are `_`.
+    ellipsis: bool,
 }
 enum Pattern<'a> {
     Bind(Option<Name>),
@@ -60,6 +62,10 @@ fn identifier(name: Name) -> Syntax {
         val: name,
         preresolved: Vec::new(),
     }
+}
+/// `..` as a generated pattern's last argument (`Term.ellipsis`).
+fn ellipsis() -> Syntax {
+    Syntax::node(parser_kind(&["Term", "ellipsis"]), vec![atom("..")])
 }
 fn wildcard() -> Syntax {
     Syntax::node(parser_kind(&["Term", "hole"]), vec![atom("_")])
@@ -557,7 +563,7 @@ impl Context {
     ) -> Result<usize, NatDefinitionElabError> {
         enum Task<'a> {
             Visit(&'a Syntax),
-            Constructor(Head, Cow<'a, Syntax>, usize),
+            Constructor(Head, Cow<'a, Syntax>, usize, bool),
             Named(Name),
         }
         let mut pending = vec![Task::Visit(syntax)];
@@ -570,13 +576,14 @@ impl Context {
                     values.push(arena.len());
                     arena.push(Pattern::Named { name, pattern });
                 }
-                Task::Constructor(head, syntax, start) => {
+                Task::Constructor(head, syntax, start, ellipsis) => {
                     let fields = values.split_off(start);
                     values.push(arena.len());
                     arena.push(Pattern::Constructor(Constructor {
                         head,
                         syntax,
                         fields,
+                        ellipsis,
                     }));
                 }
                 Task::Visit(syntax) => {
@@ -600,6 +607,7 @@ impl Context {
                             },
                             Cow::Owned(anonymous_head()),
                             values.len(),
+                            false,
                         ));
                         pending.extend(elements.into_iter().rev().map(Task::Visit));
                         continue;
@@ -614,8 +622,12 @@ impl Context {
                     } else {
                         (syntax, &[][..])
                     };
+                    // `c a ..` (`Term.ellipsis`, only ever last): the remaining arguments are
+                    // `_`, however many the constructor turns out to have (vendored
+                    // `Lean/Elab/PatternVar.lean:360-366`).
+                    let (arguments, ellipsis) = application::split_ellipsis(arguments)?;
                     if let Some(literal) = self.decode_pattern_literal(head)? {
-                        if !arguments.is_empty() {
+                        if !arguments.is_empty() || ellipsis {
                             return Err(invalid());
                         }
                         values.push(arena.len());
@@ -663,10 +675,11 @@ impl Context {
                             head_key,
                             Cow::Borrowed(head),
                             values.len(),
+                            ellipsis,
                         ));
                         pending.extend(arguments.iter().rev().map(Task::Visit));
                     } else {
-                        if !arguments.is_empty() {
+                        if !arguments.is_empty() || ellipsis {
                             return Err(invalid());
                         }
                         let name = matching::pattern_name(head)?;
@@ -1016,7 +1029,30 @@ impl Context {
                         let Pattern::Constructor(constructor) = &arena[pattern] else {
                             unreachable!()
                         };
-                        let fields: Vec<_> = (0..constructor.fields.len())
+                        // A pattern without `..` fixes the head's arity in this column, and one
+                        // with `..` may write a prefix of it. When every pattern of the head
+                        // ends in `..`, the longest prefix is split here and the generated
+                        // pattern keeps `..`, so the typed backend supplies the rest.
+                        let mut exact = None;
+                        let mut written = 0;
+                        for row in &matrix.rows {
+                            self.tick()?;
+                            if let Pattern::Constructor(other) = &arena[row.patterns[0]]
+                                && canonical[&other.head] == canonical[&constructor.head]
+                            {
+                                written = written.max(other.fields.len());
+                                if !other.ellipsis {
+                                    if exact.is_some_and(|arity| arity != other.fields.len()) {
+                                        return Err(invalid());
+                                    }
+                                    exact = Some(other.fields.len());
+                                }
+                            }
+                        }
+                        if exact.is_some_and(|arity| arity < written) {
+                            return Err(invalid());
+                        }
+                        let fields: Vec<_> = (0..written)
                             .map(|_| self.matrix_name())
                             .collect::<Result<_, _>>()?;
                         let mut rows = Vec::new();
@@ -1027,10 +1063,15 @@ impl Context {
                                 Pattern::Constructor(other)
                                     if canonical[&other.head] == canonical[&constructor.head] =>
                                 {
-                                    if other.fields.len() != fields.len() {
-                                        return Err(invalid());
-                                    }
-                                    copy.patterns.splice(..0, other.fields.iter().copied());
+                                    let omitted = fields.len() - other.fields.len();
+                                    copy.patterns.splice(
+                                        ..0,
+                                        other
+                                            .fields
+                                            .iter()
+                                            .copied()
+                                            .chain(std::iter::repeat_n(0, omitted)),
+                                    );
                                 }
                                 Pattern::Constructor(_) => continue,
                                 Pattern::Literal(_) | Pattern::Named { .. } => {
@@ -1068,13 +1109,14 @@ impl Context {
                                 };
                             identifier(name)
                         };
-                        let pattern = if fields.is_empty() {
+                        let mut arguments: Vec<_> = fields.into_iter().map(identifier).collect();
+                        if exact.is_none() {
+                            arguments.push(ellipsis());
+                        }
+                        let pattern = if arguments.is_empty() {
                             head
                         } else {
-                            Syntax::node(
-                                parser_kind(&["Term", "app"]),
-                                vec![head, null(fields.into_iter().map(identifier).collect())],
-                            )
+                            Syntax::node(parser_kind(&["Term", "app"]), vec![head, null(arguments)])
                         };
                         alternatives.push(Alternative { pattern });
                         branches.push(Matrix {
@@ -1243,6 +1285,7 @@ impl Context {
             loops |= do_notation::is_while_loop(node);
             needed |= complex(node, &self.txn.env)
                 || pattern_function(node)
+                || diagnostics::is_diagnostic(node)
                 || collections::is_notation(node)
                 || cdot::is_cdot(node)
                 || binders::is_exists(node)
@@ -1341,6 +1384,7 @@ impl Context {
                     };
                     // `·` first: collection notation would turn a tuple into `Prod.mk`.
                     let node = self.expand_cdot_node(node, pattern)?;
+                    let node = self.expand_diagnostic_node(node, original, pattern)?;
                     let node = self.expand_collection_node(node, pattern)?;
                     let node = self.expand_do_node(node, pattern)?;
                     let node = self.expand_binder_predicate_node(node, pattern)?;

@@ -35,7 +35,13 @@ fn replay(artifact: &Path) {
     assert!(String::from_utf8_lossy(&output.stdout).contains("\"returnValue\":42"));
     assert_eq!(before, std::fs::read(artifact).unwrap());
 }
-fn personalities_and_replay(source: &str) {
+/// The pinned `lean` v4.32.0's stdout on `examples/native_proof_erasure.lean` (2026-10-22), with
+/// `{path}` for the file as the command line names it.
+const PROOF_ERASURE_LEAN: &str = "{path}:5:0: warning: Definition `evidence` is a proposition; use `theorem` instead of `def`\n\nNote: This linter can be disabled with `set_option linter.defProp false`\n{path}:9:10: warning: Variable name `h` is not explicitly referenced.\n\nThe binding can be removed (if unused) or named `_` (if used implicitly).\n\nNote: This linter can be disabled with `set_option linter.unusedVariables false`\n42\n";
+
+/// Run both personalities on `source`, replay the artifact, and compare the `lean` door's stdout
+/// with the pin's, `expected` (`{path}` stands for the file).
+fn personalities_and_replay(source: &str, expected: &str) {
     let path = directory().join("Main.lean");
     let artifact = path.with_extension("flbc");
     std::fs::write(&path, source).unwrap();
@@ -50,16 +56,25 @@ fn personalities_and_replay(source: &str) {
         .unwrap();
     assert!(lean.status.success(), "{lean:?}");
     assert!(lean.stderr.is_empty(), "{lean:?}");
-    assert_eq!(lean.stdout, b"42\n");
+    assert_eq!(
+        String::from_utf8(lean.stdout).unwrap(),
+        expected.replace("{path}", &path.display().to_string())
+    );
     assert_eq!(source, std::fs::read_to_string(&path).unwrap());
 }
 #[test]
 fn checked_proof_computations_are_not_native_runtime_work() {
-    personalities_and_replay(include_str!("../../../examples/native_proof_erasure.lean"));
+    personalities_and_replay(
+        include_str!("../../../examples/native_proof_erasure.lean"),
+        PROOF_ERASURE_LEAN,
+    );
 }
 #[test]
 fn dependent_proof_fields_and_callable_slots_replay_without_source() {
-    personalities_and_replay(include_str!("../../../examples/native_proof_data.lean"));
+    personalities_and_replay(
+        include_str!("../../../examples/native_proof_data.lean"),
+        "42\n",
+    );
 }
 #[test]
 fn imported_defaults_recover_and_invalid_proofs_publish_no_artifacts() {

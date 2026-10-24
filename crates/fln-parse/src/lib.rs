@@ -742,6 +742,8 @@ pub struct ParsedSourceCommand {
     syntax: Syntax,
     epilogue: ByteSpan,
     query_term: Option<ByteSpan>,
+    /// Whether the query term is an identifier as written, before any notation expands.
+    query_identifier: bool,
 }
 
 impl ParsedSourceCommand {
@@ -779,6 +781,12 @@ impl ParsedSourceCommand {
 
     pub fn reconstruct_original(&self) -> Vec<u8> {
         self.source_view.reconstruct_original()
+    }
+
+    /// Whether the query term was an identifier as written (`#check id`), which `#check`
+    /// prints as the constant's signature. A notation's use is not, though it expands to one.
+    pub const fn query_is_identifier(&self) -> bool {
+        self.query_identifier
     }
 
     /// Reconstruct the source-covered query term for `#eval` or `#check`.
@@ -899,6 +907,14 @@ fn bounded_infix(kind: Option<&TokenKind>, grammar: DefinitionGrammar) -> Option
     let Some(TokenKind::Symbol(symbol)) = kind else {
         return None;
     };
+    // An infix notation of the entered grammar that outranks the default priority on a builtin
+    // operator's token is read in its place, as the pin keeps only the higher-priority parse
+    // (`infix:65 (priority := high) "+" => f`).
+    if grammar == DefinitionGrammar::Scalar
+        && let Some(operator) = extensions::overriding_infix(symbol)
+    {
+        return Some(BoundedInfix::Extension(operator));
+    }
     match symbol.as_str() {
         "->" | "→" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::Arrow),
         "∧" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::And),
@@ -2176,10 +2192,43 @@ fn push_bounded_operand(
     empty_at: usize,
 ) -> Result<(), NatDefinitionParseError> {
     let application = std::mem::take(&mut frame.application);
+    // `Term.argument := checkWsBefore >> checkColGt >> …` (vendored `Lean/Parser/Term.lean:885`):
+    // an argument starts right of the saved position. A command saves its own start
+    // (`withPosition`, `Lean/Parser/Module.lean:133`), and a bracket clears it
+    // (`withoutPosition`). So outside every bracket an argument at or left of the command's first
+    // token is no argument at the pin: the term ends before it, and what follows is no command
+    // (`def g : Nat := f` with `2` at column 0 on the next line). Later positions a construct saves
+    // lie right of the command's, so this checks the weakest of them.
+    if frame.open.is_none() {
+        for (_, at) in application.iter().skip(1) {
+            if !right_of_command_start(view, tokens, *at) {
+                return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                    at: original_position(view, tokens, *at),
+                    expected: NatDefinitionExpectation::EndOfCommand,
+                });
+            }
+        }
+    }
     let first_at = application.first().map_or(empty_at, |(_, at)| *at);
     let term = finish_bounded_application(view, tokens, application, grammar, empty_at)?;
     frame.operands.push((term, first_at));
     Ok(())
+}
+
+/// Whether token `at` starts right of the command's first token, in codepoint columns as the
+/// pin's `FileMap` counts them. A token the view cannot place is taken to pass.
+fn right_of_command_start(view: &SourceView, tokens: &[LexedToken], at: usize) -> bool {
+    let text = view.normalized();
+    let column = |index: usize| {
+        tokens
+            .get(index)
+            .and_then(|token| text.position_of(token.extent.start()))
+            .map(|position| position.scalar_column)
+    };
+    match (column(at), column(0)) {
+        (Some(argument), Some(command)) => argument > command,
+        _ => true,
+    }
 }
 
 fn push_bounded_infix(
@@ -3771,8 +3820,19 @@ fn bounded_term_token(
         Some(TokenKind::Symbol(symbol))
             if grammar == DefinitionGrammar::Scalar && symbol == "[" =>
         {
-            if !lists.open_index(tokens, frames, index) {
+            // Both readings are `Init` syntax, absent from a `prelude` file that does not
+            // import its declaring module, where `[` is no term.
+            let bracket = if lists.open_index(tokens, frames, index) {
+                collections::Bracket::Index
+            } else {
                 lists.open(frames, index, collections::Bracket::List);
+                collections::Bracket::List
+            };
+            if !extensions::declares_kind(&bracket.kind()) {
+                return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                    at: original_position(view, tokens, index),
+                    expected: NatDefinitionExpectation::ScalarValue,
+                });
             }
         }
         Some(TokenKind::Symbol(symbol))
@@ -4451,6 +4511,7 @@ fn extension_command(
         syntax,
         epilogue,
         query_term: None,
+        query_identifier: false,
     }))
 }
 
@@ -4485,6 +4546,7 @@ fn add_decl_doc(source: &[u8]) -> Result<Option<ParsedSourceCommand>, Definition
         syntax,
         epilogue,
         query_term: None,
+        query_identifier: false,
     }))
 }
 
@@ -4519,6 +4581,7 @@ fn source_declaration(source: &[u8]) -> Result<ParsedSourceCommand, DefinitionPa
         syntax: parsed.syntax,
         epilogue: parsed.epilogue,
         query_term: None,
+        query_identifier: false,
     })
 }
 
@@ -4600,6 +4663,7 @@ fn deriving_command(
         ),
         epilogue,
         query_term: None,
+        query_identifier: false,
     })
 }
 
@@ -4666,6 +4730,10 @@ fn print_command(
         .get(argument)
         .map(|token| token.extent)
         .ok_or_else(|| refuse(argument))?;
+    let query_identifier = matches!(
+        tokens.get(argument).map(|token| &token.kind),
+        Some(TokenKind::Ident(_))
+    );
     let epilogue = leaves.attachment().epilogue();
     Ok(ParsedSourceCommand {
         kind: SourceCommandKind::Check,
@@ -4673,6 +4741,7 @@ fn print_command(
         syntax: Syntax::node(parser_kind(&["Command", form.unwrap_or("print")]), children),
         epilogue,
         query_term: Some(query_term),
+        query_identifier,
     })
 }
 
@@ -4715,6 +4784,7 @@ fn export_command(
         ),
         epilogue,
         query_term: None,
+        query_identifier: false,
     })
 }
 
@@ -4835,6 +4905,7 @@ fn grind_pattern_command(
         ),
         epilogue,
         query_term: None,
+        query_identifier: false,
     })
 }
 
@@ -5006,22 +5077,27 @@ pub fn parse_source_command(source: &[u8]) -> Result<ParsedSourceCommand, Defini
                     syntax: parsed.syntax,
                     epilogue: parsed.epilogue,
                     query_term: None,
+                    query_identifier: false,
                 })
             }
             TokenKind::Symbol(symbol)
                 if symbol == "#eval"
                     || symbol == "#check"
                     || symbol == "#guard"
-                    || symbol == "#synth" =>
+                    || symbol == "#synth"
+                    || symbol == "#reduce" =>
             {
                 // `#guard e` (`syntax (name := guardCmd) "#guard " term : command`,
                 // `Init/Guard.lean:127`) is an evaluation whose result must be `true`.
                 // `#synth C` (`Lean.Parser.Command.synth`) is a scratch query, as `#check` is:
-                // the instance it finds is printed, nothing is published.
+                // the instance it finds is printed, nothing is published. So is `#reduce e`
+                // (`syntax (name := reduceCmd) "#reduce" reduceConfig term : command`,
+                // `Init/Notation.lean:766`), which prints its term's normal form.
                 let (kind, command_kind) = match symbol.as_str() {
                     "#eval" => (SourceCommandKind::Evaluation, "eval"),
                     "#guard" => (SourceCommandKind::Evaluation, "guardCmd"),
                     "#synth" => (SourceCommandKind::Check, "synth"),
+                    "#reduce" => (SourceCommandKind::Check, "reduce"),
                     _ => (SourceCommandKind::Check, "check"),
                 };
                 let tokens = run
@@ -5032,8 +5108,29 @@ pub fn parse_source_command(source: &[u8]) -> Result<ParsedSourceCommand, Defini
                         Event::Trivia(_) | Event::Refused { .. } => None,
                     })
                     .collect::<Vec<_>>();
-                let (let_bindings, body_start) = bounded_let_bindings(&view, &tokens, 1)?;
                 let leaves = Leaves::build(view.normalized(), &tokens)?;
+                // `#reduce`'s configuration, `reduceConfig := many(colGt atomic(" (" ident " := ")
+                // term ")")` (`Init/Notation.lean:750`): each `(name := value)` here has a
+                // one-token value, as `true`; a longer one is left to the term parser to refuse.
+                let mut term_start = 1;
+                let mut config = Vec::new();
+                if command_kind == "reduce" {
+                    while term_locals::word(&tokens, term_start, "(")
+                        && matches!(
+                            tokens.get(term_start + 1).map(|token| &token.kind),
+                            Some(TokenKind::Ident(_))
+                        )
+                        && term_locals::word(&tokens, term_start + 2, ":=")
+                        && term_locals::word(&tokens, term_start + 4, ")")
+                    {
+                        let item = (term_start..term_start + 5)
+                            .map(|at| leaves.leaf(at))
+                            .collect::<Result<Vec<_>, _>>()?;
+                        config.push(null_node(item));
+                        term_start += 5;
+                    }
+                }
+                let (let_bindings, body_start) = bounded_let_bindings(&view, &tokens, term_start)?;
                 let epilogue = leaves.attachment().epilogue();
                 let value = bounded_value_syntax(
                     &leaves,
@@ -5044,7 +5141,7 @@ pub fn parse_source_command(source: &[u8]) -> Result<ParsedSourceCommand, Defini
                     DefinitionGrammar::Scalar,
                 )?;
                 let query_term = tokens
-                    .get(1)
+                    .get(term_start)
                     .zip(tokens.last())
                     .and_then(|(first, last)| {
                         ByteSpan::new(first.extent.start(), last.extent.end())
@@ -5053,15 +5150,32 @@ pub fn parse_source_command(source: &[u8]) -> Result<ParsedSourceCommand, Defini
                         at: BytePos(source.len()),
                         expected: NatDefinitionExpectation::ScalarValue,
                     })?;
+                let query_identifier = matches!(value, Syntax::Ident { .. });
+                let syntax = if command_kind == "reduce" {
+                    Syntax::node(
+                        Name::from_components(["Lean", "reduceCmd"]),
+                        vec![
+                            leaves.leaf(0)?,
+                            Syntax::node(
+                                Name::from_components(["Lean", "reduceConfig"]),
+                                vec![null_node(config)],
+                            ),
+                            value,
+                        ],
+                    )
+                } else {
+                    Syntax::node(
+                        parser_kind(&["Command", command_kind]),
+                        vec![leaves.leaf(0)?, value],
+                    )
+                };
                 Ok(ParsedSourceCommand {
                     kind,
                     source_view: view,
-                    syntax: Syntax::node(
-                        parser_kind(&["Command", command_kind]),
-                        vec![leaves.leaf(0)?, value],
-                    ),
+                    syntax,
                     epilogue,
                     query_term: Some(query_term),
+                    query_identifier,
                 })
             }
             TokenKind::Symbol(symbol) if symbol == "#print" => {
@@ -5145,6 +5259,7 @@ pub fn parse_source_command(source: &[u8]) -> Result<ParsedSourceCommand, Defini
                         syntax,
                         epilogue,
                         query_term: None,
+                        query_identifier: false,
                     });
                 }
                 if let Some(parsed) = extension_command(view, &tokens)? {
@@ -6774,15 +6889,17 @@ mod nat_definition_tests {
         assert!(empty.imports.is_empty());
         assert!(empty.commands.is_empty());
 
-        // `#reduce` parses at the pin and not here.
-        let unsupported = partition_source_module(b"#reduce answer")
-            .expect("the header parser leaves an unsupported body to the command parser");
-        assert!(unsupported.imports.is_empty());
-        assert_eq!(unsupported.commands.len(), 1);
-        assert!(matches!(
-            parse_source_command(unsupported.commands[0].1),
-            Err(NatDefinitionParseError::OutsideSeedGrammar { .. })
-        ));
+        // `#reduce` is the pin's `Lean.reduceCmd`: keyword, options, term.
+        let reduce = partition_source_module(b"#reduce answer")
+            .expect("the header parser leaves the body to the command parser");
+        assert!(reduce.imports.is_empty());
+        assert_eq!(reduce.commands.len(), 1);
+        let parsed = parse_source_command(reduce.commands[0].1).expect("`#reduce` parses");
+        assert_eq!(parsed.kind(), SourceCommandKind::Check);
+        assert_eq!(
+            parsed.syntax().kind(),
+            Some(&Name::from_components(["Lean", "reduceCmd"]))
+        );
     }
 
     #[test]

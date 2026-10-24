@@ -14,6 +14,11 @@ impl Message<'_> {
         }
     }
 
+    /// Whether a linter logged it after the command, so after the command's own output.
+    pub fn follows_output(&self) -> bool {
+        matches!(self, Self::Warning(warning) if warning.follows_output)
+    }
+
     pub fn emit(
         &self,
         sink: WarningSink<'_>,

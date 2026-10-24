@@ -23,6 +23,7 @@ pub(super) struct NamedApplication<'a> {
     positional: VecDeque<ApplicationValue<'a>>,
     named: Vec<Named<'a>>,
     explicit: bool,
+    ellipsis: bool,
     expected: Option<Expr>,
     result_expected: Option<Expr>,
     saved: LocalContext,
@@ -43,7 +44,7 @@ impl NamedApplication<'_> {
     }
 
     pub(super) fn has_arguments(&self) -> bool {
-        !self.positional.is_empty() || !self.named.is_empty()
+        self.ellipsis || !self.positional.is_empty() || !self.named.is_empty()
     }
 }
 
@@ -54,11 +55,41 @@ pub(super) struct Argument<'a> {
     pub(super) infer_exception_action: bool,
 }
 
+/// Select the telescope-aware application path. Besides named arguments,
+/// ellipsis needs that path even when no explicit arguments remain to visit.
 pub(super) fn has_named(arguments: &[Syntax]) -> bool {
     let kind = parser_kind(&["Term", "namedArgument"]);
     arguments
         .iter()
-        .any(|argument| argument.kind() == Some(&kind))
+        .any(|argument| argument.kind() == Some(&kind) || is_ellipsis(argument))
+}
+
+pub(super) fn is_ellipsis(argument: &Syntax) -> bool {
+    argument.kind() == Some(&parser_kind(&["Term", "ellipsis"]))
+}
+
+/// Ellipsis consumes the remaining telescope; it is not a term argument.
+/// Validate its exact node and terminal position even for macro-built syntax.
+pub(super) fn split_ellipsis(
+    arguments: &[Syntax],
+) -> Result<(&[Syntax], bool), NatDefinitionElabError> {
+    let Some((last, prefix)) = arguments.split_last() else {
+        return Ok((arguments, false));
+    };
+    if prefix.iter().any(is_ellipsis) {
+        return Err(failure(SourceInferenceError::ExpectedFunction));
+    }
+    if !is_ellipsis(last) {
+        return Ok((arguments, false));
+    }
+    let parts = expect_node(
+        last,
+        &parser_kind(&["Term", "ellipsis"]),
+        1,
+        "application ellipsis",
+    )?;
+    expect_atom(&parts[0], "..", "application ellipsis")?;
+    Ok((prefix, true))
 }
 
 impl Context {
@@ -70,6 +101,7 @@ impl Context {
         explicit: bool,
     ) -> Result<NamedApplication<'a>, NatDefinitionElabError> {
         let mut positional = VecDeque::new();
+        let (arguments, ellipsis) = split_ellipsis(arguments)?;
         let mut named = Vec::new();
         let mut names = HashSet::new();
         let kind = parser_kind(&["Term", "namedArgument"]);
@@ -110,6 +142,7 @@ impl Context {
             positional,
             named,
             explicit,
+            ellipsis,
             result_expected: expected.clone(),
             expected,
             saved: self.txn.lctx.clone(),
@@ -123,10 +156,18 @@ impl Context {
     ) -> Result<Option<Argument<'a>>, NatDefinitionElabError> {
         loop {
             let has_arguments = !state.positional.is_empty() || !state.named.is_empty();
-            if !has_arguments
-                && (state.explicit || !self.has_optional_parameter(&state.function.type_)?)
-            {
-                break;
+            if !has_arguments {
+                if state.ellipsis {
+                    // Saturate only the actual known Pi telescope. An unknown
+                    // result is not evidence for inventing another function.
+                    let type_ = self.whnf(&state.function.type_)?;
+                    if !matches!(type_.node(), ExprNode::ForallE { .. }) {
+                        break;
+                    }
+                    state.function.type_ = type_;
+                } else if state.explicit || !self.has_optional_parameter(&state.function.type_)? {
+                    break;
+                }
             }
             self.tick()?;
             state.function = match self.coerce_function(state.function.clone()) {
@@ -161,7 +202,7 @@ impl Context {
             let argument_domain = self.projection_domain(domain.clone())?;
             let codomain = body.clone();
             let style = *binder_info;
-            if !has_arguments && style == BinderInfo::StrictImplicit {
+            if !has_arguments && !state.explicit && style == BinderInfo::StrictImplicit {
                 break;
             }
             let mut selected = None;
@@ -188,6 +229,7 @@ impl Context {
             if let Some(value) = value {
                 if state.positional.is_empty()
                     && state.named.is_empty()
+                    && !state.ellipsis
                     && !codomain.has_loose_bvar(0)
                     && let Some(expected) = &state.result_expected
                 {
@@ -209,7 +251,9 @@ impl Context {
                 && let Some(value) = optional::default_value(&domain)
             {
                 value.clone()
-            } else if self.named_argument_depends_on_current(&state.function.type_, &state.named)? {
+            } else if state.ellipsis
+                || self.named_argument_depends_on_current(&state.function.type_, &state.named)?
+            {
                 self.hole(argument_domain)?
             } else {
                 let id = FVarId(self.fresh_name()?);
@@ -506,5 +550,92 @@ impl Context {
             }
         }
         Ok(false)
+    }
+}
+
+#[cfg(test)]
+mod ellipsis_tests {
+    use super::*;
+    use fln_syntax::source::SourceInfo;
+
+    fn marker(parts: Vec<Syntax>) -> Syntax {
+        Syntax::node(parser_kind(&["Term", "ellipsis"]), parts)
+    }
+    fn dots() -> Syntax {
+        marker(vec![Syntax::atom(SourceInfo::None, "..")])
+    }
+    fn function() -> Typed {
+        let mut type_ = nat_const();
+        for _ in 0..32 {
+            type_ = Expr::forall_e(Name::anonymous(), nat_const(), type_, BinderInfo::Default);
+        }
+        Typed {
+            value: Expr::const_(Name::from_components(["telescopeFixture"]), vec![]),
+            type_,
+        }
+    }
+    #[test]
+    fn macro_built_ellipsis_must_be_terminal_and_have_its_exact_shape() {
+        let ordinary = Syntax::atom(SourceInfo::None, "argument");
+        let args = [ordinary.clone(), dots()];
+        let (prefix, ellipsis) = split_ellipsis(&args).unwrap();
+        assert!(ellipsis);
+        assert_eq!(prefix, std::slice::from_ref(&ordinary));
+        assert!(has_named(&args));
+        for malformed in [
+            vec![dots(), ordinary.clone()],
+            vec![dots(), dots()],
+            vec![marker(vec![])],
+            vec![marker(vec![ordinary.clone()])],
+            vec![marker(vec![Syntax::atom(SourceInfo::None, ".."), ordinary])],
+        ] {
+            assert!(split_ellipsis(&malformed).is_err());
+        }
+        assert_eq!(split_ellipsis(&[]).unwrap(), (&[][..], false));
+    }
+    #[test]
+    fn saturation_creates_ordinary_holes_and_never_eta_binds_the_missing_arguments() {
+        let env = crate::seed::bootstrap_nat_environment(Budget::DEFAULT).unwrap();
+        let mut cx = Context::new(&env, Budget::DEFAULT);
+        let args = [dots()];
+        let mut state = cx
+            .start_named_application(function(), &args, None, false)
+            .unwrap();
+        assert!(cx.next_named_argument(&mut state).unwrap().is_none());
+        assert!(state.eta.is_empty());
+        assert_eq!(state.function.type_, nat_const());
+        assert!(state.function.value.has_expr_mvar());
+        assert!(!state.function.value.has_fvar());
+        let mut value = &state.function.value;
+        let mut count = 0;
+        while let ExprNode::App { f, a } = value.node() {
+            assert!(matches!(a.node(), ExprNode::MVar { .. }));
+            count += 1;
+            value = f;
+        }
+        assert_eq!(count, 32);
+    }
+    #[test]
+    fn generated_argument_saturation_obeys_the_callers_work_limit() {
+        let env = crate::seed::bootstrap_nat_environment(Budget::DEFAULT).unwrap();
+        let mut cx = Context::new(&env, Budget::DEFAULT);
+        let args = [dots()];
+        let mut state = cx
+            .start_named_application(function(), &args, None, false)
+            .unwrap();
+        cx.txn.budget.max_heartbeats = cx.txn.budget.heartbeats_consumed + 2;
+        assert!(matches!(
+            cx.next_named_argument(&mut state),
+            Err(NatDefinitionElabError::Inference(
+                SourceInferenceError::ResourceLimit
+            ))
+        ));
+        assert!(state.eta.is_empty());
+        let mut clean = Context::new(&env, Budget::DEFAULT);
+        let mut retry = clean
+            .start_named_application(function(), &args, None, false)
+            .unwrap();
+        assert!(clean.next_named_argument(&mut retry).unwrap().is_none());
+        assert_eq!(retry.function.type_, nat_const());
     }
 }

@@ -23,15 +23,15 @@ fn interleaved_parameters_execute_export_replay_and_recover_without_partial_publ
     let artifact = directory.join("Example.flbc");
     let program = include_str!("../../../examples/native_interleaved_specialization.lean");
     std::fs::write(&source, program).unwrap();
-    assert_eq!(
-        success(
-            Command::new(env!("CARGO_BIN_EXE_lean"))
-                .arg(&source)
-                .output()
-                .unwrap()
-        ),
-        "42\n"
-    );
+    // Headerless, the `lean` door imports `Init`, which already declares `Pure`, `Bind` and
+    // `Id`: the pinned v4.32.0 refuses the redeclarations, and so does this `lean`
+    // (`reference_differential.tsv` records the row). The native `fln run` profile below
+    // elaborates the file without `Init`.
+    let lean = Command::new(env!("CARGO_BIN_EXE_lean"))
+        .arg(&source)
+        .output()
+        .unwrap();
+    assert!(!lean.status.success(), "{lean:?}");
     let run = success(
         Command::new(env!("CARGO_BIN_EXE_fln"))
             .args(["run", "--json", "--emit-flbc"])

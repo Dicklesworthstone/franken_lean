@@ -80,7 +80,9 @@ mod macro_rules;
 mod modules;
 mod quotation;
 mod scoped_rules;
+mod unexpanders;
 pub use modules::NativeSyntaxModule;
+pub use unexpanders::{Notations, Unexpander, UnexpanderItem};
 
 /// A `ParserDescr` (`Init/Prelude.lean`, `inductive ParserDescr`), one variant per constructor,
 /// fields in declaration order.
@@ -753,6 +755,10 @@ pub struct ActiveGrammar {
     infix: BTreeMap<String, ExtensionInfix>,
     /// Each [`ExtensionInfix`]'s node kinds, the most recently added parser first.
     infix_kinds: Vec<Vec<Name>>,
+    /// The infix symbols every active declaration of which outranks the default priority: on a
+    /// builtin operator's token (`infix:65 (priority := high) "+" => f`), the pin's parser keeps
+    /// only the higher-priority reading of the same input, so the builtin one is not read.
+    overriding: BTreeSet<String>,
     /// Leading `tactic` declarations by the text of their first atom, highest priority first.
     tactics: BTreeMap<String, Vec<usize>>,
     /// Leading `term` declarations that read as an atom: at `lead` precedence or above, from a
@@ -775,6 +781,9 @@ pub struct ActiveGrammar {
     /// Whether the imports' syntax is entered (see [`FileGrammar::own_syntax_only`]): only then
     /// does a census declaration missing here mean the file lacks it.
     imports_entered: bool,
+    /// The node kinds the header's import closure declares, entered or not; `None` where this
+    /// is no file's grammar, which then has Init's. See [`declares_kind`].
+    closure_kinds: Option<Arc<BTreeSet<Name>>>,
     /// The file's notation expansion, when built from a [`FileGrammar`].
     expander: Option<Expander>,
     /// The doc-comment options in effect.
@@ -808,7 +817,7 @@ pub(crate) fn doc_options() -> DocOptions {
 
 impl ActiveGrammar {
     fn new(tokens: BTreeSet<String>, decls: Vec<Arc<SyntaxDecl>>) -> ActiveGrammar {
-        let mut operators: BTreeMap<String, Vec<(ExtensionInfix, Name)>> = BTreeMap::new();
+        let mut operators: BTreeMap<String, Vec<(ExtensionInfix, Name, u32)>> = BTreeMap::new();
         let mut tactics: BTreeMap<String, Vec<usize>> = BTreeMap::new();
         let mut terms: BTreeMap<String, Vec<usize>> = BTreeMap::new();
         let mut attrs: BTreeMap<String, Vec<usize>> = BTreeMap::new();
@@ -902,6 +911,7 @@ impl ActiveGrammar {
                                 rhs_prec: (*rhs_prec).min(u32::from(u16::MAX)) as u16,
                             },
                             kind.clone(),
+                            decl.priority,
                         ));
                     }
                 }
@@ -949,13 +959,20 @@ impl ActiveGrammar {
         // Different precedences would parse differently, which is not built here.
         let mut infix = BTreeMap::new();
         let mut infix_kinds = Vec::new();
+        let mut overriding = BTreeSet::new();
         for (symbol, entries) in operators {
-            let (first, _) = entries[0];
-            if entries.iter().any(|(entry, _)| {
+            let (first, _, _) = entries[0];
+            if entries.iter().any(|(entry, _, _)| {
                 (entry.prec, entry.lhs_prec, entry.rhs_prec)
                     != (first.prec, first.lhs_prec, first.rhs_prec)
             }) {
                 continue;
+            }
+            if entries
+                .iter()
+                .all(|(_, _, priority)| *priority > DEFAULT_PRIORITY)
+            {
+                overriding.insert(symbol.clone());
             }
             infix.insert(
                 symbol,
@@ -964,7 +981,7 @@ impl ActiveGrammar {
                     ..first
                 },
             );
-            infix_kinds.push(entries.into_iter().rev().map(|(_, kind)| kind).collect());
+            infix_kinds.push(entries.into_iter().rev().map(|(_, kind, _)| kind).collect());
         }
         let mut category_decls: BTreeMap<Name, Vec<usize>> = BTreeMap::new();
         for (index, decl) in decls.iter().enumerate() {
@@ -982,6 +999,7 @@ impl ActiveGrammar {
             decls,
             infix,
             infix_kinds,
+            overriding,
             tactics,
             terms,
             interpolated,
@@ -990,6 +1008,7 @@ impl ActiveGrammar {
             attrs,
             commands,
             imports_entered: true,
+            closure_kinds: None,
             expander: None,
             docs: DocOptions::default(),
         }
@@ -1174,6 +1193,8 @@ pub struct FileGrammar {
     expansions: Rc<Cell<u64>>,
     /// Whether the imports' syntax is entered, or only the file's own ([`Self::own_syntax_only`]).
     imports_entered: bool,
+    /// The node kinds the import closure declares, whether or not they are entered.
+    closure_kinds: Arc<BTreeSet<Name>>,
     scopes: Vec<FileScope>,
     cache: RefCell<GrammarCache>,
 }
@@ -1242,6 +1263,13 @@ impl FileGrammar {
                 _ => None,
             })
             .collect();
+        // A syntax declaration's name is its node kind, leading (`node`) or trailing
+        // (`trailingNode`, as `xs[i]`'s is).
+        let closure_kinds = imported
+            .iter()
+            .chain(scoped.values().flatten())
+            .map(|decl| decl.decl.clone())
+            .collect();
         Ok(FileGrammar {
             module,
             base_tokens: tokens.tokens_for(prelude, imports)?,
@@ -1269,6 +1297,7 @@ impl FileGrammar {
             interpolation_kinds: Arc::new(interpolation_kinds),
             expansions: Rc::new(Cell::new(0)),
             imports_entered: true,
+            closure_kinds: Arc::new(closure_kinds),
             scopes: vec![FileScope {
                 namespace: Name::anonymous(),
                 trail: Vec::new(),
@@ -1536,6 +1565,7 @@ impl FileGrammar {
             .source_categories
             .extend(self.declared_categories.keys().cloned());
         grammar.imports_entered = self.imports_entered;
+        grammar.closure_kinds = Some(Arc::clone(&self.closure_kinds));
         grammar.expander = Some(self.expander_for(&key.0));
         grammar.docs = docs;
         let grammar = Rc::new(grammar);
@@ -3231,6 +3261,19 @@ fn active() -> Option<Rc<ActiveGrammar>> {
     ACTIVE.with(|active| active.borrow().last().cloned())
 }
 
+/// Whether the file's import closure declares `kind`, an `Init` syntax that the term parser
+/// reads by hand (`[a, b]` is `Init.Data.List.Notation`'s, `xs[i]` `Init.GetElem`'s). A `prelude`
+/// file importing less than its declaring module does not have it, as at the pin. With no file
+/// grammar in effect the grammar is Init's, which declares it.
+pub(crate) fn declares_kind(kind: &Name) -> bool {
+    active().is_none_or(|grammar| {
+        grammar
+            .closure_kinds
+            .as_ref()
+            .is_none_or(|kinds| kinds.contains(kind))
+    })
+}
+
 /// Call `lex` with the token table in effect: the active grammar's, or production's.
 pub(crate) fn with_token_table<R>(lex: impl FnOnce(&TokenTable) -> R) -> R {
     match active() {
@@ -3462,6 +3505,17 @@ pub fn expand_active(syntax: &Syntax) -> Result<Option<Syntax>, &'static str> {
 /// The active infix declarations spelled `symbol`.
 pub(crate) fn infix(symbol: &str) -> Option<ExtensionInfix> {
     active()?.infix.get(symbol).copied()
+}
+
+/// The active infix declarations spelled `symbol` when they outrank the default priority, so
+/// that they replace a builtin operator spelled the same.
+pub(crate) fn overriding_infix(symbol: &str) -> Option<ExtensionInfix> {
+    let grammar = active()?;
+    grammar
+        .overriding
+        .contains(symbol)
+        .then(|| grammar.infix.get(symbol).copied())
+        .flatten()
 }
 
 /// The node an [`ExtensionInfix`] of the active grammar builds over its operands: its kind's, or

@@ -743,6 +743,7 @@ pub(super) fn run_collecting(
                         header.module_system.then_some(module.name),
                         Some(module.name),
                         public.as_mut(),
+                        Some((module.source, header.body_start)),
                     )
                 }
                 .map_err(|mut error| {

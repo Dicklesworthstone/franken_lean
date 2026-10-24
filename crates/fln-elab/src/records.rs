@@ -66,6 +66,8 @@ pub enum RecordError {
     UnsupportedSort,
     NonProofField,
     ResourceLimit,
+    /// Two parents share a field at types that are not definitionally equal.
+    ParentFieldMismatch,
 }
 impl std::fmt::Display for RecordError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -80,6 +82,9 @@ impl std::fmt::Display for RecordError {
             }
             Self::NonProofField => "a field of a Prop-valued record must be a proof",
             Self::ResourceLimit => "record generation resource limit reached",
+            Self::ParentFieldMismatch => {
+                "Field type mismatch: a field two parents share has different types"
+            }
         })
     }
 }
@@ -265,39 +270,48 @@ impl Builder {
     /// Match the kernel's consumeTypeAnnotations rule on generated telescope
     /// locals. Keep source class/constructor annotations intact: instance search
     /// reads them from the class declaration, not from its eliminator.
-    fn recursor_locals(&mut self, locals: &[LocalDecl]) -> Result<Vec<LocalDecl>, RecordError> {
+    pub(crate) fn recursor_type(&mut self, type_: &Expr) -> Result<Expr, RecordError> {
+        let mut type_ = type_.clone();
+        loop {
+            self.tick()?;
+            let mut head = &type_;
+            let mut arguments = Vec::new();
+            while let ExprNode::App { f, a } = head.node() {
+                self.tick()?;
+                arguments.push(a);
+                head = f;
+            }
+            let ExprNode::Const { name, .. } = head.node() else {
+                break;
+            };
+            if !name.parent().is_anonymous() {
+                break;
+            }
+            let recognized = match name.leaf_view() {
+                LeafView::Str("outParam" | "semiOutParam") => arguments.len() == 1,
+                LeafView::Str("optParam" | "autoParam") => arguments.len() == 2,
+                _ => false,
+            };
+            if !recognized {
+                break;
+            }
+            // The spine was collected in reverse application order.
+            type_ = (*arguments
+                .last()
+                .expect("recognized annotation has arguments"))
+            .clone();
+        }
+        Ok(type_)
+    }
+
+    pub(crate) fn recursor_locals(
+        &mut self,
+        locals: &[LocalDecl],
+    ) -> Result<Vec<LocalDecl>, RecordError> {
         let mut normalized = Vec::with_capacity(locals.len());
         for local in locals {
             let mut local = local.clone();
-            loop {
-                self.tick()?;
-                let mut head = &local.type_;
-                let mut arguments = Vec::new();
-                while let ExprNode::App { f, a } = head.node() {
-                    self.tick()?;
-                    arguments.push(a);
-                    head = f;
-                }
-                let ExprNode::Const { name, .. } = head.node() else {
-                    break;
-                };
-                if !name.parent().is_anonymous() {
-                    break;
-                }
-                let recognized = match name.leaf_view() {
-                    LeafView::Str("outParam" | "semiOutParam") => arguments.len() == 1,
-                    LeafView::Str("optParam" | "autoParam") => arguments.len() == 2,
-                    _ => false,
-                };
-                if !recognized {
-                    break;
-                }
-                // The spine was collected in reverse application order.
-                local.type_ = (*arguments
-                    .last()
-                    .expect("recognized annotation has arguments"))
-                .clone();
-            }
+            local.type_ = self.recursor_type(&local.type_)?;
             normalized.push(local);
         }
         Ok(normalized)

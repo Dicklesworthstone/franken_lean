@@ -1031,6 +1031,14 @@ impl Model<'_> {
         let Some(info) = self.constructor(constructor) else {
             return Ok(Err(Stop::Unknown));
         };
+        // `c a ..`: the pin makes every remaining argument a hole, in an order this model does
+        // not replay (vendored `Lean/Elab/PatternVar.lean:363-366`, `App.lean:810-825`).
+        if arguments
+            .iter()
+            .any(|argument| application::is_ellipsis(argument))
+        {
+            return Ok(Err(Stop::Unknown));
+        }
         let levels = info
             .base
             .level_params

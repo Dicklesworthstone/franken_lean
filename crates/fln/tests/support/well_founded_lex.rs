@@ -3,7 +3,6 @@
 //! search infers the product over Nat parameters.
 #![forbid(unsafe_code)]
 use fln::{ClosedVmValue, Engine, EngineExecutionLimits, KVMap, Name, SourceCheckLimits};
-use fln_core::outcome::{InconclusiveCause, Outcome};
 
 // Independently evaluated by the pin with prelude, Init.WFComputable and
 // Init.Omega. Init.Data.Repr serves only the oracle's #eval output.
@@ -87,28 +86,34 @@ const INFERRED: &[(&str, &str, &str, usize)] = &[
         6,
     ),
     (
+        // The pin infers `termination_by (a, b, c)`. This search once exhausted the
+        // 1,000,000-heartbeat budget here (measured 2026-10-20: 589,143 in inference and
+        // 219,444 re-elaborating the body before the three final proofs); with the default
+        // decreasing proof's subtraction kept symbolic (834c3098) it completes.
         "nestedLexInferred",
+        INFERRED_NESTED,
+        "nestedLexInferred 2 1 2",
+        17,
+    ),
+    (
+        "nestedLexInferredWide",
         INFERRED_NESTED,
         "nestedLexInferred 2 3 4",
         25,
     ),
 ];
 
-/// The pin infers `termination_by (a, b, c)` and computes 25 at (2, 3, 4).
-/// This exhausted the ordinary elaboration budget on 2026-10-20; smart delta
-/// now checks it within the unchanged limits. Keep the computation positive
-/// and exercise exhaustion separately with an explicit caller work bound.
+/// The pin infers `termination_by (a, b, c)`. Measured 2026-10-20, inference spent
+/// 589,143 heartbeats and the body was re-elaborated for 219,444 more before the
+/// three final proofs; symbolic subtraction (834c3098) lets it complete. The same
+/// definition computes 17 at (2, 1, 2) and 25 at (2, 3, 4) under ordinary limits.
+/// The refusal below uses a one-step kernel bound so a resource stop stays distinct
+/// from acceptance or a semantic rejection.
 const INFERRED_NESTED: &str = r#"def nestedLexInferred (a b c : Nat) : Nat :=
   if hc : 0 < c then nestedLexInferred a b (c - 1) + 1
   else if hb : 0 < b then nestedLexInferred a (b - 1) 2 + 1
   else if ha : 0 < a then nestedLexInferred (a - 1) 1 2 + 1 else 0"#;
 
-/// Inferred orders this search refuses, with the refusal's variant where it is the search's.
-/// The pin finds no order for `notLex`, where no parameter decreases a call without
-/// increasing another, nor for `stuck`, where `a` decreases the first call and nothing the
-/// second ("Could not find a decreasing measure"). It accepts `needsDifference` with
-/// `termination_by (b, n - i)`, from the hypothesis `i < n`: a measure this search does not
-/// try, so its refusal says so rather than that no order exists.
 const INFERRED_REFUSALS: &[(&str, &str, Option<&str>)] = &[
     (
         "notLex",

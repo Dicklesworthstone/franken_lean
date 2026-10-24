@@ -973,14 +973,21 @@ fn print_shows_declarations_as_the_pin_does() {
     let refused_import = lean_door(&workspace, &imported, &lib);
     assert_eq!(refused_import.code, 5, "{refused_import:?}");
     assert!(refused_import.stdout.is_empty(), "{refused_import:?}");
-    // The pin prints `{ default := 7 }`; this door does not reproduce structure instances.
+    // An instance's value is a structure instance, printed as the pin prints it (measured
+    // 2026-10-22).
     let instance = workspace.write(
         "Instance.lean",
         "prelude\nimport Init.Core\ninstance foo : Inhabited Nat := ⟨7⟩\n#print foo\n",
     );
-    let refused = lean_door(&workspace, &instance, &lib);
-    assert_eq!(refused.code, 5, "{refused:?}");
-    assert!(refused.stdout.is_empty(), "{refused:?}");
+    let printed = lean_door(&workspace, &instance, &lib);
+    assert_eq!(
+        (printed.code, printed.stdout.as_str()),
+        (
+            0,
+            "@[implicit_reducible] def foo : Inhabited Nat :=\n{ default := 7 }\n"
+        ),
+        "{printed:?}"
+    );
 }
 
 /// `#exit` is the pin's terminal command (`elabExit`, `Parser.isTerminalCommand`): it warns
@@ -1023,6 +1030,68 @@ fn exit_stops_the_file_with_the_pins_warning() {
             assert_eq!(String::from_utf8(theirs.stdout).unwrap(), ours.stdout);
         }
         None => eprintln!("SKIP: no pinned lean beside the library; stdout was not compared"),
+    }
+}
+
+/// `#eval` refuses an expression that depends on `sorryAx` through any constant it reaches, as
+/// the pin's `collectAxioms` test does before running anything
+/// (`Lean/Elab/BuiltinEvalCommand.lean:104-113`): a definition by `sorry`, one whose
+/// `decreasing_by` is `sorry`, and one applied to a theorem proved by `sorry`. The pinned v4.32.0
+/// exits 1 on each with that error (measured 2026-10-22), and the control without `sorry` prints
+/// as it does. The pinned binary beside the library is consulted again when present.
+#[test]
+fn eval_refuses_an_expression_that_depends_on_sorry() {
+    let Some(lib) = pinned_lib() else { return };
+    let workspace = Workspace::new("lean-door-eval-sorry");
+    let header = "prelude\nimport Init.Data.Repr\n";
+    let pinned = lib
+        .parent()
+        .and_then(Path::parent)
+        .map(|toolchain| toolchain.join("bin/lean"))
+        .filter(|lean| lean.is_file());
+    let theirs = |entry: &Path| {
+        pinned.as_ref().map(|pinned| {
+            Command::new(pinned)
+                .arg(entry)
+                .env("LEAN_PATH", &lib)
+                .output()
+                .expect("run the pinned lean")
+        })
+    };
+    let refused = [
+        "def f : Nat := sorry\n#eval f + 1\n",
+        "def g (n : Nat) : Nat := if h : n = 0 then 0 else g (n - 1)\ndecreasing_by sorry\n\
+         #eval g 3\n",
+        "theorem t : 1 = 1 := sorry\ndef h : Nat := (fun (_ : 1 = 1) => 5) t\n#eval h\n",
+    ];
+    for (index, program) in refused.iter().enumerate() {
+        let entry = workspace.write(
+            &format!("Refused{index}.lean"),
+            format!("{header}{program}"),
+        );
+        if let Some(theirs) = theirs(&entry) {
+            assert_eq!(theirs.status.code(), Some(1), "the pin moved: {program}");
+        }
+        let ours = lean_door(&workspace, &entry, &lib);
+        assert_eq!(ours.code, 1, "{program}: {ours:?}");
+        assert!(
+            ours.stderr
+                .contains("Aborting evaluation since the expression depends on the 'sorry' axiom"),
+            "{program}: {ours:?}"
+        );
+    }
+    let entry = workspace.write(
+        "Control.lean",
+        format!(
+            "{header}def f (n : Nat) : Nat := n + 1\n#eval f 2\ntheorem ok : 1 = 1 := rfl\n\
+             def h : Nat := (fun (_ : 1 = 1) => 5) ok\n#eval h\n"
+        ),
+    );
+    let ours = lean_door(&workspace, &entry, &lib);
+    assert_eq!((ours.code, ours.stdout.as_str()), (0, "3\n5\n"), "{ours:?}");
+    if let Some(theirs) = theirs(&entry) {
+        assert!(theirs.status.success(), "{theirs:?}");
+        assert_eq!(String::from_utf8(theirs.stdout).unwrap(), ours.stdout);
     }
 }
 

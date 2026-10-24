@@ -87,9 +87,11 @@ fn named_and_anonymous_parameterized_public_instances_export_reducible_dictionar
     }
 }
 
+/// `Evidence` is annotated `Type`: unannotated, a class whose only field is a proof is a `Prop`
+/// at the pin (`isPropCandidate`), and an instance of it a theorem (measured 2026-10-22).
 #[test]
 fn public_instances_with_universes_and_proof_fields_are_data_instances() {
-    let api = "module\nprelude\npublic class Carry.{u} (A : Type u) where\n  value : A\npublic class Evidence (P : Prop) where\n  proof : P\npublic instance carry.{u} {A : Type u} (x : A) : Carry A := Carry.mk x\n@[expose] public instance evidence (P : Prop) (h : P) : Evidence P := Evidence.mk h";
+    let api = "module\nprelude\npublic class Carry.{u} (A : Type u) where\n  value : A\npublic class Evidence (P : Prop) : Type where\n  proof : P\npublic instance carry.{u} {A : Type u} (x : A) : Carry A := Carry.mk x\n@[expose] public instance evidence (P : Prop) (h : P) : Evidence P := Evidence.mk h";
     let main = "prelude\nimport Api\ndef fromCarry.{u} {A : Type u} (x : A) : A := (carry x).value\ndef fromEvidence (P : Prop) (h : P) : P := (evidence P h).proof";
     for result in check_both(&[("Main", main), ("Api", api)]) {
         let checked = result.unwrap().into_complete().unwrap();

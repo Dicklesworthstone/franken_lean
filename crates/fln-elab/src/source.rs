@@ -16,6 +16,7 @@ mod codegen;
 mod coercions;
 mod collections;
 pub mod deriving;
+mod diagnostics;
 mod do_notation;
 mod dotted_ident;
 pub use dotted_ident::DottedIdentError;
@@ -97,6 +98,9 @@ pub enum SourceInferenceError {
         name: Name,
         interpretations: Vec<Name>,
     },
+    /// `{}` elaborated both as the empty structure instance and as `∅`; the pin's `choice`
+    /// reports the term ambiguous.
+    AmbiguousEmptyBraces,
     /// Every interpretation of an overloaded identifier definitely fails.
     OverloadFailed {
         name: Name,
@@ -328,6 +332,9 @@ impl std::fmt::Display for SourceInferenceError {
                 }
                 Ok(())
             }
+            Self::AmbiguousEmptyBraces => f.write_str(
+                "Ambiguous term `{}`; Possible interpretations: `∅` and the empty structure instance",
+            ),
             Self::OverloadFailed { name, failures } => {
                 write!(f, "overloaded `{}`, errors:", name.to_display_string())?;
                 for (index, (candidate, reason)) in failures.iter().enumerate() {
@@ -530,6 +537,10 @@ struct Context {
     inspection: Option<inspect::Probe>,
     traces: trace::TraceLog,
     goal_tags: std::collections::HashMap<MVarId, Name>,
+    // Rewritten hypotheses: the pin asserts each and applies the new goal to its proof, which
+    // `instantiateMVars` beta-reduces away when nothing reads it, so such a binding nothing
+    // reads leaves the term (and with it every use of the hypothesis it rewrote).
+    discarded_lets: std::collections::HashSet<FVarId>,
     trace_local_names: std::collections::HashMap<FVarId, Name>,
     // Elimination fields no alternative named: the pin's inaccessible `n✝`, which
     // `rename_i`/`next`/`case` may name. Other anonymous locals are this engine's own.
@@ -549,6 +560,8 @@ struct Context {
     // returned at that boundary; no body or declaration is constructed.
     declaration_header_probe: Option<bool>,
     source_scope: SourceScope,
+    /// The pin's `getDeclName?`, independent of recursion's temporary owner.
+    diagnostic_declaration: Option<Name>,
     // Speculative tactics must observe rigid typing failures before choosing
     // their successful alternative. Outside speculation, ordinary final K1
     // admission retains its existing error boundary.
@@ -618,15 +631,25 @@ struct Context {
     omitted_results: Vec<recursion::OmittedResult>,
     recursion: Option<recursion::Recursion>,
     well_founded: Option<recursion::WellFounded>,
+    // Set while one member of a mutual well-founded group is elaborated against
+    // the group's shared fixpoint (`recursion::well_founded::mutual`).
+    mutual_member: Option<recursion::MutualMember>,
     // Set only after a top-level well-founded lowering succeeds. The source
     // declaration result carries this status to post-admission metadata.
     well_founded_definition: bool,
+    // Set once the definition's body refers to the definition itself, so it is
+    // lowered as a recursion: the pin's `recExt` tag (`Lean/Meta/RecExt.lean`).
+    recursive_definition: bool,
     // Enabled only by the batch-only partial-definition entry point. A recursive
     // body needs its opaque logical interface AND its executable companion.
     partial: Option<partial::State>,
     // A supported compiler refusal suppressed by a noncomputable section.
     // Only the successful declaration result can carry it to post-admission metadata.
     noncomputable_definition: bool,
+    // Set while the `unfold` tactic expands a selection. The pin's `unfold` rewrites by the
+    // unfold equation, so an occurrence whose match is stuck becomes a `match`, which a
+    // compiled recursor application does not print as.
+    unfold_tactic: bool,
     // A local recursive helper suspends its parent's structural compiler.
     // Complete parent calls still lower against that parent's hypotheses
     // before the helper closes over them as an opaque value.
@@ -674,6 +697,7 @@ impl Context {
             inspection: None,
             traces: trace::TraceLog::default(),
             goal_tags: std::collections::HashMap::new(),
+            discarded_lets: std::collections::HashSet::new(),
             trace_local_names: std::collections::HashMap::new(),
             unnamed_fields: std::collections::HashSet::new(),
             private_proof_body: None,
@@ -684,6 +708,7 @@ impl Context {
             private_instance_body: false,
             declaration_header_probe: None,
             source_scope: SourceScope::default(),
+            diagnostic_declaration: None,
             attempt_depth: 0,
             opaque_locals: std::collections::HashSet::new(),
             deferred_local_functions: Vec::new(),
@@ -716,9 +741,12 @@ impl Context {
             omitted_results: Vec::new(),
             recursion: None,
             well_founded: None,
+            mutual_member: None,
             well_founded_definition: false,
+            recursive_definition: false,
             partial: None,
             noncomputable_definition: false,
+            unfold_tactic: false,
             enclosing_recursions: Vec::new(),
             postponed_eliminators: Vec::new(),
             postponed_coercions: Vec::new(),
@@ -808,6 +836,19 @@ impl Context {
     }
 
     fn constant(&mut self, name: &Name) -> Result<Typed, NatDefinitionElabError> {
+        // A mutual well-founded member's peers are the group's private recursive
+        // references, however they are spelled, never the group's header locals.
+        if let Some(recursion) = &self.well_founded
+            && recursion.is_mutual()
+            && let Some(reference) = recursion.target(name)
+        {
+            if recursion.proving {
+                return Err(failure(SourceInferenceError::Recursion(
+                    recursion::RecursionError::RecursionInDecreasingProof,
+                )));
+            }
+            return Ok(reference.clone());
+        }
         if let Some(term) = self.partial_group_reference(name)? {
             return Ok(term);
         }
@@ -1040,9 +1081,12 @@ impl Context {
                     type_: local.type_.clone(),
                 });
             }
-            // A template's name (macro-scoped) is a global once its scopes are erased; the
-            // exact local scan above was its only local match (`resolve_source_candidates`).
+            // A template's name (macro-scoped) is a global once its scopes are erased, unless a
+            // prefix of it, with its scopes, names a local the template bound.
             let hygienic = name.has_macro_scopes();
+            if hygienic && let Some(term) = self.hygienic_record_field(name, expected)? {
+                return Ok(term);
+            }
             let resolved = self
                 .resolve_source_name(name)?
                 .unwrap_or_else(|| name.erase_macro_scopes());
@@ -1082,14 +1126,14 @@ impl Context {
                 return Ok(recursion.reference.clone());
             }
             if let Some(recursion) = &self.well_founded
-                && &recursion.name == name
+                && let Some(reference) = recursion.target(name)
             {
                 if recursion.proving {
                     return Err(failure(SourceInferenceError::Recursion(
                         recursion::RecursionError::RecursionInDecreasingProof,
                     )));
                 }
-                return Ok(recursion.reference.clone());
+                return Ok(reference.clone());
             }
             let mut resolved = name.clone();
             if !self.txn.env.contains(name) {
@@ -1375,6 +1419,26 @@ impl Context {
             Some(fault) => Err(fault),
             None => Ok(result),
         }
+    }
+
+    /// Whether a pending equation mentions the local `id`, its metavariables instantiated.
+    fn equations_mention(&mut self, id: &FVarId) -> Result<bool, NatDefinitionElabError> {
+        for index in 0..self.equations.len() {
+            self.tick()?;
+            let (left, right) = self.equations[index].sides.clone();
+            for side in [left, right] {
+                let side = self.instantiate(&side)?;
+                if side.has_fvar()
+                    && side
+                        .abstract_fvar(id, 0)
+                        .map_err(|_| failure(SourceInferenceError::Scope))?
+                        .has_loose_bvar(0)
+                {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
     }
 
     fn flush(&mut self, final_pass: bool) -> Result<(), NatDefinitionElabError> {
@@ -1755,6 +1819,7 @@ impl Context {
             DoBindJoinValue(LocalContext, FVarId, Name, Typed),
             DoNestedAnnotation(&'a Syntax, Option<Expr>, bool),
             DoAction(&'a [Syntax], Option<Expr>),
+            DoPureValue(Option<Expr>),
             CalcNext(calc::Build<'a>),
             CalcRelation(calc::Build<'a>),
             CalcProof(calc::Build<'a>, Expr),
@@ -1766,6 +1831,8 @@ impl Context {
             MatchBranch(matching::MatchBuild<'a>, matching::BranchBinders),
             Ascription(&'a Syntax, Option<Expr>, bool),
             AscribedValue(Expr, Option<Expr>, bool),
+            /// `↑e`'s value, made to have the expected type.
+            Coerced(Option<Expr>),
             Projection(Name, &'a [Syntax], Option<Expr>, bool, bool),
             RecordType(record_terms::RecordParts<'a>, Option<Expr>),
             RecordPrepare(record_terms::RecordParts<'a>, Option<Expr>, Vec<Typed>),
@@ -1786,7 +1853,10 @@ impl Context {
             Apply(Typed, Arguments<'a>, Option<Expr>, bool),
             ApplyNext(Typed, Arguments<'a>, Option<Expr>, bool),
             Infix(BoundedInfixIntrinsic, Option<Expr>),
-            Operator(operators::OperatorTree<'a>, Option<Expr>),
+            Operator(operators::OperatorTree<'a>, Option<Expr>, Vec<bool>),
+            /// An operator's result and the holes of its postponed leaves, whose values are
+            /// the last ones visited.
+            PostponedLeaves(Typed, Vec<Expr>),
             Arrow(Option<Expr>),
             BinderNext(binders::Telescope<'a>),
             BinderDomain(binders::Telescope<'a>),
@@ -1947,6 +2017,19 @@ impl Context {
                     }
                     match task {
                         Task::RestoreOptions(options) => self.txn.options = options,
+                        Task::DoPureValue(expected) => {
+                            let argument = values.pop().expect("do return value visit");
+                            let monad = match &expected {
+                                Some(type_) => self.do_monad(type_)?,
+                                None => None,
+                            };
+                            let function = self.do_operation(false, monad)?;
+                            let function = self.do_pure_result(function, expected.as_ref())?;
+                            let function = self
+                                .insert_implicits(function, ImplicitInsertion::ExplicitArgument)?;
+                            let term = self.match_apply(function, argument)?;
+                            values.push(self.finish_application(term, expected.as_ref())?);
+                        }
                         Task::CheckArgument(syntax, expected, infer_exception_action) => {
                             if let Some(checkpoint) = postponed::Checkpoint::argument(
                                 self,
@@ -2156,6 +2239,22 @@ impl Context {
                                     if args.len() != if bind { 2 } else { 1 } {
                                         return Err(failure(SourceInferenceError::Scope));
                                     }
+                                    if !bind {
+                                        // Check the value before creating Pure's dictionary.
+                                        // Its type can determine the monad's universe, as in
+                                        // `Id.run do return (42 : Nat)`. Keep the written
+                                        // result parameter even for a noninjective monad.
+                                        let value_type =
+                                            self.do_pure_result_type(expected.as_ref())?;
+                                        tasks.push(Task::DoPureValue(expected));
+                                        tasks.push(match value_type {
+                                            Some(type_) => {
+                                                Task::CheckArgument(&args[0], type_, false)
+                                            }
+                                            None => Task::Visit(&args[0], None, true),
+                                        });
+                                        continue;
+                                    }
                                     let monad = match &expected {
                                         Some(type_) => self.do_monad(type_)?,
                                         None => None,
@@ -2167,10 +2266,8 @@ impl Context {
                                         let function = self.do_operation(bind, monad)?;
                                         let function = if nested {
                                             self.do_nested_action_function(function, &args[1])?
-                                        } else if bind {
-                                            function
                                         } else {
-                                            self.do_pure_result(function, expected.as_ref())?
+                                            function
                                         };
                                         tasks.push(Task::Apply(
                                             function,
@@ -2397,6 +2494,16 @@ impl Context {
                                     ));
                                     continue;
                                 }
+                                // `↑e` (`elabCoe`, vendored `Lean/Elab/BuiltinNotation.lean:21-27`):
+                                // `e` elaborates without an expected type, then is made to have
+                                // the expected type, a coercion inserted where the types differ.
+                                if kind == &Name::from_components(["coeNotation"]) {
+                                    let parts = expect_node(syntax, kind, 2, "coercion notation")?;
+                                    expect_atom(&parts[0], "↑", "coercion arrow")?;
+                                    tasks.push(Task::Coerced(expected));
+                                    tasks.push(Task::Visit(&parts[1], None, true));
+                                    continue;
+                                }
                                 if kind == &parser_kind(&["Term", "typeAscription"]) {
                                     let parts = expect_node(syntax, kind, 5, "term ascription")?;
                                     expect_atom(&parts[2], ":", "ascription colon")?;
@@ -2553,9 +2660,16 @@ impl Context {
                                 {
                                     let tree = self.operator_tree(syntax, notation)?;
                                     let leaves = tree.leaves.clone();
-                                    tasks.push(Task::Operator(tree, expected));
-                                    for leaf in leaves.into_iter().rev() {
-                                        tasks.push(Task::Visit(leaf, None, true));
+                                    let postponed: Vec<bool> = leaves
+                                        .iter()
+                                        .map(|leaf| operators::postponed_leaf(leaf))
+                                        .collect();
+                                    tasks.push(Task::Operator(tree, expected, postponed.clone()));
+                                    for (leaf, postpone) in leaves.into_iter().zip(postponed).rev()
+                                    {
+                                        if !postpone {
+                                            tasks.push(Task::Visit(leaf, None, true));
+                                        }
                                     }
                                     continue;
                                 }
@@ -2835,10 +2949,13 @@ impl Context {
                         }
                         Task::Projection(field, arguments, expected, explicit, finish) => {
                             let receiver = values.pop().expect("receiver precedes projection");
+                            // `x.f ..` has no arguments to process: `hasArgs` counts positional
+                            // and named arguments only (vendored `Lean/Elab/App.lean:1850`), so a
+                            // strict-implicit receiver is not instantiated before the lookup.
                             match self.resolve_field_path(
                                 receiver,
                                 &field,
-                                !arguments.is_empty(),
+                                !arguments.iter().all(application::is_ellipsis),
                             )? {
                                 record_terms::FieldResolution::Value(term)
                                     if arguments.is_empty() =>
@@ -2910,6 +3027,16 @@ impl Context {
                             tasks.push(Task::AscribedValue(type_.value.clone(), expected, show));
                             tasks.push(Task::Visit(syntax, Some(type_.value), true));
                         }
+                        Task::Coerced(expected) => {
+                            let term = values.pop().expect("coerced term visit");
+                            // The pin postpones `↑e` while its expected type is unknown. When it
+                            // is finally run with the type still a metavariable, the value only
+                            // unifies with it: `def up (n : Nat) := ↑n` is `n`, of type `Nat`,
+                            // and `#check ↑(3 : Nat)` prints `3 : Nat` (pinned v4.32.0). An
+                            // operator's `↑` leaf waits for the type the others give it
+                            // (`operators::postponed_leaf`).
+                            values.push(self.finish_term(term, expected.as_ref())?);
+                        }
                         Task::AscribedValue(annotation, expected, show) => {
                             let term = values.pop().expect("ascribed term follows its annotation");
                             // The value's actual type guides surrounding inference.
@@ -2978,7 +3105,16 @@ impl Context {
                                 self.accept_record_field(&mut state, &target, value)?;
                                 tasks.push(Task::RecordNext(state));
                             }
-                            record_terms::RecordStep::Complete(term) => values.push(term),
+                            record_terms::RecordStep::Complete(term) => {
+                                if state.empty_braces()
+                                    && self.empty_braces_ambiguous(&term.type_)?
+                                {
+                                    return Err(failure(
+                                        SourceInferenceError::AmbiguousEmptyBraces,
+                                    ));
+                                }
+                                values.push(term)
+                            }
                             record_terms::RecordStep::Continue => {
                                 tasks.push(Task::RecordNext(state))
                             }
@@ -3513,17 +3649,56 @@ impl Context {
                                 explicit,
                             ));
                         }
-                        Task::Operator(tree, expected) => {
+                        Task::Operator(tree, expected, postponed) => {
+                            let visited = postponed.iter().filter(|postpone| !**postpone).count();
                             let start = values
                                 .len()
-                                .checked_sub(tree.leaves.len())
+                                .checked_sub(visited)
+                                .ok_or_else(|| failure(SourceInferenceError::Scope))?;
+                            let mut visited = values.split_off(start).into_iter();
+                            let mut leaves = Vec::with_capacity(postponed.len());
+                            let mut holes = Vec::new();
+                            for (index, postpone) in postponed.iter().enumerate() {
+                                if *postpone {
+                                    // A hole of unknown type stands for the leaf meanwhile.
+                                    let level = self.level()?;
+                                    let type_ = self.hole(Expr::sort(level))?;
+                                    let value = self.hole(type_.clone())?;
+                                    holes.push((tree.leaves[index], value.clone(), type_.clone()));
+                                    leaves.push(Typed { value, type_ });
+                                } else {
+                                    leaves.push(
+                                        visited
+                                            .next()
+                                            .ok_or_else(|| failure(SourceInferenceError::Scope))?,
+                                    );
+                                }
+                            }
+                            let result =
+                                self.finish_operator_tree(tree, leaves, expected.as_ref())?;
+                            if holes.is_empty() {
+                                values.push(result);
+                            } else {
+                                tasks.push(Task::PostponedLeaves(
+                                    result,
+                                    holes.iter().map(|(_, hole, _)| hole.clone()).collect(),
+                                ));
+                                for (syntax, _, type_) in holes.into_iter().rev() {
+                                    let expected = self.instantiate(&type_)?;
+                                    tasks.push(Task::Visit(syntax, Some(expected), true));
+                                }
+                            }
+                        }
+                        Task::PostponedLeaves(result, holes) => {
+                            let start = values
+                                .len()
+                                .checked_sub(holes.len())
                                 .ok_or_else(|| failure(SourceInferenceError::Scope))?;
                             let leaves = values.split_off(start);
-                            values.push(self.finish_operator_tree(
-                                tree,
-                                leaves,
-                                expected.as_ref(),
-                            )?);
+                            for (hole, leaf) in holes.iter().zip(leaves) {
+                                self.constrain(hole, &leaf.value)?;
+                            }
+                            values.push(result);
                         }
                         Task::Infix(intrinsic, expected) => {
                             let right = values.pop().expect("infix right visit");
@@ -3871,9 +4046,14 @@ impl Context {
                         }
                         Task::LetBody(saved, id, name, value, opaque, inline) => {
                             if opaque {
-                                // Do not postpone equations past the context that
-                                // gives this assertion its opaque interpretation.
-                                self.flush(true)?;
+                                // Do not postpone equations over the assertion past the
+                                // context that gives it its opaque interpretation. The
+                                // others stay pending, as at the pin: a numeral's type may
+                                // still be defaulted (`have h : 1 = 1 := rfl`).
+                                self.flush(false)?;
+                                if self.equations_mention(&id)? {
+                                    self.flush(true)?;
+                                }
                                 self.opaque_locals.remove(&id);
                             }
                             self.matrix_aliases.remove(&id);
@@ -4221,12 +4401,14 @@ impl Context {
         )?;
         let name = if let Syntax::Ident { val: name, .. } = &id[0] {
             name.clone()
-        } else if opaque {
+        } else if !recursive {
+            // The pin's letIdLhs uses hygieneInfo for every omitted name,
+            // including `let : T := ...` and `letI : C := ...`.
             let hygiene = expect_node(
                 &id[0],
                 &Name::from_components(["hygieneInfo"]),
                 1,
-                "anonymous assertion hygiene",
+                "anonymous local binding hygiene",
             )?;
             if !matches!(&hygiene[0], Syntax::Ident { val, preresolved, .. } if val.is_anonymous() && preresolved.is_empty())
             {
@@ -5103,6 +5285,7 @@ fn definition_in_context_named(
     };
     context.local_function_lifting.parent =
         (!owned_name.is_anonymous()).then(|| owned_name.clone());
+    context.diagnostic_declaration = (!owned_name.is_anonymous()).then(|| owned_name.clone());
     // The pin tags a protected declaration before elaborating its body, and
     // names its recursive local `<last namespace component>.<short name>`, so
     // the body cannot reach it by its atomic name either.
@@ -5197,6 +5380,7 @@ fn definition_in_context_named(
             .ok_or_else(|| failure(SourceInferenceError::ExpectedType))?;
         owned_name = context.generated_instance_name(&parameters, expected)?;
         context.local_function_lifting.parent = Some(owned_name.clone());
+        context.diagnostic_declaration = Some(owned_name.clone());
     }
     if is_instance && !hidden_instance {
         // Naming may consult the private predecessor only for collisions. Once
@@ -5352,7 +5536,12 @@ fn definition_in_context_named(
         termination,
         !is_theorem && !is_instance && !is_abbrev && !is_opaque,
     )?;
-    if context.partial.is_some()
+    // An ordinary mutual group judges its members' hints once its recursive
+    // components are known (`partial::group::ordinary`).
+    if context
+        .partial
+        .as_ref()
+        .is_some_and(|state| !state.ordinary)
         && !matches!(
             termination,
             None | Some(recursion::TerminationHint::Automatic)
@@ -5399,6 +5588,13 @@ fn definition_in_context_named(
         termination.as_ref(),
         header_parameters,
     )?;
+    // The pin's `isValidMacroInline` (vendored `Lean/Compiler/InlineAttrs.lean:31`): a
+    // recursive definition does not take `[macro_inline]`.
+    if context.recursive_definition && scope::simp::macro_inline_requested(syntax)? {
+        return Err(NatDefinitionElabError::UnexpectedSyntax {
+            expected: "a `macro_inline` attribute on a non-recursive definition",
+        });
+    }
     if let Some(expected) = expected {
         term.type_ = expected;
     }
@@ -5735,6 +5931,26 @@ fn query_term(
     context: &mut Context,
     evaluate: bool,
 ) -> Result<(Typed, Vec<Name>, Vec<usize>), NatDefinitionElabError> {
+    if evaluate {
+        let module = context
+            .source_scope
+            .source_module
+            .clone()
+            .unwrap_or_default();
+        context.diagnostic_declaration = Some(Name::str(
+            Name::num(Name::from_components(["_private"]).append_core(&module), 0),
+            "_eval",
+        ));
+    } else {
+        let command = if syntax.kind() == Some(&parser_kind(&["Command", "synth"])) {
+            "_synth_cmd"
+        } else if syntax.kind() == Some(&Name::from_components(["Lean", "reduceCmd"])) {
+            "_reduce"
+        } else {
+            "_check"
+        };
+        context.diagnostic_declaration = Some(Name::from_components([command]));
+    }
     let expanded = context.expand_match_alternatives(syntax)?;
     let syntax = expanded.as_ref();
     if !name.parent().is_anonymous() || !matches!(name.leaf_view(), LeafView::Num(_)) {
@@ -5762,11 +5978,96 @@ fn query_term(
         let hole = context.instance_hole(class.clone())?;
         context.resolve_instances(true)?;
         context.complete_local_functions()?;
-        let term = context.finish(Typed {
+        let mut term = context.finish(Typed {
             value: hole,
             type_: class,
         })?;
+        // `synthInstance` enters the class's telescope first (`forallTelescopeReducing`): for a
+        // class that unfolds to a function type (`DecidableEq (Nat × Nat)`), the instance found
+        // is applied to the telescope's locals and abstracted again with `etaReduce := true`
+        // (`tryResolve`). That reduces back to the instance itself (`instDecidableEqI4`, elab/9541)
+        // unless the instance still had subgoals then, its instance arguments, whose holes
+        // depend on the locals: `fun a b => instDecidableEqProd a b` (elab/typeclass_easy).
+        let has_subgoals = {
+            let mut head = &term.value;
+            let mut arity = 0_usize;
+            while let ExprNode::App { f, .. } = head.node() {
+                arity += 1;
+                head = f;
+            }
+            let mut found = false;
+            if let ExprNode::Const { name, .. } = head.node()
+                && let Some(info) = context.txn.env.find(name)
+            {
+                let mut type_ = info.constant_val().type_.clone();
+                for _ in 0..arity {
+                    let ExprNode::ForallE {
+                        binder_info, body, ..
+                    } = type_.node()
+                    else {
+                        break;
+                    };
+                    found |= *binder_info == BinderInfo::InstImplicit;
+                    let body = body.clone();
+                    type_ = body;
+                }
+            }
+            found
+        };
+        let unfolded = context.whnf_with_transparency(
+            &term.type_,
+            UnificationTransparency::Abbreviations,
+            false,
+        )?;
+        let mut binders = Vec::new();
+        let mut cursor = &unfolded;
+        while let ExprNode::ForallE {
+            binder_name,
+            binder_type,
+            body,
+            binder_info,
+        } = cursor.node()
+        {
+            binders.push((binder_name.clone(), binder_type.clone(), *binder_info));
+            cursor = body;
+        }
+        if has_subgoals && !binders.is_empty() {
+            let count =
+                u32::try_from(binders.len()).map_err(|_| failure(SourceInferenceError::Scope))?;
+            let mut value = term.value.clone();
+            for index in (0..count).rev() {
+                value = Expr::app(
+                    value,
+                    Expr::bvar(index).map_err(|_| failure(SourceInferenceError::Scope))?,
+                );
+            }
+            for (name, domain, info) in binders.into_iter().rev() {
+                value = Expr::lam(name, domain, value, info);
+            }
+            term.value = value;
+        }
         return context.close_query_section(term, Vec::new());
+    }
+    // `#reduce e` (`elabReduce`, Lean/Elab/BuiltinCommand.lean:459): `e` elaborated with no
+    // expected type, its universe holes made parameters, then its normal form
+    // (`Meta.reduce`), which the candidate states at `e`'s type and the caller prints alone.
+    let reduce = Name::from_components(["Lean", "reduceCmd"]);
+    if !evaluate && syntax.kind() == Some(&reduce) {
+        let parts = expect_node(syntax, &reduce, 3, "Lean.reduceCmd")?;
+        expect_atom(&parts[0], "#reduce", "reduce keyword")?;
+        let config = reduce_config(&parts[1])?;
+        let term = context.term(&parts[2], None)?;
+        context.complete_local_functions()?;
+        let level_params = context.generalize_level_mvars(&term)?;
+        let term = context.finish(term)?;
+        let value = context.meta_reduce(&term.value, config)?;
+        return context.close_query_section(
+            Typed {
+                value,
+                type_: term.type_,
+            },
+            level_params,
+        );
     }
     // `#print` (`Lean/Elab/Print.lean`): its identifier or string is elaborated as `#check`
     // elaborates a term, and the caller prints from the constant or literal the candidate is.
@@ -5897,6 +6198,56 @@ impl Context {
         }
         Ok((term, level_params, positions))
     }
+}
+
+/// `#reduce`'s options (`reduceConfig := many(colGt atomic(" (" ident " := ") term ")")`), each a
+/// boolean written `true` or `false`. Every other option keeps the pin's default, and naming one is
+/// refused, as is a value this engine does not read.
+fn reduce_config(syntax: &Syntax) -> Result<reduce::ReduceConfig, NatDefinitionElabError> {
+    let parts = expect_node(
+        syntax,
+        &Name::from_components(["Lean", "reduceConfig"]),
+        1,
+        "Lean.reduceConfig",
+    )?;
+    let mut config = reduce::ReduceConfig::default();
+    for item in expect_null_args(&parts[0], "reduce options")? {
+        let [
+            open,
+            Syntax::Ident { val: name, .. },
+            assign,
+            Syntax::Ident { val: value, .. },
+            close,
+        ] = expect_null_args(item, "reduce option")?
+        else {
+            return Err(NatDefinitionElabError::UnexpectedSyntax {
+                expected: "a #reduce option written `(name := true)` or `(name := false)`",
+            });
+        };
+        expect_atom(open, "(", "reduce option bracket")?;
+        expect_atom(assign, ":=", "reduce option assignment")?;
+        expect_atom(close, ")", "reduce option bracket")?;
+        let value = match value.to_display_string().as_str() {
+            "true" => true,
+            "false" => false,
+            _ => {
+                return Err(NatDefinitionElabError::UnexpectedSyntax {
+                    expected: "a #reduce option written `(name := true)` or `(name := false)`",
+                });
+            }
+        };
+        match name.to_display_string().as_str() {
+            "types" => config.types = value,
+            "proofs" => config.proofs = value,
+            "implicits" => config.implicits = value,
+            _ => {
+                return Err(NatDefinitionElabError::UnexpectedSyntax {
+                    expected: "a #reduce option among `types`, `proofs` and `implicits`",
+                });
+            }
+        }
+    }
+    Ok(config)
 }
 
 fn query_declaration(

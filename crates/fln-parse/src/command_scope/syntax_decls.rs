@@ -582,6 +582,7 @@ pub(crate) fn declaration(
         syntax,
         epilogue,
         query_term: None,
+        query_identifier: false,
     }))
 }
 
@@ -675,6 +676,7 @@ fn binder_predicate(
         syntax,
         epilogue,
         query_term: None,
+        query_identifier: false,
     }))
 }
 
@@ -845,6 +847,7 @@ fn macro_command(
         syntax,
         epilogue,
         query_term: None,
+        query_identifier: false,
     }))
 }
 
@@ -1064,5 +1067,6 @@ fn finish(
         syntax,
         epilogue,
         query_term: None,
+        query_identifier: false,
     }))
 }

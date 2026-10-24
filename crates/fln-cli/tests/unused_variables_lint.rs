@@ -1,8 +1,8 @@
 //! The pin's `linter.unusedVariables`, `linter.deprecated` and `linter.defProp` warnings, through the drop-in
 //! `lean` over `prelude` with `Init.Core` (bead `fln-default-linters-unused-variables-mtnt`).
 //! Each program runs through the pinned `lean` v4.32.0 in the same test: an `IDENTICAL` program
-//! must print exactly what the pin prints, and every warning printed for a `SUBSET` program,
-//! which this increment does not fully decide (tactic proofs), must be one the pin prints too.
+//! must print exactly what the pin prints, and every warning printed for a `SUBSET` program
+//! must be one the pin prints too.
 #![forbid(unsafe_code)]
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -41,6 +41,45 @@ def p6 (o : Option Nat) : Nat :=
   match o with
   | some _w => 0
   | none => 1
+";
+
+/// Patterns under an indexed family's constructor, where the index is a variable the match
+/// generalizes: the pin warns about the fields read here (`x`, `b : Fin (n + 1)`) and not about
+/// an index field (`k`) or one of an indexed family's type (`t`), which this door leaves
+/// unread. `Box.mk n` names no indexed constructor although `Tagged.mk` is spelled like it.
+/// Each family's constructors are spelled apart: the pin resolves a dotted head (`.cons`) by the
+/// expected type, which this door does not read, so constructors spelled alike are read together
+/// and only the fields all of them read stay decided.
+const INDEXED: &str = "inductive IVec (A : Type) : Nat → Type where
+  | inil : IVec A 0
+  | icons {n : Nat} (head : A) (tail : IVec A n) : IVec A (n + 1)
+inductive EVec (A : Type) : Nat → Type where
+  | enil : EVec A 0
+  | econs (n : Nat) (head : A) (tail : EVec A n) : EVec A (n + 1)
+inductive FVec (A : Type) : Nat → Type where
+  | fnil : FVec A 0
+  | fcons {n : Nat} (bound : Fin (n + 1)) (head : A) (tail : FVec A n) : FVec A (n + 1)
+inductive Tagged : Nat → Type where
+  | mk (n : Nat) : Tagged n
+structure Box where
+  val : Nat
+inductive Wrap (B : Type) where
+  | wrap (x : B)
+def i1 {A : Type} {m : Nat} : IVec A m → Nat
+  | .icons x t => 1
+  | .inil => 0
+def i2 {A : Type} {m : Nat} : EVec A m → Nat
+  | .econs k x t => 1
+  | .enil => 0
+def i3 {A : Type} {m : Nat} : FVec A m → Nat
+  | .fcons b x t => 1
+  | .fnil => 0
+def i4 {A : Type} {m : Nat} (v : IVec A m) : Nat :=
+  match v with
+  | .icons x t => 1
+  | .inil => 0
+def i5 : Wrap Box → Nat
+  | Wrap.wrap (Box.mk n) => 0
 ";
 
 /// `fun` binders (plain, typed, grouped, a tuple pattern, `_`) and the binder of an implicit
@@ -98,12 +137,67 @@ mutual
 end
 ";
 
+/// Binders under no `fun`: an `if h :`'s, a `let`'s (one shadowing a parameter of its name),
+/// and a theorem's statement's, which are linted though its proof is a tactic block (only a
+/// scope holding the block is not read).
+const LOCALS: &str = "def a (n : Nat) : Nat := if h : n = 3 then 1 else 2
+def b (n : Nat) : Nat := if h : n = 3 then n else 2
+def c (n : Nat) (k : n = 3 → Nat) : Nat := if h : n = 3 then k h else 2
+def h1 : Nat := let x := 1; 2
+def h2 : Nat := let x := 1; x
+def h3 (x : Nat) : Nat := let x := x; 2
+theorem l (x y : Nat) : (match x with | 0 => y | n+1 => y) = y := by cases x <;> rfl
+theorem m : ∀ x : Nat, x = x := by intro x; rfl
+theorem m2 : ∀ x : Nat, True := by intro; trivial
+theorem m3 (p : Prop) (hp : p) : p := by exact hp
+def o : Nat := (fun (x : Nat) => 3) 1
+";
+
+/// Tactic bodies: the pin reads only the final term, so a binder a tactic's syntax names is
+/// still unused when the term does not use it (`have h`, `clear`), `assumption` takes the
+/// last matching hypothesis, `‹_›` is a tactic block, and a binder used only in a later
+/// binder's type stays used.
+const TACTICS: &str = "theorem ta (p q : Prop) (hp : p) (hq : q) : p := by exact hp
+theorem tb (p : Prop) (hp : p) (hp2 : p) : p := by assumption
+theorem tc (x y : Nat) (h : x = y) (k : 0 = 0) : y = x := by subst h; rfl
+def td (x : Nat) (y : Subtype (fun v => v = x)) (z : Nat) : Nat := by clear y x; exact z
+theorem te (n : Nat) (h : n = n) : True := by trivial
+example (h : Nat) : Nat := by
+  have h : Nat := 0
+  exact h
+theorem tf (p q : Prop) (hp : p) (hq : q) : p ∧ q := ⟨hp, by exact hq⟩
+theorem tg (a b : Nat) (h : a = b) (h' : b = a) : b = a := by exact h'
+theorem th (p q : Prop) (hq : q) (hp : p) : p := ‹p›
+";
+
+/// A tactic block anywhere in a body silences every binder the body introduces, not only
+/// those whose scope holds it; without one they are linted.
+const TACTIC_ELSEWHERE: &str =
+    "def g8 (n : Nat) : Nat := Nat.add ((fun (x : Nat) => n) 0) (by exact 1)
+def g9 (n : Nat) : Nat := Nat.add ((fun (x : Nat) => n) 0) 1
+def g10 (n : Nat) : Nat := Nat.add (let k := 5; n) (by exact 1)
+def g11 (n : Nat) : Nat := Nat.add (let k := 5; n) 1
+theorem g13 (p : Prop) (hp : p) : p ∧ True := And.intro (have z := 3; hp) (by trivial)
+";
+
 const IDENTICAL: &[(&str, &str)] = &[
+    ("tactics", TACTICS),
+    ("tactic_elsewhere", TACTIC_ELSEWHERE),
     ("linted", LINTED),
     ("scopes", SCOPES),
+    ("locals", LOCALS),
     ("patterns", PATTERNS),
+    ("indexed", INDEXED),
     ("functions", FUNCTIONS),
     ("deprecated_and_def_prop", DEPRECATED_AND_DEF_PROP),
+    // A structure instance's field name given a value (`x := 3`) does not read a local `x`; a
+    // field abbreviation (`{ x }`) does.
+    (
+        "struct_instance_fields",
+        "structure T where\n  x : Nat\n  y : Nat\ndef g (x : Nat) : T := { x := 3, y := 4 }\n\
+         def h (y : Nat) : T := { x := 3, y := 4 }\ndef ab (x : Nat) : T := { x, y := 4 }\n\
+         def v (x : Nat) : T := { x := x, y := 4 }\n",
+    ),
     (
         "pattern_vars_off",
         "set_option linter.unusedVariables.patternVars false\ndef p (o : Option Nat) : Nat :=\n  match o with\n  | some v => 0\n  | none => 1\n",
@@ -126,12 +220,34 @@ const IDENTICAL: &[(&str, &str)] = &[
     ),
 ];
 
-const SUBSET: &[(&str, &str)] = &[(
-    "tactics",
-    "theorem a (p q : Prop) (hp : p) (hq : q) : p := by exact hp
-theorem b (p : Prop) (hp : p) (n : Nat) : p := by assumption
+/// A tactic body with `where` helpers is left undecided: the pin warns about `m` here, and
+/// this door prints nothing for it rather than read a term the pin need not share. Under an
+/// indexed constructor whose index the match does not generalize (an applied index, one bound
+/// by `_`) or inside a named pattern, the pin warns about `t`, `va` and `bv` too, which this
+/// door leaves unread.
+const SUBSET: &[(&str, &str)] = &[
+    (
+        "tactic_where",
+        "def w (n : Nat) (m : Nat) : Nat := helper n
+where helper (k : Nat) : Nat := by exact k
 ",
-)];
+    ),
+    (
+        "indexed_unread",
+        "inductive IVec (A : Type) : Nat → Type where
+  | nil : IVec A 0
+  | cons {n : Nat} (head : A) (tail : IVec A n) : IVec A (n + 1)
+def s1 {A : Type} {m : Nat} : IVec A (m + 1) → Nat
+  | .cons x t => 1
+def s2 {A : Type} : {n : Nat} → IVec A n → IVec A n → A → A
+  | _, .cons a va, .cons b bv, _ => a
+  | _, .nil, .nil, z => z
+def s3 {A : Type} {m : Nat} : IVec A m → Nat
+  | w@(.cons x t) => 1
+  | .nil => 0
+",
+    ),
+];
 
 fn pinned_toolchain() -> Option<PathBuf> {
     let lib = std::env::var_os("FLN_REFERENCE_LIB")
@@ -170,8 +286,19 @@ fn workspace() -> PathBuf {
 
 /// The stdout of this crate's `lean` and of the pinned `lean` on `HEADER` + `program`.
 fn outputs(lib: &Path, root: &Path, name: &str, program: &str) -> (String, String) {
+    outputs_under(lib, root, name, HEADER, program)
+}
+
+/// [`outputs`] under another `header`.
+fn outputs_under(
+    lib: &Path,
+    root: &Path,
+    name: &str,
+    header: &str,
+    program: &str,
+) -> (String, String) {
     let entry = format!("{name}.lean");
-    std::fs::write(root.join(&entry), format!("{HEADER}{program}")).unwrap();
+    std::fs::write(root.join(&entry), format!("{header}{program}")).unwrap();
     let run = |binary: &Path| {
         let output = Command::new(binary)
             .arg(&entry)
@@ -226,8 +353,11 @@ fn signature_binder_warnings_match_the_pin_and_are_never_invented() {
     for (name, program, count) in [
         ("linted", LINTED, 4),
         ("patterns", PATTERNS, 6),
+        ("indexed", INDEXED, 6),
         ("functions", FUNCTIONS, 8),
         ("scopes", SCOPES, 7),
+        ("tactics", TACTICS, 8),
+        ("tactic_elsewhere", TACTIC_ELSEWHERE, 2),
     ] {
         let (ours, _) = outputs(&lib, &root, name, program);
         assert_eq!(
@@ -246,4 +376,192 @@ fn signature_binder_warnings_match_the_pin_and_are_never_invented() {
             );
         }
     }
+}
+
+/// `simp_all` keeps no hypothesis it leaves as `True` (`SimpAll.main`), so its goal shows
+/// none, and a parameter that reached `True` is unused: its rewriting proof never enters
+/// the term. A hypothesis given as `True` is dropped too. A hypothesis `rw … at h` rewrote
+/// and nothing then reads leaves no proof either (the pin's asserted goal applied to it is
+/// beta-reduced away), so neither it nor the equation is used.
+#[test]
+fn simp_all_drops_true_hypotheses_and_their_proofs_as_the_pin_does() {
+    let Some(lib) = pinned_toolchain() else {
+        return;
+    };
+    let root = workspace();
+    let program = "axiom q : Nat → Prop
+axiom p : Nat → Prop
+axiom q_eq_p : q = p
+example (h₁ : ¬ q 0) (h₂ : ¬ q 0) : ¬ p 0 := by
+  simp_all
+  trace_state
+  rw [← q_eq_p]
+  assumption
+example (a : Nat) (h₀ : True) (h₁ : a = 1) : a = 1 := by
+  simp_all
+example (a b : Nat) (h : a = b) (e : b = a) (p : Prop) (hp : p) : p := by
+  rw [e] at h
+  trace_state
+  exact hp
+";
+    let (ours, pinned) = outputs_under(
+        &lib,
+        &root,
+        "simp_all_true",
+        "prelude\nimport Init.SimpLemmas\n",
+        program,
+    );
+    assert_eq!(ours, pinned, "{program}");
+    assert_eq!(
+        ours.matches("is not explicitly referenced").count(),
+        4,
+        "{ours}"
+    );
+    assert!(ours.contains("h₂ : ¬q 0\n⊢ ¬p 0\n"), "{ours}");
+}
+
+/// An unqualified head names this file's constructor first: with `Init.Data.List.Basic`
+/// imported, `cons` under `open BV` is `BV.cons`, not `List.Sublist.cons`, whose first explicit
+/// field is an index. Under a named pattern `x@(vec.cons h t)` the pin warns about every
+/// unused field, `t` included. Both are as the pinned v4.32.0 prints them (2026-10-22).
+#[test]
+fn a_local_constructor_and_a_named_pattern_are_read_as_the_pin_reads_them() {
+    let Some(lib) = pinned_toolchain() else {
+        return;
+    };
+    let root = workspace();
+    let program = "inductive BV : Nat → Type
+| nil  : BV 0
+| cons : {n : Nat} → Bool → BV n → BV (n+1)
+open BV
+def g : {n : Nat} → BV n → Nat → Nat
+  | _, cons b v, 1000000 => g v 0
+  | _, cons b v, x       => g v (x + 1)
+  | _, nil, _            => 0
+inductive vec : Nat → Type where
+  | nil : vec 0
+  | cons : Nat → vec n → vec n.succ
+def tst2 : vec n → Option (Nat × vec n)
+  | x@(vec.cons h t) => some (h, x)
+  | _ => none
+";
+    let (ours, pinned) = outputs_under(
+        &lib,
+        &root,
+        "local_constructors",
+        "prelude\nimport Init.Data.List.Basic\n",
+        program,
+    );
+    assert_eq!(ours, pinned, "{program}");
+    assert_eq!(
+        ours.matches("is not explicitly referenced").count(),
+        3,
+        "{ours}"
+    );
+}
+
+/// A body whose elaboration runs a tactic is read only through its elaborated term, so its own
+/// binders are never linted (`linter.unusedVariables.analyzeTactics` off): `xs[0]` runs its
+/// `get_elem_tactic` auto-parameter, and a structure instance leaving out a field `p : P := by
+/// rfl` runs that field's tactic. With the proof given (`xs[0]'h`, `proof := rfl`) no tactic runs
+/// and the binder warns. As the pinned v4.32.0 prints it (2026-10-22).
+#[test]
+fn a_body_running_an_implicit_tactic_is_not_linted_as_at_the_pin() {
+    let Some(lib) = pinned_toolchain() else {
+        return;
+    };
+    let root = workspace();
+    let program = "def g1 (xs : Array Nat) (h : 0 < xs.size) : Nat := (fun (y : Nat) => xs[0]) 5
+def g2 (xs : Array Nat) (h : 0 < xs.size) : Nat := (fun (y : Nat) => xs[0]'h) 5
+structure C where
+  value : Nat
+  proof : value = value := by rfl
+  callback : (n : Nat) → n = n → Nat
+def a1 : C := { value := 40, callback := fun n h => n + 2 }
+def a2 : C := { value := 40, proof := rfl, callback := fun n h => n + 2 }
+";
+    let (ours, pinned) = outputs_under(
+        &lib,
+        &root,
+        "implicit_tactics",
+        "prelude\nimport Init.Data.Array.Basic\n",
+        program,
+    );
+    assert_eq!(ours, pinned, "{program}");
+    assert_eq!(
+        ours.matches("is not explicitly referenced").count(),
+        2,
+        "{ours}"
+    );
+}
+
+/// A `do` element binding the same name (`let s ← e`) shadows a `fun` binder in the elements
+/// after it. A binder read only after such a rebinding is unused (`elab/IRbug`), while one read
+/// in the rebinding's own value or before it is not. Each is as the pinned v4.32.0 prints it
+/// (2026-10-22).
+#[test]
+fn a_do_rebinding_shadows_an_outer_binder_as_the_pin_reads_it() {
+    let Some(lib) = pinned_toolchain() else {
+        return;
+    };
+    let root = workspace();
+    let program = "def f (b : Bool) : Id String := do
+  let t ← pure \"t\"
+  (fun (s : String) => do
+    let s ← pure (if b then t else \"u\"); pure s) \"\"
+def g (b : Bool) : Id String := do
+  (fun (s : String) => do
+    let s ← pure (if b then s else \"u\"); pure s) \"\"
+def h (b : Bool) : Id String := do
+  (fun (s : String) => do
+    let r ← pure s
+    let s ← pure (if b then r else \"u\"); pure s) \"\"
+";
+    let (ours, pinned) = outputs_under(
+        &lib,
+        &root,
+        "do_shadowing",
+        "prelude\nimport Init.Control.Id\n",
+        program,
+    );
+    assert_eq!(ours, pinned, "{program}");
+    assert_eq!(
+        ours.matches("is not explicitly referenced").count(),
+        1,
+        "{ours}"
+    );
+}
+
+/// The pin lints a query's term as it lints a declaration's: `#check`, `#eval` and `#reduce`
+/// warn about their unused binders, each warning after the command's own output (the linters
+/// run once the command has logged its messages). A query whose syntax holds `sorry` is not
+/// linted. As the pinned v4.32.0 prints it (2026-10-22).
+#[test]
+fn queries_are_linted_after_their_output_as_at_the_pin() {
+    let Some(lib) = pinned_toolchain() else {
+        return;
+    };
+    let root = workspace();
+    let program = "#check fun (y : Nat) => 3
+#eval (fun (z : Nat) => 3) 2
+#reduce (fun (w : Nat) => 3) 2
+#check (fun (v : Nat) => 3 : Nat → Nat)
+#check fun (u : Nat) (h : u = u) => u
+#check ∀ (q : Nat), True
+#check fun (r : Nat) => (sorry : Nat)
+example : Nat := (fun (e : Nat) => 3) 2
+";
+    let (ours, pinned) = outputs_under(
+        &lib,
+        &root,
+        "queries",
+        "prelude\nimport Init.Data.Repr\n",
+        program,
+    );
+    assert_eq!(ours, pinned, "{program}");
+    assert_eq!(
+        ours.matches("is not explicitly referenced").count(),
+        7,
+        "{ours}"
+    );
 }

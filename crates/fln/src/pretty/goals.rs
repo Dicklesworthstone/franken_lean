@@ -109,6 +109,9 @@ impl Printer<'_> {
             self.bind(shown.clone(), binder_type);
             (value, type_) = (value_body.clone(), type_body.clone());
         }
+        // The term printed next is the top of the line, as at the pin, where these variables are
+        // free rather than bound.
+        self.top_names = self.names.len();
         Ok((value, type_))
     }
 }

@@ -20,6 +20,10 @@
 //! src/Lean/PrivateName.lean: sha256 f40339a7ed3fa6d741b26d9fe3e5c3c16c4ab8f283604e756dc6d0d43e399ae1
 //! src/Lean/Compiler/NoncomputableAttr.lean: sha256 8d1ba44757e2a2b4d1916ee97b8c0dd54171ff1890db8a1452f0346119d65859
 //! src/Lean/DefEqAttrib.lean: sha256 f0973ec2778b85e0c4a60d9e3267a5e8fff46a651fa4ddda04286e6d101f0adc
+//! src/Lean/PrettyPrinter/Delaborator/Attributes.lean: sha256 88dd9277c39f702b241ffa8853862538baee0cf546260eb09ae19c63c3151b26
+//! src/Lean/PrettyPrinter/Delaborator/Basic.lean: sha256 f109b13153edb8c12b2bf86edf7b334b7b0a3f3d02b73a43a7a0f4d9d911544a
+//! src/Lean/KeyedDeclsAttribute.lean: sha256 1d00864816438bbe7410fe9fd3a01599391f2c7d669b35fc300a38576d5aa063
+//! src/Lean/Compiler/InlineAttrs.lean: sha256 a3599016d38e2128d6c1f3cc384a544540b33db1288221754700da42c7e7d01c
 #![allow(dead_code)]
 
 pub const CLASS_NAME: usize = 0;
@@ -106,6 +110,12 @@ pub const AUX_RECURSOR_EXTENSION: &str = "Lean.auxRecExt";
 pub const NONCOMPUTABLE_EXTENSION: &str = "Lean.noncomputableExt";
 pub const DEFEQ_EXTENSION: &str = "Lean.defeqAttr";
 pub const BACKWARD_DEFEQ_EXTENSION: &str = "Lean.backwardDefeqAttr";
+pub const PP_ANONYMOUS_CONSTRUCTOR_EXTENSION: &str = "Lean.ppUsingAnonymousConstructorAttr";
+pub const PP_NODOT_EXTENSION: &str = "Lean.ppNoDotAttr";
+pub const APP_UNEXPANDER_EXTENSION: &str = "Lean.PrettyPrinter.Delaborator.appUnexpanderAttribute";
+pub const KEYED_ENTRY_KEY: usize = 0;
+pub const KEYED_ENTRY_DECL_NAME: usize = 1;
+pub const KEYED_ENTRY_POINTERS: usize = 2;
 pub const BINDER_DEFAULT: u8 = 0;
 pub const BINDER_IMPLICIT: u8 = 1;
 pub const BINDER_STRICT_IMPLICIT: u8 = 2;
@@ -133,6 +143,12 @@ pub const REDUCIBILITY_IRREDUCIBLE: usize = 2;
 pub const REDUCIBILITY_IMPLICIT_REDUCIBLE: usize = 3;
 pub const EXTERN_EXTENSION: &str = "Lean.externAttr";
 pub const IMPLEMENTED_BY_EXTENSION: &str = "Lean.Compiler.implementedByAttr";
+pub const INLINE_EXTENSION: &str = "Lean.Compiler.inlineAttrs";
+pub const INLINE_INLINE: usize = 0;
+pub const INLINE_NOINLINE: usize = 1;
+pub const INLINE_MACRO_INLINE: usize = 2;
+pub const INLINE_INLINE_IF_REDUCE: usize = 3;
+pub const INLINE_ALWAYS_INLINE: usize = 4;
 pub const LIST_NIL: u8 = 0;
 pub const LIST_CONS: u8 = 1;
 pub const LIST_CONS_HEAD: usize = 0;

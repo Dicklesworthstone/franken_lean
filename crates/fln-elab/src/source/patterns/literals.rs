@@ -206,6 +206,7 @@ impl Context {
                     },
                     syntax: Cow::Owned(identifier(name)),
                     fields,
+                    ellipsis: false,
                 }));
                 expanded.insert(pattern, index);
                 row.patterns[0] = index;

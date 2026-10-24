@@ -14,6 +14,8 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[path = "source_io_presentation/evaluation_capture.rs"]
+mod evaluation_capture;
 #[path = "source_io_presentation/executable_main.rs"]
 mod executable_main;
 #[path = "source_io_presentation/fixture.rs"]
@@ -411,6 +413,32 @@ fn admitted_io_printing_refuses_before_effects_and_skips_printers_on_exceptions(
         ).unwrap().into_complete().unwrap();
         assert_eq!(raw.batch.executions[0].evaluation_output(), None);
         assert_eq!(std::fs::read(&guard_effect).unwrap(), b"once\nonce\nonce\n");
+        // Under the `lean` presentation a guarded action runs, as the pin's `#eval` runs it
+        // inside `withIsolatedStreams`: its stdout is retained for the guard, its other
+        // effects happen. Every other presentation still refuses it before any effect.
+        for (payload, returned) in [("Unit", "()"), ("Nat", "42")] {
+            let effect = directory.0.join(format!("guarded-{payload}.txt"));
+            let source = format!(r#"#guard_msgs in
+#eval show IO {payload} from do
+  let h ← IO.FS.Handle.mk {} IO.FS.Mode.append
+  h.putStr "written\n"
+  return {returned}"#, quoted(&effect));
+            let guarded = engine.execute_source_commands_with_presentation(
+                source.as_bytes(), &KVMap::new(), limits(), EvaluationPresentation::Lean,
+            ).unwrap().into_complete().unwrap();
+            // File writes stay outside the evaluation's output capture. The
+            // adjacent capture tests exercise the admitted stdout/stderr paths.
+            assert_eq!(guarded.batch.executions[0].captured_stdout(), Some(&[][..]));
+            assert_eq!(std::fs::read(&effect).unwrap(), b"written\n");
+        }
+        let raw = engine.execute_source_commands_with_presentation(
+            format!("#guard_msgs in\n{}", action("IoBoth", "IoBoth.mk")).as_bytes(),
+            &KVMap::new(), limits(), EvaluationPresentation::PreferRaw,
+        ).unwrap_err();
+        assert!(matches!(inner_error(&raw), fln::EngineExecutionError::NotImplemented {
+            feature: "`#guard_msgs` over an IO action",
+        }), "{raw:?}");
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"unchanged\n");
 
         // Silent Unit has no printer options or MessageData requirement. The
         // same inputs remain explicit refusals when a payload needs printing.

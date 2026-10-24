@@ -2,7 +2,7 @@
 //! elaboration results, never guesses from a declaration's name or body.
 use super::*;
 
-fn register_irreducible(
+pub(crate) fn register_irreducible(
     engine: &mut Engine,
     declaration: &Declaration,
 ) -> Result<(), EngineExecutionError> {

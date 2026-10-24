@@ -6,6 +6,7 @@ use super::*;
 use crate::instances::{InstanceRegistry, InstanceRegistryError, result_head};
 
 pub(super) mod audit;
+mod first_order;
 mod parameters;
 mod reconcile;
 mod table;
@@ -1106,12 +1107,28 @@ impl Context {
         // then synthesizes its prerequisites using ordinary instance search.
         // Preserve alias inputs during normal selection; only this selected
         // default application may use safe-definition conversion.
+        let result_type = term.type_;
         self.equations.push(if default_application {
-            SourceEquation::default_instance(term.type_, target.clone())
+            SourceEquation::default_instance(result_type.clone(), target.clone())
         } else {
-            SourceEquation::selection(term.type_, target.clone())
+            SourceEquation::selection(result_type.clone(), target.clone())
         });
-        self.flush(true)?;
+        match self.flush(true) {
+            Err(
+                error @ NatDefinitionElabError::Inference(SourceInferenceError::Unification(_)),
+            ) if !default_application
+                && matches!(
+                    &error,
+                    NatDefinitionElabError::Inference(SourceInferenceError::Unification(reason))
+                        if matches!(reason.as_ref(), UnificationError::Deferred(_))
+                ) =>
+            {
+                if !self.first_order_instance_selection(&result_type, target, registry)? {
+                    return Err(error);
+                }
+            }
+            result => result?,
+        }
         Ok(Some(Expansion {
             value: term.value,
             subgoals,

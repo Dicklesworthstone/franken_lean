@@ -35,13 +35,29 @@ impl Context {
             self.decide_constant(),
             [proposition.clone(), dictionary.clone()],
         );
-        if !self.decision_computes_true(computation)? {
+        if !self.decision_computes_true(computation.clone())? {
             return Err(error(TacticError::DecisionNotTrue));
         }
         let reflexive = apps(
             constant("Eq.refl", vec![Level::one()]),
             [constant("Bool", vec![]), constant("Bool.true", vec![])],
         );
+        // `mkDecideProof` (vendored `Lean/Meta/AppBuilder.lean:593-598`): the reflexivity proof
+        // carries its expected type, `@id (decide p = true) rfl` (`mkExpectedPropHint`); `#print`
+        // shows it as `of_decide_eq_true (id (Eq.refl true))`. The seed dialect has no `id`.
+        let reflexive = if self.txn.env.contains(&Name::from_components(["id"])) {
+            let equation = apps(
+                constant("Eq", vec![Level::one()]),
+                [
+                    constant("Bool", vec![]),
+                    computation,
+                    constant("Bool.true", vec![]),
+                ],
+            );
+            apps(constant("id", vec![Level::zero()]), [equation, reflexive])
+        } else {
+            reflexive
+        };
         let value = apps(
             constant("of_decide_eq_true", vec![]),
             [proposition, dictionary, reflexive],

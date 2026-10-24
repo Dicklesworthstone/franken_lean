@@ -13,8 +13,9 @@
 //! dangerous direction is accepting source the Reference rejects, whichever
 //! door does it.
 //! Output is compared only when the Reference and FrankenLean's `lean` both
-//! accept: the Reference's `--json` information messages, in order, must equal
-//! FrankenLean's stdout lines. Reference warnings (linters) are not compared.
+//! accept: the two plain stdouts must be equal once every warning the Reference
+//! reports (`--json`, its linters) is removed from both. A linter this door lacks
+//! is not compared; a warning only this door prints is a difference.
 //!
 //! Without the pinned Reference toolchain the test prints a typed SKIP; set
 //! `FLN_REQUIRE_REFERENCE=1` in any job that installs the pin so absence fails.
@@ -122,21 +123,33 @@ fn observe(reference: &Path, file: &Path) -> Observed {
         .output()
         .expect("run pinned Reference lean");
     let reference_json = String::from_utf8_lossy(&reference_run.stdout);
-    let mut information = Vec::new();
     let mut first_error = String::new();
+    // Each warning as the pin's plain output prints it, `file:line:column: warning: data`.
+    let mut warnings = Vec::new();
     for line in reference_json.lines().filter(|line| line.starts_with('{')) {
         let severity = json_string_field(line, "severity").unwrap_or_default();
         let data = json_string_field(line, "data").unwrap_or_default();
-        if severity == "information" {
-            information.push(data);
-        } else if severity == "error" && first_error.is_empty() {
-            let line_no = line
-                .split("\"pos\":{")
+        let position = |field: &str| {
+            line.split("\"pos\":{")
                 .nth(1)
-                .and_then(|pos| pos.split("\"line\":").nth(1))
+                .and_then(|pos| pos.split(&format!("\"{field}\":")).nth(1))
                 .and_then(|rest| rest.split(|c: char| !c.is_ascii_digit()).next())
-                .unwrap_or("?");
-            first_error = format!("{}: {}", line_no, data.lines().next().unwrap_or_default());
+                .unwrap_or("?")
+                .to_owned()
+        };
+        if severity == "error" && first_error.is_empty() {
+            first_error = format!(
+                "{}: {}",
+                position("line"),
+                data.lines().next().unwrap_or_default()
+            );
+        } else if severity == "warning" {
+            warnings.push(format!(
+                "{}:{}:{}: warning: {data}\n",
+                file.display(),
+                position("line"),
+                position("column")
+            ));
         }
     }
     let reference_accepts = reference_run.status.success();
@@ -159,11 +172,22 @@ fn observe(reference: &Path, file: &Path) -> Observed {
     };
 
     let output = if reference_accepts && lean_run.status.success() {
-        let mut expected = information.join("\n");
-        if !expected.is_empty() {
-            expected.push('\n');
-        }
-        if String::from_utf8_lossy(&lean_run.stdout) == expected {
+        let plain = Command::new(reference)
+            .arg(file)
+            .output()
+            .expect("run pinned Reference lean");
+        // The pin's warnings are not compared: each is removed from both outputs, so a linter
+        // this door lacks is not a difference, while a warning only this door prints is.
+        let without_warnings = |bytes: &[u8]| {
+            let mut text = String::from_utf8_lossy(bytes).into_owned();
+            for warning in &warnings {
+                if let Some(at) = text.find(warning.as_str()) {
+                    text.replace_range(at..at + warning.len(), "");
+                }
+            }
+            text
+        };
+        if without_warnings(&lean_run.stdout) == without_warnings(&plain.stdout) {
             "match"
         } else {
             "differ"
@@ -466,10 +490,8 @@ const DIVERGENCE_ALLOWANCE: &[&str] = &[
     "crates/fln-cli/tests/fixtures/source_ladder/inductive_equation_compiler.lean",
     "crates/fln-cli/tests/fixtures/source_ladder/init_lemma_reference.lean",
     "crates/fln-cli/tests/fixtures/source_ladder/io_main.lean",
-    "crates/fln-cli/tests/fixtures/source_ladder/omega_and_simp.lean",
     "crates/fln-cli/tests/fixtures/source_ladder/option_do_notation.lean",
     "crates/fln-cli/tests/fixtures/source_ladder/string_interpolation.lean",
-    "crates/fln-cli/tests/fixtures/source_ladder/structure_instance_anonymous_constructor.lean",
     "examples/native_constrained_matching.lean",
     "examples/native_constrained_recursion.lean",
     "examples/native_constructor_tactics.lean",

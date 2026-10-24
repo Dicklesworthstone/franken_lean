@@ -3,6 +3,7 @@
 //! An unsuccessful alternative restores its complete elaboration state while
 //! retaining spent work. Every productive step is ordinary Eq.rec transport.
 
+mod arith;
 mod binders;
 mod dsimp;
 mod locations;
@@ -29,13 +30,17 @@ pub(in crate::source) enum SimpRule<'a> {
     /// A wildcard selects a proof by local identity, not its display spelling.
     /// Location simplification remaps this identity when replacing the local.
     Local(FVarId),
+    /// `+arith`'s linear normalization (`arith.rs`), always the last rule: the pin's
+    /// `simpArith` runs after `rewritePost` (`Rewrite.lean:542-546`). It rewrites; it never
+    /// closes a goal by itself.
+    Arith,
 }
 impl SimpRule<'_> {
     fn reverse(&self) -> bool {
         match self {
             Self::Explicit(rule) => rule.reverse,
             Self::Global(rule) => rule.reverse,
-            Self::Local(_) => false,
+            Self::Local(_) | Self::Arith => false,
         }
     }
 }
@@ -53,7 +58,10 @@ impl Context {
         let mut changed = false;
         for syntax in names {
             self.tick()?;
-            match self.unfold_simp_term(syntax, false, &current)? {
+            self.unfold_tactic = true;
+            let unfolded = self.unfold_simp_term(syntax, false, &current);
+            self.unfold_tactic = false;
+            match unfolded? {
                 UnfoldResult::NotDefinition => {
                     let name = match syntax {
                         Syntax::Ident { val, .. } => val.clone(),
@@ -372,6 +380,9 @@ impl Context {
         index: Option<&SimpTargetIndex>,
         side: SimpKeySide,
     ) -> bool {
+        if matches!(rule, SimpRule::Arith) {
+            return matches!(side, SimpKeySide::Rewrite);
+        }
         let (Some(index), SimpRule::Global(entry)) = (index, rule) else {
             return true;
         };
@@ -739,6 +750,8 @@ impl Context {
                     type_: local.type_.clone(),
                 })
             }
+            // Arithmetic normalization has no single proof term to select.
+            SimpRule::Arith => Err(error(TacticError::MalformedScript)),
         }
     }
 
@@ -824,12 +837,27 @@ impl Context {
             },
             "simplification keyword",
         )?;
-        expect_default_config(config, "default simplification configuration")?;
+        // `dsimp`'s configuration has no `arith` field.
+        let arith = self.simp_arith_config(config, !dsimp)?;
         expect_empty_null(discharger, "default simplification discharger")?;
         if !simpa {
             let location = location.ok_or_else(|| error(TacticError::MalformedScript))?;
             self.rewrite_locations(location)?;
         }
+        let mut rules = self.simp_rule_selection(dsimp, only, arguments)?;
+        if arith {
+            rules.push(SimpRule::Arith);
+        }
+        Ok(rules)
+    }
+
+    /// The rules `simp_rules` selects, before `+arith`'s normalization joins them last.
+    fn simp_rule_selection<'a>(
+        &mut self,
+        dsimp: bool,
+        only: &'a Syntax,
+        arguments: &'a Syntax,
+    ) -> Result<Vec<SimpRule<'a>>, NatDefinitionElabError> {
         let use_default = match expect_null_args(only, "optional explicit simp set")? {
             [] => true,
             [only] => {
@@ -1101,7 +1129,7 @@ impl Context {
             lctx: self.txn.lctx.clone(),
             introduced: Vec::new(),
         };
-        if let Some(value) = self.simp_reflexivity(&goal)? {
+        if let Some(value) = self.simp_reflexivity(&goal, rules)? {
             return Ok(Some(value));
         }
         if rules.is_empty() {
@@ -1163,7 +1191,7 @@ impl Context {
             }
             let value = match self.simp_selected_proof(&goal.target, rules)? {
                 Some(value) => Some(value),
-                None => self.simp_reflexivity(&goal)?,
+                None => self.simp_reflexivity(&goal, rules)?,
             };
             let Some(value) = value else {
                 return Ok(None);
@@ -1208,9 +1236,16 @@ impl Context {
     /// Check a candidate only after the shared automatic-closure policy admits
     /// it. Full K1 assignment conversion alone would unfold ordinary definitions
     /// that are absent from this tactic's explicit rule set.
+    ///
+    /// The pin closes a goal only once its simp result is `True` (`simpTargetCore`,
+    /// `Lean/Meta/Tactic/Simp/Main.lean:784`). A quantified goal whose leaf closes becomes
+    /// `∀ y, True` there, and `True` only through `implies_true`, so `rules` decide whether
+    /// it closes: `∀ y : Nat, y + 0 = y := by simp only [Nat.add_zero]` is "unsolved goals
+    /// ⊢ ∀ (y : Nat), True" at v4.32.0, and `by simp` accepts it.
     fn simp_reflexivity(
         &mut self,
         goal: &ProofGoal,
+        rules: &[SimpRule<'_>],
     ) -> Result<Option<Expr>, NatDefinitionElabError> {
         let target = self.whnf_with_transparency(
             &goal.target,
@@ -1225,6 +1260,9 @@ impl Context {
                     .value,
             )
         } else if matches!(target.node(), ExprNode::ForallE { .. }) {
+            if !self.simp_rules_close_implications(rules)? {
+                return Ok(None);
+            }
             self.simp_quantified_reflexivity(goal, target)?
         } else {
             self.automatic_reflexivity_candidate(goal, false)?
@@ -1346,7 +1384,7 @@ impl Context {
                 self.close_proof_goal(goal, completion.value.clone())?;
             } else if let Some(value) = self.simp_selected_proof(&goal.target, rules)? {
                 self.close_proof_goal(goal, value)?;
-            } else if let Some(value) = self.simp_reflexivity(&goal)? {
+            } else if let Some(value) = self.simp_reflexivity(&goal, rules)? {
                 self.close_proof_goal(goal, value)?;
             } else if steps > 0 {
                 // Simplification can expose a non-reflexive remaining goal.

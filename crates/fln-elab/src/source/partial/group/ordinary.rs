@@ -1,8 +1,11 @@
-//! Acyclic ordinary mutual predefinitions, following MutualDef's header/body
-//! boundary and dependency partition. Headers are private candidate data, never
-//! temporary environment axioms. A recursive component needs a termination
-//! elaborator and is refused here, never downgraded to a partial definition.
+//! Ordinary mutual predefinitions, following MutualDef's header/body boundary
+//! and dependency partition. Headers are private candidate data, never
+//! temporary environment axioms. A recursive component of definitions with Nat
+//! `termination_by` measures is elaborated by well-founded recursion over one
+//! shared fixpoint; any other recursive component is refused here, never
+//! downgraded to a partial definition.
 use super::*;
+use recursion::MemberHint;
 
 pub fn is_ordinary_group_member(syntax: &Syntax) -> bool {
     let Some(declaration) = syntax_args(syntax, &parser_kind(&["Command", "declaration"])) else {
@@ -176,6 +179,7 @@ fn elaborate_with_meter(
     };
     let mut bodies = Vec::new();
     let mut universes = Vec::new();
+    let mut hints = Vec::new();
     let theorem = proof_group == Some(true);
     for syntax in members {
         let mut context = Context::scoped(environment, kernel, scope);
@@ -183,6 +187,7 @@ fn elaborate_with_meter(
         context.partial = Some(State {
             kind: Kind::Unsafe,
             group: Some(group.clone()),
+            ordinary: true,
             ..State::default()
         });
         let mut definition = match definition_in_context(syntax, &mut context)? {
@@ -209,6 +214,13 @@ fn elaborate_with_meter(
             Some(&mut definition.value),
         )?;
         universes.push((context.level_params.clone(), context.explicit_levels));
+        hints.push(
+            context
+                .partial
+                .as_ref()
+                .and_then(|state| state.member_hint.clone())
+                .unwrap_or(MemberHint::None),
+        );
         meter.txn.budget = context.txn.budget;
         bodies.push(definition);
     }
@@ -232,25 +244,77 @@ fn elaborate_with_meter(
             pending.extend(children(expr));
         }
     }
+    // `partitionPreDefs` (Lean/Elab/PreDefinition/Main.lean): components of the
+    // value-only call graph, members in the pin's Tarjan order. Admission keeps
+    // this module's source-ordered dependency sort over the components.
+    let mut successors = Vec::new();
+    for body in &bodies {
+        successors.push(meter.mutual_call_order(&body.value, &names)?);
+    }
+    let components = recursion::strongly_connected(&successors);
+    let mut component_of = vec![0; names.len()];
+    for (index, component) in components.iter().enumerate() {
+        for &member in component {
+            component_of[member] = index;
+        }
+    }
     let mut remaining = vec![true; names.len()];
     let mut declarations = Vec::new();
-    while declarations.len() < names.len() {
+    let mut irreducible = BTreeSet::new();
+    while remaining.iter().any(|pending| *pending) {
         let mut next = None;
         for (index, pending) in remaining.iter().enumerate() {
             meter.tick()?;
+            let component = &components[component_of[index]];
             if *pending
-                && edges[index]
-                    .iter()
-                    .zip(&remaining)
-                    .all(|(edge, live)| !edge || !live)
+                && component.iter().all(|&from| {
+                    edges[from]
+                        .iter()
+                        .zip(&remaining)
+                        .enumerate()
+                        .all(|(to, (edge, live))| !edge || !live || component.contains(&to))
+                })
             {
-                next = Some(index);
+                next = Some(component_of[index]);
                 break;
             }
         }
-        let index = next.ok_or_else(|| {
+        let component = components[next.ok_or_else(|| {
             refusal("recursive ordinary mutual component requires termination elaboration")
-        })?;
+        })?]
+        .clone();
+        if component.len() > 1 || edges[component[0]][component[0]] {
+            if theorem {
+                return Err(refusal(
+                    "recursive ordinary mutual component requires termination elaboration",
+                ));
+            }
+            let (mutual, members_published, executable) = mutual_well_founded(
+                &mut meter,
+                (environment, kernel, scope),
+                &Parts {
+                    group: &group,
+                    members,
+                    names: &names,
+                    bodies: &bodies,
+                    hints: &hints,
+                    headers: &headers,
+                    level_names: level_names.as_deref().unwrap_or_default(),
+                },
+                &component,
+            )?;
+            declarations.push(Declaration::Defn(mutual));
+            for definition in members_published {
+                irreducible.insert(definition.base.name.clone());
+                declarations.push(Declaration::Defn(definition));
+            }
+            declarations.push(Declaration::Mutual(executable));
+            for &index in &component {
+                remaining[index] = false;
+            }
+            continue;
+        }
+        let index = component[0];
         let mut definition = bodies[index].clone();
         definition.safety = DefinitionSafety::Safe;
         definition.all = vec![names[index].clone()];
@@ -268,10 +332,231 @@ fn elaborate_with_meter(
     Ok(ElaboratedPartial {
         declarations,
         noncomputable: BTreeSet::new(),
+        irreducible,
         scope: scope.clone(),
         budget: meter.txn.budget,
         kernel,
     })
+}
+
+/// The whole group's elaborated data, indexed by source position.
+struct Parts<'a> {
+    group: &'a Group,
+    members: &'a [Syntax],
+    names: &'a [Name],
+    bodies: &'a [DefinitionVal],
+    hints: &'a [MemberHint],
+    headers: &'a [ConstantVal],
+    level_names: &'a [Name],
+}
+
+/// A recursive component of two or more definitions, all with Nat measures:
+/// the pin's `wfRecursion` over the component (see
+/// `recursion::well_founded::mutual`). Returns `<first>._mutual`, the members'
+/// wrappers in SCC order, and their `_unsafe_rec` executable companions.
+/// Every other recursive component is refused.
+fn mutual_well_founded(
+    meter: &mut Context,
+    (environment, kernel, scope): (&Environment, Budget, &SourceScope),
+    parts: &Parts<'_>,
+    component: &[usize],
+) -> Result<(DefinitionVal, Vec<DefinitionVal>, Vec<DefinitionVal>), NatDefinitionElabError> {
+    let Parts {
+        group,
+        members,
+        names,
+        bodies,
+        hints,
+        headers,
+        level_names,
+    } = *parts;
+    let unsupported = |shape| {
+        failure(SourceInferenceError::Recursion(
+            recursion::RecursionError::MutualWellFoundedUnsupported(shape),
+        ))
+    };
+    if component.len() < 2 {
+        return Err(refusal(
+            "recursive ordinary mutual component requires termination elaboration",
+        ));
+    }
+    let component_hints: Vec<_> = component.iter().map(|&index| &hints[index]).collect();
+    if component_hints
+        .iter()
+        .all(|hint| matches!(hint, MemberHint::None))
+    {
+        return Err(refusal(
+            "recursive ordinary mutual component requires termination elaboration",
+        ));
+    }
+    if component_hints
+        .iter()
+        .any(|hint| matches!(hint, MemberHint::Structural))
+    {
+        return Err(unsupported("structural mutual recursion"));
+    }
+    let mut measured = Vec::new();
+    for hint in component_hints {
+        match hint {
+            MemberHint::Measured(Ok(member)) => measured.push(member.clone()),
+            MemberHint::Measured(Err(problem)) => return Err(problem.clone()),
+            // The pin reports an incomplete set of termination hints and
+            // guesses every measure (GuessLex), which this group does not.
+            MemberHint::None | MemberHint::DecreasingOnly => {
+                return Err(unsupported(
+                    "a member without a termination_by measure (the pin's GuessLex)",
+                ));
+            }
+            MemberHint::Structural => return Err(unsupported("structural mutual recursion")),
+        }
+    }
+    // `checkCodomains` (WF/Rel.lean): one measure type for the whole group.
+    if let Some(position) = measured.iter().position(|member| !member.nat) {
+        if measured.iter().any(|member| member.nat) {
+            let first = measured.iter().position(|member| member.nat).unwrap_or(0);
+            let (first, other) = if first < position {
+                (first, position)
+            } else {
+                (position, first)
+            };
+            return Err(failure(SourceInferenceError::Recursion(
+                recursion::RecursionError::MutualMeasureTypeMismatch {
+                    first: names[component[first]].clone(),
+                    other: names[component[other]].clone(),
+                },
+            )));
+        }
+        return Err(unsupported("measures of a type other than Nat"));
+    }
+    if measured.iter().any(|member| !member.natural) {
+        return Err(unsupported(
+            "a Nat measure under a WellFoundedRelation other than Nat.lt_wfRel",
+        ));
+    }
+    if !scope.variables.is_empty() {
+        return Err(unsupported("section variables"));
+    }
+    for &index in component {
+        if headers[index].level_params != level_names {
+            return Err(unsupported(
+                "universe parameters written identically on every member",
+            ));
+        }
+    }
+    let component_names: Vec<_> = component
+        .iter()
+        .map(|&index| names[index].clone())
+        .collect();
+    let arities: Vec<_> = measured.iter().map(|member| member.arity).collect();
+    let values: Vec<_> = component
+        .iter()
+        .map(|&index| bodies[index].value.clone())
+        .collect();
+    let fixed = meter
+        .mutual_fixed_prefix(&values, &arities, &component_names)?
+        .ok_or_else(|| {
+            unsupported("fixed parameters that are not one common unreordered prefix")
+        })?;
+    let auxiliary = Name::str(component_names[0].clone(), "_mutual");
+    let executable: Vec<_> = component_names
+        .iter()
+        .map(|name| Name::str(name.clone(), "_unsafe_rec"))
+        .collect();
+    if std::iter::once(&auxiliary)
+        .chain(&executable)
+        .any(|name| environment.contains(name) || names.contains(name))
+    {
+        return Err(refusal("fresh distinct ordinary mutual names"));
+    }
+    let types: Vec<_> = component
+        .iter()
+        .map(|&index| headers[index].type_.clone())
+        .collect();
+    let measures: Vec<_> = measured
+        .iter()
+        .map(|member| member.measure.clone())
+        .collect();
+    let mut planner = Context::scoped(environment, kernel, scope);
+    planner.txn.budget = meter.txn.budget.clone();
+    let plan = std::sync::Arc::new(planner.mutual_well_founded_plan(
+        component_names.clone(),
+        types,
+        arities,
+        &measures,
+        fixed,
+        level_names.to_vec(),
+    )?);
+    meter.txn.budget = planner.txn.budget;
+    let mut wrappers = Vec::new();
+    let mut pieces = Vec::new();
+    for (position, &index) in component.iter().enumerate() {
+        let member = &members[index];
+        let mut context = Context::scoped(environment, kernel, scope);
+        context.txn.budget = meter.txn.budget.clone();
+        context.partial = Some(State {
+            kind: Kind::Unsafe,
+            group: Some(group.clone()),
+            ordinary: true,
+            ..State::default()
+        });
+        context.mutual_member = Some(recursion::MutualMember::new(plan.clone(), position));
+        let Declaration::Mutual(mut definitions) = definition_in_context(member, &mut context)?
+        else {
+            return Err(refusal("one ordinary body per mutual header"));
+        };
+        let (Some(mut wrapper), true) = (definitions.pop(), definitions.is_empty()) else {
+            return Err(refusal("one ordinary body per mutual header"));
+        };
+        if context.noncomputable_definition {
+            return Err(refusal("computable ordinary mutual definition"));
+        }
+        let piece = context
+            .mutual_member
+            .as_ref()
+            .and_then(|member| member.piece())
+            .cloned()
+            .ok_or_else(|| failure(SourceInferenceError::Scope))?;
+        meter.txn.budget = context.txn.budget;
+        wrapper.safety = DefinitionSafety::Safe;
+        wrapper.hints = ReducibilityHints::Regular(1);
+        wrapper.all = component_names.clone();
+        if wrapper.base.name != component_names[position] {
+            return Err(failure(SourceInferenceError::Scope));
+        }
+        wrappers.push(wrapper);
+        pieces.push(piece);
+    }
+    let mut assembler = Context::scoped(environment, kernel, scope);
+    assembler.txn.budget = meter.txn.budget.clone();
+    let mutual = assembler.assemble_mutual_well_founded(&plan, &pieces)?;
+    meter.txn.budget = assembler.txn.budget;
+    // `addAndCompileUnsafe` (Lean/Elab/PreDefinition/Basic.lean): the pin also
+    // admits each member's original recursive body as `partial def
+    // <member>._unsafe_rec`, calling its peers' companions, and compiles those.
+    // The runtime selects such a companion only for a complete linked group.
+    let mut implementations = Vec::new();
+    for &index in component {
+        let mut definition = bodies[index].clone();
+        definition.value = map(meter, &definition.value, &|_, expr| {
+            let ExprNode::Const { name, levels } = expr.node() else {
+                return Ok(None);
+            };
+            Ok(component_names
+                .iter()
+                .position(|member| member == name)
+                .map(|target| Expr::const_(executable[target].clone(), levels.clone())))
+        })?;
+        let position = component_names
+            .iter()
+            .position(|member| member == &definition.base.name)
+            .ok_or_else(|| failure(SourceInferenceError::Scope))?;
+        definition.base.name = executable[position].clone();
+        definition.safety = DefinitionSafety::Partial;
+        definition.hints = ReducibilityHints::Opaque;
+        definition.all = executable.clone();
+        implementations.push(definition);
+    }
+    Ok((mutual, wrappers, implementations))
 }
 
 #[cfg(test)]

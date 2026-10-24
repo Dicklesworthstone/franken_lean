@@ -1,7 +1,7 @@
-//! Explicit, thread-local memory sinks for reviewed Golem stream callbacks.
+//! Explicit, thread-local memory sinks for reviewed native stream callbacks.
 //! No native FILE is created, closed, or redirected. A retained callback binds
-//! each scope to validated stdout/optional stderr Handles; other Handles keep
-//! normal fwrite.
+//! each scope to validated stdout and optionally stderr Handles; other Handles
+//! keep normal fwrite.
 
 use super::Obj;
 use std::cell::RefCell;
@@ -36,11 +36,12 @@ pub struct StdoutCapture {
 struct Frame {
     id: u64,
     callback: Obj,
-    stderr: Option<Obj>,
-    escaped: bool,
+    stderr_callback: Option<Obj>,
     bytes: Vec<u8>,
     escaped_bytes: usize,
     limit: usize,
+    /// Raw isolation counts bytes as written. Evaluation capture counts escaped JSON bytes.
+    count_raw: bool,
     error: Option<StdoutCaptureError>,
 }
 
@@ -59,27 +60,59 @@ impl StdoutCapture {
     /// bounds JSON string content after escaping (excluding quotes), and hence
     /// also bounds the unchanged raw UTF-8 bytes. Each write is all-or-nothing.
     pub fn begin(max_escaped_bytes: usize) -> Result<Self, StdoutCaptureError> {
-        Self::begin_scope(max_escaped_bytes, false, true)
+        Self::begin_streams(max_escaped_bytes, false, false)
+    }
+
+    /// Capture this thread's exact current native stdout and stderr in one
+    /// ordered buffer. Native nonfatal panic and trace lines join the same
+    /// bounded stream. This does not replace or empty the thread's stdin.
+    pub fn begin_evaluation(max_escaped_bytes: usize) -> Result<Self, StdoutCaptureError> {
+        Self::begin_streams(max_escaped_bytes, true, false)
     }
 
     /// Isolate this thread's stdout and optionally stderr into one ordered
-    /// UTF-8 buffer. Unlike JSON capture, the allowance counts raw bytes.
+    /// buffer whose allowance counts raw bytes, not JSON escapes.
     pub fn begin_isolated(
         max_bytes: usize,
         isolate_stderr: bool,
     ) -> Result<Self, StdoutCaptureError> {
-        Self::begin_scope(max_bytes, isolate_stderr, false)
+        Self::begin_streams(max_bytes, isolate_stderr, true)
     }
 
-    fn begin_scope(
-        limit: usize,
-        isolate_stderr: bool,
-        escaped: bool,
+    /// The current thread's first unsettled capture failure.
+    pub fn current_error() -> Option<StdoutCaptureError> {
+        STATE.with(|state| {
+            state
+                .borrow()
+                .frames
+                .iter()
+                .rev()
+                .find_map(|frame| frame.error)
+        })
+    }
+
+    /// Retain text in the enclosing memory capture. Absent scope refuses.
+    pub fn append_current(text: &str) -> Result<(), StdoutCaptureError> {
+        STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            let frame = state
+                .frames
+                .last_mut()
+                .ok_or(StdoutCaptureError::ScopeUnavailable)?;
+            frame.append(text.as_bytes())
+        })
+    }
+
+    fn begin_streams(
+        max_escaped_bytes: usize,
+        capture_stderr: bool,
+        count_raw: bool,
     ) -> Result<Self, StdoutCaptureError> {
         let callback = Obj::stdio_stdout()
             .and_then(|stream| stream.try_ctor_child(4))
             .ok_or(StdoutCaptureError::InvalidStdout)?;
-        let stderr = if isolate_stderr {
+        // Both complete native streams must validate before a frame exists.
+        let stderr_callback = if capture_stderr {
             Some(
                 Obj::stdio_stderr()
                     .and_then(|stream| stream.try_ctor_child(4))
@@ -103,43 +136,17 @@ impl StdoutCapture {
             state.frames.push(Frame {
                 id,
                 callback,
-                stderr,
-                escaped,
+                stderr_callback,
                 bytes: Vec::new(),
                 escaped_bytes: 0,
-                limit,
+                limit: max_escaped_bytes,
+                count_raw,
                 error: None,
             });
             Ok(Self {
                 id: Some(id),
                 not_send: PhantomData,
             })
-        })
-    }
-
-    /// The current thread's first unsettled capture failure. Runtime callers
-    /// use this after void diagnostic effects to stop before a continuation.
-    pub fn current_error() -> Option<StdoutCaptureError> {
-        STATE.with(|state| {
-            state
-                .borrow()
-                .frames
-                .iter()
-                .rev()
-                .find_map(|frame| frame.error)
-        })
-    }
-
-    /// Retain already isolated output in the enclosing memory capture. This
-    /// never writes to a process stream when no capture is installed.
-    pub fn append_current(text: &str) -> Result<(), StdoutCaptureError> {
-        STATE.with(|state| {
-            let mut state = state.borrow_mut();
-            let frame = state
-                .frames
-                .last_mut()
-                .ok_or(StdoutCaptureError::ScopeUnavailable)?;
-            append(frame, &[text.as_bytes()])
         })
     }
 
@@ -204,116 +211,95 @@ fn same_handle(left: &Obj, right: &Obj) -> bool {
     }
 }
 
-fn matches(frame: &Frame, callback: &Obj) -> bool {
-    same_handle(callback, &frame.callback)
-        || frame
-            .stderr
-            .as_ref()
-            .is_some_and(|stderr| same_handle(callback, stderr))
-}
+impl Frame {
+    fn matches(&self, callback: &Obj) -> bool {
+        same_handle(callback, &self.callback)
+            || self
+                .stderr_callback
+                .as_ref()
+                .is_some_and(|stderr| same_handle(callback, stderr))
+    }
 
-fn append(frame: &mut Frame, parts: &[&[u8]]) -> Result<(), StdoutCaptureError> {
-    if let Some(error) = frame.error {
-        return Err(error);
-    }
-    let size = parts.iter().try_fold(0usize, |n, p| n.checked_add(p.len()));
-    let requested = parts.iter().try_fold(frame.escaped_bytes, |n, p| {
-        n.checked_add(if frame.escaped {
-            escaped_length(p)?
-        } else {
-            p.len()
-        })
-    });
-    let error = if requested.is_none_or(|length| length > frame.limit) {
-        Some(StdoutCaptureError::Limit {
-            limit: frame.limit,
-            requested: requested.unwrap_or(usize::MAX),
-        })
-    } else if size.is_none_or(|size| frame.bytes.try_reserve(size).is_err()) {
-        Some(StdoutCaptureError::Allocation)
-    } else {
-        None
-    };
-    if let Some(error) = error {
-        frame.error = Some(error);
-        return Err(error);
-    }
-    for part in parts {
-        frame.bytes.extend_from_slice(part);
-    }
-    frame.escaped_bytes = requested.unwrap_or(frame.escaped_bytes);
-    Ok(())
-}
-
-/// The native panic/trace router uses its current validated stderr callback,
-/// including a deliberate alias of stdout. Foreign streams keep their router.
-pub(crate) fn write_diagnostic_if_captured(bytes: &[u8]) -> Result<bool, StdoutCaptureError> {
-    let Some(callback) = Obj::stdio_stderr().and_then(|stream| stream.try_ctor_child(4)) else {
-        return Ok(false);
-    };
-    STATE.with(|state| {
-        let mut state = state.borrow_mut();
-        let Some(frame) = state
-            .frames
-            .iter_mut()
-            .rev()
-            .find(|frame| matches(frame, &callback))
-        else {
-            return Ok(false);
-        };
-        if let Some(error) = frame.error {
+    fn reserve_write(
+        &mut self,
+        raw_bytes: Option<usize>,
+        escaped_bytes: Option<usize>,
+    ) -> Result<usize, StdoutCaptureError> {
+        if let Some(error) = self.error {
             return Err(error);
         }
-        // Lossy UTF-8 cannot be shorter than these bytes. Refuse an already
-        // impossible request before allocating its normalized representation.
-        let minimum = frame
-            .escaped_bytes
-            .checked_add(bytes.len())
-            .and_then(|n| n.checked_add(1));
-        if minimum.is_none_or(|n| n > frame.limit) {
-            let error = StdoutCaptureError::Limit {
-                limit: frame.limit,
-                requested: minimum.unwrap_or(usize::MAX),
-            };
-            frame.error.get_or_insert(error);
-            return Err(frame.error.unwrap_or(error));
-        }
-        if std::str::from_utf8(bytes).is_ok() {
-            append(frame, &[bytes, b"\n"])?;
+        let requested = escaped_bytes.and_then(|length| self.escaped_bytes.checked_add(length));
+        let error = if raw_bytes.is_none() || requested.is_none_or(|length| length > self.limit) {
+            Some(StdoutCaptureError::Limit {
+                limit: self.limit,
+                requested: requested.unwrap_or(usize::MAX),
+            })
+        } else if self.bytes.try_reserve(raw_bytes.unwrap_or(0)).is_err() {
+            Some(StdoutCaptureError::Allocation)
         } else {
-            let normalized_len = bytes.utf8_chunks().try_fold(0usize, |n, chunk| {
-                n.checked_add(chunk.valid().len())?
-                    .checked_add(if chunk.invalid().is_empty() { 0 } else { 3 })
+            None
+        };
+        if let Some(error) = error {
+            self.error = Some(error);
+            return Err(error);
+        }
+        Ok(requested.expect("the complete write fits the capture limit"))
+    }
+
+    fn append(&mut self, bytes: &[u8]) -> Result<(), StdoutCaptureError> {
+        let budget = if self.count_raw {
+            Some(bytes.len())
+        } else {
+            escaped_length(bytes)
+        };
+        let requested = self.reserve_write(Some(bytes.len()), budget)?;
+        self.bytes.extend_from_slice(bytes);
+        self.escaped_bytes = requested;
+        Ok(())
+    }
+
+    fn append_diagnostic(&mut self, message: &[u8]) -> Result<(), StdoutCaptureError> {
+        if let Some(error) = self.error {
+            return Err(error);
+        }
+        // Count lossy UTF-8 recovery and the added newline before allocating.
+        // A refused message never builds an unbounded recovered String or
+        // contributes a partial line to the capture.
+        let mut raw_bytes = Some(1usize);
+        let mut escaped_bytes = Some(2usize);
+        lossy_chunks(message, |chunk| {
+            raw_bytes = raw_bytes.and_then(|length| length.checked_add(chunk.len()));
+            escaped_bytes = escaped_bytes.and_then(|length| {
+                escaped_length(chunk).and_then(|extra| length.checked_add(extra))
             });
-            let requested = normalized_len
-                .and_then(|n| frame.escaped_bytes.checked_add(n))
-                .and_then(|n| n.checked_add(1));
-            if requested.is_none_or(|n| n > frame.limit) {
-                let error = StdoutCaptureError::Limit {
-                    limit: frame.limit,
-                    requested: requested.unwrap_or(usize::MAX),
-                };
-                frame.error = Some(error);
-                return Err(error);
+        });
+        let budget = if self.count_raw { raw_bytes } else { escaped_bytes };
+        let requested = self.reserve_write(raw_bytes, budget)?;
+        lossy_chunks(message, |chunk| self.bytes.extend_from_slice(chunk));
+        self.bytes.push(b'\n');
+        self.escaped_bytes = requested;
+        Ok(())
+    }
+}
+
+fn lossy_chunks(mut bytes: &[u8], mut visit: impl FnMut(&[u8])) {
+    loop {
+        match std::str::from_utf8(bytes) {
+            Ok(valid) => {
+                visit(valid.as_bytes());
+                return;
             }
-            let mut normalized = String::new();
-            if normalized
-                .try_reserve_exact(normalized_len.unwrap_or(0))
-                .is_err()
-            {
-                frame.error = Some(StdoutCaptureError::Allocation);
-                return Err(StdoutCaptureError::Allocation);
-            }
-            for chunk in bytes.utf8_chunks() {
-                normalized.push_str(chunk.valid());
-                if !chunk.invalid().is_empty() {
-                    normalized.push('\u{fffd}');
+            Err(error) => {
+                let valid = error.valid_up_to();
+                visit(&bytes[..valid]);
+                visit("\u{fffd}".as_bytes());
+                match error.error_len() {
+                    Some(invalid) => bytes = &bytes[valid + invalid..],
+                    None => return,
                 }
             }
-            append(frame, &[normalized.as_bytes(), b"\n"])?;
         }
-        Ok(true)
-    })
+    }
 }
 
 /// Called only after the normal callback, canonical String, and world checks.
@@ -324,7 +310,7 @@ pub(super) fn write_if_captured(callback: &Obj, text: &Obj) -> Result<bool, Stdo
             .frames
             .iter_mut()
             .rev()
-            .find(|frame| matches(frame, callback))
+            .find(|frame| frame.matches(callback))
         else {
             return Ok(false);
         };
@@ -336,11 +322,42 @@ pub(super) fn write_if_captured(callback: &Obj, text: &Obj) -> Result<bool, Stdo
             frame.error = Some(StdoutCaptureError::ScopeUnavailable);
             return Err(StdoutCaptureError::ScopeUnavailable);
         };
-        let bytes = &bytes[..size - 1];
-        append(frame, &[bytes])?;
+        frame.append(&bytes[..size - 1])?;
         Ok(true)
     })
 }
 
+/// The nonfatal native panic/trace route. A captured failure is handled too:
+/// `finish` reports its sticky error, and no rejected bytes escape to fwrite.
+pub(crate) fn diagnostic_if_captured(message: &[u8]) -> bool {
+    if STATE
+        .try_with(|state| state.borrow().frames.is_empty())
+        .unwrap_or(true)
+    {
+        return false;
+    }
+    let Some(callback) = Obj::stdio_stderr().and_then(|stream| stream.try_ctor_child(4)) else {
+        return false;
+    };
+    STATE
+        .try_with(|state| {
+            let mut state = state.borrow_mut();
+            let Some(frame) = state
+                .frames
+                .iter_mut()
+                .rev()
+                .find(|frame| frame.matches(&callback))
+            else {
+                return false;
+            };
+            let _ = frame.append_diagnostic(message);
+            true
+        })
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod evaluation_tests;

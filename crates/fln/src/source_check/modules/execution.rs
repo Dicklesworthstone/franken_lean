@@ -413,10 +413,13 @@ impl imported::SourceOleanImport {
             let module = modules[index];
             // Empty forwarding modules still import a grammar world. Enforce
             // its phase boundary before bypassing the command stream.
-            let grammar = grammar::SourceGrammar::for_engine(
+            let header = &plan.headers[index];
+            let grammar = grammar::SourceGrammar::for_engine_with_header(
                 &engine,
                 Some(module.name),
-                plan.headers[index].module_system,
+                header.module_system,
+                header.prelude,
+                &header.imports,
             )
             .map_err(|error| source_error(module.name, error))?;
             let public_imports = if plan.headers[index].module_system {
@@ -462,6 +465,7 @@ impl imported::SourceOleanImport {
                         Some(module.name),
                         public.as_mut(),
                         presentation,
+                        &[(module.source, Some(module.name))],
                     )
                     .map_err(|error| source_error(module.name, error))?
                 {

@@ -136,7 +136,18 @@ impl SourceGrammar {
         module: Option<&Name>,
         module_system: bool,
     ) -> Result<Self, EngineExecutionError> {
-        let mut grammar = Self::for_module(module, module_system);
+        Self::for_environment_with_header(environment, module, module_system, false, &[])
+    }
+
+    /// [`Self::for_environment`] for a file with this header ([`Self::for_header`]).
+    pub(crate) fn for_environment_with_header(
+        environment: &Environment,
+        module: Option<&Name>,
+        module_system: bool,
+        prelude: bool,
+        imports: &[Name],
+    ) -> Result<Self, EngineExecutionError> {
+        let mut grammar = Self::for_header(module, module_system, prelude, imports);
         if module_system && journal::present(environment) {
             return Err(Self::module_phase_refusal());
         }
@@ -151,22 +162,56 @@ impl SourceGrammar {
         module: Option<&Name>,
         module_system: bool,
     ) -> Result<Self, EngineExecutionError> {
-        let mut grammar = Self::for_environment(engine.environment(), module, module_system)?;
+        Self::for_engine_with_header(engine, module, module_system, false, &[])
+    }
+
+    /// [`Self::for_engine`] for a file with this header ([`Self::for_header`]).
+    pub(crate) fn for_engine_with_header(
+        engine: &Engine,
+        module: Option<&Name>,
+        module_system: bool,
+        prelude: bool,
+        imports: &[Name],
+    ) -> Result<Self, EngineExecutionError> {
+        let mut grammar = Self::for_environment_with_header(
+            engine.environment(),
+            module,
+            module_system,
+            prelude,
+            imports,
+        )?;
         grammar
             .file
             .retain_imported_expansions(|module| engine.imported_modules.contains(module));
         Ok(grammar)
     }
 
-    pub(crate) fn for_module(module: Option<&Name>, module_system: bool) -> Self {
+    /// The grammar of a file with this header. A `prelude` file sees only the tokens and syntax
+    /// of its imports' closure, as at the pin: `prelude import Init.Prelude` has no `+`, `=` or
+    /// `∃`, which `Init.Notation` and `Init.NotationExtra` declare. A file without `prelude`
+    /// imports `Init` implicitly, so it keeps that table, and so does a `prelude` file whose
+    /// closure the grammar census does not describe (a module outside `Init`).
+    ///
+    /// A `prelude` file that imports nothing keeps it too. That is this engine's self-contained
+    /// seed world, where the Init table is the seed grammar. The pin would have only its builtin
+    /// tokens there, without `exact` or `+`: a known divergence of the seed world, not of
+    /// imported ones.
+    pub(crate) fn for_header(
+        module: Option<&Name>,
+        module_system: bool,
+        prelude: bool,
+        imports: &[Name],
+    ) -> Self {
+        let name = module.cloned().unwrap_or_else(Name::anonymous);
+        let file = (prelude && !imports.is_empty())
+            .then(|| FileGrammar::new(true, imports, Some(name.clone())).ok())
+            .flatten()
+            .unwrap_or_else(|| {
+                FileGrammar::new(false, &[], Some(name))
+                    .expect("invariant: the grammar census describes Init")
+            });
         Self {
-            file: FileGrammar::new(
-                false,
-                &[],
-                Some(module.cloned().unwrap_or_else(Name::anonymous)),
-            )
-            .expect("invariant: the grammar census describes Init")
-            .own_syntax_only(),
+            file: file.own_syntax_only(),
             rule_sources: BTreeMap::new(),
             module_system,
             declared_syntax: false,
@@ -227,6 +272,12 @@ impl SourceGrammar {
     /// Run `parse` with this file's grammar in effect.
     pub(crate) fn enter<R>(&self, parse: impl FnOnce() -> R) -> R {
         with_grammar(&self.file.grammar(), parse)
+    }
+
+    /// The notations active here, as a printer applies them
+    /// ([`fln_parse::extensions::FileGrammar::notations`]).
+    pub(crate) fn notations(&self) -> fln_parse::extensions::Notations {
+        self.file.notations()
     }
 
     /// Advance past one scope command.

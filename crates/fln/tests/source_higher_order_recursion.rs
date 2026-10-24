@@ -139,17 +139,36 @@ fn reject(source: &str) {
     );
     assert_eq!(engine.logical_root(&KVMap::new()), before);
 }
+/// Each is refused by the pinned v4.32.0 too (measured 2026-10-22): two non-positive
+/// occurrences, a non-uniform parameter and a constructor in too large a universe.
 #[test]
-fn nonpositive_nested_nonuniform_and_oversized_children_never_publish() {
+fn nonpositive_nonuniform_and_oversized_children_never_publish() {
     for source in [
         "inductive Bad where | mk (next : Bad -> Bad)",
         "inductive Bad where | mk (next : (Bad -> Nat) -> Bad)",
-        "inductive Box (A : Type) where | mk (a : A)\ninductive Bad where | mk (next : Nat -> Box Bad)",
         "inductive Bad (A : Type) where | mk (next : Nat -> Bad Nat)",
         "inductive Tiny : Type where | mk (next : Type -> Tiny)",
     ] {
         reject(source);
     }
+}
+/// A nested occurrence under a function arrow is admitted, as at the pin. Under the implicit
+/// `Init` the pinned v4.32.0 accepts this block (measured 2026-10-22), and its `Bad.rec` has a
+/// second motive, for the auxiliary `Box Bad`.
+#[test]
+fn a_nested_occurrence_under_a_function_arrow_is_admitted() {
+    let engine = check(
+        "inductive Box (A : Type) where | mk (a : A)\ninductive Bad where | mk (next : Nat -> Box Bad)",
+    );
+    let name = |text: &str| fln::Name::from_components(text.split('.'));
+    let Some(fln::ConstantInfo::Induct(family)) = engine.environment().find(&name("Bad")) else {
+        panic!("Bad is not admitted as an inductive family");
+    };
+    assert_eq!(family.num_nested, 1);
+    let Some(fln::ConstantInfo::Rec(recursor)) = engine.environment().find(&name("Bad.rec")) else {
+        panic!("Bad.rec is not admitted");
+    };
+    assert_eq!((recursor.num_motives, recursor.num_minors), (2, 2));
 }
 #[test]
 fn cases_does_not_expose_function_induction_hypotheses() {

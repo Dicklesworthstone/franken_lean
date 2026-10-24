@@ -299,6 +299,25 @@ impl Context {
         actual: &Expr,
         expected: &Expr,
     ) -> Result<(), NatDefinitionElabError> {
+        // A last written argument can still precede implicit binders. They
+        // belong to the application, not its result. Comparing this telescope
+        // with a function-backed expected carrier can wrongly identify its
+        // binders with the carrier's state argument. The ordinary application
+        // finisher inserts these holes and compares the actual result later.
+        // Strict implicits are not consumed at application end and stay out.
+        let instantiated = self.instantiate(actual)?;
+        if matches!(
+            instantiated.node(),
+            ExprNode::ForallE {
+                binder_info: BinderInfo::Implicit | BinderInfo::InstImplicit,
+                ..
+            }
+        ) {
+            return Ok(());
+        }
+        if self.contextual_result_hint(actual, expected)? {
+            return Ok(());
+        }
         if !self.has_coercion_class("CoeT")?
             && !self.has_coercion_class("CoeFun")?
             && !self.has_coercion_class("MonadLiftT")?
@@ -326,7 +345,7 @@ impl Context {
         } else if self.coercion_eq(actual, expected)? {
             return Ok(());
         }
-        self.first_order_result_hint(actual, expected)
+        self.first_order_result_hint(actual, expected).map(|_| ())
     }
 
     fn coercion_level(&mut self, type_: &Expr) -> Result<Option<Level>, NatDefinitionElabError> {
@@ -565,6 +584,10 @@ impl Context {
         term: Typed,
         expected: &Expr,
     ) -> Result<Typed, NatDefinitionElabError> {
+        // An ascribed argument can constrain an applied expected hole such
+        // as `?m sigma`. Preserve its named carrier before type conversion
+        // opens a function-backed definition into an anonymous telescope.
+        self.contextual_result_hint(&term.type_, expected)?;
         if !self.has_coercion_class("CoeT")?
             && !self.has_coercion_class("CoeSort")?
             && !self.has_coercion_class("CoeFun")?

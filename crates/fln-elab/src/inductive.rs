@@ -5,8 +5,10 @@
 //! infers positivity from a flag or publishes a candidate into an environment.
 pub mod auxiliaries;
 mod mutual;
+mod nested;
 pub use mutual::mutual_inductive_declaration;
 pub(crate) use mutual::mutual_inductive_with_promoted_parameters;
+pub(crate) use nested::nested_inductive_declaration;
 
 use crate::lctx::LocalDecl;
 use crate::records::{Builder, RecordBudget, RecordError, app, fresh, fv};
@@ -68,7 +70,9 @@ impl From<RecordError> for InductiveError {
     fn from(error: RecordError) -> Self {
         match error {
             RecordError::InvalidName => Self::InvalidName,
-            RecordError::DuplicateField => Self::DuplicateConstructor,
+            RecordError::DuplicateField | RecordError::ParentFieldMismatch => {
+                Self::DuplicateConstructor
+            }
             RecordError::InvalidTelescope => Self::InvalidTelescope,
             RecordError::UnsupportedSort | RecordError::NonProofField => Self::UnsupportedSort,
             RecordError::ResourceLimit => Self::ResourceLimit,
@@ -135,6 +139,7 @@ fn recursive_field(
     let mut arguments = Vec::new();
     loop {
         builder.tick()?;
+        current = builder.recursor_type(&current)?;
         match current.node() {
             ExprNode::MData { expr, .. } => current = expr.clone(),
             ExprNode::ForallE {
@@ -145,8 +150,9 @@ fn recursive_field(
             } => {
                 // Strict positivity is not inferred from metadata: an occurrence
                 // in even one argument domain prevents this construction.
-                builder.scan(binder_type, &scope, &spec.name)?;
-                let mut local = fresh(used, "arg", binder_type.clone(), *binder_info);
+                let domain = builder.recursor_type(binder_type)?;
+                builder.scan(&domain, &scope, &spec.name)?;
+                let mut local = fresh(used, "arg", domain, *binder_info);
                 local.user_name = binder_name.clone();
                 current = body
                     .subst_loose(0, &[fv(&local)])
@@ -335,6 +341,16 @@ fn build_inductive(
         .cloned()
         .map(Level::param)
         .collect();
+    // The kernel opens recursor locals after consumeTypeAnnotations. Keep the
+    // original constructor domains for default insertion, and strip only each
+    // local's head: a function field retains annotations inside its telescope.
+    let rec_parameters = builder.recursor_locals(&spec.parameters)?;
+    let rec_indices = builder.recursor_locals(&spec.indices)?;
+    let rec_fields: Vec<_> = spec
+        .constructors
+        .iter()
+        .map(|ctor| builder.recursor_locals(&ctor.fields))
+        .collect::<Result<_, _>>()?;
     // Reserve every caller-supplied identity before introducing function
     // arguments, including fields of constructors visited later.
     for constructor in &spec.constructors {
@@ -372,7 +388,7 @@ fn build_inductive(
         }
         let mut allowed: HashSet<_> = spec.parameters.iter().map(|p| p.id.clone()).collect();
         let mut fields = Vec::new();
-        for field in &constructor.fields {
+        for field in &rec_fields[position] {
             builder.tick()?;
             if field.is_let() || !allowed.insert(field.id.clone()) {
                 return Err(InductiveError::InvalidTelescope);
@@ -422,7 +438,7 @@ fn build_inductive(
         false,
         false,
     )?;
-    let motive_type = builder.close(&spec.indices, motive_type, false, false)?;
+    let motive_type = builder.close(&rec_indices, motive_type, false, false)?;
     let motive = fresh(&mut used, "motive", motive_type, BinderInfo::Default);
     let ctor_names: Vec<_> = spec
         .constructors
@@ -453,7 +469,7 @@ fn build_inductive(
             constructor,
         );
         let body = builder.close(&ihs, body, false, false)?;
-        let minor_type = builder.close(&ctor.fields, body, false, false)?;
+        let minor_type = builder.close(&rec_fields[index], body, false, false)?;
         let mut minor = fresh(&mut used, "minor", minor_type, BinderInfo::Default);
         minor.user_name = ctor.name.clone();
         minors.push(minor);
@@ -506,10 +522,10 @@ fn build_inductive(
                 rhs = Expr::app(rhs, call);
             }
         }
-        rhs = builder.close(&ctor.fields, rhs, true, false)?;
+        rhs = builder.close(&rec_fields[index], rhs, true, false)?;
         rhs = builder.close(&minors, rhs, true, false)?;
         rhs = builder.close(std::slice::from_ref(&motive), rhs, true, false)?;
-        rhs = builder.close(&spec.parameters, rhs, true, false)?;
+        rhs = builder.close(&rec_parameters, rhs, true, false)?;
         rules.push(RecursorRule {
             ctor: ctor_names[index].clone(),
             nfields: constructors[index].num_fields,
@@ -522,7 +538,7 @@ fn build_inductive(
         false,
         false,
     )?;
-    let rec_type = builder.close(&spec.indices, rec_type, false, true)?;
+    let rec_type = builder.close(&rec_indices, rec_type, false, true)?;
     let rec_type = builder.close(&minors, rec_type, false, false)?;
     // With no minor premises, no later binder domain mentions the motive.
     // It stays explicit under the Reference's strict implicit inference rule.
@@ -532,7 +548,7 @@ fn build_inductive(
         false,
         !minors.is_empty(),
     )?;
-    let rec_type = builder.close(&spec.parameters, rec_type, false, true)?;
+    let rec_type = builder.close(&rec_parameters, rec_type, false, true)?;
     let mut lparams = if large { vec![elim] } else { Vec::new() };
     lparams.extend(spec.level_params.iter().cloned());
     let params = u32::try_from(spec.parameters.len()).map_err(|_| InductiveError::ResourceLimit)?;

@@ -772,8 +772,8 @@ const BIND_LIST_RELATIONS_AND_PREFIXES: &[Accepted] = &[
 ];
 
 /// `inferInstanceAs <| T` (the keyword's own `<|` slot, nested pipelines to its right), `bif c then
-/// a else b` (`boolIfThenElse`, nested and parenthesized), and `xs[i]'h` with a name or a
-/// parenthesized proof (`term__[_]'_`).
+/// a else b` (`boolIfThenElse`, nested and parenthesized), and `xs[i]'h` with a name, a
+/// parenthesized proof or `sorry` (`term__[_]'_`; the `sorry` row captured 2026-10-22).
 const INSTANCE_PIPES_BOOL_CONDITIONALS_AND_PROVED_INDICES: &[Accepted] = &[
     Accepted {
         source: "instance i1 : Inhabited Nat := inferInstanceAs <| Inhabited Nat",
@@ -794,6 +794,10 @@ const INSTANCE_PIPES_BOOL_CONDITIONALS_AND_PROVED_INDICES: &[Accepted] = &[
     Accepted {
         source: "theorem q3 (xs : Array Nat) (i : Nat) (h : i + 1 < xs.size) : xs[i]'(by omega) = xs[i]'(by omega) := rfl",
         tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.theorem "theorem" (Command.declId `q3 []) (Command.declSig [(Term.explicitBinder "(" [`xs] [":" (Term.app `Array [`Nat])] [] ")") (Term.explicitBinder "(" [`i] [":" `Nat] [] ")") (Term.explicitBinder "(" [`h] [":" («term_<_» («term_+_» `i "+" (num "1")) "<" `xs.size)] [] ")")] (Term.typeSpec ":" («term_=_» («term__[_]'_» `xs "[" `i "]'" (Term.paren (Term.hygienicLParen "(" (hygieneInfo `[anonymous])) (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.omega "omega" (Tactic.optConfig []))]))) ")")) "=" («term__[_]'_» `xs "[" `i "]'" (Term.paren (Term.hygienicLParen "(" (hygieneInfo `[anonymous])) (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.omega "omega" (Tactic.optConfig []))]))) ")"))))) (Command.declValSimple ":=" `rfl (Termination.suffix [] []) [])))"#,
+    },
+    Accepted {
+        source: "def q5 (xs : Array Nat) (i : Nat) : Nat := xs[i]'sorry",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `q5 []) (Command.optDeclSig [(Term.explicitBinder "(" [`xs] [":" (Term.app `Array [`Nat])] [] ")") (Term.explicitBinder "(" [`i] [":" `Nat] [] ")")] [(Term.typeSpec ":" `Nat)]) (Command.declValSimple ":=" («term__[_]'_» `xs "[" `i "]'" (Term.sorry "sorry")) (Termination.suffix [] []) []) []))"#,
     },
     Accepted {
         source: "def q4 (b c : Bool) (x y : Nat) : Nat := bif b && c then x + 1 else bif c then y else 0",

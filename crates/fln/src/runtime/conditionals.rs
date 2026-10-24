@@ -1,9 +1,17 @@
-//! Preserve the pin's lazy `ite`/`dite` code generation contract.
+//! Preserve the pin's `@[macro_inline]` code generation contract.
 //!
-//! These Prelude functions are macro-inlined before strict argument evaluation.
-//! Unfold only a verified complete logical model, while the original proof
-//! context still exists; the ordinary Decidable recursor supplies native lazy
-//! branches and its usual checked-family representation guard.
+//! The pin's compiler unfolds every application of a `@[macro_inline]` definition
+//! before it evaluates anything (`macroInline`, vendored
+//! `src/Lean/Compiler/LCNF/ToDecl.lean:22`, applied at `:157` and again after
+//! matcher inlining at `:161`), so an argument the body does not select is never
+//! evaluated. [`Preparation::macro_inline`] does the same from the environment's
+//! own tags (`fln_elab::macro_inline`), while the original proof context still
+//! exists; the selected branches stay branches of the eliminator the body uses.
+//!
+//! A source-seed environment carries no compiler attributes, so its `ite`/`dite`
+//! keep the earlier special case: unfold only a verified complete logical model;
+//! the ordinary Decidable recursor supplies native lazy branches and its usual
+//! checked-family representation guard.
 use super::*;
 use fln_env::constants::DefinitionSafety;
 
@@ -74,6 +82,93 @@ impl Preparation<'_> {
         }
         Ok(crate::olean_imports::expr_eqv(&actual.base.type_, &type_)
             && crate::olean_imports::expr_eqv(&actual.value, &value))
+    }
+
+    /// Unfold an application of a `@[macro_inline]` definition, as the pin's `macroInline`:
+    /// `instantiateValueLevelParams` and then `Expr.beta` over the unevaluated argument
+    /// expressions. A partial application leaves the remaining lambdas, and extra arguments
+    /// are applied to the body. A bare constant is the pin's case with no argument.
+    pub(super) fn macro_inline(
+        &mut self,
+        head: &Expr,
+        arguments: &[Expr],
+    ) -> Result<Option<Expr>, IngressError> {
+        let ExprNode::Const {
+            name: callee,
+            levels,
+        } = head.node()
+        else {
+            return Ok(None);
+        };
+        if self.macro_inline.is_none() {
+            // Bound the metadata work before decoding. A failed read never
+            // populates the cache, and is never read as "nothing is tagged".
+            if let Some(state) = self
+                .environment
+                .extension(&fln_elab::macro_inline::journal_name())
+            {
+                for entry in state.entries() {
+                    let observed = self
+                        .visited
+                        .saturating_add(1)
+                        .saturating_add(entry.payload.len());
+                    if observed > self.limits.max_nodes {
+                        return Err(IngressError::ResourceLimit {
+                            resource: IngressResource::Nodes,
+                            limit: self.limits.max_nodes,
+                            observed,
+                        });
+                    }
+                    self.visited = observed;
+                }
+            }
+            let names =
+                fln_elab::macro_inline::read(self.environment).map_err(|error| match error {
+                    fln_elab::macro_inline::MacroInlineError::Limit => {
+                        IngressError::MetadataResourceExhausted {
+                            kind: "native macro_inline journal capacity",
+                        }
+                    }
+                    _ => unsupported("malformed native macro_inline journal"),
+                })?;
+            self.macro_inline = Some(names);
+        }
+        if !self
+            .macro_inline
+            .as_ref()
+            .is_some_and(|names| names.contains(callee))
+        {
+            return Ok(None);
+        }
+        // The journal read admitted only a non-mutual definition under this name.
+        let Some(ConstantInfo::Defn(definition)) = self.environment.find(callee).cloned() else {
+            return Err(unsupported("macro_inline definition"));
+        };
+        if definition.base.level_params.len() != levels.len() {
+            return Err(unsupported("macro_inline universe arity"));
+        }
+        self.tick()?;
+        let mut body =
+            self.universe_instance(&definition.value, &definition.base.level_params, levels)?;
+        let mut rest = arguments.iter();
+        for argument in rest.by_ref() {
+            self.tick()?;
+            // `Expr.beta` looks through metadata while arguments remain.
+            while let ExprNode::MData { expr, .. } = body.node() {
+                self.tick()?;
+                body = expr.clone();
+            }
+            let ExprNode::Lam { body: next, .. } = body.node() else {
+                body = Expr::app(body, argument.clone());
+                break;
+            };
+            body = self.substitution(next, argument)?;
+        }
+        for argument in rest {
+            self.tick()?;
+            body = Expr::app(body, argument.clone());
+        }
+        Ok(Some(body))
     }
 
     pub(super) fn lazy_conditional(

@@ -341,7 +341,9 @@ fn run_loaded(
             let execution = if ordinary_lean {
                 receipt.execute_lean_source_modules_with_validation(
                     &inputs, &names[0], &fln::KVMap::new(), limits, None, evaluation_presentation,
-                    &mut validate_lean_module,
+                    &mut |module: &Name, commands: &fln::SourceCommandBatchExecution| {
+                        validate_lean_module(module, commands, module == &names[0])
+                    },
                 )
                 .map_err(|error| match error {
                     fln::source_check::modules::execution::SourceProgramExecutionError::Source(error) => {
@@ -769,13 +771,21 @@ fn validate_module_exits(
 /// Validate retained module evidence before its declarations are exported or
 /// any dependent source module starts. In particular, a failing dependency
 /// guard or VM exit cannot be followed by an entry's IO effects.
+/// An entry's failure keeps what its actions printed before it: the pin logs an action's output
+/// ahead of its exception. A dependency's output is not the entry's, so it is not printed.
 fn validate_lean_module(
     module: &Name,
     commands: &fln::SourceCommandBatchExecution,
+    entry: bool,
 ) -> Result<(), MultiplexerOutput> {
     if let Err(error) = validate_module_exits(module, commands) {
         let has_output = error.class == "io-exception";
         let mut failed = failure(error, Presentation::Lean);
+        if entry {
+            failed
+                .stdout
+                .insert_str(0, &captured_through_failure(commands));
+        }
         if has_output {
             failed.stdout = source_evaluation::output_before_failure(&commands.batch.executions)
                 .map_err(|error| error.failure(0, SourcePresentation::Lean))?;
@@ -806,6 +816,8 @@ fn lean_output(
     without_init: bool,
     sink: crate::WarningSink<'_>,
 ) -> Result<MultiplexerOutput, Failure> {
+    // `validate_lean_module` already refused each module as it finished; this keeps a failed
+    // exit a typed failure for any other caller, never presented output.
     validate_exits(program)?;
     let (module, dependencies) = program
         .modules
@@ -849,6 +861,24 @@ fn lean_output(
         ));
     }
     Ok(render_lean_source_commands(&module.commands, sink))
+}
+
+/// What a module's captured IO evaluations wrote, in order, through the first evaluation that
+/// did not complete: the `lean` presentation holds an action's output until it is printed, and
+/// the pin prints it ahead of the action's exception.
+fn captured_through_failure(commands: &fln::SourceCommandBatchExecution) -> String {
+    let mut text = String::new();
+    for execution in &commands.batch.executions {
+        if let Some(bytes) = execution.captured_stdout() {
+            text.push_str(&String::from_utf8_lossy(bytes));
+        }
+        if !matches!(execution.exit, fln::VmExit::Returned(_))
+            || source_evaluation::check(execution).is_err()
+        {
+            break;
+        }
+    }
+    text
 }
 
 /// Invoke main only after the complete source front end, including dependency
@@ -1134,7 +1164,8 @@ fn render_commands(
                     let mut printer = fln::pretty::Printer::in_scope(
                         commands.batch.engine.environment(),
                         &check.scope,
-                    );
+                    )
+                    .with_notations(&check.notations);
                     let type_ = match &check.declaration {
                         fln::Declaration::Defn(definition) => printer
                             .open_section_variables(

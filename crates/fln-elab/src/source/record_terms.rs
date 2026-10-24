@@ -68,6 +68,15 @@ pub(super) struct RecordBuild<'a> {
     // Parent subobjects use heap continuations, never recursive elaboration.
     frames: Vec<RecordFrame<'a>>,
     imported: Option<imported::ImportedRecord<'a>>,
+    // Written `{}`: no field, source or annotation ([`Context::empty_braces_ambiguous`]).
+    empty_braces: bool,
+}
+
+impl RecordBuild<'_> {
+    /// Whether the record was written `{}`, which the pin also reads as `∅`.
+    pub(super) fn empty_braces(&self) -> bool {
+        self.empty_braces
+    }
 }
 struct RecordFrame<'a> {
     parents: HashMap<Name, Vec<Name>>,
@@ -249,6 +258,63 @@ impl Context {
         };
         let field = self.resolve_field_path(receiver, &path, false)?;
         Ok(Some(self.field_value(field, expected)?))
+    }
+
+    /// A template's dotted name reading a field of a local the same template bound
+    /// (`` `(let xs := $x; xs.succ) ``): each prefix takes the name's macro scopes before it is
+    /// looked up among the locals, as the pin's `resolveLocalName` does. `None` when no prefix
+    /// names such a local.
+    pub(super) fn hygienic_record_field(
+        &mut self,
+        name: &Name,
+        expected: Option<&Expr>,
+    ) -> Result<Option<Typed>, NatDefinitionElabError> {
+        let Ok(view) = fln_syntax::hygiene::extract_macro_scopes(name) else {
+            return Ok(None);
+        };
+        let mut prefix = view.name.clone();
+        let mut suffix = Vec::new();
+        while !prefix.is_anonymous() {
+            self.tick()?;
+            let LeafView::Str(part) = prefix.leaf_view() else {
+                return Ok(None);
+            };
+            suffix.push(Name::from_components([part]));
+            prefix = prefix.parent().clone();
+            if prefix.is_anonymous() {
+                break;
+            }
+            let scoped = fln_syntax::hygiene::MacroScopesView {
+                name: prefix.clone(),
+                ..view.clone()
+            }
+            .review();
+            let Some(local) = self
+                .txn
+                .lctx
+                .decls()
+                .iter()
+                .rev()
+                .find(|local| local.user_name == scoped)
+            else {
+                continue;
+            };
+            let receiver = Typed {
+                value: self
+                    .matrix_aliases
+                    .get(&local.id)
+                    .cloned()
+                    .unwrap_or_else(|| Expr::fvar(local.id.clone())),
+                type_: local.type_.clone(),
+            };
+            let path = suffix
+                .iter()
+                .rev()
+                .fold(Name::anonymous(), |path, part| path.append_core(part));
+            let field = self.resolve_field_path(receiver, &path, false)?;
+            return Ok(Some(self.field_value(field, expected)?));
+        }
+        Ok(None)
     }
 
     /// Splitting is reserved for identifiers that did not resolve as a whole.
@@ -466,7 +532,7 @@ impl Context {
                 });
             }
             if let Some(recursion) = &self.well_founded
-                && recursion.name == method
+                && let Some(reference) = recursion.target(&method)
             {
                 if recursion.proving {
                     return Err(failure(SourceInferenceError::Recursion(
@@ -474,7 +540,7 @@ impl Context {
                     )));
                 }
                 return Ok(FieldResolution::Method {
-                    function: recursion.reference.clone(),
+                    function: reference.clone(),
                     receiver,
                     base,
                 });
@@ -871,17 +937,50 @@ impl Context {
         expected: Option<Expr>,
         sources: Vec<Typed>,
     ) -> Result<RecordBuild<'a>, NatDefinitionElabError> {
+        let empty_braces =
+            parts.fields.is_empty() && parts.sources.is_empty() && parts.annotation.is_none();
         let frame = self.start_record_frame(parts, expected, sources)?;
         if let Some(layout) = self.imported_record_layout(&frame)? {
             return Ok(RecordBuild {
                 frames: Vec::new(),
                 imported: Some(self.start_imported_record(frame, layout)?),
+                empty_braces,
             });
         }
         Ok(RecordBuild {
             frames: vec![frame],
             imported: None,
+            empty_braces,
         })
+    }
+
+    /// Whether `{}` that elaborated as the empty structure instance of `type_` is ambiguous at
+    /// the pin. There `{}` is a `choice` between that instance and `∅`
+    /// (`EmptyCollection.emptyCollection`, vendored `Init/Core.lean`), and when both elaborate the
+    /// pin reports `Ambiguous term` rather than picking one (`elab_fail/emptyc.lean`). The
+    /// instance search is tried and rolled back; a resource stop is not read as an answer.
+    pub(super) fn empty_braces_ambiguous(
+        &mut self,
+        type_: &Expr,
+    ) -> Result<bool, NatDefinitionElabError> {
+        let class = Name::from_components(["EmptyCollection"]);
+        if !self.txn.env.contains(&class) {
+            return Ok(false);
+        }
+        let saved = self.clone();
+        let result = (|| -> Result<bool, NatDefinitionElabError> {
+            let target = self.instantiate(type_)?;
+            // The instance search fixes `EmptyCollection`'s universe, as elaborating `∅` does.
+            let universe = self.level()?;
+            let goal = Expr::app(Expr::const_(class, vec![universe]), target);
+            let hole = self.instance_hole(goal)?;
+            if self.resolve_instances(false).is_err() {
+                return Ok(false);
+            }
+            Ok(!self.instantiate(&hole)?.has_expr_mvar())
+        })();
+        *self = saved;
+        result
     }
 
     fn start_record_frame<'a>(

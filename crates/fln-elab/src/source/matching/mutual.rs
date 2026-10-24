@@ -1,6 +1,7 @@
-//! Specialize an admitted mutual recursor to an ordinary single-family match.
+//! Specialize an admitted mutual or nested recursor to an ordinary single-family match.
 //!
-//! Other families use the constant motive `R -> R`, inhabited by identity at
+//! Other families, and a nested family's auxiliaries (`List T` for `inductive T | node :
+//! List T → T`), use the constant motive `R -> R`, inhabited by identity at
 //! exactly the same universe as R (including Prop). This needs no new axiom,
 //! default instance, trusted evaluator or universe-cumulative coercion. The
 //! selected family's supplied branches remain the actual recursor minors.
@@ -90,7 +91,7 @@ impl Context {
             if !names.insert(name.clone())
                 || member.all != family.all
                 || member.is_unsafe
-                || member.num_nested != 0
+                || member.num_nested != family.num_nested
                 || member.num_params != family.num_params
                 || member.base.level_params != family.base.level_params
             {
@@ -103,7 +104,13 @@ impl Context {
                 constructors.push((name.clone(), ctor.clone()));
             }
         }
-        if constructors.len() != rec.num_minors as usize
+        // An auxiliary's constructors follow the families' (the kernel's translated block), and
+        // are not constants of their own: they only ever receive the neutral minor.
+        let auxiliary_minors = (rec.num_minors as usize)
+            .checked_sub(constructors.len())
+            .ok_or_else(|| error(MatchError::UnsupportedFamily))?;
+        if (family.num_nested == 0) != (auxiliary_minors == 0)
+            || rec.num_motives as usize != family.all.len() + family.num_nested as usize
             || rec.rules.iter().map(|r| &r.ctor).ne(family.ctors.iter())
             || target.has_loose_bvars()
         {
@@ -126,9 +133,14 @@ impl Context {
         };
         let saved = self.txn.lctx.clone();
         let result = (|| {
-            for name in &family.all {
+            let others = family
+                .all
+                .iter()
+                .map(Some)
+                .chain(std::iter::repeat_n(None, family.num_nested as usize));
+            for name in others {
                 self.tick()?;
-                let argument = if name == &family.base.name {
+                let argument = if name == Some(&family.base.name) {
                     motive.clone()
                 } else {
                     let type_ = self.whnf(&recursor.type_)?;
@@ -146,7 +158,11 @@ impl Context {
                 recursor = self.match_apply(recursor, argument)?;
             }
             let mut selected = Vec::new();
-            for (owner, _) in &constructors {
+            let owners = constructors
+                .iter()
+                .map(|(owner, _)| Some(owner))
+                .chain(std::iter::repeat_n(None, auxiliary_minors));
+            for owner in owners {
                 self.tick()?;
                 let type_ = self.whnf(&recursor.type_)?;
                 let ExprNode::ForallE {
@@ -158,7 +174,7 @@ impl Context {
                 else {
                     return Err(error(MatchError::UnsupportedFamily));
                 };
-                let argument = if owner == &family.base.name {
+                let argument = if owner == Some(&family.base.name) {
                     let id = FVarId(self.fresh_name()?);
                     self.txn.lctx.add_param(
                         id.clone(),

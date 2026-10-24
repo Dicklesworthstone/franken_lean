@@ -610,7 +610,8 @@ mod tests {
 
     #[test]
     fn multiline_crlf_templates_keep_the_source_view_their_unicode_spans_address() {
-        let mut library = SourceGrammar::for_module(Some(&Name::from_components(["Lib"])), false);
+        let mut library =
+            SourceGrammar::for_header(Some(&Name::from_components(["Lib"])), false, false, &[]);
         assert!(
             library
                 .declare("notation \"quoted\" =>\r\n  α".as_bytes(), |_| {

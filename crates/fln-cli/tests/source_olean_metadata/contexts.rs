@@ -79,15 +79,15 @@ fn siblings_select_different_dictionaries_without_changing_their_checked_types()
         &[
             (
                 "Left",
-                "prelude\nimport A\ndef leftUse [d : Class] : Class := d\ndef left : Family leftUse := valueA\n",
+                "prelude\nimport A\ndef leftUse [d : Class] : Class := d\nnoncomputable def left : Family leftUse := valueA\n",
             ),
             (
                 "Right",
-                "prelude\nimport B\ndef rightUse [d : Class] : Class := d\ndef right : Family rightUse := valueB\n",
+                "prelude\nimport B\ndef rightUse [d : Class] : Class := d\nnoncomputable def right : Family rightUse := valueB\n",
             ),
             (
                 "Main",
-                "prelude\nimport Left\nimport Right\ndef leftAgain : Family a := left\ndef rightAgain : Family b := right\n",
+                "prelude\nimport Left\nimport Right\nnoncomputable def leftAgain : Family a := left\nnoncomputable def rightAgain : Family b := right\n",
             ),
         ],
     );
@@ -103,15 +103,15 @@ fn equal_external_sets_keep_each_modules_own_import_order() {
         &[
             (
                 "Left",
-                "prelude\nimport A\nimport B\ndef leftUse [d : Class] : Class := d\ndef left : Family leftUse := valueB\n",
+                "prelude\nimport A\nimport B\ndef leftUse [d : Class] : Class := d\nnoncomputable def left : Family leftUse := valueB\n",
             ),
             (
                 "Right",
-                "prelude\nimport B\nimport A\ndef rightUse [d : Class] : Class := d\ndef right : Family rightUse := valueA\n",
+                "prelude\nimport B\nimport A\ndef rightUse [d : Class] : Class := d\nnoncomputable def right : Family rightUse := valueA\n",
             ),
             (
                 "Main",
-                "prelude\nimport Left\nimport Right\ndef checkLeft : Family b := left\ndef checkRight : Family a := right\n",
+                "prelude\nimport Left\nimport Right\nnoncomputable def checkLeft : Family b := left\nnoncomputable def checkRight : Family a := right\n",
             ),
         ],
     );
@@ -127,10 +127,10 @@ fn public_source_imports_preserve_external_dictionary_order_and_private_boundari
         vec![(INSTANCE, vec![instance("b", 1000)])],
     );
     let receipt = imported(&p);
-    let main = "prelude\nimport Wrapper\ndef use [d : Class] : Class := d\ndef chosen : Family use := valueA";
+    let main = "prelude\nimport Wrapper\ndef use [d : Class] : Class := d\nnoncomputable def chosen : Family use := valueA";
     for wrapper in [
-        "module\nprelude\nimport A\npublic import B\npublic import A\ndef localUse [d : Class] : Class := d\ndef localChoice : Family localUse := valueB",
-        "module\nprelude\nimport B\npublic import A\ndef localSecret : Class := onlyB",
+        "module\nprelude\nimport A\npublic import B\npublic import A\ndef localUse [d : Class] : Class := d\nnoncomputable def localChoice : Family localUse := valueB",
+        "module\nprelude\nimport B\npublic import A\nnoncomputable def localSecret : Class := onlyB",
     ] {
         let checked = checked(&receipt, &[("Wrapper", wrapper), ("Main", main)]);
         if !wrapper.contains("public import B") {
@@ -140,10 +140,10 @@ fn public_source_imports_preserve_external_dictionary_order_and_private_boundari
         p.write("Main.lean", main);
         p.success();
     }
-    let leaking = "prelude\nimport Wrapper\ndef leak : Class := onlyB";
+    let leaking = "prelude\nimport Wrapper\nnoncomputable def leak : Class := onlyB";
     let names = [n("Wrapper"), n("Main")];
     let sources = [
-        "module\nprelude\nimport B\npublic import A\ndef localSecret : Class := onlyB",
+        "module\nprelude\nimport B\npublic import A\nnoncomputable def localSecret : Class := onlyB",
         leaking,
     ];
     assert!(matches!(
@@ -167,14 +167,14 @@ fn source_registrations_stay_between_the_external_imports_that_surround_them() {
     let receipt = imported(&fixture());
     for (order, value) in [("Local\nimport B", "valueB"), ("B\nimport Local", "valueA")] {
         let main = format!(
-            "prelude\nimport {order}\ndef use [d : Class] : Class := d\ndef chosen : Family use := {value}\n"
+            "prelude\nimport {order}\ndef use [d : Class] : Class := d\nnoncomputable def chosen : Family use := {value}\n"
         );
         checked(
             &receipt,
             &[
                 (
                     "Local",
-                    "prelude\nimport A\ninstance localChoice : Class := a\n",
+                    "prelude\nimport A\nnoncomputable instance localChoice : Class := a\n",
                 ),
                 ("Main", &main),
             ],
@@ -194,9 +194,9 @@ fn unrelated_external_constants_and_instances_cannot_leak_into_a_sibling() {
     let receipt = imported(&p);
     let root = receipt.engine.logical_root(&KVMap::new());
     for right in [
-        "prelude\nimport B\ndef bad : Class := onlyA\n",
+        "prelude\nimport B\nnoncomputable def bad : Class := onlyA\n",
         "prelude\nimport Core\ndef use [d : Class] : Class := d\ndef bad : Class := use\n",
-        "prelude\nimport B\ndef use [d : Class] : Class := d\ndef bad : Family use := valueA\n",
+        "prelude\nimport B\ndef use [d : Class] : Class := d\nnoncomputable def bad : Family use := valueA\n",
     ] {
         let names = [n("Right"), n("Main")];
         let source = [right, "prelude\nimport A\nimport Right\n"];
@@ -216,7 +216,10 @@ fn unrelated_external_constants_and_instances_cannot_leak_into_a_sibling() {
     }
     checked(
         &receipt,
-        &[("Main", "prelude\nimport A\ndef recovery : Class := onlyA\n")],
+        &[(
+            "Main",
+            "prelude\nimport A\nnoncomputable def recovery : Class := onlyA\n",
+        )],
     );
 }
 
@@ -231,7 +234,7 @@ fn public_report_mutation_cannot_replace_the_private_admission_receipt() {
         &receipt,
         &[(
             "Main",
-            "prelude\nimport A\ndef use [d : Class] : Class := d\ndef chosen : Family use := valueA\n",
+            "prelude\nimport A\ndef use [d : Class] : Class := d\nnoncomputable def chosen : Family use := valueA\n",
         )],
     );
 }
@@ -264,8 +267,8 @@ fn source_graph_errors_and_request_budgets_remain_atomic() {
         );
     }
     let sources = [
-        "prelude\nimport A\ndef first : Class := a\n",
-        "prelude\nimport Left\nimport B\ndef second : Class := b\n",
+        "prelude\nimport A\nnoncomputable def first : Class := a\n",
+        "prelude\nimport Left\nimport B\nnoncomputable def second : Class := b\n",
     ];
     let inputs = inputs(&names, &sources);
     for budget in [0, 1, 8] {
@@ -297,7 +300,10 @@ fn source_graph_errors_and_request_budgets_remain_atomic() {
     ));
     checked(
         &receipt,
-        &[("Main", "prelude\nimport B\ndef recovery : Class := b\n")],
+        &[(
+            "Main",
+            "prelude\nimport B\nnoncomputable def recovery : Class := b\n",
+        )],
     );
 }
 
@@ -307,9 +313,9 @@ fn separate_context_artifacts_round_trip_through_both_checkers() {
     let receipt = imported(&p);
     let names = [n("Left"), n("Right"), n("Main")];
     let sources = [
-        "prelude\nimport A\ndef leftUse [d : Class] : Class := d\ndef left : Family leftUse := valueA\n",
-        "prelude\nimport B\ndef rightUse [d : Class] : Class := d\ndef right : Family rightUse := valueB\n",
-        "prelude\nimport Left\nimport Right\ndef leftAgain : Family a := left\ndef rightAgain : Family b := right\n",
+        "prelude\nimport A\ndef leftUse [d : Class] : Class := d\nnoncomputable def left : Family leftUse := valueA\n",
+        "prelude\nimport B\ndef rightUse [d : Class] : Class := d\nnoncomputable def right : Family rightUse := valueB\n",
+        "prelude\nimport Left\nimport Right\nnoncomputable def leftAgain : Family a := left\nnoncomputable def rightAgain : Family b := right\n",
     ];
     let built = receipt
         .compile_source_modules(
@@ -372,8 +378,8 @@ fn cancellation_at_each_observed_checkpoint_never_returns_a_partial_engine() {
     let root = receipt.engine.logical_root(&KVMap::new());
     let names = [n("Local"), n("Main")];
     let sources = [
-        "prelude\nimport A\ninstance localChoice : Class := a\n",
-        "prelude\nimport Local\nimport B\ndef use [d : Class] : Class := d\ndef chosen : Family use := valueB\n",
+        "prelude\nimport A\nnoncomputable instance localChoice : Class := a\n",
+        "prelude\nimport Local\nimport B\ndef use [d : Class] : Class := d\nnoncomputable def chosen : Family use := valueB\n",
     ];
     let inputs = inputs(&names, &sources);
     let probe = StopAfter {
@@ -416,7 +422,7 @@ fn cancellation_at_each_observed_checkpoint_never_returns_a_partial_engine() {
 fn metadata_and_encoding_budgets_remain_aggregate_and_unsupported_exports_refuse() {
     let receipt = imported(&fixture());
     let names = [n("Main")];
-    let sources = ["prelude\nimport A\ndef chosen : Class := a\n"];
+    let sources = ["prelude\nimport A\nnoncomputable def chosen : Class := a\n"];
     let inputs = inputs(&names, &sources);
     let mut limited = limits();
     limited.max_extension_bytes = 0;
@@ -433,7 +439,9 @@ fn metadata_and_encoding_budgets_remain_aggregate_and_unsupported_exports_refuse
             .compile_source_modules(&inputs, &n("Main"), &KVMap::new(), limits(), budget)
             .is_err()
     );
-    let source = b"prelude\nimport A\ninstance localChoice : Class := a\n";
+    // Instance rows are exported now; a scoped one still has no `.olean` writer.
+    let source =
+        b"prelude\nimport A\nnamespace Scope\nnoncomputable scoped instance localChoice : Class := a\nend Scope\n";
     let inputs = [SourceModuleInput {
         name: &names[0],
         source,
@@ -514,9 +522,9 @@ fn private_context_sessions_reuse_artifacts_without_lending_sibling_dictionaries
     );
     let names = [n("Left"), n("Right"), n("Main")];
     let sources = [
-        "prelude\nimport A\ndef leftUse [d : Class] : Class := d\ndef left : Family leftUse := valueA\n",
-        "prelude\nimport B\ndef rightUse [d : Class] : Class := d\ndef right : Family rightUse := valueB\n",
-        "prelude\nimport Left\nimport Right\ndef checkLeft : Family a := left\ndef checkRight : Family b := right\n",
+        "prelude\nimport A\ndef leftUse [d : Class] : Class := d\nnoncomputable def left : Family leftUse := valueA\n",
+        "prelude\nimport B\ndef rightUse [d : Class] : Class := d\nnoncomputable def right : Family rightUse := valueB\n",
+        "prelude\nimport Left\nimport Right\nnoncomputable def checkLeft : Family a := left\nnoncomputable def checkRight : Family b := right\n",
     ];
     let run = |session: &mut SourceModuleSession, sources: &[&str]| {
         session.compile(
@@ -545,7 +553,7 @@ fn private_context_sessions_reuse_artifacts_without_lending_sibling_dictionaries
         assert_eq!((&actual.name, &actual.bytes), (name, bytes));
     }
     let mut bad = sources;
-    bad[1] = "prelude\nimport B\ndef rightUse [d : Class] : Class := d\ndef right : Family rightUse := valueA\n";
+    bad[1] = "prelude\nimport B\ndef rightUse [d : Class] : Class := d\nnoncomputable def right : Family rightUse := valueA\n";
     assert!(run(&mut session, &bad).is_err());
     assert_eq!(session.retained_modules(), 3);
     let tiny = OleanWriteBudget {
@@ -587,8 +595,8 @@ fn warm_context_session_cancellation_preserves_the_successful_cache() {
     );
     let names = [n("Local"), n("Main")];
     let sources = [
-        "prelude\nimport A\ndef localValue : Class := a\n",
-        "prelude\nimport Local\nimport B\ndef mainValue : Class := b\n",
+        "prelude\nimport A\nnoncomputable def localValue : Class := a\n",
+        "prelude\nimport Local\nimport B\nnoncomputable def mainValue : Class := b\n",
     ];
     let inputs = inputs(&names, &sources);
     session

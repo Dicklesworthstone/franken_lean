@@ -233,11 +233,15 @@ impl Context {
         })
     }
 
+    /// `at_end` asserts the replacement after every local, as the pin's `simpGoal` asserts a
+    /// hypothesis whose simplification needs a proof; otherwise it goes right after the old
+    /// local and the locals its new type reads, as `replaceLocalDecl` places it for `rw`.
     pub(super) fn replace_rewritten_hypothesis(
         &mut self,
         mut parent: ProofGoal,
         local: &LocalDecl,
         replacement: Typed,
+        at_end: bool,
     ) -> Result<(ProofGoal, ProofGoal, Expr), NatDefinitionElabError> {
         let target = self.instantiate(&parent.target)?;
         let mut needed =
@@ -271,7 +275,7 @@ impl Context {
             .lctx
             .decls()
             .iter()
-            .filter(|other| other.id == local.id || dependencies.contains(&other.id))
+            .filter(|other| at_end || other.id == local.id || dependencies.contains(&other.id))
             .map(|other| other.index)
             .max()
             .ok_or_else(|| error(TacticError::RewriteLocation))?;
@@ -297,6 +301,9 @@ impl Context {
         }
         self.txn.lctx = context.clone();
         let (child, next) = self.proof_goal(target)?;
+        // The pin asserts the rewritten hypothesis and applies the new goal to its proof, which
+        // `instantiateMVars` beta-reduces away when nothing reads it; so does this binding.
+        self.discarded_lets.insert(id.clone());
         // Delay abstraction until the child and all rule premises are solved.
         // The parent retains the old variable needed by the transport's RHS.
         parent.introduced.push(binding);
@@ -351,7 +358,7 @@ impl Context {
                 let replacement =
                     self.rewrite_hypothesis_value(&local, term, &occurrence, rule.reverse)?;
                 let (next, parent, value) =
-                    self.replace_rewritten_hypothesis(goal, &local, replacement)?;
+                    self.replace_rewritten_hypothesis(goal, &local, replacement, false)?;
                 proof.work.push(Work::Close(parent, value));
                 proof
                     .work
@@ -436,8 +443,12 @@ impl Context {
                     };
                     let replacement =
                         trial.rewrite_hypothesis_value(&local, term, &occurrence, rule.reverse)?;
-                    let (next, parent, value) =
-                        trial.replace_rewritten_hypothesis(goal.clone(), &local, replacement)?;
+                    let (next, parent, value) = trial.replace_rewritten_hypothesis(
+                        goal.clone(),
+                        &local,
+                        replacement,
+                        false,
+                    )?;
                     Ok(Some((next, parent, value, premises)))
                 })();
                 self.txn.budget.heartbeats_consumed = trial.txn.budget.heartbeats_consumed;

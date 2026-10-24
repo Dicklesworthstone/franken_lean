@@ -37,6 +37,39 @@ fn checked(base: &Engine, source: &str) -> Engine {
     .engine
 }
 
+/// With no resulting sort written, a structure or class whose fields are all proofs is a `Prop`
+/// (the pin's `isPropCandidate`; `#check G` is `G : Prop`, 2026-10-21), its proof projection a
+/// theorem. A data field, or no field at all, keeps `Type`.
+#[test]
+fn unannotated_records_of_proofs_are_propositions() {
+    let engine = checked(
+        &seed(),
+        "structure G where\n  m (n : Nat) : n = n\n\
+         theorem g : G := ⟨fun _ => rfl⟩\n\
+         class C (p : Prop) where\n  pf : p\n\
+         structure K extends G where\n  k : 1 = 1\n\
+         structure H where\n  a : Nat\n  m : a = a\n\
+         structure E\n",
+    );
+    let sort = |record: &str| {
+        let info = engine.environment().find(&name(record)).unwrap();
+        let mut type_ = &info.constant_val().type_;
+        while let ExprNode::ForallE { body, .. } = type_.node() {
+            type_ = body;
+        }
+        match type_.node() {
+            ExprNode::Sort { level } => level.normalize_fixpoint().is_zero(),
+            _ => panic!("{record}: not a sort"),
+        }
+    };
+    assert!(sort("G") && sort("C") && sort("K"));
+    assert!(!sort("H") && !sort("E"));
+    assert!(matches!(
+        engine.environment().find(&name("G.m")),
+        Some(ConstantInfo::Thm(_))
+    ));
+}
+
 #[test]
 fn proof_records_and_polymorphic_classes_generate_checked_theorem_projections() {
     let base = seed();

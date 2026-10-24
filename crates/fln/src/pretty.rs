@@ -21,7 +21,9 @@ use fln_core::level::LevelView;
 
 pub mod format;
 pub mod goals;
+mod notations;
 mod print;
+mod structures;
 use format::Format;
 
 /// Why a term could not be printed the pin's way.
@@ -232,6 +234,24 @@ const WIDTH: usize = 120;
 
 /// A term node as the pin's formatter groups it: `fill (nest 2 …)`
 /// (`categoryParser.formatter`, vendored `PrettyPrinter/Formatter.lean`).
+/// `let`, or `have` for a nondependent binding (`let +nondep`), as the pin prints each.
+/// How a dependent `let` prints: as itself, or as `#print` shows a definition's value after the
+/// pin's `letToHave` cleanup (vendored `Lean/Elab/PreDefinition/Basic.lean:96-108`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LetMode {
+    AsIs,
+    /// The value is a safe definition's whose type is not a proposition: the pin has turned
+    /// each nondependent `let` into `have`. One whose body never uses its variable is
+    /// certainly nondependent; for any other this door does not decide dependence.
+    ToHave,
+    /// The value may have had `letToHave` applied or not: no `let` prints.
+    Refuse,
+}
+
+fn let_keyword(non_dep: bool) -> &'static str {
+    if non_dep { "have" } else { "let" }
+}
+
 fn node(content: Format) -> Format {
     content.nest(2).fill()
 }
@@ -424,6 +444,18 @@ fn is_token(text: &str) -> bool {
 /// `_inaccessible`), macro-scoped names and the delaborator's pseudo-syntax (`_`, `#…`,
 /// `?…`) print as they are.
 fn escaped_name(name: &Name) -> String {
+    escaped_name_with(name, is_token)
+}
+
+/// A name as the pin's `Name.toString` prints it, which no token forces to escape: the
+/// form `m!"{n}"` gives a name in a message (`MessageData.ofName`, vendored
+/// `src/Lean/Message.lean:276`; `Init/Data/ToString/Name.lean:123`).
+pub(crate) fn message_name(name: &Name) -> String {
+    escaped_name_with(name, |_| false)
+}
+
+/// [`escaped_name`] with `is_token` deciding which names read as tokens.
+fn escaped_name_with(name: &Name, is_token: impl Fn(&str) -> bool) -> String {
     // Components root first; `Err` is a numeric component.
     let mut parts: Vec<Result<String, u64>> = Vec::new();
     let mut current = name.clone();
@@ -476,6 +508,24 @@ fn escaped_name(name: &Name) -> String {
     text
 }
 
+/// Whether `name` is a binder this engine's elaboration introduced (`_fln…`, or named by a
+/// number), which the pin's term never has. The first component decides: a hygienic
+/// `x._@.M._hyg.4` is the user's `x`.
+pub(crate) fn internal_name(name: &Name) -> bool {
+    let mut first = name.clone();
+    while !first.parent().is_anonymous() {
+        first = first.parent();
+    }
+    match first.leaf_view() {
+        LeafView::Str(text) => text.starts_with("_fln"),
+        LeafView::Num(_) => true,
+        LeafView::Anonymous => false,
+    }
+}
+
+const INTERNAL_BINDER: Unsupported =
+    Unsupported("a binder this engine's elaboration introduced (a compiled `if` or `match`)");
+
 fn binder_name(name: &Name) -> String {
     if accessible(name) {
         escaped_name(name)
@@ -508,6 +558,22 @@ pub struct Printer<'a> {
     /// body extends to the right (`∃ x, p`) there, where the body would absorb it, and as
     /// an argument.
     trailing: bool,
+    /// How many binders the top of the printed term sits under: the section variables a
+    /// `#check` opens, then each `let` of a chain at the top. A `let` there breaks after its `;`.
+    top_names: usize,
+    /// The source's own notations in force ([`notations`]).
+    notations: Option<&'a fln_parse::extensions::Notations>,
+    /// How a dependent `let` prints ([`LetMode`]).
+    lets: LetMode,
+    /// The imported delaborator tags (`pp_using_anonymous_constructor`, `pp_nodot`,
+    /// `app_unexpander` keys), or `None` when the journal cannot be read.
+    tags: Option<fln_elab::delaborator_tags::DelaboratorTags>,
+    /// Whether the environment records imported delaborator tags at all: importing any `Init`
+    /// module does (`Init.Prelude` tags `Subtype`). Without them, as in the native source
+    /// profile, the `Init.NotationExtra` unexpanders this printer reproduces are assumed.
+    imported_tags: bool,
+    /// Structure metadata, read when a structure instance is first printed.
+    structures: Option<structures::StructureTables>,
 }
 
 /// The imported `export` aliases, each declaration's aliases, and the `protected` names: what
@@ -642,6 +708,14 @@ impl<'a> Printer<'a> {
             budget: 100_000,
             resolution: None,
             trailing: false,
+            top_names: 0,
+            notations: None,
+            lets: LetMode::AsIs,
+            tags: fln_elab::delaborator_tags::DelaboratorTags::read(env).ok(),
+            imported_tags: env
+                .extension(&fln_elab::delaborator_tags::journal_name())
+                .is_some(),
+            structures: None,
         }
     }
 
@@ -905,13 +979,27 @@ impl<'a> Printer<'a> {
             }
             return self.subterm(e, outer);
         }
+        // An ascription's anonymous `let` prints as its value, so the root is that value: the
+        // pin's `(e : T)` elaborates to `e` itself, and `e` decides `pp.proofs` there.
+        let mut root = e;
+        while let ExprNode::LetE {
+            decl_name,
+            value,
+            body,
+            ..
+        } = root.node()
+            && decl_name.is_anonymous()
+            && matches!(body.node(), ExprNode::BVar { idx: 0 })
+        {
+            root = value;
+        }
         self.nested = true;
-        self.proofs = self.is_proof(e);
+        self.proofs = self.is_proof(root);
         let printed = self.subterm(e, outer);
         self.nested = false;
         // The root is always grouped (`formatCategory` is `fill (nest 2 …)` with no
         // `isUngrouped` check), so a `fun` that is ungrouped as a child is grouped here.
-        let lambda = matches!(e.node(), ExprNode::Lam { .. }) && outer == 0;
+        let lambda = matches!(root.node(), ExprNode::Lam { .. }) && outer == 0;
         printed.map(|doc| if lambda { node(doc) } else { doc })
     }
 
@@ -941,10 +1029,26 @@ impl<'a> Printer<'a> {
                 })
             }
             // `unexpandUnit` (`Init/NotationExtra.lean:149`).
-            ExprNode::Const { name, .. } if name.to_display_string() == "Unit.unit" => {
+            ExprNode::Const { name, .. }
+                if name.to_display_string() == "Unit.unit" && self.registered("Unit.unit") =>
+            {
                 Ok(Format::text("()"))
             }
-            ExprNode::Const { name, .. } => Ok(Format::text(self.constant(name))),
+            // A structure's constructor without parameters or fields is a structure instance
+            // too, `{ }`.
+            ExprNode::Const { name, .. }
+                if let Some(ConstantInfo::Ctor(ctor)) = self.env.find(name)
+                    && ctor.num_params == 0
+                    && ctor.num_fields == 0
+                    && let Some(ConstantInfo::Induct(inductive)) = self.env.find(&ctor.induct)
+                    && self.structure_like(inductive) =>
+            {
+                let ctor = ctor.clone();
+                self.structure_instance(&ctor, &[])
+            }
+            ExprNode::Const { name, .. } => self
+                .notation(name, &[], outer)
+                .unwrap_or_else(|| Ok(Format::text(self.constant(name)))),
             ExprNode::Lit { literal } => Ok(Format::text(match literal {
                 Literal::Nat(value) => nat_decimal(value),
                 Literal::Str(text) => string_literal(text),
@@ -974,6 +1078,10 @@ impl<'a> Printer<'a> {
                     if *binder_info == BinderInfo::InstImplicit {
                         self.unbind_to(depth);
                         return Err(Unsupported("an instance-implicit `fun` binder"));
+                    }
+                    if internal_name(name) {
+                        self.unbind_to(depth);
+                        return Err(INTERNAL_BINDER);
                     }
                     let shown = self.bound_name(name, inner);
                     self.bind(shown.clone(), binder_type);
@@ -1013,11 +1121,14 @@ impl<'a> Printer<'a> {
                     fun
                 })
             }
-            // `let x : T := v; x` is how a type ascription `(v : T)` elaborates here; the
-            // pin's term is `v` itself.
-            ExprNode::LetE { value, body, .. }
-                if matches!(body.node(), ExprNode::BVar { idx: 0 }) =>
-            {
+            // An anonymous `let : T := v; ·` is how a type ascription `(v : T)` elaborates here;
+            // the pin's term is `v` itself. A written `let b := a; b` names its binder.
+            ExprNode::LetE {
+                decl_name,
+                value,
+                body,
+                ..
+            } if decl_name.is_anonymous() && matches!(body.node(), ExprNode::BVar { idx: 0 }) => {
                 self.doc(value, outer)
             }
             // At the top of the printed term the pin breaks a `let` after its `;` with no
@@ -1028,23 +1139,70 @@ impl<'a> Printer<'a> {
                 type_,
                 value,
                 body,
-                ..
-            } if outer == 0 && self.names.is_empty() => {
+                non_dep,
+            } if outer == 0 && self.names.len() == self.top_names => {
+                if internal_name(name) {
+                    return Err(INTERNAL_BINDER);
+                }
+                let non_dep = &self.nondependent(body, *non_dep)?;
+                let value = self.doc(value, 0)?;
+                let shown = binder_name(name);
+                let depth = self.names.len();
+                self.bind(shown.clone(), type_);
+                // The body continues the chain at the top.
+                let top = std::mem::replace(&mut self.top_names, self.names.len());
+                let printed = self.doc(body, 0);
+                self.top_names = top;
+                self.unbind_to(depth);
+                Ok(
+                    Format::text(format!("{} {shown} := ", let_keyword(*non_dep)))
+                        .then(value)
+                        .then(Format::text(";\n"))
+                        .then(printed?),
+                )
+            }
+            // Nested, a `let` (`have` when nondependent) is `let x := v;`, the hard line of
+            // `optSemicolon`'s `ppLine`, and its body, under `ppDedent`: in parentheses below
+            // `leadPrec`, the `paren` node's dedent returns the body to the enclosing
+            // indentation, and the hard line breaks every group around it.
+            ExprNode::LetE {
+                decl_name: name,
+                type_,
+                value,
+                body,
+                non_dep,
+            } => {
+                if internal_name(name) {
+                    return Err(INTERNAL_BINDER);
+                }
+                let non_dep = &self.nondependent(body, *non_dep)?;
                 let value = self.doc(value, 0)?;
                 let shown = binder_name(name);
                 let depth = self.names.len();
                 self.bind(shown.clone(), type_);
                 let printed = self.doc(body, 0);
                 self.unbind_to(depth);
-                Ok(Format::text(format!("let {shown} := "))
+                let doc = Format::text(format!("{} {shown} := ", let_keyword(*non_dep)))
                     .then(value)
                     .then(Format::text(";\n"))
-                    .then(printed?))
+                    .then(printed?);
+                Ok(paren_doc(doc, MAX_PREC - 1, outer))
             }
-            ExprNode::LetE { .. } => Err(Unsupported("a nested let expression")),
             ExprNode::Proj { idx, expr, .. } => Ok(node(
                 self.doc(expr, MAX_PREC)?
                     .then(Format::text(format!(".{}", idx + 1))),
+            )),
+        }
+    }
+
+    /// Whether a `let` with this body prints as `have`, under [`Printer::lets`].
+    fn nondependent(&self, body: &Expr, non_dep: bool) -> Result<bool, Unsupported> {
+        match self.lets {
+            _ if non_dep => Ok(true),
+            LetMode::AsIs => Ok(false),
+            LetMode::ToHave if !body.has_loose_bvar(0) => Ok(true),
+            LetMode::ToHave | LetMode::Refuse => Err(Unsupported(
+                "a `let` the pin's `letToHave` may make a `have`",
             )),
         }
     }
@@ -1061,6 +1219,10 @@ impl<'a> Printer<'a> {
             {
                 return Ok(Format::text(nat_decimal(value)));
             }
+            // The source's own notations: their unexpanders are the newest.
+            if let Some(printed) = self.notation(name, &args, outer) {
+                return printed;
+            }
             // `notation:max "¬" p:40 => Not p`; `notation:max "!" b:40 => not b`
             // (`Init/Notation.lean`, `not` being `Bool.not`).
             if (text == "Not" || text == "Bool.not") && args.len() == 1 {
@@ -1071,11 +1233,48 @@ impl<'a> Printer<'a> {
                     outer,
                 ));
             }
+            // `delabSigma`/`delabPSigma` (vendored `PrettyPrinter/Delaborator/Builtins.lean:
+            // 1300-1317`): `Sigma fun (x : α) => b` is `(x : α) × b`, `(_ : α) × b` when `b` does
+            // not use `x`. The notation (`macro:35 … " × " b:term:35`) is declared in
+            // `Init.NotationExtra`; without it the pin fails to print the term at all.
+            if (text == "Sigma" || text == "PSigma")
+                && args.len() == 2
+                && let ExprNode::Lam {
+                    binder_name,
+                    binder_type,
+                    body,
+                    ..
+                } = args[1].node()
+            {
+                if !self.registered(&text) {
+                    return Err(Unsupported("a `Σ` type without `Init.NotationExtra`"));
+                }
+                let domain = self.with_trailing(false, |printer| printer.doc(binder_type, 0))?;
+                let shown = if body.has_loose_bvar(0) {
+                    self.bound_name(binder_name, body)
+                } else {
+                    "_".to_owned()
+                };
+                let depth = self.names.len();
+                self.bind(shown.clone(), binder_type);
+                let trailing = self.trailing && 35 >= outer;
+                let printed = self.with_trailing(trailing, |printer| printer.doc(body, 35));
+                self.unbind_to(depth);
+                let symbol = if text == "Sigma" { " ×" } else { " ×'" };
+                let doc = Format::text(format!("({shown} : "))
+                    .then(domain)
+                    .then(Format::text(")"))
+                    .then(Format::text(symbol))
+                    .then(Format::Line)
+                    .then(printed?);
+                return Ok(paren_doc(node(doc), 35, outer));
+            }
             // `unexpandExists` (`Init/NotationExtra.lean:185-189`): `Exists fun x => b` is
             // `∃ x, b`, nested ones sharing one binder list. A `fun` binder that is not
             // explicit does not match the unexpander and is not reproduced.
             if text == "Exists"
                 && args.len() == 2
+                && self.registered("Exists")
                 && matches!(
                     args[1].node(),
                     ExprNode::Lam {
@@ -1119,7 +1318,11 @@ impl<'a> Printer<'a> {
                 )));
             }
             // `[a, b, …]` (the `List.cons`/`List.nil` unexpanders); an open tail is `::`.
-            if text == "List.cons" && args.len() == 3 {
+            if text == "List.cons"
+                && args.len() == 3
+                && self.registered("List.cons")
+                && self.registered("List.nil")
+            {
                 let mut elements = vec![args[1].clone()];
                 let mut tail = args[2].clone();
                 loop {
@@ -1148,12 +1351,15 @@ impl<'a> Printer<'a> {
                     break;
                 }
             }
-            if text == "List.nil" && args.len() == 1 {
+            if text == "List.nil" && args.len() == 1 && self.registered("List.nil") {
                 return Ok(Format::text("[]"));
             }
+            // Each operator is an `infixl`/`infixr`/`notation` of `Init.Notation`, which registers
+            // its unexpander: without that import the pin prints the application.
             if let Some(infix) = INFIXES
                 .iter()
                 .find(|infix| infix.function == text && infix.arity == args.len())
+                .filter(|infix| self.registered(infix.function))
             {
                 let (lhs_prec, rhs_prec) = if infix.right {
                     (infix.precedence + 1, infix.precedence)
@@ -1215,67 +1421,172 @@ impl<'a> Printer<'a> {
                 }
                 return Err(Unsupported("an applied sorry"));
             }
+            if text == "Prod.mk" && args.len() == 4 && self.registered("Prod.mk") {
+                return self.tuple(&args[2], &args[3]);
+            }
             // A structure's constructor, fully applied, is `{ x := a, … }` at the pin, or
-            // `⟨a, …⟩` for a type tagged `pp_using_anonymous_constructor`, which is not decoded.
+            // `⟨a, …⟩` for a type tagged `pp_using_anonymous_constructor` ([`structures`]).
             if let Some(ConstantInfo::Ctor(ctor)) = self.env.find(name)
                 && args.len() == (ctor.num_params + ctor.num_fields) as usize
                 && let Some(ConstantInfo::Induct(inductive)) = self.env.find(&ctor.induct)
                 && self.structure_like(inductive)
             {
-                return Err(Unsupported("a structure instance"));
+                let ctor = ctor.clone();
+                return self.structure_instance(&ctor, &args);
+            }
+            // Any other constant an imported `@[app_unexpander]` prints (`ite` as `if … then …
+            // else …`, `GetElem.getElem` as `xs[i]`, …) runs code this door does not reproduce:
+            // its application is refused rather than printed as an application.
+            if self.imported_tags && self.unexpander_in_force(name) {
+                return Err(Unsupported("an application an `@[app_unexpander]` prints"));
             }
             let infos = self.binder_infos(name);
             // Generalized field notation: `C.f r …` is `r.f …` when `r` is `C.f`'s first
             // explicit argument and has type `C …` (never on a numeric literal).
             if let Some((receiver, field)) = self.field_receiver(name, &infos, &args) {
+                let object = self.without_parent_projections(&args[receiver])?;
                 let projection = node(
-                    self.doc(&args[receiver], MAX_PREC)?
+                    self.doc(&object, MAX_PREC)?
                         .then(Format::text(format!(".{field}"))),
                 );
                 let mut shown = projection;
                 let mut applied = false;
-                for (index, arg) in args.iter().enumerate() {
-                    let explicit = infos
-                        .get(index)
-                        .is_none_or(|info| *info == BinderInfo::Default);
-                    if explicit && index != receiver {
-                        shown = shown.then(Format::Line).then(self.doc(arg, MAX_PREC)?);
-                        applied = true;
-                    }
+                let shown_args: Vec<usize> = (0..args.len())
+                    .filter(|&index| {
+                        index != receiver
+                            && infos
+                                .get(index)
+                                .is_none_or(|info| *info == BinderInfo::Default)
+                    })
+                    .collect();
+                let mut open = false;
+                for (position, &index) in shown_args.iter().enumerate() {
+                    let last = position + 1 == shown_args.len();
+                    let (printed, bare) = self.argument(&args[index], last)?;
+                    shown = shown.then(Format::Line).then(printed);
+                    open = bare;
+                    applied = true;
                 }
                 return Ok(if applied {
-                    paren_doc(node(shown), MAX_PREC - 1, outer)
+                    self.applied(node(shown), open, outer)
                 } else {
                     shown
                 });
             }
             let mut shown = Format::Nil;
             let mut applied = false;
-            for (index, arg) in args.iter().enumerate() {
-                let explicit = infos
-                    .get(index)
-                    .is_none_or(|info| *info == BinderInfo::Default);
-                if explicit {
-                    shown = shown.then(Format::Line).then(self.doc(arg, MAX_PREC)?);
-                    applied = true;
-                }
+            let shown_args: Vec<usize> = (0..args.len())
+                .filter(|&index| {
+                    infos
+                        .get(index)
+                        .is_none_or(|info| *info == BinderInfo::Default)
+                })
+                .collect();
+            let mut open = false;
+            for (position, &index) in shown_args.iter().enumerate() {
+                let last = position + 1 == shown_args.len();
+                let (printed, bare) = self.argument(&args[index], last)?;
+                shown = shown.then(Format::Line).then(printed);
+                open = bare;
+                applied = true;
             }
             let text = self.display_name(name);
             if !applied {
                 return Ok(Format::text(text));
             }
             // `app := many1 argument`, each argument after a line (`checkWsBefore`).
-            return Ok(paren_doc(
-                node(Format::text(text).then(shown)),
-                MAX_PREC - 1,
-                outer,
-            ));
+            return Ok(self.applied(node(Format::text(text).then(shown)), open, outer));
         }
         let mut shown = self.doc(&head, MAX_PREC)?;
-        for arg in &args {
-            shown = shown.then(Format::Line).then(self.doc(arg, MAX_PREC)?);
+        let mut open = false;
+        for (index, arg) in args.iter().enumerate() {
+            let last = index + 1 == args.len();
+            let (printed, bare) = self.argument(arg, last)?;
+            shown = shown.then(Format::Line).then(printed);
+            open = bare;
         }
-        Ok(paren_doc(node(shown), MAX_PREC - 1, outer))
+        Ok(self.applied(node(shown), open, outer))
+    }
+
+    /// Whether an `@[app_unexpander]` is registered for `key`, which this printer reproduces.
+    fn registered(&self, key: &str) -> bool {
+        match &self.tags {
+            Some(_) if self.imported_tags => {
+                self.unexpander_in_force(&Name::from_components(key.split('.')))
+            }
+            _ => true,
+        }
+    }
+
+    /// Whether an imported `@[app_unexpander]` for `constant` is in force here. A `scoped` one
+    /// is in force where its namespace is active in this command's scope. Without a scope,
+    /// every registered one is taken to be in force.
+    fn unexpander_in_force(&self, constant: &Name) -> bool {
+        self.tags.as_ref().is_some_and(|tags| {
+            tags.unexpanded(constant, |namespace| {
+                self.scope
+                    .is_none_or(|scope| scope.instance_scopes.is_active(namespace))
+            })
+        })
+    }
+
+    /// `unexpandProdMk` (`Init/NotationExtra.lean:168-171`): `Prod.mk x y` is `(x, y)`, and a
+    /// second component that is itself a pair continues the tuple, `(x, y, z)`.
+    fn tuple(&mut self, first: &Expr, second: &Expr) -> Doc {
+        let mut elements = vec![first.clone()];
+        let mut rest = second.clone();
+        loop {
+            self.tick()?;
+            let (head, args) = spine(&rest);
+            match head.node() {
+                ExprNode::Const { name, .. }
+                    if name.to_display_string() == "Prod.mk" && args.len() == 4 =>
+                {
+                    elements.push(args[2].clone());
+                    rest = args[3].clone();
+                }
+                _ => break,
+            }
+        }
+        elements.push(rest);
+        // `"(" term ", " sepBy1 term ", " ")"`: a line after each comma.
+        let mut shown = Format::Nil;
+        for (index, element) in elements.iter().enumerate() {
+            if index > 0 {
+                shown = shown.then(Format::text(",")).then(Format::Line);
+            }
+            shown = shown.then(self.with_trailing(false, |printer| printer.doc(element, 0))?);
+        }
+        Ok(node(Format::text("(").then(shown).then(Format::text(")"))))
+    }
+
+    /// An application's argument, at `maxPrec`, and whether it is a `fun` left bare. `fun`
+    /// parses at `maxPrec` too (`basicFun`), so the pin's parenthesizer brackets it only before a
+    /// later argument: last, it is `Subtype fun n => n = 1`, and an application ending so is
+    /// bracketed whole where a token follows it ([`Printer::applied`]).
+    fn argument(&mut self, arg: &Expr, last: bool) -> Result<(Format, bool), Unsupported> {
+        let mut bare = arg;
+        while let ExprNode::MData { expr, .. } = bare.node() {
+            bare = expr;
+        }
+        if last && matches!(bare.node(), ExprNode::Lam { .. }) {
+            Ok((
+                self.with_trailing(false, |printer| printer.doc(arg, 0))?,
+                true,
+            ))
+        } else {
+            Ok((self.doc(arg, MAX_PREC)?, false))
+        }
+    }
+
+    /// `paren_doc` for an application at `outer`, also bracketed when it ends in a bare `fun`
+    /// and a token follows it: `(ap2 1 fun x => x) + 2`, `(Subtype fun n => n = 1) → Nat`.
+    fn applied(&self, doc: Format, open: bool, outer: u32) -> Format {
+        if open && self.trailing && outer < MAX_PREC {
+            paren_doc(doc, 0, 1)
+        } else {
+            paren_doc(doc, MAX_PREC - 1, outer)
+        }
     }
 
     /// The receiver index and field name when `C.f args` prints as `receiver.f`.
@@ -1296,6 +1607,7 @@ impl<'a> Printer<'a> {
         if namespace.is_anonymous()
             || namespace.to_display_string() == "Function"
             || name.to_display_string() == "List.toArrayImpl"
+            || self.tags.as_ref().is_some_and(|tags| tags.nodot(name))
         {
             return None;
         }
@@ -1528,6 +1840,9 @@ impl<'a> Printer<'a> {
                     && !self.is_prop(binder_type));
             if !dependent && *binder_info == BinderInfo::Default {
                 break self.pi(current, ARROW_PREC);
+            }
+            if internal_name(name) {
+                break Err(INTERNAL_BINDER);
             }
             let type_doc = self.doc(binder_type, 0)?;
             let type_text = flat(&type_doc);

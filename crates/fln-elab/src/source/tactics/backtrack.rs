@@ -123,6 +123,10 @@ pub(in crate::source) fn recoverable(problem: &NatDefinitionElabError) -> bool {
                 reason,
                 TacticError::MalformedScript
                     | TacticError::UnsupportedTactic(_)
+                    | TacticError::UnfoldStuckMatch(_)
+                    | TacticError::SplitMatchUnsupported
+                    | TacticError::SplitBoundDecision
+                    | TacticError::SplitDependentCondition
                     | TacticError::ArithmeticUnsupported
                     | TacticError::ArithmeticInvalidCertificate
             )

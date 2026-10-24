@@ -5,6 +5,8 @@
 //! resubmitted in an unproductive loop. Neither reduction nor transparency can
 //! publish a declaration or eliminate an original source typing obligation.
 mod imported_smart;
+mod meta;
+pub(in crate::source) use meta::ReduceConfig;
 #[cfg(test)]
 mod projection_tests;
 mod quotient;
@@ -419,6 +421,16 @@ impl Context {
             result => result,
         };
         let value = match unfolding {
+            // Only an occurrence applied to every parameter: the pin's unfold equation matches
+            // none other, and a bare or partial application is visited here as the function
+            // of the application that holds it.
+            SmartUnfolding::Folded
+                if self.unfold_tactic && arguments.len() >= lambda_count(&definition.value) =>
+            {
+                return Err(failure(SourceInferenceError::Tactic(
+                    tactics::TacticError::UnfoldStuckMatch(name.clone()),
+                )));
+            }
             SmartUnfolding::Folded => return Ok(term.clone()),
             SmartUnfolding::Plain => {
                 self.instantiate_params(&definition.value, &definition.base.level_params, levels)?
@@ -721,13 +733,15 @@ impl Context {
         };
         if family.is_unsafe
             || family.num_indices != recursor.num_indices
-            || family.num_nested != 0
             || family.num_params != recursor.num_params
             || family.all != recursor.all
             || recursor.rules.len() != family.ctors.len()
         {
             return Ok(None);
         }
+        // A nested block's recursor also takes a motive per auxiliary family, and minors for
+        // the auxiliaries' constructors, which are not constants of their own.
+        let nested = family.num_nested as usize;
         for (rule, constructor) in recursor.rules.iter().zip(&family.ctors) {
             self.tick()?;
             if &rule.ctor != constructor {
@@ -744,7 +758,7 @@ impl Context {
             if !members.insert(member)
                 || &info.base.name != member
                 || info.is_unsafe
-                || info.num_nested != 0
+                || info.num_nested != family.num_nested
                 || info.all != recursor.all
                 || info.num_params != recursor.num_params
                 || info.base.level_params != family.base.level_params
@@ -755,9 +769,11 @@ impl Context {
                 .checked_add(info.ctors.len())
                 .ok_or_else(|| failure(SourceInferenceError::ResourceLimit))?;
         }
+        let all_minors = recursor.num_minors as usize;
         if !members.contains(&family_name)
-            || recursor.num_motives as usize != members.len()
-            || recursor.num_minors as usize != minors
+            || Some(recursor.num_motives as usize) != members.len().checked_add(nested)
+            || (nested == 0 && all_minors != minors)
+            || (nested != 0 && all_minors <= minors)
         {
             return Ok(None);
         }
@@ -857,6 +873,17 @@ impl Context {
         }
         Ok(Some(result))
     }
+}
+
+/// The leading lambdas of a definition's value: the parameters its unfolding takes.
+fn lambda_count(value: &Expr) -> usize {
+    let mut count = 0;
+    let mut body = value;
+    while let ExprNode::Lam { body: inner, .. } = body.node() {
+        count += 1;
+        body = inner;
+    }
+    count
 }
 
 #[cfg(test)]

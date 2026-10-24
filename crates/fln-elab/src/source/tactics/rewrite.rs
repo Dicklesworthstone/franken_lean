@@ -480,7 +480,11 @@ impl Context {
 
     /// A sufficient syntactic match, with pair memoization and metered visits;
     /// no recursive Expr equality over an exponentially shared input graph.
-    fn rewrite_same(&mut self, left: &Expr, right: &Expr) -> Result<bool, NatDefinitionElabError> {
+    pub(super) fn rewrite_same(
+        &mut self,
+        left: &Expr,
+        right: &Expr,
+    ) -> Result<bool, NatDefinitionElabError> {
         let mut work = vec![(left, right)];
         let mut seen = HashSet::new();
         while let Some((a, b)) = work.pop() {

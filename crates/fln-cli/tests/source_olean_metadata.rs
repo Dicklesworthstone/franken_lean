@@ -194,7 +194,7 @@ fn fixture() -> Project {
 }
 fn source(imports: &str, selected: &str) -> String {
     format!(
-        "prelude\nimport {imports}\ndef use [d : Class] : Class := d\ndef selected : Family use := {selected}\n"
+        "prelude\nimport {imports}\ndef use [d : Class] : Class := d\nnoncomputable def selected : Family use := {selected}\n"
     )
 }
 
@@ -240,7 +240,7 @@ fn cli_replays_dictionary_order_and_reports_uninterpreted_metadata() {
 #[test]
 fn imports_through_local_modules_preserve_declared_not_discovery_order() {
     let p = fixture();
-    p.write("Wrapper.lean", "prelude\nimport B\nimport A\ndef wrapperUse [d : Class] : Class := d\ndef wrapperChoice : Family wrapperUse := valueA\n");
+    p.write("Wrapper.lean", "prelude\nimport B\nimport A\ndef wrapperUse [d : Class] : Class := d\nnoncomputable def wrapperChoice : Family wrapperUse := valueA\n");
     // Filesystem discovery sees external A before visiting Wrapper. Metadata
     // replay must nevertheless visit Wrapper's B before the following A.
     p.write("Main.lean", source("Wrapper\nimport A", "valueA"));
@@ -338,7 +338,7 @@ fn lake_build_uses_checked_metadata_and_original_external_import_order() {
     assert!(artifact.is_file());
     p.write(
         "Consumer.lean",
-        "prelude\nimport Main\ndef downstream : Family use := selected\n",
+        "prelude\nimport Main\nnoncomputable def downstream : Family use := selected\n",
     );
     let search =
         std::env::join_paths([p.0.join(".lake/build/lib/lean"), p.0.join("objects")]).unwrap();

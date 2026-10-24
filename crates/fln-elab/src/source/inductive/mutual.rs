@@ -418,6 +418,12 @@ pub(in crate::source) fn elaborate_mutual(
             result_level: result_level.clone(),
         });
     }
+    if let Some(declaration) =
+        crate::inductive::nested_inductive_declaration(env, &specs, budget, &promoted)
+            .map_err(|e| failure(SourceInferenceError::Inductive(e)))?
+    {
+        return Ok(declaration);
+    }
     mutual_inductive_with_promoted_parameters(&specs, budget, &promoted)
         .map_err(|e| failure(SourceInferenceError::Inductive(e)))
 }

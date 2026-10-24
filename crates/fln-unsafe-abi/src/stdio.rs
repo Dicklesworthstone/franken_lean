@@ -737,9 +737,8 @@ pub(crate) unsafe fn io_result_show_error_core(r: *mut LeanObject, sink: &mut dy
 // UNSAFE-LEDGER: FLN-UL-0423
 #[allow(unsafe_code)]
 pub(crate) fn panic_message_via_stream(msg: &[u8]) -> bool {
-    match crate::handle::stdout_capture::write_diagnostic_if_captured(msg) {
-        Ok(true) | Err(_) => return true,
-        Ok(false) => {}
+    if crate::handle::stdout_capture::diagnostic_if_captured(msg) {
+        return true;
     }
     // SAFETY: the duplicated stream is settled; field reads stay within
     // live objects; the handle is borrowed from the closure's fixed slot

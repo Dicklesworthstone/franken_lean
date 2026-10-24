@@ -32,6 +32,15 @@ def ioSelectUnit := (pure () : IO Unit)
 def ioSelectBaseUnit := (pure () : BaseIO Unit)
 def ioSelectString := (pure "λ🙂" : IO String)
 def ioSelectAppend : String := String.append "[" "]"
+def ioSelectStdout := IO.getStdout
+def ioSelectStderr := IO.getStderr
+def ioSelectPrint : IO Unit := do
+  IO.print "out:"
+  IO.eprint "err"
+  IO.eprintln " λ"
+  IO.println "done"
+def ioSelectTrace : Nat := dbgTrace "trace" (fun _ => 7)
+def ioSelectPanic : Nat := panic! "checked diagnostic"
 def ioSelectRecord := (pure (IoPrintRecord.mk true) : IO IoPrintRecord)
 def ioSelectTree := (pure (IoPrintTree.leaf true) : IO IoPrintTree)
 def ioSelectAlias := (pure (show IoPayloadAlias from (42 : Nat)) : IO IoPayloadAlias)
@@ -582,8 +591,19 @@ pub(super) fn admitted(library: &Path) -> Engine {
     // actual declaration/proof closure and extern journal are retained by
     // ioSelectAppend's checked references, not supplied as comparison models.
     assert!(engine.environment().contains(&name("String.append")));
+    for declaration in [
+        "IO.getStdout",
+        "IO.getStderr",
+        "dbgTrace",
+        "panicWithPosWithDecl",
+    ] {
+        assert!(engine.environment().contains(&name(declaration)));
+    }
     assert!(!engine.environment().contains(&name("ioSelectAppend")));
     assert!(!engine.environment().contains(&name("ioSelectEffect")));
+    assert!(!engine.environment().contains(&name("ioSelectPrint")));
+    assert!(!engine.environment().contains(&name("ioSelectTrace")));
+    assert!(!engine.environment().contains(&name("ioSelectPanic")));
     eprintln!(
         "IO printing fixture: selected declarations and actual metadata ready in {:?}",
         start.elapsed()
