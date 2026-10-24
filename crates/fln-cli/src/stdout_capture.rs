@@ -106,7 +106,9 @@ fn capture_failure(
         fln::StdoutCaptureError::Allocation | fln::StdoutCaptureError::Limit { .. } => {
             ("resource", 3)
         }
-        fln::StdoutCaptureError::InvalidStdout => ("capability", 5),
+        fln::StdoutCaptureError::InvalidStdout | fln::StdoutCaptureError::InvalidStderr => {
+            ("capability", 5)
+        }
         fln::StdoutCaptureError::ScopeUnavailable => ("internal-fault", 4),
     };
     failure(

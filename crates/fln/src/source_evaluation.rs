@@ -98,8 +98,9 @@ impl DefinitionExecution {
         self.evaluation_presentation
     }
 
-    /// What an IO evaluation wrote to stdout, when the `lean` presentation captured it
-    /// (`None` elsewhere: other presentations let an action write while it runs).
+    /// Ordered stdout and stderr from a pure or IO `#eval`, including native
+    /// panic and trace diagnostics, when the `lean` presentation captured it.
+    /// Other presentations retain ordinary native writes and return `None`.
     pub fn captured_stdout(&self) -> Option<&[u8]> {
         self.io_stdout.as_deref()
     }

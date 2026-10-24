@@ -14,6 +14,8 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+#[path = "source_io_presentation/evaluation_capture.rs"]
+mod evaluation_capture;
 #[path = "source_io_presentation/executable_main.rs"]
 mod executable_main;
 #[path = "source_io_presentation/fixture.rs"]
@@ -395,9 +397,8 @@ fn admitted_io_printing_refuses_before_effects_and_skips_printers_on_exceptions(
             let guarded = engine.execute_source_commands_with_presentation(
                 source.as_bytes(), &KVMap::new(), limits(), EvaluationPresentation::Lean,
             ).unwrap().into_complete().unwrap();
-            // This fixture's world has no stdout handle (`IO.getStdout` is outside its closure),
-            // so the capture is present and empty; the installed `lean` door's `io_printing`
-            // test checks captured text end to end.
+            // File writes stay outside the evaluation's output capture. The
+            // adjacent capture tests exercise the admitted stdout/stderr paths.
             assert_eq!(guarded.batch.executions[0].captured_stdout(), Some(&[][..]));
             assert_eq!(std::fs::read(&effect).unwrap(), b"written\n");
         }

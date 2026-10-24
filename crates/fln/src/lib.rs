@@ -8462,22 +8462,23 @@ impl Engine {
                 }
                 merged
             });
-            // The pin's `#eval` runs an action inside `IO.FS.withIsolatedStreams` and logs what
-            // it wrote as a message of its own, ahead of the result's. The `lean` presentation
-            // keeps those bytes for the door to print at this command's position.
+            // The pin's `#eval` collects stdout and stderr from the evaluated expression
+            // and its printer, including native panic/trace diagnostics from pure values.
+            // Keep that ordered output ahead of the result at this command's position.
             let capture = if presentation == EvaluationPresentation::Lean
                 && matches!(
                     evaluation_presentation,
                     Some(
-                        EvaluationResultPresentation::IoFormat { .. }
+                        EvaluationResultPresentation::Format { .. }
+                            | EvaluationResultPresentation::IoFormat { .. }
                             | EvaluationResultPresentation::IoUnit
                     )
                 ) {
-                match StdoutCapture::begin(LEAN_EVALUATION_STDOUT_LIMIT) {
+                match StdoutCapture::begin_evaluation(LEAN_EVALUATION_STDOUT_LIMIT) {
                     Ok(capture) => Some(capture),
                     Err(error) => {
                         return Ok(Outcome::InternalFault(InternalFault::new(
-                            "lean evaluation stdout capture",
+                            "lean evaluation output capture",
                             format!(
                                 "command {command_index}: the capture did not begin: {error:?}"
                             ),
@@ -8510,7 +8511,7 @@ impl Engine {
                         ))
                     }
                     error => Outcome::InternalFault(InternalFault::new(
-                        "lean evaluation stdout capture",
+                        "lean evaluation output capture",
                         format!("command {command_index}: the capture failed: {error:?}"),
                     )),
                 });

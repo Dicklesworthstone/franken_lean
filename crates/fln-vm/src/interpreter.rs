@@ -3311,12 +3311,12 @@ fn stdio_apply_failure(refusal: VmRefusal, steps: u64, peak: u64) -> Result<VmEx
             StdoutCaptureError::Allocation => Stop::Inconclusive(
                 Inconclusive::dependency_unavailable("host allocation for stdout capture"),
             ),
-            StdoutCaptureError::InvalidStdout | StdoutCaptureError::ScopeUnavailable => {
-                Stop::InternalFault(InternalFault::new(
-                    "STDOUT-CAPTURE-SCOPE",
-                    "validated stdout capture lost its scope contract",
-                ))
-            }
+            StdoutCaptureError::InvalidStdout
+            | StdoutCaptureError::InvalidStderr
+            | StdoutCaptureError::ScopeUnavailable => Stop::InternalFault(InternalFault::new(
+                "STDOUT-CAPTURE-SCOPE",
+                "validated stdout capture lost its scope contract",
+            )),
         });
     }
     Ok(VmExit::Refused {

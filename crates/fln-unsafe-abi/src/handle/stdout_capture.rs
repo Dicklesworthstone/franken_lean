@@ -1,6 +1,7 @@
-//! Explicit, thread-local memory sinks for the reviewed Golem stdout callback.
+//! Explicit, thread-local memory sinks for reviewed native stream callbacks.
 //! No native FILE is created, closed, or redirected. A retained callback binds
-//! each scope to one validated stdout Handle; other Handles keep normal fwrite.
+//! each scope to validated stdout and optionally stderr Handles; other Handles
+//! keep normal fwrite.
 
 use super::Obj;
 use std::cell::RefCell;
@@ -11,6 +12,7 @@ use std::rc::Rc;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StdoutCaptureError {
     InvalidStdout,
+    InvalidStderr,
     Allocation,
     Limit { limit: usize, requested: usize },
     ScopeUnavailable,
@@ -34,6 +36,7 @@ pub struct StdoutCapture {
 struct Frame {
     id: u64,
     callback: Obj,
+    stderr_callback: Option<Obj>,
     bytes: Vec<u8>,
     escaped_bytes: usize,
     limit: usize,
@@ -55,9 +58,33 @@ impl StdoutCapture {
     /// bounds JSON string content after escaping (excluding quotes), and hence
     /// also bounds the unchanged raw UTF-8 bytes. Each write is all-or-nothing.
     pub fn begin(max_escaped_bytes: usize) -> Result<Self, StdoutCaptureError> {
+        Self::begin_streams(max_escaped_bytes, false)
+    }
+
+    /// Capture this thread's exact current native stdout and stderr in one
+    /// ordered buffer. Native nonfatal panic and trace lines join the same
+    /// bounded stream. This does not replace or empty the thread's stdin.
+    pub fn begin_evaluation(max_escaped_bytes: usize) -> Result<Self, StdoutCaptureError> {
+        Self::begin_streams(max_escaped_bytes, true)
+    }
+
+    fn begin_streams(
+        max_escaped_bytes: usize,
+        capture_stderr: bool,
+    ) -> Result<Self, StdoutCaptureError> {
         let callback = Obj::stdio_stdout()
             .and_then(|stream| stream.try_ctor_child(4))
             .ok_or(StdoutCaptureError::InvalidStdout)?;
+        // Both complete native streams must validate before a frame exists.
+        let stderr_callback = if capture_stderr {
+            Some(
+                Obj::stdio_stderr()
+                    .and_then(|stream| stream.try_ctor_child(4))
+                    .ok_or(StdoutCaptureError::InvalidStderr)?,
+            )
+        } else {
+            None
+        };
         STATE.with(|state| {
             let mut state = state.borrow_mut();
             let next_id = state
@@ -73,6 +100,7 @@ impl StdoutCapture {
             state.frames.push(Frame {
                 id,
                 callback,
+                stderr_callback,
                 bytes: Vec::new(),
                 escaped_bytes: 0,
                 limit: max_escaped_bytes,
@@ -146,6 +174,91 @@ fn same_handle(left: &Obj, right: &Obj) -> bool {
     }
 }
 
+impl Frame {
+    fn matches(&self, callback: &Obj) -> bool {
+        same_handle(callback, &self.callback)
+            || self
+                .stderr_callback
+                .as_ref()
+                .is_some_and(|stderr| same_handle(callback, stderr))
+    }
+
+    fn reserve_write(
+        &mut self,
+        raw_bytes: Option<usize>,
+        escaped_bytes: Option<usize>,
+    ) -> Result<usize, StdoutCaptureError> {
+        if let Some(error) = self.error {
+            return Err(error);
+        }
+        let requested = escaped_bytes.and_then(|length| self.escaped_bytes.checked_add(length));
+        let error = if raw_bytes.is_none() || requested.is_none_or(|length| length > self.limit) {
+            Some(StdoutCaptureError::Limit {
+                limit: self.limit,
+                requested: requested.unwrap_or(usize::MAX),
+            })
+        } else if self.bytes.try_reserve(raw_bytes.unwrap_or(0)).is_err() {
+            Some(StdoutCaptureError::Allocation)
+        } else {
+            None
+        };
+        if let Some(error) = error {
+            self.error = Some(error);
+            return Err(error);
+        }
+        Ok(requested.expect("the complete write fits the capture limit"))
+    }
+
+    fn append(&mut self, bytes: &[u8]) -> Result<(), StdoutCaptureError> {
+        let requested = self.reserve_write(Some(bytes.len()), escaped_length(bytes))?;
+        self.bytes.extend_from_slice(bytes);
+        self.escaped_bytes = requested;
+        Ok(())
+    }
+
+    fn append_diagnostic(&mut self, message: &[u8]) -> Result<(), StdoutCaptureError> {
+        if let Some(error) = self.error {
+            return Err(error);
+        }
+        // Count lossy UTF-8 recovery and the added newline before allocating.
+        // A refused message never builds an unbounded recovered String or
+        // contributes a partial line to the capture.
+        let mut raw_bytes = Some(1usize);
+        let mut escaped_bytes = Some(2usize);
+        lossy_chunks(message, |chunk| {
+            raw_bytes = raw_bytes.and_then(|length| length.checked_add(chunk.len()));
+            escaped_bytes = escaped_bytes.and_then(|length| {
+                escaped_length(chunk).and_then(|extra| length.checked_add(extra))
+            });
+        });
+        let requested = self.reserve_write(raw_bytes, escaped_bytes)?;
+        lossy_chunks(message, |chunk| self.bytes.extend_from_slice(chunk));
+        self.bytes.push(b'\n');
+        self.escaped_bytes = requested;
+        Ok(())
+    }
+}
+
+fn lossy_chunks(mut bytes: &[u8], mut visit: impl FnMut(&[u8])) {
+    loop {
+        match std::str::from_utf8(bytes) {
+            Ok(valid) => {
+                visit(valid.as_bytes());
+                return;
+            }
+            Err(error) => {
+                let valid = error.valid_up_to();
+                visit(&bytes[..valid]);
+                visit("\u{fffd}".as_bytes());
+                match error.error_len() {
+                    Some(invalid) => bytes = &bytes[valid + invalid..],
+                    None => return,
+                }
+            }
+        }
+    }
+}
+
 /// Called only after the normal callback, canonical String, and world checks.
 pub(super) fn write_if_captured(callback: &Obj, text: &Obj) -> Result<bool, StdoutCaptureError> {
     STATE.with(|state| {
@@ -154,7 +267,7 @@ pub(super) fn write_if_captured(callback: &Obj, text: &Obj) -> Result<bool, Stdo
             .frames
             .iter_mut()
             .rev()
-            .find(|frame| same_handle(callback, &frame.callback))
+            .find(|frame| frame.matches(callback))
         else {
             return Ok(false);
         };
@@ -166,28 +279,42 @@ pub(super) fn write_if_captured(callback: &Obj, text: &Obj) -> Result<bool, Stdo
             frame.error = Some(StdoutCaptureError::ScopeUnavailable);
             return Err(StdoutCaptureError::ScopeUnavailable);
         };
-        let bytes = &bytes[..size - 1];
-        let requested =
-            escaped_length(bytes).and_then(|length| frame.escaped_bytes.checked_add(length));
-        let error = if requested.is_none_or(|length| length > frame.limit) {
-            Some(StdoutCaptureError::Limit {
-                limit: frame.limit,
-                requested: requested.unwrap_or(usize::MAX),
-            })
-        } else if frame.bytes.try_reserve(bytes.len()).is_err() {
-            Some(StdoutCaptureError::Allocation)
-        } else {
-            None
-        };
-        if let Some(error) = error {
-            frame.error = Some(error);
-            return Err(error);
-        }
-        frame.bytes.extend_from_slice(bytes);
-        frame.escaped_bytes = requested.unwrap_or(frame.escaped_bytes);
+        frame.append(&bytes[..size - 1])?;
         Ok(true)
     })
 }
 
+/// The nonfatal native panic/trace route. A captured failure is handled too:
+/// `finish` reports its sticky error, and no rejected bytes escape to fwrite.
+pub(crate) fn diagnostic_if_captured(message: &[u8]) -> bool {
+    if STATE
+        .try_with(|state| state.borrow().frames.is_empty())
+        .unwrap_or(true)
+    {
+        return false;
+    }
+    let Some(callback) = Obj::stdio_stderr().and_then(|stream| stream.try_ctor_child(4)) else {
+        return false;
+    };
+    STATE
+        .try_with(|state| {
+            let mut state = state.borrow_mut();
+            let Some(frame) = state
+                .frames
+                .iter_mut()
+                .rev()
+                .find(|frame| frame.matches(&callback))
+            else {
+                return false;
+            };
+            let _ = frame.append_diagnostic(message);
+            true
+        })
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod evaluation_tests;

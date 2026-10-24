@@ -12209,11 +12209,10 @@ fn render_lean_source_commands(
                     );
                 }
                 evaluation_output_position += 1;
-                // The pin logs what an action wrote as a message of its own, ahead of the
-                // result's. Only a captured action has its output here to place; anything else
-                // wrote while it ran, so a guard over it stays refused (the source adapter
-                // refuses such a batch before execution; this keeps the boundary for retained
-                // ones).
+                // The pin logs an evaluation's ordered output as a message of its own,
+                // ahead of the result's. This includes stderr and native diagnostics from
+                // pure expressions. An uncaptured action cannot be guarded here: its output
+                // was already written while it ran.
                 let captured = execution.captured_stdout();
                 if captured.is_none()
                     && guarded.contains_key(&command_index)
