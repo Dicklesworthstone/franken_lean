@@ -7799,6 +7799,7 @@ impl Engine {
                         syntax,
                         scope.options.clone(),
                         block,
+                        scope.clone(),
                     ),
                 );
             }
@@ -8798,12 +8799,13 @@ impl Engine {
                     .imported_environment()
                     .is_none_or(|imported| !imported.contains(name))
             };
-            let constructors = unused_variables::Constructors {
-                names: environment
-                    .constants()
-                    .filter(|(_, info)| matches!(info, ConstantInfo::Ctor(_)))
-                    .filter_map(|(name, _)| spelling(name))
-                    .collect(),
+            let spellings: std::collections::HashSet<String> = environment
+                .constants()
+                .filter(|(_, info)| matches!(info, ConstantInfo::Ctor(_)))
+                .filter_map(|(name, _)| spelling(name))
+                .collect();
+            let mut constructors = unused_variables::Constructors {
+                names: std::collections::HashSet::new(),
                 local: environment
                     .constants()
                     .filter(|(name, info)| matches!(info, ConstantInfo::Ctor(_)) && local(name))
@@ -8839,7 +8841,40 @@ impl Engine {
                     })
                     .collect(),
             };
-            for (&(command, _), (offset, syntax, options, _)) in &lint_sites {
+            // Which of a command's atomic identifiers name a constructor where it is, by the pin's
+            // `resolveGlobalName`. Without the alias or protected tables every constructor
+            // spelling is kept, which only withholds warnings.
+            let resolution = fln_elab::aliases::AliasTable::read(environment)
+                .ok()
+                .zip(fln_elab::protected_names::ProtectedNames::read(environment).ok());
+            let is_constructor =
+                |name: &Name| matches!(environment.find(name), Some(ConstantInfo::Ctor(_)));
+            for (&(command, _), (offset, syntax, options, _, scope)) in &lint_sites {
+                constructors.names = match &resolution {
+                    Some((aliases, protected)) => unused_variables::atomic_spellings(syntax)
+                        .into_iter()
+                        .filter(|text| {
+                            constructors.local.contains(text)
+                                || spellings.contains(text)
+                                    && match scope.resolve_with_aliases(
+                                        &Name::from_components([text.as_str()]),
+                                        |declaration| environment.contains(declaration),
+                                        aliases,
+                                        protected,
+                                    ) {
+                                        Ok(found) => {
+                                            found.is_some_and(|name| is_constructor(&name))
+                                        }
+                                        Err(fln_elab::source::scope::ScopeError::Ambiguous(
+                                            _,
+                                            candidates,
+                                        )) => candidates.iter().any(is_constructor),
+                                        Err(_) => true,
+                                    }
+                        })
+                        .collect(),
+                    None => spellings.clone(),
+                };
                 // In the pin's order: the `:=` note while the command elaborates (`sorry` does
                 // not suppress it), then the unused-variables linter (skipped with `sorry`),
                 // then `linter.defProp`.
@@ -12833,6 +12868,9 @@ type LintSite = (
     fln_syntax::tree::Syntax,
     KVMap,
     Option<fln_parse::BytePos>,
+    // Where the command's identifiers resolve, for telling its pattern variables from
+    // constructors.
+    fln_elab::source::scope::SourceScope,
 );
 
 /// The pin's reducibility warnings for each declaration command, in command order: the
@@ -12857,7 +12895,7 @@ fn declaration_reducibility_warnings(
     // The current command's class-typed definitions, which follow all its members' attributes.
     let mut classes = Vec::new();
     let mut current = None;
-    for (&(command, _), (offset, syntax, options, block)) in lint_sites {
+    for (&(command, _), (offset, syntax, options, block, _)) in lint_sites {
         if current != Some(command) {
             warnings.append(&mut classes);
             current = Some(command);

@@ -509,6 +509,26 @@ fn term_scopes<'a, T>(
     found
 }
 
+/// The atomic identifiers `syntax` spells: the only ones a pattern of it can be.
+pub(crate) fn atomic_spellings(syntax: &Syntax) -> HashSet<String> {
+    let mut spellings = HashSet::new();
+    let mut pending = vec![syntax];
+    while let Some(node) = pending.pop() {
+        match node {
+            Syntax::Ident { val, .. } => {
+                if let LeafView::Str(text) = val.leaf_view()
+                    && val.parent().is_anonymous()
+                {
+                    spellings.insert(text.to_owned());
+                }
+            }
+            Syntax::Node { .. } => pending.extend(args(node)),
+            Syntax::Atom { .. } | Syntax::Missing => {}
+        }
+    }
+    spellings
+}
+
 /// Whether one of `node`'s own children is the atom `atom`.
 fn contains_atom_shallow(node: &Syntax, atom: &str) -> bool {
     args(node)
@@ -516,9 +536,14 @@ fn contains_atom_shallow(node: &Syntax, atom: &str) -> bool {
         .any(|child| matches!(child, Syntax::Atom { val, .. } if val == atom))
 }
 
-/// The environment's constructor spellings (the last component of each name), for telling a
-/// pattern variable from a constructor, and its indexed families with their constructors.
+/// The constructor spellings a pattern identifier may name, for telling a pattern variable from
+/// a constructor, and the environment's indexed families with their constructors.
 pub(crate) struct Constructors {
+    /// The atomic identifiers that name a constructor where the linted command is: the pin's
+    /// pattern elaborator reads an identifier as a constructor only when `resolveGlobalName`
+    /// resolves it to one in the command's scope (vendored `Lean/Elab/PatternVar.lean`,
+    /// `processId`), so `tail` is a variable unless something opens `List.Mem`. Set per
+    /// command ([`atomic_spellings`] gives the candidates).
     pub(crate) names: HashSet<String>,
     /// The spellings of the constructors this source declares, not imported: an unqualified or
     /// dotted head spelled like one names it (`open BV` then `cons`), not an `Init` constructor
@@ -684,16 +709,24 @@ impl Constructors {
             .collect()
     }
 
-    /// The indexed constructors a pattern `head` (an identifier, `.c` or `@c`) may name.
+    /// The indexed constructors a pattern `head` (an identifier, `.c` or `@c`) may name. An
+    /// atomic identifier names one only where it resolves to a constructor ([`Self::names`]):
+    /// `head` is a variable, not `List.Mem.head`, unless something opens `List.Mem`.
     fn head_candidates(&self, head: &Syntax) -> Vec<&IndexedConstructor> {
-        let written =
-            if is_kind(head, &["Term", "dotIdent"]) || is_kind(head, &["Term", "explicit"]) {
-                args(head).get(1)
-            } else {
-                Some(head)
-            };
+        let dotted = is_kind(head, &["Term", "dotIdent"]);
+        let written = if dotted || is_kind(head, &["Term", "explicit"]) {
+            args(head).get(1)
+        } else {
+            Some(head)
+        };
         match written {
-            Some(Syntax::Ident { val, .. }) => self.candidates(val),
+            Some(Syntax::Ident { val, .. })
+                if dotted
+                    || !val.parent().is_anonymous()
+                    || matches!(val.leaf_view(), LeafView::Str(text) if self.names.contains(text)) =>
+            {
+                self.candidates(val)
+            }
             _ => Vec::new(),
         }
     }

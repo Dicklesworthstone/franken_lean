@@ -529,6 +529,48 @@ def tst2 : vec n → Option (Nat × vec n)
     );
 }
 
+/// A pattern identifier is a constructor only where the pin's `resolveGlobalName` resolves it to
+/// one (`processId`, vendored `Lean/Elab/PatternVar.lean:338`). `Init.Data.List.Basic` declares
+/// `List.Mem.head`, `List.Mem.tail` and `Nat.le.refl` is imported, but nothing here opens their
+/// namespaces, so `head`, `tail` and `refl` are variables the pin warns about, and so is `x`
+/// before the aliased `tail` of an indexed match. As the pinned v4.32.0 prints it (2026-10-24).
+#[test]
+fn pattern_identifiers_name_constructors_only_where_they_resolve() {
+    let Some(lib) = pinned_toolchain() else {
+        return;
+    };
+    let root = workspace();
+    let program = "inductive Vec (A : Type) : Nat → Type where
+  | nil : Vec A 0
+  | cons (n : Nat) (head : A) (tail : Vec A n) : Vec A (Nat.succ n)
+def rest {A : Type} (n : Nat) (xs : Vec A (Nat.succ n)) : Vec A n :=
+  match xs with | .cons k x tail => tail
+def size {A : Type} (n : Nat) (xs : Vec A n) : Nat :=
+  match xs with | .cons k x tail => 0 | .nil => 1
+def tl (xs : List Nat) : Nat :=
+  match xs with
+  | head :: tail => 0
+  | [] => 1
+def tl3 (xs : List Nat) : Nat :=
+  match xs with
+  | refl :: t => 0
+  | [] => 1
+";
+    let (ours, pinned) = outputs_under(
+        &lib,
+        &root,
+        "resolved_constructors",
+        "prelude\nimport Init.Data.List.Basic\n",
+        program,
+    );
+    assert_eq!(ours, pinned, "{program}");
+    assert_eq!(
+        ours.matches("is not explicitly referenced").count(),
+        6,
+        "{ours}"
+    );
+}
+
 /// A body whose elaboration runs a tactic is read only through its elaborated term, so its own
 /// binders are never linted (`linter.unusedVariables.analyzeTactics` off): `xs[0]` runs its
 /// `get_elem_tactic` auto-parameter, and a structure instance leaving out a field `p : P := by
