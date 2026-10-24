@@ -9,21 +9,19 @@
 //!
 //! Every program was run through the pinned `lean` v4.32.0 with the same header first
 //! (2026-10-23), and is compared with the pinned binary's output again when that is present. The
-//! pin writes `dbg_trace` text into the command's message on stdout, where this `lean` writes it
-//! to stderr (bead `fln-eval-stderr-capture-ay5r`), so a case records the pin's stdout and which
-//! of its lines are trace text: this `lean` must print the other lines on stdout and exactly the
-//! trace lines, in order, on stderr. A refusal is compared by its verdict, not by the pin's wording.
+//! pin writes `dbg_trace` text into the command's message on stdout (`stderrAsMessages`), and so
+//! does this `lean`: its stdout must be the pin's, byte for byte, and its stderr empty. A refusal
+//! is compared by its verdict, not by the pin's wording.
 #![forbid(unsafe_code)]
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 const HEADER: &str = "prelude\nimport Init.Util\nimport Init.Data.ToString.Macro\n";
 
-/// An accepted program: the pin's stdout and, in order, the lines of it that are trace text.
+/// An accepted program and the pin's stdout, trace text included.
 struct Accepted {
     body: &'static str,
     pin_stdout: &'static str,
-    traces: &'static [&'static str],
 }
 
 /// The bead's divergence (`walk` recursed without end before `||` was unfolded) and the three
@@ -42,7 +40,6 @@ def k (b : Bool) : Nat := cond b 1 (dbg_trace "cond else"; 2)
 #eval k false
 "#,
     pin_stdout: "true\ntrue\nor rhs\nfalse\nfalse\nand rhs\ntrue\n1\ncond else\n2\n",
-    traces: &["or rhs", "and rhs", "cond else"],
 };
 
 /// `if p ∧ q` and `if p ∨ q`: the instances `instDecidableAnd` and `instDecidableOr` match on
@@ -58,7 +55,6 @@ def either (a b : Bool) : Nat :=
 #eval either false true
 "#,
     pin_stdout: "0\nand right\n1\n1\nor right\n1\n",
-    traces: &["and right", "or right"],
 };
 
 /// `Option.getD` evaluates its default only for `none`.
@@ -68,7 +64,6 @@ const GET_D: Accepted = Accepted {
 #eval dflt none
 "#,
     pin_stdout: "3\ndefault\n7\n",
-    traces: &["default"],
 };
 
 /// A `@[macro_inline]` definition of this file: an unselected argument is not evaluated, a
@@ -87,7 +82,6 @@ def viaHigher (f : Bool → Bool → Bool) : Bool := f true (dbg_trace "higher";
 #eval viaHigher orElse
 "#,
     pin_stdout: "true\nuser rhs\nfalse\nargument\nargument\n6\nhigher\ntrue\n",
-    traces: &["user rhs", "argument", "argument", "higher"],
 };
 
 /// Programs the pin refuses, with the pin's first error after the file name and position, and the
@@ -208,34 +202,10 @@ fn ours(lib: &Path, root: &Path, body: &str) -> (Option<i32>, String, String) {
     )
 }
 
-/// The pin's stdout split into this `lean`'s stdout and stderr: `traces`, in order, are trace text.
-fn split(case: &Accepted) -> (String, String) {
-    let (mut values, mut traces) = (String::new(), String::new());
-    let mut pending = case.traces.iter().peekable();
-    for line in case.pin_stdout.lines() {
-        let channel = if pending.next_if(|trace| **trace == line).is_some() {
-            &mut traces
-        } else {
-            &mut values
-        };
-        channel.push_str(line);
-        channel.push('\n');
-    }
-    assert!(
-        pending.next().is_none(),
-        "every trace is a line of the pin's stdout"
-    );
-    (values, traces)
-}
-
 fn accepted(lib: &Path, root: &Path, case: &Accepted) {
     let (code, stdout, stderr) = ours(lib, root, case.body);
-    let (values, traces) = split(case);
     assert_eq!(code, Some(0), "stderr: {stderr}");
-    assert_eq!(
-        (stdout.as_str(), stderr.as_str()),
-        (values.as_str(), traces.as_str())
-    );
+    assert_eq!((stdout.as_str(), stderr.as_str()), (case.pin_stdout, ""));
     if let Some((code, stdout)) = pinned(lib, &root.join("MacroInline.lean")) {
         assert_eq!(
             (code, stdout.as_str()),
