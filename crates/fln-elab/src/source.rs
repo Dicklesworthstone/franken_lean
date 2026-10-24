@@ -6357,22 +6357,37 @@ fn query_elaboration(
             &parts[1]
         }
     };
-    // `#print c` and `#check c` name a global constant without elaborating it
-    // (`realizeGlobalConstWithInfos`, `elabCheckCore`), so they check no deprecation.
-    let names_constant = printed.is_some()
-        || (!evaluate
-            && matches!(argument, Syntax::Ident { val, .. }
-                if context.txn.lctx.find_by_user_name(val).is_none()
-                    && context
-                        .resolve_source_name(val)
-                        .ok()
-                        .flatten()
-                        .is_some_and(|name| context.txn.env.contains(&name))));
-    let check_deprecated = context.check_deprecated;
-    context.check_deprecated = check_deprecated && !names_constant;
-    let term = context.term(argument, None);
-    context.check_deprecated = check_deprecated;
-    let mut term = term?;
+    // `#check id` and `#print id` (`elabCheckCore`, vendored `Lean/Elab/BuiltinCommand.lean:434-443`;
+    // `elabPrint`, `Lean/Elab/Print.lean`): an identifier `realizeGlobalConstWithInfos` resolves
+    // to a constant names that constant, which is not elaborated as a term. Elaborating it would
+    // fill a trailing optional parameter's default and eta-expand over the parameters before it
+    // (`fun n => f n 3`), or leave an implicit argument unresolved.
+    let global = if evaluate {
+        None
+    } else {
+        context.global_constant_query(argument)?
+    };
+    let mut term = match global {
+        Some(term) => term,
+        None => {
+            // `#print c` and `#check c` name a global constant without elaborating it
+            // (`realizeGlobalConstWithInfos`, `elabCheckCore`), so they check no deprecation.
+            let names_constant = printed.is_some()
+                || (!evaluate
+                    && matches!(argument, Syntax::Ident { val, .. }
+                        if context.txn.lctx.find_by_user_name(val).is_none()
+                            && context
+                                .resolve_source_name(val)
+                                .ok()
+                                .flatten()
+                                .is_some_and(|name| context.txn.env.contains(&name))));
+            let check_deprecated = context.check_deprecated;
+            context.check_deprecated = check_deprecated && !names_constant;
+            let term = context.term(argument, None);
+            context.check_deprecated = check_deprecated;
+            term?
+        }
+    };
     if evaluate {
         let (head, explicit) = context.explicit_application_head(argument)?;
         if !explicit
@@ -6407,6 +6422,35 @@ fn query_elaboration(
 }
 
 impl Context {
+    /// The constant a query identifier names, at fresh universe levels, when it names one: no
+    /// local of that name, and resolution in this scope finds exactly one declaration. Anything
+    /// else (a local, an ambiguous name, `x.f` field access) is elaborated as a term instead, as
+    /// the pin does when `realizeGlobalConstWithInfos` throws.
+    fn global_constant_query(
+        &mut self,
+        syntax: &Syntax,
+    ) -> Result<Option<Typed>, NatDefinitionElabError> {
+        let Syntax::Ident { val: name, .. } = syntax else {
+            return Ok(None);
+        };
+        if name.is_anonymous() || name.has_macro_scopes() {
+            return Ok(None);
+        }
+        if self.txn.lctx.find_by_user_name(name).is_some() {
+            return Ok(None);
+        }
+        let Ok(Some(resolved)) = self.resolve_source_candidates(name)? else {
+            return Ok(None);
+        };
+        if crate::seed::protected::source_unreachable(&resolved)
+            || !self.txn.env.contains(&resolved)
+            || self.txn.lctx.find_by_user_name(&resolved).is_some()
+        {
+            return Ok(None);
+        }
+        self.constant(&resolved).map(Some)
+    }
+
     /// The pin elaborates `#check` and `#synth` with every section variable in the local
     /// context (`runTermElabM`, vendored `Lean/Elab/Command.lean`) and prints the term with
     /// those variables as they are named there. The candidate here is closed over the variables

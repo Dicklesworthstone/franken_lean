@@ -574,6 +574,77 @@ pub struct Printer<'a> {
     imported_tags: bool,
     /// Structure metadata, read when a structure instance is first printed.
     structures: Option<structures::StructureTables>,
+    /// The next `∀` printed is on the spine of a signature's type after its colon, where the
+    /// pin shows every accessible binder name (`pp.piBinderNames`, set by `processSpine`,
+    /// vendored `PrettyPrinter/Delaborator/Builtins.lean:1644-1660`). Taken by [`Printer::pi`].
+    spine_names: bool,
+}
+
+/// A function parameter as the pin's `getParamKinds` records it (vendored
+/// `PrettyPrinter/Delaborator/Builtins.lean:160-213`).
+struct ParamKind {
+    info: BinderInfo,
+    /// Whether the domain is an `optParam`.
+    optional: bool,
+    /// For a parameter an argument supplies, its `optParam` default instantiated with the
+    /// universe levels and the arguments before it.
+    default: Option<Expr>,
+    /// Whether the domain is an `autoParam`.
+    auto: bool,
+}
+
+impl ParamKind {
+    /// `ParamKind.isRegularExplicit`: explicit, with neither a default nor a tactic.
+    fn regular_explicit(&self) -> bool {
+        self.info == BinderInfo::Default && !self.optional && !self.auto
+    }
+}
+
+/// `e.isAppOfArity gadget 2` for the root type annotation `gadget` (`optParam`, `autoParam`):
+/// its type and its default or tactic (`Expr.getOptParamDefault?`, `Expr.isAutoParam`).
+fn annotation<'e>(e: &'e Expr, gadget: &str) -> Option<(&'e Expr, &'e Expr)> {
+    let ExprNode::App { f, a: value } = e.node() else {
+        return None;
+    };
+    let ExprNode::App { f: head, a: type_ } = f.node() else {
+        return None;
+    };
+    matches!(head.node(), ExprNode::Const { name, .. }
+        if name.parent().is_anonymous() && name.leaf_view() == LeafView::Str(gadget))
+    .then_some((type_, value))
+}
+
+/// `useAppExplicit` under the default options: an application with `count` arguments is
+/// printed in explicit mode when the next parameter is implicit or an instance, or a later
+/// explicit parameter has a default or a tactic (the elaborator would fill it eagerly).
+fn app_explicit(count: usize, kinds: &[ParamKind]) -> bool {
+    kinds.len() < count
+        || kinds.get(count).is_some_and(|next| {
+            matches!(next.info, BinderInfo::Implicit | BinderInfo::InstImplicit)
+        })
+        || kinds
+            .iter()
+            .skip(count)
+            .any(|kind| kind.info == BinderInfo::Default && !kind.regular_explicit())
+}
+
+/// `needsExplicit`: whether explicit mode heads the application with `@`.
+fn needs_explicit(count: usize, kinds: &[ParamKind]) -> bool {
+    kinds.len() < count
+        || kinds
+            .iter()
+            .take(count)
+            .any(|kind| kind.info != BinderInfo::Default)
+        || app_explicit(count, kinds)
+}
+
+/// How an argument prints in the pin's implicit mode (`AppImplicitArg`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Shown {
+    Skip,
+    Regular,
+    /// Equal to its parameter's default: dropped when it, and all after it, are.
+    Optional,
 }
 
 /// The imported `export` aliases, each declaration's aliases, and the `protected` names: what
@@ -716,6 +787,7 @@ impl<'a> Printer<'a> {
                 .extension(&fln_elab::delaborator_tags::journal_name())
                 .is_some(),
             structures: None,
+            spine_names: false,
         }
     }
 
@@ -858,6 +930,62 @@ impl<'a> Printer<'a> {
             type_ = body;
         }
         infos
+    }
+
+    /// `getParamKinds` for the constant `name` at `levels` applied to `args`: one kind per
+    /// leading binder of its type, the default of each binder an argument supplies instantiated
+    /// with the universe levels and the arguments before it. Arguments past those binders (an
+    /// over-application through a type the pin reduces to a function type) are taken as
+    /// regular explicit parameters, as they are for an arrow.
+    fn param_kinds(&self, name: &Name, levels: &[Level], args: &[Expr]) -> Vec<ParamKind> {
+        let mut kinds = Vec::new();
+        if let Some(info) = self.env.find(name) {
+            let base = info.constant_val();
+            let mut type_ = &base.type_;
+            while let ExprNode::ForallE {
+                binder_type,
+                body,
+                binder_info,
+                ..
+            } = type_.node()
+            {
+                let index = kinds.len();
+                let default = annotation(binder_type, "optParam").and_then(|(_, value)| {
+                    if index >= args.len() {
+                        return None;
+                    }
+                    let value = if base.level_params.len() == levels.len() {
+                        fln_elab::universe::parameters::instantiate(
+                            || Ok(()),
+                            || (),
+                            value,
+                            &base.level_params,
+                            levels,
+                        )
+                        .ok()?
+                    } else {
+                        value.clone()
+                    };
+                    value.subst_loose(0, &args[..index]).ok()
+                });
+                kinds.push(ParamKind {
+                    info: *binder_info,
+                    optional: annotation(binder_type, "optParam").is_some(),
+                    default,
+                    auto: annotation(binder_type, "autoParam").is_some(),
+                });
+                type_ = body;
+            }
+        }
+        while kinds.len() < args.len() {
+            kinds.push(ParamKind {
+                info: BinderInfo::Default,
+                optional: false,
+                default: None,
+                auto: false,
+            });
+        }
+        kinds
     }
 
     /// Whether `e` is (syntactically) a proposition: a sort-`Prop` application, a
@@ -1042,7 +1170,7 @@ impl<'a> Printer<'a> {
             }
             // A structure's constructor without parameters or fields is a structure instance
             // too, `{ }`.
-            ExprNode::Const { name, .. }
+            ExprNode::Const { name, levels }
                 if let Some(ConstantInfo::Ctor(ctor)) = self.env.find(name)
                     && ctor.num_params == 0
                     && ctor.num_fields == 0
@@ -1050,7 +1178,7 @@ impl<'a> Printer<'a> {
                     && self.structure_like(inductive) =>
             {
                 let ctor = ctor.clone();
-                self.structure_instance(&ctor, &[])
+                self.structure_instance(&ctor, levels, &[])
             }
             ExprNode::Const { name, .. } => self
                 .notation(name, &[], outer)
@@ -1438,7 +1566,10 @@ impl<'a> Printer<'a> {
                 && self.structure_like(inductive)
             {
                 let ctor = ctor.clone();
-                return self.structure_instance(&ctor, &args);
+                let ExprNode::Const { levels, .. } = head.node() else {
+                    unreachable!("a constant head")
+                };
+                return self.structure_instance(&ctor, levels, &args);
             }
             // Any other constant an imported `@[app_unexpander]` prints (`ite` as `if … then …
             // else …`, `GetElem.getElem` as `xs[i]`, …) runs code this door does not reproduce:
@@ -1446,10 +1577,63 @@ impl<'a> Printer<'a> {
             if self.imported_tags && self.unexpander_in_force(name) {
                 return Err(Unsupported("an application an `@[app_unexpander]` prints"));
             }
+            let ExprNode::Const { levels, .. } = head.node() else {
+                unreachable!("a constant head")
+            };
+            let kinds = self.param_kinds(name, levels, &args);
+            // `delabAppExplicitCore`: every argument, implicit and instance ones included, after
+            // `@c` (`needsExplicit`). The pin takes explicit mode when the next parameter is
+            // implicit (`@List.map Nat`) or a later explicit one has a default (`@f 1`).
+            if app_explicit(args.len(), &kinds) {
+                let text = self.display_name(name);
+                let text = if needs_explicit(args.len(), &kinds) {
+                    format!("@{text}")
+                } else {
+                    text
+                };
+                let mut shown = Format::text(text);
+                let mut open = false;
+                for (index, arg) in args.iter().enumerate() {
+                    let last = index + 1 == args.len();
+                    let (printed, bare) = self.argument(arg, last)?;
+                    shown = shown.then(Format::Line).then(printed);
+                    open = bare;
+                }
+                return Ok(self.applied(node(shown), open, outer));
+            }
             let infos = self.binder_infos(name);
+            let receiver = self.field_receiver(name, &infos, &args);
+            // `delabAppImplicitCore`'s `mkArg`: an argument equal to its parameter's default is
+            // optional, then the field-notation object and explicit arguments are shown; the
+            // trailing optional arguments are dropped (`f 1` for `f 1 3`, `f n m := 3`).
+            let mut kinds_shown: Vec<Shown> = args
+                .iter()
+                .zip(&kinds)
+                .enumerate()
+                .map(|(index, (arg, kind))| {
+                    if kind.default.as_ref() == Some(arg) {
+                        Shown::Optional
+                    } else if receiver.as_ref().is_some_and(|(at, _)| *at == index)
+                        || kind.info == BinderInfo::Default
+                    {
+                        Shown::Regular
+                    } else {
+                        Shown::Skip
+                    }
+                })
+                .collect();
+            while kinds_shown.last() == Some(&Shown::Optional) {
+                kinds_shown.pop();
+            }
+            let shown_args: Vec<usize> = (0..kinds_shown.len())
+                .filter(|&index| kinds_shown[index] != Shown::Skip)
+                .collect();
             // Generalized field notation: `C.f r …` is `r.f …` when `r` is `C.f`'s first
-            // explicit argument and has type `C …` (never on a numeric literal).
-            if let Some((receiver, field)) = self.field_receiver(name, &infos, &args) {
+            // explicit argument and has type `C …` (never on a numeric literal). The object
+            // must remain a regular argument once the optional ones are dropped.
+            if let Some((receiver, field)) = receiver
+                && kinds_shown.get(receiver) == Some(&Shown::Regular)
+            {
                 let object = self.without_parent_projections(&args[receiver])?;
                 let projection = node(
                     self.doc(&object, MAX_PREC)?
@@ -1457,13 +1641,9 @@ impl<'a> Printer<'a> {
                 );
                 let mut shown = projection;
                 let mut applied = false;
-                let shown_args: Vec<usize> = (0..args.len())
-                    .filter(|&index| {
-                        index != receiver
-                            && infos
-                                .get(index)
-                                .is_none_or(|info| *info == BinderInfo::Default)
-                    })
+                let shown_args: Vec<usize> = shown_args
+                    .into_iter()
+                    .filter(|&index| index != receiver)
                     .collect();
                 let mut open = false;
                 for (position, &index) in shown_args.iter().enumerate() {
@@ -1481,13 +1661,6 @@ impl<'a> Printer<'a> {
             }
             let mut shown = Format::Nil;
             let mut applied = false;
-            let shown_args: Vec<usize> = (0..args.len())
-                .filter(|&index| {
-                    infos
-                        .get(index)
-                        .is_none_or(|info| *info == BinderInfo::Default)
-                })
-                .collect();
             let mut open = false;
             for (position, &index) in shown_args.iter().enumerate() {
                 let last = position + 1 == shown_args.len();
@@ -1670,18 +1843,16 @@ impl<'a> Printer<'a> {
         Some((receiver, escaped_part(field, false)))
     }
 
-    /// A bare constant: `@c` when it has implicit binders the pin would otherwise fill.
-    /// A leading strict implicit is left unapplied without a written argument,
-    /// so it does not require the marker.
+    /// A bare constant, as the pin's application delaborator prints it with no arguments: `@c`
+    /// in explicit mode (`useAppExplicit`, `needsExplicit`), which a first parameter that is
+    /// implicit or an instance selects, and so does an explicit parameter with a default or a
+    /// tactic (`@f : Nat → optParam Nat 3 → Nat`). A strict implicit first parameter does not.
     pub fn constant(&self, name: &Name) -> String {
-        let explicit = self
-            .binder_infos(name)
-            .first()
-            .is_none_or(|info| matches!(info, BinderInfo::Default | BinderInfo::StrictImplicit));
-        if explicit {
-            self.display_name(name)
-        } else {
+        let kinds = self.param_kinds(name, &[], &[]);
+        if app_explicit(0, &kinds) && needs_explicit(0, &kinds) {
             format!("@{}", self.display_name(name))
+        } else {
+            self.display_name(name)
         }
     }
 
@@ -1697,6 +1868,7 @@ impl<'a> Printer<'a> {
         names: &[String],
         type_: Format,
         hidden: bool,
+        default: Option<Format>,
     ) -> Format {
         let (open, close) = match info {
             BinderInfo::Implicit => ("{", "}"),
@@ -1714,12 +1886,15 @@ impl<'a> Printer<'a> {
             }
             doc = doc.then(Format::text(name.clone()));
         }
-        node(
-            doc.then(Format::text(" :"))
+        let mut doc = doc.then(Format::text(" :")).then(Format::Line).then(type_);
+        // `binderDefault` (`" := " term`, vendored `Parser/Term/Basic.lean`).
+        if let Some(default) = default {
+            doc = doc
+                .then(Format::text(" :="))
                 .then(Format::Line)
-                .then(type_)
-                .then(Format::text(close)),
-        )
+                .then(default);
+        }
+        node(doc.then(Format::text(close)))
     }
 
     /// The name the pin's delaborator gives a bound binder (`getUnusedName`, vendored
@@ -1800,11 +1975,19 @@ impl<'a> Printer<'a> {
         else {
             unreachable!("pi called on a pi")
         };
+        // On a signature's spine after its colon, an accessible binder name not already in
+        // scope is shown as if the binder were dependent (`delabForallBinders`' `dep` with
+        // `pp.piBinderNames`); one already in scope was renamed inaccessible by `processSpine`.
+        let spine = std::mem::take(&mut self.spine_names);
+        let named = |printer: &Self, name: &Name| {
+            spine && accessible(name) && !printer.names.contains(&escaped_name(name))
+        };
         let proposition = self.is_prop(e);
         // `delabForallBinders` (vendored `PrettyPrinter/Delaborator/Builtins.lean:1020-1031`): a
         // binder shows its name when it is dependent, and also (RFC #1834, `pp.foralls`) when
         // it is explicit, in a proposition, and its domain is not a proposition.
         let dependent = body.has_loose_bvar(0)
+            || named(self, name)
             || (proposition && *binder_info == BinderInfo::Default && !self.is_prop(binder_type));
         // A non-dependent explicit binder is an arrow (or an implication): `arrow` is
         // `term " → " term`, the token's trailing space a line.
@@ -1815,7 +1998,9 @@ impl<'a> Printer<'a> {
             let depth = self.names.len();
             self.bind(shown, binder_type);
             let trailing = self.trailing && ARROW_PREC >= outer;
+            self.spine_names = spine && matches!(body.node(), ExprNode::ForallE { .. });
             let codomain = self.with_trailing(trailing, |printer| printer.doc(body, ARROW_PREC));
+            self.spine_names = false;
             self.unbind_to(depth);
             return Ok(paren_doc(
                 node(
@@ -1843,11 +2028,15 @@ impl<'a> Printer<'a> {
                 break self.doc(current, ARROW_PREC);
             };
             let dependent = body.has_loose_bvar(0)
+                || named(self, name)
                 || (proposition
                     && *binder_info == BinderInfo::Default
                     && !self.is_prop(binder_type));
             if !dependent && *binder_info == BinderInfo::Default {
-                break self.pi(current, ARROW_PREC);
+                self.spine_names = spine;
+                let printed = self.pi(current, ARROW_PREC);
+                self.spine_names = false;
+                break printed;
             }
             if internal_name(name) {
                 break Err(INTERNAL_BINDER);
@@ -1867,6 +2056,7 @@ impl<'a> Printer<'a> {
             } = next.node()
             {
                 let other_dependent = other_body.has_loose_bvar(0)
+                    || named(self, other)
                     || (proposition
                         && *other_info == BinderInfo::Default
                         && !self.is_prop(other_type));
@@ -1883,14 +2073,16 @@ impl<'a> Printer<'a> {
                 self.bind(shown, other_type);
                 next = other_body;
             }
-            groups.push(self.binder_group(*binder_info, &names, type_doc, hidden));
+            groups.push(self.binder_group(*binder_info, &names, type_doc, hidden, None));
             current = next;
             if proposition {
                 // `∀ (x : A) (y : B), p` keeps collecting dependent binders.
                 continue;
             }
             // `(x : A) → B`: `depArrow` is `bracketedBinder " → " term`.
+            self.spine_names = spine && matches!(current.node(), ExprNode::ForallE { .. });
             let rest = self.pi_tail(current);
+            self.spine_names = false;
             self.unbind_to(depth);
             let group = groups.pop().expect("one binder group");
             return Ok(paren_doc(
@@ -1949,8 +2141,21 @@ impl<'a> Printer<'a> {
                 break;
             }
             used.push(binder.clone());
-            let type_doc = self.doc(binder_type, 0)?;
-            let type_text = flat(&type_doc);
+            // `delabParamsAux`: an explicit parameter with a default is `(x : α := v)`. One with
+            // a tactic is `(h : p := by tac)`, the tactic read by evaluating its syntax constant,
+            // which this door does not do.
+            if *binder_info == BinderInfo::Default && annotation(binder_type, "autoParam").is_some()
+            {
+                self.unbind_to(depth);
+                return Err(Unsupported("a parameter whose default is a tactic"));
+            }
+            let (type_doc, default) = match annotation(binder_type, "optParam") {
+                Some((domain, value)) if *binder_info == BinderInfo::Default => {
+                    (self.doc(domain, 0)?, Some(self.doc(value, 0)?))
+                }
+                _ => (self.doc(binder_type, 0)?, None),
+            };
+            let type_text = flat(&self.doc(binder_type, 0)?);
             let mut names = vec![self.parameter_name(binder)];
             self.bind(names[0].clone(), binder_type);
             let mut next = body;
@@ -1978,10 +2183,13 @@ impl<'a> Printer<'a> {
                 next = other_body;
             }
             let hidden = !accessible(binder);
-            groups.push(self.binder_group(*binder_info, &names, type_doc, hidden));
+            groups.push(self.binder_group(*binder_info, &names, type_doc, hidden, default));
             current = next;
         }
+        // `processSpine`: after the colon, the type's spine shows its accessible binder names.
+        self.spine_names = matches!(current.node(), ExprNode::ForallE { .. });
         let rest = self.doc(current, 0);
+        self.spine_names = false;
         self.unbind_to(depth);
         // The signature names the constant's universe parameters (`List.map.{u_1, u_2}`).
         let parameters = self

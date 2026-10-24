@@ -223,8 +223,10 @@ co3 (n : Nat) : Int
 ";
 
 /// What this door refuses rather than print another way: a local type without fields (the pin
-/// prints `structure E` as `{ }` and `inductive E | mk` as `E.mk`) and a field with a default
-/// value (which the pin omits when the value equals it).
+/// prints `structure E` as `{ }` and `inductive E | mk` as `E.mk`) and a field the pin compares
+/// with its default by a reducible `isDefEq` that is not decided here (`1 + 2` against `3`, which
+/// the pin omits: `{ } : D`). A field syntactically equal to its default, or a literal other than
+/// a literal default (`{ x := 4 } : D`), prints (`source_check_optional_parameters`).
 ///
 /// Without `Init.NotationExtra`, whose macro the `Σ` notation is, the pin fails to print a `Sigma`
 /// at all ("failed to pretty print expression"); this door refuses it there.
@@ -235,7 +237,7 @@ co3 (n : Nat) : Int
 /// Inside `open Int`, the pin prints `Int.negSucc 9` as `-[9+1]`, which is refused here too.
 const REFUSED: &[&str] = &[
     "prelude\nimport Init.Core\nstructure E\n#check ({ } : E)\n",
-    "prelude\nimport Init.Core\nstructure D where\n  x : Nat := 3\n#check ({ x := 4 } : D)\n",
+    "prelude\nimport Init.Core\nstructure D where\n  x : Nat := 3\n#check ({ x := 1 + 2 } : D)\n",
     "prelude\nimport Init.NotationExtra\n#check (⟨1, rfl⟩ : Subtype (fun n : Nat => n = 1))\n",
     "prelude\nimport Init.NotationExtra\n#check fun (n : Nat) => if n = 0 then 1 else 2\n",
     "prelude\nimport Init.Core\n#check Sigma fun (n : Nat) => Fin n\n",
