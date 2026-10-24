@@ -1051,7 +1051,12 @@ impl Engine<'_> {
         // `instances` transparency an instance subgoal then carries the unfolded
         // form, which no stored instance path matches (bead fln-eeew). Only a
         // constant-headed side is assigned here, the case where reducing first
-        // would unfold a definition, and so is a `let`/`have`, which reducing would
+        // would unfold a definition, and a local-headed one, where reducing first
+        // zeta-delta-expands a `let` variable: `CoeT Bool b (Option Bool)` assigned
+        // the instance's `a` the value of `let b := getElem bs n`, unfolded through
+        // both instances, so `expandCoe` gave `some (bs.getInternal n sorry)` with a
+        // spurious `sorry` warning where the pin gives `some b` (upstream
+        // tests/elab/forOutParamIssue.lean). So is a `let`/`have`, which reducing would
         // zeta-reduce (`apply` assigned `?x := instHAdd.1 0 1` where the pin assigns
         // `have x := 0; x + 1`, elab/consumePPHint). Only a closed `have` is taken so: the
         // pin assigns any `let`, but this engine's instance search reads a `let`-headed
@@ -1069,7 +1074,7 @@ impl Engine<'_> {
                 head = f;
             }
             match head.node() {
-                ExprNode::Const { .. } => true,
+                ExprNode::Const { .. } | ExprNode::FVar { .. } => true,
                 ExprNode::LetE { non_dep, .. } => *non_dep && !expr.has_expr_mvar(),
                 _ => false,
             }

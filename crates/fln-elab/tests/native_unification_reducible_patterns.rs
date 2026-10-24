@@ -607,7 +607,44 @@ fn a_metavariable_is_assigned_a_constant_headed_side_unreduced() {
     }
 }
 
-/// The quick assignment is limited to a constant-headed side: a beta redex still
+/// The same holds for a local-headed side: `?m =?= b` for an in-scope `let b := two` gives
+/// `?m := b`, in both orientations, where reducing first zeta-delta-expanded `b` and gave
+/// `?m := 2`. A coercion's `CoeT Bool b (Option Bool)` then carried the value, not `b`, into
+/// `expandCoe` (upstream tests/elab/forOutParamIssue.lean). A hole whose context lacks `b`
+/// cannot be assigned it and still receives its value.
+#[test]
+fn a_metavariable_is_assigned_a_let_variable_unexpanded() {
+    for reverse in [false, true] {
+        let (mut txn, two) = with_abbreviation();
+        let alias = FVarId(name("b"));
+        txn.lctx
+            .add_let(alias.clone(), alias.0.clone(), nat(), two.clone());
+        let b = Expr::fvar(alias);
+        let m = hole(&mut txn, "m", nat(), MetavarKind::Natural);
+        let (left, right) = if reverse {
+            (b.clone(), Expr::mvar(m.clone()))
+        } else {
+            (Expr::mvar(m.clone()), b.clone())
+        };
+        let report = txn.unify(&left, &right, budget()).unwrap();
+        assert_eq!(report.expression_assignments, vec![m.clone()]);
+        assert_eq!(
+            txn.mvars.get_assigned_expr(&m),
+            Some(&b),
+            "reverse={reverse}"
+        );
+    }
+    let (mut txn, two) = with_abbreviation();
+    let outer = hole(&mut txn, "outer", nat(), MetavarKind::Natural);
+    let alias = FVarId(name("b"));
+    txn.lctx.add_let(alias.clone(), alias.0.clone(), nat(), two);
+    txn.unify(&Expr::mvar(outer.clone()), &Expr::fvar(alias), budget())
+        .unwrap();
+    let assigned = txn.mvars.get_assigned_expr(&outer).unwrap();
+    assert!(!assigned.has_fvar(), "{assigned:?}");
+}
+
+/// The quick assignment is limited to a constant- or local-headed side: a beta redex still
 /// takes the reducing path, as it did before (the pin would keep an in-scope redex).
 #[test]
 fn a_beta_redex_is_still_reduced_before_it_is_assigned() {
