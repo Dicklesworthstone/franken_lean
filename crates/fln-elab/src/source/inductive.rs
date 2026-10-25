@@ -165,6 +165,41 @@ struct PromotionFamily<'a> {
     constructors: &'a [ConstructorSpec],
 }
 
+/// The pin's `isPropCandidate` (Lean/Elab/MutualInductive.lean): each
+/// family is a syntactic subsingleton, with at least one proof field across
+/// the block and no field referring to a provisional family. Empty stubs and
+/// nullary enumerations deliberately remain Type-valued.
+fn prop_candidate(
+    context: &mut Context,
+    families: &[(&[ConstructorSpec], &[Vec<Level>])],
+    ids: &[FVarId],
+) -> Result<bool, NatDefinitionElabError> {
+    if families.iter().map(|(ctors, _)| ctors.len()).max() != Some(1) {
+        return Ok(false);
+    }
+    let mut has_field = false;
+    for (constructors, universes) in families {
+        if constructors.len() != universes.len() {
+            return Err(invalid());
+        }
+        for (constructor, universes) in constructors.iter().zip(*universes) {
+            if constructor.fields.len() != universes.len() {
+                return Err(invalid());
+            }
+            for (field, universe) in constructor.fields.iter().zip(universes) {
+                context.tick()?;
+                if !universe.normalize().is_zero()
+                    || !family_occurrences(context, &field.type_, ids)?.is_empty()
+                {
+                    return Ok(false);
+                }
+                has_field = true;
+            }
+        }
+    }
+    Ok(has_field)
+}
+
 /// Which of a family's indices are fixed (`computeFixedIndexBitMask`).
 ///
 /// Index `j` is fixed when every constructor binds it as its own field `j` and
@@ -462,6 +497,7 @@ fn header<'a>(
         })?;
     context.refuse_auto_bound_dependencies(&autos, &parameters)?;
     parameters.splice(0..0, autos);
+    // ubs:ignore[rust.security.constant-time-compare] — these are public Lean binder names, not account credentials.
     if parameters.iter().any(|p| p.user_name == name) {
         return Err(invalid());
     }
@@ -634,7 +670,19 @@ pub(super) fn elaborate_inductive_scoped(
         )?;
         parameters.extend(promoted_indices);
     }
-    let result_level = explicit.unwrap_or(inferred);
+    let result_level = if let Some(explicit) = explicit {
+        explicit
+    } else if prop_candidate(
+        &mut context,
+        &[(&constructors, &field_universes)],
+        std::slice::from_ref(&self_id),
+    )? {
+        Level::zero()
+    } else {
+        // This level is observable in the stored declaration. Use the pin's
+        // single normalization pass, not our cache-key fixpoint normalizer.
+        inferred.normalize()
+    };
     let mut closer = Builder {
         remaining: budget.max_nodes,
     };
@@ -890,6 +938,7 @@ fn bodies(
                 arguments.push(a.clone());
                 head = f.clone();
             }
+            // ubs:ignore[rust.security.constant-time-compare] — FVarId identifies the provisional inductive family, not a secret.
             if !matches!(head.node(), ExprNode::FVar { id } if id == self_id) {
                 return Err(invalid());
             }

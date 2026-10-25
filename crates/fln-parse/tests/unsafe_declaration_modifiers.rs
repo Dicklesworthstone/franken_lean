@@ -1,5 +1,6 @@
 //! The native unsafe declaration door consumes the pin's exact modifier slot.
 #![forbid(unsafe_code)]
+mod common;
 
 use fln_core::name::Name;
 use fln_parse::parse_definition;
@@ -79,8 +80,9 @@ fn mutual_unsafe_members_keep_their_modifiers_and_original_error_positions() {
         .unwrap();
     let commands = partition(body.as_bytes()).unwrap();
     assert_eq!(members.len(), 2);
-    for (member, (_, bytes)) in members.iter().zip(&commands) {
-        assert_eq!(member, parse_definition(bytes).unwrap().syntax());
+    for (member, (offset, bytes)) in members.iter().zip(&commands) {
+        let normalized_offset = 6 + body[..offset.0].replace("\r\n", "\n").len();
+        common::assert_member_in_group(member, bytes, normalized_offset);
         assert_eq!(args(&args(&args(member)[0])[5]).len(), 1);
     }
     for source in [

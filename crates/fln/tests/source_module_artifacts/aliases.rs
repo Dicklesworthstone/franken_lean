@@ -1,4 +1,5 @@
 //! Native artifacts carry the pin's actual alias extension, not a private shim.
+#![cfg(test)]
 #![forbid(unsafe_code)]
 use super::*;
 
@@ -31,6 +32,47 @@ fn exported_aliases_survive_an_alias_only_module_and_a_fresh_physical_import() {
         .into_complete()
         .unwrap();
     assert_eq!(receipt.modules.iter().map(|m| m.aliases).sum::<usize>(), 4);
+}
+
+#[test]
+fn empty_namespaces_and_dotted_aliases_keep_distinct_physical_import_semantics() {
+    let lib = "prelude\nnamespace Original.Inner\ninductive Token where | mk\nend Original.Inner\n\
+        export Original (Inner.Token)\nnamespace Empty.Nested\nend Empty.Nested";
+    let bridge = "prelude\nimport Lib\nnamespace View\nexport Original.Inner (Token)\nend View";
+    let built = compiled(&[
+        ("Main", "prelude\nimport Bridge"),
+        ("Bridge", bridge),
+        ("Lib", lib),
+    ]);
+    let lib_metadata = metadata(&built.artifacts[0].bytes);
+    assert!(lib_metadata.namespaces.contains(&name("Empty.Nested")));
+    assert!(lib_metadata.namespaces.contains(&name("Original.Inner")));
+    assert!(!lib_metadata.namespaces.contains(&name("Inner")));
+    assert_eq!(built.artifacts[1].report.constants, 0);
+    assert_eq!(
+        metadata(&built.artifacts[1].bytes).namespaces,
+        vec![name("View")]
+    );
+    let engine = imported(&built).engine;
+    let root = engine.logical_root(&KVMap::new());
+    let good = "open Empty.Nested\nopen View (Token)\n\
+        theorem same (P : Inner.Token -> Prop) (x : Token) (h : P x) : P x := h";
+    engine
+        .check_source_files(&[good.as_bytes()], &KVMap::new(), limits().source)
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    reference_import(&built, &format!("prelude\nimport Main\n{good}"), true);
+    for bad in ["open Inner", "export Inner (Token)", "open Empty.Missing"] {
+        assert!(
+            engine
+                .check_source_files(&[bad.as_bytes()], &KVMap::new(), limits().source)
+                .is_err(),
+            "{bad}"
+        );
+        assert_eq!(engine.logical_root(&KVMap::new()), root);
+        reference_import(&built, &format!("prelude\nimport Main\n{bad}"), false);
+    }
 }
 
 fn pinned_lean() -> Option<std::path::PathBuf> {

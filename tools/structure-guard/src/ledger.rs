@@ -146,6 +146,62 @@ fn rust_lexemes(text: &str) -> Vec<Lexeme> {
     lex(text, None)
 }
 
+/// A character contains exactly one scalar or escape. A nearby apostrophe in
+/// `Active<'a>(&'a T)` closes no character: skipping between those apostrophes
+/// would also skip `(` and corrupt every subsequent delimiter depth.
+fn character_end(text: &str, start: usize) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut cursor = start + 1;
+    let character = text.get(cursor..)?.chars().next()?;
+    cursor += character.len_utf8();
+    match character {
+        '\\' => {
+            let escape = *bytes.get(cursor)?;
+            cursor += 1;
+            match escape {
+                b'0' | b'n' | b'r' | b't' | b'\\' | b'\'' | b'"' => {}
+                b'x' => {
+                    let digits = bytes.get(cursor..cursor + 2)?;
+                    if !matches!(digits[0], b'0'..=b'7') || !digits[1].is_ascii_hexdigit() {
+                        return None;
+                    }
+                    cursor += 2;
+                }
+                b'u' => {
+                    if bytes.get(cursor) != Some(&b'{') {
+                        return None;
+                    }
+                    cursor += 1;
+                    let mut digits = 0;
+                    let mut scalar = 0;
+                    while *bytes.get(cursor)? != b'}' {
+                        let byte = bytes[cursor];
+                        if byte == b'_' && digits != 0 {
+                            cursor += 1;
+                            continue;
+                        }
+                        let digit = char::from(byte).to_digit(16)?;
+                        digits += 1;
+                        if digits > 6 {
+                            return None;
+                        }
+                        scalar = scalar * 16 + digit;
+                        cursor += 1;
+                    }
+                    if digits == 0 || char::from_u32(scalar).is_none() {
+                        return None;
+                    }
+                    cursor += 1;
+                }
+                _ => return None,
+            }
+        }
+        '\'' | '\n' | '\r' | '\t' => return None,
+        _ => {}
+    }
+    (bytes.get(cursor) == Some(&b'\'')).then_some(cursor + 1)
+}
+
 /// The lexemes of `text`, and, into `strings` when given, the raw contents of its
 /// string literals (escapes unprocessed). Comments contribute to neither.
 fn lex(text: &str, mut strings: Option<&mut Vec<String>>) -> Vec<Lexeme> {
@@ -236,28 +292,11 @@ fn lex(text: &str, mut strings: Option<&mut Vec<String>>) -> Vec<Lexeme> {
             }
             continue;
         }
-        if byte == b'\'' {
-            // Skip a character literal when a closing quote is nearby. A Rust lifetime
-            // has no closing quote and is tokenized as punctuation + identifier instead.
-            let mut end = cursor + 1;
-            let mut escaped = false;
-            let mut closed = false;
-            while end < bytes.len() && end <= cursor + 8 && bytes[end] != b'\n' {
-                let current = bytes[end];
-                end += 1;
-                if escaped {
-                    escaped = false;
-                } else if current == b'\\' {
-                    escaped = true;
-                } else if current == b'\'' {
-                    closed = true;
-                    break;
-                }
-            }
-            if closed {
-                cursor = end;
-                continue;
-            }
+        if byte == b'\''
+            && let Some(end) = character_end(text, cursor)
+        {
+            cursor = end;
+            continue;
         }
         if bytes.get(cursor..cursor + 2) == Some(b"r#")
             && bytes
@@ -1346,6 +1385,7 @@ pub fn public_item_sites(text: &str) -> Vec<PubItem> {
                     .iter()
                     .map(String::as_str)
                     .chain(in_scope.iter().copied())
+                    // ubs:ignore[rust.security.constant-time-compare] — these are public Rust type parameter identifiers, not secrets.
                     .find(|param| signature.ret_idents.iter().any(|ident| ident == param))
                     .map(str::to_string),
                 ret: signature.ret,
@@ -1713,6 +1753,73 @@ fn two() {}
 
         let decoy = "const DECOY: &str = \"#[cfg(test)] mod tests { assert_eq!(1, 1); }\";\n";
         assert_eq!(release_authority_source(decoy), decoy);
+    }
+
+    #[test]
+    fn adjacent_lifetimes_preserve_the_exact_test_tail_and_later_production() {
+        let production = "use std::sync::atomic::AtomicUsize;\n";
+        let tail = "#[cfg(test)] mod tests { struct Active<'a>(&'a AtomicUsize); }\n";
+        let source = format!("{production}{tail}");
+        assert_eq!(release_authority_source(&source), production);
+
+        let later = format!(
+            "{source}fn production(env: Environment, d: Declaration) {{ env.add_decl(d); }}\n"
+        );
+        assert_eq!(
+            release_authority_source(&later),
+            later,
+            "a lifetime in a test tail must not hide later production admission"
+        );
+        assert!(
+            method_call_sites(release_authority_source(&later), &["add_decl"])
+                .iter()
+                .any(|site| site.name == "add_decl" && site.arity == Some(1))
+        );
+    }
+
+    #[test]
+    fn characters_hide_only_their_own_scalar_or_escape() {
+        for literal in [
+            "'a'",
+            "'λ'",
+            "'💡'",
+            r"'\''",
+            r"'\\'",
+            r"'\n'",
+            r"'\x7f'",
+            r"'\u{1F4A1}'",
+            r"'\u{10_ffff}'",
+            "'{'",
+            "'}'",
+            "'('",
+            "')'",
+            "'['",
+            "']'",
+            "'\"'",
+        ] {
+            assert_eq!(character_end(literal, 0), Some(literal.len()), "{literal}");
+            let production = format!("const C: char = {literal};\n");
+            let source = format!("{production}#[cfg(test)] mod tests {{}}\n");
+            assert_eq!(release_authority_source(&source), production, "{literal}");
+        }
+        for not_a_character in [
+            "'a",
+            "'static",
+            "'_",
+            "'a, 'b",
+            "'a>(&'a T)",
+            "''",
+            "'ab'",
+            r"'\q'",
+            r"'\x80'",
+            r"'\u{}'",
+            r"'\u{D800}'",
+            r"'\u{110000}'",
+            r"'\u{0000000}'",
+            r"'\u{_61}'",
+        ] {
+            assert_eq!(character_end(not_a_character, 0), None, "{not_a_character}");
+        }
     }
 
     #[test]

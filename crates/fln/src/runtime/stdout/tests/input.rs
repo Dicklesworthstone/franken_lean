@@ -5,10 +5,12 @@
 //! that isolated evaluator's input behavior. Pin syntax/type evidence is in
 //! validation/stdio-input-draft/oracle/run-0001/results.json: BaseIO-first
 //! unannotated do is refused, while explicit IO result types are accepted.
+#![cfg(test)]
 use super::*;
 use std::io::Write;
 use std::process::{Command, Stdio};
 
+#[cfg(test)]
 mod stderr;
 
 fn register_getter(

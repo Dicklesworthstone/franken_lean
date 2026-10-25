@@ -1,6 +1,9 @@
 //! Source-inferred inductive universes must pass both native checkers.
 #![forbid(unsafe_code)]
 use fln::{Budget, Engine, EngineAdmissionLimits, KVMap, SourceCheckLimits};
+use fln_core::expr::ExprNode;
+use fln_core::level::Level;
+use fln_core::name::Name;
 
 fn limits() -> SourceCheckLimits {
     SourceCheckLimits::new(EngineAdmissionLimits::new(Budget::for_stack_bytes(
@@ -24,6 +27,108 @@ fn inferred_polymorphic_sum_eliminates_and_retains_independent_carrier_universes
     check(include_str!(
         "../../fln-parse/tests/fixtures/polymorphic_sum.lean"
     ));
+}
+
+fn stored_result_levels(source: &str, expected: &[(&str, Level)]) {
+    let engine = Engine::with_source_seed(limits().admission)
+        .unwrap()
+        .into_complete()
+        .unwrap()
+        .check_source_files(&[source.as_bytes()], &KVMap::new(), limits())
+        .unwrap_or_else(|error| panic!("{source}\n{error:?}"))
+        .into_complete()
+        .expect("source and both judges complete")
+        .engine;
+    for (name, expected) in expected {
+        let info = engine
+            .environment()
+            .find(&Name::from_components(name.split('.')))
+            .unwrap_or_else(|| panic!("missing {name}"));
+        let mut type_ = &info.constant_val().type_;
+        while let ExprNode::ForallE { body, .. } = type_.node() {
+            type_ = body;
+        }
+        let ExprNode::Sort { level } = type_.node() else {
+            panic!("{name} does not end in a sort: {type_:?}");
+        };
+        assert_eq!(level, expected, "stored result universe of {name}");
+    }
+}
+
+// Oracle: pinned Lean 4.32.0, `repr (getConstInfo name).type`, rather than
+// pretty printing or universe equivalence (both can hide redundant maxima).
+#[test]
+fn inferred_result_levels_store_the_pins_normalized_terms() {
+    let u = Level::param(Name::from_components(["u"]));
+    let v = Level::param(Name::from_components(["v"]));
+    stored_result_levels(
+        "universe u v\n\
+         inductive SortNat where | mk (n m : Nat)\n\
+         inductive SortPoly (A : Type u) where | mk (x : A)\n\
+         inductive SortMixed (A : Sort u) (B : Type v) where | mk (x : A) (y : B)\n\
+         mutual\n\
+           inductive SortTree (A : Type u) where | leaf (x : A) | node (f : SortForest A)\n\
+           inductive SortForest (A : Type u) where | nil | cons (x : SortTree A) (xs : SortForest A)\n\
+         end\n",
+        &[
+            ("SortNat", Level::one()),
+            ("SortPoly", Level::succ(u.clone()).unwrap()),
+            (
+                "SortMixed",
+                Level::max(u.clone(), Level::succ(v).unwrap()).unwrap(),
+            ),
+            ("SortTree", Level::succ(u.clone()).unwrap()),
+            ("SortForest", Level::succ(u).unwrap()),
+        ],
+    );
+}
+
+#[test]
+fn inferred_prop_candidates_keep_empty_enumeration_and_recursive_controls_in_type() {
+    stored_result_levels(
+        "inductive SortProof where | mk (h : True)\n\
+         inductive SortProp : Prop where | mk (h : True)\n\
+         inductive SortEmpty\n\
+         inductive SortUnit where | mk\n\
+         inductive SortEnum where | left (h : True) | right (h : True)\n\
+         inductive SortRecursive where | mk (child : SortRecursive)\n\
+         mutual\n\
+           inductive SortProofLeft where | mk (h : True)\n\
+           inductive SortProofRight where | mk (h : True)\n\
+         end\n",
+        &[
+            ("SortProof", Level::zero()),
+            ("SortProp", Level::zero()),
+            ("SortEmpty", Level::one()),
+            ("SortUnit", Level::one()),
+            ("SortEnum", Level::one()),
+            ("SortRecursive", Level::one()),
+            ("SortProofLeft", Level::zero()),
+            ("SortProofRight", Level::zero()),
+        ],
+    );
+}
+
+#[test]
+fn inferred_record_results_share_the_pins_normalized_terms() {
+    let u = Level::param(Name::from_components(["u"]));
+    let v = Level::param(Name::from_components(["v"]));
+    stored_result_levels(
+        "universe u v\n\
+         structure SortRecord where\n  first : Nat\n  second : Nat\n\
+         structure SortRecordPoly (A : Type u) where\n  value : A\n\
+         structure SortRecordMixed (A : Sort u) (B : Type v) where\n  first : A\n  second : B\n\
+         structure SortRecordProof where\n  proof : True\n",
+        &[
+            ("SortRecord", Level::one()),
+            ("SortRecordPoly", Level::succ(u.clone()).unwrap()),
+            (
+                "SortRecordMixed",
+                Level::max(u, Level::succ(v).unwrap()).unwrap(),
+            ),
+            ("SortRecordProof", Level::zero()),
+        ],
+    );
 }
 
 #[test]

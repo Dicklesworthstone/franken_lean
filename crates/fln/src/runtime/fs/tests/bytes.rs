@@ -1,9 +1,12 @@
 //! Actual pinned dependency data, checked source, and honest logical bytes.
 //! This deliberately bounded raw fixture is not full IO module admission.
+#![cfg(test)]
 
 use super::*;
 
+#[cfg(test)]
 mod implemented_by;
+#[cfg(test)]
 mod write;
 
 fn raw_bytes_environment() -> Option<Environment> {

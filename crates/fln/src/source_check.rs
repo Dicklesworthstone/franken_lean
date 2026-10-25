@@ -359,7 +359,7 @@ pub(crate) fn apply_module_control_command(
             .map_err(|(resource, limit)| SourceCheckError::Limit { resource, limit })?;
         let aliases = scopes
             .export_aliases(engine.environment(), namespace, names)
-            .map_err(refuse)?;
+            .map_err(|error| error.into_source(file, command, offset))?;
         if let Some(public) = public {
             // `elabExport` adds aliasExtension entries regardless of the section's
             // declaration visibility (Lean/Elab/BuiltinCommand.lean). The native
@@ -510,6 +510,7 @@ pub(crate) fn apply_module_control_command(
             .check_limits(&control)
             .map_err(|(resource, limit)| SourceCheckError::Limit { resource, limit })?;
         let (file, command, offset) = position;
+        let namespace_command = matches!(control, ScopeCommand::Namespace(_));
         let transitioned = if let Some(public) = public.as_ref() {
             scopes.transition_worlds(
                 control,
@@ -520,6 +521,32 @@ pub(crate) fn apply_module_control_command(
             scopes.transition(control, engine.environment())
         };
         transitioned.map_err(|error| error.into_source(file, command, offset))?;
+        if namespace_command {
+            let register = |env: &Environment| {
+                fln_elab::namespaces::register_source(env, &scopes.current.namespace).map_err(
+                    |error| {
+                        scopes::TransitionError::Registry(error).into_source(file, command, offset)
+                    },
+                )
+            };
+            if let Some(public) = public {
+                let mut next = public.engine().clone();
+                next.environment = register(next.environment())?;
+                return match public
+                    .publish(engine, next, Vec::new(), &scopes.public_scope(), options)
+                    .map_err(|error| {
+                        command_error(file, command, fln_parse::BytePos(offset), error)
+                    })? {
+                    Outcome::Complete(next) => {
+                        *engine = next;
+                        Ok(Outcome::Complete(()))
+                    }
+                    Outcome::Inconclusive(reason) => Ok(Outcome::Inconclusive(reason)),
+                    Outcome::InternalFault(fault) => Ok(Outcome::InternalFault(fault)),
+                };
+            }
+            engine.environment = register(engine.environment())?;
+        }
         return Ok(Outcome::Complete(()));
     }
     // Global default attributes export according to each candidate's visibility,

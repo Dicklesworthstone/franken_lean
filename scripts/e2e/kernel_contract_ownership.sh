@@ -15,8 +15,11 @@ export CARGO_TERM_COLOR=never
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 RCH_BRIDGE_ENTERED=false
 
-DEFAULT_MAX_FILE_BYTES=8388608
-DEFAULT_MAX_LINE_BYTES=262144
+# Match OwnershipLimits::default() for ordinary source-bound cases: production
+# defaults already accommodate the live tracker. Keep all explicit zero/exact/
+# one-over requests below: those still measure the resource refusals themselves.
+DEFAULT_MAX_FILE_BYTES=33554432
+DEFAULT_MAX_LINE_BYTES=2097152
 DEFAULT_MAX_RECORDS=100000
 DEFAULT_MAX_ID_BYTES=256
 DEFAULT_MAX_PARSE_DEPTH=128
@@ -207,12 +210,12 @@ manifest_prefix_max_id_bytes_file() {
 manifest_first_id_over_limit_record() {
   local path="$1"
   local limit="$2"
+  # Drain sed after the first match; an early awk exit can SIGPIPE it under pipefail.
   sed -n 's/^{"id":"\([^"]*\)"}$/\1/p' "$path" \
     | awk -v limit="$limit" '
-        length($0) > limit {
+        !found && length($0) > limit {
           print NR
           found = 1
-          exit
         }
         END {
           if (!found) {
@@ -1960,7 +1963,11 @@ observed_manifest_hash="$(jq -er '.manifest_hash' "$positive_result")"
 observed_projection_hash="$(jq -er '.projection_hash' "$positive_result")"
 [[ "$observed_manifest_hash" =~ ^[0-9a-f]{64}$ \
     && "$observed_projection_hash" =~ ^[0-9a-f]{64}$ ]] \
-  || { note "positive preflight published a noncanonical binding"; exit 1; }
+  || {
+    note "positive preflight published a noncanonical binding"
+    jq '{classification, diagnostic, evidence_grade, limits, usage}' "$positive_result" >&2
+    exit 1
+  }
 [[ "$observed_projection_hash" == "$BASELINE_PROJECTION_HASH" ]] \
   || { note "positive preflight projection disagrees with the manifest"; exit 1; }
 if [[ "$LANE" == "rch" ]]; then

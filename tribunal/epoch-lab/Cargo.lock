@@ -6,6 +6,7 @@ version = 4
 name = "fln"
 version = "0.0.0"
 dependencies = [
+ "fln-anvil",
  "fln-checker",
  "fln-comp",
  "fln-core",
@@ -15,9 +16,21 @@ dependencies = [
  "fln-kernel",
  "fln-olean",
  "fln-parse",
+ "fln-rt",
  "fln-server",
+ "fln-syntax",
  "fln-verdict",
  "fln-vm",
+]
+
+[[package]]
+name = "fln-anvil"
+version = "0.0.0"
+dependencies = [
+ "fln-bignum",
+ "fln-core",
+ "fln-elab",
+ "fln-env",
 ]
 
 [[package]]
@@ -42,7 +55,9 @@ dependencies = [
  "fln-core",
  "fln-hash",
  "fln-lake",
+ "fln-parse",
  "fln-server",
+ "fln-syntax",
 ]
 
 [[package]]
@@ -204,5 +219,6 @@ dependencies = [
  "fln-comp",
  "fln-core",
  "fln-hash",
+ "fln-libm",
  "fln-rt",
 ]

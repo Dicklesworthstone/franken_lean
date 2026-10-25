@@ -1,6 +1,8 @@
 //! Checked logical bytes cross into a private native buffer only at the write.
+#![cfg(test)]
 use super::*;
 
+#[cfg(test)]
 mod string;
 
 fn write_environment(raw: &Environment, omit: Option<&str>) -> Environment {

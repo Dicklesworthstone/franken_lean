@@ -24,6 +24,8 @@
 //! src/Lean/PrettyPrinter/Delaborator/Basic.lean: sha256 f109b13153edb8c12b2bf86edf7b334b7b0a3f3d02b73a43a7a0f4d9d911544a
 //! src/Lean/KeyedDeclsAttribute.lean: sha256 1d00864816438bbe7410fe9fd3a01599391f2c7d669b35fc300a38576d5aa063
 //! src/Lean/Compiler/InlineAttrs.lean: sha256 a3599016d38e2128d6c1f3cc384a544540b33db1288221754700da42c7e7d01c
+//! src/Lean/Namespace.lean: sha256 2c57f58257d03fa961507c1cf7896dfdf15d22b47a8c3689d3bbaf0db09eab61
+//! stage0/stdlib/Lean/Namespace.c: sha256 8cf4f058beba378edd817ea2c953ce79b3219753a752392ae13544d95adcd528
 #![allow(dead_code)]
 
 pub const CLASS_NAME: usize = 0;
@@ -125,6 +127,9 @@ pub const STRUCTURE_EXTENSION_MODULE: &str = "Lean.Structure";
 pub const STRUCTURE_EXTENSION_DECLARATION: &str = "Lean.structureExt";
 pub const STRUCTURE_EXTENSION_PRIVATE_INDEX: u64 = 0;
 pub const STRUCTURE_PRIVATE_HEADER: &str = "_private";
+pub const NAMESPACE_EXTENSION_MODULE: &str = "Lean.Namespace";
+pub const NAMESPACE_EXTENSION_DECLARATION: &str = "Lean.namespacesExt";
+pub const NAMESPACE_EXTENSION_PRIVATE_INDEX: u64 = 0;
 pub const KEY_STAR: u8 = 0;
 pub const KEY_OTHER: u8 = 1;
 pub const KEY_LIT: u8 = 2;

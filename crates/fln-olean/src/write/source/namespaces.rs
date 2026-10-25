@@ -1,14 +1,12 @@
 //! Namespace entries for modules written by the source pipeline.
 //!
 //! The pin's Lean.Namespace exports an Array Name, sorted by Name.quickLt.
-//! Qualified declarations and aliases register their proper prefixes. Alias
-//! targets do not: their namespaces belong to the defining module.
+//! Qualified declarations register their proper prefixes. Alias names and
+//! targets do not register namespaces.
 //! Merely writing the constants does not perform this registration on import.
 //!
-//! Empty namespaces cannot be reconstructed from constants. This module does
-//! not pretend otherwise, and does not infer namespaces from imported names,
-//! referenced constants, class metadata or extra runtime constant names. A
-//! re-export-only namespace is reconstructed from its own qualified aliases.
+//! Empty and re-export-only namespaces come from explicit registrations, never
+//! inferred from aliases, referenced constants or extra runtime constant names.
 //! A scoped registration also names its exact namespace, even when its
 //! declaration lives elsewhere and the namespace has no constants of its own.
 use super::*;
@@ -18,27 +16,46 @@ use super::*;
 /// name is constructed in vendored stage0/stdlib/Lean/Namespace.c, initFn's
 /// closed__13, from closed__3/5/7/10/11 (closed__10 is Name.num 0).
 pub(super) fn extension_name() -> Name {
-    Name::str(
-        Name::str(
-            Name::num(Name::from_components(["_private", "Lean", "Namespace"]), 0),
-            "Lean",
-        ),
-        "namespacesExt",
-    )
+    crate::source_extensions::namespace_extension_name()
 }
 
 impl Encoder {
+    fn retain_namespace(&self, names: &mut HashSet<Name>, namespace: &Name) -> WResult<bool> {
+        if names.contains(namespace) {
+            return Ok(false);
+        }
+        let count = names.len().checked_add(1).ok_or(WriteError::Contract {
+            what: "namespace entry count overflows",
+        })?;
+        self.source_array_bound(count)?;
+        let nonanonymous =
+            count - usize::from(namespace.is_anonymous() || names.contains(&Name::anonymous()));
+        let attempted = u64::try_from(nonanonymous).map_err(|_| WriteError::Contract {
+            what: "namespace object count overflows",
+        })?;
+        // Each distinct nonanonymous Name needs at least one object. The
+        // shared encoder charges the actual name and supporting objects.
+        if attempted > self.budget.max_objects {
+            return Err(WriteError::Budget {
+                resource: WriteResource::Objects,
+                limit: self.budget.max_objects,
+                attempted,
+            });
+        }
+        names.insert(namespace.clone());
+        Ok(true)
+    }
+
     fn declaration_namespaces(
         &self,
         constants: &[ConstantInfo],
-        aliases: &[AliasEntry],
+        namespaces: &[Name],
         instances: &[InstanceEntry],
     ) -> WResult<Vec<Name>> {
         let mut names = HashSet::new();
         for mut namespace in constants
             .iter()
             .map(|constant| constant.constant_val().name.parent())
-            .chain(aliases.iter().map(|alias| alias.alias.parent()))
             .chain(
                 instances
                     .iter()
@@ -48,29 +65,17 @@ impl Encoder {
             while !namespace.is_anonymous() {
                 // Every previous walk finished its ancestor chain. A shared
                 // prefix therefore lets us stop, not repeatedly walk to root.
-                if names.contains(&namespace) {
+                if !self.retain_namespace(&mut names, &namespace)? {
                     break;
                 }
-                let count = names.len().checked_add(1).ok_or(WriteError::Contract {
-                    what: "namespace entry count overflows",
-                })?;
-                self.source_array_bound(count)?;
-                let attempted = u64::try_from(count).map_err(|_| WriteError::Contract {
-                    what: "namespace object count overflows",
-                })?;
-                // Each distinct nonanonymous Name needs at least one object.
-                // Preflight before retaining it; actual bytes and supporting
-                // objects are charged by the shared name/array/ctor encoder.
-                if attempted > self.budget.max_objects {
-                    return Err(WriteError::Budget {
-                        resource: WriteResource::Objects,
-                        limit: self.budget.max_objects,
-                        attempted,
-                    });
-                }
-                names.insert(namespace.clone());
                 namespace = namespace.parent();
             }
+        }
+        // `Environment.registerNamespace` registers exactly its argument, not
+        // its ancestors. Source namespace commands supply their entered
+        // prefixes themselves; metadata must not invent additional entries.
+        for namespace in namespaces {
+            self.retain_namespace(&mut names, namespace)?;
         }
         let mut names: Vec<_> = names.into_iter().collect();
         names.sort_by(Name::quick_cmp);
@@ -97,8 +102,11 @@ pub(super) fn encode(
 ) -> WResult<EncodedModule> {
     let header_bytes = build_header(header)?;
     let mut encoder = Encoder::new(budget, header.version)?;
-    let namespaces =
-        encoder.declaration_namespaces(input.constants, &metadata.aliases, &metadata.instances)?;
+    let namespaces = encoder.declaration_namespaces(
+        input.constants,
+        &metadata.namespaces,
+        &metadata.instances,
+    )?;
     if namespaces.is_empty() {
         return if metadata.classes.is_empty()
             && metadata.instances.is_empty()
@@ -362,9 +370,8 @@ mod tests {
             let decoded = source_extensions::decode(&blocks, DecodeLimits::default()).unwrap();
             assert_eq!(decoded.classes, metadata.classes);
             assert_eq!(decoded.protected, metadata.protected);
-            // Source activation still reports this journal opaquely. Its
-            // Reference consumer, rather than that report, owns namespace lookup.
-            assert_eq!(decoded.uninterpreted, vec![extension_name()]);
+            assert_eq!(decoded.namespaces, vec![name("Lib")]);
+            assert!(decoded.uninterpreted.is_empty());
             assert_eq!(encoded.report.constants, 2);
             assert_eq!(encoded.bytes.len() as u64, encoded.report.file_bytes);
             let exact = WriteBudget {
@@ -427,6 +434,55 @@ mod tests {
     }
 
     #[test]
+    fn explicit_root_namespace_round_trips_in_both_formats() {
+        let metadata = SourceMetadata {
+            namespaces: vec![name("Only.Exact"), Name::anonymous()],
+            ..SourceMetadata::default()
+        };
+        for version in [2, 3] {
+            let encoded = encode_module_with_source_metadata(
+                input(&[]),
+                &metadata,
+                header(version),
+                WriteBudget::default(),
+            )
+            .unwrap();
+            let view = OleanView::parse(&encoded.bytes).unwrap();
+            view.walk(WalkBudget::default()).unwrap();
+            let blocks = view
+                .extension_payloads(WalkBudget::default(), 1024 * 1024)
+                .unwrap();
+            let decoded = source_extensions::decode(&blocks, DecodeLimits::default()).unwrap();
+            let mut expected = metadata.namespaces.clone();
+            expected.sort_by(Name::quick_cmp);
+            assert_eq!(decoded.namespaces, expected);
+            assert!(!decoded.namespaces.contains(&name("Only")));
+            assert_eq!(encoded.report.constants, 0);
+            assert!(decoded.classes.is_empty());
+        }
+        // The root name is an immediate scalar, not a heap name object.
+        let encoder = Encoder::new(
+            WriteBudget {
+                max_objects: 0,
+                ..WriteBudget::default()
+            },
+            2,
+        )
+        .unwrap();
+        assert_eq!(
+            encoder
+                .declaration_namespaces(&[], &[Name::anonymous()], &[])
+                .unwrap(),
+            vec![Name::anonymous()]
+        );
+        assert!(
+            encoder
+                .declaration_namespaces(&[], &[name("A")], &[])
+                .is_err()
+        );
+    }
+
+    #[test]
     fn namespace_planning_is_bounded_and_failure_does_not_poison_a_retry() {
         let constants = [constant(name("A.B.C.D.value"))];
         let limited = Encoder::new(
@@ -452,5 +508,45 @@ mod tests {
                 .len(),
             4
         );
+    }
+
+    #[test]
+    fn explicit_empty_namespaces_survive_but_dotted_aliases_create_none() {
+        let metadata = SourceMetadata {
+            namespaces: vec![
+                name("Empty"),
+                name("Empty.ReexportOnly"),
+                name("Only.Exact"),
+            ],
+            aliases: vec![AliasEntry {
+                alias: name("Invented.Inner.x"),
+                declaration: name("Original.x"),
+            }],
+            ..SourceMetadata::default()
+        };
+        for version in [2, 3] {
+            let encoded = encode_module_with_source_metadata(
+                input(&[]),
+                &metadata,
+                header(version),
+                WriteBudget::default(),
+            )
+            .unwrap();
+            let view = OleanView::parse(&encoded.bytes).unwrap();
+            let blocks = view
+                .extension_payloads(WalkBudget::default(), 1024 * 1024)
+                .unwrap();
+            let decoded = source_extensions::decode(&blocks, DecodeLimits::default()).unwrap();
+            let mut expected = vec![
+                name("Empty"),
+                name("Empty.ReexportOnly"),
+                name("Only.Exact"),
+            ];
+            expected.sort_by(Name::quick_cmp);
+            assert_eq!(decoded.namespaces, expected);
+            assert!(!decoded.namespaces.contains(&name("Only")));
+            assert_eq!(decoded.aliases, metadata.aliases);
+            assert!(decoded.uninterpreted.is_empty());
+        }
     }
 }
