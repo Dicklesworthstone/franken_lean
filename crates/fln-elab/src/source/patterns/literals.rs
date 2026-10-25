@@ -208,6 +208,7 @@ impl Context {
                     labels: vec![None; fields.len()],
                     fields,
                     ellipsis: false,
+                    record: false,
                 }));
                 expanded.insert(pattern, index);
                 row.patterns[0] = index;

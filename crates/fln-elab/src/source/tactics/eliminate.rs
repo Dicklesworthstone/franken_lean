@@ -475,6 +475,9 @@ impl Context {
             add_local(&mut self.txn.lctx, &local);
             branch.introduced.push(local);
         }
+        if source_match {
+            self.bind_record_matrix_projections(&mut branch.introduced)?;
+        }
         branch.lctx = self.txn.lctx.clone();
         Ok(branch)
     }

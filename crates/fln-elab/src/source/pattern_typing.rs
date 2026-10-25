@@ -373,7 +373,9 @@ impl Model<'_> {
         let mut named = false;
         while let Some(syntax) = scan.pop() {
             self.cx.tick()?;
-            if syntax.kind() == Some(&parser_kind(&["Term", "namedArgument"])) {
+            if syntax.kind() == Some(&parser_kind(&["Term", "namedArgument"]))
+                || syntax.kind() == Some(&parser_kind(&["Term", "structInst"]))
+            {
                 named = true;
                 break;
             }
@@ -396,6 +398,10 @@ impl Model<'_> {
                 let index = order.len();
                 order.entry(name).or_insert(index);
                 pending.push(inner);
+                continue;
+            }
+            if let Some(record) = patterns::records::parts(syntax)? {
+                pending.extend(record.fields.into_iter().rev().map(|(_, value)| value));
                 continue;
             }
             let (head, arguments) = match syntax {
@@ -1128,6 +1134,48 @@ impl Model<'_> {
         let synthetic = parser_kind(&["Term", "syntheticHole"]);
         if matches!(syntax.kind(), Some(kind) if kind == &hole || kind == &synthetic) {
             return Ok(Ok((self.fresh_mvar(), expected.clone())));
+        }
+        if let Some(record) = patterns::records::parts(syntax)? {
+            let Some(expected) = self.inst(expected, 0)? else {
+                return Ok(Err(Stop::Unknown));
+            };
+            // A record alias must not hide a written-order scope error. Reduce in a
+            // snapshot: retain spent work, but never speculative assignments.
+            let mut reduction = self.cx.clone();
+            let reduced = reduction.whnf(&expected);
+            self.cx.txn.budget.heartbeats_consumed = reduction.txn.budget.heartbeats_consumed;
+            let expected = reduced?;
+            let (head, _) = spine(&expected);
+            let Some(family) = const_name(head) else {
+                return Ok(Err(Stop::Unknown));
+            };
+            let labels = record
+                .fields
+                .iter()
+                .map(|(name, _)| name.clone())
+                .collect::<Vec<_>>();
+            let paths = self
+                .cx
+                .record_pattern_paths(family, &labels, record.ellipsis)?;
+            let Some(info) = self.inductive(family) else {
+                return Ok(Err(Stop::Unknown));
+            };
+            let [constructor] = info.ctors.as_slice() else {
+                return Ok(Err(Stop::Unknown));
+            };
+            let constructor = constructor.clone();
+            let arguments = self
+                .cx
+                .record_pattern_model_arguments(&record.fields, &paths)?;
+            let arguments = arguments.iter().collect::<Vec<_>>();
+            return self.application(
+                &constructor,
+                &arguments,
+                &expected,
+                ensure,
+                variables,
+                depth,
+            );
         }
         if syntax.kind() == Some(&Name::from_components(["num"])) {
             // A numeral is `OfNat.ofNat ?α n ?inst`; only at `Nat` is its value known here.

@@ -913,6 +913,14 @@ fn pattern(
         /// `(field := p)` (`Term.namedArgument`): retain the label and parse its value
         /// as a pattern, including nested constructors and aliases.
         Argument(usize, usize),
+        /// Retain record syntax wrappers while parsing their values as patterns.
+        Record(
+            usize,
+            usize,
+            Vec<(usize, Option<usize>, Option<usize>)>,
+            Option<usize>,
+            Option<usize>,
+        ),
         /// `(p : T)` (`Term.typeAscription`): the brackets and the colon; the type is a term.
         Ascription(usize, usize, usize),
         /// `..` as an application's last argument (`Term.ellipsis`): every remaining explicit
@@ -922,11 +930,20 @@ fn pattern(
     let mut pairs = HashMap::new();
     let mut opens = Vec::new();
     for at in range.clone() {
-        if is_symbol(tokens, at, "(") || is_symbol(tokens, at, "⟨") {
+        if ["(", "⟨", "{", "["]
+            .iter()
+            .any(|s| is_symbol(tokens, at, s))
+        {
             opens.push(at);
-        } else if is_symbol(tokens, at, ")") || is_symbol(tokens, at, "⟩") {
+        } else if [")", "⟩", "}", "]"]
+            .iter()
+            .any(|s| is_symbol(tokens, at, s))
+        {
             let open = opens.pop().ok_or_else(|| refuse(view, tokens, at))?;
-            if is_symbol(tokens, open, "(") != is_symbol(tokens, at, ")") {
+            if ![("(", ")"), ("⟨", "⟩"), ("{", "}"), ("[", "]")]
+                .iter()
+                .any(|(left, right)| is_symbol(tokens, open, left) && is_symbol(tokens, at, right))
+            {
                 return Err(refuse(view, tokens, at));
             }
             pairs.insert(open, at);
@@ -939,6 +956,74 @@ fn pattern(
     let mut values = Vec::new();
     while let Some(task) = tasks.pop() {
         match task {
+            Task::Record(open, close, fields, ellipsis, colon) => {
+                let patterns = values.split_off(values.len() - fields.len());
+                let mut rows = Vec::new();
+                for ((name, assignment, separator), value) in fields.into_iter().zip(patterns) {
+                    rows.push(Syntax::node(
+                        parser_kind(&["Term", "structInstField"]),
+                        vec![
+                            Syntax::node(
+                                parser_kind(&["Term", "structInstLVal"]),
+                                vec![leaves.leaf(name)?, null_node(vec![])],
+                            ),
+                            match assignment {
+                                Some(at) => null_node(vec![
+                                    null_node(vec![]),
+                                    null_node(vec![]),
+                                    Syntax::node(
+                                        parser_kind(&["Term", "structInstFieldDef"]),
+                                        vec![leaves.leaf(at)?, null_node(vec![]), value],
+                                    ),
+                                ]),
+                                None => null_node(vec![]),
+                            },
+                        ],
+                    ));
+                    if let Some(at) = separator {
+                        rows.push(leaves.leaf(at)?);
+                    } else {
+                        rows.push(null_node(vec![]));
+                    }
+                }
+                // A synthetic line separator after the final field is not a source token.
+                if matches!(rows.last(), Some(Syntax::Node {args,..}) if args.is_empty()) {
+                    rows.pop();
+                }
+                let annotation = match colon {
+                    Some(at) => null_node(vec![
+                        leaves.leaf(at)?,
+                        bounded_term(
+                            leaves,
+                            view,
+                            tokens,
+                            at + 1..close,
+                            DefinitionGrammar::Scalar,
+                        )?,
+                    ]),
+                    None => null_node(vec![]),
+                };
+                values.push(Syntax::node(
+                    parser_kind(&["Term", "structInst"]),
+                    vec![
+                        leaves.leaf(open)?,
+                        null_node(vec![]),
+                        Syntax::node(
+                            parser_kind(&["Term", "structInstFields"]),
+                            vec![null_node(rows)],
+                        ),
+                        Syntax::node(
+                            parser_kind(&["Term", "optEllipsis"]),
+                            vec![null_node(match ellipsis {
+                                Some(at) => vec![leaves.leaf(at)?],
+                                None => vec![],
+                            })],
+                        ),
+                        annotation,
+                        leaves.leaf(close)?,
+                    ],
+                ));
+            }
             Task::Argument(open, close) => {
                 let pattern = values.pop().expect("planned named constructor argument");
                 values.push(Syntax::node(
@@ -1126,6 +1211,82 @@ fn pattern(
                     );
                     continue;
                 }
+                if is_symbol(tokens, range.start, "{") {
+                    let close = pairs[&range.start];
+                    if close + 1 != range.end {
+                        return Err(refuse(view, tokens, close + 1));
+                    }
+                    let mut cursor = range.start + 1;
+                    let mut fields = Vec::new();
+                    let mut patterns = Vec::new();
+                    let mut ellipsis = None;
+                    let mut colon = None;
+                    while cursor < close {
+                        if is_symbol(tokens, cursor, "..") {
+                            ellipsis = Some(cursor);
+                            cursor += 1;
+                            if cursor < close && !is_symbol(tokens, cursor, ":") {
+                                return Err(refuse(view, tokens, cursor));
+                            }
+                        }
+                        if is_symbol(tokens, cursor, ":") {
+                            if cursor + 1 == close {
+                                return Err(refuse(view, tokens, cursor));
+                            }
+                            colon = Some(cursor);
+                            break;
+                        }
+                        if cursor == close {
+                            break;
+                        }
+                        let name = cursor;
+                        if !matches!(tokens[name].kind, TokenKind::Ident(_)) {
+                            return Err(refuse(view, tokens, name));
+                        }
+                        cursor += 1;
+                        let assignment = is_symbol(tokens, cursor, ":=").then_some(cursor);
+                        let value = if assignment.is_some() {
+                            cursor += 1;
+                            let start = cursor;
+                            while cursor < close {
+                                if [",", ":", ".."]
+                                    .iter()
+                                    .any(|s| is_symbol(tokens, cursor, s))
+                                {
+                                    break;
+                                }
+                                if cursor > start
+                                    && later_line(view, tokens, cursor, name)
+                                    && column(view, tokens, cursor) <= column(view, tokens, name)
+                                {
+                                    break;
+                                }
+                                cursor = pairs.get(&cursor).map_or(cursor + 1, |end| end + 1);
+                            }
+                            if start == cursor {
+                                return Err(refuse(view, tokens, start));
+                            }
+                            start..cursor
+                        } else {
+                            name..name + 1
+                        };
+                        let separator = is_symbol(tokens, cursor, ",").then_some(cursor);
+                        if separator.is_some() {
+                            cursor += 1;
+                        } else if cursor < close
+                            && ![":", ".."].iter().any(|s| is_symbol(tokens, cursor, s))
+                            && !(later_line(view, tokens, cursor, name)
+                                && column(view, tokens, cursor) <= column(view, tokens, name))
+                        {
+                            return Err(refuse(view, tokens, cursor));
+                        }
+                        fields.push((name, assignment, separator));
+                        patterns.push(value);
+                    }
+                    tasks.push(Task::Record(range.start, close, fields, ellipsis, colon));
+                    tasks.extend(patterns.into_iter().rev().map(Task::Parse));
+                    continue;
+                }
                 if is_symbol(tokens, range.start, "(") {
                     let close = pairs[&range.start];
                     if close + 1 != range.end {
@@ -1253,7 +1414,10 @@ fn pattern(
                     {
                         cursor += 2;
                     }
-                    if is_symbol(tokens, cursor, "(") || is_symbol(tokens, cursor, "⟨") {
+                    if ["(", "⟨", "{", "["]
+                        .iter()
+                        .any(|s| is_symbol(tokens, cursor, s))
+                    {
                         cursor = pairs[&cursor] + 1;
                     } else if is_symbol(tokens, cursor, ".") {
                         cursor += 2;

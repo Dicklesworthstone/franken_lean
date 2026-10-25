@@ -1145,13 +1145,56 @@ impl Context {
                         }
                         layouts
                             .iter()
-                            .map(|layout| expect_null_args(layout, "constructor row layout"))
+                            .map(|layout| {
+                                if layout.kind()
+                                    == Some(&parser_kind(&["Term", "matrixRecordLayout"]))
+                                {
+                                    let [arguments, annotation] = expect_node(
+                                        layout,
+                                        &parser_kind(&["Term", "matrixRecordLayout"]),
+                                        2,
+                                        "record row layout",
+                                    )?
+                                    else {
+                                        return Err(error(MatchError::InvalidPattern));
+                                    };
+                                    let annotation = match expect_null_args(
+                                        annotation,
+                                        "record row annotation",
+                                    )? {
+                                        [] => None,
+                                        [annotation] => Some(annotation),
+                                        _ => return Err(error(MatchError::InvalidPattern)),
+                                    };
+                                    Ok((
+                                        expect_null_args(arguments, "record row arguments")?,
+                                        annotation,
+                                        true,
+                                    ))
+                                } else {
+                                    Ok((
+                                        expect_null_args(layout, "constructor row layout")?,
+                                        None,
+                                        false,
+                                    ))
+                                }
+                            })
                             .collect::<Result<Vec<_>, _>>()?
                     }
-                    None => vec![arguments],
+                    None => vec![(arguments, None, false)],
                 };
-                for layout in layouts {
+                for (layout, annotation, record) in layouts {
                     self.tick()?;
+                    if record {
+                        if let Some(annotation) = annotation {
+                            let actual = self.term(parts.discriminant, None)?.type_;
+                            let annotated = self.type_term(annotation)?;
+                            self.constrain(&actual, &annotated)?;
+                            self.flush(false)?;
+                        }
+                        self.bind_record_pattern_layout(name, &constructor, layout, &mut fields)?;
+                        continue;
+                    }
                     let arguments: Vec<_> = layout.iter().collect();
                     let normalized =
                         patterns::arguments::normalize(self, &arguments, &constructor)?;
@@ -1391,6 +1434,7 @@ impl Context {
                         .clone(),
                 );
             }
+            self.bind_record_matrix_projections(&mut locals)?;
             return Ok(MatchStep::Branch {
                 syntax,
                 expected: state.target.clone(),
@@ -1707,6 +1751,7 @@ impl Context {
                 }
             }
         }
+        self.bind_record_matrix_projections(&mut locals)?;
         Ok(MatchStep::Branch {
             syntax: branch.syntax,
             expected,
