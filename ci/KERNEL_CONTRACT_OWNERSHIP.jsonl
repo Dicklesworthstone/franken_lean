@@ -1,4 +1,4 @@
-{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":695,"projection_hash":"265b0fb6b9d3e293df4afb74305ef222ed08ef5fbb5f42480aaaa95c9efca090"}
+{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":700,"projection_hash":"918aa3063b75286d1bc38739db9a4ad96a35b99580543359592f0ee696a635d4"}
 {"id":"fln-0bw5"}
 {"id":"fln-0eq8"}
 {"id":"fln-0rxm"}
@@ -108,7 +108,9 @@
 {"id":"fln-ci-tests-need-pin-d3ci"}
 {"id":"fln-class-def-reducibility-warnings-3hbf"}
 {"id":"fln-coercion-arrow-elaboration-chb4"}
+{"id":"fln-coercion-value-zeta-whnf-q5v1"}
 {"id":"fln-command-offset-loss-l7ij"}
+{"id":"fln-conv-mode-3csa"}
 {"id":"fln-corpus-thread-matrix-93te"}
 {"id":"fln-cross-tree-baked-root-k60n"}
 {"id":"fln-d18-product-half-rgsg"}
@@ -125,6 +127,7 @@
 {"id":"fln-deprecated-constant-warning-lx45"}
 {"id":"fln-derived-declaration-frontier-cj7s"}
 {"id":"fln-deriving-repr-ingress-closure-2gdf"}
+{"id":"fln-do-expected-type-not-monad-false-accept-7aub"}
 {"id":"fln-dyfz"}
 {"id":"fln-e44s"}
 {"id":"fln-eae"}
@@ -283,6 +286,7 @@
 {"id":"fln-optparam-constructor-field-recursor-1b0b"}
 {"id":"fln-ordinary-lean-probe-g03u"}
 {"id":"fln-otk7"}
+{"id":"fln-outparam-result-expected-type-6l9h"}
 {"id":"fln-panic-contract-seed-regression-q8iy"}
 {"id":"fln-panic-family-and-silent-panic-output-uyuk"}
 {"id":"fln-parity-freshness-denylist-direction-dy22"}
@@ -336,6 +340,7 @@
 {"id":"fln-simp-default-set-a4nb"}
 {"id":"fln-simp-literal-arithmetic-under-application-ameh"}
 {"id":"fln-simp-quantified-true-false-accept-70o1"}
+{"id":"fln-simp-suggest-kbyk"}
 {"id":"fln-simp-unfold-indexed-4v9t"}
 {"id":"fln-sn0w"}
 {"id":"fln-snv7"}
