@@ -9,6 +9,10 @@ use super::*;
 #[derive(Clone, Default)]
 pub(in crate::source) struct RefinementFrame {
     holes: Vec<(Option<Name>, ProofGoal)>,
+    /// `refine'`: a `_` is a new goal too, as the pin's `holesAsSyntheticOpaque` makes it
+    /// (`withCollectingNewGoalsFrom` with `allowNaturalHoles`, vendored
+    /// src/Lean/Elab/Tactic/ElabTerm.lean:140-180).
+    placeholders: bool,
 }
 
 impl Context {
@@ -16,6 +20,23 @@ impl Context {
         let depth = self.refinements.len();
         self.refinements.push(RefinementFrame::default());
         depth
+    }
+
+    /// [`Self::begin_refinement`] for `refine'`, whose `_`s are new goals.
+    pub(in crate::source) fn begin_placeholder_refinement(&mut self) -> usize {
+        let depth = self.refinements.len();
+        self.refinements.push(RefinementFrame {
+            holes: Vec::new(),
+            placeholders: true,
+        });
+        depth
+    }
+
+    /// Whether a `_` here is a goal of the innermost `refine'` rather than a natural hole.
+    pub(in crate::source) fn placeholders_are_goals(&self) -> bool {
+        self.refinements
+            .last()
+            .is_some_and(|frame| frame.placeholders)
     }
 
     pub(in crate::source) fn synthetic_proof_hole(
@@ -137,6 +158,102 @@ impl Context {
         self.finish_refinement(proof, goal, term, depth)
     }
 
+    /// The pin's `tagUntaggedGoals parentTag suffix newGoals` (vendored
+    /// src/Lean/Elab/Tactic/ElabTerm.lean): among the holes still unassigned, in creation order
+    /// (`sortMVarIdsByIndex`), a lone anonymous one takes the parent's tag, and several each take
+    /// the parent's tag with `suffix_i` appended. A named hole `?x` is tagged `x`.
+    fn tag_refinement_goals(&mut self, parent: &ProofGoal, frame: &RefinementFrame, suffix: &str) {
+        let open: Vec<&(Option<Name>, ProofGoal)> = frame
+            .holes
+            .iter()
+            .filter(|(_, hole)| !self.txn.mvars.is_assigned(&hole.id))
+            .collect();
+        let anonymous = open.iter().filter(|(name, _)| name.is_none()).count();
+        let tag = self
+            .goal_tags
+            .get(&parent.id)
+            .cloned()
+            .unwrap_or_else(Name::anonymous);
+        let mut index = 1;
+        for (name, hole) in open {
+            match name {
+                Some(name) => {
+                    self.goal_tags.insert(hole.id.clone(), name.clone());
+                }
+                None if anonymous == 1 => {
+                    self.goal_tags.insert(hole.id.clone(), tag.clone());
+                }
+                None => {
+                    self.goal_tags.insert(
+                        hole.id.clone(),
+                        Name::str(tag.clone(), format!("{suffix}_{index}")),
+                    );
+                    index += 1;
+                }
+            }
+        }
+    }
+
+    /// `exists e₁, …, eₙ`, the pin's `(refine ⟨e₁, …, eₙ, ?_⟩; try trivial)` (vendored
+    /// src/Init/Tactics.lean:1243-1244): `trivial` on the refinement's main goal, undone when it
+    /// fails.
+    pub(super) fn exists_proof_goal(
+        &mut self,
+        proof: &mut ProofState<'_>,
+        goal: ProofGoal,
+        args: &[Syntax],
+    ) -> Result<(), NatDefinitionElabError> {
+        let [keyword, witnesses] = args else {
+            return Err(error(TacticError::MalformedScript));
+        };
+        expect_atom(keyword, "exists", "exists keyword")?;
+        self.require_declared_tactic(&["Lean", "Parser", "Tactic", "tacticExists_,,"])?;
+        let atom = |text: &str| Syntax::atom(fln_syntax::source::SourceInfo::None, text);
+        let mut fields = expect_null_args(witnesses, "exists witnesses")?.to_vec();
+        if fields.is_empty() {
+            return Err(error(TacticError::MalformedScript));
+        }
+        fields.push(atom(","));
+        fields.push(Syntax::node(
+            parser_kind(&["Term", "syntheticHole"]),
+            vec![atom("?"), atom("_")],
+        ));
+        let syntax = Syntax::node(
+            parser_kind(&["Term", "anonymousCtor"]),
+            vec![
+                atom("⟨"),
+                Syntax::node(Name::from_components(["null"]), fields),
+                atom("⟩"),
+            ],
+        );
+        self.txn.lctx = goal.lctx.clone();
+        let depth = self.begin_refinement();
+        let term = self.term(&syntax, Some(goal.target.clone()))?;
+        self.finish_refinement(proof, goal, term, depth)?;
+        // `try trivial` on the main goal the refinement left.
+        let Some(Work::Goal(main)) = proof.work.pop() else {
+            return Err(error(TacticError::MalformedScript));
+        };
+        if self.txn.mvars.is_assigned(&main.id) {
+            proof.work.push(Work::Goal(main));
+            return Ok(());
+        }
+        let snapshot = Box::new(self.clone());
+        match self.trivial_proof_goal(main.clone()) {
+            Ok(()) => Ok(()),
+            Err(problem) if backtrack::recoverable(&problem) => {
+                let spent = self.txn.budget.heartbeats_consumed;
+                let aux_names = self.aux_names.take();
+                *self = *snapshot;
+                self.txn.budget.heartbeats_consumed = spent;
+                self.aux_names = aux_names;
+                proof.work.push(Work::Goal(main));
+                Ok(())
+            }
+            Err(problem) => Err(problem),
+        }
+    }
+
     pub(in crate::source) fn finish_refinement(
         &mut self,
         proof: &mut ProofState<'_>,
@@ -151,6 +268,12 @@ impl Context {
         self.txn.lctx = goal.lctx.clone();
         self.resolve_instances(false)?;
         self.flush(false)?;
+        let suffix = if frame.placeholders {
+            "refine'"
+        } else {
+            "refine"
+        };
+        self.tag_refinement_goals(&goal, &frame, suffix);
         // The parent is closed only after all holes, including holes in unused
         // let values or annotations, have supplied their actual checked terms.
         proof.work.push(Work::Close(goal, term.value));

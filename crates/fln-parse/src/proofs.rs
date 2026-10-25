@@ -305,6 +305,8 @@ pub(crate) fn tactic(
             "apply_rules",
             "apply",
             "refine",
+            // `syntax (name := refine') "refine' " term : tactic` (`Init/Tactics.lean:250`).
+            "refine'",
             "constructor",
             "left",
             "right",
@@ -381,6 +383,10 @@ pub(crate) fn tactic(
             // `syntax (name := guardExpr) "guard_expr " term:51 equal term : tactic`
             // (`Init/Guard.lean:61`).
             "guard_expr",
+            // `syntax "and_intros" : tactic` (`Init/Tactics.lean:1356`), kind `tacticAnd_intros`.
+            "and_intros",
+            // `syntax (name := rename) "rename " term " => " ident : tactic` (`Init/Tactics.lean:115`).
+            "rename",
             // `macro "admit" : tactic => `(tactic| sorry)` (`Init/Tactics.lean:462`).
             "admit",
             // `syntax (name := traceState) "trace_state" : tactic` and
@@ -443,9 +449,10 @@ pub(crate) fn tactic(
         "change" => change(leaves, view, tokens, range, atom),
         "guard_target" => guard_target(leaves, view, tokens, range, atom),
         "guard_expr" => guard_expr(leaves, view, tokens, range, atom),
+        "rename" => rename(leaves, view, tokens, range, atom),
         "guard_hyp" => guard_hyp::parse(leaves, view, tokens, range, atom),
         // `"specialize " term` (`Init/Tactics.lean`) has `exact`'s shape.
-        "exact" | "apply" | "refine" | "specialize" | "show" => {
+        "exact" | "apply" | "refine" | "refine'" | "specialize" | "show" => {
             term_tactic(leaves, view, tokens, range, keyword, atom)
         }
         _ => local_tactic(leaves, view, tokens, range, keyword, atom),
@@ -689,6 +696,7 @@ fn local_tactic(
         | "decreasing_trivial_pre_omega"
         | "decreasing_tactic"
         | "trace_state"
+        | "and_intros"
             if range.end == start + 1 => {}
         // `"trace " str` (`Init/Tactics.lean`, `Lean.Parser.Tactic.traceMessage`).
         "trace"
@@ -790,6 +798,7 @@ fn local_tactic(
         "norm_cast" => "tacticNorm_cast__",
         "subst_eqs" => "substEqs",
         "rotate_left" => "rotateLeft",
+        "and_intros" => "tacticAnd_intros",
         "rotate_right" => "rotateRight",
         "native_decide" => "nativeDecide",
         _ => keyword,
@@ -1035,6 +1044,37 @@ fn guard_expr(
     Ok(Syntax::node(
         parser_kind(&["Tactic", "guardExpr"]),
         vec![atom, left, equal, right],
+    ))
+}
+
+/// `"rename " term " => " ident` (`Init/Tactics.lean:115`): the last `=>` outside brackets
+/// ends the type, which a `fun … =>` inside it does not reach.
+#[inline(never)]
+fn rename(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    range: Range<usize>,
+    atom: Syntax,
+) -> Result<Syntax, NatDefinitionParseError> {
+    let arrow = range.end.checked_sub(2).filter(|&arrow| {
+        arrow > range.start + 1
+            && matches!(&tokens[arrow].kind, TokenKind::Symbol(symbol) if symbol == "=>")
+            && matches!(&tokens[arrow + 1].kind, TokenKind::Ident(_))
+    });
+    let Some(arrow) = arrow else {
+        return Err(refusal(view, tokens, range.end.min(range.start + 1)));
+    };
+    let type_ = bounded_term(
+        leaves,
+        view,
+        tokens,
+        range.start + 1..arrow,
+        DefinitionGrammar::Scalar,
+    )?;
+    Ok(Syntax::node(
+        parser_kind(&["Tactic", "rename"]),
+        vec![atom, type_, leaves.leaf(arrow)?, leaves.leaf(arrow + 1)?],
     ))
 }
 

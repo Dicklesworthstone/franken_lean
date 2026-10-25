@@ -186,9 +186,14 @@ pub enum TacticError {
     InjectionUnusedNames {
         unused: Vec<Name>,
     },
+    /// `injections` nested five injections (`Meta.injections`' `maxDepth`): the pin's
+    /// "recursion depth exceeded", which undoes the injection whose continuation reached it.
+    InjectionsDepth,
     /// `rename_i` named more hypotheses than are inaccessible or shadowed
     /// (`renameInaccessibles`, vendored src/Lean/Elab/Tactic/RenameInaccessibles.lean).
     RenameTooManyNames,
+    /// `rename e => h` found no hypothesis whose type unifies with `e` (`evalRename`).
+    RenameNoHypothesis,
     /// `clear` of a local that a later local, or the target, still reads (`MVarId.clear`,
     /// vendored src/Lean/Meta/Tactic/Clear.lean); `dependent: None` is the target.
     ClearDependency {
@@ -500,6 +505,9 @@ impl std::fmt::Display for TacticError {
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
+            Self::InjectionsDepth => {
+                write!(f, "Tactic `injections` failed: recursion depth exceeded")
+            }
             // The pin's words.
             Self::SubstitutionNoEquation { local } => write!(
                 f,
@@ -508,6 +516,8 @@ impl std::fmt::Display for TacticError {
             ),
             // The pin's words.
             Self::RenameTooManyNames => write!(f, "too many variable names provided"),
+            // The pin's words, without the type it prints after them.
+            Self::RenameNoHypothesis => write!(f, "Failed to find a hypothesis with type"),
             Self::ClearDependency {
                 local,
                 dependent: Some(dependent),
@@ -722,9 +732,11 @@ pub(super) enum ProofAction<'a> {
     },
     Attempt(backtrack::Spec<'a>),
     AttemptComplete(usize),
+    /// `refine e`, or `refine' e` (`placeholders`), whose `_`s are new goals too.
     Refine {
         syntax: &'a Syntax,
         goal: ProofGoal,
+        placeholders: bool,
     },
     Binding {
         goal: ProofGoal,
@@ -1425,12 +1437,26 @@ impl Context {
                 self.obtain_proof_goal(proof, goal, args)?;
             } else if kind == &parser_kind(&["Tactic", "rcases"]) {
                 self.rcases_proof_goal(proof, goal, args)?;
-            } else if kind == &parser_kind(&["Tactic", "refine"]) {
+            } else if kind == &parser_kind(&["Tactic", "refine"])
+                || kind == &parser_kind(&["Tactic", "refine'"])
+            {
+                let placeholders = kind == &parser_kind(&["Tactic", "refine'"]);
                 let [keyword, term] = args.as_slice() else {
                     return Err(error(TacticError::MalformedScript));
                 };
-                expect_atom(keyword, "refine", "refinement tactic")?;
-                return Ok(ProofAction::Refine { syntax: term, goal });
+                expect_atom(
+                    keyword,
+                    if placeholders { "refine'" } else { "refine" },
+                    "refinement tactic",
+                )?;
+                if placeholders {
+                    self.require_declared_tactic(&["Lean", "Parser", "Tactic", "refine'"])?;
+                }
+                return Ok(ProofAction::Refine {
+                    syntax: term,
+                    goal,
+                    placeholders,
+                });
             } else if kind == &Name::from_components(["tacticBy_cases_:_"]) {
                 let [keyword, binder, proposition] = args.as_slice() else {
                     return Err(error(TacticError::MalformedScript));
@@ -1555,6 +1581,8 @@ impl Context {
                 self.contradict_proof_goal(goal)?;
             } else if kind == &parser_kind(&["Tactic", "injection"]) {
                 self.inject_proof_goal(proof, goal, args)?;
+            } else if kind == &parser_kind(&["Tactic", "injections"]) {
+                self.injections_proof_goal(proof, goal, args)?;
             } else if kind == &parser_kind(&["Tactic", "subst"]) {
                 let [keyword, names] = args.as_slice() else {
                     return Err(error(TacticError::MalformedScript));
@@ -1651,6 +1679,13 @@ impl Context {
                 }
                 let goal = self.renamed_proof_goal(proof, goal, names)?;
                 proof.work.push(Work::Goal(goal));
+            } else if kind == &parser_kind(&["Tactic", "rename"]) {
+                let goal = self.rename_proof_goal(proof, goal, args)?;
+                proof.work.push(Work::Goal(goal));
+            } else if kind == &parser_kind(&["Tactic", "tacticAnd_intros"]) {
+                self.and_intros_proof_goal(proof, goal, args)?;
+            } else if kind == &parser_kind(&["Tactic", "tacticExists_,,"]) {
+                self.exists_proof_goal(proof, goal, args)?;
             } else if kind == &parser_kind(&["Tactic", "clear"]) {
                 self.clear_proof_locals(proof, goal, args)?;
             } else if kind == &parser_kind(&["Tactic", "tacticNext_=>_"]) {
@@ -1696,6 +1731,113 @@ impl Context {
                 let goal = self.renamed_proof_goal(proof, goal, names)?;
                 self.goal_tags.remove(&goal.id);
                 self.start_goal_control(proof, goal, body, control::Mode::Solve)?;
+            } else if kind == &parser_kind(&["Tactic", "case'"]) {
+                // `"case' " sepBy1(caseArg, " | ") " => " tacticSeq` (`evalCase'`, vendored
+                // src/Lean/Elab/Tactic/BuiltinTactic.lean): for each tag in turn, the goal it
+                // selects among those no earlier tag took, renamed, runs the body alone, and a
+                // run leaving exactly one goal gives it that tag; what each run leaves comes
+                // first, in order, then the other goals. Unlike `case`, the body need not close
+                // its goal, and the tag is kept.
+                let [keyword, cases, arrow, body] = args.as_slice() else {
+                    return Err(error(TacticError::MalformedScript));
+                };
+                expect_atom(keyword, "case'", "case' keyword")?;
+                expect_atom(arrow, "=>", "case' arrow")?;
+                self.require_declared_tactic(&["Lean", "Parser", "Tactic", "case'"])?;
+                let mut tags = Vec::new();
+                for (index, case) in expect_null_args(cases, "case' arguments")?
+                    .iter()
+                    .enumerate()
+                {
+                    if index % 2 == 1 {
+                        expect_atom(case, "|", "case' separator")?;
+                        continue;
+                    }
+                    let [tag, names] = expect_node(
+                        case,
+                        &parser_kind(&["Tactic", "caseArg"]),
+                        2,
+                        "case' argument",
+                    )?
+                    else {
+                        return Err(error(TacticError::MalformedScript));
+                    };
+                    tags.push((tag, expect_null_args(names, "case' names")?));
+                }
+                if let [(tag, names)] = tags.as_slice() {
+                    let goal = self.case_goal(proof, goal, tag)?;
+                    let goal = self.renamed_proof_goal(proof, goal, names)?;
+                    self.start_case_prime_focus(proof, goal, body)?;
+                } else {
+                    // The tags are selected first, as the runs do not change the other goals'
+                    // tags; renaming would have to wait for each run, so names are refused.
+                    if tags.is_empty() || tags.iter().any(|(_, names)| !names.is_empty()) {
+                        return Err(error(TacticError::UnsupportedTactic(kind.clone())));
+                    }
+                    let count = tags.len();
+                    let goal =
+                        self.reorder_visible_goals(proof, goal, kind, |this, mut goals| {
+                            let mut selected = Vec::new();
+                            for (tag, _) in &tags {
+                                let index = this.case_tag_position(&goals, tag)?;
+                                selected.push(goals.remove(index));
+                            }
+                            selected.extend(goals);
+                            Ok(selected)
+                        })?;
+                    self.start_limited_all_goals(proof, goal, body, count)?;
+                }
+            } else if kind == &parser_kind(&["Tactic", "rotateLeft"])
+                || kind == &parser_kind(&["Tactic", "rotateRight"])
+            {
+                // `"rotate_left" (ppSpace num)?` (`evalRotateLeft`, vendored
+                // src/Lean/Elab/Tactic/BuiltinTactic.lean): the goal list rotated by `n`, 1 by
+                // default (`List.rotateLeft`, `List.rotateRight`).
+                let left = kind == &parser_kind(&["Tactic", "rotateLeft"]);
+                let [keyword, count] = args.as_slice() else {
+                    return Err(error(TacticError::MalformedScript));
+                };
+                expect_atom(
+                    keyword,
+                    if left { "rotate_left" } else { "rotate_right" },
+                    "rotation keyword",
+                )?;
+                self.require_declared_tactic(&[
+                    "Lean",
+                    "Parser",
+                    "Tactic",
+                    if left { "rotateLeft" } else { "rotateRight" },
+                ])?;
+                let count = match expect_null_args(count, "rotation count")? {
+                    [] => 1,
+                    [number] => {
+                        let [Syntax::Atom { val, .. }] = expect_node(
+                            number,
+                            &Name::str(Name::anonymous(), "num"),
+                            1,
+                            "rotation count",
+                        )?
+                        else {
+                            return Err(error(TacticError::MalformedScript));
+                        };
+                        val.parse::<usize>()
+                            .map_err(|_| error(TacticError::UnsupportedTactic(kind.clone())))?
+                    }
+                    _ => return Err(error(TacticError::MalformedScript)),
+                };
+                let goal = self.reorder_visible_goals(proof, goal, kind, |_, mut goals| {
+                    let length = goals.len();
+                    if length > 1 {
+                        let shift = count % length;
+                        if left {
+                            goals.rotate_left(shift);
+                        } else {
+                            goals.rotate_right(shift);
+                        }
+                    }
+                    Ok(goals)
+                })?;
+                proof.work.push(Work::Goal(goal));
             } else if kind == &parser_kind(&["Tactic", "revert"]) {
                 self.revert_proof_locals(proof, goal, args)?;
             } else if kind == &parser_kind(&["Tactic", "generalize"]) {

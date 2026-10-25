@@ -1105,6 +1105,9 @@ impl Context {
                     return Err(failure(SourceInferenceError::Scope));
                 };
                 expect_atom(hole, "_", "placeholder")?;
+                if self.placeholders_are_goals() {
+                    return self.synthetic_proof_hole(None, expected);
+                }
                 let type_ = match expected {
                     Some(type_) => type_.clone(),
                     None => {
@@ -3465,10 +3468,18 @@ impl Context {
                                 }
                                 tasks.push(Task::Proof(proof));
                             }
-                            tactics::ProofAction::Refine { syntax, goal } => {
+                            tactics::ProofAction::Refine {
+                                syntax,
+                                goal,
+                                placeholders,
+                            } => {
                                 self.txn.lctx = goal.lctx.clone();
                                 let expected = goal.target.clone();
-                                let depth = self.begin_refinement();
+                                let depth = if placeholders {
+                                    self.begin_placeholder_refinement()
+                                } else {
+                                    self.begin_refinement()
+                                };
                                 tasks.push(Task::RefineTerm(proof, goal, depth));
                                 tasks.push(Task::Visit(syntax, Some(expected), true));
                             }

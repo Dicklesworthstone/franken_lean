@@ -417,6 +417,79 @@ impl Context {
         Ok(child)
     }
 
+    /// `rename e => h` (`evalRename`, vendored src/Lean/Elab/Tactic/ElabTerm.lean:344-359): the
+    /// last hypothesis, implementation details aside, whose type unifies with `e` at the ambient
+    /// transparency (`findDeclRevM?`), the search's unifications undone
+    /// (`withoutModifyingState`), is renamed `h` in a fresh goal that closes `goal`
+    /// (`MVarId.rename`, vendored src/Lean/Meta/Tactic/Rename.lean).
+    pub(super) fn rename_proof_goal(
+        &mut self,
+        proof: &mut ProofState<'_>,
+        goal: ProofGoal,
+        args: &[Syntax],
+    ) -> Result<ProofGoal, NatDefinitionElabError> {
+        let [keyword, pattern, arrow, Syntax::Ident { val: name, .. }] = args else {
+            return Err(error(TacticError::MalformedScript));
+        };
+        expect_atom(keyword, "rename", "rename keyword")?;
+        expect_atom(arrow, "=>", "rename arrow")?;
+        self.require_declared_tactic(&["Lean", "Parser", "Tactic", "rename"])?;
+        let snapshot = self.clone();
+        let found = (|| {
+            self.txn.lctx = goal.lctx.clone();
+            let pattern = self.term(pattern, None)?;
+            let pending = self.equations.len();
+            for local in goal.lctx.decls().iter().rev() {
+                self.tick()?;
+                if self.is_matrix_hypothesis(local)
+                    || (local.user_name.is_anonymous() && !self.unnamed_fields.contains(&local.id))
+                {
+                    continue;
+                }
+                // `isDefEq`, which synthesizes a pattern's pending instance once its type is
+                // known (`synthPending`): `rename 1 = 1 => h` meets `@Eq Nat 1 1`.
+                let candidate = self.clone();
+                let matched = (|| {
+                    self.constrain(&pattern.value, &local.type_)?;
+                    self.resolve_instances(false)?;
+                    self.flush(false)?;
+                    Ok(self.equations.len() <= pending)
+                })();
+                match matched {
+                    Ok(true) => return Ok(Some(local.id.clone())),
+                    Ok(false) => {}
+                    Err(problem) if backtrack::recoverable(&problem) => {}
+                    Err(problem) => return Err(problem),
+                }
+                let spent = self.txn.budget.heartbeats_consumed;
+                *self = candidate;
+                self.txn.budget.heartbeats_consumed = spent;
+            }
+            Ok(None)
+        })();
+        let spent = self.txn.budget.heartbeats_consumed;
+        *self = snapshot;
+        self.txn.budget.heartbeats_consumed = spent;
+        let id = found?.ok_or_else(|| error(TacticError::RenameNoHypothesis))?;
+        let mut context = LocalContext::new();
+        for local in goal.lctx.decls() {
+            self.tick()?;
+            let mut updated = local.clone();
+            if local.id == id {
+                updated.user_name = name.clone();
+                self.trace_local_names.remove(&local.id);
+                self.unnamed_fields.remove(&local.id);
+            }
+            eliminate::add_local(&mut context, &updated);
+        }
+        let target = self.instantiate(&goal.target)?;
+        self.txn.lctx = context;
+        let (value, child) = self.proof_goal(target)?;
+        self.inherit_goal_tag(&goal, &child);
+        proof.work.push(Work::Close(goal, value));
+        Ok(child)
+    }
+
     fn inherit_goal_tag(&mut self, parent: &ProofGoal, child: &ProofGoal) {
         if let Some(tag) = self.goal_tags.get(&parent.id).cloned() {
             self.goal_tags.insert(child.id.clone(), tag);
