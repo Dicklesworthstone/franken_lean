@@ -69,10 +69,10 @@ use fln_env::provenance::{
 };
 use fln_hash::canon::{
     CanonWriter, Canonical, SCHEMA_CARTRIDGE_ARCHIVE, SCHEMA_CARTRIDGE_MANIFEST,
-    SCHEMA_DECLARATION_CERTIFICATE, SCHEMA_FLBC_PRODUCT_SIDECAR, SCHEMA_KVMAP_SET, SCHEMA_NAME,
-    SCHEMA_REGISTRY, SCHEMA_SHADOW_CELL, SCHEMA_SHADOW_SEMANTIC_NDJSON,
-    SCHEMA_SHADOW_TELEMETRY_NDJSON, SCHEMA_WARM_DEFEQ_CACHE, SchemaId, SchemaRow,
-    kvmap_canonical_set_bytes,
+    SCHEMA_DECLARATION_CERTIFICATE, SCHEMA_FLBC_PRODUCT_SIDECAR, SCHEMA_IR_CALL_GRAPH,
+    SCHEMA_KVMAP_SET, SCHEMA_NAME, SCHEMA_REGISTRY, SCHEMA_SHADOW_CELL,
+    SCHEMA_SHADOW_SEMANTIC_NDJSON, SCHEMA_SHADOW_TELEMETRY_NDJSON, SCHEMA_WARM_DEFEQ_CACHE,
+    SchemaId, SchemaRow, kvmap_canonical_set_bytes,
 };
 use fln_hash::cartridge::{
     AttachmentRoleV1, CartridgeArchiveV1, CartridgeBuilderV1, CartridgeDecodeBudgetsV1,
@@ -86,6 +86,9 @@ use fln_hash::certificate::{
     NatOperationV1, ReductionHintV1, TermDagV1, TermNodeId, TermNodeV1,
 };
 use fln_hash::domain::{Digest, Domain, DomainHasher};
+use fln_hash::ir_graph::{
+    GraphArchiveError, GraphArchiveLimits, GraphClass, GraphKind, GraphNode, GraphSnapshot,
+};
 use fln_hash::product::{
     ClosureMaterialV1, FlbcProductSidecarV1, ProductSidecarRefusal, StandardProductCoordinatesV1,
 };
@@ -330,7 +333,7 @@ pub fn projection_root(descriptors: &[CorpusDescriptor<'_>]) -> Digest {
 ///
 /// One row per `SCHEMA_REGISTRY` row, joined in both directions by [`project`]. The
 /// order matches the registry's for readability only — the join does not depend on it.
-pub const CORPUS_COVERAGE: [CorpusCoverage; 20] = [
+pub const CORPUS_COVERAGE: [CorpusCoverage; 21] = [
     CorpusCoverage {
         schema: "fln.canon.name",
         version: 1,
@@ -421,6 +424,15 @@ pub const CORPUS_COVERAGE: [CorpusCoverage; 20] = [
                    coordinate and root, verify the original product, and refuse a substituted \
                    product before execution",
         run: exercise_flbc_product_sidecar,
+    },
+    CorpusCoverage {
+        schema: "fln.canon.ir-call-graph",
+        version: 1,
+        exercise: "round trip and byte-identically re-encode empty and cyclic static \
+                   graphs with every node kind and class, numeric census names and \
+                   dynamic-call metadata; query decoded bytes and refuse checksum \
+                   corruption, every truncation and insufficient node/edge budgets",
+        run: exercise_ir_call_graph,
     },
     CorpusCoverage {
         schema: "fln.canon.warm-defeq-cache",
@@ -1106,6 +1118,112 @@ fn exercise_flbc_product_sidecar(row: &SchemaRow) -> Result<(), String> {
         != Err(ProductSidecarRefusal::ProductRootMismatch)
     {
         return Err("FLBC product sidecar accepted substituted product bytes".to_string());
+    }
+    Ok(())
+}
+
+fn exercise_ir_call_graph(row: &SchemaRow) -> Result<(), String> {
+    bind(row, SCHEMA_IR_CALL_GRAPH)?;
+    let limits = GraphArchiveLimits::default();
+    let nodes = [
+        (GraphKind::Function, GraphClass::ToolchainApi),
+        (GraphKind::Extern, GraphClass::LibraryCode),
+        (GraphKind::SignatureOnly, GraphClass::Data),
+        (GraphKind::Function, GraphClass::User),
+        (GraphKind::Function, GraphClass::Unclassified),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(index, (kind, class))| GraphNode {
+        name: Name::str(Name::from_components(["Corpus"]), format!("node{index}")),
+        kind,
+        class,
+        census_name: matches!(
+            class,
+            GraphClass::ToolchainApi | GraphClass::LibraryCode | GraphClass::Data
+        )
+        .then(|| Name::num(Name::from_components(["Origin"]), index as u64)),
+        callees: match index {
+            0 => vec![1, 3],
+            3 => vec![0, 4],
+            _ => vec![],
+        },
+    })
+    .collect();
+    let populated = ok(
+        GraphSnapshot::new(nodes, 7, Some(Digest([0x39; 32])), limits),
+        "construct static IR call graph",
+    )?;
+    let empty = ok(
+        GraphSnapshot::new(vec![], 0, None, limits),
+        "construct empty static IR call graph",
+    )?;
+    for graph in [&empty, &populated] {
+        let encoded = ok(graph.encode(limits), "encode IR call graph")?;
+        if !encoded
+            .bytes
+            .starts_with(&schema_prefix(SCHEMA_IR_CALL_GRAPH))
+        {
+            return Err("IR call graph lacks its registered schema header".to_string());
+        }
+        let decoded = ok(
+            GraphSnapshot::decode(&encoded.bytes, limits),
+            "decode IR call graph",
+        )?;
+        let reencoded = ok(decoded.encode(limits), "re-encode IR call graph")?;
+        if decoded != *graph
+            || reencoded.bytes != encoded.bytes
+            || reencoded.digest != encoded.digest
+        {
+            return Err("IR call graph round trip changed its value, bytes or digest".to_string());
+        }
+        for end in 0..encoded.bytes.len() {
+            if GraphSnapshot::decode(&encoded.bytes[..end], limits).is_ok() {
+                return Err(format!("IR call graph accepted truncation at byte {end}"));
+            }
+        }
+        let mut corrupt = encoded.bytes.clone();
+        let Some(trailer) = corrupt.last_mut() else {
+            return Err("IR call graph encoding is empty".to_string());
+        };
+        *trailer ^= 1;
+        if GraphSnapshot::decode(&corrupt, limits) != Err(GraphArchiveError::DigestMismatch) {
+            return Err("IR call graph did not refuse its corrupted digest".to_string());
+        }
+        if !graph.nodes().is_empty() {
+            let reached = ok(
+                decoded.reach(&[graph.nodes()[0].name.clone()], |_| true, 1_000),
+                "query decoded IR call graph",
+            )?;
+            if reached != [0, 1, 3, 4] {
+                return Err(format!(
+                    "decoded IR call graph reachability changed: {reached:?}"
+                ));
+            }
+            for (narrowed, reason) in [
+                (
+                    GraphArchiveLimits {
+                        max_nodes: graph.nodes().len() - 1,
+                        ..limits
+                    },
+                    "nodes",
+                ),
+                (
+                    GraphArchiveLimits {
+                        max_edges: graph.edge_count() - 1,
+                        ..limits
+                    },
+                    "edges",
+                ),
+            ] {
+                if graph.encode(narrowed) != Err(GraphArchiveError::Limit(reason))
+                    || GraphSnapshot::decode(&encoded.bytes, narrowed)
+                        != Err(GraphArchiveError::Limit(reason))
+                {
+                    return Err(format!("IR call graph did not enforce its {reason} budget"));
+                }
+            }
+        }
     }
     Ok(())
 }

@@ -353,18 +353,15 @@ fn pinned_prelude_defaults_reach_source_simp_and_keep_negative_controls() {
     let root = n("Init.Prelude");
     let input = OleanModuleInput {
         name: &root,
-        artifact: include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../fln-conformance/fixtures/tag_attributes/prelude.olean"
+        artifact: include_bytes!(
+            "../../../../../../fln-conformance/fixtures/tag_attributes/prelude.olean"
+        ),
+        server_artifact: Some(include_bytes!(
+            "../../../../../../fln-conformance/fixtures/tag_attributes/prelude.olean.server"
         )),
-        server_artifact: Some(include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../fln-conformance/fixtures/tag_attributes/prelude.olean.server"
-        ))),
-        private_artifact: Some(include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../fln-conformance/fixtures/tag_attributes/prelude.olean.private"
-        ))),
+        private_artifact: Some(include_bytes!(
+            "../../../../../../fln-conformance/fixtures/tag_attributes/prelude.olean.private"
+        )),
     };
     on_import_stack(|| {
         let receipt = Engine::from_environment(Environment::new())
