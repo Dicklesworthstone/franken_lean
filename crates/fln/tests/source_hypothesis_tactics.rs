@@ -219,3 +219,70 @@ fn rename_i_passes_over_the_engines_own_anonymous_locals() {
         "set_option warn.classDefReducibility false\n\nclass Foo where\n\nclass Bar extends Foo where\n  bar : True\n\ndef foo : Foo := {}\n\nexample [Bar] : Bar := {\n  foo with bar := by {\n    rename_i inst\n    guard_hyp inst : Bar\n    trivial\n  }\n}\n",
     );
 }
+
+fn assumption_choice(prefix: &str) -> u32 {
+    use fln_core::expr::ExprNode;
+    use fln_env::constants::ConstantInfo;
+
+    let source = format!(
+        "{prefix}\ntheorem chosen (n : Nat) (old : n = n) \
+         (latest : Hidden n = n) : n = n := by assumption"
+    );
+    let checked = engine()
+        .check_source_files(
+            &[source.as_bytes()],
+            &KVMap::new(),
+            fln::SourceCheckLimits::new(EngineAdmissionLimits::new(Budget::for_stack_bytes(
+                2 * 1024 * 1024,
+            ))),
+        )
+        .unwrap_or_else(|error| panic!("{source}\n{error:?}"))
+        .into_complete()
+        .unwrap();
+    let Some(ConstantInfo::Thm(theorem)) = checked
+        .engine
+        .environment()
+        .find(&fln::Name::from_components(["chosen"]))
+    else {
+        panic!("the source theorem was not admitted");
+    };
+    let mut proof = &theorem.value;
+    for _ in 0..3 {
+        let ExprNode::Lam { body, .. } = proof.node() else {
+            panic!("the checked proof must retain its three source parameters");
+        };
+        proof = body;
+    }
+    let ExprNode::BVar { idx } = proof.node() else {
+        panic!("assumption must select an actual source hypothesis: {proof:?}");
+    };
+    *idx
+}
+
+// Pinned v4.32.0 probes (2026-10-25): a plain def selects `latest`;
+// opaque, irreducible and nonmatching definitions select `old`.
+#[test]
+fn assumption_uses_default_conversion_to_pick_the_newest_hypothesis() {
+    assert_eq!(assumption_choice("def Hidden (n : Nat) : Nat := n"), 0);
+}
+
+#[test]
+fn assumption_does_not_unfold_an_opaque_definition_to_pick_a_hypothesis() {
+    assert_eq!(assumption_choice("opaque Hidden (n : Nat) : Nat := n"), 1);
+}
+
+#[test]
+fn assumption_does_not_unfold_an_irreducible_definition_to_pick_a_hypothesis() {
+    assert_eq!(
+        assumption_choice("@[irreducible] def Hidden (n : Nat) : Nat := n"),
+        1
+    );
+}
+
+#[test]
+fn assumption_rejects_a_newer_hypothesis_with_a_different_type() {
+    assert_eq!(
+        assumption_choice("def Hidden (n : Nat) : Nat := Nat.succ n"),
+        1
+    );
+}
