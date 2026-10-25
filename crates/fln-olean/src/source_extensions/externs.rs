@@ -38,6 +38,14 @@ fn string(obj: &Obj) -> Result<String, DecodeError> {
 }
 
 impl Reader {
+    // Backends are arbitrary Names, unlike the declaration owning an attribute.
+    // Preserve anonymous names too, without relaxing declaration-name checks.
+    fn extern_backend(&mut self, obj: &Obj) -> Result<Name, DecodeError> {
+        self.conversion
+            .project_name(obj)
+            .map_err(DecodeError::Conversion)
+    }
+
     fn extern_entry(&mut self, obj: &Obj) -> Result<ExternEntry, DecodeError> {
         if obj.is_scalar() {
             return if obj.unbox() == usize::from(entry_format::EXTERN_ENTRY_OPAQUE) {
@@ -51,21 +59,25 @@ impl Reader {
             entry_format::EXTERN_ENTRY_ADHOC => {
                 constructor(obj, tag, entry_format::EXTERN_ENTRY_ADHOC_POINTERS)?;
                 Ok(ExternEntry::Adhoc {
-                    backend: self.name(&field(obj, entry_format::EXTERN_ENTRY_ADHOC_BACKEND)?)?,
+                    backend: self
+                        .extern_backend(&field(obj, entry_format::EXTERN_ENTRY_ADHOC_BACKEND)?)?,
                 })
             }
             entry_format::EXTERN_ENTRY_INLINE => {
                 constructor(obj, tag, entry_format::EXTERN_ENTRY_INLINE_POINTERS)?;
                 Ok(ExternEntry::Inline {
-                    backend: self.name(&field(obj, entry_format::EXTERN_ENTRY_INLINE_BACKEND)?)?,
+                    backend: self
+                        .extern_backend(&field(obj, entry_format::EXTERN_ENTRY_INLINE_BACKEND)?)?,
                     pattern: string(&field(obj, entry_format::EXTERN_ENTRY_INLINE_PATTERN)?)?,
                 })
             }
             entry_format::EXTERN_ENTRY_STANDARD => {
                 constructor(obj, tag, entry_format::EXTERN_ENTRY_STANDARD_POINTERS)?;
                 Ok(ExternEntry::Standard {
-                    backend: self
-                        .name(&field(obj, entry_format::EXTERN_ENTRY_STANDARD_BACKEND)?)?,
+                    backend: self.extern_backend(&field(
+                        obj,
+                        entry_format::EXTERN_ENTRY_STANDARD_BACKEND,
+                    )?)?,
                     symbol: string(&field(obj, entry_format::EXTERN_ENTRY_STANDARD_FN)?)?,
                 })
             }

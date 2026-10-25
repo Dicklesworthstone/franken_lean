@@ -118,6 +118,8 @@ pub(super) fn encode(
             && metadata.defeq.is_empty()
             && metadata.reducibility.is_empty()
             && metadata.inline.is_empty()
+            && metadata.implemented_by.is_empty()
+            && metadata.externs.is_empty()
             && metadata.structures.is_empty()
         {
             encode_module(input, header, budget)
