@@ -198,7 +198,7 @@ impl Context {
     ) -> Result<(), NatDefinitionElabError> {
         use crate::native::{NativeEvaluation, NativeEvaluationError};
         use fln_env::constants::{
-            AxiomVal, ConstantInfo, ConstantVal, DefinitionSafety, DefinitionVal, ReducibilityHints,
+            AxiomVal, ConstantVal, DefinitionSafety, DefinitionVal, ReducibilityHints,
         };
 
         let tactic_name = Name::from_components([tactic]);
@@ -297,14 +297,10 @@ impl Context {
             },
             is_unsafe: false,
         };
-        // Later elaboration in this declaration sees the axiom, as the pin's `addDecl` makes it
-        // visible. It is admitted, through both checkers, before the declaration citing it.
-        self.txn.env = self
-            .txn
-            .env
-            .add_decl(ConstantInfo::Axiom(axiom.clone()))
-            .map_err(|_| failure(SourceInferenceError::Scope))?;
-        self.native_axioms.push(Declaration::Axiom(axiom));
+        // Private elaboration visibility requires K1's capability too. The outer
+        // facade still admits the recorded axiom through both checkers before
+        // publishing the declaration that cites it.
+        self.expose_native_axiom(axiom)?;
         // `addDecl` checks the axiom in a task forked from the generator when `Elab.async`
         // holds (vendored Lean/AddDecl.lean:167-169), which advances its index (`mkChild`).
         if self
@@ -324,6 +320,88 @@ impl Context {
             [proposition, dictionary, evidence],
         );
         self.close_proof_goal(goal, value)
+    }
+
+    fn expose_native_axiom(
+        &mut self,
+        axiom: fln_env::constants::AxiomVal,
+    ) -> Result<(), NatDefinitionElabError> {
+        use fln_core::outcome::InternalFault;
+        use fln_env::environment::{DeclarationBudget, DeclarationCommitted};
+        use fln_env::pmap::CollisionBudget;
+        use fln_kernel::capability::{Admitted, Published, admit};
+        use fln_kernel::council::{Council, CouncilOutcome, convene};
+
+        self.tick()?;
+        let remaining = if self.txn.budget.max_heartbeats == 0 {
+            u64::MAX
+        } else {
+            self.txn
+                .budget
+                .max_heartbeats
+                .saturating_sub(self.txn.budget.heartbeats_consumed)
+        };
+        let kernel = self
+            .kernel
+            .narrowed(self.kernel.steps.min(remaining), self.kernel.depth);
+        let nonanswer = |outcome| failure(SourceInferenceError::TypeObligation(Box::new(outcome)));
+        let admitted = match admit(&self.txn.env, Declaration::Axiom(axiom.clone()), kernel) {
+            Outcome::Complete(admitted) => admitted,
+            Outcome::Inconclusive(reason) => return Err(nonanswer(Outcome::Inconclusive(reason))),
+            Outcome::InternalFault(fault) => return Err(nonanswer(Outcome::InternalFault(fault))),
+        };
+        let consumption = match &admitted {
+            Admitted::Accepted(accepted) => accepted.consumption(),
+            Admitted::Rejected { consumption, .. } => *consumption,
+        };
+        self.txn.budget.heartbeats_consumed = self
+            .txn
+            .budget
+            .heartbeats_consumed
+            .checked_add(consumption.steps_used)
+            .ok_or_else(|| failure(SourceInferenceError::ResourceLimit))?;
+        // This is private tactic state, not final engine publication. The outer
+        // facade retains its independent checker and trust-surface reporting.
+        let checked = match convene(&Council::nobody_was_asked(), admitted) {
+            CouncilOutcome::Agreed(checked) => checked,
+            CouncilOutcome::KernelRejected {
+                class,
+                message,
+                consumption,
+            } => {
+                return Err(nonanswer(Outcome::Complete(Verdict::Rejected {
+                    class,
+                    message,
+                    consumption,
+                })));
+            }
+            CouncilOutcome::Halted(_) => {
+                return Err(nonanswer(Outcome::InternalFault(InternalFault::new(
+                    "FL-INV-02",
+                    "an empty local native-axiom council halted",
+                ))));
+            }
+        };
+        let environment = match checked.publish(
+            DeclarationBudget::default(),
+            CollisionBudget::default(),
+            None,
+        ) {
+            Outcome::Complete(Published::Committed(DeclarationCommitted::Published(
+                publication,
+            ))) => publication.environment,
+            Outcome::Complete(_) => {
+                return Err(nonanswer(Outcome::InternalFault(InternalFault::new(
+                    "FL-INV-02",
+                    "a fresh checked native axiom did not commit",
+                ))));
+            }
+            Outcome::Inconclusive(reason) => return Err(nonanswer(Outcome::Inconclusive(reason))),
+            Outcome::InternalFault(fault) => return Err(nonanswer(Outcome::InternalFault(fault))),
+        };
+        self.txn.env = environment;
+        self.native_axioms.push(Declaration::Axiom(axiom));
+        Ok(())
     }
 
     /// `decide`'s configuration (`Lean.Parser.Tactic.DecideConfig`): whether it asks for
@@ -820,5 +898,55 @@ mod tests {
                 SourceInferenceError::ResourceLimit
             ))
         ));
+    }
+
+    fn native_axiom(name: &str, type_: Expr) -> fln_env::constants::AxiomVal {
+        fln_env::constants::AxiomVal {
+            base: fln_env::constants::ConstantVal {
+                name: n(name),
+                level_params: vec![],
+                type_,
+            },
+            is_unsafe: false,
+        }
+    }
+
+    #[test]
+    fn native_axiom_visibility_requires_kernel_acceptance() {
+        let mut context = context();
+        let axiom = native_axiom("nativeAccepted", Expr::sort(Level::zero()));
+        context.expose_native_axiom(axiom.clone()).unwrap();
+        assert!(context.txn.env.contains(&axiom.base.name));
+        assert_eq!(context.native_axioms.len(), 1);
+        assert!(context.txn.budget.heartbeats_consumed > 0);
+
+        let before = context.txn.env.clone();
+        let before_count = context.native_axioms.len();
+        let invalid = native_axiom("nativeInvalid", Expr::bvar(0).unwrap());
+        let error = context.expose_native_axiom(invalid).unwrap_err();
+        assert!(matches!(error,
+            NatDefinitionElabError::Inference(SourceInferenceError::TypeObligation(outcome))
+                if matches!(*outcome, Outcome::Complete(Verdict::Rejected { .. }))));
+        assert_eq!(context.txn.env, before);
+        assert_eq!(context.native_axioms.len(), before_count);
+        assert!(!context.txn.env.contains(&n("nativeInvalid")));
+    }
+
+    #[test]
+    fn native_axiom_kernel_exhaustion_is_not_visibility_or_rejection() {
+        let mut context = context();
+        let before = context.txn.env.clone();
+        context.kernel = context.kernel.narrowed(0, context.kernel.depth);
+        let axiom = native_axiom("nativeStopped", Expr::sort(Level::zero()));
+        let error = context.expose_native_axiom(axiom.clone()).unwrap_err();
+        assert!(matches!(error,
+            NatDefinitionElabError::Inference(SourceInferenceError::TypeObligation(outcome))
+                if matches!(*outcome, Outcome::Inconclusive(_))));
+        assert_eq!(context.txn.env, before);
+        assert!(context.native_axioms.is_empty());
+        context.kernel = Budget::for_stack_bytes(2 * 1024 * 1024);
+        context.expose_native_axiom(axiom.clone()).unwrap();
+        assert!(context.txn.env.contains(&axiom.base.name));
+        assert_eq!(context.native_axioms.len(), 1);
     }
 }
