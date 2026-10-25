@@ -11,6 +11,12 @@ pub(in crate::source) struct RewriteMatch {
     rule: Typed,
     occurrence: Expr,
     premises: Vec<ProofGoal>,
+    /// A simp rule whose sides are equal up to its pattern variables (`SimpTheorem.perm`).
+    perm: bool,
+    /// Simplification's post-order ordinal of the occurrence in the target (one-based).
+    position: usize,
+    /// Simplification's rule pattern before matching, its holes open.
+    pattern: Option<Expr>,
 }
 
 use super::*;
@@ -62,6 +68,7 @@ impl Context {
             rules.push_back(RewriteRule {
                 syntax: &parts[1],
                 reverse,
+                global: None,
             });
         }
         Ok(rules)
@@ -339,6 +346,7 @@ impl Context {
             rule,
             occurrence,
             premises,
+            ..
         } = self
             .instantiate_rewrite_rule(rule, &original_target, reverse, false, &[])?
             .ok_or_else(|| error(TacticError::RewriteNoMatch))?;
@@ -369,6 +377,7 @@ impl Context {
             rule,
             occurrence,
             premises,
+            ..
         } = self
             .instantiate_rewrite_rule(rule, &target, reverse, false, &[])?
             .ok_or_else(|| error(TacticError::RewriteNoMatch))?;

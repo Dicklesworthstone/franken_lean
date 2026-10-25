@@ -682,6 +682,10 @@ struct Context {
     check_deprecated: bool,
     // Registered simp rules' discrimination keys, shared by speculative snapshots.
     simp_key_cache: tactics::SimpKeyCache,
+    // While simp chooses among its rules as the pin's traversal does, the post-order ordinal
+    // of the earliest rewrite found so far: the next rule's occurrence search reads it once and
+    // stops past it (`aclt.rs`, `simp_first_rewrite`).
+    simp_reach_limit: Option<usize>,
     // The declaration being elaborated, when it is `protected`.
     protected_declaration: Option<Name>,
     refinements: Vec<tactics::RefinementFrame>,
@@ -822,6 +826,7 @@ impl Context {
             deprecated_uses: Vec::new(),
             check_deprecated: true,
             simp_key_cache: tactics::SimpKeyCache::default(),
+            simp_reach_limit: None,
             protected_declaration: None,
             refinements: Vec::new(),
             defining: None,

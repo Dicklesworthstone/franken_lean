@@ -10,25 +10,28 @@ impl Context {
         local: &LocalDecl,
         rule: &SimpRule<'_>,
         rules: &[SimpRule<'_>],
-    ) -> Result<Option<(Typed, bool)>, NatDefinitionElabError> {
+    ) -> Result<SimpRewrite<(Typed, bool)>, NatDefinitionElabError> {
         let target = self.instantiate(&local.type_)?;
         match self.unfold_simp_rule(rule, &target)? {
             UnfoldResult::Unchanged => Ok(None),
             UnfoldResult::Changed(type_) => Ok(Some((
-                Typed {
-                    value: Expr::fvar(local.id.clone()),
-                    type_,
-                },
-                true,
+                (
+                    Typed {
+                        value: Expr::fvar(local.id.clone()),
+                        type_,
+                    },
+                    true,
+                ),
+                SimpPlace::of(SimpReach::Unfold),
             ))),
             UnfoldResult::NotDefinition => {
-                let Some((term, occurrence, reverse)) =
+                let Some((term, occurrence, reverse, place)) =
                     self.simp_rule_evidence(&target, rule, rules)?
                 else {
                     return Ok(None);
                 };
                 self.rewrite_hypothesis_value(local, term, &occurrence, reverse, false)
-                    .map(|replacement| Some((replacement, false)))
+                    .map(|replacement| Some(((replacement, false), place)))
             }
         }
     }
@@ -176,7 +179,7 @@ impl Context {
         proof: &mut ProofState<'_>,
         initial: &ProofGoal,
         locations: super::super::locations::RewriteLocations,
-        mut rules: Vec<SimpRule<'_>>,
+        rules: Vec<SimpRule<'_>>,
         saturate: bool,
     ) -> Result<(), NatDefinitionElabError> {
         let mut protected = HashSet::new();
@@ -210,6 +213,8 @@ impl Context {
         let mut goal = initial.clone();
         let mut steps = 0;
         let mut tagged = None;
+        let permute = self.simp_rules_permute(&rules)?;
+        let mut rules = simp_rules_keyed(&rules, permute);
         // `simp_all` hypotheses it reduced to `True` and cleared, never asserted again.
         let mut cleared = HashSet::new();
         loop {
@@ -244,18 +249,16 @@ impl Context {
                         .collect();
                     let target = self.instantiate(&local.type_)?;
                     let index = self.simp_target_index(&target)?;
-                    for rule in &active {
-                        if !self.simp_rule_admitted(rule, index.as_ref(), SimpKeySide::Rewrite) {
-                            continue;
-                        }
-                        self.tick()?;
-                        let original = self.rewrite_trial();
-                        let Some((replacement, unfolded)) =
-                            self.simp_hypothesis_step(&local, rule, &active)?
-                        else {
-                            self.restore_simp_trial(original);
-                            continue;
-                        };
+                    let transition = self.simp_first_rewrite(
+                        &active,
+                        permute,
+                        |this, rule| {
+                            Ok(this.simp_rule_admitted(rule, index.as_ref(), SimpKeySide::Rewrite))
+                        },
+                        |this, rule| this.simp_hypothesis_step(&local, rule, &active),
+                    )?;
+                    if let Some((chosen, (replacement, unfolded))) = transition {
+                        let rule = &active[chosen];
                         if steps >= MAX_SIMPLIFICATION_STEPS {
                             return Err(failure(SourceInferenceError::ResourceLimit));
                         }
@@ -342,7 +345,6 @@ impl Context {
                         goal = next;
                         steps += 1;
                         advanced = true;
-                        break;
                     }
                     if !advanced {
                         break;

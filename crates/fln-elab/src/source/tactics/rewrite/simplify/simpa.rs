@@ -95,6 +95,9 @@ impl Context {
         rules: &[SimpRule<'_>],
         term: Typed,
     ) -> Result<(), NatDefinitionElabError> {
+        let permute = self.simp_rules_permute(rules)?;
+        let keyed = aclt::simp_rules_keyed(rules, permute);
+        let rules = &keyed[..];
         self.resolve_instances(false)?;
         self.flush(false)?;
         let term = Typed {
@@ -143,7 +146,8 @@ impl Context {
                 }
                 self.tick()?;
                 let original = self.rewrite_trial();
-                let Some((replacement, _)) = self.simp_hypothesis_step(&local, rule, rules)? else {
+                let Some(((replacement, _), _)) = self.simp_hypothesis_step(&local, rule, rules)?
+                else {
                     self.restore_simp_trial(original);
                     continue;
                 };

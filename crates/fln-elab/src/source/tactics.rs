@@ -657,6 +657,10 @@ fn local_declaration(
 pub(super) struct RewriteRule<'a> {
     pub(super) syntax: &'a Syntax,
     pub(super) reverse: bool,
+    /// The global declaration a bare identifier selects (`resolveSimpIdTheorem?`), for a simp
+    /// rule whose call holds a permutation rule; it is then keyed as the pin's discrimination
+    /// tree keys that theorem (`simp_rules_keyed`).
+    pub(super) global: Option<Name>,
 }
 
 pub(super) enum ProofAction<'a> {

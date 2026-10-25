@@ -447,6 +447,7 @@ impl Context {
                 rule: term,
                 occurrence,
                 premises,
+                ..
             } = self
                 .instantiate_rewrite_rule(term, &target, reverse, false, &[])?
                 .ok_or_else(|| error(TacticError::RewriteNoMatch))?;
@@ -470,6 +471,7 @@ impl Context {
                 rule: term,
                 occurrence,
                 premises,
+                ..
             } = self
                 .instantiate_rewrite_rule(term, &target, reverse, false, &[])?
                 .ok_or_else(|| error(TacticError::RewriteNoMatch))?;
@@ -550,6 +552,7 @@ impl Context {
                         rule: term,
                         occurrence,
                         premises,
+                        ..
                     }) = trial.instantiate_rewrite_rule(term, &target, reverse, false, &[])?
                     else {
                         return Ok(None);
@@ -586,6 +589,7 @@ impl Context {
                     rule: term,
                     occurrence,
                     premises,
+                    ..
                 }) = trial.instantiate_rewrite_rule(term, &target, reverse, false, &[])?
                 else {
                     return Ok(None);

@@ -20,9 +20,10 @@
 //! `dsimp?`; term, `↓`/`↑` and projection arguments; any node whose head is a lambda, a let,
 //! a projection, a matcher or recursor, a binder other than a non-dependent arrow, `ite`/`dite`
 //! or another head with a simplification procedure or congruence theorem the model does not
-//! reproduce; rules that leave parameters open, permutation rules, rules whose pattern unfolds
-//! at reducible transparency where their order decides; and `simp_all?` with a propositional
-//! hypothesis.
+//! reproduce; rules that leave parameters open, conditional permutation rules, rules whose
+//! pattern unfolds at reducible transparency where their order decides; and `simp_all?` with a
+//! propositional hypothesis. A permutation rule rewrites only where the pin's `acLt` admits it
+//! (`aclt.rs`).
 use super::*;
 
 /// The pin's `Simp.Config.maxDischargeDepth`.
@@ -538,51 +539,6 @@ fn printable(name: &Name) -> Option<String> {
     Some(parts.join("."))
 }
 
-/// Whether a pattern is a permutation of its other side (`isPerm`,
-/// `src/Lean/Meta/Tactic/Simp/SimpTheorems.lean`): equal up to its pattern variables.
-fn permutation(left: &Expr, right: &Expr) -> bool {
-    let mut pending = vec![(left, right)];
-    while let Some((left, right)) = pending.pop() {
-        match (left.node(), right.node()) {
-            (ExprNode::BVar { .. }, ExprNode::BVar { .. }) => {}
-            (ExprNode::App { f: f1, a: a1 }, ExprNode::App { f: f2, a: a2 }) => {
-                pending.push((f1, f2));
-                pending.push((a1, a2));
-            }
-            (
-                ExprNode::ForallE {
-                    binder_type: d1,
-                    body: b1,
-                    ..
-                },
-                ExprNode::ForallE {
-                    binder_type: d2,
-                    body: b2,
-                    ..
-                },
-            )
-            | (
-                ExprNode::Lam {
-                    binder_type: d1,
-                    body: b1,
-                    ..
-                },
-                ExprNode::Lam {
-                    binder_type: d2,
-                    body: b2,
-                    ..
-                },
-            ) => {
-                pending.push((d1, d2));
-                pending.push((b1, b2));
-            }
-            _ if left == right => {}
-            _ => return false,
-        }
-    }
-    true
-}
-
 impl Context {
     /// `simp?` and `simp_all?`: this engine's `simp`/`simp_all`, then the pin's suggestion.
     pub(in crate::source) fn simp_trace_proof_goal(
@@ -1021,6 +977,7 @@ impl Context {
                     rule: SimpRule::Explicit(RewriteRule {
                         syntax: term,
                         reverse,
+                        global: None,
                     }),
                     origin: Used::Stx(if reverse { format!("← {text}") } else { text }),
                     priority: 1000,
@@ -1055,9 +1012,12 @@ impl Context {
                         .candidates
                         .retain(|c| !matches!(&c.origin, Used::Decl { name: n, .. } if *n == name));
                     simulation.candidates.push(Candidate {
+                        // Keyed as the pin's discrimination tree keys it, whatever the
+                        // simplifier does (`simp_rules_keyed`): a difference is a refusal.
                         rule: SimpRule::Explicit(RewriteRule {
                             syntax: term,
                             reverse,
+                            global: Some(name.clone()),
                         }),
                         origin: Used::Decl {
                             name: name.clone(),
@@ -1829,8 +1789,17 @@ impl Context {
                 }
                 continue;
             }
+            // `tryTheoremCore` discharges first, then rejects a permutation rewrite that does not
+            // decrease in the pin's term order (`Rewrite.lean:143-150`); a rejected candidate
+            // records nothing. Uses its discharge recorded before that rejection stay recorded
+            // at the pin, which this model does not reproduce.
             if perm {
-                return refuse("a permutation rule");
+                if !premises.is_empty() {
+                    return refuse("a conditional permutation rule");
+                }
+                if !self.simp_ac_lt(&result, expr)? {
+                    continue;
+                }
             }
             let mut discharged = true;
             for premise in &premises {
@@ -1901,14 +1870,10 @@ impl Context {
         let attempt = (|| {
             let term = trial.selected_simp_term(&candidate.rule)?;
             let reverse = candidate.rule.reverse();
-            let statement = trial.instantiate(&term.type_)?;
             let Some(found) = trial.instantiate_simp_rule_at_root(term, expr, reverse)? else {
                 return Ok(None);
             };
-            let perm = match trial.simulated_pattern(&statement, reverse)? {
-                (pattern, Some(other)) => permutation(&pattern, &other),
-                _ => false,
-            };
+            let perm = found.perm;
             let Some((_, _, from, to)) = equality_target(&found.rule.type_) else {
                 return refuse("a rule that is not an equation after its preparation");
             };
