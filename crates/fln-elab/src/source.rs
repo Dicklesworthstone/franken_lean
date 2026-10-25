@@ -5798,7 +5798,13 @@ fn definition_in_context_named(
     // These still pass ordinary term elaboration and council admission, but a missing
     // runtime recursor implementation is irrelevant when no code may be generated.
     if !is_theorem && !proof_instance && !is_noncomputable {
-        context.noncomputable_definition = context.check_definition_codegen(&term)?;
+        if scope::executable::registrations(syntax)?.is_empty() {
+            context.noncomputable_definition = context.check_definition_codegen(&term)?;
+        } else {
+            // The declared body remains fully typed and checked, but the pin
+            // compiles the executable replacement instead of that logical body.
+            context.validate_codegen_metadata()?;
+        }
     }
     let type_ = if let Some(header) = public_definition_type {
         context.instantiate(&header)?

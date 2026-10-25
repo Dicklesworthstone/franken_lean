@@ -1,6 +1,7 @@
 //! Explicit command scope for native source elaboration. It carries no admission
 //! authority and never installs aliases or unchecked constants in the environment.
 use super::*;
+pub mod executable;
 pub mod options;
 mod reserved;
 pub mod simp;

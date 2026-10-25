@@ -788,6 +788,33 @@ pub(crate) fn command_syntax(
     }
 }
 
+pub(super) fn parse_executable(
+    view: &SourceView,
+    tokens: &[LexedToken],
+) -> Result<Option<Syntax>, DefinitionParseError> {
+    let has_executable = tokens
+        .iter()
+        .skip(2)
+        .take_while(|token| !matches!(&token.kind, TokenKind::Symbol(symbol) if symbol == "]"))
+        .any(|token| {
+            matches!(
+                view.normalized().span_str(token.extent),
+                Some("implemented_by" | "extern")
+            )
+        });
+    if !has_executable {
+        return Ok(None);
+    }
+    let mut reader = AttributeReader {
+        view,
+        tokens,
+        at: 0,
+    };
+    let shape = reader.command()?;
+    let leaves = Leaves::build(view.normalized(), tokens)?;
+    build(&shape, &leaves, view, tokens).map(Some)
+}
+
 /// The `grindMod` at token `at`, if one starts there, and the token after it: a `grind` lemma's
 /// (`grindLemma := (Attr.grindMod ppSpace)? term`, `Init/Grind/Interactive.lean`), read as the
 /// attribute's is.
@@ -924,6 +951,26 @@ pub fn parse(source: &[u8]) -> Result<Option<SimpAttribute>, DefinitionParseErro
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn executable_commands_keep_full_attribute_lists_and_declaration_names() {
+        for source in [
+            "attribute [implemented_by Backend.call] f g",
+            "attribute [extern c inline \"#1\" cpp \"call_λ\"] f",
+            "attribute [local implemented_by f, extern] g",
+        ] {
+            let Some(ScopeCommand::Executable(syntax)) =
+                super::super::parse(source.as_bytes()).unwrap()
+            else {
+                panic!("executable attribute command was lost: {source}");
+            };
+            let Syntax::Node { kind, args, .. } = &syntax else {
+                panic!("attribute command tree")
+            };
+            assert_eq!(kind, &parser_kind(&["Command", "attribute"]));
+            assert_eq!(args.len(), 5);
+        }
+        assert!(super::super::parse(b"attribute [implemented_by f] g trailing +").is_err());
+    }
     #[test]
     fn inline_attributes_preserve_every_source_leaf_and_declaration_boundary() {
         let source = "/- 😀 -/ namespace N\r\n@[simp <- 700]\r\ntheorem flip (n : Nat) : n = n := by rfl\r\n@[simp] def wrap (n : Nat) := n\r\nend N\r\n";

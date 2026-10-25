@@ -35,6 +35,9 @@ pub enum ScopeCommand {
     Simp(attributes::SimpAttribute),
     Instance(instances::InstanceAttribute),
     Reducibility(reducibility::ReducibilityAttribute),
+    /// Executable metadata is checked against admitted declarations by the
+    /// source driver; preserve the complete attribute tree and its ordering.
+    Executable(Syntax),
     /// `open A B in <command>` (`Lean.Parser.Command.in`): the pin's macro elaborates it as
     /// `section open A B <command> end`. `body` is the byte offset, within this command's own
     /// source, where the inner command starts.
@@ -556,6 +559,9 @@ pub fn parse(source: &[u8]) -> Result<Option<ScopeCommand>, DefinitionParseError
         return variables::parse(&view, &tokens).map(|syntax| Some(ScopeCommand::Variable(syntax)));
     }
     if keyword == "attribute" {
+        if let Some(attribute) = attributes::parse_executable(&view, &tokens)? {
+            return Ok(Some(ScopeCommand::Executable(attribute)));
+        }
         if let Some(attribute) = instances::parse(&view, &tokens)? {
             return Ok(Some(ScopeCommand::Instance(attribute)));
         }

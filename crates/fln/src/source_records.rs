@@ -623,6 +623,9 @@ impl Engine {
         let macro_inline = fln_elab::source::scope::simp::macro_inline(syntax)
             .map_err(DefinitionFrontendError::Elaborate)
             .map_err(EngineExecutionError::Frontend)?;
+        let executable = fln_elab::source::scope::executable::registrations(syntax)
+            .map_err(DefinitionFrontendError::Elaborate)
+            .map_err(EngineExecutionError::Frontend)?;
         let noncomputable = fln_elab::source::noncomputable_registration(syntax)
             .map_err(DefinitionFrontendError::Elaborate)
             .map_err(EngineExecutionError::Frontend)?;
@@ -776,6 +779,16 @@ impl Engine {
                     };
                     batch.engine.environment =
                         tag_macro_inline(&batch.engine, &admitted.declaration)?;
+                    batch.result_logical_root = batch.engine.logical_root(options);
+                }
+                if !executable.is_empty() {
+                    let [admitted] = batch.admissions.as_slice() else {
+                        return Err(EngineExecutionError::UnexpectedPublication {
+                            detail: "executable metadata requires one checked declaration",
+                        });
+                    };
+                    batch.engine.environment =
+                        tag_executable(&batch.engine, &admitted.declaration, scope, &executable)?;
                     batch.result_logical_root = batch.engine.logical_root(options);
                 }
                 return self.finish_local_function_batch(batch, &local_functions, options, limits);
@@ -1404,6 +1417,30 @@ pub(crate) fn tag_macro_inline(
     };
     fln_elab::macro_inline::register(engine.environment(), &definition.base.name)
         .map_err(|_| refused())
+}
+
+/// Install executable metadata only after the exact declaration has passed
+/// ordinary admission. Logical declarations are never substituted here.
+pub(crate) fn tag_executable(
+    engine: &Engine,
+    declaration: &Declaration,
+    scope: &fln_elab::source::scope::SourceScope,
+    rows: &[fln_elab::source::scope::executable::Attribute],
+) -> Result<Environment, EngineExecutionError> {
+    let name = match declaration {
+        Declaration::Defn(value) => &value.base.name,
+        Declaration::Thm(value) => &value.base.name,
+        Declaration::Opaque(value) => &value.base.name,
+        Declaration::Axiom(value) => &value.base.name,
+        _ => {
+            return Err(EngineExecutionError::UnexpectedPublication {
+                detail: "executable metadata requires one checked constant",
+            });
+        }
+    };
+    fln_elab::source::scope::executable::apply(engine.environment(), scope, name, rows, false)
+        .map_err(DefinitionFrontendError::Elaborate)
+        .map_err(EngineExecutionError::Frontend)
 }
 
 #[cfg(test)]

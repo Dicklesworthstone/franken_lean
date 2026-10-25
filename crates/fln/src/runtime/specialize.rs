@@ -602,6 +602,14 @@ impl Preparation<'_> {
                             && definition.safety == DefinitionSafety::Safe
                             && definition.base.level_params.len() == levels.len() =>
                     {
+                        if self.has_extern_attribute(name)? {
+                            // A verified native function is an inert value,
+                            // but its logical body is not its implementation.
+                            if !self.inert_native_function(&head)? {
+                                return Ok(false);
+                            }
+                            continue;
+                        }
                         let value = self.universe_instance(
                             &definition.value,
                             &definition.base.level_params,
@@ -684,7 +692,7 @@ impl Preparation<'_> {
             self.tick()?;
             let (head, args) = self.spine(&value)?;
             if let ExprNode::Const { name, .. } = head.node()
-                && self.has_implementation(name)?
+                && (self.has_implementation(name)? || self.has_extern_attribute(name)?)
             {
                 return Ok(None);
             }

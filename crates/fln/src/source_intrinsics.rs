@@ -26,18 +26,15 @@ pub(super) use string_append::imported_string_append_matches;
 pub(super) use string_internal::imported_string_internal_matches;
 pub(super) use string_length::imported_string_length_matches;
 
-/// A present extern attribute is a separate execution contract. A complete
-/// logical model may justify a native optimization without one, but it must
-/// never override a conflicting explicit runtime implementation.
-fn extern_attribute_matches(
+/// Cache only a complete, metered journal read. Presence is useful to prevent
+/// logical-body folding; it does not itself authorize any native implementation.
+pub(super) fn read_extern_attributes(
     environment: &Environment,
-    requested: &Name,
-    required: bool,
     cache: &mut Option<fln_elab::externs::ExternTable>,
     visited: &mut usize,
     limits: IngressLimits,
-) -> Result<bool, IngressError> {
-    use fln_elab::externs::{ExternEntry, ExternReadError, ExternTable};
+) -> Result<(), IngressError> {
+    use fln_elab::externs::{ExternReadError, ExternTable};
     charge_catalog_node(visited, limits)?;
     if cache.is_none() {
         let table = ExternTable::read_metered(environment, |amount| {
@@ -65,6 +62,22 @@ fn extern_attribute_matches(
         })?;
         *cache = Some(table);
     }
+    Ok(())
+}
+
+/// A present extern attribute is a separate execution contract. A complete
+/// logical model may justify a native optimization without one, but it must
+/// never override a conflicting explicit runtime implementation.
+fn extern_attribute_matches(
+    environment: &Environment,
+    requested: &Name,
+    required: bool,
+    cache: &mut Option<fln_elab::externs::ExternTable>,
+    visited: &mut usize,
+    limits: IngressLimits,
+) -> Result<bool, IngressError> {
+    use fln_elab::externs::ExternEntry;
+    read_extern_attributes(environment, cache, visited, limits)?;
     let table = cache
         .as_ref()
         .expect("only successful extern tables are cached");

@@ -131,6 +131,9 @@ impl Preparation<'_> {
             &mut self.visited,
             self.limits,
         )?;
+        if self.has_extern_attribute(name)? {
+            return Ok(None);
+        }
         definition.base.type_ = self.universe_instance(
             &definition.base.type_,
             &definition.base.level_params,

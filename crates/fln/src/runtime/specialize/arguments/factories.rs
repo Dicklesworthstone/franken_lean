@@ -141,6 +141,12 @@ impl Preparation<'_> {
                         | ExprNode::Sort { .. }
                         | ExprNode::Lit { .. } => values.push(head),
                         ExprNode::Const { name, levels } => {
+                            // The native-function fast path above preserves a
+                            // verified callable. Any other explicit extern
+                            // must retain its runtime head, never its body.
+                            if self.has_extern_attribute(name)? {
+                                return Ok(None);
+                            }
                             let Some(definition) = self.definition(name) else {
                                 return Ok(None);
                             };

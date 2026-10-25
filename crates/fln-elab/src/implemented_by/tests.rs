@@ -4,6 +4,50 @@ use fln_core::level::Level;
 use fln_core::options::KVMap;
 use fln_env::constants::{AxiomVal, ConstantInfo, ConstantVal};
 
+#[test]
+fn module_export_preserves_final_owned_values_and_enforces_exact_work() {
+    let base = register(&simple(), &n("a"), &n("b")).unwrap();
+    let local = base
+        .add_decl(axiom(n("local"), vec![], Expr::sort(Level::one())))
+        .unwrap();
+    let result = register(
+        &register(&local, &n("local"), &n("a")).unwrap(),
+        &n("local"),
+        &n("c"),
+    )
+    .unwrap();
+    let rows = export::registrations(&base, &result, usize::MAX)
+        .unwrap()
+        .unwrap();
+    assert_eq!(rows.entries, [(n("local"), n("c"))]);
+    assert_eq!(
+        export::registrations(&base, &result, rows.work).unwrap(),
+        Some(rows.clone()),
+    );
+    assert_eq!(
+        export::registrations(&base, &result, rows.work - 1),
+        Err(ImplementedByError::Limit),
+    );
+    assert_eq!(
+        export::registrations(
+            &base,
+            &register(&base, &n("a"), &n("c")).unwrap(),
+            usize::MAX,
+        )
+        .unwrap(),
+        None,
+    );
+    assert_eq!(
+        export::registrations(&base, &simple(), usize::MAX),
+        Err(ImplementedByError::Malformed),
+    );
+    let cycle = register(&base, &n("b"), &n("a")).unwrap();
+    assert!(matches!(
+        export::registrations(&Environment::new(), &cycle, usize::MAX),
+        Err(ImplementedByError::Cycle(_)),
+    ));
+}
+
 fn n(label: &str) -> Name {
     Name::from_components(label.split('.'))
 }

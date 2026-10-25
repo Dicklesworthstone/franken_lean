@@ -6839,6 +6839,9 @@ impl Engine {
         let macro_inline = fln_elab::source::scope::simp::macro_inline(parsed.syntax())
             .map_err(DefinitionFrontendError::Elaborate)
             .map_err(EngineExecutionError::Frontend)?;
+        let executable = fln_elab::source::scope::executable::registrations(parsed.syntax())
+            .map_err(DefinitionFrontendError::Elaborate)
+            .map_err(EngineExecutionError::Frontend)?;
         let noncomputable = fln_elab::source::noncomputable_registration(parsed.syntax())
             .map_err(DefinitionFrontendError::Elaborate)
             .map_err(EngineExecutionError::Frontend)?;
@@ -6982,6 +6985,15 @@ impl Engine {
                 if macro_inline {
                     admitted.engine.environment =
                         source_records::tag_macro_inline(&admitted.engine, &admitted.declaration)?;
+                    admitted.result_logical_root = admitted.engine.logical_root(options);
+                }
+                if !executable.is_empty() {
+                    admitted.engine.environment = source_records::tag_executable(
+                        &admitted.engine,
+                        &admitted.declaration,
+                        &scope,
+                        &executable,
+                    )?;
                     admitted.result_logical_root = admitted.engine.logical_root(options);
                 }
                 return self.finish_local_function_admission(
@@ -7678,6 +7690,7 @@ impl Engine {
                     | ScopeCommand::Include(_)
                     | ScopeCommand::Omit(_)
                     | ScopeCommand::Simp(_)
+                    | ScopeCommand::Executable(_)
                     | ScopeCommand::Instance(_)
                     | ScopeCommand::Export { .. }
                     | ScopeCommand::Reducibility(_) => {
@@ -8126,6 +8139,16 @@ impl Engine {
                         error: Box::new(error),
                         at: Some(original_offset),
                     })?;
+            let has_executable = parsed.kind() == fln_parse::SourceCommandKind::Definition
+                && !fln_elab::source::scope::executable::registrations(parsed.syntax())
+                    .map_err(DefinitionFrontendError::Elaborate)
+                    .map_err(EngineExecutionError::Frontend)
+                    .map_err(|error| EngineExecutionError::BatchCommand {
+                        index: command_index,
+                        error: Box::new(error),
+                        at: Some(original_offset),
+                    })?
+                    .is_empty();
             if fln_elab::source::is_record(parsed.syntax())
                 || fln_elab::source::is_inductive(parsed.syntax())
                 || fln_elab::source::partial::is_partial(parsed.syntax())
@@ -8133,6 +8156,7 @@ impl Engine {
                 || has_inline_simp
                 || has_inline_default
                 || has_macro_inline
+                || has_executable
                 || is_noncomputable
                 || (scope.noncomputable_section
                     && parsed.kind() == fln_parse::SourceCommandKind::Definition)
@@ -9442,11 +9466,15 @@ impl Engine {
             || fln_elab::source::scope::simp::macro_inline(parsed.syntax())
                 .map_err(DefinitionFrontendError::Elaborate)
                 .map_err(EngineExecutionError::Frontend)?
+            || !fln_elab::source::scope::executable::registrations(parsed.syntax())
+                .map_err(DefinitionFrontendError::Elaborate)
+                .map_err(EngineExecutionError::Frontend)?
+                .is_empty()
         {
             return Err(EngineExecutionError::Frontend(
                 DefinitionFrontendError::Elaborate(
                     fln_elab::NatDefinitionElabError::UnexpectedSyntax {
-                        expected: "an executable definition; use check-source for simp attributes",
+                        expected: "an executable definition; use check-source for declaration attributes",
                     },
                 ),
             ));

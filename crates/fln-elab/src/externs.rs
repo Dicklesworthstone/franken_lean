@@ -5,6 +5,8 @@
 //! must separately match the entire applicable entry and its supported ABI.
 //! In particular, absence is not a default extern binding. The append-ordered
 //! journal participates in ordinary environment identity and context replay.
+pub mod export;
+
 use crate::instances::{InstanceRegistryError, read_name, write_name};
 use fln_core::name::Name;
 use fln_env::environment::Environment;

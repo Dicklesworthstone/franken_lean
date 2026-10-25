@@ -279,6 +279,50 @@ pub(crate) fn apply_control_command(
             engine.environment =
                 reducibility::apply(engine.environment(), file_base, scope, attribute, position)?;
         }
+        ScopeCommand::Executable(syntax) => {
+            let (rows, names) = fln_elab::source::scope::executable::command(&syntax)
+                .map_err(DefinitionFrontendError::Elaborate)
+                .map_err(EngineExecutionError::Frontend)
+                .map_err(|error| command_error(file, command, fln_parse::BytePos(offset), error))?;
+            let mut environment = engine.environment.clone();
+            for requested in names {
+                let name =
+                    fln_elab::source::scope::executable::resolve(&environment, scope, &requested)
+                        .map_err(DefinitionFrontendError::Elaborate)
+                        .map_err(EngineExecutionError::Frontend)
+                        .map_err(|error| {
+                            command_error(file, command, fln_parse::BytePos(offset), error)
+                        })?
+                        .ok_or_else(|| SourceCheckError::Scope {
+                            file,
+                            command,
+                            offset,
+                            message: format!(
+                                "unknown executable attribute declaration `{}`",
+                                requested.to_display_string()
+                            ),
+                        })?;
+                if file_base.contains(&name) {
+                    return Err(SourceCheckError::Scope {
+                        file,
+                        command,
+                        offset,
+                        message: "executable attributes cannot modify imported declarations".into(),
+                    });
+                }
+                environment = fln_elab::source::scope::executable::apply(
+                    &environment,
+                    scope,
+                    &name,
+                    &rows,
+                    true,
+                )
+                .map_err(DefinitionFrontendError::Elaborate)
+                .map_err(EngineExecutionError::Frontend)
+                .map_err(|error| command_error(file, command, fln_parse::BytePos(offset), error))?;
+            }
+            engine.environment = environment;
+        }
         ScopeCommand::Simp(attribute) => {
             // Resolve in the lexical scope, but retain exact declaration
             // identities. A later failure discards every earlier update.
@@ -504,6 +548,7 @@ pub(crate) fn apply_module_control_command(
         ScopeCommand::Variable(_)
             | ScopeCommand::Instance(_)
             | ScopeCommand::Reducibility(_)
+            | ScopeCommand::Executable(_)
             | ScopeCommand::Simp(_)
     ) {
         scopes
