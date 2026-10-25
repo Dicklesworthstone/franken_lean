@@ -19,6 +19,7 @@ mod well_founded;
 pub(super) use constrained::ConstrainedBranch;
 use std::collections::{HashMap, HashSet};
 pub(super) use well_founded::State as WellFounded;
+pub(in crate::source) use well_founded::decreasing_tactic_expansion;
 pub(in crate::source) use well_founded::mutual::{MemberHint, MutualMember, strongly_connected};
 
 #[derive(Debug, Clone, PartialEq, Eq)]

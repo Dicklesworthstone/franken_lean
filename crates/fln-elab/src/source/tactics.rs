@@ -1682,10 +1682,22 @@ impl Context {
             } else if kind == &parser_kind(&["Tactic", "rename"]) {
                 let goal = self.rename_proof_goal(proof, goal, args)?;
                 proof.work.push(Work::Goal(goal));
+            } else if kind == &parser_kind(&["Tactic", "match"]) {
+                self.match_proof_goal(proof, goal, args)?;
+            } else if kind == &parser_kind(&["Tactic", "letrec"]) {
+                self.let_rec_proof_goal(proof, goal, args)?;
             } else if kind == &parser_kind(&["Tactic", "tacticAnd_intros"]) {
                 self.and_intros_proof_goal(proof, goal, args)?;
             } else if kind == &parser_kind(&["Tactic", "tacticExists_,,"]) {
                 self.exists_proof_goal(proof, goal, args)?;
+            } else if let Some((word, expansion)) = self.wf_macro_expansion(kind, &goal)? {
+                let [keyword] = args.as_slice() else {
+                    return Err(error(TacticError::MalformedScript));
+                };
+                expect_atom(keyword, word, "well-founded recursion tactic")?;
+                let body = self.proof_instructions(expansion)?;
+                proof.work.push(Work::Goal(goal));
+                self.start_macro_scope(proof, body)?;
             } else if kind == &parser_kind(&["Tactic", "clear"]) {
                 self.clear_proof_locals(proof, goal, args)?;
             } else if kind == &parser_kind(&["Tactic", "tacticNext_=>_"]) {
@@ -2000,6 +2012,87 @@ impl Context {
                 });
             }
         }
+    }
+
+    /// The well-founded recursion macros this engine expands as written (vendored
+    /// src/Init/WFTactics.lean), with their keyword: `decreasing_tactic` as the default
+    /// `decreasing_by` runs it, `decreasing_trivial_pre_omega`'s rules, and `simp_wf`, whose
+    /// `try simp +unfoldPartialApp +zetaDelta [invImage, …]` is `try simp` on a target that
+    /// mentions none of its seven definitions and no `let` variable. A target that does is
+    /// refused, never simplified without them.
+    fn wf_macro_expansion(
+        &mut self,
+        kind: &Name,
+        goal: &ProofGoal,
+    ) -> Result<Option<(&'static str, &'static Syntax)>, NatDefinitionElabError> {
+        let root = |text: &str| Name::from_components([text]);
+        if kind == &root("tacticDecreasing_tactic") {
+            self.require_declared_tactic(&["tacticDecreasing_tactic"])?;
+            return Ok(Some((
+                "decreasing_tactic",
+                recursion::decreasing_tactic_expansion(),
+            )));
+        }
+        if kind == &root("tacticDecreasing_trivial_pre_omega") {
+            self.require_declared_tactic(&["tacticDecreasing_trivial_pre_omega"])?;
+            return Ok(Some((
+                "decreasing_trivial_pre_omega",
+                control::expansions::decreasing_trivial_pre_omega(),
+            )));
+        }
+        if kind != &root("tacticSimp_wf") {
+            return Ok(None);
+        }
+        self.require_declared_tactic(&["tacticSimp_wf"])?;
+        let unfolded: Vec<Name> = [
+            "invImage",
+            "InvImage",
+            "Prod.lex",
+            "sizeOfWFRel",
+            "measure",
+            "Nat.lt_wfRel",
+            "WellFoundedRelation.rel",
+        ]
+        .into_iter()
+        .map(|name| Name::from_components(name.split('.')))
+        .collect();
+        let target = self.instantiate(&goal.target)?;
+        let mut pending = vec![target];
+        let mut seen = std::collections::HashSet::new();
+        while let Some(expr) = pending.pop() {
+            self.tick()?;
+            if !seen.insert(expr.allocation_identity()) {
+                continue;
+            }
+            match expr.node() {
+                ExprNode::Const { name, .. } if unfolded.contains(name) => {
+                    return Err(error(TacticError::UnsupportedTactic(kind.clone())));
+                }
+                ExprNode::FVar { id }
+                    if goal
+                        .lctx
+                        .find(id)
+                        .is_some_and(|local| local.value.is_some()) =>
+                {
+                    return Err(error(TacticError::UnsupportedTactic(kind.clone())));
+                }
+                ExprNode::App { f, a } => pending.extend([f.clone(), a.clone()]),
+                ExprNode::Lam {
+                    binder_type, body, ..
+                }
+                | ExprNode::ForallE {
+                    binder_type, body, ..
+                } => pending.extend([binder_type.clone(), body.clone()]),
+                ExprNode::LetE {
+                    type_, value, body, ..
+                } => pending.extend([type_.clone(), value.clone(), body.clone()]),
+                ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => {
+                    pending.push(expr.clone())
+                }
+                _ => {}
+            }
+        }
+        Ok(Some(("simp_wf", control::expansions::try_simp())))
     }
 
     /// Introduce only a completed local value. The declaration is not in scope

@@ -299,6 +299,45 @@ impl Context {
         Ok(())
     }
 
+    /// Run `body` in place of the instruction just read, as the pin runs a macro's expansion
+    /// (`expandEval`, vendored src/Lean/Elab/Tactic/Basic.lean): on every visible goal, the goals
+    /// it leaves passed on to the instructions after it. The barrier restores nothing but the
+    /// instruction stream.
+    pub(super) fn start_macro_scope<'a>(
+        &mut self,
+        proof: &mut ProofState<'a>,
+        body: Vec<&'a Syntax>,
+    ) -> Result<(), NatDefinitionElabError> {
+        if body.is_empty() {
+            return Err(error(TacticError::MalformedScript));
+        }
+        let boundary = proof
+            .work
+            .iter()
+            .rposition(|work| {
+                matches!(
+                    work,
+                    Work::EndScript(..)
+                        | Work::EndControl(_)
+                        | Work::EndAttempt(_)
+                        | Work::EndOptions(_)
+                )
+            })
+            .map_or(0, |position| position + 1);
+        let scope = OptionScope {
+            options: self.txn.options.clone(),
+            instance_scopes: self.source_scope.instance_scopes.clone(),
+            transparency: self.tactic_transparency,
+            instructions: std::mem::replace(&mut proof.instructions, body),
+            cursor: proof.cursor,
+        };
+        proof.cursor = 0;
+        proof
+            .work
+            .insert(boundary, Work::EndOptions(Box::new(scope)));
+        Ok(())
+    }
+
     pub(super) fn finish_tactic_options<'a>(
         &mut self,
         proof: &mut ProofState<'a>,
@@ -733,5 +772,107 @@ impl Context {
             proof.cursor += 1;
         }
         Ok(())
+    }
+}
+
+/// Native syntax for the expansions of the macro tactics this engine runs as written: atoms,
+/// root-anchored identifiers and tactic sequences, built once.
+pub(super) mod expansions {
+    use super::*;
+
+    fn null(args: Vec<Syntax>) -> Syntax {
+        Syntax::node(Name::from_components(["null"]), args)
+    }
+
+    fn atom(value: &str) -> Syntax {
+        Syntax::atom(fln_syntax::source::SourceInfo::None, value)
+    }
+
+    fn ident(components: &[&str]) -> Syntax {
+        Syntax::Ident {
+            info: fln_syntax::source::SourceInfo::None,
+            raw_val: fln_syntax::source::ByteSpan::default(),
+            val: Name::from_components(std::iter::once("_root_").chain(components.iter().copied())),
+            preresolved: Vec::new(),
+        }
+    }
+
+    fn sequence(tactics: Vec<Syntax>) -> Syntax {
+        let mut rows = Vec::new();
+        for tactic in tactics {
+            if !rows.is_empty() {
+                rows.push(null(Vec::new()));
+            }
+            rows.push(tactic);
+        }
+        Syntax::node(
+            parser_kind(&["Tactic", "tacticSeq"]),
+            vec![Syntax::node(
+                parser_kind(&["Tactic", "tacticSeq1Indented"]),
+                vec![null(rows)],
+            )],
+        )
+    }
+
+    fn apply(components: &[&str]) -> Syntax {
+        Syntax::node(
+            parser_kind(&["Tactic", "apply"]),
+            vec![atom("apply"), ident(components)],
+        )
+    }
+
+    fn assumption() -> Syntax {
+        Syntax::node(
+            parser_kind(&["Tactic", "assumption"]),
+            vec![atom("assumption")],
+        )
+    }
+
+    /// `simp_wf`'s `try simp …` (vendored src/Init/WFTactics.lean:21-22) where its
+    /// configuration and its unfold set cannot act: `try simp`.
+    pub(in crate::source::tactics) fn try_simp() -> &'static Syntax {
+        static EXPANSION: std::sync::OnceLock<Syntax> = std::sync::OnceLock::new();
+        EXPANSION.get_or_init(|| {
+            let simp = Syntax::node(
+                parser_kind(&["Tactic", "simp"]),
+                vec![
+                    atom("simp"),
+                    null(Vec::new()),
+                    null(Vec::new()),
+                    null(Vec::new()),
+                    null(Vec::new()),
+                    null(Vec::new()),
+                ],
+            );
+            sequence(vec![Syntax::node(
+                parser_kind(&["Tactic", "tacticTry_"]),
+                vec![atom("try"), sequence(vec![simp])],
+            )])
+        })
+    }
+
+    /// `decreasing_trivial_pre_omega`'s three `macro_rules` (vendored
+    /// src/Init/WFTactics.lean:48-50), the most recent tried first, as `first` tries them.
+    pub(in crate::source::tactics) fn decreasing_trivial_pre_omega() -> &'static Syntax {
+        static EXPANSION: std::sync::OnceLock<Syntax> = std::sync::OnceLock::new();
+        EXPANSION.get_or_init(|| {
+            let alternatives = [
+                ["Nat", "pred_lt"].as_slice(),
+                &["Nat", "pred_lt_of_lt"],
+                &["Nat", "sub_succ_lt_self"],
+            ]
+            .into_iter()
+            .map(|lemma| {
+                Syntax::node(
+                    Name::from_components(["group"]),
+                    vec![atom("|"), sequence(vec![apply(lemma), assumption()])],
+                )
+            })
+            .collect();
+            sequence(vec![Syntax::node(
+                parser_kind(&["Tactic", "first"]),
+                vec![atom("first"), null(alternatives)],
+            )])
+        })
     }
 }

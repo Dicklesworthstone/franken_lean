@@ -244,6 +244,13 @@ pub(in crate::source) fn hint(syntax: &Syntax) -> Result<Option<Hint<'_>>, NatDe
     }))
 }
 
+/// [`automatic_decreasing_proof`], built once, for a script that names `decreasing_tactic`
+/// itself: the same expansion the default `decreasing_by` runs.
+pub(in crate::source) fn decreasing_tactic_expansion() -> &'static Syntax {
+    static EXPANSION: std::sync::OnceLock<Syntax> = std::sync::OnceLock::new();
+    EXPANSION.get_or_init(automatic_decreasing_proof)
+}
+
 /// The pin's lexicographic constructor prefix and Nat base-case fragment of
 /// decreasing_tactic after the checked continuation has exposed its measure.
 /// This is native syntax expansion; no Reference metaprogram is executed.
