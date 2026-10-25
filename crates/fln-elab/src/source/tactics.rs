@@ -874,18 +874,11 @@ impl Context {
             if self.is_matrix_hypothesis(local) || hidden.contains(&local.id) {
                 continue;
             }
-            // The pin keeps ordinary conversion during decreasing proofs.
-            // Cleanup can expose Nat.lt while a retained hypothesis still
-            // names LT.lt through its instance. Both inferred probes and
-            // supplied/default WF proofs must recognize that same evidence.
+            // `findLocalDeclWithType?` uses ordinary `isDefEq`, not reducible
+            // conversion (Lean/Meta/Tactic/Assumption.lean:16-20). The latest
+            // semireducibly matching proof must win for get_elem_tactic too.
             let mut budget = UnificationBudget::new(self.kernel);
-            if self
-                .well_founded
-                .as_ref()
-                .is_some_and(|state| state.proving)
-            {
-                budget.transparency = UnificationTransparency::Default;
-            }
+            budget.transparency = UnificationTransparency::Default;
             if self.proof_types_match_with_budget(&local.type_, &goal.target, budget)? {
                 return Ok(Some(Expr::fvar(local.id.clone())));
             }
