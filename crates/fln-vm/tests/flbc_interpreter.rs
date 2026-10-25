@@ -6887,141 +6887,201 @@ fn managerless_io_wait_any_selects_the_first_finished_task_in_list_order() {
 #[test]
 fn delayed_thunk_forces_once_and_caches_the_same_abi_value() {
     let _guard = lock();
-    let program = validated(vec![
-        function(
-            0,
-            0,
-            8,
-            vec![
-                Instruction::Nat {
-                    dst: r(0),
-                    value: 0,
-                },
-                intrinsic(r(1), "extern:ST.Prim.mkRef", vec![r(0)]),
-                Instruction::Closure {
-                    dst: r(2),
-                    function: fid(1),
-                    captures: vec![r(1)],
-                    capture_ownership: vec![ArgumentOwnership::Borrowed],
-                },
-                intrinsic(r(3), "extern:Thunk.mk", vec![r(2)]),
-                intrinsic(r(4), "extern:Thunk.get", vec![r(3)]),
-                intrinsic(r(5), "extern:Thunk.get", vec![r(3)]),
-                intrinsic(r(6), "extern:ST.Prim.Ref.get", vec![r(1)]),
-                Instruction::Array {
-                    dst: r(7),
-                    items: vec![r(3), r(4), r(5), r(6)],
-                },
-                Instruction::Return { src: r(7) },
-            ],
-        ),
-        function_with_ownership(
-            1,
-            vec![ArgumentOwnership::Borrowed, ArgumentOwnership::Scalar],
-            7,
-            vec![
-                intrinsic(r(2), "extern:ST.Prim.Ref.get", vec![r(0)]),
-                Instruction::Nat {
-                    dst: r(3),
-                    value: 1,
-                },
-                intrinsic(r(4), "extern:Nat.add", vec![r(2), r(3)]),
-                intrinsic(r(5), "extern:ST.Prim.Ref.set", vec![r(0), r(4)]),
-                Instruction::String {
-                    dst: r(6),
-                    value: "forced".to_string(),
-                },
-                Instruction::Return { src: r(6) },
-            ],
-        ),
-    ]);
+    for unit_ownership in [
+        ArgumentOwnership::Scalar,
+        ArgumentOwnership::Borrowed,
+        ArgumentOwnership::Owned,
+    ] {
+        let program = validated(vec![
+            function(
+                0,
+                0,
+                8,
+                vec![
+                    Instruction::Nat {
+                        dst: r(0),
+                        value: 0,
+                    },
+                    intrinsic(r(1), "extern:ST.Prim.mkRef", vec![r(0)]),
+                    Instruction::Closure {
+                        dst: r(2),
+                        function: fid(1),
+                        captures: vec![r(1)],
+                        capture_ownership: vec![ArgumentOwnership::Borrowed],
+                    },
+                    intrinsic(r(3), "extern:Thunk.mk", vec![r(2)]),
+                    intrinsic(r(4), "extern:Thunk.get", vec![r(3)]),
+                    intrinsic(r(5), "extern:Thunk.get", vec![r(3)]),
+                    intrinsic(r(6), "extern:ST.Prim.Ref.get", vec![r(1)]),
+                    Instruction::Array {
+                        dst: r(7),
+                        items: vec![r(3), r(4), r(5), r(6)],
+                    },
+                    Instruction::Return { src: r(7) },
+                ],
+            ),
+            function_with_ownership(
+                1,
+                vec![ArgumentOwnership::Borrowed, unit_ownership],
+                7,
+                vec![
+                    intrinsic(r(2), "extern:ST.Prim.Ref.get", vec![r(0)]),
+                    Instruction::Nat {
+                        dst: r(3),
+                        value: 1,
+                    },
+                    intrinsic(r(4), "extern:Nat.add", vec![r(2), r(3)]),
+                    intrinsic(r(5), "extern:ST.Prim.Ref.set", vec![r(0), r(4)]),
+                    Instruction::String {
+                        dst: r(6),
+                        value: "forced".to_string(),
+                    },
+                    Instruction::Return { src: r(6) },
+                ],
+            ),
+        ]);
 
-    shadow::enable();
-    let completed = returned(execute(&program, ExecutionLimits::default(), None));
-    assert_eq!(completed.value.array_view(), (4, 4));
-    assert_eq!(completed.usage.peak_stack_depth, 2);
-    {
-        let thunk = completed.value.array_child(0);
-        let first = completed.value.array_child(1);
-        let cached = completed.value.array_child(2);
-        assert_eq!(value_kind(&thunk), ValueKind::Thunk);
-        assert_eq!(string_contents(&first), "forced");
-        assert_eq!(string_contents(&cached), "forced");
-        assert_eq!(
-            first.identity_token(),
-            cached.identity_token(),
-            "the second force retains the cached object instead of re-running"
-        );
-        let stored = thunk
-            .evaluated_thunk_value()
-            .expect("successful force completes the ABI thunk");
-        assert_eq!(stored.identity_token(), first.identity_token());
-        assert_eq!(
-            completed.value.array_child(3).unbox(),
-            1,
-            "the captured cell proves the delayed closure ran exactly once"
+        shadow::enable();
+        let completed = returned(execute(&program, ExecutionLimits::default(), None));
+        assert_eq!(completed.value.array_view(), (4, 4));
+        assert_eq!(completed.usage.peak_stack_depth, 2);
+        {
+            let thunk = completed.value.array_child(0);
+            let first = completed.value.array_child(1);
+            let cached = completed.value.array_child(2);
+            assert_eq!(value_kind(&thunk), ValueKind::Thunk);
+            assert_eq!(string_contents(&first), "forced");
+            assert_eq!(string_contents(&cached), "forced");
+            assert_eq!(
+                first.identity_token(),
+                cached.identity_token(),
+                "the second force retains the cached object instead of re-running"
+            );
+            let stored = thunk
+                .evaluated_thunk_value()
+                .expect("successful force completes the ABI thunk");
+            assert_eq!(stored.identity_token(), first.identity_token());
+            assert_eq!(
+                completed.value.array_child(3).unbox(),
+                1,
+                "the captured cell proves the delayed closure ran exactly once"
+            );
+        }
+        drop(completed);
+        let (events, live) = shadow::disable_and_drain();
+        assert_eq!(live, 0, "forced thunk execution leaves no live ABI object");
+        assert!(
+            events.iter().all(|event| {
+                event.kind != shadow::EventKind::DoubleRelease
+                    && event.kind != shadow::EventKind::ForeignPointer
+            }),
+            "forcing and cached reads preserve exact ownership"
         );
     }
-    drop(completed);
-    let (events, live) = shadow::disable_and_drain();
-    assert_eq!(live, 0, "forced thunk execution leaves no live ABI object");
-    assert!(
-        events.iter().all(|event| {
-            event.kind != shadow::EventKind::DoubleRelease
-                && event.kind != shadow::EventKind::ForeignPointer
-        }),
-        "forcing and cached reads preserve exact ownership"
-    );
 }
 
 #[test]
 fn delayed_thunk_caches_an_under_applied_closure_without_entering_it() {
     let _guard = lock();
-    let program = validated(vec![
-        function(
-            0,
-            0,
-            5,
-            vec![
-                Instruction::Closure {
-                    dst: r(0),
-                    function: fid(1),
-                    captures: Vec::new(),
-                    capture_ownership: Vec::new(),
-                },
-                intrinsic(r(1), "extern:Thunk.mk", vec![r(0)]),
-                intrinsic(r(2), "extern:Thunk.get", vec![r(1)]),
-                intrinsic(r(3), "extern:Thunk.get", vec![r(1)]),
-                Instruction::Array {
-                    dst: r(4),
-                    items: vec![r(2), r(3)],
-                },
-                Instruction::Return { src: r(4) },
-            ],
-        ),
-        function_with_ownership(
-            1,
-            vec![ArgumentOwnership::Scalar, ArgumentOwnership::Borrowed],
-            2,
-            vec![Instruction::Return { src: r(0) }],
-        ),
-    ]);
+    for unit_ownership in [
+        ArgumentOwnership::Scalar,
+        ArgumentOwnership::Borrowed,
+        ArgumentOwnership::Owned,
+    ] {
+        let program = validated(vec![
+            function(
+                0,
+                0,
+                5,
+                vec![
+                    Instruction::Closure {
+                        dst: r(0),
+                        function: fid(1),
+                        captures: Vec::new(),
+                        capture_ownership: Vec::new(),
+                    },
+                    intrinsic(r(1), "extern:Thunk.mk", vec![r(0)]),
+                    intrinsic(r(2), "extern:Thunk.get", vec![r(1)]),
+                    intrinsic(r(3), "extern:Thunk.get", vec![r(1)]),
+                    Instruction::Array {
+                        dst: r(4),
+                        items: vec![r(2), r(3)],
+                    },
+                    Instruction::Return { src: r(4) },
+                ],
+            ),
+            function_with_ownership(
+                1,
+                vec![unit_ownership, ArgumentOwnership::Borrowed],
+                2,
+                vec![Instruction::Return { src: r(0) }],
+            ),
+        ]);
 
-    let completed = returned(execute(&program, ExecutionLimits::default(), None));
-    assert_eq!(
-        completed.usage.peak_stack_depth, 1,
-        "under-application completes without entering the target"
-    );
-    let first = completed.value.array_child(0);
-    let cached = completed.value.array_child(1);
-    assert_eq!(value_kind(&first), ValueKind::Closure);
-    assert_eq!(first.closure_view(), (3, 2));
-    assert_eq!(first.identity_token(), cached.identity_token());
-    let (_, fixed) = first
-        .closure_shell_parts()
-        .expect("the cached partial application stays a Golem shell");
-    assert_eq!(fixed[0].unbox(), 1);
-    assert_eq!(fixed[1].unbox(), 0, "Thunk.get supplies Unit");
+        let completed = returned(execute(&program, ExecutionLimits::default(), None));
+        assert_eq!(
+            completed.usage.peak_stack_depth, 1,
+            "under-application completes without entering the target"
+        );
+        let first = completed.value.array_child(0);
+        let cached = completed.value.array_child(1);
+        assert_eq!(value_kind(&first), ValueKind::Closure);
+        assert_eq!(first.closure_view(), (3, 2));
+        assert_eq!(first.identity_token(), cached.identity_token());
+        let (_, fixed) = first
+            .closure_shell_parts()
+            .expect("the cached partial application stays a Golem shell");
+        assert_eq!(fixed[0].unbox(), 1);
+        assert_eq!(fixed[1].unbox(), 0, "Thunk.get supplies Unit");
+    }
+}
+
+#[test]
+fn delayed_thunk_refuses_a_unique_unit_parameter_before_call_or_partial_application() {
+    let _guard = lock();
+    for parameters in [
+        vec![ArgumentOwnership::Unique],
+        vec![ArgumentOwnership::Unique, ArgumentOwnership::Borrowed],
+    ] {
+        let program = validated(vec![
+            function(
+                0,
+                0,
+                3,
+                vec![
+                    Instruction::Closure {
+                        dst: r(0),
+                        function: fid(1),
+                        captures: vec![],
+                        capture_ownership: vec![],
+                    },
+                    intrinsic(r(1), "extern:Thunk.mk", vec![r(0)]),
+                    intrinsic(r(2), "extern:Thunk.get", vec![r(1)]),
+                    Instruction::Return { src: r(2) },
+                ],
+            ),
+            function_with_ownership(1, parameters, 2, vec![Instruction::Return { src: r(0) }]),
+        ]);
+        shadow::enable();
+        assert!(matches!(
+            execute(&program, ExecutionLimits::default(), None),
+            Outcome::Complete(VmExit::Refused {
+                refusal: VmRefusal::ApplyOwnershipMismatch {
+                    function,
+                    argument: 0,
+                    expected: ArgumentOwnership::Unique,
+                    actual: ArgumentOwnership::Scalar,
+                },
+                ..
+            }) if function == fid(1)
+        ));
+        let (events, live) = shadow::disable_and_drain();
+        assert_eq!(live, 0, "refusing a force reclaims the claimed thunk");
+        assert!(events.iter().all(|event| {
+            event.kind != shadow::EventKind::DoubleRelease
+                && event.kind != shadow::EventKind::ForeignPointer
+        }));
+    }
 }
 
 #[test]
