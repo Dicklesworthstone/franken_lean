@@ -2459,12 +2459,7 @@ fn run(
                                 });
                             }
                         };
-                        match prepare_internal_apply(
-                            program,
-                            &closure,
-                            Obj::mk_nat(0),
-                            ArgumentOwnership::Scalar,
-                        ) {
+                        match prepare_thunk_apply(program, &closure) {
                             Ok(PreparedApply::Partial { function, captures }) => {
                                 let value = make_golem_closure(program, function, captures)?;
                                 let value = match finish_intrinsic_result(
@@ -3443,13 +3438,32 @@ fn make_golem_closure(
     Ok(Obj::mk_closure(encoded_arity, fixed))
 }
 
-fn prepare_internal_apply(
+fn prepare_thunk_apply(
     program: &ValidatedProgram,
     closure: &Obj,
-    argument: Obj,
-    argument_ownership: ArgumentOwnership,
 ) -> Result<PreparedApply, VmRefusal> {
-    prepare_internal_apply_many(program, closure, vec![argument], vec![argument_ownership])
+    // Source callbacks borrow Unit, while ABI callbacks may declare the same
+    // scalar-zero argument Scalar or Owned. Inspect the validated target and
+    // honor its next parameter, as dbgTrace does for its continuation. This
+    // internally supplied scalar has no heap ownership to lose or duplicate;
+    // it does not grant a Unique argument or relax ordinary Apply checking.
+    let plan = plan_apply(program, closure, 1, None, None)?;
+    let ownership = program
+        .function(plan.function)
+        .and_then(|function| function.parameter_ownership.get(plan.captures.len()))
+        .copied()
+        .ok_or(VmRefusal::MalformedClosure {
+            reason: "thunk continuation parameter is absent",
+        })?;
+    if ownership == ArgumentOwnership::Unique {
+        return Err(VmRefusal::ApplyOwnershipMismatch {
+            function: plan.function,
+            argument: 0,
+            expected: ownership,
+            actual: ArgumentOwnership::Scalar,
+        });
+    }
+    Ok(finish_apply(plan, vec![Obj::mk_nat(0)], Some(&[ownership])))
 }
 
 fn prepare_internal_apply_many(

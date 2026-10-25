@@ -5,6 +5,22 @@ use super::*;
 use fln_elab::implemented_by::{ImplementedByError, ImplementedByReadError, ImplementedByTable};
 
 impl Preparation<'_> {
+    /// Inert-value inspection may retain an extern name but must not replace it
+    /// with its logical body. Actual execution still needs a complete native
+    /// contract; this query grants no implementation or ABI authority.
+    pub(super) fn has_extern_attribute(&mut self, name: &Name) -> Result<bool, IngressError> {
+        source_intrinsics::read_extern_attributes(
+            self.environment,
+            &mut self.externs,
+            &mut self.visited,
+            self.limits,
+        )?;
+        Ok(self
+            .externs
+            .as_ref()
+            .is_some_and(|table| table.get(name).is_some()))
+    }
+
     fn implementations(&mut self) -> Result<&ImplementedByTable, IngressError> {
         if self.implementations.is_none() {
             let table = ImplementedByTable::read_metered(self.environment, |amount| {
@@ -122,12 +138,25 @@ impl Preparation<'_> {
             Some(ConstantInfo::Defn(value)) => value.safety != DefinitionSafety::Unsafe,
             Some(ConstantInfo::Opaque(value)) => !value.is_unsafe,
             Some(ConstantInfo::Axiom(value)) => !value.is_unsafe,
+            Some(ConstantInfo::Ctor(value)) => !value.is_unsafe,
             _ => false,
         };
         if !safe_target {
             return Err(unsupported(
                 "implemented_by target has no supported safe or partial executable body",
             ));
+        }
+        if matches!(self.environment.find(&target), Some(ConstantInfo::Ctor(_))) {
+            // A constructor such as Nat.succ has no definition body. Preserve
+            // its extern gate, then use ordinary constructor/native lowering.
+            source_intrinsics::check_selected_extern_attribute(
+                self.environment,
+                &target,
+                &mut self.externs,
+                &mut self.visited,
+                self.limits,
+            )?;
+            return Ok(Some(target));
         }
         // A replacement retains the target's ordinary execution authority.
         // Generic intrinsics compare their complete admitted models. File IO

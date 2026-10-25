@@ -677,6 +677,10 @@ impl Context {
             .read_with_scopes(&self.txn.env, &self.source_scope.instance_scopes)
             .map_err(registry_error)?;
         while self.resolve_default_instance(&registry)? {
+            // The final default may solve every instance goal, making ordinary
+            // synthesis return immediately. Its assignments still unblock
+            // retained typing equations, including a method's receiver type.
+            self.flush(false)?;
             self.resolve_instances(false)?;
         }
         Ok(())

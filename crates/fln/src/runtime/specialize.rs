@@ -218,6 +218,8 @@ impl Preparation<'_> {
             || self.nat_primitive_intrinsic_type(name).is_some()
             || self.diagnostic_intrinsic_type(name).is_some()
             || self.st_intrinsic_type(name).is_some()
+            || self.thunk_intrinsic_type(name).is_some()
+            || self.thunk_function_type(name).is_some()
             || self.io_intrinsic_type(name).is_some()
             || self.fs_intrinsic_type(name).is_some()
             || self.float_intrinsic_type(name).is_some()
@@ -581,6 +583,11 @@ impl Preparation<'_> {
                             && args.len()
                                 == ctor.num_params as usize + ctor.num_fields as usize =>
                     {
+                        // Native Thunk allocation has observable sharing even
+                        // when its delayed closure is syntactically inert.
+                        if self.thunk_record_forbidden(&ctor.induct)? {
+                            return Ok(false);
+                        }
                         // A value parameter can execute work even when it is
                         // absent from the runtime field layout. Erasing a
                         // dictionary must not discard that computation.
@@ -602,6 +609,14 @@ impl Preparation<'_> {
                             && definition.safety == DefinitionSafety::Safe
                             && definition.base.level_params.len() == levels.len() =>
                     {
+                        if self.has_extern_attribute(name)? {
+                            // A verified native function is an inert value,
+                            // but its logical body is not its implementation.
+                            if !self.inert_native_function(&head)? {
+                                return Ok(false);
+                            }
+                            continue;
+                        }
                         let value = self.universe_instance(
                             &definition.value,
                             &definition.base.level_params,
@@ -626,7 +641,7 @@ impl Preparation<'_> {
         // Native ST handles have no ordinary record fields. In particular a
         // source constructor/projection cannot relabel a raw opaque carrier as
         // a cell whose contents received the checked Nat representation.
-        if self.st_ref_record_forbidden(family)? {
+        if self.st_ref_record_forbidden(family)? || self.thunk_record_forbidden(family)? {
             return Ok(None);
         }
         if !self.static_value(value)? {
@@ -684,7 +699,7 @@ impl Preparation<'_> {
             self.tick()?;
             let (head, args) = self.spine(&value)?;
             if let ExprNode::Const { name, .. } = head.node()
-                && self.has_implementation(name)?
+                && (self.has_implementation(name)? || self.has_extern_attribute(name)?)
             {
                 return Ok(None);
             }
@@ -1017,6 +1032,8 @@ impl Preparation<'_> {
                 .nat_primitive_intrinsic_type(name)
                 .or_else(|| self.diagnostic_intrinsic_type(name))
                 .or_else(|| self.st_intrinsic_type(name))
+                .or_else(|| self.thunk_intrinsic_type(name))
+                .or_else(|| self.thunk_function_type(name))
                 .or_else(|| self.io_intrinsic_type(name))
                 .or_else(|| self.fs_intrinsic_type(name))
                 .or_else(|| self.float_intrinsic_type(name))
@@ -1090,7 +1107,9 @@ impl Preparation<'_> {
     ) -> Result<Option<Expr>, IngressError> {
         // These private entries are emitted only at their real prefix arity.
         // Their remaining Pi is a returned closure, not missing arguments.
-        if matches!(head.node(), ExprNode::Const { name, .. } if self.is_partial_stage(name)) {
+        if matches!(head.node(), ExprNode::Const { name, .. }
+            if self.is_partial_stage(name) || self.thunk_function_type(name).is_some())
+        {
             return Ok(None);
         }
         let Some(mut type_) = self.callable_type(head)? else {

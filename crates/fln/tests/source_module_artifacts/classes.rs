@@ -9,6 +9,8 @@ use fln_olean::source_extensions::{self, ClassEntry, DecodeLimits};
 mod aliases;
 #[path = "defaults.rs"]
 mod defaults;
+#[path = "executable.rs"]
+mod executable;
 #[path = "instances.rs"]
 mod instances;
 #[path = "macro_inline.rs"]

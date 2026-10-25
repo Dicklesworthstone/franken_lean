@@ -26,6 +26,55 @@ fn named() -> Name {
 }
 
 #[test]
+fn record_patterns_keep_nested_aliases_fields_ellipsis_and_original_spans() {
+    for source in [
+        "def f : R -> Nat\r\n | { «𝒃» /-field-/ := all@(.some x), nested := { value := y, .. }, .. : R } => x\r\n",
+        "def f (r : R) : Nat := match r with | { parent.value := x, other := _ } => x",
+        "def f : R -> Nat | { value := x\n                     other := y } => x",
+    ] {
+        let parsed = parse_definition(source.as_bytes())
+            .unwrap_or_else(|error| panic!("{source}\n{error:?}"));
+        let records = nodes(
+            parsed.syntax(),
+            &Name::from_components(["Lean", "Parser", "Term", "structInst"]),
+        );
+        assert!(!records.is_empty());
+        assert_eq!(parsed.reconstruct_original(), source.as_bytes());
+        for record in records {
+            assert_eq!(record.len(), 6);
+            for (index, spelling) in [(0, "{"), (5, "}")] {
+                let Syntax::Atom {
+                    info: SourceInfo::Original { pos, end_pos, .. },
+                    val,
+                } = &record[index]
+                else {
+                    panic!("record punctuation lost original span")
+                };
+                assert_eq!(val, spelling);
+                assert_eq!(
+                    &parsed.source_view().normalized().as_bytes()[pos.0..end_pos.0],
+                    spelling.as_bytes()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn malformed_record_patterns_are_not_accepted_as_constructor_binders() {
+    for source in [
+        "def f : R -> Nat | { value := } => 0",
+        "def f : R -> Nat | { value := x, , other := y } => 0",
+        "def f : R -> Nat | { .., value := x } => 0",
+        "def f : R -> Nat | { value := x : } => 0",
+        "def f : R -> Nat | { old with value := x } => 0",
+        "def f : R -> Nat | { value := (x } => 0",
+    ] {
+        assert!(parse_definition(source.as_bytes()).is_err(), "{source}");
+    }
+}
+
+#[test]
 fn named_constructor_arguments_keep_labels_nested_patterns_and_original_spans() {
     let source =
         "def f : T -> Nat\r\n  | .mk («𝒃» /-label-/ := whole@(.some x)) (a := _) .. => x\r\n";

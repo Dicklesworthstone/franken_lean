@@ -169,9 +169,10 @@ fn scope_name(command: &ScopeCommand) -> &'static str {
         ScopeCommand::SetOption { .. } | ScopeCommand::SetOptionIn { .. } => "set_option",
         ScopeCommand::GuardMsgs { .. } => "guard_msgs",
         ScopeCommand::In { .. } => "in",
-        ScopeCommand::Simp(_) | ScopeCommand::Instance(_) | ScopeCommand::Reducibility(_) => {
-            "attribute"
-        }
+        ScopeCommand::Simp(_)
+        | ScopeCommand::Instance(_)
+        | ScopeCommand::Reducibility(_)
+        | ScopeCommand::Executable(_) => "attribute",
         ScopeCommand::Trivia => "trivia",
         ScopeCommand::Exit => "exit",
     }

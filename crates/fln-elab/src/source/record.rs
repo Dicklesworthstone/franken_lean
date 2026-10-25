@@ -47,33 +47,66 @@ fn empty_modifiers(syntax: &Syntax) -> Result<(), NatDefinitionElabError> {
     Ok(())
 }
 
-/// `(x y : T := d)` (`structExplicitBinder`) declares each name as the field `x : T := d`, as the
-/// pin's `expandFields` reads it: one `structSimpleBinder` per name, sharing the modifiers, the
-/// signature and the default. The implicit and instance binder forms stay refused.
-fn simple_fields(fields: &[Syntax]) -> Result<Vec<Syntax>, NatDefinitionElabError> {
+/// Expand grouped fields while preserving their constructor binder style. The
+/// common elaboration path handles their types, defaults and generated projections.
+fn simple_fields(fields: &[Syntax]) -> Result<Vec<(Syntax, BinderInfo)>, NatDefinitionElabError> {
     let mut output = Vec::with_capacity(fields.len());
     for field in fields {
-        if field.kind() != Some(&parser_kind(&["Command", "structExplicitBinder"])) {
-            output.push(field.clone());
-            continue;
-        }
+        let (kind, open, close, style, count) =
+            if field.kind() == Some(&parser_kind(&["Command", "structExplicitBinder"])) {
+                ("structExplicitBinder", "(", ")", BinderInfo::Default, 6)
+            } else if field.kind() == Some(&parser_kind(&["Command", "structImplicitBinder"])) {
+                ("structImplicitBinder", "{", "}", BinderInfo::Implicit, 5)
+            } else if field.kind() == Some(&parser_kind(&["Command", "structInstBinder"])) {
+                ("structInstBinder", "[", "]", BinderInfo::InstImplicit, 5)
+            } else {
+                output.push((field.clone(), BinderInfo::Default));
+                continue;
+            };
         let parts = expect_node(
             field,
-            &parser_kind(&["Command", "structExplicitBinder"]),
-            6,
-            "explicit structure field",
+            &parser_kind(&["Command", kind]),
+            count,
+            "grouped structure field",
         )?;
-        expect_atom(&parts[1], "(", "explicit structure field bracket")?;
-        expect_atom(&parts[5], ")", "explicit structure field bracket")?;
-        for name in expect_null_args(&parts[2], "explicit structure field names")? {
-            output.push(Syntax::node(
-                parser_kind(&["Command", "structSimpleBinder"]),
-                vec![
-                    parts[0].clone(),
-                    name.clone(),
-                    parts[3].clone(),
-                    parts[4].clone(),
-                ],
+        expect_atom(&parts[1], open, "structure field opening bracket")?;
+        expect_atom(&parts[count - 1], close, "structure field closing bracket")?;
+        let (signature, default) = if style == BinderInfo::Default {
+            (parts[3].clone(), parts[4].clone())
+        } else {
+            let signature = expect_node(
+                &parts[3],
+                &parser_kind(&["Command", "declSig"]),
+                2,
+                "implicit structure field signature",
+            )?;
+            (
+                Syntax::node(
+                    parser_kind(&["Command", "optDeclSig"]),
+                    vec![
+                        signature[0].clone(),
+                        Syntax::node(Name::from_components(["null"]), vec![signature[1].clone()]),
+                    ],
+                ),
+                Syntax::node(Name::from_components(["null"]), vec![]),
+            )
+        };
+        let names = expect_null_args(&parts[2], "structure field names")?;
+        if names.is_empty() {
+            return Err(failure(SourceInferenceError::Scope));
+        }
+        for name in names {
+            output.push((
+                Syntax::node(
+                    parser_kind(&["Command", "structSimpleBinder"]),
+                    vec![
+                        parts[0].clone(),
+                        name.clone(),
+                        signature.clone(),
+                        default.clone(),
+                    ],
+                ),
+                style,
             ));
         }
     }
@@ -282,7 +315,7 @@ pub(super) fn elaborate_record_scoped(
             helper,
         });
     }
-    for field in fields {
+    for (field, style) in fields {
         context.tick()?;
         let parts = expect_node(
             field,
@@ -453,12 +486,10 @@ pub(super) fn elaborate_record_scoped(
         inferred =
             Level::max(inferred, universe).map_err(|_| failure(SourceInferenceError::Scope))?;
         let id = FVarId(context.fresh_name()?);
-        context.txn.lctx.add_param(
-            id.clone(),
-            user_name.clone(),
-            completed.value,
-            BinderInfo::Default,
-        );
+        context
+            .txn
+            .lctx
+            .add_param(id.clone(), user_name.clone(), completed.value, *style);
         output.push(
             context
                 .txn

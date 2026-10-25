@@ -634,6 +634,8 @@ struct Context {
     // Distinct symbolic columns can select one constructor field. Only the typed matcher
     // creates these aliases, and both names are unspellable generated column identities.
     matrix_field_aliases: std::collections::HashMap<Name, Name>,
+    // Record labels select checked projections from physical constructor columns.
+    matrix_record_projections: std::collections::HashMap<Name, Vec<(Name, Vec<Name>)>>,
     // Constructor columns shared by named/positional layouts, including their descendants.
     matrix_shared_columns: std::collections::HashSet<Name>,
     // A written match the pattern-matrix compiler lowered, by its last input's binder: the
@@ -778,6 +780,7 @@ impl Context {
             inaccessible_columns: std::collections::HashSet::new(),
             matrix_aliases: std::collections::HashMap::new(),
             matrix_field_aliases: std::collections::HashMap::new(),
+            matrix_record_projections: std::collections::HashMap::new(),
             matrix_shared_columns: std::collections::HashSet::new(),
             pattern_typing_checks: std::collections::HashMap::new(),
             registry_cache: crate::instances::RegistryCache::default(),
@@ -5795,7 +5798,13 @@ fn definition_in_context_named(
     // These still pass ordinary term elaboration and council admission, but a missing
     // runtime recursor implementation is irrelevant when no code may be generated.
     if !is_theorem && !proof_instance && !is_noncomputable {
-        context.noncomputable_definition = context.check_definition_codegen(&term)?;
+        if scope::executable::registrations(syntax)?.is_empty() {
+            context.noncomputable_definition = context.check_definition_codegen(&term)?;
+        } else {
+            // The declared body remains fully typed and checked, but the pin
+            // compiles the executable replacement instead of that logical body.
+            context.validate_codegen_metadata()?;
+        }
     }
     let type_ = if let Some(header) = public_definition_type {
         context.instantiate(&header)?

@@ -6,6 +6,52 @@ use fln_env::constants::{AxiomVal, ConstantInfo, ConstantVal};
 use fln_env::extensions::{CheckpointLimits, ProofBudget};
 use fln_env::modules::ModuleEpoch;
 
+#[test]
+fn module_export_preserves_final_owned_values_and_enforces_exact_work() {
+    let base = register(&environment(), &n("A.call"), vec![standard("imported")]).unwrap();
+    let local = base
+        .add_decl(ConstantInfo::Axiom(AxiomVal {
+            base: ConstantVal {
+                name: n("local"),
+                level_params: Vec::new(),
+                type_: Expr::sort(Level::one()),
+            },
+            is_unsafe: false,
+        }))
+        .unwrap();
+    let result = register(
+        &register(&local, &n("local"), vec![standard("old")]).unwrap(),
+        &n("local"),
+        vec![],
+    )
+    .unwrap();
+    let rows = export::registrations(&base, &result, usize::MAX)
+        .unwrap()
+        .unwrap();
+    assert_eq!(rows.entries, [(n("local"), vec![])]);
+    assert_eq!(
+        export::registrations(&base, &result, rows.work).unwrap(),
+        Some(rows.clone()),
+    );
+    assert_eq!(
+        export::registrations(&base, &result, rows.work - 1),
+        Err(ExternError::Limit),
+    );
+    assert_eq!(
+        export::registrations(
+            &base,
+            &register(&base, &n("B.call"), vec![]).unwrap(),
+            usize::MAX,
+        )
+        .unwrap(),
+        None,
+    );
+    assert_eq!(
+        export::registrations(&base, &environment(), usize::MAX),
+        Err(ExternError::Malformed),
+    );
+}
+
 fn n(text: &str) -> Name {
     Name::from_components(text.split('.'))
 }

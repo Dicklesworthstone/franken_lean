@@ -835,6 +835,8 @@ mod tests {
         // source_simp_instance_matching exercises both values.
         // `stderrAsMessages`: presented `#eval` stream capture (`fln`, lib.rs);
         // `presented_evaluations_do_not_escape_their_command_streams` sets it false.
+        // `stderrAsMessages`: the source executor's stderr routing (`fln`, `lib.rs`);
+        // runtime/stdout/tests/input/stderr.rs exercises scoped and persistent values.
         // `autoImplicit`: `auto_bound_name` (source.rs); `source_auto_bound_implicits` sets it false.
         // `Elab.async`: the names `native_decide` gives its axioms (source.rs,
         // tactics/decision.rs); `source_native_decide` sets it false.

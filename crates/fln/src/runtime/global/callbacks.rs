@@ -90,6 +90,9 @@ impl Preparation<'_> {
         if let Some(diagnostic) = self.diagnostic_call(head, arguments)? {
             return Ok(Some(diagnostic));
         }
+        if let Some(thunk) = self.thunk_call(head, arguments)? {
+            return Ok(Some(thunk));
+        }
         let Some(specialized) = self.specialize_call(head, arguments)? else {
             return Ok(None);
         };
@@ -122,6 +125,9 @@ impl Preparation<'_> {
             &mut self.visited,
             self.limits,
         )?;
+        if self.has_extern_attribute(name)? {
+            return Ok(None);
+        }
         let definition = self.normalize_definition_signature(&definition)?;
         self.annotate_callable_tail(&definition.value, &definition.base.type_)
             .map(Some)
@@ -491,6 +497,9 @@ impl Preparation<'_> {
             &mut self.visited,
             self.limits,
         )?;
+        if self.has_extern_attribute(name)? {
+            return Ok(None);
+        }
         let definition = self.normalize_definition_signature(&definition)?;
         self.inline_callback_arguments(definition, args)
     }

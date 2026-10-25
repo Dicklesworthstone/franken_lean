@@ -11,6 +11,7 @@ mod coverage;
 mod functions;
 mod literals;
 pub(super) mod named;
+pub(super) mod records;
 use fln_env::constants::ConstantInfo;
 use fln_syntax::source::{ByteSpan, SourceInfo};
 use std::borrow::Cow;
@@ -29,6 +30,7 @@ struct Constructor<'a> {
     labels: Vec<Option<Name>>,
     /// Written with a trailing `..`: `fields` is a prefix, the rest are `_`.
     ellipsis: bool,
+    record: bool,
 }
 enum Pattern<'a> {
     Bind(Option<Name>),
@@ -566,7 +568,7 @@ impl Context {
     ) -> Result<usize, NatDefinitionElabError> {
         enum Task<'a> {
             Visit(&'a Syntax),
-            Constructor(Head, Cow<'a, Syntax>, usize, Vec<Option<Name>>, bool),
+            Constructor(Head, Cow<'a, Syntax>, usize, Vec<Option<Name>>, bool, bool),
             Named(Name),
         }
         let mut pending = vec![Task::Visit(syntax)];
@@ -579,7 +581,7 @@ impl Context {
                     values.push(arena.len());
                     arena.push(Pattern::Named { name, pattern });
                 }
-                Task::Constructor(head, syntax, start, labels, ellipsis) => {
+                Task::Constructor(head, syntax, start, labels, ellipsis, record) => {
                     let fields = values.split_off(start);
                     values.push(arena.len());
                     arena.push(Pattern::Constructor(Constructor {
@@ -588,6 +590,7 @@ impl Context {
                         fields,
                         labels,
                         ellipsis,
+                        record,
                     }));
                 }
                 Task::Visit(syntax) => {
@@ -598,6 +601,31 @@ impl Context {
                     if let Some((name, pattern)) = named::parts(syntax)? {
                         pending.push(Task::Named(name));
                         pending.push(Task::Visit(pattern));
+                        continue;
+                    }
+                    if let Some(record) = records::parts(syntax)? {
+                        pending.push(Task::Constructor(
+                            Head {
+                                relative: true,
+                                name: Name::anonymous(),
+                            },
+                            Cow::Borrowed(syntax),
+                            values.len(),
+                            record
+                                .fields
+                                .iter()
+                                .map(|(label, _)| Some(label.clone()))
+                                .collect(),
+                            record.ellipsis,
+                            true,
+                        ));
+                        pending.extend(
+                            record
+                                .fields
+                                .into_iter()
+                                .rev()
+                                .map(|(_, value)| Task::Visit(value)),
+                        );
                         continue;
                     }
                     // `⟨p, …⟩`: a constructor pattern whose head is the column type's only
@@ -612,6 +640,7 @@ impl Context {
                             Cow::Owned(anonymous_head()),
                             values.len(),
                             vec![None; elements.len()],
+                            false,
                             false,
                         ));
                         pending.extend(elements.into_iter().rev().map(Task::Visit));
@@ -703,6 +732,7 @@ impl Context {
                             values.len(),
                             labels,
                             ellipsis,
+                            false,
                         ));
                         pending.extend(fields.into_iter().rev().map(Task::Visit));
                     } else {
@@ -1015,7 +1045,10 @@ impl Context {
                         if head.relative {
                             for (candidate, family) in &explicit {
                                 self.tick()?;
-                                if family.append_core(&c.head.name) == candidate.name {
+                                if family.append_core(&c.head.name) == candidate.name
+                                    || c.head.name.is_anonymous()
+                                        && matches!(self.txn.env.find(family), Some(ConstantInfo::Induct(info)) if info.ctors.len() == 1)
+                                {
                                     if !head.relative && head != *candidate {
                                         return Err(invalid());
                                     }
@@ -1059,7 +1092,7 @@ impl Context {
                         let named = matrix.rows.iter().any(|row| {
                             matches!(&arena[row.patterns[0]], Pattern::Constructor(other)
                                 if canonical[&other.head] == canonical[&constructor.head]
-                                    && other.labels.iter().any(Option::is_some))
+                                    && (other.record || other.labels.iter().any(Option::is_some)))
                         });
                         // A pattern without `..` fixes the head's arity in this column, and one
                         // with `..` may write a prefix of it. When every pattern of the head
@@ -1138,7 +1171,9 @@ impl Context {
                         let mut subjects = fields.clone();
                         subjects.extend(matrix.subjects.iter().cloned());
                         let resolved = &canonical[&constructor.head];
-                        let head = if resolved.relative {
+                        let head = if constructor.record {
+                            anonymous_head()
+                        } else if resolved.relative {
                             self.copy_pattern_syntax(&constructor.syntax)?
                         } else {
                             // This name was resolved against the admitted
@@ -1184,7 +1219,36 @@ impl Context {
                                 if other.ellipsis {
                                     args.push(ellipsis());
                                 }
-                                rows.push(null(args));
+                                rows.push(if other.record {
+                                    let record =
+                                        records::parts(&other.syntax)?.ok_or_else(invalid)?;
+                                    let mut annotation = record
+                                        .annotation
+                                        .map(|syntax| self.copy_pattern_syntax(syntax))
+                                        .transpose()?;
+                                    if let Some(mut type_) = annotation.take() {
+                                        // Earlier pattern columns are private until the row's
+                                        // body. An annotation still sees their written aliases.
+                                        for (name, subject) in row.bindings.iter().rev() {
+                                            self.tick()?;
+                                            type_ = Syntax::node(
+                                                parser_kind(&["Term", "matrixAlias"]),
+                                                vec![
+                                                    identifier(name.clone()),
+                                                    identifier(subject.clone()),
+                                                    type_,
+                                                ],
+                                            );
+                                        }
+                                        annotation = Some(type_);
+                                    }
+                                    Syntax::node(
+                                        parser_kind(&["Term", "matrixRecordLayout"]),
+                                        vec![null(args), null(annotation.into_iter().collect())],
+                                    )
+                                } else {
+                                    null(args)
+                                });
                             }
                             Syntax::node(
                                 parser_kind(&["Term", "matrixCtorPattern"]),

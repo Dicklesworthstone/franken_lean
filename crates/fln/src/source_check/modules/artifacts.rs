@@ -259,6 +259,75 @@ impl PendingArtifact {
                 });
         }
         let remaining = meter.limits.max_work.saturating_sub(meter.work);
+        let exported = fln_elab::implemented_by::export::registrations(base, checked, remaining)
+            .map_err(|error| match error {
+                fln_elab::implemented_by::ImplementedByError::Limit => {
+                    SourceModuleCheckError::Limit {
+                        resource: "module work",
+                        limit: meter.limits.max_work,
+                    }
+                }
+                _ => SourceModuleCheckError::Extension {
+                    module: name.clone(),
+                    extension: fln_elab::implemented_by::journal_name(),
+                    reason: "invalid executable attribute metadata export",
+                },
+            })?;
+        let rows = exported.ok_or_else(|| SourceModuleCheckError::Extension {
+            module: name.clone(),
+            extension: fln_elab::implemented_by::journal_name(),
+            reason: "executable attributes must belong to declarations defined in this module",
+        })?;
+        meter.work(rows.work)?;
+        meter.bytes(rows.bytes_examined)?;
+        for (declaration, implementation) in rows.entries {
+            meter.work(1)?;
+            metadata
+                .implemented_by
+                .push(fln_olean::source_extensions::ImplementedByEntry {
+                    declaration,
+                    implementation,
+                });
+        }
+        let remaining = meter.limits.max_work.saturating_sub(meter.work);
+        let exported = fln_elab::externs::export::registrations(base, checked, remaining).map_err(
+            |error| match error {
+                fln_elab::externs::ExternError::Limit => SourceModuleCheckError::Limit {
+                    resource: "module work",
+                    limit: meter.limits.max_work,
+                },
+                _ => SourceModuleCheckError::Extension {
+                    module: name.clone(),
+                    extension: fln_elab::externs::journal_name(),
+                    reason: "invalid executable attribute metadata export",
+                },
+            },
+        )?;
+        let rows = exported.ok_or_else(|| SourceModuleCheckError::Extension {
+            module: name.clone(),
+            extension: fln_elab::externs::journal_name(),
+            reason: "executable attributes must belong to declarations defined in this module",
+        })?;
+        meter.work(rows.work)?;
+        meter.bytes(rows.bytes_examined)?;
+        for (declaration, entries) in rows.entries {
+            use fln_elab::externs::ExternEntry as Native;
+            use fln_olean::source_extensions::{ExternAttribute, ExternEntry as Wire};
+            meter.work(entries.len().saturating_add(1))?;
+            metadata.externs.push(ExternAttribute {
+                declaration,
+                entries: entries
+                    .into_iter()
+                    .map(|entry| match entry {
+                        Native::Adhoc { backend } => Wire::Adhoc { backend },
+                        Native::Inline { backend, pattern } => Wire::Inline { backend, pattern },
+                        Native::Standard { backend, symbol } => Wire::Standard { backend, symbol },
+                        Native::Opaque => Wire::Opaque,
+                    })
+                    .collect(),
+            });
+        }
+        let remaining = meter.limits.max_work.saturating_sub(meter.work);
         let exported = fln_elab::macro_inline::export::registrations(base, checked, remaining)
             .map_err(|error| match error {
                 fln_elab::macro_inline::MacroInlineError::Limit => SourceModuleCheckError::Limit {

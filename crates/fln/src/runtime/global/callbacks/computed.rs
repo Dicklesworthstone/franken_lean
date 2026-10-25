@@ -114,6 +114,9 @@ impl Preparation<'_> {
             &mut self.visited,
             self.limits,
         )?;
+        if self.has_extern_attribute(name)? {
+            return Ok(None);
+        }
         let definition = self.normalize_definition_signature(&definition)?;
         self.inline_callback_arguments(definition, args)
     }

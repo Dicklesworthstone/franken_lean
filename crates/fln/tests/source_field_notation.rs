@@ -40,6 +40,24 @@ fn collections_resolve_methods_and_insert_the_receiver_after_function_arguments(
 }
 
 #[test]
+fn defaulted_callback_results_resume_chained_field_constraints() {
+    // The callback's numeral defaults only after both function binders have
+    // closed. Its type equations must resume before the second field lookup.
+    // This is an ordinary user family; no native Thunk name selects the fix.
+    let declarations = "structure Delayed (A : Type) where\n  run : Nat -> A\n\
+                        def Delayed.get {A : Type} (x : Delayed A) : A := x.run 0\n\
+                        def through {A : Type} (f : Nat -> A) : A := f 0\n";
+    for value in [
+        "let t := Delayed.mk (fun _ => Delayed.mk (fun _ => 21)); t.get.get + t.get.get",
+        "let t := Delayed.mk (fun _ => through (fun _ => Delayed.mk (fun _ => 21))); t.get.get + t.get.get",
+    ] {
+        check(&format!(
+            "{declarations}def value := {value}\ntheorem computes : value = 42 := by rfl"
+        ));
+    }
+}
+
+#[test]
 fn proof_methods_use_the_receivers_actual_dependent_type() {
     check(
         "theorem reverse.{u} {A B : Sort u} {a : A} {b : B} (h : HEq a b) : HEq b a := h.symm\n\

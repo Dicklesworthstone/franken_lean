@@ -333,6 +333,7 @@ pub fn registration(
     let mut macro_inline = false;
     for attribute in super::visibility::attributes(&modifiers[1])? {
         if super::visibility::exposure_attribute(attribute)?.is_some()
+            || super::executable::attribute(attribute)?.is_some()
             || instance_command::default_attribute(attribute)?.is_some()
             || instance_command::attribute_priority(attribute)?.is_some()
         {

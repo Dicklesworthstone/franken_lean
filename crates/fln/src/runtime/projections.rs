@@ -42,6 +42,7 @@ enum ProjectionFrame {
     LetValue(Name, Expr, Expr, bool),
     LetBody(Name, Expr, Expr, bool),
     Projection(Name, u64),
+    Thunk(Expr),
 }
 
 impl Preparation<'_> {
@@ -55,6 +56,9 @@ impl Preparation<'_> {
     ) -> Result<Option<Expr>, IngressError> {
         if let Some(replacement) = self.implemented_by_call(head, arguments)? {
             return Ok(Some(replacement));
+        }
+        if let Some(getter) = self.thunk_call(head, arguments)? {
+            return Ok(Some(getter));
         }
         let ExprNode::Const { name, levels } = head.node() else {
             return Ok(None);
@@ -158,6 +162,14 @@ impl Preparation<'_> {
         receiver: &Expr,
     ) -> Result<Option<Expr>, IngressError> {
         self.tick()?;
+        if self.thunk_record_forbidden(family)? {
+            let Some(type_) = self.projection_receiver_type(receiver, &[])? else {
+                return Ok(None);
+            };
+            return self
+                .thunk_projection_factory(&type_, family, index)
+                .map(|factory| factory.map(|factory| Expr::app(factory, receiver.clone())));
+        }
         let key = specialize::closed(receiver).then(|| (family.clone(), index, receiver.clone()));
         if let Some(value) = key
             .as_ref()
@@ -596,6 +608,13 @@ impl Preparation<'_> {
                                 // parameters still refer to an existential type field.
                                 // Select the uniform layout before discarding that context.
                                 let runtime_type = self.erase_hidden_types(&type_, &locals)?;
+                                if let Some(factory) =
+                                    self.thunk_projection_factory(&runtime_type, struct_name, *idx)?
+                                {
+                                    tasks.push(ProjectionFrame::Thunk(factory));
+                                    tasks.push(ProjectionFrame::Visit(receiver.clone()));
+                                    continue;
+                                }
                                 if let Some((shape, _)) =
                                     self.projection_slot(&runtime_type, struct_name, *idx)?
                                     && self.value_type(&shape.source)?
@@ -662,6 +681,10 @@ impl Preparation<'_> {
                 ProjectionFrame::Projection(name, index) => {
                     let receiver = pop(&mut values)?;
                     values.push(Expr::proj(name, index, receiver));
+                }
+                ProjectionFrame::Thunk(factory) => {
+                    let receiver = pop(&mut values)?;
+                    values.push(Expr::app(factory, receiver));
                 }
             }
         }

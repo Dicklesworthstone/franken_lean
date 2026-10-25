@@ -5,6 +5,8 @@
 //! declaration authority nor an implementation for an unsupported runtime ABI.
 //! Readers validate the whole journal, including overwritten rows, and resolve
 //! replacement chains before any executable body is selected.
+pub mod export;
+
 use crate::instances::{InstanceRegistryError, read_name, write_name};
 use fln_core::name::Name;
 use fln_env::environment::Environment;

@@ -146,6 +146,251 @@ fn same(engine: &Engine, left: &str, right: &str) {
 }
 
 #[test]
+fn record_patterns_select_actual_structure_fields_in_written_order() {
+    with_fixture(|base, compiler| {
+        check(
+            base,
+            compiler,
+            r#"
+structure Pair where
+  left : Nat
+  right : Nat
+def direct : Pair -> Nat | { left := x, right := y } => x
+def reordered : Pair -> Nat | { right := y, left := x } => y
+def takeRight : Pair -> Nat | { right := y, .. } => y
+def annotated : Pair -> Nat | { right := y, .. : Pair } => y
+def whole : Pair -> Pair | all@{ left := x, .. } => all
+def explicitMatch (p : Pair) : Nat := match p with | { left := x, right := y } => x
+def abbreviated : Pair -> Nat | { left, right } => right
+theorem direct_eq : Eq (direct { left := 4, right := 9 }) 4 := Eq.refl 4
+theorem reordered_eq : Eq (reordered { left := 4, right := 9 }) 9 := Eq.refl 9
+theorem partial_eq : Eq (takeRight { left := 4, right := 9 }) 9 := Eq.refl 9
+theorem explicit_eq : Eq (explicitMatch { left := 4, right := 9 }) 4 := Eq.refl 4
+theorem abbreviated_eq : Eq (abbreviated { left := 4, right := 9 }) 9 := Eq.refl 9
+"#,
+        );
+    });
+}
+
+#[test]
+fn record_patterns_cover_inherited_nested_and_repeated_field_paths() {
+    with_fixture(|base, compiler| {
+        check(
+            base,
+            compiler,
+            r#"
+structure Base where
+  left : Nat
+structure Child extends Base where
+  right : Nat
+structure Nested where
+  child : Child
+  flag : Bool
+def inherited : Child -> Nat | { left := x, right := y } => x
+def parent : Child -> Nat | { toBase := { left := x }, right := y } => y
+def nested : Nested -> Nat | { child := { right := y, .. }, flag := _ } => y
+def dotted : Nested -> Nat | { child.left := x, child.right := y, flag := _ } => x
+def alternatives : Nested -> Nat
+  | { child.left := x, flag := true, .. } => x
+  | { child := { right := y, .. }, flag := false } => y
+theorem inherited_eq : Eq (inherited { left := 4, right := 9 }) 4 := Eq.refl 4
+theorem parent_eq : Eq (parent { left := 4, right := 9 }) 9 := Eq.refl 9
+theorem nested_eq : Eq (nested { child := { left := 4, right := 9 }, flag := true }) 9 := Eq.refl 9
+theorem dotted_eq : Eq (dotted { child := { left := 4, right := 9 }, flag := true }) 4 := Eq.refl 4
+theorem true_eq : Eq (alternatives { child := { left := 4, right := 9 }, flag := true }) 4 := Eq.refl 4
+theorem false_eq : Eq (alternatives { child := { left := 4, right := 9 }, flag := false }) 9 := Eq.refl 9
+"#,
+        );
+    });
+}
+
+#[test]
+fn dependent_record_patterns_keep_implicit_fields_and_scope_checks() {
+    with_fixture(|base, compiler| {
+        check(
+            base,
+            compiler,
+            r#"
+structure Pack : Type 1 where
+  A : Type
+  value : A
+def rebuild : Pack -> Pack | { A := A, value := x } => { A := A, value := x }
+abbrev PackAlias := Pack
+def aliasRebuild : PackAlias -> Pack | { A := A, value := x } => { A := A, value := x }
+structure ImplicitPack : Type 1 where
+  {A : Type}
+  value : A
+def implicitRebuild : ImplicitPack -> ImplicitPack | { A := A, value := x } => @ImplicitPack.mk A x
+def inferred : ImplicitPack -> ImplicitPack | { value := x, .. } => { value := x }
+def implicitConstruct : ImplicitPack := ImplicitPack.mk 4
+structure InstancePack where
+  [inst : Inhabited Nat]
+  value : Nat
+def instanceRebuild : InstancePack -> InstancePack | { inst := h, value := x } => @InstancePack.mk h x
+def instanceIgnored : InstancePack -> Nat | { value := x, .. } => x
+def instanceConstruct [h : Inhabited Nat] : InstancePack := InstancePack.mk 4
+structure Box (A : Type) where
+  value : A
+def annotatedColumn : (A : Type) -> Box A -> A
+  | A, { value := x : Box A } => x
+"#,
+        );
+    });
+}
+
+#[test]
+fn record_pattern_branches_execute_on_the_native_vm_like_the_pin() {
+    with_fixture(|_, compiler| {
+        let library = compiler
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("lib/lean");
+        let root_module = Name::from_components(["Init", "Data", "Repr"]);
+        let mut pending = vec![root_module.clone()];
+        let mut artifacts = std::collections::BTreeMap::new();
+        while let Some(module) = pending.pop() {
+            if artifacts.contains_key(&module) {
+                continue;
+            }
+            assert!(artifacts.len() < 256, "bounded actual Repr import closure");
+            let path = library
+                .join(module.to_display_string().replace('.', "/"))
+                .with_extension("olean");
+            let parts = [
+                std::fs::read(&path).unwrap(),
+                std::fs::read(path.with_extension("olean.server")).unwrap(),
+                std::fs::read(path.with_extension("olean.private")).unwrap(),
+            ];
+            pending.extend(
+                fln::olean_module_imports(&parts[0], fln::OleanDecodeLimits::new(STACK)).unwrap(),
+            );
+            artifacts.insert(module, parts);
+        }
+        let inputs: Vec<_> = artifacts
+            .iter()
+            .map(|(module, parts)| OleanModuleInput {
+                name: module,
+                artifact: &parts[0],
+                server_artifact: Some(&parts[1]),
+                private_artifact: Some(&parts[2]),
+            })
+            .collect();
+        let mut admission =
+            SourceOleanImportLimits::new(OleanCheckLimits::new(STACK, limits().admission.kernel));
+        admission.jobs.threads = std::num::NonZeroUsize::new(1).unwrap();
+        admission.jobs.worker_stack_bytes = STACK;
+        admission.read_jobs = admission.jobs;
+        let base = Engine::builder()
+            .build_empty()
+            .import_olean_modules_for_source(&inputs, &[root_module], &KVMap::new(), admission)
+            .unwrap()
+            .into_complete()
+            .unwrap()
+            .engine;
+        let source = r#"
+structure Base where
+  left : Nat
+structure Child extends Base where
+  right : Nat
+structure Nested where
+  child : Child
+  flag : Bool
+def first : Child -> Nat | { left := x, .. } => x
+def second : Child -> Nat | { right := y, .. } => y
+def total : Child -> Nat | { right := y, left := x } => Nat.add x y
+def whole : Child -> Child | all@{ left := _, .. } => all
+def nested : Nested -> Nat | { child := { right := y, .. }, flag := _ } => y
+def alternatives : Nested -> Nat
+  | { child.left := x, flag := true, .. } => x
+  | { child := { right := y, .. }, flag := false } => y
+def dotted : Nested -> Nat | { child.left := x, child.right := y, flag := _ } => Nat.add x y
+#eval first { left := 4, right := 9 }
+#eval second { left := 4, right := 9 }
+#eval total { left := 4, right := 9 }
+#eval (whole { left := 4, right := 9 }).left
+#eval nested { child := { left := 4, right := 9 }, flag := true }
+#eval alternatives { child := { left := 4, right := 9 }, flag := true }
+#eval alternatives { child := { left := 4, right := 9 }, flag := false }
+#eval dotted { child := { left := 4, right := 9 }, flag := true }
+"#;
+        let path = std::env::temp_dir().join(format!(
+            "fln-record-pattern-runtime-{}.lean",
+            std::process::id()
+        ));
+        std::fs::write(&path, format!("prelude\nimport Init.Data.Repr\n{source}")).unwrap();
+        let pinned = Command::new(compiler).arg(path).output().unwrap();
+        assert!(pinned.status.success(), "{pinned:?}");
+        assert_eq!(
+            String::from_utf8(pinned.stdout).unwrap(),
+            "4\n9\n13\n4\n9\n4\n9\n13\n"
+        );
+        assert!(pinned.stderr.is_empty());
+        let options = KVMap::new();
+        let root = base.logical_root(&options);
+        let result = base
+            .execute_source_commands_with_checks(
+                source.as_bytes(),
+                &options,
+                fln::EngineExecutionLimits::new(limits().admission.kernel),
+            )
+            .unwrap()
+            .into_complete()
+            .expect("record patterns compile and execute natively");
+        let values: Vec<_> = result
+            .batch
+            .source_evaluation_indices
+            .iter()
+            .map(|index| {
+                fln::closed_vm_value(&result.batch.executions[*index].exit)
+                    .unwrap()
+                    .unwrap()
+            })
+            .collect();
+        let expected = [4, 9, 13, 4, 9, 4, 9, 13].map(fln::ClosedVmValue::Scalar);
+        assert_eq!(values, expected);
+        assert_eq!(base.logical_root(&options), root);
+    });
+}
+
+#[test]
+fn invalid_record_patterns_are_semantic_refusals_and_publish_no_declarations() {
+    with_fixture(|base, compiler| {
+        for source in [
+            "structure R where\n a : Nat\n b : Nat\ndef bad : R -> Nat | { a := x } => x",
+            "structure R where\n a : Nat\n b : Nat := 8\ndef bad : R -> Nat | { a := x } => x",
+            "structure R where\n a : Nat\ndef bad : R -> Nat | { nope := x, .. } => x",
+            "structure R where\n a : Nat\ndef bad : R -> Nat | { a := x, a := y } => x",
+            "structure R where\n a : Nat\n b : Nat\ndef bad : R -> Nat | { a := x, b := x } => x",
+            "inductive R where\n | mk (a : Nat)\ndef bad : R -> Nat | { a := x } => x",
+            "structure R where\n {a : Nat}\n b : Nat\ndef bad : R -> Nat | { b := x } => x",
+            "structure R where\n [h : Inhabited Nat]\n b : Nat\ndef bad : R -> Nat | { b := x } => x",
+            "structure R where\n a : Nat\nstructure S where\n a : Nat\ndef bad : R -> Nat | { a := x : S } => x",
+            "structure Base where\n a : Nat\nstructure R extends Base where\n b : Nat\ndef bad : R -> Nat | { toBase := p, a := x, b := y } => x",
+            "structure Base where\n a : Nat\n b : Nat\nstructure R where\n inner : Base\ndef bad : R -> Nat | { inner.a := x } => x",
+            "structure Pack : Type 1 where\n A : Type\n value : A\ndef bad : Pack -> Pack | { value := x, A := A } => { A := A, value := x }",
+            "structure Pack : Type 1 where\n A : Type\n value : A\nabbrev Alias := Pack\ndef bad : Alias -> Pack | { value := x, A := A } => { A := A, value := x }",
+            "structure Pack : Type 1 where\n A : Type\n value : A\ndef Alias := Pack\ndef bad : Alias -> Pack | { value := x, A := A } => { A := A, value := x }",
+        ] {
+            oracle(compiler, source, false);
+            let options = KVMap::new();
+            let root = base.logical_root(&options);
+            let error = base
+                .check_source_files(&[source.as_bytes()], &options, limits())
+                .unwrap_err();
+            assert_eq!(error.disposition().2, 1, "{source}\n{error:?}");
+            assert_eq!(
+                error.disposition().0,
+                "elaboration",
+                "semantic refusal required: {source}\n{error:?}"
+            );
+            assert_eq!(base.logical_root(&options), root);
+        }
+    });
+}
+
+#[test]
 fn expected_results_infer_all_explicit_arguments_without_eta_expansion() {
     with_fixture(|base, compiler| {
         let engine = check(

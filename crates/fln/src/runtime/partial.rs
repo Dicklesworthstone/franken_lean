@@ -29,6 +29,24 @@ impl Preparation<'_> {
     ) -> Result<Option<DefinitionVal>, IngressError> {
         let replacement = self.executable_replacement(requested)?;
         let requested = replacement.as_ref().unwrap_or(requested);
+        // An explicit extern selects native code, never the stored logical
+        // fallback. Check unknown ABI requests before specialization can erase
+        // the name; supported native names stay available to their ordinary
+        // model-checked intrinsic path without exposing a definition body.
+        source_intrinsics::check_selected_extern_attribute(
+            self.environment,
+            requested,
+            &mut self.externs,
+            &mut self.visited,
+            self.limits,
+        )?;
+        if self
+            .externs
+            .as_ref()
+            .is_some_and(|table| table.get(requested).is_some())
+        {
+            return Ok(None);
+        }
         self.recursive_definition(requested)
     }
 

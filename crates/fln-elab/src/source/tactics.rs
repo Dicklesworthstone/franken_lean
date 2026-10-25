@@ -20,6 +20,7 @@ mod empty;
 mod equality;
 mod extensionality;
 mod false_or_by_contra;
+mod grind;
 mod guard;
 mod guard_hyp;
 mod index_equations;
@@ -1664,6 +1665,8 @@ impl Context {
                 });
             } else if kind == &parser_kind(&["Tactic", "split"]) {
                 self.split_proof_goal(proof, goal, args)?;
+            } else if kind == &parser_kind(&["Tactic", "grind"]) {
+                self.grind_proof_goal(goal, args)?;
             } else if kind == &parser_kind(&["Tactic", "omega"]) {
                 let [keyword, config] = args.as_slice() else {
                     return Err(error(TacticError::MalformedScript));
