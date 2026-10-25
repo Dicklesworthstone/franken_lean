@@ -90,6 +90,9 @@ impl Preparation<'_> {
         if let Some(diagnostic) = self.diagnostic_call(head, arguments)? {
             return Ok(Some(diagnostic));
         }
+        if let Some(thunk) = self.thunk_call(head, arguments)? {
+            return Ok(Some(thunk));
+        }
         let Some(specialized) = self.specialize_call(head, arguments)? else {
             return Ok(None);
         };

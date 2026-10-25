@@ -64,6 +64,14 @@ impl Preparation<'_> {
                         if self.has_implementation(name)? {
                             return Ok(None);
                         }
+                        // A cached Thunk is a runtime allocation, not an inert
+                        // dictionary. Unfolding pure/get here could duplicate
+                        // that allocation or expose its nonmemoized field.
+                        if crate::source_intrinsics::thunks::Operation::from_name(name).is_some()
+                            && self.thunk_record_forbidden(&Name::from_components(["Thunk"]))?
+                        {
+                            return Ok(None);
+                        }
                         // A verified primitive is inert as a function value,
                         // whether its logical declaration is an axiom or a
                         // definition. Keep its name in dictionary fields so
