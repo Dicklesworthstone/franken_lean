@@ -166,7 +166,8 @@ fn resource_nonanswers_are_preserved_for_literal_declarations() {
     limited.kernel = limited.kernel.narrowed(0, limited.kernel.depth);
     let source = b"def p : Point := { x := 1 }";
     let parsed = fln_parse::parse_definition(source).unwrap();
-    // Witness the actual elaboration-time K1 stop, before facade admission.
+    // With no kernel steps, the declared type is checked before any field
+    // assignment. Preserve that exact elaboration-time K1 nonanswer at admission.
     let raw = fln_elab::elaborate_definition_in_with_budget(
         parsed.syntax(),
         base.environment(),
@@ -174,18 +175,20 @@ fn resource_nonanswers_are_preserved_for_literal_declarations() {
     )
     .unwrap_err();
     let fln_elab::NatDefinitionElabError::Inference(
-        fln_elab::source::SourceInferenceError::Unification(error),
+        fln_elab::source::SourceInferenceError::TypeObligation(outcome),
     ) = raw
     else {
-        panic!("expected assignment checking to reach K1: {raw:?}");
-    };
-    let fln_elab::constraint::unify::UnificationError::AssignmentCheck { outcome, .. } = *error
-    else {
-        panic!("expected a kernel assignment outcome: {error:?}");
+        panic!("expected the declared type to reach K1: {raw:?}");
     };
     let Outcome::Inconclusive(expected) = *outcome else {
         panic!("expected a kernel resource stop: {outcome:?}");
     };
+    assert!(matches!(
+        &expected.cause,
+        fln_core::outcome::InconclusiveCause::ResourceExhausted { usage }
+            if usage.reason == fln_core::diag::ResourceReason::ExecutionSteps
+                && usage.allowed == 0 && usage.observed == 1
+    ));
     let result = base.admit_source_declaration(source, &KVMap::new(), limited);
     let Ok(Outcome::Inconclusive(actual)) = result else {
         panic!("expected facade nonanswer: {result:?}");

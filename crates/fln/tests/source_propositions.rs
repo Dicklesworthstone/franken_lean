@@ -183,7 +183,19 @@ end Examples"#;
     assert_eq!(result.commands, 12);
     assert_eq!(result.theorems, 0);
     assert_eq!(result.base_logical_root, root);
-    assert_eq!(result.result_logical_root, root);
+    // Entering an empty namespace records it even without declarations.
+    // Examples must add nothing beyond those same ordinary scope commands.
+    let scopes_only = check(
+        "namespace Examples\nsection\nvariable {A : Type u} (x : A) (P : Prop) (h : P)\nend\nend Examples",
+    );
+    assert_ne!(scopes_only.result_logical_root, root);
+    assert_eq!(result.result_logical_root, scopes_only.result_logical_root);
+    assert!(
+        fln_elab::namespaces::read(result.engine.environment())
+            .unwrap()
+            .contains(&Name::from_components(["Examples"]))
+    );
+    assert_eq!(base.logical_root(&options), root);
     assert_eq!(result.engine.environment().len(), base.environment().len());
     assert!(
         !result
