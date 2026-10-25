@@ -979,6 +979,19 @@ impl Context {
                             Ok(value)
                         }
                     })
+                    .or_else(|problem| {
+                        // A failed synthetic argument can leave holes whose later
+                        // assignment reports a scope error. The selected body's
+                        // earlier termination diagnostic still belongs to this
+                        // candidate. Explicit tactic rollback restores that list;
+                        // internal faults and resource stops keep their own outcome.
+                        if tactics::backtrack::recoverable(&problem) {
+                            self.require_no_postponed_recursion_since(
+                                snapshot.postponed_application_errors.len(),
+                            )?;
+                        }
+                        Err(problem)
+                    })
                     .and_then(|value| {
                         self.require_no_postponed_recursion_since(
                             snapshot.postponed_application_errors.len(),

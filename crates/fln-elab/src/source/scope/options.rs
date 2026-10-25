@@ -836,6 +836,8 @@ mod tests {
         // `tactic.skipAssignedInstances`: matching/instance_args.rs;
         // source_simp_instance_matching exercises both values.
         // `autoImplicit`: `auto_bound_name` (source.rs); `source_auto_bound_implicits` sets it false.
+        // `stderrAsMessages`: the source executor's stderr routing (`fln`, `lib.rs`);
+        // runtime/stdout/tests/input/stderr.rs exercises scoped and persistent values.
         // `linter.*`: the unused-variables, deprecated-syntax and defProp warnings (`fln`,
         // `unused_variables.rs` and `linters.rs`); `unused_variables_lint` sets each one.
         // `warn.sorry`: the source executor's "declaration uses `sorry`" warning (`fln`,
@@ -847,6 +849,7 @@ mod tests {
             [
                 "tactic.skipAssignedInstances",
                 "autoLift",
+                "stderrAsMessages",
                 "maxHeartbeats",
                 "synthInstance.maxSize",
                 "autoImplicit",
