@@ -340,6 +340,9 @@ pub(crate) fn tactic(
             "fail",
             "omega",
             "unfold",
+            // `syntax (name := delta) "delta" (ppSpace colGt ident)+ (location)? : tactic`
+            // (`Init/Tactics.lean:812`), `unfold`'s shape.
+            "delta",
             "split",
             "rwa",
             "intros",
@@ -375,6 +378,9 @@ pub(crate) fn tactic(
             // `syntax (name := guardTarget) "guard_target " equal term : tactic` (`Init/Guard.lean:75`).
             "guard_target",
             "guard_hyp",
+            // `syntax (name := guardExpr) "guard_expr " term:51 equal term : tactic`
+            // (`Init/Guard.lean:61`).
+            "guard_expr",
             // `macro "admit" : tactic => `(tactic| sorry)` (`Init/Tactics.lean:462`).
             "admit",
             // `syntax (name := traceState) "trace_state" : tactic` and
@@ -425,7 +431,7 @@ pub(crate) fn tactic(
         "rw" | "rewrite" | "rwa" | "erw" | "rw_mod_cast" => {
             rewrite(leaves, view, tokens, range, atom, keyword)
         }
-        "unfold" | "split" => located(leaves, view, tokens, range, atom, keyword),
+        "unfold" | "split" | "delta" => located(leaves, view, tokens, range, atom, keyword),
         "obtain" | "rcases" | "rintro" | "ext" | "ext1" => {
             rcases::tactic(leaves, view, tokens, range, keyword, atom)
         }
@@ -436,6 +442,7 @@ pub(crate) fn tactic(
         "suffices" => suffices(leaves, view, tokens, range, atom),
         "change" => change(leaves, view, tokens, range, atom),
         "guard_target" => guard_target(leaves, view, tokens, range, atom),
+        "guard_expr" => guard_expr(leaves, view, tokens, range, atom),
         "guard_hyp" => guard_hyp::parse(leaves, view, tokens, range, atom),
         // `"specialize " term` (`Init/Tactics.lean`) has `exact`'s shape.
         "exact" | "apply" | "refine" | "specialize" | "show" => {
@@ -957,6 +964,80 @@ fn guard_target(
     ))
 }
 
+/// `"guard_expr " term:51 equal term` (`Init/Guard.lean:61`): every `equal` relation is at
+/// precedence 50, so the first one outside brackets ends the left term.
+#[inline(never)]
+fn guard_expr(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    range: Range<usize>,
+    atom: Syntax,
+) -> Result<Syntax, NatDefinitionParseError> {
+    let relation_kind = |at: usize| match &tokens[at].kind {
+        TokenKind::Symbol(symbol) => match symbol.as_str() {
+            "=" => Some("equalR"),
+            "=~" => Some("equalD"),
+            "=ₛ" => Some("equalS"),
+            "=ₐ" => Some("equalA"),
+            _ => None,
+        },
+        _ => None,
+    };
+    let mut depth = 0_usize;
+    let mut found = None;
+    for at in range.start + 1..range.end {
+        if let TokenKind::Symbol(symbol) = &tokens[at].kind {
+            match crate::canonical_bracket(symbol.as_str()) {
+                "(" | "[" | "{" | ".{" | "⦃" | "⟨" => depth += 1,
+                ")" | "]" | "}" | "⦄" | "⟩" => {
+                    depth = depth
+                        .checked_sub(1)
+                        .ok_or_else(|| refusal(view, tokens, at))?;
+                }
+                _ if depth == 0 => {
+                    if let Some(kind) = relation_kind(at) {
+                        found = Some((at, kind));
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let Some((relation, kind)) = found else {
+        return Err(refusal(view, tokens, range.end));
+    };
+    if relation == range.start + 1 || relation + 1 >= range.end {
+        return Err(refusal(view, tokens, relation));
+    }
+    let left = bounded_term(
+        leaves,
+        view,
+        tokens,
+        range.start + 1..relation,
+        DefinitionGrammar::Scalar,
+    )?;
+    let equal = Syntax::node(
+        parser_kind(&["equal"]),
+        vec![Syntax::node(
+            parser_kind(&[kind]),
+            vec![leaves.leaf(relation)?],
+        )],
+    );
+    let right = bounded_term(
+        leaves,
+        view,
+        tokens,
+        relation + 1..range.end,
+        DefinitionGrammar::Scalar,
+    )?;
+    Ok(Syntax::node(
+        parser_kind(&["Tactic", "guardExpr"]),
+        vec![atom, left, equal, right],
+    ))
+}
+
 #[inline(never)]
 fn change(
     leaves: &Leaves,
@@ -1352,7 +1433,7 @@ fn located(
 ) -> Result<Syntax, NatDefinitionParseError> {
     let (range, location) = locations::split(leaves, view, tokens, range)?;
     let arguments = range.start + 1..range.end;
-    let argument = if form == "unfold" {
+    let argument = if form == "unfold" || form == "delta" {
         if arguments.is_empty() {
             return Err(refusal(view, tokens, range.start));
         }

@@ -51,6 +51,8 @@ pub enum TacticError {
     /// `guard_target`'s comparison failed (`evalGuardTarget`: "The main goal is … but was
     /// expected to be …").
     GuardTargetMismatch,
+    /// `guard_expr`'s comparison failed (`evalGuardExpr`: "Failed: `a` is not … `b`").
+    GuardExprMismatch,
     /// `guard_hyp` must refer to a local, not a constant or computed expression.
     GuardHypExpectedLocal,
     GuardHypTypeMismatch(Name),
@@ -103,6 +105,12 @@ pub enum TacticError {
         hint: bool,
     },
     UnfoldFailed(Name),
+    /// `delta` changed none of its selected types (`evalDelta`, vendored
+    /// src/Lean/Elab/Tactic/Delta.lean); `at` names the hypothesis that did not change.
+    DeltaFailed {
+        declarations: Vec<Name>,
+        at: Option<Name>,
+    },
     /// `unfold f` at an occurrence whose match the argument does not reduce. The pin rewrites
     /// it by `f`'s unfold equation to a `match` (vendored `Lean/Meta/Tactic/Unfold.lean`), which
     /// this engine's compiled recursor application does not stand for. Never caught by
@@ -238,6 +246,10 @@ impl std::fmt::Display for TacticError {
                 f,
                 "guard_target: the main goal is not what it was expected to be"
             ),
+            Self::GuardExprMismatch => write!(
+                f,
+                "guard_expr: the two terms do not match by the given relation"
+            ),
             Self::GuardHypExpectedLocal => {
                 write!(f, "guard_hyp: expected a local hypothesis")
             }
@@ -330,6 +342,22 @@ impl std::fmt::Display for TacticError {
                 "unfold failed for `{}` in the selected location",
                 name.to_display_string()
             ),
+            // The pin's words, without the goal it appends.
+            Self::DeltaFailed { declarations, at } => {
+                write!(
+                    f,
+                    "Tactic `delta` failed: did not delta reduce [{}]",
+                    declarations
+                        .iter()
+                        .map(Name::to_display_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )?;
+                if let Some(at) = at {
+                    write!(f, " at {}", at.to_display_string())?;
+                }
+                Ok(())
+            }
             Self::UnfoldStuckMatch(name) => write!(
                 f,
                 "unfold of `{}` where its match does not reduce, which the pin shows as a `match`",
@@ -584,10 +612,11 @@ enum Work<'a> {
     EndScript(Vec<&'a Syntax>, usize),
 }
 #[derive(Clone)]
-// The lexical barrier restores both options and tactic-local instances.
+// The lexical barrier restores options, tactic-local instances and the ambient transparency.
 struct OptionScope<'a> {
     options: KVMap,
     instance_scopes: crate::instances::scoped::ActiveScopes,
+    transparency: Option<UnificationTransparency>,
     instructions: Vec<&'a Syntax>,
     cursor: usize,
 }
@@ -899,6 +928,22 @@ impl Context {
         &mut self,
         left: &Expr,
         right: &Expr,
+        mut budget: UnificationBudget,
+    ) -> Result<bool, NatDefinitionElabError> {
+        // `with_reducible` and its siblings cap the tactic's own comparisons too.
+        if self.tactic_transparency.is_some() {
+            budget.transparency = self.ambient_transparency(budget.transparency);
+            budget.offset_constraints = true;
+        }
+        self.proof_types_match_at(left, right, budget)
+    }
+
+    /// [`Self::proof_types_match_with_budget`] at exactly `budget`'s transparency, as a query
+    /// that fixes its own does (`withTransparency`).
+    fn proof_types_match_at(
+        &mut self,
+        left: &Expr,
+        right: &Expr,
         budget: UnificationBudget,
     ) -> Result<bool, NatDefinitionElabError> {
         self.flush(false)?;
@@ -949,9 +994,28 @@ impl Context {
         Ok(None)
     }
 
-    /// `rfl` on an `Eq` or `HEq` goal: both sides, and for `HEq` both types, are unified.
+    /// `rfl` on an `Eq`, `HEq` or `Iff` goal: both sides, and for `HEq` both types, are
+    /// unified. An `Iff` is the pin's latest `rfl` rule, `exact Iff.rfl` (vendored
+    /// src/Init/Core.lean:1042), where the environment declares `Iff.rfl`.
     pub(super) fn rfl_proof_goal(&mut self, goal: ProofGoal) -> Result<(), NatDefinitionElabError> {
         let target = self.whnf(&goal.target)?;
+        if let ExprNode::App { f, a: right } = target.node()
+            && let ExprNode::App { f: head, a: left } = f.node()
+            && matches!(head.node(), ExprNode::Const { name, levels }
+                if name == &Name::from_components(["Iff"]) && levels.is_empty())
+        {
+            let rfl = Name::from_components(["Iff", "rfl"]);
+            if self
+                .txn
+                .env
+                .find(&rfl)
+                .is_some_and(|info| info.constant_val().level_params.is_empty())
+            {
+                let (left, right) = (left.clone(), right.clone());
+                self.constrain(&left, &right)?;
+                return self.close_proof_goal(goal, Expr::app(Expr::const_(rfl, Vec::new()), left));
+            }
+        }
         if let Some((level, alpha, left, beta, right)) = equality::heterogeneous_target(&target) {
             self.constrain(&alpha, &beta)?;
             self.constrain(&left, &right)?;
@@ -1232,6 +1296,17 @@ impl Context {
                 let relation = guard::relation(relation)?;
                 if !self.guard_target_matches(&goal, relation, expected)? {
                     return Err(error(TacticError::GuardTargetMismatch));
+                }
+                proof.work.push(Work::Goal(goal));
+            } else if kind == &parser_kind(&["Tactic", "guardExpr"]) {
+                let [keyword, left, relation, right] = args.as_slice() else {
+                    return Err(error(TacticError::MalformedScript));
+                };
+                expect_atom(keyword, "guard_expr", "guard_expr keyword")?;
+                self.require_declared_tactic(&["Lean", "Parser", "Tactic", "guardExpr"])?;
+                let relation = guard::relation(relation)?;
+                if !self.guard_expr_holds(&goal, left, relation, right)? {
+                    return Err(error(TacticError::GuardExprMismatch));
                 }
                 proof.work.push(Work::Goal(goal));
             } else if kind == &parser_kind(&["Tactic", "guardHyp"]) {
@@ -1540,6 +1615,8 @@ impl Context {
                 }
             } else if kind == &parser_kind(&["Tactic", "unfold"]) {
                 self.unfold_proof_goal(proof, goal, args)?;
+            } else if kind == &parser_kind(&["Tactic", "delta"]) {
+                self.delta_proof_goal(proof, goal, args)?;
             } else if kind == &parser_kind(&["Tactic", "rwSeq"])
                 || kind == &parser_kind(&["Tactic", "rewriteSeq"])
             {

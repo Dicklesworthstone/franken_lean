@@ -191,7 +191,7 @@ impl Context {
 
     /// `expr` with every `let _ : T := e; _` that a non-`show` ascription elaborates to
     /// replaced by `e`.
-    pub(super) fn without_source_ascriptions(
+    pub(in crate::source) fn without_source_ascriptions(
         &mut self,
         root: &Expr,
     ) -> Result<Expr, NatDefinitionElabError> {

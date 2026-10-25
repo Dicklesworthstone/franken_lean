@@ -722,6 +722,10 @@ struct Context {
     // unfold equation, so an occurrence whose match is stuck becomes a `match`, which a
     // compiled recursor application does not print as.
     unfold_tactic: bool,
+    // The ambient transparency `with_reducible`, `with_reducible_and_instances` and
+    // `with_unfolding_none` set for the tactics they run (`withReducible` &c., vendored
+    // src/Lean/Elab/Tactic/BuiltinTactic.lean). `None` is the elaborator's own default.
+    tactic_transparency: Option<UnificationTransparency>,
     // A local recursive helper suspends its parent's structural compiler.
     // Complete parent calls still lower against that parent's hypotheses
     // before the helper closes over them as an opaque value.
@@ -840,6 +844,7 @@ impl Context {
             partial: None,
             noncomputable_definition: false,
             unfold_tactic: false,
+            tactic_transparency: None,
             enclosing_recursions: Vec::new(),
             postponed_eliminators: Vec::new(),
             postponed_coercions: Vec::new(),
@@ -1260,7 +1265,8 @@ impl Context {
     }
 
     fn whnf(&mut self, expr: &Expr) -> Result<Expr, NatDefinitionElabError> {
-        self.whnf_with_transparency(expr, UnificationTransparency::Default, true)
+        let transparency = self.ambient_transparency(UnificationTransparency::Default);
+        self.whnf_with_transparency(expr, transparency, true)
     }
 
     /// `` `a.b `` (`Term.quotedName`): the pin's `elabQuotedName` is `toExpr` of the literal's name
@@ -1400,6 +1406,17 @@ impl Context {
         expected: &Expr,
     ) -> Result<(), NatDefinitionElabError> {
         self.check_attempt_equation(actual, expected)?;
+        // Under a transparency the ambient tactic scope lowers, the pin's `isDefEq` unfolds
+        // no more than it allows; the kernel's conversion below would unfold every
+        // definition that is not irreducible.
+        if self.tactic_transparency.is_some() {
+            let budget = self.ambient_budget(UnificationTransparency::Default);
+            return self
+                .txn
+                .unify(actual, expected, budget)
+                .map(|report| assert!(report.awakened.is_empty(), "private source queue"))
+                .map_err(|problem| failure(SourceInferenceError::Unification(Box::new(problem))));
+        }
         // Kernel admission unfolds definitions that ordinary elaboration must
         // leave opaque. Check closed equations at Default as well; otherwise
         // explicit proof arguments and carrier conversions bypass inference.
@@ -1452,15 +1469,52 @@ impl Context {
         pairs: &[(Expr, Expr)],
         allow_delta: bool,
     ) -> Result<(), UnificationError> {
-        let mut result =
-            self.txn
-                .unify_many_with(pairs, UnificationBudget::new(self.kernel), &|| false);
-        if allow_delta && retries_with_delta(&result) {
-            let mut budget = UnificationBudget::new(self.kernel);
-            budget.transparency = UnificationTransparency::Default;
-            result = self.txn.unify_many_with(pairs, budget, &|| false);
+        let first = self.ambient_budget(UnificationTransparency::Abbreviations);
+        let mut result = self.txn.unify_many_with(pairs, first, &|| false);
+        let retry = self.ambient_budget(UnificationTransparency::Default);
+        if allow_delta && retry.transparency != first.transparency && retries_with_delta(&result) {
+            result = self.txn.unify_many_with(pairs, retry, &|| false);
         }
         result.map(|report| assert!(report.awakened.is_empty(), "private source queue"))
+    }
+
+    /// The transparency an ordinary elaboration or tactic query asking for `requested` runs
+    /// at: the ambient transparency `with_reducible`, `with_reducible_and_instances` and
+    /// `with_unfolding_none` set (`withReducible`, `withReducibleAndInstances` and
+    /// `withTransparency .none`, vendored src/Lean/Elab/Tactic/BuiltinTactic.lean) caps it.
+    /// Queries that fix their own transparency (instance selection at `instances`, `rw`'s
+    /// occurrence query, `simp`'s matching) do not ask through this.
+    pub(in crate::source) fn ambient_transparency(
+        &self,
+        requested: UnificationTransparency,
+    ) -> UnificationTransparency {
+        let rank = |transparency| match transparency {
+            UnificationTransparency::None => 0,
+            UnificationTransparency::Abbreviations => 1,
+            UnificationTransparency::Instances => 2,
+            UnificationTransparency::Default => 3,
+            UnificationTransparency::SafeDefinitions => 4,
+        };
+        match self.tactic_transparency {
+            Some(cap) if rank(cap) < rank(requested) => cap,
+            _ => requested,
+        }
+    }
+
+    /// An ordinary query's budget at `requested` capped by [`Self::ambient_transparency`].
+    /// Under a cap the pin's `isDefEq` still compares Nat offsets and literals before
+    /// reducing (`isDefEqOffsetNat`, vendored Lean/Meta/ExprDefEq.lean), which this engine
+    /// otherwise reaches by unfolding `Nat.add` at default transparency.
+    pub(in crate::source) fn ambient_budget(
+        &self,
+        requested: UnificationTransparency,
+    ) -> UnificationBudget {
+        let mut budget = UnificationBudget::new(self.kernel);
+        budget.transparency = self.ambient_transparency(requested);
+        if self.tactic_transparency.is_some() {
+            budget.offset_constraints = true;
+        }
+        budget
     }
 
     /// `unify_source_batch` for the pending source equations, where a batch
@@ -1484,12 +1538,14 @@ impl Context {
             // which also unfolds `implicitReducible` definitions such as
             // `instOfNatNat` (bead fln-gkhu).
             budget.transparency = UnificationTransparency::Instances;
+        } else {
+            budget = self.ambient_budget(UnificationTransparency::Abbreviations);
         }
+        let first = budget.transparency;
         let mut result = self.unify_pending(pairs, budget)?;
-        if allow_delta && retries_with_delta(&result) {
-            let mut budget = UnificationBudget::new(self.kernel);
-            budget.transparency = UnificationTransparency::Default;
-            result = self.unify_pending(pairs, budget)?;
+        let retry = self.ambient_budget(UnificationTransparency::Default);
+        if allow_delta && retry.transparency != first && retries_with_delta(&result) {
+            result = self.unify_pending(pairs, retry)?;
         }
         Ok(result.map(|report| assert!(report.awakened.is_empty(), "private source queue")))
     }

@@ -38,6 +38,35 @@ pub(super) fn mode(kind: &Name) -> Option<Mode> {
 pub(super) fn is_scope(kind: &Name) -> bool {
     kind == &parser_kind(&["Tactic", "set_option"])
         || kind == &parser_kind(&["Tactic", "classical"])
+        || transparency_scope(kind).is_some()
+}
+
+/// `syntax (name := withReducible) "with_reducible " tacticSeq : tactic` and its siblings
+/// (vendored src/Init/Tactics.lean:358-376): the keyword, its kind's last component, and the
+/// transparency its body runs at (`evalWithReducible` &c., vendored
+/// src/Lean/Elab/Tactic/BuiltinTactic.lean). The body runs on every goal, unfocused.
+fn transparency_scope(
+    kind: &Name,
+) -> Option<(&'static str, &'static str, UnificationTransparency)> {
+    [
+        (
+            "with_reducible",
+            "withReducible",
+            UnificationTransparency::Abbreviations,
+        ),
+        (
+            "with_reducible_and_instances",
+            "withReducibleAndInstances",
+            UnificationTransparency::Instances,
+        ),
+        (
+            "with_unfolding_none",
+            "withUnfoldingNone",
+            UnificationTransparency::None,
+        ),
+    ]
+    .into_iter()
+    .find(|(_, component, _)| kind == &parser_kind(&["Tactic", component]))
 }
 
 /// A name's components, root first, each as a one-component name.
@@ -152,7 +181,18 @@ impl Context {
         args: &'a [Syntax],
     ) -> Result<(), NatDefinitionElabError> {
         let instance_scopes = self.source_scope.instance_scopes.clone();
-        let (body, options) = if kind == &parser_kind(&["Tactic", "classical"]) {
+        let transparency = self.tactic_transparency;
+        let (body, options) = if let Some((word, component, ambient)) = transparency_scope(kind) {
+            let [keyword, sequence] = args else {
+                return Err(error(TacticError::MalformedScript));
+            };
+            expect_atom(keyword, word, "transparency tactic")?;
+            self.require_declared_tactic(&["Lean", "Parser", "Tactic", component])?;
+            let body = self.proof_instructions(sequence)?;
+            // The pin's `withTransparency` sets the mode, so an inner scope replaces an outer one.
+            self.tactic_transparency = Some(ambient);
+            (body, self.txn.options.clone())
+        } else if kind == &parser_kind(&["Tactic", "classical"]) {
             let [keyword, sequence] = args else {
                 return Err(error(TacticError::MalformedScript));
             };
@@ -195,6 +235,7 @@ impl Context {
         let scope = OptionScope {
             options,
             instance_scopes,
+            transparency,
             instructions: std::mem::replace(&mut proof.instructions, body),
             cursor: proof.cursor + 1,
         };
@@ -215,6 +256,7 @@ impl Context {
         }
         self.txn.options = scope.options;
         self.source_scope.instance_scopes = scope.instance_scopes;
+        self.tactic_transparency = scope.transparency;
         proof.instructions = scope.instructions;
         proof.cursor = scope.cursor;
         Ok(())
