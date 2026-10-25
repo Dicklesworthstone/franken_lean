@@ -6,13 +6,15 @@
 use super::*;
 use crate::source_extension_format as layout;
 use crate::source_extensions::{
-    AliasEntry, ClassEntry, DefaultEntry, InlineEntry, InstanceEntry, InstanceKey,
-    ReducibilityEntry, StructureEntry, StructureField, StructureParent,
+    AliasEntry, ClassEntry, DefaultEntry, ExternAttribute, ExternEntry, ImplementedByEntry,
+    InlineEntry, InstanceEntry, InstanceKey, ReducibilityEntry, StructureEntry, StructureField,
+    StructureParent,
 };
 use std::collections::HashSet;
 
 mod aliases;
 mod defaults;
+mod executable;
 mod inlining;
 mod instances;
 mod namespaces;
@@ -51,6 +53,12 @@ pub struct SourceMetadata {
     /// Final inlining kind for each module-owned declaration, written as the
     /// pin's `inlineAttrs` enum map in `Name.quickLt` order.
     pub inline: Vec<InlineEntry>,
+    /// Final executable replacement for each owned declaration, sorted by
+    /// `Name.quickLt` for the pin's parametric-attribute lookup.
+    pub implemented_by: Vec<ImplementedByEntry>,
+    /// Final extern attribute per owned declaration. Preserve backend order,
+    /// entry kinds and an explicitly empty list; these convey no ABI authority.
+    pub externs: Vec<ExternAttribute>,
     /// Module-owned structure interfaces, including physical parent subobjects.
     /// The writer preserves field/parent order and sorts only the pin's indexes.
     pub structures: Vec<StructureEntry>,
@@ -147,6 +155,12 @@ impl Encoder {
         }
         if !metadata.inline.is_empty() {
             blocks.push(self.inline_block(&metadata.inline)?);
+        }
+        if !metadata.implemented_by.is_empty() {
+            blocks.push(self.implemented_by_block(&metadata.implemented_by)?);
+        }
+        if !metadata.externs.is_empty() {
+            blocks.push(self.extern_block(&metadata.externs)?);
         }
         if !metadata.noncomputable.is_empty() {
             blocks.push(self.tagged_names_block(
