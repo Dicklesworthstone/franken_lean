@@ -102,9 +102,15 @@ impl Context {
             }
             let record_error = |error| failure(SourceInferenceError::Record(error));
             // `mkLambdaFVars params`: the value keeps each parameter's own binder, so it prints
-            // `fun α self => …`; only the type's become implicit (`inferImplicit`).
+            // `fun α self => …`; only the type's become implicit (`inferImplicit`). The receiver
+            // is the structure's `source` local, an explicit binder in the value: only the type's
+            // is made an instance binder (`setSourceInstImplicit`).
+            let source = LocalDecl {
+                binder_info: BinderInfo::Default,
+                ..receiver.clone()
+            };
             let value = closer
-                .close(std::slice::from_ref(&receiver), value, true, false)
+                .close(std::slice::from_ref(&source), value, true, false)
                 .and_then(|value| closer.close(&spec.parameters, value, true, false))
                 .map_err(record_error)?;
             let type_ = closer
