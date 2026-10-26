@@ -305,3 +305,111 @@ theorem customRepeatMutableReturnValue : @customRepeatMutableReturn stopRepeat =
         );
     }
 }
+
+/// The generated fallback contains a real `Inhabited (Except String Nat)` dictionary. Its
+/// default is an error action, and its projection must have a runtime layout even when a loop
+/// exits through an exception or return before that fallback can execute.
+#[test]
+fn result_bearing_repeats_and_except_panic_defaults_execute() {
+    let Some(lib) = pinned_lib() else {
+        return;
+    };
+    let root = workspace();
+    let source = root.join("RepeatExecution.lean");
+    std::fs::write(
+        &source,
+        r#"prelude
+import Init.While
+import Init.Control.Except
+import Init.Control.Id
+def repeatThrowNat : Except String Nat := do
+  repeat
+    throw "stop"
+def repeatReturnNat : Except String Nat := do
+  repeat
+    return 42
+def repeatMutableReturn : Except String Nat := do
+  let mut n := 0
+  repeat
+    n := n + 1
+    if n = 2 then return n
+#eval match (unreachable! : Except String Nat) with
+  | Except.error _ => (0 : Nat)
+  | Except.ok _ => 99
+#eval match repeatThrowNat with
+  | Except.error _ => (1 : Nat)
+  | Except.ok _ => 0
+#eval match repeatReturnNat with
+  | Except.error _ => (0 : Nat)
+  | Except.ok n => n
+#eval match repeatMutableReturn with
+  | Except.error _ => (0 : Nat)
+  | Except.ok n => n
+"#,
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_fln"))
+        .args(["run", "--json", "--jobs=1"])
+        .arg(&source)
+        .env("LEAN_PATH", &lib)
+        .env("FLN_IMPORT_REUSE_DIR", root.join("records"))
+        .env("LEAN_BACKTRACE", "0")
+        .env_remove("LEAN_ABORT_ON_PANIC")
+        .output()
+        .expect("run result-bearing repeat programs");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "{}\n{stdout}\n{stderr}",
+        output.status
+    );
+    assert_eq!(
+        stdout.matches("\"event\":\"evaluation\"").count(),
+        4,
+        "{stdout}"
+    );
+    for (command, value) in [(3, 0), (4, 1), (5, 42), (6, 2)] {
+        assert!(
+            stdout.contains(&format!(
+                "\"command\":{command},\"event\":\"evaluation\",\"kind\":\"nat\",\"value\":{value},"
+            )),
+            "{stdout}"
+        );
+    }
+    // The JSON runner captures runtime diagnostics in the report's stdout field.
+    assert!(stdout.contains("\"stdout\":\"PANIC at "), "{stdout}");
+    assert_eq!(
+        stdout.matches("unreachable code has been reached").count(),
+        1,
+        "{stdout}"
+    );
+    assert!(stderr.is_empty(), "{stderr}");
+    if let Some(pinned) = lib
+        .parent()
+        .and_then(Path::parent)
+        .map(|toolchain| toolchain.join("bin/lean"))
+        .filter(|lean| lean.is_file())
+    {
+        let output = Command::new(pinned)
+            .arg(&source)
+            .env("LEAN_PATH", &lib)
+            .env("LEAN_BACKTRACE", "0")
+            .env_remove("LEAN_ABORT_ON_PANIC")
+            .output()
+            .expect("run the pinned repeat programs");
+        assert!(output.status.success(), "{output:?}");
+        // The pin's #eval reporter captures its panic diagnostic on stdout.
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let values: Vec<_> = stdout
+            .lines()
+            .filter(|line| !line.starts_with("PANIC at "))
+            .collect();
+        assert_eq!(values, ["0", "1", "42", "2"], "{stdout}");
+        assert_eq!(
+            stdout.matches("unreachable code has been reached").count(),
+            1,
+        );
+        assert!(output.stderr.is_empty(), "{output:?}");
+    }
+}
