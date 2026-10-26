@@ -436,6 +436,179 @@ fn array_and_sarray_facts() {
 }
 
 #[test]
+fn owned_array_updates_reuse_storage_and_preserve_shared_values() {
+    let _guard = lock();
+    shadow::enable();
+    {
+        let mut array = Obj::mk_array(Vec::new());
+        let mut growths = 0;
+        for value in 0..1000 {
+            let identity = array.identity_token();
+            let (size, capacity) = array.array_view();
+            array = array
+                .try_array_push(Obj::mk_nat(value))
+                .unwrap_or_else(|_| panic!("a well-formed array must support push"));
+            assert_eq!(array.array_view().0, size + 1);
+            if size < capacity {
+                assert_eq!(array.identity_token(), identity);
+            } else {
+                growths += 1;
+                assert_eq!(array.array_view().1, (capacity + 1) * 2);
+            }
+        }
+        assert!(
+            growths < 16,
+            "push must grow geometrically, not per element"
+        );
+        let identity = array.identity_token();
+        array = array.try_array_set(3, Obj::mk_nat(42)).unwrap();
+        array = array.try_array_swap(3, 999).unwrap();
+        array = array.try_array_pop().unwrap();
+        assert_eq!(array.identity_token(), identity);
+        assert_eq!(array.array_child(3).unbox(), 999);
+        assert_eq!(array.array_view().0, 999);
+
+        let original = Obj::mk_array(vec![Obj::mk_string("first"), Obj::mk_string("last")]);
+        let pushed = original
+            .clone_ref()
+            .try_array_push(Obj::mk_string("new"))
+            .unwrap_or_else(|_| panic!("a shared array must support push"));
+        let set = original
+            .clone_ref()
+            .try_array_set(0, Obj::mk_string("new"))
+            .unwrap();
+        let swapped = original.clone_ref().try_array_swap(0, 1).unwrap();
+        let popped = original.clone_ref().try_array_pop().unwrap();
+        assert_eq!(original.array_view().0, 2);
+        assert_eq!(original.array_child(0).string_view().3, b"first\0");
+        assert_eq!(original.array_child(1).string_view().3, b"last\0");
+        assert_eq!(pushed.array_view().0, 3);
+        assert_eq!(set.array_child(0).string_view().3, b"new\0");
+        assert_eq!(swapped.array_child(0).string_view().3, b"last\0");
+        assert_eq!(popped.array_view().0, 1);
+        for changed in [&pushed, &set, &swapped, &popped] {
+            assert_ne!(changed.identity_token(), original.identity_token());
+        }
+    }
+    let (events, live) = shadow::disable_and_drain();
+    assert_eq!(live, 0);
+    assert!(events.iter().all(|event| !matches!(
+        event.kind,
+        EventKind::DoubleRelease | EventKind::ForeignPointer
+    )));
+}
+
+#[test]
+fn shared_array_updates_preserve_reserved_capacity() {
+    let _guard = lock();
+    shadow::enable();
+    for multithreaded in [false, true] {
+        let mut original = Obj::mk_array(Vec::new());
+        for value in 0..3 {
+            original = original
+                .try_array_push(Obj::mk_nat(value))
+                .unwrap_or_else(|_| panic!("a well-formed array must support push"));
+        }
+        let (size, capacity) = original.array_view();
+        assert!(capacity > size);
+        if multithreaded {
+            original.make_mt();
+        }
+        let updates = [
+            original
+                .clone_ref()
+                .try_array_set(0, Obj::mk_nat(42))
+                .unwrap(),
+            original.clone_ref().try_array_swap(0, 2).unwrap(),
+            original.clone_ref().try_array_pop().unwrap(),
+        ];
+        for updated in updates {
+            assert_eq!(updated.array_view().1, capacity);
+            let identity = updated.identity_token();
+            let pushed = updated
+                .try_array_push(Obj::mk_nat(9))
+                .unwrap_or_else(|_| panic!("a copied array must support push"));
+            assert_eq!(pushed.identity_token(), identity);
+            assert_eq!(pushed.array_view().1, capacity);
+        }
+        assert_eq!(original.array_view(), (size, capacity));
+        for index in 0..size {
+            assert_eq!(original.array_child(index).unbox(), index);
+        }
+    }
+    let (events, live) = shadow::disable_and_drain();
+    assert_eq!(live, 0);
+    assert!(events.iter().all(|event| !matches!(
+        event.kind,
+        EventKind::DoubleRelease | EventKind::ForeignPointer
+    )));
+}
+
+#[test]
+fn owned_array_updates_check_bounds_and_release_each_removed_child_once() {
+    let _guard = lock();
+    shadow::enable();
+    {
+        let child = Obj::mk_string("owned child");
+        let array = Obj::mk_array(vec![child.clone_ref()]);
+        assert_eq!(child.header().rc, 2);
+        let array = array.try_array_set(0, Obj::mk_nat(3)).unwrap();
+        assert_eq!(child.header().rc, 1);
+        let array = array
+            .try_array_push(child.clone_ref())
+            .unwrap_or_else(|_| panic!("an owned child must be transferred"));
+        assert_eq!(child.header().rc, 2);
+        let array = array.try_array_pop().unwrap();
+        assert_eq!(child.header().rc, 1);
+        assert!(
+            array
+                .clone_ref()
+                .try_array_set(1, child.clone_ref())
+                .is_none()
+        );
+        assert!(array.clone_ref().try_array_swap(0, usize::MAX).is_none());
+        assert_eq!(
+            child.header().rc,
+            1,
+            "rejected replacement releases its value"
+        );
+        assert_eq!(array.array_child(0).unbox(), 3);
+        for invalid in [Obj::mk_nat(0), Obj::mk_string("not an array")] {
+            assert!(
+                invalid
+                    .clone_ref()
+                    .try_array_push(child.clone_ref())
+                    .is_err()
+            );
+            assert!(
+                invalid
+                    .clone_ref()
+                    .try_array_set(0, child.clone_ref())
+                    .is_none()
+            );
+            assert!(invalid.clone_ref().try_array_swap(0, 0).is_none());
+            assert!(invalid.try_array_pop().is_none());
+        }
+        let empty = Obj::mk_array(Vec::new());
+        let identity = empty.identity_token();
+        assert_eq!(empty.try_array_pop().unwrap().identity_token(), identity);
+
+        let mt = Obj::mk_array(vec![child.clone_ref()]);
+        mt.make_mt();
+        let identity = mt.identity_token();
+        let changed = mt.try_array_set(0, Obj::mk_nat(7)).unwrap();
+        assert_ne!(changed.identity_token(), identity, "MT objects must copy");
+        assert_eq!(child.header().rc, -1, "the child retains one MT reference");
+    }
+    let (events, live) = shadow::disable_and_drain();
+    assert_eq!(live, 0);
+    assert!(events.iter().all(|event| !matches!(
+        event.kind,
+        EventKind::DoubleRelease | EventKind::ForeignPointer
+    )));
+}
+
+#[test]
 fn closure_ref_thunk_task_mpz_facts() {
     let _g = lock();
     let cl = Obj::mk_closure(3, vec![Obj::mk_nat(9), Obj::mk_string("fixed")]);

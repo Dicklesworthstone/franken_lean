@@ -681,6 +681,91 @@ impl Obj {
         self.try_array_view().expect("array header is consistent")
     }
 
+    /// Consume an array and replace one element, copying only when shared.
+    /// A bad carrier or index is refused before touching any slot.
+    pub fn try_array_set(self, index: usize, value: Obj) -> Option<Obj> {
+        let (size, capacity) = self.try_array_view()?;
+        if index >= size {
+            return None;
+        }
+        let array = self.exclusive_array(size, capacity)?;
+        // SAFETY: the array is exclusively owned and index < size. Transfer
+        // the old slot into an Obj before initializing it with the new owned
+        // reference; dropping the old Obj releases exactly that slot's ref.
+        unsafe {
+            let old = Obj(object::array_get(array.0, index));
+            object::array_set_core(array.0, index, value.into_raw());
+            drop(old);
+        }
+        Some(array)
+    }
+
+    /// Consume an array and remove its last element, reusing exclusive storage.
+    /// Empty arrays retain their identity and capacity.
+    pub fn try_array_pop(self) -> Option<Obj> {
+        let (size, capacity) = self.try_array_view()?;
+        if size == 0 {
+            return Some(self);
+        }
+        let array = self.exclusive_array(size, capacity)?;
+        // SAFETY: the last slot is initialized and exclusively owned. Remove
+        // it from the live range before releasing its reference, so the array
+        // destructor can never release the removed child a second time.
+        unsafe {
+            let old = Obj(object::array_get(array.0, size - 1));
+            (*array.0.cast::<crate::layout::LeanArrayObject>()).m_size = size - 1;
+            drop(old);
+        }
+        Some(array)
+    }
+
+    /// Consume an array and exchange two in-bounds slots. Shared arrays copy;
+    /// an equal-index exchange returns the original handle without allocation.
+    pub fn try_array_swap(self, first: usize, second: usize) -> Option<Obj> {
+        let (size, capacity) = self.try_array_view()?;
+        if first >= size || second >= size {
+            return None;
+        }
+        if first == second {
+            return Some(self);
+        }
+        let array = self.exclusive_array(size, capacity)?;
+        // SAFETY: distinct initialized slots of one exclusive array exchange
+        // their owned references. Neither reference is cloned or released.
+        unsafe {
+            let left = object::array_get(array.0, first);
+            let right = object::array_get(array.0, second);
+            object::array_set_core(array.0, first, right);
+            object::array_set_core(array.0, second, left);
+        }
+        Some(array)
+    }
+
+    /// Called only after the array header has been validated. MT and persistent
+    /// references are never exclusive, even when this is their only Obj handle.
+    /// Like `lean_copy_expand_array(a, false)`, a copy keeps spare capacity.
+    fn exclusive_array(self, size: usize, capacity: usize) -> Option<Obj> {
+        if self.header().rc == 1 {
+            return Some(self);
+        }
+        let bytes = size_of::<crate::layout::LeanArrayObject>()
+            .checked_add(size_of::<*mut LeanObject>().checked_mul(capacity)?)?;
+        if bytes > isize::MAX as usize {
+            return None;
+        }
+        let items: Vec<_> = (0..size).map(|index| self.array_child(index)).collect();
+        // SAFETY: the validated header has size <= capacity, and allocation
+        // arithmetic is checked above. Every initialized source slot supplies
+        // one retained reference; spare slots stay outside the live range.
+        unsafe {
+            let array = object::alloc_array(size, capacity);
+            for (index, item) in items.into_iter().enumerate() {
+                object::array_set_core(array, index, item.into_raw());
+            }
+            Some(Obj(array))
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn plant_array_size(&self, size: usize) {
         assert!(self.obj_tag() == usize::from(crate::contract::TAG_ARRAY));

@@ -2420,7 +2420,7 @@ fn run(
                         plan
                     }
                 };
-                let mut values = transfer_intrinsic_arguments(
+                let values = transfer_intrinsic_arguments(
                     current_frame_mut(&mut stack)?,
                     args,
                     argument_ownership,
@@ -2676,7 +2676,7 @@ fn run(
                     match invoke_intrinsic(
                         plan.implementation,
                         plan.row,
-                        &mut values,
+                        values,
                         limits.max_nat_magnitude_bytes,
                     ) {
                         Ok(result) => {
@@ -4354,19 +4354,52 @@ fn scalar_nat_result(
 fn invoke_intrinsic(
     implementation: IntrinsicImplementation,
     row: &str,
-    args: &mut [Obj],
+    args: Vec<Obj>,
     max_nat_magnitude_bytes: u64,
 ) -> Result<IntrinsicResult, IntrinsicFailure> {
-    if let Some(result) = scalar_nat_result(implementation, args) {
+    // The validated row has already transferred owned operands out of their
+    // registers. Keep those handles owned here: borrowing and cloning them
+    // again would make every unique array look shared at its mutation boundary.
+    if implementation == IntrinsicImplementation::ArrayPush {
+        expect_arity(row, &args, 2)?;
+        array_value(&args[0], "Array.push", 0)?;
+        let mut args = args.into_iter();
+        let array = args.next().expect("checked push arity");
+        let value = args.next().expect("checked push arity");
+        return array
+            .try_array_push(value)
+            .map(IntrinsicResult::raw_object)
+            .map_err(|_| VmRefusal::InvalidArrayObject.into());
+    }
+    if let IntrinsicImplementation::ArrayExtra(intrinsic) = implementation {
+        return intrinsic.invoke(row, args);
+    }
+    if implementation == IntrinsicImplementation::ByteArrayPush {
+        expect_arity(row, &args, 2)?;
+        if value_kind(&args[0]) != ValueKind::ScalarArray {
+            return Err(type_mismatch("ByteArray.push", 0, "ByteArray", &args[0]).into());
+        }
+        if !matches!(args[0].try_borrow_sarray_view(), Some((1, _, _, _))) {
+            return Err(VmRefusal::InvalidByteArrayObject.into());
+        }
+        let value = byte_argument(&args[1], "ByteArray.push", 1)?;
+        // Preserve the native push path's owned array and scalar contract.
+        let array = args.into_iter().next().expect("checked byte push arity");
+        return array
+            .try_byte_array_push(value)
+            .map(IntrinsicResult::owned)
+            .map_err(|_| VmRefusal::InvalidByteArrayObject.into());
+    }
+    if let Some(result) = scalar_nat_result(implementation, &args) {
         return Ok(result);
     }
-    dispatch_intrinsic(implementation, row, args, max_nat_magnitude_bytes)
+    dispatch_intrinsic(implementation, row, &args, max_nat_magnitude_bytes)
 }
 
 fn dispatch_intrinsic(
     implementation: IntrinsicImplementation,
     row: &str,
-    args: &mut [Obj],
+    args: &[Obj],
     max_nat_magnitude_bytes: u64,
 ) -> Result<IntrinsicResult, IntrinsicFailure> {
     let max_nat_magnitude_bytes = max_nat_magnitude_bytes.min(
@@ -4377,7 +4410,11 @@ fn dispatch_intrinsic(
     match implementation {
         IntrinsicImplementation::PanicCore => diagnostics::panic(row, args),
         IntrinsicImplementation::ArrayConstruction(intrinsic) => intrinsic.invoke(row, args),
-        IntrinsicImplementation::ArrayExtra(intrinsic) => intrinsic.invoke(row, args),
+        IntrinsicImplementation::ArrayExtra(_)
+        | IntrinsicImplementation::ArrayPush
+        | IntrinsicImplementation::ByteArrayPush => {
+            unreachable!("owned array operations are dispatched before borrowing arguments")
+        }
         IntrinsicImplementation::Float(intrinsic) => intrinsic.invoke(row, args),
         IntrinsicImplementation::StringInternal(intrinsic) => intrinsic.invoke(row, args),
         IntrinsicImplementation::NatAdd => {
@@ -6461,19 +6498,6 @@ fn dispatch_intrinsic(
             let (size, _) = array_value(&args[0], "Array.usize", 0)?;
             Ok(IntrinsicResult::scalar(Obj::mk_nat(size)))
         }
-        IntrinsicImplementation::ArrayPush => {
-            expect_arity(row, args, 2)?;
-            array_value(&args[0], "Array.push", 0)?;
-            // The generated contract consumes both operands. Move their
-            // transferred references into Marrow instead of retaining or
-            // rebuilding the array, preserving its exclusive-capacity path.
-            let value = std::mem::replace(&mut args[1], Obj::mk_nat(0));
-            let array = std::mem::replace(&mut args[0], Obj::mk_nat(0));
-            array
-                .try_array_push(value)
-                .map(IntrinsicResult::raw_object)
-                .map_err(|_| VmRefusal::InvalidArrayObject.into())
-        }
         IntrinsicImplementation::NatDecEq
         | IntrinsicImplementation::NatDecLe
         | IntrinsicImplementation::NatDecLt => {
@@ -6576,23 +6600,6 @@ fn dispatch_intrinsic(
             let mut updated = bytes;
             updated[index] = value;
             Ok(IntrinsicResult::raw_object(mk_byte_array(&updated)))
-        }
-        IntrinsicImplementation::ByteArrayPush => {
-            expect_arity(row, args, 2)?;
-            if value_kind(&args[0]) != ValueKind::ScalarArray {
-                return Err(type_mismatch("ByteArray.push", 0, "ByteArray", &args[0]).into());
-            }
-            if !matches!(args[0].try_borrow_sarray_view(), Some((1, _, _, _))) {
-                return Err(VmRefusal::InvalidByteArrayObject.into());
-            }
-            let value = byte_argument(&args[1], "ByteArray.push", 1)?;
-            // Only the array is consumed; the UInt8 scalar keeps its declared
-            // register semantics. Neither validation step copies its payload.
-            let array = std::mem::replace(&mut args[0], Obj::mk_nat(0));
-            array
-                .try_byte_array_push(value)
-                .map(IntrinsicResult::owned)
-                .map_err(|_| VmRefusal::InvalidByteArrayObject.into())
         }
         IntrinsicImplementation::ByteArrayMk => {
             expect_arity(row, args, 1)?;
@@ -8272,7 +8279,7 @@ mod tests {
         let ceilings = [0, 7, 8, 16, u64::MAX];
         let (mut answered, mut declined) = (0usize, 0usize);
         let mut agree = |implementation, row: &str, values: &[usize]| -> Result<(), String> {
-            let mut args: Vec<Obj> = values.iter().map(|&value| Obj::mk_nat(value)).collect();
+            let args: Vec<Obj> = values.iter().map(|&value| Obj::mk_nat(value)).collect();
             let Some(fast) = scalar_nat_result(implementation, &args) else {
                 declined += 1;
                 return Ok(());
@@ -8280,7 +8287,7 @@ mod tests {
             answered += 1;
             for ceiling in ceilings {
                 let slow =
-                    dispatch_intrinsic(implementation, row, &mut args, ceiling).map_err(|_| {
+                    dispatch_intrinsic(implementation, row, &args, ceiling).map_err(|_| {
                         format!("{row} {values:?} at {ceiling}: the bignum arm refused")
                     })?;
                 assert_eq!(slow.ownership(), fast.ownership(), "{row} {values:?}");
@@ -8435,7 +8442,6 @@ mod tests {
     const CEILING: u64 = 8 * 1024 * 1024;
 
     fn invoke(row: &'static str, args: &[Obj]) -> Result<Obj, VmRefusal> {
-        let mut owned: Vec<Obj> = args.iter().map(Obj::clone_ref).collect();
         let implementation = IntrinsicImplementation::for_row(row);
         assert!(
             implementation != IntrinsicImplementation::Unsupported,
@@ -8458,14 +8464,18 @@ mod tests {
         finish_intrinsic_result(
             row,
             expected_ownership,
-            invoke_intrinsic(implementation, row, &mut owned, CEILING).map_err(|failure| {
-                match failure {
-                    IntrinsicFailure::Refused(refusal) => refusal,
-                    other => panic!(
-                        "unexpected intrinsic failure class: {name}",
-                        name = std::any::type_name_of_val(&other)
-                    ),
-                }
+            invoke_intrinsic(
+                implementation,
+                row,
+                args.iter().map(Obj::clone_ref).collect(),
+                CEILING,
+            )
+            .map_err(|failure| match failure {
+                IntrinsicFailure::Refused(refusal) => refusal,
+                other => panic!(
+                    "unexpected intrinsic failure class: {name}",
+                    name = std::any::type_name_of_val(&other)
+                ),
             })?,
         )
     }
