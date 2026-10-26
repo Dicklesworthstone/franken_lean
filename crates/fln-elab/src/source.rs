@@ -2323,14 +2323,40 @@ impl Context {
                                     ));
                                     continue;
                                 }
-                                if kind == &parser_kind(&["Term", "nativeDoBind"])
+                                if kind == &parser_kind(&["Term", "nativeDoRepeatDefault"]) {
+                                    let [normal, fallback] = args.as_slice() else {
+                                        return Err(failure(SourceInferenceError::Scope));
+                                    };
+                                    let body =
+                                        if self.do_repeat_needs_fallback(expected.as_ref())? {
+                                            fallback
+                                        } else {
+                                            normal
+                                        };
+                                    tasks.push(Task::Visit(body, expected, finish));
+                                    continue;
+                                }
+                                let repeat =
+                                    kind == &parser_kind(&["Term", "nativeDoRepeatResult"]);
+                                if repeat {
+                                    let [action, _] = args.as_slice() else {
+                                        return Err(failure(SourceInferenceError::Scope));
+                                    };
+                                    if !self.do_repeat_needs_fallback(expected.as_ref())? {
+                                        tasks.push(Task::Visit(action, expected, finish));
+                                        continue;
+                                    }
+                                }
+                                if repeat
+                                    || kind == &parser_kind(&["Term", "nativeDoBind"])
                                     || kind == &parser_kind(&["Term", "nativeDoPure"])
                                     || kind == &parser_kind(&["Term", "nativeDoNestedAction"])
                                 {
                                     let nested =
                                         kind == &parser_kind(&["Term", "nativeDoNestedAction"]);
-                                    let bind =
-                                        nested || kind == &parser_kind(&["Term", "nativeDoBind"]);
+                                    let bind = repeat
+                                        || nested
+                                        || kind == &parser_kind(&["Term", "nativeDoBind"]);
                                     if args.len() != if bind { 2 } else { 1 } {
                                         return Err(failure(SourceInferenceError::Scope));
                                     }

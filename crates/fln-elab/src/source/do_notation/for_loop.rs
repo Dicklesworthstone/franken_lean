@@ -41,6 +41,7 @@ pub(super) struct LoopHeader {
     annotation: Syntax,
     witness: Option<Syntax>,
     collection: Syntax,
+    pub(super) repeat_fallback: Option<Syntax>,
 }
 
 impl Context {
@@ -137,7 +138,8 @@ impl Context {
             _ => return Err(invalid()),
         };
         expect_atom(&declaration[2], "in", "loop membership keyword")?;
-        let collection = declaration.pop().expect("validated collection");
+        let (collection, repeat_fallback) =
+            repeat::split_collection(declaration.pop().expect("validated collection"))?;
         let name = declaration.remove(1);
         // `for (x : T) in xs`: the binder with the element type it fixes. The pin reads a loop
         // binder as a term pattern (`doFor`), and an ascription pattern matches its variable.
@@ -163,6 +165,7 @@ impl Context {
                 annotation,
                 witness,
                 collection,
+                repeat_fallback,
             },
             sequence,
         ))
@@ -172,13 +175,24 @@ impl Context {
         &mut self,
         syntax: Syntax,
     ) -> Result<Syntax, NatDefinitionElabError> {
-        let (header, sequence) = self.split_for_loop(syntax)?;
+        let (mut header, sequence) = self.split_for_loop(syntax)?;
+        let fallback = header.repeat_fallback.take();
         let accumulator = self.do_control_name()?;
         let yield_step = application(root(&["ForInStep", "yield"]), vec![accumulator.clone()]);
         // Only return-free loops use this lightweight PUnit accumulator.
         // Nonlocal returns use the enclosing do's result-carrying worklist.
         let body = self.expand_do_sequence(sequence, Some(call(false, vec![yield_step])))?;
         let action = self.finish_for_loop(header, accumulator, root(&["PUnit", "unit"]), body)?;
+        let action = match fallback {
+            Some(fallback) => Syntax::node(
+                parser_kind(&["Term", "nativeDoRepeatResult"]),
+                vec![
+                    action,
+                    lambda(self.do_control_name()?, unit_annotation(), fallback)?,
+                ],
+            ),
+            None => action,
+        };
         Ok(Syntax::node(parser_kind(&["Term", "doExpr"]), vec![action]))
     }
 
@@ -194,6 +208,7 @@ impl Context {
             annotation,
             witness,
             collection,
+            repeat_fallback: _,
         } = header;
         let callback = lambda(accumulator, null(vec![]), body)?;
         let (operation, callback) = if let Some(witness) = witness {

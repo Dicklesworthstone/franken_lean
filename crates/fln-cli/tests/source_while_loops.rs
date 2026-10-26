@@ -130,8 +130,18 @@ fn workspace() -> PathBuf {
 
 /// `fln check-source` on `HEADER` + `program`, and the pinned binary's exit code when present.
 fn check(lib: &Path, root: &Path, name: &str, program: &str) -> (i32, String, Option<i32>) {
+    check_with_header(lib, root, name, HEADER, program)
+}
+
+fn check_with_header(
+    lib: &Path,
+    root: &Path,
+    name: &str,
+    header: &str,
+    program: &str,
+) -> (i32, String, Option<i32>) {
     let entry = root.join(format!("{name}.lean"));
-    std::fs::write(&entry, format!("{HEADER}{program}")).unwrap();
+    std::fs::write(&entry, format!("{header}{program}")).unwrap();
     let ours = Command::new(env!("CARGO_BIN_EXE_fln"))
         .arg("check-source")
         .arg(&entry)
@@ -154,11 +164,14 @@ fn check(lib: &Path, root: &Path, name: &str, program: &str) -> (i32, String, Op
                 .code()
                 .expect("normal pinned exit")
         });
-    (
-        ours.status.code().expect("normal process exit"),
-        String::from_utf8_lossy(&ours.stderr).into_owned(),
-        theirs,
-    )
+    let stderr = String::from_utf8_lossy(&ours.stderr).into_owned();
+    let code = ours.status.code().unwrap_or_else(|| {
+        panic!(
+            "{name}: source checker terminated with {}\n{stderr}",
+            ours.status
+        )
+    });
+    (code, stderr, theirs)
 }
 
 #[test]
@@ -176,5 +189,119 @@ fn a_while_loop_is_its_loop_over_lean_loop() {
         let (code, _, pinned) = check(&lib, &root, name, program);
         assert_ne!(code, 0, "{name}: accepted {program}");
         assert_ne!(pinned.unwrap_or(1), 0, "{name}: the pinned lean accepts it");
+    }
+}
+
+/// The pin inserts `unreachable!` after a break-free terminal repeat only when its result is
+/// not PUnit. A terminating ForIn dictionary makes that checked continuation observable: its default
+/// is the whole monadic result, and a Unit result or an explicit suffix never uses it.
+#[test]
+fn terminal_break_free_repeat_preserves_result_and_control_scopes() {
+    let Some(lib) = pinned_lib() else {
+        return;
+    };
+    let root = workspace();
+    let header = "prelude\nimport Init.While\nimport Init.Control.Except\nimport Init.Control.Id\n";
+    let program = r#"
+def repeatThrowNat : Except String Nat := do
+  repeat
+    throw "stop"
+def repeatReturnNat : Except String Nat := do
+  repeat
+    return 42
+def repeatInnerBreak : Except String Nat := do
+  repeat
+    repeat
+      break
+    return 42
+def repeatForBreak : Except String Nat := do
+  repeat
+    for _ in Lean.Loop.mk do
+      break
+    throw "stop"
+def repeatMutation : Except String Nat := do
+  let mut n := 0
+  repeat
+    n := n + 1
+    throw "stop"
+def repeatMutableReturn : Except String Nat := do
+  let mut n := 0
+  repeat
+    n := n + 1
+    if n = 2 then return n
+def repeatGeneric {A : Type} [Inhabited A] : Id A := do
+  repeat
+    pure ()
+def stopRepeat : ForIn (Except String) Lean.Loop Unit where
+  forIn _ state _ := pure state
+def customRepeatUnit [ForIn (Except String) Lean.Loop Unit] : Except String Unit := do
+  repeat
+    throw "stop"
+theorem customRepeatUnitValue : @customRepeatUnit stopRepeat = Except.ok () := by rfl
+def customRepeatNat [ForIn (Except String) Lean.Loop Unit] : Except String Nat := do
+  repeat
+    throw "stop"
+theorem customRepeatNatValue : @customRepeatNat stopRepeat = Except.error "" := by rfl
+def customRepeatSuffix [ForIn (Except String) Lean.Loop Unit] : Except String Nat := do
+  repeat
+    throw "stop"
+  return 5
+theorem customRepeatSuffixValue : @customRepeatSuffix stopRepeat = Except.ok 5 := by rfl
+def customRepeatMutable [ForIn (Except String) Lean.Loop Unit] : Except String Nat := do
+  let mut n := 0
+  repeat
+    n := n + 1
+    throw "stop"
+theorem customRepeatMutableValue : @customRepeatMutable stopRepeat = Except.error "" := by rfl
+def customRepeatReturn [ForIn (Except String) Lean.Loop Unit] : Except String Nat := do
+  repeat
+    return 42
+theorem customRepeatReturnValue : @customRepeatReturn stopRepeat = Except.error "" := by rfl
+def customRepeatMutableReturn [ForIn (Except String) Lean.Loop Unit] : Except String Nat := do
+  let mut n := 0
+  repeat
+    n := n + 1
+    return n
+theorem customRepeatMutableReturnValue : @customRepeatMutableReturn stopRepeat = Except.error "" := by rfl
+"#;
+    let (code, stderr, pinned) = check_with_header(&lib, &root, "repeat_results", header, program);
+    assert_eq!(pinned.unwrap_or(0), 0, "the pinned lean refuses {program}");
+    assert_eq!(code, 0, "{program}\n{stderr}");
+    for (name, program) in [
+        (
+            "repeat_direct_break_result",
+            "def f : Except String Nat := do\n  repeat\n    break\n",
+        ),
+        (
+            "repeat_branch_break_result",
+            "def f (stop : Bool) : Except String Nat := do\n  repeat\n    if stop then break else throw \"stop\"\n",
+        ),
+        (
+            "repeat_nested_block_break_result",
+            "def f : Except String Nat := do\n  repeat\n    do\n      break\n",
+        ),
+        (
+            "repeat_else_if_break_result",
+            "def f (a b : Bool) : Except String Nat := do\n  repeat\n    if a then throw \"stop\"\n    else if b then break\n    else throw \"stop\"\n",
+        ),
+        (
+            "repeat_requires_inhabited_result",
+            "def f {A : Type} : Id A := do\n  repeat\n    pure ()\n",
+        ),
+        (
+            "repeat_checks_body",
+            "def f : Except String Nat := do\n  repeat\n    (5 : Nat)\n",
+        ),
+    ] {
+        let (code, stderr, pinned) = check_with_header(&lib, &root, name, header, program);
+        assert_eq!(
+            pinned.unwrap_or(1),
+            1,
+            "the pinned lean did not reject {program}"
+        );
+        assert_eq!(
+            code, 1,
+            "{name}: expected a typing refusal for {program}\n{stderr}"
+        );
     }
 }

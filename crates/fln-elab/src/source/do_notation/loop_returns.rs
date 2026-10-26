@@ -238,7 +238,11 @@ impl Context {
             } else {
                 (syntax, Vec::new())
             };
-        let (header, sequence) = self.split_for_loop(syntax)?;
+        let (mut header, sequence) = self.split_for_loop(syntax)?;
+        // A child loop's source continuation is still PUnit even though our internal packet
+        // carries the enclosing return. Only an outer terminal loop needs a result fallback.
+        let fallback = header.repeat_fallback.take().filter(|_| parent.is_none());
+        let suffix = suffix.unwrap_or_else(|| repeat::default_result(skip(), fallback));
         let join = self.do_control_name()?;
         let accumulator = self.do_control_name()?;
         let parameter = if state.is_empty() {
@@ -286,7 +290,7 @@ impl Context {
                 state,
                 initial,
                 join,
-                suffix: suffix.unwrap_or_else(skip),
+                suffix,
                 parent: parent.map(|parent| parent.targets.clone()),
             },
             sequence,
