@@ -545,6 +545,16 @@ pub fn decode(
     blocks: &[OpaqueExtensionBlock],
     limits: DecodeLimits,
 ) -> Result<SourceExtensions, DecodeError> {
+    decode_with_remaining_limits(blocks, limits).map(|(decoded, _)| decoded)
+}
+
+/// Decode a batch and return its remaining cumulative allowances. Importers
+/// can project tags before merging journals without resetting any resource
+/// limit for each module or charging a retained payload twice.
+pub fn decode_with_remaining_limits(
+    blocks: &[OpaqueExtensionBlock],
+    limits: DecodeLimits,
+) -> Result<(SourceExtensions, DecodeLimits), DecodeError> {
     let name = |s: &str| Name::from_components(s.split('.'));
     let selected = [
         name(format::CLASS_EXTENSION),
@@ -735,5 +745,14 @@ pub fn decode(
             }
         }
     }
-    Ok(out)
+    Ok((
+        out,
+        DecodeLimits {
+            max_bytes: bytes_left,
+            max_objects: objects_left,
+            max_entries: entries_left,
+            max_indices: reader.indices_left,
+            max_keys: reader.keys_left,
+        },
+    ))
 }

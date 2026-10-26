@@ -16,6 +16,67 @@ mod simp;
 #[path = "imported/structures.rs"]
 mod structures;
 
+#[derive(Default)]
+struct ReflexivityTags {
+    payloads: BTreeMap<Vec<u8>, Name>,
+    names: BTreeSet<Name>,
+    declarations: Vec<Name>,
+}
+
+impl ReflexivityTags {
+    fn capture(
+        &mut self,
+        module: &Name,
+        extension: &Name,
+        entries: Vec<Vec<u8>>,
+        remaining: &mut DecodeLimits,
+    ) -> Result<usize> {
+        let before = self.declarations.len();
+        let mut local = BTreeSet::new();
+        for payload in entries {
+            let declaration = if let Some(declaration) = self.payloads.get(&payload) {
+                declaration.clone()
+            } else {
+                let mut block = OpaqueExtensionBlock {
+                    name: extension.clone(),
+                    entries: vec![payload],
+                };
+                let (decoded, rest) = metadata::decode_with_remaining_limits(
+                    std::slice::from_ref(&block),
+                    *remaining,
+                )
+                .map_err(SourceOleanImportError::Decode)?;
+                let mut names = decoded.defeq.into_iter().chain(decoded.backward_defeq);
+                let declaration = names.next().ok_or(SourceOleanImportError::Internal(
+                    "a reflexivity entry did not decode to a name",
+                ))?;
+                if names.next().is_some() {
+                    return Err(SourceOleanImportError::Internal(
+                        "a reflexivity entry decoded to several names",
+                    ));
+                }
+                *remaining = rest;
+                let payload = block.entries.pop().ok_or(SourceOleanImportError::Internal(
+                    "a decoded reflexivity payload disappeared",
+                ))?;
+                self.payloads.insert(payload, declaration.clone());
+                declaration
+            };
+            if !local.insert(declaration.clone()) {
+                return Err(SourceOleanImportError::Metadata {
+                    module: module.clone(),
+                    declaration,
+                    reason: "duplicate reflexivity tag in one module",
+                });
+            }
+            if self.names.insert(declaration.clone()) {
+                self.declarations.push(declaration);
+            }
+        }
+        Ok(self.declarations.len() - before)
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct SourceOleanImportLimits {
     pub check: OleanCheckLimits,
@@ -375,8 +436,9 @@ impl Engine {
         let mut reports = Vec::new();
         let mut capture_left = limits.max_capture_bytes;
         let mut entries_left = limits.metadata.max_entries;
-        let mut defeq_payloads = HashSet::new();
-        let mut backward_defeq_payloads = HashSet::new();
+        let mut defeq_tags = ReflexivityTags::default();
+        let mut backward_defeq_tags = ReflexivityTags::default();
+        let mut metadata_remaining = limits.metadata;
         // Each module's capture reads only its own parts, so the walks run
         // `limits.read_jobs` at once; the cumulative byte allowance is charged below
         // in replay order, exactly as when one walk followed another.
@@ -432,27 +494,34 @@ impl Engine {
                         .ok_or(SourceOleanImportError::Limit("captured extension bytes"))?;
                 }
                 if let Some(kind) = selected.iter().position(|name| name == &block.name) {
-                    let mut entries = block.entries;
+                    let entries = block.entries;
                     if kind == 14 || kind == 21 {
-                        // An equation theorem realized in several modules carries its
-                        // `@[defeq]` tag in each (`Nat.lt_wfRel.eq_1` in five of `Init`'s);
-                        // the first module's tag stands for the others. The decoder still
-                        // refuses a repeat within the stream it is given.
-                        let mut local = HashSet::new();
-                        if entries.iter().any(|payload| !local.insert(payload)) {
-                            return Err(SourceOleanImportError::Metadata {
-                                module: module.name.clone(),
-                                declaration: block.name,
-                                reason: "duplicate reflexivity tag in one module",
-                            });
-                        }
-                        drop(local);
-                        let seen = if kind == 14 {
-                            &mut defeq_payloads
+                        // A realized equation can carry the same tag in several
+                        // modules with different compacted object layouts. Compare
+                        // decoded names, retaining the first module's registration.
+                        // Cached byte-identical entries keep their old zero decode
+                        // cost; a same-module name repeat still refuses.
+                        let tags = if kind == 14 {
+                            &mut defeq_tags
                         } else {
-                            &mut backward_defeq_payloads
+                            &mut backward_defeq_tags
                         };
-                        entries.retain(|payload| seen.insert(payload.clone()));
+                        let before = metadata_remaining.max_entries;
+                        let count = tags.capture(
+                            &module.name,
+                            &block.name,
+                            entries,
+                            &mut metadata_remaining,
+                        )?;
+                        entries_left = entries_left
+                            .checked_sub(before - metadata_remaining.max_entries)
+                            .ok_or(SourceOleanImportError::Limit("metadata entries"))?;
+                        if kind == 14 {
+                            report.defeq = count;
+                        } else {
+                            report.backward_defeq = count;
+                        }
+                        continue;
                     }
                     entries_left = entries_left
                         .checked_sub(entries.len())
@@ -486,8 +555,8 @@ impl Engine {
                             ));
                         }
                     }
-                    // Move payloads, not copies. Decoding once gives all modules
-                    // one cumulative byte/object/index allowance.
+                    // Move payloads, not copies. The remaining allowances include
+                    // every tag already decoded across the module boundaries.
                     blocks[kind].entries.extend(entries);
                 } else if !block.entries.is_empty() {
                     report.uninterpreted.push(block.name);
@@ -496,8 +565,10 @@ impl Engine {
             reports.push(report);
         }
         cancelled!("source-olean/before-metadata-decode");
-        let decoded =
-            metadata::decode(&blocks, limits.metadata).map_err(SourceOleanImportError::Decode)?;
+        let mut decoded = metadata::decode(&blocks, metadata_remaining)
+            .map_err(SourceOleanImportError::Decode)?;
+        decoded.defeq = defeq_tags.declarations;
+        decoded.backward_defeq = backward_defeq_tags.declarations;
         let mut implementation_scopes = implemented_by::Scopes::new(
             &checked,
             &decoded.implemented_by,
@@ -1973,6 +2044,161 @@ pub(super) mod tests {
                 &parallel.checked.engine,
                 "source result",
             );
+        });
+    }
+
+    #[test]
+    fn reflexivity_tags_merge_by_name_across_modules_but_not_within_one() {
+        use fln_env::constants::{ConstantVal, DefinitionVal, ReducibilityHints};
+        use fln_olean::extension_write::{ModuleExtensionInput, encode_module_with_extensions};
+        use fln_rt::convert::inject_name;
+        use fln_rt::obj::Obj;
+        use fln_rt::region::compact;
+
+        on_import_stack(|| {
+            let declaration = n("tag.tag");
+            let unshared = inject_name(&declaration);
+            let prefix = unshared.try_ctor_child(0).unwrap();
+            // Both Name components have the same string. Sharing that string
+            // changes compacted bytes without changing a component or its hash.
+            let shared = Obj::mk_ctor(
+                u8::try_from(unshared.obj_tag()).unwrap(),
+                vec![prefix.clone_ref(), prefix.try_ctor_child(1).unwrap()],
+                &declaration.hash().to_le_bytes(),
+            );
+            assert_ne!(compact(&unshared, 0).unwrap(), compact(&shared, 0).unwrap());
+            let constants = [ConstantInfo::Defn(DefinitionVal {
+                base: ConstantVal {
+                    name: declaration.clone(),
+                    level_params: vec![],
+                    type_: Expr::forall_e(
+                        n("A"),
+                        Expr::sort(Level::one()),
+                        Expr::forall_e(
+                            n("x"),
+                            Expr::bvar(0).unwrap(),
+                            Expr::bvar(1).unwrap(),
+                            BinderInfo::Default,
+                        ),
+                        BinderInfo::Default,
+                    ),
+                },
+                value: Expr::lam(
+                    n("A"),
+                    Expr::sort(Level::one()),
+                    Expr::lam(
+                        n("x"),
+                        Expr::bvar(0).unwrap(),
+                        Expr::bvar(0).unwrap(),
+                        BinderInfo::Default,
+                    ),
+                    BinderInfo::Default,
+                ),
+                hints: ReducibilityHints::Abbrev,
+                safety: DefinitionSafety::Safe,
+                all: vec![declaration.clone()],
+            })];
+            let base = n("Base");
+            let main = n("Main");
+            let imports = [OleanModuleImport {
+                module: base.clone(),
+                import_all: false,
+                is_exported: false,
+                is_meta: false,
+            }];
+            for extension in [
+                metadata::DEFEQ_EXTENSION,
+                metadata::BACKWARD_DEFEQ_EXTENSION,
+            ] {
+                let extension = n(extension);
+                let encode =
+                    |imports: &[OleanModuleImport], constants: &[ConstantInfo], entries: &[Obj]| {
+                        encode_module_with_extensions(
+                            OleanModuleWriteInput {
+                                is_module: false,
+                                imports,
+                                constants,
+                                extra_const_names: &[],
+                            },
+                            &[ModuleExtensionInput {
+                                name: &extension,
+                                entries,
+                            }],
+                            OleanWriteHeader {
+                                version: OLEAN_ACCEPTED_VERSIONS[0],
+                                flags: 1,
+                                lean_version: OLEAN_PIN_TAG.strip_prefix('v').unwrap(),
+                                githash: OLEAN_PIN_COMMIT,
+                                base_addr: (OLEAN_REGION_ALIGN as u64) * 2,
+                            },
+                            OleanWriteBudget::default(),
+                        )
+                        .unwrap()
+                    };
+                let first = encode(&[], &constants, std::slice::from_ref(&unshared));
+                let run = |entries: &[Obj], limits: SourceOleanImportLimits| {
+                    let second = encode(&imports, &[], entries);
+                    let inputs = [
+                        OleanModuleInput {
+                            name: &base,
+                            artifact: &first.bytes,
+                            server_artifact: None,
+                            private_artifact: None,
+                        },
+                        OleanModuleInput {
+                            name: &main,
+                            artifact: &second.bytes,
+                            server_artifact: None,
+                            private_artifact: None,
+                        },
+                    ];
+                    import(&inputs, std::slice::from_ref(&main), limits)
+                };
+                for second in [&shared, &unshared] {
+                    let imported = run(std::slice::from_ref(second), limits(1))
+                        .unwrap()
+                        .into_complete()
+                        .unwrap();
+                    let counts: Vec<_> = imported
+                        .modules
+                        .iter()
+                        .map(|report| report.defeq + report.backward_defeq)
+                        .collect();
+                    assert_eq!(counts, [1, 0]);
+                    use fln_elab::source::scope::simp::defeq;
+                    assert_eq!(
+                        defeq::read_backward(imported.engine.environment(), || Ok(())).unwrap(),
+                        BTreeSet::from([declaration.clone()]),
+                    );
+                }
+                for entries in [
+                    vec![shared.clone_ref(), unshared.clone_ref()],
+                    vec![shared.clone_ref(), shared.clone_ref()],
+                ] {
+                    assert!(matches!(
+                        run(&entries, limits(1)),
+                        Err(SourceOleanImportError::Metadata { module, declaration: repeated, reason: "duplicate reflexivity tag in one module" })
+                            if module == main && repeated == declaration
+                    ));
+                }
+                let mut bounded = limits(1);
+                bounded.metadata.max_entries = 1;
+                assert!(
+                    run(std::slice::from_ref(&unshared), bounded)
+                        .unwrap()
+                        .into_complete()
+                        .is_some(),
+                    "byte-identical cross-module tags retain their original cached decode cost"
+                );
+                assert!(matches!(
+                    run(std::slice::from_ref(&shared), bounded),
+                    Err(SourceOleanImportError::Decode(
+                        metadata::DecodeError::Limit {
+                            resource: "entries"
+                        }
+                    ))
+                ));
+            }
         });
     }
 
