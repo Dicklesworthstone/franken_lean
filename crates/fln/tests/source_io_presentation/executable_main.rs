@@ -265,17 +265,41 @@ fn admitted_main_selection_refuses_before_effects_and_retains_typed_exceptions()
             let Some(engine) = imported() else { return };
             let original = engine.logical_root(&KVMap::new());
             let arguments = ["one".to_owned()];
+            // A root `main` of another type is the pin's compile error (`isValidMainType`,
+            // vendored `Lean/Compiler/LCNF/Main.lean:69-80, 153-156`), so checking it refuses. As
+            // `noncomputable` it generates no code and is admitted, as at the pin, and the
+            // executable door still refuses to select it.
+            for source in [
+                "def main : Nat := 0",
+                "def main : IO Nat := pure 0",
+                "def main : BaseIO Unit := pure ()",
+                "def main (_arg : String) : IO Unit := pure ()",
+                "def main (_args : List String) (_extra : Nat) : IO Unit := pure ()",
+                "def MainArgsAlias := List String\ndef main (_args : MainArgsAlias) : IO Unit := pure ()",
+                "def MainActionAlias := IO Unit\ndef main : MainActionAlias := show MainActionAlias from (pure () : IO Unit)",
+                "def MainResultAlias := Unit\ndef main : IO MainResultAlias := pure (show MainResultAlias from ())",
+            ] {
+                let refusal = engine
+                    .check_source_files(
+                        &[source.as_bytes()],
+                        &KVMap::new(),
+                        SourceCheckLimits::new(admission()),
+                    )
+                    .err()
+                    .map(|error| format!("{error:?}"))
+                    .unwrap_or_default();
+                assert!(refusal.contains("InvalidMainType"), "{source}\n{refusal}");
+                let uncompiled = source.replace("def main", "noncomputable def main");
+                let candidate = checked(engine, &uncompiled);
+                let error = candidate.execute_main(&arguments, &KVMap::new(), limits()).unwrap_err();
+                assert!(
+                    matches!(error, MainExecutionError::InvalidMainType),
+                    "selection must refuse before compilation: {uncompiled}\n{error:?}"
+                );
+            }
             for (source, missing) in [
                 ("", true),
                 ("namespace MainNamespace\ndef main : IO Unit := pure ()\nend MainNamespace", true),
-                ("def main : Nat := 0", false),
-                ("def main : IO Nat := pure 0", false),
-                ("def main : BaseIO Unit := pure ()", false),
-                ("def main (_arg : String) : IO Unit := pure ()", false),
-                ("def main (_args : List String) (_extra : Nat) : IO Unit := pure ()", false),
-                ("def MainArgsAlias := List String\ndef main (_args : MainArgsAlias) : IO Unit := pure ()", false),
-                ("def MainActionAlias := IO Unit\ndef main : MainActionAlias := show MainActionAlias from (pure () : IO Unit)", false),
-                ("def MainResultAlias := Unit\ndef main : IO MainResultAlias := pure (show MainResultAlias from ())", false),
             ] {
                 let candidate = if source.is_empty() { engine.clone() } else { checked(engine, source) };
                 let error = candidate.execute_main(&arguments, &KVMap::new(), limits()).unwrap_err();
@@ -318,7 +342,7 @@ fn admitted_main_selection_refuses_before_effects_and_retains_typed_exceptions()
             let directory = Directory::new("main-refusal");
             let sentinel = directory.0.join("sentinel.txt");
             std::fs::write(&sentinel, b"unchanged\n").unwrap();
-            let invalid = checked(engine, &format!(r#"def main : IO Nat := do
+            let invalid = checked(engine, &format!(r#"noncomputable def main : IO Nat := do
   let h ← IO.FS.Handle.mk {} IO.FS.Mode.append
   h.putStr "invalid main ran\n"
   return 42"#, quoted(&sentinel)));

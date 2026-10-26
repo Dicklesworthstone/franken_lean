@@ -1409,9 +1409,11 @@ mod tests {
                     // invalid executable signature. Its distinct selection
                     // error proves whether the saved dependency guard allowed
                     // the main path to proceed; no synthetic VM result is used.
+                    // It is `noncomputable`: compiled, a root `main` of this type
+                    // is already the pin's compile error at the declaration.
                     let commands = engine
                         .execute_source_commands_with_checks(
-                            b"def main : Nat := 7\n#eval 42\n",
+                            b"noncomputable def main : Nat := 7\n#eval 42\n",
                             &fln::KVMap::new(),
                             limits,
                         )
