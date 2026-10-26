@@ -7555,6 +7555,283 @@ fn managerless_task_world_callbacks_honor_borrows_and_refuse_unique() {
     }
 }
 
+fn base_io_composition_callback_program(
+    row: &str,
+    scalar_payload: bool,
+    callback: Function,
+) -> ValidatedProgram {
+    validated(vec![
+        function(
+            0,
+            0,
+            13,
+            vec![
+                if scalar_payload {
+                    Instruction::Nat {
+                        dst: r(0),
+                        value: 41,
+                    }
+                } else {
+                    Instruction::String {
+                        dst: r(0),
+                        value: "retained task payload".to_string(),
+                    }
+                },
+                // Task.pure consumes its argument. Keep the original alias
+                // alive so the assertions can compare its exact identity.
+                Instruction::Copy {
+                    dst: r(10),
+                    src: r(0),
+                },
+                intrinsic(r(1), "extern:Task.pure", vec![r(10)]),
+                Instruction::String {
+                    dst: r(2),
+                    value: "captured composition argument".to_string(),
+                },
+                Instruction::Closure {
+                    dst: r(3),
+                    function: fid(1),
+                    captures: vec![r(2)],
+                    capture_ownership: vec![ArgumentOwnership::Borrowed],
+                },
+                Instruction::Nat {
+                    dst: r(4),
+                    value: 0,
+                },
+                Instruction::Nat {
+                    dst: r(5),
+                    value: 0,
+                },
+                intrinsic(
+                    r(6),
+                    row,
+                    if row == "extern:BaseIO.mapTask" {
+                        vec![r(3), r(1), r(4), r(5)]
+                    } else {
+                        vec![r(1), r(3), r(4), r(5)]
+                    },
+                ),
+                // Task.get consumes its task; retain both task aliases for
+                // the later identity and finished-state assertions.
+                Instruction::Copy {
+                    dst: r(11),
+                    src: r(6),
+                },
+                intrinsic(r(7), "extern:Task.get", vec![r(11)]),
+                Instruction::Copy {
+                    dst: r(12),
+                    src: r(1),
+                },
+                intrinsic(r(8), "extern:Task.get", vec![r(12)]),
+                Instruction::Array {
+                    dst: r(9),
+                    items: vec![r(0), r(1), r(2), r(3), r(6), r(7), r(8)],
+                },
+                Instruction::Return { src: r(9) },
+            ],
+        ),
+        callback,
+    ])
+}
+
+#[test]
+fn managerless_base_io_composition_honors_callback_ownership_without_claiming_unique() {
+    let _guard = lock();
+    let dispositions = [
+        ArgumentOwnership::Borrowed,
+        ArgumentOwnership::Owned,
+        ArgumentOwnership::Scalar,
+        ArgumentOwnership::Unique,
+    ];
+    for row in ["extern:BaseIO.mapTask", "extern:BaseIO.bindTask"] {
+        for scalar_payload in [false, true] {
+            for payload in dispositions {
+                for world in dispositions {
+                    let mut code = vec![Instruction::Array {
+                        dst: r(3),
+                        items: vec![r(0), r(1), r(2)],
+                    }];
+                    if row == "extern:BaseIO.bindTask" {
+                        code.push(intrinsic(r(4), "extern:Task.pure", vec![r(3)]));
+                        code.push(Instruction::Return { src: r(4) });
+                    } else {
+                        code.push(Instruction::Return { src: r(3) });
+                    }
+                    let program = base_io_composition_callback_program(
+                        row,
+                        scalar_payload,
+                        function_with_ownership(
+                            1,
+                            vec![ArgumentOwnership::Borrowed, payload, world],
+                            5,
+                            code,
+                        ),
+                    );
+                    let invalid_payload = payload == ArgumentOwnership::Unique
+                        || (payload == ArgumentOwnership::Scalar && !scalar_payload);
+                    let invalid_world = world == ArgumentOwnership::Unique;
+                    shadow::enable();
+                    let outcome = execute(&program, ExecutionLimits::default(), None);
+                    if invalid_payload || invalid_world {
+                        let argument = usize::from(!invalid_payload);
+                        let expected = if invalid_payload { payload } else { world };
+                        let actual = if invalid_payload && !scalar_payload {
+                            ArgumentOwnership::Owned
+                        } else {
+                            ArgumentOwnership::Scalar
+                        };
+                        assert!(
+                            matches!(
+                                outcome,
+                                Outcome::Complete(VmExit::Refused {
+                                    refusal: VmRefusal::ApplyOwnershipMismatch {
+                                        function,
+                                        argument: observed_argument,
+                                        expected: observed_expected,
+                                        actual: observed_actual,
+                                    },
+                                    usage,
+                                }) if function == fid(1)
+                                    && observed_argument == argument
+                                    && observed_expected == expected
+                                    && observed_actual == actual
+                                    && usage.peak_stack_depth == 1
+                            ),
+                            "{row}, scalar payload {scalar_payload}, {payload:?}/{world:?}"
+                        );
+                    } else {
+                        let completed = returned(outcome);
+                        assert_eq!(completed.value.array_view(), (7, 7));
+                        assert_eq!(completed.usage.peak_stack_depth, 2);
+                        let retained = completed.value.array_child(0);
+                        if scalar_payload {
+                            assert_eq!(retained.unbox(), 41);
+                        } else {
+                            assert_eq!(string_contents(&retained), "retained task payload");
+                        }
+                        let original = completed
+                            .value
+                            .array_child(1)
+                            .finished_task_value()
+                            .expect("the original task is still finished");
+                        assert_eq!(original.identity_token(), retained.identity_token());
+                        let captured = completed.value.array_child(2);
+                        assert_eq!(string_contents(&captured), "captured composition argument");
+                        assert_eq!(
+                            value_kind(&completed.value.array_child(3)),
+                            ValueKind::Closure
+                        );
+                        let result = completed.value.array_child(5);
+                        assert_eq!(result.array_view(), (3, 3));
+                        assert_eq!(
+                            result.array_child(0).identity_token(),
+                            captured.identity_token()
+                        );
+                        assert_eq!(
+                            result.array_child(1).identity_token(),
+                            retained.identity_token()
+                        );
+                        assert_eq!(result.array_child(2).unbox(), 0);
+                        let composed = completed
+                            .value
+                            .array_child(4)
+                            .finished_task_value()
+                            .expect("the composed task is finished");
+                        assert_eq!(composed.identity_token(), result.identity_token());
+                        assert_eq!(
+                            completed.value.array_child(6).identity_token(),
+                            retained.identity_token(),
+                            "a later read of the original task retains its exact payload"
+                        );
+                        drop(composed);
+                        drop(result);
+                        drop(captured);
+                        drop(original);
+                        drop(retained);
+                        drop(completed);
+                    }
+                    let (events, live) = shadow::disable_and_drain();
+                    assert_eq!(
+                        live, 0,
+                        "{row}, scalar payload {scalar_payload}, {payload:?}/{world:?}"
+                    );
+                    assert!(events.iter().all(|event| {
+                        event.kind != shadow::EventKind::DoubleRelease
+                            && event.kind != shadow::EventKind::ForeignPointer
+                    }));
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn managerless_base_io_composition_refuses_overapplication_and_retains_partial_callbacks() {
+    let _guard = lock();
+    for row in ["extern:BaseIO.mapTask", "extern:BaseIO.bindTask"] {
+        for remaining in [1, 3] {
+            let arity = remaining + 1;
+            let program = base_io_composition_callback_program(
+                row,
+                false,
+                function_with_ownership(
+                    1,
+                    vec![ArgumentOwnership::Borrowed; arity],
+                    u16::try_from(arity).unwrap(),
+                    vec![Instruction::Panic { message: r(0) }],
+                ),
+            );
+            shadow::enable();
+            let outcome = execute(&program, ExecutionLimits::default(), None);
+            if remaining == 1 {
+                assert!(matches!(
+                    outcome,
+                    Outcome::Complete(VmExit::Refused {
+                        refusal: VmRefusal::MalformedClosure {
+                            reason: "task composition continuation requires payload and world parameters",
+                        },
+                        usage,
+                    }) if usage.peak_stack_depth == 1
+                ));
+            } else if row == "extern:BaseIO.bindTask" {
+                assert!(matches!(
+                    outcome,
+                    Outcome::Complete(VmExit::Refused {
+                        refusal: VmRefusal::TypeMismatch {
+                            operation: "Task.bind result",
+                            argument: 0,
+                            expected: "finished Task",
+                            actual: ValueKind::Closure,
+                        },
+                        usage,
+                    }) if usage.peak_stack_depth == 1
+                ));
+            } else {
+                let completed = returned(outcome);
+                assert_eq!(completed.usage.peak_stack_depth, 1);
+                let partial = completed.value.array_child(5);
+                assert_eq!(value_kind(&partial), ValueKind::Closure);
+                let (arity, fixed) = partial.closure_shell_parts().unwrap();
+                assert_eq!(arity, 5);
+                assert_eq!(fixed.len(), 4);
+                assert_eq!(fixed[0].unbox(), 1);
+                assert_eq!(string_contents(&fixed[1]), "captured composition argument");
+                assert_eq!(string_contents(&fixed[2]), "retained task payload");
+                assert_eq!(fixed[3].unbox(), 0);
+                drop(fixed);
+                drop(partial);
+                drop(completed);
+            }
+            let (events, live) = shadow::disable_and_drain();
+            assert_eq!(live, 0, "{row}, remaining parameters {remaining}");
+            assert!(events.iter().all(|event| {
+                event.kind != shadow::EventKind::DoubleRelease
+                    && event.kind != shadow::EventKind::ForeignPointer
+            }));
+        }
+    }
+}
+
 #[test]
 fn managerless_base_io_map_and_bind_apply_real_world_and_compose_finished_tasks() {
     let _guard = lock();

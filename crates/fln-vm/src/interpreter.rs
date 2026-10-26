@@ -6967,6 +6967,50 @@ fn cache_thunk_value(thunk: &Obj, value: &Obj) -> Result<(), Stop> {
     )))
 }
 
+fn task_composition_argument_ownership(
+    program: &ValidatedProgram,
+    closure: &Obj,
+    payload: &Obj,
+) -> Result<Vec<ArgumentOwnership>, VmRefusal> {
+    let plan = plan_apply(program, closure, 2, None, None)?;
+    let ownership = program
+        .function(plan.function)
+        .and_then(|function| function.parameter_ownership.get(plan.captures.len()..))
+        .and_then(|parameters| parameters.get(..2))
+        .ok_or(VmRefusal::MalformedClosure {
+            reason: "task composition continuation requires payload and world parameters",
+        })?;
+    // finished_task_value retained the payload, so this temporary can be
+    // borrowed or consumed by the callback. The original task may still own
+    // it: neither this retain nor the internally created world grants Unique.
+    // A Scalar parameter also requires the physical value to be tagged.
+    for (argument, (expected, actual)) in ownership
+        .iter()
+        .copied()
+        .zip([
+            if payload.is_scalar() {
+                ArgumentOwnership::Scalar
+            } else {
+                ArgumentOwnership::Owned
+            },
+            ArgumentOwnership::Scalar,
+        ])
+        .enumerate()
+    {
+        if expected == ArgumentOwnership::Unique
+            || (expected == ArgumentOwnership::Scalar && actual != ArgumentOwnership::Scalar)
+        {
+            return Err(VmRefusal::ApplyOwnershipMismatch {
+                function: plan.function,
+                argument,
+                expected,
+                actual,
+            });
+        }
+    }
+    Ok(ownership.to_vec())
+}
+
 fn closure_intrinsic_application(
     program: &ValidatedProgram,
     implementation: IntrinsicImplementation,
@@ -7026,11 +7070,13 @@ fn closure_intrinsic_application(
             let argument = task
                 .finished_task_value()
                 .ok_or(VmRefusal::UnsupportedTaskState)?;
+            let argument_ownership =
+                task_composition_argument_ownership(program, &closure, &argument)?;
             Ok(IntrinsicApplication {
                 row,
                 closure,
                 arguments: vec![argument, Obj::mk_nat(0)],
-                argument_ownership: vec![ArgumentOwnership::Owned, ArgumentOwnership::Scalar],
+                argument_ownership,
                 completion: IntrinsicCompletion::WrapPure,
                 trace: None,
             })
@@ -7050,11 +7096,13 @@ fn closure_intrinsic_application(
             let argument = task
                 .finished_task_value()
                 .ok_or(VmRefusal::UnsupportedTaskState)?;
+            let argument_ownership =
+                task_composition_argument_ownership(program, &closure, &argument)?;
             Ok(IntrinsicApplication {
                 row,
                 closure,
                 arguments: vec![argument, Obj::mk_nat(0)],
-                argument_ownership: vec![ArgumentOwnership::Owned, ArgumentOwnership::Scalar],
+                argument_ownership,
                 completion: IntrinsicCompletion::RequireFinishedTask,
                 trace: None,
             })
