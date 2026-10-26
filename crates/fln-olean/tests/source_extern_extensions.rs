@@ -105,7 +105,9 @@ fn malformed_extern_tags_fields_names_and_list_tails_refuse_atomically() {
         Obj::mk_ctor(4, vec![inject_name(&name("all"))], &[]),
         Obj::mk_ctor(2, vec![inject_name(&name("all"))], &[]),
         Obj::mk_ctor(0, vec![Obj::mk_string("all")], &[]),
-        Obj::mk_ctor(0, vec![inject_name(&Name::anonymous())], &[]),
+        // A backend may be any Name, anonymous included (see the test below),
+        // but a tagged scalar other than the anonymous box is no Name at all.
+        Obj::mk_ctor(0, vec![Obj::mk_nat(1)], &[]),
         Obj::mk_ctor(1, vec![inject_name(&name("cpp")), Obj::mk_nat(7)], &[]),
         Obj::mk_ctor(2, vec![inject_name(&name("all")), Obj::mk_nat(7)], &[]),
     ];
@@ -137,6 +139,36 @@ fn malformed_extern_tags_fields_names_and_list_tails_refuse_atomically() {
     bytes.truncate(bytes.len() / 2);
     truncated[0].entries.push(bytes);
     assert!(decode(&truncated, DecodeLimits::default()).is_err());
+}
+
+/// The pin's `ExternEntry` backend is an arbitrary `Name`. Pinned `lean` v4.32.0
+/// sets `[.adhoc .anonymous]` with `externAttr.setParam`, writes it to an olean, and
+/// an importing module reads back exactly that entry (both runs exit 0, 2026-10-25).
+/// So an anonymous backend is data to preserve, not a malformed name; the owning
+/// declaration keeps the decoder's non-anonymous check.
+#[test]
+fn an_anonymous_backend_is_preserved_as_the_pin_round_trips_it() {
+    let adhoc = Obj::mk_ctor(0, vec![inject_name(&Name::anonymous())], &[]);
+    let decoded = decode(
+        &blocks(&attribute(list(vec![adhoc]))),
+        DecodeLimits::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        decoded.externs,
+        [ExternAttribute {
+            declaration: name("sample"),
+            entries: vec![ExternEntry::Adhoc {
+                backend: Name::anonymous()
+            }],
+        }]
+    );
+    let nameless = Obj::mk_ctor(
+        0,
+        vec![inject_name(&Name::anonymous()), list(vec![standard()])],
+        &[],
+    );
+    assert!(decode(&blocks(&nameless), DecodeLimits::default()).is_err());
 }
 
 #[test]

@@ -619,7 +619,8 @@ fn registry_resource_stops_are_nonanswers_not_successful_fallbacks() {
 
 /// The parser keeps every attribute the pin parses in the declaration's tree. The elaborator
 /// implements one global `simp` and the code generator hints (`inline`, `specialize`, …), which
-/// change no checked meaning, and `macro_inline`, recorded for the runtime, and refuses the rest.
+/// change no checked meaning, and `macro_inline` and `extern`, recorded for the runtime, and
+/// refuses the rest.
 /// So no attribute is dropped and none is admitted without its meaning.
 #[test]
 fn attributes_the_elaborator_does_not_implement_are_refused_after_parsing() {
@@ -631,7 +632,6 @@ fn attributes_the_elaborator_does_not_implement_are_refused_after_parsing() {
         "@[simp ↓] theorem t : (0 : Nat) = 0 := by rfl",
         "@[grind =] theorem t : (0 : Nat) = 0 := by rfl",
         "@[deprecated (since := \"2026-01-01\")] def x : Nat := 0",
-        "@[extern \"lean_x\"] def x : Nat := 0",
         "@[simp 4294967296] theorem t : (0 : Nat) = 0 := by rfl",
         "@[simp 0xff] theorem t : (0 : Nat) = 0 := by rfl",
         "@[simp] example : (0 : Nat) = 0 := by rfl",
@@ -663,6 +663,22 @@ fn attributes_the_elaborator_does_not_implement_are_refused_after_parsing() {
     ] {
         checked(&base, &[source]);
     }
+    // The pinned `lean` v4.32.0 accepts `@[extern "lean_x"] def x : Nat := 0` as a headerless
+    // file (exit 0, no diagnostics, 2026-10-25), which this test refused while source `extern`
+    // was unregistered. It is admitted now, and its explicit entry is recorded.
+    let result = checked(&base, &["@[extern \"lean_x\"] def x : Nat := 0"]);
+    assert_eq!(
+        fln_elab::externs::ExternTable::read(result.engine.environment())
+            .unwrap()
+            .get(&Name::from_components(["x"])),
+        Some(
+            [fln_elab::externs::ExternEntry::Standard {
+                backend: Name::from_components(["all"]),
+                symbol: "lean_x".into(),
+            }]
+            .as_slice()
+        )
+    );
 }
 
 /// `default`, `low`, `mid` and `high` are the pin's priorities 1000, 100, 500 and 10000
