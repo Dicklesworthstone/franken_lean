@@ -209,6 +209,21 @@ impl Obj {
         }
     }
 
+    /// Append a byte, preserving an exclusive byte array's spare capacity.
+    ///
+    /// The borrowed header check performs no payload copy. Wrong categories,
+    /// element widths, or inconsistent headers return the original owned
+    /// handle. Shared arrays follow the existing export's copy-on-write path.
+    pub fn try_byte_array_push(self, value: u8) -> Result<Obj, Obj> {
+        if !matches!(self.try_borrow_sarray_view(), Some((1, _, _, _))) {
+            return Err(self);
+        }
+        Ok(Obj(export::export_lean_byte_array_push(
+            self.into_raw(),
+            value,
+        )))
+    }
+
     /// Closure shell (function pointer dangling; layout/RC suites only). A
     /// shell must never reach [`Obj::apply`] — the callable constructors are
     /// the `mk_closure_fn*` family, where the arity comes from the TYPE.

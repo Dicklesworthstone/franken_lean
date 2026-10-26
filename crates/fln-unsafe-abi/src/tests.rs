@@ -2901,6 +2901,99 @@ fn owned_array_push_returns_invalid_inputs_without_consuming_them() {
 }
 
 #[test]
+fn owned_byte_array_push_reuses_capacity_and_preserves_aliases() {
+    let _guard = lock();
+    shadow::enable();
+    {
+        let array = Obj::mk_sarray(1, &[])
+            .try_byte_array_push(0)
+            .unwrap_or_else(|_| panic!("an empty byte array must support push"));
+        assert_eq!(
+            array.try_borrow_sarray_view().unwrap(),
+            (1, 1, 2, [0].as_slice())
+        );
+        let identity = array.identity_token();
+        let mut array = array
+            .try_byte_array_push(1)
+            .unwrap_or_else(|_| panic!("exclusive spare capacity must support push"));
+        assert_eq!(array.identity_token(), identity);
+        for index in 2..2048 {
+            array = array
+                .try_byte_array_push(u8::try_from(index % 256).unwrap())
+                .unwrap_or_else(|_| panic!("a well-formed byte array must support push"));
+        }
+        let (element_size, size, capacity, bytes) = array.try_borrow_sarray_view().unwrap();
+        assert_eq!((element_size, size, capacity), (1, 2048, 4094));
+        for (index, &byte) in bytes.iter().enumerate() {
+            assert_eq!(usize::from(byte), index % 256);
+        }
+        let alias = array.clone_ref();
+        let pushed = array
+            .try_byte_array_push(255)
+            .unwrap_or_else(|_| panic!("a shared byte array must support push"));
+        let (_, old_size, old_capacity, old) = alias.try_borrow_sarray_view().unwrap();
+        let (_, new_size, new_capacity, new) = pushed.try_borrow_sarray_view().unwrap();
+        assert_eq!((old_size, old_capacity), (2048, 4094));
+        assert_eq!((new_size, new_capacity), (2049, 4094));
+        assert_ne!(alias.identity_token(), pushed.identity_token());
+        assert_eq!(&new[..old_size], old);
+        assert_eq!(new[old_size], 255);
+    }
+    let (events, live) = shadow::disable_and_drain();
+    assert_eq!(live, 0);
+    let allocations = events
+        .iter()
+        .filter(|event| {
+            event.kind == EventKind::Alloc && event.category == Some(contract::TAG_SCALAR_ARRAY)
+        })
+        .count();
+    assert!(
+        allocations <= 16,
+        "byte push copied on every append: {allocations}"
+    );
+    assert!(events.iter().all(|event| !matches!(
+        event.kind,
+        EventKind::DoubleRelease | EventKind::ForeignPointer
+    )));
+}
+
+#[test]
+fn owned_byte_array_push_returns_invalid_inputs_without_consuming_them() {
+    let _guard = lock();
+    for invalid in [
+        Obj::mk_nat(3),
+        Obj::mk_string("not a byte array"),
+        Obj::mk_array(Vec::new()),
+        Obj::mk_sarray(2, &[1, 2]),
+        Obj::mk_sarray(8, &[0; 8]),
+    ] {
+        let identity = invalid.identity_token();
+        let original = invalid
+            .try_byte_array_push(7)
+            .err()
+            .expect("category and byte width must be checked before transfer");
+        assert_eq!(original.identity_token(), identity);
+    }
+    let array = Obj::mk_sarray(1, &[9]);
+    array.plant_sarray_size(2);
+    let original = array
+        .try_byte_array_push(10)
+        .err()
+        .expect("an inconsistent header must retain the input handle");
+    original.restore_sarray_size(1);
+    assert_eq!(original.try_borrow_sarray_view().unwrap().3, &[9]);
+
+    let array = Obj::mk_sarray(1, &[11]);
+    array.plant_sarray_elem(0);
+    let original = array
+        .try_byte_array_push(12)
+        .err()
+        .expect("zero element width must retain the input handle");
+    original.plant_sarray_elem(1);
+    assert_eq!(original.try_borrow_sarray_view().unwrap().3, &[11]);
+}
+
+#[test]
 fn export_byte_array_families_match_pin_laws() {
     let _g = lock();
     use crate::export::{

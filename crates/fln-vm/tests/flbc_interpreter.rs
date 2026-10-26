@@ -7733,36 +7733,38 @@ fn managerless_task_spawn_wraps_an_under_applied_closure_without_entering_it() {
 #[test]
 fn internal_thunk_and_task_application_bind_argument_ownership_before_entry() {
     let _guard = lock();
-    let thunk = validated(vec![
-        function(
-            0,
-            0,
-            3,
-            vec![
-                Instruction::Closure {
-                    dst: r(0),
-                    function: fid(1),
-                    captures: Vec::new(),
-                    capture_ownership: Vec::new(),
-                },
-                intrinsic(r(1), "extern:Thunk.mk", vec![r(0)]),
-                intrinsic(r(2), "extern:Thunk.get", vec![r(1)]),
-                Instruction::Return { src: r(2) },
-            ],
-        ),
-        function_with_ownership(
-            1,
-            vec![ArgumentOwnership::Borrowed],
-            2,
-            vec![
-                Instruction::String {
-                    dst: r(1),
-                    value: "unreachable".to_string(),
-                },
-                Instruction::Return { src: r(1) },
-            ],
-        ),
-    ]);
+    let thunk = |ownership| {
+        validated(vec![
+            function(
+                0,
+                0,
+                3,
+                vec![
+                    Instruction::Closure {
+                        dst: r(0),
+                        function: fid(1),
+                        captures: Vec::new(),
+                        capture_ownership: Vec::new(),
+                    },
+                    intrinsic(r(1), "extern:Thunk.mk", vec![r(0)]),
+                    intrinsic(r(2), "extern:Thunk.get", vec![r(1)]),
+                    Instruction::Return { src: r(2) },
+                ],
+            ),
+            function_with_ownership(
+                1,
+                vec![ownership],
+                2,
+                vec![
+                    Instruction::String {
+                        dst: r(1),
+                        value: "unit result".to_string(),
+                    },
+                    Instruction::Return { src: r(1) },
+                ],
+            ),
+        ])
+    };
     let spawn = validated(vec![
         function(
             0,
@@ -7878,8 +7880,8 @@ fn internal_thunk_and_task_application_bind_argument_ownership_before_entry() {
     let cases = [
         (
             "Thunk.get",
-            thunk,
-            ArgumentOwnership::Borrowed,
+            thunk(ArgumentOwnership::Unique),
+            ArgumentOwnership::Unique,
             ArgumentOwnership::Scalar,
         ),
         (
@@ -7903,6 +7905,16 @@ fn internal_thunk_and_task_application_bind_argument_ownership_before_entry() {
     ];
 
     shadow::enable();
+    // An internally supplied Unit has no heap ownership to transfer. Source
+    // thunks borrow it; only a Unique claim is refused before entering them.
+    let completed = returned(execute(
+        &thunk(ArgumentOwnership::Borrowed),
+        ExecutionLimits::default(),
+        None,
+    ));
+    assert_eq!(string_contents(&completed.value), "unit result");
+    assert_eq!(completed.usage.peak_stack_depth, 2);
+    drop(completed);
     for (row, program, expected, actual) in cases {
         assert!(
             matches!(
@@ -8743,6 +8755,162 @@ fn generated_array_push_preserves_shared_aliases_and_owned_children() {
     assert_eq!(pushed.array_child(0).string_view().3, b"old\0");
     assert_eq!(pushed.array_child(1).string_view().3, b"new\0");
     drop((original, pushed, result));
+    let (events, live) = shadow::disable_and_drain();
+    assert_eq!(live, 0);
+    assert!(events.iter().all(|event| !matches!(
+        event.kind,
+        shadow::EventKind::DoubleRelease | shadow::EventKind::ForeignPointer
+    )));
+}
+
+#[test]
+fn generated_byte_array_push_reuses_transferred_capacity() {
+    let _guard = lock();
+    let mut code = vec![
+        Instruction::Array {
+            dst: r(0),
+            items: Vec::new(),
+        },
+        intrinsic(r(0), "extern:ByteArray.mk", vec![r(0)]),
+    ];
+    for value in 0..2048 {
+        code.push(Instruction::Nat {
+            dst: r(1),
+            value: value % 256,
+        });
+        code.push(intrinsic(r(0), "extern:ByteArray.push", vec![r(0), r(1)]));
+    }
+    code.push(Instruction::Return { src: r(0) });
+    let program = validated(vec![function(0, 0, 2, code)]);
+    let bytes = encode_canonical(&program, CodecLimits::default()).expect("encode byte pushes");
+    let program = decode_canonical(&bytes, CodecLimits::default()).expect("decode byte pushes");
+
+    shadow::enable();
+    let result = returned(execute(&program, ExecutionLimits::default(), None));
+    let (element_size, size, capacity, bytes) = result.value.try_borrow_sarray_view().unwrap();
+    assert_eq!((element_size, size, capacity), (1, 2048, 4094));
+    for (index, &byte) in bytes.iter().enumerate() {
+        assert_eq!(usize::from(byte), index % 256);
+    }
+    drop(result);
+    let (events, live) = shadow::disable_and_drain();
+    assert_eq!(live, 0);
+    let allocations = events
+        .iter()
+        .filter(|event| {
+            event.kind == shadow::EventKind::Alloc && event.category == Some(abi::TAG_SCALAR_ARRAY)
+        })
+        .count();
+    assert!(
+        allocations <= 16,
+        "ByteArray.push copied each prefix: {allocations}"
+    );
+    assert!(events.iter().all(|event| !matches!(
+        event.kind,
+        shadow::EventKind::DoubleRelease | shadow::EventKind::ForeignPointer
+    )));
+}
+
+#[test]
+fn generated_byte_array_push_preserves_shared_aliases_and_scalar_operands() {
+    let _guard = lock();
+    let program = validated(vec![function(
+        0,
+        0,
+        5,
+        vec![
+            Instruction::Nat {
+                dst: r(0),
+                value: 65,
+            },
+            Instruction::Array {
+                dst: r(1),
+                items: vec![r(0)],
+            },
+            intrinsic(r(1), "extern:ByteArray.mk", vec![r(1)]),
+            Instruction::Nat {
+                dst: r(0),
+                value: 66,
+            },
+            intrinsic(r(1), "extern:ByteArray.push", vec![r(1), r(0)]),
+            Instruction::Copy {
+                dst: r(2),
+                src: r(1),
+            },
+            Instruction::Nat {
+                dst: r(0),
+                value: 255,
+            },
+            intrinsic(r(3), "extern:ByteArray.push", vec![r(1), r(0)]),
+            Instruction::Array {
+                dst: r(4),
+                items: vec![r(2), r(3), r(0)],
+            },
+            Instruction::Return { src: r(4) },
+        ],
+    )]);
+    shadow::enable();
+    let result = returned(execute(&program, ExecutionLimits::default(), None));
+    let original = result.value.array_child(0);
+    let pushed = result.value.array_child(1);
+    assert_eq!(
+        original.try_borrow_sarray_view().unwrap(),
+        (1, 2, 4, b"AB".as_slice())
+    );
+    assert_eq!(
+        pushed.try_borrow_sarray_view().unwrap(),
+        (1, 3, 4, b"AB\xff".as_slice())
+    );
+    assert_eq!(result.value.array_child(2).unbox(), 255);
+    drop((original, pushed, result));
+    let (events, live) = shadow::disable_and_drain();
+    assert_eq!(live, 0);
+    assert!(events.iter().all(|event| !matches!(
+        event.kind,
+        shadow::EventKind::DoubleRelease | shadow::EventKind::ForeignPointer
+    )));
+}
+
+#[test]
+fn generated_byte_array_push_refuses_wrong_categories_and_wide_bytes() {
+    let _guard = lock();
+    let program = |byte_array, value| {
+        let mut code = vec![Instruction::Array {
+            dst: r(0),
+            items: Vec::new(),
+        }];
+        if byte_array {
+            code.push(intrinsic(r(0), "extern:ByteArray.mk", vec![r(0)]));
+        }
+        code.extend([
+            Instruction::Nat { dst: r(1), value },
+            intrinsic(r(2), "extern:ByteArray.push", vec![r(0), r(1)]),
+            Instruction::Return { src: r(2) },
+        ]);
+        validated(vec![function(0, 0, 3, code)])
+    };
+    shadow::enable();
+    assert!(matches!(
+        execute(&program(false, 7), ExecutionLimits::default(), None),
+        Outcome::Complete(VmExit::Refused {
+            refusal: VmRefusal::TypeMismatch {
+                operation: "ByteArray.push",
+                argument: 0,
+                expected: "ByteArray",
+                actual: ValueKind::Array,
+            },
+            ..
+        })
+    ));
+    assert!(matches!(
+        execute(&program(true, 256), ExecutionLimits::default(), None),
+        Outcome::Complete(VmExit::Refused {
+            refusal: VmRefusal::NatOverflow {
+                operation: "ByteArray.push"
+            },
+            ..
+        })
+    ));
     let (events, live) = shadow::disable_and_drain();
     assert_eq!(live, 0);
     assert!(events.iter().all(|event| !matches!(

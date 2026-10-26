@@ -6491,10 +6491,8 @@ fn dispatch_intrinsic(
             };
             Ok(IntrinsicResult::scalar(Obj::mk_nat(usize::from(ordering))))
         }
-        // ByteArray rows. The pin mutates in place when its refcount shows a
-        // sole owner and copies otherwise; that optimization is invisible to
-        // pure value semantics, so every handler here still builds a fresh
-        // object. Array.push above preserves transferred ownership instead.
+        // ByteArray.push transfers its consumed reference so the native export
+        // retains the pin's growth and copy-on-write behavior.
         IntrinsicImplementation::ByteArraySize => {
             expect_arity(row, args, 1)?;
             let bytes = byte_array_bytes(&args[0], "ByteArray.size", 0)?;
@@ -6579,9 +6577,20 @@ fn dispatch_intrinsic(
         }
         IntrinsicImplementation::ByteArrayPush => {
             expect_arity(row, args, 2)?;
-            let mut bytes = byte_array_bytes(&args[0], "ByteArray.push", 0)?;
-            bytes.push(byte_argument(&args[1], "ByteArray.push", 1)?);
-            Ok(IntrinsicResult::owned(mk_byte_array(&bytes)))
+            if value_kind(&args[0]) != ValueKind::ScalarArray {
+                return Err(type_mismatch("ByteArray.push", 0, "ByteArray", &args[0]).into());
+            }
+            if !matches!(args[0].try_borrow_sarray_view(), Some((1, _, _, _))) {
+                return Err(VmRefusal::InvalidByteArrayObject.into());
+            }
+            let value = byte_argument(&args[1], "ByteArray.push", 1)?;
+            // Only the array is consumed; the UInt8 scalar keeps its declared
+            // register semantics. Neither validation step copies its payload.
+            let array = std::mem::replace(&mut args[0], Obj::mk_nat(0));
+            array
+                .try_byte_array_push(value)
+                .map(IntrinsicResult::owned)
+                .map_err(|_| VmRefusal::InvalidByteArrayObject.into())
         }
         IntrinsicImplementation::ByteArrayMk => {
             expect_arity(row, args, 1)?;
