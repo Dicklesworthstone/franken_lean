@@ -19,6 +19,28 @@ fn check(source: &str) -> Result<usize, String> {
 }
 
 #[test]
+fn quotation_section_capture_cannot_fall_back_to_a_shadowed_global() {
+    for body in ["x", "Nat.add x 1"] {
+        let source = format!(
+            "def x : Nat := 1\nsection\nvariable (x : Nat)\nnotation \"capturedValue!\" => {body}\nend\ntheorem escaped : capturedValue! = 1 := rfl\n"
+        );
+        let error = check(&source).expect_err("section capture must not become global x");
+        assert!(
+            error.contains("quotation capture of a section variable"),
+            "{error}"
+        );
+    }
+    // The refusal is about a captured lexical identity, not the presence of a
+    // section or an unrelated variable. Explicit root qualification is global.
+    for variables in ["variable (y : Nat)", "variable (x : Nat)"] {
+        let source = format!(
+            "def x : Nat := 1\nsection\n{variables}\nnotation \"globalValue!\" => _root_.x\nend\ntheorem globalMeaning : globalValue! = 1 := rfl\n"
+        );
+        assert_eq!(check(&source).unwrap(), 1);
+    }
+}
+
+#[test]
 fn numeric_captures_do_not_match_identifiers_or_parenthesized_terms() {
     let source = r#"
 syntax "numeric! " term:max : term

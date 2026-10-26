@@ -707,6 +707,11 @@ pub(super) fn preresolve(
                         })
                     }
                     Resolution::Unchecked => built.push(ident.clone()),
+                    Resolution::SectionVariable => {
+                        return Err(EngineExecutionError::NotImplemented {
+                            feature: "quotation capture of a section variable",
+                        });
+                    }
                     Resolution::Nothing if !rule.prechecked => built.push(ident.clone()),
                     Resolution::Nothing => {
                         return Err(EngineExecutionError::ScopeTransition {
@@ -823,6 +828,24 @@ mod tests {
 
     fn global(name: &Name) -> Resolution {
         Resolution::Global(Name::from_components(["Declared"]).append_core(name))
+    }
+
+    #[test]
+    fn a_quotation_binder_shadows_a_section_variable_but_a_free_capture_refuses() {
+        let resolve = |name: &Name| {
+            if *name == Name::from_components(["x"]) {
+                Resolution::SectionVariable
+            } else {
+                global(name)
+            }
+        };
+        assert!(matches!(
+            preresolve(&rule("notation \"captured\" => x"), &resolve),
+            Err(EngineExecutionError::NotImplemented {
+                feature: "quotation capture of a section variable"
+            })
+        ));
+        assert!(preresolve(&rule("notation \"bound\" => fun x : Nat => x"), &resolve).is_ok());
     }
 
     #[test]

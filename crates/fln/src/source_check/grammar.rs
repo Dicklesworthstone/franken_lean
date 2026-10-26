@@ -406,6 +406,9 @@ pub(crate) enum Resolution {
     Global(Name),
     /// A constructor, whose bare use in a match pattern is not a variable.
     Constructor(Name),
+    /// A lexical section parameter. Capturing its declaration-site identity
+    /// across later expansions is not represented by the current journal.
+    SectionVariable,
     /// Nothing: the quotation precheck refuses the notation.
     Nothing,
     /// Several declarations, or the scope tables could not be read.
@@ -424,6 +427,15 @@ pub(crate) fn resolver<'e>(
         .ok()
         .zip(fln_elab::protected_names::ProtectedNames::read(environment).ok());
     move |name| {
+        if scope
+            .variables
+            .declared()
+            .iter()
+            .rev()
+            .any(|local| &local.user_name == name)
+        {
+            return Resolution::SectionVariable;
+        }
         let Some((aliases, protected)) = &tables else {
             return Resolution::Undetermined;
         };

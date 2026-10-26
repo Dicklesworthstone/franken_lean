@@ -254,3 +254,21 @@ fn an_application_an_undecided_notation_may_print_is_refused() {
         "stderr: {stderr}"
     );
 }
+
+#[test]
+fn a_section_capture_never_resolves_to_an_unrelated_global() {
+    let Some(lib) = pinned_lib() else { return };
+    let root = workspace();
+    let source = "prelude\nimport Init.Core\ndef x : Nat := 1\nsection\nvariable (x : Nat)\nnotation \"capturedValue!\" => x\nend\n#check capturedValue!\n";
+    let (code, stdout, stderr) = ours(&lib, &root, source);
+    assert_eq!(code, Some(5), "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(
+        stderr.contains("quotation capture of a section variable"),
+        "{stderr}"
+    );
+    if let Some((code, output)) = pinned(&lib, &root.join("Notations.lean")) {
+        assert_eq!(code, 1, "{output}");
+        assert!(output.contains("Unknown constant"), "{output}");
+    }
+}
