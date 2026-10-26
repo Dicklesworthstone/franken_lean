@@ -7395,6 +7395,7 @@ impl Engine {
         // The pin's warning for each definition an `attribute [instance]` command adds while it
         // is neither `@[reducible]` nor `@[implicit_reducible]` (`Lean/Meta/Instances.lean:288`).
         let mut instance_attribute_warnings: Vec<SourceWarning> = Vec::new();
+        let mut macro_pattern_warnings: Vec<SourceWarning> = Vec::new();
         // The pin's deprecation warnings, logged while each command elaborates
         // (`Linter.checkDeprecated`). This thread's elaborations publish their uses here; the
         // uses of a command are read at the next step, before anything else runs, with the
@@ -7825,6 +7826,18 @@ impl Engine {
                     at: Some(original_offset),
                 })?
             {
+                macro_pattern_warnings.extend(
+                    grammar
+                        .macro_warnings(&scopes.current.options)
+                        .iter()
+                        .map(|binder| SourceWarning {
+                            command_index,
+                            at: fln_parse::BytePos(original_offset.0 + binder.at),
+                            message: unused_variables::message(&binder.name),
+                            severity: SourceSeverity::Warning,
+                            follows_output: true,
+                        }),
+                );
                 grammar.extend_scopes(&mut scopes);
                 continue;
             }
@@ -7843,8 +7856,12 @@ impl Engine {
             // the pin's reserved-name action adds them when it resolves the name.
             if public.is_none() && source_records::may_name_equation_theorems(command_source) {
                 let parsed = grammar.enter(|| {
-                    fln_parse::parse_source_command(command_source)
-                        .and_then(fln_parse::ParsedSourceCommand::expanded)
+                    fln_parse::parse_source_command(command_source).and_then(|parsed| {
+                        grammar.expand_command(
+                            parsed,
+                            source_check::grammar::resolver(engine.environment(), &scope),
+                        )
+                    })
                 });
                 let members = match &parsed {
                     Ok(_) => None,
@@ -8044,8 +8061,12 @@ impl Engine {
             }
             let parsed = grammar
                 .enter(|| {
-                    fln_parse::parse_source_command(command_source)
-                        .and_then(fln_parse::ParsedSourceCommand::expanded)
+                    fln_parse::parse_source_command(command_source).and_then(|parsed| {
+                        grammar.expand_command(
+                            parsed,
+                            source_check::grammar::resolver(engine.environment(), &scope),
+                        )
+                    })
                 })
                 .map_err(|error| error.with_original_offset(original_offset))
                 .map_err(DefinitionFrontendError::Parse)
@@ -9093,6 +9114,7 @@ impl Engine {
         let mut warnings: Vec<SourceWarning> = deprecations;
         if pin_world {
             warnings.extend(instance_attribute_warnings);
+            warnings.extend(macro_pattern_warnings);
             warnings.extend(declaration_reducibility_warnings(
                 &lint_sites,
                 &linted,
@@ -9427,8 +9449,11 @@ impl Engine {
             Some(source_check::source_site(source)?.at_offset(terminal_offset));
         let checked = grammar
             .enter(|| {
-                let terminal = terminal
-                    .expanded()
+                let terminal = grammar
+                    .expand_command(
+                        terminal,
+                        source_check::grammar::resolver(query_engine.environment(), &query_scope),
+                    )
                     .map_err(DefinitionFrontendError::Parse)
                     .map_err(EngineExecutionError::Frontend)?;
                 query_engine.check_parsed_source_command_in_scope(

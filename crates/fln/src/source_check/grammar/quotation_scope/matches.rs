@@ -15,13 +15,16 @@ fn rebuild(syntax: &Syntax, args: Vec<Syntax>) -> Result<Syntax, EngineExecution
 }
 
 fn global_ident(syntax: &Syntax, global: Name) -> Result<Syntax, EngineExecutionError> {
-    let Syntax::Ident { info, raw_val, .. } = syntax else {
+    let Syntax::Ident {
+        info, raw_val, val, ..
+    } = syntax
+    else {
         return Err(unsupported_binder());
     };
     Ok(Syntax::Ident {
         info: *info,
         raw_val: *raw_val,
-        val: Name::from_components(["_root_"]).append_core(&global),
+        val: val.clone(),
         preresolved: vec![Preresolved::Decl {
             name: global,
             fields: Vec::new(),

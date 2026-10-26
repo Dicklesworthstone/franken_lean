@@ -116,7 +116,7 @@ fn unsupported_scoped_registration_preserves_every_earlier_meaning() {
     declare(&mut file, "namespace Choice");
     let before = file.export_native().unwrap();
     let generation = file.generation;
-    let source = "scoped macro_rules | `(picked! 0) => `(7) | `($n:num) => `($n)";
+    let source = "scoped macro_rules | `(picked! 0) => `(7) | `($n) => `($n)";
     let parsed = with_grammar(&file.grammar(), || {
         crate::parse_source_command(source.as_bytes())
     })

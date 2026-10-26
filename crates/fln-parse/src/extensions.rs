@@ -73,6 +73,7 @@ use std::ops::Range;
 use std::rc::Rc;
 use std::sync::{Arc, OnceLock};
 
+mod atoms;
 mod categories;
 pub(crate) use categories::{category_for_quotation, parse_category_quotation};
 mod local_rules;
@@ -1582,6 +1583,21 @@ impl FileGrammar {
         };
         let command_kind = components(kind);
         let parts: Vec<&str> = command_kind.iter().map(String::as_str).collect();
+        if matches!(
+            parts.as_slice(),
+            [
+                "Lean",
+                "Parser",
+                "Command",
+                "syntax" | "syntaxAbbrev" | "syntaxCat" | "notation" | "mixfix" | "macro"
+            ]
+        ) && self.expander().rules.keys().any(atoms::is_kind)
+        {
+            // The pin elaborates generated parser-description definitions. Their
+            // numeric priorities, tokens and helper references also see atom
+            // macros; installing our direct descriptor would bypass that code.
+            return Err("syntax declarations under active atomic macro rules");
+        }
         let mut rule = None;
         let declaration = match parts.as_slice() {
             ["Lean", "Parser", "Command", "syntax"] => {
@@ -2334,7 +2350,9 @@ impl Expander {
         {
             return Ok(syntax.clone());
         }
-        self.expand_at(syntax, 0)
+        let mut expanded = self.expand_at(syntax, 0)?;
+        atoms::anchor_preresolved(&mut expanded)?;
+        Ok(expanded)
     }
 
     fn expand_at(&self, syntax: &Syntax, depth: usize) -> Result<Syntax, &'static str> {
@@ -2344,24 +2362,68 @@ impl Expander {
         // A macro sees the original syntax of its arguments, not their expansions.
         // Ordinary (non-macro) children are still walked on an explicit stack.
         enum Task<'a> {
-            Visit(&'a Syntax),
+            Visit(&'a Syntax, atoms::Position),
             Build(fln_syntax::source::SourceInfo, &'a Name, usize),
         }
-        let mut tasks = vec![Task::Visit(syntax)];
+        let atom_rules = self.rules.keys().any(atoms::is_kind);
+        let mut tasks = vec![Task::Visit(syntax, atoms::Position::Term)];
         let mut built: Vec<Syntax> = Vec::new();
         while let Some(task) = tasks.pop() {
             match task {
-                Task::Visit(Syntax::Node { info, kind, args }) => {
-                    if let Some(rule) = self.rules.get(kind) {
-                        let mut selected = None;
+                Task::Visit(syntax, position)
+                    if atom_rules
+                        && (position == atoms::Position::Raw
+                            || syntax.kind().is_some_and(atoms::raw_node)
+                            || (matches!(
+                                position,
+                                atoms::Position::Binder | atoms::Position::AppHead
+                            ) && matches!(syntax, Syntax::Ident { .. }))) =>
+                {
+                    built.push(syntax.clone());
+                }
+                Task::Visit(syntax @ Syntax::Ident { .. }, _) => {
+                    let kind = Name::from_components(["ident"]);
+                    let args = std::slice::from_ref(syntax);
+                    let mut expansion = None;
+                    if let Some(rule) = self.rules.get(&kind) {
                         for candidate in rule.cases() {
                             if quotation::matches(candidate, args)? {
+                                expansion = Some(self.instantiate(candidate, args)?);
+                                break;
+                            }
+                        }
+                    }
+                    built.push(match expansion {
+                        Some(expansion) => self.expand_at(&expansion, depth + 1)?,
+                        None => syntax.clone(),
+                    });
+                }
+                Task::Visit(syntax @ Syntax::Node { info, kind, args }, position) => {
+                    if let Some(rule) = self.rules.get(kind) {
+                        let operands = if atoms::is_kind(kind) {
+                            std::slice::from_ref(syntax)
+                        } else {
+                            args
+                        };
+                        let mut selected = None;
+                        for candidate in rule.cases() {
+                            if quotation::matches(candidate, operands)? {
                                 selected = Some(candidate);
                                 break;
                             }
                         }
-                        let selected = selected.ok_or("no matching quoted macro rule")?;
-                        let expansion = self.instantiate(selected, args)?;
+                        if let Some(selected) = selected {
+                            let expansion = self.instantiate(selected, operands)?;
+                            built.push(self.expand_at(&expansion, depth + 1)?);
+                            continue;
+                        }
+                        if !atoms::is_kind(kind) {
+                            return Err("no matching quoted macro rule");
+                        }
+                    }
+                    if self.rules.contains_key(&Name::from_components(["ident"]))
+                        && let Some(expansion) = atoms::field_abbreviation(syntax)
+                    {
                         built.push(self.expand_at(&expansion, depth + 1)?);
                         continue;
                     }
@@ -2371,9 +2433,16 @@ impl Expander {
                         continue;
                     }
                     tasks.push(Task::Build(*info, kind, args.len()));
-                    tasks.extend(args.iter().rev().map(Task::Visit));
+                    tasks.extend(args.iter().enumerate().rev().map(|(index, child)| {
+                        let position = if atom_rules {
+                            atoms::child(kind, index, position)
+                        } else {
+                            atoms::Position::Term
+                        };
+                        Task::Visit(child, position)
+                    }));
                 }
-                Task::Visit(leaf) => built.push(leaf.clone()),
+                Task::Visit(leaf, _) => built.push(leaf.clone()),
                 Task::Build(info, kind, count) => {
                     let args = built.split_off(built.len() - count);
                     if kind == &crate::parser_kind(&["Term", "dbgTrace"]) {
@@ -2691,16 +2760,6 @@ fn macro_variable(base: &Name) -> Name {
         1,
     )
     .unwrap_or_else(|_| base.clone())
-}
-
-/// The node a quotation pattern holds (`` `(k $x "a" $y) ``, `` `(tactic| k $x) ``): its kind,
-/// the quotation's category, and its children.
-fn quotation_root(pattern: &Syntax) -> Option<(Name, Name, &[Syntax])> {
-    let (category, contents) = quotation_contents(pattern)?;
-    let Syntax::Node { kind, args, .. } = contents else {
-        return None;
-    };
-    Some((kind.clone(), category, args))
 }
 
 /// Read the pin's three quotation envelopes without erasing the category.

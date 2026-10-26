@@ -158,7 +158,7 @@ fn mixed_local_registration_refuses_all_targets_before_mutation() {
     let mut g = base();
     refused_without_mutation(
         &mut g,
-        "local macro_rules | `(select! 0) => `(10) | `(num| 1) => `(num| 2)",
+        "local macro_rules | `(select! 0) => `(10) | `($term) => `(num| 2)",
     );
     // A refused builtin override neither shadows the known rule nor prevents
     // the same native clause from being installed in a subsequent request.

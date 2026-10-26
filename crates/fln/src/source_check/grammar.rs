@@ -23,8 +23,9 @@
 //! A quotation's identifiers are pre-resolved where it is written (`Syntax.ident`'s
 //! `preresolved`), and a use takes those constants before any of its own scope: a notation
 //! declared in `namespace A` over `A.foo` means `A.foo` wherever it is used, a root `foo`
-//! notwithstanding. So each identifier of a template is resolved when the notation is declared
-//! and written `_root_.<constant>`, which names exactly that declaration; a name that resolves to
+//! notwithstanding. Each template identifier keeps its original spelling while macros match
+//! and recursively expand, with the chosen declaration in `preresolved`. Only the finished
+//! expansion writes `_root_.<constant>` for the native term elaborator. A name that resolves to
 //! several declarations (which the pin would elaborate as overloaded) is refused as not
 //! implemented.
 //!
@@ -111,6 +112,7 @@ const BINDING: [&str; 15] = [
 pub(crate) struct SourceGrammar {
     file: FileGrammar,
     rule_sources: BTreeMap<Name, Arc<[u8]>>,
+    macro_warnings: Vec<crate::unused_variables::UnusedBinder>,
     module_system: bool,
     declared_syntax: bool,
 }
@@ -124,6 +126,7 @@ impl SourceGrammar {
                 .expect("invariant: the grammar census describes Init")
                 .own_syntax_only(),
             rule_sources: BTreeMap::new(),
+            macro_warnings: Vec::new(),
             module_system: false,
             declared_syntax: false,
         }
@@ -213,6 +216,7 @@ impl SourceGrammar {
         Self {
             file: file.own_syntax_only(),
             rule_sources: BTreeMap::new(),
+            macro_warnings: Vec::new(),
             module_system,
             declared_syntax: false,
         }
@@ -293,6 +297,7 @@ impl SourceGrammar {
         command: &[u8],
         resolve: impl Fn(&Name) -> Resolution,
     ) -> Result<bool, EngineExecutionError> {
+        self.macro_warnings.clear();
         if !may_declare(command) {
             return Ok(false);
         }
@@ -311,16 +316,37 @@ impl SourceGrammar {
         self.file
             .declare(syntax)
             .map_err(|feature| EngineExecutionError::NotImplemented { feature })?;
+        let macro_rules = syntax.kind()
+            == Some(&Name::from_components([
+                "Lean",
+                "Parser",
+                "Command",
+                "macro_rules",
+            ]));
         // Resolve only fresh clauses. Older fallbacks keep their definition-site
         // names and source buffers, even when this registration is in a new scope.
         let mut templates = Vec::new();
         for (kind, rule) in self.file.rules() {
             for (index, case) in rule.cases().enumerate() {
                 if case.source.is_none() {
+                    if macro_rules {
+                        self.macro_warnings.extend(
+                            crate::unused_variables::unused_macro_pattern_variables(case)
+                                .into_iter()
+                                .map(|mut binder| {
+                                    binder.at = parsed
+                                        .source_view()
+                                        .to_original(fln_parse::BytePos(binder.at))
+                                        .0;
+                                    binder
+                                }),
+                        );
+                    }
                     templates.push((kind.clone(), index, preresolve(case, &resolve)?));
                 }
             }
         }
+        self.macro_warnings.sort_by_key(|binder| binder.at);
         let source: Arc<[u8]> = Arc::from(parsed.source_view().normalized().as_bytes());
         for (kind, index, template) in templates {
             self.file
@@ -335,6 +361,42 @@ impl SourceGrammar {
             return Err(Self::module_phase_refusal());
         }
         Ok(true)
+    }
+
+    /// Warnings for the last successful macro registration. Imported and older
+    /// fallback clauses have their own source buffers and are never linted again.
+    pub(crate) fn macro_warnings(
+        &self,
+        options: &fln_core::options::KVMap,
+    ) -> &[crate::unused_variables::UnusedBinder] {
+        if crate::unused_variables::lint_macro_pattern_variables(options) {
+            &self.macro_warnings
+        } else {
+            &[]
+        }
+    }
+
+    /// `#check id` first asks for the signature of an existing global, before
+    /// entering term elaboration or its macros (`elabCheckCore`). An unknown
+    /// identifier still takes the normal atom-macro expansion path.
+    pub(crate) fn expand_command(
+        &self,
+        parsed: fln_parse::ParsedSourceCommand,
+        resolve: impl Fn(&Name) -> Resolution,
+    ) -> Result<fln_parse::ParsedSourceCommand, fln_parse::NatDefinitionParseError> {
+        if parsed.kind() == fln_parse::SourceCommandKind::Check
+            && parsed.query_is_identifier()
+            && let Syntax::Node { kind, args, .. } = parsed.syntax()
+            && *kind == Name::from_components(["Lean", "Parser", "Command", "check"])
+            && let Some(Syntax::Ident { val, .. }) = args.get(1)
+            && matches!(
+                resolve(val),
+                Resolution::Global(_) | Resolution::Constructor(_)
+            )
+        {
+            return Ok(parsed);
+        }
+        parsed.expanded()
     }
 }
 
