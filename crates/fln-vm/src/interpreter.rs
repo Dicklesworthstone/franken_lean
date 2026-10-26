@@ -871,6 +871,7 @@ enum IntrinsicImplementation {
     FileHandleGetLine,
     FileHandleRead,
     FileHandleWrite,
+    FileHandleFlush,
     FilePathReadDir,
     IoGetTaskState,
     IoWait,
@@ -1238,6 +1239,7 @@ impl IntrinsicImplementation {
             "extern:IO.FS.Handle.getLine" => Self::FileHandleGetLine,
             "extern:IO.FS.Handle.read" => Self::FileHandleRead,
             "extern:IO.FS.Handle.write" => Self::FileHandleWrite,
+            "extern:IO.FS.Handle.flush" => Self::FileHandleFlush,
             "extern:System.FilePath.readDir" => Self::FilePathReadDir,
             "extern:IO.getTaskState" => Self::IoGetTaskState,
             "extern:IO.wait" => Self::IoWait,
@@ -6756,6 +6758,13 @@ fn dispatch_intrinsic(
                 .map(IntrinsicResult::owned)
                 .map_err(|error| VmRefusal::NativeFileIo { error }.into())
         }
+        IntrinsicImplementation::FileHandleFlush => {
+            expect_arity(row, args, 1)?;
+            args[0]
+                .try_file_flush(&Obj::mk_nat(0))
+                .map(IntrinsicResult::owned)
+                .map_err(|error| VmRefusal::NativeFileIo { error }.into())
+        }
         IntrinsicImplementation::FileHandleGetLine => {
             expect_arity(row, args, 1)?;
             args[0]
@@ -7358,6 +7367,7 @@ fn closure_intrinsic_application(
         | IntrinsicImplementation::FileHandleGetLine
         | IntrinsicImplementation::FileHandleRead
         | IntrinsicImplementation::FileHandleWrite
+        | IntrinsicImplementation::FileHandleFlush
         | IntrinsicImplementation::FilePathReadDir
         | IntrinsicImplementation::IoGetTaskState
         | IntrinsicImplementation::IoWait

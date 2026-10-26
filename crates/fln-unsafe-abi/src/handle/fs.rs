@@ -52,6 +52,8 @@ pub enum FileIoError {
     MalformedOpenResult,
     UnrepresentableWrite { errno: i32, bytes_written: usize },
     MalformedWriteResult { bytes_written: usize },
+    UnrepresentableFlush { errno: i32 },
+    MalformedFlushResult,
     MalformedDirectoryResult,
 }
 
@@ -130,6 +132,31 @@ impl Obj {
         let result = Obj(result);
         file_result_transport(&result, false)
             .ok_or(FileIoError::MalformedWriteResult { bytes_written })
+    }
+
+    /// Flush this borrowed native Handle's buffered output through fflush.
+    /// This does not close the Handle or promise fsync durability. Failure
+    /// follows an attempted flush and carries no rollback or byte-count claim.
+    ///
+    /// Returns the same seven-field neutral transport as try_file_open, with
+    /// Unit scalar zero as the success payload.
+    pub fn try_file_flush(&self, world: &Obj) -> Result<Obj, FileIoError> {
+        if !world.is_scalar() || world.unbox() != 0 {
+            return Err(FileIoError::InvalidWorld);
+        }
+        if !self.is_file_handle() {
+            return Err(FileIoError::InvalidHandle);
+        }
+        crate::stdio::initialize_io_signals();
+        // SAFETY: the exact live Handle and world0 were checked before any
+        // effect. The helper borrows its FILE and returns one owned result.
+        // UNSAFE-LEDGER: FLN-UL-0660
+        #[allow(unsafe_code)]
+        let result = unsafe { crate::stdio::checked_handle_flush(self.0) }
+            .map_err(|errno| FileIoError::UnrepresentableFlush { errno })?
+            .ok_or(FileIoError::InvalidHandle)?;
+        let result = Obj(result);
+        file_result_transport(&result, false).ok_or(FileIoError::MalformedFlushResult)
     }
 }
 

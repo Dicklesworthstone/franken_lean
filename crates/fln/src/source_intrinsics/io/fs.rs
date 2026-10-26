@@ -25,6 +25,7 @@ pub(crate) enum Operation {
     Read,
     Write,
     ReadDir,
+    Flush,
 }
 
 impl Operation {
@@ -36,6 +37,7 @@ impl Operation {
             Self::Read,
             Self::Write,
             Self::ReadDir,
+            Self::Flush,
         ]
         .into_iter()
         .find(|operation| requested == &operation.source_name())
@@ -49,13 +51,14 @@ impl Operation {
             Self::Read => "IO.FS.Handle.read",
             Self::Write => "IO.FS.Handle.write",
             Self::ReadDir => "System.FilePath.readDir",
+            Self::Flush => "IO.FS.Handle.flush",
         };
         Name::from_components(label.split('.'))
     }
 
     pub(crate) fn source_arity(self) -> usize {
         match self {
-            Self::GetLine | Self::ReadDir => 1,
+            Self::GetLine | Self::ReadDir | Self::Flush => 1,
             _ => 2,
         }
     }
@@ -156,6 +159,7 @@ pub(crate) fn assert_pin_models(environment: &Environment) {
             model::primitive(Operation::Read),
             model::primitive(Operation::Write),
             model::primitive(Operation::ReadDir),
+            model::primitive(Operation::Flush),
         ])
     {
         assert!(

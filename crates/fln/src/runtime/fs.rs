@@ -1,4 +1,4 @@
-//! Deferred file writing and line reading through checked Handle primitives.
+//! Deferred file writing, flushing and reading through checked Handle primitives.
 //!
 //! FilePath and Mode retain their admitted logical layouts. Native handles
 //! have a separate owned ABI carrier, never Handle's opaque Unit default.
@@ -253,7 +253,9 @@ impl Preparation<'_> {
                 vec![ValueType::Abi, ValueType::String],
                 vec![layout.receiver.clone(), c("String")],
             ),
-            Operation::GetLine => (vec![ValueType::Abi], vec![layout.receiver.clone()]),
+            Operation::GetLine | Operation::Flush => {
+                (vec![ValueType::Abi], vec![layout.receiver.clone()])
+            }
             Operation::Read => {
                 let bytes = self.fs_bytes_layout()?;
                 (
@@ -322,7 +324,7 @@ impl Preparation<'_> {
             // The error-arm placeholder is never projected as a Handle.
             // Only the safe native open producer authorizes this payload.
             Operation::Open => field(layout, 0)?,
-            Operation::PutStr | Operation::Write => {
+            Operation::PutStr | Operation::Write | Operation::Flush => {
                 Expr::const_(layout.error.unit_constructor.clone(), Vec::new())
             }
             // The native producer validates canonical String success. The
@@ -399,7 +401,7 @@ impl Preparation<'_> {
         let primitive = self.fs_bind_primitive(operation, &layout)?;
         let result_type = match operation {
             Operation::Open => c("IO.FS.Handle"),
-            Operation::PutStr | Operation::Write => c("Unit"),
+            Operation::PutStr | Operation::Write | Operation::Flush => c("Unit"),
             Operation::GetLine => c("String"),
             Operation::Read => c("ByteArray"),
             Operation::ReadDir => directory::result_type(),
@@ -449,7 +451,7 @@ impl Preparation<'_> {
                 vec![layout.receiver.clone(), c("String")],
                 vec![b(2)?, b(1)?],
             ),
-            Operation::GetLine => (vec![layout.receiver.clone()], vec![b(1)?]),
+            Operation::GetLine | Operation::Flush => (vec![layout.receiver.clone()], vec![b(1)?]),
             Operation::Read => {
                 let bytes = self.fs_bytes_layout()?;
                 (

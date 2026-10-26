@@ -205,6 +205,7 @@ pub(super) fn primitive(operation: Operation) -> ConstantInfo {
             c("IO.FS.Handle"),
         ),
         Operation::PutStr => (vec![c("IO.FS.Handle"), c("String")], c("Unit")),
+        Operation::Flush => (vec![c("IO.FS.Handle")], c("Unit")),
         Operation::GetLine => (vec![c("IO.FS.Handle")], c("String")),
         Operation::Read => (vec![c("IO.FS.Handle"), c("USize")], c("ByteArray")),
         Operation::Write => (vec![c("IO.FS.Handle"), c("ByteArray")], c("Unit")),

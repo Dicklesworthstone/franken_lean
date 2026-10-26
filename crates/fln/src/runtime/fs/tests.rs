@@ -14,6 +14,8 @@ use std::path::{Path, PathBuf};
 #[cfg(test)]
 mod bytes;
 #[cfg(test)]
+mod flush;
+#[cfg(test)]
 mod read;
 #[cfg(test)]
 mod read_dir;
@@ -88,13 +90,25 @@ fn activate_source_metadata(
     module: &str,
 ) -> Environment {
     use fln_elab::instances::imported;
-    // Ordinary do sequencing and catch need their real class/projection
+    // Ordinary do sequencing, return and catch need their real class/projection
     // journals just as a string path needs the actual coercion chain.
     // These are imported rows, preserving priority, order, scope and keys.
     let (class_labels, instance_labels): (&[&str], &[&str]) = match module {
         "Init/Prelude" => (
-            &["Bind", "Monad", "MonadExceptOf", "MonadExcept"],
-            &["Monad.toBind", "instMonadExceptOfMonadExceptOf"],
+            &[
+                "Bind",
+                "Pure",
+                "Applicative",
+                "Monad",
+                "MonadExceptOf",
+                "MonadExcept",
+            ],
+            &[
+                "Monad.toBind",
+                "Monad.toApplicative",
+                "Applicative.toPure",
+                "instMonadExceptOfMonadExceptOf",
+            ],
         ),
         "Init/System/IO" => (&[], &["instMonadEIO", "instMonadExceptOfEIO"]),
         "Init/Coe" => (

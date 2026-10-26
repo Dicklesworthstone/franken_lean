@@ -83,6 +83,143 @@ fn file_io_preserves_borrows_aliases_unicode_nuls_and_finalizes_the_last_handle(
 }
 
 #[test]
+fn file_flush_publishes_buffered_bytes_and_preserves_live_aliases() {
+    let _guard = lock();
+    let path = path("flush-aliases");
+    shadow::enable();
+    {
+        let opened = open(&path, 1);
+        let original = handle(&opened);
+        let alias = original.clone_ref();
+        drop(opened);
+        let first = "buffered λ🙂\0tail";
+        let written = original
+            .try_file_put_str(&Obj::mk_string(first), &Obj::mk_nat(0))
+            .unwrap();
+        assert_eq!(field(&written, 1).unbox(), 1);
+        assert!(std::fs::read(&path).unwrap().is_empty());
+        let before = original.header().rc;
+        for _ in 0..2 {
+            let result = alias.try_file_flush(&Obj::mk_nat(0)).unwrap();
+            assert_eq!(field(&result, 0).unbox(), 0);
+            assert_eq!(field(&result, 1).unbox(), 1);
+            for index in 2..5 {
+                assert_eq!(field(&result, index).unbox(), 0);
+            }
+            assert!(text(&field(&result, 5)).is_empty());
+            assert!(text(&field(&result, 6)).is_empty());
+            assert_eq!(original.header().rc, before);
+            assert_eq!(std::fs::read(&path).unwrap(), first.as_bytes());
+        }
+        drop(original);
+        let written = alias
+            .try_file_put_str(&Obj::mk_string("\nsecond"), &Obj::mk_nat(0))
+            .unwrap();
+        assert_eq!(field(&written, 1).unbox(), 1);
+        let result = alias.try_file_flush(&Obj::mk_nat(0)).unwrap();
+        assert_eq!(field(&result, 1).unbox(), 1);
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            "buffered λ🙂\0tail\nsecond".as_bytes()
+        );
+        assert!(alias.is_file_handle());
+    }
+    no_leaks();
+}
+
+#[test]
+fn file_flush_rejects_invalid_inputs_before_flushing_any_handle() {
+    let _guard = lock();
+    let path = path("flush-preconditions");
+    let opened = open(&path, 1);
+    let handle = handle(&opened);
+    let written = handle
+        .try_file_put_str(&Obj::mk_string("still buffered"), &Obj::mk_nat(0))
+        .unwrap();
+    assert_eq!(field(&written, 1).unbox(), 1);
+    assert!(std::fs::read(&path).unwrap().is_empty());
+    for world in [Obj::mk_nat(1), Obj::mk_ctor(0, vec![], &[])] {
+        assert!(matches!(
+            handle.try_file_flush(&world),
+            Err(FileIoError::InvalidWorld)
+        ));
+        assert!(std::fs::read(&path).unwrap().is_empty());
+    }
+    for other in [
+        Obj::mk_nat(0),
+        Obj::mk_ctor(0, vec![], &[]),
+        Obj::mk_ref(Obj::mk_nat(0)),
+        Obj::mk_external_counting(),
+        Obj::mk_closure(2, vec![]),
+        Obj::mk_string("not a handle"),
+    ] {
+        assert!(matches!(
+            other.try_file_flush(&Obj::mk_nat(0)),
+            Err(FileIoError::InvalidHandle)
+        ));
+        assert!(std::fs::read(&path).unwrap().is_empty());
+    }
+    let flushed = handle.try_file_flush(&Obj::mk_nat(0)).unwrap();
+    assert_eq!(field(&flushed, 1).unbox(), 1);
+    assert_eq!(std::fs::read(path).unwrap(), b"still buffered");
+}
+
+#[test]
+fn file_flush_reports_real_buffered_write_failure() {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+
+    let _guard = lock();
+    let full = std::path::Path::new("/dev/full");
+    let Ok(metadata) = std::fs::symlink_metadata(full) else {
+        return;
+    };
+    // Only Linux's actual full device (major 1, minor 7), never a regular
+    // file or a symlink supplied at the same host path, may receive this write.
+    if !metadata.file_type().is_char_device() || metadata.rdev() != 0x107 {
+        return;
+    }
+    shadow::enable();
+    {
+        let opened = open(full, 1);
+        let handle = handle(&opened);
+        let written = handle
+            .try_file_put_str(&Obj::mk_string("buffered"), &Obj::mk_nat(0))
+            .unwrap();
+        assert_eq!(field(&written, 1).unbox(), 1);
+        let before = handle.header().rc;
+        let result = handle.try_file_flush(&Obj::mk_nat(0)).unwrap();
+        assert_eq!(field(&result, 0).unbox(), 0);
+        assert_eq!(field(&result, 1).unbox(), 0);
+        assert_eq!(field(&result, 2).unbox(), 14); // resourceExhausted.
+        assert_eq!(field(&result, 3).unbox(), crate::stdio::ENOSPC as usize);
+        assert_eq!(field(&result, 4).unbox(), 0);
+        assert!(text(&field(&result, 5)).is_empty());
+        assert!(!text(&field(&result, 6)).is_empty());
+        assert_eq!(handle.header().rc, before);
+    }
+    no_leaks();
+}
+
+#[test]
+fn file_flush_refuses_errors_requiring_an_unavailable_filename() {
+    let _guard = lock();
+    shadow::enable();
+    for code in [crate::stdio::EINTR, crate::stdio::ENOENT] {
+        assert_eq!(crate::stdio::checked_flush_result(Err(code)), Err(code));
+    }
+    {
+        let native = Obj(crate::stdio::checked_flush_result(Err(crate::stdio::EPIPE)).unwrap());
+        let result = file_result_transport(&native, false).unwrap();
+        assert_eq!(field(&result, 1).unbox(), 0);
+        assert_eq!(field(&result, 2).unbox(), 3); // resourceVanished.
+        assert_eq!(field(&result, 3).unbox(), crate::stdio::EPIPE as usize);
+        assert_eq!(field(&result, 4).unbox(), 0);
+        assert!(!text(&field(&result, 6)).is_empty());
+    }
+    no_leaks();
+}
+
+#[test]
 fn file_io_modes_keep_truncate_append_exclusive_and_read_only_semantics() {
     let _guard = lock();
     let path = path("modes");
@@ -298,6 +435,48 @@ fn file_io_initializes_sigpipe_without_default_streams() {
             .unwrap();
         assert_eq!(field(&result, 1).unbox(), 0);
         assert_eq!(field(&result, 3).unbox(), 32); // EPIPE.
+        assert!(!text(&field(&result, 6)).is_empty());
+    }
+}
+
+#[test]
+fn file_flush_initializes_sigpipe_without_default_streams() {
+    const NAME: &str = "handle::fs::tests::file_flush_initializes_sigpipe_without_default_streams";
+    if std::env::var_os("FLN_FILE_FLUSH_SIGPIPE_CHILD").is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", NAME, "--nocapture", "--test-threads=1"])
+            .env("FLN_FILE_FLUSH_SIGPIPE_CHILD", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child status {:?}\n{}\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        return;
+    }
+    // SAFETY: the isolated child owns the pipe descriptors, transfers the
+    // writer FILE to one Handle, and buffers one byte before closing its own
+    // reader. Raw putStr does not seed the SIGPIPE policy; safe flush must.
+    // UNSAFE-LEDGER: FLN-UL-0663
+    #[allow(unsafe_code)]
+    unsafe {
+        signal(13, 0); // Linux SIGPIPE, SIG_DFL.
+        let mut descriptors = [-1; 2];
+        assert_eq!(pipe(descriptors.as_mut_ptr()), 0);
+        let file = fdopen(descriptors[1], c"w".as_ptr());
+        assert!(!file.is_null());
+        let handle = Obj(crate::stdio::io_wrap_handle(file));
+        let input = Obj::mk_string("x");
+        let written = Obj(crate::stdio::prim_handle_put_str(handle.0, input.0));
+        assert_eq!(written.header().tag, 0);
+        assert_eq!(close(descriptors[0]), 0);
+        let result = handle.try_file_flush(&Obj::mk_nat(0)).unwrap();
+        assert_eq!(field(&result, 1).unbox(), 0);
+        assert_eq!(field(&result, 3).unbox(), crate::stdio::EPIPE as usize);
         assert!(!text(&field(&result, 6)).is_empty());
     }
 }
