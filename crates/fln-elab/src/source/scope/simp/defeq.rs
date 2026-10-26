@@ -206,9 +206,48 @@ pub fn infer(
             super::SimpSetError::UnsupportedDeclaration(name.clone()),
         )));
     }
+    record(environment, name, tagged.len())
+}
+
+/// The pin's `inferDefEqAttr` (vendored `Lean/DefEqAttrib.lean:159-190`) for a theorem this
+/// engine generates, such as an equation theorem: it is tagged only when its proof is a
+/// reflexivity proof (`isRflProofCore`) and its statement holds at `dsimp`'s transparency.
+/// Any other theorem is left untagged, never refused: unlike [`infer`], nothing here was
+/// written as `:= rfl`.
+pub fn infer_generated(
+    environment: &Environment,
+    name: &Name,
+    kernel: Budget,
+) -> Result<Environment, NatDefinitionElabError> {
+    let Some(ConstantInfo::Thm(theorem)) = environment.find(name) else {
+        return Ok(environment.clone());
+    };
+    let mut context = Context::new(environment, kernel);
+    let tagged = read(environment, || context.tick())?;
+    if tagged.contains(name) {
+        return Ok(environment.clone());
+    }
+    let proof = Typed {
+        value: theorem.value.clone(),
+        type_: theorem.base.type_.clone(),
+    };
+    if !context.dsimp_rfl_proof(proof, &tagged)?
+        || !context.dsimp_generic_defeq(&theorem.base.type_, &theorem.base.level_params)?
+    {
+        return Ok(environment.clone());
+    }
+    record(environment, name, tagged.len())
+}
+
+/// Record `name`'s tag, one more row beside the `rows` already read.
+fn record(
+    environment: &Environment,
+    name: &Name,
+    rows: usize,
+) -> Result<Environment, NatDefinitionElabError> {
     let mut payload = MAGIC.to_vec();
     crate::instances::write_name(name, &mut payload).map_err(codec)?;
-    if payload.len() > MAX_ENTRY_BYTES || tagged.len() >= MAX_ROWS {
+    if payload.len() > MAX_ENTRY_BYTES || rows >= MAX_ROWS {
         return Err(limit());
     }
     let descriptor = descriptor();

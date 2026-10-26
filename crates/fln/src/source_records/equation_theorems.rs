@@ -59,15 +59,17 @@ impl Engine {
                 Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
                 Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
             };
-            // The pin's `inferDefEqAttr`: a theorem proved by reflexivity is a `dsimp` rule.
+            // The pin's `inferDefEqAttr`: a theorem proved by reflexivity is a `dsimp` rule;
+            // one proved otherwise, by case analysis, stays untagged.
             for admitted in &batch.admissions {
                 if let Declaration::Thm(theorem) = &admitted.declaration {
-                    batch.engine.environment = fln_elab::source::scope::simp::defeq::infer(
-                        batch.engine.environment(),
-                        &theorem.base.name,
-                        limits.kernel,
-                    )
-                    .map_err(elaborate)?;
+                    batch.engine.environment =
+                        fln_elab::source::scope::simp::defeq::infer_generated(
+                            batch.engine.environment(),
+                            &theorem.base.name,
+                            limits.kernel,
+                        )
+                        .map_err(elaborate)?;
                 }
             }
             engine = batch.engine;
