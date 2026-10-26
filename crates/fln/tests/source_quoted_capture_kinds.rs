@@ -182,3 +182,24 @@ macro_rules
             .is_err()
     );
 }
+
+/// A rule whose pattern is a bare capture names an atom kind (`num`, `ident`, `str`) as its
+/// target. Such a rule would rewrite every literal of that kind (upstream `tests/elab/414`,
+/// where `2` elaborates to `"world"`). This door cannot install it, and dropping it would leave
+/// the native meaning in force where the pin runs the rule, so it is refused.
+#[test]
+fn a_rule_over_an_atom_kind_is_refused_rather_than_dropped() {
+    for registration in [
+        "macro_rules (kind := num)\n  | `($n:num) => `((7 : Nat))\n",
+        "macro_rules\n  | `($n:num) => `((7 : Nat))\n",
+        "macro_rules (kind := num)\n  | n => `((7 : Nat))\n",
+    ] {
+        let source = format!("{registration}theorem t : 2 = (2 : Nat) := rfl\n");
+        let error = check(&source).unwrap_err();
+        assert!(
+            error.contains("a macro_rules registration whose target syntax kind is not read"),
+            "{registration}: {error}"
+        );
+    }
+    assert_eq!(check("theorem t : 2 = (2 : Nat) := rfl\n").unwrap(), 1);
+}

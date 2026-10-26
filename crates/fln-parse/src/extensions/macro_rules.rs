@@ -37,6 +37,7 @@ pub(super) fn declare(file: &mut FileGrammar, args: &[Syntax]) -> Result<(), &'s
     let mut groups: BTreeMap<Name, Vec<NotationRule>> = BTreeMap::new();
     let mut refused = BTreeSet::new();
     let mut malformed = explicit_requested && explicit.is_none();
+    let mut antiquoted = false;
     for alternative in alternatives.unwrap_or(&[]) {
         let Some([_, patterns, _, rhs]) = node_args(alternative) else {
             malformed = true;
@@ -65,6 +66,12 @@ pub(super) fn declare(file: &mut FileGrammar, args: &[Syntax]) -> Result<(), &'s
             malformed = true;
             continue;
         };
+        // A pattern that is one antiquotation (`$n:num`, `$x`) targets that antiquotation's
+        // own kind, an atom kind or a whole category, not the antiquotation node's kind.
+        if matches!(kind.leaf_view(), LeafView::Str("antiquot")) {
+            antiquoted = true;
+            continue;
+        }
         if explicit.as_ref().is_some_and(|expected| *expected != kind) {
             malformed = true;
             refused.insert(kind);
@@ -86,6 +93,13 @@ pub(super) fn declare(file: &mut FileGrammar, args: &[Syntax]) -> Result<(), &'s
                 refused.insert(kind);
             }
         }
+    }
+    // A registration over a kind this door cannot host, or one that names no kind, can be no
+    // barrier: dropping it would leave the older meaning in force where the pin runs the new
+    // rule, as for `macro_rules (kind := num)` or `$n:num` over numeral literals (upstream
+    // tests/elab/414).
+    if antiquoted || (affected.is_empty() && (malformed || alternatives.is_none())) {
+        return Err("a macro_rules registration whose target syntax kind is not read");
     }
     let locality = attr_kind_of(attr_kind)?;
     let local = locality == AttrKind::Local;
