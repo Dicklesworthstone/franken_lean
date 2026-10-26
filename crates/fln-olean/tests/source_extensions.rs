@@ -51,6 +51,42 @@ fn read(blocks: &[OpaqueExtensionBlock]) -> Result<SourceExtensions, DecodeError
 }
 
 #[test]
+fn decoding_in_phases_keeps_one_byte_object_and_entry_budget() {
+    use fln_olean::source_extensions::{DEFEQ_EXTENSION, Decoder};
+    let first = one(DEFEQ_EXTENSION, &inject_name(&n("first")));
+    let second = one(DEFEQ_EXTENSION, &inject_name(&n("second")));
+    let bytes = first[0].entries[0].len();
+    let objects = fln_rt::region::audit(&first[0].entries[0], 0)
+        .unwrap()
+        .objects;
+    for (max_bytes, max_objects, max_entries, resource) in [
+        (bytes, u64::MAX, 2, "payload bytes"),
+        (usize::MAX, objects, 2, "objects"),
+        (usize::MAX, u64::MAX, 1, "entries"),
+    ] {
+        let mut decoder = Decoder::new(DecodeLimits {
+            max_bytes,
+            max_objects,
+            max_entries,
+            max_indices: 0,
+            max_keys: 0,
+        });
+        let decoded = decoder.decode(&first).unwrap();
+        assert_eq!(decoded.defeq, [n("first")]);
+        assert!(matches!(
+            decoder.decode(&second),
+            Err(DecodeError::Limit { resource: actual }) if actual == resource
+        ));
+        assert!(matches!(
+            decoder.decode(&[]),
+            Err(DecodeError::Shape {
+                detail: "source-extension decoder reused after refusal"
+            })
+        ));
+    }
+}
+
+#[test]
 fn real_prelude_decodes_class_outputs_instance_order_and_defaults() {
     let decoded = read(blocks()).unwrap();
     assert_eq!(

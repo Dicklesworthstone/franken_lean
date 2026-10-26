@@ -29,7 +29,7 @@ impl ReflexivityTags {
         module: &Name,
         extension: &Name,
         entries: Vec<Vec<u8>>,
-        remaining: &mut DecodeLimits,
+        decoder: &mut metadata::Decoder,
     ) -> Result<usize> {
         let before = self.declarations.len();
         let mut local = BTreeSet::new();
@@ -41,11 +41,9 @@ impl ReflexivityTags {
                     name: extension.clone(),
                     entries: vec![payload],
                 };
-                let (decoded, rest) = metadata::decode_with_remaining_limits(
-                    std::slice::from_ref(&block),
-                    *remaining,
-                )
-                .map_err(SourceOleanImportError::Decode)?;
+                let decoded = decoder
+                    .decode(std::slice::from_ref(&block))
+                    .map_err(SourceOleanImportError::Decode)?;
                 let mut names = decoded.defeq.into_iter().chain(decoded.backward_defeq);
                 let declaration = names.next().ok_or(SourceOleanImportError::Internal(
                     "a reflexivity entry did not decode to a name",
@@ -55,7 +53,6 @@ impl ReflexivityTags {
                         "a reflexivity entry decoded to several names",
                     ));
                 }
-                *remaining = rest;
                 let payload = block.entries.pop().ok_or(SourceOleanImportError::Internal(
                     "a decoded reflexivity payload disappeared",
                 ))?;
@@ -438,7 +435,7 @@ impl Engine {
         let mut entries_left = limits.metadata.max_entries;
         let mut defeq_tags = ReflexivityTags::default();
         let mut backward_defeq_tags = ReflexivityTags::default();
-        let mut metadata_remaining = limits.metadata;
+        let mut metadata_decoder = metadata::Decoder::new(limits.metadata);
         // Each module's capture reads only its own parts, so the walks run
         // `limits.read_jobs` at once; the cumulative byte allowance is charged below
         // in replay order, exactly as when one walk followed another.
@@ -506,15 +503,15 @@ impl Engine {
                         } else {
                             &mut backward_defeq_tags
                         };
-                        let before = metadata_remaining.max_entries;
+                        let before = metadata_decoder.remaining_limits().max_entries;
                         let count = tags.capture(
                             &module.name,
                             &block.name,
                             entries,
-                            &mut metadata_remaining,
+                            &mut metadata_decoder,
                         )?;
                         entries_left = entries_left
-                            .checked_sub(before - metadata_remaining.max_entries)
+                            .checked_sub(before - metadata_decoder.remaining_limits().max_entries)
                             .ok_or(SourceOleanImportError::Limit("metadata entries"))?;
                         if kind == 14 {
                             report.defeq = count;
@@ -565,7 +562,8 @@ impl Engine {
             reports.push(report);
         }
         cancelled!("source-olean/before-metadata-decode");
-        let mut decoded = metadata::decode(&blocks, metadata_remaining)
+        let mut decoded = metadata_decoder
+            .decode(&blocks)
             .map_err(SourceOleanImportError::Decode)?;
         decoded.defeq = defeq_tags.declarations;
         decoded.backward_defeq = backward_defeq_tags.declarations;

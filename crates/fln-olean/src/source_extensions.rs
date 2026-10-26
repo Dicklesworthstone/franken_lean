@@ -545,15 +545,59 @@ pub fn decode(
     blocks: &[OpaqueExtensionBlock],
     limits: DecodeLimits,
 ) -> Result<SourceExtensions, DecodeError> {
-    decode_with_remaining_limits(blocks, limits).map(|(decoded, _)| decoded)
+    Decoder::new(limits).decode(blocks)
 }
 
-/// Decode a batch and return its remaining cumulative allowances. Importers
-/// can project tags before merging journals without resetting any resource
-/// limit for each module or charging a retained payload twice.
-pub fn decode_with_remaining_limits(
+/// Incremental batches share all explicit allowances and the converter's own
+/// walk counter. A refused batch poisons this decoder; no later batch can
+/// continue from a partially projected journal.
+pub struct Decoder {
+    remaining: DecodeLimits,
+    reader: Reader,
+    refused: bool,
+}
+
+impl Decoder {
+    pub fn new(limits: DecodeLimits) -> Self {
+        Self {
+            remaining: limits,
+            reader: Reader {
+                conversion: Conversion::new(),
+                indices_left: limits.max_indices,
+                keys_left: limits.max_keys,
+            },
+            refused: false,
+        }
+    }
+
+    pub fn remaining_limits(&self) -> DecodeLimits {
+        self.remaining
+    }
+
+    pub fn decode(
+        &mut self,
+        blocks: &[OpaqueExtensionBlock],
+    ) -> Result<SourceExtensions, DecodeError> {
+        if self.refused {
+            return Err(shape("source-extension decoder reused after refusal"));
+        }
+        match decode_batch(blocks, self.remaining, &mut self.reader) {
+            Ok((decoded, remaining)) => {
+                self.remaining = remaining;
+                Ok(decoded)
+            }
+            Err(error) => {
+                self.refused = true;
+                Err(error)
+            }
+        }
+    }
+}
+
+fn decode_batch(
     blocks: &[OpaqueExtensionBlock],
     limits: DecodeLimits,
+    reader: &mut Reader,
 ) -> Result<(SourceExtensions, DecodeLimits), DecodeError> {
     let name = |s: &str| Name::from_components(s.split('.'));
     let selected = [
@@ -584,11 +628,6 @@ pub fn decode_with_remaining_limits(
     let mut bytes_left = limits.max_bytes;
     let mut entries_left = limits.max_entries;
     let mut objects_left = limits.max_objects;
-    let mut reader = Reader {
-        conversion: Conversion::new(),
-        indices_left: limits.max_indices,
-        keys_left: limits.max_keys,
-    };
     let mut out = SourceExtensions::default();
     let mut protected = BTreeSet::new();
     let mut aux_recursors = BTreeSet::new();
