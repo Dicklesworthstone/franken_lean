@@ -168,6 +168,9 @@ pub enum SourceInferenceError {
     AuxiliaryNotCompiled(Name),
     /// A surviving executable reference has no compiled implementation.
     NoncomputableDependency(Name),
+    /// The root `main` would generate code but its type is not one the pin's compiler runs
+    /// (`isValidMainType`, `codegen.rs`).
+    InvalidMainType,
     /// Invalid dependency metadata cannot become a suppressed compiler failure.
     NoncomputableJournal(crate::noncomputable::NoncomputableError),
     ExternJournal(crate::externs::ExternError),
@@ -441,6 +444,10 @@ impl std::fmt::Display for SourceInferenceError {
                 f,
                 "failed to compile definition, consider marking it as 'noncomputable' because it depends on '{}', which is 'noncomputable'",
                 name.to_display_string()
+            ),
+            Self::InvalidMainType => write!(
+                f,
+                "`main` function must have type `(List String →)? IO (UInt32 | Unit | PUnit)`"
             ),
             Self::NoncomputableJournal(error) => write!(f, "{error}"),
             Self::ExternJournal(error) => write!(f, "{error}"),
@@ -6020,7 +6027,12 @@ fn definition_elaboration(
     // runtime recursor implementation is irrelevant when no code may be generated.
     if !is_theorem && !proof_instance && !is_noncomputable {
         if scope::executable::registrations(syntax)?.is_empty() {
-            context.noncomputable_definition = context.check_definition_codegen(&term)?;
+            // `[macro_inline]` generates no code (`shouldGenerateCode`), so neither is its
+            // `main` checked. A failed `main` check ends compilation before any other.
+            let main_failed = !scope::simp::macro_inline_requested(syntax)?
+                && context.check_main_type(name, &term.type_)?;
+            context.noncomputable_definition =
+                main_failed || context.check_definition_codegen(&term)?;
         } else {
             // The declared body remains fully typed and checked, but the pin
             // compiles the executable replacement instead of that logical body.

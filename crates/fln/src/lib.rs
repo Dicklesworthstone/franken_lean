@@ -8064,7 +8064,8 @@ impl Engine {
                     })?
                     .is_empty();
             // The pin keeps a definition whose code generation fails: `addAndCompile` logs
-            // "failed to compile definition, …" after kernel admission and the file goes on.
+            // "failed to compile definition, …" (or that a root `main` has a type the compiler
+            // does not run) after kernel admission and the file goes on.
             // Under a guard expecting an error, such a definition is admitted uncompiled, as a
             // `noncomputable section` admits it, and that message is logged for the guard.
             let mut guarded_compile_error = None;
@@ -8074,7 +8075,8 @@ impl Engine {
                 && !(has_inline_simp || has_inline_default)
                 && let Err(
                     error @ fln_elab::NatDefinitionElabError::Inference(
-                        fln_elab::source::SourceInferenceError::NoncomputableDependency(_),
+                        fln_elab::source::SourceInferenceError::NoncomputableDependency(_)
+                        | fln_elab::source::SourceInferenceError::InvalidMainType,
                     ),
                 ) = grammar.enter(|| {
                     fln_elab::elaborate_definition_in_scope_with_budget(

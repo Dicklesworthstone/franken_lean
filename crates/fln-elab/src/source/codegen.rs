@@ -102,6 +102,30 @@ fn compiles(name: &Name) -> bool {
         || csimp_recursors().contains(name)
 }
 
+/// The pin's `isValidMainType` (vendored `Lean/Compiler/LCNF/Main.lean:69-80`), read off the
+/// declared type as written: `IO r` or `List String → IO r`, with `r` the constant `UInt32`,
+/// `Unit` or `PUnit`.
+fn valid_main_type(type_: &Expr) -> bool {
+    let constant = |e: &Expr, names: &[&str]| {
+        matches!(e.node(), ExprNode::Const { name, .. }
+            if names.iter().any(|n| *name == Name::from_components([*n])))
+    };
+    let io = |e: &Expr| {
+        matches!(e.node(), ExprNode::App { f, a }
+            if constant(f, &["IO"]) && constant(a, &["UInt32", "Unit", "PUnit"]))
+    };
+    match type_.node() {
+        ExprNode::ForallE {
+            binder_type, body, ..
+        } => {
+            matches!(binder_type.node(), ExprNode::App { f, a }
+                if constant(f, &["List"]) && constant(a, &["String"]))
+                && io(body)
+        }
+        _ => io(type_),
+    }
+}
+
 /// A motive whose body is a sort, or a function type ending in one, builds types: the
 /// pin erases what it produces.
 fn type_former_motive(motive: &Expr) -> bool {
@@ -172,6 +196,34 @@ impl Context {
             )) if self.source_scope.noncomputable_section => Ok(true),
             Err(error) => Err(error),
         }
+    }
+
+    /// `compileDecls` refuses the root `main` before generating any code when its type is not
+    /// one the compiler runs (vendored `Lean/Compiler/LCNF/Main.lean:153-156`), once
+    /// `shouldGenerateCode` has passed over proofs and type formers (`isCompIrrelevant`,
+    /// `Main.lean:31-49`). Like every compiler failure, a `noncomputable section` makes the
+    /// declaration noncomputable instead (`Ok(true)`, vendored `Lean/CoreM.lean:760-765`).
+    pub(super) fn check_main_type(
+        &mut self,
+        name: &Name,
+        type_: &Expr,
+    ) -> Result<bool, NatDefinitionElabError> {
+        if *name != Name::from_components(["main"]) || valid_main_type(type_) {
+            return Ok(false);
+        }
+        if self.codegen_type_former(type_)? {
+            return Ok(false);
+        }
+        if let Some(sort) = self.known_type(type_)? {
+            let sort = self.whnf(&sort)?;
+            if matches!(sort.node(), ExprNode::Sort { level } if level.normalize().is_zero()) {
+                return Ok(false);
+            }
+        }
+        if self.source_scope.noncomputable_section {
+            return Ok(true);
+        }
+        Err(failure(SourceInferenceError::InvalidMainType))
     }
 
     /// Track both ordinary constants and constants with explicit universe arguments.
@@ -600,5 +652,38 @@ mod tests {
         assert!(type_former_motive(&to_type));
         assert!(type_former_motive(&to_family));
         assert!(!type_former_motive(&to_nat));
+    }
+
+    #[test]
+    fn main_types_are_read_as_the_pins_is_valid_main_type() {
+        let constant = |name: &str| Expr::const_(Name::from_components([name]), Vec::new());
+        let io = |result: &str| Expr::app(constant("IO"), constant(result));
+        let args = |domain: Expr, body: Expr| {
+            Expr::forall_e(
+                Name::from_components(["args"]),
+                domain,
+                body,
+                BinderInfo::Default,
+            )
+        };
+        let strings = Expr::app(constant("List"), constant("String"));
+        for result in ["UInt32", "Unit", "PUnit"] {
+            assert!(valid_main_type(&io(result)), "IO {result}");
+            assert!(
+                valid_main_type(&args(strings.clone(), io(result))),
+                "List String → IO {result}"
+            );
+        }
+        let bytes = Expr::app(constant("List"), constant("ByteArray"));
+        for invalid in [
+            constant("Unit"),
+            io("Nat"),
+            constant("UInt32"),
+            args(strings.clone(), constant("UInt32")),
+            args(bytes, io("Unit")),
+            args(constant("Nat"), args(strings, io("Unit"))),
+        ] {
+            assert!(!valid_main_type(&invalid), "{invalid:?}");
+        }
     }
 }
