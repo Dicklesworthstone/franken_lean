@@ -6988,11 +6988,31 @@ fn closure_intrinsic_application(
             // mismatch would treat 2^64 as ill-typed rather than a valid
             // (and here unused) priority.
             with_nat_view(&priority, operation, 1, |_| ())?;
+            // Source callbacks borrow their token, while ABI callbacks may
+            // declare this internally supplied scalar zero Scalar or Owned.
+            // Honor the validated target's next parameter, after its captures,
+            // without granting a Unique argument or relaxing ordinary Apply.
+            let plan = plan_apply(program, &closure, 1, None, None)?;
+            let ownership = program
+                .function(plan.function)
+                .and_then(|function| function.parameter_ownership.get(plan.captures.len()))
+                .copied()
+                .ok_or(VmRefusal::MalformedClosure {
+                    reason: "task continuation parameter is absent",
+                })?;
+            if ownership == ArgumentOwnership::Unique {
+                return Err(VmRefusal::ApplyOwnershipMismatch {
+                    function: plan.function,
+                    argument: 0,
+                    expected: ownership,
+                    actual: ArgumentOwnership::Scalar,
+                });
+            }
             Ok(IntrinsicApplication {
                 row,
                 closure,
                 arguments: vec![Obj::mk_nat(0)],
-                argument_ownership: vec![ArgumentOwnership::Scalar],
+                argument_ownership: vec![ownership],
                 completion: IntrinsicCompletion::WrapPure,
                 trace: None,
             })

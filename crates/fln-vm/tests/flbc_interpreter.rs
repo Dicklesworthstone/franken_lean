@@ -7469,6 +7469,93 @@ fn managerless_base_io_as_task_runs_the_action_and_preserves_borrowed_arguments(
 }
 
 #[test]
+fn managerless_task_world_callbacks_honor_borrows_and_refuse_unique() {
+    let _guard = lock();
+    for row in ["extern:BaseIO.asTask", "extern:Task.spawn"] {
+        for ownership in [
+            ArgumentOwnership::Borrowed,
+            ArgumentOwnership::Owned,
+            ArgumentOwnership::Scalar,
+            ArgumentOwnership::Unique,
+        ] {
+            let program = validated(vec![
+                function(
+                    0,
+                    0,
+                    5,
+                    vec![
+                        Instruction::String {
+                            dst: r(0),
+                            value: "captured task argument".to_string(),
+                        },
+                        Instruction::Closure {
+                            dst: r(1),
+                            function: fid(1),
+                            captures: vec![r(0)],
+                            capture_ownership: vec![ArgumentOwnership::Borrowed],
+                        },
+                        Instruction::Nat {
+                            dst: r(2),
+                            value: 0,
+                        },
+                        intrinsic(r(3), row, vec![r(1), r(2)]),
+                        intrinsic(r(4), "extern:Task.get", vec![r(3)]),
+                        Instruction::Return { src: r(4) },
+                    ],
+                ),
+                function_with_ownership(
+                    1,
+                    vec![ArgumentOwnership::Borrowed, ownership],
+                    3,
+                    vec![
+                        Instruction::Array {
+                            dst: r(2),
+                            items: vec![r(0), r(1)],
+                        },
+                        Instruction::Return { src: r(2) },
+                    ],
+                ),
+            ]);
+            shadow::enable();
+            let outcome = execute(&program, ExecutionLimits::default(), None);
+            if ownership == ArgumentOwnership::Unique {
+                assert!(matches!(
+                    outcome,
+                    Outcome::Complete(VmExit::Refused {
+                        refusal: VmRefusal::ApplyOwnershipMismatch {
+                            function,
+                            argument: 0,
+                            expected: ArgumentOwnership::Unique,
+                            actual: ArgumentOwnership::Scalar,
+                        },
+                        ..
+                    }) if function == fid(1)
+                ));
+            } else {
+                let completed = returned(outcome);
+                assert_eq!(completed.value.array_view(), (2, 2));
+                assert_eq!(
+                    string_contents(&completed.value.array_child(0)),
+                    "captured task argument",
+                    "{row} {ownership:?}"
+                );
+                assert_eq!(completed.value.array_child(1).unbox(), 0);
+                drop(completed);
+            }
+            let (events, live) = shadow::disable_and_drain();
+            assert_eq!(live, 0, "{row} {ownership:?} releases every object");
+            assert!(
+                events.iter().all(|event| {
+                    event.kind != shadow::EventKind::DoubleRelease
+                        && event.kind != shadow::EventKind::ForeignPointer
+                }),
+                "{row} {ownership:?} preserves the ownership graph"
+            );
+        }
+    }
+}
+
+#[test]
 fn managerless_base_io_map_and_bind_apply_real_world_and_compose_finished_tasks() {
     let _guard = lock();
     let program = validated(vec![
@@ -7787,7 +7874,7 @@ fn internal_thunk_and_task_application_bind_argument_ownership_before_entry() {
         ),
         function_with_ownership(
             1,
-            vec![ArgumentOwnership::Owned],
+            vec![ArgumentOwnership::Unique],
             2,
             vec![
                 Instruction::String {
@@ -7887,7 +7974,7 @@ fn internal_thunk_and_task_application_bind_argument_ownership_before_entry() {
         (
             "Task.spawn",
             spawn,
-            ArgumentOwnership::Owned,
+            ArgumentOwnership::Unique,
             ArgumentOwnership::Scalar,
         ),
         (
