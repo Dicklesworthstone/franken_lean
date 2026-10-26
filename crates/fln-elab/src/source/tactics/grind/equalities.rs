@@ -77,6 +77,51 @@ impl Equalities {
         id
     }
 
+    /// E-matching reads the already established classes without interning a
+    /// pattern or manufacturing an equality. A rigid ground pattern may also
+    /// match by checked definitional conversion.
+    pub fn equivalent(
+        &self,
+        context: &mut Context,
+        left: &Expr,
+        right: &Expr,
+    ) -> Result<bool, Error> {
+        let left = normalize(context, left)?;
+        let right = normalize(context, right)?;
+        if let (Some(left), Some(right)) = (self.indices.get(&left), self.indices.get(&right))
+            && self.root(*left) == self.root(*right)
+        {
+            return Ok(true);
+        }
+        convert(context, &left, &right)
+    }
+
+    /// Stable insertion order, including every representative: a nested
+    /// pattern `f (g x)` must see `g a` when its ground argument is an equal
+    /// local `b`. Matching only the union-find representative misses this case.
+    pub fn class_terms(
+        &self,
+        context: &mut Context,
+        expression: &Expr,
+    ) -> Result<Vec<Expr>, Error> {
+        let expression = normalize(context, expression)?;
+        let Some(index) = self.indices.get(&expression) else {
+            return Ok(vec![expression]);
+        };
+        if self.edges[*index].is_empty() {
+            return Ok(vec![expression]);
+        }
+        let root = self.root(*index);
+        let mut terms = Vec::new();
+        for (index, node) in self.nodes.iter().enumerate() {
+            context.tick()?;
+            if self.root(index) == root {
+                terms.push(node.term.clone());
+            }
+        }
+        Ok(terms)
+    }
+
     fn join(
         &mut self,
         context: &mut Context,
