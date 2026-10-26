@@ -255,11 +255,13 @@ impl Context {
         } else {
             (from, to)
         };
-        if occurrence.has_expr_mvar() || occurrence.has_level_mvar() || occurrence.has_loose_bvars()
+        let original = self.instantiate(&local.type_)?;
+        if occurrence.has_expr_mvar()
+            || occurrence.has_loose_bvars()
+            || !self.rewrite_levels_known(occurrence, &original)?
         {
             return Err(error(TacticError::ExpectedEquality));
         }
-        let original = self.instantiate(&local.type_)?;
         let marker = self.equality_local(alpha.clone())?;
         let (template, matched) = if kabstract {
             self.rewrite_kabstract(&original, occurrence, &Expr::fvar(marker.id.clone()))?

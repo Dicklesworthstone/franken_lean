@@ -20,7 +20,7 @@ pub(in crate::source) struct RewriteMatch {
 }
 
 use super::*;
-use fln_core::level::LevelView;
+use fln_core::level::{LMVarId, Level, LevelView};
 use fln_env::constants::ConstantInfo;
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -407,7 +407,10 @@ impl Context {
         let alpha = self.instantiate(&alpha)?;
         let value = self.instantiate(&evidence.value)?;
         let pattern = self.instantiate(occurrence)?;
-        if pattern.has_expr_mvar() || pattern.has_level_mvar() || pattern.has_loose_bvars() {
+        if pattern.has_expr_mvar()
+            || pattern.has_loose_bvars()
+            || !self.rewrite_levels_known(&pattern, target)?
+        {
             return Err(error(TacticError::ExpectedEquality));
         }
         let (replacement, equation) = if reverse {
@@ -537,7 +540,10 @@ impl Context {
         let rule_value = self.instantiate(&rule.value)?;
         let pattern = occurrence;
         let replacement = if reverse { &from } else { &to };
-        if pattern.has_expr_mvar() || pattern.has_level_mvar() || pattern.has_loose_bvars() {
+        if pattern.has_expr_mvar()
+            || pattern.has_loose_bvars()
+            || !self.rewrite_levels_known(pattern, &target)?
+        {
             return Err(error(TacticError::ExpectedEquality));
         }
         let marker = FVarId(self.fresh_name()?);
@@ -693,6 +699,23 @@ impl Context {
         budget.offset_constraints = true;
         budget.max_assignments = 0;
         self.proof_types_match_with_budget(term, occurrence, budget)
+    }
+
+    /// Whether every universe metavariable of `pattern` is one `target` already has. A
+    /// declaration whose universe is still being inferred (an auto-bound `A` of `Type _`)
+    /// elaborates its tactic blocks over its own universe metavariables, as the pin's does, and
+    /// generalizes them when it is finished; a rewrite may carry those. A metavariable a rule
+    /// introduced and the match left open is a universe nothing determined.
+    pub(super) fn rewrite_levels_known(
+        &mut self,
+        pattern: &Expr,
+        target: &Expr,
+    ) -> Result<bool, NatDefinitionElabError> {
+        if !pattern.has_level_mvar() {
+            return Ok(true);
+        }
+        let target = self.instantiate(target)?;
+        Ok(level_mvars(pattern).is_subset(&level_mvars(&target)))
     }
 
     /// Allocation-memoized replacement of exact elaborated occurrences. The
@@ -996,6 +1019,46 @@ fn children(expr: &Expr) -> [Option<&Expr>; 3] {
         ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => [Some(expr), None, None],
         _ => [None, None, None],
     }
+}
+
+/// The universe metavariables `expr` mentions, assigned or not.
+pub(super) fn level_mvars(expr: &Expr) -> HashSet<LMVarId> {
+    let mut found = HashSet::new();
+    let mut seen = HashSet::new();
+    let mut exprs = vec![expr];
+    while let Some(expr) = exprs.pop() {
+        if !expr.has_level_mvar() || !seen.insert(expr.allocation_identity()) {
+            continue;
+        }
+        let mut levels: Vec<&Level> = Vec::new();
+        match expr.node() {
+            ExprNode::Sort { level } => levels.push(level),
+            ExprNode::Const { levels: args, .. } => levels.extend(args.iter()),
+            ExprNode::App { f, a } => exprs.extend([f, a]),
+            ExprNode::Lam {
+                binder_type, body, ..
+            }
+            | ExprNode::ForallE {
+                binder_type, body, ..
+            } => exprs.extend([binder_type, body]),
+            ExprNode::LetE {
+                type_, value, body, ..
+            } => exprs.extend([type_, value, body]),
+            ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => exprs.push(expr),
+            _ => {}
+        }
+        while let Some(level) = levels.pop() {
+            match level.view() {
+                LevelView::MVar(id) => {
+                    found.insert(id.clone());
+                }
+                LevelView::Succ(inner) => levels.push(inner),
+                LevelView::Max(a, b) | LevelView::IMax(a, b) => levels.extend([a, b]),
+                _ => {}
+            }
+        }
+    }
+    found
 }
 
 #[cfg(test)]

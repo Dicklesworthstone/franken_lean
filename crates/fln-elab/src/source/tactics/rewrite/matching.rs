@@ -776,10 +776,17 @@ impl Context {
                 }
                 let value = trial.instantiate(&rule.value)?;
                 let type_ = trial.instantiate(&rule.type_)?;
-                if value.has_level_mvar()
-                    || type_.has_level_mvar()
-                    || inside_out && !deferred && (value.has_expr_mvar() || type_.has_expr_mvar())
-                {
+                // A universe metavariable the target already has may remain (`level_mvars`); one
+                // of the rule's own that the match left open is a universe nothing determined.
+                if value.has_level_mvar() || type_.has_level_mvar() {
+                    let known = super::level_mvars(&trial.instantiate(target)?);
+                    if !super::level_mvars(&value).is_subset(&known)
+                        || !super::level_mvars(&type_).is_subset(&known)
+                    {
+                        return Ok(None);
+                    }
+                }
+                if inside_out && !deferred && (value.has_expr_mvar() || type_.has_expr_mvar()) {
                     return Ok(None);
                 }
                 let occurrence = trial.instantiate(term)?;
