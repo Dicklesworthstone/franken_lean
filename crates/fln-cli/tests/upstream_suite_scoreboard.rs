@@ -39,9 +39,13 @@
 //! FrankenLean admits an explicit import closure itself, and nothing carries over between
 //! runs: its reuse records go to a directory inside the run's copy. Every closure of a
 //! non-`prelude` header contains `Init`, and admitting a closure does at least the work of
-//! admitting any closure inside it. So a header-only `import Init` is run first, and when
-//! even that is not admitted within `FILE_TIMEOUT`, those files are recorded as that measured
-//! timeout rather than each spending `FILE_TIMEOUT` to find it again.
+//! admitting any closure inside it. So a header-only `import Init` runs before any file,
+//! under its own `INIT_TIMEOUT`, and every file then runs against the record it leaves. A
+//! file without an explicit import is no exception: since `a5c5293c` it carries the implicit
+//! `Init`, and run first against an empty record directory each one spent `FILE_TIMEOUT` on a
+//! cold admission it could not finish. When even the header-only `import Init` is not admitted,
+//! every file whose closure contains `Init` is recorded as that measured timeout rather than
+//! each spending `FILE_TIMEOUT` to find it again.
 //!
 //! Run it (pin required, about the pin's own elaboration time over 3,379 files):
 //! `FLN_REQUIRE_REFERENCE=1 cargo test -p fln-cli --release --test upstream_suite_scoreboard \
@@ -80,6 +84,10 @@ const INIT_STUB: &str = "fln-init-closure.lean";
 /// load (one oracle recorded a timeout, the next an acceptance), and a verdict the host can
 /// flip cannot anchor a drift check.
 const FILE_TIMEOUT: Duration = Duration::from_secs(300);
+/// The header-only `import Init` is a cold admission of the whole `Init` closure: 1,711 s
+/// (2026-10-17) and 1,448 s (2026-10-26) on the measurement host at `-j 32`. It gets its own
+/// budget and is never measured against `FILE_TIMEOUT`.
+const INIT_TIMEOUT: Duration = Duration::from_secs(3_600);
 
 /// What one process did. `exit` is `None` when there was no verdict: a timeout or a signal.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -695,9 +703,9 @@ fn reference_lean(root: &Path) -> Result<PathBuf, String> {
     }
 }
 
-/// Run `program file` from `directory`, bounded by `FILE_TIMEOUT`. FrankenLean keeps its
-/// import reuse records in `reuse`; the pin ignores the variable.
-fn run(program: &Path, directory: &Path, file: &str, reuse: &Path) -> Run {
+/// Run `program file` from `directory`, bounded by `budget`. FrankenLean keeps its import
+/// reuse records in `reuse`; the pin ignores the variable.
+fn run(program: &Path, directory: &Path, file: &str, reuse: &Path, budget: Duration) -> Run {
     let mut child = Command::new(program)
         .arg(file)
         .current_dir(directory)
@@ -719,7 +727,7 @@ fn run(program: &Path, directory: &Path, file: &str, reuse: &Path) -> Run {
         stderr.read_to_end(&mut bytes).map(|_| bytes)
     });
     let started = Instant::now();
-    let deadline = started + FILE_TIMEOUT;
+    let deadline = started + budget;
     let exit = loop {
         if let Some(status) = child.try_wait().expect("poll child") {
             break status.code();
@@ -786,7 +794,7 @@ fn run_all(program: &Path, copy: &Path, files: &[String], workers: usize) -> BTr
                     let index = next.fetch_add(1, Ordering::Relaxed);
                     let Some(file) = files.get(index) else { break };
                     let (directory, name) = file.split_once('/').expect("dir/file");
-                    let seen = run(program, &copy.join(directory), name, &reuse);
+                    let seen = run(program, &copy.join(directory), name, &reuse, FILE_TIMEOUT);
                     observed
                         .lock()
                         .expect("observation lock")
@@ -798,9 +806,17 @@ fn run_all(program: &Path, copy: &Path, files: &[String], workers: usize) -> BTr
     observed.into_inner().expect("observation lock")
 }
 
-/// FrankenLean over the suite: files without explicit imports on `WORKERS`, the rest on
-/// `IMPORT_WORKERS`, after the header-only `import Init` decides whether the non-`prelude`
-/// ones can be admitted at all (see the module documentation).
+/// Whether a header of this kind gives its file the implicit `Init`: every non-`prelude`
+/// header, in a `module` file as in a legacy one.
+fn contains_init(kind: &str) -> bool {
+    kind == "implicit" || kind == "module-implicit"
+}
+
+/// FrankenLean over the suite. The header-only `import Init` runs first, under its own
+/// `INIT_TIMEOUT`, and leaves its record in the run's reuse directory. Files without explicit
+/// imports then run on `WORKERS` and the rest on `IMPORT_WORKERS`, all against that record.
+/// When `Init` itself was not admitted, every file whose closure contains it is that measured
+/// timeout (see the module documentation).
 fn run_subject(
     program: &Path,
     copy: &Path,
@@ -809,25 +825,31 @@ fn run_subject(
 ) -> BTreeMap<String, Run> {
     let headers: BTreeMap<&str, &OracleRow> =
         oracle.iter().map(|row| (row.file.as_str(), row)).collect();
-    let (imported, plain): (Vec<String>, Vec<String>) = files.iter().cloned().partition(|file| {
+    std::fs::write(copy.join(INIT_STUB), "import Init\n").expect("write the Init stub");
+    let init = run(
+        program,
+        copy,
+        INIT_STUB,
+        &copy.join("fln-import-reuse"),
+        INIT_TIMEOUT,
+    );
+    eprintln!(
+        "upstream_suite_scoreboard: header-only `import Init` (warm-up): exit {:?} in {} ms",
+        init.exit, init.millis
+    );
+    let (bounded, measured): (Vec<String>, Vec<String>) = files.iter().cloned().partition(|file| {
+        init.exit.is_none()
+            && headers
+                .get(file.as_str())
+                .is_some_and(|row| contains_init(&row.kind))
+    });
+    let (imported, plain): (Vec<String>, Vec<String>) = measured.into_iter().partition(|file| {
         headers
             .get(file.as_str())
             .is_some_and(|row| !row.imports.is_empty())
     });
     let mut observed = run_all(program, copy, &plain, WORKERS);
-    std::fs::write(copy.join(INIT_STUB), "import Init\n").expect("write the Init stub");
-    let init = run(program, copy, INIT_STUB, &copy.join("fln-import-reuse"));
-    eprintln!(
-        "upstream_suite_scoreboard: header-only `import Init`: exit {:?} in {} ms",
-        init.exit, init.millis
-    );
-    let (bounded, measured): (Vec<String>, Vec<String>) = imported.into_iter().partition(|file| {
-        init.exit.is_none()
-            && headers
-                .get(file.as_str())
-                .is_some_and(|row| row.kind == "implicit")
-    });
-    observed.extend(run_all(program, copy, &measured, IMPORT_WORKERS));
+    observed.extend(run_all(program, copy, &imported, IMPORT_WORKERS));
     for file in bounded {
         observed.insert(file, closure_timeout(&init));
     }
@@ -835,7 +857,7 @@ fn run_subject(
 }
 
 /// The row of a file whose closure contains `Init` when the header-only `import Init`
-/// had no verdict within `FILE_TIMEOUT`: that measured timeout, never a run of its own.
+/// had no verdict within `INIT_TIMEOUT`: that measured timeout, never a run of its own.
 fn closure_timeout(init: &Run) -> Run {
     assert!(
         init.exit.is_none(),
@@ -846,7 +868,7 @@ fn closure_timeout(init: &Run) -> Run {
         stdout: String::new(),
         stderr: format!(
             "not run: the header-only `import Init` was not admitted within {} s ({} ms), and this closure contains it",
-            FILE_TIMEOUT.as_secs(),
+            INIT_TIMEOUT.as_secs(),
             init.millis
         ),
         millis: init.millis,
@@ -938,7 +960,13 @@ fn upstream_suite_scoreboard_measures_the_drop_in_against_the_pin() {
     let reuse = copy.join("fln-import-reuse");
     let (host_dependent_exits, unscored) = retry_drifted(&oracle, &mut pin, |file| {
         let (directory, name) = file.split_once('/').expect("dir/file");
-        run(&reference, &copy.join(directory), name, &reuse)
+        run(
+            &reference,
+            &copy.join(directory),
+            name,
+            &reuse,
+            FILE_TIMEOUT,
+        )
     });
     eprintln!(
         "upstream_suite_scoreboard: pin exits that drifted under load and reproduced the oracle alone: {}",
@@ -1312,6 +1340,16 @@ fn pin_drift_and_broken_scans_are_refused() {
     let (files, problems) = scan(Path::new("/nonexistent-fln-upstream-suite"));
     assert!(files.is_empty());
     assert_eq!(problems.len(), DIRECTORIES.len(), "{problems:?}");
+}
+
+#[test]
+fn every_non_prelude_header_carries_init_and_no_prelude_header_does() {
+    for kind in ["implicit", "module-implicit"] {
+        assert!(contains_init(kind), "{kind}");
+    }
+    for kind in ["prelude", "module-prelude", "unparsed", "unreadable"] {
+        assert!(!contains_init(kind), "{kind}");
+    }
 }
 
 #[test]
