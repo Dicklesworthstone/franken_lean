@@ -6,6 +6,8 @@
 mod aclt;
 mod arith;
 mod binders;
+mod config;
+mod decide;
 mod dsimp;
 mod locations;
 mod simpa;
@@ -16,6 +18,7 @@ use super::matching::RigidTypeHead;
 use super::*;
 use crate::lctx::LocalContext;
 use aclt::{SimpPlace, SimpReach, SimpRewrite, simp_rules_keyed};
+pub(in crate::source) use config::SimpConfig;
 use fln_core::expr::BinderInfo;
 use fln_env::environment::Environment;
 use std::collections::{HashMap, HashSet};
@@ -37,13 +40,17 @@ pub(in crate::source) enum SimpRule<'a> {
     /// `simpArith` runs after `rewritePost` (`Rewrite.lean:542-546`). It rewrites; it never
     /// closes a goal by itself.
     Arith,
+    /// `+decide`'s decision of closed propositions (`decide.rs`), always the first rule: the
+    /// pin's `simpUsingDecide` ends `preDefault` (`Rewrite.lean:536-540`), which runs at a node
+    /// before its post rewrites.
+    Decide,
 }
 impl SimpRule<'_> {
     fn reverse(&self) -> bool {
         match self {
             Self::Explicit(rule) => rule.reverse,
             Self::Global(rule) => rule.reverse,
-            Self::Local(_) | Self::Arith => false,
+            Self::Local(_) | Self::Arith | Self::Decide => false,
         }
     }
 }
@@ -395,7 +402,7 @@ impl Context {
         index: Option<&SimpTargetIndex>,
         side: SimpKeySide,
     ) -> bool {
-        if matches!(rule, SimpRule::Arith) {
+        if matches!(rule, SimpRule::Arith | SimpRule::Decide) {
             return matches!(side, SimpKeySide::Rewrite);
         }
         let (Some(index), Some(entry)) = (index, simp_rule_entry(rule)) else {
@@ -765,8 +772,8 @@ impl Context {
                     type_: local.type_.clone(),
                 })
             }
-            // Arithmetic normalization has no single proof term to select.
-            SimpRule::Arith => Err(error(TacticError::MalformedScript)),
+            // Arithmetic normalization and decision have no single proof term to select.
+            SimpRule::Arith | SimpRule::Decide => Err(error(TacticError::MalformedScript)),
         }
     }
 
@@ -826,6 +833,15 @@ impl Context {
         &mut self,
         args: &'a [Syntax],
     ) -> Result<Vec<SimpRule<'a>>, NatDefinitionElabError> {
+        Ok(self.simp_selection(args)?.0)
+    }
+
+    /// The rules a `simp`, `simpa` or `dsimp` call's slots `args` select, with its configuration.
+    /// `+decide`'s decision joins them first and `+arith`'s normalization last.
+    fn simp_selection<'a>(
+        &mut self,
+        args: &'a [Syntax],
+    ) -> Result<(Vec<SimpRule<'a>>, SimpConfig), NatDefinitionElabError> {
         self.tick()?;
         // `simp`'s six slots, or the pin's `simpa` (`"simpa" "?"? "!"? simpaArgsRest`), whose
         // arguments are `simpaArgsRest`'s first four slots and whose fifth is its evidence.
@@ -859,18 +875,35 @@ impl Context {
             },
             "simplification keyword",
         )?;
-        // `dsimp`'s configuration has no `arith` field.
-        let arith = self.simp_arith_config(config, !dsimp)?;
+        let config = self.simp_config(config, dsimp)?;
+        // `dsimp` decides nothing here: its `decide` is not wired to its reductions.
+        if dsimp && config.decide {
+            return Err(NatDefinitionElabError::UnexpectedSyntax {
+                expected: "default simplification configuration",
+            });
+        }
         expect_empty_null(discharger, "default simplification discharger")?;
         if !simpa {
             let location = location.ok_or_else(|| error(TacticError::MalformedScript))?;
             self.rewrite_locations(location)?;
         }
         let mut rules = self.simp_rule_selection(dsimp, only, arguments)?;
-        if arith {
+        if config.decide {
+            rules.insert(0, SimpRule::Decide);
+        }
+        // `arith` is honoured as the pin's `updateArith` does: off while the environment lacks
+        // `Nat.Linear.ExprCnstr.eq_of_toNormPoly_eq`.
+        if config.arith
+            && self.txn.env.contains(&Name::from_components([
+                "Nat",
+                "Linear",
+                "ExprCnstr",
+                "eq_of_toNormPoly_eq",
+            ]))
+        {
             rules.push(SimpRule::Arith);
         }
-        Ok(rules)
+        Ok((rules, config))
     }
 
     /// The rules `simp_rules` selects, before `+arith`'s normalization joins them last.
@@ -1470,8 +1503,13 @@ impl Context {
         if self.simplify_at_locations(proof, &goal, args)? {
             return Ok(());
         }
-        let rules = self.simp_rules(args)?;
-        self.simplify_goal_with_rules(proof, goal, &rules, 0, None)
+        let (rules, config) = self.simp_selection(args)?;
+        if config.fail_if_unchanged {
+            return self.simplify_goal_with_rules(proof, goal, &rules, 0, None);
+        }
+        let start = proof.work.len();
+        let result = self.simplify_goal_with_rules(proof, goal.clone(), &rules, 0, None);
+        simp_unchanged(proof, goal, start, result)
     }
 
     // Hypothesis and goal simplification share one productive-step limit. A
@@ -1586,6 +1624,26 @@ fn simp_rule_entry<'r>(
             order: 0,
         })),
         _ => None,
+    }
+}
+
+/// `failIfUnchanged := false`: a call that changed nothing leaves its goal open, as the pin's
+/// `simpGoal` then returns the goal it was given, rather than failing. Only the typed no-progress
+/// refusal of an attempt that pushed no work since `start` is absorbed.
+fn simp_unchanged(
+    proof: &mut ProofState<'_>,
+    goal: ProofGoal,
+    start: usize,
+    result: Result<(), NatDefinitionElabError>,
+) -> Result<(), NatDefinitionElabError> {
+    match result {
+        Err(NatDefinitionElabError::Inference(SourceInferenceError::Tactic(
+            TacticError::SimplificationNoProgress,
+        ))) if proof.work.len() == start => {
+            proof.work.push(Work::Goal(goal));
+            Ok(())
+        }
+        result => result,
     }
 }
 

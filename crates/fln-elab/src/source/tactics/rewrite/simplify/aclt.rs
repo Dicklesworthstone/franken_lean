@@ -145,6 +145,8 @@ fn beta(function: &Expr, args: &[Expr]) -> Option<Expr> {
 /// (`Rewrite.lean:542-546`), last.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub(super) enum SimpReach {
+    /// `simpUsingDecide`, which runs before a node's other rewrites (`decide.rs`).
+    Decide,
     Unfold,
     /// The occurrence's one-based post-order ordinal in the target.
     Node(usize),
@@ -316,7 +318,7 @@ impl Context {
         }
         for rule in rules {
             let statement = match rule {
-                SimpRule::Arith | SimpRule::Global(_) => continue,
+                SimpRule::Arith | SimpRule::Decide | SimpRule::Global(_) => continue,
                 SimpRule::Explicit(explicit) if explicit.global.is_some() => continue,
                 SimpRule::Local(id) => {
                     let Some(local) = self.txn.lctx.find(id) else {

@@ -33,6 +33,20 @@ impl Context {
     ) -> Result<Option<(Typed, Expr, bool, SimpPlace)>, NatDefinitionElabError> {
         // A rewrite at a node is already chosen: one beneath a binder or by `+arith` comes later.
         let limited = self.simp_reach_limit.is_some();
+        if matches!(rule, SimpRule::Decide) {
+            // The walk reaches every closed proposition, under binders too: one mentioning a
+            // bound variable is never decided (`simpUsingDecide` skips free variables).
+            return Ok(self
+                .simp_decide_evidence(target)?
+                .map(|(evidence, occurrence)| {
+                    (
+                        evidence,
+                        occurrence,
+                        false,
+                        SimpPlace::of(SimpReach::Decide),
+                    )
+                }));
+        }
         if matches!(rule, SimpRule::Arith) {
             if limited {
                 self.simp_reach_limit = None;
@@ -143,6 +157,10 @@ impl Context {
         rule: &SimpRule<'_>,
         premises: &[SimpRule<'_>],
     ) -> Result<Option<(Expr, Typed)>, NatDefinitionElabError> {
+        // Decision never opens a binder: its walk already reaches every closed proposition.
+        if matches!(rule, SimpRule::Decide) {
+            return Ok(None);
+        }
         if matches!(rule, SimpRule::Arith) {
             let Some((evidence, occurrence)) = self.simp_arith_evidence(body)? else {
                 return Ok(None);

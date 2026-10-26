@@ -8,12 +8,14 @@ impl Context {
     ) -> Result<DsimpSet<'a>, NatDefinitionElabError> {
         let environment = self.txn.env.clone();
         let tagged = scope::simp::defeq::read(&environment, || self.tick())?;
+        let (rules, config) = self.simp_selection(args)?;
         let mut set = DsimpSet {
             definitions: Vec::new(),
             rewrites: Vec::new(),
             tagged,
+            fail_if_unchanged: config.fail_if_unchanged,
         };
-        for rule in self.simp_rules(args)? {
+        for rule in rules {
             // A named, admitted theorem already has a proposition telescope.
             // The pin's isRflProof classifies a constant by its defeq tag,
             // without instantiating universes or re-inferring that telescope.

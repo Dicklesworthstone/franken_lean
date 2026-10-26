@@ -13,6 +13,8 @@ impl Context {
         self.txn.lctx = goal.lctx.clone();
         // Freeze selection before adding private evidence, so `[*]` cannot
         // acquire a synthetic assumption or use it as its own rewrite rule.
+        // `failIfUnchanged` changes nothing here: simp's no-progress refusal below is already
+        // `simpa`'s fallback to an assumption, as the pin's `simpa` makes no progress silently.
         let rules = self.simp_rules(args)?;
         if let Some(term) = using {
             return self.simpa_candidate(proof, goal, &rules, term);

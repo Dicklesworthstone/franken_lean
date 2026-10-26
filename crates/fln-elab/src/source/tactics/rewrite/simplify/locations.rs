@@ -44,8 +44,11 @@ impl Context {
         rule: &SimpRule<'_>,
         tagged: &mut Option<std::collections::BTreeSet<Name>>,
     ) -> Result<bool, NatDefinitionElabError> {
-        // A linear normalization's proof is a reflection proof, not `rfl`.
-        if matches!(rule, SimpRule::Local(_) | SimpRule::Arith) {
+        // A linear normalization's or a decision's proof is a reflection proof, not `rfl`.
+        if matches!(
+            rule,
+            SimpRule::Local(_) | SimpRule::Arith | SimpRule::Decide
+        ) {
             return Ok(false);
         }
         let tagged = match tagged {
@@ -100,7 +103,7 @@ impl Context {
             no_location,
         ];
         self.txn.lctx = initial.lctx.clone();
-        let mut rules = self.simp_rules(&selection)?;
+        let (mut rules, config) = self.simp_selection(&selection)?;
         let mut hypotheses = Vec::new();
         let mut selected = HashSet::new();
         for rule in &rules {
@@ -153,7 +156,12 @@ impl Context {
             target: true,
             all: true,
         };
-        self.simplify_location_rules(proof, &initial, locations, rules, true)
+        if config.fail_if_unchanged {
+            return self.simplify_location_rules(proof, &initial, locations, rules, true);
+        }
+        let start = proof.work.len();
+        let result = self.simplify_location_rules(proof, &initial, locations, rules, true);
+        simp_unchanged(proof, initial, start, result)
     }
 
     pub(super) fn simplify_at_locations(
@@ -169,8 +177,14 @@ impl Context {
         let Some(locations) = self.rewrite_locations(location)? else {
             return Ok(false);
         };
-        let rules = self.simp_rules(args)?;
-        self.simplify_location_rules(proof, initial, locations, rules, false)?;
+        let (rules, config) = self.simp_selection(args)?;
+        let start = proof.work.len();
+        let result = self.simplify_location_rules(proof, initial, locations, rules, false);
+        if config.fail_if_unchanged {
+            result?;
+        } else {
+            simp_unchanged(proof, initial.clone(), start, result)?;
+        }
         Ok(true)
     }
 

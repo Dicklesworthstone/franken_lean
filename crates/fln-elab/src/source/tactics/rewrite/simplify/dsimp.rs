@@ -13,7 +13,6 @@ mod rules;
 #[cfg(test)]
 mod tests;
 
-#[derive(Default)]
 struct DsimpSet<'a> {
     definitions: Vec<Selection>,
     /// Theorem rules in the set's order, each with whether it is structurally reflexive.
@@ -24,6 +23,19 @@ struct DsimpSet<'a> {
     rewrites: Vec<(SimpRule<'a>, std::cell::Cell<Option<bool>>)>,
     /// The `rfl`-tagged declarations a classification reads.
     tagged: std::collections::BTreeSet<Name>,
+    /// `failIfUnchanged`: a call that changes nothing fails, rather than leaving its goal.
+    fail_if_unchanged: bool,
+}
+
+impl Default for DsimpSet<'_> {
+    fn default() -> Self {
+        Self {
+            definitions: Vec::new(),
+            rewrites: Vec::new(),
+            tagged: std::collections::BTreeSet::new(),
+            fail_if_unchanged: true,
+        }
+    }
 }
 
 impl DsimpSet<'_> {
@@ -183,7 +195,7 @@ impl Context {
                 return Ok(None);
             }
         }
-        if !changed {
+        if !changed && set.fail_if_unchanged {
             return Err(error(TacticError::DefinitionalSimplificationNoProgress));
         }
         Ok(Some(goal))
