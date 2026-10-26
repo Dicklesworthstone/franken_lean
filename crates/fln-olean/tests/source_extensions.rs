@@ -77,13 +77,23 @@ fn decoding_in_phases_keeps_one_byte_object_and_entry_budget() {
             decoder.decode(&second),
             Err(DecodeError::Limit { resource: actual }) if actual == resource
         ));
-        assert!(matches!(
-            decoder.decode(&[]),
-            Err(DecodeError::Shape {
-                detail: "source-extension decoder reused after refusal"
-            })
-        ));
+        assert!(decoder.decode(&[]).unwrap_err().is_resource());
     }
+}
+
+#[test]
+fn malformed_incremental_decode_cannot_publish_a_later_batch() {
+    use fln_olean::source_extensions::{DEFEQ_EXTENSION, Decoder};
+    let mut decoder = Decoder::new(DecodeLimits::default());
+    let malformed = one(DEFEQ_EXTENSION, &Obj::mk_nat(7));
+    assert!(!decoder.decode(&malformed).unwrap_err().is_resource());
+    let valid = one(DEFEQ_EXTENSION, &inject_name(&n("valid")));
+    assert!(matches!(
+        decoder.decode(&valid),
+        Err(DecodeError::Shape {
+            detail: "source-extension decoder reused after refusal"
+        })
+    ));
 }
 
 #[test]

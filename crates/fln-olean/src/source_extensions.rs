@@ -550,11 +550,18 @@ pub fn decode(
 
 /// Incremental batches share all explicit allowances and the converter's own
 /// walk counter. A refused batch poisons this decoder; no later batch can
-/// continue from a partially projected journal.
+/// continue from a partially projected journal. Resource exhaustion remains a
+/// resource outcome even if a caller attempts to reuse the poisoned decoder.
 pub struct Decoder {
     remaining: DecodeLimits,
     reader: Reader,
-    refused: bool,
+    refusal: Option<Refusal>,
+}
+
+#[derive(Clone, Copy)]
+enum Refusal {
+    Resource,
+    Malformed,
 }
 
 impl Decoder {
@@ -566,7 +573,7 @@ impl Decoder {
                 indices_left: limits.max_indices,
                 keys_left: limits.max_keys,
             },
-            refused: false,
+            refusal: None,
         }
     }
 
@@ -578,8 +585,11 @@ impl Decoder {
         &mut self,
         blocks: &[OpaqueExtensionBlock],
     ) -> Result<SourceExtensions, DecodeError> {
-        if self.refused {
-            return Err(shape("source-extension decoder reused after refusal"));
+        if let Some(refusal) = self.refusal {
+            return Err(match refusal {
+                Refusal::Resource => limit("source-extension decoder after resource exhaustion"),
+                Refusal::Malformed => shape("source-extension decoder reused after refusal"),
+            });
         }
         match decode_batch(blocks, self.remaining, &mut self.reader) {
             Ok((decoded, remaining)) => {
@@ -587,7 +597,11 @@ impl Decoder {
                 Ok(decoded)
             }
             Err(error) => {
-                self.refused = true;
+                self.refusal = Some(if error.is_resource() {
+                    Refusal::Resource
+                } else {
+                    Refusal::Malformed
+                });
                 Err(error)
             }
         }
