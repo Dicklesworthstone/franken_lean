@@ -42,7 +42,7 @@ enum ProjectionFrame {
     LetValue(Name, Expr, Expr, bool),
     LetBody(Name, Expr, Expr, bool),
     Projection(Name, u64),
-    Thunk(Expr),
+    NativeField(Expr),
 }
 
 impl Preparation<'_> {
@@ -58,6 +58,9 @@ impl Preparation<'_> {
             return Ok(Some(replacement));
         }
         if let Some(getter) = self.thunk_call(head, arguments)? {
+            return Ok(Some(getter));
+        }
+        if let Some(getter) = self.task_call(head, arguments)? {
             return Ok(Some(getter));
         }
         let ExprNode::Const { name, levels } = head.node() else {
@@ -168,6 +171,14 @@ impl Preparation<'_> {
             };
             return self
                 .thunk_projection_factory(&type_, family, index)
+                .map(|factory| factory.map(|factory| Expr::app(factory, receiver.clone())));
+        }
+        if self.task_record_forbidden(family)? {
+            let Some(type_) = self.projection_receiver_type(receiver, &[])? else {
+                return Ok(None);
+            };
+            return self
+                .task_projection_factory(&type_, family, index)
                 .map(|factory| factory.map(|factory| Expr::app(factory, receiver.clone())));
         }
         let key = specialize::closed(receiver).then(|| (family.clone(), index, receiver.clone()));
@@ -598,7 +609,14 @@ impl Preparation<'_> {
                                 if let Some(factory) =
                                     self.thunk_projection_factory(&runtime_type, struct_name, *idx)?
                                 {
-                                    tasks.push(ProjectionFrame::Thunk(factory));
+                                    tasks.push(ProjectionFrame::NativeField(factory));
+                                    tasks.push(ProjectionFrame::Visit(receiver.clone()));
+                                    continue;
+                                }
+                                if let Some(factory) =
+                                    self.task_projection_factory(&runtime_type, struct_name, *idx)?
+                                {
+                                    tasks.push(ProjectionFrame::NativeField(factory));
                                     tasks.push(ProjectionFrame::Visit(receiver.clone()));
                                     continue;
                                 }
@@ -669,7 +687,7 @@ impl Preparation<'_> {
                     let receiver = pop(&mut values)?;
                     values.push(Expr::proj(name, index, receiver));
                 }
-                ProjectionFrame::Thunk(factory) => {
+                ProjectionFrame::NativeField(factory) => {
                     let receiver = pop(&mut values)?;
                     values.push(Expr::app(factory, receiver));
                 }

@@ -74,7 +74,10 @@ impl Preparation<'_> {
         // Only exact primitive adapters create native cells. A same-named or
         // differently instantiated source Ref never receives an object-field
         // layout that could be confused with the VM's reference handle.
-        if self.st_ref_record_forbidden(name)? || self.thunk_record_forbidden(name)? {
+        if self.st_ref_record_forbidden(name)?
+            || self.thunk_record_forbidden(name)?
+            || self.task_record_forbidden(name)?
+        {
             return Ok(None);
         }
         let Some(ConstantInfo::Induct(family)) = self.environment.find(name) else {
@@ -318,6 +321,7 @@ impl Preparation<'_> {
         }
         let source = self.erase_data_indices(source)?;
         self.thunk_value_type(&source)?;
+        self.task_value_type(&source)?;
         if let Some((value, _)) = executable_value_type(&source, &self.value_types) {
             return Ok(Some(value));
         }
@@ -367,6 +371,7 @@ impl Preparation<'_> {
             match task {
                 Task::Enter(source) => {
                     self.thunk_value_type(&source)?;
+                    self.task_value_type(&source)?;
                     if executable_value_type(&source, &self.value_types).is_some() {
                         continue;
                     }
