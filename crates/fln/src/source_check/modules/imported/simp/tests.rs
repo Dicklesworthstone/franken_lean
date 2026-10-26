@@ -197,6 +197,76 @@ fn data_proofs_are_not_activated_but_safe_unfolding_is() {
 }
 
 #[test]
+fn equation_associations_activate_beside_unfolding_and_keep_theorem_origins() {
+    let env = model();
+    let mut equation = theorem();
+    let metadata::SimpKind::Theorem(theorem) = &mut equation.kind else {
+        unreachable!()
+    };
+    theorem.origin = n("proof");
+    let association = metadata::SimpEntry {
+        scope: None,
+        kind: metadata::SimpKind::UnfoldTheorems {
+            declaration: n("data"),
+            theorems: vec![n("proof")],
+        },
+    };
+    let unfolding = metadata::SimpEntry {
+        scope: None,
+        kind: metadata::SimpKind::Unfold(n("data")),
+    };
+    let operations: Vec<_> = [&equation, &association, &unfolding]
+        .into_iter()
+        .map(|row| {
+            let (Some(operation), false) = select(&env, &n("Module"), row).unwrap() else {
+                panic!("ordinary equation metadata must activate")
+            };
+            operation
+        })
+        .collect();
+    let active = native::import_rules(&env, &operations).unwrap();
+    let rows = native::read(&active).unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().any(|row| row.declaration == n("proof")
+        && row.proof == Some(n("proof"))
+        && row.priority == 900));
+    assert!(
+        rows.iter()
+            .any(|row| row.declaration == n("data") && row.proof.is_none())
+    );
+
+    let equation_erased = native::update(&active, &n("proof"), None).unwrap();
+    let rows = native::read(&equation_erased).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].declaration, n("data"));
+    let definition_erased = native::update(&active, &n("data"), None).unwrap();
+    assert!(native::read(&definition_erased).unwrap().is_empty());
+
+    let mut scoped = association;
+    scoped.scope = Some(n("Scope"));
+    let (operation, deferred) = select(&active, &n("Module"), &scoped).unwrap();
+    assert!(deferred);
+    assert!(operation.is_none());
+    assert_eq!(native::read(&active).unwrap().len(), 2);
+}
+
+#[test]
+fn missing_equation_association_targets_are_errors_not_silent_withdrawals() {
+    let row = metadata::SimpEntry {
+        scope: None,
+        kind: metadata::SimpKind::UnfoldTheorems {
+            declaration: n("data"),
+            theorems: vec![n("proof"), n("missing")],
+        },
+    };
+    assert!(matches!(
+        select(&model(), &n("Module"), &row),
+        Err(SourceOleanImportError::Metadata { declaration, .. })
+            if declaration == n("missing")
+    ));
+}
+
+#[test]
 fn missing_names_are_errors_not_deferred_rules() {
     let env = model();
     for change_origin in [false, true] {
@@ -273,6 +343,29 @@ fn imported_siblings_cannot_supply_proofs_but_real_dependencies_can() {
         .unwrap();
     graph
         .authorize(&env, &env, &left, &n("Left"), &n("proof"))
+        .unwrap();
+}
+
+#[test]
+fn equation_association_names_obey_their_modules_import_world() {
+    let env = model();
+    let mut graph = graph();
+    let row = metadata::SimpEntry {
+        scope: None,
+        kind: metadata::SimpKind::UnfoldTheorems {
+            declaration: n("origin"),
+            theorems: vec![n("proof")],
+        },
+    };
+    let left = graph.closure(1).unwrap();
+    assert!(matches!(
+        graph.authorize_entry(&Environment::new(), &env, &left, &n("Left"), &row),
+        Err(SourceOleanImportError::Metadata { declaration, .. })
+            if declaration == n("proof")
+    ));
+    let right = graph.closure(2).unwrap();
+    graph
+        .authorize_entry(&Environment::new(), &env, &right, &n("Right"), &row)
         .unwrap();
 }
 

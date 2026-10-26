@@ -77,6 +77,21 @@ impl Engine {
             Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
         };
+        let equation_scope = public_scope
+            .for_declaration(syntax)
+            .map_err(DefinitionFrontendError::Elaborate)
+            .map_err(EngineExecutionError::Frontend)?;
+        let private_implementation = match self.finish_source_simp_batch(
+            private_implementation,
+            None,
+            &equation_scope,
+            options,
+            limits,
+        )? {
+            Outcome::Complete(checked) => checked,
+            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+        };
         // The primary implementation is first; each following helper has its
         // own council receipt and remains private. None is an exported axiom.
         let Some(admitted) = private_implementation.admissions.first() else {

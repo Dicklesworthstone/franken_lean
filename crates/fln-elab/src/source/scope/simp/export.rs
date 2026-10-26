@@ -37,6 +37,10 @@ pub struct Theorem {
 pub enum Kind {
     Unfold(Name),
     Theorem(Theorem),
+    UnfoldTheorems {
+        declaration: Name,
+        theorems: Vec<Name>,
+    },
 }
 
 /// Capability at the instant of registration. Even an unsupported or exhausted
@@ -79,6 +83,9 @@ impl Snapshot {
                 reflexive: theorem.reflexive,
                 backward_reflexive: theorem.backward_reflexive,
             }),
+            // Association rows have their own journal operation; an ordinary
+            // registration never manufactures a theorem group snapshot.
+            Ok(Kind::UnfoldTheorems { .. }) => Err(SimpSetError::Malformed),
             Err(SimpSetError::UnsupportedDeclaration(_)) => Ok(Self::Unsupported),
             Err(SimpSetError::Limit) => Ok(Self::ResourceLimit),
             Err(error) => Err(error),
@@ -217,7 +224,7 @@ fn derive_registration(
     if let ConstantInfo::Defn(definition) = info
         && definition.safety == DefinitionSafety::Safe
         && entry.proof.is_none()
-        && !keys::is_proposition(env, &definition.base.type_, meter)?
+        && !definition_type_is_proposition(env, &definition.base.type_, meter)?
     {
         if entry.reverse {
             return Err(SimpSetError::UnsupportedDeclaration(
@@ -225,10 +232,13 @@ fn derive_registration(
             ));
         }
         // Simp.ignoreEquations applies to reducible definitions and registered
-        // projections. Support the explicit reducible case here. Ordinary
-        // definitions may create equation theorems lazily at registration, so
-        // absence of eq_1 is never evidence that a bare unfolding is sufficient.
-        if !known_reducible(env, &entry.declaration, meter)? {
+        // projections, including semireducible class fields. Other definitions
+        // need their actual generated equations before a bare unfolding is
+        // sufficient for persistent registration.
+        if !known_reducible(env, &entry.declaration, meter)?
+            && !registered_projection(env, &entry.declaration, meter)?
+            && !super::equations::generated(env, &entry.declaration, meter)?
+        {
             return Err(SimpSetError::UnsupportedDeclaration(
                 entry.declaration.clone(),
             ));
@@ -239,11 +249,75 @@ fn derive_registration(
     }
 }
 
-fn known_reducible(
+/// Both equation realization and export must classify the complete declaration
+/// type by its inferred sort. A syntactic check cannot distinguish data from a
+/// beta-headed proposition, and must never authorize equation generation.
+pub(super) fn definition_type_is_proposition(
+    env: &Environment,
+    type_: &Expr,
+    meter: &mut Meter,
+) -> Result<bool, SimpSetError> {
+    keys::is_proposition(env, type_, meter)
+}
+
+pub(super) fn known_reducible(
     env: &Environment,
     declaration: &Name,
     meter: &mut Meter,
 ) -> Result<bool, SimpSetError> {
+    Ok(
+        known_status(env, declaration, meter)?
+            == Some(crate::reducibility::Reducibility::Reducible),
+    )
+}
+
+/// The pin's projection exception is an environment registration, not a name
+/// pattern or a lambda/proj shape. First skip impossible bodies cheaply, then
+/// require the actual validated physical-field identity. The structure exporter
+/// supplies bounded declaration/body validation and charges its complete work.
+pub(super) fn registered_projection(
+    env: &Environment,
+    declaration: &Name,
+    meter: &mut Meter,
+) -> Result<bool, SimpSetError> {
+    let Some(ConstantInfo::Defn(definition)) = env.find(declaration) else {
+        return Ok(false);
+    };
+    let mut body = &definition.value;
+    while let ExprNode::Lam { body: inner, .. } = body.node() {
+        meter.work(1)?;
+        body = inner;
+    }
+    meter.work(1)?;
+    if !matches!(body.node(), ExprNode::Proj { .. }) {
+        return Ok(false);
+    }
+    let structures =
+        crate::records::imported::export::registrations(&Environment::new(), env, meter.remaining)
+            .map_err(|error| match error {
+                crate::records::RecordError::ResourceLimit => SimpSetError::Limit,
+                _ => SimpSetError::Malformed,
+            })?;
+    meter.work(structures.work)?;
+    meter.bytes(structures.bytes_examined)?;
+    for structure in &structures.structures {
+        meter.work(1 + structure.fields.len())?;
+        if structure
+            .fields
+            .iter()
+            .any(|field| &field.projection == declaration)
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+pub(super) fn known_status(
+    env: &Environment,
+    declaration: &Name,
+    meter: &mut Meter,
+) -> Result<Option<crate::reducibility::Reducibility>, SimpSetError> {
     // Charge every journal consumed by the cached effective table, even on a
     // cache hit. Hints alone do not establish an imported declaration's status.
     for (journal, version) in [
@@ -265,7 +339,7 @@ fn known_reducible(
         crate::reducibility::ReducibilityError::Instances(error) => codec(error),
         _ => SimpSetError::Malformed,
     })?;
-    Ok(table.get(declaration) == Some(crate::reducibility::Reducibility::Reducible))
+    Ok(table.get(declaration))
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -277,7 +351,7 @@ pub struct Registrations {
 
 pub(super) struct Meter {
     pub(super) remaining: usize,
-    bytes: usize,
+    pub(super) bytes: usize,
 }
 
 impl Meter {
@@ -356,6 +430,23 @@ pub fn registrations(
         meter.payload(&row.payload)?;
         let decoded = decode_entry(&row.payload, index)?;
         let (entry, snapshot) = match decoded {
+            JournalEntry::UnfoldTheorems {
+                declaration,
+                theorems,
+            } => {
+                super::imports::validate_unfold_theorems(result, &declaration, &theorems)?;
+                for theorem in &theorems {
+                    meter.work(1)?;
+                    if !matches!(result.find(theorem), Some(ConstantInfo::Thm(_))) {
+                        return Err(SimpSetError::UnsupportedDeclaration(theorem.clone()));
+                    }
+                }
+                entries.push(Kind::UnfoldTheorems {
+                    declaration,
+                    theorems,
+                });
+                continue;
+            }
             JournalEntry::Erase(declaration) => {
                 if !result.contains(&declaration) {
                     return Err(SimpSetError::UnknownDeclaration(declaration));
@@ -379,7 +470,7 @@ pub fn registrations(
                 if entry.proof.is_some()
                     || !matches!(info, ConstantInfo::Defn(definition)
                         if definition.safety == DefinitionSafety::Safe
-                            && !keys::is_proposition(result, &definition.base.type_, &mut meter)?)
+                            && !definition_type_is_proposition(result, &definition.base.type_, &mut meter)?)
                 {
                     return Err(SimpSetError::UnsupportedDeclaration(entry.declaration));
                 }
@@ -644,6 +735,14 @@ mod tests {
             }))
             .unwrap();
         let recorded = update(&env, &n("betaProof"), Some((1000, false))).unwrap();
+        assert_eq!(
+            super::super::equations::prepare_owned(
+                &env,
+                &n("betaProof"),
+                fln_kernel::verdict::Budget::for_stack_bytes(2 * 1024 * 1024),
+            ),
+            Ok(super::super::equations::Preparation::NotRequired)
+        );
         let exported = registrations(&Environment::new(), &recorded, usize::MAX).unwrap();
         let [Kind::Theorem(theorem)] = exported.entries.as_slice() else {
             panic!("a beta-headed proposition is proof evidence")

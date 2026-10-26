@@ -51,6 +51,10 @@ pub struct SourceMetadata {
     /// backward_defeq; emit both sorted tag arrays, never just the subset.
     /// These flags are metadata, not a certificate of equality.
     pub defeq: Vec<Name>,
+    /// Additional owned backward-definitional tags, including generated
+    /// equation lemmas that are not strict `defeq` theorems. The exported
+    /// backward array is the union with `defeq`; overlap between arrays is valid.
+    pub backward_defeq: Vec<Name>,
     /// This module's final status for each owned declaration. The writer sorts
     /// these by Name.quickLt for the pin's per-module binary search.
     pub reducibility: Vec<ReducibilityEntry>,
@@ -177,13 +181,39 @@ impl Encoder {
             )?);
         }
         if !metadata.defeq.is_empty() {
-            for extension in [layout::DEFEQ_EXTENSION, layout::BACKWARD_DEFEQ_EXTENSION] {
-                blocks.push(self.tagged_names_block(
-                    extension,
-                    &metadata.defeq,
-                    "anonymous or duplicate definitional-equality declaration",
-                )?);
+            blocks.push(self.tagged_names_block(
+                layout::DEFEQ_EXTENSION,
+                &metadata.defeq,
+                "anonymous or duplicate definitional-equality declaration",
+            )?);
+        }
+        if !metadata.defeq.is_empty() || !metadata.backward_defeq.is_empty() {
+            let count = metadata
+                .defeq
+                .len()
+                .checked_add(metadata.backward_defeq.len())
+                .ok_or(WriteError::Contract {
+                    what: "backward-definitional tag count overflow",
+                })?;
+            self.source_array_bound(count)?;
+            let mut backward = metadata.defeq.clone();
+            let mut union: HashSet<_> = metadata.defeq.iter().collect();
+            let mut supplied = HashSet::new();
+            for name in &metadata.backward_defeq {
+                if name.is_anonymous() || !supplied.insert(name) {
+                    return Err(WriteError::Contract {
+                        what: "anonymous or duplicate backward-definitional declaration",
+                    });
+                }
+                if union.insert(name) {
+                    backward.push(name.clone());
+                }
             }
+            blocks.push(self.tagged_names_block(
+                layout::BACKWARD_DEFEQ_EXTENSION,
+                &backward,
+                "anonymous or duplicate backward-definitional declaration",
+            )?);
         }
         Ok(blocks)
     }

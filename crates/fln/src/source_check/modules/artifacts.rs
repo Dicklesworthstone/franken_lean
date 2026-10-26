@@ -152,6 +152,41 @@ impl PendingArtifact {
                 reason: "module-system .olean emission requires public/private split artifacts",
             });
         }
+        // Default equation policies and realization provenance are local
+        // compilation facts: the pin reconstructs their result from the actual
+        // checked equation declarations. Nondefault definition-time options
+        // require its persistent eqnOptionsExt and cannot be silently dropped.
+        if let Some(journal) =
+            checked.extension(&fln_elab::source::scope::simp::equations::journal_name())
+        {
+            for entry in journal.entries() {
+                meter.bytes(entry.payload.len())?;
+            }
+        }
+        let remaining = meter.limits.max_work.saturating_sub(meter.work);
+        let work =
+            fln_elab::source::scope::simp::equations::validate_export(checked, remaining)
+                .map_err(|error| match error {
+                    fln_elab::source::scope::simp::SimpSetError::Limit => {
+                        SourceModuleCheckError::Limit {
+                            resource: "module work",
+                            limit: meter.limits.max_work,
+                        }
+                    }
+                    fln_elab::source::scope::simp::SimpSetError::UnsupportedDeclaration(_) => {
+                        SourceModuleCheckError::Extension {
+                            module: name.clone(),
+                            extension: fln_elab::source::scope::simp::equations::journal_name(),
+                            reason: "nondefault equation-generation options require pinned persistent metadata that the writer cannot yet serialize",
+                        }
+                    }
+                    _ => SourceModuleCheckError::Extension {
+                        module: name.clone(),
+                        extension: fln_elab::source::scope::simp::equations::journal_name(),
+                        reason: "invalid equation-generation provenance",
+                    },
+                })?;
+        meter.work(work)?;
         let mut constants = Vec::new();
         for (name, constant) in checked.constants() {
             meter.work(1)?;
@@ -251,7 +286,7 @@ impl PendingArtifact {
                     SourceModuleCheckError::Extension {
                         module: name.clone(),
                         extension: fln_elab::source::scope::simp::export::journal_name(),
-                        reason: "simp export requires supported equality proofs or reducible definitions; equation theorem generation, erasures and imported proof re-registration are unsupported",
+                        reason: "simp export requires supported equality proofs, checked equation theorems, or reducible definitions; unsupported equation generation, erasures and imported proof re-registration cannot be serialized",
                     }
                 }
                 _ => SourceModuleCheckError::Extension {
@@ -268,6 +303,19 @@ impl PendingArtifact {
             meter.work(1)?;
             let kind = match row {
                 Kind::Unfold(declaration) => SimpKind::Unfold(declaration),
+                Kind::UnfoldTheorems {
+                    declaration,
+                    theorems,
+                } => {
+                    meter.work(theorems.len())?;
+                    for theorem in &theorems {
+                        meter.bytes(theorem.to_canonical_bytes().len())?;
+                    }
+                    SimpKind::UnfoldTheorems {
+                        declaration,
+                        theorems,
+                    }
+                }
                 Kind::Theorem(theorem) => {
                     meter.work(
                         theorem
@@ -565,36 +613,54 @@ impl PendingArtifact {
             use fln_elab::source::scope::simp::{SimpSetError, defeq};
             if let Some(journal) = env.extension(&defeq::journal_name()) {
                 for entry in journal.entries() {
-                    meter.work(1 + entry.payload.len().div_ceil(64))?;
+                    meter.work(2 * (1 + entry.payload.len().div_ceil(64)))?;
                     meter.bytes(entry.payload.len())?;
                 }
             }
-            defeq::read(env, || Ok(())).map_err(|error| match error {
-                fln_elab::NatDefinitionElabError::Inference(
-                    fln_elab::source::SourceInferenceError::SimpSet(SimpSetError::Limit),
-                ) => SourceModuleCheckError::Limit {
-                    resource: "native reflexivity tags",
-                    limit: defeq::MAX_ROWS,
-                },
-                _ => SourceModuleCheckError::Extension {
-                    module: name.clone(),
-                    extension: defeq::journal_name(),
-                    reason: "invalid reflexivity-declaration journal",
-                },
-            })
+            defeq::read(env, || Ok(()))
+                .and_then(|strict| {
+                    defeq::read_backward(env, || Ok(())).map(|backward| (strict, backward))
+                })
+                .map_err(|error| match error {
+                    fln_elab::NatDefinitionElabError::Inference(
+                        fln_elab::source::SourceInferenceError::SimpSet(SimpSetError::Limit),
+                    ) => SourceModuleCheckError::Limit {
+                        resource: "native reflexivity tags",
+                        limit: defeq::MAX_ROWS,
+                    },
+                    _ => SourceModuleCheckError::Extension {
+                        module: name.clone(),
+                        extension: defeq::journal_name(),
+                        reason: "invalid reflexivity-declaration journal",
+                    },
+                })
         };
-        let inherited = defeq(base, meter)?;
-        for tagged in defeq(checked, meter)? {
+        let (inherited, inherited_backward) = defeq(base, meter)?;
+        let (strict, backward) = defeq(checked, meter)?;
+        for tagged in &strict {
             meter.work(1)?;
-            if !inherited.contains(&tagged) {
-                if base.contains(&tagged) {
+            if !inherited.contains(tagged) {
+                if base.contains(tagged) {
                     return Err(SourceModuleCheckError::Extension {
                         module: name.clone(),
                         extension: fln_elab::source::scope::simp::defeq::journal_name(),
                         reason: "a module cannot tag an imported reflexivity theorem",
                     });
                 }
-                metadata.defeq.push(tagged);
+                metadata.defeq.push(tagged.clone());
+            }
+        }
+        for tagged in backward.difference(&strict) {
+            meter.work(1)?;
+            if !inherited_backward.contains(tagged) {
+                if base.contains(tagged) {
+                    return Err(SourceModuleCheckError::Extension {
+                        module: name.clone(),
+                        extension: fln_elab::source::scope::simp::defeq::journal_name(),
+                        reason: "a module cannot tag an imported backward-reflexivity theorem",
+                    });
+                }
+                metadata.backward_defeq.push(tagged.clone());
             }
         }
         let remaining = meter.limits.max_work.saturating_sub(meter.work);

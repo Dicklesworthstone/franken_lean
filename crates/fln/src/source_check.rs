@@ -251,9 +251,10 @@ pub(crate) fn apply_control_command(
     scope: &mut fln_elab::source::scope::SourceScope,
     file_base: &Environment,
     control: fln_parse::command_scope::ScopeCommand,
-    kernel: Budget,
+    limits: EngineAdmissionLimits,
     position @ (file, command, offset): (usize, usize, usize),
-) -> Result<Outcome<()>, SourceCheckError> {
+    options: &KVMap,
+) -> Result<Outcome<Vec<DeclarationAdmission>>, SourceCheckError> {
     use fln_parse::command_scope::ScopeCommand;
 
     match control {
@@ -262,7 +263,7 @@ pub(crate) fn apply_control_command(
                 source_records::elaboration_outcome(fln_elab::source::scope::variables::declare(
                     &syntax,
                     engine.environment(),
-                    kernel,
+                    limits.kernel,
                     scope,
                 ))
                 .map_err(|error| command_error(file, command, fln_parse::BytePos(offset), error))?;
@@ -332,11 +333,14 @@ pub(crate) fn apply_control_command(
         }
         ScopeCommand::Simp(attribute) => {
             // Resolve in the lexical scope, but retain exact declaration
-            // identities. A later failure discards every earlier update.
-            let mut environment = engine.environment.clone();
+            // identities. Equation candidates receive ordinary admission in
+            // the staged successor; a later failure discards their receipts
+            // together with every earlier metadata update in this command.
+            let mut next = engine.clone();
+            let mut admissions = Vec::new();
             for requested in attribute.declarations {
                 let name = scope
-                    .resolve(&requested, |name| environment.contains(name))
+                    .resolve(&requested, |name| next.environment().contains(name))
                     .map_err(|error| SourceCheckError::Scope {
                         file,
                         command,
@@ -352,22 +356,27 @@ pub(crate) fn apply_control_command(
                             requested.to_display_string()
                         ),
                     })?;
-                environment =
-                    fln_elab::source::scope::simp::update(&environment, &name, attribute.rule)
-                        .map_err(|error| {
-                            command_error(
-                                file,
-                                command,
-                                fln_parse::BytePos(offset),
-                                EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
-                                    fln_elab::NatDefinitionElabError::Inference(
-                                        fln_elab::source::SourceInferenceError::SimpSet(error),
-                                    ),
-                                )),
-                            )
-                        })?;
+                let checked = match next
+                    .apply_checked_source_simp(
+                        &name,
+                        attribute.rule,
+                        true,
+                        !file_base.contains(&name),
+                        options,
+                        limits,
+                    )
+                    .map_err(|error| {
+                        command_error(file, command, fln_parse::BytePos(offset), error)
+                    })? {
+                    Outcome::Complete(checked) => checked,
+                    Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                    Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                };
+                next = checked.engine;
+                admissions.extend(checked.admissions);
             }
-            engine.environment = environment;
+            *engine = next;
+            return Ok(Outcome::Complete(admissions));
         }
         _ => {
             return Err(SourceCheckError::Scope {
@@ -378,7 +387,7 @@ pub(crate) fn apply_control_command(
             });
         }
     }
-    Ok(Outcome::Complete(()))
+    Ok(Outcome::Complete(Vec::new()))
 }
 
 /// Public section controls use the same exported world as public declarations.
@@ -390,11 +399,11 @@ pub(crate) fn apply_module_control_command(
     scopes: &mut scopes::Scopes,
     file_base: &Environment,
     control: fln_parse::command_scope::ScopeCommand,
-    kernel: Budget,
+    limits: EngineAdmissionLimits,
     position: (usize, usize, usize),
     mut public: Option<&mut modules::visibility::PublicWorld<'_>>,
     options: &KVMap,
-) -> Result<Outcome<()>, SourceCheckError> {
+) -> Result<Outcome<Vec<DeclarationAdmission>>, SourceCheckError> {
     use fln_parse::command_scope::ScopeCommand;
 
     if let ScopeCommand::Export { namespace, names } = &control {
@@ -436,7 +445,7 @@ pub(crate) fn apply_module_control_command(
             {
                 Outcome::Complete(next) => {
                     *engine = next;
-                    Ok(Outcome::Complete(()))
+                    Ok(Outcome::Complete(Vec::new()))
                 }
                 Outcome::Inconclusive(reason) => Ok(Outcome::Inconclusive(reason)),
                 Outcome::InternalFault(fault) => Ok(Outcome::InternalFault(fault)),
@@ -448,10 +457,11 @@ pub(crate) fn apply_module_control_command(
                 .map_err(|error| refuse(format!("{error:?}")))?;
         }
         engine.environment = environment;
-        return Ok(Outcome::Complete(()));
+        return Ok(Outcome::Complete(Vec::new()));
     }
     // `attribute [local simp] x`: a rule of `simp`'s default set until the enclosing scope ends,
-    // validated as a registered rule is, and never registered.
+    // validated as a registered rule is, and never globally registered. Lazy
+    // equation declarations still need their own retained admission receipts.
     if let ScopeCommand::Simp(attribute) = &control
         && attribute.local
         && let Some((priority, reverse)) = attribute.rule
@@ -463,12 +473,23 @@ pub(crate) fn apply_module_control_command(
             offset,
             message,
         };
-        let environment = engine.environment();
+        let mut next = engine.clone();
+        let mut public_next = public.as_deref().map(|world| world.engine().clone());
+        let public_base = public_next
+            .as_ref()
+            .map(|engine| engine.logical_root(options));
+        let mut public_declarations = Vec::new();
+        let mut admissions = Vec::new();
         let mut rules = Vec::with_capacity(attribute.declarations.len());
         for requested in &attribute.declarations {
             let name = scopes
                 .current
-                .resolve(requested, |name| environment.contains(name))
+                .resolve(requested, |name| {
+                    next.environment().contains(name)
+                        || public_next
+                            .as_ref()
+                            .is_some_and(|engine| engine.environment().contains(name))
+                })
                 .map_err(|error| refuse(error.to_string()))?
                 .ok_or_else(|| {
                     refuse(format!(
@@ -476,19 +497,48 @@ pub(crate) fn apply_module_control_command(
                         requested.to_display_string()
                     ))
                 })?;
-            fln_elab::source::scope::simp::update(environment, &name, Some((priority, reverse)))
-                .map_err(|error| {
-                    command_error(
-                        file,
-                        command,
-                        fln_parse::BytePos(offset),
-                        EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
-                            fln_elab::NatDefinitionElabError::Inference(
-                                fln_elab::source::SourceInferenceError::SimpSet(error),
-                            ),
-                        )),
-                    )
-                })?;
+            // Exposed public owners realize public equation declarations even
+            // when their simp activation is local. Stage their public world
+            // separately so a later failed name cannot publish a prefix, and
+            // a later global registration can reuse the same checked theorem.
+            let public_owner = public_next.as_ref().is_some_and(|engine| {
+                matches!(
+                    engine.environment().find(&name),
+                    Some(ConstantInfo::Defn(_) | ConstantInfo::Thm(_))
+                )
+            });
+            let target = if public_owner {
+                public_next.as_ref().expect("checked public owner")
+            } else {
+                &next
+            };
+            let checked = match target
+                .apply_checked_source_simp(
+                    &name,
+                    Some((priority, reverse)),
+                    false,
+                    !file_base.contains(&name),
+                    options,
+                    limits,
+                )
+                .map_err(|error| command_error(file, command, fln_parse::BytePos(offset), error))?
+            {
+                Outcome::Complete(checked) => checked,
+                Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+            };
+            if public_owner {
+                public_declarations.extend(
+                    checked
+                        .admissions
+                        .iter()
+                        .map(|admitted| admitted.declaration.clone()),
+                );
+                public_next = Some(checked.engine);
+            } else {
+                next = checked.engine;
+            }
+            admissions.extend(checked.admissions);
             rules.push(fln_elab::source::scope::simp::SimpEntry {
                 declaration: name,
                 proof: None,
@@ -497,8 +547,27 @@ pub(crate) fn apply_module_control_command(
                 order: usize::MAX - scopes.current.local_simp.len() - rules.len(),
             });
         }
+        if let (Some(public), Some(staged)) = (public.as_deref_mut(), public_next)
+            && Some(staged.logical_root(options)) != public_base
+        {
+            next = match public
+                .publish(
+                    &next,
+                    staged,
+                    public_declarations,
+                    &scopes.public_scope(),
+                    options,
+                )
+                .map_err(|error| command_error(file, command, fln_parse::BytePos(offset), error))?
+            {
+                Outcome::Complete(engine) => engine,
+                Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+            };
+        }
+        *engine = next;
         scopes.current.local_simp.extend(rules);
-        return Ok(Outcome::Complete(()));
+        return Ok(Outcome::Complete(admissions));
     }
     // Erasure changes only the lexical selection state. In particular it must
     // not enter the persistent registration branch below or a module export.
@@ -527,7 +596,7 @@ pub(crate) fn apply_module_control_command(
                 &attribute.declarations,
             )
             .map_err(|error| error.into_source(file, command, offset))?;
-        return Ok(Outcome::Complete(()));
+        return Ok(Outcome::Complete(Vec::new()));
     }
     // `attribute [local instance] x`: selected until the enclosing scope ends, as a `local
     // instance` declaration is; nothing is written to the persistent registration journal.
@@ -548,7 +617,7 @@ pub(crate) fn apply_module_control_command(
                 offset,
                 message,
             })?;
-        return Ok(Outcome::Complete(()));
+        return Ok(Outcome::Complete(Vec::new()));
     }
     if !matches!(
         control,
@@ -591,7 +660,7 @@ pub(crate) fn apply_module_control_command(
                     })? {
                     Outcome::Complete(next) => {
                         *engine = next;
-                        Ok(Outcome::Complete(()))
+                        Ok(Outcome::Complete(Vec::new()))
                     }
                     Outcome::Inconclusive(reason) => Ok(Outcome::Inconclusive(reason)),
                     Outcome::InternalFault(fault) => Ok(Outcome::InternalFault(fault)),
@@ -599,7 +668,7 @@ pub(crate) fn apply_module_control_command(
             }
             engine.environment = register(engine.environment())?;
         }
-        return Ok(Outcome::Complete(()));
+        return Ok(Outcome::Complete(Vec::new()));
     }
     // Global default attributes export according to each candidate's visibility,
     // including commands written in a private section or mixing both worlds.
@@ -622,7 +691,7 @@ pub(crate) fn apply_module_control_command(
         {
             Outcome::Complete(next) => {
                 *engine = next;
-                Ok(Outcome::Complete(()))
+                Ok(Outcome::Complete(Vec::new()))
             }
             Outcome::Inconclusive(reason) => Ok(Outcome::Inconclusive(reason)),
             Outcome::InternalFault(fault) => Ok(Outcome::InternalFault(fault)),
@@ -634,27 +703,33 @@ pub(crate) fn apply_module_control_command(
             &mut scopes.current,
             file_base,
             control,
-            kernel,
+            limits,
             position,
+            options,
         );
     };
     let mut scope = scopes.public_scope();
     let mut next = public.engine().clone();
-    match apply_control_command(
+    let admissions = match apply_control_command(
         &mut next,
         &mut scope,
         public.file_base(),
         control,
-        kernel,
+        limits,
         position,
+        options,
     )? {
-        Outcome::Complete(()) => {}
+        Outcome::Complete(admissions) => admissions,
         Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
         Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
-    }
+    };
     let (file, command, offset) = position;
+    let declarations = admissions
+        .iter()
+        .map(|admitted| admitted.declaration.clone())
+        .collect();
     match public
-        .publish(engine, next, Vec::new(), &scope, options)
+        .publish(engine, next, declarations, &scope, options)
         .map_err(|error| command_error(file, command, fln_parse::BytePos(offset), error))?
     {
         Outcome::Complete(next) => {
@@ -666,7 +741,7 @@ pub(crate) fn apply_module_control_command(
         Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
         Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
     }
-    Ok(Outcome::Complete(()))
+    Ok(Outcome::Complete(admissions))
 }
 
 impl Engine {
@@ -841,12 +916,23 @@ impl Engine {
                         &mut scopes,
                         &file_base,
                         control,
-                        limits.admission.kernel,
+                        limits.admission,
                         (file, count, start.0),
                         public.as_deref_mut(),
                         options,
                     )? {
-                        Outcome::Complete(()) => {}
+                        Outcome::Complete(admissions) => {
+                            theorems += admissions
+                                .iter()
+                                .filter(|row| matches!(row.declaration, Declaration::Thm(_)))
+                                .count();
+                            for admitted in admissions {
+                                scopes.admitted(&admitted.declaration);
+                                if let Some(journal) = declarations.as_deref_mut() {
+                                    journal.push(admitted.declaration);
+                                }
+                            }
+                        }
                         Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
                         Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
                     }
@@ -898,11 +984,12 @@ impl Engine {
                 } else {
                     match grammar
                         .enter(|| {
-                            engine.admit_source_command_in_scope(
+                            engine.admit_source_command_in_scope_with_base(
                                 command,
                                 options,
                                 limits.admission,
                                 &scope,
+                                Some(&file_base),
                             )
                         })
                         .map_err(|error| command_error(file, count, start, error))?

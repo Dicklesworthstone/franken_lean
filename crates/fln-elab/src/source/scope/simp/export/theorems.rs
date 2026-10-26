@@ -140,6 +140,19 @@ fn derive_inner(
         _ => SimpSetError::Malformed,
     })?;
     let reflexive = tagged.contains(&row.declaration);
+    let backward = super::super::defeq::read_backward(env, || {
+        meter.work(1).map_err(|error| {
+            crate::NatDefinitionElabError::Inference(crate::source::SourceInferenceError::SimpSet(
+                error,
+            ))
+        })
+    })
+    .map_err(|error| match error {
+        crate::NatDefinitionElabError::Inference(crate::source::SourceInferenceError::SimpSet(
+            error,
+        )) => error,
+        _ => SimpSetError::Malformed,
+    })?;
     Ok(Theorem {
         // SimpTheorem.getValue instantiates a global constant's universes from
         // its declaration; storing them here would change that convention.
@@ -151,10 +164,10 @@ fn derive_inner(
         post: true,
         permutation,
         reflexive,
-        // Source registrations currently support defeq, which implies the
-        // backward tag as well. The caller refuses imported theorem re-tagging
-        // because its backward-only metadata is not retained by that journal.
-        backward_reflexive: reflexive,
+        // Generated equation proofs may be reflexive only under default/all
+        // transparency. Retain that independent tag rather than promoting it
+        // to the stricter dsimp selection merely because the proof is rfl.
+        backward_reflexive: backward.contains(&row.declaration),
         keys,
     })
 }

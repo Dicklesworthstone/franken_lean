@@ -120,6 +120,7 @@ pub(super) fn encode(
             && metadata.aux_recursors.is_empty()
             && metadata.noncomputable.is_empty()
             && metadata.defeq.is_empty()
+            && metadata.backward_defeq.is_empty()
             && metadata.reducibility.is_empty()
             && metadata.inline.is_empty()
             && metadata.implemented_by.is_empty()

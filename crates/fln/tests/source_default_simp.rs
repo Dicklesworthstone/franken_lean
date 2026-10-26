@@ -111,7 +111,7 @@ fn inline_attributes_bind_qualified_names_and_survive_command_and_file_scopes() 
          attribute [-simp] wrap «re.verse»",
         ],
     );
-    assert_eq!(result.theorems, 2);
+    assert_eq!(result.theorems, 3);
     assert!(simp::read(result.engine.environment()).unwrap().is_empty());
     assert!(
         result
@@ -144,7 +144,7 @@ fn single_declaration_admission_publishes_the_simp_extension_and_logical_root() 
         admitted.engine.logical_root(&KVMap::new())
     );
     assert_ne!(admitted.base_logical_root, admitted.result_logical_root);
-    assert_eq!(simp::read(admitted.engine.environment()).unwrap().len(), 1);
+    assert_eq!(simp::read(admitted.engine.environment()).unwrap().len(), 2);
     checked(
         &admitted.engine,
         &["theorem use (n : Nat) : wrapped (wrapped n) = n := by simp"],
@@ -787,8 +787,8 @@ fn unrelated_registered_theorems_do_not_exhaust_simple_default_simp() {
 ",
     );
     let result = checked(&engine(), &[&source]);
-    assert_eq!(result.theorems, 4002);
-    assert_eq!(simp::read(result.engine.environment()).unwrap().len(), 4035);
+    assert_eq!(result.theorems, 4036);
+    assert_eq!(simp::read(result.engine.environment()).unwrap().len(), 4069);
     for source in [
         "attribute [-simp] unwrap
 theorem missing_rule (n : Nat) : wrap n = n := by simp",

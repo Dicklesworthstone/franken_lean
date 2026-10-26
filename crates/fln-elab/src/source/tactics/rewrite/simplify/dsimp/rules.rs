@@ -160,6 +160,18 @@ impl Context {
         type_: &Expr,
         levels: &[Name],
     ) -> Result<bool, NatDefinitionElabError> {
+        self.dsimp_generic_defeq_at(type_, levels, UnificationTransparency::SafeDefinitions)
+    }
+
+    /// Generated-theorem inference compares the two sides at instance
+    /// transparency. As the pin's `withEqLhsRhs` does, opening the type's
+    /// telescope still permits safe delta to expose its final equality.
+    pub(in crate::source) fn dsimp_generic_defeq_at(
+        &mut self,
+        type_: &Expr,
+        levels: &[Name],
+        transparency: UnificationTransparency,
+    ) -> Result<bool, NatDefinitionElabError> {
         let mut trial = self.rewrite_trial();
         let result = (|| {
             for level in levels {
@@ -194,7 +206,7 @@ impl Context {
                 return Ok(false);
             };
             let mut budget = UnificationBudget::new(trial.kernel);
-            budget.transparency = UnificationTransparency::SafeDefinitions;
+            budget.transparency = transparency;
             budget.zeta_delta = false;
             trial.proof_types_match_with_budget(&left, &right, budget)
         })();

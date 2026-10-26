@@ -15,9 +15,12 @@ use fln_env::{
 };
 use std::collections::BTreeMap;
 pub mod defeq;
+pub mod equations;
 pub mod export;
 mod imports;
-pub use imports::{ImportedSimpRule, import_rules, register_imported_proof};
+pub use imports::{
+    ImportedSimpRule, import_rules, register_imported_proof, register_unfold_theorems,
+};
 
 /// A `prio` tree's value: a decimal numeral, `default`/`low`/`mid`/`high` (1000, 100, 500 and
 /// 10000, vendored `src/Init/Notation.lean`), or either in parentheses. Priority arithmetic and
@@ -470,6 +473,9 @@ const PROOF_MAGIC: &[u8] = b"FLNSIMP\x03";
 // Native additions capture their persistent indexing/flags at registration.
 // Later reducibility/class changes cannot rewrite already exported entries.
 const SNAPSHOT_MAGIC: &[u8] = b"FLNSIMP\x04";
+// Equation theorem origins remain separate from their definition's unfolding.
+// The association records only the pin's recursive attribute-erasure relation.
+const UNFOLD_THEOREMS_MAGIC: &[u8] = b"FLNSIMP\x05";
 // A proof's type traversal and an imported library's journal are independent
 // resources. Init alone carries more than 4,096 simp events.
 const MAX_TYPE_STEPS: usize = 4096;
@@ -730,6 +736,10 @@ enum JournalEntry {
         entry: SimpEntry,
         snapshot: Option<export::Snapshot>,
     },
+    UnfoldTheorems {
+        declaration: Name,
+        theorems: Vec<Name>,
+    },
     Erase(Name),
 }
 
@@ -743,9 +753,14 @@ fn decode_entry(payload: &[u8], order: usize) -> Result<JournalEntry, SimpSetErr
     let header = take(&mut bytes, MAGIC.len())?;
     let proof_row = header == PROOF_MAGIC;
     let snapshot_row = header == SNAPSHOT_MAGIC;
+    let unfold_theorems_row = header == UNFOLD_THEOREMS_MAGIC;
     let structural = match header {
         header if header == MAGIC => false,
-        header if header == STRUCTURAL_MAGIC || proof_row || snapshot_row => true,
+        header
+            if header == STRUCTURAL_MAGIC || proof_row || snapshot_row || unfold_theorems_row =>
+        {
+            true
+        }
         _ => return Err(SimpSetError::Malformed),
     };
     let operation = take(&mut bytes, 1)?[0];
@@ -754,6 +769,34 @@ fn decode_entry(payload: &[u8], order: usize) -> Result<JournalEntry, SimpSetErr
     } else {
         read_name(&mut bytes)?
     };
+    if unfold_theorems_row {
+        if operation != 3 {
+            return Err(SimpSetError::Malformed);
+        }
+        let count = number(&mut bytes)? as usize;
+        // Every structural name has at least its count and one component tag
+        // plus a length/value payload.
+        // Refuse impossible lengths before allocating attacker-provided counts.
+        if count > bytes.len() / 5 {
+            return Err(SimpSetError::Malformed);
+        }
+        let mut theorems = Vec::new();
+        theorems
+            .try_reserve(count)
+            .map_err(|_| SimpSetError::Limit)?;
+        for _ in 0..count {
+            theorems.push(
+                crate::instances::read_name(&mut bytes).map_err(|_| SimpSetError::Malformed)?,
+            );
+        }
+        if !bytes.is_empty() {
+            return Err(SimpSetError::Malformed);
+        }
+        return Ok(JournalEntry::UnfoldTheorems {
+            declaration,
+            theorems,
+        });
+    }
     let proof = if proof_row {
         if operation != 2 {
             return Err(SimpSetError::Malformed);
@@ -802,15 +845,27 @@ fn decode_entry(payload: &[u8], order: usize) -> Result<JournalEntry, SimpSetErr
 /// Read active rows in deterministic priority order (newer ties first).
 /// Corrupt entries and dangling references are errors, never an empty simp set.
 pub fn read(env: &Environment) -> Result<Vec<SimpEntry>, SimpSetError> {
+    Ok(read_state(env)?.rows)
+}
+
+#[derive(Default)]
+struct SimpState {
+    rows: Vec<SimpEntry>,
+    unfold_theorems: BTreeMap<Name, Vec<Name>>,
+}
+
+fn read_state(env: &Environment) -> Result<SimpState, SimpSetError> {
     let expected = descriptor();
     let Some(extension) = env.extension(&expected.name) else {
-        return Ok(Vec::new());
+        return Ok(SimpState::default());
     };
     if extension.descriptor != expected {
         return Err(SimpSetError::Malformed);
     }
     check_journal_capacity(extension.len(), extension.payload_bytes())?;
     let mut active: BTreeMap<Name, BTreeMap<Option<Name>, SimpEntry>> = BTreeMap::new();
+    let mut unfold_theorems: BTreeMap<Name, Vec<Name>> = BTreeMap::new();
+    let mut erase_work = MAX_JOURNAL_BYTES;
     for (order, row) in extension.entries().enumerate() {
         match decode_entry(&row.payload, order)? {
             JournalEntry::Add { entry, .. } if entry.proof.is_none() => {
@@ -821,7 +876,27 @@ pub fn read(env: &Environment) -> Result<Vec<SimpEntry>, SimpSetError> {
                 if !env.contains(&declaration) {
                     return Err(SimpSetError::UnknownDeclaration(declaration));
                 }
-                active.remove(&declaration);
+                let mut pending = vec![declaration];
+                let mut seen = std::collections::BTreeSet::new();
+                while let Some(name) = pending.pop() {
+                    erase_work = erase_work.checked_sub(1).ok_or(SimpSetError::Limit)?;
+                    if !seen.insert(name.clone()) {
+                        continue;
+                    }
+                    active.remove(&name);
+                    if let Some(theorems) = unfold_theorems.get(&name) {
+                        pending.extend(theorems.iter().cloned());
+                    }
+                }
+            }
+            JournalEntry::UnfoldTheorems {
+                declaration,
+                theorems,
+            } => {
+                imports::validate_unfold_theorems(env, &declaration, &theorems)?;
+                // Like the pin, keep the association after erasure. Re-adding
+                // an equation origin must still be erased by the definition.
+                unfold_theorems.insert(declaration, theorems);
             }
             JournalEntry::Add { entry, .. } => {
                 let proof = entry.proof.as_ref().ok_or(SimpSetError::Malformed)?;
@@ -846,7 +921,10 @@ pub fn read(env: &Environment) -> Result<Vec<SimpEntry>, SimpSetError> {
             .cmp(&a.priority)
             .then_with(|| b.order.cmp(&a.order))
     });
-    Ok(rows)
+    Ok(SimpState {
+        rows,
+        unfold_theorems,
+    })
 }
 
 /// Add/update an already admitted rule, or erase it with `None`. The returned
@@ -856,8 +934,8 @@ pub fn update(
     declaration: &Name,
     rule: Option<(u32, bool)>,
 ) -> Result<Environment, SimpSetError> {
-    let rows = read(env)?;
-    let current = rows.iter().find(|r| &r.declaration == declaration);
+    let state = read_state(env)?;
+    let current = state.rows.iter().find(|r| &r.declaration == declaration);
     if !env.contains(declaration) {
         return Err(SimpSetError::UnknownDeclaration(declaration.clone()));
     }
@@ -870,7 +948,7 @@ pub fn update(
             export::snapshot_payload(env, declaration, priority, reverse)?,
         );
     }
-    if current.is_none() {
+    if current.is_none() && !state.unfold_theorems.contains_key(declaration) {
         return Ok(env.clone());
     }
     append(env, source_payload(declaration, rule)?)

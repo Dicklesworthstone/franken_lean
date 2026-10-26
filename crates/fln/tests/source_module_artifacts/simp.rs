@@ -92,7 +92,7 @@ fn inline_reducibility_precedes_simp_regardless_of_attribute_order() {
 }
 
 #[test]
-fn ordinary_simp_definitions_wait_for_checked_equation_theorem_export() {
+fn ordinary_simp_definitions_without_equality_keep_an_explicit_export_refusal() {
     let initial = Engine::builder().build_empty();
     let body = "@[simp] def wrap.{u} {A : Sort u} (x : A) : A := x";
     accepted(&initial, body);
@@ -102,6 +102,318 @@ fn ordinary_simp_definitions_wait_for_checked_equation_theorem_export() {
         SourceModuleBuildError::Check(SourceModuleCheckError::Extension { extension, .. })
             if extension == simp::export::journal_name()));
     assert!(initial.environment().is_empty());
+}
+
+#[test]
+fn ordinary_definition_equations_and_backward_tags_survive_physical_import() {
+    let source = format!(
+        "prelude\n{EQUALITY}\
+         @[simp 1400] def wrap.{{u}} {{A : Sort u}} (x : A) : A := x\n\
+         attribute [irreducible] wrap"
+    );
+    let built = compiled(&[("Main", &source)]);
+    assert!(
+        built
+            .checked
+            .checked
+            .engine
+            .environment()
+            .contains(&name("wrap.eq_1"))
+    );
+    let physical = metadata(&built.artifacts[0].bytes);
+    assert_eq!(physical.simps.len(), 3);
+    let SimpKind::Theorem(theorem) = &physical.simps[0].kind else {
+        panic!("the equation proof must precede its group and unfolding entry")
+    };
+    assert_eq!(theorem.origin, name("wrap.eq_1"));
+    assert_eq!(theorem.priority, 1400);
+    assert!(!theorem.reflexive);
+    assert!(theorem.backward_reflexive);
+    assert_eq!(
+        physical.simps[1].kind,
+        SimpKind::UnfoldTheorems {
+            declaration: name("wrap"),
+            theorems: vec![name("wrap.eq_1")],
+        }
+    );
+    assert_eq!(physical.simps[2].kind, SimpKind::Unfold(name("wrap")));
+    assert!(!physical.defeq.contains(&name("wrap.eq_1")));
+    assert!(physical.backward_defeq.contains(&name("wrap.eq_1")));
+
+    let receipt = imported(&built);
+    assert_eq!(receipt.modules[0].activated_simps, 3);
+    assert!(
+        !simp::defeq::read(receipt.engine.environment(), || Ok(()))
+            .unwrap()
+            .contains(&name("wrap.eq_1"))
+    );
+    assert!(
+        simp::defeq::read_backward(receipt.engine.environment(), || Ok(()))
+            .unwrap()
+            .contains(&name("wrap.eq_1"))
+    );
+    accepted(
+        &receipt.engine,
+        "theorem use.{u} {A : Sort u} (x : A) : wrap (wrap x) = x := by simp",
+    );
+    accepted(
+        &receipt.engine,
+        "theorem useEquation.{u} {A : Sort u} (x : A) : wrap x = x := wrap.eq_1 x",
+    );
+    accepted(
+        &receipt.engine,
+        "attribute [-simp] wrap.eq_1\ntheorem unfoldingRemains.{u} {A : Sort u} (x : A) : wrap x = x := by simp",
+    );
+    refused(
+        &receipt.engine,
+        "attribute [-simp] wrap\ntheorem erased.{u} {A : Sort u} (x : A) : wrap x = x := by simp",
+    );
+    refused(
+        &receipt.engine,
+        "theorem falseGoal.{u} {A : Sort u} (x y : A) : wrap x = y := by simp",
+    );
+}
+
+#[test]
+fn dependent_universes_and_let_bodies_produce_importable_checked_equations() {
+    let source = format!(
+        "prelude\n{EQUALITY}\
+         @[simp] def dependent.{{u,v}} {{A : Sort u}} (B : A -> Sort v) (x : A) (y : B x) : B x := y\n\
+         @[simp] def letWrap.{{u}} {{A : Sort u}} (x : A) : A := let y := x; y\n\
+         attribute [irreducible] dependent letWrap"
+    );
+    let built = compiled(&[("Main", &source)]);
+    let receipt = imported(&built);
+    accepted(
+        &receipt.engine,
+        "theorem dependentProof.{u,v} {A : Sort u} (B : A -> Sort v) (x : A) (y : B x) : dependent B x y = y := dependent.eq_1 B x y\n\
+         theorem letProof.{u} {A : Sort u} (x : A) : letWrap x = x := letWrap.eq_1 x\n\
+         theorem simplify.{u,v} {A : Sort u} (B : A -> Sort v) (x : A) (y : B x) : letWrap (dependent B x y) = y := by simp",
+    );
+    refused(
+        &receipt.engine,
+        "theorem falseDependent.{u,v} {A : Sort u} (B : A -> Sort v) (x : A) (y z : B x) : dependent B x y = z := by simp",
+    );
+}
+
+#[test]
+fn class_projections_unfold_without_equations_but_ordinary_wrappers_generate_them() {
+    let source = format!(
+        "prelude\n{EQUALITY}\
+         class Cell (A : Type) where\n  value : A\n\
+         attribute [simp] Cell.value\n\
+         @[simp] def getCell {{A : Type}} (h : Cell A) : A := @Cell.value A h"
+    );
+    let built = compiled(&[("Main", &source)]);
+    let env = built.checked.checked.engine.environment();
+    assert!(!env.contains(&name("Cell.value.eq_1")));
+    assert!(env.contains(&name("getCell.eq_1")));
+    let rows = metadata(&built.artifacts[0].bytes).simps;
+    assert_eq!(rows.len(), 4);
+    assert_eq!(rows[0].kind, SimpKind::Unfold(name("Cell.value")));
+    let receipt = imported(&built);
+    accepted(
+        &receipt.engine,
+        "theorem projection (A : Type) (x : A) : @Cell.value A (Cell.mk x) = x := by simp\n\
+         theorem wrapper {A : Type} (h : Cell A) : getCell h = @Cell.value A h := getCell.eq_1 h",
+    );
+}
+
+#[test]
+fn lazy_equation_requests_and_simp_attributes_share_one_checked_realization() {
+    for first in ["wrap.eq_1 x", "by rw [wrap]"] {
+        let source = format!(
+            "prelude\n{EQUALITY}\
+             def wrap.{{u}} {{A : Sort u}} (x : A) : A := x\n\
+             theorem first.{{u}} {{A : Sort u}} (x : A) : wrap x = x := {first}\n\
+             attribute [simp 1300] wrap\n\
+             attribute [irreducible] wrap\n\
+             theorem second.{{u}} {{A : Sort u}} (x : A) : wrap (wrap x) = x := by simp"
+        );
+        let built = compiled(&[("Main", &source)]);
+        let physical = metadata(&built.artifacts[0].bytes);
+        assert_eq!(physical.simps.len(), 3, "{first}");
+        let SimpKind::Theorem(theorem) = &physical.simps[0].kind else {
+            panic!("the lazy generated proof remains the selected equation")
+        };
+        assert_eq!(theorem.origin, name("wrap.eq_1"));
+        assert_eq!(theorem.priority, 1300);
+        assert!(!theorem.reflexive);
+        assert!(theorem.backward_reflexive);
+        let receipt = imported(&built);
+        accepted(
+            &receipt.engine,
+            "theorem downstream.{u} {A : Sort u} (x : A) : wrap (wrap x) = x := by simp",
+        );
+    }
+}
+
+#[test]
+fn repeated_definition_attributes_reuse_one_checked_equation_with_each_priority() {
+    let source = format!(
+        "prelude\n{EQUALITY}\
+         @[simp 1200] def wrap.{{u}} {{A : Sort u}} (x : A) : A := x\n\
+         attribute [simp 1500] wrap\n\
+         attribute [irreducible] wrap"
+    );
+    let built = compiled(&[("Main", &source)]);
+    let physical = metadata(&built.artifacts[0].bytes);
+    assert_eq!(physical.simps.len(), 6);
+    let priorities: Vec<_> = physical
+        .simps
+        .iter()
+        .filter_map(|row| match &row.kind {
+            SimpKind::Theorem(theorem) => Some(theorem.priority),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(priorities, [1200, 1500]);
+    assert_eq!(
+        physical
+            .backward_defeq
+            .iter()
+            .filter(|tag| **tag == name("wrap.eq_1"))
+            .count(),
+        1
+    );
+    let receipt = imported(&built);
+    let selected = simp::read(receipt.engine.environment()).unwrap();
+    let equation = selected
+        .iter()
+        .find(|rule| rule.declaration == name("wrap.eq_1"))
+        .expect("the final equation registration remains selected");
+    assert_eq!(equation.priority, 1500);
+    accepted(
+        &receipt.engine,
+        "theorem use.{u} {A : Sort u} (x : A) : wrap (wrap x) = x := by simp",
+    );
+}
+
+#[test]
+fn checked_equations_replay_across_fresh_module_sessions() {
+    use fln::source_check::modules::persisted::{
+        PersistedModules, SourceModuleKey, SourceModuleStore,
+    };
+    use fln::source_check::modules::reuse::CheckerIdentity;
+    use std::cell::RefCell;
+    use std::collections::BTreeMap;
+
+    #[derive(Default)]
+    struct Records(RefCell<BTreeMap<SourceModuleKey, Vec<u8>>>);
+    impl SourceModuleStore for Records {
+        fn load(&self, key: SourceModuleKey) -> Result<Option<Vec<u8>>, String> {
+            Ok(self.0.borrow().get(&key).cloned())
+        }
+        fn save(&self, key: SourceModuleKey, bytes: &[u8]) -> Result<(), String> {
+            self.0.borrow_mut().insert(key, bytes.to_vec());
+            Ok(())
+        }
+    }
+
+    let base = format!(
+        "prelude\n{EQUALITY}\
+         def wrap.{{u}} {{A : Sort u}} (x : A) : A := x\n\
+         attribute [simp] wrap\n\
+         attribute [irreducible] wrap"
+    );
+    let files = [
+        ("Base", base.as_str()),
+        ("Left", "prelude\nimport Base"),
+        ("Right", "prelude\nimport Base"),
+        (
+            "Main",
+            "prelude\nimport Left\nimport Right\ntheorem use.{u} {A : Sort u} (x : A) : wrap (wrap x) = x := by simp",
+        ),
+    ];
+    let names: Vec<_> = files.iter().map(|(module, _)| name(module)).collect();
+    let inputs: Vec<_> = files
+        .iter()
+        .zip(&names)
+        .map(|((_, source), name)| SourceModuleInput {
+            name,
+            source: source.as_bytes(),
+        })
+        .collect();
+    let records = Records::default();
+    let compile = || {
+        let mut session = SourceModuleSession::new(
+            Engine::builder().build_empty(),
+            KVMap::new(),
+            limits(),
+            SourceModuleCacheLimits::default(),
+        );
+        session
+            .compile_with_records(
+                &inputs,
+                &name("Main"),
+                OleanWriteBudget::default(),
+                Some(PersistedModules {
+                    checker: CheckerIdentity::of_executable(b"checked-simp-equation-replay"),
+                    store: &records,
+                }),
+                None,
+            )
+            .unwrap()
+            .into_complete()
+            .unwrap()
+    };
+    let cold = compile();
+    let warm = compile();
+    assert_eq!((cold.elaborated_modules, cold.persisted_modules), (4, 0));
+    assert_eq!((warm.elaborated_modules, warm.persisted_modules), (0, 4));
+    assert_eq!(warm.checked.checked.theorems, cold.checked.checked.theorems);
+    assert_eq!(
+        warm.checked.checked.result_logical_root,
+        cold.checked.checked.result_logical_root
+    );
+    for (cold, warm) in cold.artifacts.iter().zip(&warm.artifacts) {
+        assert_eq!(warm.name, cold.name);
+        assert_eq!(warm.bytes, cold.bytes);
+        let rows = metadata(&warm.bytes);
+        assert_eq!(
+            rows.simps.len(),
+            if warm.name == name("Base") { 3 } else { 0 }
+        );
+    }
+    let receipt = imported(&warm);
+    accepted(
+        &receipt.engine,
+        "theorem useAgain.{u} {A : Sort u} (x : A) : wrap (wrap x) = x := by simp",
+    );
+}
+
+#[test]
+fn nondefault_equation_policy_cannot_disappear_from_an_artifact() {
+    let initial = Engine::builder().build_empty();
+    let module = name("Main");
+    let files = [SourceModuleInput {
+        name: &module,
+        source: b"prelude\ndef plain.{u} {A : Sort u} (x : A) : A := x",
+    }];
+    for (option, value) in [
+        ("backward.eqns.nonrecursive", false),
+        ("backward.eqns.deepRecursiveSplit", false),
+        ("backward.defeqAttrib.useBackward", true),
+    ] {
+        let mut options = KVMap::new();
+        options.insert(name(option), fln::DataValue::OfBool(value));
+        let error = initial
+            .compile_source_modules(
+                &files,
+                &module,
+                &options,
+                limits(),
+                OleanWriteBudget::default(),
+            )
+            .expect_err("the pinned persistent equation options must not be omitted");
+        assert!(
+            matches!(error,
+            SourceModuleBuildError::Check(SourceModuleCheckError::Extension { extension, .. })
+                if extension == simp::equations::journal_name()),
+            "{option}"
+        );
+        assert!(initial.environment().is_empty());
+    }
 }
 
 #[test]

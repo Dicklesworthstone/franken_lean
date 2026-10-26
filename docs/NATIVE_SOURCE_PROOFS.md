@@ -249,6 +249,48 @@ annotated instances/inductives are refused. The admission APIs and `check-source
 publish inline attributes; the separate executable-definition entry point
 refuses them instead of silently dropping their effects.
 
+### Checked equations for ordinary simp definitions
+
+Registering an exposed, safe, nonrecursive definition can now generate its
+`f.eq_1` theorem. The definition must belong to the current source file or
+already carry validated native equation provenance. The supported body has no
+matcher or recursor splitting; dependent and universe-polymorphic parameters
+and top-level RHS lets are supported.
+
+```lean
+@[simp 1200] def identity.{u} {A : Sort u} (x : A) : A := x
+theorem identityProof.{u} {A : Sort u} (x : A) : identity x = x :=
+  identity.eq_1 x
+```
+
+The generated theorem receives its own K1 and independent-checker admission.
+Inline and later attributes retain those actual receipts, including in
+executable source streams. Repeated registration reuses the checked theorem;
+erasing the definition's simp attribute also erases its associated equation
+rules. Local simp activation leaves the generated declaration available without
+adding global simp rules.
+
+The source module writer emits the equation declaration, its theorem rule,
+the definition-to-equations association, and the nonrecursive unfolding rule.
+Physical imports and persisted module replay preserve these products. Generated
+reflexivity metadata distinguishes strict `defeq` from `backward_defeq`; a
+semireducible identity equation does not become a strict `dsimp` rule merely
+because its proof uses `Eq.refl`. Registered structure and class projections
+retain unfolding rules without generating equation theorems.
+
+The portable simp path shares the ordinary equation candidate builder with
+lazy `f.eq_1` lookup and `rw [f]`. A source-owned equation realized by either
+request can subsequently be registered for simp without creating a second
+theorem or guessing provenance from its name.
+
+These simp export guarantees cover the split-free nonrecursive slice. The lazy
+generator's pattern equations and `eq_def`/`eq_unfold` paths retain their own
+support boundaries. Hidden equation naming, first simp realization after a
+definition is already irreducible, and imported definitions lacking native
+provenance remain outside this simp generation slice. Nondefault definition-time
+equation options are retained and explicitly refuse artifact export until their
+pinned persistent metadata can be encoded.
+
 ## APIs and limits
 
 ### Equivalence rewriting

@@ -6953,30 +6953,6 @@ impl Engine {
                         source_records::set_reducibility(&admitted.engine, &name, status)?;
                     admitted.result_logical_root = admitted.engine.logical_root(options);
                 }
-                if let Some((name, priority, reverse)) = simp {
-                    let name = fln_elab::source::scope::SourceScope::default()
-                        .declaration_name(&name)
-                        .map_err(|error| {
-                            EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
-                                fln_elab::NatDefinitionElabError::Inference(
-                                    fln_elab::source::SourceInferenceError::NameScope(error),
-                                ),
-                            ))
-                        })?;
-                    admitted.engine.environment = fln_elab::source::scope::simp::update(
-                        admitted.engine.environment(),
-                        &name,
-                        Some((priority, reverse)),
-                    )
-                    .map_err(|error| {
-                        EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
-                            fln_elab::NatDefinitionElabError::Inference(
-                                fln_elab::source::SourceInferenceError::SimpSet(error),
-                            ),
-                        ))
-                    })?;
-                    admitted.result_logical_root = admitted.engine.logical_root(options);
-                }
                 if let Some(name) = noncomputable {
                     admitted.engine.environment = source_records::tag_noncomputable(
                         &admitted.engine,
@@ -7018,12 +6994,21 @@ impl Engine {
                     admitted.engine.environment = environment;
                     admitted.result_logical_root = admitted.engine.logical_root(options);
                 }
-                return self.finish_local_function_admission(
+                let admitted = match self.finish_local_function_admission(
                     admitted,
                     &elaborated.local_functions,
                     options,
                     limits,
-                );
+                )? {
+                    Outcome::Complete(admitted) => admitted,
+                    Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                    Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                };
+                let scope = scope
+                    .for_declaration(parsed.syntax())
+                    .map_err(DefinitionFrontendError::Elaborate)
+                    .map_err(EngineExecutionError::Frontend)?;
+                return self.finish_source_simp_admission(admitted, simp, &scope, options, limits);
             }
             Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
             Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
@@ -7066,7 +7051,26 @@ impl Engine {
             Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
         };
-        self.execute_definition(declaration, options, limits)
+        Ok(
+            match self.execute_definition(declaration, options, limits)? {
+                Outcome::Complete(mut execution) => {
+                    execution.engine = match execution.engine.freeze_source_equation_policy(
+                        &execution.declaration,
+                        &self.base_source_scope(),
+                        options,
+                        limits.kernel,
+                    )? {
+                        Outcome::Complete(engine) => engine,
+                        Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                        Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                    };
+                    execution.result_logical_root = execution.engine.logical_root(options);
+                    Outcome::Complete(execution)
+                }
+                Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
+                Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
+            },
+        )
     }
 
     /// Parse, elaborate, admit, publish, compile, canonically encode/decode,
@@ -7751,12 +7755,13 @@ impl Engine {
                             }
                             _ => Vec::new(),
                         };
+                        let command_base = engine.logical_root(options);
                         match source_check::apply_module_control_command(
                             &mut engine,
                             &mut scopes,
                             &file_base,
                             control,
-                            limits.kernel,
+                            limits.admission(),
                             (0, command_index, original_offset.0),
                             public.as_deref_mut(),
                             options,
@@ -7768,7 +7773,26 @@ impl Engine {
                                 at: Some(original_offset),
                             }
                         })? {
-                            Outcome::Complete(()) => {}
+                            Outcome::Complete(admissions) => {
+                                if !admissions.is_empty() {
+                                    for admitted in &admissions {
+                                        scopes.admitted(&admitted.declaration);
+                                    }
+                                    source_records::push_command_admission(
+                                        &mut source_admissions,
+                                        SourceCommandAdmission {
+                                            command_index,
+                                            admission: DeclarationBatchAdmission {
+                                                engine: engine.clone(),
+                                                base_logical_root: command_base,
+                                                result_logical_root: engine.logical_root(options),
+                                                admissions,
+                                                local_instance: None,
+                                            },
+                                        },
+                                    );
+                                }
+                            }
                             Outcome::Inconclusive(reason) => {
                                 return Ok(Outcome::Inconclusive(reason));
                             }
@@ -7842,6 +7866,7 @@ impl Engine {
                                 &scope,
                                 options,
                                 limits.admission(),
+                                Some(&file_base),
                             )
                         })
                         .map_err(|error| EngineExecutionError::BatchCommand {
@@ -7857,10 +7882,13 @@ impl Engine {
                                     scope_error(command_index, original_offset, error.message())
                                 })?;
                             engine = admission.engine.clone();
-                            source_admissions.push(SourceCommandAdmission {
-                                command_index,
-                                admission,
-                            });
+                            source_records::push_command_admission(
+                                &mut source_admissions,
+                                SourceCommandAdmission {
+                                    command_index,
+                                    admission,
+                                },
+                            );
                         }
                         Outcome::Complete(None) => {}
                         Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
@@ -8662,6 +8690,26 @@ impl Engine {
                     Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
                     Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
                 };
+                let equation_scope = scope
+                    .for_declaration(parsed.syntax())
+                    .map_err(DefinitionFrontendError::Elaborate)
+                    .map_err(EngineExecutionError::Frontend)
+                    .map_err(|error| EngineExecutionError::BatchCommand {
+                        index: command_index,
+                        error: Box::new(error),
+                        at: Some(original_offset),
+                    })?;
+                admission = match engine.finish_source_simp_batch(
+                    admission,
+                    None,
+                    &equation_scope,
+                    options,
+                    limits.admission(),
+                )? {
+                    Outcome::Complete(admission) => admission,
+                    Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                    Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                };
                 // One command, one transition: the axioms precede the declaration in it.
                 if let Some(axioms) = axioms {
                     admission.base_logical_root = axioms.base_logical_root;
@@ -8807,6 +8855,37 @@ impl Engine {
                 error: Box::new(error),
                 at: Some(original_offset),
             })?;
+            if !is_evaluation {
+                let equation_scope = scope
+                    .for_declaration(parsed.syntax())
+                    .map_err(DefinitionFrontendError::Elaborate)
+                    .map_err(EngineExecutionError::Frontend)
+                    .map_err(|error| EngineExecutionError::BatchCommand {
+                        index: command_index,
+                        error: Box::new(error),
+                        at: Some(original_offset),
+                    })?;
+                execution.engine = match execution
+                    .engine
+                    .freeze_source_equation_policy(
+                        &execution.declaration,
+                        &equation_scope,
+                        options,
+                        limits.kernel,
+                    )
+                    .map_err(|error| EngineExecutionError::BatchCommand {
+                        index: command_index,
+                        error: Box::new(error),
+                        at: Some(original_offset),
+                    })? {
+                    Outcome::Complete(engine) => engine,
+                    Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                    Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                };
+                execution.result_logical_root = execution
+                    .engine
+                    .logical_root(scoped_options.as_ref().unwrap_or(options));
+            }
             if let Some(name) = &protected {
                 execution.engine.environment =
                     source_records::tag_protected(&execution.engine, name).map_err(|error| {
@@ -9712,6 +9791,21 @@ impl Engine {
                         elaborated.equation_info.as_ref(),
                         options,
                     )?;
+                    let scope = scope
+                        .for_declaration(parsed.syntax())
+                        .map_err(DefinitionFrontendError::Elaborate)
+                        .map_err(EngineExecutionError::Frontend)?;
+                    execution.engine = match execution.engine.freeze_source_equation_policy(
+                        &execution.declaration,
+                        &scope,
+                        options,
+                        limits.kernel,
+                    )? {
+                        Outcome::Complete(engine) => engine,
+                        Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                        Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                    };
+                    execution.result_logical_root = execution.engine.logical_root(options);
                     Outcome::Complete(execution)
                 }
                 Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),

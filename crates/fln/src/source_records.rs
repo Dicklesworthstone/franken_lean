@@ -10,6 +10,7 @@ pub(crate) use equation_theorems::{may_name_equation_theorems, push_command_admi
 mod library;
 mod local_functions;
 mod public_body;
+mod simp;
 pub(crate) mod traces;
 pub use local_functions::SourceDeclarationAdmission;
 
@@ -224,6 +225,19 @@ impl Engine {
         limits: EngineAdmissionLimits,
         scope: &fln_elab::source::scope::SourceScope,
     ) -> Result<Outcome<DeclarationBatchAdmission>, EngineExecutionError> {
+        self.admit_source_command_in_scope_with_base(source, options, limits, scope, None)
+    }
+
+    /// A file driver can identify definitions introduced by this source file.
+    /// Standalone callers retain conservative imported-definition behavior.
+    pub(crate) fn admit_source_command_in_scope_with_base(
+        &self,
+        source: &[u8],
+        options: &KVMap,
+        limits: EngineAdmissionLimits,
+        scope: &fln_elab::source::scope::SourceScope,
+        source_base: Option<&Environment>,
+    ) -> Result<Outcome<DeclarationBatchAdmission>, EngineExecutionError> {
         let mut scope = scope.clone();
         if scope.source_site.is_none() {
             scope.source_site = Some(source_check::source_site(source)?);
@@ -237,7 +251,7 @@ impl Engine {
                 ScopedCommandSyntax::Example(parsed) => vec![parsed.syntax()],
                 ScopedCommandSyntax::Definition(parsed) => vec![parsed.syntax()],
             };
-            match self.realize_equation_theorems(&syntaxes, &scope, options, limits)? {
+            match self.realize_equation_theorems(&syntaxes, &scope, options, limits, source_base)? {
                 Outcome::Complete(realized) => realized,
                 Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
                 Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
@@ -773,28 +787,6 @@ impl Engine {
                     batch.engine.environment = set_reducibility(&batch.engine, &name, status)?;
                     batch.result_logical_root = batch.engine.logical_root(options);
                 }
-                if let Some((name, priority, reverse)) = simp {
-                    let name = scope.declaration_name(&name).map_err(|error| {
-                        EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
-                            fln_elab::NatDefinitionElabError::Inference(
-                                fln_elab::source::SourceInferenceError::NameScope(error),
-                            ),
-                        ))
-                    })?;
-                    batch.engine.environment = fln_elab::source::scope::simp::update(
-                        batch.engine.environment(),
-                        &name,
-                        Some((priority, reverse)),
-                    )
-                    .map_err(|error| {
-                        EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
-                            fln_elab::NatDefinitionElabError::Inference(
-                                fln_elab::source::SourceInferenceError::SimpSet(error),
-                            ),
-                        ))
-                    })?;
-                    batch.result_logical_root = batch.engine.logical_root(options);
-                }
                 if noncomputable.is_some() || inferred_noncomputable {
                     let name = noncomputable.unwrap_or_else(Name::anonymous);
                     let [admitted] = batch.admissions.as_slice() else {
@@ -841,7 +833,21 @@ impl Engine {
                     batch.engine.environment = environment;
                     batch.result_logical_root = batch.engine.logical_root(options);
                 }
-                return self.finish_local_function_batch(batch, &local_functions, options, limits);
+                let batch = match self.finish_local_function_batch(
+                    batch,
+                    &local_functions,
+                    options,
+                    limits,
+                )? {
+                    Outcome::Complete(batch) => batch,
+                    Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                    Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                };
+                let scope = scope
+                    .for_declaration(syntax)
+                    .map_err(DefinitionFrontendError::Elaborate)
+                    .map_err(EngineExecutionError::Frontend)?;
+                return self.finish_source_simp_batch(batch, simp, &scope, options, limits);
             }
             Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
             Outcome::InternalFault(fault) => Outcome::InternalFault(fault),

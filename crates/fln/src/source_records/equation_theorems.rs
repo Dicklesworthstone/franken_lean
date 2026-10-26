@@ -10,6 +10,7 @@
 //! elaborated.
 use super::*;
 use fln_elab::source::equation_theorems as equations;
+use fln_elab::source::scope::simp::equations as simp_equations;
 use fln_syntax::tree::Syntax;
 
 /// Whether `source` can name an equation theorem at all: a cheap filter before parsing.
@@ -28,11 +29,18 @@ impl Engine {
         scope: &fln_elab::source::scope::SourceScope,
         options: &KVMap,
         limits: EngineAdmissionLimits,
+        source_base: Option<&Environment>,
     ) -> Result<Outcome<Option<DeclarationBatchAdmission>>, EngineExecutionError> {
-        let elaborate =
-            |error| EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(error));
-        let requests = equations::requests(syntaxes, self.environment(), scope, limits.kernel)
-            .map_err(elaborate)?;
+        let requests = match elaboration_outcome(equations::requests(
+            syntaxes,
+            self.environment(),
+            scope,
+            limits.kernel,
+        ))? {
+            Outcome::Complete(requests) => requests,
+            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+        };
         if requests.is_empty() {
             return Ok(Outcome::Complete(None));
         }
@@ -40,14 +48,55 @@ impl Engine {
         let mut engine = self.clone();
         let mut admissions = Vec::new();
         for request in &requests {
-            let declarations =
-                match equations::realize(engine.environment(), request, limits.kernel) {
-                    Ok(declarations) => declarations,
-                    Err(fln_elab::NatDefinitionElabError::Inference(
-                        fln_elab::source::SourceInferenceError::EquationTheorem(_),
-                    )) => continue,
-                    Err(error) => return Err(elaborate(error)),
+            // Plain equation references and simp attributes share the same
+            // candidate builder and post-admission provenance. Preparing it
+            // before admission never blesses an arbitrary existing `eq_1`.
+            let origin = match request {
+                equations::Request::Equations(origin) => Some(origin.clone()),
+                equations::Request::Name(name) => equations::target(engine.environment(), name)
+                    .and_then(|(origin, suffix)| {
+                        (suffix == equations::Suffix::Equation).then_some(origin)
+                    }),
+            };
+            let mut prepared = None;
+            if let Some(origin) = origin {
+                let candidate = if source_base.is_some_and(|base| !base.contains(&origin)) {
+                    simp_equations::prepare_owned(engine.environment(), &origin, limits.kernel)
+                } else {
+                    simp_equations::prepare(engine.environment(), &origin, limits.kernel)
                 };
+                match elaboration_outcome(candidate)? {
+                    Outcome::Complete(simp_equations::Preparation::Ready(candidate)) => {
+                        prepared = Some(candidate);
+                    }
+                    Outcome::Complete(
+                        simp_equations::Preparation::NotRequired
+                        | simp_equations::Preparation::Unsupported,
+                    ) => {}
+                    Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                    Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                }
+            }
+            let declarations = if let Some(candidate) = &prepared {
+                if candidate.existing {
+                    continue;
+                }
+                vec![candidate.declaration.clone()]
+            } else {
+                let realized =
+                    match equations::realize(engine.environment(), request, limits.kernel) {
+                        Ok(declarations) => Ok(declarations),
+                        Err(fln_elab::NatDefinitionElabError::Inference(
+                            fln_elab::source::SourceInferenceError::EquationTheorem(_),
+                        )) => continue,
+                        Err(error) => Err(error),
+                    };
+                match elaboration_outcome(realized)? {
+                    Outcome::Complete(declarations) => declarations,
+                    Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                    Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                }
+            };
             if declarations.is_empty() {
                 continue;
             }
@@ -59,17 +108,37 @@ impl Engine {
                 Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
                 Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
             };
-            // The pin's `inferDefEqAttr`: a theorem proved by reflexivity is a `dsimp` rule;
-            // one proved otherwise, by case analysis, stays untagged.
-            for admitted in &batch.admissions {
-                if let Declaration::Thm(theorem) = &admitted.declaration {
-                    batch.engine.environment =
-                        fln_elab::source::scope::simp::defeq::infer_generated(
-                            batch.engine.environment(),
-                            &theorem.base.name,
-                            limits.kernel,
-                        )
-                        .map_err(elaborate)?;
+            if let Some(candidate) = &prepared {
+                batch.engine.environment = match elaboration_outcome(simp_equations::finish(
+                    batch.engine.environment(),
+                    candidate,
+                    limits.kernel,
+                ))? {
+                    Outcome::Complete(environment) => environment,
+                    Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                    Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                };
+            } else {
+                // Match equations and the distinct eq_def/eq_unfold requests
+                // retain their existing generators and inferred metadata.
+                for admitted in &batch.admissions {
+                    if let Declaration::Thm(theorem) = &admitted.declaration {
+                        batch.engine.environment = match elaboration_outcome(
+                            fln_elab::source::scope::simp::defeq::infer_generated(
+                                batch.engine.environment(),
+                                &theorem.base.name,
+                                limits.kernel,
+                            ),
+                        )? {
+                            Outcome::Complete(environment) => environment,
+                            Outcome::Inconclusive(reason) => {
+                                return Ok(Outcome::Inconclusive(reason));
+                            }
+                            Outcome::InternalFault(fault) => {
+                                return Ok(Outcome::InternalFault(fault));
+                            }
+                        };
+                    }
                 }
             }
             engine = batch.engine;

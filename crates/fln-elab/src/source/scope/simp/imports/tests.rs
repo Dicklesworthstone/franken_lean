@@ -54,8 +54,12 @@ fn proof(s: &str, priority: u32) -> ImportedSimpRule {
 fn legacy_and_structural_rows_keep_exact_bytes_beside_auxiliary_proofs() {
     let textual = Name::from_components(["private", "7", "proof"]);
     let numeric = Name::str(Name::num(name("private"), 7), "proof");
-    let old = update(&environment(), &textual, Some((500, false))).unwrap();
-    let old = update(&old, &numeric, Some((700, false))).unwrap();
+    let old = append(
+        &environment(),
+        source_payload(&textual, Some((500, false))).unwrap(),
+    )
+    .unwrap();
+    let old = append(&old, source_payload(&numeric, Some((700, false))).unwrap()).unwrap();
     let before: Vec<_> = old
         .extension(&descriptor().name)
         .unwrap()
@@ -102,6 +106,129 @@ fn multiple_proofs_share_erasure_but_not_evidence_identity() {
             .is_empty()
     );
     assert_eq!(read(&both).unwrap(), rows);
+}
+
+#[test]
+fn equation_origins_and_unfolding_coexist_with_independent_erasure() {
+    let env = environment();
+    let first = ImportedSimpRule::Proof {
+        origin: name("first"),
+        proof: name("first"),
+        priority: 900,
+    };
+    let second = ImportedSimpRule::Proof {
+        origin: name("second"),
+        proof: name("second"),
+        priority: 900,
+    };
+    let association = ImportedSimpRule::UnfoldTheorems {
+        declaration: name("origin"),
+        theorems: vec![name("first"), name("second")],
+    };
+    let unfolding = ImportedSimpRule::Unfold {
+        declaration: name("origin"),
+    };
+    let operations = [first.clone(), second, association, unfolding];
+    let registered = import_rules(&env, &operations).unwrap();
+    let rows = read(&registered).unwrap();
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0].declaration, name("origin"));
+    assert_eq!(rows[0].proof, None);
+    assert_eq!(rows[1].declaration, name("second"));
+    assert_eq!(rows[2].declaration, name("first"));
+
+    let one_erased = update(&registered, &name("first"), None).unwrap();
+    let remaining = read(&one_erased).unwrap();
+    assert_eq!(remaining.len(), 2);
+    assert!(
+        remaining
+            .iter()
+            .any(|row| row.declaration == name("origin"))
+    );
+    assert!(
+        remaining
+            .iter()
+            .any(|row| row.declaration == name("second"))
+    );
+    let all_erased = update(&one_erased, &name("origin"), None).unwrap();
+    assert!(read(&all_erased).unwrap().is_empty());
+
+    // The pin retains the association after erasure. Even with no active
+    // unfolding, erasing the parent again must erase a re-added equation.
+    let readded = import_rules(&all_erased, &[first]).unwrap();
+    assert_eq!(read(&readded).unwrap().len(), 1);
+    assert!(
+        read(&update(&readded, &name("origin"), None).unwrap())
+            .unwrap()
+            .is_empty()
+    );
+    let repeated = import_rules(&registered, &operations).unwrap();
+    assert_eq!(read(&repeated).unwrap().len(), 3);
+    assert_eq!(
+        repeated.extension(&descriptor().name).unwrap().len(),
+        operations.len() * 2
+    );
+    assert_eq!(read(&registered).unwrap(), rows);
+}
+
+#[test]
+fn association_alone_preserves_theorems_and_erases_without_an_unfold_entry() {
+    let selected =
+        register_imported_proof(&environment(), &name("first"), &name("first"), 700).unwrap();
+    let associated =
+        register_unfold_theorems(&selected, &name("origin"), &[name("first")]).unwrap();
+    assert_eq!(read(&selected).unwrap(), read(&associated).unwrap());
+    assert!(
+        read(&update(&associated, &name("origin"), None).unwrap())
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn malformed_or_unavailable_equation_associations_fail_without_a_prefix() {
+    let env = environment().register_extension(descriptor()).unwrap();
+    let payload = unfold_theorems_payload(&name("origin"), &[name("first")]).unwrap();
+    for end in 0..payload.len() {
+        let broken = env
+            .push_extension_entry(&descriptor().name, payload[..end].to_vec())
+            .unwrap();
+        assert!(read(&broken).is_err(), "association prefix {end}");
+    }
+    let mut trailing = payload.clone();
+    trailing.push(0);
+    let mut bad_operation = payload;
+    bad_operation[UNFOLD_THEOREMS_MAGIC.len()] = 2;
+    for malformed in [trailing, bad_operation] {
+        let broken = env
+            .push_extension_entry(&descriptor().name, malformed)
+            .unwrap();
+        assert_eq!(read(&broken), Err(SimpSetError::Malformed));
+    }
+    for theorem in [name("missing"), name("data")] {
+        assert!(
+            import_rules(
+                &env,
+                &[
+                    proof("first", 900),
+                    ImportedSimpRule::UnfoldTheorems {
+                        declaration: name("origin"),
+                        theorems: vec![theorem],
+                    },
+                ],
+            )
+            .is_err()
+        );
+    }
+    assert!(read(&env).unwrap().is_empty());
+    assert_eq!(
+        unfold_theorems_payload(&Name::anonymous(), &[]),
+        Err(SimpSetError::Malformed)
+    );
+    assert_eq!(
+        unfold_theorems_payload(&name("origin"), &vec![name("first"); MAX_BYTES]),
+        Err(SimpSetError::Limit)
+    );
 }
 #[test]
 fn redundant_import_events_survive_a_different_replay_context() {

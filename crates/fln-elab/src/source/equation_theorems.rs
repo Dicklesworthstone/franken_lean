@@ -1142,6 +1142,30 @@ pub fn realize(
     })
 }
 
+/// The shared simple-equation producer, without the already-generated-name
+/// shortcut used by lazy realization. Simp registration uses this same proof
+/// construction, then checks/adopts it through ordinary engine admission.
+/// Pattern equations retain their separate recorded-matcher realization path.
+pub fn simple_equation_candidate(
+    env: &Environment,
+    declaration: &Name,
+    kernel: Budget,
+) -> Result<Option<Declaration>, NatDefinitionElabError> {
+    let Some(definition) = safe_definition(env, declaration).cloned() else {
+        return Ok(None);
+    };
+    if is_matcher_name(declaration)
+        || unsupported_reason(env, declaration, &definition.value).is_some()
+    {
+        return Ok(None);
+    }
+    let mut context = Context::new(env, kernel);
+    if context.proposition_typed(&definition)? {
+        return Ok(None);
+    }
+    context.simple_equation(&definition).map(Some)
+}
+
 /// Whether `rw [f]` asks for `f`'s equations: a safe definition whose type is not a
 /// proposition (`getEqnsFor?`'s `shouldGenerateEqnThms`).
 pub fn has_equations(

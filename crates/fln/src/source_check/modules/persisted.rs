@@ -370,6 +370,7 @@ impl SourceModuleRecord {
             fln_elab::noncomputable::journal_name(),
             fln_elab::source::scope::simp::export::journal_name(),
             fln_elab::source::scope::simp::defeq::journal_name(),
+            fln_elab::source::scope::simp::equations::journal_name(),
             fln_elab::macro_inline::journal_name(),
             fln_elab::records::imported::export::journal_name(),
             fln_elab::source::equation_theorems::journal::journal_name(),

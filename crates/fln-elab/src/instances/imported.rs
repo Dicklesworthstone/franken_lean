@@ -648,6 +648,16 @@ impl ImportActivation {
         Ok(self)
     }
 
+    /// Record a backward-only equation tag without promoting it to a strict
+    /// `dsimp` rule or changing the kept class/instance activation state.
+    pub fn register_backward_defeq(
+        mut self,
+        declaration: &Name,
+    ) -> Result<Self, crate::NatDefinitionElabError> {
+        self.env = crate::source::scope::simp::defeq::register_backward(&self.env, declaration)?;
+        Ok(self)
+    }
+
     /// Record one imported reducibility status in the environment being
     /// activated ([`crate::reducibility::register`]). The reducibility journal is
     /// not one this activation keeps or reads, so the kept class and instance

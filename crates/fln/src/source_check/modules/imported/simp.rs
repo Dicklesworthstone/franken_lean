@@ -62,13 +62,7 @@ impl Replay<'_> {
                     "simp count changed during replay",
                 ))?;
                 scopes.spend(1)?;
-                let origin = origin_of(&row);
-                scopes.authorize(self.origin, env, &reachable, &report.module, origin)?;
-                if let metadata::SimpKind::Theorem(theorem) = &row.kind
-                    && let ExprNode::Const { name, .. } = theorem.proof.node()
-                {
-                    scopes.authorize(self.origin, env, &reachable, &report.module, name)?;
-                }
+                scopes.authorize_entry(self.origin, env, &reachable, &report.module, &row)?;
                 let (operation, deferred) = select(env, &report.module, &row)?;
                 report.deferred_simps += usize::from(deferred);
                 if let Some(operation) = operation {
@@ -154,6 +148,13 @@ fn candidate(env: &Environment, row: &metadata::SimpEntry) -> Option<ImportedSim
         metadata::SimpKind::Unfold(declaration) => Some(ImportedSimpRule::Unfold {
             declaration: declaration.clone(),
         }),
+        metadata::SimpKind::UnfoldTheorems {
+            declaration,
+            theorems,
+        } => Some(ImportedSimpRule::UnfoldTheorems {
+            declaration: declaration.clone(),
+            theorems: theorems.clone(),
+        }),
         _ => None,
     }
 }
@@ -177,6 +178,16 @@ fn select(
             module,
             SimpSetError::UnknownDeclaration(name.clone()),
         ));
+    }
+    if let metadata::SimpKind::UnfoldTheorems { theorems, .. } = &row.kind {
+        for theorem in theorems {
+            if !env.contains(theorem) {
+                return Err(registry_error(
+                    module,
+                    SimpSetError::UnknownDeclaration(theorem.clone()),
+                ));
+            }
+        }
     }
     if let Some(operation) = candidate(env, row) {
         match operation.validate(env) {
@@ -242,6 +253,12 @@ impl ScopeIndex {
                 && let ExprNode::Const { name, .. } = theorem.proof.node()
             {
                 result.owners.entry(name.clone()).or_default();
+            }
+            if let metadata::SimpKind::UnfoldTheorems { theorems, .. } = &row.kind {
+                for theorem in theorems {
+                    result.spend(1)?;
+                    result.owners.entry(theorem.clone()).or_default();
+                }
             }
         }
         result.spend(checked.modules.len() as u64)?;
@@ -331,6 +348,31 @@ impl ScopeIndex {
                 declaration: name.clone(),
                 reason: "simp declaration is outside this module's checked import closure",
             });
+        }
+        Ok(())
+    }
+
+    fn authorize_entry(
+        &mut self,
+        origin: &Environment,
+        active: &Environment,
+        reachable: &BTreeSet<usize>,
+        module: &Name,
+        row: &metadata::SimpEntry,
+    ) -> Result<()> {
+        self.authorize(origin, active, reachable, module, origin_of(row))?;
+        match &row.kind {
+            metadata::SimpKind::Theorem(theorem) => {
+                if let ExprNode::Const { name, .. } = theorem.proof.node() {
+                    self.authorize(origin, active, reachable, module, name)?;
+                }
+            }
+            metadata::SimpKind::UnfoldTheorems { theorems, .. } => {
+                for theorem in theorems {
+                    self.authorize(origin, active, reachable, module, theorem)?;
+                }
+            }
+            metadata::SimpKind::Unfold(_) => {}
         }
         Ok(())
     }
