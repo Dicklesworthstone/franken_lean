@@ -1,4 +1,4 @@
-//! Adapt the checked Char object to the existing native String.push row.
+//! Adapt checked Char objects at the native String and character boundaries.
 //!
 //! Char keeps its ordinary logical UInt32/BitVec/Fin fields. Only this private
 //! call reads their scalar value, after the complete source contract matches.
@@ -10,11 +10,15 @@ use fln_comp::fir::EffectClass;
 use fln_comp::flbc::{ArgumentOwnership, ResultOwnership};
 
 const PRIMITIVE: &str = "_fln_runtime_string_push_abi";
+const CHAR_OF_NAT: &str = "_fln_runtime_char_ofNatAux";
+const CHAR_OF_NAT_PRIMITIVE: &str = "_fln_runtime_char_ofNatAux_abi";
 
 #[derive(Default)]
 pub(super) struct Store {
     next_adapter: u64,
     primitive: Option<(IntrinsicBinding, Expr)>,
+    character_primitive: Option<(IntrinsicBinding, Expr)>,
+    character_adapter: Option<Name>,
     character: Option<CharacterLayout>,
 }
 
@@ -43,19 +47,25 @@ impl Preparation<'_> {
         &self,
         requested: &Name,
     ) -> Option<IntrinsicBinding> {
-        self.string_push
-            .primitive
-            .as_ref()
-            .filter(|(binding, _)| &binding.name == requested)
-            .map(|(binding, _)| binding.clone())
+        [
+            self.string_push.primitive.as_ref(),
+            self.string_push.character_primitive.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .find(|(binding, _)| &binding.name == requested)
+        .map(|(binding, _)| binding.clone())
     }
 
     pub(super) fn string_push_intrinsic_type(&self, requested: &Name) -> Option<Expr> {
-        self.string_push
-            .primitive
-            .as_ref()
-            .filter(|(binding, _)| &binding.name == requested)
-            .map(|(_, type_)| type_.clone())
+        [
+            self.string_push.primitive.as_ref(),
+            self.string_push.character_primitive.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .find(|(binding, _)| &binding.name == requested)
+        .map(|(_, type_)| type_.clone())
     }
 
     fn string_push_adapter_name(&mut self) -> Result<Name, IngressError> {
@@ -150,6 +160,134 @@ impl Preparation<'_> {
             Expr::app(Expr::const_(character, vec![]), result),
             proofs::erased_value(),
         ))
+    }
+
+    /// The ABI erases the validity proof and returns a UInt32 scalar. Rebuild
+    /// the existing logical Char fields around that scalar only after matching
+    /// the entire admitted definition and its executable dependency closure.
+    pub(super) fn native_char_of_nat_target(
+        &mut self,
+        requested: &Name,
+    ) -> Result<Option<Name>, IngressError> {
+        if requested != &name("Char.ofNatAux") {
+            return Ok(None);
+        }
+        if let Some(target) = &self.string_push.character_adapter {
+            let target = target.clone();
+            self.tick()?;
+            return Ok(Some(target));
+        }
+        if !self.has_extern_attribute(requested)? {
+            return Ok(None);
+        }
+        self.implementations()?;
+        string_push::char_of_nat_matches(
+            self.environment,
+            self.implementations
+                .as_ref()
+                .expect("checked implementation journal"),
+            self.runtime_initializers,
+            &mut self.externs,
+            &mut self.visited,
+            self.limits,
+        )?;
+        let primitive = name(CHAR_OF_NAT_PRIMITIVE);
+        if self.environment.contains(&primitive) || self.has_private_callable(&primitive) {
+            return Err(unsupported("Char.ofNatAux primitive name collision"));
+        }
+        let row = fln_vm::extern_table_generated::EXTERN_ROWS
+            .iter()
+            .find(|row| row.id == "extern:Char.ofNatAux")
+            .ok_or_else(|| unsupported("Char.ofNatAux generated primitive row"))?;
+        if row.name != "Char.ofNatAux"
+            || row.kind != "defn"
+            || row.levels != 0
+            || row.arity != 2
+            || row.symbol != "lean_uint32_of_nat"
+            || row.effect != "pure"
+            || row.ownership != "abi((a: borrowed_arg) -> value)"
+        {
+            return Err(unsupported("Char.ofNatAux generated primitive contract"));
+        }
+        let Some(ConstantInfo::Defn(original)) = self.environment.find(requested) else {
+            return Err(unsupported("Char.ofNatAux checked interface"));
+        };
+        let mut definition = original.clone();
+        let mut telescope = definition.base.type_.clone();
+        let mut binders = Vec::new();
+        while let ExprNode::ForallE {
+            binder_name,
+            binder_type,
+            body,
+            binder_info,
+        } = telescope.node()
+        {
+            self.tick()?;
+            reserve(&mut binders, self.limits.max_context_depth)?;
+            binders.push((binder_name.clone(), binder_type.clone(), *binder_info));
+            telescope = body.clone();
+        }
+        if !definition.base.level_params.is_empty() || binders.len() != 2 || telescope != c("Char")
+        {
+            return Err(unsupported("Char.ofNatAux checked telescope"));
+        }
+        let mut value = self.native_character_from_scalar(Expr::app(
+            Expr::const_(primitive.clone(), vec![]),
+            b(1)?,
+        ))?;
+        for (binder_name, binder_type, binder_info) in binders.into_iter().rev() {
+            self.tick()?;
+            value = Expr::lam(binder_name, binder_type, value, binder_info);
+        }
+        definition.base.name = name(CHAR_OF_NAT);
+        definition.value = value;
+        definition.hints = fln_env::constants::ReducibilityHints::Abbrev;
+        definition.all.clear();
+        self.remember_native_scalar_adapter_definition(definition)?;
+        self.string_push.character_primitive = Some((
+            IntrinsicBinding {
+                name: primitive,
+                universe_arity: 0,
+                row: row.id.to_owned(),
+                arguments: vec![ValueType::Nat],
+                argument_ownership: vec![ArgumentOwnership::Borrowed],
+                // The UInt32 handler's scalar is an ordinary bounded Nat in
+                // the private Fin field, never a logical UInt32 constructor.
+                result: ValueType::Nat,
+                result_ownership: ResultOwnership::Scalar,
+                effect: EffectClass::Pure,
+            },
+            function(&[c("Nat")], c("Nat")),
+        ));
+        let target = name(CHAR_OF_NAT);
+        self.string_push.character_adapter = Some(target.clone());
+        Ok(Some(target))
+    }
+
+    pub(super) fn char_of_nat_call(
+        &mut self,
+        head: &Expr,
+        arguments: &[Expr],
+    ) -> Result<Option<Expr>, IngressError> {
+        let ExprNode::Const {
+            name: requested,
+            levels,
+        } = head.node()
+        else {
+            return Ok(None);
+        };
+        if requested != &name("Char.ofNatAux") || !levels.is_empty() {
+            return Ok(None);
+        }
+        if let Some(replacement) = self.implemented_by_call(head, arguments)? {
+            return Ok(Some(replacement));
+        }
+        Ok(self.native_char_of_nat_target(requested)?.map(|target| {
+            arguments
+                .iter()
+                .cloned()
+                .fold(Expr::const_(target, vec![]), Expr::app)
+        }))
     }
 
     fn string_push_bind(&mut self) -> Result<[Name; 4], IngressError> {

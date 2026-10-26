@@ -1,5 +1,6 @@
-//! Extract post-admission text-decision comparison data from the retained pinned Prelude.
-//! Run with `cargo run -p fln --example extract_text_equality -- String` (or Char).
+//! Extract equality-decision comparison data from the retained pinned Prelude.
+//! Run with `cargo run -p fln --example extract_text_equality -- String` (or Char/Nat).
+//! Nat emits separate sections for its native equality and ordering decisions.
 //! Writes only the requested inventory to stdout; never changes a logical declaration.
 #![forbid(unsafe_code)]
 use fln::source_check::modules::imported::SourceOleanImportLimits;
@@ -12,7 +13,7 @@ fn n(text: &str) -> Name {
     Name::from_components(text.split('.'))
 }
 
-fn dependencies(environment: &Environment, root: &str) -> BTreeSet<Name> {
+fn dependencies(environment: &Environment, root: &str) -> Result<BTreeSet<Name>, String> {
     let mut pending = vec![n("Decidable.decide"), n(root), n("Bool"), n("Nat.beq")];
     let mut found = BTreeSet::new();
     while let Some(label) = pending.pop() {
@@ -21,7 +22,7 @@ fn dependencies(environment: &Environment, root: &str) -> BTreeSet<Name> {
         }
         let info = environment
             .find(&label)
-            .unwrap_or_else(|| panic!("missing {}", label.to_display_string()));
+            .ok_or_else(|| format!("missing {}", label.to_display_string()))?;
         let mut expressions = vec![&info.constant_val().type_];
         match info {
             ConstantInfo::Defn(value) => {
@@ -76,7 +77,7 @@ fn dependencies(environment: &Environment, root: &str) -> BTreeSet<Name> {
             }
         }
     }
-    found
+    Ok(found)
 }
 
 fn encoded(label: &Name) -> String {
@@ -98,9 +99,13 @@ fn encoded(label: &Name) -> String {
     parts.join("/")
 }
 
-fn main() {
-    let carrier = std::env::args().nth(1).expect("expected String or Char");
-    assert!(matches!(carrier.as_str(), "String" | "Char"));
+fn main() -> Result<(), String> {
+    let carrier = std::env::args()
+        .nth(1)
+        .ok_or_else(|| "expected String, Char or Nat".to_owned())?;
+    if !matches!(carrier.as_str(), "String" | "Char" | "Nat") {
+        return Err("expected String, Char or Nat".to_owned());
+    }
     std::thread::Builder::new()
         .stack_size(128 << 20)
         .spawn(move || {
@@ -131,22 +136,43 @@ fn main() {
                 .into_complete()
                 .expect("the actual Prelude must be council-admitted");
             let environment = imported.engine.environment();
-            let root = format!("instDecidableEq{carrier}");
-            let found = dependencies(environment, &root);
-            eprintln!(
-                "{}: {} complete type/body/structural dependencies",
-                carrier,
-                found.len()
-            );
-            for label in found {
-                println!(
-                    "{}\t{}",
-                    encoded(&label),
-                    environment.entry(&label).unwrap().digest().to_hex()
+            let roots = if carrier == "Nat" {
+                vec![
+                    "Nat.decEq".to_owned(),
+                    "Nat.decLe".to_owned(),
+                    "Nat.decLt".to_owned(),
+                ]
+            } else {
+                vec![format!("instDecidableEq{carrier}")]
+            };
+            // Find every closure before emitting any records. A missing input
+            // must not leave a partial inventory that looks complete.
+            let groups = roots
+                .into_iter()
+                .map(|root| dependencies(environment, &root).map(|found| (root, found)))
+                .collect::<Result<Vec<_>, _>>()?;
+            for (root, found) in groups {
+                eprintln!(
+                    "{root}: {} complete type/body/structural dependencies",
+                    found.len()
                 );
+                if carrier == "Nat" {
+                    println!("@{root}");
+                }
+                for label in found {
+                    println!(
+                        "{}\t{}",
+                        encoded(&label),
+                        environment.entry(&label).unwrap().digest().to_hex()
+                    );
+                }
+                if carrier == "Nat" {
+                    println!();
+                }
             }
+            Ok(())
         })
-        .unwrap()
+        .map_err(|error| format!("could not spawn equality extractor: {error}"))?
         .join()
-        .unwrap();
+        .map_err(|_| "equality extraction worker panicked".to_owned())?
 }

@@ -8,6 +8,44 @@ use super::*;
 
 mod model;
 
+const CHAR_OF_NAT_DEPENDENCIES: &str = include_str!("string_push/char_of_nat_dependencies.txt");
+
+/// The same extracted five-column contract grammar binds constants and all
+/// executable metadata. Share its metered validation with the Array adapters;
+/// a character adapter receives no authority from the String.push contract.
+pub(crate) fn char_of_nat_matches(
+    environment: &Environment,
+    implementations: &fln_elab::implemented_by::ImplementedByTable,
+    initializers: Option<&BTreeSet<Name>>,
+    externs: &mut Option<fln_elab::externs::ExternTable>,
+    visited: &mut usize,
+    limits: IngressLimits,
+) -> Result<(), IngressError> {
+    if !CHAR_OF_NAT_DEPENDENCIES
+        .lines()
+        .any(|line| line.starts_with("s:Char/s:ofNatAux\t"))
+    {
+        return Err(IngressError::UnsupportedNode {
+            kind: "Char.ofNatAux requires its exact dependency inventory",
+        });
+    }
+    super::array_iteration::matches_inventory(
+        CHAR_OF_NAT_DEPENDENCIES,
+        environment,
+        implementations,
+        initializers,
+        externs,
+        visited,
+        limits,
+    )
+    .map_err(|error| match error {
+        IngressError::UnsupportedNode { .. } => IngressError::UnsupportedNode {
+            kind: "Char.ofNatAux differs from its complete pinned model or execution metadata",
+        },
+        error => error,
+    })
+}
+
 pub(crate) fn source_name() -> Name {
     Name::from_components(["String", "push"])
 }

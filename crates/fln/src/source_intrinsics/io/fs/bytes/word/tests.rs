@@ -3,6 +3,7 @@
 //! The fixture retains decoded constants and extern entries only. Every source
 //! example and every changed definition below still crosses both ordinary
 //! declaration checkers before compiler ingress. No Reference code executes.
+#![cfg(test)]
 
 use super::*;
 use fln_elab::externs::{self, ExternEntry};
@@ -71,6 +72,14 @@ fn fixture() -> Option<&'static Fixture> {
             for (label, digest) in inventory(REPR_DEPENDENCIES) {
                 assert!(needed.insert(label, digest).is_none());
             }
+            for line in BOUNDED_DEPENDENCIES.lines() {
+                let columns: Vec<_> = line.split('\t').collect();
+                assert_eq!(columns.len(), 5);
+                let label = dependency_name(columns[0], &mut 0, IngressLimits::default()).unwrap();
+                if let Some(previous) = needed.insert(label, columns[1]) {
+                    assert_eq!(previous, columns[1], "shared actual model identity");
+                }
+            }
             let mut constants = BTreeMap::new();
             let mut actual_externs = BTreeMap::new();
             for module in MODULES {
@@ -127,23 +136,35 @@ fn fixture() -> Option<&'static Fixture> {
                     }
                 }
                 for info in decoded.constants {
-                    if needed.contains_key(info.name()) {
-                        // The inventory was extracted in this module order. Keep the
-                        // first actual declaration, including its actual theorem body;
-                        // never select or manufacture a body to match an expected hash.
-                        constants.entry(info.name().clone()).or_insert(info);
-                    }
+                    // Keep the first actual declaration in the extraction's
+                    // module order. The source probes additionally use proof
+                    // projections outside the executable word model itself.
+                    constants.entry(info.name().clone()).or_insert(info);
                 }
             }
-            assert_eq!(
-                constants.len(),
-                needed.len(),
-                "all actual dependencies are present"
-            );
-            let mut environment = Environment::new();
+            let mut decoded = Environment::new();
             for info in constants.into_values() {
-                environment = environment.add_decl(info).unwrap();
+                decoded = decoded.add_decl(info).unwrap();
             }
+            let mut retained = super::super::actual_dependencies(
+                &decoded,
+                &["Fin.isLt", "BitVec.toFin", "USize.size_pos"],
+            );
+            for (label, digest) in &needed {
+                assert_eq!(
+                    decoded.entry(label).unwrap().digest().to_hex(),
+                    *digest,
+                    "every original model entry retains its actual identity"
+                );
+                retained.insert(label.clone());
+            }
+            let mut environment = Environment::new();
+            for label in &retained {
+                environment = environment
+                    .with_entry(decoded.entry(label).unwrap())
+                    .unwrap();
+            }
+            assert_eq!(environment.constants().count(), retained.len());
             assert!(actual_externs.contains_key(&name("USize.repr")));
             assert!(actual_externs.contains_key(&name("USize.ofNat")));
             assert!(actual_externs.contains_key(&name("USize.ofBitVec")));
@@ -595,3 +616,147 @@ fn incomplete_word_models_foreign_externs_and_exhaustion_never_authorize_native_
 
 #[path = "platform_tests.rs"]
 mod platform;
+
+#[test]
+fn bounded_words_preserve_proofs_partial_calls_and_native_rows() {
+    with_fixture(|fixture| {
+        let engine = Engine::from_environment(fixture.environment.clone());
+        execute_and_replay(
+            &engine,
+            include_str!("../../../../../../tests/source_imported_arrays/bounded_words.lean")
+                .strip_prefix(
+                    "prelude\nimport Init.Data.Array.Basic\nimport Init.Data.List.Control\n\n",
+                )
+                .unwrap(),
+            &[
+                Expected::Nat("0"),
+                Expected::Nat("42"),
+                Expected::Nat("18446744073709551615"),
+                Expected::Nat("0"),
+                Expected::Nat("5"),
+                Expected::Nat("0"),
+                Expected::Nat("0"),
+                Expected::Nat("0"),
+            ],
+        );
+        let completed = engine
+            .execute_source_commands_with_checks(
+                b"#eval USize.toNat (USize.ofNatLT 0 USize.size_pos)",
+                &KVMap::new(),
+                EngineExecutionLimits::new(Budget::for_stack_bytes(STACK)),
+            )
+            .unwrap()
+            .into_complete()
+            .unwrap();
+        let index = completed.batch.source_evaluation_indices[0];
+        let execution = &completed.batch.executions[index];
+        let decoded = fln_comp::flbc::decode_canonical(
+            &execution.flbc_artifact,
+            fln_comp::flbc::CodecLimits::default(),
+        )
+        .unwrap();
+        assert!(decoded.functions().iter().flat_map(|f| &f.code).any(|instruction| matches!(
+            instruction, fln_comp::flbc::Instruction::Intrinsic { row, argument_ownership, .. }
+            if row == "extern:USize.ofNatLT" && argument_ownership == &[fln_comp::flbc::ArgumentOwnership::Borrowed]
+        )), "the proof-bearing call must use its actual native row");
+    });
+}
+
+#[test]
+fn bounded_words_refuse_changed_metadata_initializers_models_and_resource_exhaustion() {
+    with_fixture(|fixture| {
+        let requested = name("USize.ofNatLT");
+        let check = |environment: &Environment| {
+            let implementations =
+                fln_elab::implemented_by::ImplementedByTable::read(environment).unwrap();
+            assert!(
+                bounded_word_matches(
+                    environment,
+                    &implementations,
+                    None,
+                    &mut None,
+                    &mut 0,
+                    IngressLimits::default()
+                )
+                .is_err()
+            );
+        };
+        check(&rebuild(fixture, Some(&requested), None));
+        let ConstantInfo::Defn(mut changed) = fixture.environment.find(&requested).unwrap().clone()
+        else {
+            unreachable!()
+        };
+        changed.value = Expr::app(
+            Expr::lam(
+                Name::anonymous(),
+                changed.base.type_.clone(),
+                Expr::bvar(0).unwrap(),
+                BinderInfo::Default,
+            ),
+            changed.value.clone(),
+        );
+        check(
+            &rebuild(fixture, Some(&requested), None)
+                .add_decl(ConstantInfo::Defn(changed))
+                .unwrap(),
+        );
+        for label in ["USize.ofNatLT", "USize.toNat", "USize.ofNat"] {
+            check(
+                &externs::register(
+                    &fixture.environment,
+                    &name(label),
+                    vec![ExternEntry::Standard {
+                        backend: name("all"),
+                        symbol: "foreign_bounded_word".to_owned(),
+                    }],
+                )
+                .unwrap(),
+            );
+            let initializers = BTreeSet::from([name(label)]);
+            let implementations =
+                fln_elab::implemented_by::ImplementedByTable::read(&fixture.environment).unwrap();
+            assert!(
+                bounded_word_matches(
+                    &fixture.environment,
+                    &implementations,
+                    Some(&initializers),
+                    &mut None,
+                    &mut 0,
+                    IngressLimits::default()
+                )
+                .is_err()
+            );
+        }
+        let implementations =
+            fln_elab::implemented_by::ImplementedByTable::read(&fixture.environment).unwrap();
+        let mut cost = 0;
+        bounded_word_matches(
+            &fixture.environment,
+            &implementations,
+            None,
+            &mut None,
+            &mut cost,
+            IngressLimits::default(),
+        )
+        .unwrap();
+        assert!(cost > 1);
+        assert!(matches!(
+            bounded_word_matches(
+                &fixture.environment,
+                &implementations,
+                None,
+                &mut None,
+                &mut 0,
+                IngressLimits {
+                    max_nodes: cost - 1,
+                    ..IngressLimits::default()
+                }
+            ),
+            Err(IngressError::ResourceLimit { .. })
+        ));
+        assert!(
+            matches_word(&fixture.environment, "USize.ofNat").unwrap(),
+            "a failed probe cannot poison a fresh word call"
+        );
+    });
+}

@@ -21,7 +21,7 @@ impl Preparation<'_> {
             .is_some_and(|table| table.get(name).is_some()))
     }
 
-    fn implementations(&mut self) -> Result<&ImplementedByTable, IngressError> {
+    pub(super) fn implementations(&mut self) -> Result<&ImplementedByTable, IngressError> {
         if self.implementations.is_none() {
             let table = ImplementedByTable::read_metered(self.environment, |amount| {
                 let observed = self.visited.saturating_add(amount);
@@ -166,6 +166,10 @@ impl Preparation<'_> {
         // Recognizer errors remain refusals; none may fall back to an opaque
         // default or an ordinary body after a failed native contract.
         let native = self.native_intrinsic_binding(&target)?.is_some()
+            || self.native_natural_decision_target(&target)?.is_some()
+            || self.native_char_of_nat_target(&target)?.is_some()
+            || self.native_array_access_target(&target)?.is_some()
+            || self.bounded_word_contract(&target)?
             || match source_intrinsics::io::fs::Operation::from_name(&target) {
                 Some(operation) => source_intrinsics::io::fs::primitive_matches(
                     self.environment,

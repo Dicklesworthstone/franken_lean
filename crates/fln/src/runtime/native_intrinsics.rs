@@ -3,8 +3,9 @@
 //! A successful binding has passed the complete logical-model and extern
 //! checks against this preparation's immutable environment. Reusing that
 //! binding cannot authorize another name, replace an explicit implementation,
-//! or import a mutable private type. Only generated scalar signatures enter
-//! this table; unknown names and all refusals still take the original path.
+//! or import a mutable private type. Generated scalar signatures use the table;
+//! checked decision representations stay private to the preparation. Unknown
+//! names and all refusals still take the original path.
 
 use super::*;
 use std::collections::HashMap;
@@ -106,6 +107,9 @@ impl Preparation<'_> {
         &mut self,
         requested: &Name,
     ) -> Result<Option<IntrinsicBinding>, IngressError> {
+        if let Some(binding) = self.native_decision_intrinsic_binding(requested) {
+            return Ok(Some(binding));
+        }
         self.native_intrinsics.binding(
             self.environment,
             requested,
@@ -127,6 +131,10 @@ impl Preparation<'_> {
         // complete logical and extern contracts have already been checked.
         // Do not cache them in the scalar catalog or resolve them by spelling.
         if let Some(binding) = self.diagnostic_intrinsic_binding(requested) {
+            charge_catalog_node(visited, limits)?;
+            return Ok(Some(binding));
+        }
+        if let Some(binding) = self.native_decision_intrinsic_binding(requested) {
             charge_catalog_node(visited, limits)?;
             return Ok(Some(binding));
         }

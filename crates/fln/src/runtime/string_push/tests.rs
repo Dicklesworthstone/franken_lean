@@ -210,6 +210,221 @@ fn assert_row(execution: &DefinitionExecution) {
     )), "the checked Char must reach the genuine generated String.push row");
 }
 
+// Comparison data only: the integration target separately checks all actual
+// modules and activates their real journals before executing these operations.
+fn character_fixture() -> Environment {
+    let mut environment = raw_pin_environment().expect("actual character model is mandatory");
+    for line in
+        include_str!("../../source_intrinsics/string_push/char_of_nat_dependencies.txt").lines()
+    {
+        let fields: Vec<_> = line.split('\t').collect();
+        assert_eq!(fields.len(), 5);
+        let mut label = Name::anonymous();
+        for part in fields[0].split('/') {
+            label = if let Some(text) = part.strip_prefix("s:") {
+                Name::str(label, text)
+            } else {
+                Name::num(label, part.strip_prefix("n:").unwrap().parse().unwrap())
+            };
+        }
+        assert_eq!(
+            environment.entry(&label).unwrap().digest().to_hex(),
+            fields[1]
+        );
+        assert_eq!(
+            fields[2], "-",
+            "the pinned character closure has no replacement"
+        );
+        if fields[3] == "extern" {
+            environment = register(&environment, &label.to_display_string(), false);
+        }
+    }
+    environment
+}
+
+fn character_without(environment: &Environment, target: &Name) -> Environment {
+    let mut result = Environment::new();
+    for (label, _) in environment.constants() {
+        if label != target {
+            result = result
+                .with_entry(environment.entry(label).unwrap())
+                .unwrap();
+        }
+    }
+    for (journal, state) in environment.extensions() {
+        result = result.register_extension(state.descriptor.clone()).unwrap();
+        for entry in state.entries() {
+            result = result
+                .push_extension_entry(journal, entry.payload.clone())
+                .unwrap();
+        }
+    }
+    result
+}
+
+#[test]
+fn character_adapter_preserves_logical_authority_and_refuses_partial_publication() {
+    let environment = character_fixture();
+    let requested = name("Char.ofNatAux");
+    let original = environment.find(&requested).unwrap().clone();
+    let count = environment.constants().count();
+    let limits = IngressLimits::default();
+    let mut preparation = Preparation::new(&environment, limits);
+    assert_eq!(
+        preparation.native_char_of_nat_target(&requested).unwrap(),
+        Some(name(CHAR_OF_NAT))
+    );
+    let adapter = preparation
+        .specialized_definition(&name(CHAR_OF_NAT))
+        .unwrap();
+    assert_eq!(adapter.base.type_, original.constant_val().type_);
+    assert_eq!(adapter.safety, DefinitionSafety::Safe);
+    assert!(!adapter.value.has_loose_bvars());
+    assert!(!adapter.value.has_fvar());
+    assert!(!adapter.value.has_expr_mvar());
+    let binding = preparation
+        .string_push_intrinsic_binding(&name(CHAR_OF_NAT_PRIMITIVE))
+        .unwrap();
+    assert_eq!(binding.row, "extern:Char.ofNatAux");
+    assert_eq!(binding.arguments, [ValueType::Nat]);
+    assert_eq!(binding.argument_ownership, [ArgumentOwnership::Borrowed]);
+    assert_eq!(binding.result_ownership, ResultOwnership::Scalar);
+    let cost = preparation.visited;
+    assert!(cost > 180);
+    assert_eq!(
+        preparation.native_char_of_nat_target(&requested).unwrap(),
+        Some(name(CHAR_OF_NAT))
+    );
+    assert_eq!(preparation.visited, cost + 1);
+    assert_eq!(environment.constants().count(), count);
+    assert_eq!(environment.find(&requested), Some(&original));
+    assert!(!environment.contains(&name(CHAR_OF_NAT)));
+    assert!(!environment.contains(&name(CHAR_OF_NAT_PRIMITIVE)));
+    for max_nodes in [0, 180, cost - 1] {
+        let mut limited = Preparation::new(
+            &environment,
+            IngressLimits {
+                max_nodes,
+                ..limits
+            },
+        );
+        assert!(matches!(
+            limited.native_char_of_nat_target(&requested),
+            Err(IngressError::ResourceLimit { .. })
+        ));
+        assert!(limited.specialized_definition(&name(CHAR_OF_NAT)).is_none());
+        assert!(limited.string_push.character_adapter.is_none());
+        assert!(limited.string_push.character_primitive.is_none());
+    }
+    let mut shallow = Preparation::new(
+        &environment,
+        IngressLimits {
+            max_context_depth: 1,
+            ..limits
+        },
+    );
+    assert!(matches!(
+        shallow.native_char_of_nat_target(&requested),
+        Err(IngressError::ResourceLimit { .. })
+    ));
+    assert!(shallow.string_push.character_adapter.is_none());
+    assert!(shallow.string_push.character_primitive.is_none());
+    let mut full = Preparation::new(&environment, limits);
+    full.limits.fir.max_functions = 0;
+    assert!(matches!(
+        full.native_char_of_nat_target(&requested),
+        Err(IngressError::ResourceLimit { .. })
+    ));
+    assert!(full.string_push.character_adapter.is_none());
+    assert!(full.string_push.character_primitive.is_none());
+}
+
+#[test]
+fn character_adapter_refuses_changed_models_metadata_initializers_and_collisions() {
+    let environment = character_fixture();
+    let requested = name("Char.ofNatAux");
+    let refused = |changed: &Environment| {
+        let mut preparation = Preparation::new(changed, IngressLimits::default());
+        assert!(preparation.native_char_of_nat_target(&requested).is_err());
+        assert!(
+            preparation
+                .specialized_definition(&name(CHAR_OF_NAT))
+                .is_none()
+        );
+        assert!(preparation.string_push.character_adapter.is_none());
+        assert!(preparation.string_push.character_primitive.is_none());
+    };
+    for label in [
+        "Char.ofNatAux",
+        "Char.mk",
+        "UInt32",
+        "Fin.mk",
+        "Nat.ble._unsafe_rec",
+    ] {
+        let label = name(label);
+        let mut changed = environment.find(&label).unwrap().clone();
+        match &mut changed {
+            ConstantInfo::Defn(value) => {
+                value.value = Expr::app(
+                    Expr::lam(
+                        Name::anonymous(),
+                        value.base.type_.clone(),
+                        Expr::bvar(0).unwrap(),
+                        BinderInfo::Default,
+                    ),
+                    value.value.clone(),
+                )
+            }
+            ConstantInfo::Ctor(value) => value.num_fields += 1,
+            ConstantInfo::Induct(value) => value.is_unsafe = !value.is_unsafe,
+            _ => panic!("actual selected character model kind"),
+        }
+        refused(
+            &character_without(&environment, &label)
+                .add_decl(changed)
+                .unwrap(),
+        );
+        refused(&character_without(&environment, &label));
+    }
+    refused(&register(&environment, "Char.ofNatAux", true));
+    refused(&register(&environment, "UInt32.toNat", true));
+    for label in [requested.clone(), name("UInt32.toNat"), name("Fin.mk")] {
+        let initializers = std::collections::BTreeSet::from([label]);
+        let mut preparation = Preparation::new(&environment, IngressLimits::default())
+            .with_runtime_initializers(&initializers);
+        assert!(preparation.native_char_of_nat_target(&requested).is_err());
+        assert!(preparation.string_push.character_adapter.is_none());
+        assert!(preparation.string_push.character_primitive.is_none());
+    }
+    let Some(ConstantInfo::Defn(original)) = environment.find(&requested) else {
+        unreachable!()
+    };
+    for label in [CHAR_OF_NAT, CHAR_OF_NAT_PRIMITIVE] {
+        let mut collision = original.clone();
+        collision.base.name = name(label);
+        collision.all = vec![name(label)];
+        refused(&environment.add_decl(ConstantInfo::Defn(collision)).unwrap());
+    }
+    let mut alternate = original.clone();
+    alternate.base.name = name("alternateCheckedCharacter");
+    alternate.all = vec![alternate.base.name.clone()];
+    let changed = environment.add_decl(ConstantInfo::Defn(alternate)).unwrap();
+    let changed = fln_elab::implemented_by::register(
+        &changed,
+        &requested,
+        &name("alternateCheckedCharacter"),
+    )
+    .unwrap();
+    let mut preparation = Preparation::new(&changed, IngressLimits::default());
+    assert_eq!(
+        preparation
+            .char_of_nat_call(&c("Char.ofNatAux"), &[])
+            .unwrap(),
+        Some(c("alternateCheckedCharacter"))
+    );
+    assert!(preparation.string_push.character_adapter.is_none());
+}
+
 #[test]
 fn string_push_requires_the_complete_pin_and_matching_extern() {
     let Some(raw) = raw_pin_environment() else {

@@ -1,4 +1,4 @@
-//! A private executable bridge for the pin's selected Array traversal.
+//! Private executable bridges for the pin's List-backed Array representation.
 //!
 //! The Array record still contains its logical List. Under the complete pinned
 //! contract, List.forIn' visits exactly those elements in the same order, with
@@ -10,6 +10,33 @@ use super::*;
 #[derive(Default)]
 pub(super) struct Store {
     adapter: Option<Name>,
+    size: Option<Name>,
+    get: Option<Name>,
+}
+
+#[derive(Clone, Copy)]
+enum Access {
+    Size,
+    Get,
+}
+
+impl Access {
+    fn from_name(requested: &Name) -> Option<Self> {
+        if requested == &name("Array.size") {
+            Some(Self::Size)
+        } else if requested == &name("Array.getInternal") {
+            Some(Self::Get)
+        } else {
+            None
+        }
+    }
+
+    fn private_name(self) -> Name {
+        name(match self {
+            Self::Size => "_fln_runtime_array_size",
+            Self::Get => "_fln_runtime_array_get",
+        })
+    }
 }
 
 fn logical_name() -> Name {
@@ -37,6 +64,177 @@ fn application(head: Expr, arguments: impl IntoIterator<Item = Expr>) -> Expr {
 }
 
 impl Preparation<'_> {
+    /// The admitted Array is a List wrapper. Authorize explicit representation
+    /// templates only after checking the complete logical and selected models.
+    /// No constructor is passed to the native Array ABI, and no failed native
+    /// contract falls back to a logical body. Index proofs retain the original
+    /// telescope and enter List.get through its checked Fin interface.
+    pub(super) fn native_array_access_target(
+        &mut self,
+        requested: &Name,
+    ) -> Result<Option<Name>, IngressError> {
+        let Some(access) = Access::from_name(requested) else {
+            return Ok(None);
+        };
+        let cached = match access {
+            Access::Size => &self.array_iteration.size,
+            Access::Get => &self.array_iteration.get,
+        };
+        if let Some(adapter) = cached {
+            let adapter = adapter.clone();
+            self.tick()?;
+            return Ok(Some(adapter));
+        }
+        source_intrinsics::read_extern_attributes(
+            self.environment,
+            &mut self.externs,
+            &mut self.visited,
+            self.limits,
+        )?;
+        if !self
+            .externs
+            .as_ref()
+            .is_some_and(|table| table.get(requested).is_some())
+        {
+            return Ok(None);
+        }
+        self.implementations()?;
+        let implementations = self
+            .implementations
+            .as_ref()
+            .expect("checked implementation journal");
+        match access {
+            Access::Size => source_intrinsics::array_iteration::size_matches(
+                self.environment,
+                implementations,
+                self.runtime_initializers,
+                &mut self.externs,
+                &mut self.visited,
+                self.limits,
+            )?,
+            Access::Get => source_intrinsics::array_iteration::get_matches(
+                self.environment,
+                implementations,
+                self.runtime_initializers,
+                &mut self.externs,
+                &mut self.visited,
+                self.limits,
+            )?,
+        }
+        let Some(ConstantInfo::Defn(original)) = self.environment.find(requested) else {
+            return Err(unsupported("Array access requires its checked interface"));
+        };
+        let mut definition = original.clone();
+        let mut telescope = definition.base.type_.clone();
+        let mut binders = Vec::new();
+        while let ExprNode::ForallE {
+            binder_name,
+            binder_type,
+            body,
+            binder_info,
+        } = telescope.node()
+        {
+            self.tick()?;
+            reserve(&mut binders, self.limits.max_context_depth)?;
+            binders.push((binder_name.clone(), binder_type.clone(), *binder_info));
+            telescope = body.clone();
+        }
+        let (arity, result, helper) = match access {
+            Access::Size => (2, Expr::const_(name("Nat"), vec![]), "List.length"),
+            Access::Get => (4, variable(3)?, "List.get"),
+        };
+        if binders.len() != arity || telescope != result {
+            return Err(unsupported("Array access interface telescope"));
+        }
+        // These interfaces each quantify one element universe, but the pin
+        // names those parameters differently. Instantiate the helper with the
+        // caller's universe and check the actual element-type domain instead
+        // of treating a hygienic parameter spelling as a correspondence.
+        let list = self
+            .environment
+            .find(&name(helper))
+            .ok_or_else(|| unsupported("Array access requires its checked List helper"))?;
+        if definition.base.level_params.len() != 1 || list.constant_val().level_params.len() != 1 {
+            return Err(unsupported("Array access helper universe interface"));
+        }
+        let levels = vec![Level::param(definition.base.level_params[0].clone())];
+        let list_type = self.universe_instance(
+            &list.constant_val().type_,
+            &list.constant_val().level_params,
+            &levels,
+        )?;
+        if !matches!(list_type.node(), ExprNode::ForallE { binder_type, .. }
+            if binder_type == &binders[0].1)
+        {
+            return Err(unsupported("Array access helper element universe"));
+        }
+        let mut value = match access {
+            Access::Size => application(
+                Expr::const_(name(helper), levels),
+                [variable(1)?, Expr::proj(name("Array"), 0, variable(0)?)],
+            ),
+            Access::Get => {
+                // Context: α, array, index, bound proof. The Fin bound is
+                // definitionally the original Array.size by the pinned model;
+                // ordinary codegen erases the proof, not the element or index.
+                let storage = Expr::proj(name("Array"), 0, variable(2)?);
+                let bound = application(
+                    Expr::const_(name("List.length"), levels.clone()),
+                    [variable(3)?, storage.clone()],
+                );
+                let index = application(
+                    Expr::const_(name("Fin.mk"), vec![]),
+                    [bound, variable(1)?, variable(0)?],
+                );
+                application(
+                    Expr::const_(name(helper), levels),
+                    [variable(3)?, storage, index],
+                )
+            }
+        };
+        for (binder_name, binder_type, binder_info) in binders.into_iter().rev() {
+            self.tick()?;
+            value = Expr::lam(binder_name, binder_type, value, binder_info);
+        }
+        definition.base.name = access.private_name();
+        definition.value = value;
+        definition.hints = ReducibilityHints::Abbrev;
+        definition.all.clear();
+        let adapter = definition.base.name.clone();
+        self.remember_array_definition(definition)?;
+        match access {
+            Access::Size => self.array_iteration.size = Some(adapter.clone()),
+            Access::Get => self.array_iteration.get = Some(adapter.clone()),
+        }
+        Ok(Some(adapter))
+    }
+
+    pub(super) fn array_access_call(
+        &mut self,
+        head: &Expr,
+        arguments: &[Expr],
+    ) -> Result<Option<Expr>, IngressError> {
+        let ExprNode::Const {
+            name: requested,
+            levels,
+        } = head.node()
+        else {
+            return Ok(None);
+        };
+        if Access::from_name(requested).is_none() {
+            return Ok(None);
+        }
+        if let Some(replacement) = self.implemented_by_call(head, arguments)? {
+            return Ok(Some(replacement));
+        }
+        Ok(self.native_array_access_target(requested)?.map(|target| {
+            application(
+                Expr::const_(target, levels.clone()),
+                arguments.iter().cloned(),
+            )
+        }))
+    }
+
     /// Called only after the explicit canonical edge has been selected by the
     /// ordinary, metered implementation resolver. Reading that resolver again
     /// here would recurse through initializer checks.
@@ -172,7 +370,7 @@ impl Preparation<'_> {
         definition.hints = ReducibilityHints::Abbrev;
         definition.all.clear();
         let adapter = definition.base.name.clone();
-        self.remember_array_iteration_definition(definition)?;
+        self.remember_array_definition(definition)?;
         // Only a fully checked and registered adapter is reusable. A failed
         // model, budget, or collision leaves no partial private callable.
         self.array_iteration.adapter = Some(adapter.clone());

@@ -11,7 +11,41 @@ use super::*;
 const DEPENDENCIES: &str = include_str!("word/dependencies.txt");
 const REPR_DEPENDENCIES: &str = include_str!("word/repr_dependencies.txt");
 const PLATFORM_DEPENDENCIES: &str = include_str!("word/platform_dependencies.txt");
+const BOUNDED_DEPENDENCIES: &str = include_str!("word/bounded_dependencies.txt");
 const WORD_HELPERS: [&str; 3] = ["USize.ofBitVec", "USize.ofNat", "USize.toNat"];
+
+pub(crate) fn bounded_word_matches(
+    environment: &Environment,
+    implementations: &fln_elab::implemented_by::ImplementedByTable,
+    initializers: Option<&BTreeSet<Name>>,
+    externs: &mut Option<fln_elab::externs::ExternTable>,
+    visited: &mut usize,
+    limits: IngressLimits,
+) -> Result<(), IngressError> {
+    if !BOUNDED_DEPENDENCIES
+        .lines()
+        .any(|row| row.starts_with("s:USize/s:ofNatLT\t"))
+    {
+        return Err(IngressError::UnsupportedNode {
+            kind: "USize.ofNatLT requires its complete dependency inventory",
+        });
+    }
+    crate::source_intrinsics::array_iteration::matches_inventory(
+        BOUNDED_DEPENDENCIES,
+        environment,
+        implementations,
+        initializers,
+        externs,
+        visited,
+        limits,
+    )
+    .map_err(|error| match error {
+        IngressError::UnsupportedNode { .. } => IngressError::UnsupportedNode {
+            kind: "USize.ofNatLT differs from its complete pinned model or execution metadata",
+        },
+        error => error,
+    })
+}
 
 fn dependencies_match(
     environment: &Environment,

@@ -173,7 +173,7 @@ fn native_producer_replacements_execute_in_fresh_native_and_pinned_consumers() {
         let producer = Engine::builder().build_empty()
             .import_olean_modules_for_source(
                 &[prelude_input],
-                &[prelude.clone()],
+                std::slice::from_ref(&prelude),
                 &KVMap::new(),
                 import_limits,
             ).unwrap().into_complete().unwrap().engine;

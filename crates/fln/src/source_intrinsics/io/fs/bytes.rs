@@ -11,7 +11,7 @@
 use super::*;
 
 mod word;
-pub(crate) use word::word_matches;
+pub(crate) use word::{bounded_word_matches, word_matches};
 
 const DEPENDENCIES: &str = include_str!("bytes/dependencies.txt");
 const WRITE_DEPENDENCIES: &str = include_str!("bytes/write_dependencies.txt");

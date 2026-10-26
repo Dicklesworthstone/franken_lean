@@ -8,12 +8,12 @@ use super::*;
 mod bytes;
 mod directory;
 mod model;
-pub(crate) use bytes::word_matches;
 #[cfg(test)]
 pub(crate) use bytes::{
     HELPERS as BYTE_HELPERS, WRITE_HELPERS as WRITE_BYTE_HELPERS,
     assert_pin_layouts as assert_pin_byte_layouts, assert_pin_write_dependencies,
 };
+pub(crate) use bytes::{bounded_word_matches, word_matches};
 #[cfg(test)]
 pub(crate) use directory::HELPERS as DIRECTORY_HELPERS;
 

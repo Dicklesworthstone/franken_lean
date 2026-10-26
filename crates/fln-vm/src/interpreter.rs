@@ -1005,9 +1005,10 @@ impl IntrinsicImplementation {
             "extern:UInt32.decEq" => Self::UInt32DecEq,
             "extern:UInt32.decLe" => Self::UInt32DecLe,
             "extern:UInt32.decLt" => Self::UInt32DecLt,
-            "extern:UInt32.ofNat" | "extern:UInt32.ofNatLT" | "extern:UInt32.ofBitVec" => {
-                Self::UInt32OfNat
-            }
+            "extern:UInt32.ofNat"
+            | "extern:UInt32.ofNatLT"
+            | "extern:UInt32.ofBitVec"
+            | "extern:Char.ofNatAux" => Self::UInt32OfNat,
             "extern:UInt32.toNat" | "extern:UInt32.toBitVec" => Self::UInt32ToNat,
             "extern:UInt32.toUInt8" => Self::UInt32ToUInt8,
             "extern:UInt32.toUInt16" => Self::UInt32ToUInt16,
@@ -9589,6 +9590,13 @@ mod tests {
             u32_val(invoke("extern:UInt32.ofNat", &[n(0x1_0000_0005)])),
             5
         );
+        for (input, expected) in [(0, 0), (0x10FFFF, 0x10FFFF), (0x1_0000_0041, 65)] {
+            assert_eq!(
+                u32_val(invoke("extern:Char.ofNatAux", &[n(input)])),
+                expected,
+                "the shared UInt32 ABI truncates before rebuilding a logical Char",
+            );
+        }
         assert_eq!(owned_usize(invoke("extern:UInt32.toNat", &[n(777)])), 777);
         assert_eq!(
             byte_word(invoke("extern:UInt32.toUInt8", &[n(0x1234_5678)])),
@@ -9814,6 +9822,7 @@ mod tests {
             "extern:UInt32.ofNat",
             "extern:UInt32.ofNatLT",
             "extern:UInt32.ofBitVec",
+            "extern:Char.ofNatAux",
             "extern:UInt32.toNat",
             "extern:UInt32.toBitVec",
             "extern:UInt32.toUInt8",
