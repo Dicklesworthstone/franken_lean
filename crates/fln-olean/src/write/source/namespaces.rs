@@ -51,6 +51,7 @@ impl Encoder {
         constants: &[ConstantInfo],
         namespaces: &[Name],
         instances: &[InstanceEntry],
+        simp: &[SimpEntry],
     ) -> WResult<Vec<Name>> {
         let mut names = HashSet::new();
         for mut namespace in constants
@@ -61,6 +62,7 @@ impl Encoder {
                     .iter()
                     .filter_map(|instance| instance.scope.clone()),
             )
+            .chain(simp.iter().filter_map(|entry| entry.scope.clone()))
         {
             while !namespace.is_anonymous() {
                 // Every previous walk finished its ancestor chain. A shared
@@ -106,11 +108,13 @@ pub(super) fn encode(
         input.constants,
         &metadata.namespaces,
         &metadata.instances,
+        &metadata.simp,
     )?;
     if namespaces.is_empty() {
         return if metadata.classes.is_empty()
             && metadata.instances.is_empty()
             && metadata.defaults.is_empty()
+            && metadata.simp.is_empty()
             && metadata.aliases.is_empty()
             && metadata.protected.is_empty()
             && metadata.aux_recursors.is_empty()
@@ -244,7 +248,7 @@ mod tests {
             value: Expr::const_(name("Unrelated.candidate"), vec![]),
             priority: 1000,
             synth_order: vec![],
-            keys: vec![InstanceKey::Const(name("Class"), 0)],
+            keys: vec![DiscrTreeKey::Const(name("Class"), 0)],
             scope,
         };
         let encoder = Encoder::new(WriteBudget::default(), 2).unwrap();
@@ -253,7 +257,9 @@ mod tests {
             row(Some(escaped.clone())),
             row(None),
         ];
-        let actual = encoder.declaration_namespaces(&[], &[], &rows).unwrap();
+        let actual = encoder
+            .declaration_namespaces(&[], &[], &rows, &[])
+            .unwrap();
         let mut expected = vec![
             name("Feature"),
             name("Feature.Inner"),
@@ -274,7 +280,7 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            limited.declaration_namespaces(&[], &[], &rows),
+            limited.declaration_namespaces(&[], &[], &rows, &[]),
             Err(WriteError::Budget {
                 resource: WriteResource::Objects,
                 ..
@@ -293,14 +299,16 @@ mod tests {
         expected.sort_by(Name::quick_cmp);
         assert_eq!(
             encoder
-                .declaration_namespaces(&constants, &[], &[])
+                .declaration_namespaces(&constants, &[], &[], &[])
                 .unwrap(),
             expected
         );
         let mut reversed = constants;
         reversed.reverse();
         assert_eq!(
-            encoder.declaration_namespaces(&reversed, &[], &[]).unwrap(),
+            encoder
+                .declaration_namespaces(&reversed, &[], &[], &[])
+                .unwrap(),
             expected
         );
     }
@@ -311,7 +319,7 @@ mod tests {
         let constants = [constant(Name::str(parent.clone(), "value"))];
         let mut encoder = Encoder::new(WriteBudget::default(), 2).unwrap();
         let namespaces = encoder
-            .declaration_namespaces(&constants, &[], &[])
+            .declaration_namespaces(&constants, &[], &[], &[])
             .unwrap();
         assert!(namespaces.contains(&parent));
         assert!(namespaces.contains(&Name::str(Name::anonymous(), "A.B")));
@@ -473,13 +481,13 @@ mod tests {
         .unwrap();
         assert_eq!(
             encoder
-                .declaration_namespaces(&[], &[Name::anonymous()], &[])
+                .declaration_namespaces(&[], &[Name::anonymous()], &[], &[])
                 .unwrap(),
             vec![Name::anonymous()]
         );
         assert!(
             encoder
-                .declaration_namespaces(&[], &[name("A")], &[])
+                .declaration_namespaces(&[], &[name("A")], &[], &[])
                 .is_err()
         );
     }
@@ -496,7 +504,7 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            limited.declaration_namespaces(&constants, &[], &[]),
+            limited.declaration_namespaces(&constants, &[], &[], &[]),
             Err(WriteError::Budget {
                 resource: WriteResource::Objects,
                 ..
@@ -505,7 +513,7 @@ mod tests {
         let fresh = Encoder::new(WriteBudget::default(), 2).unwrap();
         assert_eq!(
             fresh
-                .declaration_namespaces(&constants, &[], &[])
+                .declaration_namespaces(&constants, &[], &[], &[])
                 .unwrap()
                 .len(),
             4

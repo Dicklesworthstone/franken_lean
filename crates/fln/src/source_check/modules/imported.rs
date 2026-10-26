@@ -1322,17 +1322,17 @@ impl Registrar for instances::imported::ImportActivation {
 }
 
 /// A decoded stored `DiscrTree.Key` as the native instance index holds it.
-fn instance_key(key: metadata::InstanceKey) -> instances::discr_tree::Key {
+fn instance_key(key: metadata::DiscrTreeKey) -> instances::discr_tree::Key {
     use instances::discr_tree::Key;
-    use metadata::InstanceKey;
+    use metadata::DiscrTreeKey;
     match key {
-        InstanceKey::Star => Key::Star,
-        InstanceKey::Other => Key::Other,
-        InstanceKey::Lit(literal) => Key::Lit(literal),
-        InstanceKey::FVar(name, arity) => Key::FVar(fln_core::expr::FVarId(name), arity),
-        InstanceKey::Const(name, arity) => Key::Const(name, arity),
-        InstanceKey::Arrow => Key::Arrow,
-        InstanceKey::Proj(name, field, arity) => Key::Proj(name, field, arity),
+        DiscrTreeKey::Star => Key::Star,
+        DiscrTreeKey::Other => Key::Other,
+        DiscrTreeKey::Lit(literal) => Key::Lit(literal),
+        DiscrTreeKey::FVar(name, arity) => Key::FVar(fln_core::expr::FVarId(name), arity),
+        DiscrTreeKey::Const(name, arity) => Key::Const(name, arity),
+        DiscrTreeKey::Arrow => Key::Arrow,
+        DiscrTreeKey::Proj(name, field, arity) => Key::Proj(name, field, arity),
     }
 }
 

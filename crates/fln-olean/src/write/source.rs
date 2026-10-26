@@ -6,9 +6,9 @@
 use super::*;
 use crate::source_extension_format as layout;
 use crate::source_extensions::{
-    AliasEntry, ClassEntry, DefaultEntry, ExternAttribute, ExternEntry, ImplementedByEntry,
-    InlineEntry, InstanceEntry, InstanceKey, ReducibilityEntry, StructureEntry, StructureField,
-    StructureParent,
+    AliasEntry, ClassEntry, DefaultEntry, DiscrTreeKey, ExternAttribute, ExternEntry,
+    ImplementedByEntry, InlineEntry, InstanceEntry, ReducibilityEntry, SimpEntry, SimpKind,
+    SimpTheorem, StructureEntry, StructureField, StructureParent,
 };
 use std::collections::HashSet;
 
@@ -19,6 +19,7 @@ mod inlining;
 mod instances;
 mod namespaces;
 mod reducibility;
+mod simp;
 mod structures;
 
 #[derive(Debug, Clone, Default)]
@@ -31,6 +32,9 @@ pub struct SourceMetadata {
     /// Chronological module-owned defaults, preserving repeated registrations
     /// and rows for candidates whose declarations belong to imported modules.
     pub defaults: Vec<DefaultEntry>,
+    /// Chronological default simp registrations, retaining proof orientation,
+    /// scopes, priorities and the pin's discrimination-tree paths.
+    pub simp: Vec<SimpEntry>,
     /// Chronological module-owned `export` aliases, including imported targets.
     pub aliases: Vec<AliasEntry>,
     /// The module's own `protected` declarations: the pin's `protectedExt`
@@ -129,6 +133,9 @@ impl Encoder {
         }
         if !metadata.defaults.is_empty() {
             blocks.push(self.default_block(&metadata.defaults)?);
+        }
+        if !metadata.simp.is_empty() {
+            blocks.push(self.simp_block(&metadata.simp)?);
         }
         if !metadata.aliases.is_empty() {
             blocks.push(self.alias_block(&metadata.aliases)?);

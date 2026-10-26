@@ -266,8 +266,8 @@ fn polymorphic_instances_survive_compilation_and_dual_checked_import() {
     assert_eq!(
         rows[0].keys,
         [
-            source_extensions::InstanceKey::Const(name("Mapper"), 1),
-            source_extensions::InstanceKey::Star
+            source_extensions::DiscrTreeKey::Const(name("Mapper"), 1),
+            source_extensions::DiscrTreeKey::Star
         ]
     );
     let receipt = imported(&built);

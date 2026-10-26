@@ -18,16 +18,16 @@ fn name(text: &str) -> Name {
     Name::from_components(text.split('.'))
 }
 
-fn instance_key(key: metadata::InstanceKey) -> fln_elab::instances::discr_tree::Key {
+fn instance_key(key: metadata::DiscrTreeKey) -> fln_elab::instances::discr_tree::Key {
     use fln_elab::instances::discr_tree::Key;
     match key {
-        metadata::InstanceKey::Star => Key::Star,
-        metadata::InstanceKey::Other => Key::Other,
-        metadata::InstanceKey::Lit(literal) => Key::Lit(literal),
-        metadata::InstanceKey::FVar(name, arity) => Key::FVar(fln_core::expr::FVarId(name), arity),
-        metadata::InstanceKey::Const(name, arity) => Key::Const(name, arity),
-        metadata::InstanceKey::Arrow => Key::Arrow,
-        metadata::InstanceKey::Proj(name, field, arity) => Key::Proj(name, field, arity),
+        metadata::DiscrTreeKey::Star => Key::Star,
+        metadata::DiscrTreeKey::Other => Key::Other,
+        metadata::DiscrTreeKey::Lit(literal) => Key::Lit(literal),
+        metadata::DiscrTreeKey::FVar(name, arity) => Key::FVar(fln_core::expr::FVarId(name), arity),
+        metadata::DiscrTreeKey::Const(name, arity) => Key::Const(name, arity),
+        metadata::DiscrTreeKey::Arrow => Key::Arrow,
+        metadata::DiscrTreeKey::Proj(name, field, arity) => Key::Proj(name, field, arity),
     }
 }
 

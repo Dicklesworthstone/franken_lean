@@ -71,7 +71,7 @@ fn theorem() -> metadata::SimpEntry {
             permutation: false,
             reflexive: false,
             backward_reflexive: false,
-            key_count: 1,
+            keys: vec![metadata::DiscrTreeKey::Const(n("Nat.zero"), 0)],
         }),
     }
 }

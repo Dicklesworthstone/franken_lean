@@ -200,26 +200,26 @@ impl PendingArtifact {
         }
         for instance in registrations.instances {
             use fln_elab::instances::discr_tree::Key;
-            use fln_olean::source_extensions::{InstanceEntry, InstanceKey};
+            use fln_olean::source_extensions::{DiscrTreeKey, InstanceEntry};
             meter.work(1)?;
             meter.bytes(instance.synth_order.len().saturating_mul(4))?;
             meter.bytes(
                 instance
                     .keys
                     .len()
-                    .saturating_mul(std::mem::size_of::<InstanceKey>()),
+                    .saturating_mul(std::mem::size_of::<DiscrTreeKey>()),
             )?;
             let keys = instance
                 .keys
                 .into_iter()
                 .map(|key| match key {
-                    Key::Star => InstanceKey::Star,
-                    Key::Other => InstanceKey::Other,
-                    Key::Lit(value) => InstanceKey::Lit(value),
-                    Key::FVar(id, arity) => InstanceKey::FVar(id.0, arity),
-                    Key::Const(name, arity) => InstanceKey::Const(name, arity),
-                    Key::Arrow => InstanceKey::Arrow,
-                    Key::Proj(name, index, arity) => InstanceKey::Proj(name, index, arity),
+                    Key::Star => DiscrTreeKey::Star,
+                    Key::Other => DiscrTreeKey::Other,
+                    Key::Lit(value) => DiscrTreeKey::Lit(value),
+                    Key::FVar(id, arity) => DiscrTreeKey::FVar(id.0, arity),
+                    Key::Const(name, arity) => DiscrTreeKey::Const(name, arity),
+                    Key::Arrow => DiscrTreeKey::Arrow,
+                    Key::Proj(name, index, arity) => DiscrTreeKey::Proj(name, index, arity),
                 })
                 .collect();
             metadata.instances.push(InstanceEntry {

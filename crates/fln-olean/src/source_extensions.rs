@@ -70,14 +70,14 @@ pub struct InstanceEntry {
     /// `src/Lean/Meta/Instances.lean`) and stored with it. The pin never stores
     /// an empty path. FrankenLean's own artifacts may, and an empty path leaves
     /// the instance out of the index, so it is never filtered.
-    pub keys: Vec<InstanceKey>,
+    pub keys: Vec<DiscrTreeKey>,
 }
 
 /// One edge of a pin `DiscrTree` path (`DiscrTree.Key`, vendored
 /// `src/Lean/Meta/DiscrTree/Types.lean`), in constructor order. Arities and
 /// projection indices are the pin's `Nat`s, bounded here to `u32`.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum InstanceKey {
+pub enum DiscrTreeKey {
     Star,
     Other,
     Lit(Literal),
@@ -217,7 +217,7 @@ pub struct DecodeLimits {
     /// Cumulative journal rows, extern list cells, and structure array cells.
     pub max_entries: usize,
     pub max_indices: usize,
-    /// Cumulative instance `DiscrTree` keys across the batch.
+    /// Cumulative instance and simp `DiscrTree` keys across the batch.
     pub max_keys: usize,
 }
 impl Default for DecodeLimits {
@@ -329,26 +329,26 @@ impl Reader {
         }
         Ok(out)
     }
-    /// `InstanceEntry.keys`. A field-less key is a boxed scalar carrying its
+    /// Instance and simp keys. A field-less key is a boxed scalar carrying its
     /// constructor index; every other key is a constructor object with that tag.
-    fn keys(&mut self, obj: &Obj) -> Result<Vec<InstanceKey>, DecodeError> {
+    fn keys(&mut self, obj: &Obj) -> Result<Vec<DiscrTreeKey>, DecodeError> {
         let size = array_length(obj)?;
         self.keys_left = self
             .keys_left
             .checked_sub(size)
-            .ok_or_else(|| limit("instance keys"))?;
+            .ok_or_else(|| limit("discrimination keys"))?;
         let mut out = Vec::with_capacity(size);
         for index in 0..size {
             out.push(self.key(&obj.array_child(index))?);
         }
         Ok(out)
     }
-    fn key(&mut self, obj: &Obj) -> Result<InstanceKey, DecodeError> {
+    fn key(&mut self, obj: &Obj) -> Result<DiscrTreeKey, DecodeError> {
         if obj.is_scalar() {
             return match u8::try_from(obj.unbox()) {
-                Ok(format::KEY_STAR) => Ok(InstanceKey::Star),
-                Ok(format::KEY_OTHER) => Ok(InstanceKey::Other),
-                Ok(format::KEY_ARROW) => Ok(InstanceKey::Arrow),
+                Ok(format::KEY_STAR) => Ok(DiscrTreeKey::Star),
+                Ok(format::KEY_OTHER) => Ok(DiscrTreeKey::Other),
+                Ok(format::KEY_ARROW) => Ok(DiscrTreeKey::Arrow),
                 _ => Err(shape("unknown field-less DiscrTree key")),
             };
         }
@@ -360,25 +360,25 @@ impl Reader {
                     .conversion
                     .project_literal(&field(obj, 0)?)
                     .map_err(DecodeError::Conversion)?;
-                Ok(InstanceKey::Lit(literal))
+                Ok(DiscrTreeKey::Lit(literal))
             }
             format::KEY_FVAR => {
                 constructor(obj, tag, format::KEY_FVAR_POINTERS)?;
-                Ok(InstanceKey::FVar(
+                Ok(DiscrTreeKey::FVar(
                     self.name(&field(obj, 0)?)?,
                     natural(&field(obj, 1)?)?,
                 ))
             }
             format::KEY_CONST => {
                 constructor(obj, tag, format::KEY_CONST_POINTERS)?;
-                Ok(InstanceKey::Const(
+                Ok(DiscrTreeKey::Const(
                     self.name(&field(obj, 0)?)?,
                     natural(&field(obj, 1)?)?,
                 ))
             }
             format::KEY_PROJ => {
                 constructor(obj, tag, format::KEY_PROJ_POINTERS)?;
-                Ok(InstanceKey::Proj(
+                Ok(DiscrTreeKey::Proj(
                     self.name(&field(obj, 0)?)?,
                     natural(&field(obj, 1)?)?,
                     natural(&field(obj, 2)?)?,

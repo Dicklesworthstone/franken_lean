@@ -4,8 +4,8 @@ use fln_core::expr::{Literal, NatLit};
 use fln_core::name::Name;
 use fln_olean::region::{OleanView, OpaqueExtensionBlock, WalkBudget};
 use fln_olean::source_extensions::{
-    DecodeError, DecodeLimits, InlineKind, InstanceKey, ReducibilityStatus, SourceExtensions,
-    decode,
+    DecodeError, DecodeLimits, DiscrTreeKey, InlineKind, ReducibilityStatus, SimpKind,
+    SourceExtensions, decode,
 };
 use fln_rt::convert::inject_name;
 use fln_rt::obj::Obj;
@@ -503,8 +503,8 @@ fn real_prelude_instance_keys_are_the_pins_paths() {
             .keys
             .clone()
     };
-    let c = |name: &str, arity: u32| InstanceKey::Const(n(name), arity);
-    use InstanceKey::{Arrow, Other, Star};
+    let c = |name: &str, arity: u32| DiscrTreeKey::Const(n(name), arity);
+    use DiscrTreeKey::{Arrow, Other, Star};
     assert_eq!(
         keys("instDecidableAnd"),
         [c("Decidable", 1), c("And", 2), Star, Star]
@@ -537,7 +537,7 @@ fn real_prelude_instance_keys_are_the_pins_paths() {
     let mut kinds = [0usize; 7];
     for row in &decoded.instances {
         assert!(
-            matches!(row.keys[0], InstanceKey::Const(..)),
+            matches!(row.keys[0], DiscrTreeKey::Const(..)),
             "{:?}",
             row.declaration
         );
@@ -545,16 +545,24 @@ fn real_prelude_instance_keys_are_the_pins_paths() {
             kinds[match key {
                 Star => 0,
                 Other => 1,
-                InstanceKey::Lit(_) => 2,
-                InstanceKey::FVar(..) => 3,
-                InstanceKey::Const(..) => 4,
+                DiscrTreeKey::Lit(_) => 2,
+                DiscrTreeKey::FVar(..) => 3,
+                DiscrTreeKey::Const(..) => 4,
                 Arrow => 5,
-                InstanceKey::Proj(..) => 6,
+                DiscrTreeKey::Proj(..) => 6,
             }] += 1;
         }
     }
     assert_eq!(kinds, [239, 1, 0, 0, 289, 5, 0]);
-    let total: usize = kinds.iter().sum();
+    let simp_keys: usize = decoded
+        .simps
+        .iter()
+        .map(|entry| match &entry.kind {
+            SimpKind::Theorem(theorem) => theorem.keys.len(),
+            _ => 0,
+        })
+        .sum();
+    let total: usize = kinds.iter().sum::<usize>() + simp_keys;
     let limits = |max_keys| DecodeLimits {
         max_keys,
         ..Default::default()
@@ -599,15 +607,15 @@ fn every_key_kind_decodes_and_forged_keys_refuse() {
     assert_eq!(
         decoded.instances[0].keys,
         [
-            InstanceKey::Const(n("Decidable"), 1),
-            InstanceKey::Lit(Literal::Nat(NatLit::from_u64(5))),
-            InstanceKey::Lit(Literal::Nat(NatLit::from_limbs_le(vec![0, 1]))),
-            InstanceKey::Lit(Literal::Str("é".into())),
-            InstanceKey::Proj(n("Subtype"), 0, 0),
-            InstanceKey::FVar(n("h"), 2),
-            InstanceKey::Star,
-            InstanceKey::Other,
-            InstanceKey::Arrow,
+            DiscrTreeKey::Const(n("Decidable"), 1),
+            DiscrTreeKey::Lit(Literal::Nat(NatLit::from_u64(5))),
+            DiscrTreeKey::Lit(Literal::Nat(NatLit::from_limbs_le(vec![0, 1]))),
+            DiscrTreeKey::Lit(Literal::Str("é".into())),
+            DiscrTreeKey::Proj(n("Subtype"), 0, 0),
+            DiscrTreeKey::FVar(n("h"), 2),
+            DiscrTreeKey::Star,
+            DiscrTreeKey::Other,
+            DiscrTreeKey::Arrow,
         ]
     );
     // FrankenLean's own artifacts store no path; that instance is left unindexed.

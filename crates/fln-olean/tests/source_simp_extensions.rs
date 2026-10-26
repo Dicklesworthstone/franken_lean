@@ -1,9 +1,17 @@
 //! Pinned simp journals and independently constructed hostile entry shapes.
 #![forbid(unsafe_code)]
-use fln_core::expr::Expr;
+use fln_core::expr::{Expr, FVarId, Literal, MVarId, NatLit};
+use fln_core::level::{LMVarId, Level};
 use fln_core::name::Name;
 use fln_olean::region::{OleanView, OpaqueExtensionBlock, WalkBudget};
-use fln_olean::source_extensions::{DecodeError, DecodeLimits, SIMP_EXTENSION, SimpKind, decode};
+use fln_olean::source_extensions::{
+    DecodeError, DecodeLimits, DiscrTreeKey, SIMP_EXTENSION, SimpEntry, SimpKind, SimpTheorem,
+    decode,
+};
+use fln_olean::write::source::{SourceMetadata, encode_module_with_source_metadata};
+use fln_olean::write::{
+    EncodedModule, ModuleWriteInput, OleanWriteHeader, WriteBudget, WriteError,
+};
 use fln_rt::convert::{inject_expr, inject_name};
 use fln_rt::obj::Obj;
 use fln_rt::region::compact;
@@ -77,11 +85,29 @@ fn pinned_prelude_simp_journal_retains_actual_proofs_and_origins() {
     };
     assert_eq!(rule.origin, n("id_eq"));
     assert_eq!(rule.priority, 1000);
-    assert_eq!(rule.key_count, 3);
+    assert_eq!(
+        rule.keys,
+        [
+            DiscrTreeKey::Const(n("id"), 2),
+            DiscrTreeKey::Star,
+            DiscrTreeKey::Star,
+        ]
+    );
     assert!(rule.post && rule.reflexive && rule.backward_reflexive);
     assert!(!rule.origin_reverse && !rule.permutation);
     assert_eq!(decoded.simps[2].kind, SimpKind::Unfold(n("Eq.ndrec_symm")));
     assert!(!decoded.uninterpreted.contains(&n(SIMP_EXTENSION)));
+    for &version in fln_olean::format::OLEAN_ACCEPTED_VERSIONS {
+        let encoded = write_simps(decoded.simps.clone(), version, WriteBudget::default()).unwrap();
+        let blocks = OleanView::parse(&encoded.bytes)
+            .unwrap()
+            .extension_payloads(WalkBudget::default(), 1 << 20)
+            .unwrap();
+        assert_eq!(
+            decode(&blocks, DecodeLimits::default()).unwrap().simps,
+            decoded.simps
+        );
+    }
 }
 
 #[test]
@@ -233,4 +259,274 @@ fn simp_entries_and_index_cells_share_cumulative_limits() {
         .len(),
         2
     );
+}
+
+fn write_simps(
+    simp: Vec<SimpEntry>,
+    version: u8,
+    budget: WriteBudget,
+) -> Result<EncodedModule, WriteError> {
+    encode_module_with_source_metadata(
+        ModuleWriteInput {
+            is_module: false,
+            imports: &[],
+            constants: &[],
+            extra_const_names: &[],
+        },
+        &SourceMetadata {
+            simp,
+            ..SourceMetadata::default()
+        },
+        OleanWriteHeader {
+            version,
+            flags: 1,
+            lean_version: fln_olean::format::PIN_TAG.strip_prefix('v').unwrap(),
+            githash: fln_olean::format::PIN_COMMIT,
+            base_addr: 2 * fln_olean::format::REGION_ALIGN as u64,
+        },
+        budget,
+    )
+}
+
+fn writer_theorem() -> SimpTheorem {
+    use DiscrTreeKey::*;
+    SimpTheorem {
+        proof: Expr::const_(
+            Name::num(n("_private.Library"), 17),
+            vec![Level::param(n("u"))],
+        ),
+        level_params: vec![n("u")],
+        origin: n("Library.rule"),
+        origin_reverse: false,
+        priority: 1000,
+        post: true,
+        permutation: false,
+        reflexive: false,
+        backward_reflexive: false,
+        keys: vec![
+            Const(n("head"), 7),
+            Star,
+            Other,
+            Lit(Literal::Nat(NatLit::from_limbs_le(vec![0, 1]))),
+            Lit(Literal::Str("λ".into())),
+            FVar(n("x"), 1),
+            Star,
+            Arrow,
+            Const(n("Type"), 0),
+            Proj(n("Structure"), 2, 1),
+            Const(n("structureValue"), 0),
+            Star,
+        ],
+    }
+}
+
+#[test]
+fn writer_preserves_all_keys_flags_oriented_proofs_scopes_and_journal_order() {
+    let mut rows = Vec::new();
+    for flags in 0..32u32 {
+        let mut theorem = writer_theorem();
+        theorem.priority -= flags;
+        theorem.post = flags & 1 != 0;
+        theorem.origin_reverse = flags & 2 != 0;
+        theorem.permutation = flags & 4 != 0;
+        theorem.reflexive = flags & 8 != 0;
+        theorem.backward_reflexive = flags & 16 != 0;
+        rows.push(SimpEntry {
+            scope: (flags % 2 == 0).then(|| n("Feature.Nested")),
+            kind: SimpKind::Theorem(theorem),
+        });
+    }
+    rows.push(SimpEntry {
+        scope: None,
+        kind: SimpKind::Unfold(n("function")),
+    });
+    rows.push(SimpEntry {
+        scope: Some(n("Feature")),
+        kind: SimpKind::UnfoldTheorems {
+            declaration: n("function"),
+            theorems: vec![n("function.eq_2"), n("function.eq_1")],
+        },
+    });
+    for &version in fln_olean::format::OLEAN_ACCEPTED_VERSIONS {
+        let encoded = write_simps(rows.clone(), version, WriteBudget::default()).unwrap();
+        let blocks = OleanView::parse(&encoded.bytes)
+            .unwrap()
+            .extension_payloads(WalkBudget::default(), 1 << 20)
+            .unwrap();
+        let decoded = decode(&blocks, DecodeLimits::default()).unwrap();
+        assert_eq!(decoded.simps, rows);
+        assert!(decoded.namespaces.contains(&n("Feature")));
+        assert!(decoded.namespaces.contains(&n("Feature.Nested")));
+        assert!(decoded.uninterpreted.is_empty());
+        assert_eq!(
+            write_simps(rows.clone(), version, WriteBudget::default())
+                .unwrap()
+                .bytes,
+            encoded.bytes
+        );
+    }
+}
+
+#[test]
+fn malformed_simp_keys_are_decoded_and_key_budget_is_cumulative() {
+    let with_keys = |keys| {
+        let inner = theorem(&n("rule"), &Expr::const_(n("rule"), vec![]), 1, 0, 0).ctor_child(0);
+        let mut fields: Vec<_> = (0..5).map(|index| inner.ctor_child(index)).collect();
+        fields[0] = Obj::mk_array(keys);
+        global(Obj::mk_ctor(
+            0,
+            vec![Obj::mk_ctor(0, fields, &[1, 0, 0, 1])],
+            &[],
+        ))
+    };
+    let good = with_keys(vec![
+        Obj::mk_ctor(4, vec![inject_name(&n("head")), Obj::mk_nat(1)], &[]),
+        Obj::mk_nat(0),
+    ]);
+    let blocks = block(&[good.clone_ref(), good.clone_ref()]);
+    assert_eq!(
+        decode(
+            &blocks,
+            DecodeLimits {
+                max_keys: 4,
+                ..DecodeLimits::default()
+            }
+        )
+        .unwrap()
+        .simps
+        .len(),
+        2
+    );
+    assert!(matches!(
+        decode(
+            &blocks,
+            DecodeLimits {
+                max_keys: 3,
+                ..DecodeLimits::default()
+            }
+        ),
+        Err(DecodeError::Limit { .. })
+    ));
+    for key in [
+        Obj::mk_nat(7),
+        Obj::mk_nat(4),
+        Obj::mk_ctor(4, vec![inject_name(&n("head"))], &[]),
+        Obj::mk_ctor(
+            4,
+            vec![inject_name(&Name::anonymous()), Obj::mk_nat(0)],
+            &[],
+        ),
+    ] {
+        assert!(matches!(
+            decode(
+                &block(&[good.clone_ref(), with_keys(vec![key])]),
+                DecodeLimits::default()
+            ),
+            Err(DecodeError::Shape { .. })
+        ));
+    }
+}
+
+#[test]
+fn writer_refuses_local_proofs_malformed_paths_and_invalid_names() {
+    for defect in 0..11 {
+        let mut theorem = writer_theorem();
+        match defect {
+            0 => theorem.origin = Name::anonymous(),
+            1 => theorem.proof = Expr::bvar(0).unwrap(),
+            2 => theorem.proof = Expr::fvar(FVarId(n("local"))),
+            3 => theorem.proof = Expr::mvar(MVarId(n("meta"))),
+            4 => theorem.proof = Expr::const_(n("rule"), vec![Level::mvar(LMVarId(n("level")))]),
+            5 => theorem.keys.clear(),
+            6 => theorem.keys = vec![DiscrTreeKey::Const(n("head"), 1)],
+            7 => theorem.keys = vec![DiscrTreeKey::Star, DiscrTreeKey::Other],
+            8 => theorem.keys = vec![DiscrTreeKey::Const(Name::anonymous(), 0)],
+            9 => theorem.level_params = vec![n("u"), n("u")],
+            _ => theorem.level_params = vec![Name::anonymous()],
+        }
+        assert!(
+            matches!(
+                write_simps(
+                    vec![SimpEntry {
+                        scope: None,
+                        kind: SimpKind::Theorem(theorem)
+                    }],
+                    2,
+                    WriteBudget::default()
+                ),
+                Err(WriteError::Contract { .. })
+            ),
+            "defect {defect}"
+        );
+    }
+    for row in [
+        SimpEntry {
+            scope: Some(Name::anonymous()),
+            kind: SimpKind::Unfold(n("function")),
+        },
+        SimpEntry {
+            scope: None,
+            kind: SimpKind::Unfold(Name::anonymous()),
+        },
+        SimpEntry {
+            scope: None,
+            kind: SimpKind::UnfoldTheorems {
+                declaration: Name::anonymous(),
+                theorems: vec![],
+            },
+        },
+        SimpEntry {
+            scope: None,
+            kind: SimpKind::UnfoldTheorems {
+                declaration: n("function"),
+                theorems: vec![Name::anonymous()],
+            },
+        },
+        SimpEntry {
+            scope: None,
+            kind: SimpKind::UnfoldTheorems {
+                declaration: n("function"),
+                theorems: vec![n("eq"), n("eq")],
+            },
+        },
+    ] {
+        assert!(matches!(
+            write_simps(vec![row], 2, WriteBudget::default()),
+            Err(WriteError::Contract { .. })
+        ));
+    }
+}
+
+#[test]
+fn simp_writer_charges_all_objects_and_bytes_to_the_module_budget() {
+    let rows = vec![SimpEntry {
+        scope: Some(n("Feature")),
+        kind: SimpKind::Theorem(writer_theorem()),
+    }];
+    for &version in fln_olean::format::OLEAN_ACCEPTED_VERSIONS {
+        let output = write_simps(rows.clone(), version, WriteBudget::default()).unwrap();
+        let exact = WriteBudget {
+            max_bytes: output.report.file_bytes,
+            max_objects: output.report.runtime_objects,
+        };
+        assert_eq!(
+            write_simps(rows.clone(), version, exact).unwrap().bytes,
+            output.bytes
+        );
+        for budget in [
+            WriteBudget {
+                max_bytes: exact.max_bytes - 1,
+                ..exact
+            },
+            WriteBudget {
+                max_objects: exact.max_objects - 1,
+                ..exact
+            },
+        ] {
+            assert!(matches!(
+                write_simps(rows.clone(), version, budget),
+                Err(WriteError::Budget { .. })
+            ));
+        }
+    }
 }
