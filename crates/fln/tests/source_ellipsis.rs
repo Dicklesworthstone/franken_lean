@@ -205,6 +205,58 @@ theorem false_eq : Eq (alternatives { child := { left := 4, right := 9 }, flag :
 }
 
 #[test]
+fn dotted_record_patterns_instantiate_generic_and_inherited_field_types() {
+    with_fixture(|base, compiler| {
+        check(
+            base,
+            compiler,
+            r#"
+universe u
+structure Inner where
+  value : Nat
+  spare : Nat
+structure Wrapper (A : Type u) where
+  inside : A
+  flag : Bool
+def dotted : Wrapper Inner -> Nat
+  | { inside.value := x, inside.spare := _, flag := _ } => x
+def subset : Wrapper Inner -> Nat
+  | { inside.value := x, .. } => x
+structure Base (A : Type u) where
+  entry : A
+structure Child (A : Type u) extends Base A where
+  count : Nat
+def inherited : Child Inner -> Nat
+  | { entry.value := x, .. } => x
+def explicitParent : Child Inner -> Nat
+  | { toBase.entry.value := x, toBase.entry.spare := _, count := _ } => x
+structure Cell (A : Type u) where
+  value : A
+def generic (A : Type u) : Wrapper (Cell A) -> A
+  | { inside.value := x, flag := _ } => x
+def deep : Wrapper (Wrapper Inner) -> Nat
+  | { inside.inside.value := x, .. } => x
+abbrev Alias := Wrapper Inner
+def aliased : Alias -> Nat
+  | all@{ inside.value := x, .. } => x
+def alternatives : Wrapper Inner -> Nat
+  | { inside.value := x, flag := true, .. } => x
+  | { inside.spare := x, flag := false, .. } => x
+theorem dotted_eq : Eq (dotted { inside := { value := 4, spare := 9 }, flag := true }) 4 := Eq.refl 4
+theorem subset_eq : Eq (subset { inside := { value := 4, spare := 9 }, flag := true }) 4 := Eq.refl 4
+theorem inherited_eq : Eq (inherited { entry := { value := 4, spare := 9 }, count := 7 }) 4 := Eq.refl 4
+theorem explicitParent_eq : Eq (explicitParent { entry := { value := 4, spare := 9 }, count := 7 }) 4 := Eq.refl 4
+theorem generic_eq : Eq (generic Nat { inside := { value := 9 }, flag := false }) 9 := Eq.refl 9
+theorem deep_eq : Eq (deep { inside := { inside := { value := 13, spare := 9 }, flag := false }, flag := true }) 13 := Eq.refl 13
+theorem aliased_eq : Eq (aliased { inside := { value := 4, spare := 9 }, flag := true }) 4 := Eq.refl 4
+theorem alternatives_true : Eq (alternatives { inside := { value := 4, spare := 9 }, flag := true }) 4 := Eq.refl 4
+theorem alternatives_false : Eq (alternatives { inside := { value := 4, spare := 9 }, flag := false }) 9 := Eq.refl 9
+"#,
+        );
+    });
+}
+
+#[test]
 fn dependent_record_patterns_keep_implicit_fields_and_scope_checks() {
     with_fixture(|base, compiler| {
         check(
@@ -314,6 +366,19 @@ def dotted : Nested -> Nat | { child.left := x, child.right := y, flag := _ } =>
 #eval alternatives { child := { left := 4, right := 9 }, flag := true }
 #eval alternatives { child := { left := 4, right := 9 }, flag := false }
 #eval dotted { child := { left := 4, right := 9 }, flag := true }
+structure Wrapper (A : Type) where
+  inside : A
+def genericDotted : Wrapper Child -> Nat
+  | { inside.left := x, inside.right := y } => Nat.add x y
+def genericParent : Wrapper Child -> Nat
+  | { inside.toBase.left := x, .. } => x
+def genericAlternative : Wrapper Nested -> Nat
+  | { inside.child.left := x, inside.flag := true, .. } => x
+  | { inside.child.right := y, inside.flag := false, .. } => y
+#eval genericDotted { inside := { left := 4, right := 9 } }
+#eval genericParent { inside := { left := 4, right := 9 } }
+#eval genericAlternative { inside := { child := { left := 4, right := 9 }, flag := true } }
+#eval genericAlternative { inside := { child := { left := 4, right := 9 }, flag := false } }
 "#;
         let path = std::env::temp_dir().join(format!(
             "fln-record-pattern-runtime-{}.lean",
@@ -324,7 +389,7 @@ def dotted : Nested -> Nat | { child.left := x, child.right := y, flag := _ } =>
         assert!(pinned.status.success(), "{pinned:?}");
         assert_eq!(
             String::from_utf8(pinned.stdout).unwrap(),
-            "4\n9\n13\n4\n9\n4\n9\n13\n"
+            "4\n9\n13\n4\n9\n4\n9\n13\n13\n4\n4\n9\n"
         );
         assert!(pinned.stderr.is_empty());
         let options = KVMap::new();
@@ -348,7 +413,7 @@ def dotted : Nested -> Nat | { child.left := x, child.right := y, flag := _ } =>
                     .unwrap()
             })
             .collect();
-        let expected = [4, 9, 13, 4, 9, 4, 9, 13].map(fln::ClosedVmValue::Scalar);
+        let expected = [4, 9, 13, 4, 9, 4, 9, 13, 13, 4, 4, 9].map(fln::ClosedVmValue::Scalar);
         assert_eq!(values, expected);
         assert_eq!(base.logical_root(&options), root);
     });
@@ -372,6 +437,10 @@ fn invalid_record_patterns_are_semantic_refusals_and_publish_no_declarations() {
             "structure Pack : Type 1 where\n A : Type\n value : A\ndef bad : Pack -> Pack | { value := x, A := A } => { A := A, value := x }",
             "structure Pack : Type 1 where\n A : Type\n value : A\nabbrev Alias := Pack\ndef bad : Alias -> Pack | { value := x, A := A } => { A := A, value := x }",
             "structure Pack : Type 1 where\n A : Type\n value : A\ndef Alias := Pack\ndef bad : Alias -> Pack | { value := x, A := A } => { A := A, value := x }",
+            "structure R where\n a : Nat\n b : Nat\nstructure Box (A : Type) where\n value : A\ndef bad : Box R -> Nat | { value.a := x } => x",
+            "structure R where\n a : Nat\nstructure Box (A : Type) where\n value : A\ndef bad : Box R -> Nat | { value.nope := x, .. } => x",
+            "structure R where\n a : Nat\nstructure Box (A : Type) where\n value : A\ndef bad : Box R -> Nat | { value := r, value.a := x } => x",
+            "structure Box (A : Type) where\n value : A\ndef bad : Box Nat -> Nat | { value.nope := x, .. } => x",
         ] {
             oracle(compiler, source, false);
             let options = KVMap::new();

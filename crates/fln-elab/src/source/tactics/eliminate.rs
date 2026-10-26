@@ -1098,7 +1098,7 @@ impl Context {
         let mut scripts = HashMap::new();
         let mut fallback = None;
         if let EliminationSyntax::Match(parts) | EliminationSyntax::RecursiveMatch(parts) = input {
-            let patterns = self.match_patterns(*parts, name, &family.ctors)?;
+            let patterns = self.match_patterns(*parts, name, &family.ctors, &family_type)?;
             for (ctor, (fields, syntax)) in patterns.constructors {
                 scripts.insert(
                     ctor,

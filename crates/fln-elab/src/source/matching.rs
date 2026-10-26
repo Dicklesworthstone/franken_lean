@@ -818,7 +818,7 @@ impl Context {
         let MatchPatterns {
             constructors: mut patterns,
             fallback,
-        } = self.match_patterns(parts, name, &family.ctors)?;
+        } = self.match_patterns(parts, name, &family.ctors, &family_type)?;
         let mut branches = std::collections::VecDeque::new();
         let mut seen = HashSet::new();
         for rule in &rec.rules {
@@ -934,7 +934,8 @@ impl Context {
         else {
             return Err(error(MatchError::UnsupportedFamily));
         };
-        let patterns = self.match_patterns(parts, &constructor.induct, &family.ctors)?;
+        let patterns =
+            self.match_patterns(parts, &constructor.induct, &family.ctors, &major.type_)?;
         let (names, whole, syntax) = match patterns.constructors.get(name) {
             Some((names, syntax)) => (Some(names), None, *syntax),
             None => match patterns.fallback {
@@ -1049,6 +1050,7 @@ impl Context {
         parts: MatchParts<'a>,
         name: &Name,
         constructors: &[Name],
+        family_type: &Expr,
     ) -> Result<MatchPatterns<'a>, NatDefinitionElabError> {
         let mut patterns = HashMap::new();
         if let Some(conditional) = parts.conditional {
@@ -1234,7 +1236,12 @@ impl Context {
                             self.constrain(&actual, &annotated)?;
                             self.flush(false)?;
                         }
-                        self.bind_record_pattern_layout(name, &constructor, layout, &mut fields)?;
+                        self.bind_record_pattern_layout(
+                            family_type,
+                            &constructor,
+                            layout,
+                            &mut fields,
+                        )?;
                         continue;
                     }
                     let arguments: Vec<_> = layout.iter().collect();
