@@ -1,4 +1,4 @@
-{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":716,"projection_hash":"d4f0525845a19986cdb4fd207466e7c7c11cb8441e0d7d6746ce0867638e24a3"}
+{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":718,"projection_hash":"ae9519cd2f7e27a0b0402845abc9748edb1d7a11149090bf27f2459934dd4b03"}
 {"id":"fln-0bw5"}
 {"id":"fln-0eq8"}
 {"id":"fln-0rxm"}
@@ -212,6 +212,7 @@
 {"id":"fln-index-proof-omega-fallback-ov8v"}
 {"id":"fln-inductive-inferred-sort-normalization-f178"}
 {"id":"fln-infoview-rpc-procedures-my8l"}
+{"id":"fln-ingress-string-field-projection-funz"}
 {"id":"fln-init-bnh-council-4444-b443"}
 {"id":"fln-init-chain-council-3116-kipb"}
 {"id":"fln-init-control-council-4698-1yyb"}
@@ -259,6 +260,7 @@
 {"id":"fln-macro-inline-eager-evaluation-ryay"}
 {"id":"fln-macro-rules-atom-kinds-adto"}
 {"id":"fln-macro-rung-e1rk"}
+{"id":"fln-main-init-import-defeq-tag-regression-7vn7"}
 {"id":"fln-mandated-mutant-join-unwatched-uagk"}
 {"id":"fln-manifest-complete-row-preflight-gap-77xh"}
 {"id":"fln-match-alt-column-false-accept-u3fv"}
