@@ -306,6 +306,38 @@ theorem customRepeatMutableReturnValue : @customRepeatMutableReturn stopRepeat =
     }
 }
 
+/// A locally registered loop dictionary indexes the reducible `Unit` alias as PUnit. Its
+/// lexical registration selects the terminating implementation for both result shapes and
+/// restores the imported default dictionary at `end`.
+#[test]
+fn local_repeat_dictionary_indexes_unit_alias_and_restores_scope() {
+    let Some(lib) = pinned_lib() else {
+        return;
+    };
+    let root = workspace();
+    let header = "prelude\nimport Init.While\nimport Init.Control.Except\nimport Init.Control.Id\n";
+    let program = r#"
+abbrev defaultRepeatInstance : ForIn (Except String) Lean.Loop Unit := inferInstance
+section
+local instance stopRepeat : ForIn (Except String) Lean.Loop Unit where
+  forIn _ state _ := pure state
+def localRepeatUnit : Except String Unit := do
+  repeat
+    throw "stop"
+example : localRepeatUnit = Except.ok () := by rfl
+def localRepeatNat : Except String Nat := do
+  repeat
+    throw "stop"
+example : localRepeatNat = Except.error "" := by rfl
+end
+example : (inferInstance : ForIn (Except String) Lean.Loop Unit) = defaultRepeatInstance := by rfl
+"#;
+    let (code, stderr, pinned) =
+        check_with_header(&lib, &root, "local_repeat_alias", header, program);
+    assert_eq!(pinned.unwrap_or(0), 0, "the pinned lean refuses {program}");
+    assert_eq!(code, 0, "{program}\n{stderr}");
+}
+
 /// The generated fallback contains a real `Inhabited (Except String Nat)` dictionary. Its
 /// default is an error action, and its projection must have a runtime layout even when a loop
 /// exits through an exception or return before that fallback can execute.

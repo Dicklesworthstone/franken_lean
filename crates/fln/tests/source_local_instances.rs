@@ -139,6 +139,99 @@ end
 }
 
 #[test]
+fn local_instances_index_reducible_aliases_and_restore_their_selection() {
+    let seed = Engine::with_source_seed(admission())
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let source = r#"class AliasSelection (A : Type) where
+  value : Nat
+instance fallbackAliasSelection (A : Type) : AliasSelection A := ⟨1⟩
+def aliasSelected (A : Type) [AliasSelection A] : Nat := AliasSelection.value (A := A)
+abbrev NatAlias := Nat
+abbrev AppliedAlias.{u} (A : Sort u) : Sort u := A
+#eval aliasSelected Nat
+section
+local instance namedAlias : AliasSelection NatAlias := ⟨7⟩
+#eval aliasSelected Nat
+section
+local instance newestAlias : AliasSelection (AppliedAlias NatAlias) := ⟨9⟩
+#eval aliasSelected Nat
+end
+#eval aliasSelected Nat
+end
+#eval aliasSelected Nat
+#eval @aliasSelected Nat namedAlias
+"#;
+    let checked = checked_files(&seed, &[source], &[1, 7, 9, 7, 1, 7]);
+    for alias in ["NatAlias", "AppliedAlias"] {
+        assert_eq!(
+            fln_elab::reducibility::known_status(checked.environment(), &name(alias)).unwrap(),
+            Some(fln_elab::reducibility::Reducibility::Reducible),
+            "a source abbrev records its status before local instance indexing"
+        );
+    }
+    let completed = executed(&seed, source);
+    assert_eq!(evaluated(&completed.batch), [1, 7, 9, 7, 1, 7]);
+    assert_named_types(
+        &checked,
+        &completed.batch.engine,
+        &["namedAlias", "newestAlias"],
+    );
+    assert_eq!(
+        evaluated(&executed(&checked, "#eval aliasSelected Nat").batch),
+        [1]
+    );
+}
+
+#[test]
+fn source_abbreviation_effects_preserve_execution_and_explicit_reducibility() {
+    use fln_elab::reducibility::{Reducibility, known_status};
+    let seed = Engine::with_source_seed(admission())
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let source = b"abbrev aliasValue : Nat := 7";
+    let admitted = seed
+        .admit_source_declaration(source, &KVMap::new(), admission())
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!(
+        known_status(admitted.engine.environment(), &name("aliasValue")).unwrap(),
+        Some(Reducibility::Reducible)
+    );
+    let executed = seed
+        .execute_source_definition(source, &KVMap::new(), execution_limits())
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!(
+        closed_vm_value(&executed.exit).unwrap(),
+        Some(ClosedVmValue::Scalar(7))
+    );
+    assert_eq!(
+        known_status(executed.engine.environment(), &name("aliasValue")).unwrap(),
+        Some(Reducibility::Reducible)
+    );
+    let explicit = checked_files(&seed, &["@[irreducible] def sealedValue : Nat := 7"], &[]);
+    assert_eq!(
+        known_status(explicit.environment(), &name("sealedValue")).unwrap(),
+        Some(Reducibility::Irreducible)
+    );
+    for refused in [
+        "@[irreducible] abbrev sealedAlias := Nat",
+        "abbrev sealedAlias := Nat\nattribute [irreducible] sealedAlias",
+    ] {
+        assert!(
+            seed.check_source_files(&[refused.as_bytes()], &KVMap::new(), limits())
+                .is_err(),
+            "the pin disallows changing a reducible abbrev to irreducible: {refused}"
+        );
+    }
+}
+
+#[test]
 fn local_registrations_preserve_global_priority_and_registration_order() {
     let base = base();
     let source = r#"#eval selected

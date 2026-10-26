@@ -117,6 +117,9 @@ pub struct InstanceRegistry {
     /// Erased global/local rows retained only for `native_instances`: erasure
     /// changes candidate availability, never a declaration's reducibility.
     inactive: Vec<InstanceEntry>,
+    /// Registration-time metadata of active local instances. Reducibility
+    /// changes cannot replace these keys with a newly derived or fallback path.
+    local_indices: BTreeMap<Name, std::sync::Arc<export::DerivedIndex>>,
     /// The pin's discrimination tree over `imported`, built on first use.
     index: discr_tree::IndexCell,
 }
@@ -389,6 +392,9 @@ impl InstanceRegistry {
     }
     pub fn imported_class_parameters(&self, class: &Name) -> Option<&imported::ClassParameters> {
         self.imported.classes.get(class)
+    }
+    pub(crate) fn local_instance_index(&self, declaration: &Name) -> Option<&export::DerivedIndex> {
+        self.local_indices.get(declaration).map(AsRef::as_ref)
     }
     pub fn imported_instance_parameters(
         &self,

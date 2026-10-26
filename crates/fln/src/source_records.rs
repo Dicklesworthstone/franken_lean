@@ -936,7 +936,7 @@ impl Engine {
             let mut work_left = usize::try_from(kernel.steps)
                 .unwrap_or(usize::MAX)
                 .min(1_000_000);
-            if fln_elab::instances::export::derive_index(
+            if fln_elab::instances::export::derive_local_index(
                 engine.environment(),
                 &registry,
                 name,

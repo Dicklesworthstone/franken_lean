@@ -374,7 +374,15 @@ impl InstanceIndex {
         let mut index = Self::default();
         for row in rows {
             spend(work_left)?;
-            if let Some(parameters) = registry.imported.instances.get(&row.declaration) {
+            if let Some(model) = registry.local_instance_index(&row.declaration) {
+                for _ in &model.keys {
+                    spend(work_left)?;
+                }
+                index.insert(&model.keys, &row.declaration);
+                index
+                    .native_synth_order
+                    .insert(row.declaration.clone(), model.synth_order.clone());
+            } else if let Some(parameters) = registry.imported.instances.get(&row.declaration) {
                 for _ in &parameters.keys {
                     spend(work_left)?;
                 }
