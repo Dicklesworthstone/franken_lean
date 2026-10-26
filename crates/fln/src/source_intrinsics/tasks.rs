@@ -13,13 +13,22 @@ pub(crate) enum Operation {
     Get,
     AsTask,
     Wait,
+    MapTask,
+    BindTask,
 }
 
 impl Operation {
     pub(crate) fn from_name(requested: &Name) -> Option<Self> {
-        [Self::Pure, Self::Get, Self::AsTask, Self::Wait]
-            .into_iter()
-            .find(|operation| requested == &model::name(operation.label()))
+        [
+            Self::Pure,
+            Self::Get,
+            Self::AsTask,
+            Self::Wait,
+            Self::MapTask,
+            Self::BindTask,
+        ]
+        .into_iter()
+        .find(|operation| requested == &model::name(operation.label()))
     }
 
     pub(crate) fn label(self) -> &'static str {
@@ -28,6 +37,8 @@ impl Operation {
             Self::Get => "Task.get",
             Self::AsTask => "BaseIO.asTask",
             Self::Wait => "IO.wait",
+            Self::MapTask => "BaseIO.mapTask",
+            Self::BindTask => "BaseIO.bindTask",
         }
     }
 }
@@ -86,8 +97,10 @@ pub(crate) fn operation_matches(
     if !family_matches(environment, externs, visited, limits)? {
         return Err(unsupported());
     }
-    if matches!(operation, Operation::AsTask | Operation::Wait)
-        && !io::io_world_contract_matches(environment, externs, visited, limits)?
+    if matches!(
+        operation,
+        Operation::AsTask | Operation::Wait | Operation::MapTask | Operation::BindTask
+    ) && !io::io_world_contract_matches(environment, externs, visited, limits)?
     {
         return Err(unsupported());
     }
@@ -96,12 +109,30 @@ pub(crate) fn operation_matches(
     {
         return Err(unsupported());
     }
-    if operation == Operation::AsTask {
+    if matches!(
+        operation,
+        Operation::AsTask | Operation::MapTask | Operation::BindTask
+    ) {
         // The checked Priority abbreviation determines the adapter's Nat
         // argument layout. Its ordinary default is evaluated by the caller.
         check_selected_extern_attribute(
             environment,
             &model::name("Task.Priority"),
+            externs,
+            visited,
+            limits,
+        )?;
+    }
+    if matches!(
+        operation,
+        Operation::Wait | Operation::MapTask | Operation::BindTask
+    ) {
+        // The opaque model references this exact getter. The continuation's
+        // native operation reads the task payload directly, so an absent
+        // getter extern is harmless; a conflicting selected one must not vanish.
+        check_selected_extern_attribute(
+            environment,
+            &model::name("Task.get"),
             externs,
             visited,
             limits,

@@ -13,19 +13,21 @@ use fln_comp::flbc::{ArgumentOwnership, ResultOwnership};
 
 const HANDLE: &str = "_fln_runtime_task_handle";
 const PAYLOAD: &str = "_fln_runtime_task_payload";
-const PRIMITIVES: [&str; 4] = [
+const PRIMITIVES: [&str; 6] = [
     "_fln_runtime_task_pure",
     "_fln_runtime_task_get",
     "_fln_runtime_task_as_task",
     "_fln_runtime_task_wait",
+    "_fln_runtime_task_map_task",
+    "_fln_runtime_task_bind_task",
 ];
 
 #[derive(Default)]
 pub(super) struct Store {
     family: Option<bool>,
-    operations: [bool; 4],
+    operations: [bool; 6],
     next: u64,
-    bindings: [Option<(IntrinsicBinding, Expr)>; 4],
+    bindings: [Option<(IntrinsicBinding, Expr)>; 6],
     payloads: std::collections::HashMap<Expr, Name>,
     recoveries: BTreeMap<Name, (Expr, ValueType)>,
 }
@@ -212,6 +214,8 @@ impl Preparation<'_> {
             Operation::Get => ("defn", "Init.Core", 1, 2, "lean_task_get_own", "pure"),
             Operation::AsTask => ("opaque", "Init.System.IO", 0, 3, "lean_io_as_task", "io"),
             Operation::Wait => ("opaque", "Init.System.IO", 0, 2, "lean_io_wait", "io"),
+            Operation::MapTask => ("opaque", "Init.System.IO", 1, 6, "lean_io_map_task", "io"),
+            Operation::BindTask => ("opaque", "Init.System.IO", 1, 6, "lean_io_bind_task", "io"),
         };
         let row = fln_vm::extern_table_generated::EXTERN_ROWS
             .iter()
@@ -231,6 +235,16 @@ impl Preparation<'_> {
             Operation::Pure => (vec![c(PAYLOAD)], c(HANDLE), ValueType::Task),
             Operation::Get | Operation::Wait => (vec![c(HANDLE)], c(PAYLOAD), ValueType::Abi),
             Operation::AsTask => (vec![c(PAYLOAD), c("Nat")], c(HANDLE), ValueType::Task),
+            Operation::MapTask => (
+                vec![c(PAYLOAD), c(HANDLE), c("Nat"), c("Bool")],
+                c(HANDLE),
+                ValueType::Task,
+            ),
+            Operation::BindTask => (
+                vec![c(HANDLE), c(PAYLOAD), c("Nat"), c("Bool")],
+                c(HANDLE),
+                ValueType::Task,
+            ),
         };
         let mut arguments = Vec::new();
         for domain in &domains {
@@ -273,7 +287,10 @@ impl Preparation<'_> {
                 argument_ownership,
                 result,
                 result_ownership: ResultOwnership::Owned,
-                effect: if matches!(operation, Operation::AsTask | Operation::Wait) {
+                effect: if matches!(
+                    operation,
+                    Operation::AsTask | Operation::Wait | Operation::MapTask | Operation::BindTask
+                ) {
                     EffectClass::Io
                 } else {
                     EffectClass::Task
@@ -423,7 +440,9 @@ impl Preparation<'_> {
                 let body = out(payload.clone(), value, b(0)?);
                 (vec![family, world], body, out_type(payload))
             }
-            Operation::Pure | Operation::Get => unreachable!("Task IO wrapper"),
+            Operation::Pure | Operation::Get | Operation::MapTask | Operation::BindTask => {
+                unreachable!("unary Task IO wrapper")
+            }
         };
         if self.value_type(&result_type)? != Some(ValueType::Constructor) {
             return Err(unsupported("Task checked IO result representation"));
@@ -441,6 +460,139 @@ impl Preparation<'_> {
             type_ = function(domain, type_);
         }
         self.task_typed(wrapper, type_)
+    }
+
+    fn task_composition_wrapper(
+        &mut self,
+        operation: Operation,
+        primitive: Expr,
+        input_family: Expr,
+        output_family: Expr,
+        input: Expr,
+        output: Expr,
+    ) -> Result<Expr, IngressError> {
+        let world = self
+            .st_evaluation_world()?
+            .ok_or_else(|| unsupported("Task checked IO world"))?;
+        let callback_payload = if operation == Operation::MapTask {
+            output
+        } else {
+            output_family.clone()
+        };
+        let callback_result = out_type(callback_payload);
+        if self.value_type(&callback_result)? != Some(ValueType::Constructor) {
+            return Err(unsupported("Task composition action result representation"));
+        }
+        let shape = self
+            .record_shape(&callback_result)?
+            .ok_or_else(|| unsupported("Task composition action result"))?;
+        let [constructor] = shape.constructors.as_slice() else {
+            return Err(unsupported("Task composition action result constructor"));
+        };
+        if constructor.tag != 0
+            || constructor.fields.len() != 2
+            || constructor.type_fields != [false, false]
+        {
+            return Err(unsupported("Task composition action result layout"));
+        }
+        // Within the five source arguments followed by rawValue/token, keep
+        // the captured source world. The VM's token is a raw Nat.
+        let callback_index = if operation == Operation::MapTask {
+            6
+        } else {
+            5
+        };
+        let recovered = self.task_recover(b(1)?, &input)?;
+        let evaluated = apply(b(callback_index)?, [recovered, b(2)?]);
+        let value = Expr::proj(shape.projection(constructor), 0, evaluated);
+        let callback = Expr::lam(
+            self.task_name()?,
+            c(PAYLOAD),
+            Expr::lam(self.task_name()?, c("Nat"), value, BinderInfo::Default),
+            BinderInfo::Default,
+        );
+        // The result remains boxed so a callable payload cannot add arguments
+        // to the VM continuation or delay the IO action until application.
+        let callback = self.task_typed(
+            callback,
+            function(c(PAYLOAD), function(c("Nat"), c(PAYLOAD))),
+        )?;
+        let (source_domains, primitive_arguments) = if operation == Operation::MapTask {
+            (
+                vec![
+                    function(input, function(world.clone(), callback_result)),
+                    input_family,
+                    c("Nat"),
+                    c("Bool"),
+                    world,
+                ],
+                vec![callback, b(3)?, b(2)?, b(1)?],
+            )
+        } else {
+            (
+                vec![
+                    input_family,
+                    function(input, function(world.clone(), callback_result)),
+                    c("Nat"),
+                    c("Bool"),
+                    world,
+                ],
+                vec![b(4)?, callback, b(2)?, b(1)?],
+            )
+        };
+        let task = apply(primitive, primitive_arguments);
+        let mut wrapper = out(output_family.clone(), task, b(0)?);
+        let mut type_ = out_type(output_family);
+        if self.value_type(&type_)? != Some(ValueType::Constructor) {
+            return Err(unsupported("Task composition IO result representation"));
+        }
+        for domain in source_domains.into_iter().rev() {
+            self.tick()?;
+            wrapper = Expr::lam(
+                self.task_name()?,
+                domain.clone(),
+                wrapper,
+                BinderInfo::Default,
+            );
+            type_ = function(domain, type_);
+        }
+        self.task_typed(wrapper, type_)
+    }
+
+    fn task_composition_call(
+        &mut self,
+        operation: Operation,
+        levels: &[Level],
+        arguments: &[Expr],
+    ) -> Result<Option<Expr>, IngressError> {
+        let ([input_level], [alpha, beta, rest @ ..]) = (levels, arguments) else {
+            return Ok(None);
+        };
+        let Some(primitive) = self.task_primitive(operation)? else {
+            return Ok(None);
+        };
+        let input = self.task_payload(alpha)?;
+        let output = self.task_payload(beta)?;
+        let input_family = Expr::app(
+            Expr::const_(name("Task"), vec![input_level.clone()]),
+            input.clone(),
+        );
+        let output_family = Expr::app(
+            Expr::const_(name("Task"), vec![Level::zero()]),
+            output.clone(),
+        );
+        if !self.task_value_type(&input_family)? || !self.task_value_type(&output_family)? {
+            return Err(unsupported("Task composition runtime family"));
+        }
+        let wrapper = self.task_composition_wrapper(
+            operation,
+            primitive,
+            input_family,
+            output_family,
+            input,
+            output,
+        )?;
+        Ok(Some(rest.iter().cloned().fold(wrapper, Expr::app)))
     }
 
     pub(super) fn task_call(
@@ -482,6 +634,9 @@ impl Preparation<'_> {
         let Some(operation) = Operation::from_name(requested) else {
             return Ok(None);
         };
+        if matches!(operation, Operation::MapTask | Operation::BindTask) {
+            return self.task_composition_call(operation, levels, arguments);
+        }
         let expected_levels = usize::from(matches!(operation, Operation::Pure | Operation::Get));
         let [alpha, rest @ ..] = arguments else {
             return Ok(None);
@@ -513,6 +668,7 @@ impl Preparation<'_> {
                     Expr::lam(self.task_name()?, domain.clone(), body, BinderInfo::Default);
                 self.task_typed(wrapper, function(domain, result))?
             }
+            Operation::MapTask | Operation::BindTask => unreachable!("Task composition dispatched"),
         };
         Ok(Some(rest.iter().cloned().fold(wrapper, Expr::app)))
     }

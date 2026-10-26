@@ -265,7 +265,9 @@ fn opaque(operation: Operation) -> ConstantInfo {
             );
             (type_, value)
         }
-        Operation::Pure | Operation::Get => unreachable!("opaque Task operation"),
+        Operation::Pure | Operation::Get | Operation::MapTask | Operation::BindTask => {
+            unreachable!("monomorphic opaque Task operation")
+        }
     };
     ConstantInfo::Opaque(OpaqueVal {
         base: base(operation.label(), &[], type_),
@@ -273,6 +275,100 @@ fn opaque(operation: Operation) -> ConstantInfo {
         is_unsafe: false,
         all: vec![name(operation.label())],
     })
+}
+
+fn composition(environment: &Environment, operation: Operation) -> Option<ConstantInfo> {
+    let actual = environment.find(&name(operation.label()))?.constant_val();
+    let [parameter] = actual.level_params.as_slice() else {
+        return None;
+    };
+    let u = Level::param(parameter.clone());
+    let alpha_sort = Expr::sort(u.clone().succ().ok()?);
+    let beta_sort = Expr::sort(Level::one());
+    let priority = c("Task.Priority", vec![]);
+    let bool_ = c("Bool", vec![]);
+    let priority_domain = app(
+        c("optParam", vec![Level::one()]),
+        [priority.clone(), c("Task.Priority.default", vec![])],
+    );
+    let sync_domain = app(
+        c("optParam", vec![Level::one()]),
+        [bool_.clone(), c("Bool.false", vec![])],
+    );
+    let (first, second) = match operation {
+        Operation::MapTask => (explicit(b(1), base_io(b(1))), family_type(&u, b(2))),
+        Operation::BindTask => (
+            family_type(&u, b(1)),
+            explicit(b(2), base_io(family_type(&Level::zero(), b(2)))),
+        ),
+        _ => unreachable!("Task composition operation"),
+    };
+    let type_ = pi(
+        alpha_sort.clone(),
+        pi(
+            beta_sort.clone(),
+            explicit(
+                first.clone(),
+                explicit(
+                    second.clone(),
+                    explicit(
+                        priority_domain,
+                        explicit(sync_domain, base_io(family_type(&Level::zero(), b(4)))),
+                    ),
+                ),
+            ),
+            BinderInfo::Implicit,
+        ),
+        BinderInfo::Implicit,
+    );
+    let value = match operation {
+        Operation::MapTask => {
+            let functor = app(
+                c("Applicative.toFunctor", vec![Level::zero(); 2]),
+                [c("BaseIO", vec![]), applicative()],
+            );
+            app(
+                c("Functor.map", vec![Level::zero(); 2]),
+                [
+                    c("BaseIO", vec![]),
+                    functor,
+                    b(4),
+                    family_type(&Level::zero(), b(4)),
+                    Expr::app(c("Task.pure", vec![Level::zero()]), b(4)),
+                    Expr::app(b(3), app(c("Task.get", vec![u.clone()]), [b(5), b(2)])),
+                ],
+            )
+        }
+        Operation::BindTask => Expr::app(b(2), app(c("Task.get", vec![u]), [b(5), b(3)])),
+        _ => unreachable!("Task composition operation"),
+    };
+    let value = lam(
+        alpha_sort,
+        lam(
+            beta_sort,
+            lam(
+                first,
+                lam(
+                    second,
+                    lam(
+                        priority,
+                        lam(bool_, value, BinderInfo::Default),
+                        BinderInfo::Default,
+                    ),
+                    BinderInfo::Default,
+                ),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Implicit,
+        ),
+        BinderInfo::Implicit,
+    );
+    Some(ConstantInfo::Opaque(OpaqueVal {
+        base: base(operation.label(), &actual.level_params, type_),
+        value,
+        is_unsafe: false,
+        all: vec![name(operation.label())],
+    }))
 }
 
 pub(super) fn operation_matches(
@@ -285,6 +381,15 @@ pub(super) fn operation_matches(
         Operation::Get => getter_matches(environment, comparison),
         Operation::AsTask => Ok(comparison.constant(environment, priority())?
             && comparison.constant(environment, opaque(operation))?),
-        Operation::Wait => comparison.constant(environment, opaque(operation)),
+        Operation::Wait => Ok(getter_matches(environment, comparison)?
+            && comparison.constant(environment, opaque(operation))?),
+        Operation::MapTask | Operation::BindTask => {
+            let Some(expected) = composition(environment, operation) else {
+                return Ok(false);
+            };
+            Ok(getter_matches(environment, comparison)?
+                && comparison.constant(environment, priority())?
+                && comparison.constant(environment, expected)?)
+        }
     }
 }

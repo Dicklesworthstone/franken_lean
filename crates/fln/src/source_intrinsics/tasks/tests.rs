@@ -40,13 +40,26 @@ fn raw_pin_environment() -> Option<Environment> {
 }
 
 fn registered(environment: &Environment, foreign: Option<Operation>) -> Environment {
+    registered_except(environment, foreign, None)
+}
+
+fn registered_except(
+    environment: &Environment,
+    foreign: Option<Operation>,
+    omitted: Option<Operation>,
+) -> Environment {
     let mut environment = environment.clone();
     for operation in [
         Operation::Pure,
         Operation::Get,
         Operation::AsTask,
         Operation::Wait,
+        Operation::MapTask,
+        Operation::BindTask,
     ] {
+        if omitted == Some(operation) {
+            continue;
+        }
         let row = fln_vm::extern_table_generated::EXTERN_ROWS
             .iter()
             .find(|row| row.name == operation.label())
@@ -99,7 +112,15 @@ fn exact_task_models_require_their_family_externs_and_opaque_bodies() {
         Operation::Get,
         Operation::AsTask,
         Operation::Wait,
+        Operation::MapTask,
+        Operation::BindTask,
     ] {
+        assert!(
+            !operation_matches(&raw, operation, &mut None, &mut 0, IngressLimits::default(),)
+                .unwrap(),
+            "{} needs its selected extern",
+            operation.label()
+        );
         let mut work = 0;
         assert!(
             operation_matches(
@@ -153,6 +174,13 @@ fn exact_task_models_require_their_family_externs_and_opaque_bodies() {
         ("Task.Priority", Operation::AsTask),
         ("BaseIO.asTask", Operation::AsTask),
         ("IO.wait", Operation::Wait),
+        ("BaseIO.mapTask", Operation::MapTask),
+        ("BaseIO.bindTask", Operation::BindTask),
+        ("Task.get", Operation::Wait),
+        ("Task.get", Operation::MapTask),
+        ("Task.get", Operation::BindTask),
+        ("Task.Priority", Operation::MapTask),
+        ("Task.Priority", Operation::BindTask),
     ] {
         let changed = replace(&raw, &model::name(target), |info| match info {
             ConstantInfo::Induct(value) => value.is_unsafe = true,
@@ -190,32 +218,90 @@ fn exact_task_models_require_their_family_externs_and_opaque_bodies() {
         }],
     )
     .unwrap();
-    assert!(matches!(
-        operation_matches(
-            &foreign_priority,
-            Operation::AsTask,
-            &mut None,
-            &mut 0,
-            IngressLimits::default(),
-        ),
-        Err(IngressError::UnsupportedNode {
-            kind: "native extern attribute does not match the supported ABI"
-        })
-    ));
+    for operation in [Operation::AsTask, Operation::MapTask, Operation::BindTask] {
+        assert!(matches!(
+            operation_matches(
+                &foreign_priority,
+                operation,
+                &mut None,
+                &mut 0,
+                IngressLimits::default(),
+            ),
+            Err(IngressError::UnsupportedNode {
+                kind: "native extern attribute does not match the supported ABI"
+            })
+        ));
+    }
     let world = replace(&raw, &model::name("BaseIO"), |info| {
         let ConstantInfo::Defn(value) = info else {
             unreachable!()
         };
         value.value = Expr::const_(model::name("IO"), vec![]);
     });
-    assert!(matches!(
-        operation_matches(
-            &registered(&world, None),
-            Operation::AsTask,
-            &mut None,
-            &mut 0,
-            IngressLimits::default(),
-        ),
-        Err(IngressError::UnsupportedNode { .. })
-    ));
+    for operation in [
+        Operation::AsTask,
+        Operation::Wait,
+        Operation::MapTask,
+        Operation::BindTask,
+    ] {
+        assert!(matches!(
+            operation_matches(
+                &registered(&world, None),
+                operation,
+                &mut None,
+                &mut 0,
+                IngressLimits::default(),
+            ),
+            Err(IngressError::UnsupportedNode { .. })
+        ));
+    }
+    for operation in [Operation::Wait, Operation::MapTask, Operation::BindTask] {
+        assert!(
+            operation_matches(
+                &registered_except(&raw, None, Some(Operation::Get)),
+                operation,
+                &mut None,
+                &mut 0,
+                IngressLimits::default(),
+            )
+            .unwrap()
+        );
+        assert!(matches!(
+            operation_matches(
+                &registered(&raw, Some(Operation::Get)),
+                operation,
+                &mut None,
+                &mut 0,
+                IngressLimits::default(),
+            ),
+            Err(IngressError::UnsupportedNode {
+                kind: "native extern attribute does not match the supported ABI"
+            })
+        ));
+    }
+    for operation in [Operation::MapTask, Operation::BindTask] {
+        for mutation in 0..3 {
+            let changed = replace(&raw, &model::name(operation.label()), |info| {
+                let ConstantInfo::Opaque(value) = info else {
+                    unreachable!("composition is an actual opaque declaration")
+                };
+                match mutation {
+                    0 => value.base.level_params.clear(),
+                    1 => value.is_unsafe = true,
+                    2 => value.all.clear(),
+                    _ => unreachable!(),
+                }
+            });
+            assert!(matches!(
+                operation_matches(
+                    &registered(&changed, None),
+                    operation,
+                    &mut None,
+                    &mut 0,
+                    IngressLimits::default(),
+                ),
+                Err(IngressError::UnsupportedNode { .. })
+            ));
+        }
+    }
 }
