@@ -1901,6 +1901,7 @@ impl Context {
             MatchBranch(matching::MatchBuild<'a>, matching::BranchBinders),
             Ascription(&'a Syntax, Option<Expr>, bool),
             AscribedValue(Expr, Option<Expr>, bool),
+            Noindex,
             /// `↑e`'s value, made to have the expected type.
             Coerced(Option<Expr>),
             Projection(Name, &'a [Syntax], Option<Expr>, bool, bool),
@@ -2503,11 +2504,13 @@ impl Context {
                                     });
                                     continue;
                                 }
-                                // `no_index e` is `e`: it only keeps `e` out of simp's
-                                // discrimination-tree keys (`Lean/Elab/BuiltinNotation.lean`).
+                                // The annotation is transparent to typing, but must survive in
+                                // the term: both native and exported simp indexes read it.
+                                // `Lean/Elab/BuiltinNotation.lean`, `elabNoindex`.
                                 if kind == &parser_kind(&["Term", "noindex"]) {
                                     let parts = expect_node(syntax, kind, 2, "no_index")?;
                                     expect_atom(&parts[0], "no_index", "no_index")?;
+                                    tasks.push(Task::Noindex);
                                     tasks.push(Task::Visit(&parts[1], expected, finish));
                                     continue;
                                 }
@@ -3110,6 +3113,16 @@ impl Context {
                             let branch = values.pop().expect("match branch visit");
                             self.accept_match_branch(&mut state, binders, branch)?;
                             tasks.push(Task::MatchNext(state));
+                        }
+                        Task::Noindex => {
+                            let mut term = values.pop().expect("no_index term visit");
+                            let mut data = KVMap::new();
+                            data.insert(
+                                Name::from_components(["noindex"]),
+                                fln_core::options::DataValue::OfBool(true),
+                            );
+                            term.value = Expr::mdata(data, term.value);
+                            values.push(term);
                         }
                         Task::Ascription(syntax, expected, show) => {
                             let type_ = values.pop().expect("ascription type visit");

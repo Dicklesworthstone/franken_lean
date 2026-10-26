@@ -468,7 +468,49 @@ fn reverse_registration_and_priorities_are_retained_deterministically() {
     let rows = simp::read(newer.engine.environment()).unwrap();
     assert_eq!(rows[0].declaration, Name::from_components(["unwrap"]));
     let again = checked(&newer.engine, &["attribute [simp 900] unwrap"]);
-    assert_eq!(newer.result_logical_root, again.result_logical_root);
+    // The pin's Lean.Meta.addSimpTheorem calls ext.add on every registration;
+    // ScopedEnvExtension.addEntryFn retains each global event for export.
+    assert_ne!(newer.result_logical_root, again.result_logical_root);
+    let journal = simp::export::journal_name();
+    assert_eq!(
+        again
+            .engine
+            .environment()
+            .extension(&journal)
+            .unwrap()
+            .len(),
+        newer
+            .engine
+            .environment()
+            .extension(&journal)
+            .unwrap()
+            .len()
+            + 1
+    );
+    let again_rows = simp::read(again.engine.environment()).unwrap();
+    let selected = |rows: &[simp::SimpEntry]| {
+        rows.iter()
+            .map(|row| {
+                (
+                    row.declaration.clone(),
+                    row.proof.clone(),
+                    row.priority,
+                    row.reverse,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(selected(&again_rows), selected(&rows));
+    assert_eq!(again_rows[0].order, rows[0].order + 1);
+    let same_predecessor = checked(&newer.engine, &["attribute [simp 900] unwrap"]);
+    assert_eq!(
+        again.result_logical_root,
+        same_predecessor.result_logical_root
+    );
+    checked(
+        &again.engine,
+        &["theorem afterRepeat (n : Nat) : wrap (wrap n) = n := by simp"],
+    );
 }
 
 #[test]

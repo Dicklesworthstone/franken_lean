@@ -15,6 +15,7 @@ use fln_env::{
 };
 use std::collections::BTreeMap;
 pub mod defeq;
+pub mod export;
 mod imports;
 pub use imports::{ImportedSimpRule, import_rules, register_imported_proof};
 
@@ -462,6 +463,9 @@ const MAGIC: &[u8] = b"FLNSIMP\x01";
 const STRUCTURAL_MAGIC: &[u8] = b"FLNSIMP\x02";
 // Auxiliary proofs add a new row form; existing v1/v2 rows keep their bytes.
 const PROOF_MAGIC: &[u8] = b"FLNSIMP\x03";
+// Native additions capture their persistent indexing/flags at registration.
+// Later reducibility/class changes cannot rewrite already exported entries.
+const SNAPSHOT_MAGIC: &[u8] = b"FLNSIMP\x04";
 // A proof's type traversal and an imported library's journal are independent
 // resources. Init alone carries more than 4,096 simp events.
 const MAX_TYPE_STEPS: usize = 4096;
@@ -581,10 +585,17 @@ fn validate(env: &Environment, name: &Name, reverse: bool) -> Result<(), SimpSet
 /// remain unsupported; the ordinary tactic driver still checks every use.
 fn is_proposition(env: &Environment, expression: &Expr) -> Result<bool, SimpSetError> {
     let mut remaining = MAX_TYPE_STEPS;
-    let mut spend = || -> Result<(), SimpSetError> {
+    is_proposition_with(env, expression, &mut || {
         remaining = remaining.checked_sub(1).ok_or(SimpSetError::Limit)?;
         Ok(())
-    };
+    })
+}
+
+fn is_proposition_with(
+    env: &Environment,
+    expression: &Expr,
+    spend: &mut impl FnMut() -> Result<(), SimpSetError>,
+) -> Result<bool, SimpSetError> {
     let mut locals = Vec::new();
     let mut ty = expression;
     let mut arity = 0usize;
@@ -634,7 +645,7 @@ fn is_proposition(env: &Environment, expression: &Expr) -> Result<bool, SimpSetE
                 head_type = body;
             }
             ExprNode::Sort { level } if arity == 0 => {
-                return always_zero(level, parameters, arguments, &mut spend);
+                return always_zero(level, parameters, arguments, spend);
             }
             _ => return Ok(false),
         }
@@ -710,6 +721,80 @@ fn read_name(bytes: &mut &[u8]) -> Result<Name, SimpSetError> {
     Ok(name)
 }
 
+enum JournalEntry {
+    Add {
+        entry: SimpEntry,
+        snapshot: Option<export::Snapshot>,
+    },
+    Erase(Name),
+}
+
+/// One decoder for the live simp set and its artifact export. Neither consumer
+/// may reinterpret an unknown operation or an imported proof as an unfolding.
+fn decode_entry(payload: &[u8], order: usize) -> Result<JournalEntry, SimpSetError> {
+    if payload.len() > MAX_BYTES {
+        return Err(SimpSetError::Limit);
+    }
+    let mut bytes = payload;
+    let header = take(&mut bytes, MAGIC.len())?;
+    let proof_row = header == PROOF_MAGIC;
+    let snapshot_row = header == SNAPSHOT_MAGIC;
+    let structural = match header {
+        header if header == MAGIC => false,
+        header if header == STRUCTURAL_MAGIC || proof_row || snapshot_row => true,
+        _ => return Err(SimpSetError::Malformed),
+    };
+    let operation = take(&mut bytes, 1)?[0];
+    let declaration = if structural {
+        crate::instances::read_name(&mut bytes).map_err(|_| SimpSetError::Malformed)?
+    } else {
+        read_name(&mut bytes)?
+    };
+    let proof = if proof_row {
+        if operation != 2 {
+            return Err(SimpSetError::Malformed);
+        }
+        Some(crate::instances::read_name(&mut bytes).map_err(|_| SimpSetError::Malformed)?)
+    } else {
+        None
+    };
+    let priority = number(&mut bytes)?;
+    let reverse = match take(&mut bytes, 1)?[0] {
+        0 => false,
+        1 => true,
+        _ => return Err(SimpSetError::Malformed),
+    };
+    let snapshot = if snapshot_row {
+        if operation != 0 {
+            return Err(SimpSetError::Malformed);
+        }
+        let snapshot = export::Snapshot::read(&mut bytes)?;
+        if reverse && snapshot.is_supported() {
+            return Err(SimpSetError::Malformed);
+        }
+        Some(snapshot)
+    } else {
+        None
+    };
+    if !bytes.is_empty() {
+        return Err(SimpSetError::Malformed);
+    }
+    match operation {
+        0 | 2 if operation == 0 || (proof_row && !reverse) => Ok(JournalEntry::Add {
+            entry: SimpEntry {
+                declaration,
+                proof,
+                priority,
+                reverse,
+                order,
+            },
+            snapshot,
+        }),
+        1 if priority == 0 && !reverse => Ok(JournalEntry::Erase(declaration)),
+        _ => Err(SimpSetError::Malformed),
+    }
+}
+
 /// Read active rows in deterministic priority order (newer ties first).
 /// Corrupt entries and dangling references are errors, never an empty simp set.
 pub fn read(env: &Environment) -> Result<Vec<SimpEntry>, SimpSetError> {
@@ -723,85 +808,29 @@ pub fn read(env: &Environment) -> Result<Vec<SimpEntry>, SimpSetError> {
     check_journal_capacity(extension.len(), extension.payload_bytes())?;
     let mut active: BTreeMap<Name, BTreeMap<Option<Name>, SimpEntry>> = BTreeMap::new();
     for (order, row) in extension.entries().enumerate() {
-        if row.payload.len() > MAX_BYTES {
-            return Err(SimpSetError::Limit);
-        }
-        let mut bytes: &[u8] = &row.payload;
-        let header = take(&mut bytes, MAGIC.len())?;
-        let proof_row = header == PROOF_MAGIC;
-        let structural = match header {
-            header if header == MAGIC => false,
-            header if header == STRUCTURAL_MAGIC || proof_row => true,
-            _ => return Err(SimpSetError::Malformed),
-        };
-        let operation = take(&mut bytes, 1)?[0];
-        let declaration = if structural {
-            crate::instances::read_name(&mut bytes).map_err(|_| SimpSetError::Malformed)?
-        } else {
-            read_name(&mut bytes)?
-        };
-        let proof = if proof_row {
-            if operation != 2 {
-                return Err(SimpSetError::Malformed);
+        match decode_entry(&row.payload, order)? {
+            JournalEntry::Add { entry, .. } if entry.proof.is_none() => {
+                validate(env, &entry.declaration, entry.reverse)?;
+                active.insert(entry.declaration.clone(), BTreeMap::from([(None, entry)]));
             }
-            Some(crate::instances::read_name(&mut bytes).map_err(|_| SimpSetError::Malformed)?)
-        } else {
-            None
-        };
-        let priority = number(&mut bytes)?;
-        let reverse = match take(&mut bytes, 1)?[0] {
-            0 => false,
-            1 => true,
-            _ => return Err(SimpSetError::Malformed),
-        };
-        if !bytes.is_empty() {
-            return Err(SimpSetError::Malformed);
-        }
-        match operation {
-            0 => {
-                validate(env, &declaration, reverse)?;
-                active.insert(
-                    declaration.clone(),
-                    BTreeMap::from([(
-                        None,
-                        SimpEntry {
-                            declaration,
-                            proof: None,
-                            priority,
-                            reverse,
-                            order,
-                        },
-                    )]),
-                );
-            }
-            1 if priority == 0 && !reverse => {
+            JournalEntry::Erase(declaration) => {
                 if !env.contains(&declaration) {
                     return Err(SimpSetError::UnknownDeclaration(declaration));
                 }
                 active.remove(&declaration);
             }
-            2 if proof_row && !reverse => {
-                let proof = proof.ok_or(SimpSetError::Malformed)?;
-                if !env.contains(&declaration) {
-                    return Err(SimpSetError::UnknownDeclaration(declaration));
+            JournalEntry::Add { entry, .. } => {
+                let proof = entry.proof.as_ref().ok_or(SimpSetError::Malformed)?;
+                if !env.contains(&entry.declaration) {
+                    return Err(SimpSetError::UnknownDeclaration(entry.declaration));
                 }
-                imports::validate_proof(env, &proof)?;
+                imports::validate_proof(env, proof)?;
                 // A persisted theorem group replaces a prior ordinary source
                 // selection, but its auxiliary lemmas coexist with each other.
-                let group = active.entry(declaration.clone()).or_default();
+                let group = active.entry(entry.declaration.clone()).or_default();
                 group.remove(&None);
-                group.insert(
-                    Some(proof.clone()),
-                    SimpEntry {
-                        declaration,
-                        proof: Some(proof),
-                        priority,
-                        reverse,
-                        order,
-                    },
-                );
+                group.insert(Some(proof.clone()), entry);
             }
-            _ => return Err(SimpSetError::Malformed),
         }
     }
     let mut rows: Vec<SimpEntry> = active
@@ -830,12 +859,14 @@ pub fn update(
     }
     if let Some((priority, reverse)) = rule {
         validate(env, declaration, reverse)?;
-        if current
-            .is_some_and(|r| r.proof.is_none() && r.priority == priority && r.reverse == reverse)
-        {
-            return Ok(env.clone());
-        }
-    } else if current.is_none() {
+        // A repeat refreshes the persistent path/flags in the pin. Retain the
+        // event even when its name, priority and orientation are unchanged.
+        return append(
+            env,
+            export::snapshot_payload(env, declaration, priority, reverse)?,
+        );
+    }
+    if current.is_none() {
         return Ok(env.clone());
     }
     append(env, source_payload(declaration, rule)?)
@@ -1013,8 +1044,16 @@ mod tests {
                 }))
                 .unwrap();
         }
-        let legacy = update(&env, &source_name, Some((500, false))).unwrap();
-        let both = update(&legacy, &private_name, Some((1000, false))).unwrap();
+        let legacy = append(
+            &env,
+            source_payload(&source_name, Some((500, false))).unwrap(),
+        )
+        .unwrap();
+        let both = append(
+            &legacy,
+            source_payload(&private_name, Some((1000, false))).unwrap(),
+        )
+        .unwrap();
         let rows = read(&both).unwrap();
         assert_eq!(
             rows.iter().map(|row| &row.declaration).collect::<Vec<_>>(),

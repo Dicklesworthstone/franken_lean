@@ -6867,17 +6867,22 @@ impl Engine {
                     elaborated.irreducible,
                     options,
                 )?;
-                if fln_elab::source::scope::simp::defeq::direct_rfl(parsed.syntax())
-                    && let Declaration::Thm(theorem) = &admitted.declaration
-                {
-                    admitted.engine.environment = fln_elab::source::scope::simp::defeq::infer(
-                        admitted.engine.environment(),
-                        &theorem.base.name,
-                        limits.kernel,
-                    )
-                    .map_err(DefinitionFrontendError::Elaborate)
-                    .map_err(EngineExecutionError::Frontend)?;
-                    admitted.result_logical_root = admitted.engine.logical_root(options);
+                if fln_elab::source::scope::simp::defeq::direct_rfl(parsed.syntax()) {
+                    let name = match &admitted.declaration {
+                        Declaration::Thm(theorem) => Some(&theorem.base.name),
+                        Declaration::Defn(definition) => Some(&definition.base.name),
+                        _ => None,
+                    };
+                    if let Some(name) = name {
+                        admitted.engine.environment = fln_elab::source::scope::simp::defeq::infer(
+                            admitted.engine.environment(),
+                            name,
+                            limits.kernel,
+                        )
+                        .map_err(DefinitionFrontendError::Elaborate)
+                        .map_err(EngineExecutionError::Frontend)?;
+                        admitted.result_logical_root = admitted.engine.logical_root(options);
+                    }
                 }
                 if let Some((name, priority)) = registration {
                     // A proof instance is admitted as a theorem. Both it and
@@ -6930,6 +6935,22 @@ impl Engine {
                     )?;
                     admitted.result_logical_root = admitted.engine.logical_root(options);
                 }
+                // Reducibility attributes run after type checking in the pin,
+                // before simp's after-compilation registration captures keys.
+                if let Some((name, status)) = reducibility {
+                    let name = fln_elab::source::scope::SourceScope::default()
+                        .declaration_name(&name)
+                        .map_err(|error| {
+                            EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
+                                fln_elab::NatDefinitionElabError::Inference(
+                                    fln_elab::source::SourceInferenceError::NameScope(error),
+                                ),
+                            ))
+                        })?;
+                    admitted.engine.environment =
+                        source_records::set_reducibility(&admitted.engine, &name, status)?;
+                    admitted.result_logical_root = admitted.engine.logical_root(options);
+                }
                 if let Some((name, priority, reverse)) = simp {
                     let name = fln_elab::source::scope::SourceScope::default()
                         .declaration_name(&name)
@@ -6952,20 +6973,6 @@ impl Engine {
                             ),
                         ))
                     })?;
-                    admitted.result_logical_root = admitted.engine.logical_root(options);
-                }
-                if let Some((name, status)) = reducibility {
-                    let name = fln_elab::source::scope::SourceScope::default()
-                        .declaration_name(&name)
-                        .map_err(|error| {
-                            EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
-                                fln_elab::NatDefinitionElabError::Inference(
-                                    fln_elab::source::SourceInferenceError::NameScope(error),
-                                ),
-                            ))
-                        })?;
-                    admitted.engine.environment =
-                        source_records::set_reducibility(&admitted.engine, &name, status)?;
                     admitted.result_logical_root = admitted.engine.logical_root(options);
                 }
                 if let Some(name) = noncomputable {

@@ -649,15 +649,18 @@ impl Engine {
                 apply_batch_effects(&mut batch, irreducible, options)?;
                 if fln_elab::source::scope::simp::defeq::direct_rfl(syntax) {
                     for admitted in &batch.admissions {
-                        if let Declaration::Thm(theorem) = &admitted.declaration {
-                            batch.engine.environment = fln_elab::source::scope::simp::defeq::infer(
-                                batch.engine.environment(),
-                                &theorem.base.name,
-                                limits.kernel,
-                            )
-                            .map_err(DefinitionFrontendError::Elaborate)
-                            .map_err(EngineExecutionError::Frontend)?;
-                        }
+                        let name = match &admitted.declaration {
+                            Declaration::Thm(theorem) => &theorem.base.name,
+                            Declaration::Defn(definition) => &definition.base.name,
+                            _ => continue,
+                        };
+                        batch.engine.environment = fln_elab::source::scope::simp::defeq::infer(
+                            batch.engine.environment(),
+                            name,
+                            limits.kernel,
+                        )
+                        .map_err(DefinitionFrontendError::Elaborate)
+                        .map_err(EngineExecutionError::Frontend)?;
                     }
                     batch.result_logical_root = batch.engine.logical_root(options);
                 }
@@ -723,6 +726,19 @@ impl Engine {
                     )?;
                     batch.result_logical_root = batch.engine.logical_root(options);
                 }
+                // The pin applies reducibility after type checking and simp
+                // after compilation, independently of inline attribute order.
+                if let Some((name, status)) = reducibility {
+                    let name = scope.declaration_name(&name).map_err(|error| {
+                        EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
+                            fln_elab::NatDefinitionElabError::Inference(
+                                fln_elab::source::SourceInferenceError::NameScope(error),
+                            ),
+                        ))
+                    })?;
+                    batch.engine.environment = set_reducibility(&batch.engine, &name, status)?;
+                    batch.result_logical_root = batch.engine.logical_root(options);
+                }
                 if let Some((name, priority, reverse)) = simp {
                     let name = scope.declaration_name(&name).map_err(|error| {
                         EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
@@ -743,17 +759,6 @@ impl Engine {
                             ),
                         ))
                     })?;
-                    batch.result_logical_root = batch.engine.logical_root(options);
-                }
-                if let Some((name, status)) = reducibility {
-                    let name = scope.declaration_name(&name).map_err(|error| {
-                        EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
-                            fln_elab::NatDefinitionElabError::Inference(
-                                fln_elab::source::SourceInferenceError::NameScope(error),
-                            ),
-                        ))
-                    })?;
-                    batch.engine.environment = set_reducibility(&batch.engine, &name, status)?;
                     batch.result_logical_root = batch.engine.logical_root(options);
                 }
                 if noncomputable.is_some() || inferred_noncomputable {

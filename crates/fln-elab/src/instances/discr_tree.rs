@@ -166,7 +166,7 @@ fn get32(bytes: &mut &[u8]) -> Result<u32, InstanceRegistryError> {
 }
 
 /// The imported-instance journal's encoding of one stored path.
-pub(super) fn write_keys(keys: &[Key], out: &mut Vec<u8>) -> Result<(), InstanceRegistryError> {
+pub(crate) fn write_keys(keys: &[Key], out: &mut Vec<u8>) -> Result<(), InstanceRegistryError> {
     if keys.len() > MAX_PATH_KEYS {
         return Err(InstanceRegistryError::Limit);
     }
@@ -205,7 +205,7 @@ pub(super) fn write_keys(keys: &[Key], out: &mut Vec<u8>) -> Result<(), Instance
 }
 
 /// [`write_keys`]'s inverse. A literal must be in its one canonical form.
-pub(super) fn read_keys(bytes: &mut &[u8]) -> Result<Vec<Key>, InstanceRegistryError> {
+pub(crate) fn read_keys(bytes: &mut &[u8]) -> Result<Vec<Key>, InstanceRegistryError> {
     let count = usize::try_from(get32(bytes)?).map_err(|_| InstanceRegistryError::Malformed)?;
     if count > MAX_PATH_KEYS {
         return Err(InstanceRegistryError::Limit);

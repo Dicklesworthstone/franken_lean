@@ -3,6 +3,22 @@ use super::*;
 use fln_olean::write::source::{SourceMetadata, encode_module_with_source_metadata};
 use std::sync::Arc;
 
+fn artifact_discrimination_key(
+    key: fln_elab::instances::discr_tree::Key,
+) -> fln_olean::source_extensions::DiscrTreeKey {
+    use fln_elab::instances::discr_tree::Key;
+    use fln_olean::source_extensions::DiscrTreeKey;
+    match key {
+        Key::Star => DiscrTreeKey::Star,
+        Key::Other => DiscrTreeKey::Other,
+        Key::Lit(value) => DiscrTreeKey::Lit(value),
+        Key::FVar(id, arity) => DiscrTreeKey::FVar(id.0, arity),
+        Key::Const(name, arity) => DiscrTreeKey::Const(name, arity),
+        Key::Arrow => DiscrTreeKey::Arrow,
+        Key::Proj(name, index, arity) => DiscrTreeKey::Proj(name, index, arity),
+    }
+}
+
 /// One basic (pre-module-system) `.olean`, containing only its own constants.
 #[derive(Debug)]
 pub struct SourceModuleArtifact {
@@ -199,7 +215,6 @@ impl PendingArtifact {
                 });
         }
         for instance in registrations.instances {
-            use fln_elab::instances::discr_tree::Key;
             use fln_olean::source_extensions::{DiscrTreeKey, InstanceEntry};
             meter.work(1)?;
             meter.bytes(instance.synth_order.len().saturating_mul(4))?;
@@ -212,15 +227,7 @@ impl PendingArtifact {
             let keys = instance
                 .keys
                 .into_iter()
-                .map(|key| match key {
-                    Key::Star => DiscrTreeKey::Star,
-                    Key::Other => DiscrTreeKey::Other,
-                    Key::Lit(value) => DiscrTreeKey::Lit(value),
-                    Key::FVar(id, arity) => DiscrTreeKey::FVar(id.0, arity),
-                    Key::Const(name, arity) => DiscrTreeKey::Const(name, arity),
-                    Key::Arrow => DiscrTreeKey::Arrow,
-                    Key::Proj(name, index, arity) => DiscrTreeKey::Proj(name, index, arity),
-                })
+                .map(artifact_discrimination_key)
                 .collect();
             metadata.instances.push(InstanceEntry {
                 declaration: instance.declaration,
@@ -230,6 +237,69 @@ impl PendingArtifact {
                 scope: instance.scope,
                 keys,
             });
+        }
+        let remaining = meter.limits.max_work.saturating_sub(meter.work);
+        let simps = fln_elab::source::scope::simp::export::registrations(base, checked, remaining)
+            .map_err(|error| match error {
+                fln_elab::source::scope::simp::SimpSetError::Limit => {
+                    SourceModuleCheckError::Limit {
+                        resource: "module work",
+                        limit: meter.limits.max_work,
+                    }
+                }
+                fln_elab::source::scope::simp::SimpSetError::UnsupportedDeclaration(_) => {
+                    SourceModuleCheckError::Extension {
+                        module: name.clone(),
+                        extension: fln_elab::source::scope::simp::export::journal_name(),
+                        reason: "simp export requires supported equality proofs or reducible definitions; equation theorem generation, erasures and imported proof re-registration are unsupported",
+                    }
+                }
+                _ => SourceModuleCheckError::Extension {
+                    module: name.clone(),
+                    extension: fln_elab::source::scope::simp::export::journal_name(),
+                    reason: "invalid simp metadata export",
+                },
+            })?;
+        meter.work(simps.work)?;
+        meter.bytes(simps.bytes_examined)?;
+        for row in simps.entries {
+            use fln_elab::source::scope::simp::export::Kind;
+            use fln_olean::source_extensions::{DiscrTreeKey, SimpEntry, SimpKind, SimpTheorem};
+            meter.work(1)?;
+            let kind = match row {
+                Kind::Unfold(declaration) => SimpKind::Unfold(declaration),
+                Kind::Theorem(theorem) => {
+                    meter.work(
+                        theorem
+                            .keys
+                            .len()
+                            .saturating_add(theorem.level_params.len()),
+                    )?;
+                    meter.bytes(
+                        theorem
+                            .keys
+                            .len()
+                            .saturating_mul(std::mem::size_of::<DiscrTreeKey>()),
+                    )?;
+                    SimpKind::Theorem(SimpTheorem {
+                        proof: theorem.proof,
+                        level_params: theorem.level_params,
+                        origin: theorem.origin,
+                        origin_reverse: theorem.origin_reverse,
+                        priority: theorem.priority,
+                        post: theorem.post,
+                        permutation: theorem.permutation,
+                        reflexive: theorem.reflexive,
+                        backward_reflexive: theorem.backward_reflexive,
+                        keys: theorem
+                            .keys
+                            .into_iter()
+                            .map(artifact_discrimination_key)
+                            .collect(),
+                    })
+                }
+            };
+            metadata.simp.push(SimpEntry { scope: None, kind });
         }
         let remaining = meter.limits.max_work.saturating_sub(meter.work);
         let defaults = fln_elab::instances::defaults::registrations(base, checked, remaining)
