@@ -2832,6 +2832,75 @@ fn export_array_list_roundtrip_and_push_laws() {
 }
 
 #[test]
+fn owned_array_push_reuses_capacity_and_preserves_aliases() {
+    let _guard = lock();
+    shadow::enable();
+    {
+        let mut array = Obj::mk_array(Vec::new());
+        for index in 0..2048 {
+            array = array
+                .try_array_push(Obj::mk_nat(index))
+                .unwrap_or_else(|_| panic!("a well-formed array must support push"));
+        }
+        assert_eq!(array.array_view().0, 2048);
+        for index in 0..2048 {
+            assert_eq!(array.array_child(index).unbox(), index);
+        }
+        let array = array
+            .try_array_push(Obj::mk_string("old element"))
+            .unwrap_or_else(|_| panic!("owned child must be transferred"));
+        let alias = array.clone_ref();
+        let pushed = array
+            .try_array_push(Obj::mk_string("new element"))
+            .unwrap_or_else(|_| panic!("a shared array must support push"));
+        assert_eq!(alias.array_view().0, 2049);
+        assert_eq!(alias.array_child(2047).unbox(), 2047);
+        assert_eq!(alias.array_child(2048).string_view().3, b"old element\0");
+        assert_eq!(pushed.array_view().0, 2050);
+        assert_eq!(pushed.array_child(2048).string_view().3, b"old element\0");
+        assert_eq!(pushed.array_child(2049).string_view().3, b"new element\0");
+    }
+    let (events, live) = shadow::disable_and_drain();
+    assert_eq!(live, 0);
+    let allocations = events
+        .iter()
+        .filter(|event| {
+            event.kind == EventKind::Alloc && event.category == Some(contract::TAG_ARRAY)
+        })
+        .count();
+    assert!(
+        allocations <= 16,
+        "push copied on every append: {allocations}"
+    );
+    assert!(events.iter().all(|event| !matches!(
+        event.kind,
+        EventKind::DoubleRelease | EventKind::ForeignPointer
+    )));
+}
+
+#[test]
+fn owned_array_push_returns_invalid_inputs_without_consuming_them() {
+    let _guard = lock();
+    for invalid in [Obj::mk_nat(3), Obj::mk_string("not an array")] {
+        let (original, element) = invalid
+            .try_array_push(Obj::mk_string("retained"))
+            .err()
+            .expect("the array category must be checked before transfer");
+        assert!(original.try_array_view().is_none());
+        assert_eq!(element.string_view().3, b"retained\0");
+    }
+    let array = Obj::mk_array(vec![Obj::mk_nat(9)]);
+    array.plant_array_size(2);
+    let (original, element) = array
+        .try_array_push(Obj::mk_nat(10))
+        .err()
+        .expect("an inconsistent header must retain both input handles");
+    original.restore_array_size(1);
+    assert_eq!(original.array_child(0).unbox(), 9);
+    assert_eq!(element.unbox(), 10);
+}
+
+#[test]
 fn export_byte_array_families_match_pin_laws() {
     let _g = lock();
     use crate::export::{

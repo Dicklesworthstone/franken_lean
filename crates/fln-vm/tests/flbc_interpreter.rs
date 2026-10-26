@@ -8661,6 +8661,97 @@ fn generated_array_read_family_preserves_values_ownership_and_hostile_refusals()
 }
 
 #[test]
+fn generated_array_push_reuses_transferred_capacity() {
+    let _guard = lock();
+    let mut code = vec![Instruction::Array {
+        dst: r(0),
+        items: Vec::new(),
+    }];
+    for value in 0..2048 {
+        code.push(Instruction::Nat { dst: r(1), value });
+        code.push(intrinsic(r(0), "extern:Array.push", vec![r(0), r(1)]));
+    }
+    code.push(Instruction::Return { src: r(0) });
+    let program = validated(vec![function(0, 0, 2, code)]);
+    let bytes = encode_canonical(&program, CodecLimits::default()).expect("encode array pushes");
+    let program = decode_canonical(&bytes, CodecLimits::default()).expect("decode array pushes");
+
+    shadow::enable();
+    let result = returned(execute(&program, ExecutionLimits::default(), None));
+    assert_eq!(result.value.array_view().0, 2048);
+    for index in 0..2048 {
+        assert_eq!(result.value.array_child(index).unbox(), index);
+    }
+    drop(result);
+    let (events, live) = shadow::disable_and_drain();
+    assert_eq!(live, 0);
+    let allocations = events
+        .iter()
+        .filter(|event| {
+            event.kind == shadow::EventKind::Alloc && event.category == Some(abi::TAG_ARRAY)
+        })
+        .count();
+    assert!(
+        allocations <= 16,
+        "Array.push copied each prefix: {allocations}"
+    );
+    assert!(events.iter().all(|event| !matches!(
+        event.kind,
+        shadow::EventKind::DoubleRelease | shadow::EventKind::ForeignPointer
+    )));
+}
+
+#[test]
+fn generated_array_push_preserves_shared_aliases_and_owned_children() {
+    let _guard = lock();
+    let program = validated(vec![function(
+        0,
+        0,
+        6,
+        vec![
+            Instruction::String {
+                dst: r(0),
+                value: "old".to_owned(),
+            },
+            Instruction::Array {
+                dst: r(1),
+                items: vec![r(0)],
+            },
+            Instruction::Copy {
+                dst: r(2),
+                src: r(1),
+            },
+            Instruction::String {
+                dst: r(3),
+                value: "new".to_owned(),
+            },
+            intrinsic(r(4), "extern:Array.push", vec![r(1), r(3)]),
+            Instruction::Array {
+                dst: r(5),
+                items: vec![r(2), r(4)],
+            },
+            Instruction::Return { src: r(5) },
+        ],
+    )]);
+    shadow::enable();
+    let result = returned(execute(&program, ExecutionLimits::default(), None));
+    let original = result.value.array_child(0);
+    let pushed = result.value.array_child(1);
+    assert_eq!(original.array_view().0, 1);
+    assert_eq!(pushed.array_view().0, 2);
+    assert_eq!(original.array_child(0).string_view().3, b"old\0");
+    assert_eq!(pushed.array_child(0).string_view().3, b"old\0");
+    assert_eq!(pushed.array_child(1).string_view().3, b"new\0");
+    drop((original, pushed, result));
+    let (events, live) = shadow::disable_and_drain();
+    assert_eq!(live, 0);
+    assert!(events.iter().all(|event| !matches!(
+        event.kind,
+        shadow::EventKind::DoubleRelease | shadow::EventKind::ForeignPointer
+    )));
+}
+
+#[test]
 fn generated_string_bootstrap_aliases_and_comparisons_execute_with_utf8_positions() {
     let _guard = lock();
     let program = validated(vec![function(
@@ -9262,7 +9353,9 @@ fn generated_array_ownership_transfers_exactly_and_refuses_drift_before_executio
 
     shadow::enable();
     let completed = returned(execute(rebound.program(), ExecutionLimits::default(), None));
-    assert_eq!(completed.value.array_view(), (2, 2));
+    // The pinned push export grows a full one-element array to capacity four;
+    // the VM must preserve that spare capacity for subsequent owned appends.
+    assert_eq!(completed.value.array_view(), (2, 4));
     assert_eq!(string_contents(&completed.value.array_child(0)), "first");
     assert_eq!(string_contents(&completed.value.array_child(1)), "second");
     drop(completed);

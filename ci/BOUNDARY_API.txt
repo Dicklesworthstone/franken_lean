@@ -49,6 +49,7 @@ row FLN-BX-0021 | crates/fln-unsafe-abi/src/handle.rs | fn mk_nat | (usize) -> O
 row FLN-BX-0022 | crates/fln-unsafe-abi/src/handle.rs | fn mk_ctor | (u8, Vec<Obj>, &[u8]) -> Obj | ctor suites; C4 ctor facts | consumes owned handles; contract-bounded shape
 row FLN-BX-0023 | crates/fln-unsafe-abi/src/handle.rs | fn mk_string | (&str) -> Obj | string_facts_utf8; C4 string facts | byte container
 row FLN-BX-0024 | crates/fln-unsafe-abi/src/handle.rs | fn mk_array | (Vec<Obj>) -> Obj | array suites; C4 array facts | consumes owned handles
+row FLN-BX-0128 | crates/fln-unsafe-abi/src/handle.rs | fn try_array_push | (self, Obj) -> Result<Obj, (Obj, Obj)> | owned_array_push_reuses_capacity_and_preserves_aliases; owned_array_push_returns_invalid_inputs_without_consuming_them; generated_array_push_reuses_transferred_capacity; generated_array_push_preserves_shared_aliases_and_owned_children | validates the array before consuming both owned handles through the existing COW export; returns only opaque runtime handles, never a pointer or admission authority
 row FLN-BX-0025 | crates/fln-unsafe-abi/src/handle.rs | fn mk_sarray | (u8, &[u8]) -> Obj | sarray suites; C4 sarray facts | byte container
 row FLN-BX-0026 | crates/fln-unsafe-abi/src/handle.rs | fn mk_closure | (u16, Vec<Obj>) -> Obj | closure suites; C4 closure facts | shell only; fun pointer dangling, never invoked in slice
 row FLN-BX-0027 | crates/fln-unsafe-abi/src/handle.rs | fn mk_ref | (Obj) -> Obj | ref suites | consumes the owned value

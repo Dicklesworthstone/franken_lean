@@ -2418,7 +2418,7 @@ fn run(
                         plan
                     }
                 };
-                let values = transfer_intrinsic_arguments(
+                let mut values = transfer_intrinsic_arguments(
                     current_frame_mut(&mut stack)?,
                     args,
                     argument_ownership,
@@ -2674,7 +2674,7 @@ fn run(
                     match invoke_intrinsic(
                         plan.implementation,
                         plan.row,
-                        &values,
+                        &mut values,
                         limits.max_nat_magnitude_bytes,
                     ) {
                         Ok(result) => {
@@ -4352,7 +4352,7 @@ fn scalar_nat_result(
 fn invoke_intrinsic(
     implementation: IntrinsicImplementation,
     row: &str,
-    args: &[Obj],
+    args: &mut [Obj],
     max_nat_magnitude_bytes: u64,
 ) -> Result<IntrinsicResult, IntrinsicFailure> {
     if let Some(result) = scalar_nat_result(implementation, args) {
@@ -4364,7 +4364,7 @@ fn invoke_intrinsic(
 fn dispatch_intrinsic(
     implementation: IntrinsicImplementation,
     row: &str,
-    args: &[Obj],
+    args: &mut [Obj],
     max_nat_magnitude_bytes: u64,
 ) -> Result<IntrinsicResult, IntrinsicFailure> {
     let max_nat_magnitude_bytes = max_nat_magnitude_bytes.min(
@@ -6461,13 +6461,16 @@ fn dispatch_intrinsic(
         }
         IntrinsicImplementation::ArrayPush => {
             expect_arity(row, args, 2)?;
-            let (size, _) = array_value(&args[0], "Array.push", 0)?;
-            let mut items = Vec::with_capacity(size.saturating_add(1));
-            for index in 0..size {
-                items.push(args[0].array_child(index));
-            }
-            items.push(args[1].clone_ref());
-            Ok(IntrinsicResult::raw_object(Obj::mk_array(items)))
+            array_value(&args[0], "Array.push", 0)?;
+            // The generated contract consumes both operands. Move their
+            // transferred references into Marrow instead of retaining or
+            // rebuilding the array, preserving its exclusive-capacity path.
+            let value = std::mem::replace(&mut args[1], Obj::mk_nat(0));
+            let array = std::mem::replace(&mut args[0], Obj::mk_nat(0));
+            array
+                .try_array_push(value)
+                .map(IntrinsicResult::raw_object)
+                .map_err(|_| VmRefusal::InvalidArrayObject.into())
         }
         IntrinsicImplementation::NatDecEq
         | IntrinsicImplementation::NatDecLe
@@ -6490,8 +6493,8 @@ fn dispatch_intrinsic(
         }
         // ByteArray rows. The pin mutates in place when its refcount shows a
         // sole owner and copies otherwise; that optimization is invisible to
-        // pure value semantics, so every handler here builds a fresh object —
-        // the same copy-always discipline as Array.push above.
+        // pure value semantics, so every handler here still builds a fresh
+        // object. Array.push above preserves transferred ownership instead.
         IntrinsicImplementation::ByteArraySize => {
             expect_arity(row, args, 1)?;
             let bytes = byte_array_bytes(&args[0], "ByteArray.size", 0)?;
@@ -8250,7 +8253,7 @@ mod tests {
         let ceilings = [0, 7, 8, 16, u64::MAX];
         let (mut answered, mut declined) = (0usize, 0usize);
         let mut agree = |implementation, row: &str, values: &[usize]| -> Result<(), String> {
-            let args: Vec<Obj> = values.iter().map(|&value| Obj::mk_nat(value)).collect();
+            let mut args: Vec<Obj> = values.iter().map(|&value| Obj::mk_nat(value)).collect();
             let Some(fast) = scalar_nat_result(implementation, &args) else {
                 declined += 1;
                 return Ok(());
@@ -8258,7 +8261,7 @@ mod tests {
             answered += 1;
             for ceiling in ceilings {
                 let slow =
-                    dispatch_intrinsic(implementation, row, &args, ceiling).map_err(|_| {
+                    dispatch_intrinsic(implementation, row, &mut args, ceiling).map_err(|_| {
                         format!("{row} {values:?} at {ceiling}: the bignum arm refused")
                     })?;
                 assert_eq!(slow.ownership(), fast.ownership(), "{row} {values:?}");
@@ -8413,6 +8416,7 @@ mod tests {
     const CEILING: u64 = 8 * 1024 * 1024;
 
     fn invoke(row: &'static str, args: &[Obj]) -> Result<Obj, VmRefusal> {
+        let mut owned: Vec<Obj> = args.iter().map(Obj::clone_ref).collect();
         let implementation = IntrinsicImplementation::for_row(row);
         assert!(
             implementation != IntrinsicImplementation::Unsupported,
@@ -8435,15 +8439,15 @@ mod tests {
         finish_intrinsic_result(
             row,
             expected_ownership,
-            invoke_intrinsic(implementation, row, args, CEILING).map_err(
-                |failure| match failure {
+            invoke_intrinsic(implementation, row, &mut owned, CEILING).map_err(|failure| {
+                match failure {
                     IntrinsicFailure::Refused(refusal) => refusal,
                     other => panic!(
                         "unexpected intrinsic failure class: {name}",
                         name = std::any::type_name_of_val(&other)
                     ),
-                },
-            )?,
+                }
+            })?,
         )
     }
 

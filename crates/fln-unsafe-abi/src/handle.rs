@@ -178,6 +178,24 @@ impl Obj {
         }
     }
 
+    /// Append an owned element, reusing an exclusive array's spare capacity.
+    ///
+    /// Shared arrays use the membrane's copy-on-write path, so retained aliases
+    /// keep their original contents. Invalid categories or inconsistent headers
+    /// return both owned inputs without transferring either reference.
+    pub fn try_array_push(self, value: Obj) -> Result<Obj, (Obj, Obj)> {
+        if self.try_array_view().is_none() {
+            return Err((self, value));
+        }
+        // The existing export consumes both references and returns one owned
+        // array. Transferring them without a retain preserves exclusivity; the
+        // export alone decides whether to grow, copy, or reuse its allocation.
+        Ok(Obj(export::export_lean_array_push(
+            self.into_raw(),
+            value.into_raw(),
+        )))
+    }
+
     /// Scalar array over raw bytes (`elem_size` recorded in `m_other`).
     pub fn mk_sarray(elem_size: u8, data: &[u8]) -> Obj {
         assert!(elem_size > 0 && data.len().is_multiple_of(usize::from(elem_size)));
