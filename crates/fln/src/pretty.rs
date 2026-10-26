@@ -1,9 +1,11 @@
 //! A bounded delaborator: kernel terms printed as the pin's `lean` prints them for
-//! `#check` (`Lean.PrettyPrinter.Delaborator` with default options).
+//! `#check` (`Lean.PrettyPrinter.Delaborator`), under the pretty-printer options of the
+//! printing scope ([`PpOptions`]: `pp.explicit`, `pp.universes`, `pp.notation`, `pp.all` and
+//! the others the pin's delaborator reads).
 //!
 //! Covered: constants and universe levels (`Type u_1`, `Sort (max u v)`), applications
-//! with implicit and instance arguments hidden (`pp.explicit false`), the arithmetic,
-//! relation and connective notations of `Init` (with their precedences and
+//! with implicit and instance arguments hidden (`pp.explicit false`) or shown in explicit mode,
+//! the arithmetic, relation and connective notations of `Init` (with their precedences and
 //! associativity), numerals (`OfNat.ofNat _ n _`), non-dependent arrows, dependent
 //! binders grouped as the pin groups them (`{α β : Type}`, `(n m : Nat)`, `[Inhabited α]`),
 //! `∀` for propositions, `fun`, `×`, and the signature form of `#check ident`
@@ -22,9 +24,11 @@ use fln_core::level::LevelView;
 pub mod format;
 pub mod goals;
 mod notations;
+mod options;
 mod print;
 mod structures;
 use format::Format;
+pub use options::PpOptions;
 
 /// Why a term could not be printed the pin's way.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -259,6 +263,76 @@ fn strip_mdata(mut e: &Expr) -> &Expr {
     e
 }
 
+/// `Core.betaReduce` (vendored `Lean/Meta/Transform.lean:75-76`): every subterm that is a
+/// `fun` applied to arguments (`isHeadBetaTarget`, looking through annotations on the
+/// function) is replaced by its `headBeta`, and the result visited again.
+fn beta_reduce(e: &Expr) -> Result<Expr, Unsupported> {
+    let too_many = |_| Unsupported("a term with too many bound variables to reduce");
+    let (head, args) = spine(e);
+    if !args.is_empty() && matches!(strip_mdata(&head).node(), ExprNode::Lam { .. }) {
+        // `betaRev`: consume as many `fun`s as there are arguments, then apply the rest.
+        let mut body = strip_mdata(&head).clone();
+        let mut taken = 0;
+        while taken < args.len()
+            && let ExprNode::Lam { body: inner, .. } = strip_mdata(&body).node()
+        {
+            body = inner.clone();
+            taken += 1;
+        }
+        let substs: Vec<Expr> = args[..taken].to_vec();
+        let mut reduced = body.subst_loose(0, &substs).map_err(too_many)?;
+        for arg in &args[taken..] {
+            reduced = Expr::app(reduced, arg.clone());
+        }
+        return beta_reduce(&reduced);
+    }
+    Ok(match e.node() {
+        ExprNode::App { f, a } => Expr::app(beta_reduce(f)?, beta_reduce(a)?),
+        ExprNode::Lam {
+            binder_name,
+            binder_type,
+            body,
+            binder_info,
+        } => Expr::lam(
+            binder_name.clone(),
+            beta_reduce(binder_type)?,
+            beta_reduce(body)?,
+            *binder_info,
+        ),
+        ExprNode::ForallE {
+            binder_name,
+            binder_type,
+            body,
+            binder_info,
+        } => Expr::forall_e(
+            binder_name.clone(),
+            beta_reduce(binder_type)?,
+            beta_reduce(body)?,
+            *binder_info,
+        ),
+        ExprNode::LetE {
+            decl_name,
+            type_,
+            value,
+            body,
+            non_dep,
+        } => Expr::let_e(
+            decl_name.clone(),
+            beta_reduce(type_)?,
+            beta_reduce(value)?,
+            beta_reduce(body)?,
+            *non_dep,
+        ),
+        ExprNode::MData { data, expr } => Expr::mdata(data.clone(), beta_reduce(expr)?),
+        ExprNode::Proj {
+            struct_name,
+            idx,
+            expr,
+        } => Expr::proj(struct_name.clone(), *idx, beta_reduce(expr)?),
+        _ => e.clone(),
+    })
+}
+
 fn node(content: Format) -> Format {
     content.nest(2).fill()
 }
@@ -322,6 +396,21 @@ fn scientific(digits: &str, negative: bool, exponent: &str) -> String {
         }
         _ => format!("{digits}e{}{exponent}", if negative { "-" } else { "" }),
     }
+}
+
+/// `Char.quote` (vendored `Init/Data/Repr.lean:360-374`): `'c'`, with `\n`, `\t`, `\\`, `\"`,
+/// `\'` and `\xNN` below 32 and for DEL.
+fn char_literal(c: char) -> String {
+    let inner = match c {
+        '\n' => "\\n".to_owned(),
+        '\t' => "\\t".to_owned(),
+        '\\' => "\\\\".to_owned(),
+        '"' => "\\\"".to_owned(),
+        '\'' => "\\'".to_owned(),
+        c if (c as u32) <= 31 || c == '\x7f' => format!("\\x{:02x}", c as u32),
+        c => c.to_string(),
+    };
+    format!("'{inner}'")
 }
 
 fn string_literal(text: &str) -> String {
@@ -515,6 +604,28 @@ fn escaped_name_with(name: &Name, is_token: impl Fn(&str) -> bool) -> String {
     text
 }
 
+/// Whether `e` is a numeral, `@OfNat.ofNat _ n _` of a raw literal (`delabOfNatCore`'s match).
+fn ofnat_literal(e: &Expr) -> bool {
+    let (head, args) = spine(e);
+    matches!(head.node(), ExprNode::Const { name, .. } if name.to_display_string() == "OfNat.ofNat")
+        && args.len() == 3
+        && matches!(
+            args[1].node(),
+            ExprNode::Lit {
+                literal: Literal::Nat(_)
+            }
+        )
+}
+
+/// Whether `name` is private (`isPrivateName`): its root component is `_private`.
+fn is_private(name: &Name) -> bool {
+    let mut root = name.clone();
+    while !root.parent().is_anonymous() {
+        root = root.parent();
+    }
+    root.leaf_view() == LeafView::Str("_private")
+}
+
 /// Whether `name` is a binder this engine's elaboration introduced (`_fln…`, or named by a
 /// number), which the pin's term never has. The first component decides: a hygienic
 /// `x._@.M._hyg.4` is the user's `x`.
@@ -585,6 +696,12 @@ pub struct Printer<'a> {
     /// pin shows every accessible binder name (`pp.piBinderNames`, set by `processSpine`,
     /// vendored `PrettyPrinter/Delaborator/Builtins.lean:1644-1660`). Taken by [`Printer::pi`].
     spine_names: bool,
+    /// The pin's pretty-printer options in force ([`PpOptions`]): the scope's, or the defaults.
+    pp: PpOptions,
+    /// For each binder in scope (as [`Printer::names`]), whether the term printed under it so
+    /// far has shown its name: the pin's `stxBody.raw.hasIdent`, which decides whether an
+    /// instance binder of a `fun` is named.
+    shown: Vec<bool>,
 }
 
 /// A function parameter as the pin's `getParamKinds` records it (vendored
@@ -795,6 +912,8 @@ impl<'a> Printer<'a> {
                 .is_some(),
             structures: None,
             spine_names: false,
+            pp: PpOptions::default(),
+            shown: Vec::new(),
         }
     }
 
@@ -810,12 +929,14 @@ impl<'a> Printer<'a> {
     fn bind(&mut self, shown: String, type_: &Expr) {
         self.names.push(shown);
         self.types.push(type_.clone());
+        self.shown.push(false);
     }
 
     /// Leave every binder entered after `depth`.
     fn unbind_to(&mut self, depth: usize) {
         self.names.truncate(depth);
         self.types.truncate(depth);
+        self.shown.truncate(depth);
     }
 
     /// Print current-module private names through their source spelling, as
@@ -825,6 +946,7 @@ impl<'a> Printer<'a> {
         Self {
             scope: Some(scope),
             resolution: Resolution::read(env),
+            pp: PpOptions::read(&scope.options),
             ..Self::new(env)
         }
     }
@@ -832,6 +954,39 @@ impl<'a> Printer<'a> {
     /// `∃ x y, b` for `Exists fun x => Exists fun y => b`. The parenthesizer brackets it as
     /// an argument, and where a token follows it (see [`Printer::trailing`]).
     fn exists(&mut self, lambda: &Expr, outer: u32) -> Doc {
+        // Under `pp.funBinderTypes` the `fun` carries its binder's type, which only the third
+        // pattern matches: `∃ (x : α), b`, never merged with an `∃` inside.
+        if self.pp.fun_binder_types
+            && let ExprNode::Lam {
+                binder_name,
+                binder_type,
+                body,
+                ..
+            } = lambda.node()
+        {
+            let domain = self.with_trailing(false, |printer| printer.doc(binder_type, 0))?;
+            let shown = self.bound_name(binder_name, body);
+            let depth = self.names.len();
+            self.bind(shown.clone(), binder_type);
+            let printed = self.with_trailing(false, |printer| printer.doc(body, 0));
+            self.unbind_to(depth);
+            let binder = node(
+                Format::text(format!("({shown} :"))
+                    .then(Format::Line)
+                    .then(domain)
+                    .then(Format::text(")")),
+            );
+            let shown = Format::text("∃ ")
+                .then(binder)
+                .then(Format::text(","))
+                .then(Format::Line)
+                .then(printed?);
+            return Ok(if outer >= MAX_PREC || self.trailing {
+                node(Format::text("(").then(shown).then(Format::text(")")))
+            } else {
+                node(shown)
+            });
+        }
         let depth = self.names.len();
         let mut binders = Vec::new();
         let mut current = lambda.clone();
@@ -879,14 +1034,37 @@ impl<'a> Printer<'a> {
         })
     }
 
-    /// A constant in a term, as the delaborator names it (`pp.fullNames false`).
+    /// A constant in a term, as the delaborator names it (`pp.fullNames false`), or by its whole
+    /// name under `pp.fullNames` (`unresolveNameGlobal` with `fullNames`).
     pub fn display_name(&self, name: &Name) -> String {
+        if self.pp.full_names {
+            return self.full_name(name);
+        }
         match (self.scope, &self.resolution) {
             (Some(scope), Some(resolution)) => {
                 escaped_name(&resolution.unresolve(self.env, scope, name))
             }
             _ => self.full_name(name),
         }
+    }
+
+    /// `delabConst` (vendored `PrettyPrinter/Delaborator/Builtins.lean:87-128`): the constant's
+    /// name, with its universe levels under `pp.universes` (`c.{0, u + 1}`, each level at
+    /// precedence 0). A private name under `pp.privateNames` is refused: its internal form is
+    /// not reproduced.
+    fn constant_head(&self, name: &Name, levels: &[Level]) -> Printed {
+        if self.pp.private_names && is_private(name) {
+            return Err(Unsupported("a private name under `pp.privateNames`"));
+        }
+        let shown = self.display_name(name);
+        if !self.pp.universes || levels.is_empty() {
+            return Ok(shown);
+        }
+        let levels = levels
+            .iter()
+            .map(|l| level(l, false))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(format!("{shown}.{{{}}}", levels.join(", ")))
     }
 
     /// A constant by its whole name, as `#check c`'s signature heads it. The pin's
@@ -1050,18 +1228,54 @@ impl<'a> Printer<'a> {
     fn proof_in(env: &Environment, scope: &[Expr], e: &Expr) -> bool {
         let mut local: Vec<Expr> = Vec::new();
         let mut e = e;
-        while let ExprNode::Lam {
-            binder_type, body, ..
-        } = e.node()
-        {
-            local.push(binder_type.clone());
-            e = body;
+        loop {
+            match e.node() {
+                ExprNode::Lam {
+                    binder_type, body, ..
+                } => {
+                    local.push(binder_type.clone());
+                    e = body;
+                }
+                // An ascription's anonymous `let` is its value, the pin's term (`(v : T)`).
+                ExprNode::LetE {
+                    decl_name,
+                    value,
+                    body,
+                    ..
+                } if decl_name.is_anonymous()
+                    && matches!(body.node(), ExprNode::BVar { idx: 0 }) =>
+                {
+                    e = value;
+                }
+                ExprNode::MData { expr, .. } => e = expr,
+                _ => break,
+            }
         }
-        let (head, _) = spine(e);
+        let (head, args) = spine(e);
         match head.node() {
-            ExprNode::Const { name, .. } => env
-                .find(name)
-                .is_some_and(|info| Self::prop_in(env, &[], &info.constant_val().type_)),
+            ExprNode::Const { name, .. } => env.find(name).is_some_and(|info| {
+                let type_ = &info.constant_val().type_;
+                if Self::prop_in(env, &[], type_) {
+                    return true;
+                }
+                // A head whose type ends in one of its parameters (`id h`, `sorryAx p b`,
+                // `Eq.mpr h p`): the arguments decide, as `inferType` instantiates them.
+                let mut result = type_;
+                let mut taken = 0;
+                while taken < args.len()
+                    && let ExprNode::ForallE { body, .. } = result.node()
+                {
+                    result = body;
+                    taken += 1;
+                }
+                if !matches!(spine(result).0.node(), ExprNode::BVar { .. }) {
+                    return false;
+                }
+                let outside = scope.iter().chain(&local).cloned().collect::<Vec<_>>();
+                result
+                    .subst_loose(0, &args[..taken])
+                    .is_ok_and(|result| Self::prop_in(env, &outside, &result))
+            }),
             // A binder's type is relative to the binders outside it.
             ExprNode::BVar { idx } => {
                 let idx = usize::try_from(*idx).unwrap_or(usize::MAX);
@@ -1115,11 +1329,19 @@ impl<'a> Printer<'a> {
     /// delaborator then sets `pp.proofs`, vendored `PrettyPrinter/Delaborator/Basic.lean:510-514`).
     pub fn doc(&mut self, e: &Expr, outer: u32) -> Doc {
         if self.nested {
-            if !self.proofs && !atomic(e) && self.is_proof(e) {
+            if !self.proofs && !atomic(strip_mdata(e)) && self.is_proof(e) {
                 return Ok(Format::text("⋯"));
             }
             return self.subterm(e, outer);
         }
+        // `pp.beta`: `delabCore` beta-reduces the term first (`Core.betaReduce`).
+        let reduced;
+        let e = if self.pp.beta {
+            reduced = beta_reduce(e)?;
+            &reduced
+        } else {
+            e
+        };
         // An ascription's anonymous `let` prints as its value, so the root is that value: the
         // pin's `(e : T)` elaborates to `e` itself, and `e` decides `pp.proofs` there.
         let mut root = e;
@@ -1135,7 +1357,13 @@ impl<'a> Printer<'a> {
             root = value;
         }
         self.nested = true;
-        self.proofs = self.is_proof(root);
+        // `pp.proofs` as set, or, when it is not set, on for a term that is itself a proof.
+        // Set off, a proof at the root is omitted like any other (`shouldOmitProof`).
+        self.proofs = self.pp.proofs || (!self.pp.proofs_set && self.is_proof(root));
+        if !self.proofs && !atomic(strip_mdata(e)) && self.is_proof(e) {
+            self.nested = false;
+            return Ok(Format::text("⋯"));
+        }
         let printed = self.subterm(e, outer);
         self.nested = false;
         // The root is always grouped (`formatCategory` is `fill (nest 2 …)` with no
@@ -1149,10 +1377,16 @@ impl<'a> Printer<'a> {
         match e.node() {
             ExprNode::BVar { idx } => {
                 let idx = usize::try_from(*idx).unwrap_or(usize::MAX);
-                self.names
+                let at = self
+                    .names
                     .len()
                     .checked_sub(idx + 1)
-                    .and_then(|at| self.names.get(at))
+                    .ok_or(Unsupported("a loose bound variable"))?;
+                if let Some(shown) = self.shown.get_mut(at) {
+                    *shown = true;
+                }
+                self.names
+                    .get(at)
                     .cloned()
                     .map(Format::text)
                     .ok_or(Unsupported("a loose bound variable"))
@@ -1170,8 +1404,10 @@ impl<'a> Printer<'a> {
                 })
             }
             // `unexpandUnit` (`Init/NotationExtra.lean:149`).
-            ExprNode::Const { name, .. }
-                if name.to_display_string() == "Unit.unit" && self.registered("Unit.unit") =>
+            ExprNode::Const { name, levels }
+                if name.to_display_string() == "Unit.unit"
+                    && self.unexpanding(levels)
+                    && self.registered("Unit.unit") =>
             {
                 Ok(Format::text("()"))
             }
@@ -1181,15 +1417,34 @@ impl<'a> Printer<'a> {
                 if let Some(ConstantInfo::Ctor(ctor)) = self.env.find(name)
                     && ctor.num_params == 0
                     && ctor.num_fields == 0
+                    && self.structure_instances_for(ctor, levels)
                     && let Some(ConstantInfo::Induct(inductive)) = self.env.find(&ctor.induct)
                     && self.structure_like(inductive) =>
             {
                 let ctor = ctor.clone();
                 self.structure_instance(&ctor, levels, &[])
             }
-            ExprNode::Const { name, .. } => self
-                .notation(name, &[], outer)
-                .unwrap_or_else(|| Ok(Format::text(self.constant(name)))),
+            ExprNode::Const { name, levels } => {
+                if self.unexpanding(levels)
+                    && let Some(printed) = self.notation(name, &[], outer)
+                {
+                    return printed;
+                }
+                Ok(Format::text(self.constant_at(name, levels)?))
+            }
+            // `delabLit`: a raw natural literal is `nat_lit n` under `pp.natLit` or `pp.explicit`
+            // (`rawNatLit`, a `leading_parser` at `leadPrec`).
+            ExprNode::Lit {
+                literal: Literal::Nat(value),
+            } if self.pp.nat_lit || self.pp.explicit => Ok(paren_doc(
+                node(
+                    Format::text("nat_lit")
+                        .then(Format::Line)
+                        .then(Format::text(nat_decimal(value))),
+                ),
+                MAX_PREC - 1,
+                outer,
+            )),
             ExprNode::Lit { literal } => Ok(Format::text(match literal {
                 Literal::Nat(value) => nat_decimal(value),
                 Literal::Str(text) => string_literal(text),
@@ -1197,6 +1452,7 @@ impl<'a> Printer<'a> {
             ExprNode::MData { expr, .. } => self.doc(expr, outer),
             ExprNode::App { .. } => self.application(e, outer),
             ExprNode::ForallE { .. } => self.pi(e, outer),
+            ExprNode::Lam { .. } if self.pp.fun_binder_types => self.typed_lambda(e, outer),
             ExprNode::Lam { .. } => {
                 // `fun` is ungrouped (`ppAllowUngrouped`): `fun` ++ ppGroup(binders ++ " =>")
                 // ++ line ++ body (vendored `Parser/Term.lean`, `basicFun`).
@@ -1236,7 +1492,8 @@ impl<'a> Printer<'a> {
                         binder_type: next_type,
                         binder_info: next_info,
                         ..
-                    } if next_info == binder_info && next_type == binder_type);
+                    } if next_info == binder_info
+                        && binder_type.lift_loose(0, 1).is_ok_and(|lifted| lifted == *next_type));
                     if !grouped {
                         let (open, close) = if *binder_info == BinderInfo::Implicit {
                             ("{", "}")
@@ -1289,6 +1546,7 @@ impl<'a> Printer<'a> {
                     return Err(INTERNAL_BINDER);
                 }
                 let non_dep = &self.nondependent(body, *non_dep)?;
+                let declared = self.let_type(type_)?;
                 let value = self.doc(value, 0)?;
                 let shown = binder_name(name);
                 let depth = self.names.len();
@@ -1298,12 +1556,12 @@ impl<'a> Printer<'a> {
                 let printed = self.doc(body, 0);
                 self.top_names = top;
                 self.unbind_to(depth);
-                Ok(
-                    Format::text(format!("{} {shown} := ", let_keyword(*non_dep)))
-                        .then(value)
-                        .then(Format::text(";\n"))
-                        .then(printed?),
-                )
+                Ok(Format::text(format!("{} {shown}", let_keyword(*non_dep)))
+                    .then(declared)
+                    .then(Format::text(" := "))
+                    .then(value)
+                    .then(Format::text(";\n"))
+                    .then(printed?))
             }
             // Nested, a `let` (`have` when nondependent) is `let x := v;`, the hard line of
             // `optSemicolon`'s `ppLine`, and its body, under `ppDedent`: in parentheses below
@@ -1320,26 +1578,26 @@ impl<'a> Printer<'a> {
                     return Err(INTERNAL_BINDER);
                 }
                 let non_dep = &self.nondependent(body, *non_dep)?;
+                let declared = self.let_type(type_)?;
                 let value = self.doc(value, 0)?;
                 let shown = binder_name(name);
                 let depth = self.names.len();
                 self.bind(shown.clone(), type_);
                 let printed = self.doc(body, 0);
                 self.unbind_to(depth);
+                let head = Format::text(format!("{} {shown}", let_keyword(*non_dep)))
+                    .then(declared)
+                    .then(Format::text(" := "));
                 if outer < MAX_PREC {
                     // Unbracketed, the term is its own node, `fill (nest 2 …)`, with the body
                     // under `ppDedent` (`nest (-2)`): its hard line is inside a group, so an
                     // enclosing `fill` breaks before it (`n =⏎  have k := …;⏎  k * k`).
                     return Ok(node(
-                        Format::text(format!("{} {shown} := ", let_keyword(*non_dep)))
-                            .then(value)
+                        head.then(value)
                             .then(Format::text(";\n").then(printed?).nest(-2)),
                     ));
                 }
-                let doc = Format::text(format!("{} {shown} := ", let_keyword(*non_dep)))
-                    .then(value)
-                    .then(Format::text(";\n"))
-                    .then(printed?);
+                let doc = head.then(value).then(Format::text(";\n")).then(printed?);
                 Ok(paren_doc(doc, MAX_PREC - 1, outer))
             }
             ExprNode::Proj { idx, expr, .. } => Ok(node(
@@ -1347,6 +1605,16 @@ impl<'a> Printer<'a> {
                     .then(Format::text(format!(".{}", idx + 1))),
             )),
         }
+    }
+
+    /// A `let`'s declared type as `delabLetE` shows it: ` : T` under `pp.letVarTypes`, nothing
+    /// otherwise (vendored `PrettyPrinter/Delaborator/Builtins.lean:1080-1097`).
+    fn let_type(&mut self, type_: &Expr) -> Doc {
+        if !self.pp.let_var_types {
+            return Ok(Format::Nil);
+        }
+        let type_ = self.with_trailing(false, |printer| printer.doc(type_, 0))?;
+        Ok(Format::text(" : ").then(type_))
     }
 
     /// Whether a `let` with this body prints as `have`, under [`Printer::lets`].
@@ -1361,25 +1629,202 @@ impl<'a> Printer<'a> {
         }
     }
 
+    /// Whether app unexpanders run on an application headed by a constant at `levels`
+    /// (`delabAppImplicitCore`'s `unexpand`, vendored `PrettyPrinter/Delaborator/Builtins.lean:
+    /// 364-389`): `pp.notation` is on, the application is in implicit mode (`pp.explicit` is off;
+    /// the arity of each notation here leaves no implicit parameter next), and the head has no
+    /// universe levels or `pp.universes` is off.
+    fn unexpanding(&self, levels: &[Level]) -> bool {
+        self.pp.notation && !self.pp.explicit && (levels.is_empty() || !self.pp.universes)
+    }
+
+    /// The guards of the builtin delaborators of literals, `delabOfNat`, `delabNeg` and
+    /// `delabOfScientific`: `whenNotPPOption getPPExplicit <| whenPPOption getPPCoercions`.
+    fn numerals(&self) -> bool {
+        !self.pp.explicit && self.pp.coercions
+    }
+
+    /// The guards of the builtin notation delaborators (`delabSigma`, `delabSorry`, …):
+    /// `whenNotPPOption getPPExplicit <| whenPPOption getPPNotation`.
+    fn builtin_notation(&self) -> bool {
+        !self.pp.explicit && self.pp.notation
+    }
+
+    /// `delabStructureInstance`'s guards on the options (vendored
+    /// `PrettyPrinter/Delaborator/Builtins.lean:638-648`): `pp.structureInstances`, a
+    /// constructor without universe parameters unless `pp.universes` is off, and none with
+    /// parameters under `pp.explicit`.
+    fn structure_instances_for(
+        &self,
+        ctor: &fln_env::constants::ConstructorVal,
+        levels: &[Level],
+    ) -> bool {
+        // A constructor an unexpander prints is never a structure instance; where unexpanders
+        // run, [`Printer::structure_instance`] refuses it, and where they do not, it prints as
+        // an application.
+        if !self.unexpanding(levels)
+            && (self.unexpander_in_force(&ctor.base.name) || self.notation_prints(&ctor.base.name))
+        {
+            return false;
+        }
+        // In explicit mode, a type printed `⟨…⟩` needs every field explicit.
+        let anonymous_explicit = || {
+            !self
+                .tags
+                .as_ref()
+                .is_some_and(|tags| tags.anonymous_constructor(&ctor.induct))
+                || self
+                    .binder_infos(&ctor.base.name)
+                    .iter()
+                    .skip(ctor.num_params as usize)
+                    .all(|info| *info == BinderInfo::Default)
+        };
+        self.pp.structure_instances
+            && (ctor.base.level_params.is_empty() || !self.pp.universes)
+            && (!self.pp.explicit || (ctor.num_params == 0 && anonymous_explicit()))
+    }
+
+    /// Whether a builtin delaborator this printer does not reproduce prints `function` applied
+    /// to `count` arguments under the options in force (vendored
+    /// `PrettyPrinter/Delaborator/Builtins.lean:1262-1513`): `dite`'s `if h : c then …`,
+    /// `cond`'s `bif`, `⟨a, b⟩` of `PProd.mk`/`MProd.mk`, the ranges, `do`, the lazy binary
+    /// operators and name literals. Where one is switched off by `pp.notation` or `pp.explicit`,
+    /// the application prints as one.
+    fn builtin_unreproduced(&self, function: &str, count: usize) -> bool {
+        match function {
+            "dite" => self.builtin_notation() && count >= 5,
+            "cond" => self.builtin_notation() && count >= 4,
+            "PProd.mk" | "MProd.mk" => self.builtin_notation() && count == 4,
+            "Bind.bind" => self.builtin_notation() && count == 6,
+            "HOrElse.hOrElse" | "HAndThen.hAndThen" | "Seq.seq" | "SeqLeft.seqLeft"
+            | "SeqRight.seqRight" => self.builtin_notation() && count >= 6,
+            "Std.Rcc.mk" | "Std.Rco.mk" | "Std.Rci.mk" | "Std.Roc.mk" | "Std.Roo.mk"
+            | "Std.Roi.mk" | "Std.Ric.mk" | "Std.Rio.mk" | "Std.Rii.mk" => self.builtin_notation(),
+            "Std.Legacy.Range.mk" => self.pp.notation && count == 4,
+            "Lean.Name.str" | "Lean.Name.num" | "Lean.Name.mkStr1" | "Lean.Name.mkStr2"
+            | "Lean.Name.mkStr3" | "Lean.Name.mkStr4" | "Lean.Name.mkStr5" | "Lean.Name.mkStr6"
+            | "Lean.Name.mkStr7" | "Lean.Name.mkStr8" => self.pp.notation,
+            // `delabAppMatch`: a matcher application is `match … with`, under `pp.match` too.
+            _ => {
+                self.builtin_notation()
+                    && self.pp.match_
+                    && function.rsplit('.').next().is_some_and(|leaf| {
+                        leaf.strip_prefix("match_")
+                            .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+                    })
+            }
+        }
+    }
+
+    /// The numeric literals of `delabOfNat`, `delabNeg` and `delabHDiv` (vendored
+    /// `PrettyPrinter/Delaborator/Builtins.lean:1112-1187`): `n` for `OfNat.ofNat T n _`, `-n`
+    /// for its negation, and `p / q` for a homogeneous division of one by a numeral. Under
+    /// `pp.numericTypes` each is ascribed its type, `(n : T)`. `None` where none applies.
+    fn numeric_literal(&mut self, function: &str, args: &[Expr], outer: u32) -> Option<Doc> {
+        let numeral = |e: &Expr| {
+            let (head, args) = spine(e);
+            match (head.node(), args.as_slice()) {
+                (ExprNode::Const { name, .. }, [_, value, _])
+                    if name.to_display_string() == "OfNat.ofNat" =>
+                {
+                    match value.node() {
+                        ExprNode::Lit {
+                            literal: Literal::Nat(value),
+                        } => Some(nat_decimal(value)),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            }
+        };
+        let negative = |e: &Expr| {
+            let (head, args) = spine(e);
+            match (head.node(), args.as_slice()) {
+                (ExprNode::Const { name, .. }, [_, _, operand])
+                    if name.to_display_string() == "Neg.neg" =>
+                {
+                    numeral(operand).map(|n| format!("-{n}"))
+                }
+                _ => None,
+            }
+        };
+        let (literal, precedence) = match (function, args) {
+            ("OfNat.ofNat", [_, value, _]) => match value.node() {
+                ExprNode::Lit {
+                    literal: Literal::Nat(value),
+                } => (nat_decimal(value), MAX_PREC),
+                _ => return None,
+            },
+            ("Neg.neg", [_, _, operand]) => (format!("-{}", numeral(operand)?), 75),
+            ("HDiv.hDiv", [a, b, c, _, p, q]) if a == b && b == c => {
+                let p = numeral(p).or_else(|| negative(p))?;
+                (format!("{p} / {}", numeral(q)?), 70)
+            }
+            _ => return None,
+        };
+        if !self.pp.numeric_types {
+            // `-n` and `p / q` are notation nodes, laid out as their unexpanders lay them out.
+            let doc = match literal.split_once(" / ") {
+                Some((p, q)) => node(
+                    Format::text(format!("{p} /"))
+                        .then(Format::Line)
+                        .then(Format::text(q)),
+                ),
+                None if precedence == 75 => node(Format::text(literal)),
+                None => Format::text(literal),
+            };
+            return Some(Ok(paren_doc(doc, precedence, outer)));
+        }
+        let shown = match literal.split_once(" / ") {
+            Some((p, q)) => node(
+                Format::text(format!("{p} /"))
+                    .then(Format::Line)
+                    .then(Format::text(q)),
+            ),
+            None => Format::text(literal),
+        };
+        Some(self.ascribed(shown, &args[0]))
+    }
+
     fn application(&mut self, e: &Expr, outer: u32) -> Doc {
         let (head, args) = spine(e);
-        if let ExprNode::Const { name, .. } = head.node() {
+        if let ExprNode::Const { name, levels } = head.node() {
             let text = name.to_display_string();
-            if text == "OfNat.ofNat"
-                && args.len() == 3
+            let unexpanding = self.unexpanding(levels);
+            // `delabChar` (vendored `PrettyPrinter/Delaborator/Builtins.lean:1099-1104`), under
+            // every option: `Char.ofNat` of a literal is the character literal.
+            if text == "Char.ofNat"
+                && let [arg] = args.as_slice()
                 && let ExprNode::Lit {
                     literal: Literal::Nat(value),
-                } = args[1].node()
+                } = arg.node()
             {
-                return Ok(Format::text(nat_decimal(value)));
+                return value
+                    .to_u64()
+                    .and_then(|code| u32::try_from(code).ok())
+                    .and_then(char::from_u32)
+                    .map(|c| Format::text(char_literal(c)))
+                    .ok_or(Unsupported(
+                        "a character literal that is not a scalar value",
+                    ));
+            }
+            if self.builtin_unreproduced(&text, args.len()) {
+                return Err(Unsupported(
+                    "an application a builtin notation delaborator prints",
+                ));
+            }
+            if self.numerals()
+                && let Some(printed) = self.numeric_literal(&text, &args, outer)
+            {
+                return printed;
             }
             // The source's own notations: their unexpanders are the newest.
-            if let Some(printed) = self.notation(name, &args, outer) {
+            if unexpanding && let Some(printed) = self.notation(name, &args, outer) {
                 return printed;
             }
             // `notation:max "¬" p:40 => Not p`; `notation:max "!" b:40 => not b`
             // (`Init/Notation.lean`, `not` being `Bool.not`).
-            if (text == "Not" || text == "Bool.not") && args.len() == 1 {
+            if (text == "Not" || text == "Bool.not") && args.len() == 1 && unexpanding {
                 let symbol = if text == "Not" { "¬" } else { "!" };
                 return Ok(paren_doc(
                     node(Format::text(symbol).then(self.doc(&args[0], 40)?)),
@@ -1393,6 +1838,7 @@ impl<'a> Printer<'a> {
             // `Init.NotationExtra`; without it the pin fails to print the term at all.
             if (text == "Sigma" || text == "PSigma")
                 && args.len() == 2
+                && self.builtin_notation()
                 && let ExprNode::Lam {
                     binder_name,
                     binder_type,
@@ -1423,11 +1869,52 @@ impl<'a> Printer<'a> {
                     .then(printed?);
                 return Ok(paren_doc(node(doc), 35, outer));
             }
+            // `unexpandSubtype` (`Init/NotationExtra.lean:199-202`): `Subtype fun x => p` is
+            // `{ x // p }`, and `{ x : α // p }` under `pp.funBinderTypes`, the `fun` carrying its
+            // binder's type (`"{ " ident (" : " term)? " // " term " }"`, `Init/Notation.lean:577`).
+            if text == "Subtype"
+                && args.len() == 2
+                && unexpanding
+                && self.registered("Subtype")
+                && let ExprNode::Lam {
+                    binder_name,
+                    binder_type,
+                    body,
+                    binder_info: BinderInfo::Default,
+                } = args[1].node()
+            {
+                if internal_name(binder_name) {
+                    return Err(INTERNAL_BINDER);
+                }
+                let domain = if self.pp.fun_binder_types {
+                    Some(self.with_trailing(false, |printer| printer.doc(binder_type, 0))?)
+                } else {
+                    None
+                };
+                let shown = self.bound_name(binder_name, body);
+                let depth = self.names.len();
+                self.bind(shown.clone(), binder_type);
+                let printed = self.with_trailing(false, |printer| printer.doc(body, 0));
+                self.unbind_to(depth);
+                let mut doc = Format::text("{")
+                    .then(Format::Line)
+                    .then(Format::text(shown));
+                if let Some(domain) = domain {
+                    doc = doc.then(Format::text(" :")).then(Format::Line).then(domain);
+                }
+                return Ok(node(
+                    doc.then(Format::text(" //"))
+                        .then(Format::Line)
+                        .then(printed?)
+                        .then(Format::text(" }")),
+                ));
+            }
             // `unexpandExists` (`Init/NotationExtra.lean:185-189`): `Exists fun x => b` is
             // `∃ x, b`, nested ones sharing one binder list. A `fun` binder that is not
             // explicit does not match the unexpander and is not reproduced.
             if text == "Exists"
                 && args.len() == 2
+                && unexpanding
                 && self.registered("Exists")
                 && matches!(
                     args[1].node(),
@@ -1439,8 +1926,13 @@ impl<'a> Printer<'a> {
             {
                 return self.exists(&args[1], outer);
             }
-            // `prefix:75 "-" => Neg.neg` (`Init/Notation.lean:293`).
-            if text == "Neg.neg" && args.len() == 3 {
+            // `prefix:75 "-" => Neg.neg` (`Init/Notation.lean:293`), and `delabNeg`'s negative
+            // numeral (vendored `PrettyPrinter/Delaborator/Builtins.lean:1171-1177`), which
+            // prints the same and is not an unexpander.
+            if text == "Neg.neg"
+                && args.len() == 3
+                && (unexpanding || (self.numerals() && ofnat_literal(&args[2])))
+            {
                 let trailing = self.trailing && 75 >= outer;
                 let operand = self.with_trailing(trailing, |printer| printer.doc(&args[2], 75))?;
                 // `--` would begin a comment: the pin separates the tokens, not reproduced.
@@ -1452,6 +1944,7 @@ impl<'a> Printer<'a> {
             // `delabOfScientific` (vendored `PrettyPrinter/Delaborator/Builtins.lean:1190-1207`).
             if text == "OfScientific.ofScientific"
                 && args.len() == 5
+                && self.numerals()
                 && let ExprNode::Lit {
                     literal: Literal::Nat(mantissa),
                 } = args[2].node()
@@ -1474,6 +1967,7 @@ impl<'a> Printer<'a> {
             // `[a, b, …]` (the `List.cons`/`List.nil` unexpanders); an open tail is `::`.
             if text == "List.cons"
                 && args.len() == 3
+                && unexpanding
                 && self.registered("List.cons")
                 && self.registered("List.nil")
             {
@@ -1505,7 +1999,7 @@ impl<'a> Printer<'a> {
                     break;
                 }
             }
-            if text == "List.nil" && args.len() == 1 && self.registered("List.nil") {
+            if text == "List.nil" && args.len() == 1 && unexpanding && self.registered("List.nil") {
                 return Ok(Format::text("[]"));
             }
             // Each operator is an `infixl`/`infixr`/`notation` of `Init.Notation`, which registers
@@ -1513,7 +2007,7 @@ impl<'a> Printer<'a> {
             if let Some(infix) = INFIXES
                 .iter()
                 .find(|infix| infix.function == text && infix.arity == args.len())
-                .filter(|infix| self.registered(infix.function))
+                .filter(|infix| unexpanding && self.registered(infix.function))
             {
                 let (lhs_prec, rhs_prec) = if infix.right {
                     (infix.precedence + 1, infix.precedence)
@@ -1568,10 +2062,20 @@ impl<'a> Printer<'a> {
                 .binder_infos(name)
                 .iter()
                 .position(|info| *info == BinderInfo::Default)
+                // `whenPPOption getPPCoercions`; under `pp.explicit` a coercion whose coercee is not
+                // its first argument is not one (each of the four's is not).
+                && self.pp.coercions
+                && !(self.pp.explicit && coercee != 0)
             {
                 if args.len() == coercee + 1 {
                     let shown = self.doc(&args[coercee], MAX_PREC)?;
-                    return Ok(node(Format::text("↑").then(shown)));
+                    let coercion = node(Format::text("↑").then(shown));
+                    // `withTypeAscription (cond := ← getPPOption getPPCoercionsTypes)`.
+                    if self.pp.coercions_types {
+                        let type_ = self.application_type(name, levels, &args)?;
+                        return self.ascribed(coercion, &type_);
+                    }
+                    return Ok(coercion);
                 }
                 if args.len() > coercee + 1 {
                     return Err(Unsupported("an applied coercion"));
@@ -1580,7 +2084,7 @@ impl<'a> Printer<'a> {
             // `delabSorry` (vendored `PrettyPrinter/Delaborator/Builtins.lean:1515-1542`): a
             // labeled sorry, `sorryAx (Lean.Name → α) synthetic tag`, and a plain one,
             // `sorryAx α synthetic`, both print `sorry`; arguments beyond are applied after it.
-            if text == "sorryAx" && args.len() >= 2 {
+            if text == "sorryAx" && args.len() >= 2 && self.builtin_notation() {
                 let labeled = matches!(args[0].node(), ExprNode::ForallE { binder_type, .. }
                     if matches!(binder_type.node(), ExprNode::Const { name, .. }
                         if name.to_display_string() == "Lean.Name"));
@@ -1590,54 +2094,43 @@ impl<'a> Printer<'a> {
                 }
                 return Err(Unsupported("an applied sorry"));
             }
-            if text == "Prod.mk" && args.len() == 4 && self.registered("Prod.mk") {
+            if text == "Prod.mk" && args.len() == 4 && unexpanding && self.registered("Prod.mk") {
                 return self.tuple(&args[2], &args[3]);
             }
             // A structure's constructor, fully applied, is `{ x := a, … }` at the pin, or
             // `⟨a, …⟩` for a type tagged `pp_using_anonymous_constructor` ([`structures`]).
             if let Some(ConstantInfo::Ctor(ctor)) = self.env.find(name)
                 && args.len() == (ctor.num_params + ctor.num_fields) as usize
+                && self.structure_instances_for(ctor, levels)
                 && let Some(ConstantInfo::Induct(inductive)) = self.env.find(&ctor.induct)
                 && self.structure_like(inductive)
             {
                 let ctor = ctor.clone();
-                let ExprNode::Const { levels, .. } = head.node() else {
-                    unreachable!("a constant head")
-                };
                 return self.structure_instance(&ctor, levels, &args);
             }
             // Any other constant an imported `@[app_unexpander]` prints (`ite` as `if … then …
             // else …`, `GetElem.getElem` as `xs[i]`, …) runs code this door does not reproduce:
-            // its application is refused rather than printed as an application.
-            if self.imported_tags && self.unexpander_in_force(name) {
+            // its application is refused rather than printed as an application. Where no
+            // unexpander runs, the application prints as one.
+            if unexpanding && self.imported_tags && self.unexpander_in_force(name) {
                 return Err(Unsupported("an application an `@[app_unexpander]` prints"));
             }
-            let ExprNode::Const { levels, .. } = head.node() else {
-                unreachable!("a constant head")
-            };
             let kinds = self.param_kinds(name, levels, &args);
             // `delabAppExplicitCore`: every argument, implicit and instance ones included, after
-            // `@c` (`needsExplicit`). The pin takes explicit mode when the next parameter is
-            // implicit (`@List.map Nat`) or a later explicit one has a default (`@f 1`).
-            if app_explicit(args.len(), &kinds) {
-                let text = self.display_name(name);
-                let text = if needs_explicit(args.len(), &kinds) {
-                    format!("@{text}")
-                } else {
-                    text
-                };
-                let mut shown = Format::text(text);
-                let mut open = false;
-                for (index, arg) in args.iter().enumerate() {
-                    let last = index + 1 == args.len();
-                    let (printed, bare) = self.argument(arg, last)?;
-                    shown = shown.then(Format::Line).then(printed);
-                    open = bare;
-                }
-                return Ok(self.applied(node(shown), open, outer));
+            // `@c` (`needsExplicit`). The pin takes explicit mode under `pp.explicit`, and
+            // otherwise when the next parameter is implicit (`@List.map Nat`) or a later explicit
+            // one has a default (`@f 1`).
+            if self.pp.explicit || app_explicit(args.len(), &kinds) {
+                return self.explicit_application(name, levels, &args, &kinds, outer);
             }
             let infos = self.binder_infos(name);
-            let receiver = self.field_receiver(name, &infos, &args);
+            // `delabAppImplicitCore`'s field notation: `pp.fieldNotation`, and a head without
+            // universe levels or `pp.universes` off.
+            let receiver = if self.pp.field_notation && (levels.is_empty() || !self.pp.universes) {
+                self.field_receiver(name, &infos, &args)
+            } else {
+                None
+            };
             // `delabAppImplicitCore`'s `mkArg`: an argument equal to its parameter's default is
             // optional, then the field-notation object and explicit arguments are shown; the
             // trailing optional arguments are dropped (`f 1` for `f 1 3`, `f n m := 3`).
@@ -1669,7 +2162,7 @@ impl<'a> Printer<'a> {
             if let Some((receiver, field)) = receiver
                 && kinds_shown.get(receiver) == Some(&Shown::Regular)
             {
-                let object = self.without_parent_projections(&args[receiver])?;
+                let object = self.without_parent_projections(&args[receiver], false)?;
                 let projection = node(
                     self.doc(&object, MAX_PREC)?
                         .then(Format::text(format!(".{field}"))),
@@ -1704,12 +2197,48 @@ impl<'a> Printer<'a> {
                 open = bare;
                 applied = true;
             }
-            let text = self.display_name(name);
+            let text = self.constant_head(name, levels)?;
             if !applied {
                 return Ok(Format::text(text));
             }
             // `app := many1 argument`, each argument after a line (`checkWsBefore`).
             return Ok(self.applied(node(Format::text(text).then(shown)), open, outer));
+        }
+        // A bound variable applied: every argument is shown, which is the pin's printing only
+        // when each parameter it supplies is explicit and the next is neither implicit nor an
+        // instance (`getParamKinds` of the variable's type, `needsExplicit`).
+        if let ExprNode::BVar { .. } = head.node()
+            && let Ok(type_) = self.infer_type(&head)
+        {
+            let mut type_ = &type_;
+            for _ in 0..args.len() {
+                match type_.node() {
+                    ExprNode::ForallE {
+                        body,
+                        binder_info: BinderInfo::Default,
+                        binder_type,
+                        ..
+                    } if annotation(binder_type, "optParam").is_none()
+                        && annotation(binder_type, "autoParam").is_none() =>
+                    {
+                        type_ = body;
+                    }
+                    ExprNode::ForallE { .. } => {
+                        return Err(Unsupported(
+                            "a bound variable applied to an implicit or defaulted argument",
+                        ));
+                    }
+                    _ => break,
+                }
+            }
+            if let ExprNode::ForallE { binder_info, .. } = type_.node()
+                && *binder_info != BinderInfo::Default
+                && *binder_info != BinderInfo::StrictImplicit
+            {
+                return Err(Unsupported(
+                    "a bound variable applied before an implicit parameter",
+                ));
+            }
         }
         let mut shown = self.doc(&head, MAX_PREC)?;
         let mut open = false;
@@ -1803,6 +2332,151 @@ impl<'a> Printer<'a> {
         }
     }
 
+    /// `delabAppExplicitCore` (vendored `PrettyPrinter/Delaborator/Builtins.lean:290-332`): the
+    /// head, with `@` when `needsExplicit`, and every argument. Without `@`, the application may
+    /// use field notation (`pp.fieldNotation`, not under `pp.tagAppFns`, and a head without
+    /// universe levels unless `pp.universes` is off). An instance argument is `_` without
+    /// `pp.instances`, and ascribed its type under `pp.instanceTypes`.
+    fn explicit_application(
+        &mut self,
+        name: &Name,
+        levels: &[Level],
+        args: &[Expr],
+        kinds: &[ParamKind],
+        outer: u32,
+    ) -> Doc {
+        let insert = needs_explicit(args.len(), kinds);
+        let receiver = if !insert
+            && self.pp.field_notation
+            && !self.pp.tag_app_fns
+            && (levels.is_empty() || !self.pp.universes)
+        {
+            let infos = self.binder_infos(name);
+            self.field_receiver(name, &infos, args)
+        } else {
+            None
+        };
+        let mut printed = Vec::with_capacity(args.len());
+        for (index, arg) in args.iter().enumerate() {
+            let last = index + 1 == args.len();
+            if receiver.as_ref().is_some_and(|(at, _)| *at == index) {
+                let object = self.without_parent_projections(arg, true)?;
+                printed.push((self.doc(&object, MAX_PREC)?, false));
+                continue;
+            }
+            if kinds
+                .get(index)
+                .is_some_and(|kind| kind.info == BinderInfo::InstImplicit)
+            {
+                if self.pp.instance_types {
+                    let shown = if self.pp.instances {
+                        self.with_trailing(false, |printer| printer.doc(arg, 0))?
+                    } else {
+                        Format::text("_")
+                    };
+                    let type_ = self.infer_type(arg)?;
+                    printed.push((self.ascribed(shown, &type_)?, false));
+                } else if self.pp.instances {
+                    printed.push(self.argument(arg, last)?);
+                } else {
+                    printed.push((Format::text("_"), false));
+                }
+                continue;
+            }
+            printed.push(self.argument(arg, last)?);
+        }
+        if let Some((at, field)) = receiver {
+            let (object, _) = printed.remove(at);
+            let mut shown = node(object.then(Format::text(format!(".{field}"))));
+            if printed.is_empty() {
+                return Ok(shown);
+            }
+            let mut open = false;
+            for (doc, bare) in printed {
+                shown = shown.then(Format::Line).then(doc);
+                open = bare;
+            }
+            return Ok(self.applied(node(shown), open, outer));
+        }
+        let head = self.constant_head(name, levels)?;
+        let mut shown = Format::text(if insert { format!("@{head}") } else { head });
+        if printed.is_empty() {
+            return Ok(shown);
+        }
+        let mut open = false;
+        for (doc, bare) in printed {
+            shown = shown.then(Format::Line).then(doc);
+            open = bare;
+        }
+        Ok(self.applied(node(shown), open, outer))
+    }
+
+    /// `withTypeAscription` (vendored `PrettyPrinter/Delaborator/Builtins.lean:28-36`):
+    /// `(e : T)`, the `typeAscription` node, its `" :"` token followed by `ppSpace`.
+    fn ascribed(&mut self, doc: Format, type_: &Expr) -> Doc {
+        let type_ = self.with_trailing(false, |printer| printer.doc(type_, 0))?;
+        Ok(node(
+            Format::text("(")
+                .then(doc)
+                .then(Format::text(" :"))
+                .then(Format::Line)
+                .then(type_)
+                .then(Format::text(")")),
+        ))
+    }
+
+    /// The type of `e` where it is read off without reduction: a bound variable's, or a
+    /// constant's applied to arguments that its type's leading binders take (`inferType`).
+    fn infer_type(&self, e: &Expr) -> Result<Expr, Unsupported> {
+        let unknown = Unsupported("the type of a term this printer does not infer");
+        let (head, args) = spine(strip_mdata(e));
+        match head.node() {
+            ExprNode::Const { name, levels } => self.application_type(name, levels, &args),
+            ExprNode::BVar { idx } if args.is_empty() => {
+                let index = usize::try_from(*idx).map_err(|_| unknown.clone())?;
+                let at = self
+                    .types
+                    .len()
+                    .checked_sub(index + 1)
+                    .ok_or(unknown.clone())?;
+                self.types[at].lift_loose(0, *idx + 1).map_err(|_| unknown)
+            }
+            _ => Err(unknown),
+        }
+    }
+
+    /// The type of `name` at `levels` applied to `args`: its type with the universe parameters
+    /// instantiated and one leading binder taken per argument. A type that would have to be
+    /// reduced to a function type first is refused.
+    fn application_type(
+        &self,
+        name: &Name,
+        levels: &[Level],
+        args: &[Expr],
+    ) -> Result<Expr, Unsupported> {
+        let unknown = Unsupported("the type of an application this printer does not infer");
+        let info = self.env.find(name).ok_or(unknown.clone())?;
+        let base = info.constant_val();
+        if base.level_params.len() != levels.len() {
+            return Err(unknown);
+        }
+        let mut type_ = fln_elab::universe::parameters::instantiate(
+            || Ok(()),
+            || (),
+            &base.type_,
+            &base.level_params,
+            levels,
+        )
+        .map_err(|_| unknown.clone())?;
+        for _ in args {
+            let ExprNode::ForallE { body, .. } = type_.node() else {
+                return Err(unknown);
+            };
+            type_ = body.clone();
+        }
+        type_.subst_loose(0, args).map_err(|_| unknown)
+    }
+
     /// The receiver index and field name when `C.f args` prints as `receiver.f`.
     fn field_receiver(
         &self,
@@ -1889,6 +2563,17 @@ impl<'a> Printer<'a> {
         } else {
             self.display_name(name)
         }
+    }
+
+    /// [`Printer::constant`] at `levels`, under the options in force ([`Printer::constant_head`]).
+    fn constant_at(&self, name: &Name, levels: &[Level]) -> Printed {
+        let kinds = self.param_kinds(name, levels, &[]);
+        let head = self.constant_head(name, levels)?;
+        Ok(if needs_explicit(0, &kinds) {
+            format!("@{head}")
+        } else {
+            head
+        })
     }
 
     /// One group of binders for a dependent `∀`/`→`, as the pin groups them. `hidden`
@@ -2014,10 +2699,16 @@ impl<'a> Printer<'a> {
         // scope is shown as if the binder were dependent (`delabForallBinders`' `dep` with
         // `pp.piBinderNames`); one already in scope was renamed inaccessible by `processSpine`.
         let spine = std::mem::take(&mut self.spine_names);
+        // Under `pp.piBinderNames` every binder name without macro scopes shows (with
+        // `pp.piBinderNames.hygienic`, every one), as if the binder were dependent.
         let named = |printer: &Self, name: &Name| {
-            spine && accessible(name) && !printer.names.contains(&escaped_name(name))
+            (spine && accessible(name) && !printer.names.contains(&escaped_name(name)))
+                || (printer.pp.pi_binder_names
+                    && (!name.has_macro_scopes() || printer.pp.pi_binder_names_hygienic))
         };
-        let proposition = self.is_prop(e);
+        // `∀` notation, and the binder names RFC #1834 shows, are for propositions under
+        // `pp.foralls`; without it a proposition prints with arrows.
+        let proposition = self.pp.foralls && self.is_prop(e);
         // `delabForallBinders` (vendored `PrettyPrinter/Delaborator/Builtins.lean:1020-1031`): a
         // binder shows its name when it is dependent, and also (RFC #1834, `pp.foralls`) when
         // it is explicit, in a proposition, and its domain is not a proposition.
@@ -2148,6 +2839,130 @@ impl<'a> Printer<'a> {
         ))
     }
 
+    /// `fun` under `pp.funBinderTypes` (`delabLamAux`, vendored
+    /// `PrettyPrinter/Delaborator/Builtins.lean:954-1010`): every binder group shows its type,
+    /// `(x y : α)` (a type ascription of the names), `{x y : α}`, `⦃x y : α⦄`, and an instance
+    /// binder `[inst : C α]` when it is dependent and the printed rest names it, `[C α]`
+    /// otherwise. A binder is grouped with the next when their binder infos agree, neither is an
+    /// instance binder, and the next one's domain is this one's (`shouldGroupWithNext`).
+    fn typed_lambda(&mut self, e: &Expr, outer: u32) -> Doc {
+        struct Group {
+            info: BinderInfo,
+            names: Vec<String>,
+            first: usize,
+            type_: Format,
+            dependent: bool,
+        }
+        let depth = self.names.len();
+        let mut groups: Vec<Group> = Vec::new();
+        let mut body = e;
+        while let ExprNode::Lam {
+            binder_name: name,
+            binder_type,
+            body: inner,
+            binder_info,
+        } = body.node()
+        {
+            if internal_name(name) {
+                self.unbind_to(depth);
+                return Err(INTERNAL_BINDER);
+            }
+            let type_ = match self.with_trailing(false, |printer| printer.doc(binder_type, 0)) {
+                Ok(type_) => type_,
+                Err(error) => {
+                    self.unbind_to(depth);
+                    return Err(error);
+                }
+            };
+            let first = self.names.len();
+            let shown = self.bound_name(name, inner);
+            self.bind(shown.clone(), binder_type);
+            let mut names = vec![shown];
+            let mut dependent = inner.has_loose_bvar(0);
+            let mut domain = binder_type.clone();
+            let mut next = inner;
+            while *binder_info != BinderInfo::InstImplicit
+                && let ExprNode::Lam {
+                    binder_name: other,
+                    binder_type: other_type,
+                    body: other_body,
+                    binder_info: other_info,
+                } = next.node()
+                && other_info == binder_info
+                && domain
+                    .lift_loose(0, 1)
+                    .is_ok_and(|lifted| lifted == *other_type)
+            {
+                if internal_name(other) {
+                    self.unbind_to(depth);
+                    return Err(INTERNAL_BINDER);
+                }
+                let shown = self.bound_name(other, other_body);
+                self.bind(shown.clone(), other_type);
+                names.push(shown);
+                dependent |= other_body.has_loose_bvar(0);
+                domain = other_type.clone();
+                next = other_body;
+            }
+            groups.push(Group {
+                info: *binder_info,
+                names,
+                first,
+                type_,
+                dependent,
+            });
+            body = next;
+        }
+        let trailing = self.trailing && outer == 0;
+        let printed = self.with_trailing(trailing, |printer| printer.doc(body, 0));
+        let named: Vec<bool> = groups
+            .iter()
+            .map(|group| group.dependent && self.shown.get(group.first) == Some(&true))
+            .collect();
+        self.unbind_to(depth);
+        let printed = printed?;
+        let mut binders = Format::Nil;
+        for (group, named) in groups.into_iter().zip(named) {
+            let binder = match group.info {
+                // `($stxCurNames : $T)`: the names are one application node when there are two
+                // or more.
+                BinderInfo::Default => {
+                    let mut names = Format::Nil;
+                    for (index, name) in group.names.iter().enumerate() {
+                        if index > 0 {
+                            names = names.then(Format::Line);
+                        }
+                        names = names.then(Format::text(name.clone()));
+                    }
+                    let names = if group.names.len() > 1 {
+                        node(names)
+                    } else {
+                        names
+                    };
+                    node(
+                        Format::text("(")
+                            .then(names)
+                            .then(Format::text(" :"))
+                            .then(Format::Line)
+                            .then(group.type_)
+                            .then(Format::text(")")),
+                    )
+                }
+                info => self.binder_group(info, &group.names, group.type_, !named, None),
+            };
+            binders = binders.then(Format::Line).then(binder);
+        }
+        let fun = Format::text("fun")
+            .then(node(binders.then(Format::text(" =>"))))
+            .then(Format::Line)
+            .then(printed);
+        Ok(if outer >= MAX_PREC || self.trailing {
+            node(Format::text("(").then(fun).then(Format::text(")")))
+        } else {
+            fun
+        })
+    }
+
     fn pi_tail(&mut self, e: &Expr) -> Doc {
         self.doc(e, ARROW_PREC)
     }
@@ -2155,6 +2970,9 @@ impl<'a> Printer<'a> {
     /// `#check c` for a constant: `c binders : type` (`delabConstWithSignature`), the
     /// leading binders with accessible names shown before the colon, grouped.
     pub fn signature(&mut self, name: &Name, type_: &Expr) -> Printed {
+        if self.pp.private_names && is_private(name) {
+            return Err(Unsupported("a private name under `pp.privateNames`"));
+        }
         let mut groups = Vec::new();
         let mut current = type_;
         let depth = self.names.len();

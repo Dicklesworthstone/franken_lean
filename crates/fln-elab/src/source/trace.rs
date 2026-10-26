@@ -334,10 +334,14 @@ impl Context {
                 locals,
             });
         }
+        // The goals print under the options in force at the trace, a `set_option … in` around
+        // the tactic included: they decide how the pin's `ppGoal` prints them.
+        let mut scope = self.source_scope.clone();
+        scope.options = self.txn.options.clone();
         self.traces.append(SourceTrace {
             at: args[0].info().pos(true).map_or(0, |p| p.0),
             content: TraceContent::Goals(observed),
-            scope: self.source_scope.clone(),
+            scope,
         })
     }
 }

@@ -131,7 +131,10 @@ fn tactic_options_control_lifting_and_restore_after_failed_alternatives() {
     }
     // Refusals for options outside this implementation's admitted policy
     // stay visible even when a later tactic alternative would succeed.
-    for (option, name) in [("foo.bar true", "`foo.bar`"), ("pp.all true", "`pp.all`")] {
+    for (option, name) in [
+        ("foo.bar true", "`foo.bar`"),
+        ("pp.analyze true", "`pp.analyze`"),
+    ] {
         let source = format!(
             "theorem refused : 1 = 1 := by\n  first\n  | set_option {option} in rfl\n  | rfl"
         );
@@ -306,7 +309,7 @@ fn term_and_tactic_option_refusals_are_named_and_atomic_even_after_goals_close()
         ("foo.bar true", "`foo.bar`"),
         ("maxHeartbeats true", "`maxHeartbeats`"),
         ("autoLift 1", "`autoLift`"),
-        ("pp.all true", "`pp.all`"),
+        ("pp.analyze true", "`pp.analyze`"),
         ("maxHeartbeats 1000", "`maxHeartbeats`"),
     ] {
         for source in [
@@ -347,14 +350,17 @@ fn unknown_mistyped_and_unimplemented_options_are_refused_by_name() {
         ("set_option foo.bar true", "`foo.bar`"),
         ("set_option maxHeartbeats true", "`maxHeartbeats`"),
         ("set_option autoLift 1", "`autoLift`"),
-        ("set_option pp.all true", "`pp.all`"),
+        ("set_option pp.analyze true", "`pp.analyze`"),
         ("set_option maxHeartbeats 1000", "`maxHeartbeats`"),
         ("set_option linter.missingDocs true", "`linter.missingDocs`"),
         (
             "set_option trace.Meta.synthInstance true",
             "`trace.Meta.synthInstance`",
         ),
-        ("set_option pp.all true in\ndef x : Nat := 1", "`pp.all`"),
+        (
+            "set_option pp.analyze true in\ndef x : Nat := 1",
+            "`pp.analyze`",
+        ),
     ] {
         let error = run(&base, &format!("{source}\ndef y : Nat := 2\n")).unwrap_err();
         assert!(error.contains(named), "{source}: {error}");
@@ -391,9 +397,9 @@ fn options_reach_golem_through_the_execution_path() {
         );
     }
     let refused = seed().execute_source_definitions(
-        &[b"set_option pp.all true in\n#eval 6 * 7\n"],
+        &[b"set_option pp.analyze true in\n#eval 6 * 7\n"],
         &KVMap::new(),
         EngineExecutionLimits::new(limits().admission.kernel),
     );
-    assert!(format!("{refused:?}").contains("pp.all"), "{refused:?}");
+    assert!(format!("{refused:?}").contains("pp.analyze"), "{refused:?}");
 }

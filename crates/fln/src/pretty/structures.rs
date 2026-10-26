@@ -54,7 +54,13 @@ impl<'a> Printer<'a> {
                 doc = doc.then(self.with_trailing(false, |printer| printer.doc(arg, 0))?);
                 first = false;
             }
-            return Ok(node(doc.then(Format::text("⟩"))));
+            let doc = node(doc.then(Format::text("⟩")));
+            // `withTypeAscription (cond := (← withType <| getPPOption getPPStructureInstanceType))`.
+            if self.pp.structure_instance_types {
+                let type_ = self.application_type(&ctor.base.name, levels, args)?;
+                return self.ascribed(doc, &type_);
+            }
+            return Ok(doc);
         }
         self.structure_tables()?;
         let imported = self
@@ -74,8 +80,20 @@ impl<'a> Printer<'a> {
         };
         let mut values = Vec::new();
         self.structure_fields(&root, ctor, args, &mut values, &mut fields)?;
+        // `optional (" : " termParser)`: under `pp.structureInstanceTypes`, the instance's type.
+        let type_ = if self.pp.structure_instance_types {
+            let type_ = self.application_type(&ctor.base.name, levels, args)?;
+            Some(self.with_trailing(false, |printer| printer.doc(&type_, 0))?)
+        } else {
+            None
+        };
         if fields.is_empty() {
-            return Ok(Format::text("{ }"));
+            return match type_ {
+                None => Ok(Format::text("{ }")),
+                Some(_) => Err(Unsupported(
+                    "a structure instance without fields, with its type",
+                )),
+            };
         }
         // `"{ " … sepByIndent structInstField ", " … " }"`: each token's trailing space is a line.
         let mut doc = Format::text("{").then(Format::Line);
@@ -88,6 +106,9 @@ impl<'a> Printer<'a> {
                     .then(Format::Line)
                     .then(value),
             ));
+        }
+        if let Some(type_) = type_ {
+            doc = doc.then(Format::text(" :")).then(Format::Line).then(type_);
         }
         Ok(node(doc.then(Format::text(" }"))))
     }
@@ -282,6 +303,7 @@ impl<'a> Printer<'a> {
     pub(super) fn without_parent_projections(
         &mut self,
         object: &Expr,
+        explicit: bool,
     ) -> Result<Expr, Unsupported> {
         let mut object = object.clone();
         loop {
@@ -293,6 +315,11 @@ impl<'a> Printer<'a> {
             let Some(params) = self.parent_projection(name, args.len())? else {
                 return Ok(object);
             };
+            // In explicit mode a projection of a structure with parameters stays: they are its
+            // implicit arguments (`withoutParentProjections (explicit := true)`).
+            if explicit && params > 0 {
+                return Ok(object);
+            }
             let infos = self.binder_infos(name);
             let Some((receiver, _)) = self.field_receiver(name, &infos, &args) else {
                 return Ok(object);
@@ -346,7 +373,7 @@ impl<'a> Printer<'a> {
 
     /// Whether a notation of this file prints applications of `constant`: it declares an
     /// unexpander for it, which withholds the structure instance whether or not it applies.
-    fn notation_prints(&self, constant: &Name) -> bool {
+    pub(super) fn notation_prints(&self, constant: &Name) -> bool {
         self.notations.is_some_and(|notations| {
             notations
                 .unexpanders

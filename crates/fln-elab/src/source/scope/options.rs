@@ -410,17 +410,166 @@ pub const ROWS: &[Row] = &[
         "Lean/Elab/Quotation/Util.lean:16",
         DefaultOnly,
     ),
+    // The pretty-printer options below are read by the term printer (`fln`, `pretty.rs` and
+    // `pretty/options.rs`, the pin's `getPP*` readers with their `pp.all` defaults). Where the
+    // printer meets a construct whose printing under them it does not reproduce, it refuses the
+    // term rather than print it another way.
     row(
         "pp.all",
         Bool(false),
         "Lean/PrettyPrinter/Delaborator/Options.lean:19",
-        DefaultOnly,
+        Honored,
+    ),
+    row(
+        "pp.notation",
+        Bool(true),
+        "Lean/PrettyPrinter/Delaborator/Options.lean:24",
+        Honored,
+    ),
+    row(
+        "pp.match",
+        Bool(true),
+        "Lean/PrettyPrinter/Delaborator/Options.lean:40",
+        Honored,
+    ),
+    row(
+        "pp.coercions",
+        Bool(true),
+        "Lean/PrettyPrinter/Delaborator/Options.lean:48",
+        Honored,
+    ),
+    row(
+        "pp.coercions.types",
+        Bool(false),
+        "Lean/PrettyPrinter/Delaborator/Options.lean:52",
+        Honored,
     ),
     row(
         "pp.universes",
         Bool(false),
         "Lean/PrettyPrinter/Delaborator/Options.lean:56",
+        Honored,
+    ),
+    row(
+        "pp.fullNames",
+        Bool(false),
+        "Lean/PrettyPrinter/Delaborator/Options.lean:60",
+        Honored,
+    ),
+    row(
+        "pp.privateNames",
+        Bool(false),
+        "Lean/PrettyPrinter/Delaborator/Options.lean:64",
+        Honored,
+    ),
+    row(
+        "pp.funBinderTypes",
+        Bool(false),
+        "Lean/PrettyPrinter/Delaborator/Options.lean:68",
+        Honored,
+    ),
+    row(
+        "pp.piBinderNames",
+        Bool(false),
+        "Lean/PrettyPrinter/Delaborator/Options.lean:76",
+        Honored,
+    ),
+    row(
+        "pp.piBinderNames.hygienic",
+        Bool(false),
+        "Lean/PrettyPrinter/Delaborator/Options.lean:81",
+        Honored,
+    ),
+    row(
+        "pp.foralls",
+        Bool(true),
+        "Lean/PrettyPrinter/Delaborator/Options.lean:85",
+        Honored,
+    ),
+    row(
+        "pp.letVarTypes",
+        Bool(false),
+        "Lean/PrettyPrinter/Delaborator/Options.lean:89",
+        Honored,
+    ),
+    row(
+        "pp.natLit",
+        Bool(false),
+        "Lean/PrettyPrinter/Delaborator/Options.lean:93",
+        Honored,
+    ),
+    row(
+        "pp.numericTypes",
+        Bool(false),
+        "Lean/PrettyPrinter/Delaborator/Options.lean:97",
+        Honored,
+    ),
+    row(
+        "pp.beta",
+        Bool(false),
+        "Lean/PrettyPrinter/Delaborator/Options.lean:138",
+        Honored,
+    ),
+    row(
+        "pp.structureInstances",
+        Bool(true),
+        "Lean/PrettyPrinter/Delaborator/Options.lean:142",
+        Honored,
+    ),
+    row(
+        "pp.fieldNotation",
+        Bool(true),
+        "Lean/PrettyPrinter/Delaborator/Options.lean:155",
+        Honored,
+    ),
+    row(
+        "pp.structureInstanceTypes",
+        Bool(false),
+        "Lean/PrettyPrinter/Delaborator/Options.lean:167",
+        Honored,
+    ),
+    row(
+        "pp.tagAppFns",
+        Bool(false),
+        "Lean/PrettyPrinter/Delaborator/Options.lean:175",
+        Honored,
+    ),
+    row(
+        "pp.instances",
+        Bool(true),
+        "Lean/PrettyPrinter/Delaborator/Options.lean:191",
+        Honored,
+    ),
+    row(
+        "pp.instanceTypes",
+        Bool(false),
+        "Lean/PrettyPrinter/Delaborator/Options.lean:195",
+        Honored,
+    ),
+    row(
+        "pp.analyze",
+        Bool(false),
+        "Lean/PrettyPrinter/Delaborator/TopDownAnalyze.lean:32",
         DefaultOnly,
+    ),
+    row(
+        "pp.raw.maxDepth",
+        Nat(32),
+        "Lean/Util/PPExt.lean:23",
+        Inert(
+            "it bounds the raw syntax printer (`formatRawTerm`), which prints only under \
+             `pp.raw`, and `pp.raw` has no row here",
+        ),
+    ),
+    row(
+        "pp.mvars.anonymous",
+        Bool(true),
+        "Lean/PrettyPrinter/Delaborator/Options.lean:119",
+        Inert(
+            "it names auto-generated metavariables in output, and this engine prints none: \
+             the printer refuses them, and the one message that shows one spells it `?_`, \
+             the pin's spelling with this option off",
+        ),
     ),
     row(
         "pp.mvars",
@@ -436,13 +585,13 @@ pub const ROWS: &[Row] = &[
         "pp.explicit",
         Bool(false),
         "Lean/PrettyPrinter/Delaborator/Options.lean:163",
-        DefaultOnly,
+        Honored,
     ),
     row(
         "pp.proofs",
         Bool(false),
         "Lean/PrettyPrinter/Delaborator/Options.lean:179",
-        DefaultOnly,
+        Honored,
     ),
 ];
 
@@ -717,13 +866,30 @@ mod tests {
             admitted("diagnostics", DataValue::OfBool(true)),
             Err(OptionRefusal::Unsupported { .. })
         ));
+        // `pp.analyze` is left at its default: only `false` is admitted.
         assert_eq!(
-            admitted("pp.all", DataValue::OfBool(false)),
+            admitted("pp.analyze", DataValue::OfBool(false)),
             Ok(Effect::NoChange)
         );
         assert!(matches!(
-            admitted("pp.all", DataValue::OfBool(true)),
+            admitted("pp.analyze", DataValue::OfBool(true)),
             Err(OptionRefusal::Unsupported { .. })
+        ));
+        // The printer reads `pp.all` and the options it implies, either value.
+        for value in [false, true] {
+            assert_eq!(
+                admitted("pp.all", DataValue::OfBool(value)),
+                Ok(Effect::Honored)
+            );
+        }
+        // `pp.raw.maxDepth` bounds a printer that never runs here.
+        assert_eq!(
+            admitted("pp.raw.maxDepth", DataValue::OfNat(1000)),
+            Ok(Effect::NoChange)
+        );
+        assert!(matches!(
+            admitted("pp.raw", DataValue::OfBool(true)),
+            Err(OptionRefusal::Unknown { .. })
         ));
         // No metavariable name is ever printed here, so either spelling is the pin's.
         assert_eq!(
@@ -846,6 +1012,20 @@ mod tests {
         // `execute_source_command_stream`); `sorry_is_admitted_with_the_pins_warnings` sets it false.
         // `warn.classDefReducibility`: the class-typed `def` warning (`fln`, `linters.rs`);
         // `class_def_reducibility` sets it false.
+        // `pp.*`: the term printer's `PpOptions::read` (`fln`, `pretty/options.rs`), which
+        // `Printer::in_scope` reads from the scope (`pretty.rs`): `pp.all`, `pp.explicit`,
+        // `pp.universes`, `pp.notation`, `pp.coercions`, `pp.coercions.types`, `pp.natLit`,
+        // `pp.numericTypes`, `pp.fullNames`, `pp.privateNames` and `pp.tagAppFns` in
+        // `Printer::application`, `Printer::numeric_literal` and `Printer::constant_head`;
+        // `pp.proofs` and `pp.beta` in `Printer::doc`; `pp.funBinderTypes` in
+        // `Printer::typed_lambda`; `pp.piBinderNames`, `pp.piBinderNames.hygienic` and
+        // `pp.foralls` in `Printer::pi`; `pp.letVarTypes` in `Printer::let_type`;
+        // `pp.structureInstances` and `pp.structureInstanceTypes` in
+        // `Printer::structure_instance`; `pp.fieldNotation`, `pp.instances` and
+        // `pp.instanceTypes` in `Printer::explicit_application`; `pp.match` in
+        // `Printer::builtin_unreproduced`. `fln-cli`'s `source_check_pp_options` sets each one
+        // against the pinned binary, and `pretty::options`' unit test reads `pp.all`'s
+        // implications.
         assert_eq!(
             honored,
             [
@@ -863,7 +1043,31 @@ mod tests {
                 "linter.unusedVariables.funArgs",
                 "linter.unusedVariables.patternVars",
                 "warn.sorry",
-                "warn.classDefReducibility"
+                "warn.classDefReducibility",
+                "pp.all",
+                "pp.notation",
+                "pp.match",
+                "pp.coercions",
+                "pp.coercions.types",
+                "pp.universes",
+                "pp.fullNames",
+                "pp.privateNames",
+                "pp.funBinderTypes",
+                "pp.piBinderNames",
+                "pp.piBinderNames.hygienic",
+                "pp.foralls",
+                "pp.letVarTypes",
+                "pp.natLit",
+                "pp.numericTypes",
+                "pp.beta",
+                "pp.structureInstances",
+                "pp.fieldNotation",
+                "pp.structureInstanceTypes",
+                "pp.tagAppFns",
+                "pp.instances",
+                "pp.instanceTypes",
+                "pp.explicit",
+                "pp.proofs"
             ]
         );
     }
