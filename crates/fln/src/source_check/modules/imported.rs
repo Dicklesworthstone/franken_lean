@@ -2255,16 +2255,13 @@ pub(super) mod tests {
                 }];
                 let mut bounded = limits(1);
                 bounded.metadata.max_entries = 1;
+                let exhausted = import(&input, std::slice::from_ref(&base), bounded);
                 assert!(
                     matches!(
-                        import(&input, std::slice::from_ref(&base), bounded),
-                        Err(SourceOleanImportError::Decode(
-                            metadata::DecodeError::Limit {
-                                resource: "entries"
-                            }
-                        ))
+                        &exhausted,
+                        Err(SourceOleanImportError::Limit("metadata entries"))
                     ),
-                    "the final namespace phase must share the tag phase's allowance"
+                    "assembly must retain the tag's entry charge: {exhausted:?}"
                 );
                 bounded.metadata.max_entries = 2;
                 assert!(
@@ -2273,6 +2270,46 @@ pub(super) mod tests {
                         .into_complete()
                         .is_ok(),
                     "the same mixed journal fits two entries"
+                );
+                let blocks = OleanView::parse(&mixed.bytes)
+                    .unwrap()
+                    .extension_payloads(OleanWalkBudget::default(), 1 << 20)
+                    .unwrap();
+                let tag = blocks.iter().find(|block| block.name == extension).unwrap();
+                let tag_bytes = tag.entries[0].len();
+                let tag_objects = fln_rt::region::audit(&tag.entries[0], 0).unwrap().objects;
+                let total_bytes = blocks
+                    .iter()
+                    .flat_map(|block| &block.entries)
+                    .map(Vec::len)
+                    .sum::<usize>();
+                let total_objects = blocks
+                    .iter()
+                    .flat_map(|block| &block.entries)
+                    .map(|payload| fln_rt::region::audit(payload, 0).unwrap().objects)
+                    .sum::<u64>();
+                for (max_bytes, max_objects, resource) in [
+                    (tag_bytes, u64::MAX, "payload bytes"),
+                    (usize::MAX, tag_objects, "objects"),
+                ] {
+                    bounded.metadata.max_bytes = max_bytes;
+                    bounded.metadata.max_objects = max_objects;
+                    let exhausted = import(&input, std::slice::from_ref(&base), bounded);
+                    assert!(
+                        matches!(&exhausted,
+                        Err(SourceOleanImportError::Decode(metadata::DecodeError::Limit { resource: actual }))
+                            if *actual == resource),
+                        "the final namespace phase must retain {resource}: {exhausted:?}"
+                    );
+                }
+                bounded.metadata.max_bytes = total_bytes;
+                bounded.metadata.max_objects = total_objects;
+                assert!(
+                    import(&input, std::slice::from_ref(&base), bounded)
+                        .unwrap()
+                        .into_complete()
+                        .is_ok(),
+                    "the exact combined payload byte/object allowance fits both phases"
                 );
             }
         });
