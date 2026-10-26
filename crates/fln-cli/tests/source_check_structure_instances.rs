@@ -222,11 +222,16 @@ fun n => ↑n : Nat → Int
 co3 (n : Nat) : Int
 ";
 
-/// What this door refuses rather than print another way: a local type without fields (the pin
-/// prints `structure E` as `{ }` and `inductive E | mk` as `E.mk`) and a field the pin compares
-/// with its default by a reducible `isDefEq` that is not decided here (`1 + 2` against `3`, which
-/// the pin omits: `{ } : D`). A field syntactically equal to its default, or a literal other than
-/// a literal default (`{ x := 4 } : D`), prints (`source_check_optional_parameters`).
+/// A local structure without fields: the pin prints its one instance as `{ }`.
+const EMPTY_STRUCTURE: &str = "prelude\nimport Init.Core\nstructure E\n#check ({ } : E)\n";
+
+/// The pin's output for [`EMPTY_STRUCTURE`].
+const EMPTY_STRUCTURE_EXPECTED: &str = "{ } : E\n";
+
+/// What this door refuses rather than print another way: a field the pin compares with its
+/// default by a reducible `isDefEq` that is not decided here (`1 + 2` against `3`, which the pin
+/// omits: `{ } : D`). A field syntactically equal to its default, or a literal other than a
+/// literal default (`{ x := 4 } : D`), prints (`source_check_optional_parameters`).
 ///
 /// Without `Init.NotationExtra`, whose macro the `Σ` notation is, the pin fails to print a `Sigma`
 /// at all ("failed to pretty print expression"); this door refuses it there.
@@ -236,7 +241,6 @@ co3 (n : Nat) : Int
 /// elaboration introduced (an `if` it compiles to `Decidable.rec`, where the pin has `ite`).
 /// Inside `open Int`, the pin prints `Int.negSucc 9` as `-[9+1]`, which is refused here too.
 const REFUSED: &[&str] = &[
-    "prelude\nimport Init.Core\nstructure E\n#check ({ } : E)\n",
     "prelude\nimport Init.Core\nstructure D where\n  x : Nat := 3\n#check ({ x := 1 + 2 } : D)\n",
     "prelude\nimport Init.NotationExtra\n#check (⟨1, rfl⟩ : Subtype (fun n : Nat => n = 1))\n",
     "prelude\nimport Init.NotationExtra\n#check fun (n : Nat) => if n = 0 then 1 else 2\n",
@@ -445,6 +449,26 @@ fn the_coercion_arrow_coerces_as_the_pin_does() {
     let (code, stdout, stderr) = ours(&lib, &root, &entry);
     assert_eq!(code, 0, "{stderr}");
     assert_eq!(stdout, COERCION_ARROW_EXPECTED, "{stderr}");
+}
+
+#[test]
+fn a_structure_without_fields_prints_its_instance_as_the_pin_does() {
+    let Some(lib) = pinned_lib() else {
+        return;
+    };
+    let root = workspace();
+    let entry = root.join("Empty.lean");
+    std::fs::write(&entry, EMPTY_STRUCTURE).unwrap();
+    if let Some((code, stdout)) = pinned(&lib, &entry) {
+        assert_eq!(
+            (code, stdout.as_str()),
+            (0, EMPTY_STRUCTURE_EXPECTED),
+            "the pin moved"
+        );
+    }
+    let (code, stdout, stderr) = ours(&lib, &root, &entry);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(stdout, EMPTY_STRUCTURE_EXPECTED, "{stderr}");
 }
 
 #[test]
