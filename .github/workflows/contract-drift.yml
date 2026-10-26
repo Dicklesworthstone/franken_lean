@@ -883,6 +883,17 @@ jobs:
           export FLN_REFERENCE_LIB
           export FLN_REQUIRE_REFERENCE=1
           rc=0
+          # Raw import fixtures must activate the pin's class journals, and the
+          # checked bounded-word adapter must survive real module admission,
+          # evaluation and canonical FLBC replay. Keep the original installed
+          # equality comparison required so formatter gaps cannot silently skip.
+          cargo test --locked -p fln --lib \
+            source_intrinsics::io::fs::bytes::word::tests -- --nocapture || rc=1
+          cargo test --locked -p fln --test source_imported_arrays \
+            actual_imported_bounded_word_construction_executes_and_replays \
+            -- --exact --nocapture || rc=1
+          cargo test --locked -p fln-cli \
+            --test source_equality_decisions --no-fail-fast -- --nocapture || rc=1
           cargo test --locked -p fln \
             --test source_instance_index --test source_import_aliases \
             --test source_instance_transparency --test olean_frontier --no-fail-fast || rc=1

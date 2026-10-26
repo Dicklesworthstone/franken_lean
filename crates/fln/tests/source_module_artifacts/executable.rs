@@ -1,4 +1,5 @@
 //! Executable metadata crosses source/artifact boundaries without changing logic.
+#![forbid(unsafe_code)]
 use super::*;
 use fln_elab::externs::{ExternEntry, ExternTable};
 use fln_elab::implemented_by::ImplementedByTable;

@@ -1,6 +1,7 @@
 //! Actual pinned comparison data, not admission of an imported module closure.
 //!
-//! The fixture retains decoded constants and extern entries only. Every source
+//! The fixture retains decoded constants, externs, and the LT instance journal.
+//! Every source
 //! example and every changed definition below still crosses both ordinary
 //! declaration checkers before compiler ingress. No Reference code executes.
 #![cfg(test)]
@@ -82,6 +83,8 @@ fn fixture() -> Option<&'static Fixture> {
             }
             let mut constants = BTreeMap::new();
             let mut actual_externs = BTreeMap::new();
+            let mut classes = Vec::new();
+            let mut instances = Vec::new();
             for module in MODULES {
                 let path = library.join(module).with_extension("olean");
                 let parts = [
@@ -110,6 +113,18 @@ fn fixture() -> Option<&'static Fixture> {
                     .unwrap();
                 let extensions =
                     metadata::decode(&blocks, metadata::DecodeLimits::default()).unwrap();
+                classes.extend(
+                    extensions
+                        .classes
+                        .into_iter()
+                        .filter(|row| row.name == name("LT")),
+                );
+                instances.extend(
+                    extensions
+                        .instances
+                        .into_iter()
+                        .filter(|row| row.declaration == name("instLTNat")),
+                );
                 for row in extensions.externs {
                     if !needed.contains_key(&row.declaration) {
                         continue;
@@ -175,12 +190,58 @@ fn fixture() -> Option<&'static Fixture> {
             for (label, entries) in &actual_externs {
                 environment = externs::register(&environment, label, entries.clone()).unwrap();
             }
+            // Raw constant decoding does not activate class metadata. Without
+            // this actual journal, `<` takes the bounded Nat decision bridge,
+            // whose Decidable result cannot be used as a binder proposition.
+            use fln_elab::instances::imported;
+            assert_eq!(classes.len(), 1, "the actual LT class journal");
+            assert_eq!(instances.len(), 1, "the actual Nat LT instance journal");
+            let mut activation = imported::ImportActivation::new(environment);
+            for row in classes {
+                activation = activation
+                    .register_class(
+                        &row.name,
+                        &imported::ClassParameters {
+                            out_params: row.out_params,
+                            out_level_params: row.out_level_params,
+                        },
+                    )
+                    .unwrap();
+            }
+            for row in instances {
+                assert_eq!(row.value, c("instLTNat"));
+                activation = activation
+                    .register_instance(
+                        &row.declaration,
+                        &imported::InstanceParameters {
+                            priority: row.priority,
+                            synth_order: row.synth_order,
+                            scope: row.scope,
+                            keys: row.keys.into_iter().map(instance_key).collect(),
+                        },
+                    )
+                    .unwrap();
+            }
+            let environment = activation.finish().unwrap();
             Some(Fixture {
                 environment,
                 externs: actual_externs,
             })
         })
         .as_ref()
+}
+
+fn instance_key(key: metadata::InstanceKey) -> fln_elab::instances::discr_tree::Key {
+    use fln_elab::instances::discr_tree::Key;
+    match key {
+        metadata::InstanceKey::Star => Key::Star,
+        metadata::InstanceKey::Other => Key::Other,
+        metadata::InstanceKey::Lit(literal) => Key::Lit(literal),
+        metadata::InstanceKey::FVar(name, arity) => Key::FVar(fln_core::expr::FVarId(name), arity),
+        metadata::InstanceKey::Const(name, arity) => Key::Const(name, arity),
+        metadata::InstanceKey::Arrow => Key::Arrow,
+        metadata::InstanceKey::Proj(name, field, arity) => Key::Proj(name, field, arity),
+    }
 }
 
 fn with_fixture(test: impl FnOnce(&Fixture) + Send + 'static) {
