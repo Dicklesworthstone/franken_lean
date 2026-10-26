@@ -1,15 +1,13 @@
 //! Installed-command coverage for native proof-carrying equality decisions.
 #![forbid(unsafe_code)]
 use std::{
+    path::PathBuf,
     process::Command,
     sync::atomic::{AtomicUsize, Ordering},
 };
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 
-#[test]
-fn installed_command_executes_imported_native_natural_equality_decisions() {
-    use std::path::PathBuf;
-
+fn pinned_reference() -> (PathBuf, PathBuf) {
     let lib = std::env::var_os("FLN_REFERENCE_LIB")
         .map(PathBuf::from)
         .or_else(|| {
@@ -31,6 +29,12 @@ fn installed_command_executes_imported_native_natural_equality_decisions() {
         fln::OLEAN_PIN_COMMIT,
         "the comparison requires the pinned Reference commit"
     );
+    (lib, reference)
+}
+
+#[test]
+fn installed_command_executes_imported_native_natural_equality_decisions() {
+    let (lib, reference) = pinned_reference();
     let directory = std::env::temp_dir().join(format!(
         "fln-native-nat-equality-{}-{}",
         std::process::id(),
@@ -62,6 +66,72 @@ fn installed_command_executes_imported_native_natural_equality_decisions() {
         assert!(output.stderr.is_empty(), "{executable:?}: {output:?}");
     }
     assert_eq!(std::fs::read_to_string(&path).unwrap(), source);
+}
+
+#[test]
+#[ignore = "whole pinned Init cold admission; required scheduled Reference release lane"]
+fn installed_command_imports_headerless_init_and_repeated_tag_module_closure() {
+    let (lib, reference) = pinned_reference();
+    for suffix in ["olean", "olean.server", "olean.private", "ir"] {
+        assert!(
+            lib.join(format!("Init.{suffix}")).is_file(),
+            "missing pinned Init.{suffix}"
+        );
+    }
+    let directory = std::env::temp_dir().join(format!(
+        "fln-init-tag-import-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir(&directory).unwrap();
+    let records = directory.join("records");
+    std::fs::create_dir(&records).unwrap();
+    let cases: [(&str, &str, &[u8]); 2] = [
+        ("warm.lean", "def warm : Nat := 1\n#eval warm\n", b"1\n"),
+        (
+            "control.lean",
+            "prelude\nimport Init.Control.Except\nimport Init.Data.List.Control\nimport Init.System.IO\ndef x : Nat := 1\n",
+            b"",
+        ),
+    ];
+    for (file, source, _) in &cases {
+        std::fs::write(directory.join(file), source).unwrap();
+    }
+    for (native, executable) in [
+        (false, reference.as_path()),
+        (true, std::path::Path::new(env!("CARGO_BIN_EXE_lean"))),
+    ] {
+        if native {
+            assert_eq!(
+                std::fs::read_dir(&records).unwrap().count(),
+                0,
+                "the first native import must use a fresh record store"
+            );
+        }
+        for (file, source, expected) in &cases {
+            eprintln!("checking installed Init import: {executable:?} {file}");
+            let mut command = Command::new(executable);
+            command.arg(directory.join(file)).env("LEAN_PATH", &lib);
+            if native {
+                command.env("FLN_IMPORT_REUSE_DIR", &records);
+            }
+            let output = command.output().unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(0),
+                "{executable:?} {file}: {output:?}"
+            );
+            assert_eq!(output.stdout.as_slice(), *expected, "{executable:?} {file}");
+            assert!(
+                output.stderr.is_empty(),
+                "{executable:?} {file}: {output:?}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(directory.join(file)).unwrap(),
+                *source
+            );
+        }
+    }
 }
 
 #[test]

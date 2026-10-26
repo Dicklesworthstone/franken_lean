@@ -914,6 +914,21 @@ jobs:
           cargo test --locked -p fln-kernel --test reference_differential --no-fail-fast || rc=1
           exit "$rc"
 
+      - name: run the installed Init import regression with the pin required (7vn7)
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
+        shell: bash
+        env:
+          PIN_TAG: ${{ steps.reference.outputs.pin_tag }}
+        run: |
+          set -euo pipefail
+          export FLN_REFERENCE_LIB="$HOME/.elan/toolchains/leanprover--lean4---$PIN_TAG/lib/lean"
+          export FLN_REQUIRE_REFERENCE=1
+          test -s "$FLN_REFERENCE_LIB/Init.olean"
+          test -s "$FLN_REFERENCE_LIB/Init.ir"
+          cargo test --locked --release -p fln-cli --test source_equality_decisions \
+            installed_command_imports_headerless_init_and_repeated_tag_module_closure \
+            -- --ignored --exact --nocapture
+
       - name: run the reduced reject-side mutant lane (fln-kernel-reject-side-at-scale-bemc)
         if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
         shell: bash

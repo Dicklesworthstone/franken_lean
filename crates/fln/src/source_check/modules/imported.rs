@@ -2136,6 +2136,27 @@ pub(super) mod tests {
                 let first = encode(&[], &constants, std::slice::from_ref(&unshared));
                 let run = |entries: &[Obj], limits: SourceOleanImportLimits| {
                     let second = encode(&imports, &[], entries);
+                    if entries.len() == 1 && entries[0].identity_token() == shared.identity_token()
+                    {
+                        let captured = |bytes: &[u8]| {
+                            OleanView::parse(bytes)
+                                .unwrap()
+                                .extension_payloads(OleanWalkBudget::default(), 1 << 20)
+                                .unwrap()
+                                .into_iter()
+                                .find(|block| block.name == extension)
+                                .unwrap()
+                                .entries
+                                .into_iter()
+                                .next()
+                                .unwrap()
+                        };
+                        assert_ne!(
+                            captured(&first.bytes),
+                            captured(&second.bytes),
+                            "the real module capture must preserve byte-different equal-name tags"
+                        );
+                    }
                     let inputs = [
                         OleanModuleInput {
                             name: &base,
@@ -2185,7 +2206,7 @@ pub(super) mod tests {
                     run(std::slice::from_ref(&unshared), bounded)
                         .unwrap()
                         .into_complete()
-                        .is_some(),
+                        .is_ok(),
                     "byte-identical cross-module tags retain their original cached decode cost"
                 );
                 assert!(matches!(
@@ -2196,6 +2217,63 @@ pub(super) mod tests {
                         }
                     ))
                 ));
+                let namespace = metadata::namespace_extension_name();
+                let tags = [unshared.clone_ref()];
+                let namespaces = [inject_name(&n("tag"))];
+                let mixed = encode_module_with_extensions(
+                    OleanModuleWriteInput {
+                        is_module: false,
+                        imports: &[],
+                        constants: &constants,
+                        extra_const_names: &[],
+                    },
+                    &[
+                        ModuleExtensionInput {
+                            name: &extension,
+                            entries: &tags,
+                        },
+                        ModuleExtensionInput {
+                            name: &namespace,
+                            entries: &namespaces,
+                        },
+                    ],
+                    OleanWriteHeader {
+                        version: OLEAN_ACCEPTED_VERSIONS[0],
+                        flags: 1,
+                        lean_version: OLEAN_PIN_TAG.strip_prefix('v').unwrap(),
+                        githash: OLEAN_PIN_COMMIT,
+                        base_addr: (OLEAN_REGION_ALIGN as u64) * 2,
+                    },
+                    OleanWriteBudget::default(),
+                )
+                .unwrap();
+                let input = [OleanModuleInput {
+                    name: &base,
+                    artifact: &mixed.bytes,
+                    server_artifact: None,
+                    private_artifact: None,
+                }];
+                let mut bounded = limits(1);
+                bounded.metadata.max_entries = 1;
+                assert!(
+                    matches!(
+                        import(&input, std::slice::from_ref(&base), bounded),
+                        Err(SourceOleanImportError::Decode(
+                            metadata::DecodeError::Limit {
+                                resource: "entries"
+                            }
+                        ))
+                    ),
+                    "the final namespace phase must share the tag phase's allowance"
+                );
+                bounded.metadata.max_entries = 2;
+                assert!(
+                    import(&input, std::slice::from_ref(&base), bounded)
+                        .unwrap()
+                        .into_complete()
+                        .is_ok(),
+                    "the same mixed journal fits two entries"
+                );
             }
         });
     }
