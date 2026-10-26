@@ -1,4 +1,4 @@
-{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":704,"projection_hash":"21850026279b0a7784242d5e40e573590254748f986d1516497589eeb40fdd61"}
+{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":708,"projection_hash":"455a66c9c31b86a7dc22f222f2c29d84eca73dad1fd074ffc1e7aa5a5a955a99"}
 {"id":"fln-0bw5"}
 {"id":"fln-0eq8"}
 {"id":"fln-0rxm"}
@@ -187,6 +187,7 @@
 {"id":"fln-glml"}
 {"id":"fln-golem-ordinary-loops-fbj6"}
 {"id":"fln-guard-lifetime-char-boundary-zydy"}
+{"id":"fln-guard-msgs-failing-declarations-fiwe"}
 {"id":"fln-guard-msgs-lls1"}
 {"id":"fln-guard-msgs-trace-severity-iss2"}
 {"id":"fln-h1k"}
@@ -255,10 +256,12 @@
 {"id":"fln-lvdh"}
 {"id":"fln-lyc8"}
 {"id":"fln-macro-inline-eager-evaluation-ryay"}
+{"id":"fln-macro-rules-atom-kinds-adto"}
 {"id":"fln-macro-rung-e1rk"}
 {"id":"fln-mandated-mutant-join-unwatched-uagk"}
 {"id":"fln-manifest-complete-row-preflight-gap-77xh"}
 {"id":"fln-match-alt-column-false-accept-u3fv"}
+{"id":"fln-matcher-auxiliary-definitions-lzxm"}
 {"id":"fln-merkle-decl-digest-80ni"}
 {"id":"fln-mirror-price-cszo"}
 {"id":"fln-module-header-tric"}
@@ -297,6 +300,7 @@
 {"id":"fln-path-classification-coverage-unbound-9teu"}
 {"id":"fln-peer-header-incremental-4t82"}
 {"id":"fln-pin-syntax-corpus-7b5b"}
+{"id":"fln-pp-options-wvin"}
 {"id":"fln-prelude-cdot-tactic-false-accept-3ti6"}
 {"id":"fln-prelude-list-literal-false-accept-uvga"}
 {"id":"fln-private-index-worktree-sync-mbh9"}
