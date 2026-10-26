@@ -929,6 +929,19 @@ jobs:
             installed_command_imports_headerless_init_and_repeated_tag_module_closure \
             -- --ignored --exact --nocapture
 
+      - name: compare the original upstream notation regressions with the pin (luf8)
+        if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
+        shell: bash
+        env:
+          PIN_TAG: ${{ steps.reference.outputs.pin_tag }}
+        run: |
+          set -euo pipefail
+          export FLN_REFERENCE_LIB="$HOME/.elan/toolchains/leanprover--lean4---$PIN_TAG/lib/lean"
+          export FLN_REQUIRE_REFERENCE=1
+          cargo test --locked --release -p fln-cli --test source_check_notations \
+            upstream_notation_printing_regressions_match_the_pin \
+            -- --ignored --exact --nocapture
+
       - name: run the reduced reject-side mutant lane (fln-kernel-reject-side-at-scale-bemc)
         if: ${{ !cancelled() && steps.toolchain.outcome == 'success' }}
         shell: bash

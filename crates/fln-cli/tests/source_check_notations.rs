@@ -272,3 +272,50 @@ fn a_section_capture_never_resolves_to_an_unrelated_global() {
         assert!(output.contains("Unknown constant"), "{output}");
     }
 }
+
+#[test]
+#[ignore = "whole pinned Init admission; required scheduled Reference release lane"]
+fn upstream_notation_printing_regressions_match_the_pin() {
+    let lib = pinned_lib().expect("the pinned Reference is required for the upstream comparison");
+    let reference = lib.parent().unwrap().parent().unwrap().join("bin/lean");
+    let version = Command::new(&reference).arg("--githash").output().unwrap();
+    assert!(version.status.success(), "{version:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&version.stdout).trim(),
+        fln::OLEAN_PIN_COMMIT
+    );
+    let root = workspace();
+    let records = root.join("records");
+    std::fs::create_dir(&records).unwrap();
+    let cases = [
+        ("1367", include_str!("../../../vendor/lean4-src/tests/elab/1367.lean")),
+        ("2045", include_str!("../../../vendor/lean4-src/tests/elab/2045.lean")),
+        ("469", include_str!("../../../vendor/lean4-src/tests/elab/469.lean")),
+        ("constDelab", include_str!("../../../vendor/lean4-src/tests/elab/constDelab.lean")),
+        ("scopedParsers", include_str!("../../../vendor/lean4-src/tests/elab/scopedParsers.lean")),
+        ("infixprio", include_str!("../../../vendor/lean4-src/tests/elab/infixprio.lean")),
+        ("localParsers", include_str!("../../../vendor/lean4-src/tests/elab/localParsers.lean")),
+    ];
+    for (name, source) in cases {
+        let entry = root.join(format!("{name}.lean"));
+        std::fs::write(&entry, source).unwrap();
+        eprintln!("upstream notation comparison: elab/{name}.lean");
+        let oracle = Command::new(&reference)
+            .arg(&entry)
+            .env("LEAN_PATH", &lib)
+            .output()
+            .unwrap();
+        assert_eq!(oracle.status.code(), Some(0), "{name}: {oracle:?}");
+        assert!(oracle.stderr.is_empty(), "{name}: {oracle:?}");
+        let native = Command::new(env!("CARGO_BIN_EXE_lean"))
+            .arg(&entry)
+            .env("LEAN_PATH", &lib)
+            .env("FLN_IMPORT_REUSE_DIR", &records)
+            .output()
+            .unwrap();
+        assert_eq!(native.status.code(), Some(0), "{name}: {native:?}");
+        assert_eq!(native.stdout, oracle.stdout, "elab/{name}.lean");
+        assert!(native.stderr.is_empty(), "{name}: {native:?}");
+        assert_eq!(std::fs::read_to_string(&entry).unwrap(), source);
+    }
+}
