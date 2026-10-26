@@ -1925,16 +1925,136 @@ impl Context {
         &mut self,
         obligations: &[Obligation],
     ) -> Result<Vec<tactics::ProofGoal>, NatDefinitionElabError> {
+        // A nested call's proof, in an argument of another call, is that call's own goal at the
+        // pin (`mkDecreasingProof`'s metavariable), so proving the nested call first fills it in
+        // the other goal. Here the call holds its obligation's transport applied to its captures,
+        // which is assigned only once every goal is proved; the goal stands in for it. A capture
+        // with a `let` value stays transported: the goal's proof could mention that local, which
+        // the other goal's context need not have.
+        let links: Vec<(Expr, Expr)> = obligations
+            .iter()
+            .filter(|obligation| {
+                obligation
+                    .captures
+                    .iter()
+                    .all(|local| local.value.is_none())
+            })
+            .map(|obligation| {
+                let transported = obligation.captures.iter().fold(
+                    Expr::mvar(obligation.transport.clone()),
+                    |function, local| Expr::app(function, Expr::fvar(local.id.clone())),
+                );
+                (transported, Expr::mvar(obligation.goal.id.clone()))
+            })
+            .collect();
         let mut goals = Vec::new();
         for obligation in obligations {
             self.tick()?;
             let raw_target = self.instantiate(&obligation.raw_target)?;
             let mut goal = obligation.goal.clone();
             goal.target = self.instantiate(&goal.target)?;
+            goal.target = self.link_nested_decreasing_proofs(&goal.target, &links)?;
             goal.lctx = self.clean_decreasing_context(&goal.lctx, &raw_target)?;
             goals.push(goal);
         }
         Ok(goals)
+    }
+
+    /// `target` with every exact copy of a transported proof in `links` replaced by its goal.
+    fn link_nested_decreasing_proofs(
+        &mut self,
+        target: &Expr,
+        links: &[(Expr, Expr)],
+    ) -> Result<Expr, NatDefinitionElabError> {
+        if links.is_empty() || !target.has_expr_mvar() {
+            return Ok(target.clone());
+        }
+        let mut done: HashMap<usize, Expr> = HashMap::new();
+        let mut work = vec![(target, false)];
+        while let Some((term, exit)) = work.pop() {
+            self.tick()?;
+            let key = term.allocation_identity();
+            if done.contains_key(&key) {
+                continue;
+            }
+            if !term.has_expr_mvar() {
+                done.insert(key, term.clone());
+                continue;
+            }
+            if let Some((_, goal)) = links.iter().find(|(transported, _)| transported == term) {
+                done.insert(key, goal.clone());
+                continue;
+            }
+            let children: Vec<&Expr> = match term.node() {
+                ExprNode::App { f, a } => vec![f, a],
+                ExprNode::Lam {
+                    binder_type, body, ..
+                }
+                | ExprNode::ForallE {
+                    binder_type, body, ..
+                } => vec![binder_type, body],
+                ExprNode::LetE {
+                    type_, value, body, ..
+                } => vec![type_, value, body],
+                ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => vec![expr],
+                _ => Vec::new(),
+            };
+            if !exit {
+                work.push((term, true));
+                work.extend(children.into_iter().rev().map(|child| (child, false)));
+                continue;
+            }
+            let child = |term: &Expr| done[&term.allocation_identity()].clone();
+            let rebuilt = match term.node() {
+                ExprNode::App { f, a } => Expr::app(child(f), child(a)),
+                ExprNode::Lam {
+                    binder_name,
+                    binder_type,
+                    body,
+                    binder_info,
+                } => Expr::lam(
+                    binder_name.clone(),
+                    child(binder_type),
+                    child(body),
+                    *binder_info,
+                ),
+                ExprNode::ForallE {
+                    binder_name,
+                    binder_type,
+                    body,
+                    binder_info,
+                } => Expr::forall_e(
+                    binder_name.clone(),
+                    child(binder_type),
+                    child(body),
+                    *binder_info,
+                ),
+                ExprNode::LetE {
+                    decl_name,
+                    type_,
+                    value,
+                    body,
+                    non_dep,
+                } => Expr::let_e(
+                    decl_name.clone(),
+                    child(type_),
+                    child(value),
+                    child(body),
+                    *non_dep,
+                ),
+                ExprNode::MData { data, expr } => Expr::mdata(data.clone(), child(expr)),
+                ExprNode::Proj {
+                    struct_name,
+                    idx,
+                    expr,
+                } => Expr::proj(struct_name.clone(), *idx, child(expr)),
+                _ => term.clone(),
+            };
+            done.insert(key, rebuilt);
+        }
+        Ok(done
+            .remove(&target.allocation_identity())
+            .expect("the rebuild finishes at the target"))
     }
 
     /// `clean_wf` exposes the measure at the actual branch input. Read it
