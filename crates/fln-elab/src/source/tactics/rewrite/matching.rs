@@ -19,7 +19,7 @@ enum Occurrences<'a> {
 
 /// The pin's `HeadIndex` (vendored Lean/HeadIndex.lean:28-36).
 #[derive(PartialEq, Eq)]
-pub(super) enum HeadIndex {
+pub(in crate::source) enum HeadIndex {
     Local(FVarId),
     Hole(MVarId),
     Constant(Name),
@@ -793,7 +793,7 @@ impl Context {
     /// value's head, as `toHeadIndexSlow` does. A source ascription `let _ : T := e; _`
     /// (this elaborator's spelling of `(e : T)`, absent from the pin's term) is read as `e`.
     /// `None` only for a loose bound variable.
-    pub(super) fn rewrite_head_key(
+    pub(in crate::source) fn rewrite_head_key(
         &mut self,
         expression: &Expr,
     ) -> Result<Option<(HeadIndex, usize)>, NatDefinitionElabError> {

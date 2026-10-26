@@ -1665,11 +1665,13 @@ impl<'a> Printer<'a> {
     }
 
     /// A bare constant: `@c` when it has implicit binders the pin would otherwise fill.
+    /// A leading strict implicit is left unapplied without a written argument,
+    /// so it does not require the marker.
     pub fn constant(&self, name: &Name) -> String {
         let explicit = self
             .binder_infos(name)
             .first()
-            .is_none_or(|info| *info == BinderInfo::Default);
+            .is_none_or(|info| matches!(info, BinderInfo::Default | BinderInfo::StrictImplicit));
         if explicit {
             self.display_name(name)
         } else {

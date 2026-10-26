@@ -221,6 +221,12 @@ theorem restoredWorks : restoredExplicit Nat 10 = 10 := rfl"#,
             "{name}"
         );
     }
+    // These are bare constants, not applications. Only ordinary implicits
+    // would be inserted here, so a leading strict implicit needs no `@`.
+    let printer = fln::pretty::Printer::new(e.environment());
+    assert_eq!(printer.constant(&n("beforeUpdate")), "beforeUpdate");
+    assert_eq!(printer.constant(&n("afterUpdate")), "@afterUpdate");
+    assert_eq!(printer.constant(&n("strictUpdate")), "strictUpdate");
 }
 
 #[test]

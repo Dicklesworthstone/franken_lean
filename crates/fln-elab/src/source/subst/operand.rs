@@ -106,7 +106,7 @@ impl Context {
         ) {
             return Ok(None);
         }
-        let abstracted = self.kabstract(&operand.type_, &equality.rhs)?;
+        let abstracted = self.substitution_abstract(&operand.type_, &equality.rhs)?;
         if !abstracted.has_loose_bvars() {
             return Ok(None);
         }
