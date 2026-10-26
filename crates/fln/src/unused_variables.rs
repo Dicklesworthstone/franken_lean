@@ -109,6 +109,57 @@ fn walk<'a>(syntax: &'a Syntax, mut visit: impl FnMut(&'a Syntax) -> bool) -> bo
     false
 }
 
+/// Quoted macro patterns bind syntax values, not elaborated term variables. The
+/// checked template retains those bindings as hygienic identifiers, so a use
+/// cannot be confused with an unrelated global of the same source spelling.
+pub(crate) fn unused_macro_pattern_variables(
+    rule: &fln_parse::extensions::NotationRule,
+) -> Vec<UnusedBinder> {
+    let Some(pattern) = &rule.pattern else {
+        return Vec::new();
+    };
+    let mut referenced = HashSet::new();
+    walk(&rule.rhs, |node| {
+        if let Syntax::Ident { val, .. } = node {
+            referenced.insert(val.clone());
+        }
+        false
+    });
+    let mut unused = Vec::new();
+    for (path, variable) in &rule.variables {
+        let name = variable.erase_macro_scopes();
+        if referenced.contains(variable)
+            || matches!(name.leaf_view(), LeafView::Str(text) if text.starts_with('_'))
+        {
+            continue;
+        }
+        let Some(capture) = path
+            .iter()
+            .try_fold(pattern, |node, &index| args(node).get(index))
+        else {
+            continue;
+        };
+        let mut at = None;
+        walk(capture, |node| {
+            if let Syntax::Ident { val, .. } = node
+                && val.erase_macro_scopes() == name
+            {
+                at = original_pos(node);
+            }
+            at.is_some()
+        });
+        if let Some(at) = at {
+            unused.push(UnusedBinder { at, name });
+        }
+    }
+    unused.sort_by_key(|binder| binder.at);
+    unused
+}
+
+pub(crate) fn lint_macro_pattern_variables(options: &KVMap) -> bool {
+    linted(options, Some("patternVars"))
+}
+
 /// `#reduce`, `syntax (name := reduceCmd) "#reduce" reduceConfig term : command` in namespace
 /// `Lean` (vendored `Init/Notation.lean:766`).
 pub(crate) fn is_reduce(command: &Syntax) -> bool {

@@ -13,6 +13,8 @@ impl Context {
         self.txn.lctx = goal.lctx.clone();
         // Freeze selection before adding private evidence, so `[*]` cannot
         // acquire a synthetic assumption or use it as its own rewrite rule.
+        // `failIfUnchanged` changes nothing here: simp's no-progress refusal below is already
+        // `simpa`'s fallback to an assumption, as the pin's `simpa` makes no progress silently.
         let rules = self.simp_rules(args)?;
         if let Some(term) = using {
             return self.simpa_candidate(proof, goal, &rules, term);
@@ -95,6 +97,9 @@ impl Context {
         rules: &[SimpRule<'_>],
         term: Typed,
     ) -> Result<(), NatDefinitionElabError> {
+        let permute = self.simp_rules_permute(rules)?;
+        let keyed = aclt::simp_rules_keyed(rules, permute);
+        let rules = &keyed[..];
         self.resolve_instances(false)?;
         self.flush(false)?;
         let term = Typed {
@@ -143,7 +148,8 @@ impl Context {
                 }
                 self.tick()?;
                 let original = self.rewrite_trial();
-                let Some((replacement, _)) = self.simp_hypothesis_step(&local, rule, rules)? else {
+                let Some(((replacement, _), _)) = self.simp_hypothesis_step(&local, rule, rules)?
+                else {
                     self.restore_simp_trial(original);
                     continue;
                 };

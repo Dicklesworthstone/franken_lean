@@ -817,6 +817,32 @@ impl Context {
         }
         let mut inputs = Vec::new();
         let mut subjects = Vec::new();
+        // The pin elaborates the atomic discriminants of a match as written once more, before
+        // its inputs (`deprecated.rs`): when one of them names a deprecated constant, the first
+        // input carries them all, so that each is reported in the pin's order.
+        let mut rechecked: Vec<Syntax> = if !recursive_root
+            && matches!(&parts[0], Syntax::Atom { info, .. } if matches!(info, SourceInfo::Original { .. }))
+            && !(discriminants.len() == 1 && self.simple_match(alts))
+        {
+            discriminants
+                .iter()
+                .filter_map(|discriminant| match discriminant {
+                    Syntax::Node { args, .. } => args.get(1),
+                    _ => None,
+                })
+                .filter(|term| super::deprecated::atomic_discriminant(term).is_some())
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let mut deprecated = false;
+        for term in &rechecked {
+            deprecated |= self.names_deprecated_constant(term);
+        }
+        if !deprecated {
+            rechecked.clear();
+        }
         for discriminant in discriminants {
             let parts = expect_node(
                 discriminant,
@@ -832,6 +858,15 @@ impl Context {
             // the original expression still occurs in precisely this binding.
             subjects.push(fresh.clone());
             inputs.push((fresh, self.copy_pattern_syntax(&parts[1])?));
+        }
+        if !rechecked.is_empty()
+            && let Some((_, first)) = inputs.first_mut()
+        {
+            let value = std::mem::replace(first, Syntax::Missing);
+            *first = Syntax::node(
+                parser_kind(&["Term", super::deprecated::RECHECK]),
+                vec![null(rechecked), value],
+            );
         }
         // A match as written is typed as the pin types its patterns once every input is bound
         // (`pattern_typing`); the bodies play no part, so only the pattern rows are kept.

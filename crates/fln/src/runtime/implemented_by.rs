@@ -83,10 +83,10 @@ impl Preparation<'_> {
         }
     }
 
-    /// An attribute authorizes selecting this checked target, not executing an
-    /// opaque inhabitant, unsafe body, unknown extern, or foreign IR. Exact
-    /// native contracts may authorize an opaque target; supported partial
-    /// definitions continue through their existing complete-group gate.
+    /// An attribute selects a target without granting new execution authority.
+    /// Admitted unsafe definitions use the same body, initializer and companion
+    /// checks as direct calls. Opaque targets still require their existing
+    /// authority; unknown externs and foreign IR never become body fallbacks.
     pub(super) fn implementation_target(
         &mut self,
         requested: &Name,
@@ -119,8 +119,8 @@ impl Preparation<'_> {
                 break;
             };
             // Only these exact explicit edges admit checked logical Array
-            // adapters. Other safe replacements retain generic selection;
-            // an arbitrary unsafe target never gains a logical-body fallback.
+            // adapters. Other replacements retain generic selection of their
+            // own executable bodies, without acquiring an Array adapter.
             if array_iteration::canonical_pair(&target, &next) {
                 return self.array_iteration_target().map(Some);
             }
@@ -134,16 +134,20 @@ impl Preparation<'_> {
             return Ok(None);
         }
         self.tick()?;
-        let safe_target = match self.environment.find(&target) {
-            Some(ConstantInfo::Defn(value)) => value.safety != DefinitionSafety::Unsafe,
+        let executable_target = match self.environment.find(&target) {
+            // The pin's principal use of `implemented_by` is an unsafe
+            // implementation behind a safe logical interface. Selection does
+            // not unfold that implementation in either checker: below it must
+            // pass the ordinary executable-body and selected-extern gates.
+            Some(ConstantInfo::Defn(_)) => true,
             Some(ConstantInfo::Opaque(value)) => !value.is_unsafe,
             Some(ConstantInfo::Axiom(value)) => !value.is_unsafe,
             Some(ConstantInfo::Ctor(value)) => !value.is_unsafe,
             _ => false,
         };
-        if !safe_target {
+        if !executable_target {
             return Err(unsupported(
-                "implemented_by target has no supported safe or partial executable body",
+                "implemented_by target has no supported executable body",
             ));
         }
         if matches!(self.environment.find(&target), Some(ConstantInfo::Ctor(_))) {
@@ -200,7 +204,7 @@ impl Preparation<'_> {
         // Only the raw body/linkage gate runs here, never recursive lookup.
         if self.recursive_definition(&target)?.is_none() {
             return Err(unsupported(
-                "implemented_by target has no supported safe or partial executable body",
+                "implemented_by target has no supported executable body",
             ));
         }
         source_intrinsics::check_selected_extern_attribute(

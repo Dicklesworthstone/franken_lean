@@ -15,6 +15,10 @@ mod character;
 mod codegen;
 mod coercions;
 mod collections;
+mod deprecated;
+pub use deprecated::{
+    DeprecatedAttribute, deprecated_registration, deprecation_entry, reducibly_same_type,
+};
 pub mod deriving;
 mod diagnostics;
 mod do_notation;
@@ -25,6 +29,7 @@ mod subst;
 pub use subst::SubstError;
 pub mod scope;
 use scope::SourceScope;
+pub mod equation_theorems;
 mod equations;
 pub mod evaluation;
 mod inductive;
@@ -163,6 +168,9 @@ pub enum SourceInferenceError {
     AuxiliaryNotCompiled(Name),
     /// A surviving executable reference has no compiled implementation.
     NoncomputableDependency(Name),
+    /// The root `main` would generate code but its type is not one the pin's compiler runs
+    /// (`isValidMainType`, `codegen.rs`).
+    InvalidMainType,
     /// Invalid dependency metadata cannot become a suppressed compiler failure.
     NoncomputableJournal(crate::noncomputable::NoncomputableError),
     ExternJournal(crate::externs::ExternError),
@@ -173,6 +181,8 @@ pub enum SourceInferenceError {
     SimpSet(scope::simp::SimpSetError),
     /// The protected-declaration journal refused a tag.
     ProtectedJournal(crate::protected_names::ProtectedError),
+    /// The deprecation journal refused an entry.
+    DeprecationJournal(crate::deprecations::DeprecationError),
     AuxiliaryJournal(crate::aux_recursors::AuxRecursorError),
     ResourceLimit,
     /// Private inspection stopped at a source boundary; never an admitted declaration.
@@ -200,6 +210,9 @@ pub enum SourceInferenceError {
     },
     /// A `mutual` block whose members' headers the pin refuses to combine.
     MutualHeader(MutualHeaderError),
+    /// An equation theorem the pin generates on demand that this engine does not
+    /// (`equation_theorems`): a capability refusal, not a verdict on the source.
+    EquationTheorem(Box<equation_theorems::NotGenerated>),
 }
 
 /// The pin's header checks across the members of a `mutual` inductive block
@@ -432,6 +445,10 @@ impl std::fmt::Display for SourceInferenceError {
                 "failed to compile definition, consider marking it as 'noncomputable' because it depends on '{}', which is 'noncomputable'",
                 name.to_display_string()
             ),
+            Self::InvalidMainType => write!(
+                f,
+                "`main` function must have type `(List String →)? IO (UInt32 | Unit | PUnit)`"
+            ),
             Self::NoncomputableJournal(error) => write!(f, "{error}"),
             Self::ExternJournal(error) => write!(f, "{error}"),
             Self::ImplementedByJournal(error) => write!(f, "{error}"),
@@ -442,6 +459,7 @@ impl std::fmt::Display for SourceInferenceError {
             Self::InstanceRegistry(error) => write!(f, "{error}"),
             Self::SimpSet(error) => write!(f, "{error}"),
             Self::ProtectedJournal(error) => write!(f, "{error}"),
+            Self::DeprecationJournal(error) => write!(f, "{error}"),
             Self::AuxiliaryJournal(error) => write!(f, "{error}"),
             Self::ObservationComplete => {
                 write!(f, "source observation completed without admission")
@@ -468,6 +486,7 @@ impl std::fmt::Display for SourceInferenceError {
                 "Type mismatch: a term of type `{actual}` is expected to have type `{expected}`"
             ),
             Self::MutualHeader(error) => write!(f, "{error}"),
+            Self::EquationTheorem(refusal) => write!(f, "{refusal}"),
         }
     }
 }
@@ -567,7 +586,12 @@ impl SourceEquation {
 struct Context {
     inspection: Option<inspect::Probe>,
     traces: trace::TraceLog,
+    // Information messages (`trace::Context::log_info`): elaboration state, restored with it.
+    infos: Vec<trace::SourceTrace>,
     goal_tags: std::collections::HashMap<MVarId, Name>,
+    // Conversion goals `lhs = ?rhs`, which the pin annotates as `lhs` (`mkLHSGoalRaw`, vendored
+    // Lean/Elab/Tactic/Conv/Basic.lean) and a goal display shows as `| lhs`.
+    conv_goals: std::collections::HashSet<MVarId>,
     // Rewritten hypotheses: the pin asserts each and applies the new goal to its proof, which
     // `instantiateMVars` beta-reduces away when nothing reads it, so such a binding nothing
     // reads leaves the term (and with it every use of the hypothesis it rewrote).
@@ -654,8 +678,21 @@ struct Context {
     // Only explicitly generated/imported auxiliary declarations receive the
     // pin's eliminator elaboration; a declaration's suffix is insufficient.
     auxiliary_cache: crate::aux_recursors::AuxRecursorCache,
+    // `@[deprecated]` declarations, re-read on the same terms as the protected set.
+    deprecation_cache: crate::deprecations::DeprecationCache,
+    // Each resolution of a deprecated constant, in elaboration order (`deprecated.rs`). Rollback
+    // restores it with the rest of the context, as the pin's `SavedState.restore` restores the
+    // message log; a completed elaboration publishes it.
+    deprecated_uses: Vec<crate::deprecations::DeprecatedUse>,
+    // The pin's `Term.Context.checkDeprecated`: off in the header and body of a declaration that
+    // is itself `@[deprecated]` (`withDeprecationContextFromAttrs`).
+    check_deprecated: bool,
     // Registered simp rules' discrimination keys, shared by speculative snapshots.
     simp_key_cache: tactics::SimpKeyCache,
+    // While simp chooses among its rules as the pin's traversal does, the post-order ordinal
+    // of the earliest rewrite found so far: the next rule's occurrence search reads it once and
+    // stops past it (`aclt.rs`, `simp_first_rewrite`).
+    simp_reach_limit: Option<usize>,
     // The declaration being elaborated, when it is `protected`.
     protected_declaration: Option<Name>,
     refinements: Vec<tactics::RefinementFrame>,
@@ -692,6 +729,10 @@ struct Context {
     // unfold equation, so an occurrence whose match is stuck becomes a `match`, which a
     // compiled recursor application does not print as.
     unfold_tactic: bool,
+    // The ambient transparency `with_reducible`, `with_reducible_and_instances` and
+    // `with_unfolding_none` set for the tactics they run (`withReducible` &c., vendored
+    // src/Lean/Elab/Tactic/BuiltinTactic.lean). `None` is the elaborator's own default.
+    tactic_transparency: Option<UnificationTransparency>,
     // A local recursive helper suspends its parent's structural compiler.
     // Complete parent calls still lower against that parent's hypotheses
     // before the helper closes over them as an opaque value.
@@ -721,6 +762,9 @@ struct Context {
     native_axioms: Vec<Declaration>,
     // The pin's `DeclNameGenerator` for the declaration being elaborated (`mkAuxDeclName`).
     aux_names: Option<tactics::AuxNames>,
+    /// The definition's root `match`, read for its equation theorems
+    /// (`equation_theorems::capture`), once the definition is elaborated.
+    equation_info: Option<equation_theorems::journal::Record>,
 }
 
 fn failure(reason: SourceInferenceError) -> NatDefinitionElabError {
@@ -746,7 +790,9 @@ impl Context {
         Self {
             inspection: None,
             traces: trace::TraceLog::default(),
+            infos: Vec::new(),
             goal_tags: std::collections::HashMap::new(),
+            conv_goals: std::collections::HashSet::new(),
             discarded_lets: std::collections::HashSet::new(),
             trace_local_names: std::collections::HashMap::new(),
             unnamed_fields: std::collections::HashSet::new(),
@@ -787,7 +833,11 @@ impl Context {
             alias_cache: crate::aliases::AliasCache::default(),
             protected_cache: crate::protected_names::ProtectedCache::default(),
             auxiliary_cache: crate::aux_recursors::AuxRecursorCache::default(),
+            deprecation_cache: crate::deprecations::DeprecationCache::default(),
+            deprecated_uses: Vec::new(),
+            check_deprecated: true,
             simp_key_cache: tactics::SimpKeyCache::default(),
+            simp_reach_limit: None,
             protected_declaration: None,
             refinements: Vec::new(),
             defining: None,
@@ -801,6 +851,7 @@ impl Context {
             partial: None,
             noncomputable_definition: false,
             unfold_tactic: false,
+            tactic_transparency: None,
             enclosing_recursions: Vec::new(),
             postponed_eliminators: Vec::new(),
             postponed_coercions: Vec::new(),
@@ -810,6 +861,7 @@ impl Context {
             native: None,
             native_axioms: Vec::new(),
             aux_names: None,
+            equation_info: None,
         }
     }
 
@@ -909,12 +961,9 @@ impl Context {
         if let Some(term) = self.partial_group_reference(name)? {
             return Ok(term);
         }
-        let info = self
-            .txn
-            .env
-            .find(name)
-            .cloned()
-            .ok_or_else(|| failure(SourceInferenceError::UnknownConstant(name.clone())))?;
+        let Some(info) = self.txn.env.find(name).cloned() else {
+            return Err(self.missing_equation_theorem(name)?);
+        };
         self.note_resolved_recursor(name, &info)?;
         let base = info.constant_val();
         let mut levels = Vec::new();
@@ -1063,6 +1112,9 @@ impl Context {
                     return Err(failure(SourceInferenceError::Scope));
                 };
                 expect_atom(hole, "_", "placeholder")?;
+                if self.placeholders_are_goals() {
+                    return self.synthetic_proof_hole(None, expected);
+                }
                 let type_ = match expected {
                     Some(type_) => type_.clone(),
                     None => {
@@ -1143,7 +1195,7 @@ impl Context {
             // A template's name (macro-scoped) is a global once its scopes are erased, unless a
             // prefix of it, with its scopes, names a local the template bound.
             let hygienic = name.has_macro_scopes();
-            if hygienic && let Some(term) = self.hygienic_record_field(name, expected)? {
+            if hygienic && let Some(term) = self.hygienic_record_field(name, expected, syntax)? {
                 return Ok(term);
             }
             let resolved = self
@@ -1196,7 +1248,7 @@ impl Context {
             }
             let mut resolved = name.clone();
             if !self.txn.env.contains(name) {
-                if let Some(term) = self.qualified_record_field(name, expected)? {
+                if let Some(term) = self.qualified_record_field(name, expected, Some(syntax))? {
                     return Ok(term);
                 }
                 if name == &Name::from_components(["true"]) {
@@ -1206,6 +1258,7 @@ impl Context {
                     resolved = Name::from_components(["Bool", "false"]);
                 }
             }
+            self.note_deprecated(&resolved, deprecated::syntax_span(syntax))?;
             return self.constant(&resolved);
         }
         let value = elaborate_atom(syntax, &[], true, Some(&self.txn.env))?;
@@ -1222,7 +1275,8 @@ impl Context {
     }
 
     fn whnf(&mut self, expr: &Expr) -> Result<Expr, NatDefinitionElabError> {
-        self.whnf_with_transparency(expr, UnificationTransparency::Default, true)
+        let transparency = self.ambient_transparency(UnificationTransparency::Default);
+        self.whnf_with_transparency(expr, transparency, true)
     }
 
     /// `` `a.b `` (`Term.quotedName`): the pin's `elabQuotedName` is `toExpr` of the literal's name
@@ -1362,6 +1416,17 @@ impl Context {
         expected: &Expr,
     ) -> Result<(), NatDefinitionElabError> {
         self.check_attempt_equation(actual, expected)?;
+        // Under a transparency the ambient tactic scope lowers, the pin's `isDefEq` unfolds
+        // no more than it allows; the kernel's conversion below would unfold every
+        // definition that is not irreducible.
+        if self.tactic_transparency.is_some() {
+            let budget = self.ambient_budget(UnificationTransparency::Default);
+            return self
+                .txn
+                .unify(actual, expected, budget)
+                .map(|report| assert!(report.awakened.is_empty(), "private source queue"))
+                .map_err(|problem| failure(SourceInferenceError::Unification(Box::new(problem))));
+        }
         // Kernel admission unfolds definitions that ordinary elaboration must
         // leave opaque. Check closed equations at Default as well; otherwise
         // explicit proof arguments and carrier conversions bypass inference.
@@ -1414,15 +1479,52 @@ impl Context {
         pairs: &[(Expr, Expr)],
         allow_delta: bool,
     ) -> Result<(), UnificationError> {
-        let mut result =
-            self.txn
-                .unify_many_with(pairs, UnificationBudget::new(self.kernel), &|| false);
-        if allow_delta && retries_with_delta(&result) {
-            let mut budget = UnificationBudget::new(self.kernel);
-            budget.transparency = UnificationTransparency::Default;
-            result = self.txn.unify_many_with(pairs, budget, &|| false);
+        let first = self.ambient_budget(UnificationTransparency::Abbreviations);
+        let mut result = self.txn.unify_many_with(pairs, first, &|| false);
+        let retry = self.ambient_budget(UnificationTransparency::Default);
+        if allow_delta && retry.transparency != first.transparency && retries_with_delta(&result) {
+            result = self.txn.unify_many_with(pairs, retry, &|| false);
         }
         result.map(|report| assert!(report.awakened.is_empty(), "private source queue"))
+    }
+
+    /// The transparency an ordinary elaboration or tactic query asking for `requested` runs
+    /// at: the ambient transparency `with_reducible`, `with_reducible_and_instances` and
+    /// `with_unfolding_none` set (`withReducible`, `withReducibleAndInstances` and
+    /// `withTransparency .none`, vendored src/Lean/Elab/Tactic/BuiltinTactic.lean) caps it.
+    /// Queries that fix their own transparency (instance selection at `instances`, `rw`'s
+    /// occurrence query, `simp`'s matching) do not ask through this.
+    pub(in crate::source) fn ambient_transparency(
+        &self,
+        requested: UnificationTransparency,
+    ) -> UnificationTransparency {
+        let rank = |transparency| match transparency {
+            UnificationTransparency::None => 0,
+            UnificationTransparency::Abbreviations => 1,
+            UnificationTransparency::Instances => 2,
+            UnificationTransparency::Default => 3,
+            UnificationTransparency::SafeDefinitions => 4,
+        };
+        match self.tactic_transparency {
+            Some(cap) if rank(cap) < rank(requested) => cap,
+            _ => requested,
+        }
+    }
+
+    /// An ordinary query's budget at `requested` capped by [`Self::ambient_transparency`].
+    /// Under a cap the pin's `isDefEq` still compares Nat offsets and literals before
+    /// reducing (`isDefEqOffsetNat`, vendored Lean/Meta/ExprDefEq.lean), which this engine
+    /// otherwise reaches by unfolding `Nat.add` at default transparency.
+    pub(in crate::source) fn ambient_budget(
+        &self,
+        requested: UnificationTransparency,
+    ) -> UnificationBudget {
+        let mut budget = UnificationBudget::new(self.kernel);
+        budget.transparency = self.ambient_transparency(requested);
+        if self.tactic_transparency.is_some() {
+            budget.offset_constraints = true;
+        }
+        budget
     }
 
     /// `unify_source_batch` for the pending source equations, where a batch
@@ -1446,12 +1548,14 @@ impl Context {
             // which also unfolds `implicitReducible` definitions such as
             // `instOfNatNat` (bead fln-gkhu).
             budget.transparency = UnificationTransparency::Instances;
+        } else {
+            budget = self.ambient_budget(UnificationTransparency::Abbreviations);
         }
+        let first = budget.transparency;
         let mut result = self.unify_pending(pairs, budget)?;
-        if allow_delta && retries_with_delta(&result) {
-            let mut budget = UnificationBudget::new(self.kernel);
-            budget.transparency = UnificationTransparency::Default;
-            result = self.unify_pending(pairs, budget)?;
+        let retry = self.ambient_budget(UnificationTransparency::Default);
+        if allow_delta && retry.transparency != first && retries_with_delta(&result) {
+            result = self.unify_pending(pairs, retry)?;
         }
         Ok(result.map(|report| assert!(report.awakened.is_empty(), "private source queue")))
     }
@@ -1893,6 +1997,8 @@ impl Context {
             CalcNext(calc::Build<'a>),
             CalcRelation(calc::Build<'a>),
             CalcProof(calc::Build<'a>, Expr),
+            /// A first calculation step without a proof: the term it starts from.
+            CalcStart(calc::Build<'a>),
             MatrixScope(Vec<Name>),
             CaptureRecursiveContext,
             MatchDiscriminant(matching::MatchParts<'a>, Option<Expr>),
@@ -1901,9 +2007,11 @@ impl Context {
             MatchBranch(matching::MatchBuild<'a>, matching::BranchBinders),
             Ascription(&'a Syntax, Option<Expr>, bool),
             AscribedValue(Expr, Option<Expr>, bool),
+            Noindex,
             /// `↑e`'s value, made to have the expected type.
             Coerced(Option<Expr>),
-            Projection(Name, &'a [Syntax], Option<Expr>, bool, bool),
+            /// A field path, the syntax it is spelled at the end of, the arguments.
+            Projection(Name, &'a Syntax, &'a [Syntax], Option<Expr>, bool, bool),
             RecordType(record_terms::RecordParts<'a>, Option<Expr>),
             RecordPrepare(record_terms::RecordParts<'a>, Option<Expr>, Vec<Typed>),
             RecordSource(record_terms::RecordParts<'a>, Option<Expr>, Vec<Typed>),
@@ -2154,8 +2262,12 @@ impl Context {
                             ));
                         }
                         Task::CalcNext(build) => {
-                            if let Some(step) = build.steps.get(build.cursor) {
-                                let relation = step.0;
+                            if let Some(&(relation, proof)) = build.steps.get(build.cursor) {
+                                if proof.is_none() {
+                                    tasks.push(Task::CalcStart(build));
+                                    tasks.push(Task::Visit(relation, None, true));
+                                    continue;
+                                }
                                 // The pin elaborates a calc relation with
                                 // `elabType`; its result may inhabit any Sort.
                                 let expected = self.type_expected()?;
@@ -2165,10 +2277,19 @@ impl Context {
                                 values.push(self.finish_calculation(build)?);
                             }
                         }
+                        Task::CalcStart(mut build) => {
+                            let start = values.pop().expect("calculation start visit");
+                            let (relation, proof) = self.calculation_start(start)?;
+                            let relation = self.prepare_calculation_step(&mut build, relation)?;
+                            self.add_calculation_step(&mut build, relation, proof)?;
+                            tasks.push(Task::CalcNext(build));
+                        }
                         Task::CalcRelation(mut build) => {
                             let relation = values.pop().expect("calculation relation visit");
                             let relation = self.prepare_calculation_step(&mut build, relation)?;
-                            let proof = build.steps[build.cursor].1;
+                            let proof = build.steps[build.cursor]
+                                .1
+                                .ok_or_else(|| failure(SourceInferenceError::Scope))?;
                             tasks.push(Task::CalcProof(build, relation.clone()));
                             tasks.push(Task::Visit(proof, Some(relation), true));
                         }
@@ -2244,6 +2365,26 @@ impl Context {
                                         ),
                                         None => None,
                                     };
+                                    // The pin's block always builds `pure` for its result
+                                    // (`DoElemCont.mkPure`, then `mkBindUnlessPure`, vendored
+                                    // `Lean/Elab/Do/Basic.lean:272-302, 512-525`). That asks for a
+                                    // `Pure m` instance even where the bind is then contracted away,
+                                    // so a block at a monad without one is refused there.
+                                    if let Some(application) = &expected
+                                        && let Some(monad) = self.do_monad(application)?
+                                    {
+                                        let pure = self.do_operation(false, Some(monad))?;
+                                        let type_ = self.whnf(&pure.type_)?;
+                                        let ExprNode::ForallE {
+                                            binder_type,
+                                            binder_info: BinderInfo::InstImplicit,
+                                            ..
+                                        } = type_.node()
+                                        else {
+                                            return Err(failure(SourceInferenceError::Scope));
+                                        };
+                                        self.instance_hole(binder_type.clone())?;
+                                    }
                                     tasks.push(Task::Visit(body, expected, finish));
                                     continue;
                                 }
@@ -2322,14 +2463,40 @@ impl Context {
                                     ));
                                     continue;
                                 }
-                                if kind == &parser_kind(&["Term", "nativeDoBind"])
+                                if kind == &parser_kind(&["Term", "nativeDoRepeatDefault"]) {
+                                    let [normal, fallback] = args.as_slice() else {
+                                        return Err(failure(SourceInferenceError::Scope));
+                                    };
+                                    let body =
+                                        if self.do_repeat_needs_fallback(expected.as_ref())? {
+                                            fallback
+                                        } else {
+                                            normal
+                                        };
+                                    tasks.push(Task::Visit(body, expected, finish));
+                                    continue;
+                                }
+                                let repeat =
+                                    kind == &parser_kind(&["Term", "nativeDoRepeatResult"]);
+                                if repeat {
+                                    let [action, _] = args.as_slice() else {
+                                        return Err(failure(SourceInferenceError::Scope));
+                                    };
+                                    if !self.do_repeat_needs_fallback(expected.as_ref())? {
+                                        tasks.push(Task::Visit(action, expected, finish));
+                                        continue;
+                                    }
+                                }
+                                if repeat
+                                    || kind == &parser_kind(&["Term", "nativeDoBind"])
                                     || kind == &parser_kind(&["Term", "nativeDoPure"])
                                     || kind == &parser_kind(&["Term", "nativeDoNestedAction"])
                                 {
                                     let nested =
                                         kind == &parser_kind(&["Term", "nativeDoNestedAction"]);
-                                    let bind =
-                                        nested || kind == &parser_kind(&["Term", "nativeDoBind"]);
+                                    let bind = repeat
+                                        || nested
+                                        || kind == &parser_kind(&["Term", "nativeDoBind"]);
                                     if args.len() != if bind { 2 } else { 1 } {
                                         return Err(failure(SourceInferenceError::Scope));
                                     }
@@ -2465,6 +2632,18 @@ impl Context {
                                     tasks.push(Task::Visit(first, None, true));
                                     continue;
                                 }
+                                // The pin's first elaboration of a pattern matrix's atomic
+                                // discriminants (`deprecated.rs`), then its first input.
+                                if kind == &parser_kind(&["Term", deprecated::RECHECK]) {
+                                    let [identifiers, value] = args.as_slice() else {
+                                        return Err(failure(SourceInferenceError::Scope));
+                                    };
+                                    let identifiers =
+                                        expect_null_args(identifiers, "rechecked discriminants")?;
+                                    self.recheck_identifiers(identifiers)?;
+                                    tasks.push(Task::Visit(value, expected, finish));
+                                    continue;
+                                }
                                 if kind == &parser_kind(&["Term", "match"])
                                     || kind == &parser_kind(&["Term", "matchMatrix"])
                                     || kind == &parser_kind(&["Term", "ifThenElse"])
@@ -2472,6 +2651,7 @@ impl Context {
                                     || kind == &Name::from_components(["termDepIfThenElse"])
                                 {
                                     let parts = self.match_parts(syntax)?;
+                                    self.recheck_written_discriminant(&parts)?;
                                     let discriminant = parts.discriminant;
                                     tasks.push(Task::MatchDiscriminant(parts, expected));
                                     tasks.push(Task::Visit(discriminant, None, true));
@@ -2503,11 +2683,13 @@ impl Context {
                                     });
                                     continue;
                                 }
-                                // `no_index e` is `e`: it only keeps `e` out of simp's
-                                // discrimination-tree keys (`Lean/Elab/BuiltinNotation.lean`).
+                                // The annotation is transparent to typing, but must survive in
+                                // the term: both native and exported simp indexes read it.
+                                // `Lean/Elab/BuiltinNotation.lean`, `elabNoindex`.
                                 if kind == &parser_kind(&["Term", "noindex"]) {
                                     let parts = expect_node(syntax, kind, 2, "no_index")?;
                                     expect_atom(&parts[0], "no_index", "no_index")?;
+                                    tasks.push(Task::Noindex);
                                     tasks.push(Task::Visit(&parts[1], expected, finish));
                                     continue;
                                 }
@@ -2524,7 +2706,7 @@ impl Context {
                                         "pipeline projection arguments",
                                     )?;
                                     tasks.push(Task::Projection(
-                                        field, arguments, expected, false, finish,
+                                        field, &parts[2], arguments, expected, false, finish,
                                     ));
                                     tasks.push(Task::Visit(&parts[0], None, true));
                                     continue;
@@ -2535,6 +2717,7 @@ impl Context {
                                     let field = record_terms::projection_field(&parts[2])?;
                                     tasks.push(Task::Projection(
                                         field,
+                                        &parts[2],
                                         &[],
                                         expected,
                                         false,
@@ -3041,7 +3224,7 @@ impl Context {
                                 term
                             });
                         }
-                        Task::Projection(field, arguments, expected, explicit, finish) => {
+                        Task::Projection(field, at, arguments, expected, explicit, finish) => {
                             let receiver = values.pop().expect("receiver precedes projection");
                             // `x.f ..` has no arguments to process: `hasArgs` counts positional
                             // and named arguments only (vendored `Lean/Elab/App.lean:1850`), so a
@@ -3050,6 +3233,7 @@ impl Context {
                                 receiver,
                                 &field,
                                 !arguments.iter().all(application::is_ellipsis),
+                                Some(at),
                             )? {
                                 record_terms::FieldResolution::Value(term)
                                     if arguments.is_empty() =>
@@ -3110,6 +3294,16 @@ impl Context {
                             let branch = values.pop().expect("match branch visit");
                             self.accept_match_branch(&mut state, binders, branch)?;
                             tasks.push(Task::MatchNext(state));
+                        }
+                        Task::Noindex => {
+                            let mut term = values.pop().expect("no_index term visit");
+                            let mut data = KVMap::new();
+                            data.insert(
+                                Name::from_components(["noindex"]),
+                                fln_core::options::DataValue::OfBool(true),
+                            );
+                            term.value = Expr::mdata(data, term.value);
+                            values.push(term);
                         }
                         Task::Ascription(syntax, expected, show) => {
                             let type_ = values.pop().expect("ascription type visit");
@@ -3301,10 +3495,18 @@ impl Context {
                                 }
                                 tasks.push(Task::Proof(proof));
                             }
-                            tactics::ProofAction::Refine { syntax, goal } => {
+                            tactics::ProofAction::Refine {
+                                syntax,
+                                goal,
+                                placeholders,
+                            } => {
                                 self.txn.lctx = goal.lctx.clone();
                                 let expected = goal.target.clone();
-                                let depth = self.begin_refinement();
+                                let depth = if placeholders {
+                                    self.begin_placeholder_refinement()
+                                } else {
+                                    self.begin_refinement()
+                                };
                                 tasks.push(Task::RefineTerm(proof, goal, depth));
                                 tasks.push(Task::Visit(syntax, Some(expected), true));
                             }
@@ -3349,14 +3551,29 @@ impl Context {
                                 close,
                             } => {
                                 self.txn.lctx = goal.lctx.clone();
-                                tasks.push(Task::RewriteTerm(
-                                    proof,
-                                    goal,
-                                    rule.reverse,
-                                    remaining,
-                                    close,
-                                ));
-                                tasks.push(Task::Visit(rule.syntax, None, true));
+                                if let Some((declaration, equations)) =
+                                    self.rewrite_rule_equations(rule.syntax)?
+                                {
+                                    self.rewrite_with_equations(
+                                        &mut proof,
+                                        goal,
+                                        &declaration,
+                                        &equations,
+                                        rule.reverse,
+                                        remaining,
+                                        close,
+                                    )?;
+                                    tasks.push(Task::Proof(proof));
+                                } else {
+                                    tasks.push(Task::RewriteTerm(
+                                        proof,
+                                        goal,
+                                        rule.reverse,
+                                        remaining,
+                                        close,
+                                    ));
+                                    tasks.push(Task::Visit(rule.syntax, None, true));
+                                }
                             }
                             tactics::ProofAction::Term {
                                 syntax,
@@ -3495,16 +3712,20 @@ impl Context {
                                 }
                             };
                             match receiver {
-                                Some(record_terms::FieldReceiver::Syntax(receiver, field)) => {
+                                Some(record_terms::FieldReceiver::Syntax(receiver, field, at)) => {
                                     tasks.push(Task::Projection(
-                                        field, arguments, expected, explicit, true,
+                                        field, at, arguments, expected, explicit, true,
                                     ));
                                     tasks.push(Task::Visit(receiver, None, true));
                                 }
-                                Some(record_terms::FieldReceiver::Elaborated(receiver, field)) => {
+                                Some(record_terms::FieldReceiver::Elaborated(
+                                    receiver,
+                                    field,
+                                    at,
+                                )) => {
                                     values.push(receiver);
                                     tasks.push(Task::Projection(
-                                        field, arguments, expected, explicit, true,
+                                        field, at, arguments, expected, explicit, true,
                                     ));
                                 }
                                 // `.c a b`: the head resolves against the expected type
@@ -3710,10 +3931,15 @@ impl Context {
                                 let codomain = body.clone();
                                 // Propagate a known result before checking the last
                                 // explicit argument when the codomain does not depend
-                                // on that argument (e.g. Inhabited.mk (fun x => ...)).
+                                // on that argument (e.g. Inhabited.mk (fun x => ...)),
+                                // unless it is an instance's output, which the pin
+                                // leaves to the instance (`resultIsOutParamSupport`).
                                 if rest.is_empty()
                                     && !codomain.has_loose_bvar(0)
                                     && let Some(expected) = &expected
+                                    && self
+                                        .application_result_out_param(&function, explicit)?
+                                        .is_none()
                                 {
                                     self.do_operation_result_hint(&function, &codomain, expected)?;
                                     self.constrain_result_hint(&codomain, expected)?;
@@ -3726,6 +3952,7 @@ impl Context {
                                 values.push(if explicit {
                                     self.finish_explicit_term(function, expected.as_ref())?
                                 } else {
+                                    self.settle_result_out_param(&function, explicit)?;
                                     self.finish_application(function, expected.as_ref())?
                                 });
                             }
@@ -4901,6 +5128,7 @@ pub fn elaborate_public_theorem(
     Ok(ElaboratedDeclaration {
         declaration,
         native_axioms: Vec::new(),
+        equation_info: None,
         local_functions,
         irreducible: false,
         noncomputable: context.noncomputable_definition,
@@ -5026,6 +5254,9 @@ pub struct ElaboratedDeclaration {
     /// (`crate::native`). The declaration cites them, so callers must admit every one,
     /// through both checkers, before it.
     pub native_axioms: Vec<Declaration>,
+    /// The root `match` of a definition by pattern matching, for its equation theorems: the
+    /// caller records it with the admitted definition (`equation_theorems::journal::push`).
+    pub equation_info: Option<equation_theorems::journal::Record>,
     /// Closed local recursive helpers. They grant no authority: callers must
     /// admit every helper and the owner atomically through both checkers.
     pub local_functions: Vec<Declaration>,
@@ -5075,6 +5306,7 @@ fn definition_scoped_elaboration(
     Ok(ElaboratedDeclaration {
         declaration,
         native_axioms: std::mem::take(&mut context.native_axioms),
+        equation_info: context.equation_info.take(),
         local_functions,
         irreducible: context.well_founded_definition,
         noncomputable: context.noncomputable_definition,
@@ -5191,7 +5423,23 @@ fn definition_in_context(
     definition_in_context_named(syntax, context, None)
 }
 
+/// [`definition_elaboration`], with the pin's deprecation context: a declaration that is itself
+/// `@[deprecated]` reports no deprecated constant in its header or body
+/// (`withDeprecationContextFromAttrs`). The uses of a completed elaboration are published.
 fn definition_in_context_named(
+    syntax: &Syntax,
+    context: &mut Context,
+    generated_name: Option<Name>,
+) -> Result<Declaration, NatDefinitionElabError> {
+    if deprecated::deprecated_registration(syntax)?.is_some() {
+        context.check_deprecated = false;
+    }
+    let declaration = definition_elaboration(syntax, context, generated_name)?;
+    context.publish_deprecated_uses()?;
+    Ok(declaration)
+}
+
+fn definition_elaboration(
     syntax: &Syntax,
     context: &mut Context,
     generated_name: Option<Name>,
@@ -5799,7 +6047,12 @@ fn definition_in_context_named(
     // runtime recursor implementation is irrelevant when no code may be generated.
     if !is_theorem && !proof_instance && !is_noncomputable {
         if scope::executable::registrations(syntax)?.is_empty() {
-            context.noncomputable_definition = context.check_definition_codegen(&term)?;
+            // `[macro_inline]` generates no code (`shouldGenerateCode`), so neither is its
+            // `main` checked. A failed `main` check ends compilation before any other.
+            let main_failed = !scope::simp::macro_inline_requested(syntax)?
+                && context.check_main_type(name, &term.type_)?;
+            context.noncomputable_definition =
+                main_failed || context.check_definition_codegen(&term)?;
         } else {
             // The declared body remains fully typed and checked, but the pin
             // compiles the executable replacement instead of that logical body.
@@ -5891,7 +6144,7 @@ fn definition_in_context_named(
             safety: DefinitionSafety::Partial,
         }]))
     } else {
-        Ok(Declaration::Defn(DefinitionVal {
+        let definition = DefinitionVal {
             base,
             value: term.value,
             hints: if is_abbrev {
@@ -5901,7 +6154,10 @@ fn definition_in_context_named(
             },
             safety: DefinitionSafety::Safe,
             all: vec![name.clone()],
-        }))
+        };
+        context.equation_info =
+            context.capture_equation_info(&definition, body, partial_captures.len());
+        Ok(Declaration::Defn(definition))
     }
 }
 
@@ -6060,7 +6316,19 @@ fn query_in(
     ))
 }
 
+/// [`query_elaboration`], whose completed elaboration publishes its deprecated uses.
 fn query_term(
+    syntax: &Syntax,
+    name: &Name,
+    context: &mut Context,
+    evaluate: bool,
+) -> Result<(Typed, Vec<Name>, Vec<usize>), NatDefinitionElabError> {
+    let query = query_elaboration(syntax, name, context, evaluate)?;
+    context.publish_deprecated_uses()?;
+    Ok(query)
+}
+
+fn query_elaboration(
     syntax: &Syntax,
     name: &Name,
     context: &mut Context,
@@ -6244,7 +6512,37 @@ fn query_term(
             &parts[1]
         }
     };
-    let mut term = context.term(argument, None)?;
+    // `#check id` and `#print id` (`elabCheckCore`, vendored `Lean/Elab/BuiltinCommand.lean:434-443`;
+    // `elabPrint`, `Lean/Elab/Print.lean`): an identifier `realizeGlobalConstWithInfos` resolves
+    // to a constant names that constant, which is not elaborated as a term. Elaborating it would
+    // fill a trailing optional parameter's default and eta-expand over the parameters before it
+    // (`fun n => f n 3`), or leave an implicit argument unresolved.
+    let global = if evaluate {
+        None
+    } else {
+        context.global_constant_query(argument)?
+    };
+    let mut term = match global {
+        Some(term) => term,
+        None => {
+            // `#print c` and `#check c` name a global constant without elaborating it
+            // (`realizeGlobalConstWithInfos`, `elabCheckCore`), so they check no deprecation.
+            let names_constant = printed.is_some()
+                || (!evaluate
+                    && matches!(argument, Syntax::Ident { val, .. }
+                        if context.txn.lctx.find_by_user_name(val).is_none()
+                            && context
+                                .resolve_source_name(val)
+                                .ok()
+                                .flatten()
+                                .is_some_and(|name| context.txn.env.contains(&name))));
+            let check_deprecated = context.check_deprecated;
+            context.check_deprecated = check_deprecated && !names_constant;
+            let term = context.term(argument, None);
+            context.check_deprecated = check_deprecated;
+            term?
+        }
+    };
     if evaluate {
         let (head, explicit) = context.explicit_application_head(argument)?;
         if !explicit
@@ -6279,6 +6577,35 @@ fn query_term(
 }
 
 impl Context {
+    /// The constant a query identifier names, at fresh universe levels, when it names one: no
+    /// local of that name, and resolution in this scope finds exactly one declaration. Anything
+    /// else (a local, an ambiguous name, `x.f` field access) is elaborated as a term instead, as
+    /// the pin does when `realizeGlobalConstWithInfos` throws.
+    fn global_constant_query(
+        &mut self,
+        syntax: &Syntax,
+    ) -> Result<Option<Typed>, NatDefinitionElabError> {
+        let Syntax::Ident { val: name, .. } = syntax else {
+            return Ok(None);
+        };
+        if name.is_anonymous() || name.has_macro_scopes() {
+            return Ok(None);
+        }
+        if self.txn.lctx.find_by_user_name(name).is_some() {
+            return Ok(None);
+        }
+        let Ok(Some(resolved)) = self.resolve_source_candidates(name)? else {
+            return Ok(None);
+        };
+        if crate::seed::protected::source_unreachable(&resolved)
+            || !self.txn.env.contains(&resolved)
+            || self.txn.lctx.find_by_user_name(&resolved).is_some()
+        {
+            return Ok(None);
+        }
+        self.constant(&resolved).map(Some)
+    }
+
     /// The pin elaborates `#check` and `#synth` with every section variable in the local
     /// context (`runTermElabM`, vendored `Lean/Elab/Command.lean`) and prints the term with
     /// those variables as they are named there. The candidate here is closed over the variables

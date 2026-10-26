@@ -520,3 +520,165 @@ fn actual_prelude_modulo_and_bitvector_words_execute_at_default_budgets() {
         .join()
         .unwrap();
 }
+
+/// `(Nat.brecOn.go M t F).1` with the definition already unfolded, as plain
+/// delta reduction of a structural definition leaves it in an elaborated term.
+fn unfolded_history(engine: &Engine, major: Expr, functional: Expr) -> Expr {
+    let body = Preparation::new(engine.environment(), IngressLimits::default())
+        .nat_history_body(
+            "Nat.brecOn.go",
+            &[Level::one()],
+            &[motive(), major, functional],
+        )
+        .unwrap()
+        .unwrap();
+    Expr::proj(named("PProd"), 0, body)
+}
+
+#[test]
+fn an_unfolded_history_scaffold_refolds_only_to_its_own_admitted_definition() {
+    let engine = admitted_scaffold(None);
+    let options = KVMap::new();
+    let root = engine.logical_root(&options);
+    // The receiver's motive is a type computed from the index: Nat.rec alone
+    // has no uniform layout for it, so this used to be a refusal.
+    for (initial, count, expected) in [(7, 0, 7), (7, 5, 12), (40, 2, 42)] {
+        let unfolded = unfolded_history(&engine, nat(count), successor_functional(initial));
+        let result = engine
+            .execute_definition(
+                declaration("answer", natural(), unfolded),
+                &options,
+                EngineExecutionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024)),
+            )
+            .unwrap()
+            .into_complete()
+            .unwrap();
+        assert_eq!(
+            closed_vm_value(&result.exit).unwrap(),
+            Some(ClosedVmValue::Scalar(expected))
+        );
+        assert_eq!(root, engine.logical_root(&options));
+    }
+    let functional = successor_functional(7);
+    let unfolded = unfolded_history(&engine, nat(3), functional.clone());
+    let ExprNode::Proj { expr: receiver, .. } = unfolded.node() else {
+        unreachable!()
+    };
+    let mut prep = Preparation::new(engine.environment(), IngressLimits::default());
+    assert_eq!(
+        prep.nat_history_refold(0, receiver).unwrap(),
+        Some(brec(nat(3), functional))
+    );
+    // The history component is no observable value of the fold.
+    assert_eq!(prep.nat_history_refold(1, receiver).unwrap(), None);
+    // Any change to the scaffold is not one delta step from Nat.brecOn.
+    let (head, mut args) = prep.spine(receiver).unwrap();
+    let ExprNode::Lam {
+        binder_name,
+        binder_type,
+        body,
+        binder_info,
+    } = args[2].node()
+    else {
+        unreachable!()
+    };
+    let ExprNode::Lam { body: step, .. } = body.node() else {
+        unreachable!()
+    };
+    let (mk, mut fields) = prep.spine(step).unwrap();
+    fields[3] = application(
+        constant("PProd.mk", vec![Level::one(), Level::one()]),
+        [natural(), natural(), nat(0), nat(0)],
+    );
+    let ExprNode::Lam {
+        binder_name: inner_name,
+        binder_type: inner_type,
+        binder_info: inner_info,
+        ..
+    } = body.node()
+    else {
+        unreachable!()
+    };
+    args[2] = Expr::lam(
+        binder_name.clone(),
+        binder_type.clone(),
+        Expr::lam(
+            inner_name.clone(),
+            inner_type.clone(),
+            application(mk, fields),
+            *inner_info,
+        ),
+        *binder_info,
+    );
+    let altered = application(head, args);
+    assert_eq!(prep.nat_history_refold(0, &altered).unwrap(), None);
+    // A scaffold whose admitted definitions are not the pinned model is
+    // never refolded, even when the receiver is its own unfolding.
+    let other = admitted_scaffold(Some("Nat.brecOn"));
+    let unfolded = unfolded_history(&other, nat(3), successor_functional(7));
+    let ExprNode::Proj { expr: receiver, .. } = unfolded.node() else {
+        unreachable!()
+    };
+    assert_eq!(
+        Preparation::new(other.environment(), IngressLimits::default())
+            .nat_history_refold(0, receiver)
+            .unwrap(),
+        None
+    );
+}
+
+#[test]
+fn history_refolding_never_selects_a_replaced_or_extern_brec_on() {
+    let engine = admitted_scaffold(None);
+    let unfolded = unfolded_history(&engine, nat(3), successor_functional(7));
+    let ExprNode::Proj { expr: receiver, .. } = unfolded.node() else {
+        unreachable!()
+    };
+    // Control: the pinned scaffold refolds in this environment.
+    assert!(
+        Preparation::new(engine.environment(), IngressLimits::default())
+            .nat_history_refold(0, receiver)
+            .unwrap()
+            .is_some()
+    );
+    // The original term never calls Nat.brecOn, so refolding must not hand
+    // it to an executable replacement or a native extern of that name.
+    let source = named("Nat.brecOn");
+    let Some(ConstantInfo::Defn(original)) = engine.environment().find(&source) else {
+        panic!("the admitted course-of-values definition is present");
+    };
+    let mut replacement = original.clone();
+    replacement.base.name = named("replacementBrecOn");
+    replacement.all = vec![replacement.base.name.clone()];
+    let target = replacement.base.name.clone();
+    let replaced = engine
+        .admit_declaration(
+            Declaration::Defn(replacement),
+            &KVMap::new(),
+            EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024)),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap()
+        .engine;
+    let environment =
+        fln_elab::implemented_by::register(replaced.environment(), &source, &target).unwrap();
+    assert_eq!(
+        Preparation::new(&environment, IngressLimits::default())
+            .nat_history_refold(0, receiver)
+            .unwrap(),
+        None
+    );
+    let environment = fln_elab::externs::register(
+        engine.environment(),
+        &source,
+        vec![fln_elab::externs::ExternEntry::Opaque],
+    )
+    .unwrap();
+    assert!(matches!(
+        Preparation::new(&environment, IngressLimits::default()).nat_history_refold(0, receiver),
+        Err(IngressError::UnsupportedNode {
+            kind: "native extern attribute does not match the supported ABI"
+        })
+    ));
+}

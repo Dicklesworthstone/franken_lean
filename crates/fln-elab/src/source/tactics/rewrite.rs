@@ -11,10 +11,16 @@ pub(in crate::source) struct RewriteMatch {
     rule: Typed,
     occurrence: Expr,
     premises: Vec<ProofGoal>,
+    /// A simp rule whose sides are equal up to its pattern variables (`SimpTheorem.perm`).
+    perm: bool,
+    /// Simplification's post-order ordinal of the occurrence in the target (one-based).
+    position: usize,
+    /// Simplification's rule pattern before matching, its holes open.
+    pattern: Option<Expr>,
 }
 
 use super::*;
-use fln_core::level::LevelView;
+use fln_core::level::{LMVarId, Level, LevelView};
 use fln_env::constants::ConstantInfo;
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -62,6 +68,7 @@ impl Context {
             rules.push_back(RewriteRule {
                 syntax: &parts[1],
                 reverse,
+                global: None,
             });
         }
         Ok(rules)
@@ -339,6 +346,7 @@ impl Context {
             rule,
             occurrence,
             premises,
+            ..
         } = self
             .instantiate_rewrite_rule(rule, &original_target, reverse, false, &[])?
             .ok_or_else(|| error(TacticError::RewriteNoMatch))?;
@@ -351,6 +359,163 @@ impl Context {
             .extend(premises.into_iter().rev().map(Work::Goal));
         proof.work.push(Work::Rewrite(next_goal, remaining, close));
         Ok(())
+    }
+
+    /// Conversion mode's rewrite of an expression by one rule (`MVarId.rewrite`, vendored
+    /// src/Lean/Meta/Tactic/Rewrite.lean, as `Conv.evalRewrite` calls it on `lhs`): `lhs` with
+    /// every occurrence of the rule's instantiated side replaced, the equation
+    /// `congrArg (fun _a => …) h` between them, and the rule's hypotheses left as goals.
+    pub(in crate::source) fn conv_rewrite_expression(
+        &mut self,
+        lhs: &Expr,
+        rule: Typed,
+        reverse: bool,
+    ) -> Result<(Expr, Expr, Vec<ProofGoal>), NatDefinitionElabError> {
+        self.flush(false)?;
+        let target = self.instantiate(lhs)?;
+        let RewriteMatch {
+            rule,
+            occurrence,
+            premises,
+            ..
+        } = self
+            .instantiate_rewrite_rule(rule, &target, reverse, false, &[])?
+            .ok_or_else(|| error(TacticError::RewriteNoMatch))?;
+        let (next, proof) = self.conv_congr_arg_step(&target, rule, &occurrence, reverse, true)?;
+        Ok((next, proof, premises))
+    }
+
+    /// `target` with `occurrence` (an instance of the side `evidence` rewrites, its right side
+    /// when `reverse`) replaced by the other side, and `congrArg (fun _a => …) h : target =
+    /// target'`, `h` the evidence (`Eq.symm` of it when `reverse`). With `kabstract`, every
+    /// instance of `occurrence` is abstracted as `rw` abstracts it
+    /// ([`Self::rewrite_kabstract`]; the pin's conv `rewrite` is the same `MVarId.rewrite`,
+    /// Lean/Meta/Tactic/Rewrite.lean:47); otherwise only its exact copies, as simp's step.
+    pub(in crate::source) fn conv_congr_arg_step(
+        &mut self,
+        target: &Expr,
+        evidence: Typed,
+        occurrence: &Expr,
+        reverse: bool,
+        kabstract: bool,
+    ) -> Result<(Expr, Expr), NatDefinitionElabError> {
+        let evidence_type = self.whnf(&evidence.type_)?;
+        let (u, alpha, from, to) =
+            equality_target(&evidence_type).ok_or_else(|| error(TacticError::ExpectedEquality))?;
+        let from = self.instantiate(&from)?;
+        let to = self.instantiate(&to)?;
+        let alpha = self.instantiate(&alpha)?;
+        let value = self.instantiate(&evidence.value)?;
+        let pattern = self.instantiate(occurrence)?;
+        if pattern.has_expr_mvar()
+            || pattern.has_loose_bvars()
+            || !self.rewrite_levels_known(&pattern, target)?
+        {
+            return Err(error(TacticError::ExpectedEquality));
+        }
+        let (replacement, equation) = if reverse {
+            let symm = Name::from_components(["Eq", "symm"]);
+            if !self.txn.env.contains(&symm) {
+                return Err(failure(SourceInferenceError::UnknownConstant(symm)));
+            }
+            (
+                from.clone(),
+                app(
+                    Expr::const_(symm, vec![u.clone()]),
+                    [alpha.clone(), from, to, value],
+                ),
+            )
+        } else {
+            (to, value)
+        };
+        let marker = FVarId(self.fresh_name()?);
+        let (template, matched) = if kabstract {
+            self.rewrite_kabstract(target, &pattern, &Expr::fvar(marker.clone()))?
+        } else {
+            self.rewrite_template(target, &pattern, &Expr::fvar(marker.clone()))?
+        };
+        if !matched {
+            return Err(error(TacticError::RewriteNoMatch));
+        }
+        let abstracted = template
+            .abstract_fvar(&marker, 0)
+            .map_err(|_| failure(SourceInferenceError::Scope))?;
+        let next = self.substitute(&abstracted, &replacement)?;
+        let next = self.instantiate(&next)?;
+        let target_type = self
+            .known_type(target)?
+            .ok_or_else(|| failure(SourceInferenceError::ExpectedType))?;
+        let target_type = self.instantiate(&target_type)?;
+        let sort = self
+            .known_type(&target_type)?
+            .ok_or_else(|| failure(SourceInferenceError::ExpectedType))?;
+        let v = self.sort_level(&Typed {
+            value: target_type.clone(),
+            type_: sort,
+        })?;
+        let congr = Name::from_components(["congrArg"]);
+        if !self.txn.env.contains(&congr) {
+            return Err(failure(SourceInferenceError::UnknownConstant(congr)));
+        }
+        let motive = Expr::lam(
+            Name::from_components(["_a"]),
+            alpha.clone(),
+            abstracted,
+            BinderInfo::Default,
+        );
+        let proof = app(
+            Expr::const_(congr, vec![u, v]),
+            [alpha, target_type, pattern, replacement, motive, equation],
+        );
+        Ok((next, proof))
+    }
+
+    /// `rw [f]` for a definition `f`: its equation theorems in order, the first that
+    /// rewrites the goal (`withRWRulesSeq`, vendored Lean/Elab/Tactic/Rewrite.lean:84-100).
+    /// Each is tried from the same state, which a failed attempt leaves untouched.
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::source) fn rewrite_with_equations<'a>(
+        &mut self,
+        proof: &mut ProofState<'a>,
+        goal: ProofGoal,
+        declaration: &Name,
+        equations: &[Name],
+        reverse: bool,
+        remaining: VecDeque<RewriteRule<'a>>,
+        close: bool,
+    ) -> Result<(), NatDefinitionElabError> {
+        for equation in equations {
+            self.tick()?;
+            let mut trial = self.rewrite_trial();
+            let mut trial_proof = proof.clone();
+            let attempt = trial.constant(equation).and_then(|rule| {
+                trial.rewrite_proof_term(
+                    &mut trial_proof,
+                    goal.clone(),
+                    rule,
+                    reverse,
+                    remaining.clone(),
+                    close,
+                )
+            });
+            match attempt {
+                Ok(()) => {
+                    *self = trial;
+                    *proof = trial_proof;
+                    return Ok(());
+                }
+                Err(problem)
+                    if backtrack::recoverable(&problem) || Self::rewrite_nonmatch(&problem) =>
+                {
+                    self.charge_rewrite_trial(&trial);
+                }
+                Err(problem) => return Err(problem),
+            }
+        }
+        Err(error(TacticError::RewriteEquations {
+            declaration: declaration.clone(),
+            hint: equations.len() != 1,
+        }))
     }
 
     /// Build one ordinary conversion/equality transport. The caller owns the
@@ -375,7 +540,10 @@ impl Context {
         let rule_value = self.instantiate(&rule.value)?;
         let pattern = occurrence;
         let replacement = if reverse { &from } else { &to };
-        if pattern.has_expr_mvar() || pattern.has_level_mvar() || pattern.has_loose_bvars() {
+        if pattern.has_expr_mvar()
+            || pattern.has_loose_bvars()
+            || !self.rewrite_levels_known(pattern, &target)?
+        {
             return Err(error(TacticError::ExpectedEquality));
         }
         let marker = FVarId(self.fresh_name()?);
@@ -531,6 +699,23 @@ impl Context {
         budget.offset_constraints = true;
         budget.max_assignments = 0;
         self.proof_types_match_with_budget(term, occurrence, budget)
+    }
+
+    /// Whether every universe metavariable of `pattern` is one `target` already has. A
+    /// declaration whose universe is still being inferred (an auto-bound `A` of `Type _`)
+    /// elaborates its tactic blocks over its own universe metavariables, as the pin's does, and
+    /// generalizes them when it is finished; a rewrite may carry those. A metavariable a rule
+    /// introduced and the match left open is a universe nothing determined.
+    pub(super) fn rewrite_levels_known(
+        &mut self,
+        pattern: &Expr,
+        target: &Expr,
+    ) -> Result<bool, NatDefinitionElabError> {
+        if !pattern.has_level_mvar() {
+            return Ok(true);
+        }
+        let target = self.instantiate(target)?;
+        Ok(level_mvars(pattern).is_subset(&level_mvars(&target)))
     }
 
     /// Allocation-memoized replacement of exact elaborated occurrences. The
@@ -834,6 +1019,46 @@ fn children(expr: &Expr) -> [Option<&Expr>; 3] {
         ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => [Some(expr), None, None],
         _ => [None, None, None],
     }
+}
+
+/// The universe metavariables `expr` mentions, assigned or not.
+pub(super) fn level_mvars(expr: &Expr) -> HashSet<LMVarId> {
+    let mut found = HashSet::new();
+    let mut seen = HashSet::new();
+    let mut exprs = vec![expr];
+    while let Some(expr) = exprs.pop() {
+        if !expr.has_level_mvar() || !seen.insert(expr.allocation_identity()) {
+            continue;
+        }
+        let mut levels: Vec<&Level> = Vec::new();
+        match expr.node() {
+            ExprNode::Sort { level } => levels.push(level),
+            ExprNode::Const { levels: args, .. } => levels.extend(args.iter()),
+            ExprNode::App { f, a } => exprs.extend([f, a]),
+            ExprNode::Lam {
+                binder_type, body, ..
+            }
+            | ExprNode::ForallE {
+                binder_type, body, ..
+            } => exprs.extend([binder_type, body]),
+            ExprNode::LetE {
+                type_, value, body, ..
+            } => exprs.extend([type_, value, body]),
+            ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => exprs.push(expr),
+            _ => {}
+        }
+        while let Some(level) = levels.pop() {
+            match level.view() {
+                LevelView::MVar(id) => {
+                    found.insert(id.clone());
+                }
+                LevelView::Succ(inner) => levels.push(inner),
+                LevelView::Max(a, b) | LevelView::IMax(a, b) => levels.extend([a, b]),
+                _ => {}
+            }
+        }
+    }
+    found
 }
 
 #[cfg(test)]

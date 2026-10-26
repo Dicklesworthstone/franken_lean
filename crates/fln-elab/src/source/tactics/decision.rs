@@ -579,7 +579,7 @@ impl Context {
     /// complete kernel evaluator. Close the relevant local telescope and ask
     /// the existing K1 conversion query; this is tactic selection, not admission.
     /// Final admission retains the unmodified dictionary and checks both seats.
-    fn decision_computes_true(
+    pub(super) fn decision_computes_true(
         &mut self,
         computation: Expr,
     ) -> Result<bool, NatDefinitionElabError> {

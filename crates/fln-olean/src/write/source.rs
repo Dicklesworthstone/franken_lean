@@ -6,9 +6,9 @@
 use super::*;
 use crate::source_extension_format as layout;
 use crate::source_extensions::{
-    AliasEntry, ClassEntry, DefaultEntry, ExternAttribute, ExternEntry, ImplementedByEntry,
-    InlineEntry, InstanceEntry, InstanceKey, ReducibilityEntry, StructureEntry, StructureField,
-    StructureParent,
+    AliasEntry, ClassEntry, DefaultEntry, DiscrTreeKey, ExternAttribute, ExternEntry,
+    ImplementedByEntry, InlineEntry, InstanceEntry, ReducibilityEntry, SimpEntry, SimpKind,
+    SimpTheorem, StructureEntry, StructureField, StructureParent,
 };
 use std::collections::HashSet;
 
@@ -19,6 +19,7 @@ mod inlining;
 mod instances;
 mod namespaces;
 mod reducibility;
+mod simp;
 mod structures;
 
 #[derive(Debug, Clone, Default)]
@@ -31,6 +32,9 @@ pub struct SourceMetadata {
     /// Chronological module-owned defaults, preserving repeated registrations
     /// and rows for candidates whose declarations belong to imported modules.
     pub defaults: Vec<DefaultEntry>,
+    /// Chronological default simp registrations, retaining proof orientation,
+    /// scopes, priorities and the pin's discrimination-tree paths.
+    pub simp: Vec<SimpEntry>,
     /// Chronological module-owned `export` aliases, including imported targets.
     pub aliases: Vec<AliasEntry>,
     /// The module's own `protected` declarations: the pin's `protectedExt`
@@ -47,6 +51,10 @@ pub struct SourceMetadata {
     /// backward_defeq; emit both sorted tag arrays, never just the subset.
     /// These flags are metadata, not a certificate of equality.
     pub defeq: Vec<Name>,
+    /// Additional owned backward-definitional tags, including generated
+    /// equation lemmas that are not strict `defeq` theorems. The exported
+    /// backward array is the union with `defeq`; overlap between arrays is valid.
+    pub backward_defeq: Vec<Name>,
     /// This module's final status for each owned declaration. The writer sorts
     /// these by Name.quickLt for the pin's per-module binary search.
     pub reducibility: Vec<ReducibilityEntry>,
@@ -130,6 +138,9 @@ impl Encoder {
         if !metadata.defaults.is_empty() {
             blocks.push(self.default_block(&metadata.defaults)?);
         }
+        if !metadata.simp.is_empty() {
+            blocks.push(self.simp_block(&metadata.simp)?);
+        }
         if !metadata.aliases.is_empty() {
             blocks.push(self.alias_block(&metadata.aliases)?);
         }
@@ -170,13 +181,39 @@ impl Encoder {
             )?);
         }
         if !metadata.defeq.is_empty() {
-            for extension in [layout::DEFEQ_EXTENSION, layout::BACKWARD_DEFEQ_EXTENSION] {
-                blocks.push(self.tagged_names_block(
-                    extension,
-                    &metadata.defeq,
-                    "anonymous or duplicate definitional-equality declaration",
-                )?);
+            blocks.push(self.tagged_names_block(
+                layout::DEFEQ_EXTENSION,
+                &metadata.defeq,
+                "anonymous or duplicate definitional-equality declaration",
+            )?);
+        }
+        if !metadata.defeq.is_empty() || !metadata.backward_defeq.is_empty() {
+            let count = metadata
+                .defeq
+                .len()
+                .checked_add(metadata.backward_defeq.len())
+                .ok_or(WriteError::Contract {
+                    what: "backward-definitional tag count overflow",
+                })?;
+            self.source_array_bound(count)?;
+            let mut backward = metadata.defeq.clone();
+            let mut union: HashSet<_> = metadata.defeq.iter().collect();
+            let mut supplied = HashSet::new();
+            for name in &metadata.backward_defeq {
+                if name.is_anonymous() || !supplied.insert(name) {
+                    return Err(WriteError::Contract {
+                        what: "anonymous or duplicate backward-definitional declaration",
+                    });
+                }
+                if union.insert(name) {
+                    backward.push(name.clone());
+                }
             }
+            blocks.push(self.tagged_names_block(
+                layout::BACKWARD_DEFEQ_EXTENSION,
+                &backward,
+                "anonymous or duplicate backward-definitional declaration",
+            )?);
         }
         Ok(blocks)
     }

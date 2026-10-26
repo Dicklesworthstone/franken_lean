@@ -1,4 +1,4 @@
-{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":700,"projection_hash":"918aa3063b75286d1bc38739db9a4ad96a35b99580543359592f0ee696a635d4"}
+{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":718,"projection_hash":"ae9519cd2f7e27a0b0402845abc9748edb1d7a11149090bf27f2459934dd4b03"}
 {"id":"fln-0bw5"}
 {"id":"fln-0eq8"}
 {"id":"fln-0rxm"}
@@ -89,6 +89,7 @@
 {"id":"fln-attribute-native-state-m7l"}
 {"id":"fln-attribute-real-fixtures-epj"}
 {"id":"fln-attribute-state-census-h14"}
+{"id":"fln-auto-bound-type-metavariable-w1il"}
 {"id":"fln-azxg"}
 {"id":"fln-b65e"}
 {"id":"fln-beads-stale-merge-guard-xzxt"}
@@ -187,6 +188,7 @@
 {"id":"fln-glml"}
 {"id":"fln-golem-ordinary-loops-fbj6"}
 {"id":"fln-guard-lifetime-char-boundary-zydy"}
+{"id":"fln-guard-msgs-failing-declarations-fiwe"}
 {"id":"fln-guard-msgs-lls1"}
 {"id":"fln-guard-msgs-trace-severity-iss2"}
 {"id":"fln-h1k"}
@@ -210,6 +212,7 @@
 {"id":"fln-index-proof-omega-fallback-ov8v"}
 {"id":"fln-inductive-inferred-sort-normalization-f178"}
 {"id":"fln-infoview-rpc-procedures-my8l"}
+{"id":"fln-ingress-string-field-projection-funz"}
 {"id":"fln-init-bnh-council-4444-b443"}
 {"id":"fln-init-chain-council-3116-kipb"}
 {"id":"fln-init-control-council-4698-1yyb"}
@@ -255,10 +258,13 @@
 {"id":"fln-lvdh"}
 {"id":"fln-lyc8"}
 {"id":"fln-macro-inline-eager-evaluation-ryay"}
+{"id":"fln-macro-rules-atom-kinds-adto"}
 {"id":"fln-macro-rung-e1rk"}
+{"id":"fln-main-init-import-defeq-tag-regression-7vn7"}
 {"id":"fln-mandated-mutant-join-unwatched-uagk"}
 {"id":"fln-manifest-complete-row-preflight-gap-77xh"}
 {"id":"fln-match-alt-column-false-accept-u3fv"}
+{"id":"fln-matcher-auxiliary-definitions-lzxm"}
 {"id":"fln-merkle-decl-digest-80ni"}
 {"id":"fln-mirror-price-cszo"}
 {"id":"fln-module-header-tric"}
@@ -269,6 +275,7 @@
 {"id":"fln-named-monad-argument-match-6egz"}
 {"id":"fln-narm"}
 {"id":"fln-nested-actions-e60c"}
+{"id":"fln-nested-call-decreasing-goals-vzq4"}
 {"id":"fln-nested-inductive-source-59sb"}
 {"id":"fln-nested-recursor-runtime-lowering-fno9"}
 {"id":"fln-nhf5"}
@@ -297,6 +304,7 @@
 {"id":"fln-path-classification-coverage-unbound-9teu"}
 {"id":"fln-peer-header-incremental-4t82"}
 {"id":"fln-pin-syntax-corpus-7b5b"}
+{"id":"fln-pp-options-wvin"}
 {"id":"fln-prelude-cdot-tactic-false-accept-3ti6"}
 {"id":"fln-prelude-list-literal-false-accept-uvga"}
 {"id":"fln-private-index-worktree-sync-mbh9"}
@@ -321,6 +329,7 @@
 {"id":"fln-reduce-command-crqm"}
 {"id":"fln-registry-batch-preflight-sszd"}
 {"id":"fln-repr-ingress-lambda-application-xchs"}
+{"id":"fln-rewrite-goal-universe-metavariables-0p10"}
 {"id":"fln-rfl-for-step-limit-63a9"}
 {"id":"fln-rgha"}
 {"id":"fln-rk6"}
@@ -337,11 +346,17 @@
 {"id":"fln-simp-arith-normalization-0qnk"}
 {"id":"fln-simp-at-hypothesis-order-vyxf"}
 {"id":"fln-simp-closer-reducible-i2ja"}
+{"id":"fln-simp-configuration-slot-v4b7"}
+{"id":"fln-simp-cost-full-init-set-82hy"}
 {"id":"fln-simp-default-set-a4nb"}
+{"id":"fln-simp-global-lemma-numeral-keys-tro5"}
 {"id":"fln-simp-literal-arithmetic-under-application-ameh"}
+{"id":"fln-simp-only-unchanged-goal-progress-wkcj"}
+{"id":"fln-simp-permutation-lemmas-95hc"}
 {"id":"fln-simp-quantified-true-false-accept-70o1"}
 {"id":"fln-simp-suggest-kbyk"}
 {"id":"fln-simp-unfold-indexed-4v9t"}
+{"id":"fln-small-tactics-6y6l"}
 {"id":"fln-sn0w"}
 {"id":"fln-snv7"}
 {"id":"fln-sorry-warning-per-declaration-zzlc"}
@@ -361,12 +376,14 @@
 {"id":"fln-test-safety-boundaries-o8zu"}
 {"id":"fln-tio5"}
 {"id":"fln-tlbo"}
+{"id":"fln-trace-options-cz38"}
 {"id":"fln-trace-state-goal-display-xhtn"}
 {"id":"fln-two-column-literal-matrix-78og"}
 {"id":"fln-ubs-stage-no-complete-verdict-z5kt"}
 {"id":"fln-ubs-timeout-promoted-to-rejection-pekl"}
 {"id":"fln-uc44"}
 {"id":"fln-um4a"}
+{"id":"fln-unused-simp-args-linter-fdk7"}
 {"id":"fln-upstream-suite-scoreboard-n04o"}
 {"id":"fln-user-partial-unsafe-def-c3hh"}
 {"id":"fln-uuuz"}
@@ -378,6 +395,7 @@
 {"id":"fln-vpfi"}
 {"id":"fln-w0b"}
 {"id":"fln-wasm-judge-browser-kvj"}
+{"id":"fln-wf-compile-without-wfcomputable-htbx"}
 {"id":"fln-wf-omitted-result-type-wqu9"}
 {"id":"fln-wgp"}
 {"id":"fln-wgz"}

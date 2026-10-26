@@ -204,6 +204,54 @@ const ACCEPT: &[(&str, &str)] = &[
         "classical",
         "example (P : Prop) : P ∨ ¬ P := by grind\nexample (P : Prop) (h : ¬¬P) : P := by grind",
     ),
+    (
+        "universal_equality",
+        "example (f : Nat → Nat) (a : Nat) (h : ∀ x, f x = x) : f (f a) = a := by grind",
+    ),
+    (
+        "universal_implication",
+        "example (P Q : Nat → Prop) (a : Nat) (h : ∀ x, P x → Q x) (ha : P a) : Q a := by grind",
+    ),
+    (
+        "ematch_nested_equality",
+        "example (f g : Nat → Nat) (a b : Nat) (h : ∀ x, f (g x) = x) (hab : g a = b) : f b = a := by grind",
+    ),
+    (
+        "ematch_multi_pattern",
+        "example (R : Nat → Nat → Prop) (a b c : Nat) (ht : ∀ x y z, R x y → R y z → R x z) (hab : R a b) (hbc : R b c) : R a c := by grind",
+    ),
+    (
+        "ematch_repeated_variable",
+        "example (R : Nat → Nat → Prop) (P : Nat → Prop) (a b : Nat) (h : ∀ x, R x x → P x) (hab : a = b) (hr : R a b) : P b := by grind",
+    ),
+    (
+        "quantifier_after_premise",
+        "example (P Q : Nat → Prop) (a b : Nat) (h : ∀ x, P x → ∀ y, Q y) (ha : P a) : Q b := by grind",
+    ),
+    (
+        "ematch_chain",
+        "example (P Q R : Nat → Prop) (a : Nat) (hpq : ∀ x, P x → Q x) (hqr : ∀ x, Q x → R x) (ha : P a) : R a := by grind",
+    ),
+    (
+        "quantified_dependent_domains",
+        "example (A : Nat → Type) (f : ∀ n, A n → Nat) (n : Nat) (x : A n) (h : ∀ i (y : A i), f i y = i) : f n x = n := by grind",
+    ),
+    (
+        "explicit_theorem",
+        "opaque stamp : Nat → Nat := fun x => x\naxiom stamp_eq (x : Nat) : stamp x = x\nexample (a : Nat) : stamp (stamp a) = a := by grind only [stamp_eq]",
+    ),
+    (
+        "polymorphic_theorem",
+        "universe u\nopaque marker {α : Type u} (x : α) : α := x\naxiom marker_eq {α : Type u} (x : α) : marker x = x\nexample (a : Nat) : marker (marker a) = a := by grind [marker_eq]\nexample {α : Type u} (a : α) : marker a = a := by grind only [marker_eq]",
+    ),
+    (
+        "independent_theorem_universes",
+        "universe u v\nopaque mark (α : Type u) (β : Type v) (a : α) (_ : β) : α := a\naxiom mark_eq (α : Type u) (β : Type v) (a : α) (b : β) : mark α β a b = a\nexample (a : Nat) (b : Bool) : mark Nat Bool a b = a := by grind [mark_eq]\nexample {α : Type u} {β : Type v} (a : α) : mark α (Type v) a β = a := by grind only [mark_eq]",
+    ),
+    (
+        "explicit_proof_term",
+        "axiom promise : False\nexample : False := by grind only [(promise)]",
+    ),
 ];
 
 const REFUSE: &[(&str, &str)] = &[
@@ -240,10 +288,47 @@ const REFUSE: &[(&str, &str)] = &[
         "constant_partial_equality",
         "opaque fixed : Nat → Nat → Nat := fun _ _ => 0\nexample (a b c : Nat) (h : fixed a = fixed b) : fixed a c = fixed b c := by grind",
     ),
+    (
+        "universal_missing_premise",
+        "example (P Q : Nat → Prop) (a : Nat) (h : ∀ x, P x → Q x) : Q a := by grind",
+    ),
+    (
+        "ematch_inconsistent_repetition",
+        "example (R : Nat → Nat → Prop) (P : Nat → Prop) (a b : Nat) (h : ∀ x, R x x → P x) (hr : R a b) : P a := by grind",
+    ),
+    (
+        "ematch_unrelated_term",
+        "example (f : Nat → Nat) (P : Nat → Prop) (a b : Nat) (h : ∀ x, P (f x)) : P b := by grind",
+    ),
+    (
+        "explicit_redundant_local",
+        "example (P : Prop) (h : P) : P := by grind [h]",
+    ),
+    (
+        "explicit_declaration_without_pattern",
+        "axiom promise : False\nexample : False := by grind only [promise]",
+    ),
 ];
 
+const UNSUPPORTED: &[(&str, &str)] = &[
+    (
+        "explicit_ematch_configuration",
+        "example (a : Nat) : a = a := by grind (ematch := 1)",
+    ),
+    (
+        "explicit_pattern_direction",
+        "opaque stamp : Nat → Nat := fun x => x\naxiom stamp_eq (x : Nat) : stamp x = x\nexample (a : Nat) : stamp a = a := by grind [= stamp_eq]",
+    ),
+    (
+        "minimal_pattern_selection",
+        "opaque stamp : Nat → Nat := fun x => x\naxiom stamp_eq (x : Nat) : stamp x = x\nexample (a : Nat) : stamp a = a := by grind [! stamp_eq]",
+    ),
+];
+
+const EXHAUST: &str = "example (P : Nat → Prop) (f : Nat → Nat) (a : Nat) (ha : P a) (step : ∀ x, P x → P (f x)) : False := by grind";
+
 #[test]
-fn ground_grind_proofs_and_refusals_match_the_live_pin() {
+fn ground_and_quantified_grind_proofs_and_refusals_match_the_live_pin() {
     std::thread::Builder::new()
         .stack_size(STACK)
         .spawn(|| {
@@ -265,7 +350,12 @@ fn ground_grind_proofs_and_refusals_match_the_live_pin() {
             );
             let directory = std::env::temp_dir().join(format!("fln-grind-{}", std::process::id()));
             std::fs::create_dir_all(&directory).unwrap();
-            for (accepted, cases) in [(true, ACCEPT), (false, REFUSE)] {
+            for (accepted, cases) in [
+                (true, ACCEPT),
+                (false, REFUSE),
+                (true, UNSUPPORTED),
+                (false, &[("instantiation_limit", EXHAUST)][..]),
+            ] {
                 for (label, source) in cases {
                     let path = directory.join(format!("{label}.lean"));
                     std::fs::write(&path, format!("{HEADER}{source}\n")).unwrap();
@@ -333,6 +423,56 @@ fn ground_grind_proofs_and_refusals_match_the_live_pin() {
                         "refusal mutated input logical root".into(),
                     );
                 }
+            }
+            for (label, source) in UNSUPPORTED {
+                eprintln!("grind: native capability boundary {label}");
+                match engine.check_source_files(&[source.as_bytes()], &options, limits()) {
+                    Err(error) if format!("{error:?}").contains("UnsupportedTactic") => {}
+                    other => record_failure(
+                        &mut failures,
+                        label,
+                        format!("explicit unsupported configuration required: {other:?}"),
+                    ),
+                }
+                if engine.logical_root(&options) != before {
+                    record_failure(&mut failures, label, "input logical root mutated".into());
+                }
+            }
+            eprintln!("grind: native instantiation budget and recovery");
+            match engine.check_source_files(&[EXHAUST.as_bytes()], &options, limits()) {
+                Err(error) if error.disposition().2 == 3 => {}
+                Ok(Outcome::Inconclusive(_)) => {}
+                other => record_failure(
+                    &mut failures,
+                    "instantiation_limit",
+                    format!("typed resource non-answer required: {other:?}"),
+                ),
+            }
+            if engine.logical_root(&options) != before {
+                record_failure(
+                    &mut failures,
+                    "instantiation_limit",
+                    "input logical root mutated".into(),
+                );
+            }
+            let recovery = ACCEPT
+                .iter()
+                .find(|(label, _)| *label == "ematch_nested_equality")
+                .unwrap()
+                .1;
+            let first = engine.check_source_files(&[recovery.as_bytes()], &options, limits());
+            let second = engine.check_source_files(&[recovery.as_bytes()], &options, limits());
+            match (first, second) {
+                (Ok(Outcome::Complete(first)), Ok(Outcome::Complete(second))) => {
+                    if first.result_logical_root != second.result_logical_root {
+                        record_failure(
+                            &mut failures,
+                            "ematch_recovery",
+                            "repeated proof search changed the logical root".into(),
+                        );
+                    }
+                }
+                other => record_failure(&mut failures, "ematch_recovery", format!("{other:?}")),
             }
             // The pin closes arithmetic beyond this ground fragment. Refusal must
             // propagate out of try, not turn failure into an acceptance witness.

@@ -157,8 +157,6 @@ impl Preparation<'_> {
 
     /// A literal zero already selects the checked recursor's first minor. Its
     /// result needs only the layout at zero, not a layout for every index.
-    /// Index refinement can expose this form inside an unfolded Nat.add
-    /// history dictionary, whose Nat.below component has no uniform layout.
     /// Keep the selected minor as executable code and discard the other minor
     /// only when it is already a lambda value. No runtime argument is reduced.
     /// Leave additional function arguments on the ordinary path so their
@@ -186,16 +184,14 @@ impl Preparation<'_> {
         if !self.nat_history_logical_constant(&name("Nat.rec"))? {
             return Ok(None);
         }
-        let zero = self
-            .zero_nat_history_minor(&args[0], &args[1])?
-            .unwrap_or_else(|| args[1].clone());
+        let zero = args[1].clone();
         if !self.has_literal_callable_tail(&zero)? {
             return Ok(Some(zero));
         }
         let result_type = self.erase_runtime_type(&Expr::app(args[0].clone(), args[3].clone()))?;
         let Some(result) = self.value_type(&result_type)? else {
             // Iota selection is already justified by the checked recursor.
-            // A type-level history redex need not have a runtime layout; the
+            // The result at zero need not have a runtime layout; the
             // surviving minor retains its own constructor/callee annotations.
             return Ok(Some(zero));
         };

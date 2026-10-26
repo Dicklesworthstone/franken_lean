@@ -260,3 +260,135 @@ fn synth_eta_reduces_unless_the_instance_had_subgoals() {
         assert_eq!((code, stdout.as_str()), (0, expected), "the pin moved");
     }
 }
+
+/// The pin updates stored variable declarations from the newest occurrence,
+/// while the printer keeps earlier shadowed locals accessible as `x✝`.
+#[test]
+fn section_binder_updates_and_shadowing_match_the_reference() {
+    let Some(lib) = pinned_lib() else { return };
+    let root = workspace();
+    let entry = root.join("VariableUpdates.lean");
+    std::fs::write(
+        &entry,
+        "prelude
+import Init.Core
+section
+variable (A B : Type) (a : A) (b : B)
+def beforeUpdate := a
+variable {A}
+def afterUpdate := a
+def untouched := b
+section
+variable ⦃A⦄
+def strictUpdate := a
+end
+def restoredImplicit := a
+variable (A) {B}
+def restoredExplicit := a
+def otherUpdate := b
+end
+#check @beforeUpdate
+#check @afterUpdate
+#check @untouched
+#check @strictUpdate
+#check @restoredImplicit
+#check @restoredExplicit
+#check @otherUpdate
+section
+variable (x : Nat) (h : x = x)
+variable (x : Bool)
+#check h
+#check x
+def newest := x
+end
+#check @newest
+section
+variable (A : Type) (a : A)
+variable (A : Type) (b : A)
+variable {A}
+def older := a
+def newer := b
+end
+#check @older
+#check @newer
+class SectionPick (A : Type) where
+  value : A
+section
+variable (A : Type) (inst : SectionPick A)
+variable [inst]
+def selected : A := SectionPick.value
+variable {inst}
+def explicitSelection : A := @SectionPick.value A inst
+end
+#check @selected
+#check @explicitSelection
+section
+variable (A : Type)
+variable {A}
+variable (a : A)
+def afterNewVariable := a
+end
+#check @afterNewVariable
+",
+    )
+    .unwrap();
+    let Some((code, expected)) = pinned(&lib, &entry) else {
+        eprintln!("SKIP: pinned Reference executable absent");
+        return;
+    };
+    assert_eq!(code, 0, "the reference refused the fixture: {expected}");
+    assert!(expected.contains("h : x✝ = x✝"));
+    assert!(expected.contains("⦃A : Type⦄"));
+    assert!(expected.contains("[inst : SectionPick A]"));
+    let ours = Command::new(env!("CARGO_BIN_EXE_lean"))
+        .arg(&entry)
+        .current_dir(&root)
+        .env("LEAN_PATH", &lib)
+        .env("FLN_IMPORT_REUSE_DIR", root.join("records"))
+        .output()
+        .expect("run the installed lean");
+    assert_eq!(
+        ours.status.code(),
+        Some(0),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&ours.stdout),
+        String::from_utf8_lossy(&ours.stderr)
+    );
+    assert_eq!(String::from_utf8(ours.stdout).unwrap(), expected);
+}
+
+/// This needs the real `optParam` from Init.Core; the source seed deliberately
+/// does not declare it. Both doors must reach the update refusal, not an earlier
+/// unknown-constant failure while declaring the variable.
+#[test]
+fn default_section_variable_binders_cannot_be_reannotated() {
+    let Some(lib) = pinned_lib() else { return };
+    let root = workspace();
+    let entry = root.join("DefaultUpdate.lean");
+    std::fs::write(
+        &entry,
+        "prelude\nimport Init.Core\nvariable (x : Nat := 7)\nvariable {x}\n",
+    )
+    .unwrap();
+    let expected = "cannot update binder annotation of variables with default values/tactics";
+    let Some((code, stdout)) = pinned(&lib, &entry) else {
+        eprintln!("SKIP: pinned Reference executable absent");
+        return;
+    };
+    assert_ne!(code, 0, "the pin accepted an invalid binder update");
+    assert!(stdout.contains(expected), "{stdout}");
+    let ours = Command::new(env!("CARGO_BIN_EXE_lean"))
+        .arg(&entry)
+        .current_dir(&root)
+        .env("LEAN_PATH", &lib)
+        .env("FLN_IMPORT_REUSE_DIR", root.join("records"))
+        .output()
+        .expect("run the installed lean");
+    assert_eq!(ours.status.code(), Some(1));
+    let diagnostics = format!(
+        "{}{}",
+        String::from_utf8_lossy(&ours.stdout),
+        String::from_utf8_lossy(&ours.stderr)
+    );
+    assert!(diagnostics.contains(expected), "{diagnostics}");
+}

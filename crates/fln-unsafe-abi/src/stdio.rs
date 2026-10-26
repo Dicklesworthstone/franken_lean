@@ -1590,6 +1590,51 @@ pub(crate) fn checked_get_line_error(
     }
 }
 
+/// Checked Handle.flush over the pinned single fflush effect. Invalid
+/// carriers refuse before the FILE is read or any buffered output is touched.
+///
+/// # Safety
+/// `handle` is a scalar or live membrane object, borrowed throughout. A
+/// successful Some carries one owned native IO.Result reference.
+// UNSAFE-LEDGER: FLN-UL-0661
+#[allow(unsafe_code)]
+pub(crate) unsafe fn checked_handle_flush(
+    handle: *mut LeanObject,
+) -> Result<Option<*mut LeanObject>, c_int> {
+    // SAFETY: exact class and nonnull FILE validation precede fflush. The
+    // caller retains the owner, and errno is captured immediately on failure.
+    unsafe {
+        if !is_native_file_handle(handle) {
+            return Ok(None);
+        }
+        let status = if fflush(io_get_handle(handle)) == 0 {
+            Ok(())
+        } else {
+            Err(errno())
+        };
+        checked_flush_result(status).map(Some)
+    }
+}
+
+/// Complete an attempted flush without a filename-dependent decoder arm.
+/// fflush reports no byte count, and failure may follow a visible prefix.
+pub(crate) fn checked_flush_result(status: Result<(), c_int>) -> Result<*mut LeanObject, c_int> {
+    // SAFETY: fresh results own their payloads. EINTR and ENOENT are refused
+    // before the only decoder arms requiring a nonnull filename.
+    // UNSAFE-LEDGER: FLN-UL-0662
+    #[allow(unsafe_code)]
+    unsafe {
+        match status {
+            Ok(()) => Ok(io_result_mk_ok(tagged::boxi(0))),
+            Err(code @ (EINTR | ENOENT)) => Err(code),
+            Err(code) => Ok(io_result_mk_error(decode_io_error(
+                code,
+                core::ptr::null_mut(),
+            ))),
+        }
+    }
+}
+
 /// `lean_io_prim_handle_flush` (`io.cpp:550-556`).
 ///
 /// # Safety

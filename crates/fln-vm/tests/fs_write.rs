@@ -243,6 +243,87 @@ fn file_rows_keep_prior_writes_on_later_refusal_and_do_not_enter_stdout_capture(
 }
 
 #[test]
+fn flush_row_publishes_buffered_bytes_before_the_returned_handle_closes() {
+    let content = "buffered λ🙂\0tail";
+    for flush in [false, true] {
+        let path = path(if flush { "flushed" } else { "still-buffered" });
+        let mut code = body(path.to_str().unwrap(), 1, content, false, false);
+        // Return the live handle instead of releasing it with the VM frame.
+        code.truncate(6);
+        if flush {
+            code.push(call(6, "extern:IO.FS.Handle.flush", vec![r(3)]));
+            code.push(call(7, "extern:IO.FS.Handle.flush", vec![r(3)]));
+        }
+        code.push(I::Return { src: r(3) });
+        let result = returned(&program(code, C::Owned));
+        assert!(result.value.is_file_handle());
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            if flush { content.as_bytes() } else { b"" },
+            "closing the handle must not mask a missing flush implementation"
+        );
+        drop(result);
+        assert_eq!(std::fs::read(&path).unwrap(), content.as_bytes());
+    }
+}
+
+#[test]
+fn flush_row_refuses_invalid_handles_and_census_contract_mutations() {
+    for mutation in 0..5 {
+        let mut flush = call(1, "extern:IO.FS.Handle.flush", vec![r(0)]);
+        if let I::Intrinsic {
+            args,
+            argument_ownership,
+            result_ownership,
+            ..
+        } = &mut flush
+        {
+            match mutation {
+                1 => argument_ownership[0] = A::Owned,
+                2 => *result_ownership = R::Scalar,
+                3 => {
+                    args.clear();
+                    argument_ownership.clear();
+                }
+                4 => {
+                    args.push(r(0));
+                    argument_ownership.push(A::Borrowed);
+                }
+                _ => {}
+            }
+        }
+        let program = program(
+            vec![
+                I::Nat {
+                    dst: r(0),
+                    value: 0,
+                },
+                flush,
+                I::Return { src: r(1) },
+            ],
+            if mutation == 2 { C::Scalar } else { C::Owned },
+        );
+        let exit = execute(&program, ExecutionLimits::default(), None);
+        if mutation == 0 {
+            assert!(matches!(
+                exit,
+                Outcome::Complete(VmExit::Refused {
+                    refusal: VmRefusal::NativeFileIo {
+                        error: FileIoError::InvalidHandle
+                    },
+                    ..
+                })
+            ));
+        } else {
+            assert!(
+                matches!(exit, Outcome::Complete(VmExit::Refused { .. })),
+                "mutation {mutation}: {exit:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn file_rows_validate_modes_arity_and_ownership_before_opening() {
     let path = path("unchanged");
     std::fs::write(&path, "untouched").unwrap();

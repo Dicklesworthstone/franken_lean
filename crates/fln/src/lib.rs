@@ -29,6 +29,7 @@
 // runtime Format projection also uses fallible boxes for untrusted output.
 #![feature(alloc_error_hook, allocator_api)]
 
+pub mod capsule;
 mod olean_imports;
 pub mod pretty;
 pub mod source_check;
@@ -6865,19 +6866,25 @@ impl Engine {
                 source_records::apply_admission_effects(
                     &mut admitted,
                     elaborated.irreducible,
+                    elaborated.equation_info.as_ref(),
                     options,
                 )?;
-                if fln_elab::source::scope::simp::defeq::direct_rfl(parsed.syntax())
-                    && let Declaration::Thm(theorem) = &admitted.declaration
-                {
-                    admitted.engine.environment = fln_elab::source::scope::simp::defeq::infer(
-                        admitted.engine.environment(),
-                        &theorem.base.name,
-                        limits.kernel,
-                    )
-                    .map_err(DefinitionFrontendError::Elaborate)
-                    .map_err(EngineExecutionError::Frontend)?;
-                    admitted.result_logical_root = admitted.engine.logical_root(options);
+                if fln_elab::source::scope::simp::defeq::direct_rfl(parsed.syntax()) {
+                    let name = match &admitted.declaration {
+                        Declaration::Thm(theorem) => Some(&theorem.base.name),
+                        Declaration::Defn(definition) => Some(&definition.base.name),
+                        _ => None,
+                    };
+                    if let Some(name) = name {
+                        admitted.engine.environment = fln_elab::source::scope::simp::defeq::infer(
+                            admitted.engine.environment(),
+                            name,
+                            limits.kernel,
+                        )
+                        .map_err(DefinitionFrontendError::Elaborate)
+                        .map_err(EngineExecutionError::Frontend)?;
+                        admitted.result_logical_root = admitted.engine.logical_root(options);
+                    }
                 }
                 if let Some((name, priority)) = registration {
                     // A proof instance is admitted as a theorem. Both it and
@@ -6930,30 +6937,8 @@ impl Engine {
                     )?;
                     admitted.result_logical_root = admitted.engine.logical_root(options);
                 }
-                if let Some((name, priority, reverse)) = simp {
-                    let name = fln_elab::source::scope::SourceScope::default()
-                        .declaration_name(&name)
-                        .map_err(|error| {
-                            EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
-                                fln_elab::NatDefinitionElabError::Inference(
-                                    fln_elab::source::SourceInferenceError::NameScope(error),
-                                ),
-                            ))
-                        })?;
-                    admitted.engine.environment = fln_elab::source::scope::simp::update(
-                        admitted.engine.environment(),
-                        &name,
-                        Some((priority, reverse)),
-                    )
-                    .map_err(|error| {
-                        EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
-                            fln_elab::NatDefinitionElabError::Inference(
-                                fln_elab::source::SourceInferenceError::SimpSet(error),
-                            ),
-                        ))
-                    })?;
-                    admitted.result_logical_root = admitted.engine.logical_root(options);
-                }
+                // Reducibility attributes run after type checking in the pin,
+                // before simp's after-compilation registration captures keys.
                 if let Some((name, status)) = reducibility {
                     let name = fln_elab::source::scope::SourceScope::default()
                         .declaration_name(&name)
@@ -6996,12 +6981,34 @@ impl Engine {
                     )?;
                     admitted.result_logical_root = admitted.engine.logical_root(options);
                 }
-                return self.finish_local_function_admission(
+                if let Some(declared) =
+                    source_records::declared_name(&admitted.declaration).cloned()
+                    && let Some(environment) = source_records::tag_deprecated(
+                        &admitted.engine,
+                        parsed.syntax(),
+                        &declared,
+                        &self.base_source_scope(),
+                        limits.kernel,
+                    )?
+                {
+                    admitted.engine.environment = environment;
+                    admitted.result_logical_root = admitted.engine.logical_root(options);
+                }
+                let admitted = match self.finish_local_function_admission(
                     admitted,
                     &elaborated.local_functions,
                     options,
                     limits,
-                );
+                )? {
+                    Outcome::Complete(admitted) => admitted,
+                    Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                    Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                };
+                let scope = scope
+                    .for_declaration(parsed.syntax())
+                    .map_err(DefinitionFrontendError::Elaborate)
+                    .map_err(EngineExecutionError::Frontend)?;
+                return self.finish_source_simp_admission(admitted, simp, &scope, options, limits);
             }
             Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
             Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
@@ -7044,7 +7051,26 @@ impl Engine {
             Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
         };
-        self.execute_definition(declaration, options, limits)
+        Ok(
+            match self.execute_definition(declaration, options, limits)? {
+                Outcome::Complete(mut execution) => {
+                    execution.engine = match execution.engine.freeze_source_equation_policy(
+                        &execution.declaration,
+                        &self.base_source_scope(),
+                        options,
+                        limits.kernel,
+                    )? {
+                        Outcome::Complete(engine) => engine,
+                        Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                        Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                    };
+                    execution.result_logical_root = execution.engine.logical_root(options);
+                    Outcome::Complete(execution)
+                }
+                Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
+                Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
+            },
+        )
     }
 
     /// Parse, elaborate, admit, publish, compile, canonically encode/decode,
@@ -7369,6 +7395,14 @@ impl Engine {
         // The pin's warning for each definition an `attribute [instance]` command adds while it
         // is neither `@[reducible]` nor `@[implicit_reducible]` (`Lean/Meta/Instances.lean:288`).
         let mut instance_attribute_warnings: Vec<SourceWarning> = Vec::new();
+        let mut macro_pattern_warnings: Vec<SourceWarning> = Vec::new();
+        // The pin's deprecation warnings, logged while each command elaborates
+        // (`Linter.checkDeprecated`). This thread's elaborations publish their uses here; the
+        // uses of a command are read at the next step, before anything else runs, with the
+        // environment and scope the command left.
+        let deprecation_sink = fln_elab::deprecations::UseSink::install();
+        let mut deprecations: Vec<SourceWarning> = Vec::new();
+        let mut elaborated_command: Option<(usize, fln_parse::BytePos)> = None;
         let mut evaluation_indices = Vec::new();
         let mut evaluation_output_bytes = 0usize;
         evaluation_indices
@@ -7424,6 +7458,16 @@ impl Engine {
         // one. Keep that ownership separate from the innermost option map.
         let mut command_stderr_capture: Option<(usize, bool)> = None;
         while let Some(step) = queue.pop_front() {
+            if let Some((index, offset)) = elaborated_command.take() {
+                deprecations.extend(deprecation_warnings(
+                    deprecation_sink.take(),
+                    index,
+                    offset,
+                    engine.environment(),
+                    &scopes.current,
+                    limits.kernel,
+                )?);
+            }
             let (command_index, original_offset, command_source) = match step {
                 Step::Command(index, offset, source) => (index, offset, source),
                 Step::Scope(index, transition) => {
@@ -7449,6 +7493,7 @@ impl Engine {
                     continue;
                 }
             };
+            elaborated_command = Some((command_index, original_offset));
             // Consume each file boundary once, including when a temporary
             // scope expansion revisits its original command index.
             if file_starts.peek() == Some(&command_index) {
@@ -7660,7 +7705,8 @@ impl Engine {
                         // compared as the pin's (below). Other commands keep this refusal.
                         if expected.lines().any(|line| {
                             let line = line.trim_start();
-                            line.starts_with("warning:") && !reproduced_warning(line)
+                            line.starts_with("warning:")
+                                && !reproduced_warning(line, engine.environment())
                         }) {
                             return Err(not_implemented(
                                 "`#guard_msgs` expecting an error or warning message",
@@ -7710,12 +7756,13 @@ impl Engine {
                             }
                             _ => Vec::new(),
                         };
+                        let command_base = engine.logical_root(options);
                         match source_check::apply_module_control_command(
                             &mut engine,
                             &mut scopes,
                             &file_base,
                             control,
-                            limits.kernel,
+                            limits.admission(),
                             (0, command_index, original_offset.0),
                             public.as_deref_mut(),
                             options,
@@ -7727,7 +7774,26 @@ impl Engine {
                                 at: Some(original_offset),
                             }
                         })? {
-                            Outcome::Complete(()) => {}
+                            Outcome::Complete(admissions) => {
+                                if !admissions.is_empty() {
+                                    for admitted in &admissions {
+                                        scopes.admitted(&admitted.declaration);
+                                    }
+                                    source_records::push_command_admission(
+                                        &mut source_admissions,
+                                        SourceCommandAdmission {
+                                            command_index,
+                                            admission: DeclarationBatchAdmission {
+                                                engine: engine.clone(),
+                                                base_logical_root: command_base,
+                                                result_logical_root: engine.logical_root(options),
+                                                admissions,
+                                                local_instance: None,
+                                            },
+                                        },
+                                    );
+                                }
+                            }
                             Outcome::Inconclusive(reason) => {
                                 return Ok(Outcome::Inconclusive(reason));
                             }
@@ -7760,6 +7826,18 @@ impl Engine {
                     at: Some(original_offset),
                 })?
             {
+                macro_pattern_warnings.extend(
+                    grammar
+                        .macro_warnings(&scopes.current.options)
+                        .iter()
+                        .map(|binder| SourceWarning {
+                            command_index,
+                            at: fln_parse::BytePos(original_offset.0 + binder.at),
+                            message: unused_variables::message(&binder.name),
+                            severity: SourceSeverity::Warning,
+                            follows_output: true,
+                        }),
+                );
                 grammar.extend_scopes(&mut scopes);
                 continue;
             }
@@ -7774,6 +7852,67 @@ impl Engine {
             } else {
                 scopes.current.clone()
             };
+            // The equation theorems this command names, generated and admitted before it, as
+            // the pin's reserved-name action adds them when it resolves the name.
+            if public.is_none() && source_records::may_name_equation_theorems(command_source) {
+                let parsed = grammar.enter(|| {
+                    fln_parse::parse_source_command(command_source).and_then(|parsed| {
+                        grammar.expand_command(
+                            parsed,
+                            source_check::grammar::resolver(engine.environment(), &scope),
+                        )
+                    })
+                });
+                let members = match &parsed {
+                    Ok(_) => None,
+                    Err(_) => grammar
+                        .enter(|| fln_parse::command_scope::mutual::parse(command_source))
+                        .ok()
+                        .flatten(),
+                };
+                let syntaxes: Vec<&fln_syntax::tree::Syntax> = match (&parsed, &members) {
+                    (Ok(parsed), _) => vec![parsed.syntax()],
+                    (Err(_), Some(members)) => members.iter().collect(),
+                    (Err(_), None) => Vec::new(),
+                };
+                if !syntaxes.is_empty() {
+                    let realized = grammar
+                        .enter(|| {
+                            engine.realize_equation_theorems(
+                                &syntaxes,
+                                &scope,
+                                options,
+                                limits.admission(),
+                                Some(&file_base),
+                            )
+                        })
+                        .map_err(|error| EngineExecutionError::BatchCommand {
+                            index: command_index,
+                            error: Box::new(error),
+                            at: Some(original_offset),
+                        })?;
+                    match realized {
+                        Outcome::Complete(Some(admission)) => {
+                            scopes
+                                .admitted_batch(&admission, admission.engine.environment(), None)
+                                .map_err(|error| {
+                                    scope_error(command_index, original_offset, error.message())
+                                })?;
+                            engine = admission.engine.clone();
+                            source_records::push_command_admission(
+                                &mut source_admissions,
+                                SourceCommandAdmission {
+                                    command_index,
+                                    admission,
+                                },
+                            );
+                        }
+                        Outcome::Complete(None) => {}
+                        Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                        Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                    }
+                }
+            }
             let warn_sorry = scope
                 .options
                 .get_bool(&Name::from_components(["warn", "sorry"]), true);
@@ -7864,10 +8003,13 @@ impl Engine {
                     .map_err(|error| {
                         scope_error(command_index, original_offset, error.message())
                     })?;
-                source_admissions.push(SourceCommandAdmission {
-                    command_index,
-                    admission,
-                });
+                source_records::push_command_admission(
+                    &mut source_admissions,
+                    SourceCommandAdmission {
+                        command_index,
+                        admission,
+                    },
+                );
                 continue;
             }
             if grammar
@@ -7908,16 +8050,23 @@ impl Engine {
                         scope_error(command_index, original_offset, error.message())
                     })?;
                 engine = admission.engine.clone();
-                source_admissions.push(SourceCommandAdmission {
-                    command_index,
-                    admission,
-                });
+                source_records::push_command_admission(
+                    &mut source_admissions,
+                    SourceCommandAdmission {
+                        command_index,
+                        admission,
+                    },
+                );
                 continue;
             }
             let parsed = grammar
                 .enter(|| {
-                    fln_parse::parse_source_command(command_source)
-                        .and_then(fln_parse::ParsedSourceCommand::expanded)
+                    fln_parse::parse_source_command(command_source).and_then(|parsed| {
+                        grammar.expand_command(
+                            parsed,
+                            source_check::grammar::resolver(engine.environment(), &scope),
+                        )
+                    })
                 })
                 .map_err(|error| error.with_original_offset(original_offset))
                 .map_err(DefinitionFrontendError::Parse)
@@ -7964,7 +8113,8 @@ impl Engine {
                     })?
                     .is_empty();
             // The pin keeps a definition whose code generation fails: `addAndCompile` logs
-            // "failed to compile definition, …" after kernel admission and the file goes on.
+            // "failed to compile definition, …" (or that a root `main` has a type the compiler
+            // does not run) after kernel admission and the file goes on.
             // Under a guard expecting an error, such a definition is admitted uncompiled, as a
             // `noncomputable section` admits it, and that message is logged for the guard.
             let mut guarded_compile_error = None;
@@ -7974,7 +8124,8 @@ impl Engine {
                 && !(has_inline_simp || has_inline_default)
                 && let Err(
                     error @ fln_elab::NatDefinitionElabError::Inference(
-                        fln_elab::source::SourceInferenceError::NoncomputableDependency(_),
+                        fln_elab::source::SourceInferenceError::NoncomputableDependency(_)
+                        | fln_elab::source::SourceInferenceError::InvalidMainType,
                     ),
                 ) = grammar.enter(|| {
                     fln_elab::elaborate_definition_in_scope_with_budget(
@@ -8002,6 +8153,63 @@ impl Engine {
                     }),
                     at: Some(original_offset),
                 });
+            }
+            if fln_elab::source::is_theorem(parsed.syntax())
+                && source_records::may_name_equation_theorems(command_source)
+                && let Some(public) = public.as_deref_mut()
+            {
+                // Generate eligible public equations before the private proof,
+                // but commit both worlds only after that whole proof succeeds.
+                let observed =
+                    fln_elab::source::trace::contains_trace(parsed.syntax()).then_some(&parsed);
+                let result = match grammar
+                    .enter(|| {
+                        public.admit_private_command(
+                            &engine,
+                            command_source,
+                            options,
+                            limits.admission(),
+                            &scope,
+                            &file_base,
+                            observed,
+                        )
+                    })
+                    .map_err(|error| EngineExecutionError::BatchCommand {
+                        index: command_index,
+                        error: Box::new(error),
+                        at: Some(original_offset),
+                    })? {
+                    Outcome::Complete(result) => result,
+                    Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                    Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                };
+                source_records::traces::append(
+                    &mut trace_messages,
+                    &mut trace_bytes,
+                    result.traces,
+                    &parsed,
+                    result.engine.environment(),
+                    command_index,
+                    original_offset,
+                )?;
+                scopes
+                    .admitted_batch(
+                        &result.admission,
+                        result.engine.environment(),
+                        Some(public.engine().environment()),
+                    )
+                    .map_err(|error| {
+                        scope_error(command_index, original_offset, error.message())
+                    })?;
+                engine = result.engine;
+                source_records::push_command_admission(
+                    &mut source_admissions,
+                    SourceCommandAdmission {
+                        command_index,
+                        admission: result.admission,
+                    },
+                );
+                continue;
             }
             if matches!(
                 parsed.kind(),
@@ -8213,10 +8421,13 @@ impl Engine {
                         scope_error(command_index, original_offset, error.message())
                     })?;
                 engine = admission.engine.clone();
-                source_admissions.push(SourceCommandAdmission {
-                    command_index,
-                    admission,
-                });
+                source_records::push_command_admission(
+                    &mut source_admissions,
+                    SourceCommandAdmission {
+                        command_index,
+                        admission,
+                    },
+                );
                 if let Some(message) = guarded_compile_error.take() {
                     guarded_errors.push(SourceWarning {
                         command_index,
@@ -8280,6 +8491,7 @@ impl Engine {
                             fln_elab::source::ElaboratedDeclaration {
                                 declaration,
                                 native_axioms: Vec::new(),
+                                equation_info: None,
                                 local_functions: Vec::new(),
                                 irreducible: false,
                                 noncomputable: false,
@@ -8345,6 +8557,7 @@ impl Engine {
             let fln_elab::source::ElaboratedDeclaration {
                 declaration,
                 native_axioms,
+                equation_info,
                 local_functions,
                 irreducible,
                 noncomputable,
@@ -8502,13 +8715,17 @@ impl Engine {
                     Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
                     Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
                 };
-                source_records::apply_batch_effects(&mut admission, irreducible, options).map_err(
-                    |error| EngineExecutionError::BatchCommand {
-                        index: command_index,
-                        error: Box::new(error),
-                        at: Some(original_offset),
-                    },
-                )?;
+                source_records::apply_batch_effects(
+                    &mut admission,
+                    irreducible,
+                    equation_info.as_ref(),
+                    options,
+                )
+                .map_err(|error| EngineExecutionError::BatchCommand {
+                    index: command_index,
+                    error: Box::new(error),
+                    at: Some(original_offset),
+                })?;
                 if let Some(name) = &protected {
                     admission.engine.environment =
                         source_records::tag_protected(&admission.engine, name).map_err(
@@ -8520,9 +8737,50 @@ impl Engine {
                         )?;
                     admission.result_logical_root = admission.engine.logical_root(options);
                 }
+                if let Some(declared) = admission
+                    .admissions
+                    .first()
+                    .and_then(|admitted| source_records::declared_name(&admitted.declaration))
+                    .cloned()
+                    && let Some(environment) = source_records::tag_deprecated(
+                        &admission.engine,
+                        parsed.syntax(),
+                        &declared,
+                        &scope,
+                        limits.kernel,
+                    )
+                    .map_err(|error| EngineExecutionError::BatchCommand {
+                        index: command_index,
+                        error: Box::new(error),
+                        at: Some(original_offset),
+                    })?
+                {
+                    admission.engine.environment = environment;
+                    admission.result_logical_root = admission.engine.logical_root(options);
+                }
                 let mut admission = match engine.finish_local_function_batch(
                     admission,
                     &local_functions,
+                    options,
+                    limits.admission(),
+                )? {
+                    Outcome::Complete(admission) => admission,
+                    Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                    Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                };
+                let equation_scope = scope
+                    .for_declaration(parsed.syntax())
+                    .map_err(DefinitionFrontendError::Elaborate)
+                    .map_err(EngineExecutionError::Frontend)
+                    .map_err(|error| EngineExecutionError::BatchCommand {
+                        index: command_index,
+                        error: Box::new(error),
+                        at: Some(original_offset),
+                    })?;
+                admission = match engine.finish_source_simp_batch(
+                    admission,
+                    None,
+                    &equation_scope,
                     options,
                     limits.admission(),
                 )? {
@@ -8541,10 +8799,13 @@ impl Engine {
                         scope_error(command_index, original_offset, error.message())
                     })?;
                 engine = admission.engine.clone();
-                source_admissions.push(SourceCommandAdmission {
-                    command_index,
-                    admission,
-                });
+                source_records::push_command_admission(
+                    &mut source_admissions,
+                    SourceCommandAdmission {
+                        command_index,
+                        admission,
+                    },
+                );
                 continue;
             }
             if !native_axioms.is_empty() {
@@ -8664,6 +8925,7 @@ impl Engine {
             source_records::apply_execution_effects(
                 &mut execution,
                 irreducible,
+                equation_info.as_ref(),
                 scoped_options.as_ref().unwrap_or(options),
             )
             .map_err(|error| EngineExecutionError::BatchCommand {
@@ -8671,6 +8933,37 @@ impl Engine {
                 error: Box::new(error),
                 at: Some(original_offset),
             })?;
+            if !is_evaluation {
+                let equation_scope = scope
+                    .for_declaration(parsed.syntax())
+                    .map_err(DefinitionFrontendError::Elaborate)
+                    .map_err(EngineExecutionError::Frontend)
+                    .map_err(|error| EngineExecutionError::BatchCommand {
+                        index: command_index,
+                        error: Box::new(error),
+                        at: Some(original_offset),
+                    })?;
+                execution.engine = match execution
+                    .engine
+                    .freeze_source_equation_policy(
+                        &execution.declaration,
+                        &equation_scope,
+                        options,
+                        limits.kernel,
+                    )
+                    .map_err(|error| EngineExecutionError::BatchCommand {
+                        index: command_index,
+                        error: Box::new(error),
+                        at: Some(original_offset),
+                    })? {
+                    Outcome::Complete(engine) => engine,
+                    Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                    Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                };
+                execution.result_logical_root = execution
+                    .engine
+                    .logical_root(scoped_options.as_ref().unwrap_or(options));
+            }
             if let Some(name) = &protected {
                 execution.engine.environment =
                     source_records::tag_protected(&execution.engine, name).map_err(|error| {
@@ -8680,6 +8973,27 @@ impl Engine {
                             at: Some(original_offset),
                         }
                     })?;
+                execution.result_logical_root = execution
+                    .engine
+                    .logical_root(scoped_options.as_ref().unwrap_or(options));
+            }
+            if !is_evaluation
+                && let Some(declared) =
+                    source_records::declared_name(&execution.declaration).cloned()
+                && let Some(environment) = source_records::tag_deprecated(
+                    &execution.engine,
+                    parsed.syntax(),
+                    &declared,
+                    &scope,
+                    limits.kernel,
+                )
+                .map_err(|error| EngineExecutionError::BatchCommand {
+                    index: command_index,
+                    error: Box::new(error),
+                    at: Some(original_offset),
+                })?
+            {
+                execution.engine.environment = environment;
                 execution.result_logical_root = execution
                     .engine
                     .logical_root(scoped_options.as_ref().unwrap_or(options));
@@ -8719,6 +9033,17 @@ impl Engine {
             }
         }
 
+        if let Some((index, offset)) = elaborated_command.take() {
+            deprecations.extend(deprecation_warnings(
+                deprecation_sink.take(),
+                index,
+                offset,
+                engine.environment(),
+                &scopes.current,
+                limits.kernel,
+            )?);
+        }
+        drop(deprecation_sink);
         let mut execution_indices = Vec::new();
         execution_indices
             .try_reserve_exact(execution_command_indices.len())
@@ -8785,9 +9110,11 @@ impl Engine {
             .collect();
         // The pin's reducibility warnings are logged while a command elaborates, ahead of its
         // `sorry` warning (reported with the kernel's check) and its linters.
-        let mut warnings: Vec<SourceWarning> = Vec::new();
+        // Deprecation warnings are logged while a command elaborates, ahead of its attributes'.
+        let mut warnings: Vec<SourceWarning> = deprecations;
         if pin_world {
             warnings.extend(instance_attribute_warnings);
+            warnings.extend(macro_pattern_warnings);
             warnings.extend(declaration_reducibility_warnings(
                 &lint_sites,
                 &linted,
@@ -8974,6 +9301,26 @@ impl Engine {
                         message: unused_variables::message(&unused.name),
                     }));
                 }
+                // `linter.checkUnivs`, after the unused-variables warnings and before
+                // `linter.defProp`, as the pin runs them; like every linter, not after an error.
+                if !errored {
+                    for (_, declaration) in linted.iter().filter(|(index, _)| *index == command) {
+                        for (name, type_) in universe_linted(declaration) {
+                            match linters::universes_only_together(syntax, name, type_, options) {
+                                Ok(lint) => lints.extend(lint),
+                                Err(feature) => {
+                                    return Err(EngineExecutionError::BatchCommand {
+                                        index: command,
+                                        error: Box::new(EngineExecutionError::NotImplemented {
+                                            feature,
+                                        }),
+                                        at: Some(fln_parse::BytePos(offset.0)),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
                 if let Some((name, type_, _, abbreviation)) = declared {
                     lints.extend(linters::definition_is_proposition(
                         syntax,
@@ -9102,8 +9449,11 @@ impl Engine {
             Some(source_check::source_site(source)?.at_offset(terminal_offset));
         let checked = grammar
             .enter(|| {
-                let terminal = terminal
-                    .expanded()
+                let terminal = grammar
+                    .expand_command(
+                        terminal,
+                        source_check::grammar::resolver(query_engine.environment(), &query_scope),
+                    )
                     .map_err(DefinitionFrontendError::Parse)
                     .map_err(EngineExecutionError::Frontend)?;
                 query_engine.check_parsed_source_command_in_scope(
@@ -9520,8 +9870,24 @@ impl Engine {
                     source_records::apply_execution_effects(
                         &mut execution,
                         elaborated.irreducible,
+                        elaborated.equation_info.as_ref(),
                         options,
                     )?;
+                    let scope = scope
+                        .for_declaration(parsed.syntax())
+                        .map_err(DefinitionFrontendError::Elaborate)
+                        .map_err(EngineExecutionError::Frontend)?;
+                    execution.engine = match execution.engine.freeze_source_equation_policy(
+                        &execution.declaration,
+                        &scope,
+                        options,
+                        limits.kernel,
+                    )? {
+                        Outcome::Complete(engine) => engine,
+                        Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                        Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                    };
+                    execution.result_logical_root = execution.engine.logical_root(options);
                     Outcome::Complete(execution)
                 }
                 Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
@@ -11665,6 +12031,7 @@ fn executable_dependencies(
             .nat_primitive_intrinsic_binding(&name)
             .or_else(|| preparation.st_intrinsic_binding(&name))
             .or_else(|| preparation.thunk_intrinsic_binding(&name))
+            .or_else(|| preparation.task_intrinsic_binding(&name))
             .or_else(|| preparation.io_intrinsic_binding(&name))
             .or_else(|| preparation.fs_intrinsic_binding(&name))
             .or_else(|| preparation.float_intrinsic_binding(&name))
@@ -11700,7 +12067,10 @@ fn executable_dependencies(
         }
         let private_signature = match preparation.thunk_function_signature(&name)? {
             Some(signature) => Some(signature),
-            None => preparation.partial_stage_signature(&name)?,
+            None => match preparation.task_function_signature(&name)? {
+                Some(signature) => Some(signature),
+                None => preparation.partial_stage_signature(&name)?,
+            },
         };
         let mut signature = match private_signature {
             Some(signature) => signature,
@@ -12856,13 +13226,42 @@ fn field_receiver_message(
 }
 
 /// Whether a `#guard_msgs` docstring line is a warning this engine prints with the pin's text, so
-/// the guard over it is judged rather than refused: "declaration uses `sorry`", and the two
+/// the guard over it is judged rather than refused: "declaration uses `sorry`", the two
 /// reducibility warnings of [`linters`] (`warn.classDefReducibility`, vendored
-/// `Lean/Elab/MutualDef.lean:1246-1256`, and `addInstance`'s, `Lean/Meta/Instances.lean:281-289`).
-/// `addInstance`'s `@[expose]` warning is not reproduced, and its text does not match here.
-fn reproduced_warning(line: &str) -> bool {
+/// `Lean/Elab/MutualDef.lean:1246-1256`, and `addInstance`'s, `Lean/Meta/Instances.lean:281-289`),
+/// the old `:=` forms' notes (`Lean/Elab/Structure.lean:341`, `Lean/Elab/Inductive.lean:88`),
+/// `@[deprecated]`'s own two warnings (`Lean/Linter/Deprecated.lean:41-44`), and
+/// `Linter.checkDeprecated`'s for a constant `environment` records as deprecated
+/// ([`linters::deprecation_message`]). A deprecated option's warning has the same first line
+/// and is not reproduced: its name is no deprecated constant. `addInstance`'s `@[expose]`
+/// warning is not reproduced, and its text does not match here.
+fn reproduced_warning(line: &str, environment: &Environment) -> bool {
     const MARKED: &str = " must be marked with `@[reducible]` or `@[implicit_reducible]`";
+    const EXACT: [&str; 5] = [
+        "warning: `inductive ... :=` has been deprecated in favor of `inductive ... where`",
+        "warning: `structure ... :=` has been deprecated in favor of `structure ... where`.",
+        "warning: `class ... :=` has been deprecated in favor of `class ... where`.",
+        "warning: `[deprecated]` attribute should specify either a new name or a deprecation message",
+        "warning: `[deprecated]` attribute should specify the date or library version at which the deprecation was introduced, using `(since := \"...\")`",
+    ];
+    let deprecated_constant = || {
+        let Some((name, rest)) = line
+            .strip_prefix("warning: `")
+            .and_then(|rest| rest.split_once("` has been deprecated"))
+        else {
+            return false;
+        };
+        (rest.is_empty() || rest.starts_with(": "))
+            && !name.contains(['«', '»', '`'])
+            && fln_elab::deprecations::Deprecations::read(environment).is_ok_and(|entries| {
+                entries
+                    .get(&Name::from_components(name.split('.')))
+                    .is_some()
+            })
+    };
     line == "warning: declaration uses `sorry`"
+        || EXACT.contains(&line)
+        || deprecated_constant()
         || line
             .strip_prefix("warning: Definition `")
             .and_then(|rest| rest.strip_suffix(MARKED))
@@ -12906,6 +13305,48 @@ fn guard_checks_expected_error(guard: Option<&SourceGuard>, command_index: usize
     })
 }
 
+/// The pin's `Linter.checkDeprecated` warnings for the uses a command's elaborations published
+/// ([`linters::deprecation_message`], merged by
+/// [`fln_elab::deprecations::UseSink::take`]), in the order they were logged, at the syntax each
+/// use reports, offset by where the command's source starts. A use whose syntax has no position
+/// is refused rather than placed by guessing.
+fn deprecation_warnings(
+    uses: Vec<fln_elab::deprecations::DeprecatedUse>,
+    command_index: usize,
+    offset: fln_parse::BytePos,
+    environment: &Environment,
+    scope: &fln_elab::source::scope::SourceScope,
+    kernel: Budget,
+) -> Result<Vec<SourceWarning>, EngineExecutionError> {
+    let refusal = |feature| EngineExecutionError::BatchCommand {
+        index: command_index,
+        error: Box::new(EngineExecutionError::NotImplemented { feature }),
+        at: Some(offset),
+    };
+    let mut warnings = Vec::new();
+    for used in uses {
+        let Some((at, _)) = used.span else {
+            return Err(refusal(
+                "a deprecation warning at syntax without a source position",
+            ));
+        };
+        let Some(message) =
+            linters::deprecation_message(environment, scope, &used.constant, kernel)
+                .map_err(refusal)?
+        else {
+            continue;
+        };
+        warnings.push(SourceWarning {
+            command_index,
+            at: fln_parse::BytePos(offset.0 + at),
+            message,
+            severity: SourceSeverity::Warning,
+            follows_output: false,
+        });
+    }
+    Ok(warnings)
+}
+
 /// A declaration the linters read: its offset in the file, its syntax, the options in force,
 /// and the offset of the `mutual` keyword of a block it is a member of.
 type LintSite = (
@@ -12918,11 +13359,12 @@ type LintSite = (
     fln_elab::source::scope::SourceScope,
 );
 
-/// The pin's reducibility warnings for each declaration command, in command order: the
-/// `instance` attributes of its members' own lists that find a definition unmarked
-/// ([`linters::unmarked_instance_attributes`]), then its members' class-typed `def`s
-/// ([`linters::class_definition_reducibility`]), which the pin checks once every member is
-/// elaborated, at a `mutual` block's keyword.
+/// The pin's warnings while each declaration command's attributes apply and after, in command
+/// order: in attribute order, the `instance` attributes of its members' own lists that find a
+/// definition unmarked ([`linters::unmarked_instance_attributes`]) and a `@[deprecated]`'s own
+/// warnings (`deprecatedAttr`'s `getParam`, vendored `Lean/Linter/Deprecated.lean:41-44`); then
+/// its members' class-typed `def`s ([`linters::class_definition_reducibility`]), which the pin
+/// checks once every member is elaborated, at a `mutual` block's keyword.
 fn declaration_reducibility_warnings(
     lint_sites: &BTreeMap<(usize, usize), LintSite>,
     linted: &[(usize, &Declaration)],
@@ -12948,14 +13390,26 @@ fn declaration_reducibility_warnings(
         let Some((name, type_, _, _)) = linted_declaration(syntax, linted, command) else {
             continue;
         };
+        let mut attributes: Vec<(usize, String)> = Vec::new();
         if matches!(environment.find(name), Some(ConstantInfo::Defn(_))) {
-            for at in linters::unmarked_instance_attributes(syntax) {
-                warnings.push(warning(
-                    command,
-                    fln_parse::BytePos(offset.0 + at),
-                    linters::unmarked_instance_message(name),
-                ));
-            }
+            attributes.extend(
+                linters::unmarked_instance_attributes(syntax)
+                    .into_iter()
+                    .map(|at| (at, linters::unmarked_instance_message(name))),
+            );
+        }
+        if let Ok(Some(deprecated)) = fln_elab::source::deprecated_registration(syntax) {
+            attributes.extend(
+                deprecated
+                    .warnings()
+                    .into_iter()
+                    .map(|message| (deprecated.at, message.to_owned())),
+            );
+        }
+        // Stable: one attribute's own warnings keep their order.
+        attributes.sort_by_key(|(at, _)| *at);
+        for (at, message) in attributes {
+            warnings.push(warning(command, fln_parse::BytePos(offset.0 + at), message));
         }
         let is_class = |class: &Name| {
             registry
@@ -12986,6 +13440,34 @@ fn declaration_reducibility_warnings(
 
 /// The admitted type and value `command` declares: the declaration named by its `declId`
 /// (an `example` has one declaration), or `None` when that is not determined.
+/// The declarations a command names, each with its type, as `getNewDecls` finds them (vendored
+/// `Lean/Linter/Util.lean:68-76`): every admitted definition, theorem, opaque and axiom, and an
+/// inductive block's types and constructors, not its recursors.
+fn universe_linted(declaration: &Declaration) -> Vec<(&Name, &Expr)> {
+    match declaration {
+        Declaration::Axiom(value) => vec![(&value.base.name, &value.base.type_)],
+        Declaration::Defn(value) => vec![(&value.base.name, &value.base.type_)],
+        Declaration::Thm(value) => vec![(&value.base.name, &value.base.type_)],
+        Declaration::Opaque(value) => vec![(&value.base.name, &value.base.type_)],
+        Declaration::Mutual(values) => values
+            .iter()
+            .map(|value| (&value.base.name, &value.base.type_))
+            .collect(),
+        Declaration::Inductive(block) => block
+            .types
+            .iter()
+            .map(|value| (&value.base.name, &value.base.type_))
+            .chain(
+                block
+                    .ctors
+                    .iter()
+                    .map(|value| (&value.base.name, &value.base.type_)),
+            )
+            .collect(),
+        Declaration::Quotient(_) => Vec::new(),
+    }
+}
+
 fn linted_declaration<'a>(
     command: &fln_syntax::tree::Syntax,
     declarations: &[(usize, &'a Declaration)],

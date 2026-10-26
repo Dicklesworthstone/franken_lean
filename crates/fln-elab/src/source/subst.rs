@@ -10,7 +10,9 @@
 //! A failed operand check retries the pin's reverse transport for a fully inferred local
 //! value or explicitly type-ascribed operand. Expected-type-dependent syntax is
 //! not reinterpreted without its expected type. The bad-motive `subst` fallback
-//! remains unsupported. Abstraction is structural after instantiation.
+//! remains unsupported. Abstraction follows `Meta.kabstract`: equal head keys
+//! and arities admit a Default-transparency conversion that may infer missing
+//! equality arguments. Successful assignments constrain later occurrences.
 use super::*;
 
 mod operand;
@@ -80,6 +82,28 @@ fn eq(level: &Level, alpha: &Expr, lhs: Expr, rhs: Expr) -> Expr {
 }
 
 impl Context {
+    /// The pin fixes its syntactic head key before traversing and only then
+    /// calls `isDefEq`. A bare metavariable is therefore not a wildcard for
+    /// arbitrary subterms, and a convertible expression with a different head
+    /// does not count as an occurrence. Failed conversion rolls back its
+    /// assignments while retaining spent work and resource failures.
+    fn substitution_abstract(
+        &mut self,
+        expression: &Expr,
+        pattern: &Expr,
+    ) -> Result<Expr, NatDefinitionElabError> {
+        if matches!(pattern.node(), ExprNode::FVar { .. }) {
+            return self.kabstract(expression, pattern);
+        }
+        let key = self.rewrite_head_key(pattern)?;
+        self.kabstract_matching(expression, pattern, |context, candidate, pattern| {
+            if context.rewrite_head_key(candidate)? != key {
+                return Ok(false);
+            }
+            context.coercion_eq(candidate, pattern)
+        })
+    }
+
     /// `Term.subst`'s arguments: `h`, `"▸"`, and the one-element operand list.
     pub(super) fn substitution(
         &mut self,
@@ -102,7 +126,18 @@ impl Context {
             }
             None => None,
         };
-        let heq = self.term(heq_syntax, None)?;
+        let mut heq = self.term(heq_syntax, None)?;
+        let (head, explicit) = self.explicit_application_head(heq_syntax)?;
+        if !explicit
+            && (matches!(head, Syntax::Ident { .. })
+                || head.kind() == Some(&parser_kind(&["Term", "explicitUniv"]))
+                || head.kind() == Some(&parser_kind(&["Term", "proj"])))
+        {
+            // At the pin even a bare identifier is an application with no
+            // written arguments. Infer its ordinary implicit parameters from
+            // the occurrence below; strict implicits and `@h` stay explicit.
+            heq = self.insert_implicits(heq, ImplicitInsertion::ApplicationEnd)?;
+        }
         self.flush(false)?;
         let mut proof = self.instantiate(&heq.value)?;
         let heq_type = self.instantiate(&heq.type_)?;
@@ -121,9 +156,9 @@ impl Context {
         } = parts;
         let (abstracted, operand) = match expected {
             Some(expected) => {
-                let mut abstracted = self.kabstract(&expected, &rhs)?;
+                let mut abstracted = self.substitution_abstract(&expected, &rhs)?;
                 if !abstracted.has_loose_bvars() {
-                    abstracted = self.kabstract(&expected, &lhs)?;
+                    abstracted = self.substitution_abstract(&expected, &lhs)?;
                     if !abstracted.has_loose_bvars() {
                         return Err(refuse(SubstError::ExpectedNotMentioned));
                     }
@@ -145,9 +180,9 @@ impl Context {
                 let operand = self.term(operand, None)?;
                 self.flush(false)?;
                 let operand_type = self.instantiate(&operand.type_)?;
-                let mut abstracted = self.kabstract(&operand_type, &lhs)?;
+                let mut abstracted = self.substitution_abstract(&operand_type, &lhs)?;
                 if !abstracted.has_loose_bvars() {
-                    abstracted = self.kabstract(&operand_type, &rhs)?;
+                    abstracted = self.substitution_abstract(&operand_type, &rhs)?;
                     if !abstracted.has_loose_bvars() {
                         return Err(refuse(SubstError::NotMentioned));
                     }
@@ -174,17 +209,29 @@ impl Context {
     /// checks both this motive and the operand, including an inner retry cast.
     fn substitution_transport(
         &mut self,
-        equality: &Equality,
+        parts: &Equality,
         abstracted: Expr,
         operand: Typed,
         proof: Expr,
     ) -> Result<Typed, NatDefinitionElabError> {
+        // Matching can specialize the equality after its components were
+        // first read. Construct the motive and proof with those assignments,
+        // including universe arguments, visible to type reconstruction.
+        let resolved = self.instantiate(&eq(
+            &parts.level,
+            &parts.alpha,
+            parts.lhs.clone(),
+            parts.rhs.clone(),
+        ))?;
+        let resolved = equality(&resolved).ok_or_else(|| failure(SourceInferenceError::Scope))?;
         let Equality {
             level,
             alpha,
             lhs,
             rhs,
-        } = equality;
+        } = &resolved;
+        let abstracted = self.instantiate(&abstracted)?;
+        let proof = self.instantiate(&proof)?;
         // The motive `fun x (h : lhs = x) => abstracted[x]`, and its universe.
         let result_type = self.substitute(&abstracted, rhs)?;
         let sort = self

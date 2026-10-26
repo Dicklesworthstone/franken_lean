@@ -319,6 +319,12 @@ impl Preparation<'_> {
         {
             return Err(unsupported("panicCore instance payload"));
         }
+        // A shape describes the field but does not publish its runtime projection. The
+        // dictionary can remain a real object after specialization, so register its checked
+        // representation before emitting the projection, even when no wrapper binder survives.
+        if self.value_type(&instance)? != Some(ValueType::Constructor) {
+            return Err(unsupported("panicCore instance representation"));
+        }
         let payload = Expr::proj(shape.projection(constructor), 0, b(1)?);
         // Keep the admitted payload's concrete type across the raw-object
         // boundary. The native call reports (or follows the fatal policy),

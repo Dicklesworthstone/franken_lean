@@ -3,6 +3,13 @@
 //! identity under an inaccessible name; otherwise it leaves the live context.
 use super::*;
 
+/// A rewrite rule's term: as written, or one of the equation theorems `rw [f]` tries.
+#[derive(Clone, Copy)]
+enum RuleTerm<'a> {
+    Written(&'a Syntax),
+    Equation(&'a Name),
+}
+
 pub(in crate::source) struct RewriteLocations {
     pub(in crate::source) hypotheses: Vec<Name>,
     pub(in crate::source) target: bool,
@@ -124,6 +131,66 @@ impl Context {
         Ok(Some(result))
     }
 
+    fn located_rule(&mut self, rule: RuleTerm<'_>) -> Result<Typed, NatDefinitionElabError> {
+        match rule {
+            RuleTerm::Written(syntax) => self.located_rule_term(syntax),
+            RuleTerm::Equation(name) => self.constant(name),
+        }
+    }
+
+    /// The terms to try for one rule, in order: its equation theorems when it names a
+    /// definition (`rw [f]`), else the rule as written.
+    fn rule_terms<'n>(
+        &mut self,
+        syntax: &'n Syntax,
+        equations: &'n Option<(Name, Vec<Name>)>,
+    ) -> Vec<RuleTerm<'n>> {
+        match equations {
+            Some((_, names)) => names.iter().map(RuleTerm::Equation).collect(),
+            None => vec![RuleTerm::Written(syntax)],
+        }
+    }
+
+    /// Run `body` once per candidate term, from the same state, keeping the first that
+    /// succeeds. A single written rule is run directly, as before.
+    fn first_rule_term<'a, T>(
+        &mut self,
+        proof: &mut ProofState<'a>,
+        terms: &[RuleTerm<'_>],
+        equations: &Option<(Name, Vec<Name>)>,
+        mut body: impl FnMut(
+            &mut Self,
+            &mut ProofState<'a>,
+            RuleTerm<'_>,
+        ) -> Result<T, NatDefinitionElabError>,
+    ) -> Result<T, NatDefinitionElabError> {
+        let Some((declaration, names)) = equations else {
+            return body(self, proof, terms[0]);
+        };
+        for term in terms {
+            self.tick()?;
+            let mut trial = self.rewrite_trial();
+            let mut trial_proof = proof.clone();
+            match body(&mut trial, &mut trial_proof, *term) {
+                Ok(result) => {
+                    *self = trial;
+                    *proof = trial_proof;
+                    return Ok(result);
+                }
+                Err(problem)
+                    if backtrack::recoverable(&problem) || Self::rewrite_nonmatch(&problem) =>
+                {
+                    self.charge_rewrite_trial(&trial);
+                }
+                Err(problem) => return Err(problem),
+            }
+        }
+        Err(error(TacticError::RewriteEquations {
+            declaration: declaration.clone(),
+            hint: names.len() != 1,
+        }))
+    }
+
     fn located_rule_term(&mut self, syntax: &Syntax) -> Result<Typed, NatDefinitionElabError> {
         // One bounded re-entry into the term driver, as for simp rules. Direct
         // Syntax clients cannot smuggle another proof driver into this frame.
@@ -188,11 +255,13 @@ impl Context {
         } else {
             (from, to)
         };
-        if occurrence.has_expr_mvar() || occurrence.has_level_mvar() || occurrence.has_loose_bvars()
+        let original = self.instantiate(&local.type_)?;
+        if occurrence.has_expr_mvar()
+            || occurrence.has_loose_bvars()
+            || !self.rewrite_levels_known(occurrence, &original)?
         {
             return Err(error(TacticError::ExpectedEquality));
         }
-        let original = self.instantiate(&local.type_)?;
         let marker = self.equality_local(alpha.clone())?;
         let (template, matched) = if kabstract {
             self.rewrite_kabstract(&original, occurrence, &Expr::fvar(marker.id.clone()))?
@@ -240,7 +309,7 @@ impl Context {
     /// `at_end` asserts the replacement after every local, as the pin's `simpGoal` asserts a
     /// hypothesis whose simplification needs a proof; otherwise it goes right after the old
     /// local and the locals its new type reads, as `replaceLocalDecl` places it for `rw`.
-    pub(super) fn replace_rewritten_hypothesis(
+    pub(in crate::source) fn replace_rewritten_hypothesis(
         &mut self,
         mut parent: ProofGoal,
         local: &LocalDecl,
@@ -341,62 +410,81 @@ impl Context {
         }
         let mut goal = initial.clone();
         for rule in rules {
-            for name in &locations.hypotheses {
-                self.tick()?;
-                self.txn.lctx = goal.lctx.clone();
-                let local = goal
-                    .lctx
-                    .find_by_user_name(name)
-                    .cloned()
-                    .ok_or_else(|| error(TacticError::RewriteLocation))?;
-                let term = self.located_rule_term(rule.syntax)?;
-                self.flush(false)?;
-                let target = self.instantiate(&local.type_)?;
-                let RewriteMatch {
-                    rule: term,
-                    occurrence,
-                    premises,
-                } = self
-                    .instantiate_rewrite_rule(term, &target, rule.reverse, false, &[])?
-                    .ok_or_else(|| error(TacticError::RewriteNoMatch))?;
-                let replacement =
-                    self.rewrite_hypothesis_value(&local, term, &occurrence, rule.reverse, true)?;
-                let (next, parent, value) =
-                    self.replace_rewritten_hypothesis(goal, &local, replacement, false)?;
-                proof.work.push(Work::Close(parent, value));
-                proof
-                    .work
-                    .extend(premises.into_iter().rev().map(Work::Goal));
-                goal = next;
-            }
-            // Explicit locations process the named hypotheses first, then the
-            // target, regardless of where its marker appeared in the list.
-            if locations.target {
-                self.tick()?;
-                self.txn.lctx = goal.lctx.clone();
-                let term = self.located_rule_term(rule.syntax)?;
-                self.flush(false)?;
-                let target = self.instantiate(&goal.target)?;
-                let RewriteMatch {
-                    rule: term,
-                    occurrence,
-                    premises,
-                } = self
-                    .instantiate_rewrite_rule(term, &target, rule.reverse, false, &[])?
-                    .ok_or_else(|| error(TacticError::RewriteNoMatch))?;
-                let (next, value) =
-                    self.rewrite_transport(&goal, term, &occurrence, rule.reverse, true)?;
-                proof.work.push(Work::Close(goal, value));
-                proof
-                    .work
-                    .extend(premises.into_iter().rev().map(Work::Goal));
-                goal = next;
-            }
+            self.txn.lctx = goal.lctx.clone();
+            let equations = self.rewrite_rule_equations(rule.syntax)?;
+            let terms = self.rule_terms(rule.syntax, &equations);
+            let start = goal.clone();
+            goal = self.first_rule_term(proof, &terms, &equations, |cx, proof, term| {
+                cx.rewrite_rule_at_locations(proof, start.clone(), term, rule.reverse, &locations)
+            })?;
         }
         if !close || !self.rewrite_reflexivity(&goal)? {
             proof.work.push(Work::Goal(goal));
         }
         Ok(true)
+    }
+
+    /// One rule at explicit locations: the named hypotheses first, then the target,
+    /// regardless of where its marker appeared in the list.
+    fn rewrite_rule_at_locations<'a>(
+        &mut self,
+        proof: &mut ProofState<'a>,
+        mut goal: ProofGoal,
+        rule: RuleTerm<'_>,
+        reverse: bool,
+        locations: &RewriteLocations,
+    ) -> Result<ProofGoal, NatDefinitionElabError> {
+        for name in &locations.hypotheses {
+            self.tick()?;
+            self.txn.lctx = goal.lctx.clone();
+            let local = goal
+                .lctx
+                .find_by_user_name(name)
+                .cloned()
+                .ok_or_else(|| error(TacticError::RewriteLocation))?;
+            let term = self.located_rule(rule)?;
+            self.flush(false)?;
+            let target = self.instantiate(&local.type_)?;
+            let RewriteMatch {
+                rule: term,
+                occurrence,
+                premises,
+                ..
+            } = self
+                .instantiate_rewrite_rule(term, &target, reverse, false, &[])?
+                .ok_or_else(|| error(TacticError::RewriteNoMatch))?;
+            let replacement =
+                self.rewrite_hypothesis_value(&local, term, &occurrence, reverse, true)?;
+            let (next, parent, value) =
+                self.replace_rewritten_hypothesis(goal, &local, replacement, false)?;
+            proof.work.push(Work::Close(parent, value));
+            proof
+                .work
+                .extend(premises.into_iter().rev().map(Work::Goal));
+            goal = next;
+        }
+        if locations.target {
+            self.tick()?;
+            self.txn.lctx = goal.lctx.clone();
+            let term = self.located_rule(rule)?;
+            self.flush(false)?;
+            let target = self.instantiate(&goal.target)?;
+            let RewriteMatch {
+                rule: term,
+                occurrence,
+                premises,
+                ..
+            } = self
+                .instantiate_rewrite_rule(term, &target, reverse, false, &[])?
+                .ok_or_else(|| error(TacticError::RewriteNoMatch))?;
+            let (next, value) = self.rewrite_transport(&goal, term, &occurrence, reverse, true)?;
+            proof.work.push(Work::Close(goal, value));
+            proof
+                .work
+                .extend(premises.into_iter().rev().map(Work::Goal));
+            goal = next;
+        }
+        Ok(goal)
     }
 
     fn rewrite_at_all<'a>(
@@ -410,18 +498,43 @@ impl Context {
         let mut goal = initial.clone();
         for rule in rules {
             self.txn.lctx = goal.lctx.clone();
+            let equations = self.rewrite_rule_equations(rule.syntax)?;
+            let terms = self.rule_terms(rule.syntax, &equations);
+            let start = goal.clone();
+            goal = self.first_rule_term(proof, &terms, &equations, |cx, proof, term| {
+                cx.rewrite_rule_everywhere(proof, start.clone(), term, rule.reverse, &hypotheses)
+            })?;
+        }
+        if !close || !self.rewrite_reflexivity(&goal)? {
+            proof.work.push(Work::Goal(goal));
+        }
+        Ok(true)
+    }
+
+    /// One rule at every hypothesis that does not support it, then the target; it must
+    /// rewrite at least one of them.
+    fn rewrite_rule_everywhere<'a>(
+        &mut self,
+        proof: &mut ProofState<'a>,
+        mut goal: ProofGoal,
+        rule: RuleTerm<'_>,
+        reverse: bool,
+        hypotheses: &[Name],
+    ) -> Result<ProofGoal, NatDefinitionElabError> {
+        {
+            self.txn.lctx = goal.lctx.clone();
             // Inspect in isolation; do not leave the inspection's implicit
             // metavariables behind. Every actual location elaborates afresh.
             let mut trial = self.rewrite_trial();
             let inspected = (|| {
-                let term = trial.located_rule_term(rule.syntax)?;
+                let term = trial.located_rule(rule)?;
                 trial.flush(false)?;
                 trial.wildcard_rule_dependencies(&term)
             })();
             self.txn.budget.heartbeats_consumed = trial.txn.budget.heartbeats_consumed;
             let protected = inspected?;
             let mut changed = false;
-            for name in &hypotheses {
+            for name in hypotheses {
                 self.tick()?;
                 self.txn.lctx = goal.lctx.clone();
                 let local = goal
@@ -434,24 +547,20 @@ impl Context {
                 }
                 let mut trial = self.rewrite_trial();
                 let result: Result<_, NatDefinitionElabError> = (|| {
-                    let term = trial.located_rule_term(rule.syntax)?;
+                    let term = trial.located_rule(rule)?;
                     trial.flush(false)?;
                     let target = trial.instantiate(&local.type_)?;
                     let Some(RewriteMatch {
                         rule: term,
                         occurrence,
                         premises,
-                    }) = trial.instantiate_rewrite_rule(term, &target, rule.reverse, false, &[])?
+                        ..
+                    }) = trial.instantiate_rewrite_rule(term, &target, reverse, false, &[])?
                     else {
                         return Ok(None);
                     };
-                    let replacement = trial.rewrite_hypothesis_value(
-                        &local,
-                        term,
-                        &occurrence,
-                        rule.reverse,
-                        true,
-                    )?;
+                    let replacement =
+                        trial.rewrite_hypothesis_value(&local, term, &occurrence, reverse, true)?;
                     let (next, parent, value) = trial.replace_rewritten_hypothesis(
                         goal.clone(),
                         &local,
@@ -475,19 +584,20 @@ impl Context {
             self.txn.lctx = goal.lctx.clone();
             let mut trial = self.rewrite_trial();
             let result: Result<_, NatDefinitionElabError> = (|| {
-                let term = trial.located_rule_term(rule.syntax)?;
+                let term = trial.located_rule(rule)?;
                 trial.flush(false)?;
                 let target = trial.instantiate(&goal.target)?;
                 let Some(RewriteMatch {
                     rule: term,
                     occurrence,
                     premises,
-                }) = trial.instantiate_rewrite_rule(term, &target, rule.reverse, false, &[])?
+                    ..
+                }) = trial.instantiate_rewrite_rule(term, &target, reverse, false, &[])?
                 else {
                     return Ok(None);
                 };
                 let (next, value) =
-                    trial.rewrite_transport(&goal, term, &occurrence, rule.reverse, true)?;
+                    trial.rewrite_transport(&goal, term, &occurrence, reverse, true)?;
                 Ok(Some((next, value, premises)))
             })();
             self.txn.budget.heartbeats_consumed = trial.txn.budget.heartbeats_consumed;
@@ -504,9 +614,6 @@ impl Context {
                 return Err(error(TacticError::RewriteNoMatch));
             }
         }
-        if !close || !self.rewrite_reflexivity(&goal)? {
-            proof.work.push(Work::Goal(goal));
-        }
-        Ok(true)
+        Ok(goal)
     }
 }

@@ -351,6 +351,48 @@ impl Context {
         })
     }
 
+    /// [`Self::recheck_identifiers`] for a single-discriminant `match` as written, before its
+    /// discriminant elaborates.
+    pub(super) fn recheck_written_discriminant(
+        &mut self,
+        parts: &MatchParts<'_>,
+    ) -> Result<(), NatDefinitionElabError> {
+        if !parts.written
+            || parts.generated
+            || parts.conditional.is_some()
+            || self.simple_match(parts.alternatives)
+        {
+            return Ok(());
+        }
+        self.recheck_identifiers(std::slice::from_ref(parts.discriminant))
+    }
+
+    /// `match d with | y => e` with `y` a pattern variable, which the pin elaborates as
+    /// `let y := d; e`, elaborating `d` once (`expandSimpleMatch`; `isPatternVar`: an
+    /// identifier naming no constructor).
+    pub(super) fn simple_match(&mut self, alternatives: &[Syntax]) -> bool {
+        let [alternative] = alternatives else {
+            return false;
+        };
+        let Syntax::Node { args, .. } = alternative else {
+            return false;
+        };
+        let Some(Syntax::Node { args: rows, .. }) = args.get(1) else {
+            return false;
+        };
+        let [Syntax::Node { args: row, .. }] = rows.as_slice() else {
+            return false;
+        };
+        let [Syntax::Ident { val, .. }] = row.as_slice() else {
+            return false;
+        };
+        let resolved = self.resolve_source_name(val).ok().flatten();
+        let constructor = resolved
+            .as_ref()
+            .is_some_and(|name| matches!(self.txn.env.find(name), Some(ConstantInfo::Ctor(_))));
+        !constructor && (val.parent().is_anonymous() || resolved.is_some())
+    }
+
     pub(super) fn match_apply(
         &mut self,
         mut function: Typed,
@@ -776,7 +818,7 @@ impl Context {
         let MatchPatterns {
             constructors: mut patterns,
             fallback,
-        } = self.match_patterns(parts, name, &family.ctors)?;
+        } = self.match_patterns(parts, name, &family.ctors, &family_type)?;
         let mut branches = std::collections::VecDeque::new();
         let mut seen = HashSet::new();
         for rule in &rec.rules {
@@ -892,7 +934,8 @@ impl Context {
         else {
             return Err(error(MatchError::UnsupportedFamily));
         };
-        let patterns = self.match_patterns(parts, &constructor.induct, &family.ctors)?;
+        let patterns =
+            self.match_patterns(parts, &constructor.induct, &family.ctors, &major.type_)?;
         let (names, whole, syntax) = match patterns.constructors.get(name) {
             Some((names, syntax)) => (Some(names), None, *syntax),
             None => match patterns.fallback {
@@ -1007,6 +1050,7 @@ impl Context {
         parts: MatchParts<'a>,
         name: &Name,
         constructors: &[Name],
+        family_type: &Expr,
     ) -> Result<MatchPatterns<'a>, NatDefinitionElabError> {
         let mut patterns = HashMap::new();
         if let Some(conditional) = parts.conditional {
@@ -1192,7 +1236,12 @@ impl Context {
                             self.constrain(&actual, &annotated)?;
                             self.flush(false)?;
                         }
-                        self.bind_record_pattern_layout(name, &constructor, layout, &mut fields)?;
+                        self.bind_record_pattern_layout(
+                            family_type,
+                            &constructor,
+                            layout,
+                            &mut fields,
+                        )?;
                         continue;
                     }
                     let arguments: Vec<_> = layout.iter().collect();

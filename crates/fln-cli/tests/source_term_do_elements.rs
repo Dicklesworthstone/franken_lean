@@ -155,6 +155,17 @@ const REFUSED: &[(&str, &str)] = &[
         "do_at_alias_of_nat",
         "def N := Nat\ndef n : N := do\n  let y := 1\n  y\n",
     ),
+    // A block always asks for its monad's `Pure` instance (`DoElemCont.mkPure`, then
+    // `mkBindUnlessPure`, vendored `Lean/Elab/Do/Basic.lean:272-302, 512-525`), even where the
+    // bind is contracted away: `List` has none, so even `do xs` is refused.
+    (
+        "do_at_list",
+        "def l : List Nat := do\n  let y := 1\n  [y]\n",
+    ),
+    (
+        "do_bare_list",
+        "def l (xs : List Nat) : List Nat := do\n  xs\n",
+    ),
 ];
 
 fn pinned_lib() -> Option<PathBuf> {

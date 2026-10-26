@@ -28,6 +28,7 @@ pub mod constraint;
 pub mod dataflow;
 pub mod decision;
 pub mod delaborator_tags;
+pub mod deprecations;
 pub mod effects;
 pub mod externs;
 pub mod implemented_by;
@@ -467,6 +468,13 @@ fn with_pin_unknown_name_wording(
     environment: &Environment,
 ) -> NatDefinitionElabError {
     match error {
+        // A reserved equation name (`f.eq_4` beyond `f`'s equations) resolves as a name at the
+        // pin, so it is an unknown identifier even though `f` is a constant.
+        NatDefinitionElabError::Inference(source::SourceInferenceError::UnknownConstant(name))
+            if source::equation_theorems::target(environment, &name).is_some() =>
+        {
+            NatDefinitionElabError::Inference(source::SourceInferenceError::UnknownConstant(name))
+        }
         NatDefinitionElabError::Inference(source::SourceInferenceError::UnknownConstant(name)) => {
             let mut prefix = name.parent();
             let mut under_constant = false;

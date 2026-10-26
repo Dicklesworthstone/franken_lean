@@ -199,3 +199,138 @@ fn an_imported_noncomputable_declaration_stays_uncompiled() {
         assert_eq!(ours.status.success(), accepted, "{name}: {ours:?}");
     }
 }
+
+/// The header of the `main` programs: `IO` and `#guard_msgs` (`Init.Notation`).
+const IO_HEADER: &str = "prelude\nimport Init.System.IO\n";
+
+/// The pin's message when the root `main` would be compiled at a type its compiler does not run.
+const MAIN_TYPE: &str =
+    "`main` function must have type `(List String →)? IO (UInt32 | Unit | PUnit)`";
+
+/// The drop-in `lean` on `IO_HEADER` + `program`: exit code, stdout and stderr, and the pinned
+/// binary's exit code and stdout when present.
+fn run_io(
+    lib: &Path,
+    root: &Path,
+    name: &str,
+    program: &str,
+) -> (i32, String, String, Option<(i32, String)>) {
+    let entry = root.join(format!("{name}.lean"));
+    std::fs::write(&entry, format!("{IO_HEADER}{program}")).unwrap();
+    let ours = Command::new(env!("CARGO_BIN_EXE_lean"))
+        .arg(&entry)
+        .current_dir(root)
+        .env("LEAN_PATH", lib)
+        .env("FLN_IMPORT_REUSE_DIR", root.join("records"))
+        .output()
+        .expect("run the installed lean");
+    let theirs = lib
+        .parent()
+        .and_then(Path::parent)
+        .map(|toolchain| toolchain.join("bin/lean"))
+        .filter(|lean| lean.is_file())
+        .map(|pinned| {
+            let out = Command::new(pinned)
+                .arg(&entry)
+                .current_dir(root)
+                .env("LEAN_PATH", lib)
+                .output()
+                .expect("run the pinned lean");
+            (
+                out.status.code().expect("normal pinned exit"),
+                String::from_utf8_lossy(&out.stdout).into_owned(),
+            )
+        });
+    (
+        ours.status.code().expect("normal process exit"),
+        String::from_utf8_lossy(&ours.stdout).into_owned(),
+        String::from_utf8_lossy(&ours.stderr).into_owned(),
+        theirs,
+    )
+}
+
+/// `compileDecls` refuses a root `main` of any type but `(List String →)? IO (UInt32 | Unit |
+/// PUnit)` (vendored `Lean/Compiler/LCNF/Main.lean:69-80, 153-156`) and keeps the declaration.
+/// Under `#guard_msgs` the message is judged, as at the pin; unguarded it is a rejection. A
+/// namespaced `main`, a proposition, a type former, `noncomputable`, a `noncomputable section`
+/// and `[macro_inline]` generate no code and are not checked. Every program was run through the
+/// pinned `lean` v4.32.0 with `IO_HEADER` first (2026-10-26), with the exit code and stdout here.
+#[test]
+fn a_root_main_of_another_type_is_the_pins_compile_error() {
+    let Some(lib) = pinned_lib() else { return };
+    let root = workspace("main");
+    let guarded = format!("/--\nerror: {MAIN_TYPE}\n-/\n#guard_msgs in\n");
+    let cases: Vec<(&str, String, &str)> = vec![
+        ("unit", format!("{guarded}def main : Unit := ()\n"), ""),
+        (
+            "extra",
+            format!("{guarded}def main (_ : Nat) (_ : List String) : IO Unit := pure ()\n"),
+            "",
+        ),
+        (
+            "no_io",
+            format!("{guarded}def main (_ : List String) : UInt32 := 0\n"),
+            "",
+        ),
+        (
+            "bytes",
+            format!("{guarded}def main (args : List ByteArray) : IO Unit := pure ()\n"),
+            "",
+        ),
+        ("nat", format!("{guarded}def main : IO Nat := pure 0\n"), ""),
+        ("abbrev", format!("{guarded}abbrev main : Unit := ()\n"), ""),
+        (
+            "kept",
+            format!("{guarded}def main : Unit := ()\n#check main\n"),
+            "main : Unit\n",
+        ),
+        ("io_unit", "def main : IO Unit := pure ()\n".into(), ""),
+        ("io_uint32", "def main : IO UInt32 := pure 0\n".into(), ""),
+        (
+            "args",
+            "def main (_ : List String) : IO UInt32 := pure 0\n".into(),
+            "",
+        ),
+        ("io_punit", "def main : IO PUnit := pure ()\n".into(), ""),
+        (
+            "namespaced",
+            "namespace Foo\ndef main : Unit := ()\nend Foo\n".into(),
+            "",
+        ),
+        ("prop", "def main : Prop := True\n".into(), ""),
+        ("type", "def main : Type := Nat\n".into(), ""),
+        (
+            "noncomputable",
+            "noncomputable def main : Unit := ()\n".into(),
+            "",
+        ),
+        (
+            "section",
+            "noncomputable section\ndef main : Unit := ()\nend\n".into(),
+            "",
+        ),
+        (
+            "macro_inline",
+            "@[macro_inline] def main : Unit := ()\n".into(),
+            "",
+        ),
+    ];
+    for (name, program, stdout) in &cases {
+        let (code, ours, stderr, pinned) = run_io(&lib, &root, name, program);
+        if let Some(pinned) = pinned {
+            assert_eq!(pinned, (0, stdout.to_string()), "{name}: the pin moved");
+        }
+        assert_eq!(
+            (code, ours.as_str()),
+            (0, *stdout),
+            "{name}: {program}\n{stderr}"
+        );
+    }
+    let (code, _, stderr, pinned) = run_io(&lib, &root, "unguarded", "def main : Unit := ()\n");
+    if let Some((pinned, out)) = pinned {
+        assert_eq!(pinned, 1, "the pin accepts an unguarded `main : Unit`");
+        assert!(out.contains(MAIN_TYPE), "the pin moved: {out}");
+    }
+    assert_ne!(code, 0, "an unguarded `main : Unit` was accepted");
+    assert!(stderr.contains(MAIN_TYPE), "{stderr}");
+}

@@ -99,7 +99,8 @@ Eq.refl 2 : 2 = 2
 ";
 
 /// With `Init.NotationExtra` imported, its `@[app_unexpander]`s are registered: `Prod.mk` prints
-/// as a tuple, flattened to the right, `Unit.unit` as `()`, lists and `∃` as notation. Without
+/// as a tuple, flattened to the right, `Unit.unit` as `()`, lists and `∃` as notation, `Subtype`
+/// as `{ n // n = 1 }`, and its anonymous constructor with the proof elided (`pp.proofs`). Without
 /// it (above) they are applications and structure instances.
 const NOTATION_EXTRA: &str = r#"prelude
 import Init.NotationExtra
@@ -114,6 +115,7 @@ import Init.NotationExtra
 #check Sigma fun (_ : Nat) => Nat
 #check (Sigma fun (n : Nat) => Fin n) → Nat
 #check Nat × Sigma fun (n : Nat) => Fin n
+#check (⟨1, rfl⟩ : Subtype (fun n : Nat => n = 1))
 "#;
 
 /// The pin's output for [`NOTATION_EXTRA`].
@@ -128,6 +130,7 @@ const NOTATION_EXTRA_EXPECTED: &str = "Unit.unit : Unit
 (_ : Nat) × Nat : Type
 (n : Nat) × Fin n → Nat : Type
 Nat × (n : Nat) × Fin n : Type
+⟨1, ⋯⟩ : { n // n = 1 }
 ";
 
 /// `+`, `::`, `∧` and `=` are `infixl`/`infixr` notations of `Init.Notation`, which registers
@@ -222,21 +225,25 @@ fun n => ↑n : Nat → Int
 co3 (n : Nat) : Int
 ";
 
-/// What this door refuses rather than print another way: a local type without fields (the pin
-/// prints `structure E` as `{ }` and `inductive E | mk` as `E.mk`) and a field with a default
-/// value (which the pin omits when the value equals it).
+/// A local structure without fields: the pin prints its one instance as `{ }`.
+const EMPTY_STRUCTURE: &str = "prelude\nimport Init.Core\nstructure E\n#check ({ } : E)\n";
+
+/// The pin's output for [`EMPTY_STRUCTURE`].
+const EMPTY_STRUCTURE_EXPECTED: &str = "{ } : E\n";
+
+/// What this door refuses rather than print another way: a field the pin compares with its
+/// default by a reducible `isDefEq` that is not decided here (`1 + 2` against `3`, which the pin
+/// omits: `{ } : D`). A field syntactically equal to its default, or a literal other than a
+/// literal default (`{ x := 4 } : D`), prints (`source_check_optional_parameters`).
 ///
 /// Without `Init.NotationExtra`, whose macro the `Σ` notation is, the pin fails to print a `Sigma`
 /// at all ("failed to pretty print expression"); this door refuses it there.
 ///
-/// With `Init.NotationExtra` imported, an application another registered unexpander prints
-/// (`Subtype` as `{ n // n = 1 }`) is refused too, and so is a term holding binders this engine's
-/// elaboration introduced (an `if` it compiles to `Decidable.rec`, where the pin has `ite`).
+/// With `Init.NotationExtra` imported, a term holding binders this engine's elaboration
+/// introduced (an `if` it compiles to `Decidable.rec`, where the pin has `ite`) is refused too.
 /// Inside `open Int`, the pin prints `Int.negSucc 9` as `-[9+1]`, which is refused here too.
 const REFUSED: &[&str] = &[
-    "prelude\nimport Init.Core\nstructure E\n#check ({ } : E)\n",
-    "prelude\nimport Init.Core\nstructure D where\n  x : Nat := 3\n#check ({ x := 4 } : D)\n",
-    "prelude\nimport Init.NotationExtra\n#check (⟨1, rfl⟩ : Subtype (fun n : Nat => n = 1))\n",
+    "prelude\nimport Init.Core\nstructure D where\n  x : Nat := 3\n#check ({ x := 1 + 2 } : D)\n",
     "prelude\nimport Init.NotationExtra\n#check fun (n : Nat) => if n = 0 then 1 else 2\n",
     "prelude\nimport Init.Core\n#check Sigma fun (n : Nat) => Fin n\n",
     "prelude\nimport Init.Data.Int.Basic\nopen Int in\n#reduce Int.negSucc 9\n",
@@ -443,6 +450,26 @@ fn the_coercion_arrow_coerces_as_the_pin_does() {
     let (code, stdout, stderr) = ours(&lib, &root, &entry);
     assert_eq!(code, 0, "{stderr}");
     assert_eq!(stdout, COERCION_ARROW_EXPECTED, "{stderr}");
+}
+
+#[test]
+fn a_structure_without_fields_prints_its_instance_as_the_pin_does() {
+    let Some(lib) = pinned_lib() else {
+        return;
+    };
+    let root = workspace();
+    let entry = root.join("Empty.lean");
+    std::fs::write(&entry, EMPTY_STRUCTURE).unwrap();
+    if let Some((code, stdout)) = pinned(&lib, &entry) {
+        assert_eq!(
+            (code, stdout.as_str()),
+            (0, EMPTY_STRUCTURE_EXPECTED),
+            "the pin moved"
+        );
+    }
+    let (code, stdout, stderr) = ours(&lib, &root, &entry);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(stdout, EMPTY_STRUCTURE_EXPECTED, "{stderr}");
 }
 
 #[test]

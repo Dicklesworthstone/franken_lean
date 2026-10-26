@@ -4,9 +4,12 @@
 //! tagged `@[pp_using_anonymous_constructor]`. A field that is a parent's subobject, and is that
 //! parent's constructor applied, is flattened in place (`pp.structureInstances.flatten`).
 //!
-//! The pin omits a field equal to its default value (`pp.structureInstances.defaults` is off).
-//! That takes instantiating the default and a reducible definitional check, so a structure
-//! with a default is refused here. So is a constructor that an `@[app_unexpander]` or a
+//! The pin omits a field equal to its default value (`pp.structureInstances.defaults` is off):
+//! the printed structure's default for the field, instantiated with the parameters and the
+//! fields before it, is compared with the field by a reducible definitional check. Here a field
+//! syntactically equal to it is omitted and a literal that differs from a literal default is
+//! kept; any other comparison is refused, as is a default this structure only inherits through
+//! a parent this door does not resolve. So is a constructor that an `@[app_unexpander]` or a
 //! notation of this file prints, and a local type without fields: the pin prints `structure E`
 //! as `{ }` and `inductive E | mk` as `E.mk`, which this door cannot tell apart.
 use super::*;
@@ -21,8 +24,14 @@ pub(super) struct StructureTables {
 }
 
 impl<'a> Printer<'a> {
-    /// `delabStructureInstance` for `ctor` applied to `args`, its parameters and fields.
-    pub(super) fn structure_instance(&mut self, ctor: &ConstructorVal, args: &[Expr]) -> Doc {
+    /// `delabStructureInstance` for `ctor` at `levels` applied to `args`, its parameters and
+    /// fields.
+    pub(super) fn structure_instance(
+        &mut self,
+        ctor: &ConstructorVal,
+        levels: &[Level],
+        args: &[Expr],
+    ) -> Doc {
         let tags = self
             .tags
             .as_ref()
@@ -45,7 +54,13 @@ impl<'a> Printer<'a> {
                 doc = doc.then(self.with_trailing(false, |printer| printer.doc(arg, 0))?);
                 first = false;
             }
-            return Ok(node(doc.then(Format::text("⟩"))));
+            let doc = node(doc.then(Format::text("⟩")));
+            // `withTypeAscription (cond := (← withType <| getPPOption getPPStructureInstanceType))`.
+            if self.pp.structure_instance_types {
+                let type_ = self.application_type(&ctor.base.name, levels, args)?;
+                return self.ascribed(doc, &type_);
+            }
+            return Ok(doc);
         }
         self.structure_tables()?;
         let imported = self
@@ -58,9 +73,27 @@ impl<'a> Printer<'a> {
             ));
         }
         let mut fields = Vec::new();
-        self.structure_fields(&ctor.induct, ctor, args, &mut fields)?;
+        let root = Root {
+            name: &ctor.induct,
+            levels,
+            params: args.get(..ctor.num_params as usize).unwrap_or(&[]),
+        };
+        let mut values = Vec::new();
+        self.structure_fields(&root, ctor, args, &mut values, &mut fields)?;
+        // `optional (" : " termParser)`: under `pp.structureInstanceTypes`, the instance's type.
+        let type_ = if self.pp.structure_instance_types {
+            let type_ = self.application_type(&ctor.base.name, levels, args)?;
+            Some(self.with_trailing(false, |printer| printer.doc(&type_, 0))?)
+        } else {
+            None
+        };
         if fields.is_empty() {
-            return Ok(Format::text("{ }"));
+            return match type_ {
+                None => Ok(Format::text("{ }")),
+                Some(_) => Err(Unsupported(
+                    "a structure instance without fields, with its type",
+                )),
+            };
         }
         // `"{ " … sepByIndent structInstField ", " … " }"`: each token's trailing space is a line.
         let mut doc = Format::text("{").then(Format::Line);
@@ -74,17 +107,22 @@ impl<'a> Printer<'a> {
                     .then(value),
             ));
         }
+        if let Some(type_) = type_ {
+            doc = doc.then(Format::text(" :")).then(Format::Line).then(type_);
+        }
         Ok(node(doc.then(Format::text(" }"))))
     }
 
     /// `collectStructFields`: `ctor`'s fields in order, a parent's subobject flattened when it is
     /// that parent's constructor applied. `root` is the printed structure, whose defaults govern
-    /// every field shown.
+    /// every field shown; `values` are the fields collected so far, by name, which a default
+    /// may read.
     fn structure_fields(
         &mut self,
-        root: &Name,
+        root: &Root<'_>,
         ctor: &ConstructorVal,
         args: &[Expr],
+        values: &mut Vec<(Name, Expr)>,
         out: &mut Vec<(Name, Format)>,
     ) -> Result<(), Unsupported> {
         let names = field_names(self.env, ctor)?;
@@ -93,6 +131,7 @@ impl<'a> Printer<'a> {
             let value = args
                 .get(ctor.num_params as usize + index)
                 .ok_or(Unsupported("a structure instance missing a field"))?;
+            values.push((name.clone(), value.clone()));
             let (head, parent_args) = spine(value);
             if let Some(parent) = &subobjects[index]
                 && let ExprNode::Const {
@@ -103,28 +142,110 @@ impl<'a> Printer<'a> {
                 && parent_args.len() == (parent_ctor.num_params + parent_ctor.num_fields) as usize
             {
                 let parent_ctor = parent_ctor.clone();
-                self.structure_fields(root, &parent_ctor, &parent_args, out)?;
+                self.structure_fields(root, &parent_ctor, &parent_args, values, out)?;
                 continue;
             }
-            // `getEffectiveDefaultFnForField?`: a `_default` or an `_inherited_default` helper of
-            // the printed structure's field, or of the structure this field belongs to.
-            let defaulted = [root, &ctor.induct].into_iter().any(|record| {
-                ["_default", "_inherited_default"]
+            // `getEffectiveDefaultFnForField?`: the printed structure's `_default` or
+            // `_inherited_default` helper for the field.
+            let helper = ["_default", "_inherited_default"]
+                .into_iter()
+                .map(|suffix| Name::str(root.name.append_core(name), suffix))
+                .find(|helper| self.env.find(helper).is_some());
+            match helper {
+                Some(helper) => {
+                    if self.default_matches(&helper, root, values, value)? {
+                        continue;
+                    }
+                }
+                // A default the field's own structure declares, which the printed one inherits
+                // under a name this door does not resolve.
+                None if ["_default", "_inherited_default"]
                     .into_iter()
                     .any(|suffix| {
                         self.env
-                            .find(&Name::str(record.append_core(name), suffix))
+                            .find(&Name::str(ctor.induct.append_core(name), suffix))
                             .is_some()
-                    })
-            });
-            if defaulted {
-                return Err(Unsupported("a structure field with a default value"));
+                    }) =>
+                {
+                    return Err(Unsupported(
+                        "a structure field with an inherited default value",
+                    ));
+                }
+                None => {}
             }
             // A `,` or `}` follows a field's value, which ends no term.
             let printed = self.with_trailing(false, |printer| printer.doc(value, 0))?;
             out.push((name.clone(), printed));
         }
         Ok(())
+    }
+
+    /// Whether a field `value` equals its default from `helper`: `instantiateStructDefaultValueFn?`
+    /// (vendored `Lean/Meta/Structure.lean:196-222`) with the root's levels and parameters, each
+    /// further `fun` reading the collected field of its binder's name (none: not omitted), an
+    /// `id _ a` read as `a`; then the pin's reducible `isDefEq`, decided here only for a value
+    /// syntactically equal to the default or two different literals.
+    fn default_matches(
+        &mut self,
+        helper: &Name,
+        root: &Root<'_>,
+        values: &[(Name, Expr)],
+        value: &Expr,
+    ) -> Result<bool, Unsupported> {
+        let Some(ConstantInfo::Defn(definition)) = self.env.find(helper) else {
+            return Err(Unsupported(
+                "a structure field default that is not a definition",
+            ));
+        };
+        if definition.base.level_params.len() != root.levels.len() {
+            return Err(Unsupported(
+                "a structure field default at other universe levels",
+            ));
+        }
+        let mut default = fln_elab::universe::parameters::instantiate(
+            || Ok(()),
+            || Unsupported("a structure field default at other universe levels"),
+            &definition.value,
+            &definition.base.level_params,
+            root.levels,
+        )?;
+        let instantiate = |body: &Expr, argument: &Expr| {
+            body.subst_loose(0, std::slice::from_ref(argument))
+                .map_err(|_| Unsupported("an unreadable structure field default"))
+        };
+        for param in root.params {
+            self.tick()?;
+            let ExprNode::Lam { body, .. } = default.node() else {
+                return Ok(false);
+            };
+            default = instantiate(body, param)?;
+        }
+        while let ExprNode::Lam {
+            binder_name, body, ..
+        } = default.node()
+        {
+            self.tick()?;
+            let Some((_, field)) = values.iter().rev().find(|(name, _)| name == binder_name) else {
+                return Ok(false);
+            };
+            default = instantiate(body, field)?;
+        }
+        let (head, args) = spine(&default);
+        if let ExprNode::Const { name, .. } = head.node()
+            && *name == Name::from_components(["id"])
+            && args.len() == 2
+        {
+            default = args[1].clone();
+        }
+        if default == *value {
+            return Ok(true);
+        }
+        match (literal(&default), literal(value)) {
+            (Some(left), Some(right)) if left.0 == right.0 && left.1 != right.1 => Ok(false),
+            _ => Err(Unsupported(
+                "a structure field that may be definitionally equal to its default",
+            )),
+        }
     }
 
     fn structure_tables(&mut self) -> Result<(), Unsupported> {
@@ -182,6 +303,7 @@ impl<'a> Printer<'a> {
     pub(super) fn without_parent_projections(
         &mut self,
         object: &Expr,
+        explicit: bool,
     ) -> Result<Expr, Unsupported> {
         let mut object = object.clone();
         loop {
@@ -193,6 +315,11 @@ impl<'a> Printer<'a> {
             let Some(params) = self.parent_projection(name, args.len())? else {
                 return Ok(object);
             };
+            // In explicit mode a projection of a structure with parameters stays: they are its
+            // implicit arguments (`withoutParentProjections (explicit := true)`).
+            if explicit && params > 0 {
+                return Ok(object);
+            }
             let infos = self.binder_infos(name);
             let Some((receiver, _)) = self.field_receiver(name, &infos, &args) else {
                 return Ok(object);
@@ -246,7 +373,7 @@ impl<'a> Printer<'a> {
 
     /// Whether a notation of this file prints applications of `constant`: it declares an
     /// unexpander for it, which withholds the structure instance whether or not it applies.
-    fn notation_prints(&self, constant: &Name) -> bool {
+    pub(super) fn notation_prints(&self, constant: &Name) -> bool {
         self.notations.is_some_and(|notations| {
             notations
                 .unexpanders
@@ -276,4 +403,46 @@ fn field_names(env: &Environment, ctor: &ConstructorVal) -> Result<Vec<Name>, Un
         type_ = body;
     }
     Ok(names)
+}
+
+/// The structure a structure instance prints: its name, universe levels and parameters.
+pub(super) struct Root<'r> {
+    name: &'r Name,
+    levels: &'r [Level],
+    params: &'r [Expr],
+}
+
+/// A literal's kind and value, for a literal written as the elaborator writes it: a raw
+/// natural number or string, a numeral `OfNat.ofNat Nat n _`, or `Bool.true`/`Bool.false`.
+/// Two literals of one kind that differ are never definitionally equal.
+fn literal(e: &Expr) -> Option<(u8, Expr)> {
+    match e.node() {
+        ExprNode::Lit {
+            literal: Literal::Nat(_),
+        } => return Some((0, e.clone())),
+        ExprNode::Lit {
+            literal: Literal::Str(_),
+        } => return Some((1, e.clone())),
+        _ => {}
+    }
+    let (head, args) = spine(e);
+    let ExprNode::Const { name, .. } = head.node() else {
+        return None;
+    };
+    let text = name.to_display_string();
+    match (text.as_str(), args.as_slice()) {
+        ("OfNat.ofNat", [type_, raw, _])
+            if matches!(type_.node(), ExprNode::Const { name, .. } if name.to_display_string() == "Nat")
+                && matches!(
+                    raw.node(),
+                    ExprNode::Lit {
+                        literal: Literal::Nat(_)
+                    }
+                ) =>
+        {
+            Some((0, raw.clone()))
+        }
+        ("Bool.true" | "Bool.false", []) => Some((2, e.clone())),
+        _ => None,
+    }
 }

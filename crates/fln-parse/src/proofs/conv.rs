@@ -1,10 +1,12 @@
 //! `conv` blocks (`Init/Conv.lean`): `"conv" (" at " ident)? (" in " (occs)? term)? " => "
-//! convSeq`, where `convSeq` is `sepByIndent conv "; "`. The conv tactics read are the ones the
-//! corpus uses most: the one-keyword ones (`lhs`, `congr`, `whnf`, `left`, `rfl`, …), `arg n`,
-//! `enter [n, …]`, `ext x …`, `intro x …`, `unfold f …`, `delta f …`, `rw [rules]`,
-//! `rewrite`, `simp`, `apply e`, `change e`, `tactic => tacs`, `first | … | …` and a nested
-//! `· convSeq`; any other is refused where it starts. A `(conv| …)` quotation holds one of them.
-//! The elaborator does not run conv mode: it refuses the block.
+//! convSeq`, where `convSeq` is `sepByIndent conv "; "` or `"{" … "}"`. The conv tactics read
+//! are the one-keyword ones (`lhs`, `congr`, `whnf`, `left`, `rfl`, …), `arg (@)?(-)?n`,
+//! `enter [n, @n, x, in p, …]`, `ext x …`, `intro x …`, `unfold f …`, `delta f …`, `rw [rules]`,
+//! `rewrite`, `simp`, `dsimp`, `apply e`, `change e`, `pattern (occs)? p`, `clear h …`,
+//! `tactic => tacs`, `first | … | …`, `try`, `repeat`, `fail_if_success`, a nested `conv => …`,
+//! `· convSeq`, `{ … }`, `( … )` and `calc`; any other is refused where it starts. A tactic
+//! ending in a sequence of its own takes the `;`-separated tactics after it, as the pin's
+//! `sepByIndent` does. Columns count codepoints. A `(conv| …)` quotation holds one of them.
 use super::*;
 
 fn symbol(tokens: &[LexedToken], at: usize, text: &str) -> bool {
@@ -15,14 +17,19 @@ fn word(tokens: &[LexedToken], at: usize, text: &str) -> bool {
     crate::term_locals::word(tokens, at, text)
 }
 
+/// The token's column in codepoints, as the pin's positions count it: `· lhs` puts `lhs` at
+/// the column of a line indented by four spaces under it, though `·` is two bytes.
 fn column(view: &SourceView, tokens: &[LexedToken], at: usize) -> usize {
     let pos = tokens[at].extent.start();
     let source = view.normalized();
-    pos.0
-        - source
-            .line_start(source.line_of(pos))
-            .expect("token line")
-            .0
+    let start = source
+        .line_start(source.line_of(pos))
+        .expect("token line")
+        .0;
+    source
+        .as_str()
+        .get(start..pos.0)
+        .map_or(pos.0 - start, |prefix| prefix.chars().count())
 }
 
 fn starts_line(view: &SourceView, tokens: &[LexedToken], at: usize) -> bool {
@@ -75,14 +82,18 @@ pub(super) fn tactic(
         null_node(Vec::new())
     };
     let in_slot = if symbol(tokens, next, "in") && next + 1 < arrow {
+        let (occs, after) = occurrences(leaves, view, tokens, next + 1, arrow)?;
+        if after >= arrow {
+            return Err(refusal(view, tokens, after));
+        }
         let term = bounded_term(
             leaves,
             view,
             tokens,
-            next + 1..arrow,
+            after..arrow,
             DefinitionGrammar::Scalar,
         )?;
-        let slot = null_node(vec![leaves.leaf(next)?, null_node(Vec::new()), term]);
+        let slot = null_node(vec![leaves.leaf(next)?, occs, term]);
         next = arrow;
         slot
     } else {
@@ -111,8 +122,85 @@ pub(super) fn quoted(
     conv_tactic(leaves, view, tokens, range)
 }
 
-/// `convSeq1Indented := sepByIndent conv "; "`: conv tactics separated by `;` or by a line at the
-/// first one's column (the pin's empty separator).
+/// `occs := atomic("(" &"occs") " := " (occsWildcard <|> occsIndexed) ") "` at `at`, if there is
+/// one before `limit`: the optional slot holding it, and where the term after it starts.
+fn occurrences(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    at: usize,
+    limit: usize,
+) -> Result<(Syntax, usize), NatDefinitionParseError> {
+    if !(symbol(tokens, at, "(") && word(tokens, at + 1, "occs") && symbol(tokens, at + 2, ":=")) {
+        return Ok((null_node(Vec::new()), at));
+    }
+    let atom = |at: usize, text: &str| -> Result<Syntax, NatDefinitionParseError> {
+        Ok(Syntax::Atom {
+            info: leaves.leaf(at)?.info(),
+            val: text.to_owned(),
+        })
+    };
+    let mut close = at + 3;
+    while close < limit && !symbol(tokens, close, ")") {
+        close += 1;
+    }
+    if close >= limit || close == at + 3 {
+        return Err(refusal(view, tokens, close.min(limit.saturating_sub(1))));
+    }
+    let inner = if symbol(tokens, at + 3, "*") {
+        if close != at + 4 {
+            return Err(refusal(view, tokens, at + 4));
+        }
+        Syntax::node(conv_kind("occsWildcard"), vec![leaves.leaf(at + 3)?])
+    } else {
+        let mut numbers = Vec::new();
+        for index in at + 3..close {
+            if !matches!(tokens[index].kind, TokenKind::Literal(LiteralKind::Nat)) {
+                return Err(refusal(view, tokens, index));
+            }
+            numbers.push(Syntax::node(
+                Name::str(Name::anonymous(), "num"),
+                vec![leaves.leaf(index)?],
+            ));
+        }
+        Syntax::node(conv_kind("occsIndexed"), vec![null_node(numbers)])
+    };
+    let occs = Syntax::node(
+        conv_kind("occs"),
+        vec![
+            leaves.leaf(at)?,
+            atom(at + 1, "occs")?,
+            leaves.leaf(at + 2)?,
+            inner,
+            leaves.leaf(close)?,
+        ],
+    );
+    Ok((null_node(vec![occs]), close + 1))
+}
+
+/// The index of the bracket closing the one at `open`, before `limit`.
+fn closing(tokens: &[LexedToken], open: usize, limit: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    for (at, token) in tokens.iter().enumerate().take(limit).skip(open) {
+        if let TokenKind::Symbol(s) = &token.kind {
+            match crate::canonical_bracket(s.as_str()) {
+                "(" | "[" | "{" | ".{" | "⦃" | "⟨" => depth += 1,
+                ")" | "]" | "}" | "⦄" | "⟩" => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        return Some(at);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
+/// `convSeq := convSeqBracketed <|> convSeq1Indented`, where `convSeqBracketed := "{"
+/// sepByIndentSemicolon(conv) "}"` and `convSeq1Indented := sepByIndent conv "; "`: conv tactics
+/// separated by `;` or by a line at the first one's column (the pin's empty separator).
 fn sequence(
     leaves: &Leaves,
     view: &SourceView,
@@ -122,14 +210,63 @@ fn sequence(
     if range.is_empty() {
         return Err(refusal(view, tokens, range.start));
     }
+    if symbol(tokens, range.start, "{")
+        && closing(tokens, range.start, range.end) == Some(range.end - 1)
+    {
+        return Ok(Syntax::node(
+            conv_kind("convSeq"),
+            vec![bracketed(leaves, view, tokens, range)?],
+        ));
+    }
+    Ok(Syntax::node(
+        conv_kind("convSeq"),
+        vec![Syntax::node(
+            conv_kind("convSeq1Indented"),
+            vec![null_node(items(leaves, view, tokens, range)?)],
+        )],
+    ))
+}
+
+/// `convSeqBracketed := "{" sepByIndentSemicolon(conv) "}"` over `range`, its braces included.
+fn bracketed(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    range: Range<usize>,
+) -> Result<Syntax, NatDefinitionParseError> {
+    let inner = range.start + 1..range.end - 1;
+    let rows = if inner.is_empty() {
+        Vec::new()
+    } else {
+        items(leaves, view, tokens, inner)?
+    };
+    Ok(Syntax::node(
+        conv_kind("convSeqBracketed"),
+        vec![
+            leaves.leaf(range.start)?,
+            null_node(rows),
+            leaves.leaf(range.end - 1)?,
+        ],
+    ))
+}
+
+/// The tactics and separators of a `sepByIndent conv "; "` over `range`.
+fn items(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    range: Range<usize>,
+) -> Result<Vec<Syntax>, NatDefinitionParseError> {
     let base = column(view, tokens, range.start);
     let mut items = Vec::new();
     let mut item = range.start;
     let mut depth = 0usize;
     for at in range.start..=range.end {
+        // A tactic ending in a sequence of its own (`conv => s`, `· s`, `try s`, `first | s`,
+        // `tactic => t`, …) takes the `;`-separated tactics after it into that sequence.
         let boundary = at == range.end
             || depth == 0
-                && (symbol(tokens, at, ";")
+                && (symbol(tokens, at, ";") && !takes_sequence(tokens, item)
                     || at > item
                         && starts_line(view, tokens, at)
                         && column(view, tokens, at) == base);
@@ -154,25 +291,79 @@ fn sequence(
             }
         }
     }
-    Ok(Syntax::node(
-        conv_kind("convSeq"),
-        vec![Syntax::node(
-            conv_kind("convSeq1Indented"),
-            vec![null_node(items)],
-        )],
-    ))
+    Ok(items)
 }
 
-/// `argArg := "@"? "-"? num` with only the numeral.
-fn arg_arg(leaves: &Leaves, at: usize) -> Result<Syntax, NatDefinitionParseError> {
-    Ok(Syntax::node(
-        conv_kind("argArg"),
-        vec![
-            null_node(Vec::new()),
-            null_node(Vec::new()),
-            Syntax::node(Name::str(Name::anonymous(), "num"), vec![leaves.leaf(at)?]),
-        ],
-    ))
+/// Whether the conv tactic at `at` ends in a sequence (`convSeq` or `tacticSeq`) of its own.
+fn takes_sequence(tokens: &[LexedToken], at: usize) -> bool {
+    symbol(tokens, at, "·")
+        || symbol(tokens, at, ".")
+        || ["try", "repeat", "fail_if_success", "first"]
+            .iter()
+            .any(|keyword| word(tokens, at, keyword))
+        || ["conv", "tactic", "tactic'"]
+            .iter()
+            .any(|keyword| word(tokens, at, keyword) && symbol(tokens, at + 1, "=>"))
+}
+
+/// `argArg := "@"? "-"? num` at `at`, if there is one: the node and the index after it.
+fn arg_arg(
+    leaves: &Leaves,
+    tokens: &[LexedToken],
+    at: usize,
+) -> Result<Option<(Syntax, usize)>, NatDefinitionParseError> {
+    let mut next = at;
+    let explicit = if symbol(tokens, next, "@") {
+        next += 1;
+        null_node(vec![leaves.leaf(next - 1)?])
+    } else {
+        null_node(Vec::new())
+    };
+    let negative = if symbol(tokens, next, "-") {
+        next += 1;
+        null_node(vec![leaves.leaf(next - 1)?])
+    } else {
+        null_node(Vec::new())
+    };
+    if !matches!(
+        tokens.get(next).map(|t| &t.kind),
+        Some(TokenKind::Literal(LiteralKind::Nat))
+    ) {
+        return Ok(None);
+    }
+    Ok(Some((
+        Syntax::node(
+            conv_kind("argArg"),
+            vec![
+                explicit,
+                negative,
+                Syntax::node(
+                    Name::str(Name::anonymous(), "num"),
+                    vec![leaves.leaf(next)?],
+                ),
+            ],
+        ),
+        next + 1,
+    )))
+}
+
+/// `binderIdent := ident <|> hole` at `at`.
+fn binder_ident(
+    leaves: &Leaves,
+    tokens: &[LexedToken],
+    at: usize,
+) -> Result<Option<Syntax>, NatDefinitionParseError> {
+    let binder = if symbol(tokens, at, "_") {
+        Syntax::node(parser_kind(&["Term", "hole"]), vec![leaves.leaf(at)?])
+    } else if matches!(tokens.get(at).map(|t| &t.kind), Some(TokenKind::Ident(_))) {
+        leaves.leaf(at)?
+    } else {
+        return Ok(None);
+    };
+    Ok(Some(Syntax::node(
+        Name::from_components(["Lean", "binderIdent"]),
+        vec![binder],
+    )))
 }
 
 /// `macro:1 x:conv tk:" <;> " y:conv:0 : conv` (`Init/Conv.lean`): the operands between the
@@ -239,12 +430,6 @@ fn conv_operand(
     range: Range<usize>,
 ) -> Result<Syntax, NatDefinitionParseError> {
     let start = range.start;
-    let number = |at: usize| {
-        matches!(
-            tokens.get(at).map(|t| &t.kind),
-            Some(TokenKind::Literal(LiteralKind::Nat))
-        )
-    };
     let atom = |at: usize, text: &str| -> Result<Syntax, NatDefinitionParseError> {
         Ok(Syntax::Atom {
             info: leaves.leaf(at)?.info(),
@@ -259,34 +444,73 @@ fn conv_operand(
     {
         return Ok(Syntax::node(conv_kind(kind), vec![atom(start, name)?]));
     }
-    if word(tokens, start, "arg") && range.len() == 2 && number(start + 1) {
+    // `"arg " argArg` (`Conv.arg`), `argArg := "@"? "-"? num`.
+    if word(tokens, start, "arg")
+        && let Some((argument, next)) = arg_arg(leaves, tokens, start + 1)?
+        && next == range.end
+    {
         return Ok(Syntax::node(
             conv_kind("arg"),
-            vec![atom(start, "arg")?, arg_arg(leaves, start + 1)?],
+            vec![atom(start, "arg")?, argument],
         ));
     }
+    // `"enter" " [" enterArg,+ "]"` (`Conv.enter`), `enterArg := binderIdent <|> argArg <|>
+    // enterPattern` and `enterPattern := "in " (occs)? term`.
     if word(tokens, start, "enter")
         && range.len() >= 4
         && symbol(tokens, start + 1, "[")
         && symbol(tokens, range.end - 1, "]")
     {
+        let close = range.end - 1;
         let mut args = Vec::new();
         let mut at = start + 2;
-        while at < range.end - 1 {
-            if !number(at) {
+        while at < close {
+            // The argument runs to the next top-level comma.
+            let mut end = at;
+            let mut depth = 0usize;
+            while end < close && !(depth == 0 && symbol(tokens, end, ",")) {
+                if let TokenKind::Symbol(s) = &tokens[end].kind {
+                    match crate::canonical_bracket(s.as_str()) {
+                        "(" | "[" | "{" | ".{" | "⦃" | "⟨" => depth += 1,
+                        ")" | "]" | "}" | "⦄" | "⟩" => depth = depth.saturating_sub(1),
+                        _ => {}
+                    }
+                }
+                end += 1;
+            }
+            if end == at {
                 return Err(refusal(view, tokens, at));
             }
-            args.push(Syntax::node(
-                conv_kind("enterArg"),
-                vec![arg_arg(leaves, at)?],
-            ));
-            at += 1;
-            if at < range.end - 1 {
-                if !symbol(tokens, at, ",") {
-                    return Err(refusal(view, tokens, at));
+            let inner = if let Some((argument, next)) = arg_arg(leaves, tokens, at)?
+                && next == end
+            {
+                argument
+            } else if end == at + 1
+                && let Some(binder) = binder_ident(leaves, tokens, at)?
+            {
+                binder
+            } else if symbol(tokens, at, "in") {
+                let (occs, after) = occurrences(leaves, view, tokens, at + 1, end)?;
+                if after >= end {
+                    return Err(refusal(view, tokens, after.min(end)));
                 }
+                let term =
+                    bounded_term(leaves, view, tokens, after..end, DefinitionGrammar::Scalar)?;
+                Syntax::node(
+                    conv_kind("enterPattern"),
+                    vec![leaves.leaf(at)?, occs, term],
+                )
+            } else {
+                return Err(refusal(view, tokens, at));
+            };
+            args.push(Syntax::node(conv_kind("enterArg"), vec![inner]));
+            at = end;
+            if at < close {
                 args.push(leaves.leaf(at)?);
                 at += 1;
+                if at == close {
+                    return Err(refusal(view, tokens, at));
+                }
             }
         }
         return Ok(Syntax::node(
@@ -305,17 +529,10 @@ fn conv_operand(
         if word(tokens, start, name) {
             let mut names = Vec::new();
             for at in start + 1..range.end {
-                let binder = if symbol(tokens, at, "_") {
-                    Syntax::node(parser_kind(&["Term", "hole"]), vec![leaves.leaf(at)?])
-                } else if matches!(&tokens[at].kind, TokenKind::Ident(_)) {
-                    leaves.leaf(at)?
-                } else {
+                let Some(binder) = binder_ident(leaves, tokens, at)? else {
                     return Err(refusal(view, tokens, at));
                 };
-                names.push(Syntax::node(
-                    Name::from_components(["Lean", "binderIdent"]),
-                    vec![binder],
-                ));
+                names.push(binder);
             }
             return Ok(Syntax::node(
                 conv_kind(kind),
@@ -424,6 +641,145 @@ fn conv_operand(
     }
     if word(tokens, start, "first") && symbol(tokens, start + 1, "|") {
         return first_operand(leaves, view, tokens, range, atom(start, "first")?);
+    }
+    extended_operand(leaves, view, tokens, range)
+}
+
+/// The conv tactics beyond [`conv_operand`]'s: `dsimp`, `pattern`, `clear`, a nested `conv =>`,
+/// `try`, `repeat`, `fail_if_success`, `{ … }`, `( … )` and `calc`.
+#[inline(never)]
+fn extended_operand(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    range: Range<usize>,
+) -> Result<Syntax, NatDefinitionParseError> {
+    let start = range.start;
+    let atom = |at: usize, text: &str| -> Result<Syntax, NatDefinitionParseError> {
+        Ok(Syntax::Atom {
+            info: leaves.leaf(at)?.info(),
+            val: text.to_owned(),
+        })
+    };
+    // `"dsimp" optConfig (discharger)? (&" only")? (" [" (simpErase <|> simpLemma),* "]")?`
+    // (`Conv.dsimp`): `dsimp`'s slots without a location.
+    if word(tokens, start, "dsimp") {
+        let keyword = atom(start, "dsimp")?;
+        let simplified = simplify(leaves, view, tokens, range, keyword, "dsimp")?;
+        let Syntax::Node { args, .. } = &simplified else {
+            return Err(refusal(view, tokens, start));
+        };
+        let [keyword, config, discharger, only, rules, location] = args.as_slice() else {
+            return Err(refusal(view, tokens, start));
+        };
+        if !matches!(location, Syntax::Node { args, .. } if args.is_empty()) {
+            return Err(refusal(view, tokens, start));
+        }
+        return Ok(Syntax::node(
+            conv_kind("dsimp"),
+            vec![
+                keyword.clone(),
+                config.clone(),
+                discharger.clone(),
+                only.clone(),
+                rules.clone(),
+            ],
+        ));
+    }
+    // `"pattern " (occs)? term` (`Conv.pattern`).
+    if word(tokens, start, "pattern") && range.len() > 1 {
+        let (occs, after) = occurrences(leaves, view, tokens, start + 1, range.end)?;
+        if after >= range.end {
+            return Err(refusal(view, tokens, after.min(range.end - 1)));
+        }
+        let term = bounded_term(
+            leaves,
+            view,
+            tokens,
+            after..range.end,
+            DefinitionGrammar::Scalar,
+        )?;
+        return Ok(Syntax::node(
+            conv_kind("pattern"),
+            vec![atom(start, "pattern")?, occs, term],
+        ));
+    }
+    // `"clear" (ppSpace colGt term:max)+` (`Conv.clear`), its terms the locals' names.
+    if word(tokens, start, "clear") && range.len() > 1 {
+        let mut names = Vec::new();
+        for at in start + 1..range.end {
+            if !matches!(&tokens[at].kind, TokenKind::Ident(_)) {
+                return Err(refusal(view, tokens, at));
+            }
+            names.push(leaves.leaf(at)?);
+        }
+        return Ok(Syntax::node(
+            conv_kind("clear"),
+            vec![atom(start, "clear")?, null_node(names)],
+        ));
+    }
+    // `"conv" " => " convSeq` (`Conv.convConvSeq`).
+    if word(tokens, start, "conv") && symbol(tokens, start + 1, "=>") && range.len() > 2 {
+        return Ok(Syntax::node(
+            conv_kind("convConvSeq"),
+            vec![
+                atom(start, "conv")?,
+                leaves.leaf(start + 1)?,
+                sequence(leaves, view, tokens, start + 2..range.end)?,
+            ],
+        ));
+    }
+    // `macro "try " t:convSeq : conv` (`convTry_`), `syntax "repeat " convSeq : conv`
+    // (`convRepeat_`) and `macro "fail_if_success " convSeq : conv` (`Conv.failIfSuccess`).
+    for (name, kind) in [
+        ("try", "convTry_"),
+        ("repeat", "convRepeat_"),
+        ("fail_if_success", "failIfSuccess"),
+    ] {
+        if word(tokens, start, name) && range.len() > 1 {
+            return Ok(Syntax::node(
+                conv_kind(kind),
+                vec![
+                    atom(start, name)?,
+                    sequence(leaves, view, tokens, start + 1..range.end)?,
+                ],
+            ));
+        }
+    }
+    // `convSeqBracketed` (`Conv.nestedConv`) and `"(" convSeq ")"` (`Conv.paren`).
+    if symbol(tokens, start, "{") && closing(tokens, start, range.end) == Some(range.end - 1) {
+        return Ok(Syntax::node(
+            conv_kind("nestedConv"),
+            vec![bracketed(leaves, view, tokens, range)?],
+        ));
+    }
+    if symbol(tokens, start, "(")
+        && closing(tokens, start, range.end) == Some(range.end - 1)
+        && range.len() > 2
+    {
+        return Ok(Syntax::node(
+            conv_kind("paren"),
+            vec![
+                leaves.leaf(start)?,
+                sequence(leaves, view, tokens, start + 1..range.end - 1)?,
+                leaves.leaf(range.end - 1)?,
+            ],
+        ));
+    }
+    // `macro tk:"calc" steps:calcSteps : conv` (`Lean.convCalc_`, `Init/NotationExtra.lean`).
+    if symbol(tokens, start, "calc") {
+        let (calculation, end) =
+            super::elimination::calculation(leaves, view, tokens, start, range.end)?;
+        if end != range.end {
+            return Err(refusal(view, tokens, end));
+        }
+        let Syntax::Node { args, .. } = &calculation else {
+            return Err(refusal(view, tokens, start));
+        };
+        return Ok(Syntax::node(
+            Name::from_components(["Lean", "convCalc_"]),
+            args.clone(),
+        ));
     }
     Err(refusal(view, tokens, start))
 }

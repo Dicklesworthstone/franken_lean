@@ -1156,7 +1156,7 @@ impl Model<'_> {
                 .collect::<Vec<_>>();
             let paths = self
                 .cx
-                .record_pattern_paths(family, &labels, record.ellipsis)?;
+                .record_pattern_paths(&expected, &labels, record.ellipsis)?;
             let Some(info) = self.inductive(family) else {
                 return Ok(Err(Stop::Unknown));
             };

@@ -436,6 +436,179 @@ fn array_and_sarray_facts() {
 }
 
 #[test]
+fn owned_array_updates_reuse_storage_and_preserve_shared_values() {
+    let _guard = lock();
+    shadow::enable();
+    {
+        let mut array = Obj::mk_array(Vec::new());
+        let mut growths = 0;
+        for value in 0..1000 {
+            let identity = array.identity_token();
+            let (size, capacity) = array.array_view();
+            array = array
+                .try_array_push(Obj::mk_nat(value))
+                .unwrap_or_else(|_| panic!("a well-formed array must support push"));
+            assert_eq!(array.array_view().0, size + 1);
+            if size < capacity {
+                assert_eq!(array.identity_token(), identity);
+            } else {
+                growths += 1;
+                assert_eq!(array.array_view().1, (capacity + 1) * 2);
+            }
+        }
+        assert!(
+            growths < 16,
+            "push must grow geometrically, not per element"
+        );
+        let identity = array.identity_token();
+        array = array.try_array_set(3, Obj::mk_nat(42)).unwrap();
+        array = array.try_array_swap(3, 999).unwrap();
+        array = array.try_array_pop().unwrap();
+        assert_eq!(array.identity_token(), identity);
+        assert_eq!(array.array_child(3).unbox(), 999);
+        assert_eq!(array.array_view().0, 999);
+
+        let original = Obj::mk_array(vec![Obj::mk_string("first"), Obj::mk_string("last")]);
+        let pushed = original
+            .clone_ref()
+            .try_array_push(Obj::mk_string("new"))
+            .unwrap_or_else(|_| panic!("a shared array must support push"));
+        let set = original
+            .clone_ref()
+            .try_array_set(0, Obj::mk_string("new"))
+            .unwrap();
+        let swapped = original.clone_ref().try_array_swap(0, 1).unwrap();
+        let popped = original.clone_ref().try_array_pop().unwrap();
+        assert_eq!(original.array_view().0, 2);
+        assert_eq!(original.array_child(0).string_view().3, b"first\0");
+        assert_eq!(original.array_child(1).string_view().3, b"last\0");
+        assert_eq!(pushed.array_view().0, 3);
+        assert_eq!(set.array_child(0).string_view().3, b"new\0");
+        assert_eq!(swapped.array_child(0).string_view().3, b"last\0");
+        assert_eq!(popped.array_view().0, 1);
+        for changed in [&pushed, &set, &swapped, &popped] {
+            assert_ne!(changed.identity_token(), original.identity_token());
+        }
+    }
+    let (events, live) = shadow::disable_and_drain();
+    assert_eq!(live, 0);
+    assert!(events.iter().all(|event| !matches!(
+        event.kind,
+        EventKind::DoubleRelease | EventKind::ForeignPointer
+    )));
+}
+
+#[test]
+fn shared_array_updates_preserve_reserved_capacity() {
+    let _guard = lock();
+    shadow::enable();
+    for multithreaded in [false, true] {
+        let mut original = Obj::mk_array(Vec::new());
+        for value in 0..3 {
+            original = original
+                .try_array_push(Obj::mk_nat(value))
+                .unwrap_or_else(|_| panic!("a well-formed array must support push"));
+        }
+        let (size, capacity) = original.array_view();
+        assert!(capacity > size);
+        if multithreaded {
+            original.make_mt();
+        }
+        let updates = [
+            original
+                .clone_ref()
+                .try_array_set(0, Obj::mk_nat(42))
+                .unwrap(),
+            original.clone_ref().try_array_swap(0, 2).unwrap(),
+            original.clone_ref().try_array_pop().unwrap(),
+        ];
+        for updated in updates {
+            assert_eq!(updated.array_view().1, capacity);
+            let identity = updated.identity_token();
+            let pushed = updated
+                .try_array_push(Obj::mk_nat(9))
+                .unwrap_or_else(|_| panic!("a copied array must support push"));
+            assert_eq!(pushed.identity_token(), identity);
+            assert_eq!(pushed.array_view().1, capacity);
+        }
+        assert_eq!(original.array_view(), (size, capacity));
+        for index in 0..size {
+            assert_eq!(original.array_child(index).unbox(), index);
+        }
+    }
+    let (events, live) = shadow::disable_and_drain();
+    assert_eq!(live, 0);
+    assert!(events.iter().all(|event| !matches!(
+        event.kind,
+        EventKind::DoubleRelease | EventKind::ForeignPointer
+    )));
+}
+
+#[test]
+fn owned_array_updates_check_bounds_and_release_each_removed_child_once() {
+    let _guard = lock();
+    shadow::enable();
+    {
+        let child = Obj::mk_string("owned child");
+        let array = Obj::mk_array(vec![child.clone_ref()]);
+        assert_eq!(child.header().rc, 2);
+        let array = array.try_array_set(0, Obj::mk_nat(3)).unwrap();
+        assert_eq!(child.header().rc, 1);
+        let array = array
+            .try_array_push(child.clone_ref())
+            .unwrap_or_else(|_| panic!("an owned child must be transferred"));
+        assert_eq!(child.header().rc, 2);
+        let array = array.try_array_pop().unwrap();
+        assert_eq!(child.header().rc, 1);
+        assert!(
+            array
+                .clone_ref()
+                .try_array_set(1, child.clone_ref())
+                .is_none()
+        );
+        assert!(array.clone_ref().try_array_swap(0, usize::MAX).is_none());
+        assert_eq!(
+            child.header().rc,
+            1,
+            "rejected replacement releases its value"
+        );
+        assert_eq!(array.array_child(0).unbox(), 3);
+        for invalid in [Obj::mk_nat(0), Obj::mk_string("not an array")] {
+            assert!(
+                invalid
+                    .clone_ref()
+                    .try_array_push(child.clone_ref())
+                    .is_err()
+            );
+            assert!(
+                invalid
+                    .clone_ref()
+                    .try_array_set(0, child.clone_ref())
+                    .is_none()
+            );
+            assert!(invalid.clone_ref().try_array_swap(0, 0).is_none());
+            assert!(invalid.try_array_pop().is_none());
+        }
+        let empty = Obj::mk_array(Vec::new());
+        let identity = empty.identity_token();
+        assert_eq!(empty.try_array_pop().unwrap().identity_token(), identity);
+
+        let mt = Obj::mk_array(vec![child.clone_ref()]);
+        mt.make_mt();
+        let identity = mt.identity_token();
+        let changed = mt.try_array_set(0, Obj::mk_nat(7)).unwrap();
+        assert_ne!(changed.identity_token(), identity, "MT objects must copy");
+        assert_eq!(child.header().rc, -1, "the child retains one MT reference");
+    }
+    let (events, live) = shadow::disable_and_drain();
+    assert_eq!(live, 0);
+    assert!(events.iter().all(|event| !matches!(
+        event.kind,
+        EventKind::DoubleRelease | EventKind::ForeignPointer
+    )));
+}
+
+#[test]
 fn closure_ref_thunk_task_mpz_facts() {
     let _g = lock();
     let cl = Obj::mk_closure(3, vec![Obj::mk_nat(9), Obj::mk_string("fixed")]);
@@ -2829,6 +3002,168 @@ fn export_array_list_roundtrip_and_push_laws() {
         export_lean_dec_ref_cold(pushed);
         export_lean_dec_ref_cold(arr);
     }
+}
+
+#[test]
+fn owned_array_push_reuses_capacity_and_preserves_aliases() {
+    let _guard = lock();
+    shadow::enable();
+    {
+        let mut array = Obj::mk_array(Vec::new());
+        for index in 0..2048 {
+            array = array
+                .try_array_push(Obj::mk_nat(index))
+                .unwrap_or_else(|_| panic!("a well-formed array must support push"));
+        }
+        assert_eq!(array.array_view().0, 2048);
+        for index in 0..2048 {
+            assert_eq!(array.array_child(index).unbox(), index);
+        }
+        let array = array
+            .try_array_push(Obj::mk_string("old element"))
+            .unwrap_or_else(|_| panic!("owned child must be transferred"));
+        let alias = array.clone_ref();
+        let pushed = array
+            .try_array_push(Obj::mk_string("new element"))
+            .unwrap_or_else(|_| panic!("a shared array must support push"));
+        assert_eq!(alias.array_view().0, 2049);
+        assert_eq!(alias.array_child(2047).unbox(), 2047);
+        assert_eq!(alias.array_child(2048).string_view().3, b"old element\0");
+        assert_eq!(pushed.array_view().0, 2050);
+        assert_eq!(pushed.array_child(2048).string_view().3, b"old element\0");
+        assert_eq!(pushed.array_child(2049).string_view().3, b"new element\0");
+    }
+    let (events, live) = shadow::disable_and_drain();
+    assert_eq!(live, 0);
+    let allocations = events
+        .iter()
+        .filter(|event| {
+            event.kind == EventKind::Alloc && event.category == Some(contract::TAG_ARRAY)
+        })
+        .count();
+    assert!(
+        allocations <= 16,
+        "push copied on every append: {allocations}"
+    );
+    assert!(events.iter().all(|event| !matches!(
+        event.kind,
+        EventKind::DoubleRelease | EventKind::ForeignPointer
+    )));
+}
+
+#[test]
+fn owned_array_push_returns_invalid_inputs_without_consuming_them() {
+    let _guard = lock();
+    for invalid in [Obj::mk_nat(3), Obj::mk_string("not an array")] {
+        let (original, element) = invalid
+            .try_array_push(Obj::mk_string("retained"))
+            .err()
+            .expect("the array category must be checked before transfer");
+        assert!(original.try_array_view().is_none());
+        assert_eq!(element.string_view().3, b"retained\0");
+    }
+    let array = Obj::mk_array(vec![Obj::mk_nat(9)]);
+    array.plant_array_size(2);
+    let (original, element) = array
+        .try_array_push(Obj::mk_nat(10))
+        .err()
+        .expect("an inconsistent header must retain both input handles");
+    original.restore_array_size(1);
+    assert_eq!(original.array_child(0).unbox(), 9);
+    assert_eq!(element.unbox(), 10);
+}
+
+#[test]
+fn owned_byte_array_push_reuses_capacity_and_preserves_aliases() {
+    let _guard = lock();
+    shadow::enable();
+    {
+        let array = Obj::mk_sarray(1, &[])
+            .try_byte_array_push(0)
+            .unwrap_or_else(|_| panic!("an empty byte array must support push"));
+        assert_eq!(
+            array.try_borrow_sarray_view().unwrap(),
+            (1, 1, 2, [0].as_slice())
+        );
+        let identity = array.identity_token();
+        let mut array = array
+            .try_byte_array_push(1)
+            .unwrap_or_else(|_| panic!("exclusive spare capacity must support push"));
+        assert_eq!(array.identity_token(), identity);
+        for index in 2..2048 {
+            array = array
+                .try_byte_array_push(u8::try_from(index % 256).unwrap())
+                .unwrap_or_else(|_| panic!("a well-formed byte array must support push"));
+        }
+        let (element_size, size, capacity, bytes) = array.try_borrow_sarray_view().unwrap();
+        assert_eq!((element_size, size, capacity), (1, 2048, 4094));
+        for (index, &byte) in bytes.iter().enumerate() {
+            assert_eq!(usize::from(byte), index % 256);
+        }
+        let alias = array.clone_ref();
+        let pushed = array
+            .try_byte_array_push(255)
+            .unwrap_or_else(|_| panic!("a shared byte array must support push"));
+        let (_, old_size, old_capacity, old) = alias.try_borrow_sarray_view().unwrap();
+        let (_, new_size, new_capacity, new) = pushed.try_borrow_sarray_view().unwrap();
+        assert_eq!((old_size, old_capacity), (2048, 4094));
+        assert_eq!((new_size, new_capacity), (2049, 4094));
+        assert_ne!(alias.identity_token(), pushed.identity_token());
+        assert_eq!(&new[..old_size], old);
+        assert_eq!(new[old_size], 255);
+    }
+    let (events, live) = shadow::disable_and_drain();
+    assert_eq!(live, 0);
+    let allocations = events
+        .iter()
+        .filter(|event| {
+            event.kind == EventKind::Alloc && event.category == Some(contract::TAG_SCALAR_ARRAY)
+        })
+        .count();
+    assert!(
+        allocations <= 16,
+        "byte push copied on every append: {allocations}"
+    );
+    assert!(events.iter().all(|event| !matches!(
+        event.kind,
+        EventKind::DoubleRelease | EventKind::ForeignPointer
+    )));
+}
+
+#[test]
+fn owned_byte_array_push_returns_invalid_inputs_without_consuming_them() {
+    let _guard = lock();
+    for invalid in [
+        Obj::mk_nat(3),
+        Obj::mk_string("not a byte array"),
+        Obj::mk_array(Vec::new()),
+        Obj::mk_sarray(2, &[1, 2]),
+        Obj::mk_sarray(8, &[0; 8]),
+    ] {
+        let identity = invalid.identity_token();
+        let original = invalid
+            .try_byte_array_push(7)
+            .err()
+            .expect("category and byte width must be checked before transfer");
+        assert_eq!(original.identity_token(), identity);
+    }
+    let array = Obj::mk_sarray(1, &[9]);
+    array.plant_sarray_size(2);
+    let original = array
+        .try_byte_array_push(10)
+        .err()
+        .expect("an inconsistent header must retain the input handle");
+    original.restore_sarray_size(1);
+    assert_eq!(original.try_borrow_sarray_view().unwrap().3, &[9]);
+
+    let array = Obj::mk_sarray(1, &[11]);
+    array.plant_sarray_elem(0);
+    let original = array
+        .try_byte_array_push(12)
+        .err()
+        .expect("zero element width must retain the input handle");
+    original.plant_sarray_elem(1);
+    assert_eq!(original.try_borrow_sarray_view().unwrap().3, &[11]);
 }
 
 #[test]

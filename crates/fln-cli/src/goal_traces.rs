@@ -28,6 +28,17 @@ impl Message<'_> {
     ) -> Result<(), MultiplexerOutput> {
         match self {
             Self::Warning(warning) => emit_lean_warning(warning, sink, guards, stdout),
+            // An information message (`simp?`'s suggestion) is exact text at `info:` severity,
+            // printed without a position, as the pin prints information messages.
+            Self::Trace(trace) if trace.is_info => {
+                let mut discarded = Vec::new();
+                let target = guards
+                    .get_mut(&trace.command_index)
+                    .and_then(|guard| guard.evaluation_target(&mut discarded));
+                budget
+                    .append(&trace.message, stdout, target)
+                    .map_err(|error| error.failure(trace.command_index, SourcePresentation::Lean))
+            }
             Self::Trace(trace) => {
                 let mut discarded = Vec::new();
                 let target = guards.get_mut(&trace.command_index).and_then(|guard| {

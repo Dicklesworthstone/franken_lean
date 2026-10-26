@@ -305,6 +305,8 @@ pub(crate) fn tactic(
             "apply_rules",
             "apply",
             "refine",
+            // `syntax (name := refine') "refine' " term : tactic` (`Init/Tactics.lean:250`).
+            "refine'",
             "constructor",
             "left",
             "right",
@@ -322,6 +324,10 @@ pub(crate) fn tactic(
             "simp",
             "simp_all",
             "simpa",
+            // An identifier may end in `?` (`isIdRest`), so these lex as names.
+            "simp?",
+            "simp_all?",
+            "dsimp?",
             "subst",
             "injection",
             "contradiction",
@@ -336,6 +342,9 @@ pub(crate) fn tactic(
             "fail",
             "omega",
             "unfold",
+            // `syntax (name := delta) "delta" (ppSpace colGt ident)+ (location)? : tactic`
+            // (`Init/Tactics.lean:812`), `unfold`'s shape.
+            "delta",
             "split",
             "rwa",
             "intros",
@@ -371,6 +380,13 @@ pub(crate) fn tactic(
             // `syntax (name := guardTarget) "guard_target " equal term : tactic` (`Init/Guard.lean:75`).
             "guard_target",
             "guard_hyp",
+            // `syntax (name := guardExpr) "guard_expr " term:51 equal term : tactic`
+            // (`Init/Guard.lean:61`).
+            "guard_expr",
+            // `syntax "and_intros" : tactic` (`Init/Tactics.lean:1356`), kind `tacticAnd_intros`.
+            "and_intros",
+            // `syntax (name := rename) "rename " term " => " ident : tactic` (`Init/Tactics.lean:115`).
+            "rename",
             // `macro "admit" : tactic => `(tactic| sorry)` (`Init/Tactics.lean:462`).
             "admit",
             // `syntax (name := traceState) "trace_state" : tactic` and
@@ -392,6 +408,13 @@ pub(crate) fn tactic(
         // `macro "sorry" : tactic => `(tactic| exact sorry)` (`Init/Tactics.lean:459`).
         TokenKind::Symbol(symbol) if symbol == "sorry" => Some("sorry"),
         TokenKind::Symbol(symbol) if symbol == "admit" => Some("admit"),
+        // `"simp?" "!"? simpTraceArgsRest`, `"simp_all?" "!"? simpAllTraceArgsRest` and
+        // `"dsimp?" "!"? dsimpTraceArgsRest` (`Init/Tactics.lean:728-746`), should an imported
+        // token table classify them as symbols; their elaboration requires the declaring
+        // syntax (`require_declared_tactic`).
+        TokenKind::Symbol(symbol) if symbol == "simp?" => Some("simp?"),
+        TokenKind::Symbol(symbol) if symbol == "simp_all?" => Some("simp_all?"),
+        TokenKind::Symbol(symbol) if symbol == "dsimp?" => Some("dsimp?"),
         _ => None,
     };
     let Some(keyword) = keyword else {
@@ -410,10 +433,11 @@ pub(crate) fn tactic(
         "simp" | "dsimp" => simplify(leaves, view, tokens, range, atom, keyword),
         "simp_all" => simplify_all(leaves, view, tokens, range, atom),
         "simpa" => simpa(leaves, view, tokens, range, atom),
+        "simp?" | "simp_all?" | "dsimp?" => simplify_trace(leaves, view, tokens, range, atom),
         "rw" | "rewrite" | "rwa" | "erw" | "rw_mod_cast" => {
             rewrite(leaves, view, tokens, range, atom, keyword)
         }
-        "unfold" | "split" => located(leaves, view, tokens, range, atom, keyword),
+        "unfold" | "split" | "delta" => located(leaves, view, tokens, range, atom, keyword),
         "obtain" | "rcases" | "rintro" | "ext" | "ext1" => {
             rcases::tactic(leaves, view, tokens, range, keyword, atom)
         }
@@ -424,9 +448,11 @@ pub(crate) fn tactic(
         "suffices" => suffices(leaves, view, tokens, range, atom),
         "change" => change(leaves, view, tokens, range, atom),
         "guard_target" => guard_target(leaves, view, tokens, range, atom),
+        "guard_expr" => guard_expr(leaves, view, tokens, range, atom),
+        "rename" => rename(leaves, view, tokens, range, atom),
         "guard_hyp" => guard_hyp::parse(leaves, view, tokens, range, atom),
         // `"specialize " term` (`Init/Tactics.lean`) has `exact`'s shape.
-        "exact" | "apply" | "refine" | "specialize" | "show" => {
+        "exact" | "apply" | "refine" | "refine'" | "specialize" | "show" => {
             term_tactic(leaves, view, tokens, range, keyword, atom)
         }
         _ => local_tactic(leaves, view, tokens, range, keyword, atom),
@@ -670,6 +696,7 @@ fn local_tactic(
         | "decreasing_trivial_pre_omega"
         | "decreasing_tactic"
         | "trace_state"
+        | "and_intros"
             if range.end == start + 1 => {}
         // `"trace " str` (`Init/Tactics.lean`, `Lean.Parser.Tactic.traceMessage`).
         "trace"
@@ -771,6 +798,7 @@ fn local_tactic(
         "norm_cast" => "tacticNorm_cast__",
         "subst_eqs" => "substEqs",
         "rotate_left" => "rotateLeft",
+        "and_intros" => "tacticAnd_intros",
         "rotate_right" => "rotateRight",
         "native_decide" => "nativeDecide",
         _ => keyword,
@@ -942,6 +970,111 @@ fn guard_target(
     Ok(Syntax::node(
         parser_kind(&["Tactic", "guardTarget"]),
         vec![atom, equal, term],
+    ))
+}
+
+/// `"guard_expr " term:51 equal term` (`Init/Guard.lean:61`): every `equal` relation is at
+/// precedence 50, so the first one outside brackets ends the left term.
+#[inline(never)]
+fn guard_expr(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    range: Range<usize>,
+    atom: Syntax,
+) -> Result<Syntax, NatDefinitionParseError> {
+    let relation_kind = |at: usize| match &tokens[at].kind {
+        TokenKind::Symbol(symbol) => match symbol.as_str() {
+            "=" => Some("equalR"),
+            "=~" => Some("equalD"),
+            "=ₛ" => Some("equalS"),
+            "=ₐ" => Some("equalA"),
+            _ => None,
+        },
+        _ => None,
+    };
+    let mut depth = 0_usize;
+    let mut found = None;
+    for at in range.start + 1..range.end {
+        if let TokenKind::Symbol(symbol) = &tokens[at].kind {
+            match crate::canonical_bracket(symbol.as_str()) {
+                "(" | "[" | "{" | ".{" | "⦃" | "⟨" => depth += 1,
+                ")" | "]" | "}" | "⦄" | "⟩" => {
+                    depth = depth
+                        .checked_sub(1)
+                        .ok_or_else(|| refusal(view, tokens, at))?;
+                }
+                _ if depth == 0 => {
+                    if let Some(kind) = relation_kind(at) {
+                        found = Some((at, kind));
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let Some((relation, kind)) = found else {
+        return Err(refusal(view, tokens, range.end));
+    };
+    if relation == range.start + 1 || relation + 1 >= range.end {
+        return Err(refusal(view, tokens, relation));
+    }
+    let left = bounded_term(
+        leaves,
+        view,
+        tokens,
+        range.start + 1..relation,
+        DefinitionGrammar::Scalar,
+    )?;
+    let equal = Syntax::node(
+        parser_kind(&["equal"]),
+        vec![Syntax::node(
+            parser_kind(&[kind]),
+            vec![leaves.leaf(relation)?],
+        )],
+    );
+    let right = bounded_term(
+        leaves,
+        view,
+        tokens,
+        relation + 1..range.end,
+        DefinitionGrammar::Scalar,
+    )?;
+    Ok(Syntax::node(
+        parser_kind(&["Tactic", "guardExpr"]),
+        vec![atom, left, equal, right],
+    ))
+}
+
+/// `"rename " term " => " ident` (`Init/Tactics.lean:115`): the last `=>` outside brackets
+/// ends the type, which a `fun … =>` inside it does not reach.
+#[inline(never)]
+fn rename(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    range: Range<usize>,
+    atom: Syntax,
+) -> Result<Syntax, NatDefinitionParseError> {
+    let arrow = range.end.checked_sub(2).filter(|&arrow| {
+        arrow > range.start + 1
+            && matches!(&tokens[arrow].kind, TokenKind::Symbol(symbol) if symbol == "=>")
+            && matches!(&tokens[arrow + 1].kind, TokenKind::Ident(_))
+    });
+    let Some(arrow) = arrow else {
+        return Err(refusal(view, tokens, range.end.min(range.start + 1)));
+    };
+    let type_ = bounded_term(
+        leaves,
+        view,
+        tokens,
+        range.start + 1..arrow,
+        DefinitionGrammar::Scalar,
+    )?;
+    Ok(Syntax::node(
+        parser_kind(&["Tactic", "rename"]),
+        vec![atom, type_, leaves.leaf(arrow)?, leaves.leaf(arrow + 1)?],
     ))
 }
 
@@ -1340,7 +1473,7 @@ fn located(
 ) -> Result<Syntax, NatDefinitionParseError> {
     let (range, location) = locations::split(leaves, view, tokens, range)?;
     let arguments = range.start + 1..range.end;
-    let argument = if form == "unfold" {
+    let argument = if form == "unfold" || form == "delta" {
         if arguments.is_empty() {
             return Err(refusal(view, tokens, range.start));
         }
@@ -1615,6 +1748,93 @@ fn simpa(
         ),
     ];
     Ok(parsed)
+}
+
+/// `simp?`, `simp_all?` and `dsimp?` (`Init/Tactics.lean:714-746`): the keyword, an optional
+/// `!`, and the arguments of `simp`, `simp_all` and `dsimp` as one `…TraceArgsRest` node, whose
+/// rule list is its own `simpArgs` (`dsimpArgs`, without `*`) node, as the pin's trees have it.
+#[inline(never)]
+fn simplify_trace(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    range: Range<usize>,
+    keyword: Syntax,
+) -> Result<Syntax, NatDefinitionParseError> {
+    let Syntax::Atom { val: word, .. } = &keyword else {
+        unreachable!("a tactic keyword is an atom");
+    };
+    let word = word.clone();
+    let start = range.start;
+    let bang = matches!(tokens.get(start + 1).map(|t| &t.kind),
+        Some(TokenKind::Symbol(s)) if s == "!")
+        && start + 1 < range.end;
+    let bang_slot = if bang {
+        null_node(vec![leaves.leaf(start + 1)?])
+    } else {
+        null_node(Vec::new())
+    };
+    // The shared grammar reads its configuration after the token at its range's start.
+    let rest = if bang { start + 1 } else { start }..range.end;
+    let grammar = if word == "simp?" { "simp" } else { "dsimp" };
+    let mut parsed = simplify(leaves, view, tokens, rest, keyword.clone(), grammar)?;
+    let Syntax::Node { args, .. } = &mut parsed else {
+        unreachable!("simplify builds a tactic node");
+    };
+    let [_, config, discharger, only, mut arguments, location]: [Syntax; 6] = std::mem::take(args)
+        .try_into()
+        .expect("simplify builds six slots");
+    let list_kind = if word == "simp?" {
+        "simpArgs"
+    } else {
+        "dsimpArgs"
+    };
+    if let Syntax::Node { args, .. } = &mut arguments
+        && args.len() == 3
+    {
+        let inline = std::mem::take(args);
+        arguments = null_node(vec![Syntax::node(
+            parser_kind(&["Tactic", list_kind]),
+            inline,
+        )]);
+    }
+    let empty = |slot: &Syntax| matches!(slot, Syntax::Node { args, .. } if args.is_empty());
+    let (kind, rest_kind, rest) = match word.as_str() {
+        "simp?" => (
+            "simpTrace",
+            "simpTraceArgsRest",
+            vec![config, discharger, only, arguments, location],
+        ),
+        "simp_all?" => {
+            if !empty(&location) {
+                return Err(refusal(view, tokens, range.end));
+            }
+            (
+                "simpAllTrace",
+                "simpAllTraceArgsRest",
+                vec![config, discharger, only, arguments],
+            )
+        }
+        _ => {
+            // `dsimpTraceArgsRest := optConfig (&" only")? (dsimpArgs)? (ppSpace location)?`.
+            if !empty(&discharger) {
+                return Err(refusal(view, tokens, start + 1));
+            }
+            (
+                "dsimpTrace",
+                "dsimpTraceArgsRest",
+                vec![config, only, arguments, location],
+            )
+        }
+    };
+    Ok(Syntax::node(
+        parser_kind(&["Tactic", kind]),
+        vec![
+            keyword,
+            bang_slot,
+            Syntax::node(parser_kind(&["Tactic", rest_kind]), rest),
+        ],
+    ))
 }
 
 /// `(discharger)?` at `at` (`Init/Tactics.lean`): `"(" patternIgnore("discharger" <|> "disch") " := "

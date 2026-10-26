@@ -14,6 +14,8 @@ use std::path::{Path, PathBuf};
 #[cfg(test)]
 mod bytes;
 #[cfg(test)]
+mod flush;
+#[cfg(test)]
 mod read;
 #[cfg(test)]
 mod read_dir;
@@ -88,13 +90,25 @@ fn activate_source_metadata(
     module: &str,
 ) -> Environment {
     use fln_elab::instances::imported;
-    // Ordinary do sequencing and catch need their real class/projection
+    // Ordinary do sequencing, return and catch need their real class/projection
     // journals just as a string path needs the actual coercion chain.
     // These are imported rows, preserving priority, order, scope and keys.
     let (class_labels, instance_labels): (&[&str], &[&str]) = match module {
         "Init/Prelude" => (
-            &["Bind", "Monad", "MonadExceptOf", "MonadExcept"],
-            &["Monad.toBind", "instMonadExceptOfMonadExceptOf"],
+            &[
+                "Bind",
+                "Pure",
+                "Applicative",
+                "Monad",
+                "MonadExceptOf",
+                "MonadExcept",
+            ],
+            &[
+                "Monad.toBind",
+                "Monad.toApplicative",
+                "Applicative.toPure",
+                "instMonadExceptOfMonadExceptOf",
+            ],
         ),
         "Init/System/IO" => (&[], &["instMonadEIO", "instMonadExceptOfEIO"]),
         "Init/Coe" => (
@@ -189,16 +203,16 @@ fn activate_source_metadata(
     activation.finish().unwrap()
 }
 
-fn instance_key(key: metadata::InstanceKey) -> fln_elab::instances::discr_tree::Key {
+fn instance_key(key: metadata::DiscrTreeKey) -> fln_elab::instances::discr_tree::Key {
     use fln_elab::instances::discr_tree::Key;
     match key {
-        metadata::InstanceKey::Star => Key::Star,
-        metadata::InstanceKey::Other => Key::Other,
-        metadata::InstanceKey::Lit(literal) => Key::Lit(literal),
-        metadata::InstanceKey::FVar(name, arity) => Key::FVar(fln_core::expr::FVarId(name), arity),
-        metadata::InstanceKey::Const(name, arity) => Key::Const(name, arity),
-        metadata::InstanceKey::Arrow => Key::Arrow,
-        metadata::InstanceKey::Proj(name, field, arity) => Key::Proj(name, field, arity),
+        metadata::DiscrTreeKey::Star => Key::Star,
+        metadata::DiscrTreeKey::Other => Key::Other,
+        metadata::DiscrTreeKey::Lit(literal) => Key::Lit(literal),
+        metadata::DiscrTreeKey::FVar(name, arity) => Key::FVar(fln_core::expr::FVarId(name), arity),
+        metadata::DiscrTreeKey::Const(name, arity) => Key::Const(name, arity),
+        metadata::DiscrTreeKey::Arrow => Key::Arrow,
+        metadata::DiscrTreeKey::Proj(name, field, arity) => Key::Proj(name, field, arity),
     }
 }
 

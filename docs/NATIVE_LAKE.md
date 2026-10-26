@@ -12,6 +12,22 @@ Package `srcDir`, library `srcDir`, and library `roots` determine source paths.
 Modules outside the requested import closure are not compiled. A module can be
 selected without `+` when its name does not also name a declared target.
 
+Checked source simp registrations can accompany those artifacts. The supported
+slice includes forward equality theorems and unfolding for definitions marked
+`reducible` before their simp registration. The artifact retains each rule's
+priority, discrimination keys and reflexivity flags as they were at registration
+time. Later reducibility changes do not rewrite an earlier registration; adding
+the attribute again captures the new state. Each module exports its own additions,
+including when dependencies form a diamond or a build reuses persisted records.
+
+An ordinary definition may need generated, checked equation theorems before its
+simp registration can be exported. That generation, reverse or non-equality
+rules needing auxiliary proofs, erasures, and imported-theorem re-registration
+remain unsupported in this artifact path. Unsupported indexing or exhausted
+metadata budgets also refuse artifact production. These export limits do not
+remove existing native source simp support, and metadata never substitutes for
+checking the underlying declarations.
+
 This example builds without an installed Reference toolchain: `prelude` makes
 the files' lack of implicit `Init` explicit, and all declarations use the core
 type theory.

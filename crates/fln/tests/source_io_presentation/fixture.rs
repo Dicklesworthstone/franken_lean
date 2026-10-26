@@ -288,18 +288,18 @@ fn read_metadata(parts: &Parts) -> metadata::SourceExtensions {
     metadata::decode(&blocks, limits.metadata).unwrap()
 }
 
-fn key(key: metadata::InstanceKey) -> instances::discr_tree::Key {
+fn key(key: metadata::DiscrTreeKey) -> instances::discr_tree::Key {
     use instances::discr_tree::Key;
     match key {
-        metadata::InstanceKey::Star => Key::Star,
-        metadata::InstanceKey::Other => Key::Other,
-        metadata::InstanceKey::Lit(value) => Key::Lit(value),
-        metadata::InstanceKey::FVar(value, arity) => {
+        metadata::DiscrTreeKey::Star => Key::Star,
+        metadata::DiscrTreeKey::Other => Key::Other,
+        metadata::DiscrTreeKey::Lit(value) => Key::Lit(value),
+        metadata::DiscrTreeKey::FVar(value, arity) => {
             Key::FVar(fln_core::expr::FVarId(value), arity)
         }
-        metadata::InstanceKey::Const(value, arity) => Key::Const(value, arity),
-        metadata::InstanceKey::Arrow => Key::Arrow,
-        metadata::InstanceKey::Proj(value, field, arity) => Key::Proj(value, field, arity),
+        metadata::DiscrTreeKey::Const(value, arity) => Key::Const(value, arity),
+        metadata::DiscrTreeKey::Arrow => Key::Arrow,
+        metadata::DiscrTreeKey::Proj(value, field, arity) => Key::Proj(value, field, arity),
     }
 }
 

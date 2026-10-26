@@ -14,6 +14,8 @@ pub struct SourceTraceMessage {
     pub message: String,
     /// Goal displays use the bounded partial pretty-printer; literal messages do not.
     pub is_goal_state: bool,
+    /// An information message (`simp?`'s suggestion), not a raw trace: `info:` severity.
+    pub is_info: bool,
 }
 
 /// Freeze display in the command's environment and scope, not the final file's.
@@ -63,6 +65,10 @@ pub(crate) fn append(
             is_goal_state: matches!(
                 trace.content,
                 fln_elab::source::trace::TraceContent::Goals(_)
+            ),
+            is_info: matches!(
+                trace.content,
+                fln_elab::source::trace::TraceContent::Info(_)
             ),
         });
     }
@@ -114,6 +120,7 @@ impl Engine {
                 parsed.syntax(),
                 elaborated.declaration,
                 elaborated.irreducible,
+                elaborated.equation_info,
                 elaborated.noncomputable,
                 elaborated.local_functions,
                 options,

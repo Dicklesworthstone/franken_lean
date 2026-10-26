@@ -5,6 +5,10 @@
 use super::*;
 use std::sync::{Arc, Mutex};
 
+/// The metadata key of a conv goal's target in a trace (`mkLHSGoalRaw e = mkAnnotation
+/// `_lhsGoal e`, vendored src/Lean/Elab/Tactic/Conv/Basic.lean): a display shows the goal's
+/// left-hand side, as `| lhs`.
+pub const LHS_GOAL_KEY: &str = "_lhsGoal";
 const MAX_EVENTS: usize = 4096;
 const MAX_GOALS: usize = 256;
 const MAX_LOCALS: usize = 4096;
@@ -21,6 +25,11 @@ pub struct TraceGoal {
 pub enum TraceContent {
     Goals(Vec<TraceGoal>),
     Message(String),
+    /// An information message (`logInfoAt`), such as `simp?`'s `Try this:` suggestion. Unlike a
+    /// raw trace it is part of the elaboration state, so a failed alternative discards it
+    /// (`Core.SavedState.restore` restores the message log, `Term.SavedState.restore` keeps
+    /// only the trace state), and the pin logs it before the command's traces.
+    Info(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -52,15 +61,17 @@ pub fn elaborate_definition(
     context.traces.enable();
     let declaration = definition_in_context(syntax, &mut context)?;
     let local_functions = context.lift_local_functions(&declaration)?;
+    let traces = context.observations()?;
     Ok(ObservedDeclaration {
         candidate: ElaboratedDeclaration {
             declaration,
             native_axioms: Vec::new(),
+            equation_info: context.equation_info.take(),
             local_functions,
             irreducible: context.well_founded_definition,
             noncomputable: context.noncomputable_definition,
         },
-        traces: context.traces.collect()?,
+        traces,
     })
 }
 
@@ -75,7 +86,8 @@ pub fn elaborate_example(
     let mut context = Context::scoped(environment, kernel, scope);
     context.traces.enable();
     let declaration = scope::example_in_context(syntax, name, &mut context)?;
-    Ok((declaration, context.traces.collect()?))
+    let traces = context.observations()?;
+    Ok((declaration, traces))
 }
 
 #[derive(Clone, Default)]
@@ -118,7 +130,7 @@ impl TraceLog {
             TraceContent::Goals(goals) => {
                 (goals.iter().map(|g| g.locals.len() + 1).sum::<usize>(), 0)
             }
-            TraceContent::Message(message) => (0, message.len()),
+            TraceContent::Message(message) | TraceContent::Info(message) => (0, message.len()),
         };
         if log.events.len() >= MAX_EVENTS
             || incoming.saturating_add(log.units) > 65_536
@@ -151,6 +163,41 @@ pub(super) fn append_tag(parent: &Name, child: &Name) -> Name {
 }
 
 impl Context {
+    /// The information messages this elaboration logged, then its raw traces: the pin logs an
+    /// information message when its tactic runs and adds the traces as messages at the end of
+    /// the command (`addTraceAsMessages`).
+    fn observations(&self) -> Result<Vec<SourceTrace>, NatDefinitionElabError> {
+        let mut observed = self.infos.clone();
+        observed.extend(self.traces.collect()?);
+        Ok(observed)
+    }
+
+    /// Log an information message at `at` (a syntax offset in the command), retained only if
+    /// this elaboration state is: a restored alternative discards it. Refused, as a raw trace
+    /// is, where the entry point reports no observations.
+    pub(super) fn log_info(
+        &mut self,
+        at: usize,
+        message: String,
+    ) -> Result<(), NatDefinitionElabError> {
+        if !self.traces.enabled() {
+            return Err(failure(SourceInferenceError::Tactic(
+                tactics::TacticError::SimpSuggestionUnsupported(
+                    "an information message where this elaboration reports no observations",
+                ),
+            )));
+        }
+        if self.infos.len() >= MAX_EVENTS || message.len() > MAX_MESSAGE_BYTES {
+            return Err(failure(SourceInferenceError::ResourceLimit));
+        }
+        self.infos.push(SourceTrace {
+            at,
+            content: TraceContent::Info(message),
+            scope: self.source_scope.clone(),
+        });
+        Ok(())
+    }
+
     /// Remember the source stem for an inaccessible introduction. These names
     /// are display-only: tactic name resolution still uses the original local.
     pub(super) fn trace_introduced_name(&mut self, id: &FVarId, name: &Name, binder: &Name) {
@@ -227,13 +274,16 @@ impl Context {
         instruction: &Syntax,
         goals: &[tactics::ProofGoal],
     ) -> Result<(), NatDefinitionElabError> {
-        self.require_declared_tactic(&["Lean", "Parser", "Tactic", "traceState"])?;
-        let args = expect_node(
-            instruction,
-            &parser_kind(&["Tactic", "traceState"]),
-            1,
-            "trace_state",
-        )?;
+        // `macro "trace_state" : conv => `(conv| tactic' => trace_state)` (`Init/Conv.lean`).
+        let conv = instruction.kind() == Some(&parser_kind(&["Tactic", "Conv", "convTrace_state"]));
+        let kind = if conv {
+            self.require_declared_tactic(&["Lean", "Parser", "Tactic", "Conv", "convTrace_state"])?;
+            parser_kind(&["Tactic", "Conv", "convTrace_state"])
+        } else {
+            self.require_declared_tactic(&["Lean", "Parser", "Tactic", "traceState"])?;
+            parser_kind(&["Tactic", "traceState"])
+        };
+        let args = expect_node(instruction, &kind, 1, "trace_state")?;
         expect_atom(&args[0], "trace_state", "trace_state keyword")?;
         if goals.len() > MAX_GOALS {
             return Err(failure(SourceInferenceError::ResourceLimit));
@@ -263,20 +313,35 @@ impl Context {
                     locals.add_param(local.id.clone(), user_name, type_, local.binder_info);
                 }
             }
+            let mut target = self.instantiate(&goal.target)?;
+            if self.conv_goals.contains(&goal.id) {
+                // The pin's conv goal annotation (`mkLHSGoalRaw`): a display shows `| lhs`.
+                target = Expr::mdata(
+                    KVMap::from_entries(vec![(
+                        Name::from_components([LHS_GOAL_KEY]),
+                        fln_core::options::DataValue::OfBool(true),
+                    )]),
+                    target,
+                );
+            }
             observed.push(TraceGoal {
                 tag: self
                     .goal_tags
                     .get(&goal.id)
                     .cloned()
                     .unwrap_or_else(Name::anonymous),
-                target: self.instantiate(&goal.target)?,
+                target,
                 locals,
             });
         }
+        // The goals print under the options in force at the trace, a `set_option … in` around
+        // the tactic included: they decide how the pin's `ppGoal` prints them.
+        let mut scope = self.source_scope.clone();
+        scope.options = self.txn.options.clone();
         self.traces.append(SourceTrace {
             at: args[0].info().pos(true).map_or(0, |p| p.0),
             content: TraceContent::Goals(observed),
-            scope: self.source_scope.clone(),
+            scope,
         })
     }
 }
@@ -288,6 +353,11 @@ pub fn contains_trace(syntax: &Syntax) -> bool {
         if let Syntax::Node { kind, args, .. } = syntax {
             if kind == &parser_kind(&["Tactic", "traceState"])
                 || kind == &parser_kind(&["Tactic", "traceMessage"])
+                || kind == &parser_kind(&["Tactic", "Conv", "convTrace_state"])
+                // An information message's producers report through the same channel.
+                || kind == &parser_kind(&["Tactic", "simpTrace"])
+                || kind == &parser_kind(&["Tactic", "simpAllTrace"])
+                || kind == &parser_kind(&["Tactic", "dsimpTrace"])
             {
                 return true;
             }

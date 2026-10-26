@@ -13,6 +13,10 @@ pub enum ImportedSimpRule {
     Unfold {
         declaration: Name,
     },
+    UnfoldTheorems {
+        declaration: Name,
+        theorems: Vec<Name>,
+    },
     Erase {
         declaration: Name,
     },
@@ -30,9 +34,9 @@ impl ImportedSimpRule {
     fn payload(&self, env: &Environment) -> Result<Vec<u8>, SimpSetError> {
         let origin = match self {
             ImportedSimpRule::Proof { origin, .. } => origin,
-            ImportedSimpRule::Unfold { declaration } | ImportedSimpRule::Erase { declaration } => {
-                declaration
-            }
+            ImportedSimpRule::Unfold { declaration }
+            | ImportedSimpRule::UnfoldTheorems { declaration, .. }
+            | ImportedSimpRule::Erase { declaration } => declaration,
         };
         if !env.contains(origin) {
             return Err(SimpSetError::UnknownDeclaration(origin.clone()));
@@ -53,10 +57,58 @@ impl ImportedSimpRule {
                 }
                 source_payload(declaration, Some((1000, false)))?
             }
+            ImportedSimpRule::UnfoldTheorems {
+                declaration,
+                theorems,
+            } => {
+                validate_unfold_theorems(env, declaration, theorems)?;
+                unfold_theorems_payload(declaration, theorems)?
+            }
             ImportedSimpRule::Erase { declaration } => source_payload(declaration, None)?,
         };
         Ok(payload)
     }
+}
+
+pub(super) fn validate_unfold_theorems(
+    env: &Environment,
+    declaration: &Name,
+    theorems: &[Name],
+) -> Result<(), SimpSetError> {
+    if theorems.len() > MAX_BYTES / 5 {
+        return Err(SimpSetError::Limit);
+    }
+    if !env.contains(declaration) {
+        return Err(SimpSetError::UnknownDeclaration(declaration.clone()));
+    }
+    for theorem in theorems {
+        validate_proof(env, theorem)?;
+    }
+    Ok(())
+}
+
+fn unfold_theorems_payload(declaration: &Name, theorems: &[Name]) -> Result<Vec<u8>, SimpSetError> {
+    let mut payload = UNFOLD_THEOREMS_MAGIC.to_vec();
+    payload.push(3);
+    crate::instances::write_name(declaration, &mut payload).map_err(|error| match error {
+        crate::instances::InstanceRegistryError::Limit => SimpSetError::Limit,
+        _ => SimpSetError::Malformed,
+    })?;
+    let count = u32::try_from(theorems.len()).map_err(|_| SimpSetError::Limit)?;
+    if payload.len().saturating_add(4) > MAX_BYTES || theorems.len() > MAX_BYTES / 5 {
+        return Err(SimpSetError::Limit);
+    }
+    payload.extend(count.to_le_bytes());
+    for theorem in theorems {
+        crate::instances::write_name(theorem, &mut payload).map_err(|error| match error {
+            crate::instances::InstanceRegistryError::Limit => SimpSetError::Limit,
+            _ => SimpSetError::Malformed,
+        })?;
+        if payload.len() > MAX_BYTES {
+            return Err(SimpSetError::Limit);
+        }
+    }
+    Ok(payload)
 }
 
 pub(super) fn validate_proof(env: &Environment, proof: &Name) -> Result<(), SimpSetError> {
@@ -154,6 +206,25 @@ pub fn register_imported_proof(
             origin: origin.clone(),
             proof: proof.clone(),
             priority,
+        }],
+    )
+}
+
+/// Keep a definition's equation-theorem erasure group without changing either
+/// its unfolding entry or the individual theorem origins and priorities.
+pub fn register_unfold_theorems(
+    env: &Environment,
+    declaration: &Name,
+    theorems: &[Name],
+) -> Result<Environment, SimpSetError> {
+    if theorems.len() > MAX_BYTES / 5 {
+        return Err(SimpSetError::Limit);
+    }
+    import_rules(
+        env,
+        &[ImportedSimpRule::UnfoldTheorems {
+            declaration: declaration.clone(),
+            theorems: theorems.to_vec(),
         }],
     )
 }

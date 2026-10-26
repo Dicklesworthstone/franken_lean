@@ -14,6 +14,7 @@ mod constructor_transport;
 mod constructors;
 mod context;
 mod control;
+mod conv;
 mod decision;
 pub(in crate::source) mod eliminate;
 mod empty;
@@ -50,6 +51,8 @@ pub enum TacticError {
     /// `guard_target`'s comparison failed (`evalGuardTarget`: "The main goal is … but was
     /// expected to be …").
     GuardTargetMismatch,
+    /// `guard_expr`'s comparison failed (`evalGuardExpr`: "Failed: `a` is not … `b`").
+    GuardExprMismatch,
     /// `guard_hyp` must refer to a local, not a constant or computed expression.
     GuardHypExpectedLocal,
     GuardHypTypeMismatch(Name),
@@ -94,7 +97,20 @@ pub enum TacticError {
     MalformedScript,
     ExpectedEquality,
     RewriteNoMatch,
+    /// No equation theorem of the definition `rw [f]` names rewrites the goal (the pin's
+    /// "Failed to rewrite using equation theorems for `f`", with its hint when there are
+    /// several).
+    RewriteEquations {
+        declaration: Name,
+        hint: bool,
+    },
     UnfoldFailed(Name),
+    /// `delta` changed none of its selected types (`evalDelta`, vendored
+    /// src/Lean/Elab/Tactic/Delta.lean); `at` names the hypothesis that did not change.
+    DeltaFailed {
+        declarations: Vec<Name>,
+        at: Option<Name>,
+    },
     /// `unfold f` at an occurrence whose match the argument does not reduce. The pin rewrites
     /// it by `f`'s unfold equation to a `match` (vendored `Lean/Meta/Tactic/Unfold.lean`), which
     /// this engine's compiled recursor application does not stand for. Never caught by
@@ -170,9 +186,14 @@ pub enum TacticError {
     InjectionUnusedNames {
         unused: Vec<Name>,
     },
+    /// `injections` nested five injections (`Meta.injections`' `maxDepth`): the pin's
+    /// "recursion depth exceeded", which undoes the injection whose continuation reached it.
+    InjectionsDepth,
     /// `rename_i` named more hypotheses than are inaccessible or shadowed
     /// (`renameInaccessibles`, vendored src/Lean/Elab/Tactic/RenameInaccessibles.lean).
     RenameTooManyNames,
+    /// `rename e => h` found no hypothesis whose type unifies with `e` (`evalRename`).
+    RenameNoHypothesis,
     /// `clear` of a local that a later local, or the target, still reads (`MVarId.clear`,
     /// vendored src/Lean/Meta/Tactic/Clear.lean); `dependent: None` is the target.
     ClearDependency {
@@ -185,16 +206,40 @@ pub enum TacticError {
     /// `case t => …` with no goal tagged `t` (`getCaseGoals`, vendored
     /// src/Lean/Elab/Tactic/BuiltinTactic.lean).
     CaseTagNotFound(Name),
+    /// A conv tactic on a goal that is not an equation (the pin's "Internal error:
+    /// Conversion-mode tactic found an invalid `conv` goal", vendored
+    /// src/Lean/Elab/Tactic/Conv/Basic.lean).
+    ConvInvalidGoal,
+    /// `conv`'s end left goals that reflexivity and instance synthesis do not close
+    /// (`convert`, vendored src/Lean/Elab/Tactic/Conv/Basic.lean).
+    ConvUnsolvedGoals {
+        count: usize,
+    },
+    /// A conv tactic's own failure, in the pin's words (`arg`, `congr`, `ext`, `pattern`, …,
+    /// vendored src/Lean/Elab/Tactic/Conv/*.lean), without the expressions it appends.
+    ConvFailure(String),
+    /// A conv-mode case this engine does not build, named. Never caught by `first`/`try`: the
+    /// pin may succeed there.
+    ConvUnsupported(&'static str),
     ConstructorEquality,
     NoContradiction,
     ArithmeticUnsupported,
     ArithmeticNoContradiction,
     ArithmeticInvalidCertificate,
+    /// `simp?`, `simp_all?` or `dsimp?` whose run this engine performed, but whose
+    /// suggestion it cannot reproduce exactly: the pin's `simp only` call depends on the
+    /// order the pin's simplifier visits terms and selects rules, which is modeled here only
+    /// for the named fragment. Never caught by `first`/`try`: the pin's tactic succeeds.
+    SimpSuggestionUnsupported(&'static str),
 }
 impl std::fmt::Display for TacticError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::ExplicitFailure => write!(f, "explicit tactic failure"),
+            Self::SimpSuggestionUnsupported(reason) => write!(
+                f,
+                "simp suggestion outside the fragment this engine reproduces: {reason}"
+            ),
             Self::UnsupportedTactic(kind) => {
                 write!(f, "unsupported tactic `{}`", kind.to_display_string())
             }
@@ -205,6 +250,10 @@ impl std::fmt::Display for TacticError {
             Self::GuardTargetMismatch => write!(
                 f,
                 "guard_target: the main goal is not what it was expected to be"
+            ),
+            Self::GuardExprMismatch => write!(
+                f,
+                "guard_expr: the two terms do not match by the given relation"
             ),
             Self::GuardHypExpectedLocal => {
                 write!(f, "guard_hyp: expected a local hypothesis")
@@ -278,11 +327,42 @@ impl std::fmt::Display for TacticError {
                 "rewrite location must name an available local hypothesis"
             ),
             Self::RewriteNoMatch => write!(f, "rewrite found no matching occurrence in the goal"),
+            Self::RewriteEquations { declaration, hint } => {
+                write!(
+                    f,
+                    "Failed to rewrite using equation theorems for `{}`",
+                    declaration.to_display_string()
+                )?;
+                if *hint {
+                    write!(
+                        f,
+                        "\n\nHint: Try rewriting with `{}`",
+                        Name::str(declaration.clone(), "eq_def").to_display_string()
+                    )?;
+                }
+                Ok(())
+            }
             Self::UnfoldFailed(name) => write!(
                 f,
                 "unfold failed for `{}` in the selected location",
                 name.to_display_string()
             ),
+            // The pin's words, without the goal it appends.
+            Self::DeltaFailed { declarations, at } => {
+                write!(
+                    f,
+                    "Tactic `delta` failed: did not delta reduce [{}]",
+                    declarations
+                        .iter()
+                        .map(Name::to_display_string)
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )?;
+                if let Some(at) = at {
+                    write!(f, " at {}", at.to_display_string())?;
+                }
+                Ok(())
+            }
             Self::UnfoldStuckMatch(name) => write!(
                 f,
                 "unfold of `{}` where its match does not reduce, which the pin shows as a `match`",
@@ -425,6 +505,9 @@ impl std::fmt::Display for TacticError {
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
+            Self::InjectionsDepth => {
+                write!(f, "Tactic `injections` failed: recursion depth exceeded")
+            }
             // The pin's words.
             Self::SubstitutionNoEquation { local } => write!(
                 f,
@@ -433,6 +516,8 @@ impl std::fmt::Display for TacticError {
             ),
             // The pin's words.
             Self::RenameTooManyNames => write!(f, "too many variable names provided"),
+            // The pin's words, without the type it prints after them.
+            Self::RenameNoHypothesis => write!(f, "Failed to find a hypothesis with type"),
             Self::ClearDependency {
                 local,
                 dependent: Some(dependent),
@@ -457,6 +542,18 @@ impl std::fmt::Display for TacticError {
                 f,
                 "'specialize' requires a term of the form `h x_1 .. x_n` where `h` appears in the local context"
             ),
+            Self::ConvInvalidGoal => write!(
+                f,
+                "Internal error: Conversion-mode tactic found an invalid `conv` goal"
+            ),
+            // The pin's words, without the goals it lists after them.
+            Self::ConvUnsolvedGoals { .. } => {
+                write!(f, "Tactic `conv` failed: There are unsolved goals")
+            }
+            Self::ConvFailure(message) => write!(f, "{message}"),
+            Self::ConvUnsupported(what) => {
+                write!(f, "conv mode does not support {what} here")
+            }
             Self::ConstructorEquality => write!(
                 f,
                 "constructor equality has no supported injective fields or contradiction"
@@ -525,10 +622,11 @@ enum Work<'a> {
     EndScript(Vec<&'a Syntax>, usize),
 }
 #[derive(Clone)]
-// The lexical barrier restores both options and tactic-local instances.
+// The lexical barrier restores options, tactic-local instances and the ambient transparency.
 struct OptionScope<'a> {
     options: KVMap,
     instance_scopes: crate::instances::scoped::ActiveScopes,
+    transparency: Option<UnificationTransparency>,
     instructions: Vec<&'a Syntax>,
     cursor: usize,
 }
@@ -598,6 +696,10 @@ fn local_declaration(
 pub(super) struct RewriteRule<'a> {
     pub(super) syntax: &'a Syntax,
     pub(super) reverse: bool,
+    /// The global declaration a bare identifier selects (`resolveSimpIdTheorem?`), for a simp
+    /// rule whose call holds a permutation rule; it is then keyed as the pin's discrimination
+    /// tree keys that theorem (`simp_rules_keyed`).
+    pub(super) global: Option<Name>,
 }
 
 pub(super) enum ProofAction<'a> {
@@ -630,9 +732,11 @@ pub(super) enum ProofAction<'a> {
     },
     Attempt(backtrack::Spec<'a>),
     AttemptComplete(usize),
+    /// `refine e`, or `refine' e` (`placeholders`), whose `_`s are new goals too.
     Refine {
         syntax: &'a Syntax,
         goal: ProofGoal,
+        placeholders: bool,
     },
     Binding {
         goal: ProofGoal,
@@ -836,6 +940,22 @@ impl Context {
         &mut self,
         left: &Expr,
         right: &Expr,
+        mut budget: UnificationBudget,
+    ) -> Result<bool, NatDefinitionElabError> {
+        // `with_reducible` and its siblings cap the tactic's own comparisons too.
+        if self.tactic_transparency.is_some() {
+            budget.transparency = self.ambient_transparency(budget.transparency);
+            budget.offset_constraints = true;
+        }
+        self.proof_types_match_at(left, right, budget)
+    }
+
+    /// [`Self::proof_types_match_with_budget`] at exactly `budget`'s transparency, as a query
+    /// that fixes its own does (`withTransparency`).
+    fn proof_types_match_at(
+        &mut self,
+        left: &Expr,
+        right: &Expr,
         budget: UnificationBudget,
     ) -> Result<bool, NatDefinitionElabError> {
         self.flush(false)?;
@@ -886,9 +1006,28 @@ impl Context {
         Ok(None)
     }
 
-    /// `rfl` on an `Eq` or `HEq` goal: both sides, and for `HEq` both types, are unified.
+    /// `rfl` on an `Eq`, `HEq` or `Iff` goal: both sides, and for `HEq` both types, are
+    /// unified. An `Iff` is the pin's latest `rfl` rule, `exact Iff.rfl` (vendored
+    /// src/Init/Core.lean:1042), where the environment declares `Iff.rfl`.
     pub(super) fn rfl_proof_goal(&mut self, goal: ProofGoal) -> Result<(), NatDefinitionElabError> {
         let target = self.whnf(&goal.target)?;
+        if let ExprNode::App { f, a: right } = target.node()
+            && let ExprNode::App { f: head, a: left } = f.node()
+            && matches!(head.node(), ExprNode::Const { name, levels }
+                if name == &Name::from_components(["Iff"]) && levels.is_empty())
+        {
+            let rfl = Name::from_components(["Iff", "rfl"]);
+            if self
+                .txn
+                .env
+                .find(&rfl)
+                .is_some_and(|info| info.constant_val().level_params.is_empty())
+            {
+                let (left, right) = (left.clone(), right.clone());
+                self.constrain(&left, &right)?;
+                return self.close_proof_goal(goal, Expr::app(Expr::const_(rfl, Vec::new()), left));
+            }
+        }
         if let Some((level, alpha, left, beta, right)) = equality::heterogeneous_target(&target) {
             self.constrain(&alpha, &beta)?;
             self.constrain(&left, &right)?;
@@ -989,6 +1128,7 @@ impl Context {
                 if let Some(&instruction) = proof.instructions.get(proof.cursor) {
                     if instruction.kind() == Some(&parser_kind(&["Tactic", "traceState"]))
                         || instruction.kind() == Some(&parser_kind(&["Tactic", "traceMessage"]))
+                        || instruction.kind() == Some(&conv::conv_kind("convTrace_state"))
                     {
                         self.trace_proof_state(proof, instruction)?;
                         proof.cursor += 1;
@@ -1007,6 +1147,8 @@ impl Context {
                     // `Lean/Elab/Tactic/BuiltinTactic.lean`).
                     if instruction.kind() == Some(&parser_kind(&["Tactic", "skip"]))
                         || instruction.kind() == Some(&parser_kind(&["Tactic", "done"]))
+                        || instruction.kind() == Some(&conv::conv_kind("skip"))
+                        || instruction.kind() == Some(&conv::conv_kind("convDone"))
                     {
                         proof.cursor += 1;
                         continue;
@@ -1148,6 +1290,8 @@ impl Context {
             if let Some(spec) = self.backtrack_instruction(instruction)? {
                 proof.work.push(Work::Goal(goal));
                 return Ok(ProofAction::Attempt(spec));
+            } else if conv::is_conv_kind(kind) {
+                self.conv_instruction(proof, goal, instruction)?;
             } else if kind == &parser_kind(&["Tactic", "skip"]) {
                 proof.work.push(Work::Goal(goal));
             } else if kind == &parser_kind(&["Tactic", "traceState"])
@@ -1164,6 +1308,17 @@ impl Context {
                 let relation = guard::relation(relation)?;
                 if !self.guard_target_matches(&goal, relation, expected)? {
                     return Err(error(TacticError::GuardTargetMismatch));
+                }
+                proof.work.push(Work::Goal(goal));
+            } else if kind == &parser_kind(&["Tactic", "guardExpr"]) {
+                let [keyword, left, relation, right] = args.as_slice() else {
+                    return Err(error(TacticError::MalformedScript));
+                };
+                expect_atom(keyword, "guard_expr", "guard_expr keyword")?;
+                self.require_declared_tactic(&["Lean", "Parser", "Tactic", "guardExpr"])?;
+                let relation = guard::relation(relation)?;
+                if !self.guard_expr_holds(&goal, left, relation, right)? {
+                    return Err(error(TacticError::GuardExprMismatch));
                 }
                 proof.work.push(Work::Goal(goal));
             } else if kind == &parser_kind(&["Tactic", "guardHyp"]) {
@@ -1282,12 +1437,26 @@ impl Context {
                 self.obtain_proof_goal(proof, goal, args)?;
             } else if kind == &parser_kind(&["Tactic", "rcases"]) {
                 self.rcases_proof_goal(proof, goal, args)?;
-            } else if kind == &parser_kind(&["Tactic", "refine"]) {
+            } else if kind == &parser_kind(&["Tactic", "refine"])
+                || kind == &parser_kind(&["Tactic", "refine'"])
+            {
+                let placeholders = kind == &parser_kind(&["Tactic", "refine'"]);
                 let [keyword, term] = args.as_slice() else {
                     return Err(error(TacticError::MalformedScript));
                 };
-                expect_atom(keyword, "refine", "refinement tactic")?;
-                return Ok(ProofAction::Refine { syntax: term, goal });
+                expect_atom(
+                    keyword,
+                    if placeholders { "refine'" } else { "refine" },
+                    "refinement tactic",
+                )?;
+                if placeholders {
+                    self.require_declared_tactic(&["Lean", "Parser", "Tactic", "refine'"])?;
+                }
+                return Ok(ProofAction::Refine {
+                    syntax: term,
+                    goal,
+                    placeholders,
+                });
             } else if kind == &Name::from_components(["tacticBy_cases_:_"]) {
                 let [keyword, binder, proposition] = args.as_slice() else {
                     return Err(error(TacticError::MalformedScript));
@@ -1412,6 +1581,8 @@ impl Context {
                 self.contradict_proof_goal(goal)?;
             } else if kind == &parser_kind(&["Tactic", "injection"]) {
                 self.inject_proof_goal(proof, goal, args)?;
+            } else if kind == &parser_kind(&["Tactic", "injections"]) {
+                self.injections_proof_goal(proof, goal, args)?;
             } else if kind == &parser_kind(&["Tactic", "subst"]) {
                 let [keyword, names] = args.as_slice() else {
                     return Err(error(TacticError::MalformedScript));
@@ -1445,6 +1616,11 @@ impl Context {
                 self.dsimplify_proof_goal(proof, goal, args)?;
             } else if kind == &parser_kind(&["Tactic", "simp"]) {
                 self.simplify_proof_goal(proof, goal, args)?;
+            } else if kind == &parser_kind(&["Tactic", "simpTrace"])
+                || kind == &parser_kind(&["Tactic", "simpAllTrace"])
+                || kind == &parser_kind(&["Tactic", "dsimpTrace"])
+            {
+                self.simp_trace_proof_goal(proof, goal, kind, args)?;
             } else if kind == &parser_kind(&["Tactic", "simpa"]) {
                 let [keyword, _, _, rest] = args.as_slice() else {
                     return Err(error(TacticError::MalformedScript));
@@ -1467,6 +1643,8 @@ impl Context {
                 }
             } else if kind == &parser_kind(&["Tactic", "unfold"]) {
                 self.unfold_proof_goal(proof, goal, args)?;
+            } else if kind == &parser_kind(&["Tactic", "delta"]) {
+                self.delta_proof_goal(proof, goal, args)?;
             } else if kind == &parser_kind(&["Tactic", "rwSeq"])
                 || kind == &parser_kind(&["Tactic", "rewriteSeq"])
             {
@@ -1501,6 +1679,25 @@ impl Context {
                 }
                 let goal = self.renamed_proof_goal(proof, goal, names)?;
                 proof.work.push(Work::Goal(goal));
+            } else if kind == &parser_kind(&["Tactic", "rename"]) {
+                let goal = self.rename_proof_goal(proof, goal, args)?;
+                proof.work.push(Work::Goal(goal));
+            } else if kind == &parser_kind(&["Tactic", "match"]) {
+                self.match_proof_goal(proof, goal, args)?;
+            } else if kind == &parser_kind(&["Tactic", "letrec"]) {
+                self.let_rec_proof_goal(proof, goal, args)?;
+            } else if kind == &parser_kind(&["Tactic", "tacticAnd_intros"]) {
+                self.and_intros_proof_goal(proof, goal, args)?;
+            } else if kind == &parser_kind(&["Tactic", "tacticExists_,,"]) {
+                self.exists_proof_goal(proof, goal, args)?;
+            } else if let Some((word, expansion)) = self.wf_macro_expansion(kind, &goal)? {
+                let [keyword] = args.as_slice() else {
+                    return Err(error(TacticError::MalformedScript));
+                };
+                expect_atom(keyword, word, "well-founded recursion tactic")?;
+                let body = self.proof_instructions(expansion)?;
+                proof.work.push(Work::Goal(goal));
+                self.start_macro_scope(proof, body)?;
             } else if kind == &parser_kind(&["Tactic", "clear"]) {
                 self.clear_proof_locals(proof, goal, args)?;
             } else if kind == &parser_kind(&["Tactic", "tacticNext_=>_"]) {
@@ -1546,6 +1743,113 @@ impl Context {
                 let goal = self.renamed_proof_goal(proof, goal, names)?;
                 self.goal_tags.remove(&goal.id);
                 self.start_goal_control(proof, goal, body, control::Mode::Solve)?;
+            } else if kind == &parser_kind(&["Tactic", "case'"]) {
+                // `"case' " sepBy1(caseArg, " | ") " => " tacticSeq` (`evalCase'`, vendored
+                // src/Lean/Elab/Tactic/BuiltinTactic.lean): for each tag in turn, the goal it
+                // selects among those no earlier tag took, renamed, runs the body alone, and a
+                // run leaving exactly one goal gives it that tag; what each run leaves comes
+                // first, in order, then the other goals. Unlike `case`, the body need not close
+                // its goal, and the tag is kept.
+                let [keyword, cases, arrow, body] = args.as_slice() else {
+                    return Err(error(TacticError::MalformedScript));
+                };
+                expect_atom(keyword, "case'", "case' keyword")?;
+                expect_atom(arrow, "=>", "case' arrow")?;
+                self.require_declared_tactic(&["Lean", "Parser", "Tactic", "case'"])?;
+                let mut tags = Vec::new();
+                for (index, case) in expect_null_args(cases, "case' arguments")?
+                    .iter()
+                    .enumerate()
+                {
+                    if index % 2 == 1 {
+                        expect_atom(case, "|", "case' separator")?;
+                        continue;
+                    }
+                    let [tag, names] = expect_node(
+                        case,
+                        &parser_kind(&["Tactic", "caseArg"]),
+                        2,
+                        "case' argument",
+                    )?
+                    else {
+                        return Err(error(TacticError::MalformedScript));
+                    };
+                    tags.push((tag, expect_null_args(names, "case' names")?));
+                }
+                if let [(tag, names)] = tags.as_slice() {
+                    let goal = self.case_goal(proof, goal, tag)?;
+                    let goal = self.renamed_proof_goal(proof, goal, names)?;
+                    self.start_case_prime_focus(proof, goal, body)?;
+                } else {
+                    // The tags are selected first, as the runs do not change the other goals'
+                    // tags; renaming would have to wait for each run, so names are refused.
+                    if tags.is_empty() || tags.iter().any(|(_, names)| !names.is_empty()) {
+                        return Err(error(TacticError::UnsupportedTactic(kind.clone())));
+                    }
+                    let count = tags.len();
+                    let goal =
+                        self.reorder_visible_goals(proof, goal, kind, |this, mut goals| {
+                            let mut selected = Vec::new();
+                            for (tag, _) in &tags {
+                                let index = this.case_tag_position(&goals, tag)?;
+                                selected.push(goals.remove(index));
+                            }
+                            selected.extend(goals);
+                            Ok(selected)
+                        })?;
+                    self.start_limited_all_goals(proof, goal, body, count)?;
+                }
+            } else if kind == &parser_kind(&["Tactic", "rotateLeft"])
+                || kind == &parser_kind(&["Tactic", "rotateRight"])
+            {
+                // `"rotate_left" (ppSpace num)?` (`evalRotateLeft`, vendored
+                // src/Lean/Elab/Tactic/BuiltinTactic.lean): the goal list rotated by `n`, 1 by
+                // default (`List.rotateLeft`, `List.rotateRight`).
+                let left = kind == &parser_kind(&["Tactic", "rotateLeft"]);
+                let [keyword, count] = args.as_slice() else {
+                    return Err(error(TacticError::MalformedScript));
+                };
+                expect_atom(
+                    keyword,
+                    if left { "rotate_left" } else { "rotate_right" },
+                    "rotation keyword",
+                )?;
+                self.require_declared_tactic(&[
+                    "Lean",
+                    "Parser",
+                    "Tactic",
+                    if left { "rotateLeft" } else { "rotateRight" },
+                ])?;
+                let count = match expect_null_args(count, "rotation count")? {
+                    [] => 1,
+                    [number] => {
+                        let [Syntax::Atom { val, .. }] = expect_node(
+                            number,
+                            &Name::str(Name::anonymous(), "num"),
+                            1,
+                            "rotation count",
+                        )?
+                        else {
+                            return Err(error(TacticError::MalformedScript));
+                        };
+                        val.parse::<usize>()
+                            .map_err(|_| error(TacticError::UnsupportedTactic(kind.clone())))?
+                    }
+                    _ => return Err(error(TacticError::MalformedScript)),
+                };
+                let goal = self.reorder_visible_goals(proof, goal, kind, |_, mut goals| {
+                    let length = goals.len();
+                    if length > 1 {
+                        let shift = count % length;
+                        if left {
+                            goals.rotate_left(shift);
+                        } else {
+                            goals.rotate_right(shift);
+                        }
+                    }
+                    Ok(goals)
+                })?;
+                proof.work.push(Work::Goal(goal));
             } else if kind == &parser_kind(&["Tactic", "revert"]) {
                 self.revert_proof_locals(proof, goal, args)?;
             } else if kind == &parser_kind(&["Tactic", "generalize"]) {
@@ -1708,6 +2012,87 @@ impl Context {
                 });
             }
         }
+    }
+
+    /// The well-founded recursion macros this engine expands as written (vendored
+    /// src/Init/WFTactics.lean), with their keyword: `decreasing_tactic` as the default
+    /// `decreasing_by` runs it, `decreasing_trivial_pre_omega`'s rules, and `simp_wf`, whose
+    /// `try simp +unfoldPartialApp +zetaDelta [invImage, …]` is `try simp` on a target that
+    /// mentions none of its seven definitions and no `let` variable. A target that does is
+    /// refused, never simplified without them.
+    fn wf_macro_expansion(
+        &mut self,
+        kind: &Name,
+        goal: &ProofGoal,
+    ) -> Result<Option<(&'static str, &'static Syntax)>, NatDefinitionElabError> {
+        let root = |text: &str| Name::from_components([text]);
+        if kind == &root("tacticDecreasing_tactic") {
+            self.require_declared_tactic(&["tacticDecreasing_tactic"])?;
+            return Ok(Some((
+                "decreasing_tactic",
+                recursion::decreasing_tactic_expansion(),
+            )));
+        }
+        if kind == &root("tacticDecreasing_trivial_pre_omega") {
+            self.require_declared_tactic(&["tacticDecreasing_trivial_pre_omega"])?;
+            return Ok(Some((
+                "decreasing_trivial_pre_omega",
+                control::expansions::decreasing_trivial_pre_omega(),
+            )));
+        }
+        if kind != &root("tacticSimp_wf") {
+            return Ok(None);
+        }
+        self.require_declared_tactic(&["tacticSimp_wf"])?;
+        let unfolded: Vec<Name> = [
+            "invImage",
+            "InvImage",
+            "Prod.lex",
+            "sizeOfWFRel",
+            "measure",
+            "Nat.lt_wfRel",
+            "WellFoundedRelation.rel",
+        ]
+        .into_iter()
+        .map(|name| Name::from_components(name.split('.')))
+        .collect();
+        let target = self.instantiate(&goal.target)?;
+        let mut pending = vec![target];
+        let mut seen = std::collections::HashSet::new();
+        while let Some(expr) = pending.pop() {
+            self.tick()?;
+            if !seen.insert(expr.allocation_identity()) {
+                continue;
+            }
+            match expr.node() {
+                ExprNode::Const { name, .. } if unfolded.contains(name) => {
+                    return Err(error(TacticError::UnsupportedTactic(kind.clone())));
+                }
+                ExprNode::FVar { id }
+                    if goal
+                        .lctx
+                        .find(id)
+                        .is_some_and(|local| local.value.is_some()) =>
+                {
+                    return Err(error(TacticError::UnsupportedTactic(kind.clone())));
+                }
+                ExprNode::App { f, a } => pending.extend([f.clone(), a.clone()]),
+                ExprNode::Lam {
+                    binder_type, body, ..
+                }
+                | ExprNode::ForallE {
+                    binder_type, body, ..
+                } => pending.extend([binder_type.clone(), body.clone()]),
+                ExprNode::LetE {
+                    type_, value, body, ..
+                } => pending.extend([type_.clone(), value.clone(), body.clone()]),
+                ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => {
+                    pending.push(expr.clone())
+                }
+                _ => {}
+            }
+        }
+        Ok(Some(("simp_wf", control::expansions::try_simp())))
     }
 
     /// Introduce only a completed local value. The declaration is not in scope

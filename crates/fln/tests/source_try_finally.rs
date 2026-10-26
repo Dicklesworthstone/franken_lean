@@ -216,18 +216,28 @@ def followed : Logged Nat := do
         &["123007", "123042"],
     );
 }
+/// A `do` block asks for its monad's `Pure` instance (`DoElemCont.mkPure`, vendored
+/// `Lean/Elab/Do/Basic.lean:272-302`), so cleanup over a monad known only by its `MonadFinally`
+/// and `Functor` contracts is refused. Pinned lean v4.32.0 refuses it too, under the full `Init`
+/// (2026-10-26): "failed to synthesize instance of type class Monad m".
 #[test]
-fn generic_cleanup_uses_only_the_admitted_finally_and_functor_contracts() {
-    checked(
-        &base(),
-        r#"
+fn generic_cleanup_without_a_pure_instance_is_refused_as_at_the_pin() {
+    let engine = base();
+    let root = engine.logical_root(&KVMap::new());
+    let source = r#"
 def ensure {m : Type -> Type} {A B : Type} [MonadFinally m] [Functor m] (x : m A) (cleanup : m B) : m A := do
   try
     x
   finally
     cleanup
-"#,
+"#;
+    assert!(
+        engine
+            .check_source_files(&[source.as_bytes()], &KVMap::new(), limits())
+            .is_err(),
+        "{source}"
     );
+    assert_eq!(engine.logical_root(&KVMap::new()), root);
 }
 #[test]
 fn invalid_cleanup_or_bare_try_refuses_atomically() {

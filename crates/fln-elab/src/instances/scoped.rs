@@ -46,6 +46,7 @@ enum ActivationKind {
         class: Name,
         declaration: Name,
         priority: u32,
+        index: Option<Arc<export::DerivedIndex>>,
     },
     /// A state-only removal, as at the pin's `instanceExtension.modifyState`.
     /// It is never appended to the environment's export journal.
@@ -106,6 +107,36 @@ impl ActiveScopes {
         if !registry.is_class(&class) {
             return Err(InstanceRegistryError::UnknownClass(class));
         }
+        let index = export::derive_local_index(env, &registry, declaration, &mut 1_000_000)?;
+        // The pin keeps an older tree path when the same declaration is
+        // registered under a different one. This single-slot lexical model
+        // can replace priority only after proving that the path and schedule
+        // are unchanged, including for imported or erased registrations.
+        if let Some(previous) = registry.imported.instances.get(declaration) {
+            if index.as_ref().is_none_or(|index| {
+                index.keys != previous.keys || index.synth_order != previous.synth_order
+            }) {
+                return Err(InstanceRegistryError::InvalidInstance(declaration.clone()));
+            }
+        } else if registry.updates.contains_key(declaration) {
+            let previous = export::derive_index(env, &registry, declaration, &mut 1_000_000)?;
+            if !matches!((&previous, &index), (Some(previous), Some(index)) if previous == index) {
+                return Err(InstanceRegistryError::InvalidInstance(declaration.clone()));
+            }
+        }
+        for activation in self.activations.iter() {
+            if let ActivationKind::Local {
+                declaration: previous_name,
+                index: previous,
+                ..
+            } = &activation.kind
+                && previous_name == declaration
+                && !matches!((previous.as_deref(), index.as_ref()),
+                    (Some(previous), Some(index)) if previous == index)
+            {
+                return Err(InstanceRegistryError::InvalidInstance(declaration.clone()));
+            }
+        }
         // The pin's addLocalEntry inserts or replaces in the current scoped
         // state, even for an imported, scoped, or previously local instance.
         // This is a lexical override, not a duplicate persistent registration.
@@ -113,14 +144,24 @@ impl ActiveScopes {
         let mut encoded = Vec::new();
         write_name(&class, &mut encoded)?;
         write_name(declaration, &mut encoded)?;
+        let mut bytes = encoded.len();
+        if let Some(index) = &index {
+            let mut keys = Vec::new();
+            discr_tree::write_keys(&index.keys, &mut keys)?;
+            bytes = bytes
+                .checked_add(keys.len())
+                .and_then(|bytes| bytes.checked_add(index.synth_order.len().checked_mul(4)?))
+                .ok_or(InstanceRegistryError::Limit)?;
+        }
         self.push(
             env,
             ActivationKind::Local {
                 class,
                 declaration: declaration.clone(),
                 priority,
+                index: index.map(Arc::new),
             },
-            encoded.len(),
+            bytes,
         )
     }
 
@@ -242,6 +283,8 @@ impl InstanceRegistry {
         // but addInstanceEntry still clears the name from the erased set.
         let mut selected = BTreeMap::new();
         let mut erased: BTreeMap<Name, SelectionClock> = BTreeMap::new();
+        let mut local_indices: BTreeMap<Name, (SelectionClock, Arc<export::DerivedIndex>)> =
+            BTreeMap::new();
         for (class, rows) in &registry.instances {
             for row in rows {
                 let updated = registry
@@ -268,9 +311,27 @@ impl InstanceRegistry {
                     class,
                     declaration,
                     priority,
+                    index,
                 } => {
                     if validate_instance(env, declaration)? != *class || !registry.is_class(class) {
                         return Err(InstanceRegistryError::Malformed);
+                    }
+                    if let Some(index) = index {
+                        if local_indices
+                            .get(declaration)
+                            .is_some_and(|(_, previous)| previous.as_ref() != index.as_ref())
+                        {
+                            // A different path would leave multiple tree entries
+                            // at the pin. This single-slot model must not guess
+                            // their priority or traversal order.
+                            return Err(InstanceRegistryError::InvalidInstance(
+                                declaration.clone(),
+                            ));
+                        }
+                        local_indices.insert(
+                            declaration.clone(),
+                            ((activation.at, 0, activation_index), Arc::clone(index)),
+                        );
                     }
                     record_registration(
                         &mut selected,
@@ -347,6 +408,28 @@ impl InstanceRegistry {
                     registry.inactive.push(row);
                 }
                 continue;
+            }
+            if let Some((captured_at, index)) = local_indices.get(&row.declaration) {
+                if captured_at != added {
+                    // A later global/scoped registration may replace the local
+                    // selection. An imported entry keeps its saved index when a
+                    // namespace opens; otherwise require the same immutable path.
+                    // Never replace an alias's captured path with broad search.
+                    let same =
+                        if let Some(previous) = registry.imported.instances.get(&row.declaration) {
+                            previous.keys == index.keys && previous.synth_order == index.synth_order
+                        } else {
+                            export::derive_index(env, &registry, &row.declaration, &mut 1_000_000)?
+                                .as_ref()
+                                == Some(index.as_ref())
+                        };
+                    if !same {
+                        return Err(InstanceRegistryError::InvalidInstance(row.declaration));
+                    }
+                }
+                registry
+                    .local_indices
+                    .insert(row.declaration.clone(), Arc::clone(index));
             }
             registry.instances.entry(class).or_default().push(row);
         }

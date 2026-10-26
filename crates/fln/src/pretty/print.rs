@@ -261,6 +261,10 @@ impl<'a> Printer<'a> {
             .scope
             .map_or_else(|| name.clone(), |scope| scope.user_name(name));
         if &shown != name {
+            // Under `pp.privateNames` the header names the private name's internal form.
+            if self.pp.private_names {
+                return Err(Unsupported("a private name under `pp.privateNames`"));
+            }
             head.push_str("private ");
         } else if name.to_display_string().starts_with("_private") {
             return Err(Unsupported("a private name of another module"));
@@ -306,10 +310,26 @@ impl<'a> Printer<'a> {
         Ok(if axioms.is_empty() {
             format!("'{shown}' does not depend on any axioms")
         } else {
+            // `MessageData.ofConstName`: `delabConst` of the constant at its own universe
+            // parameters, so `pp.universes` shows them.
             let names = axioms
                 .iter()
-                .map(|axiom| self.display_name(axiom))
-                .collect::<Vec<_>>();
+                .map(|axiom| {
+                    let levels: Vec<Level> = self
+                        .env
+                        .find(axiom)
+                        .map(|info| {
+                            info.constant_val()
+                                .level_params
+                                .iter()
+                                .cloned()
+                                .map(Level::param)
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    self.constant_head(axiom, &levels)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
             format!("'{shown}' depends on axioms: [{}]", names.join(", "))
         })
     }

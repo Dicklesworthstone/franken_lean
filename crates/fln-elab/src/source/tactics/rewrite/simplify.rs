@@ -3,16 +3,22 @@
 //! An unsuccessful alternative restores its complete elaboration state while
 //! retaining spent work. Every productive step is ordinary Eq.rec transport.
 
+mod aclt;
 mod arith;
 mod binders;
+mod config;
+mod decide;
 mod dsimp;
 mod locations;
 mod simpa;
+mod suggest;
 mod unfold;
 
 use super::matching::RigidTypeHead;
 use super::*;
 use crate::lctx::LocalContext;
+use aclt::{SimpPlace, SimpReach, SimpRewrite, simp_rules_keyed};
+pub(in crate::source) use config::SimpConfig;
 use fln_core::expr::BinderInfo;
 use fln_env::environment::Environment;
 use std::collections::{HashMap, HashSet};
@@ -34,13 +40,17 @@ pub(in crate::source) enum SimpRule<'a> {
     /// `simpArith` runs after `rewritePost` (`Rewrite.lean:542-546`). It rewrites; it never
     /// closes a goal by itself.
     Arith,
+    /// `+decide`'s decision of closed propositions (`decide.rs`), always the first rule: the
+    /// pin's `simpUsingDecide` ends `preDefault` (`Rewrite.lean:536-540`), which runs at a node
+    /// before its post rewrites.
+    Decide,
 }
 impl SimpRule<'_> {
     fn reverse(&self) -> bool {
         match self {
             Self::Explicit(rule) => rule.reverse,
             Self::Global(rule) => rule.reverse,
-            Self::Local(_) | Self::Arith => false,
+            Self::Local(_) | Self::Arith | Self::Decide => false,
         }
     }
 }
@@ -224,9 +234,16 @@ impl Context {
         let resolved = self
             .resolve_source_name(val)?
             .ok_or_else(|| failure(SourceInferenceError::UnknownConstant(val.clone())))?;
-        Ok((self.txn.lctx.find_by_user_name(&resolved).is_none()
-            && self.txn.env.contains(&resolved))
-        .then_some(resolved))
+        let global = self.txn.lctx.find_by_user_name(&resolved).is_none()
+            && self.txn.env.contains(&resolved);
+        // `resolveSimpIdTheorem?` resolves it with `Term.resolveId?`, which checks it.
+        if global {
+            self.note_deprecated(
+                &resolved,
+                super::super::super::deprecated::syntax_span(syntax),
+            )?;
+        }
+        Ok(global.then_some(resolved))
     }
 
     /// The pin elaborates a non-identifier simp argument as a theorem at once
@@ -252,6 +269,11 @@ impl Context {
             Ok(Some(trial.instantiate(&sort)?))
         })();
         self.charge_rewrite_trial(&trial);
+        // The pin elaborates a term rule once (`elabSimpArgs`): this trial is that elaboration
+        // for the deprecated constants it names, and [`Self::simp_rule_term`] checks none.
+        if let Some(uses) = trial.deprecated_uses.get(self.deprecated_uses.len()..) {
+            self.deprecated_uses.extend_from_slice(uses);
+        }
         let Ok(Some(sort)) = sort else {
             return Ok(());
         };
@@ -380,13 +402,13 @@ impl Context {
         index: Option<&SimpTargetIndex>,
         side: SimpKeySide,
     ) -> bool {
-        if matches!(rule, SimpRule::Arith) {
+        if matches!(rule, SimpRule::Arith | SimpRule::Decide) {
             return matches!(side, SimpKeySide::Rewrite);
         }
-        let (Some(index), SimpRule::Global(entry)) = (index, rule) else {
+        let (Some(index), Some(entry)) = (index, simp_rule_entry(rule)) else {
             return true;
         };
-        self.with_simp_key(entry, index.environment, &index.table, side, |key| {
+        self.with_simp_key(&entry, index.environment, &index.table, side, |key| {
             key.is_none_or(|key| index.admits(key))
         })
     }
@@ -431,7 +453,7 @@ impl Context {
         &mut self,
         rule: &SimpRule<'_>,
     ) -> Result<Option<SimpKey>, NatDefinitionElabError> {
-        let SimpRule::Global(entry) = rule else {
+        let Some(entry) = simp_rule_entry(rule) else {
             return Ok(None);
         };
         self.tick()?;
@@ -442,7 +464,7 @@ impl Context {
         })?;
         let environment = simp_key_environment(&self.txn.env);
         Ok(
-            self.with_simp_key(entry, environment, &table, SimpKeySide::Rewrite, |key| {
+            self.with_simp_key(&entry, environment, &table, SimpKeySide::Rewrite, |key| {
                 key.cloned()
             }),
         )
@@ -750,8 +772,8 @@ impl Context {
                     type_: local.type_.clone(),
                 })
             }
-            // Arithmetic normalization has no single proof term to select.
-            SimpRule::Arith => Err(error(TacticError::MalformedScript)),
+            // Arithmetic normalization and decision have no single proof term to select.
+            SimpRule::Arith | SimpRule::Decide => Err(error(TacticError::MalformedScript)),
         }
     }
 
@@ -760,11 +782,18 @@ impl Context {
     /// Both declarations must still be in this branch. Following only direct
     /// local aliases preserves annotations and local shadowing; ordinary term
     /// applications continue to elaborate the full conditional hypothesis.
+    ///
+    /// A rule is elaborated at each use here, where the pin elaborates it once while reading the
+    /// arguments; that reading reported its deprecated constants (`simp_rules`), so none is
+    /// reported again.
     fn simp_rule_term(&mut self, syntax: &Syntax) -> Result<Typed, NatDefinitionElabError> {
         if let Some(term) = self.specialized_induction_rule(syntax)? {
             return Ok(term);
         }
-        self.term(syntax, None)
+        let check = std::mem::replace(&mut self.check_deprecated, false);
+        let term = self.term(syntax, None);
+        self.check_deprecated = check;
+        term
     }
 
     fn specialized_induction_rule(
@@ -804,6 +833,15 @@ impl Context {
         &mut self,
         args: &'a [Syntax],
     ) -> Result<Vec<SimpRule<'a>>, NatDefinitionElabError> {
+        Ok(self.simp_selection(args)?.0)
+    }
+
+    /// The rules a `simp`, `simpa` or `dsimp` call's slots `args` select, with its configuration.
+    /// `+decide`'s decision joins them first and `+arith`'s normalization last.
+    fn simp_selection<'a>(
+        &mut self,
+        args: &'a [Syntax],
+    ) -> Result<(Vec<SimpRule<'a>>, SimpConfig), NatDefinitionElabError> {
         self.tick()?;
         // `simp`'s six slots, or the pin's `simpa` (`"simpa" "?"? "!"? simpaArgsRest`), whose
         // arguments are `simpaArgsRest`'s first four slots and whose fifth is its evidence.
@@ -837,18 +875,35 @@ impl Context {
             },
             "simplification keyword",
         )?;
-        // `dsimp`'s configuration has no `arith` field.
-        let arith = self.simp_arith_config(config, !dsimp)?;
+        let config = self.simp_config(config, dsimp)?;
+        // `dsimp` decides nothing here: its `decide` is not wired to its reductions.
+        if dsimp && config.decide {
+            return Err(NatDefinitionElabError::UnexpectedSyntax {
+                expected: "default simplification configuration",
+            });
+        }
         expect_empty_null(discharger, "default simplification discharger")?;
         if !simpa {
             let location = location.ok_or_else(|| error(TacticError::MalformedScript))?;
             self.rewrite_locations(location)?;
         }
         let mut rules = self.simp_rule_selection(dsimp, only, arguments)?;
-        if arith {
+        if config.decide {
+            rules.insert(0, SimpRule::Decide);
+        }
+        // `arith` is honoured as the pin's `updateArith` does: off while the environment lacks
+        // `Nat.Linear.ExprCnstr.eq_of_toNormPoly_eq`.
+        if config.arith
+            && self.txn.env.contains(&Name::from_components([
+                "Nat",
+                "Linear",
+                "ExprCnstr",
+                "eq_of_toNormPoly_eq",
+            ]))
+        {
             rules.push(SimpRule::Arith);
         }
-        Ok(rules)
+        Ok((rules, config))
     }
 
     /// The rules `simp_rules` selects, before `+arith`'s normalization joins them last.
@@ -1027,10 +1082,11 @@ impl Context {
                 );
             }
             rules.push((
-                origin,
+                origin.clone(),
                 SimpRule::Explicit(RewriteRule {
                     syntax: &parts[2],
                     reverse,
+                    global: origin,
                 }),
             ));
         }
@@ -1187,7 +1243,7 @@ impl Context {
                 }
                 self.tick()?;
                 let original = self.rewrite_trial();
-                let Some((next_goal, value)) = self.simp_step(&goal, rule, &[])? else {
+                let Some(((next_goal, value), _)) = self.simp_step(&goal, rule, &[])? else {
                     self.restore_simp_trial(original);
                     continue;
                 };
@@ -1231,7 +1287,7 @@ impl Context {
         goal: &ProofGoal,
         rule: &SimpRule<'_>,
         premise_rules: &[SimpRule<'_>],
-    ) -> Result<Option<(ProofGoal, Expr)>, NatDefinitionElabError> {
+    ) -> Result<SimpRewrite<(ProofGoal, Expr)>, NatDefinitionElabError> {
         let target = self.instantiate(&goal.target)?;
         if !self.simp_rule_may_rewrite(rule, &target)? {
             return Ok(None);
@@ -1240,16 +1296,16 @@ impl Context {
             UnfoldResult::Unchanged => Ok(None),
             UnfoldResult::Changed(next_target) => {
                 let (child, next_goal) = self.proof_goal(next_target)?;
-                Ok(Some((next_goal, child)))
+                Ok(Some(((next_goal, child), SimpPlace::of(SimpReach::Unfold))))
             }
             UnfoldResult::NotDefinition => {
-                let Some((term, occurrence, reverse)) =
+                let Some((term, occurrence, reverse, place)) =
                     self.simp_rule_evidence(&target, rule, premise_rules)?
                 else {
                     return Ok(None);
                 };
                 self.rewrite_transport(goal, term, &occurrence, reverse, false)
-                    .map(Some)
+                    .map(|step| Some((step, place)))
             }
         }
     }
@@ -1324,6 +1380,120 @@ impl Context {
         }
     }
 
+    /// Conversion mode's `simp` (`Conv.evalSimp`, vendored src/Lean/Elab/Tactic/Conv/Simp.lean):
+    /// `expr` rewritten by the rules a `simp` tactic's six slots `args` select, step by step as
+    /// [`Self::simplify_goal_with_rules`] rewrites a goal, but closing nothing. Returns the
+    /// result and its equation `expr = result`, `None` when every step was definitional (the
+    /// pin's `applySimpResult` then only changes `lhs`). Making no progress is no failure here:
+    /// conv's `simp` calls `Simp.main` directly, without the goal's "no progress" check.
+    pub(in crate::source) fn simp_expression_with(
+        &mut self,
+        args: &[Syntax],
+        expr: &Expr,
+    ) -> Result<(Expr, Option<Expr>), NatDefinitionElabError> {
+        let rules = self.simp_rules(args)?;
+        let original = self.instantiate(expr)?;
+        let mut current = original.clone();
+        let mut proof: Option<Expr> = None;
+        let mut history = vec![current.clone()];
+        let mut steps = 0usize;
+        let permute = self.simp_rules_permute(&rules)?;
+        let rules = simp_rules_keyed(&rules, permute);
+        loop {
+            self.tick()?;
+            let next = if let Some(normalized) = self.simp_normalize(&current)? {
+                Some((normalized, None))
+            } else {
+                let index = self.simp_target_index(&current)?;
+                self.simp_first_rewrite(
+                    &rules,
+                    permute,
+                    |this, rule| {
+                        Ok(
+                            this.simp_rule_admitted(rule, index.as_ref(), SimpKeySide::Rewrite)
+                                && !this.simp_definition_absent(rule, index.as_ref()),
+                        )
+                    },
+                    |this, rule| {
+                        if !this.simp_rule_may_rewrite(rule, &current)? {
+                            return Ok(None);
+                        }
+                        match this.unfold_simp_rule(rule, &current)? {
+                            UnfoldResult::Unchanged => Ok(None),
+                            UnfoldResult::Changed(next) => {
+                                Ok(Some(((next, None), SimpPlace::of(SimpReach::Unfold))))
+                            }
+                            UnfoldResult::NotDefinition => {
+                                let Some((evidence, occurrence, reverse, place)) =
+                                    this.simp_rule_evidence(&current, rule, &rules)?
+                                else {
+                                    return Ok(None);
+                                };
+                                let (next, step) = this.conv_congr_arg_step(
+                                    &current,
+                                    evidence,
+                                    &occurrence,
+                                    reverse,
+                                    false,
+                                )?;
+                                Ok(Some(((next, Some(step)), place)))
+                            }
+                        }
+                    },
+                )?
+                .map(|(_, found)| found)
+            };
+            let Some((next, step)) = next else {
+                break;
+            };
+            if steps >= MAX_SIMPLIFICATION_STEPS {
+                return Err(failure(SourceInferenceError::ResourceLimit));
+            }
+            for previous in &history {
+                self.tick()?;
+                if self.rewrite_same(previous, &next)? {
+                    return Err(error(TacticError::SimplificationCycle));
+                }
+            }
+            history.push(next.clone());
+            steps += 1;
+            if let Some(step) = step {
+                proof = Some(match proof {
+                    None => step,
+                    Some(previous) => {
+                        let alpha = self
+                            .known_type(&original)?
+                            .ok_or_else(|| failure(SourceInferenceError::ExpectedType))?;
+                        let alpha = self.instantiate(&alpha)?;
+                        let sort = self
+                            .known_type(&alpha)?
+                            .ok_or_else(|| failure(SourceInferenceError::ExpectedType))?;
+                        let level = self.sort_level(&Typed {
+                            value: alpha.clone(),
+                            type_: sort,
+                        })?;
+                        let trans = Name::from_components(["Eq", "trans"]);
+                        if !self.txn.env.contains(&trans) {
+                            return Err(failure(SourceInferenceError::UnknownConstant(trans)));
+                        }
+                        [
+                            alpha,
+                            original.clone(),
+                            current.clone(),
+                            next.clone(),
+                            previous,
+                            step,
+                        ]
+                        .into_iter()
+                        .fold(Expr::const_(trans, vec![level]), Expr::app)
+                    }
+                });
+            }
+            current = next;
+        }
+        Ok((current, proof))
+    }
+
     pub(in crate::source) fn simplify_proof_goal(
         &mut self,
         proof: &mut ProofState<'_>,
@@ -1333,8 +1503,13 @@ impl Context {
         if self.simplify_at_locations(proof, &goal, args)? {
             return Ok(());
         }
-        let rules = self.simp_rules(args)?;
-        self.simplify_goal_with_rules(proof, goal, &rules, 0, None)
+        let (rules, config) = self.simp_selection(args)?;
+        if config.fail_if_unchanged {
+            return self.simplify_goal_with_rules(proof, goal, &rules, 0, None);
+        }
+        let start = proof.work.len();
+        let result = self.simplify_goal_with_rules(proof, goal.clone(), &rules, 0, None);
+        simp_unchanged(proof, goal, start, result)
     }
 
     // Hypothesis and goal simplification share one productive-step limit. A
@@ -1348,6 +1523,9 @@ impl Context {
         completion: Option<&Typed>,
     ) -> Result<(), NatDefinitionElabError> {
         let mut history = vec![self.instantiate(&goal.target)?];
+        let permute = self.simp_rules_permute(rules)?;
+        let keyed = simp_rules_keyed(rules, permute);
+        let rules = &keyed[..];
         loop {
             self.tick()?;
             self.txn.lctx = goal.lctx.clone();
@@ -1371,19 +1549,18 @@ impl Context {
                 continue;
             }
             let index = self.simp_target_index(&target)?;
-            for rule in rules {
-                if !self.simp_rule_admitted(rule, index.as_ref(), SimpKeySide::Rewrite)
-                    || self.simp_definition_absent(rule, index.as_ref())
-                {
-                    continue;
-                }
-                self.tick()?;
-                let original = self.rewrite_trial();
-                let transition = self.simp_step(&goal, rule, rules)?;
-                let Some((next_goal, value)) = transition else {
-                    self.restore_simp_trial(original);
-                    continue;
-                };
+            let transition = self.simp_first_rewrite(
+                rules,
+                permute,
+                |this, rule| {
+                    Ok(
+                        this.simp_rule_admitted(rule, index.as_ref(), SimpKeySide::Rewrite)
+                            && !this.simp_definition_absent(rule, index.as_ref()),
+                    )
+                },
+                |this, rule| this.simp_step(&goal, rule, rules),
+            )?;
+            if let Some((_, (next_goal, value))) = transition {
                 if steps >= MAX_SIMPLIFICATION_STEPS {
                     return Err(failure(SourceInferenceError::ResourceLimit));
                 }
@@ -1399,7 +1576,6 @@ impl Context {
                 goal = next_goal;
                 steps += 1;
                 advanced = true;
-                break;
             }
             if advanced {
                 continue;
@@ -1424,6 +1600,50 @@ impl Context {
             }
             return Ok(());
         }
+    }
+}
+
+/// The registered entry a rule's discrimination keys are read from: a registered rule's own,
+/// or the global theorem a bare identifier argument selects, which the pin's `elabSimpArgs`
+/// inserts into the same discrimination tree (`SimpTheorems.addConst`). A term, a local and an
+/// unfolded definition stay unkeyed (`simp_rule_keys` reads a definition as no key).
+fn simp_rule_entry<'r>(
+    rule: &'r SimpRule<'_>,
+) -> Option<std::borrow::Cow<'r, scope::simp::SimpEntry>> {
+    match rule {
+        SimpRule::Global(entry) => Some(std::borrow::Cow::Borrowed(entry)),
+        SimpRule::Explicit(RewriteRule {
+            global: Some(declaration),
+            reverse,
+            ..
+        }) => Some(std::borrow::Cow::Owned(scope::simp::SimpEntry {
+            declaration: declaration.clone(),
+            proof: None,
+            priority: 1000,
+            reverse: *reverse,
+            order: 0,
+        })),
+        _ => None,
+    }
+}
+
+/// `failIfUnchanged := false`: a call that changed nothing leaves its goal open, as the pin's
+/// `simpGoal` then returns the goal it was given, rather than failing. Only the typed no-progress
+/// refusal of an attempt that pushed no work since `start` is absorbed.
+fn simp_unchanged(
+    proof: &mut ProofState<'_>,
+    goal: ProofGoal,
+    start: usize,
+    result: Result<(), NatDefinitionElabError>,
+) -> Result<(), NatDefinitionElabError> {
+    match result {
+        Err(NatDefinitionElabError::Inference(SourceInferenceError::Tactic(
+            TacticError::SimplificationNoProgress,
+        ))) if proof.work.len() == start => {
+            proof.work.push(Work::Goal(goal));
+            Ok(())
+        }
+        result => result,
     }
 }
 
@@ -1555,6 +1775,8 @@ pub(in crate::source) struct SimpKeyCache(Arc<Mutex<SimpKeyMemo>>);
 struct SimpKeyMemo {
     environment: Option<SimpKeyEnvironment>,
     rules: HashMap<(Name, Option<Name>, bool), [Option<SimpKey>; 2]>,
+    /// Whether a registered theorem's statement is a permutation (`aclt.rs`).
+    perms: HashMap<Name, bool>,
 }
 
 /// A registered rule's `[rewrite, prove]` keys, read from its admitted type: the

@@ -560,3 +560,231 @@ fn scoped_export_keeps_imported_name_updates_and_scope_changes_unsupported() {
     }
     assert!(set_instance(&scoped, &n("candidate"), 1000).is_err());
 }
+
+fn local_alias_fixture() -> Environment {
+    use fln_env::constants::DefinitionVal;
+    let env = axiom(&Environment::new(), "Nat", ty());
+    let mut env = class(&env, "Pick", pi("A", ty(), ty(), BinderInfo::Default));
+    let level = Level::param(n("u"));
+    for (name, parameters, type_, value) in [
+        ("NatAlias", vec![], ty(), c("Nat")),
+        (
+            "AppliedAlias",
+            vec![n("u")],
+            pi(
+                "A",
+                Expr::sort(level.clone()),
+                Expr::sort(level.clone()),
+                BinderInfo::Default,
+            ),
+            Expr::lam(n("A"), Expr::sort(level.clone()), b(0), BinderInfo::Default),
+        ),
+    ] {
+        env = env
+            .add_decl(ConstantInfo::Defn(DefinitionVal {
+                base: ConstantVal {
+                    name: n(name),
+                    level_params: parameters,
+                    type_,
+                },
+                value,
+                hints: ReducibilityHints::Abbrev,
+                safety: DefinitionSafety::Safe,
+                all: vec![n(name)],
+            }))
+            .unwrap();
+        env = crate::reducibility::register(
+            &env,
+            &n(name),
+            crate::reducibility::Reducibility::Reducible,
+        )
+        .unwrap();
+    }
+    axiom(
+        &env,
+        "aliasChoice",
+        app(
+            "Pick",
+            Expr::app(
+                Expr::const_(n("AppliedAlias"), vec![Level::one()]),
+                c("NatAlias"),
+            ),
+        ),
+    )
+}
+
+#[test]
+fn local_registration_normalizes_aliases_with_universes_and_exact_work_limits() {
+    let env = local_alias_fixture();
+    let root = env.logical_root(&KVMap::new());
+    let registry = InstanceRegistry::read(&env).unwrap();
+    let mut remaining = 1_000_000;
+    let index = derive_local_index(&env, &registry, &n("aliasChoice"), &mut remaining)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        index.keys,
+        [
+            discr_tree::Key::Const(n("Pick"), 1),
+            discr_tree::Key::Const(n("Nat"), 0)
+        ]
+    );
+    assert!(index.synth_order.is_empty());
+    assert_eq!(
+        derive(&env, "aliasChoice"),
+        None,
+        "export remains immutable"
+    );
+    let work = 1_000_000 - remaining;
+    let mut exact = work;
+    assert_eq!(
+        derive_local_index(&env, &registry, &n("aliasChoice"), &mut exact).unwrap(),
+        Some(index)
+    );
+    assert_eq!(exact, 0);
+    assert_eq!(
+        derive_local_index(&env, &registry, &n("aliasChoice"), &mut (work - 1)),
+        Err(InstanceRegistryError::Limit)
+    );
+    assert_eq!(env.logical_root(&KVMap::new()), root);
+}
+
+#[test]
+fn local_alias_keys_stay_frozen_when_reducibility_changes() {
+    let env = local_alias_fixture();
+    let mut scopes = scoped::ActiveScopes::default();
+    scopes
+        .register_local(&env, &n("aliasChoice"), 1000)
+        .unwrap();
+    let original = scopes.clone();
+    let changed = crate::reducibility::register(
+        &env,
+        &n("NatAlias"),
+        crate::reducibility::Reducibility::Irreducible,
+    )
+    .unwrap();
+    let registry = InstanceRegistry::read_with_scopes(&changed, &scopes).unwrap();
+    let index = registry.instance_index(&changed, &mut 1_000_000).unwrap();
+    let rows = registry.candidates(&n("Pick"));
+    assert_eq!(rows.len(), 1);
+    // The pin's old C/Nat path cannot match a now-irreducible C/Alias goal.
+    // Re-deriving None and falling back to an unfiltered row would accept it.
+    assert!(
+        index
+            .narrow(
+                &changed,
+                &crate::lctx::LocalContext::new(),
+                &app("Pick", c("NatAlias")),
+                rows,
+            )
+            .is_empty()
+    );
+    assert_eq!(
+        scopes.register_local(&changed, &n("aliasChoice"), 2000),
+        Err(InstanceRegistryError::InvalidInstance(n("aliasChoice")))
+    );
+    assert_eq!(scopes, original, "failed re-registration is atomic");
+    assert!(
+        InstanceRegistry::read(&changed)
+            .unwrap()
+            .candidates(&n("Pick"))
+            .is_empty()
+    );
+}
+
+#[test]
+fn local_reregistration_preserves_imported_paths_or_refuses_atomically() {
+    let env = local_alias_fixture();
+    for keys in [
+        vec![],
+        vec![
+            discr_tree::Key::Const(n("Pick"), 1),
+            discr_tree::Key::Const(n("NatAlias"), 0),
+        ],
+        vec![
+            discr_tree::Key::Const(n("Pick"), 1),
+            discr_tree::Key::Const(n("Nat"), 0),
+        ],
+    ] {
+        let same = keys.last() == Some(&discr_tree::Key::Const(n("Nat"), 0));
+        let imported = imported::register_instance(
+            &env,
+            &n("aliasChoice"),
+            &imported::InstanceParameters {
+                priority: 1000,
+                synth_order: vec![],
+                scope: None,
+                keys,
+            },
+        )
+        .unwrap();
+        let root = imported.logical_root(&KVMap::new());
+        let mut scopes = scoped::ActiveScopes::default();
+        let original = scopes.clone();
+        let result = scopes.register_local(&imported, &n("aliasChoice"), 2000);
+        if same {
+            result.unwrap();
+            let selected = InstanceRegistry::read_with_scopes(&imported, &scopes).unwrap();
+            assert_eq!(selected.candidates(&n("Pick"))[0].priority, 2000);
+        } else {
+            assert_eq!(
+                result,
+                Err(InstanceRegistryError::InvalidInstance(n("aliasChoice")))
+            );
+            assert_eq!(scopes, original);
+        }
+        assert_eq!(imported.logical_root(&KVMap::new()), root);
+    }
+}
+
+#[test]
+fn local_alias_override_keeps_imported_index_when_namespace_opens() {
+    let env = imported::register_instance(
+        &local_alias_fixture(),
+        &n("aliasChoice"),
+        &imported::InstanceParameters {
+            priority: 1000,
+            synth_order: vec![],
+            scope: Some(n("N")),
+            keys: vec![
+                discr_tree::Key::Const(n("Pick"), 1),
+                discr_tree::Key::Const(n("Nat"), 0),
+            ],
+        },
+    )
+    .unwrap();
+    assert_eq!(derive(&env, "aliasChoice"), None);
+    let mut scopes = scoped::ActiveScopes::default();
+    scopes
+        .register_local(&env, &n("aliasChoice"), 2000)
+        .unwrap();
+    let before_open = scopes.clone();
+    let local = InstanceRegistry::read_with_scopes(&env, &scopes).unwrap();
+    assert_eq!(local.candidates(&n("Pick"))[0].priority, 2000);
+    let captured = local.local_instance_index(&n("aliasChoice")).unwrap();
+
+    // Opening the namespace replays its saved imported entry. It changes the
+    // priority without re-deriving or discarding the normalized alias path.
+    scopes.activate(&env, &n("N")).unwrap();
+    let opened = InstanceRegistry::read_with_scopes(&env, &scopes).unwrap();
+    assert_eq!(opened.candidates(&n("Pick")).len(), 1);
+    assert_eq!(opened.candidates(&n("Pick"))[0].priority, 1000);
+    assert_eq!(
+        opened.local_instance_index(&n("aliasChoice")),
+        Some(captured)
+    );
+    assert_eq!(
+        InstanceRegistry::read_with_scopes(&env, &before_open)
+            .unwrap()
+            .candidates(&n("Pick"))[0]
+            .priority,
+        2000,
+        "restoring the lexical snapshot restores the local priority"
+    );
+    assert!(
+        InstanceRegistry::read(&env)
+            .unwrap()
+            .candidates(&n("Pick"))
+            .is_empty()
+    );
+}

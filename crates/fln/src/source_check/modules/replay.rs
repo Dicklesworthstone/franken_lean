@@ -32,12 +32,15 @@ pub(super) fn supports_artifact_extension(descriptor: &ExtensionDescriptor) -> b
         || fln_elab::protected_names::supports(descriptor)
         || fln_elab::aux_recursors::supports(descriptor)
         || fln_elab::noncomputable::supports(descriptor)
+        || fln_elab::source::scope::simp::export::supports(descriptor)
         || fln_elab::source::scope::simp::defeq::supports(descriptor)
+        || fln_elab::source::scope::simp::equations::supports(descriptor)
         || fln_elab::reducibility::export::supports(descriptor)
         || fln_elab::macro_inline::supports(descriptor)
         || fln_elab::implemented_by::supports(descriptor)
         || fln_elab::externs::supports(descriptor)
         || fln_elab::records::imported::export::supports(descriptor)
+        || fln_elab::source::equation_theorems::journal::supports(descriptor)
 }
 
 impl Export {

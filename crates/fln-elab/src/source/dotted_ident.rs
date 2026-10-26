@@ -132,7 +132,16 @@ impl Context {
                 _ => Err(DottedIdentError::NotConstantHeaded { id: id.clone() }),
             };
             match attempt {
-                Ok(term) => return Ok(term),
+                Ok(term) => {
+                    // Checked where `elabAppFnResolutions` checks a resolution, at `.c`.
+                    if let ExprNode::Const { name, .. } = term.value.node() {
+                        let span = super::deprecated::syntax_span(dot)
+                            .zip(super::deprecated::syntax_span(&args[1]))
+                            .map(|((at, _), (_, end))| (at, end));
+                        self.note_deprecated(name, span)?;
+                    }
+                    return Ok(term);
+                }
                 Err(error) => {
                     let first = first.get_or_insert(error).clone();
                     match self.unfold_head_definition(&result)? {

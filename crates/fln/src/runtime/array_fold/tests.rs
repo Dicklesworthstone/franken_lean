@@ -426,7 +426,7 @@ fn private_name_collisions_and_direct_unsafe_calls_do_not_gain_authority() {
 }
 
 #[test]
-fn changed_selected_replacements_and_externs_refuse_without_fallback() {
+fn changed_selected_replacements_and_externs_preserve_execution_authority() {
     with_fixture(|environment| {
         let Some(ConstantInfo::Defn(original)) = environment.find(&selected_name()) else {
             unreachable!("actual unsafe Array implementation");
@@ -439,10 +439,26 @@ fn changed_selected_replacements_and_externs_refuse_without_fallback() {
             .add_decl(ConstantInfo::Defn(unsafe_target))
             .unwrap();
         let changed = implemented_by::register(&changed, &logical_name(), &unsafe_name).unwrap();
-        refused(
-            &changed,
-            "implemented_by target has no supported safe or partial executable body",
+        // A different admitted unsafe implementation can execute its own body,
+        // but only the canonical pair authorizes the checked logical adapter.
+        let mut preparation = Preparation::new(&changed, IngressLimits::default());
+        assert_eq!(
+            preparation.implementation_target(&logical_name()).unwrap(),
+            Some(unsafe_name.clone()),
         );
+        let body = preparation
+            .executable_definition(&logical_name())
+            .unwrap()
+            .unwrap();
+        assert_eq!(body.base.name, unsafe_name);
+        assert_eq!(body.value, original.value);
+        assert_eq!(body.safety, DefinitionSafety::Unsafe);
+        assert!(
+            preparation
+                .specialized_definition(&private_name())
+                .is_none()
+        );
+        assert!(preparation.array_fold.adapter.is_none());
 
         let list_name = named("List.foldlM");
         let Some(ConstantInfo::Defn(original)) = environment.find(&list_name) else {

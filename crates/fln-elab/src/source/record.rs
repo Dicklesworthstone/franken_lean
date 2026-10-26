@@ -315,6 +315,9 @@ pub(super) fn elaborate_record_scoped(
             helper,
         });
     }
+    // The pin elaborates every field's type before any default value, so a default's
+    // deprecated constants are reported after all the types' (`deprecated.rs`).
+    let mut default_uses = Vec::new();
     for (field, style) in fields {
         context.tick()?;
         let parts = expect_node(
@@ -394,9 +397,11 @@ pub(super) fn elaborate_record_scoped(
         arguments.splice(0..0, autos);
         let mut domain = context.expand_record_aliases(domain, &inheritance.aliases)?;
         if let Some(syntax) = default {
+            let recorded = context.deprecated_uses.len();
             context.infer_level_params = false;
             let term = context.term(syntax, Some(domain.clone()))?;
             context.infer_level_params = true;
+            default_uses.extend(context.deprecated_uses.drain(recorded..));
             // Preserve the declared type even when the default is never selected.
             // Its ordinary helper declaration must still pass kernel checking.
             let mut term = context.finish(Typed {
@@ -499,6 +504,7 @@ pub(super) fn elaborate_record_scoped(
                 .clone(),
         );
     }
+    context.deprecated_uses.append(&mut default_uses);
     let inferred_result_level = explicit.is_none();
     let result_level = match explicit {
         Some(value) => {
@@ -699,6 +705,7 @@ pub(super) fn elaborate_record_scoped(
         fields,
         parents,
     };
+    context.publish_deprecated_uses()?;
     Ok(SourceRecord {
         name: name.clone(),
         is_class,

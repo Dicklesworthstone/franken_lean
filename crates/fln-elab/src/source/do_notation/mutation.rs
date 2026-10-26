@@ -1114,6 +1114,11 @@ impl Context {
         out: &mut Vec<Syntax>,
     ) -> Result<(), NatDefinitionElabError> {
         let mut parts = node(element, "doFor", 4)?;
+        let fallback = if last {
+            repeat::state_fallback(&parts[1])?
+        } else {
+            None
+        };
         if loop_binders(&parts[1])
             .into_iter()
             .any(|binder| shadows(binder, muts))
@@ -1161,7 +1166,10 @@ impl Context {
         if last {
             out.push(term(
                 "doExpr",
-                vec![call(false, vec![root(&["PUnit", "unit"])])],
+                vec![repeat::default_result(
+                    call(false, vec![root(&["PUnit", "unit"])]),
+                    fallback,
+                )],
             ));
         }
         Ok(())

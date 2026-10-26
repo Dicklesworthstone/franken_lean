@@ -1,14 +1,17 @@
-//! Native ground equality and propositional saturation for grind.
+//! Native equality, propositional saturation and bounded E-matching for grind.
 //!
 //! Every merge, propagation and case split retains an ordinary proof term.
-//! There is no arithmetic oracle or new axiom. Quantifier instantiation,
-//! arithmetic plugins and custom grind parameters remain outside this fragment.
+//! There is no arithmetic oracle or new axiom. Quantified facts instantiate
+//! their original proofs; arithmetic plugins and custom configurations remain
+//! outside this fragment.
 //! A failure of this fragment is a nonrecoverable capability refusal: it must
 //! never make "try grind; ..." accept a script the pin would already have closed.
 use super::*;
 use std::collections::{HashMap, HashSet, VecDeque};
 mod equalities;
+mod quantifiers;
 use equalities::Equalities;
+use quantifiers::Quantifiers;
 
 type Error = NatDefinitionElabError;
 const MAX_FACTS: usize = 256;
@@ -162,6 +165,7 @@ struct State {
     pending: VecDeque<Typed>,
     queued: HashSet<Expr>,
     rules: Vec<Rule>,
+    quantifiers: Quantifiers,
 }
 
 impl State {
@@ -232,6 +236,7 @@ impl State {
     }
 
     fn expand(&mut self, context: &mut Context, fact: Typed) -> Result<(), Error> {
+        self.quantifiers.register(context, &fact, &[], true)?;
         self.observe(context, &fact.type_)?;
         self.graph.add(context, &fact)?;
         self.truth_equality(context, &fact)?;
@@ -558,6 +563,12 @@ impl State {
                 self.construct(context, &proposition)?;
             }
             if self.pending.is_empty() {
+                let instances = self.quantifiers.instantiate(context, &self.graph)?;
+                for instance in instances {
+                    self.enqueue(context, instance)?;
+                }
+            }
+            if self.pending.is_empty() {
                 return Ok(None);
             }
         }
@@ -649,6 +660,118 @@ impl State {
 }
 
 impl Context {
+    fn grind_parameters<'a>(&mut self, syntax: &'a Syntax) -> Result<Vec<&'a Syntax>, Error> {
+        let parts = expect_null_args(syntax, "grind parameters")?;
+        if parts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let [open, entries, close] = parts else {
+            return Err(unsupported());
+        };
+        expect_atom(open, "[", "grind parameters")?;
+        expect_atom(close, "]", "grind parameters")?;
+        let entries = expect_null_args(entries, "grind parameters")?;
+        if !entries.is_empty() && entries.len() % 2 == 0 {
+            return Err(unsupported());
+        }
+        let mut terms = Vec::new();
+        for (index, entry) in entries.iter().enumerate() {
+            self.tick()?;
+            if index % 2 == 1 {
+                expect_atom(entry, ",", "grind parameter separator")?;
+                continue;
+            }
+            let [entry] = expect_node(
+                entry,
+                &parser_kind(&["Tactic", "grindParam"]),
+                1,
+                "grind parameter",
+            )
+            .map_err(|_| unsupported())?
+            else {
+                return Err(unsupported());
+            };
+            let [modifier, term] = expect_node(
+                entry,
+                &parser_kind(&["Tactic", "grindLemma"]),
+                2,
+                "grind lemma",
+            )
+            .map_err(|_| unsupported())?
+            else {
+                return Err(unsupported());
+            };
+            if !expect_null_args(modifier, "grind modifier")?.is_empty() {
+                return Err(unsupported());
+            }
+            terms.push(term);
+        }
+        Ok(terms)
+    }
+
+    fn grind_lemma(&mut self, syntax: &Syntax) -> Result<(Typed, Vec<Name>), Error> {
+        let mut level_params = Vec::new();
+        let evidence = if let Syntax::Ident { val, .. } = syntax {
+            // Bare local names are redundant parameters at the pin, which
+            // already activates quantified hypotheses automatically.
+            if self.txn.lctx.find_by_user_name(val).is_some() {
+                return Err(unsupported());
+            }
+            let resolved = self
+                .resolve_source_name(val)?
+                .ok_or_else(|| failure(SourceInferenceError::UnknownConstant(val.clone())))?;
+            let info = self
+                .txn
+                .env
+                .find(&resolved)
+                .cloned()
+                .ok_or_else(unsupported)?;
+            if !matches!(
+                info,
+                fln_env::constants::ConstantInfo::Thm(_)
+                    | fln_env::constants::ConstantInfo::Axiom(_)
+                    | fln_env::constants::ConstantInfo::Ctor(_)
+            ) {
+                // Definition selections need their equation theorem producer.
+                return Err(unsupported());
+            }
+            let base = info.constant_val();
+            for _ in &base.level_params {
+                // These names belong to this matching template, never to the
+                // caller's universe context. Every one must be instantiated
+                // from the selected ground applications before proof use.
+                level_params.push(self.fresh_name()?);
+            }
+            let levels: Vec<_> = level_params.iter().cloned().map(Level::param).collect();
+            Typed {
+                value: Expr::const_(resolved, levels.clone()),
+                type_: self.instantiate_params(&base.type_, &base.level_params, &levels)?,
+            }
+        } else {
+            // As for rewrite/simp, do not re-enter the proof driver through a
+            // syntax client while this proof worklist frame is active.
+            let mut pending = vec![syntax];
+            while let Some(term) = pending.pop() {
+                self.tick()?;
+                if let Syntax::Node { kind, args, .. } = term {
+                    if kind == &parser_kind(&["Term", "byTactic"]) {
+                        return Err(unsupported());
+                    }
+                    pending.extend(args);
+                }
+            }
+            self.term(syntax, None)?
+        };
+        let evidence = Typed {
+            value: normalize(self, &evidence.value)?,
+            type_: normalize(self, &evidence.type_)?,
+        };
+        if !is_prop(self, &evidence.type_)? {
+            return Err(unsupported());
+        }
+        Ok((evidence, level_params))
+    }
+
     pub(super) fn grind_proof_goal(
         &mut self,
         mut goal: ProofGoal,
@@ -667,15 +790,17 @@ impl Context {
         if expect_default_config(config, "grind configuration").is_err() {
             return Err(unsupported());
         }
-        let mut pending = vec![only, parameters, interactive];
-        while let Some(syntax) = pending.pop() {
-            self.tick()?;
-            match syntax {
-                Syntax::Node { args, .. } => pending.extend(args),
-                Syntax::Atom { val, .. } if ["only", "[", "]"].contains(&val.as_str()) => {}
-                _ => return Err(unsupported()),
+        match expect_null_args(only, "grind only")? {
+            [] => {}
+            [keyword] => {
+                expect_atom(keyword, "only", "grind only")?;
             }
+            _ => return Err(unsupported()),
         }
+        if !expect_null_args(interactive, "grind interactive block")?.is_empty() {
+            return Err(unsupported());
+        }
+        let parameters = self.grind_parameters(parameters)?;
         let before = self.clone();
         let result = (|| {
             self.txn.lctx = goal.lctx.clone();
@@ -708,6 +833,27 @@ impl Context {
                             value: Expr::fvar(local.id),
                         },
                     )?;
+                }
+            }
+            for parameter in parameters {
+                let (evidence, level_params) = self.grind_lemma(parameter)?;
+                if matches!(evidence.type_.node(), ExprNode::ForallE { .. }) {
+                    if !state
+                        .quantifiers
+                        .register(self, &evidence, &level_params, false)?
+                    {
+                        return Err(unsupported());
+                    }
+                } else {
+                    if !level_params.is_empty() || matches!(parameter, Syntax::Ident { .. }) {
+                        // A bare declaration uses the pin's theorem-pattern
+                        // path even when ground. In particular, `[falseAx]`
+                        // is invalid, while the explicit proof `[(falseAx)]`
+                        // is an extra fact. Ground declaration pattern
+                        // inference is not implemented by this fragment.
+                        return Err(unsupported());
+                    }
+                    state.enqueue(self, evidence)?;
                 }
             }
             let proof = state.solve(self, &target, 0)?.ok_or_else(unsupported)?;

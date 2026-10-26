@@ -4,6 +4,8 @@
 //! index as Star. Definition, recursor, projection, eta and nonempty annotation
 //! normalization are explicit unsupported results, never guessed paths. This
 //! keeps an exported path independent of later reducibility changes.
+//! Local registrations can additionally capture reducible alias keys once;
+//! those keys must travel with their lexical registration, never be re-derived.
 use super::*;
 use fln_core::expr::{FVarId, Literal, NatLit};
 
@@ -29,6 +31,7 @@ struct Indexer<'a> {
     imported_classes: &'a BTreeMap<Name, imported::ClassParameters>,
     remaining: &'a mut usize,
     locals: Vec<Local>,
+    capture_aliases: bool,
 }
 
 /// The source driver keeps an ascription `(e : T)` as the identity let `let _ : T := e; #0`
@@ -63,8 +66,31 @@ pub(super) fn derive(
         imported_classes,
         remaining,
         locals: Vec::new(),
+        capture_aliases: false,
     };
     match indexer.instance(expected_class, declaration) {
+        Ok(result) => Ok(Some(result)),
+        Err(Error::Unsupported) => Ok(None),
+        Err(Error::Registry(error)) => Err(error),
+    }
+}
+
+pub(super) fn derive_local(
+    env: &Environment,
+    classes: &BTreeSet<Name>,
+    imported_classes: &BTreeMap<Name, imported::ClassParameters>,
+    declaration: &Name,
+    remaining: &mut usize,
+) -> std::result::Result<Option<DerivedIndex>, InstanceRegistryError> {
+    let mut indexer = Indexer {
+        env,
+        classes,
+        imported_classes,
+        remaining,
+        locals: Vec::new(),
+        capture_aliases: true,
+    };
+    match indexer.instance(None, declaration) {
         Ok(result) => Ok(Some(result)),
         Err(Error::Unsupported) => Ok(None),
         Err(Error::Registry(error)) => Err(error),
@@ -614,6 +640,68 @@ impl Indexer<'_> {
         )))
     }
 
+    /// The reducible delta/beta fragment of the pin's nested `reduceDT`.
+    /// Universe arguments are substituted before the definition is applied.
+    /// Ordinary definitions, projections, recursors and unapplied lambdas
+    /// retain their existing unsupported result; no wildcard is invented.
+    fn local_alias(&mut self, expr: &Expr) -> Result<Expr> {
+        let mut current = expr.clone();
+        loop {
+            self.tick()?;
+            let (head, args) = self.spine(&current)?;
+            let ExprNode::Const { name, levels } = head.node() else {
+                return Ok(current);
+            };
+            let Some(ConstantInfo::Defn(definition)) = self.env.find(name) else {
+                return Ok(current);
+            };
+            if definition.safety != DefinitionSafety::Safe
+                || definition.hints != ReducibilityHints::Abbrev
+                || self.env.contains(&Name::str(name.clone(), "_sunfold"))
+            {
+                return Ok(current);
+            }
+            let status = crate::reducibility::known_status(self.env, name).map_err(|error| {
+                Error::Registry(match error {
+                    crate::reducibility::ReducibilityError::Limit => InstanceRegistryError::Limit,
+                    crate::reducibility::ReducibilityError::Instances(error) => error,
+                    _ => InstanceRegistryError::Malformed,
+                })
+            })?;
+            if status != Some(crate::reducibility::Reducibility::Reducible) {
+                return Ok(current);
+            }
+            *self.remaining = self
+                .remaining
+                .checked_sub(definition.base.level_params.len())
+                .ok_or(InstanceRegistryError::Limit)?;
+            let parameters = definition.base.level_params.clone();
+            let value = definition.value.clone();
+            let mut value = crate::universe::parameters::instantiate(
+                || tick(self.remaining).map_err(Error::from),
+                || Error::Unsupported,
+                &value,
+                &parameters,
+                levels,
+            )?;
+            let mut arguments = args.into_iter();
+            while let Some(argument) = arguments.next() {
+                self.tick()?;
+                value = without_ascription(&value);
+                let ExprNode::Lam { body, .. } = value.node() else {
+                    value = Expr::app(value, argument);
+                    for argument in arguments {
+                        self.tick()?;
+                        value = Expr::app(value, argument);
+                    }
+                    break;
+                };
+                value = self.substitute(body, &argument)?;
+            }
+            current = without_ascription(&value);
+        }
+    }
+
     fn path(&mut self, target: &Expr) -> Result<Vec<discr_tree::Key>> {
         use discr_tree::Key;
         let mut keys = Vec::new();
@@ -624,7 +712,10 @@ impl Indexer<'_> {
                 keys.push(Key::Star);
                 continue;
             };
-            let expr = without_ascription(&expr);
+            let mut expr = without_ascription(&expr);
+            if self.capture_aliases && !root {
+                expr = self.local_alias(&expr)?;
+            }
             if !root && let Some(literal) = self.numeral(&expr)? {
                 keys.push(Key::Lit(literal));
                 continue;

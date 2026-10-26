@@ -53,12 +53,61 @@ fn exported_defeq_includes_backward_tags_in_the_pins_quick_order() {
 
 #[test]
 fn backward_only_metadata_does_not_become_default_defeq() {
-    let encoded = encode(vec![n("onlyLegacy")], WriteBudget::default()).unwrap();
-    let mut blocks = blocks(&encoded.bytes);
-    blocks.retain(|block| block.name == n(source_extensions::BACKWARD_DEFEQ_EXTENSION));
+    let encoded = encode_module_with_source_metadata(
+        tests::input(),
+        &SourceMetadata {
+            backward_defeq: vec![n("onlyBackward")],
+            ..Default::default()
+        },
+        tests::header(),
+        WriteBudget::default(),
+    )
+    .unwrap();
+    let blocks = blocks(&encoded.bytes);
+    assert_eq!(blocks.len(), 1);
+    assert_eq!(
+        blocks[0].name,
+        n(source_extensions::BACKWARD_DEFEQ_EXTENSION)
+    );
     let decoded = source_extensions::decode(&blocks, DecodeLimits::default()).unwrap();
     assert!(decoded.defeq.is_empty());
-    assert_eq!(decoded.backward_defeq, [n("onlyLegacy")]);
+    assert_eq!(decoded.backward_defeq, [n("onlyBackward")]);
+}
+
+#[test]
+fn strict_and_backward_only_tags_union_without_promoting_generated_equations() {
+    let metadata = SourceMetadata {
+        defeq: vec![n("strict")],
+        backward_defeq: vec![n("f.eq_1"), n("strict")],
+        ..Default::default()
+    };
+    let encoded = encode_module_with_source_metadata(
+        tests::input(),
+        &metadata,
+        tests::header(),
+        WriteBudget::default(),
+    )
+    .unwrap();
+    let decoded =
+        source_extensions::decode(&blocks(&encoded.bytes), DecodeLimits::default()).unwrap();
+    assert_eq!(decoded.defeq, [n("strict")]);
+    let mut expected = vec![n("strict"), n("f.eq_1")];
+    expected.sort_by(Name::quick_cmp);
+    assert_eq!(decoded.backward_defeq, expected);
+    for names in [vec![Name::anonymous()], vec![n("strict"), n("strict")]] {
+        assert!(matches!(
+            encode_module_with_source_metadata(
+                tests::input(),
+                &SourceMetadata {
+                    backward_defeq: names,
+                    ..metadata.clone()
+                },
+                tests::header(),
+                WriteBudget::default(),
+            ),
+            Err(WriteError::Contract { .. })
+        ));
+    }
 }
 
 #[test]

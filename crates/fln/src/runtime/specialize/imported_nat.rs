@@ -45,27 +45,118 @@ impl Preparation<'_> {
         Ok(true)
     }
 
-    /// A known-zero recursor can expose an inert history dictionary without
-    /// ever constructing a runtime history. Reduce only the checked scaffold,
-    /// and keep the actual helper bodies and their execution contracts.
-    pub(in crate::runtime) fn zero_nat_history_minor(
+    /// The admitted body of a pinned course-of-values definition at one
+    /// universe, its leading binders instantiated by `arguments`. Pure
+    /// substitution: no beta, delta or iota step is taken.
+    fn nat_history_body(
         &mut self,
-        motive: &Expr,
-        minor: &Expr,
+        label: &str,
+        levels: &[Level],
+        arguments: &[Expr],
     ) -> Result<Option<Expr>, IngressError> {
-        if !closed(minor) || !self.nat_history_type(motive)? || !self.nat_history_model()? {
+        let Some(definition) = self.definition(&named(label)) else {
+            return Ok(None);
+        };
+        if definition.base.level_params.len() != levels.len() {
             return Ok(None);
         }
-        let marker = FVarId(named("_fln_runtime_unobserved_zero_nat_history"));
-        let reduced = self.nat_history_reduce(minor, &marker)?;
-        if reduced.has_fvar() {
+        let mut body =
+            self.universe_instance(&definition.value, &definition.base.level_params, levels)?;
+        for argument in arguments {
+            self.tick()?;
+            let ExprNode::Lam { body: inner, .. } = body.node() else {
+                return Ok(None);
+            };
+            body = self.substitution(inner, argument)?;
+        }
+        Ok(Some(body))
+    }
+
+    /// Reducing a structural Nat definition by plain delta (an index `n + 1`
+    /// exposed as `Nat.succ` while matching, say) leaves its course-of-values
+    /// scaffold behind: `(Nat.rec (fun t => PProd (M t) (Nat.below M t)) z s t).1`.
+    /// That pair's second component is a type computed from the index, which
+    /// has no uniform runtime layout, but only the first is ever observed.
+    /// Refold the projection to `Nat.brecOn M t F` when, and only when, the
+    /// receiver is syntactically the pinned `Nat.brecOn.go M t F` body and
+    /// `Nat.brecOn`'s own body is that projection, so the replacement is the
+    /// same admitted term one delta step up. Its ordinary lowering then keeps
+    /// the fold of `M` values alone, for a literal or a variable major alike.
+    /// Any other shape is left unchanged.
+    pub(in crate::runtime) fn nat_history_refold(
+        &mut self,
+        index: u64,
+        receiver: &Expr,
+    ) -> Result<Option<Expr>, IngressError> {
+        if index != 0 {
             return Ok(None);
         }
-        // Delta reduction can expose fresh proofs and logical projections.
-        // This closed minor supplies their complete lexical context before
-        // constructor and closure identities are registered by preparation.
-        let erased = self.erase_proofs(&reduced, None)?;
-        self.lower_projections(&erased).map(Some)
+        let (head, args) = self.spine(receiver)?;
+        if !matches!(head.node(), ExprNode::Const { name, levels }
+            if name == &named("Nat.rec") && levels.len() == 1)
+            || args.len() != 4
+        {
+            return Ok(None);
+        }
+        let ExprNode::Lam { body: pair, .. } = args[0].node() else {
+            return Ok(None);
+        };
+        let (_, components) = self.spine(pair)?;
+        let [_, history] = components.as_slice() else {
+            return Ok(None);
+        };
+        let (below, below_args) = self.spine(history)?;
+        let ExprNode::Const {
+            name: below_name,
+            levels,
+        } = below.node()
+        else {
+            return Ok(None);
+        };
+        let [motive, _] = below_args.as_slice() else {
+            return Ok(None);
+        };
+        if below_name != &named("Nat.below") || levels.len() != 1 || motive.has_loose_bvar(0) {
+            return Ok(None);
+        }
+        // `fun t => …` binds nothing in `M`: substituting lowers only its
+        // outer variables to the receiver's scope.
+        let motive = self.substitution(motive, &super::super::nat::literal(0))?;
+        let ExprNode::App { f: first, .. } = args[1].node() else {
+            return Ok(None);
+        };
+        let ExprNode::App { a: zero, .. } = first.node() else {
+            return Ok(None);
+        };
+        let ExprNode::App { f: partial, .. } = zero.node() else {
+            return Ok(None);
+        };
+        let ExprNode::App { f: functional, .. } = partial.node() else {
+            return Ok(None);
+        };
+        // The refolded term calls `Nat.brecOn`, which the original did not:
+        // an executable replacement or extern of it must not be selected.
+        if !self.nat_history_logical_constant(&named("Nat.brecOn"))? || !self.nat_history_model()? {
+            return Ok(None);
+        }
+        let arguments = [motive, args[3].clone(), functional.clone()];
+        if self
+            .nat_history_body("Nat.brecOn.go", levels, &arguments)?
+            .as_ref()
+            != Some(receiver)
+        {
+            return Ok(None);
+        }
+        let go = application(constant("Nat.brecOn.go", levels.clone()), arguments.clone());
+        if self.nat_history_body("Nat.brecOn", levels, &arguments)?
+            != Some(Expr::proj(named("PProd"), 0, go))
+        {
+            return Ok(None);
+        }
+        Ok(Some(application(
+            constant("Nat.brecOn", levels.clone()),
+            arguments,
+        )))
     }
 
     /// An executable replacement or extern must not become evidence that a

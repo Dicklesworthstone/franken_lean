@@ -84,6 +84,9 @@ pub struct SourceMetadataReport {
     pub noncomputable: usize,
     /// `@[defeq]` tags (the pin's `Lean.defeqAttr`), which select `dsimp`'s rfl lemmas.
     pub defeq: usize,
+    /// Backward-definitional tags, retained independently so an imported
+    /// semireducible equation lemma never becomes a strict `dsimp` rule.
+    pub backward_defeq: usize,
     /// Original structure fields and direct-parent metadata, validated against
     /// this module's checked constructor and projection interfaces.
     pub structures: usize,
@@ -113,6 +116,9 @@ pub struct SourceMetadataReport {
     pub pp_anonymous_constructor: usize,
     pub pp_nodot: usize,
     pub app_unexpanders: usize,
+    /// `@[deprecated]` entries on this module's own declarations (the pin's `deprecatedAttr`),
+    /// which name resolution reports from.
+    pub deprecations: usize,
     /// Unsupported scope, phase or proof forms; also named in `uninterpreted`.
     pub deferred_simps: usize,
     pub uninterpreted: Vec<Name>,
@@ -355,6 +361,8 @@ impl Engine {
                 Name::from_components(metadata::APP_UNEXPANDER_EXTENSION.split('.')),
                 Name::from_components(metadata::INLINE_EXTENSION.split('.')),
                 metadata::namespace_extension_name(),
+                Name::from_components(metadata::DEPRECATED_EXTENSION.split('.')),
+                Name::from_components(metadata::BACKWARD_DEFEQ_EXTENSION.split('.')),
             ])
             .collect();
         let mut blocks: Vec<_> = selected
@@ -368,6 +376,7 @@ impl Engine {
         let mut capture_left = limits.max_capture_bytes;
         let mut entries_left = limits.metadata.max_entries;
         let mut defeq_payloads = HashSet::new();
+        let mut backward_defeq_payloads = HashSet::new();
         // Each module's capture reads only its own parts, so the walks run
         // `limits.read_jobs` at once; the cumulative byte allowance is charged below
         // in replay order, exactly as when one walk followed another.
@@ -391,6 +400,7 @@ impl Engine {
                 aux_recursors: 0,
                 noncomputable: 0,
                 defeq: 0,
+                backward_defeq: 0,
                 structures: 0,
                 reducibility: 0,
                 externs: 0,
@@ -404,6 +414,7 @@ impl Engine {
                 pp_anonymous_constructor: 0,
                 pp_nodot: 0,
                 app_unexpanders: 0,
+                deprecations: 0,
                 uninterpreted: Vec::new(),
             };
             let mut seen = BTreeSet::new();
@@ -422,12 +433,26 @@ impl Engine {
                 }
                 if let Some(kind) = selected.iter().position(|name| name == &block.name) {
                     let mut entries = block.entries;
-                    if kind == 14 {
+                    if kind == 14 || kind == 21 {
                         // An equation theorem realized in several modules carries its
                         // `@[defeq]` tag in each (`Nat.lt_wfRel.eq_1` in five of `Init`'s);
                         // the first module's tag stands for the others. The decoder still
                         // refuses a repeat within the stream it is given.
-                        entries.retain(|payload| defeq_payloads.insert(payload.clone()));
+                        let mut local = HashSet::new();
+                        if entries.iter().any(|payload| !local.insert(payload)) {
+                            return Err(SourceOleanImportError::Metadata {
+                                module: module.name.clone(),
+                                declaration: block.name,
+                                reason: "duplicate reflexivity tag in one module",
+                            });
+                        }
+                        drop(local);
+                        let seen = if kind == 14 {
+                            &mut defeq_payloads
+                        } else {
+                            &mut backward_defeq_payloads
+                        };
+                        entries.retain(|payload| seen.insert(payload.clone()));
                     }
                     entries_left = entries_left
                         .checked_sub(entries.len())
@@ -453,6 +478,8 @@ impl Engine {
                         17 => report.app_unexpanders = entries.len(),
                         18 => report.inline = entries.len(),
                         19 => report.namespaces = entries.len(),
+                        20 => report.deprecations = entries.len(),
+                        21 => report.backward_defeq = entries.len(),
                         _ => {
                             return Err(SourceOleanImportError::Internal(
                                 "unknown selected metadata kind",
@@ -489,9 +516,11 @@ impl Engine {
         let mut aux_recursors = decoded.aux_recursors.into_iter();
         let mut noncomputable = decoded.noncomputable.into_iter();
         let mut defeq = decoded.defeq.into_iter();
+        let mut backward_defeq = decoded.backward_defeq.into_iter();
         let mut pp_anonymous_constructor = decoded.pp_anonymous_constructor.into_iter();
         let mut pp_nodot = decoded.pp_nodot.into_iter();
         let mut app_unexpanders = decoded.app_unexpanders.into_iter();
+        let mut deprecations = decoded.deprecations.into_iter();
         let mut reducibility = decoded.reducibility.into_iter();
         let mut externs = decoded.externs.into_iter();
         let mut implementations = decoded.implemented_by.into_iter();
@@ -506,6 +535,25 @@ impl Engine {
         // One activation for the whole closure: the registries are read once and
         // kept current, rather than re-read and re-validated before every row.
         let mut activation = R::new(engine.environment.clone());
+        use fln_elab::source::scope::simp::defeq as reflexivity;
+        let tag_module = roots.first().cloned().unwrap_or_default();
+        let mut tag_work = limits.metadata.max_objects;
+        let mut tick_tags = || {
+            tag_work =
+                tag_work
+                    .checked_sub(1)
+                    .ok_or(fln_elab::NatDefinitionElabError::Inference(
+                        fln_elab::source::SourceInferenceError::SimpSet(
+                            fln_elab::source::scope::simp::SimpSetError::Limit,
+                        ),
+                    ))?;
+            Ok(())
+        };
+        let mut strict_tags = reflexivity::read(activation.environment(), &mut tick_tags)
+            .map_err(|error| defeq_error(&tag_module, &reflexivity::journal_name(), error))?;
+        let mut backward_tags =
+            reflexivity::read_backward(activation.environment(), &mut tick_tags)
+                .map_err(|error| defeq_error(&tag_module, &reflexivity::journal_name(), error))?;
         for (&index, report) in order.iter().zip(&mut reports) {
             let before = activation.environment().clone();
             if report.structures != 0 {
@@ -762,6 +810,56 @@ impl Engine {
                             }
                         })?;
             }
+            if report.deprecations != 0 {
+                cancelled!("source-olean/deprecations");
+                let entries: Vec<_> = deprecations
+                    .by_ref()
+                    .take(report.deprecations)
+                    .map(|entry| fln_elab::deprecations::Deprecation {
+                        declaration: entry.declaration,
+                        new_name: entry.new_name,
+                        text: entry.text,
+                        since: entry.since,
+                    })
+                    .collect();
+                if entries.len() != report.deprecations {
+                    return Err(SourceOleanImportError::Internal(
+                        "deprecation count changed during decode",
+                    ));
+                }
+                // `ParametricAttribute.setParam` sets a parameter only on the module's own
+                // declaration.
+                let mut owners = AttributeOwners::new(
+                    &checked.modules[index].decoded.constants,
+                    entries.len(),
+                    limits.check.max_declarations,
+                    limits.metadata.max_entries,
+                )?;
+                for entry in &entries {
+                    cancelled!("source-olean/deprecation-owner");
+                    owners.validate(
+                        activation.environment(),
+                        &report.module,
+                        &entry.declaration,
+                    )?;
+                }
+                activation = activation
+                    .register_deprecations(&entries)
+                    .map_err(|error| {
+                        let declaration = match &error {
+                            fln_elab::deprecations::DeprecationError::UnknownDeclaration(name)
+                            | fln_elab::deprecations::DeprecationError::Duplicate(name) => {
+                                name.clone()
+                            }
+                            _ => report.module.clone(),
+                        };
+                        SourceOleanImportError::Metadata {
+                            module: report.module.clone(),
+                            declaration,
+                            reason: "a deprecation cannot be recorded",
+                        }
+                    })?;
+            }
             if report.noncomputable != 0 {
                 let mut owners = AttributeOwners::new(
                     &checked.modules[index].decoded.constants,
@@ -796,13 +894,35 @@ impl Engine {
                         "defeq count changed during decode",
                     ))?;
                     owners.validate(activation.environment(), &report.module, &declaration)?;
-                    activation = activation.register_defeq(&declaration).map_err(|_| {
-                        SourceOleanImportError::Metadata {
-                            module: report.module.clone(),
-                            declaration: declaration.clone(),
-                            reason: "defeq tag cannot be recorded",
-                        }
-                    })?;
+                    if strict_tags.insert(declaration.clone()) {
+                        activation = activation
+                            .register_defeq(&declaration)
+                            .map_err(|error| defeq_error(&report.module, &declaration, error))?;
+                        backward_tags.insert(declaration);
+                    }
+                }
+            }
+            if report.backward_defeq != 0 {
+                let mut owners = AttributeOwners::new(
+                    &checked.modules[index].decoded.constants,
+                    report.backward_defeq,
+                    limits.check.max_declarations,
+                    limits.metadata.max_entries,
+                )?;
+                for _ in 0..report.backward_defeq {
+                    cancelled!("source-olean/backward-defeq");
+                    let declaration =
+                        backward_defeq
+                            .next()
+                            .ok_or(SourceOleanImportError::Internal(
+                                "backward-defeq count changed during decode",
+                            ))?;
+                    owners.validate(activation.environment(), &report.module, &declaration)?;
+                    if backward_tags.insert(declaration.clone()) {
+                        activation = activation
+                            .register_backward_defeq(&declaration)
+                            .map_err(|error| defeq_error(&report.module, &declaration, error))?;
+                    }
                 }
             }
             for _ in 0..report.reducibility {
@@ -1022,9 +1142,11 @@ impl Engine {
             || aux_recursors.next().is_some()
             || noncomputable.next().is_some()
             || defeq.next().is_some()
+            || backward_defeq.next().is_some()
             || pp_anonymous_constructor.next().is_some()
             || pp_nodot.next().is_some()
             || app_unexpanders.next().is_some()
+            || deprecations.next().is_some()
             || reducibility.next().is_some()
             || externs.next().is_some()
             || implementations.next().is_some()
@@ -1178,11 +1300,19 @@ trait Registrar: Sized {
         self,
         tags: &[fln_elab::delaborator_tags::DelaboratorTag],
     ) -> std::result::Result<Self, fln_elab::delaborator_tags::DelaboratorTagError>;
+    fn register_deprecations(
+        self,
+        entries: &[fln_elab::deprecations::Deprecation],
+    ) -> std::result::Result<Self, fln_elab::deprecations::DeprecationError>;
     fn register_noncomputable(
         self,
         declaration: &Name,
     ) -> std::result::Result<Self, fln_elab::noncomputable::NoncomputableError>;
     fn register_defeq(
+        self,
+        declaration: &Name,
+    ) -> std::result::Result<Self, fln_elab::NatDefinitionElabError>;
+    fn register_backward_defeq(
         self,
         declaration: &Name,
     ) -> std::result::Result<Self, fln_elab::NatDefinitionElabError>;
@@ -1271,6 +1401,12 @@ impl Registrar for instances::imported::ImportActivation {
     ) -> std::result::Result<Self, fln_elab::delaborator_tags::DelaboratorTagError> {
         self.register_delaborator_tags(tags)
     }
+    fn register_deprecations(
+        self,
+        entries: &[fln_elab::deprecations::Deprecation],
+    ) -> std::result::Result<Self, fln_elab::deprecations::DeprecationError> {
+        self.register_deprecations(entries)
+    }
     fn register_noncomputable(
         self,
         declaration: &Name,
@@ -1282,6 +1418,12 @@ impl Registrar for instances::imported::ImportActivation {
         declaration: &Name,
     ) -> std::result::Result<Self, fln_elab::NatDefinitionElabError> {
         self.register_defeq(declaration)
+    }
+    fn register_backward_defeq(
+        self,
+        declaration: &Name,
+    ) -> std::result::Result<Self, fln_elab::NatDefinitionElabError> {
+        self.register_backward_defeq(declaration)
     }
     fn register_reducibility(
         self,
@@ -1322,17 +1464,17 @@ impl Registrar for instances::imported::ImportActivation {
 }
 
 /// A decoded stored `DiscrTree.Key` as the native instance index holds it.
-fn instance_key(key: metadata::InstanceKey) -> instances::discr_tree::Key {
+fn instance_key(key: metadata::DiscrTreeKey) -> instances::discr_tree::Key {
     use instances::discr_tree::Key;
-    use metadata::InstanceKey;
+    use metadata::DiscrTreeKey;
     match key {
-        InstanceKey::Star => Key::Star,
-        InstanceKey::Other => Key::Other,
-        InstanceKey::Lit(literal) => Key::Lit(literal),
-        InstanceKey::FVar(name, arity) => Key::FVar(fln_core::expr::FVarId(name), arity),
-        InstanceKey::Const(name, arity) => Key::Const(name, arity),
-        InstanceKey::Arrow => Key::Arrow,
-        InstanceKey::Proj(name, field, arity) => Key::Proj(name, field, arity),
+        DiscrTreeKey::Star => Key::Star,
+        DiscrTreeKey::Other => Key::Other,
+        DiscrTreeKey::Lit(literal) => Key::Lit(literal),
+        DiscrTreeKey::FVar(name, arity) => Key::FVar(fln_core::expr::FVarId(name), arity),
+        DiscrTreeKey::Const(name, arity) => Key::Const(name, arity),
+        DiscrTreeKey::Arrow => Key::Arrow,
+        DiscrTreeKey::Proj(name, field, arity) => Key::Proj(name, field, arity),
     }
 }
 
@@ -1346,6 +1488,28 @@ fn reducibility_status(
         metadata::ReducibilityStatus::Semireducible => Reducibility::Semireducible,
         metadata::ReducibilityStatus::Irreducible => Reducibility::Irreducible,
         metadata::ReducibilityStatus::ImplicitReducible => Reducibility::ImplicitReducible,
+    }
+}
+
+fn defeq_error(
+    module: &Name,
+    declaration: &Name,
+    error: fln_elab::NatDefinitionElabError,
+) -> SourceOleanImportError {
+    if matches!(
+        error,
+        fln_elab::NatDefinitionElabError::Inference(
+            fln_elab::source::SourceInferenceError::SimpSet(
+                fln_elab::source::scope::simp::SimpSetError::Limit
+            ) | fln_elab::source::SourceInferenceError::ResourceLimit
+        )
+    ) {
+        return SourceOleanImportError::Limit("native reflexivity journal");
+    }
+    SourceOleanImportError::Metadata {
+        module: module.clone(),
+        declaration: declaration.clone(),
+        reason: "reflexivity tag cannot be recorded",
     }
 }
 
@@ -1812,6 +1976,137 @@ pub(super) mod tests {
         });
     }
 
+    #[test]
+    fn imported_backward_only_tags_are_distinct_from_strict_reflexivity() {
+        use fln_env::constants::{ConstantVal, TheoremVal};
+        use fln_olean::write::source::{SourceMetadata, encode_module_with_source_metadata};
+
+        on_import_stack(|| {
+            let base = Engine::from_environment(Environment::new())
+                .admit_declarations(
+                    &[fln_elab::seed::eq_seed_declaration()],
+                    &KVMap::new(),
+                    EngineAdmissionLimits::new(Budget::for_stack_bytes(STACK)),
+                )
+                .unwrap()
+                .into_complete()
+                .unwrap()
+                .engine;
+            let a = Expr::bvar(1).unwrap();
+            let x = Expr::bvar(0).unwrap();
+            let equality = Expr::app(
+                Expr::app(
+                    Expr::app(Expr::const_(n("Eq"), vec![Level::one()]), a.clone()),
+                    x.clone(),
+                ),
+                x.clone(),
+            );
+            let proof = Expr::app(
+                Expr::app(Expr::const_(n("Eq.refl"), vec![Level::one()]), a),
+                x,
+            );
+            let type_ = Expr::forall_e(
+                n("A"),
+                Expr::sort(Level::one()),
+                Expr::forall_e(
+                    n("x"),
+                    Expr::bvar(0).unwrap(),
+                    equality,
+                    BinderInfo::Default,
+                ),
+                BinderInfo::Default,
+            );
+            let value = Expr::lam(
+                n("A"),
+                Expr::sort(Level::one()),
+                Expr::lam(n("x"), Expr::bvar(0).unwrap(), proof, BinderInfo::Default),
+                BinderInfo::Default,
+            );
+            let constants: Vec<_> = [n("strict"), n("backward")]
+                .into_iter()
+                .map(|name| {
+                    ConstantInfo::Thm(TheoremVal {
+                        base: ConstantVal {
+                            name: name.clone(),
+                            level_params: vec![],
+                            type_: type_.clone(),
+                        },
+                        value: value.clone(),
+                        all: vec![name],
+                    })
+                })
+                .collect();
+            let encoded = encode_module_with_source_metadata(
+                OleanModuleWriteInput {
+                    is_module: false,
+                    imports: &[],
+                    constants: &constants,
+                    extra_const_names: &[],
+                },
+                &SourceMetadata {
+                    defeq: vec![n("strict")],
+                    backward_defeq: vec![n("backward")],
+                    ..Default::default()
+                },
+                OleanWriteHeader {
+                    version: OLEAN_ACCEPTED_VERSIONS[0],
+                    flags: 1,
+                    lean_version: OLEAN_PIN_TAG.strip_prefix('v').unwrap(),
+                    githash: OLEAN_PIN_COMMIT,
+                    base_addr: (OLEAN_REGION_ALIGN as u64) * 2,
+                },
+                OleanWriteBudget::default(),
+            )
+            .unwrap();
+            let root = n("Tags");
+            let inputs = [OleanModuleInput {
+                name: &root,
+                artifact: &encoded.bytes,
+                server_artifact: None,
+                private_artifact: None,
+            }];
+            let imported = base
+                .import_olean_modules_for_source(
+                    &inputs,
+                    std::slice::from_ref(&root),
+                    &KVMap::new(),
+                    limits(1),
+                )
+                .unwrap()
+                .into_complete()
+                .unwrap();
+            assert_eq!(imported.modules[0].defeq, 1);
+            assert_eq!(imported.modules[0].backward_defeq, 2);
+            assert!(imported.modules[0].uninterpreted.is_empty());
+            use fln_elab::source::scope::simp::defeq;
+            let env = imported.engine.environment().clone();
+            assert_eq!(
+                defeq::read(&env, || Ok(())).unwrap(),
+                BTreeSet::from([n("strict")])
+            );
+            assert_eq!(
+                defeq::read_backward(&env, || Ok(())).unwrap(),
+                BTreeSet::from([n("strict"), n("backward")])
+            );
+            // The strict tag already implies its backward flag, so the native
+            // journal holds two events instead of three duplicated selections.
+            assert_eq!(env.extension(&defeq::journal_name()).unwrap().len(), 2);
+            let sequential = base
+                .activate_source_metadata_with::<Sequential>(
+                    imported.checked,
+                    &inputs,
+                    std::slice::from_ref(&root),
+                    &KVMap::new(),
+                    limits(1),
+                    None,
+                )
+                .unwrap()
+                .into_complete()
+                .unwrap();
+            assert_eq!(&env, sequential.engine.environment());
+        });
+    }
+
     /// The pin's `@[defeq]` tags (`Lean.defeqAttr`) are activated with each module's
     /// other metadata, so `dsimp` reads an imported rfl lemma as reflexive. None was
     /// imported before: `dsimp` on `P (id x)` made no progress, where the pinned lean
@@ -1974,6 +2269,12 @@ pub(super) mod tests {
         ) -> std::result::Result<Self, fln_elab::delaborator_tags::DelaboratorTagError> {
             fln_elab::delaborator_tags::register_module(&self.0, tags).map(Sequential)
         }
+        fn register_deprecations(
+            self,
+            entries: &[fln_elab::deprecations::Deprecation],
+        ) -> std::result::Result<Self, fln_elab::deprecations::DeprecationError> {
+            fln_elab::deprecations::register_module(&self.0, entries).map(Sequential)
+        }
         fn register_noncomputable(
             self,
             declaration: &Name,
@@ -1985,6 +2286,13 @@ pub(super) mod tests {
             declaration: &Name,
         ) -> std::result::Result<Self, fln_elab::NatDefinitionElabError> {
             fln_elab::source::scope::simp::defeq::register_imported(&self.0, declaration)
+                .map(Sequential)
+        }
+        fn register_backward_defeq(
+            self,
+            declaration: &Name,
+        ) -> std::result::Result<Self, fln_elab::NatDefinitionElabError> {
+            fln_elab::source::scope::simp::defeq::register_backward(&self.0, declaration)
                 .map(Sequential)
         }
         fn register_reducibility(

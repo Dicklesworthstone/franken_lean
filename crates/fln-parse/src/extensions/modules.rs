@@ -40,7 +40,7 @@ impl FileGrammar {
         let mut rule_scopes = BTreeMap::new();
         for (kind, rule) in self.rules.iter() {
             let inherited = self.native_rule_counts.get(kind).copied();
-            if !exported_names.contains(kind) && inherited.is_none() {
+            if !exported_names.contains(kind) && inherited.is_none() && !atoms::is_kind(kind) {
                 continue;
             }
             let Some(rule) = self.exportable_rule(kind, rule)? else {
@@ -89,11 +89,11 @@ impl FileGrammar {
                 return Err("an imported syntax declaration names an unavailable category");
             }
         }
-        if module
-            .rules
-            .keys()
-            .any(|kind| !names.contains(kind) && !self.native_rule_counts.contains_key(kind))
-        {
+        if module.rules.keys().any(|kind| {
+            !names.contains(kind)
+                && !self.native_rule_counts.contains_key(kind)
+                && !atoms::is_kind(kind)
+        }) {
             return Err("an imported macro rule has no native syntax declaration");
         }
         for (kind, scopes) in &module.rule_scopes {
@@ -126,6 +126,13 @@ impl FileGrammar {
                     if pattern_kind != kind || quotation::variables(args)? != rule.variables {
                         return Err("an imported macro pattern has inconsistent captures");
                     }
+                    if atoms::is_kind(kind) && !atoms::valid_pattern(kind, args) {
+                        return Err(
+                            "an imported atomic macro does not match a whole syntax operand",
+                        );
+                    }
+                } else if atoms::is_kind(kind) {
+                    return Err("an imported atomic macro has no quoted pattern");
                 }
             }
         }

@@ -81,16 +81,16 @@ fn retain_actual_constant(constants: &mut BTreeMap<Name, ConstantInfo>, info: &C
     }
 }
 
-fn instance_key(key: metadata::InstanceKey) -> instances::discr_tree::Key {
+fn instance_key(key: metadata::DiscrTreeKey) -> instances::discr_tree::Key {
     use instances::discr_tree::Key;
     match key {
-        metadata::InstanceKey::Star => Key::Star,
-        metadata::InstanceKey::Other => Key::Other,
-        metadata::InstanceKey::Lit(literal) => Key::Lit(literal),
-        metadata::InstanceKey::FVar(name, arity) => Key::FVar(fln_core::expr::FVarId(name), arity),
-        metadata::InstanceKey::Const(name, arity) => Key::Const(name, arity),
-        metadata::InstanceKey::Arrow => Key::Arrow,
-        metadata::InstanceKey::Proj(name, field, arity) => Key::Proj(name, field, arity),
+        metadata::DiscrTreeKey::Star => Key::Star,
+        metadata::DiscrTreeKey::Other => Key::Other,
+        metadata::DiscrTreeKey::Lit(literal) => Key::Lit(literal),
+        metadata::DiscrTreeKey::FVar(name, arity) => Key::FVar(fln_core::expr::FVarId(name), arity),
+        metadata::DiscrTreeKey::Const(name, arity) => Key::Const(name, arity),
+        metadata::DiscrTreeKey::Arrow => Key::Arrow,
+        metadata::DiscrTreeKey::Proj(name, field, arity) => Key::Proj(name, field, arity),
     }
 }
 

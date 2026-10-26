@@ -72,6 +72,14 @@ impl Preparation<'_> {
                         {
                             return Ok(None);
                         }
+                        // Native Tasks also allocate a runtime carrier. Their
+                        // logical constructor field is accessible only through
+                        // the checked native getter, never static projection.
+                        if crate::source_intrinsics::tasks::Operation::from_name(name).is_some()
+                            && self.task_record_forbidden(&Name::from_components(["Task"]))?
+                        {
+                            return Ok(None);
+                        }
                         // A verified primitive is inert as a function value,
                         // whether its logical declaration is an axiom or a
                         // definition. Keep its name in dictionary fields so

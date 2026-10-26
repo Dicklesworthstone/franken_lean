@@ -59,7 +59,7 @@ fn byte_array_string_conversion_bounds_bytes_before_utf8_and_allocation() {
     let error = match invoke_intrinsic(
         IntrinsicImplementation::for_row(ROW),
         ROW,
-        &[oversized],
+        vec![oversized],
         1024,
     ) {
         Err(IntrinsicFailure::StringFromBytesResource(error)) => error,

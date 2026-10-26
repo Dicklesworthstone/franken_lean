@@ -34,7 +34,7 @@ fn compiled_global_instances_drive_real_downstream_dictionary_selection() {
     for row in &rows {
         assert_eq!(
             row.keys,
-            [source_extensions::InstanceKey::Const(name("Pick"), 0)]
+            [source_extensions::DiscrTreeKey::Const(name("Pick"), 0)]
         );
         assert!(row.synth_order.is_empty());
         assert!(row.scope.is_none());
@@ -289,8 +289,8 @@ fn generic_instance_prerequisites_keep_absolute_telescope_positions() {
     assert_eq!(
         adapter.keys,
         [
-            source_extensions::InstanceKey::Const(name("Adapter"), 1),
-            source_extensions::InstanceKey::Star
+            source_extensions::DiscrTreeKey::Const(name("Adapter"), 1),
+            source_extensions::DiscrTreeKey::Star
         ]
     );
     let receipt = imported(&built);
@@ -325,8 +325,8 @@ fn output_parameters_preserve_the_dependency_order_of_instance_prerequisites() {
     assert_eq!(
         choose.keys,
         [
-            source_extensions::InstanceKey::Const(name("Choose"), 1),
-            source_extensions::InstanceKey::Const(name("Token"), 0)
+            source_extensions::DiscrTreeKey::Const(name("Choose"), 1),
+            source_extensions::DiscrTreeKey::Const(name("Token"), 0)
         ],
         "the pin retains an explicit concrete output type in its index"
     );
@@ -345,15 +345,15 @@ fn generic_and_specific_paths_preserve_selection_across_the_compiled_boundary() 
     assert_eq!(
         rows[0].keys,
         [
-            source_extensions::InstanceKey::Const(name("Mark"), 1),
-            source_extensions::InstanceKey::Const(name("Token"), 0)
+            source_extensions::DiscrTreeKey::Const(name("Mark"), 1),
+            source_extensions::DiscrTreeKey::Const(name("Token"), 0)
         ]
     );
     assert_eq!(
         rows[1].keys,
         [
-            source_extensions::InstanceKey::Const(name("Mark"), 1),
-            source_extensions::InstanceKey::Star
+            source_extensions::DiscrTreeKey::Const(name("Mark"), 1),
+            source_extensions::DiscrTreeKey::Star
         ]
     );
     let receipt = imported(&built);

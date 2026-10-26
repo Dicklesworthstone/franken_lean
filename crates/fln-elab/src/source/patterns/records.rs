@@ -244,41 +244,17 @@ impl Context {
         Ok(root)
     }
 
-    fn pattern_field_family(
-        &mut self,
-        owner: &Name,
-        field: usize,
-    ) -> Result<Name, NatDefinitionElabError> {
-        let Some(ConstantInfo::Induct(family)) = self.txn.env.find(owner) else {
-            return Err(invalid());
-        };
-        let Some(ConstantInfo::Ctor(ctor)) = family
-            .ctors
-            .first()
-            .and_then(|name| self.txn.env.find(name))
-        else {
-            return Err(invalid());
-        };
-        let count = ctor.num_params as usize + field;
-        let mut type_ = ctor.base.type_.clone();
-        for _ in 0..count {
-            self.tick()?;
-            let ExprNode::ForallE { body, .. } = type_.node() else {
-                return Err(invalid());
-            };
-            type_ = body.clone();
-        }
-        let ExprNode::ForallE { binder_type, .. } = type_.node() else {
-            return Err(invalid());
-        };
-        let type_ = self.whnf(binder_type)?;
+    fn pattern_record_family(&mut self, receiver: &Typed) -> Result<Name, NatDefinitionElabError> {
+        let type_ = self.whnf(&receiver.type_)?;
         let mut head = &type_;
         while let ExprNode::App { f, .. } = head.node() {
             self.tick()?;
             head = f;
         }
         let ExprNode::Const { name, .. } = head.node() else {
-            return Err(invalid());
+            return Err(field_error(
+                record_terms::RecordTermError::ExpectedRecordType,
+            ));
         };
         Ok(name.clone())
     }
@@ -288,21 +264,22 @@ impl Context {
     fn pattern_field_path(
         &mut self,
         structures: &ImportedStructures,
-        root: &Name,
+        root: &Typed,
         label: &Name,
     ) -> Result<Vec<Name>, NatDefinitionElabError> {
         let components = scope::components(label).map_err(|_| invalid())?;
-        let mut owner = root.clone();
+        let mut receiver = root.clone();
         let mut result = Vec::new();
         for (position, component) in components.iter().enumerate() {
             self.tick()?;
             let atomic = Name::from_components([component.as_str()]);
             let mut pending =
-                std::collections::VecDeque::from([(owner.clone(), Vec::<Name>::new())]);
+                std::collections::VecDeque::from([(receiver.clone(), Vec::<Name>::new())]);
             let mut found = None;
             let mut visited = HashSet::new();
-            while let Some((record, path)) = pending.pop_front() {
+            while let Some((current, path)) = pending.pop_front() {
                 self.tick()?;
+                let record = self.pattern_record_family(&current)?;
                 if !visited.insert(record.clone()) {
                     continue;
                 }
@@ -312,28 +289,29 @@ impl Context {
                 let entry = structures.get(&record).ok_or_else(|| {
                     field_error(record_terms::RecordTermError::ExpectedRecordType)
                 })?;
-                for (index, field) in entry.fields.iter().enumerate() {
+                for field in &entry.fields {
                     self.tick()?;
                     let mut next = path.clone();
                     next.push(field.name.clone());
                     if field.name == atomic {
-                        found = Some((record.clone(), index, next));
+                        found = Some((current.clone(), field.name.clone(), next));
                         break;
                     }
-                    if let Some(parent) = &field.subobject {
-                        pending.push_back((parent.clone(), next));
+                    if field.subobject.is_some() {
+                        let parent = self.record_field(current.clone(), &field.name)?;
+                        pending.push_back((parent, next));
                     }
                 }
                 if found.is_some() {
                     break;
                 }
             }
-            let (record, index, path) = found.ok_or_else(|| {
+            let (owner, field, path) = found.ok_or_else(|| {
                 field_error(record_terms::RecordTermError::UnknownField(label.clone()))
             })?;
             result.extend(path);
             if position + 1 < components.len() {
-                owner = self.pattern_field_family(&record, index)?;
+                receiver = self.record_field(owner, &field)?;
             }
         }
         if result.is_empty() {
@@ -344,12 +322,46 @@ impl Context {
 
     pub(in crate::source) fn record_pattern_paths(
         &mut self,
-        family: &Name,
+        type_: &Expr,
+        labels: &[Name],
+        ellipsis: bool,
+    ) -> Result<Vec<Vec<Name>>, NatDefinitionElabError> {
+        // Field types belong to the actual discriminant, not to an unopened
+        // constructor telescope. A projection of `Wrapper Inner.inside` has
+        // type `Inner`, although the raw constructor binder only names `A`.
+        // Probe the admitted projections in a private context so dependent
+        // fields have a scoped receiver and lookup cannot leak assignments.
+        let mut trial = self.clone();
+        let result = (|| {
+            let id = FVarId(trial.fresh_name()?);
+            trial.txn.lctx.add_param(
+                id.clone(),
+                Name::anonymous(),
+                type_.clone(),
+                BinderInfo::Default,
+            );
+            trial.record_pattern_paths_for(
+                Typed {
+                    value: Expr::fvar(id),
+                    type_: type_.clone(),
+                },
+                labels,
+                ellipsis,
+            )
+        })();
+        self.txn.budget.heartbeats_consumed = trial.txn.budget.heartbeats_consumed;
+        result
+    }
+
+    fn record_pattern_paths_for(
+        &mut self,
+        receiver: Typed,
         labels: &[Name],
         ellipsis: bool,
     ) -> Result<Vec<Vec<Name>>, NatDefinitionElabError> {
         let structures = ImportedStructures::read(&self.txn.env).map_err(metadata_error)?;
-        if structures.get(family).is_none() {
+        let family = self.pattern_record_family(&receiver)?;
+        if structures.get(&family).is_none() {
             return Err(field_error(
                 record_terms::RecordTermError::ExpectedRecordType,
             ));
@@ -357,7 +369,7 @@ impl Context {
         let mut paths = Vec::<Vec<Name>>::new();
         for label in labels {
             self.tick()?;
-            let path = self.pattern_field_path(&structures, family, label)?;
+            let path = self.pattern_field_path(&structures, &receiver, label)?;
             for previous in &paths {
                 self.tick()?;
                 if previous.starts_with(&path) || path.starts_with(previous) {
@@ -369,14 +381,15 @@ impl Context {
             paths.push(path);
         }
         if !ellipsis {
-            let mut pending = vec![(family.clone(), Vec::<Name>::new())];
-            while let Some((owner, prefix)) = pending.pop() {
+            let mut pending = vec![(receiver, Vec::<Name>::new())];
+            while let Some((current, prefix)) = pending.pop() {
                 self.tick()?;
                 if prefix.len() > 256 {
                     return Err(failure(SourceInferenceError::ResourceLimit));
                 }
+                let owner = self.pattern_record_family(&current)?;
                 let entry = structures.get(&owner).ok_or_else(invalid)?;
-                for (index, field) in entry.fields.iter().enumerate() {
+                for field in &entry.fields {
                     self.tick()?;
                     let mut path = prefix.clone();
                     path.push(field.name.clone());
@@ -390,10 +403,9 @@ impl Context {
                     if supplied {
                         continue;
                     }
-                    if let Some(parent) = &field.subobject {
-                        pending.push((parent.clone(), path));
-                    } else if nested {
-                        pending.push((self.pattern_field_family(&owner, index)?, path));
+                    if field.subobject.is_some() || nested {
+                        let child = self.record_field(current.clone(), &field.name)?;
+                        pending.push((child, path));
                     } else {
                         return Err(field_error(record_terms::RecordTermError::MissingField(
                             field.name.clone(),
@@ -408,7 +420,7 @@ impl Context {
     /// The matrix's labels resolve only here, after the actual family is known.
     pub(in crate::source) fn bind_record_pattern_layout(
         &mut self,
-        family: &Name,
+        type_: &Expr,
         constructor: &ConstructorVal,
         layout: &[Syntax],
         fields: &mut Vec<Option<Name>>,
@@ -428,7 +440,7 @@ impl Context {
             labels.push(label);
             columns.push(column);
         }
-        let paths = self.record_pattern_paths(family, &labels, ellipsis)?;
+        let paths = self.record_pattern_paths(type_, &labels, ellipsis)?;
         let mut cursor = constructor.base.type_.clone();
         let mut telescope = Vec::new();
         while let ExprNode::ForallE {

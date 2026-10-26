@@ -696,7 +696,10 @@ pub(super) fn preresolve(
                         built.push(Syntax::Ident {
                             info: *info,
                             raw_val: *raw_val,
-                            val: Name::from_components(["_root_"]).append_core(&global),
+                            // Macro matching uses the written identifier, even
+                            // after a quotation has resolved its declaration.
+                            // Anchor the name only after recursive expansion.
+                            val: val.clone(),
                             preresolved: vec![Preresolved::Decl {
                                 name: global,
                                 fields: Vec::new(),
@@ -799,8 +802,18 @@ mod tests {
         while let Some(node) = pending.pop() {
             match node {
                 Syntax::Node { args, .. } => pending.extend(args.iter().rev()),
-                Syntax::Ident { val, .. } if !val.is_anonymous() => {
-                    result.push(val.to_display_string());
+                Syntax::Ident {
+                    val, preresolved, ..
+                } if !val.is_anonymous() => {
+                    // These scope tests inspect the chosen declaration; the
+                    // original spelling remains in `val` for macro matching.
+                    let name = match preresolved.as_slice() {
+                        [Preresolved::Decl { name, fields }] if fields.is_empty() => {
+                            Name::from_components(["_root_"]).append_core(name)
+                        }
+                        _ => val.clone(),
+                    };
+                    result.push(name.to_display_string());
                 }
                 _ => {}
             }
@@ -810,6 +823,38 @@ mod tests {
 
     fn global(name: &Name) -> Resolution {
         Resolution::Global(Name::from_components(["Declared"]).append_core(name))
+    }
+
+    #[test]
+    fn preresolved_globals_retain_the_identifier_matched_by_later_macros() {
+        let rule = rule("notation \"originalName\" => value");
+        let checked = preresolve(&rule, &global).unwrap();
+        let Syntax::Ident {
+            info,
+            raw_val,
+            val,
+            preresolved,
+        } = &checked
+        else {
+            panic!("an identifier template remains an identifier");
+        };
+        let Syntax::Ident {
+            info: original_info,
+            raw_val: original_span,
+            val: original_name,
+            ..
+        } = &rule.rhs
+        else {
+            panic!("the source template is an identifier");
+        };
+        assert_eq!(val, original_name);
+        assert_eq!(info, original_info);
+        assert_eq!(raw_val, original_span);
+        assert!(matches!(
+            preresolved.as_slice(),
+            [Preresolved::Decl { name, fields }]
+                if *name == Name::from_components(["Declared", "value"]) && fields.is_empty()
+        ));
     }
 
     fn unknown(error: EngineExecutionError, expected: &str) {

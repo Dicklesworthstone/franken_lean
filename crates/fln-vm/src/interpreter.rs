@@ -871,6 +871,7 @@ enum IntrinsicImplementation {
     FileHandleGetLine,
     FileHandleRead,
     FileHandleWrite,
+    FileHandleFlush,
     FilePathReadDir,
     IoGetTaskState,
     IoWait,
@@ -1239,6 +1240,7 @@ impl IntrinsicImplementation {
             "extern:IO.FS.Handle.getLine" => Self::FileHandleGetLine,
             "extern:IO.FS.Handle.read" => Self::FileHandleRead,
             "extern:IO.FS.Handle.write" => Self::FileHandleWrite,
+            "extern:IO.FS.Handle.flush" => Self::FileHandleFlush,
             "extern:System.FilePath.readDir" => Self::FilePathReadDir,
             "extern:IO.getTaskState" => Self::IoGetTaskState,
             "extern:IO.wait" => Self::IoWait,
@@ -2675,7 +2677,7 @@ fn run(
                     match invoke_intrinsic(
                         plan.implementation,
                         plan.row,
-                        &values,
+                        values,
                         limits.max_nat_magnitude_bytes,
                     ) {
                         Ok(result) => {
@@ -4353,13 +4355,46 @@ fn scalar_nat_result(
 fn invoke_intrinsic(
     implementation: IntrinsicImplementation,
     row: &str,
-    args: &[Obj],
+    args: Vec<Obj>,
     max_nat_magnitude_bytes: u64,
 ) -> Result<IntrinsicResult, IntrinsicFailure> {
-    if let Some(result) = scalar_nat_result(implementation, args) {
+    // The validated row has already transferred owned operands out of their
+    // registers. Keep those handles owned here: borrowing and cloning them
+    // again would make every unique array look shared at its mutation boundary.
+    if implementation == IntrinsicImplementation::ArrayPush {
+        expect_arity(row, &args, 2)?;
+        array_value(&args[0], "Array.push", 0)?;
+        let mut args = args.into_iter();
+        let array = args.next().expect("checked push arity");
+        let value = args.next().expect("checked push arity");
+        return array
+            .try_array_push(value)
+            .map(IntrinsicResult::raw_object)
+            .map_err(|_| VmRefusal::InvalidArrayObject.into());
+    }
+    if let IntrinsicImplementation::ArrayExtra(intrinsic) = implementation {
+        return intrinsic.invoke(row, args);
+    }
+    if implementation == IntrinsicImplementation::ByteArrayPush {
+        expect_arity(row, &args, 2)?;
+        if value_kind(&args[0]) != ValueKind::ScalarArray {
+            return Err(type_mismatch("ByteArray.push", 0, "ByteArray", &args[0]).into());
+        }
+        if !matches!(args[0].try_borrow_sarray_view(), Some((1, _, _, _))) {
+            return Err(VmRefusal::InvalidByteArrayObject.into());
+        }
+        let value = byte_argument(&args[1], "ByteArray.push", 1)?;
+        // Preserve the native push path's owned array and scalar contract.
+        let array = args.into_iter().next().expect("checked byte push arity");
+        return array
+            .try_byte_array_push(value)
+            .map(IntrinsicResult::owned)
+            .map_err(|_| VmRefusal::InvalidByteArrayObject.into());
+    }
+    if let Some(result) = scalar_nat_result(implementation, &args) {
         return Ok(result);
     }
-    dispatch_intrinsic(implementation, row, args, max_nat_magnitude_bytes)
+    dispatch_intrinsic(implementation, row, &args, max_nat_magnitude_bytes)
 }
 
 fn dispatch_intrinsic(
@@ -4376,7 +4411,11 @@ fn dispatch_intrinsic(
     match implementation {
         IntrinsicImplementation::PanicCore => diagnostics::panic(row, args),
         IntrinsicImplementation::ArrayConstruction(intrinsic) => intrinsic.invoke(row, args),
-        IntrinsicImplementation::ArrayExtra(intrinsic) => intrinsic.invoke(row, args),
+        IntrinsicImplementation::ArrayExtra(_)
+        | IntrinsicImplementation::ArrayPush
+        | IntrinsicImplementation::ByteArrayPush => {
+            unreachable!("owned array operations are dispatched before borrowing arguments")
+        }
         IntrinsicImplementation::Float(intrinsic) => intrinsic.invoke(row, args),
         IntrinsicImplementation::StringInternal(intrinsic) => intrinsic.invoke(row, args),
         IntrinsicImplementation::NatAdd => {
@@ -6460,16 +6499,6 @@ fn dispatch_intrinsic(
             let (size, _) = array_value(&args[0], "Array.usize", 0)?;
             Ok(IntrinsicResult::scalar(Obj::mk_nat(size)))
         }
-        IntrinsicImplementation::ArrayPush => {
-            expect_arity(row, args, 2)?;
-            let (size, _) = array_value(&args[0], "Array.push", 0)?;
-            let mut items = Vec::with_capacity(size.saturating_add(1));
-            for index in 0..size {
-                items.push(args[0].array_child(index));
-            }
-            items.push(args[1].clone_ref());
-            Ok(IntrinsicResult::raw_object(Obj::mk_array(items)))
-        }
         IntrinsicImplementation::NatDecEq
         | IntrinsicImplementation::NatDecLe
         | IntrinsicImplementation::NatDecLt => {
@@ -6489,10 +6518,8 @@ fn dispatch_intrinsic(
             };
             Ok(IntrinsicResult::scalar(Obj::mk_nat(usize::from(ordering))))
         }
-        // ByteArray rows. The pin mutates in place when its refcount shows a
-        // sole owner and copies otherwise; that optimization is invisible to
-        // pure value semantics, so every handler here builds a fresh object —
-        // the same copy-always discipline as Array.push above.
+        // ByteArray.push transfers its consumed reference so the native export
+        // retains the pin's growth and copy-on-write behavior.
         IntrinsicImplementation::ByteArraySize => {
             expect_arity(row, args, 1)?;
             let bytes = byte_array_bytes(&args[0], "ByteArray.size", 0)?;
@@ -6574,12 +6601,6 @@ fn dispatch_intrinsic(
             let mut updated = bytes;
             updated[index] = value;
             Ok(IntrinsicResult::raw_object(mk_byte_array(&updated)))
-        }
-        IntrinsicImplementation::ByteArrayPush => {
-            expect_arity(row, args, 2)?;
-            let mut bytes = byte_array_bytes(&args[0], "ByteArray.push", 0)?;
-            bytes.push(byte_argument(&args[1], "ByteArray.push", 1)?);
-            Ok(IntrinsicResult::owned(mk_byte_array(&bytes)))
         }
         IntrinsicImplementation::ByteArrayMk => {
             expect_arity(row, args, 1)?;
@@ -6742,6 +6763,13 @@ fn dispatch_intrinsic(
             expect_arity(row, args, 2)?;
             args[0]
                 .try_file_put_str(&args[1], &Obj::mk_nat(0))
+                .map(IntrinsicResult::owned)
+                .map_err(|error| VmRefusal::NativeFileIo { error }.into())
+        }
+        IntrinsicImplementation::FileHandleFlush => {
+            expect_arity(row, args, 1)?;
+            args[0]
+                .try_file_flush(&Obj::mk_nat(0))
                 .map(IntrinsicResult::owned)
                 .map_err(|error| VmRefusal::NativeFileIo { error }.into())
         }
@@ -6940,6 +6968,50 @@ fn cache_thunk_value(thunk: &Obj, value: &Obj) -> Result<(), Stop> {
     )))
 }
 
+fn task_composition_argument_ownership(
+    program: &ValidatedProgram,
+    closure: &Obj,
+    payload: &Obj,
+) -> Result<Vec<ArgumentOwnership>, VmRefusal> {
+    let plan = plan_apply(program, closure, 2, None, None)?;
+    let ownership = program
+        .function(plan.function)
+        .and_then(|function| function.parameter_ownership.get(plan.captures.len()..))
+        .and_then(|parameters| parameters.get(..2))
+        .ok_or(VmRefusal::MalformedClosure {
+            reason: "task composition continuation requires payload and world parameters",
+        })?;
+    // finished_task_value retained the payload, so this temporary can be
+    // borrowed or consumed by the callback. The original task may still own
+    // it: neither this retain nor the internally created world grants Unique.
+    // A Scalar parameter also requires the physical value to be tagged.
+    for (argument, (expected, actual)) in ownership
+        .iter()
+        .copied()
+        .zip([
+            if payload.is_scalar() {
+                ArgumentOwnership::Scalar
+            } else {
+                ArgumentOwnership::Owned
+            },
+            ArgumentOwnership::Scalar,
+        ])
+        .enumerate()
+    {
+        if expected == ArgumentOwnership::Unique
+            || (expected == ArgumentOwnership::Scalar && actual != ArgumentOwnership::Scalar)
+        {
+            return Err(VmRefusal::ApplyOwnershipMismatch {
+                function: plan.function,
+                argument,
+                expected,
+                actual,
+            });
+        }
+    }
+    Ok(ownership.to_vec())
+}
+
 fn closure_intrinsic_application(
     program: &ValidatedProgram,
     implementation: IntrinsicImplementation,
@@ -6961,11 +7033,31 @@ fn closure_intrinsic_application(
             // mismatch would treat 2^64 as ill-typed rather than a valid
             // (and here unused) priority.
             with_nat_view(&priority, operation, 1, |_| ())?;
+            // Source callbacks borrow their token, while ABI callbacks may
+            // declare this internally supplied scalar zero Scalar or Owned.
+            // Honor the validated target's next parameter, after its captures,
+            // without granting a Unique argument or relaxing ordinary Apply.
+            let plan = plan_apply(program, &closure, 1, None, None)?;
+            let ownership = program
+                .function(plan.function)
+                .and_then(|function| function.parameter_ownership.get(plan.captures.len()))
+                .copied()
+                .ok_or(VmRefusal::MalformedClosure {
+                    reason: "task continuation parameter is absent",
+                })?;
+            if ownership == ArgumentOwnership::Unique {
+                return Err(VmRefusal::ApplyOwnershipMismatch {
+                    function: plan.function,
+                    argument: 0,
+                    expected: ownership,
+                    actual: ArgumentOwnership::Scalar,
+                });
+            }
             Ok(IntrinsicApplication {
                 row,
                 closure,
                 arguments: vec![Obj::mk_nat(0)],
-                argument_ownership: vec![ArgumentOwnership::Scalar],
+                argument_ownership: vec![ownership],
                 completion: IntrinsicCompletion::WrapPure,
                 trace: None,
             })
@@ -6979,11 +7071,13 @@ fn closure_intrinsic_application(
             let argument = task
                 .finished_task_value()
                 .ok_or(VmRefusal::UnsupportedTaskState)?;
+            let argument_ownership =
+                task_composition_argument_ownership(program, &closure, &argument)?;
             Ok(IntrinsicApplication {
                 row,
                 closure,
                 arguments: vec![argument, Obj::mk_nat(0)],
-                argument_ownership: vec![ArgumentOwnership::Owned, ArgumentOwnership::Scalar],
+                argument_ownership,
                 completion: IntrinsicCompletion::WrapPure,
                 trace: None,
             })
@@ -7003,11 +7097,13 @@ fn closure_intrinsic_application(
             let argument = task
                 .finished_task_value()
                 .ok_or(VmRefusal::UnsupportedTaskState)?;
+            let argument_ownership =
+                task_composition_argument_ownership(program, &closure, &argument)?;
             Ok(IntrinsicApplication {
                 row,
                 closure,
                 arguments: vec![argument, Obj::mk_nat(0)],
-                argument_ownership: vec![ArgumentOwnership::Owned, ArgumentOwnership::Scalar],
+                argument_ownership,
                 completion: IntrinsicCompletion::RequireFinishedTask,
                 trace: None,
             })
@@ -7347,6 +7443,7 @@ fn closure_intrinsic_application(
         | IntrinsicImplementation::FileHandleGetLine
         | IntrinsicImplementation::FileHandleRead
         | IntrinsicImplementation::FileHandleWrite
+        | IntrinsicImplementation::FileHandleFlush
         | IntrinsicImplementation::FilePathReadDir
         | IntrinsicImplementation::IoGetTaskState
         | IntrinsicImplementation::IoWait
@@ -8436,15 +8533,19 @@ mod tests {
         finish_intrinsic_result(
             row,
             expected_ownership,
-            invoke_intrinsic(implementation, row, args, CEILING).map_err(
-                |failure| match failure {
-                    IntrinsicFailure::Refused(refusal) => refusal,
-                    other => panic!(
-                        "unexpected intrinsic failure class: {name}",
-                        name = std::any::type_name_of_val(&other)
-                    ),
-                },
-            )?,
+            invoke_intrinsic(
+                implementation,
+                row,
+                args.iter().map(Obj::clone_ref).collect(),
+                CEILING,
+            )
+            .map_err(|failure| match failure {
+                IntrinsicFailure::Refused(refusal) => refusal,
+                other => panic!(
+                    "unexpected intrinsic failure class: {name}",
+                    name = std::any::type_name_of_val(&other)
+                ),
+            })?,
         )
     }
 

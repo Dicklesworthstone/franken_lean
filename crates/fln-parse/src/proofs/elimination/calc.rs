@@ -5,7 +5,9 @@ use super::*;
 
 pub(super) struct Step {
     pub relation: Range<usize>,
-    pub assign: usize,
+    /// The step's `:=`, which only the first step may omit (`calcFirstStep := term (" := "
+    /// term)?`): `calc a` then `_ = b := p` starts from `a`.
+    pub assign: Option<usize>,
     pub proof: Range<usize>,
 }
 pub(super) struct Calculation {
@@ -92,7 +94,18 @@ pub(super) fn plan(
             }
             delimiter_depth(&tokens[at], &mut depth);
         }
-        let assign = assign.ok_or_else(|| refusal(view, tokens, row))?;
+        let Some(assign) = assign else {
+            // A first step without a proof is a term the calculation starts from.
+            if index != 0 || row == stop || depth != 0 || equality.is_some() {
+                return Err(refusal(view, tokens, row));
+            }
+            steps.push(Step {
+                relation: row..stop,
+                assign: None,
+                proof: stop..stop,
+            });
+            continue;
+        };
         // The ordinary term parser owns the written relation. Requiring an
         // infix equality here prevents prefix relations (R a b), parenthesized
         // propositions and checked Trans instances from reaching elaboration.
@@ -106,7 +119,7 @@ pub(super) fn plan(
         }
         steps.push(Step {
             relation: row..assign,
-            assign,
+            assign: Some(assign),
             proof: assign + 1..stop,
         });
     }
@@ -202,9 +215,10 @@ mod tests {
             .steps
             .iter()
             .map(|step| {
-                assert!(symbol(&tokens, step.assign, ":="));
-                assert_eq!(step.relation.end, step.assign);
-                assert_eq!(step.proof.start, step.assign + 1);
+                let assign = step.assign.expect("each step has a proof");
+                assert!(symbol(&tokens, assign, ":="));
+                assert_eq!(step.relation.end, assign);
+                assert_eq!(step.proof.start, assign + 1);
                 let start = tokens[step.relation.start].extent.start().0;
                 let end = tokens[step.relation.end - 1].extent.end().0;
                 &view.normalized().as_str()[start..end]

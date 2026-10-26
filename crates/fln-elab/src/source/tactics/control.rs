@@ -38,6 +38,35 @@ pub(super) fn mode(kind: &Name) -> Option<Mode> {
 pub(super) fn is_scope(kind: &Name) -> bool {
     kind == &parser_kind(&["Tactic", "set_option"])
         || kind == &parser_kind(&["Tactic", "classical"])
+        || transparency_scope(kind).is_some()
+}
+
+/// `syntax (name := withReducible) "with_reducible " tacticSeq : tactic` and its siblings
+/// (vendored src/Init/Tactics.lean:358-376): the keyword, its kind's last component, and the
+/// transparency its body runs at (`evalWithReducible` &c., vendored
+/// src/Lean/Elab/Tactic/BuiltinTactic.lean). The body runs on every goal, unfocused.
+fn transparency_scope(
+    kind: &Name,
+) -> Option<(&'static str, &'static str, UnificationTransparency)> {
+    [
+        (
+            "with_reducible",
+            "withReducible",
+            UnificationTransparency::Abbreviations,
+        ),
+        (
+            "with_reducible_and_instances",
+            "withReducibleAndInstances",
+            UnificationTransparency::Instances,
+        ),
+        (
+            "with_unfolding_none",
+            "withUnfoldingNone",
+            UnificationTransparency::None,
+        ),
+    ]
+    .into_iter()
+    .find(|(_, component, _)| kind == &parser_kind(&["Tactic", component]))
 }
 
 /// A name's components, root first, each as a one-component name.
@@ -68,8 +97,63 @@ pub(super) struct Frame<'a> {
     // A sequencing frame first isolates its left operand, then maps this
     // continuation only over the resulting frontier, not over old siblings.
     after: Option<Vec<&'a Syntax>>,
+    // A conversion-mode frame: what its sequence's end does with the goals it leaves.
+    conv: Option<Box<super::conv::Finish>>,
+    // An all-goals frame over only the first goals of its frontier: how many more it runs on.
+    limit: Option<usize>,
+    // A `case'` frame: the tag of the goal its current run started on, which a run leaving
+    // exactly one goal gives that goal (`evalCase'`'s `g'.setTag mvarTag`).
+    retag: Option<Option<Name>>,
 }
 impl Context {
+    /// The index in `goals` of the goal `case tag` would select among them (`findTag?`): the
+    /// first whose tag, macro scopes erased, is `tag`, else ends with it, else starts with it;
+    /// `_` is the first goal.
+    pub(super) fn case_tag_position(
+        &mut self,
+        goals: &[ProofGoal],
+        tag: &Syntax,
+    ) -> Result<usize, NatDefinitionElabError> {
+        let [tag] = expect_node(
+            tag,
+            &Name::from_components(["Lean", "binderIdent"]),
+            1,
+            "case tag",
+        )?
+        else {
+            return Err(error(TacticError::MalformedScript));
+        };
+        let tag = match tag {
+            Syntax::Ident { val, .. } => val.erase_macro_scopes(),
+            hole if hole.kind() == Some(&parser_kind(&["Term", "hole"])) => {
+                return if goals.is_empty() {
+                    Err(error(TacticError::NoGoals))
+                } else {
+                    Ok(0)
+                };
+            }
+            _ => return Err(error(TacticError::MalformedScript)),
+        };
+        let tags: Vec<Vec<Name>> = goals
+            .iter()
+            .map(|goal| {
+                components(
+                    &self
+                        .goal_tags
+                        .get(&goal.id)
+                        .map(Name::erase_macro_scopes)
+                        .unwrap_or_else(Name::anonymous),
+                )
+            })
+            .collect();
+        let wanted = components(&tag);
+        tags.iter()
+            .position(|tags| *tags == wanted)
+            .or_else(|| tags.iter().position(|tags| tags.ends_with(&wanted)))
+            .or_else(|| tags.iter().position(|tags| tags.starts_with(&wanted)))
+            .ok_or_else(|| error(TacticError::CaseTagNotFound(tag)))
+    }
+
     /// The goal `case tag` selects (`getCaseGoals` and `findTag?`, vendored
     /// src/Lean/Elab/Tactic/BuiltinTactic.lean): among the visible goals in order, the first
     /// whose tag, macro scopes erased, is `tag`, else ends with it, else starts with it. `_`
@@ -150,7 +234,18 @@ impl Context {
         args: &'a [Syntax],
     ) -> Result<(), NatDefinitionElabError> {
         let instance_scopes = self.source_scope.instance_scopes.clone();
-        let (body, options) = if kind == &parser_kind(&["Tactic", "classical"]) {
+        let transparency = self.tactic_transparency;
+        let (body, options) = if let Some((word, component, ambient)) = transparency_scope(kind) {
+            let [keyword, sequence] = args else {
+                return Err(error(TacticError::MalformedScript));
+            };
+            expect_atom(keyword, word, "transparency tactic")?;
+            self.require_declared_tactic(&["Lean", "Parser", "Tactic", component])?;
+            let body = self.proof_instructions(sequence)?;
+            // The pin's `withTransparency` sets the mode, so an inner scope replaces an outer one.
+            self.tactic_transparency = Some(ambient);
+            (body, self.txn.options.clone())
+        } else if kind == &parser_kind(&["Tactic", "classical"]) {
             let [keyword, sequence] = args else {
                 return Err(error(TacticError::MalformedScript));
             };
@@ -193,8 +288,48 @@ impl Context {
         let scope = OptionScope {
             options,
             instance_scopes,
+            transparency,
             instructions: std::mem::replace(&mut proof.instructions, body),
             cursor: proof.cursor + 1,
+        };
+        proof.cursor = 0;
+        proof
+            .work
+            .insert(boundary, Work::EndOptions(Box::new(scope)));
+        Ok(())
+    }
+
+    /// Run `body` in place of the instruction just read, as the pin runs a macro's expansion
+    /// (`expandEval`, vendored src/Lean/Elab/Tactic/Basic.lean): on every visible goal, the goals
+    /// it leaves passed on to the instructions after it. The barrier restores nothing but the
+    /// instruction stream.
+    pub(super) fn start_macro_scope<'a>(
+        &mut self,
+        proof: &mut ProofState<'a>,
+        body: Vec<&'a Syntax>,
+    ) -> Result<(), NatDefinitionElabError> {
+        if body.is_empty() {
+            return Err(error(TacticError::MalformedScript));
+        }
+        let boundary = proof
+            .work
+            .iter()
+            .rposition(|work| {
+                matches!(
+                    work,
+                    Work::EndScript(..)
+                        | Work::EndControl(_)
+                        | Work::EndAttempt(_)
+                        | Work::EndOptions(_)
+                )
+            })
+            .map_or(0, |position| position + 1);
+        let scope = OptionScope {
+            options: self.txn.options.clone(),
+            instance_scopes: self.source_scope.instance_scopes.clone(),
+            transparency: self.tactic_transparency,
+            instructions: std::mem::replace(&mut proof.instructions, body),
+            cursor: proof.cursor,
         };
         proof.cursor = 0;
         proof
@@ -213,6 +348,7 @@ impl Context {
         }
         self.txn.options = scope.options;
         self.source_scope.instance_scopes = scope.instance_scopes;
+        self.tactic_transparency = scope.transparency;
         proof.instructions = scope.instructions;
         proof.cursor = scope.cursor;
         Ok(())
@@ -306,11 +442,168 @@ impl Context {
             waiting: std::mem::take(&mut proof.work),
             deferred: Vec::new(),
             after,
+            conv: None,
+            limit: None,
+            retag: None,
         };
         let index = proof.controls.len();
         proof.controls.push(frame);
         proof.work.push(Work::EndControl(index));
         proof.work.push(Work::Goal(goal));
+        Ok(())
+    }
+
+    /// `syntax`'s sequence run, in turn, on the main goal and the `count - 1` visible goals
+    /// after it, each with every other goal suspended, as `all_goals` runs its body; the goals
+    /// each run leaves come first, in order, then the goals after those `count`.
+    pub(super) fn start_limited_all_goals<'a>(
+        &mut self,
+        proof: &mut ProofState<'a>,
+        goal: ProofGoal,
+        syntax: &'a Syntax,
+        count: usize,
+    ) -> Result<(), NatDefinitionElabError> {
+        let body = self.proof_instructions(syntax)?;
+        let tag = self.goal_tags.get(&goal.id).cloned();
+        self.start_goal_control_body(proof, goal, body, Mode::All, None)?;
+        let frame = proof
+            .controls
+            .last_mut()
+            .ok_or_else(|| error(TacticError::MalformedScript))?;
+        frame.limit = Some(count.saturating_sub(1));
+        frame.retag = Some(tag);
+        Ok(())
+    }
+
+    /// `case'`'s run of `syntax` on `goal` alone, every other goal suspended as `focus` does:
+    /// a run leaving exactly one goal gives it `goal`'s tag.
+    pub(super) fn start_case_prime_focus<'a>(
+        &mut self,
+        proof: &mut ProofState<'a>,
+        goal: ProofGoal,
+        syntax: &'a Syntax,
+    ) -> Result<(), NatDefinitionElabError> {
+        let tag = self.goal_tags.get(&goal.id).cloned();
+        self.start_goal_control(proof, goal, syntax, Mode::Focus)?;
+        let frame = proof
+            .controls
+            .last_mut()
+            .ok_or_else(|| error(TacticError::MalformedScript))?;
+        frame.retag = Some(tag);
+        Ok(())
+    }
+
+    /// Put the visible goals (the main goal `main`, then each unassigned goal from the top of
+    /// the worklist down to the first barrier) in the order `order` gives them, the first as
+    /// the returned main goal. Each goal takes the slot the goal at its new position held, so
+    /// every other worklist entry keeps its place. A placement this engine cannot run is
+    /// refused as `kind`: a goal run after the close of a goal whose term reads it, a goal
+    /// moved across the close of a goal its target mentions, or a visible entry other than a
+    /// goal or a close.
+    pub(super) fn reorder_visible_goals(
+        &mut self,
+        proof: &mut ProofState<'_>,
+        main: ProofGoal,
+        kind: &Name,
+        order: impl FnOnce(&mut Self, Vec<ProofGoal>) -> Result<Vec<ProofGoal>, NatDefinitionElabError>,
+    ) -> Result<ProofGoal, NatDefinitionElabError> {
+        let refused = || error(TacticError::UnsupportedTactic(kind.clone()));
+        let boundary = proof
+            .work
+            .iter()
+            .rposition(|work| {
+                matches!(
+                    work,
+                    Work::EndScript(..)
+                        | Work::EndControl(_)
+                        | Work::EndAttempt(_)
+                        | Work::EndOptions(_)
+                )
+            })
+            .map_or(0, |position| position + 1);
+        // Slot positions, the main goal's above every entry; goals in visible order.
+        let top = proof.work.len();
+        let mut slots = vec![top];
+        let mut goals = vec![main];
+        let mut closes = Vec::new();
+        for index in (boundary..proof.work.len()).rev() {
+            self.tick()?;
+            match &proof.work[index] {
+                Work::Goal(goal) if !self.txn.mvars.is_assigned(&goal.id) => {
+                    slots.push(index);
+                    goals.push(goal.clone());
+                }
+                Work::Goal(_) => {}
+                Work::Close(goal, value) => {
+                    let value = self.instantiate(value)?;
+                    closes.push((index, goal.id.clone(), value));
+                }
+                _ => return Err(refused()),
+            }
+        }
+        let original: std::collections::HashMap<MVarId, usize> = goals
+            .iter()
+            .zip(&slots)
+            .map(|(goal, &slot)| (goal.id.clone(), slot))
+            .collect();
+        let ordered = order(self, goals)?;
+        if ordered.len() != slots.len() {
+            return Err(error(TacticError::MalformedScript));
+        }
+        for (goal, &slot) in ordered.iter().zip(&slots) {
+            let target = self.instantiate(&goal.target)?;
+            let mentioned = self.txn.mvars.collect_mvars(&target);
+            let before = original
+                .get(&goal.id)
+                .copied()
+                .ok_or_else(|| error(TacticError::MalformedScript))?;
+            for (index, closed, value) in &closes {
+                self.tick()?;
+                let reads = self.txn.mvars.collect_mvars(value).contains(&goal.id);
+                if reads && slot < *index {
+                    return Err(refused());
+                }
+                if mentioned.contains(closed) && ((before > *index) != (slot > *index)) {
+                    return Err(refused());
+                }
+            }
+        }
+        let mut ordered = ordered.into_iter();
+        let main = ordered
+            .next()
+            .ok_or_else(|| error(TacticError::MalformedScript))?;
+        for (goal, &slot) in ordered.zip(&slots[1..]) {
+            proof.work[slot] = Work::Goal(goal);
+        }
+        Ok(main)
+    }
+
+    /// A conversion-mode frame over `goals` (the main one first), whose sequence `body` runs
+    /// with every other goal suspended, as `focus` runs it. When the sequence ends, `finish`
+    /// receives the goals it leaves ([`Self::finish_conv`]).
+    pub(super) fn start_conv_frame<'a>(
+        &mut self,
+        proof: &mut ProofState<'a>,
+        goals: Vec<Work<'a>>,
+        body: Vec<&'a Syntax>,
+        finish: super::conv::Finish,
+    ) -> Result<(), NatDefinitionElabError> {
+        let frame = Frame {
+            mode: Mode::Focus,
+            body: body.clone(),
+            instructions: std::mem::replace(&mut proof.instructions, body),
+            cursor: std::mem::replace(&mut proof.cursor, 0),
+            waiting: std::mem::take(&mut proof.work),
+            deferred: Vec::new(),
+            after: None,
+            conv: Some(Box::new(finish)),
+            limit: None,
+            retag: None,
+        };
+        let index = proof.controls.len();
+        proof.controls.push(frame);
+        proof.work.push(Work::EndControl(index));
+        proof.work.extend(goals.into_iter().rev());
         Ok(())
     }
 
@@ -362,6 +655,28 @@ impl Context {
             return Err(error(TacticError::NoGoals));
         }
         let mut frame = proof.controls.pop().expect("validated control depth");
+        if let Some(tag) = frame.retag.clone() {
+            let mut open = pending.iter().filter_map(|work| match work {
+                Work::Goal(goal) if !self.txn.mvars.is_assigned(&goal.id) => Some(goal.id.clone()),
+                _ => None,
+            });
+            if let (Some(only), None) = (open.next(), open.next()) {
+                match tag {
+                    Some(tag) => {
+                        self.goal_tags.insert(only, tag);
+                    }
+                    None => {
+                        self.goal_tags.remove(&only);
+                    }
+                }
+            }
+        }
+        if let Some(finish) = frame.conv.take() {
+            proof.instructions = frame.instructions;
+            proof.cursor = frame.cursor;
+            proof.work = frame.waiting;
+            return self.finish_conv(proof, *finish, pending);
+        }
         if let Some(body) = frame.after.take()
             && !pending.is_empty()
         {
@@ -404,11 +719,20 @@ impl Context {
                             .push(frame.waiting.pop().expect("last exists"));
                     }
                     Some(Work::Goal(_)) => {
+                        if frame.limit == Some(0) {
+                            break;
+                        }
                         let Some(Work::Goal(goal)) = frame.waiting.pop() else {
                             unreachable!()
                         };
                         if self.txn.mvars.is_assigned(&goal.id) {
                             continue;
+                        }
+                        if let Some(limit) = &mut frame.limit {
+                            *limit -= 1;
+                        }
+                        if frame.retag.is_some() {
+                            frame.retag = Some(self.goal_tags.get(&goal.id).cloned());
                         }
                         proof.instructions = frame.body.clone();
                         proof.cursor = 0;
@@ -448,5 +772,107 @@ impl Context {
             proof.cursor += 1;
         }
         Ok(())
+    }
+}
+
+/// Native syntax for the expansions of the macro tactics this engine runs as written: atoms,
+/// root-anchored identifiers and tactic sequences, built once.
+pub(super) mod expansions {
+    use super::*;
+
+    fn null(args: Vec<Syntax>) -> Syntax {
+        Syntax::node(Name::from_components(["null"]), args)
+    }
+
+    fn atom(value: &str) -> Syntax {
+        Syntax::atom(fln_syntax::source::SourceInfo::None, value)
+    }
+
+    fn ident(components: &[&str]) -> Syntax {
+        Syntax::Ident {
+            info: fln_syntax::source::SourceInfo::None,
+            raw_val: fln_syntax::source::ByteSpan::default(),
+            val: Name::from_components(std::iter::once("_root_").chain(components.iter().copied())),
+            preresolved: Vec::new(),
+        }
+    }
+
+    fn sequence(tactics: Vec<Syntax>) -> Syntax {
+        let mut rows = Vec::new();
+        for tactic in tactics {
+            if !rows.is_empty() {
+                rows.push(null(Vec::new()));
+            }
+            rows.push(tactic);
+        }
+        Syntax::node(
+            parser_kind(&["Tactic", "tacticSeq"]),
+            vec![Syntax::node(
+                parser_kind(&["Tactic", "tacticSeq1Indented"]),
+                vec![null(rows)],
+            )],
+        )
+    }
+
+    fn apply(components: &[&str]) -> Syntax {
+        Syntax::node(
+            parser_kind(&["Tactic", "apply"]),
+            vec![atom("apply"), ident(components)],
+        )
+    }
+
+    fn assumption() -> Syntax {
+        Syntax::node(
+            parser_kind(&["Tactic", "assumption"]),
+            vec![atom("assumption")],
+        )
+    }
+
+    /// `simp_wf`'s `try simp …` (vendored src/Init/WFTactics.lean:21-22) where its
+    /// configuration and its unfold set cannot act: `try simp`.
+    pub(in crate::source::tactics) fn try_simp() -> &'static Syntax {
+        static EXPANSION: std::sync::OnceLock<Syntax> = std::sync::OnceLock::new();
+        EXPANSION.get_or_init(|| {
+            let simp = Syntax::node(
+                parser_kind(&["Tactic", "simp"]),
+                vec![
+                    atom("simp"),
+                    null(Vec::new()),
+                    null(Vec::new()),
+                    null(Vec::new()),
+                    null(Vec::new()),
+                    null(Vec::new()),
+                ],
+            );
+            sequence(vec![Syntax::node(
+                parser_kind(&["Tactic", "tacticTry_"]),
+                vec![atom("try"), sequence(vec![simp])],
+            )])
+        })
+    }
+
+    /// `decreasing_trivial_pre_omega`'s three `macro_rules` (vendored
+    /// src/Init/WFTactics.lean:48-50), the most recent tried first, as `first` tries them.
+    pub(in crate::source::tactics) fn decreasing_trivial_pre_omega() -> &'static Syntax {
+        static EXPANSION: std::sync::OnceLock<Syntax> = std::sync::OnceLock::new();
+        EXPANSION.get_or_init(|| {
+            let alternatives = [
+                ["Nat", "pred_lt"].as_slice(),
+                &["Nat", "pred_lt_of_lt"],
+                &["Nat", "sub_succ_lt_self"],
+            ]
+            .into_iter()
+            .map(|lemma| {
+                Syntax::node(
+                    Name::from_components(["group"]),
+                    vec![atom("|"), sequence(vec![apply(lemma), assumption()])],
+                )
+            })
+            .collect();
+            sequence(vec![Syntax::node(
+                parser_kind(&["Tactic", "first"]),
+                vec![atom("first"), null(alternatives)],
+            )])
+        })
     }
 }

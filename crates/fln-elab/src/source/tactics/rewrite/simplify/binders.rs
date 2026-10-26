@@ -30,14 +30,35 @@ impl Context {
         target: &Expr,
         rule: &SimpRule<'_>,
         premises: &[SimpRule<'_>],
-    ) -> Result<Option<(Typed, Expr, bool)>, NatDefinitionElabError> {
+    ) -> Result<Option<(Typed, Expr, bool, SimpPlace)>, NatDefinitionElabError> {
+        // A rewrite at a node is already chosen: one beneath a binder or by `+arith` comes later.
+        let limited = self.simp_reach_limit.is_some();
+        if matches!(rule, SimpRule::Decide) {
+            // The walk reaches every closed proposition, under binders too: one mentioning a
+            // bound variable is never decided (`simpUsingDecide` skips free variables).
+            return Ok(self
+                .simp_decide_evidence(target)?
+                .map(|(evidence, occurrence)| {
+                    (
+                        evidence,
+                        occurrence,
+                        false,
+                        SimpPlace::of(SimpReach::Decide),
+                    )
+                }));
+        }
         if matches!(rule, SimpRule::Arith) {
+            if limited {
+                self.simp_reach_limit = None;
+                return Ok(None);
+            }
+            let place = SimpPlace::of(SimpReach::Arith);
             if let Some((evidence, occurrence)) = self.simp_arith_evidence(target)? {
-                return Ok(Some((evidence, occurrence, false)));
+                return Ok(Some((evidence, occurrence, false, place)));
             }
             return Ok(self
                 .simp_binder_rule(target, rule, premises)?
-                .map(|evidence| (evidence, target.clone(), false)));
+                .map(|evidence| (evidence, target.clone(), false, place)));
         }
         let mut term = self.selected_simp_term(rule)?;
         term.type_ = self.simp_premise_target(&term.type_, premises)?;
@@ -49,11 +70,25 @@ impl Context {
                 found.premises.is_empty(),
                 "simp discharges its own premises"
             );
-            return Ok(Some((found.rule, found.occurrence, rule.reverse())));
+            let place = SimpPlace {
+                reach: SimpReach::Node(found.position),
+                pattern: found.pattern,
+            };
+            return Ok(Some((found.rule, found.occurrence, rule.reverse(), place)));
+        }
+        if limited {
+            return Ok(None);
         }
         Ok(self
             .simp_binder_rule(target, rule, premises)?
-            .map(|evidence| (evidence, target.clone(), false)))
+            .map(|evidence| {
+                (
+                    evidence,
+                    target.clone(),
+                    false,
+                    SimpPlace::of(SimpReach::Binder),
+                )
+            }))
     }
 
     /// Lift equality of an occurrence through a constant-result context. A
@@ -122,6 +157,10 @@ impl Context {
         rule: &SimpRule<'_>,
         premises: &[SimpRule<'_>],
     ) -> Result<Option<(Expr, Typed)>, NatDefinitionElabError> {
+        // Decision never opens a binder: its walk already reaches every closed proposition.
+        if matches!(rule, SimpRule::Decide) {
+            return Ok(None);
+        }
         if matches!(rule, SimpRule::Arith) {
             let Some((evidence, occurrence)) = self.simp_arith_evidence(body)? else {
                 return Ok(None);

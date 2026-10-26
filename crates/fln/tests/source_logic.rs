@@ -659,23 +659,20 @@ fn several_elimination_targets_are_refused_not_misread() {
     }
 }
 
-/// `show`, `erw`, `rw_mod_cast`, `rotate_left`, `subst_eqs`, `open … in`, and a `rw`/`simp` configuration
+/// `show`, `erw`, `rw_mod_cast`, `subst_eqs`, `open … in`, and a `rw`/`simp` configuration
 /// (`(occs := [1])`, `(config := …)`, `(maxSteps := 10)`) parse as the pin's trees; the checker
-/// runs none of them, so it refuses each file, all of which the pin accepts.
+/// refuses each file, all of which the pin accepts.
 #[test]
 fn tactics_the_checker_does_not_run_are_refused_not_misread() {
     let (engine, limits) = engine();
     for source in [
         "theorem l1 (n : Nat) : n = n := by\n  show n = n\n  rfl\n",
         "theorem l2 (a b : Nat) (h : a = b) : b = a := by\n  erw [h]\n",
-        "theorem l4 (p q : Prop) (hp : p) (hq : q) : p ∧ q := by\n  constructor\n  rotate_left\n  \
-         exact hq\n  exact hp\n",
         "theorem l6 (a b : Nat) (h : a = b) : b = a := by\n  subst_eqs\n  rfl\n",
         "theorem l10 (a b : Nat) (h : a = b) : b = a := by\n  rw_mod_cast [h]\n",
         "theorem ro1 (a b : Nat) (h : a = b) : b = a := by\n  rw (occs := [1]) [h]\n",
         "theorem ro3 (n : Nat) : n + 0 = n := by\n  simp (config := { decide := true })\n",
         "theorem ro4 (n : Nat) : n + 0 = n := by\n  simp +arith (maxSteps := 10)\n",
-        "theorem t2 : True := by\n  simpa (config := {})\n",
         "theorem oi1 (n : Nat) : n = n := by\n  open Nat in rfl\n",
         "theorem wo4 (n : Nat) : n = n := by\n  cases n with rfl\n",
     ] {
@@ -691,6 +688,23 @@ fn tactics_the_checker_does_not_run_are_refused_not_misread() {
             "{source}"
         );
     }
+}
+
+/// An empty configuration structure sets every field to its default, so it changes nothing: the
+/// pin's `simpa (config := {})` closes `True` as `simpa` does.
+#[test]
+fn an_empty_simp_configuration_changes_nothing() {
+    check("theorem t2 : True := by\n  simpa (config := {})\n");
+}
+
+/// `rotate_left` (`evalRotateLeft`, vendored `Lean/Elab/Tactic/BuiltinTactic.lean`) rotates the
+/// goal list, here so that `q` is proved first; the checker runs it.
+#[test]
+fn rotate_left_moves_the_main_goal_to_the_end() {
+    check(
+        "theorem l4 (p q : Prop) (hp : p) (hq : q) : p ∧ q := by\n  constructor\n  rotate_left\n  \
+         exact hq\n  exact hp\n",
+    );
 }
 
 /// A bracket after an operator whose right side is above precedence 25 starts no dependent arrow

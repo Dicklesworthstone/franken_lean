@@ -617,6 +617,16 @@ impl ImportActivation {
         Ok(self)
     }
 
+    /// Record one imported module's `@[deprecated]` entries. This journal, which name
+    /// resolution reports from, does not affect the kept class or instance state.
+    pub fn register_deprecations(
+        mut self,
+        entries: &[crate::deprecations::Deprecation],
+    ) -> Result<Self, crate::deprecations::DeprecationError> {
+        self.env = crate::deprecations::register_module(&self.env, entries)?;
+        Ok(self)
+    }
+
     /// Record a checked owning module's noncomputable tag. This changes no
     /// instance candidate or cached typeclass metadata.
     pub fn register_noncomputable(
@@ -635,6 +645,16 @@ impl ImportActivation {
         declaration: &Name,
     ) -> Result<Self, crate::NatDefinitionElabError> {
         self.env = crate::source::scope::simp::defeq::register_imported(&self.env, declaration)?;
+        Ok(self)
+    }
+
+    /// Record a backward-only equation tag without promoting it to a strict
+    /// `dsimp` rule or changing the kept class/instance activation state.
+    pub fn register_backward_defeq(
+        mut self,
+        declaration: &Name,
+    ) -> Result<Self, crate::NatDefinitionElabError> {
+        self.env = crate::source::scope::simp::defeq::register_backward(&self.env, declaration)?;
         Ok(self)
     }
 

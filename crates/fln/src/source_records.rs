@@ -5,9 +5,12 @@ use fln_kernel::verdict::Verdict;
 
 mod auxiliaries;
 mod elaboration;
+mod equation_theorems;
+pub(crate) use equation_theorems::{may_name_equation_theorems, push_command_admission};
 mod library;
 mod local_functions;
 mod public_body;
+mod simp;
 pub(crate) mod traces;
 pub use local_functions::SourceDeclarationAdmission;
 
@@ -222,16 +225,57 @@ impl Engine {
         limits: EngineAdmissionLimits,
         scope: &fln_elab::source::scope::SourceScope,
     ) -> Result<Outcome<DeclarationBatchAdmission>, EngineExecutionError> {
+        self.admit_source_command_in_scope_with_base(source, options, limits, scope, None)
+    }
+
+    /// A file driver can identify definitions introduced by this source file.
+    /// Standalone callers retain conservative imported-definition behavior.
+    pub(crate) fn admit_source_command_in_scope_with_base(
+        &self,
+        source: &[u8],
+        options: &KVMap,
+        limits: EngineAdmissionLimits,
+        scope: &fln_elab::source::scope::SourceScope,
+        source_base: Option<&Environment>,
+    ) -> Result<Outcome<DeclarationBatchAdmission>, EngineExecutionError> {
         let mut scope = scope.clone();
         if scope.source_site.is_none() {
             scope.source_site = Some(source_check::source_site(source)?);
         }
-        self.admit_parsed_command_in_scope(
-            source,
-            parse_scoped_command(source)?,
-            options,
-            limits,
-            &scope,
+        let parsed = parse_scoped_command(source)?;
+        // Equation theorems the command names are generated and admitted first; the
+        // command's own admissions follow them in one batch.
+        let realized = if may_name_equation_theorems(source) {
+            let syntaxes: Vec<&fln_syntax::tree::Syntax> = match &parsed {
+                ScopedCommandSyntax::Mutual(members) => members.iter().collect(),
+                ScopedCommandSyntax::Example(parsed) => vec![parsed.syntax()],
+                ScopedCommandSyntax::Definition(parsed) => vec![parsed.syntax()],
+            };
+            match self.realize_equation_theorems(&syntaxes, &scope, options, limits, source_base)? {
+                Outcome::Complete(realized) => realized,
+                Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+            }
+        } else {
+            None
+        };
+        let Some(realized) = realized else {
+            return self.admit_parsed_command_in_scope(source, parsed, options, limits, &scope);
+        };
+        Ok(
+            match realized
+                .engine
+                .admit_parsed_command_in_scope(source, parsed, options, limits, &scope)?
+            {
+                Outcome::Complete(mut batch) => {
+                    let mut admissions = realized.admissions;
+                    admissions.append(&mut batch.admissions);
+                    batch.admissions = admissions;
+                    batch.base_logical_root = realized.base_logical_root;
+                    Outcome::Complete(batch)
+                }
+                other => other,
+            },
         )
     }
 
@@ -432,6 +476,7 @@ impl Engine {
                     fln_elab::source::ElaboratedDeclaration {
                         declaration: candidate,
                         native_axioms: Vec::new(),
+                        equation_info: None,
                         local_functions,
                         irreducible: false,
                         noncomputable: inferred_noncomputable,
@@ -453,6 +498,7 @@ impl Engine {
                     parsed.syntax(),
                     candidate,
                     false,
+                    None,
                     inferred_noncomputable,
                     local_functions,
                     options,
@@ -535,6 +581,7 @@ impl Engine {
                 parsed.syntax(),
                 interface,
                 false,
+                None,
                 false,
                 Vec::new(),
                 options,
@@ -595,6 +642,7 @@ impl Engine {
         syntax: &fln_syntax::tree::Syntax,
         declaration: Declaration,
         irreducible: bool,
+        equation_info: Option<fln_elab::source::equation_theorems::journal::Record>,
         inferred_noncomputable: bool,
         local_functions: Vec<Declaration>,
         options: &KVMap,
@@ -646,18 +694,21 @@ impl Engine {
             .map_err(EngineExecutionError::from)?;
         Ok(match result {
             Outcome::Complete(mut batch) => {
-                apply_batch_effects(&mut batch, irreducible, options)?;
+                apply_batch_effects(&mut batch, irreducible, equation_info.as_ref(), options)?;
                 if fln_elab::source::scope::simp::defeq::direct_rfl(syntax) {
                     for admitted in &batch.admissions {
-                        if let Declaration::Thm(theorem) = &admitted.declaration {
-                            batch.engine.environment = fln_elab::source::scope::simp::defeq::infer(
-                                batch.engine.environment(),
-                                &theorem.base.name,
-                                limits.kernel,
-                            )
-                            .map_err(DefinitionFrontendError::Elaborate)
-                            .map_err(EngineExecutionError::Frontend)?;
-                        }
+                        let name = match &admitted.declaration {
+                            Declaration::Thm(theorem) => &theorem.base.name,
+                            Declaration::Defn(definition) => &definition.base.name,
+                            _ => continue,
+                        };
+                        batch.engine.environment = fln_elab::source::scope::simp::defeq::infer(
+                            batch.engine.environment(),
+                            name,
+                            limits.kernel,
+                        )
+                        .map_err(DefinitionFrontendError::Elaborate)
+                        .map_err(EngineExecutionError::Frontend)?;
                     }
                     batch.result_logical_root = batch.engine.logical_root(options);
                 }
@@ -723,28 +774,8 @@ impl Engine {
                     )?;
                     batch.result_logical_root = batch.engine.logical_root(options);
                 }
-                if let Some((name, priority, reverse)) = simp {
-                    let name = scope.declaration_name(&name).map_err(|error| {
-                        EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
-                            fln_elab::NatDefinitionElabError::Inference(
-                                fln_elab::source::SourceInferenceError::NameScope(error),
-                            ),
-                        ))
-                    })?;
-                    batch.engine.environment = fln_elab::source::scope::simp::update(
-                        batch.engine.environment(),
-                        &name,
-                        Some((priority, reverse)),
-                    )
-                    .map_err(|error| {
-                        EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
-                            fln_elab::NatDefinitionElabError::Inference(
-                                fln_elab::source::SourceInferenceError::SimpSet(error),
-                            ),
-                        ))
-                    })?;
-                    batch.result_logical_root = batch.engine.logical_root(options);
-                }
+                // The pin applies reducibility after type checking and simp
+                // after compilation, independently of inline attribute order.
                 if let Some((name, status)) = reducibility {
                     let name = scope.declaration_name(&name).map_err(|error| {
                         EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
@@ -791,7 +822,32 @@ impl Engine {
                         tag_executable(&batch.engine, &admitted.declaration, scope, &executable)?;
                     batch.result_logical_root = batch.engine.logical_root(options);
                 }
-                return self.finish_local_function_batch(batch, &local_functions, options, limits);
+                if let Some(declared) = batch
+                    .admissions
+                    .first()
+                    .and_then(|admitted| declared_name(&admitted.declaration))
+                    .cloned()
+                    && let Some(environment) =
+                        tag_deprecated(&batch.engine, syntax, &declared, scope, limits.kernel)?
+                {
+                    batch.engine.environment = environment;
+                    batch.result_logical_root = batch.engine.logical_root(options);
+                }
+                let batch = match self.finish_local_function_batch(
+                    batch,
+                    &local_functions,
+                    options,
+                    limits,
+                )? {
+                    Outcome::Complete(batch) => batch,
+                    Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                    Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                };
+                let scope = scope
+                    .for_declaration(syntax)
+                    .map_err(DefinitionFrontendError::Elaborate)
+                    .map_err(EngineExecutionError::Frontend)?;
+                return self.finish_source_simp_batch(batch, simp, &scope, options, limits);
             }
             Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
             Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
@@ -880,7 +936,7 @@ impl Engine {
             let mut work_left = usize::try_from(kernel.steps)
                 .unwrap_or(usize::MAX)
                 .min(1_000_000);
-            if fln_elab::instances::export::derive_index(
+            if fln_elab::instances::export::derive_local_index(
                 engine.environment(),
                 &registry,
                 name,
@@ -1011,6 +1067,7 @@ impl Engine {
                     parsed.syntax(),
                     elaborated.declaration,
                     elaborated.irreducible,
+                    elaborated.equation_info,
                     elaborated.noncomputable,
                     elaborated.local_functions,
                     options,
@@ -1331,6 +1388,46 @@ pub(crate) fn tag_protected(
                 ),
             ))
         })
+}
+
+/// Record an admitted declaration's `@[deprecated …]` in the deprecation journal, after the
+/// council admitted it, as the pin's `deprecatedAttr` sets its parameter after type checking:
+/// later commands report the declaration's uses. `declared` is the admitted declaration, and its
+/// replacement resolves in its namespace. `None` when the command carries no such attribute. A
+/// refusal is the command's.
+pub(crate) fn tag_deprecated(
+    engine: &Engine,
+    syntax: &fln_syntax::tree::Syntax,
+    declared: &Name,
+    scope: &fln_elab::source::scope::SourceScope,
+    kernel: Budget,
+) -> Result<Option<Environment>, EngineExecutionError> {
+    let frontend =
+        |error| EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(error));
+    let Some(entry) =
+        fln_elab::source::deprecation_entry(syntax, declared, engine.environment(), kernel, scope)
+            .map_err(frontend)?
+    else {
+        return Ok(None);
+    };
+    fln_elab::deprecations::register_module(engine.environment(), &[entry])
+        .map(Some)
+        .map_err(|error| {
+            frontend(fln_elab::NatDefinitionElabError::Inference(
+                fln_elab::source::SourceInferenceError::DeprecationJournal(error),
+            ))
+        })
+}
+
+/// The admitted declaration a single-declaration command names, which its attributes describe.
+pub(crate) fn declared_name(declaration: &Declaration) -> Option<&Name> {
+    match declaration {
+        Declaration::Defn(value) => Some(&value.base.name),
+        Declaration::Thm(value) => Some(&value.base.name),
+        Declaration::Opaque(value) => Some(&value.base.name),
+        Declaration::Axiom(value) => Some(&value.base.name),
+        _ => None,
+    }
 }
 
 /// Bind a source noncomputable request to the declaration that just passed the council.

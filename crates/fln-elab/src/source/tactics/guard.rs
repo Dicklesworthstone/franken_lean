@@ -85,21 +85,66 @@ impl Context {
         self.guard_expr_matches(&value, &target, relation)
     }
 
+    /// `guard_expr a r b` (`evalGuardExpr`, vendored src/Lean/Elab/Tactic/Guard.lean:84-90):
+    /// whether `a` and `b`, each elaborated with no expected type, their types then unified and
+    /// pending synthesis finished with default instances (`elabAndEvalMatchKind`), match by
+    /// `r`. As for `guard_target`, the context is restored afterwards.
+    pub(super) fn guard_expr_holds(
+        &mut self,
+        goal: &ProofGoal,
+        left: &Syntax,
+        relation: Relation,
+        right: &Syntax,
+    ) -> Result<bool, NatDefinitionElabError> {
+        let snapshot = self.clone();
+        let result = (|| {
+            self.txn.lctx = goal.lctx.clone();
+            let left = self.term(left, None)?;
+            let right = self.term(right, None)?;
+            // `isDefEqGuarded` on the two types: its answer is not read.
+            let _ = self.proof_types_match(&left.type_, &right.type_)?;
+            self.resolve_instances(false)?;
+            self.flush(false)?;
+            self.resolve_instances_with_defaults()?;
+            self.flush(false)?;
+            let left = self.instantiate(&left.value)?;
+            let right = self.instantiate(&right.value)?;
+            self.guard_expr_matches(&left, &right, relation)
+        })();
+        let spent = self.txn.budget.heartbeats_consumed;
+        *self = snapshot;
+        self.txn.budget.heartbeats_consumed = spent;
+        result
+    }
+
     /// The shared guard comparison. Callers own the snapshot that prevents
-    /// comparison-only assignments from changing the proof state.
+    /// comparison-only assignments from changing the proof state. A definitional match runs
+    /// at the relation's own transparency (`withTransparency red`), whatever the ambient one.
     pub(super) fn guard_expr_matches(
         &mut self,
         value: &Expr,
         target: &Expr,
         relation: Relation,
     ) -> Result<bool, NatDefinitionElabError> {
+        // A source ascription `(e : T)` is this engine's `let _ : T := e; _`, which the pin's
+        // term does not have: the syntactic relations compare without them.
+        let structural = matches!(relation, Relation::Syntactic | Relation::Alpha);
+        let (value, target) = if structural {
+            (
+                self.without_source_ascriptions(value)?,
+                self.without_source_ascriptions(target)?,
+            )
+        } else {
+            (value.clone(), target.clone())
+        };
+        let (value, target) = (&value, &target);
         match relation {
             Relation::Syntactic => self.expr_eqv(consume_mdata(value), consume_mdata(target)),
             Relation::Alpha => self.expr_eqv(value, target),
             Relation::DefEq(transparency) => {
                 let mut budget = UnificationBudget::new(self.kernel);
                 budget.transparency = transparency;
-                self.proof_types_match_with_budget(value, target, budget)
+                self.proof_types_match_at(value, target, budget)
             }
         }
     }

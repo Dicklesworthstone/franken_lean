@@ -753,79 +753,6 @@ pub(super) struct ArithStep {
 }
 
 impl Context {
-    /// `simp`'s configuration slot. Only `+arith`, `(arith := true)` and
-    /// `(config := { arith := true })` are read; every other item stays the typed refusal it
-    /// was. `arith` is honoured as the pin's `updateArith` does: off while the environment lacks
-    /// `Nat.Linear.ExprCnstr.eq_of_toNormPoly_eq`.
-    pub(super) fn simp_arith_config(
-        &mut self,
-        config: &Syntax,
-        accepts_arith: bool,
-    ) -> Result<bool, NatDefinitionElabError> {
-        const EXPECTED: &str = "default simplification configuration";
-        let unsupported = || NatDefinitionElabError::UnexpectedSyntax { expected: EXPECTED };
-        let items = match config {
-            Syntax::Node { kind, args, .. } if kind == &parser_kind(&["Tactic", "optConfig"]) => {
-                let [items] = args.as_slice() else {
-                    return Err(unsupported());
-                };
-                expect_null_args(items, EXPECTED)?
-            }
-            _ => {
-                expect_empty_null(config, EXPECTED)?;
-                return Ok(false);
-            }
-        };
-        if items.is_empty() {
-            return Ok(false);
-        }
-        if !accepts_arith {
-            return Err(unsupported());
-        }
-        for item in items {
-            self.tick()?;
-            let [item] = expect_node(item, &parser_kind(&["Tactic", "configItem"]), 1, EXPECTED)?
-            else {
-                return Err(unsupported());
-            };
-            let Syntax::Node { kind, args, .. } = item else {
-                return Err(unsupported());
-            };
-            let enables = if kind == &parser_kind(&["Tactic", "posConfigItem"]) {
-                matches!(args.as_slice(), [Syntax::Atom { val, .. }, Syntax::Ident { val: field, .. }]
-                    if val == "+" && field == &name("arith"))
-            } else if kind == &parser_kind(&["Tactic", "valConfigItem"]) {
-                match args.as_slice() {
-                    [
-                        Syntax::Atom { val: open, .. },
-                        Syntax::Ident { val: field, .. },
-                        Syntax::Atom { val: assign, .. },
-                        value,
-                        Syntax::Atom { val: close, .. },
-                    ] if open == "(" && assign == ":=" && close == ")" => {
-                        if field == &name("arith") {
-                            is_true_literal(value)
-                        } else if field == &name("config") {
-                            is_arith_structure(value)
-                        } else {
-                            false
-                        }
-                    }
-                    _ => false,
-                }
-            } else {
-                false
-            };
-            if !enables {
-                return Err(unsupported());
-            }
-        }
-        Ok(self
-            .txn
-            .env
-            .contains(&name("Nat.Linear.ExprCnstr.eq_of_toNormPoly_eq")))
-    }
-
     /// One `simpArith` rewrite of `target`: the first node, children before parents, that the
     /// pin's post step changes, with the proof `node = replacement`. Only closed nodes are
     /// candidates; a node under a binder that mentions it is reached by the binder walk.
@@ -850,7 +777,7 @@ impl Context {
                         || linear_constraint(term).is_some()
                         || divisibility(term).is_some()
                 };
-                for child in self.simp_arith_children(term).into_iter().rev() {
+                for child in self.simp_visited_children(term).into_iter().rev() {
                     stack.push((child, own, false));
                 }
                 continue;
@@ -885,7 +812,7 @@ impl Context {
 
     /// The subterms simp visits with `simp` rather than `dsimp`: an application's `eq`
     /// arguments (`getCongrSimpKinds`), never a type, instance or proof argument.
-    fn simp_arith_children<'e>(&self, term: &'e Expr) -> Vec<&'e Expr> {
+    pub(super) fn simp_visited_children<'e>(&self, term: &'e Expr) -> Vec<&'e Expr> {
         match term.node() {
             ExprNode::App { .. } => {
                 let mut head = term;
@@ -1512,68 +1439,6 @@ impl Context {
             }
         }))
     }
-}
-
-fn is_true_literal(value: &Syntax) -> bool {
-    matches!(value, Syntax::Ident { val, .. } if val == &name("true") || val == &name("Bool.true"))
-}
-
-/// `{ arith := true }`: a structure instance with that one field and nothing else.
-fn is_arith_structure(value: &Syntax) -> bool {
-    let null = |syntax: &Syntax| -> Option<Vec<Syntax>> {
-        match syntax {
-            Syntax::Node { kind, args, .. } if kind == &Name::str(Name::anonymous(), "null") => {
-                Some(args.clone())
-            }
-            _ => None,
-        }
-    };
-    let node = |syntax: &Syntax, path: &[&str], arity: usize| -> Option<Vec<Syntax>> {
-        match syntax {
-            Syntax::Node { kind, args, .. }
-                if kind == &parser_kind(path) && args.len() == arity =>
-            {
-                Some(args.clone())
-            }
-            _ => None,
-        }
-    };
-    let atom =
-        |syntax: &Syntax, text: &str| matches!(syntax, Syntax::Atom { val, .. } if val == text);
-    let check = || -> Option<bool> {
-        let parts = node(value, &["Term", "structInst"], 6)?;
-        if !atom(&parts[0], "{")
-            || !null(&parts[1])?.is_empty()
-            || !atom(&parts[5], "}")
-            || !null(&parts[4])?.is_empty()
-        {
-            return Some(false);
-        }
-        let ellipsis = node(&parts[3], &["Term", "optEllipsis"], 1)?;
-        if !null(&ellipsis[0])?.is_empty() {
-            return Some(false);
-        }
-        let fields = node(&parts[2], &["Term", "structInstFields"], 1)?;
-        let [field] = null(&fields[0])?.try_into().ok()?;
-        let field = node(&field, &["Term", "structInstField"], 2)?;
-        let lval = node(&field[0], &["Term", "structInstLVal"], 2)?;
-        if !matches!(&lval[0], Syntax::Ident { val, .. } if val == &name("arith"))
-            || !null(&lval[1])?.is_empty()
-        {
-            return Some(false);
-        }
-        let [binders, ascription, definition]: [Syntax; 3] = null(&field[1])?.try_into().ok()?;
-        if !null(&binders)?.is_empty() || !null(&ascription)?.is_empty() {
-            return Some(false);
-        }
-        let definition = node(&definition, &["Term", "structInstFieldDef"], 3)?;
-        Some(
-            atom(&definition[0], ":=")
-                && null(&definition[1])?.is_empty()
-                && is_true_literal(&definition[2]),
-        )
-    };
-    check() == Some(true)
 }
 
 #[cfg(test)]

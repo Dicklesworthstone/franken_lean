@@ -130,8 +130,18 @@ fn workspace() -> PathBuf {
 
 /// `fln check-source` on `HEADER` + `program`, and the pinned binary's exit code when present.
 fn check(lib: &Path, root: &Path, name: &str, program: &str) -> (i32, String, Option<i32>) {
+    check_with_header(lib, root, name, HEADER, program)
+}
+
+fn check_with_header(
+    lib: &Path,
+    root: &Path,
+    name: &str,
+    header: &str,
+    program: &str,
+) -> (i32, String, Option<i32>) {
     let entry = root.join(format!("{name}.lean"));
-    std::fs::write(&entry, format!("{HEADER}{program}")).unwrap();
+    std::fs::write(&entry, format!("{header}{program}")).unwrap();
     let ours = Command::new(env!("CARGO_BIN_EXE_fln"))
         .arg("check-source")
         .arg(&entry)
@@ -154,11 +164,14 @@ fn check(lib: &Path, root: &Path, name: &str, program: &str) -> (i32, String, Op
                 .code()
                 .expect("normal pinned exit")
         });
-    (
-        ours.status.code().expect("normal process exit"),
-        String::from_utf8_lossy(&ours.stderr).into_owned(),
-        theirs,
-    )
+    let stderr = String::from_utf8_lossy(&ours.stderr).into_owned();
+    let code = ours.status.code().unwrap_or_else(|| {
+        panic!(
+            "{name}: source checker terminated with {}\n{stderr}",
+            ours.status
+        )
+    });
+    (code, stderr, theirs)
 }
 
 #[test]
@@ -176,5 +189,259 @@ fn a_while_loop_is_its_loop_over_lean_loop() {
         let (code, _, pinned) = check(&lib, &root, name, program);
         assert_ne!(code, 0, "{name}: accepted {program}");
         assert_ne!(pinned.unwrap_or(1), 0, "{name}: the pinned lean accepts it");
+    }
+}
+
+/// The pin inserts `unreachable!` after a break-free terminal repeat only when its result is
+/// not PUnit. A terminating ForIn dictionary makes that checked continuation observable: its default
+/// is the whole monadic result, and a Unit result or an explicit suffix never uses it.
+#[test]
+fn terminal_break_free_repeat_preserves_result_and_control_scopes() {
+    let Some(lib) = pinned_lib() else {
+        return;
+    };
+    let root = workspace();
+    let header = "prelude\nimport Init.While\nimport Init.Control.Except\nimport Init.Control.Id\n";
+    let program = r#"
+def repeatThrowNat : Except String Nat := do
+  repeat
+    throw "stop"
+def repeatReturnNat : Except String Nat := do
+  repeat
+    return 42
+def repeatInnerBreak : Except String Nat := do
+  repeat
+    repeat
+      break
+    return 42
+def repeatForBreak : Except String Nat := do
+  repeat
+    for _ in Lean.Loop.mk do
+      break
+    throw "stop"
+def repeatMutation : Except String Nat := do
+  let mut n := 0
+  repeat
+    n := n + 1
+    throw "stop"
+def repeatMutableReturn : Except String Nat := do
+  let mut n := 0
+  repeat
+    n := n + 1
+    if n = 2 then return n
+def repeatGeneric {A : Type} [Inhabited A] : Id A := do
+  repeat
+    pure ()
+def stopRepeat : ForIn (Except String) Lean.Loop Unit where
+  forIn _ state _ := pure state
+def customRepeatUnit [ForIn (Except String) Lean.Loop Unit] : Except String Unit := do
+  repeat
+    throw "stop"
+theorem customRepeatUnitValue : @customRepeatUnit stopRepeat = Except.ok () := by rfl
+def customRepeatNat [ForIn (Except String) Lean.Loop Unit] : Except String Nat := do
+  repeat
+    throw "stop"
+theorem customRepeatNatValue : @customRepeatNat stopRepeat = Except.error "" := by rfl
+def customRepeatSuffix [ForIn (Except String) Lean.Loop Unit] : Except String Nat := do
+  repeat
+    throw "stop"
+  return 5
+theorem customRepeatSuffixValue : @customRepeatSuffix stopRepeat = Except.ok 5 := by rfl
+def customRepeatMutable [ForIn (Except String) Lean.Loop Unit] : Except String Nat := do
+  let mut n := 0
+  repeat
+    n := n + 1
+    throw "stop"
+theorem customRepeatMutableValue : @customRepeatMutable stopRepeat = Except.error "" := by rfl
+def customRepeatReturn [ForIn (Except String) Lean.Loop Unit] : Except String Nat := do
+  repeat
+    return 42
+theorem customRepeatReturnValue : @customRepeatReturn stopRepeat = Except.error "" := by rfl
+def customRepeatMutableReturn [ForIn (Except String) Lean.Loop Unit] : Except String Nat := do
+  let mut n := 0
+  repeat
+    n := n + 1
+    return n
+theorem customRepeatMutableReturnValue : @customRepeatMutableReturn stopRepeat = Except.error "" := by rfl
+"#;
+    let (code, stderr, pinned) = check_with_header(&lib, &root, "repeat_results", header, program);
+    assert_eq!(pinned.unwrap_or(0), 0, "the pinned lean refuses {program}");
+    assert_eq!(code, 0, "{program}\n{stderr}");
+    for (name, program) in [
+        (
+            "repeat_direct_break_result",
+            "def f : Except String Nat := do\n  repeat\n    break\n",
+        ),
+        (
+            "repeat_branch_break_result",
+            "def f (stop : Bool) : Except String Nat := do\n  repeat\n    if stop then break else throw \"stop\"\n",
+        ),
+        (
+            "repeat_nested_block_break_result",
+            "def f : Except String Nat := do\n  repeat\n    do\n      break\n",
+        ),
+        (
+            "repeat_else_if_break_result",
+            "def f (a b : Bool) : Except String Nat := do\n  repeat\n    if a then throw \"stop\"\n    else if b then break\n    else throw \"stop\"\n",
+        ),
+        (
+            "repeat_requires_inhabited_result",
+            "def f {A : Type} : Id A := do\n  repeat\n    pure ()\n",
+        ),
+        (
+            "repeat_checks_body",
+            "def f : Except String Nat := do\n  repeat\n    (5 : Nat)\n",
+        ),
+    ] {
+        let (code, stderr, pinned) = check_with_header(&lib, &root, name, header, program);
+        assert_eq!(
+            pinned.unwrap_or(1),
+            1,
+            "the pinned lean did not reject {program}"
+        );
+        assert_eq!(
+            code, 1,
+            "{name}: expected a typing refusal for {program}\n{stderr}"
+        );
+    }
+}
+
+/// A locally registered loop dictionary indexes the reducible `Unit` alias as PUnit. Its
+/// lexical registration selects the terminating implementation for both result shapes and
+/// restores the imported default dictionary at `end`.
+#[test]
+fn local_repeat_dictionary_indexes_unit_alias_and_restores_scope() {
+    let Some(lib) = pinned_lib() else {
+        return;
+    };
+    let root = workspace();
+    let header = "prelude\nimport Init.While\nimport Init.Control.Except\nimport Init.Control.Id\n";
+    let program = r#"
+abbrev defaultRepeatInstance : ForIn (Except String) Lean.Loop Unit := inferInstance
+section
+local instance stopRepeat : ForIn (Except String) Lean.Loop Unit where
+  forIn _ state _ := pure state
+def localRepeatUnit : Except String Unit := do
+  repeat
+    throw "stop"
+example : localRepeatUnit = Except.ok () := by rfl
+def localRepeatNat : Except String Nat := do
+  repeat
+    throw "stop"
+example : localRepeatNat = Except.error "" := by rfl
+end
+example : (inferInstance : ForIn (Except String) Lean.Loop Unit) = defaultRepeatInstance := by rfl
+"#;
+    let (code, stderr, pinned) =
+        check_with_header(&lib, &root, "local_repeat_alias", header, program);
+    assert_eq!(pinned.unwrap_or(0), 0, "the pinned lean refuses {program}");
+    assert_eq!(code, 0, "{program}\n{stderr}");
+}
+
+/// The generated fallback contains a real `Inhabited (Except String Nat)` dictionary. Its
+/// default is an error action, and its projection must have a runtime layout even when a loop
+/// exits through an exception or return before that fallback can execute.
+#[test]
+fn result_bearing_repeats_and_except_panic_defaults_execute() {
+    let Some(lib) = pinned_lib() else {
+        return;
+    };
+    let root = workspace();
+    let source = root.join("RepeatExecution.lean");
+    std::fs::write(
+        &source,
+        r#"prelude
+import Init.While
+import Init.Control.Except
+import Init.Control.Id
+def repeatThrowNat : Except String Nat := do
+  repeat
+    throw "stop"
+def repeatReturnNat : Except String Nat := do
+  repeat
+    return 42
+def repeatMutableReturn : Except String Nat := do
+  let mut n := 0
+  repeat
+    n := n + 1
+    if n = 2 then return n
+#eval match (unreachable! : Except String Nat) with
+  | Except.error _ => (0 : Nat)
+  | Except.ok _ => 99
+#eval match repeatThrowNat with
+  | Except.error _ => (1 : Nat)
+  | Except.ok _ => 0
+#eval match repeatReturnNat with
+  | Except.error _ => (0 : Nat)
+  | Except.ok n => n
+#eval match repeatMutableReturn with
+  | Except.error _ => (0 : Nat)
+  | Except.ok n => n
+"#,
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_fln"))
+        .args(["run", "--json", "--jobs=1"])
+        .arg(&source)
+        .env("LEAN_PATH", &lib)
+        .env("FLN_IMPORT_REUSE_DIR", root.join("records"))
+        .env("LEAN_BACKTRACE", "0")
+        .env_remove("LEAN_ABORT_ON_PANIC")
+        .output()
+        .expect("run result-bearing repeat programs");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "{}\n{stdout}\n{stderr}",
+        output.status
+    );
+    assert_eq!(
+        stdout.matches("\"event\":\"evaluation\"").count(),
+        4,
+        "{stdout}"
+    );
+    for (command, value) in [(3, 0), (4, 1), (5, 42), (6, 2)] {
+        assert!(
+            stdout.contains(&format!(
+                "\"command\":{command},\"event\":\"evaluation\",\"kind\":\"nat\",\"value\":{value},"
+            )),
+            "{stdout}"
+        );
+    }
+    // The JSON runner captures runtime diagnostics in the report's stdout field.
+    assert!(stdout.contains("\"stdout\":\"PANIC at "), "{stdout}");
+    assert_eq!(
+        stdout.matches("unreachable code has been reached").count(),
+        1,
+        "{stdout}"
+    );
+    assert!(stderr.is_empty(), "{stderr}");
+    if let Some(pinned) = lib
+        .parent()
+        .and_then(Path::parent)
+        .map(|toolchain| toolchain.join("bin/lean"))
+        .filter(|lean| lean.is_file())
+    {
+        let output = Command::new(pinned)
+            .arg(&source)
+            .env("LEAN_PATH", &lib)
+            .env("LEAN_BACKTRACE", "0")
+            .env_remove("LEAN_ABORT_ON_PANIC")
+            .output()
+            .expect("run the pinned repeat programs");
+        assert!(output.status.success(), "{output:?}");
+        // The pin's #eval reporter captures its panic diagnostic on stdout.
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let values: Vec<_> = stdout
+            .lines()
+            .filter(|line| !line.starts_with("PANIC at "))
+            .collect();
+        assert_eq!(values, ["0", "1", "42", "2"], "{stdout}");
+        assert_eq!(
+            stdout.matches("unreachable code has been reached").count(),
+            1,
+        );
+        assert!(output.stderr.is_empty(), "{output:?}");
     }
 }

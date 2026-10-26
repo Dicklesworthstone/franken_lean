@@ -570,6 +570,20 @@ impl Context {
         expr: &Expr,
         pattern: &Expr,
     ) -> Result<Expr, NatDefinitionElabError> {
+        self.kabstract_matching(expr, pattern, |_, candidate, pattern| {
+            Ok(candidate == pattern)
+        })
+    }
+
+    /// Outside-in abstraction with the caller's occurrence policy. In
+    /// particular, substitution may infer equality arguments while structural
+    /// eliminator abstraction keeps its existing exact-match behavior.
+    pub(super) fn kabstract_matching(
+        &mut self,
+        expr: &Expr,
+        pattern: &Expr,
+        mut matches: impl FnMut(&mut Self, &Expr, &Expr) -> Result<bool, NatDefinitionElabError>,
+    ) -> Result<Expr, NatDefinitionElabError> {
         let expr = self.instantiate(expr)?;
         if expr.has_loose_bvars() {
             return Err(failure(SourceInferenceError::Scope));
@@ -590,7 +604,7 @@ impl Context {
                 Work::Visit(e, offset) => {
                     // A subterm under binders that mentions them cannot be the
                     // closed pattern.
-                    if !e.has_loose_bvars() && &e == pattern {
+                    if !e.has_loose_bvars() && matches(self, &e, pattern)? {
                         values.push(
                             Expr::bvar(offset).map_err(|_| failure(SourceInferenceError::Scope))?,
                         );

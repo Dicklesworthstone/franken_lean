@@ -42,7 +42,7 @@ enum ProjectionFrame {
     LetValue(Name, Expr, Expr, bool),
     LetBody(Name, Expr, Expr, bool),
     Projection(Name, u64),
-    Thunk(Expr),
+    NativeField(Expr),
 }
 
 impl Preparation<'_> {
@@ -58,6 +58,9 @@ impl Preparation<'_> {
             return Ok(Some(replacement));
         }
         if let Some(getter) = self.thunk_call(head, arguments)? {
+            return Ok(Some(getter));
+        }
+        if let Some(getter) = self.task_call(head, arguments)? {
             return Ok(Some(getter));
         }
         let ExprNode::Const { name, levels } = head.node() else {
@@ -170,6 +173,14 @@ impl Preparation<'_> {
                 .thunk_projection_factory(&type_, family, index)
                 .map(|factory| factory.map(|factory| Expr::app(factory, receiver.clone())));
         }
+        if self.task_record_forbidden(family)? {
+            let Some(type_) = self.projection_receiver_type(receiver, &[])? else {
+                return Ok(None);
+            };
+            return self
+                .task_projection_factory(&type_, family, index)
+                .map(|factory| factory.map(|factory| Expr::app(factory, receiver.clone())));
+        }
         let key = specialize::closed(receiver).then(|| (family.clone(), index, receiver.clone()));
         if let Some(value) = key
             .as_ref()
@@ -179,28 +190,15 @@ impl Preparation<'_> {
         }
         let field = if let Some(field) = self.static_projection(family, index, receiver)? {
             field
+        } else if let Some(refolded) = self.nat_history_refold(index, receiver)? {
+            // Index refinement can expose an unfolded Nat course-of-values
+            // scaffold under an existing projection, including a receiver
+            // kept verbatim as a static argument (an equality endpoint). Its
+            // history component has no runtime layout at any major; refold
+            // the observed component to the `Nat.brecOn` it unfolds.
+            refolded
         } else {
-            // Index refinement can expose a zero Nat history under an
-            // existing projection. Select it before its constructor and
-            // callbacks acquire compiler-private identities. Every discarded
-            // field must still pass the ordinary inert projection check.
-            if !specialize::closed(receiver) {
-                return Ok(None);
-            }
-            let (head, args) = self.spine(receiver)?;
-            let ExprNode::Const { name, levels } = head.node() else {
-                return Ok(None);
-            };
-            if name != &super::name("Nat.rec") || levels.len() != 1 {
-                return Ok(None);
-            }
-            let Some(zero) = self.zero_nat_recursion(&args)? else {
-                return Ok(None);
-            };
-            let Some(field) = self.static_projection(family, index, &zero)? else {
-                return Ok(None);
-            };
-            field
+            return Ok(None);
         };
         // The selected field can come from an unfolded logical definition,
         // not from the already-erased input tree. Reapply the representation
@@ -611,7 +609,14 @@ impl Preparation<'_> {
                                 if let Some(factory) =
                                     self.thunk_projection_factory(&runtime_type, struct_name, *idx)?
                                 {
-                                    tasks.push(ProjectionFrame::Thunk(factory));
+                                    tasks.push(ProjectionFrame::NativeField(factory));
+                                    tasks.push(ProjectionFrame::Visit(receiver.clone()));
+                                    continue;
+                                }
+                                if let Some(factory) =
+                                    self.task_projection_factory(&runtime_type, struct_name, *idx)?
+                                {
+                                    tasks.push(ProjectionFrame::NativeField(factory));
                                     tasks.push(ProjectionFrame::Visit(receiver.clone()));
                                     continue;
                                 }
@@ -682,7 +687,7 @@ impl Preparation<'_> {
                     let receiver = pop(&mut values)?;
                     values.push(Expr::proj(name, index, receiver));
                 }
-                ProjectionFrame::Thunk(factory) => {
+                ProjectionFrame::NativeField(factory) => {
                     let receiver = pop(&mut values)?;
                     values.push(Expr::app(factory, receiver));
                 }

@@ -288,7 +288,7 @@ fn implemented_by_native_write_rejects_incomplete_contracts_and_exhaustion() {
     assert!(matches!(
         Preparation::new(&unsafe_engine.environment, limits).implementation_target(&name(ORIGINAL)),
         Err(IngressError::UnsupportedNode {
-            kind: "implemented_by target has no supported safe or partial executable body"
+            kind: "implemented_by target has no supported executable body"
         })
     ));
 }

@@ -108,7 +108,10 @@ impl PreparedEvaluation {
         let mut context = Context::scoped(environment, budget, scope);
         let guard = syntax.kind() == Some(&parser_kind(&["Command", "guardCmd"]));
         let term = if guard {
-            guard_term(syntax, &mut context)
+            guard_term(syntax, &mut context).and_then(|term| {
+                context.publish_deprecated_uses()?;
+                Ok(term)
+            })
         } else {
             query_term(syntax, &generated_name, &mut context, true).map(|(term, _, _)| term)
         }

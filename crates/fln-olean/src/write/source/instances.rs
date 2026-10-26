@@ -3,7 +3,7 @@
 use super::*;
 
 impl Encoder {
-    fn instance_keys(&mut self, keys: &[InstanceKey]) -> WResult<Obj> {
+    pub(super) fn discr_tree_keys(&mut self, keys: &[DiscrTreeKey]) -> WResult<Obj> {
         self.source_array_bound(keys.len())?;
         // One complete prefix-encoded tree, never an unindexed empty fallback.
         let mut pending = 1usize;
@@ -11,17 +11,17 @@ impl Encoder {
         for key in keys {
             if pending == 0 {
                 return Err(WriteError::Contract {
-                    what: "trailing instance discrimination keys",
+                    what: "trailing discrimination keys",
                 });
             }
             let arity = match key {
-                InstanceKey::Const(_, arity) | InstanceKey::FVar(_, arity) => *arity as usize,
-                InstanceKey::Arrow => 1,
-                InstanceKey::Proj(_, _, arity) => {
+                DiscrTreeKey::Const(_, arity) | DiscrTreeKey::FVar(_, arity) => *arity as usize,
+                DiscrTreeKey::Arrow => 1,
+                DiscrTreeKey::Proj(_, _, arity) => {
                     (*arity as usize)
                         .checked_add(1)
                         .ok_or(WriteError::Contract {
-                            what: "instance key arity overflows",
+                            what: "discrimination key arity overflows",
                         })?
                 }
                 _ => 0,
@@ -29,34 +29,34 @@ impl Encoder {
             pending = (pending - 1)
                 .checked_add(arity)
                 .ok_or(WriteError::Contract {
-                    what: "instance key arity overflows",
+                    what: "discrimination key arity overflows",
                 })?;
-            values.push(self.instance_key(key)?);
+            values.push(self.discr_tree_key(key)?);
         }
         if pending != 0 {
             return Err(WriteError::Contract {
-                what: "empty or incomplete instance discrimination path",
+                what: "empty or incomplete discrimination path",
             });
         }
         self.array(values)
     }
 
-    fn instance_key(&mut self, key: &InstanceKey) -> WResult<Obj> {
+    fn discr_tree_key(&mut self, key: &DiscrTreeKey) -> WResult<Obj> {
         match key {
-            InstanceKey::Star => Ok(Obj::mk_nat(usize::from(layout::KEY_STAR))),
-            InstanceKey::Other => Ok(Obj::mk_nat(usize::from(layout::KEY_OTHER))),
-            InstanceKey::Arrow => Ok(Obj::mk_nat(usize::from(layout::KEY_ARROW))),
-            InstanceKey::Lit(value) => {
+            DiscrTreeKey::Star => Ok(Obj::mk_nat(usize::from(layout::KEY_STAR))),
+            DiscrTreeKey::Other => Ok(Obj::mk_nat(usize::from(layout::KEY_OTHER))),
+            DiscrTreeKey::Arrow => Ok(Obj::mk_nat(usize::from(layout::KEY_ARROW))),
+            DiscrTreeKey::Lit(value) => {
                 let value = self.literal(value)?;
                 self.ctor(layout::KEY_LIT, vec![value], &[])
             }
-            InstanceKey::Const(name, arity) | InstanceKey::FVar(name, arity) => {
+            DiscrTreeKey::Const(name, arity) | DiscrTreeKey::FVar(name, arity) => {
                 if name.is_anonymous() {
                     return Err(WriteError::Contract {
-                        what: "anonymous instance key name",
+                        what: "anonymous discrimination key name",
                     });
                 }
-                let tag = if matches!(key, InstanceKey::Const(..)) {
+                let tag = if matches!(key, DiscrTreeKey::Const(..)) {
                     layout::KEY_CONST
                 } else {
                     layout::KEY_FVAR
@@ -65,10 +65,10 @@ impl Encoder {
                 let arity = self.nat_u64(u64::from(*arity))?;
                 self.ctor(tag, vec![name, arity], &[])
             }
-            InstanceKey::Proj(name, index, arity) => {
+            DiscrTreeKey::Proj(name, index, arity) => {
                 if name.is_anonymous() {
                     return Err(WriteError::Contract {
-                        what: "anonymous instance projection name",
+                        what: "anonymous discrimination projection name",
                     });
                 }
                 let name = self.name(name)?;
@@ -93,7 +93,7 @@ impl Encoder {
                     what: "invalid global instance declaration or scope",
                 });
             }
-            let keys = self.instance_keys(&instance.keys)?;
+            let keys = self.discr_tree_keys(&instance.keys)?;
             let value = self.expression(&instance.value)?;
             let priority = self.nat_u64(u64::from(instance.priority))?;
             let name = self.name(&instance.declaration)?;
@@ -144,7 +144,7 @@ mod tests {
         name: &str,
         priority: u32,
         scope: Option<Name>,
-        keys: Vec<InstanceKey>,
+        keys: Vec<DiscrTreeKey>,
     ) -> InstanceEntry {
         InstanceEntry {
             declaration: n(name),
@@ -156,7 +156,7 @@ mod tests {
         }
     }
     fn rows() -> Vec<InstanceEntry> {
-        use InstanceKey::*;
+        use DiscrTreeKey::*;
         vec![
             row(
                 "zFirst",
@@ -227,12 +227,12 @@ mod tests {
 
     #[test]
     fn malformed_paths_values_scopes_and_orders_are_refused() {
-        let good = row("instance", 1000, None, vec![InstanceKey::Const(n("C"), 0)]);
+        let good = row("instance", 1000, None, vec![DiscrTreeKey::Const(n("C"), 0)]);
         for keys in [
             vec![],
-            vec![InstanceKey::Const(n("C"), 1)],
-            vec![InstanceKey::Star, InstanceKey::Other],
-            vec![InstanceKey::FVar(Name::anonymous(), 0)],
+            vec![DiscrTreeKey::Const(n("C"), 1)],
+            vec![DiscrTreeKey::Star, DiscrTreeKey::Other],
+            vec![DiscrTreeKey::FVar(Name::anonymous(), 0)],
         ] {
             let mut bad = good.clone();
             bad.keys = keys;

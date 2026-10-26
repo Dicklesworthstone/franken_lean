@@ -29,10 +29,16 @@ impl Preparation<'_> {
     ) -> Result<Option<DefinitionVal>, IngressError> {
         let replacement = self.executable_replacement(requested)?;
         let requested = replacement.as_ref().unwrap_or(requested);
-        // An explicit extern selects native code, never the stored logical
-        // fallback. Check unknown ABI requests before specialization can erase
-        // the name; supported native names stay available to their ordinary
-        // model-checked intrinsic path without exposing a definition body.
+        // An explicit extern must be the pin's checked native ABI before any
+        // body is exposed: an unknown symbol is refused here, before
+        // specialization can erase the name and run its logical fallback.
+        // A supported extern keeps native code wherever a native catalog
+        // binds it; the catalogs are consulted before this body. Otherwise a
+        // safe definition's admitted value is exactly what the pin's extern
+        // contract computes, and the Prelude depends on it: `Nat.decLt`,
+        // `UInt32.toNat` and `ByteArray.emptyWithCapacity` have no other
+        // executable route. An extern opaque's value is only an inhabitant,
+        // so `opaque_value` still refuses it.
         source_intrinsics::check_selected_extern_attribute(
             self.environment,
             requested,
@@ -40,13 +46,6 @@ impl Preparation<'_> {
             &mut self.visited,
             self.limits,
         )?;
-        if self
-            .externs
-            .as_ref()
-            .is_some_and(|table| table.get(requested).is_some())
-        {
-            return Ok(None);
-        }
         self.recursive_definition(requested)
     }
 

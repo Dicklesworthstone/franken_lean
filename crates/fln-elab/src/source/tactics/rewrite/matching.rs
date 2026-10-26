@@ -15,11 +15,15 @@ enum Occurrences<'a> {
     Root,
     /// Every subterm whose own key the rule's key admits (simp's per-node retrieval).
     Admitted(&'a super::simplify::SimpKey),
+    /// The target itself only, leaving the rule's propositional premises undischarged and
+    /// returned (`simp?`'s model of the pin's `tryTheoremCore`, which discharges after
+    /// unification with its own simplifier).
+    RootDeferred,
 }
 
 /// The pin's `HeadIndex` (vendored Lean/HeadIndex.lean:28-36).
 #[derive(PartialEq, Eq)]
-pub(super) enum HeadIndex {
+pub(in crate::source) enum HeadIndex {
     Local(FVarId),
     Hole(MVarId),
     Constant(Name),
@@ -421,6 +425,25 @@ impl Context {
         )
     }
 
+    /// Match a simp rule at `target`'s root only, returning its instantiation with its
+    /// propositional premises open (`RewriteMatch::premises`) and without the no-change test:
+    /// the caller discharges them as the pin's simplifier does and judges the result itself.
+    pub(super) fn instantiate_simp_rule_at_root(
+        &mut self,
+        rule: Typed,
+        target: &Expr,
+        reverse: bool,
+    ) -> Result<Option<RewriteMatch>, NatDefinitionElabError> {
+        self.instantiate_rewrite_rule_with_scope(
+            rule,
+            target,
+            reverse,
+            true,
+            &[],
+            Occurrences::RootDeferred,
+        )
+    }
+
     pub(in crate::source) fn instantiate_dsimp_rule(
         &mut self,
         rule: Typed,
@@ -446,7 +469,10 @@ impl Context {
         selected_rules: &[SimpRule<'_>],
         occurrences: Occurrences<'_>,
     ) -> Result<Option<RewriteMatch>, NatDefinitionElabError> {
-        let root_only = matches!(occurrences, Occurrences::Root);
+        let root_only = matches!(occurrences, Occurrences::Root | Occurrences::RootDeferred);
+        let deferred = matches!(occurrences, Occurrences::RootDeferred);
+        // Read once, so a nested search (a premise's discharge) is never limited by it.
+        let reach_limit = self.simp_reach_limit.take();
         self.flush(false)?;
         let mut template = self.rewrite_trial();
         // Preparing a rule is speculative too. Charge its private context on
@@ -553,7 +579,22 @@ impl Context {
                 }
                 return Err(error(TacticError::ExpectedEquality));
             };
+            // `mkSimpTheoremKeys` marks the rule `perm` from its prepared sides (vendored
+            // `src/Lean/Meta/Tactic/Simp/SimpTheorems.lean:384-404`). Instantiating charges
+            // nothing here: every simp rule is prepared at every step.
+            let perm = inside_out
+                && {
+                    let left = template.txn.instantiate_expr(&lhs);
+                    let right = template.txn.instantiate_expr(&rhs);
+                    matches!((left, right), (Ok(left), Ok(right)) if template.simp_is_perm(&left, &right))
+                };
             let pattern = if reverse { rhs } else { lhs };
+            // The pattern its holes open, as the pin's discrimination tree keys it.
+            let key_pattern = if inside_out {
+                template.txn.instantiate_expr(&pattern).ok()
+            } else {
+                None
+            };
             if root_only {
                 // Dsimp's rule lookup is head-directed. A conversion-based
                 // occurrence match must not unfold a named pattern into an
@@ -609,10 +650,19 @@ impl Context {
                     }
                 }
             }
-            Ok(Some((rule, alpha, pattern, holes, rule_instances)))
+            Ok(Some((
+                rule,
+                alpha,
+                pattern,
+                holes,
+                rule_instances,
+                perm,
+                key_pattern,
+            )))
         })();
         self.charge_rewrite_trial(&template);
-        let Some((rule, alpha, pattern, holes, rule_instances)) = prepared? else {
+        let Some((rule, alpha, pattern, holes, rule_instances, perm, key_pattern)) = prepared?
+        else {
             return Ok(None);
         };
         // `rw` abstracts like the pin's `kabstract` (vendored Lean/Meta/KAbstract.lean:30-55):
@@ -636,8 +686,17 @@ impl Context {
         let reflexive = inside_out && reflexive_pattern(&pattern);
         let mut pending = vec![(target, false)];
         let mut visited = HashSet::new();
+        // The post-order ordinal of the node being tried: the same for every rule at one target.
+        let mut position = 0usize;
         while let Some((term, exit)) = pending.pop() {
             self.tick()?;
+            if exit {
+                position += 1;
+                // A rewrite already found at an earlier node is the one the pin performs.
+                if reach_limit.is_some_and(|limit| position > limit) {
+                    break;
+                }
+            }
             if !exit {
                 if !visited.insert(term.allocation_identity()) {
                     continue;
@@ -709,28 +768,89 @@ impl Context {
                 {
                     return Ok(None);
                 }
-                if inside_out && !trial.discharge_rewrite_premises(&holes, selected_rules)? {
+                if inside_out
+                    && !deferred
+                    && !trial.discharge_rewrite_premises(&holes, selected_rules)?
+                {
                     return Ok(None);
                 }
                 let value = trial.instantiate(&rule.value)?;
                 let type_ = trial.instantiate(&rule.type_)?;
-                if value.has_level_mvar()
-                    || type_.has_level_mvar()
-                    || inside_out && (value.has_expr_mvar() || type_.has_expr_mvar())
-                {
+                // A universe metavariable the target already has may remain (`level_mvars`); one
+                // of the rule's own that the match left open is a universe nothing determined.
+                if value.has_level_mvar() || type_.has_level_mvar() {
+                    let known = super::level_mvars(&trial.instantiate(target)?);
+                    if !super::level_mvars(&value).is_subset(&known)
+                        || !super::level_mvars(&type_).is_subset(&known)
+                    {
+                        return Ok(None);
+                    }
+                }
+                if inside_out && !deferred && (value.has_expr_mvar() || type_.has_expr_mvar()) {
                     return Ok(None);
                 }
                 let occurrence = trial.instantiate(term)?;
-                if inside_out {
+                if inside_out && !deferred {
                     let (_, _, from, to) =
                         equality_target(&type_).expect("instantiated equality retains its shape");
                     let replacement = if reverse { from } else { to };
                     if trial.rewrite_same(&occurrence, &replacement)? {
                         return Ok(None);
                     }
+                    // Ordered rewriting (`tryTheoremCore`, vendored
+                    // `src/Lean/Meta/Tactic/Simp/Rewrite.lean:143-150`): a permutation rule
+                    // rewrites only to a term `acLt` puts below this occurrence. The rule may
+                    // still apply at a later occurrence.
+                    if perm && !trial.simp_ac_lt(&replacement, &occurrence)? {
+                        return Ok(None);
+                    }
                 }
                 let mut premises = Vec::new();
-                if !inside_out {
+                if deferred {
+                    let mut open_data = false;
+                    for id in &holes {
+                        trial.tick()?;
+                        if trial.txn.mvars.is_assigned(id) {
+                            continue;
+                        }
+                        let declaration = trial
+                            .txn
+                            .mvars
+                            .get_decl(id)
+                            .expect("rule parameter was declared")
+                            .clone();
+                        let target = trial.instantiate(&declaration.type_)?;
+                        let proposition = match trial.known_type(&target)? {
+                            Some(universe) => matches!(trial.whnf(&universe)?.node(),
+                                ExprNode::Sort { level } if level.normalize().is_zero()),
+                            None => false,
+                        };
+                        if !proposition {
+                            open_data = true;
+                            continue;
+                        }
+                        premises.push(ProofGoal {
+                            id: id.clone(),
+                            target,
+                            lctx: declaration.lctx,
+                            introduced: Vec::new(),
+                        });
+                    }
+                    // The pin's `synthesizeArgs` leaves a data argument to unification alone:
+                    // one unification did not fix makes the proof `hasAssignableMVar`, and the
+                    // rule fails, unless discharging a premise that mentions it assigns it.
+                    if premises
+                        .iter()
+                        .any(|premise| premise.target.has_expr_mvar())
+                    {
+                        return Err(error(TacticError::SimpSuggestionUnsupported(
+                            "a rule whose premise its matching leaves open",
+                        )));
+                    }
+                    if open_data || type_.has_expr_mvar() {
+                        return Ok(None);
+                    }
+                } else if !inside_out {
                     for id in &holes {
                         trial.tick()?;
                         if trial.txn.mvars.is_assigned(id) {
@@ -770,6 +890,9 @@ impl Context {
                     rule: Typed { value, type_ },
                     occurrence,
                     premises,
+                    perm,
+                    position,
+                    pattern: key_pattern.clone(),
                 }))
             })();
             self.charge_rewrite_trial(&trial);
@@ -793,7 +916,7 @@ impl Context {
     /// value's head, as `toHeadIndexSlow` does. A source ascription `let _ : T := e; _`
     /// (this elaborator's spelling of `(e : T)`, absent from the pin's term) is read as `e`.
     /// `None` only for a loose bound variable.
-    pub(super) fn rewrite_head_key(
+    pub(in crate::source) fn rewrite_head_key(
         &mut self,
         expression: &Expr,
     ) -> Result<Option<(HeadIndex, usize)>, NatDefinitionElabError> {

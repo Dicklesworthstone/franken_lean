@@ -34,6 +34,7 @@ mod string_bootstrap;
 mod string_bytes;
 mod string_from_list;
 mod string_push;
+mod tasks;
 mod thunks;
 mod transport;
 mod variants;
@@ -92,6 +93,7 @@ pub(super) struct Preparation<'a> {
     array_iteration: array_iteration::Store,
     diagnostics: diagnostics::Store,
     st: st::Store,
+    tasks: tasks::Store,
     thunks: thunks::Store,
     io: io::Store,
     fs: fs::Store,
@@ -201,6 +203,7 @@ impl<'a> Preparation<'a> {
             array_iteration: array_iteration::Store::default(),
             diagnostics: diagnostics::Store::default(),
             st: st::Store::default(),
+            tasks: tasks::Store::default(),
             thunks: thunks::Store::default(),
             io: io::Store::default(),
             fs: fs::Store::default(),
@@ -576,6 +579,10 @@ impl<'a> Preparation<'a> {
                             continue;
                         }
                         if let Some(value) = self.thunk_call(&head, &args)? {
+                            tasks.push(Task::Visit(value));
+                            continue;
+                        }
+                        if let Some(value) = self.task_call(&head, &args)? {
                             tasks.push(Task::Visit(value));
                             continue;
                         }

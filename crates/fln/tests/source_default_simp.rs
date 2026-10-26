@@ -111,7 +111,7 @@ fn inline_attributes_bind_qualified_names_and_survive_command_and_file_scopes() 
          attribute [-simp] wrap «re.verse»",
         ],
     );
-    assert_eq!(result.theorems, 2);
+    assert_eq!(result.theorems, 3);
     assert!(simp::read(result.engine.environment()).unwrap().is_empty());
     assert!(
         result
@@ -144,7 +144,7 @@ fn single_declaration_admission_publishes_the_simp_extension_and_logical_root() 
         admitted.engine.logical_root(&KVMap::new())
     );
     assert_ne!(admitted.base_logical_root, admitted.result_logical_root);
-    assert_eq!(simp::read(admitted.engine.environment()).unwrap().len(), 1);
+    assert_eq!(simp::read(admitted.engine.environment()).unwrap().len(), 2);
     checked(
         &admitted.engine,
         &["theorem use (n : Nat) : wrapped (wrapped n) = n := by simp"],
@@ -468,7 +468,49 @@ fn reverse_registration_and_priorities_are_retained_deterministically() {
     let rows = simp::read(newer.engine.environment()).unwrap();
     assert_eq!(rows[0].declaration, Name::from_components(["unwrap"]));
     let again = checked(&newer.engine, &["attribute [simp 900] unwrap"]);
-    assert_eq!(newer.result_logical_root, again.result_logical_root);
+    // The pin's Lean.Meta.addSimpTheorem calls ext.add on every registration;
+    // ScopedEnvExtension.addEntryFn retains each global event for export.
+    assert_ne!(newer.result_logical_root, again.result_logical_root);
+    let journal = simp::export::journal_name();
+    assert_eq!(
+        again
+            .engine
+            .environment()
+            .extension(&journal)
+            .unwrap()
+            .len(),
+        newer
+            .engine
+            .environment()
+            .extension(&journal)
+            .unwrap()
+            .len()
+            + 1
+    );
+    let again_rows = simp::read(again.engine.environment()).unwrap();
+    let selected = |rows: &[simp::SimpEntry]| {
+        rows.iter()
+            .map(|row| {
+                (
+                    row.declaration.clone(),
+                    row.proof.clone(),
+                    row.priority,
+                    row.reverse,
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(selected(&again_rows), selected(&rows));
+    assert_eq!(again_rows[0].order, rows[0].order + 1);
+    let same_predecessor = checked(&newer.engine, &["attribute [simp 900] unwrap"]);
+    assert_eq!(
+        again.result_logical_root,
+        same_predecessor.result_logical_root
+    );
+    checked(
+        &again.engine,
+        &["theorem afterRepeat (n : Nat) : wrap (wrap n) = n := by simp"],
+    );
 }
 
 #[test]
@@ -618,9 +660,10 @@ fn registry_resource_stops_are_nonanswers_not_successful_fallbacks() {
 }
 
 /// The parser keeps every attribute the pin parses in the declaration's tree. The elaborator
-/// implements one global `simp` and the code generator hints (`inline`, `specialize`, …), which
-/// change no checked meaning, and `macro_inline`, recorded for the runtime, and refuses the rest.
-/// So no attribute is dropped and none is admitted without its meaning.
+/// implements one global `simp`, `@[deprecated]` and the code generator hints (`inline`,
+/// `specialize`, …), which change no checked meaning, and `macro_inline` and `extern`, recorded
+/// for the runtime, and refuses the rest. So no attribute is dropped and none is admitted without
+/// its meaning.
 #[test]
 fn attributes_the_elaborator_does_not_implement_are_refused_after_parsing() {
     let base = engine();
@@ -630,8 +673,6 @@ fn attributes_the_elaborator_does_not_implement_are_refused_after_parsing() {
         "@[scoped simp] theorem t : (0 : Nat) = 0 := by rfl",
         "@[simp ↓] theorem t : (0 : Nat) = 0 := by rfl",
         "@[grind =] theorem t : (0 : Nat) = 0 := by rfl",
-        "@[deprecated (since := \"2026-01-01\")] def x : Nat := 0",
-        "@[extern \"lean_x\"] def x : Nat := 0",
         "@[simp 4294967296] theorem t : (0 : Nat) = 0 := by rfl",
         "@[simp 0xff] theorem t : (0 : Nat) = 0 := by rfl",
         "@[simp] example : (0 : Nat) = 0 := by rfl",
@@ -663,6 +704,36 @@ fn attributes_the_elaborator_does_not_implement_are_refused_after_parsing() {
     ] {
         checked(&base, &[source]);
     }
+    // The pinned `lean` v4.32.0 accepts `@[extern "lean_x"] def x : Nat := 0` as a headerless
+    // file (exit 0, no diagnostics, 2026-10-25), which this test refused while source `extern`
+    // was unregistered. It is admitted now, and its explicit entry is recorded.
+    let result = checked(&base, &["@[extern \"lean_x\"] def x : Nat := 0"]);
+    assert_eq!(
+        fln_elab::externs::ExternTable::read(result.engine.environment())
+            .unwrap()
+            .get(&Name::from_components(["x"])),
+        Some(
+            [fln_elab::externs::ExternEntry::Standard {
+                backend: Name::from_components(["all"]),
+                symbol: "lean_x".into(),
+            }]
+            .as_slice()
+        )
+    );
+    // `@[deprecated]` records its entry (`Lean/Linter/Deprecated.lean`): the pinned `lean`
+    // accepts this declaration, warning that the attribute names neither a replacement nor a
+    // message.
+    let deprecated = checked(
+        &base,
+        &["@[deprecated (since := \"2026-01-01\")] def x : Nat := 0"],
+    );
+    let entries = fln_elab::deprecations::Deprecations::read(deprecated.engine.environment())
+        .expect("a readable deprecation journal");
+    let entry = entries
+        .get(&Name::from_components(["x"]))
+        .expect("the declaration is deprecated");
+    assert_eq!(entry.since.as_deref(), Some("2026-01-01"));
+    assert!(entry.new_name.is_none() && entry.text.is_none());
 }
 
 /// `default`, `low`, `mid` and `high` are the pin's priorities 1000, 100, 500 and 10000
@@ -716,8 +787,8 @@ fn unrelated_registered_theorems_do_not_exhaust_simple_default_simp() {
 ",
     );
     let result = checked(&engine(), &[&source]);
-    assert_eq!(result.theorems, 4002);
-    assert_eq!(simp::read(result.engine.environment()).unwrap().len(), 4035);
+    assert_eq!(result.theorems, 4036);
+    assert_eq!(simp::read(result.engine.environment()).unwrap().len(), 4069);
     for source in [
         "attribute [-simp] unwrap
 theorem missing_rule (n : Nat) : wrap n = n := by simp",

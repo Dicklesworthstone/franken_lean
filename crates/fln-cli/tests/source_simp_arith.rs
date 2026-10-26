@@ -95,10 +95,11 @@ const REJECTED: &[(&str, &str)] = &[
     ),
 ];
 
-/// Refused here as unsupported: configuration other than `arith`.
+/// Refused here as unsupported: a configuration field this engine does not honour, set away
+/// from its default (`source_simp_config.rs` reads the slot as a whole).
 const REFUSED: &[(&str, &str, &str)] = &[(
     "other_configuration",
-    "example (x : Nat) : x + 0 = x := by simp (config := { decide := true })\n",
+    "example (x : Nat) : x + 0 = x := by simp (config := { zeta := false })\n",
     "expected default simplification configuration",
 )];
 

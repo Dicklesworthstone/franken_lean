@@ -9,6 +9,7 @@
 
 #![forbid(unsafe_code)]
 
+mod capsule;
 mod goal_traces;
 #[cfg(test)]
 mod guard_filter_tests;
@@ -236,7 +237,8 @@ const USAGE: &str = concat!(
     "  fln replay [--json] PATH\n",
     "  fln cache [inspect | clear | stats]\n",
     "  fln build explain\n",
-    "  fln verify-capsule [--json] [--max-bytes BYTES] PATH\n",
+    "  fln seal-capsule [--json] [--max-bytes BYTES] --output PATH MODULE_DIR\n",
+    "  fln verify-capsule [--json] [--require-semantic] [--max-bytes BYTES] PATH\n",
     "  fln --help\n",
     "  fln --version\n",
     "\n",
@@ -251,9 +253,13 @@ const USAGE: &str = concat!(
     "tree: changed inputs with old and new hashes, and the Reference (file-cone)\n",
     "rebuild decision. The native decision is unavailable (no Ledger records). It\n",
     "exits 5 when no snapshot exists or an input cannot be read.\n",
-    "`verify-capsule` checks the transport completeness and content-hash integrity\n",
-    "of a sealed .flnpack capsule and decodes its certificate objects; it does not\n",
-    "replay certificates through a checker.\n",
+    "`seal-capsule` checks a closed directory of named .olean modules, including\n",
+    "required .olean.server/.olean.private companions, through the kernel and\n",
+    "independent checker before atomically writing a self-contained .flnpack.\n",
+    "`verify-capsule` rechecks those declarations from the embedded artifacts\n",
+    "without external imports or caches. Legacy capsules receive transport\n",
+    "integrity verification only; --require-semantic refuses that weaker result.\n",
+    "Certificate decoding remains separate from declaration verification.\n",
     "\n",
     "Exit codes: 0 success; 1 rejected or failed; 2 usage error; 3 inconclusive or\n",
     "resource limit; 4 internal fault; 5 capability not implemented.\n",
@@ -579,6 +585,13 @@ enum MultiplexerCommand {
     },
     VerifyCapsule {
         path: PathBuf,
+        max_bytes: usize,
+        json: bool,
+        require_semantic: bool,
+    },
+    SealCapsule {
+        directory: PathBuf,
+        output: PathBuf,
         max_bytes: usize,
         json: bool,
     },
@@ -1720,21 +1733,7 @@ fn parse_doctor(arguments: Vec<OsString>) -> Result<MultiplexerCommand, UsageErr
 }
 
 fn parse_verify_capsule(arguments: Vec<OsString>) -> Result<MultiplexerCommand, UsageError> {
-    let Some((paths, max_bytes, json)) =
-        parse_path_options(arguments, "verify-capsule", CAPSULE_DEFAULT_MAX_BYTES)?
-    else {
-        return Ok(MultiplexerCommand::Help);
-    };
-    let [path] = paths.as_slice() else {
-        return Err(UsageError(
-            "verify-capsule accepts exactly one input path".to_owned(),
-        ));
-    };
-    Ok(MultiplexerCommand::VerifyCapsule {
-        path: path.clone(),
-        max_bytes,
-        json,
-    })
+    capsule::parse(arguments, false)
 }
 
 fn parse_build_explain(arguments: Vec<OsString>) -> Result<MultiplexerCommand, UsageError> {
@@ -1887,6 +1886,9 @@ fn parse_command(
     }
     if command == "verify-capsule" {
         return parse_verify_capsule(arguments.collect());
+    }
+    if command == "seal-capsule" {
+        return capsule::parse(arguments.collect(), true);
     }
     if command == "doctor" {
         return parse_doctor(arguments.collect());
@@ -3515,7 +3517,12 @@ fn verify_capsule_failure(error: VerifyCapsuleFailure, json: bool) -> Multiplexe
     } else {
         format!("fln verify-capsule: {class}: {}\n", detail.text())
     };
-    MultiplexerOutput::failure(stderr, if class == "resource" { 3 } else { 1 })
+    let exit_code = match class {
+        "resource" => 3,
+        "internal_fault" => 4,
+        _ => 1,
+    };
+    MultiplexerOutput::failure(stderr, exit_code)
 }
 
 fn verify_capsule_bytes(
@@ -3746,7 +3753,8 @@ fn verify_capsule_bytes(
                 "\"status\":\"integrity_verified\",\"manifest_root\":{},\"archive_digest\":{},",
                 "\"transport_state\":{},\"objects_present\":{},\"objects_declared\":{},",
                 "\"chunk_count\":{},\"bytes\":{},\"certificates_decoded\":{},",
-                "\"certificate_replay\":\"not_implemented\",",
+                "\"verification_method\":\"integrity_only\",",
+                "\"declarations_verified\":0,\"certificate_replay\":\"not_implemented\",",
                 "\"warm_cache_decoded\":{}}}\n"
             ),
             json_string(VERIFY_CAPSULE_SCHEMA),
@@ -3792,13 +3800,6 @@ fn verify_capsule_bytes(
             },
         );
         MultiplexerOutput::success(stdout)
-    }
-}
-
-fn verify_capsule(path: &Path, max_bytes: usize, json: bool) -> MultiplexerOutput {
-    match read_bounded(path, max_bytes, ".flnpack capsule") {
-        Ok(bytes) => verify_capsule_bytes(path, &bytes, max_bytes, json),
-        Err(error) => verify_capsule_failure(VerifyCapsuleFailure::Read(error), json),
     }
 }
 
@@ -14452,7 +14453,14 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOutput {
             path,
             max_bytes,
             json,
-        }) => verify_capsule(&path, max_bytes, json),
+            require_semantic,
+        }) => capsule::verify(path, max_bytes, json, require_semantic),
+        Ok(MultiplexerCommand::SealCapsule {
+            directory,
+            output,
+            max_bytes,
+            json,
+        }) => capsule::seal(directory, output, max_bytes, json),
         Ok(MultiplexerCommand::BuildExplain {
             target,
             dir,

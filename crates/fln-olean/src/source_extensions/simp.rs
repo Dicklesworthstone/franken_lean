@@ -34,8 +34,9 @@ pub struct SimpTheorem {
     pub permutation: bool,
     pub reflexive: bool,
     pub backward_reflexive: bool,
-    /// The native simplifier rebuilds selection from checked types.
-    pub key_count: usize,
+    /// The pin's complete discrimination-tree path. Retained for faithful
+    /// re-export; selection metadata never grants proof authority.
+    pub keys: Vec<DiscrTreeKey>,
 }
 
 fn boolean(obj: &Obj, pointers: usize, index: usize) -> Result<bool, DecodeError> {
@@ -124,7 +125,7 @@ impl Reader {
                 format::SIMP_THM_POINTERS,
                 format::SIMP_THM_BACKWARD_RFL_SCALAR,
             )?,
-            key_count: self.simp_array_size(&field(obj, format::SIMP_THM_KEYS)?)?,
+            keys: self.keys(&field(obj, format::SIMP_THM_KEYS)?)?,
         })
     }
 

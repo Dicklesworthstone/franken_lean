@@ -69,7 +69,8 @@ impl Intrinsic {
             Self::Empty => {
                 // As with ByteArray.emptyWithCapacity, capacity is a hint,
                 // not permission to allocate an arbitrary attacker-sized buffer.
-                // The VM's copy-always arrays expose the canonical empty value.
+                // Start empty; consuming pushes grow this storage geometrically
+                // without turning an untrusted hint into an allocation request.
                 with_nat_view(&args[0], "Array.emptyWithCapacity", 0, |_| ())?;
                 Obj::mk_array(Vec::new())
             }

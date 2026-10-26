@@ -22,6 +22,7 @@ pub(super) mod string_from_list;
 mod string_internal;
 mod string_length;
 pub(super) mod string_push;
+pub(super) mod tasks;
 pub(super) mod thunks;
 pub(super) use string_append::imported_string_append_matches;
 pub(super) use string_internal::imported_string_internal_matches;

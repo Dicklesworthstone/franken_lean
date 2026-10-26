@@ -3,6 +3,22 @@ use super::*;
 use fln_olean::write::source::{SourceMetadata, encode_module_with_source_metadata};
 use std::sync::Arc;
 
+fn artifact_discrimination_key(
+    key: fln_elab::instances::discr_tree::Key,
+) -> fln_olean::source_extensions::DiscrTreeKey {
+    use fln_elab::instances::discr_tree::Key;
+    use fln_olean::source_extensions::DiscrTreeKey;
+    match key {
+        Key::Star => DiscrTreeKey::Star,
+        Key::Other => DiscrTreeKey::Other,
+        Key::Lit(value) => DiscrTreeKey::Lit(value),
+        Key::FVar(id, arity) => DiscrTreeKey::FVar(id.0, arity),
+        Key::Const(name, arity) => DiscrTreeKey::Const(name, arity),
+        Key::Arrow => DiscrTreeKey::Arrow,
+        Key::Proj(name, index, arity) => DiscrTreeKey::Proj(name, index, arity),
+    }
+}
+
 /// One basic (pre-module-system) `.olean`, containing only its own constants.
 #[derive(Debug)]
 pub struct SourceModuleArtifact {
@@ -136,6 +152,41 @@ impl PendingArtifact {
                 reason: "module-system .olean emission requires public/private split artifacts",
             });
         }
+        // Default equation policies and realization provenance are local
+        // compilation facts: the pin reconstructs their result from the actual
+        // checked equation declarations. Nondefault definition-time options
+        // require its persistent eqnOptionsExt and cannot be silently dropped.
+        if let Some(journal) =
+            checked.extension(&fln_elab::source::scope::simp::equations::journal_name())
+        {
+            for entry in journal.entries() {
+                meter.bytes(entry.payload.len())?;
+            }
+        }
+        let remaining = meter.limits.max_work.saturating_sub(meter.work);
+        let work =
+            fln_elab::source::scope::simp::equations::validate_export(checked, remaining)
+                .map_err(|error| match error {
+                    fln_elab::source::scope::simp::SimpSetError::Limit => {
+                        SourceModuleCheckError::Limit {
+                            resource: "module work",
+                            limit: meter.limits.max_work,
+                        }
+                    }
+                    fln_elab::source::scope::simp::SimpSetError::UnsupportedDeclaration(_) => {
+                        SourceModuleCheckError::Extension {
+                            module: name.clone(),
+                            extension: fln_elab::source::scope::simp::equations::journal_name(),
+                            reason: "nondefault equation-generation options require pinned persistent metadata that the writer cannot yet serialize",
+                        }
+                    }
+                    _ => SourceModuleCheckError::Extension {
+                        module: name.clone(),
+                        extension: fln_elab::source::scope::simp::equations::journal_name(),
+                        reason: "invalid equation-generation provenance",
+                    },
+                })?;
+        meter.work(work)?;
         let mut constants = Vec::new();
         for (name, constant) in checked.constants() {
             meter.work(1)?;
@@ -199,28 +250,19 @@ impl PendingArtifact {
                 });
         }
         for instance in registrations.instances {
-            use fln_elab::instances::discr_tree::Key;
-            use fln_olean::source_extensions::{InstanceEntry, InstanceKey};
+            use fln_olean::source_extensions::{DiscrTreeKey, InstanceEntry};
             meter.work(1)?;
             meter.bytes(instance.synth_order.len().saturating_mul(4))?;
             meter.bytes(
                 instance
                     .keys
                     .len()
-                    .saturating_mul(std::mem::size_of::<InstanceKey>()),
+                    .saturating_mul(std::mem::size_of::<DiscrTreeKey>()),
             )?;
             let keys = instance
                 .keys
                 .into_iter()
-                .map(|key| match key {
-                    Key::Star => InstanceKey::Star,
-                    Key::Other => InstanceKey::Other,
-                    Key::Lit(value) => InstanceKey::Lit(value),
-                    Key::FVar(id, arity) => InstanceKey::FVar(id.0, arity),
-                    Key::Const(name, arity) => InstanceKey::Const(name, arity),
-                    Key::Arrow => InstanceKey::Arrow,
-                    Key::Proj(name, index, arity) => InstanceKey::Proj(name, index, arity),
-                })
+                .map(artifact_discrimination_key)
                 .collect();
             metadata.instances.push(InstanceEntry {
                 declaration: instance.declaration,
@@ -230,6 +272,82 @@ impl PendingArtifact {
                 scope: instance.scope,
                 keys,
             });
+        }
+        let remaining = meter.limits.max_work.saturating_sub(meter.work);
+        let simps = fln_elab::source::scope::simp::export::registrations(base, checked, remaining)
+            .map_err(|error| match error {
+                fln_elab::source::scope::simp::SimpSetError::Limit => {
+                    SourceModuleCheckError::Limit {
+                        resource: "module work",
+                        limit: meter.limits.max_work,
+                    }
+                }
+                fln_elab::source::scope::simp::SimpSetError::UnsupportedDeclaration(_) => {
+                    SourceModuleCheckError::Extension {
+                        module: name.clone(),
+                        extension: fln_elab::source::scope::simp::export::journal_name(),
+                        reason: "simp export requires supported equality proofs, checked equation theorems, or reducible definitions; unsupported equation generation, erasures and imported proof re-registration cannot be serialized",
+                    }
+                }
+                _ => SourceModuleCheckError::Extension {
+                    module: name.clone(),
+                    extension: fln_elab::source::scope::simp::export::journal_name(),
+                    reason: "invalid simp metadata export",
+                },
+            })?;
+        meter.work(simps.work)?;
+        meter.bytes(simps.bytes_examined)?;
+        for row in simps.entries {
+            use fln_elab::source::scope::simp::export::Kind;
+            use fln_olean::source_extensions::{DiscrTreeKey, SimpEntry, SimpKind, SimpTheorem};
+            meter.work(1)?;
+            let kind = match row {
+                Kind::Unfold(declaration) => SimpKind::Unfold(declaration),
+                Kind::UnfoldTheorems {
+                    declaration,
+                    theorems,
+                } => {
+                    meter.work(theorems.len())?;
+                    for theorem in &theorems {
+                        meter.bytes(theorem.to_canonical_bytes().len())?;
+                    }
+                    SimpKind::UnfoldTheorems {
+                        declaration,
+                        theorems,
+                    }
+                }
+                Kind::Theorem(theorem) => {
+                    meter.work(
+                        theorem
+                            .keys
+                            .len()
+                            .saturating_add(theorem.level_params.len()),
+                    )?;
+                    meter.bytes(
+                        theorem
+                            .keys
+                            .len()
+                            .saturating_mul(std::mem::size_of::<DiscrTreeKey>()),
+                    )?;
+                    SimpKind::Theorem(SimpTheorem {
+                        proof: theorem.proof,
+                        level_params: theorem.level_params,
+                        origin: theorem.origin,
+                        origin_reverse: theorem.origin_reverse,
+                        priority: theorem.priority,
+                        post: theorem.post,
+                        permutation: theorem.permutation,
+                        reflexive: theorem.reflexive,
+                        backward_reflexive: theorem.backward_reflexive,
+                        keys: theorem
+                            .keys
+                            .into_iter()
+                            .map(artifact_discrimination_key)
+                            .collect(),
+                    })
+                }
+            };
+            metadata.simp.push(SimpEntry { scope: None, kind });
         }
         let remaining = meter.limits.max_work.saturating_sub(meter.work);
         let defaults = fln_elab::instances::defaults::registrations(base, checked, remaining)
@@ -495,36 +613,54 @@ impl PendingArtifact {
             use fln_elab::source::scope::simp::{SimpSetError, defeq};
             if let Some(journal) = env.extension(&defeq::journal_name()) {
                 for entry in journal.entries() {
-                    meter.work(1 + entry.payload.len().div_ceil(64))?;
+                    meter.work(2 * (1 + entry.payload.len().div_ceil(64)))?;
                     meter.bytes(entry.payload.len())?;
                 }
             }
-            defeq::read(env, || Ok(())).map_err(|error| match error {
-                fln_elab::NatDefinitionElabError::Inference(
-                    fln_elab::source::SourceInferenceError::SimpSet(SimpSetError::Limit),
-                ) => SourceModuleCheckError::Limit {
-                    resource: "native reflexivity tags",
-                    limit: defeq::MAX_ROWS,
-                },
-                _ => SourceModuleCheckError::Extension {
-                    module: name.clone(),
-                    extension: defeq::journal_name(),
-                    reason: "invalid reflexivity-declaration journal",
-                },
-            })
+            defeq::read(env, || Ok(()))
+                .and_then(|strict| {
+                    defeq::read_backward(env, || Ok(())).map(|backward| (strict, backward))
+                })
+                .map_err(|error| match error {
+                    fln_elab::NatDefinitionElabError::Inference(
+                        fln_elab::source::SourceInferenceError::SimpSet(SimpSetError::Limit),
+                    ) => SourceModuleCheckError::Limit {
+                        resource: "native reflexivity tags",
+                        limit: defeq::MAX_ROWS,
+                    },
+                    _ => SourceModuleCheckError::Extension {
+                        module: name.clone(),
+                        extension: defeq::journal_name(),
+                        reason: "invalid reflexivity-declaration journal",
+                    },
+                })
         };
-        let inherited = defeq(base, meter)?;
-        for tagged in defeq(checked, meter)? {
+        let (inherited, inherited_backward) = defeq(base, meter)?;
+        let (strict, backward) = defeq(checked, meter)?;
+        for tagged in &strict {
             meter.work(1)?;
-            if !inherited.contains(&tagged) {
-                if base.contains(&tagged) {
+            if !inherited.contains(tagged) {
+                if base.contains(tagged) {
                     return Err(SourceModuleCheckError::Extension {
                         module: name.clone(),
                         extension: fln_elab::source::scope::simp::defeq::journal_name(),
                         reason: "a module cannot tag an imported reflexivity theorem",
                     });
                 }
-                metadata.defeq.push(tagged);
+                metadata.defeq.push(tagged.clone());
+            }
+        }
+        for tagged in backward.difference(&strict) {
+            meter.work(1)?;
+            if !inherited_backward.contains(tagged) {
+                if base.contains(tagged) {
+                    return Err(SourceModuleCheckError::Extension {
+                        module: name.clone(),
+                        extension: fln_elab::source::scope::simp::defeq::journal_name(),
+                        reason: "a module cannot tag an imported backward-reflexivity theorem",
+                    });
+                }
+                metadata.backward_defeq.push(tagged.clone());
             }
         }
         let remaining = meter.limits.max_work.saturating_sub(meter.work);

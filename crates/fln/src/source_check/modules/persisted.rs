@@ -368,9 +368,12 @@ impl SourceModuleRecord {
             fln_elab::aux_recursors::journal_name(),
             fln_elab::reducibility::export::journal_name(),
             fln_elab::noncomputable::journal_name(),
+            fln_elab::source::scope::simp::export::journal_name(),
             fln_elab::source::scope::simp::defeq::journal_name(),
+            fln_elab::source::scope::simp::equations::journal_name(),
             fln_elab::macro_inline::journal_name(),
             fln_elab::records::imported::export::journal_name(),
+            fln_elab::source::equation_theorems::journal::journal_name(),
         ]
         .map(|name| {
             let bytes = name.to_canonical_bytes();
@@ -841,6 +844,54 @@ mod tests {
 
     fn checker(label: &[u8]) -> CheckerIdentity {
         CheckerIdentity::of_executable(label)
+    }
+
+    #[test]
+    fn simp_journals_survive_a_fresh_persisted_build_session() {
+        for (library, rule) in [
+            (
+                "prelude\ndef wrap.{u} {A : Sort u} (x : A) : A := x\n\
+                 attribute [reducible] wrap\nattribute [simp] wrap",
+                "wrap",
+            ),
+            (
+                "prelude\ninductive Eq.{u} {A : Sort u} : A -> A -> Prop where | refl (a : A) : Eq a a\n\
+                 def wrap.{u} {A : Sort u} (x : A) : A := x\n\
+                 @[simp 900] theorem unwrap.{u} {A : Sort u} (x : A) : wrap x = x := by rfl\n\
+                 attribute [irreducible] wrap",
+                "unwrap",
+            ),
+        ] {
+            let graph = [
+                ("Base", library),
+                (
+                    "Main",
+                    "prelude\nimport Base\ndef use.{u} {A : Sort u} (x : A) : A := wrap x",
+                ),
+            ];
+            let store = Memory::default();
+            let identity = checker(b"simp-journal-replay");
+            let run = || {
+                compile(&store, identity, fln_core::mode::Mode::DEFAULT, &graph)
+                    .unwrap()
+                    .into_complete()
+                    .unwrap()
+            };
+            let cold = run();
+            assert_eq!((cold.elaborated_modules, cold.persisted_modules), (2, 0));
+            let warm = run();
+            assert_eq!((warm.elaborated_modules, warm.persisted_modules), (0, 2));
+            assert_eq!(products(&warm), products(&cold));
+            assert_eq!(
+                warm.checked.checked.result_logical_root,
+                cold.checked.checked.result_logical_root
+            );
+            let rules =
+                fln_elab::source::scope::simp::read(warm.checked.checked.engine.environment())
+                    .unwrap();
+            assert_eq!(rules.len(), 1);
+            assert_eq!(rules[0].declaration, n(rule));
+        }
     }
 
     #[test]

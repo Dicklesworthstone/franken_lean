@@ -1069,7 +1069,9 @@ impl Context {
                 .ok_or_else(|| failure(SourceInferenceError::ResourceLimit))?;
         }
         let synth_order = if let Candidate::Global(name) = candidate {
-            if let Some(parameters) = registry.imported_instance_parameters(name) {
+            if let Some(index) = registry.local_instance_index(name) {
+                Some(index.synth_order.as_slice())
+            } else if let Some(parameters) = registry.imported_instance_parameters(name) {
                 Some(parameters.synth_order.as_slice())
             } else {
                 self.instance_search_index(registry)?

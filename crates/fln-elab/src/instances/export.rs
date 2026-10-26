@@ -35,6 +35,25 @@ pub fn derive_index(
     )
 }
 
+/// Derive a local registration's keys at the moment it is registered. Unlike
+/// [`derive_index`], this may normalize reducible aliases in nested keys. The
+/// caller must retain the returned metadata with the lexical registration:
+/// recomputing it after a reducibility change would change candidate selection.
+pub fn derive_local_index(
+    env: &Environment,
+    registry: &InstanceRegistry,
+    declaration: &Name,
+    work_left: &mut usize,
+) -> Result<Option<DerivedIndex>, InstanceRegistryError> {
+    index::derive_local(
+        env,
+        &registry.classes,
+        &registry.imported.classes,
+        declaration,
+        work_left,
+    )
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClassRegistration {
     pub name: Name,

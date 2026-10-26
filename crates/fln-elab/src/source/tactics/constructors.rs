@@ -800,7 +800,7 @@ impl Context {
     pub(super) fn inject_named_proof_goal(
         &mut self,
         proof: &mut ProofState<'_>,
-        mut goal: ProofGoal,
+        goal: ProofGoal,
         name: &Name,
         names: &[Name],
     ) -> Result<(), NatDefinitionElabError> {
@@ -812,6 +812,194 @@ impl Context {
             .find_by_user_name(name)
             .cloned()
             .ok_or_else(|| error(TacticError::ConstructorEquality))?;
+        self.inject_local_proof_goal(proof, goal, local, names)
+    }
+
+    /// `injections` (`Meta.injections`, vendored src/Lean/Meta/Tactic/Injection.lean:119-146):
+    /// `injection` on each hypothesis in context order that is an equation (or a homogeneous
+    /// `HEq`) whose sides are not both literals, the equations each makes tried next, at most
+    /// five deep; one that fails, or whose continuation exhausts that depth, is undone and
+    /// skipped. Then the pin's `tryAssumption` on the goal left (`evalInjections`). Names for the
+    /// new equations are refused, typed: this engine's `injection` does not hand back the ones
+    /// it leaves unused.
+    pub(super) fn injections_proof_goal(
+        &mut self,
+        proof: &mut ProofState<'_>,
+        goal: ProofGoal,
+        args: &[Syntax],
+    ) -> Result<(), NatDefinitionElabError> {
+        let [keyword, names] = args else {
+            return Err(error(TacticError::MalformedScript));
+        };
+        expect_atom(keyword, "injections", "injections keyword")?;
+        self.require_declared_tactic(&["Lean", "Parser", "Tactic", "injections"])?;
+        if !expect_null_args(names, "injections names")?.is_empty() {
+            return Err(error(TacticError::UnsupportedTactic(parser_kind(&[
+                "Tactic",
+                "injections",
+            ]))));
+        }
+        self.txn.lctx = goal.lctx.clone();
+        self.resolve_instances(false)?;
+        self.flush(false)?;
+        let locals: std::collections::VecDeque<FVarId> = goal
+            .lctx
+            .decls()
+            .iter()
+            .map(|local| local.id.clone())
+            .collect();
+        let Some(child) = self.injections_at(proof, goal, locals, 5, &HashSet::new())? else {
+            return Ok(());
+        };
+        self.txn.lctx = child.lctx.clone();
+        match self.matching_assumption(&child)? {
+            Some(value) => self.close_proof_goal(child, value),
+            None => {
+                proof.work.push(Work::Goal(child));
+                Ok(())
+            }
+        }
+    }
+
+    /// `Meta.injections.go`: the goal left, or `None` when an injection closed it.
+    fn injections_at(
+        &mut self,
+        proof: &mut ProofState<'_>,
+        goal: ProofGoal,
+        mut locals: std::collections::VecDeque<FVarId>,
+        depth: usize,
+        forbidden: &HashSet<FVarId>,
+    ) -> Result<Option<ProofGoal>, NatDefinitionElabError> {
+        loop {
+            self.tick()?;
+            if depth == 0 {
+                return Err(error(TacticError::InjectionsDepth));
+            }
+            let Some(id) = locals.pop_front() else {
+                return Ok(Some(goal));
+            };
+            if forbidden.contains(&id) {
+                continue;
+            }
+            let Some(local) = goal.lctx.find(&id).cloned() else {
+                continue;
+            };
+            self.txn.lctx = goal.lctx.clone();
+            if !self.injections_candidate(&local)? {
+                continue;
+            }
+            let snapshot = (Box::new(self.clone()), proof.clone());
+            let attempt = (|| {
+                let before: HashSet<FVarId> = goal
+                    .lctx
+                    .decls()
+                    .iter()
+                    .map(|local| local.id.clone())
+                    .collect();
+                let height = proof.work.len();
+                self.inject_local_proof_goal(proof, goal.clone(), local.clone(), &[])?;
+                if proof.work.len() == height && self.txn.mvars.is_assigned(&goal.id) {
+                    return Ok(None);
+                }
+                let Some(Work::Goal(child)) = proof.work.pop() else {
+                    return Err(error(TacticError::MalformedScript));
+                };
+                let mut next: std::collections::VecDeque<FVarId> = child
+                    .lctx
+                    .decls()
+                    .iter()
+                    .filter(|local| !before.contains(&local.id))
+                    .map(|local| local.id.clone())
+                    .collect();
+                next.extend(locals.iter().cloned());
+                let mut forbidden = forbidden.clone();
+                forbidden.insert(id.clone());
+                self.injections_at(proof, child, next, depth - 1, &forbidden)
+            })();
+            match attempt {
+                Ok(result) => return Ok(result),
+                Err(problem)
+                    if backtrack::recoverable(&problem)
+                        || matches!(
+                            &problem,
+                            NatDefinitionElabError::Inference(SourceInferenceError::Tactic(
+                                TacticError::InjectionsDepth
+                            ))
+                        ) =>
+                {
+                    let spent = self.txn.budget.heartbeats_consumed;
+                    let aux_names = self.aux_names.take();
+                    *self = *snapshot.0;
+                    *proof = snapshot.1;
+                    self.txn.budget.heartbeats_consumed = spent;
+                    self.aux_names = aux_names;
+                }
+                Err(problem) => return Err(problem),
+            }
+        }
+    }
+
+    /// `matchEqHEq?` on `local`'s type, as written or in weak head normal form, with sides that
+    /// are not both literals once in weak head normal form.
+    fn injections_candidate(&mut self, local: &LocalDecl) -> Result<bool, NatDefinitionElabError> {
+        let mut type_ = self.instantiate(&local.type_)?;
+        for attempt in 0..2 {
+            if attempt == 1 {
+                type_ = self.whnf(&type_)?;
+            }
+            if let Some((_, _, left, right)) = equality_target(&type_) {
+                return self.injections_sides_not_literals(&left, &right);
+            }
+            if let Some((_, alpha, left, beta, right)) =
+                super::equality::heterogeneous_target(&type_)
+            {
+                if !self.proof_types_match(&alpha, &beta)? {
+                    return Ok(false);
+                }
+                return self.injections_sides_not_literals(&left, &right);
+            }
+        }
+        Ok(false)
+    }
+
+    fn injections_sides_not_literals(
+        &mut self,
+        left: &Expr,
+        right: &Expr,
+    ) -> Result<bool, NatDefinitionElabError> {
+        Ok(!(self.whnf_is_nat_literal(left)? && self.whnf_is_nat_literal(right)?))
+    }
+
+    /// Whether the pin's `whnf` makes `expr` a raw `Nat` literal: this engine's, then each
+    /// `Nat.succ` of a literal folded as `reduceNat?` folds it (`isRawNatLit`).
+    fn whnf_is_nat_literal(&mut self, expr: &Expr) -> Result<bool, NatDefinitionElabError> {
+        let mut current = expr.clone();
+        loop {
+            self.tick()?;
+            current = self.whnf(&current)?;
+            match current.node() {
+                ExprNode::Lit {
+                    literal: fln_core::expr::Literal::Nat(_),
+                } => return Ok(true),
+                ExprNode::App { f, a }
+                    if matches!(f.node(), ExprNode::Const { name, levels }
+                    if name == &Name::from_components(["Nat", "succ"]) && levels.is_empty()) =>
+                {
+                    current = a.clone();
+                }
+                _ => return Ok(false),
+            }
+        }
+    }
+
+    pub(super) fn inject_local_proof_goal(
+        &mut self,
+        proof: &mut ProofState<'_>,
+        mut goal: ProofGoal,
+        local: LocalDecl,
+        names: &[Name],
+    ) -> Result<(), NatDefinitionElabError> {
+        self.txn.lctx = goal.lctx.clone();
         let equality = self
             .homogeneous_equality_evidence(&Typed {
                 value: Expr::fvar(local.id),

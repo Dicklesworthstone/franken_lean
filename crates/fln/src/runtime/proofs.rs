@@ -271,6 +271,19 @@ impl Preparation<'_> {
                         work.push(Frame::Visit(replacement, expected));
                         continue;
                     }
+                    // Before this pass rewrites the receiver's binder types,
+                    // which the refolding check compares exactly.
+                    if let ExprNode::Proj {
+                        idx,
+                        expr: receiver,
+                        ..
+                    } = expr.node()
+                        && let Some(refolded) = self.nat_history_refold(*idx, receiver)?
+                    {
+                        reserve(&mut work, self.limits.max_nodes)?;
+                        work.push(Frame::Visit(refolded, expected));
+                        continue;
+                    }
                     self.check_noncomputable_head(&expr)?;
                     match expr.node() {
                         ExprNode::App { .. } => {
