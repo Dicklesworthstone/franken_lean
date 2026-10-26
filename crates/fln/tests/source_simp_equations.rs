@@ -1,10 +1,12 @@
 //! Lazy equation theorems retain ordinary admission evidence at every source door.
 #![forbid(unsafe_code)]
 
-use fln::source_check::modules::SourceModuleCheckLimits;
+use fln::execution::SourceProgramLimits;
+use fln::source_check::modules::{SourceModuleCacheLimits, SourceModuleCheckLimits};
 use fln::{
     Budget, CheckerAdmissionBudget, DataValue, Declaration, Engine, EngineAdmissionLimits,
     EngineExecutionLimits, KVMap, Name, Outcome, SourceCheckLimits, SourceModuleInput,
+    SourceModuleSession,
 };
 use fln_elab::source::scope::simp;
 
@@ -402,6 +404,170 @@ fn a_public_local_equation_is_exported_and_later_global_registration_reuses_it()
             );
         }
     }
+    assert!(initial.environment().is_empty());
+}
+
+const PUBLIC_EQUATION_PREFIX: &str = "module\nprelude\n\
+    public inductive Eq.{u} {A : Sort u} : A -> A -> Prop where | refl (a : A) : Eq a a\n\
+    @[expose] public def wrap.{u} {A : Sort u} (x : A) : A := x\n";
+
+#[test]
+fn private_and_hidden_public_proofs_publish_equations_once_before_later_simp() {
+    let initial = Engine::builder().build_empty();
+    let api_name = name("Api");
+    let main_name = name("Main");
+    let main = "prelude\nimport Api\n\
+        theorem witness.{u} {A : Sort u} (x : A) : wrap x = x := by simp";
+    let module_limits = SourceModuleCheckLimits::new(SourceCheckLimits::new(limits()));
+    for (visibility, proof) in [
+        ("", "wrap.eq_1 x"),
+        ("", "by rw [wrap]"),
+        ("", "by\n  trace \"equation retained\"\n  exact wrap.eq_1 x"),
+        ("public ", "wrap.eq_1 x"),
+        ("public ", "by rw [wrap]"),
+    ] {
+        let api = format!(
+            "{PUBLIC_EQUATION_PREFIX}{visibility}theorem first.{{u}} {{A : Sort u}} (x : A) : \
+             wrap x = x := {proof}\npublic section\nattribute [simp] wrap\n"
+        );
+        let modules = [
+            SourceModuleInput {
+                name: &api_name,
+                source: api.as_bytes(),
+            },
+            SourceModuleInput {
+                name: &main_name,
+                source: main.as_bytes(),
+            },
+        ];
+        let checked = initial
+            .check_source_modules(&modules, &main_name, &KVMap::new(), module_limits)
+            .unwrap_or_else(|error| panic!("{api}\n{error:?}"))
+            .into_complete()
+            .unwrap();
+        let exported = checked.checked.engine.environment();
+        assert!(matches!(
+            exported.find(&name("wrap.eq_1")),
+            Some(fln::ConstantInfo::Thm(_))
+        ));
+        assert_eq!(exported.contains(&name("first")), !visibility.is_empty());
+        if !visibility.is_empty() {
+            assert!(matches!(
+                exported.find(&name("first")),
+                Some(fln::ConstantInfo::Axiom(_))
+            ));
+        }
+        assert_eq!(simp::read(exported).unwrap().len(), 2);
+
+        let executed =
+            fln::source_check::modules::imported::SourceOleanImport::empty(&KVMap::new())
+                .execute_source_modules(
+                    &modules,
+                    &main_name,
+                    &KVMap::new(),
+                    SourceProgramLimits::new(EngineExecutionLimits::new(limits().kernel)),
+                    None,
+                )
+                .unwrap_or_else(|error| panic!("{api}\n{error:?}"))
+                .into_complete()
+                .unwrap();
+        let api = executed
+            .modules
+            .iter()
+            .find(|module| module.module == api_name)
+            .unwrap();
+        let equation_rows: Vec<_> = api
+            .commands
+            .batch
+            .source_admissions
+            .iter()
+            .filter(|row| {
+                row.admission.admissions.iter().any(|admitted| {
+                    matches!(&admitted.declaration, Declaration::Thm(theorem)
+                    if theorem.base.name == name("wrap.eq_1"))
+                })
+            })
+            .collect();
+        assert_eq!(
+            equation_rows.len(),
+            1,
+            "the first requesting command owns the receipt"
+        );
+        let [equation, theorem] = equation_rows[0].admission.admissions.as_slice() else {
+            panic!("exactly the checked equation and the requesting proof")
+        };
+        assert!(
+            matches!(&equation.declaration, Declaration::Thm(value) if value.base.name == name("wrap.eq_1"))
+        );
+        assert!(matches!(theorem.declaration, Declaration::Thm(_)));
+        if proof.contains("trace") {
+            assert_eq!(api.commands.traces.len(), 1);
+            assert_eq!(api.commands.traces[0].message, "equation retained");
+        }
+    }
+    assert!(initial.environment().is_empty());
+}
+
+#[test]
+fn failed_private_or_hidden_public_proof_does_not_publish_staged_equations() {
+    let options = KVMap::new();
+    let initial = Engine::builder().build_empty();
+    let mut session = SourceModuleSession::new(
+        initial.clone(),
+        options,
+        SourceModuleCheckLimits::new(SourceCheckLimits::new(limits())),
+        SourceModuleCacheLimits::default(),
+    );
+    let api_name = name("Api");
+    for visibility in ["", "public "] {
+        let failed = format!(
+            "{PUBLIC_EQUATION_PREFIX}{visibility}theorem bad.{{u}} {{A : Sort u}} (x y : A) : \
+             wrap x = y := wrap.eq_1 x\n"
+        );
+        assert!(
+            session
+                .check(
+                    &[SourceModuleInput {
+                        name: &api_name,
+                        source: failed.as_bytes(),
+                    }],
+                    &api_name
+                )
+                .is_err()
+        );
+        assert_eq!(session.retained_modules(), 0);
+    }
+    let recovered = format!(
+        "{PUBLIC_EQUATION_PREFIX}theorem first.{{u}} {{A : Sort u}} (x : A) : \
+         wrap x = x := wrap.eq_1 x\npublic section\nattribute [simp] wrap\n"
+    );
+    let files = [SourceModuleInput {
+        name: &api_name,
+        source: recovered.as_bytes(),
+    }];
+    let checked = session
+        .check(&files, &api_name)
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert!(
+        checked
+            .checked
+            .checked
+            .engine
+            .environment()
+            .contains(&name("wrap.eq_1"))
+    );
+    let reused = session
+        .check(&files, &api_name)
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!(reused.reused_modules, 1);
+    assert_eq!(
+        checked.checked.checked.result_logical_root,
+        reused.checked.checked.result_logical_root
+    );
     assert!(initial.environment().is_empty());
 }
 

@@ -249,6 +249,35 @@ fn lazy_equation_requests_and_simp_attributes_share_one_checked_realization() {
 }
 
 #[test]
+fn private_equation_requests_preserve_public_simp_artifacts() {
+    for first in ["wrap.eq_1 x", "by rw [wrap]"] {
+        let source = format!(
+            "module\nprelude\n\
+             public inductive Eq.{{u}} {{A : Sort u}} : A -> A -> Prop where | refl (a : A) : Eq a a\n\
+             @[expose] public def wrap.{{u}} {{A : Sort u}} (x : A) : A := x\n\
+             theorem first.{{u}} {{A : Sort u}} (x : A) : wrap x = x := {first}\n\
+             public section\nattribute [simp 1300] wrap\n\
+             attribute [irreducible] wrap"
+        );
+        let built = compiled(&[("Main", &source)]);
+        let physical = metadata(&built.artifacts[0].bytes);
+        assert_eq!(physical.simps.len(), 3, "{first}");
+        let SimpKind::Theorem(theorem) = &physical.simps[0].kind else {
+            panic!("the public equation retains its theorem registration")
+        };
+        assert_eq!(theorem.origin, name("wrap.eq_1"));
+        assert_eq!(theorem.priority, 1300);
+        let receipt = imported(&built);
+        assert!(!receipt.engine.environment().contains(&name("first")));
+        assert!(receipt.engine.environment().contains(&name("wrap.eq_1")));
+        accepted(
+            &receipt.engine,
+            "theorem downstream.{u} {A : Sort u} (x : A) : wrap (wrap x) = x := by simp",
+        );
+    }
+}
+
+#[test]
 fn repeated_definition_attributes_reuse_one_checked_equation_with_each_priority() {
     let source = format!(
         "prelude\n{EQUALITY}\

@@ -157,6 +157,52 @@ fn the_equations_of_a_definition_by_matching_are_proved_and_admitted() {
 }
 
 #[test]
+fn previously_realized_pattern_equations_keep_source_simp_fallback() {
+    use fln_elab::source::scope::simp;
+
+    let base = engine();
+    for proof in [
+        "theorem first : pred' 0 = 0 := pred'.eq_1",
+        "theorem first : pred' 0 = 0 := by rw [pred']",
+    ] {
+        // Keep the definition, first request and attribute in one source file:
+        // source ownership permits default simple-equation preparation here.
+        let after = check(
+            &base,
+            &format!(
+                "def pred' : Nat → Nat\n  | 0 => 0\n  | n+1 => n\n\
+                 {proof}\nattribute [simp] pred'\n\
+                 theorem simplified : pred' 0 = 0 := by simp"
+            ),
+        );
+        for equation in ["pred'.eq_1", "pred'.eq_2"] {
+            assert!(
+                matches!(
+                    after.environment().find(&name(equation)),
+                    Some(ConstantInfo::Thm(_))
+                ),
+                "{proof}: {equation} remains a checked pattern equation"
+            );
+        }
+        assert!(matches!(
+            simp::equations::prepare_owned(
+                after.environment(),
+                &name("pred'"),
+                limits().admission.kernel
+            )
+            .unwrap(),
+            simp::equations::Preparation::Unsupported
+        ));
+        // Preserving source unfolding must not grant simple-equation
+        // provenance or claim portable metadata for the matched definition.
+        assert!(matches!(
+            simp::export::registrations(base.environment(), after.environment(), 1 << 20),
+            Err(simp::SimpSetError::UnsupportedDeclaration(owner)) if owner == name("pred'")
+        ));
+    }
+}
+
+#[test]
 fn an_equation_the_pin_states_with_its_matcher_is_refused_typed() {
     let base = check(&engine(), MATCHING);
     for source in [

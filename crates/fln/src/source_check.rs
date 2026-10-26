@@ -981,6 +981,27 @@ impl Engine {
                         Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
                         Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
                     }
+                } else if source_records::may_name_equation_theorems(command)
+                    && let Some(public) = public.as_deref_mut()
+                {
+                    match grammar
+                        .enter(|| {
+                            public.admit_private_command(
+                                &engine,
+                                command,
+                                options,
+                                limits.admission,
+                                &scope,
+                                &file_base,
+                                None,
+                            )
+                        })
+                        .map_err(|error| command_error(file, count, start, error))?
+                    {
+                        Outcome::Complete(result) => (result.engine, result.admission),
+                        Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                        Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                    }
                 } else {
                     match grammar
                         .enter(|| {

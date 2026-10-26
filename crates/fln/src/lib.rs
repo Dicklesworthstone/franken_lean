@@ -8133,6 +8133,63 @@ impl Engine {
                     at: Some(original_offset),
                 });
             }
+            if fln_elab::source::is_theorem(parsed.syntax())
+                && source_records::may_name_equation_theorems(command_source)
+                && let Some(public) = public.as_deref_mut()
+            {
+                // Generate eligible public equations before the private proof,
+                // but commit both worlds only after that whole proof succeeds.
+                let observed =
+                    fln_elab::source::trace::contains_trace(parsed.syntax()).then_some(&parsed);
+                let result = match grammar
+                    .enter(|| {
+                        public.admit_private_command(
+                            &engine,
+                            command_source,
+                            options,
+                            limits.admission(),
+                            &scope,
+                            &file_base,
+                            observed,
+                        )
+                    })
+                    .map_err(|error| EngineExecutionError::BatchCommand {
+                        index: command_index,
+                        error: Box::new(error),
+                        at: Some(original_offset),
+                    })? {
+                    Outcome::Complete(result) => result,
+                    Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                    Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                };
+                source_records::traces::append(
+                    &mut trace_messages,
+                    &mut trace_bytes,
+                    result.traces,
+                    &parsed,
+                    result.engine.environment(),
+                    command_index,
+                    original_offset,
+                )?;
+                scopes
+                    .admitted_batch(
+                        &result.admission,
+                        result.engine.environment(),
+                        Some(public.engine().environment()),
+                    )
+                    .map_err(|error| {
+                        scope_error(command_index, original_offset, error.message())
+                    })?;
+                engine = result.engine;
+                source_records::push_command_admission(
+                    &mut source_admissions,
+                    SourceCommandAdmission {
+                        command_index,
+                        admission: result.admission,
+                    },
+                );
+                continue;
+            }
             if matches!(
                 parsed.kind(),
                 SourceCommandKind::Check | SourceCommandKind::Example

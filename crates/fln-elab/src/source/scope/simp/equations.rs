@@ -659,27 +659,39 @@ fn prepare_inner(
         return Ok(Preparation::Unsupported);
     }
     let theorem_name = Name::str(origin.clone(), "eq_1");
-    let (theorem, existing) = match env.find(&theorem_name) {
-        None if state.generated.contains_key(origin) => {
-            return Err(failure_set(SimpSetError::Malformed));
-        }
-        None => {
-            let Some(theorem) = build(env, definition, kernel)? else {
-                return Ok(Preparation::Unsupported);
-            };
-            (theorem, false)
-        }
-        Some(ConstantInfo::Thm(actual)) if state.generated.contains_key(origin) => {
-            if !exact_shape(env, definition, actual, &mut meter.remaining).map_err(failure_set)? {
-                return Err(failure_set(SimpSetError::Malformed));
+    let (theorem, existing) = if state.generated.contains_key(origin) {
+        match env.find(&theorem_name) {
+            None => return Err(failure_set(SimpSetError::Malformed)),
+            Some(ConstantInfo::Thm(actual)) => {
+                if !exact_shape(env, definition, actual, &mut meter.remaining)
+                    .map_err(failure_set)?
+                {
+                    return Err(failure_set(SimpSetError::Malformed));
+                }
+                (actual.clone(), true)
             }
-            (actual.clone(), true)
+            Some(_) => {
+                return Err(failure_set(SimpSetError::UnsupportedDeclaration(
+                    theorem_name,
+                )));
+            }
         }
-        Some(_) => {
+    } else {
+        // Matcher and recursive equations can already have been realized by
+        // the source equation producer. Their existence must not turn this
+        // simple-equation boundary's ordinary unsupported fallback into a
+        // collision error. Classify the owner before claiming its eq_1 name.
+        let Some(theorem) = build(env, definition, kernel)? else {
+            return Ok(Preparation::Unsupported);
+        };
+        // For a supported simple owner, a same-named theorem still provides
+        // no authority to adopt an independently admitted declaration.
+        if env.contains(&theorem_name) {
             return Err(failure_set(SimpSetError::UnsupportedDeclaration(
                 theorem_name,
             )));
         }
+        (theorem, false)
     };
     Ok(Preparation::Ready(Candidate {
         declaration: Declaration::Thm(theorem),

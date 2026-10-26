@@ -502,7 +502,7 @@ mod tests {
                 all: vec![name("f")],
             }),
         );
-        let universe = Level::succ(Level::one());
+        let universe = Level::succ(Level::one()).expect("universe two is within the depth bound");
         let lhs = Expr::const_(name("f"), vec![]);
         let carrier = Expr::sort(Level::one());
         let type_ = [carrier.clone(), lhs.clone(), Expr::sort(Level::zero())]
