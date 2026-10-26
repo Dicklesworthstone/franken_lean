@@ -30,12 +30,15 @@
 //! Merging two values into one is sound only where no operation consumes a
 //! value, so a function is rewritten only when every operand it passes is
 //! borrowed or scalar, and a callee is absorbed only under the same rule.
-//! The result is validated again; on a validation error the caller keeps the
-//! program as written.
+//! The simplified result is validated again. A separate, bounded ownership
+//! rewrite then transfers Array parameters through internal calls and closures.
+//! Fresh aliases preserve every caller read; FLBC's independent liveness pass
+//! subsequently turns only last-use copies into moves. If that candidate does
+//! not validate, the already-validated simplified program is retained.
 
 use super::{
-    Block, BlockId, EffectClass, Function, FunctionId, Operation, Program, Terminator,
-    ValidatedProgram, ValidationError, ValidationLimits, ValueId, validate,
+    Binding, Block, BlockId, EffectClass, Function, FunctionId, Operation, Program, Terminator,
+    ValidatedProgram, ValidationError, ValidationLimits, ValueId, ValueType, validate,
 };
 use crate::flbc::ArgumentOwnership;
 use std::collections::{BTreeMap, BTreeSet};
@@ -51,6 +54,9 @@ const CALLER_BINDINGS: usize = 1_024;
 /// ...and at most this many times per function and round, never absorbing a
 /// function twice into one block in a round, so recursion cannot unroll.
 const ABSORPTIONS_PER_ROUND: usize = 16;
+/// Maximum new SSA aliases in the whole ownership candidate. This pass cannot
+/// grow an operand-heavy program without an independent, explicit bound.
+const ARRAY_OWNERSHIP_ALIASES: usize = 65_536;
 
 /// Simplify every function of `program`, then validate the result.
 pub fn optimize(
@@ -78,7 +84,214 @@ pub fn optimize(
         renumber(&mut function);
         work.functions[index] = function;
     }
-    validate(work, limits)
+    let simplified = validate(work, limits)?;
+    Ok(infer_array_ownership(&simplified, limits).unwrap_or(simplified))
+}
+
+const fn promote_array(ty: ValueType, ownership: ArgumentOwnership) -> bool {
+    matches!(ty, ValueType::Array) && matches!(ownership, ArgumentOwnership::Borrowed)
+}
+
+/// Native callees retain their published ABI, including callback signatures.
+/// Do not change a closure contract visible through an intrinsic, even through
+/// another callable's parameter or result. Internal closure types may share
+/// these ids, so conservatively retain the prior program in that case.
+fn intrinsic_exposes_array_callable(program: &Program) -> bool {
+    let mut pending: Vec<_> = program
+        .intrinsics
+        .iter()
+        .flat_map(|intrinsic| intrinsic.arguments.iter().chain([&intrinsic.result]))
+        .filter_map(|ty| match ty {
+            ValueType::Closure(id) => Some(*id),
+            _ => None,
+        })
+        .collect();
+    let mut visited = BTreeSet::new();
+    while let Some(id) = pending.pop() {
+        if !visited.insert(id) {
+            continue;
+        }
+        let Some(signature) = id
+            .index()
+            .and_then(|index| program.closure_types.get(index))
+        else {
+            return true;
+        };
+        if signature
+            .parameters
+            .iter()
+            .copied()
+            .zip(signature.parameter_ownership.iter().copied())
+            .any(|(ty, mode)| promote_array(ty, mode))
+        {
+            return true;
+        }
+        pending.extend(
+            signature
+                .parameters
+                .iter()
+                .chain([&signature.result])
+                .filter_map(|ty| match ty {
+                    ValueType::Closure(id) => Some(*id),
+                    _ => None,
+                }),
+        );
+    }
+    false
+}
+
+/// Infer an internal consuming convention for arrays without promising unique
+/// ownership. Shared values remain shared: each newly consuming operand gets
+/// its own SSA alias. Only the later independent FLBC ownership pass may
+/// remove a retain, and only after proving the original has no remaining use.
+fn infer_array_ownership(
+    prior: &ValidatedProgram,
+    limits: ValidationLimits,
+) -> Option<ValidatedProgram> {
+    if intrinsic_exposes_array_callable(&prior.program) {
+        return None;
+    }
+    let promoted: Vec<Vec<bool>> = prior
+        .program
+        .functions
+        .iter()
+        .map(|function| {
+            function
+                .parameters
+                .iter()
+                .copied()
+                .zip(function.parameter_ownership.iter().copied())
+                .map(|(ty, mode)| promote_array(ty, mode))
+                .collect()
+        })
+        .collect();
+    if !promoted.iter().flatten().any(|changed| *changed) {
+        return None;
+    }
+    let mut work = prior.program.clone();
+    for signature in &mut work.closure_types {
+        for (ty, mode) in signature
+            .parameters
+            .iter()
+            .zip(&mut signature.parameter_ownership)
+        {
+            if promote_array(*ty, *mode) {
+                *mode = ArgumentOwnership::Owned;
+            }
+        }
+    }
+    // A program may already contain distinct Borrowed/Owned signatures with
+    // the same types. Promoting them can merge or reorder canonical rows.
+    // Preserve that program rather than changing closure identities or
+    // weakening the canonical-table validator in this bounded pass.
+    super::validate_closure_types(&work.closure_types).ok()?;
+    let alias_limit = ARRAY_OWNERSHIP_ALIASES
+        .min(limits.max_values)
+        .min(limits.max_operations);
+    let mut aliases = 0usize;
+    for (function, changed_parameters) in work.functions.iter_mut().zip(&promoted) {
+        let value_types: BTreeMap<_, _> = function
+            .parameters
+            .iter()
+            .enumerate()
+            .map(|(index, ty)| (ValueId::new(index as u32), *ty))
+            .chain(
+                function
+                    .blocks
+                    .iter()
+                    .flat_map(|block| &block.bindings)
+                    .map(|binding| (binding.id, binding.ty)),
+            )
+            .collect();
+        let mut next = u32::try_from(
+            function
+                .parameters
+                .len()
+                .checked_add(binding_count(function))?,
+        )
+        .ok()?;
+        for (changed, mode) in changed_parameters
+            .iter()
+            .zip(&mut function.parameter_ownership)
+        {
+            if *changed {
+                *mode = ArgumentOwnership::Owned;
+            }
+        }
+        for block in &mut function.blocks {
+            let mut bindings = Vec::new();
+            for mut binding in std::mem::take(&mut block.bindings) {
+                let operands: Vec<_> = match &binding.operation {
+                    Operation::Call { function, args } => args
+                        .iter()
+                        .copied()
+                        .zip(promoted.get(function.index()?)?.iter().copied())
+                        .enumerate()
+                        .filter_map(|(index, (value, changed))| changed.then_some((index, value)))
+                        .collect(),
+                    Operation::Closure {
+                        captures,
+                        capture_ownership,
+                        ..
+                    }
+                    | Operation::Apply {
+                        args: captures,
+                        argument_ownership: capture_ownership,
+                        ..
+                    } => captures
+                        .iter()
+                        .copied()
+                        .zip(capture_ownership.iter().copied())
+                        .enumerate()
+                        .filter_map(|(index, (value, mode))| {
+                            value_types
+                                .get(&value)
+                                .is_some_and(|ty| promote_array(*ty, mode))
+                                .then_some((index, value))
+                        })
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                for (index, source) in operands {
+                    aliases = aliases.checked_add(1)?;
+                    if aliases > alias_limit {
+                        return None;
+                    }
+                    let id = ValueId::new(next);
+                    next = next.checked_add(1)?;
+                    bindings.push(Binding {
+                        id,
+                        ty: ValueType::Array,
+                        operation: Operation::Alias(source),
+                    });
+                    match &mut binding.operation {
+                        Operation::Call { args, .. } => args[index] = id,
+                        Operation::Closure {
+                            captures,
+                            capture_ownership,
+                            ..
+                        }
+                        | Operation::Apply {
+                            args: captures,
+                            argument_ownership: capture_ownership,
+                            ..
+                        } => {
+                            captures[index] = id;
+                            capture_ownership[index] = ArgumentOwnership::Owned;
+                        }
+                        _ => unreachable!("only calls, captures and applications acquire aliases"),
+                    }
+                }
+                bindings.push(binding);
+            }
+            block.bindings = bindings;
+        }
+        renumber(function);
+    }
+    // This independently checks types and each partial/overapplied callable's
+    // complete ownership telescope. FLBC lowering additionally validates
+    // definite initialization after consuming operands.
+    validate(work, limits).ok()
 }
 
 const fn plain(ownership: ArgumentOwnership) -> bool {
@@ -679,5 +892,432 @@ fn renumber(function: &mut Function) {
     rename_function(function, &rename);
     for (position, block) in function.blocks.iter_mut().enumerate() {
         block.id = BlockId::new(u32::try_from(position).unwrap_or(u32::MAX));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fir::{ClosureTypeDecl, ClosureTypeId, IntrinsicDecl, IntrinsicId};
+    use crate::flbc::{self, ArgumentOwnership::*, CallableResultOwnership};
+
+    fn value(raw: u32) -> ValueId {
+        ValueId::new(raw)
+    }
+
+    fn closure(raw: u32) -> ClosureTypeId {
+        ClosureTypeId::new(raw)
+    }
+
+    fn binding(raw: u32, ty: ValueType, operation: Operation) -> Binding {
+        Binding {
+            id: value(raw),
+            ty,
+            operation,
+        }
+    }
+
+    fn function(
+        raw: u32,
+        parameters: Vec<ValueType>,
+        parameter_ownership: Vec<ArgumentOwnership>,
+        result: ValueType,
+        bindings: Vec<Binding>,
+        returned: u32,
+    ) -> Function {
+        Function {
+            id: FunctionId::new(raw),
+            parameters,
+            parameter_ownership,
+            result,
+            result_ownership: CallableResultOwnership::Owned,
+            blocks: vec![Block {
+                id: BlockId::new(0),
+                bindings,
+                terminator: Terminator::Return {
+                    value: value(returned),
+                },
+            }],
+        }
+    }
+
+    fn signature(
+        raw: u32,
+        parameters: Vec<ValueType>,
+        modes: Vec<ArgumentOwnership>,
+        result: ValueType,
+    ) -> ClosureTypeDecl {
+        ClosureTypeDecl {
+            id: closure(raw),
+            parameters,
+            parameter_ownership: modes,
+            result,
+            result_ownership: CallableResultOwnership::Owned,
+        }
+    }
+
+    fn validated(
+        functions: Vec<Function>,
+        closure_types: Vec<ClosureTypeDecl>,
+    ) -> ValidatedProgram {
+        validate(
+            Program::new_with_closures(
+                FunctionId::new(0),
+                vec![],
+                vec![],
+                closure_types,
+                vec![],
+                functions,
+            ),
+            ValidationLimits::default(),
+        )
+        .unwrap()
+    }
+
+    fn direct(shared: bool, repeated: bool) -> ValidatedProgram {
+        let arity = if repeated { 2 } else { 1 };
+        validated(
+            vec![
+                function(
+                    0,
+                    vec![],
+                    vec![],
+                    ValueType::Array,
+                    vec![
+                        binding(0, ValueType::Array, Operation::Array { items: vec![] }),
+                        binding(
+                            1,
+                            ValueType::Array,
+                            Operation::Call {
+                                function: FunctionId::new(1),
+                                args: vec![value(0); arity],
+                            },
+                        ),
+                    ],
+                    if shared { 0 } else { 1 },
+                ),
+                function(
+                    1,
+                    vec![ValueType::Array; arity],
+                    vec![Borrowed; arity],
+                    ValueType::Array,
+                    vec![],
+                    0,
+                ),
+            ],
+            vec![],
+        )
+    }
+
+    fn with_verified_moves(program: &ValidatedProgram) -> flbc::OwnershipProgram {
+        let lowered = crate::fir::lower_to_flbc(program).unwrap();
+        let result = flbc::insert_ownership(&lowered, flbc::OwnershipLimits::default()).unwrap();
+        flbc::validate_ownership_candidate(
+            &lowered,
+            result.program().clone(),
+            result.witness().clone(),
+            flbc::OwnershipLimits::default(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn array_call_ownership_preserves_shared_reads_and_moves_only_last_uses() {
+        for shared in [false, true] {
+            for repeated in [false, true] {
+                let prior = direct(shared, repeated);
+                let optimized = infer_array_ownership(&prior, ValidationLimits::default()).unwrap();
+                assert!(
+                    prior.functions()[1]
+                        .parameter_ownership
+                        .iter()
+                        .all(|mode| *mode == Borrowed)
+                );
+                assert!(
+                    optimized.functions()[1]
+                        .parameter_ownership
+                        .iter()
+                        .all(|mode| *mode == Owned)
+                );
+                let lowered = with_verified_moves(&optimized);
+                let entry = &lowered.program().functions()[0];
+                let moves_from_original = entry.code.iter().filter(|instruction| {
+                    matches!(instruction, flbc::Instruction::Move { src, .. } if src.get() == 0)
+                }).count();
+                assert_eq!(moves_from_original, usize::from(!shared));
+                if shared {
+                    assert!(entry.code.iter().any(|instruction| {
+                        matches!(instruction, flbc::Instruction::Copy { src, .. } if src.get() == 0)
+                    }));
+                    // FIR checks types and dominance. The separate FLBC
+                    // validator checks consuming operands: replacing an alias
+                    // with the original makes its later return uninitialized.
+                    let mut broken = optimized.program.clone();
+                    for binding in &mut broken.functions[0].blocks[0].bindings {
+                        if let Operation::Call { args, .. } = &mut binding.operation {
+                            args[0] = value(0);
+                        }
+                    }
+                    let broken = validate(broken, ValidationLimits::default())
+                        .expect("the ownership mutation preserves FIR types and dominance");
+                    let error = crate::fir::lower_to_flbc(&broken)
+                        .expect_err("consuming the original before returning it is refused");
+                    assert!(matches!(
+                        error,
+                        crate::fir::LoweringError::FlbcValidation(
+                            flbc::ValidationError::ReadBeforeWrite {
+                                function,
+                                register,
+                                ..
+                            }
+                        ) if function.get() == 0 && register.get() == 0
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn captured_arrays_transfer_a_distinct_alias_without_consuming_the_callers_value() {
+        let prior = validated(
+            vec![
+                function(
+                    0,
+                    vec![],
+                    vec![],
+                    ValueType::Array,
+                    vec![
+                        binding(0, ValueType::Array, Operation::Array { items: vec![] }),
+                        binding(
+                            1,
+                            ValueType::Closure(closure(0)),
+                            Operation::Closure {
+                                closure_type: closure(0),
+                                function: FunctionId::new(1),
+                                captures: vec![value(0)],
+                                capture_ownership: vec![Borrowed],
+                            },
+                        ),
+                        binding(2, ValueType::Nat, Operation::Nat(0)),
+                        binding(
+                            3,
+                            ValueType::Array,
+                            Operation::Apply {
+                                closure: value(1),
+                                args: vec![value(2)],
+                                argument_ownership: vec![Scalar],
+                                result_ownership: CallableResultOwnership::Owned,
+                            },
+                        ),
+                    ],
+                    0,
+                ),
+                function(
+                    1,
+                    vec![ValueType::Array, ValueType::Nat],
+                    vec![Borrowed, Scalar],
+                    ValueType::Array,
+                    vec![],
+                    0,
+                ),
+            ],
+            vec![signature(
+                0,
+                vec![ValueType::Nat],
+                vec![Scalar],
+                ValueType::Array,
+            )],
+        );
+        let optimized = infer_array_ownership(&prior, ValidationLimits::default()).unwrap();
+        let captures = optimized.functions()[0].blocks[0]
+            .bindings
+            .iter()
+            .find_map(|binding| {
+                if let Operation::Closure {
+                    captures,
+                    capture_ownership,
+                    ..
+                } = &binding.operation
+                {
+                    Some((captures, capture_ownership))
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        assert_ne!(captures.0, &[value(0)]);
+        assert_eq!(captures.1, &[Owned]);
+        let result = with_verified_moves(&optimized);
+        assert_eq!(result.witness().functions()[0].consumed_closure_captures, 1);
+        assert_eq!(optimized.closure_types(), prior.closure_types());
+    }
+
+    #[test]
+    fn partial_and_overapplied_array_callables_keep_consistent_ownership_telescopes() {
+        for overapplied in [false, true] {
+            let array_signature =
+                signature(1, vec![ValueType::Array], vec![Borrowed], ValueType::Array);
+            let first_signature = if overapplied {
+                signature(
+                    0,
+                    vec![ValueType::Nat],
+                    vec![Scalar],
+                    ValueType::Closure(closure(1)),
+                )
+            } else {
+                signature(
+                    0,
+                    vec![ValueType::Nat, ValueType::Array],
+                    vec![Scalar, Borrowed],
+                    ValueType::Array,
+                )
+            };
+            let mut bindings = vec![
+                binding(0, ValueType::Array, Operation::Array { items: vec![] }),
+                binding(1, ValueType::Nat, Operation::Nat(7)),
+                binding(
+                    2,
+                    ValueType::Closure(closure(0)),
+                    Operation::Closure {
+                        closure_type: closure(0),
+                        function: FunctionId::new(1),
+                        captures: vec![],
+                        capture_ownership: vec![],
+                    },
+                ),
+            ];
+            if overapplied {
+                bindings.push(binding(
+                    3,
+                    ValueType::Array,
+                    Operation::Apply {
+                        closure: value(2),
+                        args: vec![value(1), value(0)],
+                        argument_ownership: vec![Scalar, Borrowed],
+                        result_ownership: CallableResultOwnership::Owned,
+                    },
+                ));
+            } else {
+                bindings.push(binding(
+                    3,
+                    ValueType::Closure(closure(1)),
+                    Operation::Apply {
+                        closure: value(2),
+                        args: vec![value(1)],
+                        argument_ownership: vec![Scalar],
+                        result_ownership: CallableResultOwnership::Owned,
+                    },
+                ));
+                bindings.push(binding(
+                    4,
+                    ValueType::Array,
+                    Operation::Apply {
+                        closure: value(3),
+                        args: vec![value(0)],
+                        argument_ownership: vec![Borrowed],
+                        result_ownership: CallableResultOwnership::Owned,
+                    },
+                ));
+            }
+            let mut functions = vec![function(0, vec![], vec![], ValueType::Array, bindings, 0)];
+            if overapplied {
+                functions.push(function(
+                    1,
+                    vec![ValueType::Nat],
+                    vec![Scalar],
+                    ValueType::Closure(closure(1)),
+                    vec![binding(
+                        1,
+                        ValueType::Closure(closure(1)),
+                        Operation::Closure {
+                            closure_type: closure(1),
+                            function: FunctionId::new(2),
+                            captures: vec![],
+                            capture_ownership: vec![],
+                        },
+                    )],
+                    1,
+                ));
+                functions.push(function(
+                    2,
+                    vec![ValueType::Array],
+                    vec![Borrowed],
+                    ValueType::Array,
+                    vec![],
+                    0,
+                ));
+            } else {
+                functions.push(function(
+                    1,
+                    vec![ValueType::Nat, ValueType::Array],
+                    vec![Scalar, Borrowed],
+                    ValueType::Array,
+                    vec![],
+                    1,
+                ));
+            }
+            let prior = validated(functions, vec![first_signature, array_signature]);
+            let optimized = infer_array_ownership(&prior, ValidationLimits::default()).unwrap();
+            assert_eq!(optimized.closure_types()[1].parameter_ownership, [Owned]);
+            let application = optimized.functions()[0].blocks[0]
+                .bindings
+                .iter()
+                .rev()
+                .find_map(|binding| {
+                    if let Operation::Apply {
+                        argument_ownership, ..
+                    } = &binding.operation
+                    {
+                        Some(argument_ownership)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap();
+            assert_eq!(application.last(), Some(&Owned));
+            let result = with_verified_moves(&optimized);
+            assert_eq!(result.witness().functions()[0].consumed_apply_args, 1);
+        }
+    }
+
+    #[test]
+    fn array_ownership_keeps_the_prior_program_when_limits_or_public_contracts_prevent_it() {
+        let prior = direct(false, false);
+        let tight = ValidationLimits {
+            max_values: 3,
+            ..ValidationLimits::default()
+        };
+        assert!(validate(prior.program.clone(), tight).is_ok());
+        assert!(infer_array_ownership(&prior, tight).is_none());
+        let mut external = prior.program.clone();
+        external.closure_types = vec![signature(
+            0,
+            vec![ValueType::Array],
+            vec![Borrowed],
+            ValueType::Array,
+        )];
+        external.intrinsics.push(IntrinsicDecl {
+            id: IntrinsicId::new(0),
+            row: "extern:callback".to_owned(),
+            arguments: vec![ValueType::Closure(closure(0))],
+            argument_ownership: vec![Borrowed],
+            result: ValueType::Array,
+            result_ownership: flbc::ResultOwnership::Owned,
+            effect: EffectClass::Pure,
+        });
+        let external = validate(external, ValidationLimits::default()).unwrap();
+        assert!(infer_array_ownership(&external, ValidationLimits::default()).is_none());
+        let mut collision = prior.program.clone();
+        collision.closure_types = vec![
+            signature(0, vec![ValueType::Array], vec![Borrowed], ValueType::Array),
+            signature(1, vec![ValueType::Array], vec![Owned], ValueType::Array),
+        ];
+        let collision = validate(collision, ValidationLimits::default()).unwrap();
+        assert!(infer_array_ownership(&collision, ValidationLimits::default()).is_none());
+        assert!(optimize(&collision, ValidationLimits::default()).is_ok());
+        let mut already_owned = prior.program.clone();
+        already_owned.functions[1].parameter_ownership[0] = Owned;
+        let already_owned = validate(already_owned, ValidationLimits::default()).unwrap();
+        assert!(infer_array_ownership(&already_owned, ValidationLimits::default()).is_none());
     }
 }
