@@ -2939,3 +2939,72 @@ fn a_files_own_axioms_are_counted_in_the_report() {
         assert!(stdout.contains(expected), "{stdout}");
     }
 }
+
+#[test]
+fn rw_keeps_the_pins_bound_proof_choice_for_a_definition_head() {
+    let lib = std::env::var_os("FLN_REFERENCE_LIB")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| {
+                PathBuf::from(home)
+                    .join(".elan/toolchains")
+                    .join(format!("leanprover--lean4---{}", fln::OLEAN_PIN_TAG))
+                    .join("lib/lean")
+            })
+        })
+        .filter(|lib| lib.join("Init.olean").is_file());
+    assert!(
+        lib.is_some() || std::env::var_os("FLN_REQUIRE_REFERENCE").is_none(),
+        "the pinned Reference library is required"
+    );
+    let Some(lib) = lib else {
+        eprintln!("SKIP: pinned Reference lib/lean absent");
+        return;
+    };
+    let pinned = lib.parent().unwrap().parent().unwrap().join("bin/lean");
+    assert!(pinned.is_file(), "missing pinned oracle: {pinned:?}");
+    // Keep the original headerless fixture in the differential ledger. This
+    // regression needs only GetElem, avoiding a second full Init admission.
+    let source = format!(
+        "prelude\nimport Init.GetElem\n{}",
+        include_str!("fixtures/source_ladder/rw_assumption_default_transparency.lean")
+    );
+    let definition = "def drop (xs : Array α) : Array α := xs";
+    assert_eq!(source.matches(definition).count(), 1);
+    let axiom = source.replacen(definition, "axiom drop : Array α → Array α", 1);
+    let path = file(&source);
+    let root = path.parent().unwrap();
+    std::fs::write(root.join("axiom.lean"), axiom).unwrap();
+    // The accepting control and a repeated rejection share the same admitted
+    // imports, exercising recovery without changing the proof or tactic.
+    for (name, expected) in [("proof.lean", 1), ("axiom.lean", 0), ("proof.lean", 1)] {
+        for (mut command, oracle) in [
+            (Command::new(&pinned), true),
+            (Command::new(env!("CARGO_BIN_EXE_lean")), false),
+        ] {
+            let executable = command.get_program().to_owned();
+            let output = command
+                .arg(name)
+                .current_dir(root)
+                .env("LEAN_PATH", &lib)
+                .env("FLN_IMPORT_REUSE_DIR", root.join("records"))
+                .env("LEAN_BACKTRACE", "0")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(
+                output.status.code(),
+                Some(expected),
+                "{executable:?} {name}:\n{stdout}{stderr}"
+            );
+            if expected == 1 {
+                let diagnostic = if oracle { &stdout } else { &stderr };
+                assert!(
+                    diagnostic.contains("unsolved goals"),
+                    "{executable:?} {name} refused before reaching the goal: {stdout}{stderr}"
+                );
+            }
+        }
+    }
+}

@@ -559,6 +559,18 @@ impl<'a> Preparation<'a> {
                             tasks.push(Task::Visit(replacement));
                             continue;
                         }
+                        if let Some(decision) = self.native_natural_decision_call(&head, &args)? {
+                            tasks.push(Task::Visit(decision));
+                            continue;
+                        }
+                        if let Some(value) = self.char_of_nat_call(&head, &args)? {
+                            tasks.push(Task::Visit(value));
+                            continue;
+                        }
+                        if let Some(value) = self.array_access_call(&head, &args)? {
+                            tasks.push(Task::Visit(value));
+                            continue;
+                        }
                         if let Some(value) = self.diagnostic_call(&head, &args)? {
                             tasks.push(Task::Visit(value));
                             continue;
@@ -927,6 +939,18 @@ impl<'a> Preparation<'a> {
                             tasks.push(Task::Visit(expr.clone()));
                         }
                         ExprNode::Const { name, levels } => {
+                            if let Some(value) = self.array_access_call(&expr, &[])? {
+                                tasks.push(Task::Visit(value));
+                                continue;
+                            }
+                            if let Some(decision) = self.native_natural_decision_call(&expr, &[])? {
+                                tasks.push(Task::Visit(decision));
+                                continue;
+                            }
+                            if let Some(value) = self.char_of_nat_call(&expr, &[])? {
+                                tasks.push(Task::Visit(value));
+                                continue;
+                            }
                             // No source or private callable means no constructor,
                             // producer or partial-application transformation can
                             // apply. Preserve the unresolved name for ingress to

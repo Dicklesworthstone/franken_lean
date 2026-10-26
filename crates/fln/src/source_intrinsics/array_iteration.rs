@@ -7,6 +7,8 @@
 use super::*;
 
 const DEPENDENCIES: &str = include_str!("array_iteration/dependencies.txt");
+const SIZE_DEPENDENCIES: &str = include_str!("array_iteration/size_dependencies.txt");
+const GET_DEPENDENCIES: &str = include_str!("array_iteration/get_dependencies.txt");
 
 fn dependency_name(
     encoded: &str,
@@ -40,12 +42,70 @@ pub(crate) fn matches(
     visited: &mut usize,
     limits: IngressLimits,
 ) -> Result<(), IngressError> {
-    if DEPENDENCIES.trim().is_empty() {
+    matches_inventory(
+        DEPENDENCIES,
+        environment,
+        implementations,
+        initializers,
+        externs,
+        visited,
+        limits,
+    )
+}
+
+pub(crate) fn size_matches(
+    environment: &Environment,
+    implementations: &fln_elab::implemented_by::ImplementedByTable,
+    initializers: Option<&BTreeSet<Name>>,
+    externs: &mut Option<fln_elab::externs::ExternTable>,
+    visited: &mut usize,
+    limits: IngressLimits,
+) -> Result<(), IngressError> {
+    matches_inventory(
+        SIZE_DEPENDENCIES,
+        environment,
+        implementations,
+        initializers,
+        externs,
+        visited,
+        limits,
+    )
+}
+
+pub(crate) fn get_matches(
+    environment: &Environment,
+    implementations: &fln_elab::implemented_by::ImplementedByTable,
+    initializers: Option<&BTreeSet<Name>>,
+    externs: &mut Option<fln_elab::externs::ExternTable>,
+    visited: &mut usize,
+    limits: IngressLimits,
+) -> Result<(), IngressError> {
+    matches_inventory(
+        GET_DEPENDENCIES,
+        environment,
+        implementations,
+        initializers,
+        externs,
+        visited,
+        limits,
+    )
+}
+
+pub(super) fn matches_inventory(
+    inventory: &str,
+    environment: &Environment,
+    implementations: &fln_elab::implemented_by::ImplementedByTable,
+    initializers: Option<&BTreeSet<Name>>,
+    externs: &mut Option<fln_elab::externs::ExternTable>,
+    visited: &mut usize,
+    limits: IngressLimits,
+) -> Result<(), IngressError> {
+    if inventory.trim().is_empty() {
         return Err(IngressError::UnsupportedNode {
             kind: "Array iteration requires its exact dependency inventory",
         });
     }
-    for line in DEPENDENCIES.lines() {
+    for line in inventory.lines() {
         charge_catalog_node(visited, limits)?;
         // name, ConstantInfo digest, selected implemented_by target (or -),
         // whether a native extern is present, and the selected recursive

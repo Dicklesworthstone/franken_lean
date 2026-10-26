@@ -290,6 +290,7 @@ impl Preparation<'_> {
             return Ok(false);
         }
         let native = self.native_intrinsic_binding(logical)?.is_some()
+            || self.native_natural_decision_target(logical)?.is_some()
             || (source_intrinsics::float::is_primitive(logical) && self.imported_float_model()?)
             || match source_intrinsics::io::fs::Operation::from_name(logical) {
                 Some(operation) => source_intrinsics::io::fs::primitive_matches(

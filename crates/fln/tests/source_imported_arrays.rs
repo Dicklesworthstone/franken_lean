@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf};
 
 const STACK: usize = 256 * 1024 * 1024;
 const BYTES: usize = 256 * 1024 * 1024;
+const ARRAY_IMPORT_HEADER: &str =
+    "prelude\nimport Init.Data.Array.Basic\nimport Init.Data.List.Control\n\n";
 const MODEL_ROOTS: [&str; 8] = [
     "Array.forIn'",
     "Array.forIn'Unsafe",
@@ -370,7 +372,25 @@ fn dump_pinned_array_iteration_model() {
                 if value.safety == DefinitionSafety::Unsafe),
             "the pin selects an unsafe runtime body for Array iteration",
         );
-        let found = dependencies(environment, &implementation);
+        let found = match std::env::var("FLN_ARRAY_MODEL_ROOT").as_deref() {
+            Ok("size") => dependencies_from_roots(environment, &implementation, &["Array.size"]),
+            Ok("get") => {
+                dependencies_from_roots(environment, &implementation, &["Array.getInternal"])
+            }
+            Ok("char") => dependencies_from_roots(environment, &implementation, &["Char.ofNatAux"]),
+            Ok("word_lt") => dependencies_from_roots(
+                environment,
+                &implementation,
+                &[
+                    "USize.ofNatLT",
+                    "USize.ofNat",
+                    "USize.ofBitVec",
+                    "USize.toNat",
+                ],
+            ),
+            Err(std::env::VarError::NotPresent) => dependencies(environment, &implementation),
+            _ => panic!("FLN_ARRAY_MODEL_ROOT must be absent, size, get, char or word_lt"),
+        };
         let externs =
             fln_elab::externs::ExternTable::read(environment).expect("actual extern journal");
         let mut rows: Vec<_> = found
@@ -443,6 +463,182 @@ fn collect_case_failure(failures: &mut Vec<String>, label: &str, check: impl FnO
         eprintln!("{label}: failed: {message}");
         failures.push(format!("{label}: {message}"));
     }
+}
+
+#[test]
+fn actual_imported_array_size_executes_replays_and_preserves_authority() {
+    with_actual_import(false, |engine| {
+        let implementations =
+            fln_elab::implemented_by::ImplementedByTable::read(engine.environment()).unwrap();
+        let actual: BTreeSet<_> =
+            dependencies_from_roots(engine.environment(), &implementations, &["Array.size"])
+                .iter()
+                .map(encoded_name)
+                .collect();
+        let expected: BTreeSet<_> =
+            include_str!("../src/source_intrinsics/array_iteration/size_dependencies.txt")
+                .lines()
+                .map(|line| line.split('\t').next().unwrap().to_owned())
+                .collect();
+        assert!(!expected.is_empty());
+        assert_eq!(
+            actual, expected,
+            "bind the full logical and selected size closure"
+        );
+        execution::program(
+            engine,
+            "actual imported Array sizes",
+            include_str!("source_imported_arrays/sizes.lean")
+                .strip_prefix(ARRAY_IMPORT_HEADER)
+                .expect("the size fixture uses exactly the already-admitted Array/List imports"),
+            8,
+        );
+    });
+}
+
+#[test]
+fn actual_imported_array_get_executes_replays_and_preserves_authority() {
+    with_actual_import(false, |engine| {
+        let implementations =
+            fln_elab::implemented_by::ImplementedByTable::read(engine.environment()).unwrap();
+        let actual: BTreeSet<_> = dependencies_from_roots(
+            engine.environment(),
+            &implementations,
+            &["Array.getInternal"],
+        )
+        .iter()
+        .map(encoded_name)
+        .collect();
+        let expected: BTreeSet<_> =
+            include_str!("../src/source_intrinsics/array_iteration/get_dependencies.txt")
+                .lines()
+                .map(|line| line.split('\t').next().unwrap().to_owned())
+                .collect();
+        assert!(!expected.is_empty());
+        assert_eq!(
+            actual, expected,
+            "bind every actual getter and selected dependency"
+        );
+        execution::program(
+            engine,
+            "actual imported Array getters",
+            include_str!("source_imported_arrays/gets.lean")
+                .strip_prefix(ARRAY_IMPORT_HEADER)
+                .expect("getter probes use exactly the admitted Array/List imports"),
+            12,
+        );
+        execution::program(
+            engine,
+            "Array size alongside getter support",
+            include_str!("source_imported_arrays/sizes.lean")
+                .strip_prefix(ARRAY_IMPORT_HEADER)
+                .expect("all original size probes retain their import header"),
+            8,
+        );
+        // This is a VM safety control, not an oracle parity claim: an
+        // inconsistent user axiom must not manufacture an array element.
+        // Every valid getter above has already executed and replayed.
+        let options = KVMap::new();
+        let before = engine.logical_root(&options);
+        let invalid = "axiom invalidGetBound : 0 < (#[] : Array Nat).size\n#eval Array.getInternal (#[] : Array Nat) 0 invalidGetBound\n";
+        let completed = engine
+            .execute_source_commands_with_checks(
+                invalid.as_bytes(),
+                &options,
+                fln::EngineExecutionLimits::new(Budget::for_stack_bytes(STACK)),
+            )
+            .expect("the checked invalid bound reaches execution rather than a compiler refusal")
+            .into_complete()
+            .expect("the VM reports its own nonreturning exit");
+        assert_eq!(completed.batch.source_evaluation_indices.len(), 1);
+        let index = completed.batch.source_evaluation_indices[0];
+        match &completed.batch.executions[index].exit {
+            fln::VmExit::Panicked { usage, .. } | fln::VmExit::Refused { usage, .. } => {
+                assert!(
+                    usage.steps > 0,
+                    "the invalid bound must enter the actual VM"
+                );
+            }
+            exit => panic!("an impossible bound must never return an element: {exit:?}"),
+        }
+        assert_eq!(engine.logical_root(&options), before);
+        assert!(!engine.environment().contains(&name("invalidGetBound")));
+        execution::program(
+            engine,
+            "Array getter recovery after invalid bound",
+            "-- FLN_EXPECT_NAT 4\n#eval Array.getInternal #[4] 0 (by decide)\n",
+            1,
+        );
+        assert_eq!(engine.logical_root(&options), before);
+    });
+}
+
+#[test]
+fn actual_imported_char_construction_executes_and_replays() {
+    with_actual_import(false, |engine| {
+        let implementations =
+            fln_elab::implemented_by::ImplementedByTable::read(engine.environment()).unwrap();
+        let actual: BTreeSet<_> =
+            dependencies_from_roots(engine.environment(), &implementations, &["Char.ofNatAux"])
+                .iter()
+                .map(encoded_name)
+                .collect();
+        let expected: BTreeSet<_> =
+            include_str!("../src/source_intrinsics/string_push/char_of_nat_dependencies.txt")
+                .lines()
+                .map(|line| line.split('\t').next().unwrap().to_owned())
+                .collect();
+        assert_eq!(expected.len(), 180, "the extracted full character closure");
+        assert_eq!(actual, expected);
+        execution::program(
+            engine,
+            "actual imported character construction",
+            include_str!("source_imported_arrays/characters.lean")
+                .strip_prefix(ARRAY_IMPORT_HEADER)
+                .expect("the character probes use exactly the admitted imports"),
+            12,
+        );
+    });
+}
+
+#[test]
+fn actual_imported_bounded_word_construction_executes_and_replays() {
+    with_actual_import(false, |engine| {
+        let implementations =
+            fln_elab::implemented_by::ImplementedByTable::read(engine.environment()).unwrap();
+        let actual: BTreeSet<_> = dependencies_from_roots(
+            engine.environment(),
+            &implementations,
+            &[
+                "USize.ofNatLT",
+                "USize.ofNat",
+                "USize.ofBitVec",
+                "USize.toNat",
+            ],
+        )
+        .iter()
+        .map(encoded_name)
+        .collect();
+        let expected: BTreeSet<_> =
+            include_str!("../src/source_intrinsics/io/fs/bytes/word/bounded_dependencies.txt")
+                .lines()
+                .map(|line| line.split('\t').next().unwrap().to_owned())
+                .collect();
+        assert_eq!(
+            expected.len(),
+            270,
+            "the actual bounded-word and helper closure"
+        );
+        assert_eq!(actual, expected);
+        execution::program(
+            engine,
+            "actual imported bounded word construction",
+            include_str!("source_imported_arrays/bounded_words.lean")
+                .strip_prefix(ARRAY_IMPORT_HEADER)
+                .expect("bounded word probes use exactly the admitted imports"),
+            8,
+        );
+    });
 }
 
 #[test]

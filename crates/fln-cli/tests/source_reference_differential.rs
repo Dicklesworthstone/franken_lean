@@ -9,7 +9,8 @@
 //! ledger shrinks as divergences are fixed and cannot silently grow.
 //!
 //! FrankenLean's outcome is `accept` when its drop-in `lean` exits 0,
-//! `check-only` when only `fln check-source` does, and `reject` otherwise. The
+//! `check-only` when only `fln check-source` does, and `reject` when both return
+//! a completed rejection. Typed native nonanswers fail the measurement. The
 //! dangerous direction is accepting source the Reference rejects, whichever
 //! door does it.
 //! Output is compared only when the Reference and FrankenLean's `lean` both
@@ -116,6 +117,31 @@ fn json_string_field(line: &str, key: &str) -> Option<String> {
     None
 }
 
+fn native_outcome(
+    lean: &std::process::Output,
+    check: &std::process::Output,
+) -> Result<&'static str, String> {
+    let completed = |output: &std::process::Output, surface: &str| match output.status.code() {
+        Some(0) => Ok(true),
+        Some(1) => Ok(false),
+        _ => Err(format!(
+            "{surface} returned a nonanswer ({:?}):\n{}{}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )),
+    };
+    let lean_accepts = completed(lean, "lean")?;
+    let check_accepts = completed(check, "fln check-source")?;
+    Ok(if lean_accepts {
+        "accept"
+    } else if check_accepts {
+        "check-only"
+    } else {
+        "reject"
+    })
+}
+
 fn observe(reference: &Path, file: &Path) -> Observed {
     let reference_run = Command::new(reference)
         .arg("--json")
@@ -163,13 +189,8 @@ fn observe(reference: &Path, file: &Path) -> Observed {
         .arg(file)
         .output()
         .expect("run fln check-source");
-    let frankenlean = if lean_run.status.success() {
-        "accept"
-    } else if check_run.status.success() {
-        "check-only"
-    } else {
-        "reject"
-    };
+    let frankenlean = native_outcome(&lean_run, &check_run)
+        .unwrap_or_else(|error| panic!("{}: {error}", file.display()));
 
     let output = if reference_accepts && lean_run.status.success() {
         let plain = Command::new(reference)
@@ -371,6 +392,50 @@ fn json_string_field_decodes_escapes_and_surrogate_pairs() {
         Some("information")
     );
     assert_eq!(json_string_field(line, "missing"), None);
+}
+
+#[test]
+fn real_native_nonanswers_cannot_become_parity_verdicts() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let accepted = Command::new(env!("CARGO_BIN_EXE_lean"))
+        .arg("--version")
+        .output()
+        .unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_lean"))
+        .arg("--stdin")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"prelude\ndef broken :")
+        .unwrap();
+    let rejected = child.wait_with_output().unwrap();
+    let exhausted = Command::new(env!("CARGO_BIN_EXE_lean"))
+        .args(["--max-bytes=1", "--run", "/missing/Main.lean", "too big"])
+        .output()
+        .unwrap();
+    assert_eq!(accepted.status.code(), Some(0));
+    assert_eq!(rejected.status.code(), Some(1));
+    assert_eq!(exhausted.status.code(), Some(3));
+    assert!(String::from_utf8_lossy(&exhausted.stderr).starts_with("lean: resource:"));
+    assert_eq!(native_outcome(&accepted, &accepted).unwrap(), "accept");
+    assert_eq!(native_outcome(&rejected, &accepted).unwrap(), "check-only");
+    assert_eq!(native_outcome(&rejected, &rejected).unwrap(), "reject");
+    for (lean, check) in [
+        (&exhausted, &accepted),
+        (&exhausted, &rejected),
+        (&rejected, &exhausted),
+        (&accepted, &exhausted),
+    ] {
+        assert!(native_outcome(lean, check).is_err());
+    }
 }
 
 #[test]

@@ -12,6 +12,10 @@ use std::sync::OnceLock;
 const STACK: usize = 256 * 1024 * 1024;
 const BYTES: usize = 256 * 1024 * 1024;
 const INVENTORY: &str = include_str!("../../source_intrinsics/array_iteration/dependencies.txt");
+const SIZE_INVENTORY: &str =
+    include_str!("../../source_intrinsics/array_iteration/size_dependencies.txt");
+const GET_INVENTORY: &str =
+    include_str!("../../source_intrinsics/array_iteration/get_dependencies.txt");
 
 fn named(label: &str) -> Name {
     Name::from_components(label.split('.'))
@@ -163,9 +167,9 @@ fn with_fixture(test: impl FnOnce(&Environment) + Send + 'static) {
         .unwrap();
 }
 
-fn inventory_names() -> BTreeSet<Name> {
+fn inventory_names(inventory: &str) -> BTreeSet<Name> {
     let mut names = BTreeSet::new();
-    for line in INVENTORY.lines() {
+    for line in inventory.lines() {
         let columns: Vec<_> = line.split('\t').collect();
         assert_eq!(columns.len(), 5);
         let mut label = Name::anonymous();
@@ -189,7 +193,10 @@ fn inventory_names() -> BTreeSet<Name> {
 }
 
 fn replace(environment: &Environment, info: ConstantInfo) -> Environment {
-    let target = info.name();
+    without(environment, info.name()).add_decl(info).unwrap()
+}
+
+fn without(environment: &Environment, target: &Name) -> Environment {
     let mut result = Environment::new();
     for (label, _) in environment.constants() {
         if label != target {
@@ -206,7 +213,7 @@ fn replace(environment: &Environment, info: ConstantInfo) -> Environment {
                 .unwrap();
         }
     }
-    result.add_decl(info).unwrap()
+    result
 }
 
 fn identity_body(value: &mut DefinitionVal) {
@@ -462,7 +469,7 @@ fn changed_selected_replacements_and_externs_refuse_without_fallback() {
 #[test]
 fn recursive_companion_presence_and_bodies_are_part_of_the_exact_model() {
     with_fixture(|environment| {
-        let inventory = inventory_names();
+        let inventory = inventory_names(INVENTORY);
         let logical = inventory
             .iter()
             .find_map(|label| match environment.find(label) {
@@ -549,6 +556,580 @@ fn recursive_companion_presence_and_bodies_are_part_of_the_exact_model() {
         }
         eprintln!(
             "checked new companion presence/body plus {actual_companions} actual selected companion bodies"
+        );
+    });
+}
+
+fn size_private_name() -> Name {
+    named("_fln_runtime_array_size")
+}
+
+fn size_refused(environment: &Environment, expected: &str) {
+    let mut preparation = Preparation::new(environment, IngressLimits::default());
+    let error = preparation
+        .native_array_access_target(&named("Array.size"))
+        .unwrap_err();
+    assert!(
+        matches!(error, IngressError::UnsupportedNode { kind } if kind.contains(expected)),
+        "{error:?}",
+    );
+    assert!(
+        preparation
+            .specialized_definition(&size_private_name())
+            .is_none()
+    );
+    assert!(preparation.array_iteration.size.is_none());
+}
+
+#[test]
+fn actual_size_model_selects_private_callable_and_keeps_logical_authority() {
+    with_fixture(|environment| {
+        let requested = named("Array.size");
+        let original = environment.find(&requested).unwrap().clone();
+        let count = environment.constants().count();
+        let mut preparation = Preparation::new(environment, IngressLimits::default());
+        assert_eq!(
+            preparation.native_array_access_target(&requested).unwrap(),
+            Some(size_private_name())
+        );
+        let adapter = preparation
+            .specialized_definition(&size_private_name())
+            .unwrap();
+        assert_eq!(adapter.safety, DefinitionSafety::Safe);
+        assert_eq!(adapter.base.type_, original.constant_val().type_);
+        assert_eq!(
+            adapter.base.level_params,
+            original.constant_val().level_params
+        );
+        assert!(!adapter.value.has_loose_bvars());
+        assert!(!adapter.value.has_fvar());
+        assert!(!adapter.value.has_expr_mvar());
+        let cost = preparation.visited;
+        assert!(cost > 0);
+        assert_eq!(
+            preparation.native_array_access_target(&requested).unwrap(),
+            Some(size_private_name())
+        );
+        assert_eq!(preparation.visited, cost + 1, "a cache hit remains metered");
+        assert_eq!(
+            preparation.specialized_definition(&size_private_name()),
+            Some(adapter)
+        );
+        preparation.limits.max_nodes = preparation.visited;
+        assert!(matches!(
+            preparation.native_array_access_target(&requested),
+            Err(IngressError::ResourceLimit {
+                resource: IngressResource::Nodes,
+                ..
+            })
+        ));
+        assert_eq!(environment.find(&requested), Some(&original));
+        assert_eq!(environment.constants().count(), count);
+        assert!(!environment.contains(&size_private_name()));
+    });
+}
+
+#[test]
+fn size_model_binds_bodies_layouts_and_recursive_companions() {
+    with_fixture(|environment| {
+        let inventory = inventory_names(SIZE_INVENTORY);
+        let externs = fln_elab::externs::ExternTable::read(environment).unwrap();
+        for label in [
+            "Array.size",
+            "Array.toList",
+            "List.length",
+            "List.length._unsafe_rec",
+            "Array",
+            "Array.mk",
+            "List.rec",
+        ] {
+            let target = named(label);
+            assert!(
+                inventory.contains(&target),
+                "{label} belongs to the actual size closure"
+            );
+            let mut altered = environment.find(&target).unwrap().clone();
+            match &mut altered {
+                ConstantInfo::Defn(value) => identity_body(value),
+                ConstantInfo::Induct(value) => value.num_params += 1,
+                ConstantInfo::Ctor(value) => value.num_fields += 1,
+                ConstantInfo::Rec(value) => value.num_minors += 1,
+                _ => panic!("unexpected actual size dependency kind: {label}"),
+            }
+            let changed = replace(environment, altered);
+            assert_ne!(
+                changed.entry(&target).unwrap().digest(),
+                environment.entry(&target).unwrap().digest()
+            );
+            size_refused(&changed, "Array iteration dependency differs");
+            let missing_guard = if externs.get(&target).is_some() {
+                "invalid native extern attribute journal"
+            } else {
+                "Array iteration dependency"
+            };
+            size_refused(&without(environment, &target), missing_guard);
+        }
+        let Some(ConstantInfo::Defn(original)) = environment.find(&named("Array.size")) else {
+            unreachable!()
+        };
+        let mut companion = original.clone();
+        companion.base.name = named("Array.size._unsafe_rec");
+        companion.all = vec![companion.base.name.clone()];
+        companion.safety = DefinitionSafety::Partial;
+        let added = environment.add_decl(ConstantInfo::Defn(companion)).unwrap();
+        size_refused(&added, "different recursive companion");
+    });
+}
+
+#[test]
+fn size_metadata_and_explicit_safe_replacements_keep_authority() {
+    with_fixture(|environment| {
+        for label in [
+            "Array.size",
+            "List.length",
+            "List.length._unsafe_rec",
+            "Array",
+        ] {
+            let initializers = BTreeSet::from([named(label)]);
+            let mut preparation = Preparation::new(environment, IngressLimits::default())
+                .with_runtime_initializers(&initializers);
+            assert!(matches!(
+                preparation.native_array_access_target(&named("Array.size")),
+                Err(IngressError::UnsupportedNode {
+                    kind: "Array iteration dependency requires runtime initialization"
+                })
+            ));
+            assert!(
+                preparation
+                    .specialized_definition(&size_private_name())
+                    .is_none()
+            );
+            assert!(preparation.array_iteration.size.is_none());
+        }
+        for label in ["Array.size", "List.length"] {
+            let changed = externs::register(
+                environment,
+                &named(label),
+                vec![ExternEntry::Standard {
+                    backend: named("all"),
+                    symbol: "unsupported_foreign_array_size".to_owned(),
+                }],
+            )
+            .unwrap();
+            size_refused(&changed, "extern");
+        }
+        let Some(ConstantInfo::Defn(original)) = environment.find(&named("Array.size")) else {
+            unreachable!()
+        };
+        let mut collision = original.clone();
+        collision.base.name = size_private_name();
+        collision.all = vec![size_private_name()];
+        let collided = environment.add_decl(ConstantInfo::Defn(collision)).unwrap();
+        size_refused(&collided, "collision");
+
+        let mut alternate = original.clone();
+        alternate.base.name = named("alternateSafeArraySize");
+        alternate.all = vec![alternate.base.name.clone()];
+        let alternate_name = alternate.base.name.clone();
+        let changed = environment.add_decl(ConstantInfo::Defn(alternate)).unwrap();
+        let changed =
+            implemented_by::register(&changed, &named("Array.size"), &alternate_name).unwrap();
+        let levels: Vec<_> = original
+            .base
+            .level_params
+            .iter()
+            .cloned()
+            .map(Level::param)
+            .collect();
+        let mut preparation = Preparation::new(&changed, IngressLimits::default());
+        assert_eq!(
+            preparation
+                .array_access_call(&Expr::const_(named("Array.size"), levels.clone()), &[])
+                .unwrap(),
+            Some(Expr::const_(alternate_name, levels))
+        );
+        assert!(
+            preparation
+                .specialized_definition(&size_private_name())
+                .is_none()
+        );
+        assert!(preparation.array_iteration.size.is_none());
+
+        // A selected dependency replacement is different from overriding the
+        // public operation: it must not silently change the pinned adapter.
+        let Some(ConstantInfo::Defn(original)) = environment.find(&named("List.length")) else {
+            unreachable!()
+        };
+        let mut alternate = original.clone();
+        alternate.base.name = named("alternateSafeListLength");
+        alternate.all = vec![alternate.base.name.clone()];
+        let alternate_name = alternate.base.name.clone();
+        let changed = environment.add_decl(ConstantInfo::Defn(alternate)).unwrap();
+        let changed =
+            implemented_by::register(&changed, &named("List.length"), &alternate_name).unwrap();
+        size_refused(&changed, "different selected implementation");
+    });
+}
+
+#[test]
+fn size_resource_limits_never_publish_partial_callables() {
+    with_fixture(|environment| {
+        let requested = named("Array.size");
+        let mut complete = Preparation::new(environment, IngressLimits::default());
+        assert_eq!(
+            complete.native_array_access_target(&requested).unwrap(),
+            Some(size_private_name())
+        );
+        let cost = complete.visited;
+        assert!(cost > 128);
+        for max_nodes in [0, 16, 128, cost - 1] {
+            let mut preparation = Preparation::new(
+                environment,
+                IngressLimits {
+                    max_nodes,
+                    ..IngressLimits::default()
+                },
+            );
+            assert!(
+                matches!(preparation.native_array_access_target(&requested), Err(IngressError::ResourceLimit { resource: IngressResource::Nodes, limit, observed }) if limit == max_nodes && observed > limit)
+            );
+            assert!(
+                preparation
+                    .specialized_definition(&size_private_name())
+                    .is_none()
+            );
+            assert!(preparation.array_iteration.size.is_none());
+        }
+        let mut shallow = Preparation::new(
+            environment,
+            IngressLimits {
+                max_context_depth: 1,
+                ..IngressLimits::default()
+            },
+        );
+        assert!(matches!(
+            shallow.native_array_access_target(&requested),
+            Err(IngressError::ResourceLimit { .. })
+        ));
+        assert!(
+            shallow
+                .specialized_definition(&size_private_name())
+                .is_none()
+        );
+        assert!(shallow.array_iteration.size.is_none());
+        let mut full = Preparation::new(environment, IngressLimits::default());
+        full.limits.fir.max_functions = 0;
+        assert!(matches!(
+            full.native_array_access_target(&requested),
+            Err(IngressError::ResourceLimit {
+                resource: IngressResource::ProgramTables,
+                ..
+            })
+        ));
+        assert!(full.specialized_definition(&size_private_name()).is_none());
+        assert!(full.array_iteration.size.is_none());
+        let mut fresh = Preparation::new(environment, IngressLimits::default());
+        assert_eq!(
+            fresh.native_array_access_target(&requested).unwrap(),
+            Some(size_private_name())
+        );
+    });
+}
+
+fn get_private_name() -> Name {
+    named("_fln_runtime_array_get")
+}
+
+fn get_refused(environment: &Environment, expected: &str) {
+    let mut preparation = Preparation::new(environment, IngressLimits::default());
+    let error = preparation
+        .native_array_access_target(&named("Array.getInternal"))
+        .unwrap_err();
+    assert!(
+        matches!(error, IngressError::UnsupportedNode { kind } if kind.contains(expected)),
+        "{error:?}"
+    );
+    assert!(
+        preparation
+            .specialized_definition(&get_private_name())
+            .is_none()
+    );
+    assert!(preparation.array_iteration.get.is_none());
+}
+
+#[test]
+fn actual_get_model_builds_a_well_typed_private_callable_without_publication() {
+    with_fixture(|environment| {
+        let requested = named("Array.getInternal");
+        let original = environment.find(&requested).unwrap().clone();
+        let count = environment.constants().count();
+        let mut preparation = Preparation::new(environment, IngressLimits::default());
+        assert_eq!(
+            preparation.native_array_access_target(&requested).unwrap(),
+            Some(get_private_name())
+        );
+        let adapter = preparation
+            .specialized_definition(&get_private_name())
+            .unwrap();
+        assert_eq!(adapter.safety, DefinitionSafety::Safe);
+        assert_eq!(adapter.base.type_, original.constant_val().type_);
+        assert_eq!(
+            adapter.base.level_params,
+            original.constant_val().level_params
+        );
+        assert!(!adapter.value.has_loose_bvars());
+        assert!(!adapter.value.has_fvar());
+        assert!(!adapter.value.has_expr_mvar());
+        // This checks the constructed dependent Fin application, including
+        // Array.size/List.length conversion, without publishing a declaration.
+        let mut checked = adapter.clone();
+        checked.all = vec![checked.base.name.clone()];
+        let verdict = fln_kernel::check(
+            environment,
+            &fln_kernel::Declaration::Defn(checked),
+            fln_kernel::verdict::Budget::for_stack_bytes(STACK),
+        );
+        assert!(
+            matches!(
+                verdict,
+                fln_core::outcome::Outcome::Complete(fln_kernel::verdict::Verdict::Accepted { .. })
+            ),
+            "{verdict:?}"
+        );
+        let cost = preparation.visited;
+        assert_eq!(
+            preparation.native_array_access_target(&requested).unwrap(),
+            Some(get_private_name())
+        );
+        assert_eq!(preparation.visited, cost + 1);
+        assert_eq!(
+            preparation.specialized_definition(&get_private_name()),
+            Some(adapter)
+        );
+        preparation.limits.max_nodes = preparation.visited;
+        assert!(matches!(
+            preparation.native_array_access_target(&requested),
+            Err(IngressError::ResourceLimit {
+                resource: IngressResource::Nodes,
+                ..
+            })
+        ));
+        assert_eq!(environment.find(&requested), Some(&original));
+        assert_eq!(environment.constants().count(), count);
+        assert!(!environment.contains(&get_private_name()));
+    });
+}
+
+#[test]
+fn get_model_binds_array_fin_list_and_selected_companion_bodies() {
+    with_fixture(|environment| {
+        let inventory = inventory_names(GET_INVENTORY);
+        let externs = fln_elab::externs::ExternTable::read(environment).unwrap();
+        for label in [
+            "Array.getInternal",
+            "Array",
+            "Array.mk",
+            "Array.toList",
+            "Array.size",
+            "List.get",
+            "List.get._unsafe_rec",
+            "List.length",
+            "Fin",
+            "Fin.mk",
+            "Fin.rec",
+        ] {
+            let target = named(label);
+            assert!(
+                inventory.contains(&target),
+                "{label} belongs to the actual getter closure"
+            );
+            let mut altered = environment.find(&target).unwrap().clone();
+            match &mut altered {
+                ConstantInfo::Defn(value) => identity_body(value),
+                ConstantInfo::Induct(value) => value.num_params += 1,
+                ConstantInfo::Ctor(value) => value.num_fields += 1,
+                ConstantInfo::Rec(value) => value.num_minors += 1,
+                _ => panic!("unexpected actual getter dependency: {label}"),
+            }
+            get_refused(
+                &replace(environment, altered),
+                "Array iteration dependency differs",
+            );
+            let kind = if externs.get(&target).is_some() {
+                "invalid native extern attribute journal"
+            } else {
+                "Array iteration dependency"
+            };
+            get_refused(&without(environment, &target), kind);
+        }
+        let Some(ConstantInfo::Defn(original)) = environment.find(&named("Array.getInternal"))
+        else {
+            unreachable!()
+        };
+        let mut companion = original.clone();
+        companion.base.name = named("Array.getInternal._unsafe_rec");
+        companion.all = vec![companion.base.name.clone()];
+        companion.safety = DefinitionSafety::Partial;
+        get_refused(
+            &environment.add_decl(ConstantInfo::Defn(companion)).unwrap(),
+            "different recursive companion",
+        );
+    });
+}
+
+#[test]
+fn get_initializers_externs_replacements_and_collisions_keep_authority() {
+    with_fixture(|environment| {
+        for label in [
+            "Array.getInternal",
+            "List.get",
+            "List.get._unsafe_rec",
+            "Fin.mk",
+        ] {
+            let initializers = BTreeSet::from([named(label)]);
+            let mut preparation = Preparation::new(environment, IngressLimits::default())
+                .with_runtime_initializers(&initializers);
+            assert!(matches!(
+                preparation.native_array_access_target(&named("Array.getInternal")),
+                Err(IngressError::UnsupportedNode {
+                    kind: "Array iteration dependency requires runtime initialization"
+                })
+            ));
+            assert!(
+                preparation
+                    .specialized_definition(&get_private_name())
+                    .is_none()
+            );
+            assert!(preparation.array_iteration.get.is_none());
+        }
+        for label in ["Array.getInternal", "List.get"] {
+            let changed = externs::register(
+                environment,
+                &named(label),
+                vec![ExternEntry::Standard {
+                    backend: named("all"),
+                    symbol: "unsupported_foreign_array_getter".to_owned(),
+                }],
+            )
+            .unwrap();
+            get_refused(&changed, "extern");
+        }
+        let Some(ConstantInfo::Defn(original)) = environment.find(&named("Array.getInternal"))
+        else {
+            unreachable!()
+        };
+        let mut collision = original.clone();
+        collision.base.name = get_private_name();
+        collision.all = vec![get_private_name()];
+        get_refused(
+            &environment.add_decl(ConstantInfo::Defn(collision)).unwrap(),
+            "collision",
+        );
+        let mut alternate = original.clone();
+        alternate.base.name = named("alternateSafeArrayGet");
+        alternate.all = vec![alternate.base.name.clone()];
+        let target = alternate.base.name.clone();
+        let changed = environment.add_decl(ConstantInfo::Defn(alternate)).unwrap();
+        let changed =
+            implemented_by::register(&changed, &named("Array.getInternal"), &target).unwrap();
+        let levels: Vec<_> = original
+            .base
+            .level_params
+            .iter()
+            .cloned()
+            .map(Level::param)
+            .collect();
+        let mut preparation = Preparation::new(&changed, IngressLimits::default());
+        assert_eq!(
+            preparation
+                .array_access_call(
+                    &Expr::const_(named("Array.getInternal"), levels.clone()),
+                    &[]
+                )
+                .unwrap(),
+            Some(Expr::const_(target, levels))
+        );
+        assert!(
+            preparation
+                .specialized_definition(&get_private_name())
+                .is_none()
+        );
+        assert!(preparation.array_iteration.get.is_none());
+        let Some(ConstantInfo::Defn(original)) = environment.find(&named("List.get")) else {
+            unreachable!()
+        };
+        let mut alternate = original.clone();
+        alternate.base.name = named("alternateSafeListGet");
+        alternate.all = vec![alternate.base.name.clone()];
+        let target = alternate.base.name.clone();
+        let changed = environment.add_decl(ConstantInfo::Defn(alternate)).unwrap();
+        let changed = implemented_by::register(&changed, &named("List.get"), &target).unwrap();
+        get_refused(&changed, "different selected implementation");
+    });
+}
+
+#[test]
+fn get_resource_boundaries_publish_only_complete_private_callables() {
+    with_fixture(|environment| {
+        let requested = named("Array.getInternal");
+        let mut complete = Preparation::new(environment, IngressLimits::default());
+        assert_eq!(
+            complete.native_array_access_target(&requested).unwrap(),
+            Some(get_private_name())
+        );
+        let cost = complete.visited;
+        assert!(cost > 128);
+        for max_nodes in [0, 128, cost - 1] {
+            let mut preparation = Preparation::new(
+                environment,
+                IngressLimits {
+                    max_nodes,
+                    ..IngressLimits::default()
+                },
+            );
+            assert!(
+                matches!(preparation.native_array_access_target(&requested), Err(IngressError::ResourceLimit { resource: IngressResource::Nodes, limit, observed }) if limit == max_nodes && observed > limit)
+            );
+            assert!(
+                preparation
+                    .specialized_definition(&get_private_name())
+                    .is_none()
+            );
+            assert!(preparation.array_iteration.get.is_none());
+        }
+        let mut shallow = Preparation::new(
+            environment,
+            IngressLimits {
+                max_context_depth: 3,
+                ..IngressLimits::default()
+            },
+        );
+        assert!(matches!(
+            shallow.native_array_access_target(&requested),
+            Err(IngressError::ResourceLimit { .. })
+        ));
+        assert!(
+            shallow
+                .specialized_definition(&get_private_name())
+                .is_none()
+        );
+        assert!(shallow.array_iteration.get.is_none());
+        let mut full = Preparation::new(environment, IngressLimits::default());
+        full.limits.fir.max_functions = 0;
+        assert!(matches!(
+            full.native_array_access_target(&requested),
+            Err(IngressError::ResourceLimit {
+                resource: IngressResource::ProgramTables,
+                ..
+            })
+        ));
+        assert!(full.specialized_definition(&get_private_name()).is_none());
+        assert!(full.array_iteration.get.is_none());
+        assert_eq!(
+            Preparation::new(environment, IngressLimits::default())
+                .native_array_access_target(&requested)
+                .unwrap(),
+            Some(get_private_name())
         );
     });
 }

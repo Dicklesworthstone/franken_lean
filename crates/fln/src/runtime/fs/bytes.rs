@@ -68,6 +68,7 @@ enum Helper {
     FromNat,
     WordRepr,
     PlatformNumBits,
+    BoundedWordOfNat,
 }
 
 impl Helper {
@@ -107,6 +108,13 @@ impl Helper {
                 "defn",
                 0,
                 1,
+                "abi((a: borrowed_arg) -> value)",
+            ),
+            Self::BoundedWordOfNat => (
+                "USize.ofNatLT",
+                "defn",
+                0,
+                2,
                 "abi((a: borrowed_arg) -> value)",
             ),
             Self::WordToNat => ("USize.toNat", "defn", 0, 1, "abi((n: value) -> owned_res)"),
@@ -453,6 +461,88 @@ impl Preparation<'_> {
         Ok(Some(apply(wrapper, arguments.iter().cloned())))
     }
 
+    pub(in crate::runtime) fn bounded_word_contract(
+        &mut self,
+        requested: &Name,
+    ) -> Result<bool, IngressError> {
+        if requested != &name("USize.ofNatLT") {
+            return Ok(false);
+        }
+        if self.fs.bounded_word_checked {
+            self.tick()?;
+            return Ok(true);
+        }
+        if !self.has_extern_attribute(requested)? {
+            return Ok(false);
+        }
+        self.implementations()?;
+        fs::bounded_word_matches(
+            self.environment,
+            self.implementations
+                .as_ref()
+                .expect("checked implementation journal"),
+            self.runtime_initializers,
+            &mut self.externs,
+            &mut self.visited,
+            self.limits,
+        )?;
+        Ok(true)
+    }
+
+    fn bounded_word_call(
+        &mut self,
+        requested: &Name,
+        arguments: &[Expr],
+    ) -> Result<Option<Expr>, IngressError> {
+        if !self.bounded_word_contract(requested)? {
+            return Ok(None);
+        }
+        let Some(ConstantInfo::Defn(original)) = self.environment.find(requested) else {
+            return Err(unsupported("USize.ofNatLT checked interface"));
+        };
+        let type_ = original.base.type_.clone();
+        let mut telescope = type_.clone();
+        let mut binders = Vec::new();
+        while let ExprNode::ForallE {
+            binder_name,
+            binder_type,
+            body,
+            binder_info,
+        } = telescope.node()
+        {
+            self.tick()?;
+            reserve(&mut binders, self.limits.max_context_depth)?;
+            binders.push((binder_name.clone(), binder_type.clone(), *binder_info));
+            telescope = body.clone();
+        }
+        if !original.base.level_params.is_empty() || binders.len() != 2 || telescope != c("USize") {
+            return Err(unsupported("USize.ofNatLT checked telescope"));
+        }
+        let layout = self.fs_word_layout()?;
+        let producer = self.fs_bytes_helper(
+            Helper::BoundedWordOfNat,
+            vec![c("Nat")],
+            vec![ValueType::Nat],
+            layout.native.clone(),
+            ValueType::Abi,
+        )?;
+        let boxed = Expr::app(Expr::const_(producer, vec![]), b(1)?);
+        let natural = Expr::app(Expr::const_(layout.to_nat, vec![]), boxed);
+        let finite = constructor(
+            &layout.finite.constructors[0],
+            [natural, proofs::erased_value()],
+        );
+        let bits = constructor(&layout.bits.constructors[0], [finite]);
+        let mut value = constructor(&layout.logical.constructors[0], [bits]);
+        for (binder_name, binder_type, binder_info) in binders.into_iter().rev() {
+            self.tick()?;
+            value = Expr::lam(binder_name, binder_type, value, binder_info);
+        }
+        let wrapper = Expr::let_e(self.fs_adapter_name()?, type_, value, b(0)?, false);
+        self.fs.bounded_word_checked = true;
+        Ok(Some(apply(wrapper, arguments.iter().cloned())))
+    }
+
     /// The pin's USize.ofNat requires an opaque platform width. Invoke its
     /// exact genuine row, then rebuild logical records from the corresponding
     /// native toNat result; public USize never becomes a boxed-word alias.
@@ -473,13 +563,19 @@ impl Preparation<'_> {
         };
         if ![
             name("USize.ofNat"),
+            name("USize.ofNatLT"),
             name("USize.toNat"),
             name("USize.repr"),
             name("System.Platform.getNumBits"),
         ]
         .contains(requested)
             || !levels.is_empty()
-            || arguments.len() > 1
+            || arguments.len()
+                > if requested == &name("USize.ofNatLT") {
+                    2
+                } else {
+                    1
+                }
         {
             return Ok(None);
         }
@@ -488,6 +584,9 @@ impl Preparation<'_> {
         // replacement before selecting the root's native word contract.
         if let Some(replacement) = self.implemented_by_call(head, arguments)? {
             return Ok(Some(replacement));
+        }
+        if requested == &name("USize.ofNatLT") {
+            return self.bounded_word_call(requested, arguments);
         }
         if requested == &name("System.Platform.getNumBits") {
             return self.fs_platform_bits_call(requested, arguments);

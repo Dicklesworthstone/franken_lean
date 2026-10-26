@@ -1,13 +1,16 @@
-//! Post-admission execution of the pin's constructive String/Char equality.
+//! Post-admission contracts for the pin's constructive equality decisions.
 //!
-//! Only `Decidable.decide` applied to these exact standard decisions selects
-//! this adapter. The kernel expressions, propositions and proof fields are
+//! For String/Char, `Decidable.decide` applied to the exact standard decision
+//! selects the adapter. The kernel expressions, propositions and proof fields are
 //! untouched. The inventories bind the full type/body/structural dependency
 //! closure, extracted by `cargo run -p fln --example extract_text_equality`.
+//! The raw Nat decision bindings share these checks and keep their constructor
+//! representation rather than applying `Decidable.decide`.
 use super::*;
 
 const STRING: &str = include_str!("string_dependencies.txt");
 const CHARACTER: &str = include_str!("char_dependencies.txt");
+const NATURAL: &str = include_str!("nat_dependencies.txt");
 const PRIMITIVE: &str = "_fln_runtime_text_equality_abi";
 
 #[derive(Default)]
@@ -15,6 +18,7 @@ pub(in crate::runtime) struct Store {
     string_checked: bool,
     char_checked: bool,
     string_primitive: Option<IntrinsicBinding>,
+    pub(super) natural_primitives: [Option<IntrinsicBinding>; 3],
 }
 
 fn dependency(encoded: &str) -> Name {
@@ -75,6 +79,55 @@ impl Preparation<'_> {
             return Ok(true);
         }
         let inventory = if character { CHARACTER } else { STRING };
+        if !self.checked_equality_inventory(inventory)? {
+            return Ok(false);
+        }
+        // Cache only after every body, rule, metadata entry and budget check.
+        if character {
+            self.text_decisions.char_checked = true;
+        } else {
+            self.text_decisions.string_checked = true;
+        }
+        Ok(true)
+    }
+
+    pub(super) fn native_natural_decision_model(
+        &mut self,
+        requested: &Name,
+    ) -> Result<bool, IngressError> {
+        let header = format!("@{}", requested.to_display_string());
+        let mut inventory = None;
+        for section in NATURAL.trim_end().split("\n\n") {
+            self.tick()?;
+            let (label, rows) = section
+                .split_once('\n')
+                .ok_or_else(|| unsupported("malformed natural decision contract section"))?;
+            if !label.starts_with('@') {
+                return Err(unsupported("malformed natural decision contract header"));
+            }
+            if label == header && inventory.replace(rows).is_some() {
+                return Err(unsupported("duplicate natural decision contract section"));
+            }
+        }
+        let inventory =
+            inventory.ok_or_else(|| unsupported("missing natural decision contract section"))?;
+        // This contract refuses every selected replacement in its dependency
+        // closure. Inspect those edges before resolving targets so a refused
+        // candidate cannot invoke another native recognizer during selection.
+        for line in inventory.lines() {
+            self.tick()?;
+            let (encoded, _) = line.split_once('\t').expect("fixed natural equality row");
+            for _ in encoded.split('/') {
+                self.tick()?;
+            }
+            if self.implementations()?.get(&dependency(encoded)).is_some() {
+                return Ok(false);
+            }
+        }
+        self.checked_equality_inventory(inventory)
+    }
+
+    fn checked_equality_inventory(&mut self, inventory: &str) -> Result<bool, IngressError> {
         if inventory.trim().is_empty() {
             return Err(unsupported(
                 "text equality requires its complete pinned model",
@@ -114,12 +167,6 @@ impl Preparation<'_> {
                 &mut self.visited,
                 self.limits,
             )?;
-        }
-        // Cache only after every body, rule, metadata entry and budget check.
-        if character {
-            self.text_decisions.char_checked = true;
-        } else {
-            self.text_decisions.string_checked = true;
         }
         Ok(true)
     }
@@ -213,7 +260,11 @@ mod tests {
     }
 
     fn environment() -> &'static Environment {
-        static PIN: OnceLock<Environment> = OnceLock::new();
+        engine().environment()
+    }
+
+    fn engine() -> &'static Engine {
+        static PIN: OnceLock<Engine> = OnceLock::new();
         PIN.get_or_init(|| {
             let module = name("Init.Prelude");
             Engine::builder()
@@ -244,9 +295,91 @@ mod tests {
                 .into_complete()
                 .expect("both checking seats admit the mandatory retained Prelude")
                 .engine
-                .environment()
-                .clone()
         })
+    }
+
+    #[test]
+    fn pinned_natural_decisions_execute_dynamic_constructor_branches() {
+        on_stack(|| {
+            let definitions = r"
+def chooseEq (n m : Nat) : Bool := if _h : n = m then true else false
+def chooseLe (n m : Nat) : Bool := if _h : n ≤ m then true else false
+def chooseLt (n m : Nat) : Bool := if _h : n < m then true else false
+def choosePartial (n m : Nat) : Bool :=
+  let f := Nat.decEq n
+  match f m with
+  | .isFalse _ => false
+  | .isTrue _ => true
+structure NatDecision where
+  run : (n m : Nat) → Decidable (n = m)
+def chooseStored (n m : Nat) : Bool :=
+  let box : NatDecision := ⟨Nat.decEq⟩
+  match box.run n m with
+  | .isFalse _ => false
+  | .isTrue _ => true
+";
+            let checked = engine()
+                .check_source_files(
+                    &[definitions.as_bytes()],
+                    &KVMap::new(),
+                    crate::SourceCheckLimits::new(crate::EngineAdmissionLimits::new(
+                        Budget::for_stack_bytes(STACK),
+                    )),
+                )
+                .unwrap()
+                .into_complete()
+                .expect("the actual source definitions pass both checkers");
+            let source = "#eval chooseEq 0 0\n\
+                #eval chooseEq 0 7\n\
+                #eval chooseEq 18446744073709551616 18446744073709551616\n\
+                #eval chooseEq 18446744073709551617 18446744073709551616\n\
+                #eval chooseLe 0 0\n\
+                #eval chooseLe 0 7\n\
+                #eval chooseLe 18446744073709551617 18446744073709551616\n\
+                #eval chooseLe 18446744073709551616 18446744073709551617\n\
+                #eval chooseLt 0 0\n\
+                #eval chooseLt 0 7\n\
+                #eval chooseLt 18446744073709551617 18446744073709551616\n\
+                #eval chooseLt 18446744073709551616 18446744073709551617\n\
+                #eval choosePartial 0 0\n\
+                #eval choosePartial 0 7\n\
+                #eval choosePartial 18446744073709551616 18446744073709551616\n\
+                #eval choosePartial 18446744073709551617 18446744073709551616\n\
+                #eval chooseStored 0 0\n\
+                #eval chooseStored 0 7\n";
+            let result = checked
+                .engine
+                .execute_source_definitions(
+                    &[source.as_bytes()],
+                    &KVMap::new(),
+                    crate::EngineExecutionLimits::new(Budget::for_stack_bytes(STACK)),
+                )
+                .unwrap()
+                .into_complete()
+                .expect("the checked source evaluation completes");
+            assert_eq!(result.executions.len(), 18);
+            let values: Vec<_> = result
+                .executions
+                .iter()
+                .map(|execution| {
+                    crate::closed_vm_value(&execution.exit)
+                        .unwrap_or_else(|error| {
+                            panic!("{error:?}; actual VM exit: {:?}", execution.exit)
+                        })
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "each query returns a closed Bool; actual VM exit: {:?}",
+                                execution.exit
+                            )
+                        })
+                })
+                .collect();
+            assert_eq!(
+                values,
+                [1, 0, 1, 0, 1, 1, 0, 1, 0, 1, 0, 1, 1, 0, 1, 0, 1, 0]
+                    .map(crate::ClosedVmValue::Scalar)
+            );
+        });
     }
 
     /// Hostile comparison data only: altered constants are not admitted by a
@@ -277,6 +410,146 @@ mod tests {
             }
         }
         result
+    }
+
+    #[test]
+    fn pinned_raw_natural_decisions_keep_constructor_and_native_ownership_contracts() {
+        on_stack(|| {
+            for operation in ["Nat.decEq", "Nat.decLe", "Nat.decLt"] {
+                let mut prep = Preparation::new(environment(), IngressLimits::default());
+                let target = prep
+                    .native_natural_decision_target(&name(operation))
+                    .unwrap()
+                    .expect("the actual pinned native decision has a compiler adapter");
+                assert!(prep.specialized_definition(&target).is_some());
+                assert!(
+                    prep.native_decision_intrinsic_binding(&name(operation))
+                        .is_none()
+                );
+                let binding = prep
+                    .text_decisions
+                    .natural_primitives
+                    .iter()
+                    .flatten()
+                    .next()
+                    .unwrap();
+                assert_eq!(binding.row, format!("extern:{operation}"));
+                assert_eq!(binding.arguments, [ValueType::Nat, ValueType::Nat]);
+                assert_eq!(binding.result, ValueType::Bool);
+                assert_eq!(binding.effect, EffectClass::Pure);
+                assert_eq!(
+                    binding.argument_ownership,
+                    [ArgumentOwnership::Borrowed, ArgumentOwnership::Borrowed]
+                );
+                assert_eq!(binding.result_ownership, ResultOwnership::Scalar);
+                let cost = prep.visited;
+                assert!(cost > 1);
+                let mut stopped = Preparation::new(
+                    environment(),
+                    IngressLimits {
+                        max_nodes: cost - 1,
+                        ..IngressLimits::default()
+                    },
+                );
+                assert!(matches!(
+                    stopped.native_natural_decision_target(&name(operation)),
+                    Err(IngressError::ResourceLimit { .. })
+                ));
+            }
+        });
+    }
+
+    #[test]
+    fn changed_natural_decision_dependencies_and_externs_never_receive_native_bindings() {
+        on_stack(|| {
+            for (target, operation) in [
+                ("Nat.decEq", "Nat.decEq"),
+                ("Nat.decEq.match_1", "Nat.decEq"),
+                ("Nat", "Nat.decEq"),
+                ("Nat.zero", "Nat.decEq"),
+                ("Nat.rec", "Nat.decEq"),
+                ("Decidable", "Nat.decEq"),
+                ("Decidable.isTrue", "Nat.decEq"),
+                ("Decidable.rec", "Nat.decEq"),
+                ("Nat.decLe", "Nat.decLe"),
+                ("Nat.decLt", "Nat.decLt"),
+            ] {
+                for omit in [false, true] {
+                    let changed = altered(target, |mut info| {
+                        if omit {
+                            return None;
+                        }
+                        match &mut info {
+                            ConstantInfo::Defn(value) => value.value = natural(13),
+                            ConstantInfo::Induct(value) => value.num_indices += 1,
+                            ConstantInfo::Ctor(value) => value.num_fields += 1,
+                            ConstantInfo::Rec(value) => value.rules[0].rhs = natural(13),
+                            _ => panic!("unexpected comparison mutant"),
+                        }
+                        Some(info)
+                    });
+                    let mut prep = Preparation::new(&changed, IngressLimits::default());
+                    assert!(
+                        prep.native_natural_decision_target(&name(operation))
+                            .is_err(),
+                        "{target}; omit={omit}"
+                    );
+                }
+            }
+            for operation in ["Nat.decEq", "Nat.decLe", "Nat.decLt"] {
+                let foreign = fln_elab::externs::register(
+                    environment(),
+                    &name(operation),
+                    vec![fln_elab::externs::ExternEntry::Standard {
+                        backend: name("all"),
+                        symbol: "foreign_natural_equality".to_owned(),
+                    }],
+                )
+                .unwrap();
+                let mut prep = Preparation::new(&foreign, IngressLimits::default());
+                assert!(
+                    prep.native_natural_decision_target(&name(operation))
+                        .is_err()
+                );
+            }
+            let changed_ordering = altered("Nat.decLt", |mut info| {
+                let ConstantInfo::Defn(value) = &mut info else {
+                    panic!("the pinned ordering decision is a definition");
+                };
+                value.value = natural(13);
+                Some(info)
+            });
+            let mut prep = Preparation::new(&changed_ordering, IngressLimits::default());
+            assert!(
+                prep.native_natural_decision_target(&name("Nat.decEq"))
+                    .unwrap()
+                    .is_some()
+            );
+            let ConstantInfo::Defn(mut replacement) =
+                environment().find(&name("Nat.decEq")).unwrap().clone()
+            else {
+                unreachable!();
+            };
+            let replacement_name = name("replacementNaturalDecision");
+            replacement.base.name = replacement_name.clone();
+            replacement.all = vec![replacement_name.clone()];
+            let replaced = environment()
+                .add_decl(ConstantInfo::Defn(replacement))
+                .unwrap();
+            let replaced = fln_elab::implemented_by::register(
+                &replaced,
+                &name("Nat.decEq"),
+                &replacement_name,
+            )
+            .unwrap();
+            let mut prep = Preparation::new(&replaced, IngressLimits::default());
+            assert!(
+                prep.native_natural_decision_target(&name("Nat.decEq"))
+                    .unwrap()
+                    .is_none(),
+                "a selected replacement must refuse the closed native adapter"
+            );
+        });
     }
 
     #[test]

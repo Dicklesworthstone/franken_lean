@@ -11887,11 +11887,6 @@ fn source_intrinsic_binding(environment: &Environment, name: &Name) -> Option<In
 }
 
 fn generated_source_intrinsic_binding(name: &Name) -> Option<IntrinsicBinding> {
-    use fln_vm::extern_row::{
-        ArgumentOwnership as ContractArgumentOwnership, EffectClass as ContractEffectClass,
-        Ownership as ContractOwnership, ResultOwnership as ContractResultOwnership,
-    };
-
     let row_name = name.to_display_string();
     let (argument_types, result, type_family_anchor) = match row_name.as_str() {
         "Nat.add" | "Nat.sub" | "Nat.mul" | "Nat.div" | "Nat.gcd" | "Nat.land" | "Nat.lor"
@@ -11976,6 +11971,23 @@ fn generated_source_intrinsic_binding(name: &Name) -> Option<IntrinsicBinding> {
             }
         }
     };
+    generated_runtime_intrinsic_binding(name, argument_types, result, type_family_anchor)
+}
+
+/// Bind an already recognized runtime representation to the generated ABI row.
+/// Recognition and proof erasure remain the caller's responsibility.
+fn generated_runtime_intrinsic_binding(
+    name: &Name,
+    argument_types: Vec<ValueType>,
+    result: ValueType,
+    type_family_anchor: Option<&str>,
+) -> Option<IntrinsicBinding> {
+    use fln_vm::extern_row::{
+        ArgumentOwnership as ContractArgumentOwnership, EffectClass as ContractEffectClass,
+        Ownership as ContractOwnership, ResultOwnership as ContractResultOwnership,
+    };
+
+    let row_name = name.to_display_string();
     let arity = u32::try_from(argument_types.len()).ok()?;
     let row = fln_vm::extern_table_generated::EXTERN_ROWS
         .iter()

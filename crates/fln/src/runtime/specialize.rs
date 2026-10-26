@@ -141,16 +141,22 @@ impl Preparation<'_> {
         self.specializations.constructor_types.insert(name, type_);
         Ok(())
     }
-    /// Register only the fully model-checked Array traversal template. This
+    /// Register only fully model-checked Array representation templates. Each
     /// private definition must participate in the same callable and universe
     /// specialization paths as ordinary executable definitions.
-    pub(super) fn remember_array_iteration_definition(
+    pub(super) fn remember_array_definition(
         &mut self,
         definition: DefinitionVal,
     ) -> Result<(), IngressError> {
         self.tick()?;
         let name = &definition.base.name;
-        if name != &Name::from_components(["_fln_runtime_array_forIn"])
+        if ![
+            "_fln_runtime_array_forIn",
+            "_fln_runtime_array_size",
+            "_fln_runtime_array_get",
+        ]
+        .into_iter()
+        .any(|label| name == &Name::from_components([label]))
             || self.environment.contains(name)
             || self.has_private_callable(name)
         {
@@ -204,6 +210,37 @@ impl Preparation<'_> {
         self.specializations.definitions.get(name).cloned()
     }
 
+    pub(super) fn remember_native_scalar_adapter_definition(
+        &mut self,
+        definition: DefinitionVal,
+    ) -> Result<(), IngressError> {
+        self.tick()?;
+        let name = &definition.base.name;
+        if !(name == &super::name("_fln_runtime_char_ofNatAux")
+            || ["decEq", "decLe", "decLt"]
+                .into_iter()
+                .any(|suffix| name == &super::name(&format!("_fln_runtime_nat_{suffix}"))))
+            || self.environment.contains(name)
+            || self.has_private_callable(name)
+        {
+            return Err(unsupported(
+                "native scalar adapter private callable name collision",
+            ));
+        }
+        let observed = self.specializations.definitions.len().saturating_add(1);
+        if observed > self.limits.fir.max_functions {
+            return Err(IngressError::ResourceLimit {
+                resource: IngressResource::ProgramTables,
+                limit: self.limits.fir.max_functions,
+                observed,
+            });
+        }
+        self.specializations
+            .definitions
+            .insert(name.clone(), definition);
+        Ok(())
+    }
+
     pub(in crate::runtime) fn canonical_definition_generation(&self) -> usize {
         self.specializations.definitions.len()
     }
@@ -226,6 +263,7 @@ impl Preparation<'_> {
             || self.stdout_intrinsic_type(name).is_some()
             || self.string_push_intrinsic_type(name).is_some()
             || self.text_equality_intrinsic_type(name).is_some()
+            || self.native_decision_intrinsic_type(name).is_some()
             || self.string_bootstrap_intrinsic_type(name).is_some()
             || self.string_bytes_intrinsic_type(name).is_some()
     }
@@ -1040,12 +1078,25 @@ impl Preparation<'_> {
                 .or_else(|| self.stdout_intrinsic_type(name))
                 .or_else(|| self.string_push_intrinsic_type(name))
                 .or_else(|| self.text_equality_intrinsic_type(name))
+                .or_else(|| self.native_decision_intrinsic_type(name))
                 .or_else(|| self.string_bootstrap_intrinsic_type(name))
                 .or_else(|| self.string_bytes_intrinsic_type(name))
         {
             return Ok(Some(type_));
         }
         if let Some(definition) = self.executable_definition(name)? {
+            return self
+                .universe_instance(
+                    &definition.base.type_,
+                    &definition.base.level_params,
+                    levels,
+                )
+                .map(Some);
+        }
+        if let Some(target) = self.native_array_access_target(name)? {
+            let definition = self
+                .specialized_definition(&target)
+                .ok_or_else(|| unsupported("missing checked Array access adapter"))?;
             return self
                 .universe_instance(
                     &definition.base.type_,
@@ -1065,7 +1116,10 @@ impl Preparation<'_> {
         // saturated invocation, including its selected extern. The ordinary
         // partial-call path then captures supplied values in strict lets and
         // emits a saturated native call inside a checked closure.
-        if self.native_intrinsic_binding(name)?.is_some() {
+        if self.native_intrinsic_binding(name)?.is_some()
+            || self.native_natural_decision_target(name)?.is_some()
+            || self.native_char_of_nat_target(name)?.is_some()
+        {
             return Ok(self
                 .environment
                 .find(name)

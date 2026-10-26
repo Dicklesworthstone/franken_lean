@@ -7,6 +7,8 @@
 //! never authorizes erasure. The logical declarations remain unchanged.
 
 use super::*;
+use fln_core::level::Level;
+use fln_core::name::LeafView;
 mod text;
 pub(super) use text::Store;
 
@@ -36,6 +38,176 @@ fn canonical_decision_proof_alias(actual: Option<&ConstantInfo>, expected: &Defi
 }
 
 impl Preparation<'_> {
+    /// Native decisions return immediate tags at the ABI. Golem's Decidable
+    /// layout instead retains one inert proof slot. Adapt only after the full
+    /// pinned model and execution metadata checks; never unfold the proof body.
+    pub(super) fn native_natural_decision_target(
+        &mut self,
+        requested: &Name,
+    ) -> Result<Option<Name>, IngressError> {
+        let (index, suffix) = match requested.leaf_view() {
+            LeafView::Str("decEq") => (0, "decEq"),
+            LeafView::Str("decLe") => (1, "decLe"),
+            LeafView::Str("decLt") => (2, "decLt"),
+            _ => return Ok(None),
+        };
+        if requested.parent() != name("Nat") {
+            return Ok(None);
+        }
+        let target = name(&format!("_fln_runtime_nat_{suffix}"));
+        if self.text_decisions.natural_primitives[index].is_some() {
+            self.tick()?;
+            return Ok(Some(target));
+        }
+        source_intrinsics::read_extern_attributes(
+            self.environment,
+            &mut self.externs,
+            &mut self.visited,
+            self.limits,
+        )?;
+        if !self
+            .externs
+            .as_ref()
+            .is_some_and(|table| table.get(requested).is_some())
+        {
+            return Ok(None);
+        }
+        source_intrinsics::check_selected_extern_attribute(
+            self.environment,
+            requested,
+            &mut self.externs,
+            &mut self.visited,
+            self.limits,
+        )?;
+        if !self.native_natural_decision_model(requested)? {
+            return Ok(None);
+        }
+        let decision = Expr::app(
+            Expr::const_(name("Decidable"), vec![]),
+            Expr::const_(name("True"), vec![]),
+        );
+        if self.value_type(&decision)? != Some(ValueType::Constructor) {
+            return Err(unsupported("native decision constructor representation"));
+        }
+        let primitive = name(&format!("_fln_runtime_nat_{suffix}_abi"));
+        if self.environment.contains(&primitive) || self.has_private_callable(&primitive) {
+            return Err(unsupported("native decision primitive name collision"));
+        }
+        let mut binding = generated_runtime_intrinsic_binding(
+            requested,
+            vec![ValueType::Nat, ValueType::Nat],
+            ValueType::Bool,
+            None,
+        )
+        .ok_or_else(|| unsupported("native decision generated ABI row"))?;
+        binding.name = primitive.clone();
+        let mut branches = Vec::new();
+        for constructor in ["Decidable.isFalse", "Decidable.isTrue"] {
+            let value = self
+                .specialize_constructor(
+                    &Expr::const_(name(constructor), vec![]),
+                    &[Expr::const_(name("True"), vec![]), proofs::erased_value()],
+                )?
+                .ok_or_else(|| unsupported("native decision constructor adapter"))?;
+            branches.push(value);
+        }
+        let natural = Expr::const_(name("Nat"), vec![]);
+        let mut value = Expr::const_(primitive, vec![]);
+        for index in [1, 0] {
+            value = Expr::app(
+                value,
+                Expr::bvar(index).expect("fixed native decision argument"),
+            );
+        }
+        let motive = Expr::lam(
+            Name::anonymous(),
+            Expr::const_(name("Bool"), vec![]),
+            decision.clone(),
+            BinderInfo::Default,
+        );
+        value = [motive, branches.remove(0), branches.remove(0), value]
+            .into_iter()
+            .fold(
+                Expr::const_(name("Bool.rec"), vec![Level::one()]),
+                Expr::app,
+            );
+        let mut type_ = decision;
+        for _ in 0..2 {
+            value = Expr::lam(
+                Name::anonymous(),
+                natural.clone(),
+                value,
+                BinderInfo::Default,
+            );
+            type_ = Expr::forall_e(
+                Name::anonymous(),
+                natural.clone(),
+                type_,
+                BinderInfo::Default,
+            );
+        }
+        self.remember_native_scalar_adapter_definition(DefinitionVal {
+            base: fln_env::constants::ConstantVal {
+                name: target.clone(),
+                level_params: Vec::new(),
+                type_,
+            },
+            value,
+            hints: fln_env::constants::ReducibilityHints::Abbrev,
+            safety: fln_env::constants::DefinitionSafety::Safe,
+            all: Vec::new(),
+        })?;
+        self.text_decisions.natural_primitives[index] = Some(binding);
+        Ok(Some(target))
+    }
+
+    pub(super) fn native_natural_decision_call(
+        &mut self,
+        head: &Expr,
+        arguments: &[Expr],
+    ) -> Result<Option<Expr>, IngressError> {
+        let ExprNode::Const { name, levels } = head.node() else {
+            return Ok(None);
+        };
+        if !levels.is_empty() {
+            return Ok(None);
+        }
+        Ok(self.native_natural_decision_target(name)?.map(|target| {
+            arguments
+                .iter()
+                .cloned()
+                .fold(Expr::const_(target, vec![]), Expr::app)
+        }))
+    }
+
+    pub(crate) fn native_decision_intrinsic_binding(
+        &self,
+        requested: &Name,
+    ) -> Option<IntrinsicBinding> {
+        self.text_decisions
+            .natural_primitives
+            .iter()
+            .flatten()
+            .find(|binding| &binding.name == requested)
+            .cloned()
+    }
+
+    pub(super) fn native_decision_intrinsic_type(&self, requested: &Name) -> Option<Expr> {
+        self.native_decision_intrinsic_binding(requested).map(|_| {
+            let natural = Expr::const_(name("Nat"), vec![]);
+            let mut type_ = Expr::const_(name("Bool"), vec![]);
+            for _ in 0..2 {
+                type_ = Expr::forall_e(
+                    Name::anonymous(),
+                    natural.clone(),
+                    type_,
+                    BinderInfo::Default,
+                );
+            }
+            type_
+        })
+    }
+
     /// Proposition arguments do not affect Decidable's runtime layout: both
     /// constructors retain their tag and one erased proof slot. Choose a closed
     /// representative only AFTER admission, in the compiler's type plane. The

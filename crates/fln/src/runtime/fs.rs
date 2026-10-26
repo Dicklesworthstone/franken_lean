@@ -33,6 +33,7 @@ pub(super) struct Store {
     word: Option<bytes::WordLayout>,
     word_repr_checked: bool,
     word_platform_checked: bool,
+    bounded_word_checked: bool,
     bytes: Option<bytes::Layout>,
     write_bytes: Option<bytes::WriteLayout>,
     directory: Option<directory::Layout>,
