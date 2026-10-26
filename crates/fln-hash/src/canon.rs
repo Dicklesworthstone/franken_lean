@@ -114,6 +114,8 @@ pub enum SchemaOwner {
     Olean,
     /// `fln-verdict` — the CNF / model / proof wire formats.
     Verdict,
+    /// `fln` — capsules whose module contents are checked by both engines.
+    Fln,
 }
 
 impl SchemaOwner {
@@ -123,6 +125,7 @@ impl SchemaOwner {
             SchemaOwner::Env => "fln-env",
             SchemaOwner::Olean => "fln-olean",
             SchemaOwner::Verdict => "fln-verdict",
+            SchemaOwner::Fln => "fln",
         }
     }
 
@@ -136,14 +139,16 @@ impl SchemaOwner {
             SchemaOwner::Env => "crates/fln-env/src/provenance.rs",
             SchemaOwner::Olean => "crates/fln-olean/src/artifact.rs",
             SchemaOwner::Verdict => "crates/fln-verdict/src/lib.rs",
+            SchemaOwner::Fln => "crates/fln/src/capsule.rs",
         }
     }
 
-    pub const ALL: [SchemaOwner; 4] = [
+    pub const ALL: [SchemaOwner; 5] = [
         SchemaOwner::Hash,
         SchemaOwner::Env,
         SchemaOwner::Olean,
         SchemaOwner::Verdict,
+        SchemaOwner::Fln,
     ];
 }
 
@@ -176,7 +181,7 @@ pub struct SchemaRow {
 ///
 /// Adding a durable format means adding a row here. That is the point: the registry is
 /// the reviewed inventory the conformance corpus is meant to be a projection of.
-pub const SCHEMA_REGISTRY: [SchemaRow; 21] = [
+pub const SCHEMA_REGISTRY: [SchemaRow; 22] = [
     SchemaRow {
         id: SCHEMA_IR_CALL_GRAPH,
         owner: SchemaOwner::Hash,
@@ -299,6 +304,14 @@ pub const SCHEMA_REGISTRY: [SchemaRow; 21] = [
         },
         owner: SchemaOwner::Verdict,
         covers: "an unsatisfiability proof on the wire",
+    },
+    SchemaRow {
+        id: SchemaId {
+            name: "fln.capsule.olean-replay",
+            version: 1,
+        },
+        owner: SchemaOwner::Fln,
+        covers: "a sealed module closure with exact companion parts, ordered options and roots for full independent rechecking",
     },
 ];
 
@@ -2349,6 +2362,9 @@ mod tests {
                 // module (`canon`) rather than the crate; recorded here rather than
                 // renamed, because a schema name is frozen once published.
                 SchemaOwner::Hash => "fln.canon.".to_string(),
+                // The composition crate owns capsule profiles; the lower transport
+                // codec remains in fln-hash.
+                SchemaOwner::Fln => "fln.capsule.".to_string(),
                 _ => format!("fln.{subsystem}."),
             };
             for row in SCHEMA_REGISTRY.iter().filter(|row| row.owner == owner) {

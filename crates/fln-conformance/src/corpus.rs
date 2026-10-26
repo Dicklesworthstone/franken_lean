@@ -333,7 +333,7 @@ pub fn projection_root(descriptors: &[CorpusDescriptor<'_>]) -> Digest {
 ///
 /// One row per `SCHEMA_REGISTRY` row, joined in both directions by [`project`]. The
 /// order matches the registry's for readability only — the join does not depend on it.
-pub const CORPUS_COVERAGE: [CorpusCoverage; 21] = [
+pub const CORPUS_COVERAGE: [CorpusCoverage; 22] = [
     CorpusCoverage {
         schema: "fln.canon.name",
         version: 1,
@@ -504,6 +504,14 @@ pub const CORPUS_COVERAGE: [CorpusCoverage; 21] = [
         exercise: "round trip and re-encode byte identity of a resolution proof \
                    concluding the empty clause, decoded against its own CNF",
         run: exercise_unsat_proof,
+    },
+    CorpusCoverage {
+        schema: "fln.capsule.olean-replay",
+        version: 1,
+        exercise: "seal a checked universe-polymorphic definition with deterministic bytes, \
+                   decode its receipt and recheck through both engines with matching roots, \
+                   and refuse transport corruption or an insufficient byte budget",
+        run: exercise_olean_capsule,
     },
 ];
 
@@ -1745,6 +1753,121 @@ fn unsat_formula() -> Result<Cnf, String> {
         ),
         "build UNSAT CNF",
     )
+}
+
+fn exercise_olean_capsule(row: &SchemaRow) -> Result<(), String> {
+    use fln::capsule::{
+        CapsuleLimits, CapsuleVerification, PINNED_EPOCH, SCHEMA_OLEAN_CAPSULE, seal_olean_capsule,
+        verify_olean_capsule,
+    };
+    use fln_env::constants::{
+        ConstantInfo, ConstantVal, DefinitionSafety, DefinitionVal, ReducibilityHints,
+    };
+    use fln_olean::write::{ModuleWriteInput, OleanWriteHeader, WriteBudget, encode_module};
+
+    bind(row, SCHEMA_OLEAN_CAPSULE)?;
+    let name = n("capsuleIdentity");
+    let universe = n("u");
+    let sort = Expr::sort(Level::param(universe.clone()));
+    let zero = ok(Expr::bvar(0), "capsule binder zero")?;
+    let one = ok(Expr::bvar(1), "capsule binder one")?;
+    let declaration = ConstantInfo::Defn(DefinitionVal {
+        base: ConstantVal {
+            name: name.clone(),
+            level_params: vec![universe],
+            type_: Expr::forall_e(
+                n("A"),
+                sort.clone(),
+                Expr::forall_e(n("x"), zero.clone(), one, BinderInfo::Default),
+                BinderInfo::Default,
+            ),
+        },
+        value: Expr::lam(
+            n("A"),
+            sort,
+            Expr::lam(n("x"), zero.clone(), zero, BinderInfo::Default),
+            BinderInfo::Default,
+        ),
+        hints: ReducibilityHints::Regular(0),
+        safety: DefinitionSafety::Safe,
+        all: vec![name],
+    });
+    let module = ok(
+        encode_module(
+            ModuleWriteInput {
+                is_module: false,
+                imports: &[],
+                constants: &[declaration],
+                extra_const_names: &[],
+            },
+            OleanWriteHeader {
+                version: fln::OLEAN_ACCEPTED_VERSIONS[0],
+                flags: 1,
+                lean_version: fln::OLEAN_PIN_TAG.trim_start_matches('v'),
+                githash: fln::OLEAN_PIN_COMMIT,
+                base_addr: (fln::OLEAN_REGION_ALIGN as u64) * 2,
+            },
+            WriteBudget::default(),
+        ),
+        "write capsule module",
+    )?;
+    let module_name = n("CapsuleCorpus");
+    let inputs = [fln::OleanModuleInput {
+        name: &module_name,
+        artifact: &module.bytes,
+        server_artifact: None,
+        private_artifact: None,
+    }];
+    let limits = || CapsuleLimits::new(1 << 20, fln::Budget::for_stack_bytes(1 << 20));
+    let sealed = ok(
+        seal_olean_capsule(&inputs, &KVMap::new(), PINNED_EPOCH, limits()),
+        "seal checked capsule",
+    )?
+    .into_complete()
+    .map_err(|stop| format!("capsule sealing did not complete: {stop:?}"))?;
+    let repeated = ok(
+        seal_olean_capsule(&inputs, &KVMap::new(), PINNED_EPOCH, limits()),
+        "repeat capsule sealing",
+    )?
+    .into_complete()
+    .map_err(|stop| format!("repeated capsule sealing did not complete: {stop:?}"))?;
+    if repeated.bytes != sealed.bytes {
+        return Err("sealing identical checked inputs changed the capsule bytes".into());
+    }
+    let verified = ok(
+        verify_olean_capsule(&sealed.bytes, limits()),
+        "independently recheck capsule",
+    )?
+    .into_complete()
+    .map_err(|stop| format!("capsule verification did not complete: {stop:?}"))?;
+    let CapsuleVerification::Semantic(report) = verified else {
+        return Err("a semantic capsule was downgraded to transport-only verification".into());
+    };
+    if report.modules != 1
+        || report.declarations != 1
+        || report.base_logical_root != sealed.report.base_logical_root
+        || report.result_logical_root != sealed.report.result_logical_root
+        || report.manifest_root != sealed.report.manifest_root
+        || report.archive_digest != sealed.report.archive_digest
+    {
+        return Err("capsule recomputation changed the declared counts or roots".into());
+    }
+    let mut corrupted = sealed.bytes.clone();
+    let last = corrupted.last_mut().ok_or("capsule encoding was empty")?;
+    *last ^= 1;
+    if verify_olean_capsule(&corrupted, limits()).is_ok() {
+        return Err("a corrupted capsule was not refused".into());
+    }
+    if matches!(
+        verify_olean_capsule(
+            &sealed.bytes,
+            CapsuleLimits::new(0, fln::Budget::for_stack_bytes(1 << 20)),
+        ),
+        Ok(fln::Outcome::Complete(_))
+    ) {
+        return Err("capsule verification exceeded an explicit zero byte budget".into());
+    }
+    Ok(())
 }
 
 fn exercise_cnf(row: &SchemaRow) -> Result<(), String> {

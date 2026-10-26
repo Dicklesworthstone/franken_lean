@@ -230,6 +230,31 @@ fn canonical_archive_round_trip_and_derived_random_access_are_exact() {
 }
 
 #[test]
+fn bounded_archive_encoding_preserves_exact_bytes_and_refuses_before_output_growth() {
+    let archive = full_archive();
+    let bytes = archive.to_canonical_bytes().unwrap();
+    assert_eq!(
+        archive.to_canonical_bytes_within(bytes.len()).unwrap(),
+        Some(bytes.clone())
+    );
+    for limit in [
+        0,
+        1,
+        archive.manifest.to_canonical_bytes().unwrap().len() - 1,
+        bytes.len() - 1,
+    ] {
+        assert_eq!(archive.to_canonical_bytes_within(limit).unwrap(), None);
+    }
+    assert_eq!(
+        archive.to_canonical_bytes_within(bytes.len() + 1).unwrap(),
+        Some(bytes)
+    );
+    let mut malformed = archive;
+    malformed.frames[0].bytes.push(0);
+    assert!(malformed.to_canonical_bytes_within(usize::MAX).is_err());
+}
+
+#[test]
 fn staging_is_failure_atomic_and_recovers_exactly() {
     let archive = full_archive();
     let mut stager = CartridgeStagerV1::new(archive.manifest.clone()).expect("stager");

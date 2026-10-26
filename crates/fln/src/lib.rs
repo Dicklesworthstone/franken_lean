@@ -29,6 +29,7 @@
 // runtime Format projection also uses fallible boxes for untrusted output.
 #![feature(alloc_error_hook, allocator_api)]
 
+pub mod capsule;
 mod olean_imports;
 pub mod pretty;
 pub mod source_check;

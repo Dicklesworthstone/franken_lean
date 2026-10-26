@@ -1120,14 +1120,44 @@ impl CartridgeArchiveV1 {
         self.validate()?;
         let manifest_bytes = self.manifest.to_canonical_bytes()?;
         let mut writer = CanonWriter::new();
+        self.write_archive(&manifest_bytes, &mut writer);
+        Ok(writer.into_bytes())
+    }
+
+    /// Encode with a ceiling on each materialized byte buffer. `None` means the
+    /// encoding exceeds the caller's allowance, never a malformed archive.
+    /// Both the nested manifest and final transport are bounded before allocation
+    /// can pass `limit`; the ordinary encoder uses the same archive writer.
+    pub fn to_canonical_bytes_within(
+        &self,
+        limit: usize,
+    ) -> Result<Option<Vec<u8>>, CartridgeRefusalV1> {
+        self.validate()?;
+        let mut manifest = CanonWriter::with_limit(limit);
+        manifest.schema(SCHEMA_CARTRIDGE_MANIFEST);
+        write_manifest_body(&mut manifest, &self.manifest);
+        if manifest.overflowed() {
+            return Ok(None);
+        }
+        let manifest = manifest.into_bytes();
+        let mut count = CanonWriter::counting();
+        self.write_archive(&manifest, &mut count);
+        if count.overflowed() || count.written() > limit {
+            return Ok(None);
+        }
+        let mut writer = CanonWriter::with_limit(limit);
+        self.write_archive(&manifest, &mut writer);
+        Ok(Some(writer.into_bytes()))
+    }
+
+    fn write_archive(&self, manifest_bytes: &[u8], writer: &mut CanonWriter) {
         writer.schema(SCHEMA_CARTRIDGE_ARCHIVE);
-        writer.bytes(&manifest_bytes);
+        writer.bytes(manifest_bytes);
         writer.u64(self.frames.len() as u64);
         for frame in &self.frames {
-            write_chunk_id(&mut writer, frame.id);
+            write_chunk_id(writer, frame.id);
             writer.bytes(&frame.bytes);
         }
-        Ok(writer.into_bytes())
     }
 
     /// Byte identity of this exact transport population. The logical cartridge

@@ -174,7 +174,7 @@ Honest framing. FrankenLean is not the first project to re-check Lean's kernel; 
 | Incremental granularity | Declaration (true dependency cone) | File (import cone) | n/a | n/a |
 | Server import cost | Once per daemon, shared pages | ≈60 s + GBs *per worker* | n/a | n/a |
 | External tools | 0 mandatory (cc/git optional) | cc mandatory for executables; git; CaDiCaL for `bv_decide` | — | — |
-| Proof certificates / transparency log | target: ✓ by default. Today: receipts on request (`fln check-olean --receipts`) and certificates inside sealed capsules; no transparency log | ✗ | export formats exist | partial |
+| Proof certificates / transparency log | target: ✓ by default. Today: receipts on request (`fln check-olean --receipts`) and sealed `.olean` capsules rechecked by the kernel and independent checker; certificate replay acceleration and a transparency log remain open | ✗ | export formats exist | partial |
 
 ## The `fln` CLI
 
@@ -188,7 +188,8 @@ lean --server                      # the daemon behind the standard wire dialect
 
 # The Independent Judge
 fln check-olean <path|project> --receipts    # re-check oleans on the foreign kernel
-fln verify-capsule proof.flnpack             # verify a sealed capsule (also: browser/WASM)
+fln seal-capsule --output proof.flnpack capsule-modules/  # check and pack a closed module set
+fln verify-capsule --require-semantic --json proof.flnpack # re-check its declarations offline
 
 # Trust & provenance
 fln audit --tcb                    # axioms, native_decide sites, plugins, façade classes
@@ -210,7 +211,7 @@ fln serve-mcp                      # Envoy: snapshots, tactics, search, eval —
 fln identity --json                # implementation commit, epoch, profile, TCB hash
 ```
 
-> **Live today (bounded):** `fln check-olean [--receipts]`, `fln run`, `fln flbc run`, `fln olean inspect|diff|verify-rebuild`, `fln ilean inspect`, `fln ir inspect`, `fln audit --tcb`, `fln why-trusts`, `fln identity`, `fln goals`, `fln verify-capsule`, `fln doctor` and `fln diff` (an alias of `fln olean diff LEFT RIGHT`; it has no `--level`) are implemented and tested against real pinned artifacts — see IMPLEMENTATION_STATUS for exact scope and refusals. The `leanc` personality hands its arguments unchanged to the host C compiler (`LEAN_CC`, else `cc`); `--print-cflags` and `--print-ldflags` print the pin's flags, and those link flags name the Reference's runtime libraries (`-lleancpp -lLean -lInit -lleanrt -lgmp`), which FrankenLean does not build. Ordinary headerless files and standard input now use their implicit `Init` import, and each `prelude` source module suppresses its own implicit edge. The earlier bounded-seed probe accepted 15 of the 29 programs the pinned Reference accepted, all 15 with identical output, and none of the 8 it rejected (`cargo test -p fln-cli --release --test ordinary_lean_probe -- --nocapture`, 2026-10-07); that historical result is not a measurement of the new import route. Compiled imports, whether implicit or explicit, are read from `LEAN_PATH`, else from the pinned toolchain under `ELAN_HOME` or `~/.elan`, decoded and checked by both checkers, and never executed. The first admission of a large closure is expensive, with cost depending on its size and the worker count; a later run reuses a verified record of it. The `lake` personality covers package `init`/`new`/`clean`, TOML discovery, `check-build`, and `lake build +Module:olean` for modules under declared TOML library roots. That module facet checks the local import closure through K1 and the independent checker and emits separate, importable pinned-format `.olean` files under `buildDir/lib/lean`. A module whose source and imported environment are unchanged since a build by the same binary is not elaborated again. Both checkers re-admit it from a per-user record, and it is reported in `modules_cached`; `--import-posture recheck` elaborates every module. By default an external `.olean` import closure this binary admitted before is rebuilt from its bytes and matched against a per-user admission record instead of being admitted again; `--import-posture recheck` admits it again with both checkers. Default library `leanArts`, executables, executable `lakefile.lean` configuration and unsupported extension exports still refuse; see [the working example and exact boundaries](docs/NATIVE_LAKE.md). `fln verify-capsule` checks a capsule's integrity and decodes its certificates; it does not yet replay them through a checker, and its report says so. The remaining verbs above are the 1.0 target this README describes, not shipped code: `serve-mcp`, `cache` and `replay` exit with status 5 and a typed "not implemented" notice naming their gate. `fln build explain` compares the snapshot each successful `lake build` writes with the current tree. It reports changed inputs with their old and new content hashes, and Lake's file-cone rebuild decision. The native decision is reported as unavailable, because no Ledger records exist (franken_lean-z8j.1.2).
+> **Live today (bounded):** `fln check-olean [--receipts]`, `fln run`, `fln flbc run`, `fln olean inspect|diff|verify-rebuild`, `fln ilean inspect`, `fln ir inspect`, `fln audit --tcb`, `fln why-trusts`, `fln identity`, `fln goals`, `fln seal-capsule`, `fln verify-capsule`, `fln doctor` and `fln diff` (an alias of `fln olean diff LEFT RIGHT`; it has no `--level`) are implemented; see IMPLEMENTATION_STATUS for each command's evidence, exact scope and refusals. The `leanc` personality hands its arguments unchanged to the host C compiler (`LEAN_CC`, else `cc`); `--print-cflags` and `--print-ldflags` print the pin's flags, and those link flags name the Reference's runtime libraries (`-lleancpp -lLean -lInit -lleanrt -lgmp`), which FrankenLean does not build. Ordinary headerless files and standard input now use their implicit `Init` import, and each `prelude` source module suppresses its own implicit edge. The earlier bounded-seed probe accepted 15 of the 29 programs the pinned Reference accepted, all 15 with identical output, and none of the 8 it rejected (`cargo test -p fln-cli --release --test ordinary_lean_probe -- --nocapture`, 2026-10-07); that historical result is not a measurement of the new import route. Compiled imports, whether implicit or explicit, are read from `LEAN_PATH`, else from the pinned toolchain under `ELAN_HOME` or `~/.elan`, decoded and checked by both checkers, and never executed. The first admission of a large closure is expensive, with cost depending on its size and the worker count; a later run reuses a verified record of it. The `lake` personality covers package `init`/`new`/`clean`, TOML discovery, `check-build`, and `lake build +Module:olean` for modules under declared TOML library roots. That module facet checks the local import closure through K1 and the independent checker and emits separate, importable pinned-format `.olean` files under `buildDir/lib/lean`. A module whose source and imported environment are unchanged since a build by the same binary is not elaborated again. Both checkers re-admit it from a per-user record, and it is reported in `modules_cached`; `--import-posture recheck` elaborates every module. By default an external `.olean` import closure this binary admitted before is rebuilt from its bytes and matched against a per-user admission record instead of being admitted again; `--import-posture recheck` admits it again with both checkers. Default library `leanArts`, executables, executable `lakefile.lean` configuration and unsupported extension exports still refuse; see [the working example and exact boundaries](docs/NATIVE_LAKE.md). `fln seal-capsule` and `fln verify-capsule --require-semantic` now check a complete sealed `.olean` closure through the kernel and independent checker; legacy capsules retain explicitly labeled integrity verification. See the capsule workflow below for the exact boundary. The remaining verbs above are the 1.0 target this README describes, not shipped code: `serve-mcp`, `cache` and `replay` exit with status 5 and a typed "not implemented" notice naming their gate. `fln build explain` compares the snapshot each successful `lake build` writes with the current tree. It reports changed inputs with their old and new content hashes, and Lake's file-cone rebuild decision. The native decision is reported as unavailable, because no Ledger records exist (franken_lean-z8j.1.2).
 
 Native source execution also supports bounded `Float` and `Float32` programs:
 decimal and scientific literals, arithmetic, typed function arguments, branches,
@@ -218,6 +219,34 @@ captured closures, bit and precision conversions, and native string output. Run
 [`examples/native_floats.lean`](examples/native_floats.lean) with `lean` or
 `fln run`; [the numeric source guide](docs/NATIVE_FLOATS.md) explains dictionary
 selection, exact literal rounding, and the remaining runtime boundaries.
+
+### Sealed declaration capsules
+
+`seal-capsule` reads a directory whose relative paths name modules: for example,
+`A/B.olean` supplies `A.B`. Include every imported module and each required
+`.olean.server` / `.olean.private` companion. The producer checks the complete
+set before atomically publishing the output file. Verification needs only that
+capsule and the native `fln` binary; it reconstructs the declarations from an
+empty environment and checks them again, without an ambient import library or
+admission cache.
+
+A successful semantic verification reports `status: "declarations_verified"`,
+`verification_method: "full_recomputation"`, module/declaration counts, and
+recomputed logical roots. The profile binds the embedded artifact bytes,
+module graph, ordered options and v4.32.0 compiler pin, in sound mode with the
+standard reproducibility profile. `--max-bytes BYTES` bounds archive and
+expanded object bytes. Resource exhaustion remains a nonanswer, never a
+successful check.
+
+Plain `verify-capsule` still accepts legacy capsules for transport integrity,
+reporting `verification_method: "integrity_only"` and zero verified declarations.
+Use `--require-semantic` when declaration checking is required; legacy capsules
+and unsupported semantic-profile versions cannot satisfy it. Declaration
+checking is relative to the supplied axioms. Persisted extension bytes are
+bound by the archive but are not executed or semantically validated by this
+path. Certificate replay acceleration, a browser/WASM verifier and transparency
+log verification remain open; see
+[the current evidence and limits](IMPLEMENTATION_STATUS.md#sealed-olean-declaration-verification-2026-10-26).
 
 ## Installation
 
