@@ -56,7 +56,7 @@ fn on_stack(body: impl FnOnce() + Send) {
             .unwrap();
     });
 }
-fn added(base: &Engine, source: &str) -> Vec<ConstantInfo> {
+fn checked(base: &Engine, source: &str) -> Engine {
     base.check_source_files(
         &[source.as_bytes()],
         &KVMap::new(),
@@ -66,11 +66,14 @@ fn added(base: &Engine, source: &str) -> Vec<ConstantInfo> {
     .into_complete()
     .unwrap()
     .engine
-    .environment()
-    .constants()
-    .filter(|(name, _)| !base.environment().contains(name))
-    .map(|(_, constant)| constant.clone())
-    .collect()
+}
+fn added(base: &Engine, source: &str) -> Vec<ConstantInfo> {
+    checked(base, source)
+        .environment()
+        .constants()
+        .filter(|(name, _)| !base.environment().contains(name))
+        .map(|(_, constant)| constant.clone())
+        .collect()
 }
 fn row(source: &str, implementation: &str) -> Obj {
     Obj::mk_ctor(
@@ -290,70 +293,268 @@ fn replacement_chains_and_checked_partial_targets_use_their_executable_bodies() 
 }
 
 #[test]
-fn unsafe_or_unsupported_extern_replacements_refuse_instead_of_running_logical_defaults() {
+fn unsafe_replacements_execute_source_and_imported_bodies_without_changing_logic() {
     on_stack(|| {
         let base = seed();
-        let mut constants = added(
+        let direct = checked(
             &base,
-            "def original (x : Nat) : Nat := 0\ndef actual (x : Nat) : Nat := x + 2",
+            r#"
+unsafe def actual (x : Nat) : Nat := x + 2
+@[implemented_by actual] def original (x : Nat) : Nat := 0
+@[implemented_by original] def chained (x : Nat) : Nat := 1
+def alias : Nat -> Nat := original
+def invoke (f : Nat -> Nat) (x : Nat) : Nat := f x
+unsafe def actualMaker (n : Nat) : Nat -> Nat := let paid : Nat := n + 1; fun (x : Nat) => paid + x
+@[implemented_by actualMaker] def logicalMaker (n : Nat) : Nat -> Nat := fun (x : Nat) => 0
+unsafe def actualGcd (a b : Nat) : Nat := if b == 0 then a else actualGcd b (a % b)
+@[implemented_by actualGcd] def logicalGcd (a b : Nat) : Nat := 0
+unsafe def absurd (n : Nat) : False := absurd n
+"#,
         );
-        let constant = constants
-            .iter_mut()
-            .find(|constant| constant.name() == &n("actual"))
-            .unwrap();
-        let ConstantInfo::Defn(actual) = constant else {
-            panic!("definition")
-        };
-        actual.safety = DefinitionSafety::Unsafe;
+        let constants: Vec<_> = direct
+            .environment()
+            .constants()
+            .filter(|(name, _)| !base.environment().contains(name))
+            .map(|(_, constant)| constant.clone())
+            .collect();
         let artifacts = vec![(
             n("Library"),
-            encode(&constants, &[], vec![row("original", "actual")]),
+            encode(
+                &constants,
+                &[],
+                vec![
+                    row("original", "actual"),
+                    row("chained", "original"),
+                    row("logicalMaker", "actualMaker"),
+                    row("logicalGcd", "actualGcd"),
+                ],
+            ),
         )];
         let imported = import(&base, &artifacts, &[n("Library")], 1);
-        let root = imported.result_logical_root;
-        let error = imported
-            .engine
-            .execute_source_definitions(&[b"#eval original 40"], &KVMap::new(), execution())
-            .unwrap_err();
-        assert!(
-            format!("{error:?}")
-                .contains("implemented_by target has no supported safe or partial executable body")
-        );
-        assert_eq!(imported.engine.logical_root(&KVMap::new()), root);
+        assert_eq!(imported.modules[0].implemented_by, 4);
+        for engine in [&direct, &imported.engine] {
+            assert!(matches!(
+                engine.environment().find(&n("actual")),
+                Some(ConstantInfo::Defn(value)) if value.safety == DefinitionSafety::Unsafe
+            ));
+            assert!(matches!(
+                engine.environment().find(&n("original")),
+                Some(ConstantInfo::Defn(value)) if value.safety == DefinitionSafety::Safe
+            ));
+            for (expression, expected) in [
+                ("original 40", "42"),
+                ("chained 40", "42"),
+                ("alias 40", "42"),
+                ("invoke original 40", "42"),
+                ("let f : Nat -> Nat := original; f 40", "42"),
+                ("logicalMaker 20 21", "42"),
+                (
+                    "let make : Nat -> Nat -> Nat := logicalMaker; make 20 21",
+                    "42",
+                ),
+                ("logicalGcd 48 18", "6"),
+            ] {
+                evaluate(engine, expression, expected);
+            }
+            let proved = checked(
+                engine,
+                "theorem originalIsZero : original 40 = 0 := by rfl\n\
+                 theorem chainedIsOne : chained 40 = 1 := by rfl\n\
+                 theorem gcdIsZero : logicalGcd 48 18 = 0 := by rfl",
+            );
+            assert!(proved.environment().contains(&n("originalIsZero")));
+            let root = engine.logical_root(&KVMap::new());
+            for source in [
+                "def leak : Nat := actual 40",
+                "theorem leak : False := absurd 0",
+                "theorem leak : actual 40 = actual 40 := by rfl",
+                "theorem leak : original 40 = 42 := by rfl",
+            ] {
+                assert!(
+                    engine
+                        .check_source_files(
+                            &[source.as_bytes()],
+                            &KVMap::new(),
+                            SourceCheckLimits::new(admission()),
+                        )
+                        .is_err(),
+                    "{source}: executable replacement leaked into safe checking"
+                );
+                assert_eq!(engine.logical_root(&KVMap::new()), root);
+                assert!(!engine.environment().contains(&n("leak")));
+            }
+        }
+    });
+}
 
-        let checked = base
-            .check_source_files(
-                &[b"def logical (x : Nat) : Nat := 0\ndef selected (x : Nat) : Nat := x + 2"],
+#[test]
+fn native_source_artifacts_preserve_unsafe_polymorphic_replacements() {
+    on_stack(|| {
+        let library = n("Library");
+        let source = br"prelude
+unsafe def replacement.{v} {B : Sort v} (a b : B) : B := b
+@[implemented_by replacement] def original.{u} {A : Sort u} (x y : A) : A := x
+def alias.{u} {A : Sort u} (x y : A) : A := original x y
+";
+        let built = Engine::builder()
+            .build_empty()
+            .compile_source_modules(
+                &[SourceModuleInput {
+                    name: &library,
+                    source,
+                }],
+                &library,
                 &KVMap::new(),
-                SourceCheckLimits::new(admission()),
+                source_check::modules::SourceModuleCheckLimits::new(SourceCheckLimits::new(
+                    admission(),
+                )),
+                OleanWriteBudget::default(),
             )
             .unwrap()
             .into_complete()
-            .unwrap()
-            .engine;
-        let env = fln_elab::implemented_by::register(
-            checked.environment(),
-            &n("logical"),
-            &n("selected"),
-        )
-        .unwrap();
-        let env = fln_elab::externs::register(
-            &env,
-            &n("selected"),
-            vec![fln_elab::externs::ExternEntry::Standard {
-                backend: n("all"),
-                symbol: "unavailable_implementation".into(),
-            }],
-        )
-        .unwrap();
-        let engine = Engine::from_environment(env);
-        let error = engine
-            .execute_source_definitions(&[b"#eval logical 40"], &KVMap::new(), execution())
-            .unwrap_err();
-        assert!(
-            format!("{error:?}")
-                .contains("native extern attribute does not match the supported ABI")
+            .unwrap();
+        let artifacts: Artifacts = built
+            .artifacts
+            .into_iter()
+            .map(|artifact| (artifact.name, artifact.bytes))
+            .collect();
+        let imported = import(&seed(), &artifacts, &[library], 1);
+        assert_eq!(imported.modules[0].implemented_by, 1);
+        assert!(matches!(
+            imported.engine.environment().find(&n("replacement")),
+            Some(ConstantInfo::Defn(value)) if value.safety == DefinitionSafety::Unsafe
+        ));
+        for expression in [
+            "original 7 42",
+            "alias 7 42",
+            "let f : Nat -> Nat -> Nat := original; f 7 42",
+        ] {
+            evaluate(&imported.engine, expression, "42");
+        }
+        checked(
+            &imported.engine,
+            "theorem originalIsFirst : original 7 42 = 7 := by rfl",
         );
+    });
+}
+
+#[test]
+fn unsupported_extern_replacements_refuse_instead_of_running_logical_defaults() {
+    on_stack(|| {
+        let base = seed();
+        for safety in ["", "unsafe "] {
+            let checked = checked(
+                &base,
+                &format!(
+                    "def logical (x : Nat) : Nat := 0\n{safety}def selected (x : Nat) : Nat := x + 2"
+                ),
+            );
+            let env = fln_elab::implemented_by::register(
+                checked.environment(),
+                &n("logical"),
+                &n("selected"),
+            )
+            .unwrap();
+            let env = fln_elab::externs::register(
+                &env,
+                &n("selected"),
+                vec![fln_elab::externs::ExternEntry::Standard {
+                    backend: n("all"),
+                    symbol: "unavailable_implementation".into(),
+                }],
+            )
+            .unwrap();
+            let engine = Engine::from_environment(env);
+            let root = engine.logical_root(&KVMap::new());
+            let error = engine
+                .execute_source_definitions(&[b"#eval logical 40"], &KVMap::new(), execution())
+                .unwrap_err();
+            assert!(
+                format!("{error:?}")
+                    .contains("native extern attribute does not match the supported ABI"),
+                "{safety}: {error:?}",
+            );
+            assert_eq!(engine.logical_root(&KVMap::new()), root);
+        }
+    });
+}
+
+#[test]
+fn unsafe_replacements_preserve_initializer_and_companion_refusals() {
+    on_stack(|| {
+        let base = seed();
+        let constants = added(
+            &base,
+            "def IO (A : Type) : Type := A\nunsafe def selected : Nat := 7\n\
+             def logical : Nat := 0\ndef initializeSelected : IO Nat := (42 : Nat)",
+        );
+        let replacement_extension = n(IMPLEMENTED_BY_EXTENSION);
+        let replacements = [row("logical", "selected")];
+        for initializer_extension in [
+            fln_olean::initializers::REGULAR_INIT_EXTENSION,
+            fln_olean::initializers::BUILTIN_INIT_EXTENSION,
+        ] {
+            let initializer_extension = n(initializer_extension);
+            let initializers = [row("selected", "initializeSelected")];
+            let artifacts = vec![(
+                n("Library"),
+                encode_extensions(
+                    &constants,
+                    &[],
+                    &[
+                        ModuleExtensionInput {
+                            name: &replacement_extension,
+                            entries: &replacements,
+                        },
+                        ModuleExtensionInput {
+                            name: &initializer_extension,
+                            entries: &initializers,
+                        },
+                    ],
+                ),
+            )];
+            let imported = import(&base, &artifacts, &[n("Library")], 1);
+            let error = imported
+                .engine
+                .execute_source_definitions(&[b"#eval logical"], &KVMap::new(), execution())
+                .unwrap_err();
+            assert!(
+                format!("{error:?}")
+                    .contains("implemented_by target has no supported executable body"),
+                "{initializer_extension:?}: {error:?}"
+            );
+            assert_eq!(
+                imported.engine.logical_root(&KVMap::new()),
+                imported.result_logical_root
+            );
+        }
+
+        let constants = added(
+            &base,
+            "unsafe def selected (x : Nat) : Nat := x + 2\n\
+             unsafe def selected._unsafe_rec (x : Nat) : Nat := x + 3\n\
+             def logical (x : Nat) : Nat := 0",
+        );
+        for target in ["selected", "selected._unsafe_rec"] {
+            let artifacts = vec![(
+                n("Library"),
+                encode(&constants, &[], vec![row("logical", target)]),
+            )];
+            let imported = import(&base, &artifacts, &[n("Library")], 1);
+            let error = imported
+                .engine
+                .execute_source_definitions(&[b"#eval logical 40"], &KVMap::new(), execution())
+                .unwrap_err();
+            assert!(
+                format!("{error:?}")
+                    .contains("implemented_by target has no supported executable body"),
+                "{target}: {error:?}"
+            );
+            assert_eq!(
+                imported.engine.logical_root(&KVMap::new()),
+                imported.result_logical_root
+            );
+        }
     });
 }
 
