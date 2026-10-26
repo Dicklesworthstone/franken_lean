@@ -1,4 +1,4 @@
-{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":718,"projection_hash":"ae9519cd2f7e27a0b0402845abc9748edb1d7a11149090bf27f2459934dd4b03"}
+{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":721,"projection_hash":"6bd2813c21b8c685ce493ed613ab776e381df2c046c3cafad1f8cc7a7a2ea292"}
 {"id":"fln-0bw5"}
 {"id":"fln-0eq8"}
 {"id":"fln-0rxm"}
@@ -282,6 +282,7 @@
 {"id":"fln-nomatch-nofun-h78u"}
 {"id":"fln-noncomputable-check-false-refusal-bhf2"}
 {"id":"fln-notation-from-imports-0edr"}
+{"id":"fln-notation-section-variable-hygiene-false-accept-di30"}
 {"id":"fln-nu8r"}
 {"id":"fln-o0j"}
 {"id":"fln-oavg"}
@@ -349,6 +350,7 @@
 {"id":"fln-simp-configuration-slot-v4b7"}
 {"id":"fln-simp-cost-full-init-set-82hy"}
 {"id":"fln-simp-default-set-a4nb"}
+{"id":"fln-simp-equation-set-limit-regression-re4l"}
 {"id":"fln-simp-global-lemma-numeral-keys-tro5"}
 {"id":"fln-simp-literal-arithmetic-under-application-ameh"}
 {"id":"fln-simp-only-unchanged-goal-progress-wkcj"}
@@ -360,6 +362,7 @@
 {"id":"fln-sn0w"}
 {"id":"fln-snv7"}
 {"id":"fln-sorry-warning-per-declaration-zzlc"}
+{"id":"fln-source-notation-printing-regression-luf8"}
 {"id":"fln-source-notation-unexpanders-727b"}
 {"id":"fln-split-tactic-o28s"}
 {"id":"fln-sr2z"}
