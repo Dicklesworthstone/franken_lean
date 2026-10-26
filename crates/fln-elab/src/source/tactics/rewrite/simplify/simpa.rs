@@ -97,9 +97,6 @@ impl Context {
         rules: &[SimpRule<'_>],
         term: Typed,
     ) -> Result<(), NatDefinitionElabError> {
-        let permute = self.simp_rules_permute(rules)?;
-        let keyed = aclt::simp_rules_keyed(rules, permute);
-        let rules = &keyed[..];
         self.resolve_instances(false)?;
         self.flush(false)?;
         let term = Typed {

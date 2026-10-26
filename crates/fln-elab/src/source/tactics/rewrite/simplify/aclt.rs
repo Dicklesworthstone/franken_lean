@@ -260,26 +260,6 @@ fn statement_is_perm(statement: &Expr) -> bool {
     true
 }
 
-/// `rules` as a call uses them: an explicit theorem argument is keyed as the pin's
-/// discrimination tree keys it (`RewriteRule::global`) only when `permute`. Every rule is then
-/// tried at every step, and an unkeyed one unified at every node exhausted the budget (about
-/// 70,000 heartbeats a rule a step, against 7,000 keyed, in a four-rule call). Otherwise an
-/// explicit argument keeps its unkeyed search: this elaborator drops `no_index` (the pin keeps
-/// it as an annotation its keys read), so a key from a theorem stated with it would refuse a
-/// node the pin admits (upstream `tests/elab/1253.lean`).
-pub(super) fn simp_rules_keyed<'a>(rules: &[SimpRule<'a>], permute: bool) -> Vec<SimpRule<'a>> {
-    rules
-        .iter()
-        .cloned()
-        .map(|mut rule| {
-            if !permute && let SimpRule::Explicit(explicit) = &mut rule {
-                explicit.global = None;
-            }
-            rule
-        })
-        .collect()
-}
-
 impl Context {
     /// Whether `rules` hold a permutation rule, read from each rule's statement. Without one,
     /// rules are taken in this engine's order (the first that applies), as before ordered

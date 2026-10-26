@@ -228,7 +228,7 @@ impl Context {
         let mut steps = 0;
         let mut tagged = None;
         let permute = self.simp_rules_permute(&rules)?;
-        let mut rules = simp_rules_keyed(&rules, permute);
+        let mut rules = rules;
         // `simp_all` hypotheses it reduced to `True` and cleared, never asserted again.
         let mut cleared = HashSet::new();
         loop {

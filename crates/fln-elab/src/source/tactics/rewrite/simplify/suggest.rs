@@ -1012,8 +1012,8 @@ impl Context {
                         .candidates
                         .retain(|c| !matches!(&c.origin, Used::Decl { name: n, .. } if *n == name));
                     simulation.candidates.push(Candidate {
-                        // Keyed as the pin's discrimination tree keys it, whatever the
-                        // simplifier does (`simp_rules_keyed`): a difference is a refusal.
+                        // Keyed as the pin's discrimination tree keys it, as the simplifier
+                        // keys an explicit lemma.
                         rule: SimpRule::Explicit(RewriteRule {
                             syntax: term,
                             reverse,
