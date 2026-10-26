@@ -113,38 +113,29 @@ impl FileGrammar {
 /// `mkUnexpander` for one notation clause, `None` where the pin derives none.
 fn derive(decl: &SyntaxDecl, case: &NotationRule) -> Option<Unexpander> {
     let (head, arguments) = match &case.rhs {
-        Syntax::Ident { val, .. } => (val, &[][..]),
+        head @ Syntax::Ident { .. } => (head, &[][..]),
         Syntax::Node { kind, args, .. }
             if *kind == Name::from_components(["Lean", "Parser", "Term", "app"]) =>
         {
-            let [Syntax::Ident { val, .. }, arguments] = args.as_slice() else {
+            let [head @ Syntax::Ident { .. }, arguments] = args.as_slice() else {
                 return None;
             };
-            (val, null_args(arguments)?)
+            (head, null_args(arguments)?)
         }
         _ => return None,
     };
-    // The template's globals are written `_root_.c` where it was declared.
-    let mut components = Vec::new();
-    let mut cursor = head.clone();
-    while !cursor.is_anonymous() {
-        components.push(cursor.clone());
-        cursor = cursor.parent();
-    }
-    let (root, rest) = components.split_last()?;
-    if root.to_display_string() != "_root_" || rest.is_empty() {
+    // Templates retain their written identifiers so later macro rules can
+    // match them. Definition-site identity lives in pre-resolution metadata;
+    // only the final expansion anchors the spelling under `_root_`.
+    let Syntax::Ident { preresolved, .. } = head else {
+        return None;
+    };
+    let [Preresolved::Decl { name: head, fields }] = preresolved.as_slice() else {
+        return None;
+    };
+    if head.is_anonymous() || !fields.is_empty() {
         return None;
     }
-    let head = rest
-        .iter()
-        .rev()
-        .try_fold(Name::anonymous(), |name, component| {
-            match component.leaf_view() {
-                LeafView::Str(text) => Some(Name::str(name, text)),
-                LeafView::Num(value) => Some(Name::num(name, value)),
-                LeafView::Anonymous => None,
-            }
-        })?;
     let variables: Vec<&Name> = case.variables.iter().map(|(_, name)| name).collect();
     // `hasDuplicateAntiquot`: a variable twice anywhere in the arguments, and no unexpander.
     let mut seen = BTreeSet::new();
