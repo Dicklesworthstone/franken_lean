@@ -42,21 +42,24 @@ impl SectionVariables {
         if names.len() > MAX_SECTION_VARIABLES {
             return Err(ScopeError::VariableSelectionLimit);
         }
-        let by_name: HashMap<_, _> = self
-            .locals
-            .decls()
-            .iter()
-            .map(|local| (&local.user_name, &local.id))
-            .collect();
-        let selected = names
-            .iter()
-            .map(|name| {
-                by_name
-                    .get(name)
-                    .map(|id| (*id).clone())
-                    .ok_or_else(|| ScopeError::UnknownVariable(name.clone()))
-            })
-            .collect::<Result<HashSet<_>, _>>()?;
+        let mut by_name: HashMap<&Name, Vec<&FVarId>> = HashMap::new();
+        for local in self.locals.decls() {
+            by_name.entry(&local.user_name).or_default().push(&local.id);
+        }
+        let mut selected = HashSet::new();
+        for name in names {
+            let ids = by_name
+                .get(name)
+                .ok_or_else(|| ScopeError::UnknownVariable(name.clone()))?;
+            // Unlike term lookup and binder updates, the pin's `elabInclude`
+            // uses `findIdx?` over declarations in source order. `elabOmit`
+            // walks every local, so it omits every occurrence of a name.
+            if include {
+                selected.insert((*ids[0]).clone());
+            } else {
+                selected.extend(ids.iter().map(|id| (*id).clone()));
+            }
+        }
         for id in selected {
             if include {
                 self.omitted.remove(&id);
@@ -79,6 +82,219 @@ impl SectionVariables {
 
     pub(in crate::source) fn levels(&self) -> &[Name] {
         &self.levels
+    }
+}
+
+/// A stored bracketed binder, before optional-parameter expansion. Annotation
+/// updates rewrite this syntax too: declarations replay it in their own scope.
+struct VariableBinder<'a> {
+    names: &'a [Syntax],
+    type_: Option<&'a Syntax>,
+    style: BinderInfo,
+    has_default: bool,
+}
+
+fn variable_binder(syntax: &Syntax) -> Result<VariableBinder<'_>, NatDefinitionElabError> {
+    let Syntax::Node { kind, args, .. } = syntax else {
+        return Err(failure(SourceInferenceError::Scope));
+    };
+    if kind == &parser_kind(&["Term", "instBinder"]) {
+        let [open, names, type_, close] = args.as_slice() else {
+            return Err(failure(SourceInferenceError::Scope));
+        };
+        expect_atom(open, "[", "instance binder opener")?;
+        expect_atom(close, "]", "instance binder closer")?;
+        let names = expect_null_args(names, "optional instance name")?;
+        let names = match names {
+            [] => names,
+            [Syntax::Ident { .. }, colon] => {
+                expect_atom(colon, ":", "instance name colon")?;
+                &names[..1]
+            }
+            _ => return Err(failure(SourceInferenceError::Scope)),
+        };
+        return Ok(VariableBinder {
+            names,
+            type_: Some(type_),
+            style: BinderInfo::InstImplicit,
+            has_default: false,
+        });
+    }
+    let (style, open, close, arity) = if kind == &parser_kind(&["Term", "implicitBinder"]) {
+        (BinderInfo::Implicit, "{", "}", 4)
+    } else if kind == &parser_kind(&["Term", "strictImplicitBinder"]) {
+        (BinderInfo::StrictImplicit, "⦃", "⦄", 4)
+    } else if kind == &parser_kind(&["Term", "explicitBinder"]) {
+        (BinderInfo::Default, "(", ")", 5)
+    } else {
+        return Err(failure(SourceInferenceError::Scope));
+    };
+    let parts = expect_node(syntax, kind, arity, "section variable binder")?;
+    expect_atom(&parts[0], open, "binder opener")?;
+    expect_atom(&parts[arity - 1], close, "binder closer")?;
+    let names = expect_null_args(&parts[1], "binder names")?;
+    if names.is_empty() {
+        return Err(failure(SourceInferenceError::Scope));
+    }
+    let type_ = match expect_null_args(&parts[2], "binder type")? {
+        [] => None,
+        [colon, type_] => {
+            expect_atom(colon, ":", "binder type ascription")?;
+            Some(type_)
+        }
+        _ => return Err(failure(SourceInferenceError::Scope)),
+    };
+    Ok(VariableBinder {
+        names,
+        type_,
+        style,
+        has_default: arity == 5 && !expect_null_args(&parts[3], "binder default")?.is_empty(),
+    })
+}
+
+fn rebuilt_binder(name: Syntax, type_: Option<&Syntax>, style: BinderInfo) -> Syntax {
+    let atom = |s: &str| Syntax::atom(fln_syntax::source::SourceInfo::None, s);
+    let null = |args| Syntax::node(Name::from_components(["null"]), args);
+    if style == BinderInfo::InstImplicit {
+        return Syntax::node(
+            parser_kind(&["Term", "instBinder"]),
+            vec![
+                atom("["),
+                null(vec![name, atom(":")]),
+                type_
+                    .expect("instance updates require a written type")
+                    .clone(),
+                atom("]"),
+            ],
+        );
+    }
+    let (kind, open, close) = match style {
+        BinderInfo::Default => ("explicitBinder", "(", ")"),
+        BinderInfo::Implicit => ("implicitBinder", "{", "}"),
+        BinderInfo::StrictImplicit => ("strictImplicitBinder", "⦃", "⦄"),
+        BinderInfo::InstImplicit => unreachable!("handled above"),
+    };
+    let mut args = vec![
+        atom(open),
+        null(vec![name]),
+        null(type_.map_or_else(Vec::new, |type_| vec![atom(":"), type_.clone()])),
+    ];
+    if style == BinderInfo::Default {
+        args.push(null(vec![]));
+    }
+    args.push(atom(close));
+    Syntax::node(parser_kind(&["Term", kind]), args)
+}
+
+impl Context {
+    /// `replaceBinderAnnotation` (vendored Lean/Elab/BuiltinCommand.lean): only
+    /// typeless binders update existing variables, and the latest declaration
+    /// of a name wins. Unmatched names remain ordinary new binders. Process all
+    /// updates before declaring that residue, as the pin's `flatMapM` does.
+    fn section_binder_updates(
+        &mut self,
+        syntax: &Syntax,
+    ) -> Result<Syntax, NatDefinitionElabError> {
+        let mut variables = self.source_scope.variables.clone();
+        let mut locals = self.txn.lctx.decls().to_vec();
+        let mut residue = Vec::new();
+        for incoming in expect_null_args(syntax, "declaration binders")? {
+            self.tick()?;
+            let binder = variable_binder(incoming)?;
+            let mut names = if binder.style == BinderInfo::InstImplicit
+                && binder.names.is_empty()
+                && let Some(name @ Syntax::Ident { .. }) = binder.type_
+            {
+                vec![name.clone()]
+            } else if binder.type_.is_none() && !binder.has_default {
+                binder.names.to_vec()
+            } else {
+                residue.push(incoming.clone());
+                continue;
+            };
+            let initial = names.len();
+            // Locate the same written occurrence in syntax and in the checked
+            // local context. Consume even unselected occurrences so shadowed
+            // names never change an older variable's identity or dependencies.
+            let mut positions: HashMap<Name, Vec<usize>> = HashMap::new();
+            for (index, local) in locals.iter().enumerate() {
+                self.tick()?;
+                positions
+                    .entry(local.user_name.clone())
+                    .or_default()
+                    .push(index);
+            }
+            for (command, _) in variables.commands.iter_mut().rev() {
+                let mut groups = expect_null_args(command, "stored variable binders")?.to_vec();
+                for group_index in (0..groups.len()).rev() {
+                    self.tick()?;
+                    let old = variable_binder(&groups[group_index])?;
+                    let mut replacements = Vec::new();
+                    let mut changed = false;
+                    for name in old.names.iter().rev() {
+                        self.tick()?;
+                        let Syntax::Ident { val, .. } = name else {
+                            replacements.push(rebuilt_binder(name.clone(), old.type_, old.style));
+                            continue;
+                        };
+                        let position = positions.get_mut(val).and_then(Vec::pop);
+                        let selected = names.iter().position(|candidate| {
+                            matches!(candidate, Syntax::Ident { val: target, .. } if target == val)
+                        });
+                        let style = if let Some(selected) = selected {
+                            if old.has_default {
+                                return Err(error(ScopeError::VariableBinderUpdateWithDefault));
+                            }
+                            if old.style == binder.style {
+                                return Err(error(ScopeError::RedundantVariableBinderUpdate));
+                            }
+                            let position =
+                                position.ok_or_else(|| failure(SourceInferenceError::Scope))?;
+                            if binder.style == BinderInfo::InstImplicit {
+                                if old.type_.is_none() {
+                                    return Err(error(
+                                        ScopeError::InstanceBinderUpdateWithoutType(val.clone()),
+                                    ));
+                                }
+                                self.validate_instance_binder(&locals[position].type_)?;
+                            }
+                            names.remove(selected);
+                            locals[position].binder_info = binder.style;
+                            changed = true;
+                            binder.style
+                        } else {
+                            old.style
+                        };
+                        replacements.push(rebuilt_binder(name.clone(), old.type_, style));
+                    }
+                    if changed {
+                        replacements.reverse();
+                        groups.splice(group_index..=group_index, replacements);
+                    }
+                }
+                *command = Syntax::node(Name::from_components(["null"]), groups);
+            }
+            if names.len() == initial {
+                residue.push(incoming.clone());
+            } else {
+                if binder.style == BinderInfo::InstImplicit && !names.is_empty() {
+                    return Err(failure(SourceInferenceError::Scope));
+                }
+                residue.extend(
+                    names
+                        .into_iter()
+                        .map(|name| rebuilt_binder(name, None, binder.style)),
+                );
+            }
+        }
+        let mut lctx = LocalContext::new();
+        for local in locals {
+            lctx.add_param(local.id, local.user_name, local.type_, local.binder_info);
+        }
+        self.txn.lctx = lctx.clone();
+        variables.locals = lctx;
+        self.source_scope.variables = variables;
+        Ok(Syntax::node(Name::from_components(["null"]), residue))
     }
 }
 
@@ -108,22 +324,22 @@ fn elaborate_command(
     let mut context = Context::scoped(env, kernel, scope);
     context.declare_levels(&Syntax::node(Name::from_components(["null"]), vec![]))?;
     context.infer_level_params = true;
+    let syntax = if kernel_check {
+        context.section_binder_updates(syntax)?
+    } else {
+        // Stored commands already contain only declaration residue, with the
+        // latest annotations substituted at their original binder positions.
+        syntax.clone()
+    };
     // Auto-bound implicits become implicit variables of their own, included where used, as at the
     // pin (`@r : ∀ {α : Sort u_1} (R : α → α → Prop) (x : α), …` after `variable (R : α → α → Prop)`).
     let (autos, written) =
-        context.with_auto_bound_implicits(&[], |context| context.bind_parameters(syntax))?;
+        context.with_auto_bound_implicits(&[], |context| context.bind_parameters(&syntax))?;
     context.refuse_auto_bound_dependencies(&autos, &written)?;
     if context.txn.lctx.len() > MAX_SECTION_VARIABLES {
         return Err(failure(SourceInferenceError::ResourceLimit));
     }
-    let mut names = HashSet::new();
     let mut locals = context.txn.lctx.decls().to_vec();
-    for local in &locals {
-        context.tick()?;
-        if !names.insert(local.user_name.clone()) {
-            return Err(error(ScopeError::InvalidName));
-        }
-    }
     let types: Vec<_> = locals.iter().map(|local| local.type_.clone()).collect();
     context.generalize_declaration_universes(&types)?;
     for local in &mut locals {
@@ -171,8 +387,10 @@ fn elaborate_command(
     for local in locals {
         lctx.add_param(local.id, local.user_name, local.type_, local.binder_info);
     }
-    let mut commands = scope.variables.commands.clone();
-    commands.push((syntax.clone(), lctx.len()));
+    let mut commands = context.source_scope.variables.commands.clone();
+    // Even an update-only command consumes the temporary telescope-check name
+    // above. Replay its empty residue too, so later variables keep their IDs.
+    commands.push((syntax, lctx.len()));
     Ok(SectionVariables {
         locals: lctx,
         next: context.next,
@@ -419,5 +637,29 @@ mod tests {
         assert!(vars.included.is_empty());
         vars.select(&[name], true).unwrap();
         assert_eq!(vars, before);
+    }
+
+    #[test]
+    fn include_selects_the_first_occurrence_and_omit_selects_all_occurrences() {
+        let name = Name::from_components(["h"]);
+        let first = FVarId(Name::from_components(["section", "first"]));
+        let last = FVarId(Name::from_components(["section", "last"]));
+        let mut vars = SectionVariables::default();
+        for id in [&first, &last] {
+            vars.locals.add_param(
+                id.clone(),
+                name.clone(),
+                Expr::sort(Level::zero()),
+                BinderInfo::Default,
+            );
+        }
+        vars.select(std::slice::from_ref(&name), true).unwrap();
+        assert_eq!(vars.included, HashSet::from([first.clone()]));
+        vars.select(std::slice::from_ref(&name), false).unwrap();
+        assert_eq!(vars.omitted, HashSet::from([first.clone(), last.clone()]));
+        assert!(vars.included.is_empty());
+        vars.select(&[name], true).unwrap();
+        assert_eq!(vars.included, HashSet::from([first]));
+        assert_eq!(vars.omitted, HashSet::from([last]));
     }
 }

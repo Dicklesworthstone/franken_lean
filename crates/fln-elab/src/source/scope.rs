@@ -155,6 +155,9 @@ pub enum ScopeError {
     UnknownVariable(Name),
     OmittedVariable(Name),
     VariableSelectionLimit,
+    RedundantVariableBinderUpdate,
+    VariableBinderUpdateWithDefault,
+    InstanceBinderUpdateWithoutType(Name),
     /// `protected` on an atomic name in the root namespace (the pin's `mkDeclName`).
     ProtectedOutsideNamespace,
     PrivateShadowsPublic(Name),
@@ -187,6 +190,18 @@ impl std::fmt::Display for ScopeError {
                 name.to_display_string()
             ),
             Self::VariableSelectionLimit => write!(f, "section variable selection limit exceeded"),
+            Self::RedundantVariableBinderUpdate => {
+                write!(f, "redundant binder annotation update")
+            }
+            Self::VariableBinderUpdateWithDefault => write!(
+                f,
+                "cannot update binder annotation of variables with default values/tactics"
+            ),
+            Self::InstanceBinderUpdateWithoutType(name) => write!(
+                f,
+                "cannot update binder annotation of variable `{}` to instance implicit:\nvariable was originally declared without an explicit type",
+                name.to_display_string()
+            ),
             Self::ProtectedOutsideNamespace => {
                 write!(f, "protected declarations must be in a namespace")
             }

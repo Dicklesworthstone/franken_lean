@@ -136,7 +136,6 @@ fn variable_types_are_checked_even_without_subsequent_declarations() {
     for source in [
         "variable (x : 7)",
         "variable (A : Type) (x : A) (bad : x)",
-        "variable (x : Nat) (x : Bool)",
         "variable (x : Missing)",
         "variable [bad : Nat]",
         "variable (x : _)",
@@ -178,6 +177,225 @@ theorem escapedWorks : Outer.escaped 8 = 8 := by rfl"#,
         vec![(n("x"), BinderInfo::Default)]
     );
     assert_eq!(binders(&e, "Outer.shadow").len(), 1);
+}
+
+/// `replaceBinderAnnotation` changes the earlier declaration, not the local's
+/// identity or the declarations already closed over it. This covers all three
+/// ordinary binder styles, a partial group update, and restoration at `end`.
+#[test]
+fn section_binder_updates_preserve_dependencies_and_lexical_lifetimes() {
+    let e = checked(
+        &engine(),
+        r#"section
+variable (A B : Type) (a : A) (b : B)
+def beforeUpdate := a
+variable {A}
+def afterUpdate := a
+def untouched := b
+section
+variable ⦃A⦄
+def strictUpdate := a
+end
+def restoredImplicit := a
+variable (A) {B}
+def restoredExplicit := a
+def otherUpdate := b
+end
+theorem firstWorks : beforeUpdate Nat 7 = 7 := rfl
+theorem secondWorks : afterUpdate 8 = 8 := rfl
+theorem strictWorks : strictUpdate 9 = 9 := rfl
+theorem restoredWorks : restoredExplicit Nat 10 = 10 := rfl"#,
+    );
+    for (name, parameter, value, style) in [
+        ("beforeUpdate", "A", "a", BinderInfo::Default),
+        ("afterUpdate", "A", "a", BinderInfo::Implicit),
+        ("untouched", "B", "b", BinderInfo::Default),
+        ("strictUpdate", "A", "a", BinderInfo::StrictImplicit),
+        ("restoredImplicit", "A", "a", BinderInfo::Implicit),
+        ("restoredExplicit", "A", "a", BinderInfo::Default),
+        ("otherUpdate", "B", "b", BinderInfo::Implicit),
+    ] {
+        assert_eq!(
+            binders(&e, name),
+            [(n(parameter), style), (n(value), BinderInfo::Default)],
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn section_instance_binder_updates_change_generalized_calling_conventions() {
+    let e = checked(
+        &engine(),
+        r#"class SectionPick (A : Type) where
+  value : A
+section
+variable (A : Type) (inst : SectionPick A)
+variable [inst]
+def selected : A := SectionPick.value
+variable {inst}
+def explicitSelection : A := @SectionPick.value A inst
+end
+theorem explicitSelectionWorks : @explicitSelection Nat (SectionPick.mk 17) = 17 := rfl"#,
+    );
+    assert_eq!(
+        binders(&e, "selected"),
+        [
+            (n("A"), BinderInfo::Default),
+            (n("inst"), BinderInfo::InstImplicit)
+        ]
+    );
+    assert_eq!(
+        binders(&e, "explicitSelection"),
+        [
+            (n("A"), BinderInfo::Default),
+            (n("inst"), BinderInfo::Implicit)
+        ]
+    );
+}
+
+#[test]
+fn new_variables_after_annotation_updates_keep_replay_identities() {
+    let e = checked(
+        &engine(),
+        r#"section
+variable (A : Type)
+variable {A}
+variable (a : A)
+def afterNewVariable := a
+variable (A)
+variable ⦃A⦄
+variable (b : A)
+def afterTwoUpdates := b
+end
+section
+variable (A : Type) (a : A)
+variable {A B} (b : B)
+def residueOld := a
+def residueNew := b
+end
+theorem firstIdentity : afterNewVariable 23 = 23 := rfl
+theorem secondIdentity : afterTwoUpdates 29 = 29 := rfl"#,
+    );
+    assert_eq!(
+        binders(&e, "afterNewVariable"),
+        [
+            (n("A"), BinderInfo::Implicit),
+            (n("a"), BinderInfo::Default)
+        ]
+    );
+    assert_eq!(
+        binders(&e, "afterTwoUpdates"),
+        [
+            (n("A"), BinderInfo::StrictImplicit),
+            (n("b"), BinderInfo::Default)
+        ]
+    );
+    assert_eq!(
+        binders(&e, "residueOld"),
+        [
+            (n("A"), BinderInfo::Implicit),
+            (n("a"), BinderInfo::Default)
+        ]
+    );
+    assert_eq!(
+        binders(&e, "residueNew"),
+        [
+            (n("B"), BinderInfo::Implicit),
+            (n("b"), BinderInfo::Default)
+        ]
+    );
+}
+
+#[test]
+fn section_shadowing_keeps_old_dependencies_and_updates_only_the_latest_name() {
+    let e = checked(
+        &engine(),
+        r#"section
+variable (A : Type) (a : A)
+variable (A : Type) (b : A)
+variable {A}
+def older := a
+def newer := b
+end
+section
+variable (x : Nat) (h : x = x)
+variable (x : Bool)
+def latest := x
+theorem oldProof : h = h := rfl
+end
+section
+variable (x : Nat) (x : Bool)
+def sameCommand := x
+end
+section
+variable (p q : Prop) (h : p)
+variable (h : q)
+include h
+theorem includedHypothesis : p := h
+end
+theorem oldWorks : older Nat 17 = 17 := rfl
+theorem newWorks : newer 19 = 19 := rfl
+theorem latestWorks : latest true = true := rfl
+theorem sameCommandWorks : sameCommand false = false := rfl"#,
+    );
+    assert_eq!(
+        binders(&e, "older"),
+        [(n("A"), BinderInfo::Default), (n("a"), BinderInfo::Default)]
+    );
+    assert_eq!(
+        binders(&e, "newer"),
+        [
+            (n("A"), BinderInfo::Implicit),
+            (n("b"), BinderInfo::Default)
+        ]
+    );
+    assert_eq!(
+        binders(&e, "oldProof"),
+        [(n("x"), BinderInfo::Default), (n("h"), BinderInfo::Default)]
+    );
+    assert_eq!(
+        binders(&e, "includedHypothesis"),
+        [(n("p"), BinderInfo::Default), (n("h"), BinderInfo::Default)]
+    );
+    for name in ["latest", "sameCommand"] {
+        let type_ = &e.environment().find(&n(name)).unwrap().constant_val().type_;
+        assert!(
+            matches!(type_.node(), ExprNode::ForallE { binder_type, .. }
+                if matches!(binder_type.node(), ExprNode::Const { name, .. } if name == &n("Bool"))),
+            "{name} must use the latest Bool binder"
+        );
+    }
+}
+
+#[test]
+fn invalid_section_binder_updates_are_atomic() {
+    let base = engine();
+    let before = base.logical_root(&KVMap::new());
+    for (source, expected) in [
+        (
+            "variable (A : Type)\nvariable (A)",
+            "redundant binder annotation update",
+        ),
+        (
+            "variable {A : Type}\nvariable {A}",
+            "redundant binder annotation update",
+        ),
+        (
+            "variable (x : Nat)\nvariable [x]",
+            "instance binder must end in a registered class",
+        ),
+        (
+            "class SectionPick where\n  value : Nat\nvariable (inst) (h : @Eq SectionPick inst inst)\nvariable [inst]",
+            "variable was originally declared without an explicit type",
+        ),
+    ] {
+        let error = base
+            .check_source_files(&[source.as_bytes()], &KVMap::new(), limits())
+            .expect_err(source);
+        assert!(error.to_string().contains(expected), "{source}: {error}");
+        assert_eq!(base.logical_root(&KVMap::new()), before);
+    }
 }
 
 /// The pin keeps a `variable` command's syntax and elaborates it again in each declaration. After
