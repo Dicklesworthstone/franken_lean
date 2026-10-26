@@ -13,9 +13,9 @@
 # test binaries. Raise it when the measured count rises; lowering it needs the
 # reason in the commit that does it.
 #
-# What this does NOT run: the pinned Reference toolchain is not installed here,
-# so pin-dependent suites take their typed SKIP (contract-drift.yml is the
-# weekly lane that installs the pin and holds those to account).
+# The SUITE.lock Reference supplies artifacts and the differential oracle for
+# imported-source tests. A missing pin must fail setup rather than turn those
+# tests into skips or leave mandatory installed-command tests without inputs.
 
 name: product gate
 
@@ -69,6 +69,41 @@ jobs:
       - name: clippy (workspace, all targets, warnings denied)
         if: ${{ !cancelled() }}
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: install and verify the SUITE.lock Reference for source tests
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tool_root="$RUNNER_TEMP/product-elan-bin"
+          archive="$RUNNER_TEMP/product-elan.tar.gz"
+          mkdir "$tool_root"
+          curl --user-agent 'franken_lean-agent (+https://github.com/Dicklesworthstone/franken_lean)' \
+            --fail --location --retry 3 --output "$archive" \
+            https://github.com/leanprover/elan/releases/download/v4.2.1/elan-x86_64-unknown-linux-gnu.tar.gz
+          printf '%s  %s\n' \
+            4e717523217af592fa2d7b9c479410a31816c065d66ccbf0c2149337cfec0f5c \
+            "$archive" | sha256sum --check
+          tar -xzf "$archive" -C "$tool_root"
+          export ELAN_HOME="$HOME/.elan"
+          "$tool_root/elan-init" -y --no-modify-path --default-toolchain none
+          export PATH="$ELAN_HOME/bin:$PATH"
+          mapfile -t reference_rows < <(grep -E '^reference ' SUITE.lock)
+          test "${#reference_rows[@]}" -eq 1
+          pin_tag="$(sed -nE 's/.* tag=([^ ]+).*/\1/p' <<<"${reference_rows[0]}")"
+          pin_commit="$(sed -nE 's/.* commit=([0-9a-f]{40}).*/\1/p' <<<"${reference_rows[0]}")"
+          [[ "$pin_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$ ]]
+          test -n "$pin_commit"
+          elan toolchain install "leanprover/lean4:$pin_tag"
+          elan default "leanprover/lean4:$pin_tag"
+          toolchain_root="$ELAN_HOME/toolchains/leanprover--lean4---$pin_tag"
+          test "$("$toolchain_root/bin/lean" --githash)" = "$pin_commit"
+          for suffix in olean olean.server olean.private; do
+            test -s "$toolchain_root/lib/lean/Init/Prelude.$suffix"
+            test -s "$toolchain_root/lib/lean/Init/Data/Repr.$suffix"
+          done
+          printf 'ELAN_HOME=%s\nFLN_REFERENCE_LIB=%s/lib/lean\nFLN_REFERENCE_LEAN=%s/bin/lean\nFLN_REQUIRE_REFERENCE=1\n' \
+            "$ELAN_HOME" "$toolchain_root" "$toolchain_root" >> "$GITHUB_ENV"
+          printf '%s\n' "$ELAN_HOME/bin" >> "$GITHUB_PATH"
       - name: test (workspace, no fail-fast)
         if: ${{ !cancelled() }}
         # Six tests are skipped here BY NAME, and only these; each name is unique
