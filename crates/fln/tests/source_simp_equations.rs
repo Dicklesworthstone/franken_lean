@@ -1,12 +1,13 @@
 //! Lazy equation theorems retain ordinary admission evidence at every source door.
 #![forbid(unsafe_code)]
 
-use fln::execution::SourceProgramLimits;
-use fln::source_check::modules::{SourceModuleCacheLimits, SourceModuleCheckLimits};
+use fln::source_check::modules::execution::SourceProgramLimits;
+use fln::source_check::modules::{
+    SourceModuleCacheLimits, SourceModuleCheckLimits, SourceModuleSession,
+};
 use fln::{
     Budget, CheckerAdmissionBudget, DataValue, Declaration, Engine, EngineAdmissionLimits,
     EngineExecutionLimits, KVMap, Name, Outcome, SourceCheckLimits, SourceModuleInput,
-    SourceModuleSession,
 };
 use fln_elab::source::scope::simp;
 
