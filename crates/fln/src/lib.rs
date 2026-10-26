@@ -9143,6 +9143,26 @@ impl Engine {
                         message: unused_variables::message(&unused.name),
                     }));
                 }
+                // `linter.checkUnivs`, after the unused-variables warnings and before
+                // `linter.defProp`, as the pin runs them; like every linter, not after an error.
+                if !errored {
+                    for (_, declaration) in linted.iter().filter(|(index, _)| *index == command) {
+                        for (name, type_) in universe_linted(declaration) {
+                            match linters::universes_only_together(syntax, name, type_, options) {
+                                Ok(lint) => lints.extend(lint),
+                                Err(feature) => {
+                                    return Err(EngineExecutionError::BatchCommand {
+                                        index: command,
+                                        error: Box::new(EngineExecutionError::NotImplemented {
+                                            feature,
+                                        }),
+                                        at: Some(fln_parse::BytePos(offset.0)),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
                 if let Some((name, type_, _, abbreviation)) = declared {
                     lints.extend(linters::definition_is_proposition(
                         syntax,
@@ -13228,6 +13248,34 @@ fn declaration_reducibility_warnings(
 
 /// The admitted type and value `command` declares: the declaration named by its `declId`
 /// (an `example` has one declaration), or `None` when that is not determined.
+/// The declarations a command names, each with its type, as `getNewDecls` finds them (vendored
+/// `Lean/Linter/Util.lean:68-76`): every admitted definition, theorem, opaque and axiom, and an
+/// inductive block's types and constructors, not its recursors.
+fn universe_linted(declaration: &Declaration) -> Vec<(&Name, &Expr)> {
+    match declaration {
+        Declaration::Axiom(value) => vec![(&value.base.name, &value.base.type_)],
+        Declaration::Defn(value) => vec![(&value.base.name, &value.base.type_)],
+        Declaration::Thm(value) => vec![(&value.base.name, &value.base.type_)],
+        Declaration::Opaque(value) => vec![(&value.base.name, &value.base.type_)],
+        Declaration::Mutual(values) => values
+            .iter()
+            .map(|value| (&value.base.name, &value.base.type_))
+            .collect(),
+        Declaration::Inductive(block) => block
+            .types
+            .iter()
+            .map(|value| (&value.base.name, &value.base.type_))
+            .chain(
+                block
+                    .ctors
+                    .iter()
+                    .map(|value| (&value.base.name, &value.base.type_)),
+            )
+            .collect(),
+        Declaration::Quotient(_) => Vec::new(),
+    }
+}
+
 fn linted_declaration<'a>(
     command: &fln_syntax::tree::Syntax,
     declarations: &[(usize, &'a Declaration)],

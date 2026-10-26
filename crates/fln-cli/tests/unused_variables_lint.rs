@@ -177,6 +177,29 @@ structure D :=
   y : Nat
 ";
 
+/// `linter.checkUnivs`: universe parameters that occur only together in a `max`, never alone, in
+/// a definition's, a theorem's, a structure's and an inductive type's own type, between the
+/// unused-variables warnings and `linter.defProp` of the same command, as at the pin. Each
+/// parameter alone somewhere (`good`), or beside one that is (`dominated`), is no warning;
+/// `set_option linter.checkUnivs false in` silences one command (upstream `783`, `9541` and
+/// `linterCheckUnivs`).
+const UNIVERSES: &str = "universe u v
+def badProp (α : Type (max u v)) (x : Nat) : True := trivial
+structure S where
+  {α : Type u}
+  {β : Type v}
+  a : α
+  b : β
+inductive I.{a, b} : Type (max a b)
+  | A
+set_option linter.checkUnivs false in
+inductive J.{a, b} : Type (max a b)
+  | A
+theorem thm (_ : Type (max u v)) : True := trivial
+def good (α : Type u) (β : Type v) : Type (max u v) := Prod α β
+def dominated (α : Type u) (β : Type (max u v)) : Type (max u v) := Prod α β
+";
+
 /// Binders under no `fun` in the source: a subtype's and a structure-instance field's, linted
 /// even with `funArgs` off; a named argument's name, which is no reference to a local of that
 /// name; and the `fun` binders of a `mutual` block's members.
@@ -255,6 +278,7 @@ const IDENTICAL: &[(&str, &str)] = &[
     ("indexed_unaliased", INDEXED_UNALIASED),
     ("functions", FUNCTIONS),
     ("deprecated_and_def_prop", DEPRECATED_AND_DEF_PROP),
+    ("universes", UNIVERSES),
     // A structure instance's field name given a value (`x := 3`) does not read a local `x`; a
     // field abbreviation (`{ x }`) does.
     (
@@ -435,6 +459,9 @@ fn signature_binder_warnings_match_the_pin_and_are_never_invented() {
             "{ours}"
         );
     }
+    // The universes program exercises `linter.checkUnivs` four times and silences it once.
+    let (ours, _) = outputs(&lib, &root, "universes", UNIVERSES);
+    assert_eq!(ours.matches("only occur together").count(), 4, "{ours}");
     for (name, program) in SUBSET {
         let (ours, pinned) = outputs(&lib, &root, name, program);
         let pinned = messages(&pinned);

@@ -7,7 +7,8 @@
 //! The unused-variables linter has its own module.
 use crate::unused_variables::{linter_value, parser_kind};
 use fln_core::expr::{Expr, ExprNode};
-use fln_core::name::Name;
+use fln_core::level::{Level, LevelView};
+use fln_core::name::{LeafView, Name};
 use fln_core::options::KVMap;
 use fln_elab::reducibility::Reducibility;
 use fln_syntax::source::SourceInfo;
@@ -157,6 +158,156 @@ pub(crate) fn definition_is_proposition(
             name.to_display_string()
         ),
     })
+}
+
+/// The parameters of `level`, in the order `CollectLevelParams.visitLevel` first meets them
+/// (vendored `Lean/Util/CollectLevelParams.lean`): left to right, each once.
+fn level_params(level: &Level, params: &mut Vec<Name>) {
+    match level.view() {
+        LevelView::Succ(inner) => level_params(inner, params),
+        LevelView::Max(left, right) | LevelView::IMax(left, right) => {
+            level_params(left, params);
+            level_params(right, params);
+        }
+        LevelView::Param(name) => {
+            if !params.contains(name) {
+                params.push(name.clone());
+            }
+        }
+        LevelView::Zero | LevelView::MVar(_) => {}
+    }
+}
+
+/// `univParamsGrouped` (vendored `Lean/Linter/CheckUnivs.lean:43-55`): the parameters of every
+/// level in `type_`, a `Sort`'s or a constant's universe argument, one group per level, skipping
+/// `name`'s own `proof_*` auxiliaries. Distinct groups, in first-seen order.
+fn level_groups(type_: &Expr, name: &Name) -> Vec<Vec<Name>> {
+    let mut groups: Vec<Vec<Name>> = Vec::new();
+    let mut insert = |level: &Level| {
+        let mut params = Vec::new();
+        level_params(level, &mut params);
+        if !groups.contains(&params) {
+            groups.push(params);
+        }
+    };
+    let mut visited = std::collections::HashSet::new();
+    let mut pending = vec![type_];
+    while let Some(expr) = pending.pop() {
+        if !visited.insert(expr) {
+            continue;
+        }
+        match expr.node() {
+            ExprNode::Sort { level } => insert(level),
+            ExprNode::Const {
+                name: constant,
+                levels,
+            } => {
+                let auxiliary = constant.parent() == *name
+                    && matches!(constant.leaf_view(), LeafView::Str(leaf) if leaf.starts_with("proof_"));
+                if !auxiliary {
+                    levels.iter().for_each(&mut insert);
+                }
+            }
+            ExprNode::App { f, a } => pending.extend([f, a]),
+            ExprNode::Lam {
+                binder_type, body, ..
+            }
+            | ExprNode::ForallE {
+                binder_type, body, ..
+            } => pending.extend([binder_type, body]),
+            ExprNode::LetE {
+                type_, value, body, ..
+            } => pending.extend([type_, value, body]),
+            ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => pending.push(expr),
+            ExprNode::BVar { .. }
+            | ExprNode::FVar { .. }
+            | ExprNode::MVar { .. }
+            | ExprNode::Lit { .. } => {}
+        }
+    }
+    groups
+}
+
+/// `badParams` (vendored `Lean/Linter/CheckUnivs.lean:57-69`): a parameter is good where a group
+/// holds it alone, or (recursively) only beside good ones; the rest of the groups' parameters are
+/// bad, flattened in group order. The pin keeps the groups in a hash set, so their order is the
+/// set's: `None` where two orders of the groups would print the bad parameters differently.
+fn bad_params(mut groups: Vec<Vec<Name>>) -> Option<Vec<Name>> {
+    loop {
+        let good: Vec<Name> = groups
+            .iter()
+            .filter_map(|group| match group.as_slice() {
+                [only] => Some(only.clone()),
+                _ => None,
+            })
+            .collect();
+        if good.is_empty() {
+            break;
+        }
+        for group in &mut groups {
+            group.retain(|param| !good.contains(param));
+        }
+    }
+    let flatten = |groups: &[&Vec<Name>]| {
+        let mut bad: Vec<Name> = Vec::new();
+        for param in groups.iter().flat_map(|group| group.iter()) {
+            if !bad.contains(param) {
+                bad.push(param.clone());
+            }
+        }
+        bad
+    };
+    let remaining: Vec<&Vec<Name>> = groups.iter().filter(|group| !group.is_empty()).collect();
+    let bad = flatten(&remaining);
+    // Every order of the remaining groups must flatten alike. Two groups are compared in both
+    // orders; more than two that are not all one order of the same parameters are refused.
+    let unordered = match remaining.as_slice() {
+        [] | [_] => false,
+        [first, second] => flatten(&[second, first]) != bad,
+        _ => remaining.iter().any(|group| **group != bad),
+    };
+    (!unordered).then_some(bad)
+}
+
+/// `linter.checkUnivs` (vendored `Lean/Linter/CheckUnivs.lean:71-87`): a declaration whose type
+/// has universe parameters that occur only together, never alone, warns at the command. `Err`
+/// where the pin's message depends on what this door does not reproduce: the order of its hash
+/// set (`bad_params`) or a private name's displayed form.
+pub(crate) fn universes_only_together(
+    command: &Syntax,
+    name: &Name,
+    type_: &Expr,
+    options: &KVMap,
+) -> Result<Option<Lint>, &'static str> {
+    if !linter_value(options, &["linter", "checkUnivs"]) {
+        return Ok(None);
+    }
+    let Some(bad) = bad_params(level_groups(type_, name)) else {
+        return Err("`linter.checkUnivs` over levels the pin orders by its hash set");
+    };
+    if bad.is_empty() {
+        return Ok(None);
+    }
+    if crate::pretty::is_private(name) {
+        return Err("`linter.checkUnivs` for a private declaration");
+    }
+    let universes = bad
+        .iter()
+        .map(|param| format!("`{}`", param.to_display_string()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let Some(at) = first_position(command) else {
+        return Ok(None);
+    };
+    Ok(Some(Lint {
+        at,
+        message: format!(
+            "`{}`: universes {universes} only occur together. This usually means there is a \
+             `max` expression in the type where none of these universes appear on their own.\n\n\
+             Note: This linter can be disabled with `set_option linter.checkUnivs false`",
+            name.to_display_string()
+        ),
+    }))
 }
 
 /// Whether a constant's type ends in `Prop`, i.e. its full application is a proposition.
@@ -414,4 +565,63 @@ pub(crate) fn deprecation_message(
         }
     }
     Ok(Some(message))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn names(params: &[&str]) -> Vec<Name> {
+        params
+            .iter()
+            .map(|param| Name::from_components([*param]))
+            .collect()
+    }
+
+    #[test]
+    fn bad_params_are_the_pins_bad_params() {
+        // `max u v` alone: both bad, in the level's order.
+        assert_eq!(
+            bad_params(vec![names(&["u", "v"])]),
+            Some(names(&["u", "v"]))
+        );
+        // `u` alone somewhere, so `max u v` is fine (`goodUnivsDominated`).
+        assert_eq!(
+            bad_params(vec![names(&["u"]), names(&["u", "v"])]),
+            Some(Vec::new())
+        );
+        // Each alone somewhere.
+        assert_eq!(
+            bad_params(vec![names(&["u"]), names(&["v"]), names(&["u", "v"])]),
+            Some(Vec::new())
+        );
+        // A good parameter is removed, then the rest are judged again.
+        assert_eq!(
+            bad_params(vec![names(&["u"]), names(&["u", "v", "w"])]),
+            Some(names(&["v", "w"]))
+        );
+        // Levels without parameters (`Sort 0`) contribute nothing.
+        assert_eq!(bad_params(vec![Vec::new()]), Some(Vec::new()));
+        // Two levels naming the bad parameters in different orders: the pin's hash set decides.
+        assert_eq!(
+            bad_params(vec![names(&["u", "v"]), names(&["v", "u"])]),
+            None
+        );
+    }
+
+    #[test]
+    fn level_groups_read_sorts_and_constant_levels_but_not_proof_auxiliaries() {
+        let max = Level::max(
+            Level::param(Name::from_components(["u"])),
+            Level::param(Name::from_components(["v"])),
+        )
+        .unwrap();
+        let sort = Expr::sort(max.clone());
+        let name = Name::from_components(["f"]);
+        assert_eq!(level_groups(&sort, &name), vec![names(&["u", "v"])]);
+        let auxiliary = Expr::const_(Name::str(name.clone(), "proof_1"), vec![max.clone()]);
+        assert_eq!(level_groups(&auxiliary, &name), Vec::<Vec<Name>>::new());
+        let other = Expr::const_(Name::from_components(["g"]), vec![max]);
+        assert_eq!(level_groups(&other, &name), vec![names(&["u", "v"])]);
+    }
 }

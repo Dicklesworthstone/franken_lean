@@ -618,7 +618,7 @@ fn ofnat_literal(e: &Expr) -> bool {
 }
 
 /// Whether `name` is private (`isPrivateName`): its root component is `_private`.
-fn is_private(name: &Name) -> bool {
+pub(crate) fn is_private(name: &Name) -> bool {
     let mut root = name.clone();
     while !root.parent().is_anonymous() {
         root = root.parent();

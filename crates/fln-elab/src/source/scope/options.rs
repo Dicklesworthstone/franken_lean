@@ -357,11 +357,12 @@ pub const ROWS: &[Row] = &[
         "Lean/Linter/List.lean:40",
         Silent,
     ),
+    // Read by the source executor's `linter.checkUnivs` (`fln::linters`).
     row(
         "linter.checkUnivs",
         Bool(true),
         "Lean/Linter/CheckUnivs.lean:29",
-        Silent,
+        Honored,
     ),
     // Read by the source executor: a declaration that uses `sorry` warns while it is true.
     row("warn.sorry", Bool(true), "Lean/AddDecl.lean:69", Honored),
@@ -1006,8 +1007,8 @@ mod tests {
         // `autoImplicit`: `auto_bound_name` (source.rs); `source_auto_bound_implicits` sets it false.
         // `Elab.async`: the names `native_decide` gives its axioms (source.rs,
         // tactics/decision.rs); `source_native_decide` sets it false.
-        // `linter.*`: the unused-variables, deprecated-syntax and defProp warnings (`fln`,
-        // `unused_variables.rs` and `linters.rs`); `unused_variables_lint` sets each one.
+        // `linter.*`: the unused-variables, deprecated-syntax, defProp and checkUnivs warnings
+        // (`fln`, `unused_variables.rs` and `linters.rs`); `unused_variables_lint` sets each one.
         // `warn.sorry`: the source executor's "declaration uses `sorry`" warning (`fln`,
         // `execute_source_command_stream`); `sorry_is_admitted_with_the_pins_warnings` sets it false.
         // `warn.classDefReducibility`: the class-typed `def` warning (`fln`, `linters.rs`);
@@ -1042,6 +1043,7 @@ mod tests {
                 "linter.defProp",
                 "linter.unusedVariables.funArgs",
                 "linter.unusedVariables.patternVars",
+                "linter.checkUnivs",
                 "warn.sorry",
                 "warn.classDefReducibility",
                 "pp.all",
