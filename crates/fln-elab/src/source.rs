@@ -2365,6 +2365,26 @@ impl Context {
                                         ),
                                         None => None,
                                     };
+                                    // The pin's block always builds `pure` for its result
+                                    // (`DoElemCont.mkPure`, then `mkBindUnlessPure`, vendored
+                                    // `Lean/Elab/Do/Basic.lean:272-302, 512-525`). That asks for a
+                                    // `Pure m` instance even where the bind is then contracted away,
+                                    // so a block at a monad without one is refused there.
+                                    if let Some(application) = &expected
+                                        && let Some(monad) = self.do_monad(application)?
+                                    {
+                                        let pure = self.do_operation(false, Some(monad))?;
+                                        let type_ = self.whnf(&pure.type_)?;
+                                        let ExprNode::ForallE {
+                                            binder_type,
+                                            binder_info: BinderInfo::InstImplicit,
+                                            ..
+                                        } = type_.node()
+                                        else {
+                                            return Err(failure(SourceInferenceError::Scope));
+                                        };
+                                        self.instance_hole(binder_type.clone())?;
+                                    }
                                     tasks.push(Task::Visit(body, expected, finish));
                                     continue;
                                 }

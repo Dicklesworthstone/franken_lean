@@ -71,6 +71,8 @@ fn source_environment() -> Option<Environment> {
         let decoded = metadata::decode(&blocks, metadata::DecodeLimits::default()).unwrap();
         let classes: &[&str] = if module == "Init/Prelude" {
             &[
+                "Pure",
+                "Applicative",
                 "Bind",
                 "Monad",
                 "MonadExceptOf",
@@ -83,6 +85,8 @@ fn source_environment() -> Option<Environment> {
         };
         let instances: &[&str] = if module == "Init/Prelude" {
             &[
+                "Applicative.toPure",
+                "Monad.toApplicative",
                 "Monad.toBind",
                 "instMonadExceptOfMonadExceptOf",
                 "instMonadLiftTOfMonadLift",
