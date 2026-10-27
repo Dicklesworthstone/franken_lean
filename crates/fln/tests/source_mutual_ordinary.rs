@@ -32,6 +32,133 @@ fn forward_definitions_reduce_after_dependency_ordered_admission() {
         "mutual\n def first : Nat := second + 1\n def second : Nat := 41\nend\nexample : first = 42 := rfl\n",
     );
 }
+
+#[test]
+fn mutual_structural_members_reduce_and_execute_their_own_components() {
+    use fln_env::constants::{ConstantInfo, DefinitionSafety};
+    let base = check(
+        "mutual\n\
+         def countLeft : Nat -> Nat\n | 0 => 7\n | n+1 => countRight n + 1\n\
+         def countRight : Nat -> Nat\n | 0 => 13\n | n+1 => countLeft n + 2\n\
+         end\n\
+         example : countLeft 4 = 13 := rfl\n\
+         example : countRight 4 = 19 := rfl\n\
+         example (n : Nat) : countLeft (n+1) = countRight n + 1 := rfl\n",
+    );
+    for label in ["countLeft", "countRight"] {
+        let Some(ConstantInfo::Defn(definition)) = base.environment().find(&name(label)) else {
+            panic!("checked structural definition");
+        };
+        assert_eq!(definition.safety, DefinitionSafety::Safe);
+        assert!(!definition.value.has_fvar());
+        assert!(!definition.value.has_loose_bvars());
+        let Some(ConstantInfo::Defn(companion)) = base
+            .environment()
+            .find(&name(&format!("{label}._unsafe_rec")))
+        else {
+            panic!("executable companion");
+        };
+        assert_eq!(companion.safety, DefinitionSafety::Partial);
+    }
+    run(&base, "#eval countLeft 4", "13");
+    run(&base, "#eval countRight 4", "19");
+}
+
+#[test]
+fn mutual_structural_product_preserves_distinct_member_result_types() {
+    check(
+        "mutual\n\
+         def count : Nat -> Nat\n | 0 => 7\n | n+1 => match flag n with | true => 1 | false => 0\n\
+         def flag : Nat -> Bool\n | 0 => false\n | n+1 => match count n with | 0 => true | _ => false\n\
+         end\n\
+         example : count 1 = 0 := rfl\n\
+         example : flag 1 = false := rfl\n\
+         example : flag 2 = true := rfl\n\
+         example : count 3 = 1 := rfl\n",
+    );
+}
+
+#[test]
+fn mutual_structural_three_member_cycle_keeps_projection_order() {
+    let base = check(
+        "mutual\n\
+         def firstCycle : Nat -> Nat\n | 0 => 1\n | n+1 => secondCycle n\n\
+         def secondCycle : Nat -> Nat\n | 0 => 2\n | n+1 => thirdCycle n\n\
+         def thirdCycle : Nat -> Nat\n | 0 => 3\n | n+1 => firstCycle n\n\
+         end\n\
+         example : firstCycle 1 = 2 := rfl\n\
+         example : firstCycle 2 = 3 := rfl\n\
+         example : firstCycle 3 = 1 := rfl\n",
+    );
+    run(&base, "#eval secondCycle 5", "1");
+}
+
+#[test]
+fn mutual_structural_generalizes_trailing_parameters_and_preserves_abbrev() {
+    use fln_env::constants::{ConstantInfo, ReducibilityHints};
+    let base = check(
+        "mutual\n\
+         def left (n seed : Nat) : Nat := match n with\n | 0 => seed\n | k+1 => right k seed 3\n\
+         abbrev right (n seed extra : Nat) : Nat := match n with\n | 0 => seed + extra\n | k+1 => left k seed + extra\n\
+         end\n\
+         example : left 2 7 = 10 := rfl\n\
+         example : right 2 7 3 = 13 := rfl\n",
+    );
+    let Some(ConstantInfo::Defn(right)) = base.environment().find(&name("right")) else {
+        panic!("checked structural abbreviation");
+    };
+    assert_eq!(right.hints, ReducibilityHints::Abbrev);
+    run(&base, "#eval left 2 7", "10");
+    run(&base, "#eval right 2 7 3", "13");
+}
+
+#[test]
+fn mutual_structural_checks_unused_initializers_and_escaping_peers() {
+    let (base, limits) = engine();
+    let root = base.logical_root(&KVMap::new());
+    for source in [
+        "mutual\ndef badLeft : Nat -> Nat\n | 0 => 0\n | n+1 => let unused := badRight (n+2); badRight n\ntermination_by structural n => n\ndef badRight : Nat -> Nat\n | 0 => 1\n | n+1 => badLeft n\ntermination_by structural n => n\nend",
+        "mutual\ndef badLeft : Nat -> Nat\n | 0 => 0\n | n+1 => let invalid : Bool := n; badRight n\ndef badRight : Nat -> Nat\n | 0 => 1\n | n+1 => badLeft n\nend",
+        "mutual\ndef badLeft : Nat -> Nat\n | 0 => 0\n | n+1 => (fun f : Nat -> Nat => f (n+1)) badRight\ntermination_by structural n => n\ndef badRight : Nat -> Nat\n | 0 => 1\n | n+1 => badLeft n\ntermination_by structural n => n\nend",
+    ] {
+        oracle(source, false);
+        assert!(
+            base.check_source_files(
+                &[source.as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits),
+            )
+            .is_err(),
+            "invalid original body must not be erased: {source}"
+        );
+        assert_eq!(base.logical_root(&KVMap::new()), root);
+        assert!(!base.environment().contains(&name("badLeft")));
+    }
+}
+
+#[test]
+fn mutual_structural_hint_never_admits_a_nondecreasing_cycle() {
+    let (base, limits) = engine();
+    let root = base.logical_root(&KVMap::new());
+    for source in [
+        "mutual\ndef badLeft (n : Nat) : Nat := badRight n\ntermination_by structural n\ndef badRight (n : Nat) : Nat := badLeft n\ntermination_by structural n\nend",
+        "mutual\ndef badLeft : Nat -> Nat\n | 0 => 0\n | n+1 => badRight (n+2)\ntermination_by structural n => n\ndef badRight : Nat -> Nat\n | 0 => 1\n | n+1 => badLeft n\ntermination_by structural n => n\nend",
+    ] {
+        oracle(source, false);
+        let result = base.check_source_files(
+            &[source.as_bytes()],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits),
+        );
+        assert!(
+            result.is_err(),
+            "nondecreasing component must not be admitted: {source}"
+        );
+        assert_eq!(base.logical_root(&KVMap::new()), root);
+        assert!(!base.environment().contains(&name("badLeft")));
+    }
+    check("theorem recovered (n : Nat) : n = n := rfl");
+}
 #[test]
 fn forward_theorems_remain_theorems_and_need_no_placeholder_axioms() {
     check(

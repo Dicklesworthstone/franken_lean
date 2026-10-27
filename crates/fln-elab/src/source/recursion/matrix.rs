@@ -13,6 +13,10 @@ impl Context {
             .as_ref()
             .is_some_and(|state| state.hides(local))
             || self
+                .mutual_structural_member
+                .as_ref()
+                .is_some_and(|member| member.hides(local))
+            || self
                 .recursion
                 .iter()
                 .chain(&self.enclosing_recursions)
@@ -65,6 +69,9 @@ impl Context {
         &mut self,
         value: &Expr,
     ) -> Result<Expr, NatDefinitionElabError> {
+        if let Some(lowered) = self.lower_mutual_structural_call(value)? {
+            return Ok(lowered);
+        }
         if !value.has_fvar() || (self.recursion.is_none() && self.enclosing_recursions.is_empty()) {
             return Ok(value.clone());
         }

@@ -1,9 +1,9 @@
 //! Ordinary mutual predefinitions, following MutualDef's header/body boundary
 //! and dependency partition. Headers are private candidate data, never
-//! temporary environment axioms. A recursive component of definitions with Nat
-//! `termination_by` measures is elaborated by well-founded recursion over one
-//! shared fixpoint; any other recursive component is refused here, never
-//! downgraded to a partial definition.
+//! temporary environment axioms. Same-family structural components share one
+//! course-of-values recursor; components with Nat `termination_by` measures
+//! share one well-founded fixpoint. Unsupported components are never downgraded
+//! to partial logical definitions.
 use super::*;
 use recursion::MemberHint;
 
@@ -289,23 +289,61 @@ fn elaborate_with_meter(
                     "recursive ordinary mutual component requires termination elaboration",
                 ));
             }
-            let (mutual, members_published, executable) = mutual_well_founded(
-                &mut meter,
-                (environment, kernel, scope),
-                &Parts {
-                    group: &group,
-                    members,
-                    names: &names,
-                    bodies: &bodies,
-                    hints: &hints,
-                    headers: &headers,
-                    level_names: level_names.as_deref().unwrap_or_default(),
-                },
-                &component,
-            )?;
+            let parts = Parts {
+                group: &group,
+                members,
+                names: &names,
+                bodies: &bodies,
+                hints: &hints,
+                headers: &headers,
+                level_names: level_names.as_deref().unwrap_or_default(),
+            };
+            let structural = component.len() > 1
+                && component.iter().all(|&index| {
+                    matches!(hints[index], MemberHint::None | MemberHint::Structural)
+                });
+            let compiled = if structural {
+                match mutual_structural(
+                    &mut meter,
+                    (environment, kernel, scope),
+                    &parts,
+                    &component,
+                ) {
+                    Ok(compiled) => Some(compiled),
+                    // An automatic attempt that cannot establish structural descent retains
+                    // the existing well-founded boundary. Resource/type failures never select
+                    // another interpretation, and an explicit structural hint never falls back.
+                    Err(NatDefinitionElabError::Inference(SourceInferenceError::Recursion(
+                        recursion::RecursionError::MutualStructuralUnsupported(_)
+                        | recursion::RecursionError::NotDecreasing
+                        | recursion::RecursionError::ChangedParameter
+                        | recursion::RecursionError::PartialApplication,
+                    ))) if component
+                        .iter()
+                        .all(|&index| matches!(hints[index], MemberHint::None)) =>
+                    {
+                        None
+                    }
+                    Err(problem) => return Err(problem),
+                }
+            } else {
+                None
+            };
+            let is_structural = compiled.is_some();
+            let (mutual, members_published, executable) = match compiled {
+                Some(compiled) => compiled,
+                None => mutual_well_founded(
+                    &mut meter,
+                    (environment, kernel, scope),
+                    &parts,
+                    &component,
+                )?,
+            };
             declarations.push(Declaration::Defn(mutual));
             for definition in members_published {
-                irreducible.insert(definition.base.name.clone());
+                if !is_structural {
+                    irreducible.insert(definition.base.name.clone());
+                }
                 declarations.push(Declaration::Defn(definition));
             }
             declarations.push(Declaration::Mutual(executable));
@@ -348,6 +386,241 @@ struct Parts<'a> {
     hints: &'a [MemberHint],
     headers: &'a [ConstantVal],
     level_names: &'a [Name],
+}
+
+/// Build every component against one below dictionary, then publish the fully checked
+/// product recursor and reducible projections. Runtime companions retain the source bodies.
+fn mutual_structural(
+    meter: &mut Context,
+    (environment, kernel, scope): (&Environment, Budget, &SourceScope),
+    parts: &Parts<'_>,
+    component: &[usize],
+) -> Result<(DefinitionVal, Vec<DefinitionVal>, Vec<DefinitionVal>), NatDefinitionElabError> {
+    let unsupported = |shape| {
+        failure(SourceInferenceError::Recursion(
+            recursion::RecursionError::MutualStructuralUnsupported(shape),
+        ))
+    };
+    if !scope.variables.is_empty() {
+        return Err(unsupported(
+            "section captures outside a common parameter prefix",
+        ));
+    }
+    let names: Vec<_> = component
+        .iter()
+        .map(|&index| parts.names[index].clone())
+        .collect();
+    let levels = parts.bodies[component[0]].base.level_params.clone();
+    if component.iter().any(|&index| {
+        parts.headers[index].level_params != levels
+            || parts.bodies[index].base.level_params != levels
+    }) {
+        return Err(unsupported("one universe telescope for all members"));
+    }
+    let mut arities = Vec::new();
+    let mut values = Vec::new();
+    let mut types = Vec::new();
+    for &index in component {
+        let value = &parts.bodies[index].value;
+        let mut cursor = value;
+        let mut arity = 0;
+        while let ExprNode::Lam { body, .. } = cursor.node() {
+            meter.tick()?;
+            arity += 1;
+            cursor = body;
+        }
+        arities.push(arity);
+        values.push(value.clone());
+        types.push(parts.bodies[index].base.type_.clone());
+    }
+    let fixed = meter.mutual_structural_fixed_prefix(&values, &arities, &names)?;
+    let auxiliary = Name::str(names[0].clone(), "_mutual");
+    if std::iter::once(auxiliary)
+        .chain(
+            names
+                .iter()
+                .map(|name| Name::str(name.clone(), "_unsafe_rec")),
+        )
+        .any(|name| environment.contains(&name) || parts.names.contains(&name))
+    {
+        return Err(refusal("fresh distinct ordinary mutual names"));
+    }
+    let mut planner = Context::scoped(environment, kernel, scope);
+    planner.txn.budget = meter.txn.budget.clone();
+    let planned = planner.mutual_structural_plan(names.clone(), types, arities, fixed, levels);
+    meter.txn.budget = planner.txn.budget;
+    let plan = std::sync::Arc::new(planned?);
+    let mut wrappers = Vec::new();
+    let mut pieces = Vec::new();
+    for (position, &index) in component.iter().enumerate() {
+        let mut context = Context::scoped(environment, kernel, scope);
+        context.txn.budget = meter.txn.budget.clone();
+        context.partial = Some(State {
+            kind: Kind::Unsafe,
+            group: Some(parts.group.clone()),
+            ordinary: true,
+            ..State::default()
+        });
+        context.mutual_structural_member =
+            Some(recursion::StructuralMember::new(plan.clone(), position));
+        let elaborated = definition_in_context(&parts.members[index], &mut context);
+        meter.txn.budget = context.txn.budget.clone();
+        let Declaration::Mutual(mut definitions) = elaborated? else {
+            return Err(refusal("one ordinary body per mutual header"));
+        };
+        let (Some(mut wrapper), true) = (definitions.pop(), definitions.is_empty()) else {
+            return Err(refusal("one ordinary body per mutual header"));
+        };
+        if context.noncomputable_definition {
+            return Err(refusal("computable ordinary mutual definition"));
+        }
+        let piece = context
+            .mutual_structural_member
+            .as_ref()
+            .and_then(recursion::StructuralMember::piece)
+            .cloned()
+            .ok_or_else(|| failure(SourceInferenceError::Scope))?;
+        wrapper.safety = DefinitionSafety::Safe;
+        if !matches!(wrapper.hints, ReducibilityHints::Abbrev) {
+            wrapper.hints = ReducibilityHints::Regular(1);
+        }
+        wrapper.all = names.clone();
+        if wrapper.base.name != names[position] {
+            return Err(failure(SourceInferenceError::Scope));
+        }
+        wrappers.push(wrapper);
+        pieces.push(piece);
+    }
+    let mut obligations = Vec::new();
+    for &index in component {
+        obligations.push(mutual_typing_obligation(
+            meter,
+            &plan,
+            &parts.bodies[index],
+        )?);
+    }
+    let mut assembler = Context::scoped(environment, kernel, scope);
+    assembler.txn.budget = meter.txn.budget.clone();
+    let assembled = assembler.assemble_mutual_structural(&plan, &pieces, &obligations);
+    meter.txn.budget = assembler.txn.budget;
+    let mutual = assembled?;
+    let implementations = mutual_implementations(meter, parts.bodies, component, &names)?;
+    Ok((mutual, wrappers, implementations))
+}
+
+/// Retain the original source body as a checked initializer under abstract peer functions.
+/// This prevents structural compilation from erasing a malformed source annotation.
+fn mutual_typing_obligation(
+    meter: &mut Context,
+    plan: &recursion::StructuralPlan,
+    definition: &DefinitionVal,
+) -> Result<Typed, NatDefinitionElabError> {
+    let mut markers = Vec::new();
+    for _ in &plan.names {
+        markers.push(FVarId(meter.fresh_name()?));
+    }
+    let levels: Vec<_> = plan
+        .level_params
+        .iter()
+        .cloned()
+        .map(Level::param)
+        .collect();
+    let original = map(meter, &definition.value, &|_, expr| {
+        let ExprNode::Const {
+            name,
+            levels: actual,
+        } = expr.node()
+        else {
+            return Ok(None);
+        };
+        let Some(index) = plan.names.iter().position(|candidate| candidate == name) else {
+            return Ok(None);
+        };
+        if actual != &levels {
+            return Err(failure(SourceInferenceError::Recursion(
+                recursion::RecursionError::MutualStructuralUnsupported(
+                    "polymorphic recursive calls",
+                ),
+            )));
+        }
+        Ok(Some(Expr::fvar(markers[index].clone())))
+    })?;
+    let bound = |index| Expr::bvar(index).map_err(|_| failure(SourceInferenceError::Scope));
+    let proposition = Expr::forall_e(
+        Name::anonymous(),
+        Expr::sort(Level::zero()),
+        Expr::forall_e(Name::anonymous(), bound(0)?, bound(1)?, BinderInfo::Default),
+        BinderInfo::Default,
+    );
+    let proof = Expr::lam(
+        Name::anonymous(),
+        Expr::sort(Level::zero()),
+        Expr::lam(Name::anonymous(), bound(0)?, bound(0)?, BinderInfo::Default),
+        BinderInfo::Default,
+    );
+    let mut value = Expr::let_e(
+        Name::anonymous(),
+        definition.base.type_.clone(),
+        original,
+        proof,
+        false,
+    );
+    let mut type_ = proposition;
+    for (marker, domain) in markers.iter().zip(&plan.types).rev() {
+        meter.tick()?;
+        value = Expr::lam(
+            Name::anonymous(),
+            domain.clone(),
+            value
+                .abstract_fvar(marker, 0)
+                .map_err(|_| failure(SourceInferenceError::Scope))?,
+            BinderInfo::Default,
+        );
+        type_ = Expr::forall_e(
+            Name::anonymous(),
+            domain.clone(),
+            type_
+                .abstract_fvar(marker, 0)
+                .map_err(|_| failure(SourceInferenceError::Scope))?,
+            BinderInfo::Default,
+        );
+    }
+    Ok(Typed { value, type_ })
+}
+
+fn mutual_implementations(
+    meter: &mut Context,
+    bodies: &[DefinitionVal],
+    component: &[usize],
+    names: &[Name],
+) -> Result<Vec<DefinitionVal>, NatDefinitionElabError> {
+    let executable: Vec<_> = names
+        .iter()
+        .map(|name| Name::str(name.clone(), "_unsafe_rec"))
+        .collect();
+    let mut implementations = Vec::new();
+    for &index in component {
+        let mut definition = bodies[index].clone();
+        definition.value = map(meter, &definition.value, &|_, expr| {
+            let ExprNode::Const { name, levels } = expr.node() else {
+                return Ok(None);
+            };
+            Ok(names
+                .iter()
+                .position(|member| member == name)
+                .map(|target| Expr::const_(executable[target].clone(), levels.clone())))
+        })?;
+        let position = names
+            .iter()
+            .position(|member| member == &definition.base.name)
+            .ok_or_else(|| failure(SourceInferenceError::Scope))?;
+        definition.base.name = executable[position].clone();
+        definition.safety = DefinitionSafety::Partial;
+        definition.hints = ReducibilityHints::Opaque;
+        definition.all = executable.clone();
+        implementations.push(definition);
+    }
+    Ok(implementations)
 }
 
 /// A recursive component of two or more definitions, all with Nat measures:
@@ -534,28 +807,7 @@ fn mutual_well_founded(
     // admits each member's original recursive body as `partial def
     // <member>._unsafe_rec`, calling its peers' companions, and compiles those.
     // The runtime selects such a companion only for a complete linked group.
-    let mut implementations = Vec::new();
-    for &index in component {
-        let mut definition = bodies[index].clone();
-        definition.value = map(meter, &definition.value, &|_, expr| {
-            let ExprNode::Const { name, levels } = expr.node() else {
-                return Ok(None);
-            };
-            Ok(component_names
-                .iter()
-                .position(|member| member == name)
-                .map(|target| Expr::const_(executable[target].clone(), levels.clone())))
-        })?;
-        let position = component_names
-            .iter()
-            .position(|member| member == &definition.base.name)
-            .ok_or_else(|| failure(SourceInferenceError::Scope))?;
-        definition.base.name = executable[position].clone();
-        definition.safety = DefinitionSafety::Partial;
-        definition.hints = ReducibilityHints::Opaque;
-        definition.all = executable.clone();
-        implementations.push(definition);
-    }
+    let implementations = mutual_implementations(meter, bodies, component, &component_names)?;
     Ok((mutual, wrappers, implementations))
 }
 

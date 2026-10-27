@@ -14,9 +14,11 @@ mod context;
 mod course;
 mod lambdas;
 mod matrix;
+mod mutual_structural;
 mod obligation;
 mod well_founded;
 pub(super) use constrained::ConstrainedBranch;
+pub(in crate::source) use mutual_structural::{StructuralMember, StructuralPlan};
 use std::collections::{HashMap, HashSet};
 pub(super) use well_founded::State as WellFounded;
 pub(in crate::source) use well_founded::decreasing_tactic_expansion;
@@ -60,6 +62,8 @@ pub enum RecursionError {
     /// A mutual well-founded group outside the supported slice: Nat measures on
     /// every member, fixed parameters as one common unreordered prefix.
     MutualWellFoundedUnsupported(&'static str),
+    /// A structurally recursive SCC outside the admitted shared-family construction.
+    MutualStructuralUnsupported(&'static str),
 }
 impl std::fmt::Display for RecursionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -80,6 +84,9 @@ impl std::fmt::Display for RecursionError {
             }
             Self::MutualWellFoundedUnsupported(shape) => {
                 return write!(f, "mutual well-founded recursion is not supported here: {shape}");
+            }
+            Self::MutualStructuralUnsupported(shape) => {
+                return write!(f, "mutual structural recursion is not supported here: {shape}");
             }
             Self::ResultTypeRequired => "recursive definition requires an explicit result type",
             Self::RootMatchRequired => {
@@ -768,6 +775,16 @@ impl Context {
         header_parameters: usize,
     ) -> Result<Typed, NatDefinitionElabError> {
         self.defining = Some(name.clone());
+        if self.mutual_structural_member.is_some() {
+            return self.mutual_structural_body(
+                name,
+                parameters,
+                syntax,
+                expected,
+                hint,
+                header_parameters,
+            );
+        }
         if self.mutual_member.is_some() {
             // A member of a mutual well-founded group, after the group's pass
             // found its component and built the shared fixpoint plan.
