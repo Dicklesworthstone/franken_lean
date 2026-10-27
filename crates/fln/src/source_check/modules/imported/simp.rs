@@ -229,7 +229,23 @@ fn registry_error(module: &Name, error: SimpSetError) -> SourceOleanImportError 
 struct ScopeIndex {
     parents: Vec<Vec<usize>>,
     owners: BTreeMap<Name, Vec<usize>>,
+    /// Each module's import closure, itself included, computed once from its
+    /// parents' closures. A fresh walk per simp module made the pinned Std
+    /// closure (965 modules) charge 1,210,820 work units, quadratic in modules.
+    closures: Vec<Option<Reach>>,
     work_left: u64,
+}
+
+/// A set of module indices, one bit per module of the checked set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Reach(Vec<u64>);
+
+impl Reach {
+    fn contains(&self, index: usize) -> bool {
+        self.0
+            .get(index / 64)
+            .is_some_and(|word| word & (1 << (index % 64)) != 0)
+    }
 }
 
 impl ScopeIndex {
@@ -241,6 +257,7 @@ impl ScopeIndex {
         let mut result = Self {
             parents: Vec::new(),
             owners: BTreeMap::new(),
+            closures: Vec::new(),
             work_left,
         };
         if rows.is_empty() {
@@ -295,35 +312,74 @@ impl ScopeIndex {
         Ok(())
     }
 
-    fn closure(&mut self, module: usize) -> Result<BTreeSet<usize>> {
-        let mut seen = BTreeSet::new();
-        let mut pending = vec![module];
-        while let Some(index) = pending.pop() {
-            self.spend(1)?;
-            if !seen.insert(index) {
+    /// The import closure of `module`, itself included. A module's closure is
+    /// the union of its parents' closures, so each module is expanded once
+    /// however many simp modules import it. Work is charged before every
+    /// allocation and covers each word stored, so the budget bounds memory too.
+    fn closure(&mut self, module: usize) -> Result<Reach> {
+        const OUTSIDE: SourceOleanImportError =
+            SourceOleanImportError::Internal("simp module index is outside its graph");
+        const CYCLIC: SourceOleanImportError =
+            SourceOleanImportError::Internal("simp import graph is cyclic");
+        let modules = self.parents.len();
+        let words = modules.div_ceil(64);
+        if self.closures.len() < modules {
+            self.closures
+                .try_reserve_exact(modules - self.closures.len())
+                .map_err(|_| SourceOleanImportError::Limit("simp import-closure allocation"))?;
+            self.closures.resize(modules, None);
+        }
+        // Postorder over modules not yet closed. Popping a module that is still
+        // open, or closing one whose parent is not closed, means a cycle.
+        let mut open = BTreeSet::new();
+        let mut pending = vec![(module, false)];
+        while let Some((index, expanded)) = pending.pop() {
+            if self.closures.get(index).ok_or(OUTSIDE)?.is_some() {
                 continue;
             }
-            let parents = self
-                .parents
-                .get(index)
-                .ok_or(SourceOleanImportError::Internal(
-                    "simp module index is outside its graph",
-                ))?;
-            let count = parents.len();
-            pending
-                .try_reserve(count)
+            let count = self.parents[index].len();
+            if !expanded {
+                if !open.insert(index) {
+                    return Err(CYCLIC);
+                }
+                self.spend(1 + count as u64)?;
+                pending
+                    .try_reserve(count + 1)
+                    .map_err(|_| SourceOleanImportError::Limit("simp import-closure allocation"))?;
+                pending.push((index, true));
+                for &parent in &self.parents[index] {
+                    if self.closures.get(parent).ok_or(OUTSIDE)?.is_none() {
+                        pending.push((parent, false));
+                    }
+                }
+                continue;
+            }
+            self.spend(words as u64 * (count as u64 + 1))?;
+            let mut reach = Vec::new();
+            reach
+                .try_reserve_exact(words)
                 .map_err(|_| SourceOleanImportError::Limit("simp import-closure allocation"))?;
-            pending.extend(parents.iter().copied());
-            self.spend(count as u64)?;
+            reach.resize(words, 0u64);
+            reach[index / 64] |= 1 << (index % 64);
+            for &parent in &self.parents[index] {
+                let Some(Reach(bits)) = &self.closures[parent] else {
+                    return Err(CYCLIC);
+                };
+                for (word, bits) in reach.iter_mut().zip(bits) {
+                    *word |= bits;
+                }
+            }
+            self.closures[index] = Some(Reach(reach));
         }
-        Ok(seen)
+        self.spend(words as u64)?;
+        self.closures.get(module).cloned().flatten().ok_or(OUTSIDE)
     }
 
     fn authorize(
         &mut self,
         origin: &Environment,
         active: &Environment,
-        reachable: &BTreeSet<usize>,
+        reachable: &Reach,
         module: &Name,
         name: &Name,
     ) -> Result<()> {
@@ -336,7 +392,7 @@ impl ScopeIndex {
         }
         let allowed = if let Some(owners) = self.owners.get(name) {
             let count = owners.len();
-            let allowed = owners.iter().any(|index| reachable.contains(index));
+            let allowed = owners.iter().any(|&index| reachable.contains(index));
             self.spend(count as u64)?;
             allowed
         } else {
@@ -356,7 +412,7 @@ impl ScopeIndex {
         &mut self,
         origin: &Environment,
         active: &Environment,
-        reachable: &BTreeSet<usize>,
+        reachable: &Reach,
         module: &Name,
         row: &metadata::SimpEntry,
     ) -> Result<()> {
