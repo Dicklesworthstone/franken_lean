@@ -220,6 +220,7 @@ fn a_reflexive_close_compares_nat_offsets_under_any_head() {
     }
 }
 
+#[test]
 fn a_required_reference_without_its_binary_is_refused_before_comparison() {
     let Some(lib) = pinned_lib() else {
         return;
