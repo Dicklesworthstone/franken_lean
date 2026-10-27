@@ -15,7 +15,7 @@ on:
         description: 'Fixed validation command; negative controls are expected to fail'
         required: true
         type: choice
-        options: [range, cli, reference, missing-reference, flush-mutant]
+        options: [range, cli, reference, missing-reference, flush-mutant, ingress]
   push:
     branches: [main]
     paths: ['.github/workflows/fln-source-workbench.yml']
@@ -63,7 +63,7 @@ jobs:
               assert isinstance(blobs, list) and len(blobs) == 2
               assert all(isinstance(s, str) and re.fullmatch('[0-9a-f]{40}', s) for s in blobs)
           assert os.environ['CANDIDATE_SUITE'] in {
-              'range', 'cli', 'reference', 'missing-reference', 'flush-mutant',
+              'range', 'cli', 'reference', 'missing-reference', 'flush-mutant', 'ingress',
           }
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -141,6 +141,15 @@ jobs:
         run: |
           set -euo pipefail
           case "$CANDIDATE_SUITE" in
+            ingress)
+              cargo check --locked --all-targets
+              cargo clippy --locked --all-targets -- -D warnings
+              cargo test --locked --release --no-fail-fast -p fln \
+                --lib --test source_deriving_repr -- --nocapture
+              cargo test --locked --release --no-fail-fast -p fln-cli \
+                --test source_deriving_repr --test source_range_literals \
+                --test source_stateful_loops --test source_while_loops -- --nocapture
+              ;;
             range)
               cargo test --locked --release -p fln-cli --test source_range_literals -- --nocapture
               ;;
