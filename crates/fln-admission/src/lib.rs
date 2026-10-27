@@ -20,6 +20,12 @@
 //! [`Admitted`] is the state the council reads and writes: the part of
 //! `fln::Engine` that admission touches. Every other `Engine` field is carried
 //! through unchanged by `fln`.
+//!
+//! [`AUTHORITY`] is that digest: `build.rs` reads this crate's dependency closure from
+//! the `Cargo.toml` files and hashes every file of every crate in it, with the
+//! workspace manifest, lock and toolchain file and the compiler's own `-vV` report.
+//! `reuse::CheckerIdentity::admission_authority` keys import-reuse records by it, so a
+//! rebuild that changes no code an admission depends on keeps its records.
 
 #![forbid(unsafe_code)]
 // Allocation failure unwinds to the import frontier's per-module guard.
@@ -27,6 +33,13 @@
 
 pub mod olean_imports;
 pub mod reuse;
+
+/// The admission authority: a SHA-256 digest, made by `build.rs`, over every crate in this
+/// crate's dependency closure and the toolchain that compiles them.
+pub const AUTHORITY: &str = env!("FLN_ADMISSION_AUTHORITY");
+
+/// The crates [`AUTHORITY`] digests, by directory name, comma separated.
+pub const AUTHORITY_CLOSURE: &str = env!("FLN_ADMISSION_CLOSURE");
 
 pub use fln_checker::admit::{
     AdmissionBudget as CheckerAdmissionBudget, AdmissionGround as CheckerAdmissionGround,

@@ -12,7 +12,8 @@
 //!
 //! * **Keyed** by [`ImportClosureKey`], one `Domain::CacheKey` digest over every byte of
 //!   every imported part (exported, server and private), the ordered import roots, the
-//!   options, and the [`CheckerIdentity`] of the binary whose council admitted it.
+//!   options, and the [`CheckerIdentity`] of the admission authority whose council
+//!   admitted it (a digest of this crate's dependency closure, not of the executable).
 //! * **Re-proved on every use.** The closure is decoded from the very bytes the key
 //!   hashed and its declarations are placed into an empty environment by
 //!   `Engine::rebuild_reused_olean_set` — the one place outside `fln-kernel` that calls
@@ -149,15 +150,39 @@ impl ImportPosture {
     }
 }
 
-/// The identity of the checking binary: a digest of its exact executable bytes.
+/// The identity of the admission authority whose council admitted a closure.
 ///
 /// A record names the identity whose council admitted the closure, and a binary with
-/// any other identity refuses it, so a changed kernel, checker or decoder never inherits
-/// an earlier binary's verdicts.
+/// any other identity refuses it, so a changed kernel, checker, decoder, council or
+/// record code never inherits an earlier verdict. The front doors use
+/// [`Self::admission_authority`]: everything that decides an admission, produces a
+/// record or re-proves one is this crate or its dependency closure, which
+/// [`crate::AUTHORITY`] digests. A rebuild that changes only the elaborator, compiler or
+/// runtime keeps its records; metadata activation, which lives above this crate, is
+/// re-proved on every reuse by the result root.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CheckerIdentity(Digest);
 
 impl CheckerIdentity {
+    /// The identity of this build's admission authority ([`crate::AUTHORITY`]).
+    pub fn admission_authority() -> Self {
+        Self::of_authority(crate::AUTHORITY)
+    }
+
+    /// The identity named by an authority digest. Its domain differs from
+    /// [`Self::of_executable`]'s, so a record keyed by one is never found by the other.
+    pub fn of_authority(authority: &str) -> Self {
+        let mut hasher = DomainHasher::new(Domain::CacheKey);
+        hasher.update(b"fln.checker-identity/2\0");
+        hasher.update(
+            &u64::try_from(authority.len())
+                .unwrap_or(u64::MAX)
+                .to_le_bytes(),
+        );
+        hasher.update(authority.as_bytes());
+        CheckerIdentity(hasher.finalize())
+    }
+
     /// The identity of a binary whose executable bytes are `executable`.
     pub fn of_executable(executable: &[u8]) -> Self {
         let mut hasher = DomainHasher::new(Domain::CacheKey);
