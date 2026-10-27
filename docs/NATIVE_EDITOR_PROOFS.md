@@ -29,8 +29,10 @@ is an `.olean` import, resolved exactly as `fln check-source` resolves it: on
 `LEAN_PATH`, else the pinned toolchain's `lib/lean` (bead `fln-uyuz`). The world
 is obtained under the `reuse-verified` posture, with no explicit `Init` added,
 as for `check-source`:
-- An earlier admission of the identical bytes by this binary has a record. The
-  record is read back and the closure rebuilt and re-proved by logical root.
+- An earlier admission of the identical bytes by the same admission authority
+  (the kernel, checker and decoder crates this binary was built from) has a
+  record. The record is read back and the closure rebuilt and re-proved by
+  logical root.
 - Otherwise both checkers admit the closure and the admission is recorded.
 
 Every check reads the closure's bytes afresh. The worker keeps the world's
