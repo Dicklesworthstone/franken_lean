@@ -30,6 +30,11 @@
 //!   complete checker-row coverage. Reused and newly checked modules are assembled in
 //!   the original deterministic order before the shared metadata activation runs once.
 //!   Legacy whole-closure records never manufacture these narrower-context records.
+//! * **Checkpointed after the council.** A complete composition stores its valid
+//!   module admissions before metadata activation. Later activation failure or
+//!   cancellation never publishes a whole-closure success record. Retries re-prove
+//!   each checkpoint and activate metadata under their own limits; checkpoints
+//!   grant no metadata or initialization authority.
 //! * **Reported.** [`ImportPostureReport`] names the posture, whether the council ran,
 //!   the key, and what happened to the record; every front door prints it.
 //!
@@ -1265,6 +1270,27 @@ impl Admitted {
             },
         };
         let draft = ImportReuseRecord::draft(key, reuse.checker, options, &checked);
+        // Module records certify only the completed council in each module's own
+        // declared import world. A later activation failure does not invalidate
+        // those admissions: retrying re-proves them and activates metadata again.
+        // Nothing is stored when composition fails or falls back to an ambient
+        // legacy council, which cannot supply these narrower records.
+        let mut module_write_failure = None;
+        for (module_key, made) in module_records {
+            if cancellation.is_some_and(CancellationProbe::is_cancelled) {
+                return Ok(Outcome::Inconclusive(Inconclusive::cancelled(
+                    "import-reuse/module-record",
+                )));
+            }
+            if let Err(error) = reuse.store.save(module_key, &made.to_bytes()) {
+                module_write_failure = Some(error);
+            }
+        }
+        if cancellation.is_some_and(CancellationProbe::is_cancelled) {
+            return Ok(Outcome::Inconclusive(Inconclusive::cancelled(
+                "import-reuse/activate",
+            )));
+        }
         let admitted = host.activate(checked, modules, roots, options, cancellation)?;
         let import = match admitted {
             Outcome::Complete(import) => import,
@@ -1276,8 +1302,9 @@ impl Admitted {
                 "import-reuse/record",
             )));
         }
-        // No module memo escapes an unsuccessful import or incomplete metadata
-        // activation. Storage is optional; failures do not change its logical result.
+        // Only complete metadata activation can publish the whole-closure record
+        // and its result root. Module checkpoints above make no such claim.
+        // Storage is optional; failures do not change the import's logical result.
         let mut record_write = match draft {
             Err(refusal) => RecordWrite::Unrecordable(refusal),
             Ok(draft) => {
@@ -1288,10 +1315,8 @@ impl Admitted {
                 }
             }
         };
-        for (module_key, made) in module_records {
-            if let Err(error) = reuse.store.save(module_key, &made.to_bytes()) {
-                record_write = RecordWrite::Failed(error);
-            }
+        if let Some(error) = module_write_failure {
+            record_write = RecordWrite::Failed(error);
         }
         if let Some(refusal) = unrecordable
             && !matches!(record_write, RecordWrite::Failed(_))

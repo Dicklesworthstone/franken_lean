@@ -1149,3 +1149,225 @@ fn an_actual_pinned_metadata_closure_reuses_modules_under_different_roots() {
         );
     });
 }
+
+#[test]
+fn module_checkpoint_storage_failure_preserves_the_import_and_reports_the_failure() {
+    struct FailModules(Memory);
+    impl ImportReuseStore for FailModules {
+        fn load(&self, key: ImportClosureKey) -> std::result::Result<Option<Vec<u8>>, String> {
+            self.0.load(key)
+        }
+        fn save(&self, key: ImportClosureKey, bytes: &[u8]) -> std::result::Result<(), String> {
+            if bytes.starts_with(MODULE_RECORD_PREFIX) {
+                Err("module checkpoint storage failed".to_owned())
+            } else {
+                self.0.save(key, bytes)
+            }
+        }
+    }
+    on_import_stack(|| {
+        let artifacts = source_diamond("");
+        let all = inputs(&artifacts);
+        let roots = [n("Main")];
+        let checker = identity("module checkpoint storage failure");
+        let store = FailModules(Memory::default());
+        let (cold, _) = import_with(&all, &roots, ImportPostureRequest::Recheck);
+        let (actual, report) = import_with(&all, &roots, reuse(checker, &store));
+        same_import(&cold, &actual);
+        assert_eq!((report.reused_modules, report.council_modules), (0, 4));
+        assert_eq!(
+            report.record_write,
+            RecordWrite::Failed("module checkpoint storage failed".to_owned())
+        );
+        assert!(module_records(&store.0).is_empty());
+        assert_eq!(
+            store.0.0.lock().unwrap().len(),
+            1,
+            "the closure save succeeded"
+        );
+        let (retry, report) = import_with(&all, &roots, reuse(checker, &store));
+        assert_eq!(report.record, RecordLookup::Hit);
+        same_import(&cold, &retry);
+    });
+}
+
+#[test]
+fn cancellation_during_checkpoint_storage_keeps_only_completed_admissions() {
+    use fln_core::outcome::InconclusiveCause;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    struct CancelAfterSave {
+        store: Memory,
+        saved: AtomicBool,
+    }
+    impl ImportReuseStore for CancelAfterSave {
+        fn load(&self, key: ImportClosureKey) -> std::result::Result<Option<Vec<u8>>, String> {
+            self.store.load(key)
+        }
+        fn save(&self, key: ImportClosureKey, bytes: &[u8]) -> std::result::Result<(), String> {
+            self.store.save(key, bytes)?;
+            self.saved.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+    impl CancellationProbe for CancelAfterSave {
+        fn is_cancelled(&self) -> bool {
+            self.saved.load(Ordering::SeqCst)
+        }
+    }
+    on_import_stack(|| {
+        let artifacts = source_diamond("");
+        let all = inputs(&artifacts);
+        let roots = [n("Main")];
+        let options = KVMap::new();
+        let checker = identity("module checkpoint cancellation");
+        let store = CancelAfterSave {
+            store: Memory::default(),
+            saved: AtomicBool::new(false),
+        };
+        let base = Engine::builder().build_empty();
+        let unchanged = base.clone();
+        let actual = base
+            .import_olean_modules_with_posture(
+                &all,
+                &roots,
+                &options,
+                limits(8),
+                reuse(checker, &store),
+                Some(&store),
+            )
+            .expect("cancellation remains a nonanswer");
+        assert!(matches!(actual, Outcome::Inconclusive(reason)
+            if matches!(reason.cause, InconclusiveCause::Cancelled { .. })));
+        same_engine(
+            &base,
+            &unchanged,
+            "cancelled checkpoint storage leaves the base intact",
+        );
+        assert_eq!(module_records(&store.store).len(), 1);
+        assert_eq!(store.store.0.lock().unwrap().len(), 1);
+        let key = ImportClosureKey::compute(&all, &roots, &options, checker);
+        assert_eq!(store.store.load(key).unwrap(), None);
+        let (cold, _) = import_with(&all, &roots, ImportPostureRequest::Recheck);
+        let (recovered, report) = import_with(&all, &roots, reuse(checker, &store.store));
+        assert_eq!((report.reused_modules, report.council_modules), (1, 3));
+        same_import(&cold, &recovered);
+    });
+}
+
+/// Exercise the admission host boundary directly: the source front door now
+/// preflights metadata limits before calling this orchestration. Here real
+/// activation fails after real councils, to test checkpoint authority and retry.
+#[test]
+fn admission_checkpoints_survive_metadata_failure_and_reprove_on_retry() {
+    on_import_stack(|| {
+        let artifacts = source_diamond("namespace Checkpoint\nend Checkpoint");
+        let all = inputs(&artifacts);
+        let roots = [n("Main")];
+        let options = KVMap::new();
+        let (cold, _) = import_with(&all, &roots, ImportPostureRequest::Recheck);
+        assert!(
+            cold.modules.iter().any(|module| module.namespaces != 0),
+            "the fixture carries real metadata"
+        );
+        for threads in [1, 8] {
+            let base = Engine::builder().build_empty();
+            let unchanged = base.clone();
+            let store = Memory::default();
+            let checker = identity("module checkpoints before metadata");
+            let key = ImportClosureKey::compute(&all, &roots, &options, checker);
+            let run = |import_limits: SourceOleanImportLimits, records: &dyn ImportReuseStore| {
+                base.admitted().import_olean_modules_with_posture(
+                    &SourceImportHost::new(&base, import_limits),
+                    &all,
+                    &roots,
+                    &options,
+                    import_limits.council_limits(),
+                    reuse(checker, records),
+                    None,
+                )
+            };
+            let mut limited = limits(threads);
+            limited.metadata.max_entries = 0;
+            let error = run(limited, &store).expect_err("activation obeys its entry budget");
+            assert!(error.metadata_resource_exhausted(), "{error}");
+            assert!(matches!(
+                error,
+                SourceOleanImportError::Limit("metadata entries")
+                    | SourceOleanImportError::Decode(
+                        fln_olean::source_extensions::DecodeError::Limit {
+                            resource: "entries"
+                        }
+                    )
+            ));
+            same_engine(
+                &base,
+                &unchanged,
+                "failed activation cannot publish an engine",
+            );
+            let checkpoints = module_records(&store);
+            assert_eq!(checkpoints.len(), 4);
+            assert_eq!(store.0.lock().unwrap().len(), checkpoints.len());
+            assert_eq!(store.load(key).unwrap(), None, "no whole-closure success");
+            let before = store.0.lock().unwrap().clone();
+            let retry =
+                run(limited, &store).expect_err("checkpoints do not bypass metadata limits");
+            assert!(retry.metadata_resource_exhausted(), "{retry}");
+            assert_eq!(*store.0.lock().unwrap(), before);
+            same_engine(
+                &base,
+                &unchanged,
+                "the refused retry leaves its base unchanged",
+            );
+
+            // A checkpoint never supplies missing original artifact bytes.
+            let missing = subset(&artifacts, &["Left", "Right", "Main"]);
+            let missing = base.import_olean_modules_with_posture(
+                &inputs(&missing),
+                &roots,
+                &options,
+                limits(threads),
+                reuse(checker, &store),
+                None,
+            );
+            assert!(matches!(missing,
+                Err(SourceOleanImportError::Check(error)) if matches!(*error, OleanCheckError::MissingModuleImports { .. })
+            ));
+            assert_eq!(*store.0.lock().unwrap(), before);
+
+            // Resealed incomplete checker rows must re-enter the actual council.
+            let damaged = Memory(std::sync::Mutex::new(before));
+            let (left_key, mut left) = checkpoints
+                .iter()
+                .find(|(_, record)| record.0.modules[0].name == n("Left").to_canonical_bytes())
+                .cloned()
+                .expect("Left has a checkpoint");
+            left.0.modules[0]
+                .rows
+                .pop()
+                .expect("Left has an admitted definition");
+            damaged.save(left_key, &left.to_bytes()).unwrap();
+            let (repaired, report) = run(limits(threads), &damaged)
+                .expect("damaged checkpoint recovers through council")
+                .into_complete()
+                .expect("import completes");
+            assert_eq!(report.record, RecordLookup::Absent);
+            assert_eq!((report.reused_modules, report.council_modules), (3, 1));
+            same_import(&cold, &repaired);
+
+            let (recovered, report) = run(limits(threads), &store)
+                .expect("adequate activation budget resumes import")
+                .into_complete()
+                .expect("activation completes");
+            assert_eq!(report.record, RecordLookup::Absent);
+            assert_eq!((report.reused_modules, report.council_modules), (4, 0));
+            assert_eq!(report.record_write, RecordWrite::Stored);
+            same_import(&cold, &recovered);
+            same_source_contexts(&cold, &recovered);
+            let bytes = store
+                .load(key)
+                .unwrap()
+                .expect("only success stores closure");
+            assert!(ImportReuseRecord::parse(&bytes).is_ok());
+        }
+    });
+}
