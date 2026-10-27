@@ -205,7 +205,8 @@ impl Preparation<'_> {
         // lets. Place the annotation at their result, not outside the whole
         // telescope; otherwise a literal result lambda has no local type when
         // the ordinary closure converter visits it. All strict lets survive.
-        let mut value = value;
+        let original = value;
+        let mut value = original.clone();
         let mut bindings = Vec::new();
         loop {
             self.tick()?;
@@ -223,6 +224,23 @@ impl Preparation<'_> {
                 }
                 ExprNode::MData { expr, .. } => value = expr.clone(),
                 _ => break,
+            }
+        }
+        // The anchor is an identity let: it only names the type of the value
+        // it returns. A telescope that already returns its last binding at
+        // exactly this type is anchored, and another anchor would only alias
+        // that binding. Preparation revisits its own output, so annotating
+        // must be idempotent: an extra alias also moves the anchor off the
+        // `#0` body that `expose_callable_binding` treats as a typed result,
+        // and exposure and annotation then rebuilt each other's input with
+        // one more alias per round until the node budget ran out.
+        if let (ExprNode::BVar { idx: 0 }, Some((_, anchored, _, _))) =
+            (value.node(), bindings.last())
+        {
+            let outer = u32::try_from(bindings.len() - 1)
+                .map_err(|_| unsupported("branch result depth"))?;
+            if *anchored == self.lift(&type_, outer)? {
+                return Ok(original);
             }
         }
         let depth =
