@@ -41,6 +41,7 @@ crate fln-olean         rank=5  kind=ordinary
 crate fln-kernel        rank=6  kind=ordinary
 crate fln-checker       rank=6  kind=ordinary
 crate fln-syntax        rank=7  kind=ordinary
+crate fln-admission     rank=7  kind=ordinary
 crate fln-parse         rank=8  kind=ordinary
 crate fln-elab          rank=9  kind=ordinary
 crate fln-comp          rank=10 kind=ordinary
@@ -70,6 +71,7 @@ edge fln-conformance -> fln-cli    # diagnostic CLI/JSON projection conformance 
 edge fln-conformance -> fln-parse  # G0-4 syntax fidelity spike drives real Pratt and grammar-epoch surfaces (franken_lean-hly)
 edge fln-conformance -> fln-server # diagnostic LSP projection conformance (franken_lean-wlan)
 edge fln-conformance -> fln-syntax # G0-4 syntax fidelity spike binds lexer, trivia, SourceInfo, and tree identity (franken_lean-hly)
+edge fln -> fln-admission          # the .olean import-admission council behind a crate boundary; Engine wraps it (fln-import-reuse-composes-4ngt)
 edge fln -> fln-checker            # independent checker veto on embeddable definition publication
 edge fln -> fln-anvil              # native arithmetic provider; source proofs replay through ordinary admission (fln-7kv)
 edge fln -> fln-core               # embeddable typed diagnostic projection (franken_lean-wlan)
@@ -133,6 +135,12 @@ edge fln-elab -> fln-kernel        # every elaborated declaration crosses Crucib
 edge fln-elab -> fln-parse         # first source-to-Syntax command seam for Athanor (fln-5720; §9-§10)
 edge fln-elab -> fln-syntax        # Athanor consumes the canonical lossless Syntax tree (fln-5720; §10)
 edge fln-olean -> fln-env          # declaration decoder yields ConstantInfo (franken_lean-z6c)
+edge fln-admission -> fln-checker  # the council's independent seat and its own .olean reading (fln-import-reuse-composes-4ngt)
+edge fln-admission -> fln-core     # declarations, names and FL-INV-07 outcomes the council judges (fln-import-reuse-composes-4ngt)
+edge fln-admission -> fln-env      # the environment the council admits into and publishes (fln-import-reuse-composes-4ngt)
+edge fln-admission -> fln-hash     # logical roots and reading digests of admitted environments (fln-import-reuse-composes-4ngt)
+edge fln-admission -> fln-kernel   # every admitted declaration crosses the sole kernel authority (fln-import-reuse-composes-4ngt)
+edge fln-admission -> fln-olean    # the pinned .olean read path the council decodes (fln-import-reuse-composes-4ngt)
 edge fln-conformance -> fln-env    # kernel replay builds environments from decoded modules (franken_lean-z6c)
 edge fln-conformance -> fln-kernel # kernel replay drives the one authority (franken_lean-z6c)
 edge fln-conformance -> fln-olean  # kernel replay decodes real Reference oleans (franken_lean-z6c)

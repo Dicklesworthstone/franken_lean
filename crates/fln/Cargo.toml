@@ -7,6 +7,7 @@ license = "LicenseRef-MIT-OpenAI-Anthropic-Rider"
 publish = false
 
 [dependencies]
+fln-admission = { path = "../fln-admission" }
 fln-anvil = { path = "../fln-anvil" }
 fln-comp = { path = "../fln-comp" }
 fln-checker = { path = "../fln-checker" }

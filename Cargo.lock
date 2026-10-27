@@ -6,6 +6,7 @@ version = 4
 name = "fln"
 version = "0.0.0"
 dependencies = [
+ "fln-admission",
  "fln-anvil",
  "fln-checker",
  "fln-comp",
@@ -22,6 +23,18 @@ dependencies = [
  "fln-syntax",
  "fln-verdict",
  "fln-vm",
+]
+
+[[package]]
+name = "fln-admission"
+version = "0.0.0"
+dependencies = [
+ "fln-checker",
+ "fln-core",
+ "fln-env",
+ "fln-hash",
+ "fln-kernel",
+ "fln-olean",
 ]
 
 [[package]]
