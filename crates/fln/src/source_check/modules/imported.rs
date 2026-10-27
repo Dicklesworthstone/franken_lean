@@ -107,10 +107,13 @@ impl SourceOleanImportLimits {
     pub fn new(check: OleanCheckLimits) -> Self {
         Self {
             check,
-            // Restore the allowance for the selected simp index cells, as in
-            // fln-simp-default-set-a4nb's pinned Init measurement (96,786 cells).
-            // Byte, object, entry and instance-key limits remain independent.
+            // The pinned Std closure has 965 modules and charges 72,157 metadata
+            // entries, including extern list and structure array cells. Keep a
+            // finite ceiling with headroom above that measured requirement.
+            // Bytes, objects, indices and instance keys remain independently bound.
             metadata: DecodeLimits {
+                max_entries: 1 << 17,
+                // Preserve the separately bounded allowance for simp index cells.
                 max_indices: 1 << 17,
                 ..DecodeLimits::default()
             },
@@ -2440,6 +2443,49 @@ pub(super) mod tests {
                     .contexts
                     .assert_identical(&replayed.contexts, "preflight contexts");
             }
+        });
+    }
+
+    /// The real Std metadata must pass the source front door's finite defaults.
+    /// This reads pinned artifacts as data and performs no declaration council;
+    /// success is metadata-preflight coverage, not a claim of full Std admission.
+    #[test]
+    fn pinned_std_metadata_preflight_fits_defaults_and_preserves_entry_refusal() {
+        let Some(lib) = pinned_lib() else {
+            eprintln!("SKIP: pinned Reference lib/lean absent");
+            return;
+        };
+        on_import_stack(|| {
+            let artifacts = closure(&lib, &["Std"]);
+            assert_eq!(artifacts.len(), 965, "the measured pinned Std closure");
+            let modules = inputs(&artifacts);
+            let roots = [n("Std")];
+            let source_limits = limits(1);
+            let prepared = prepare_source_metadata(&modules, &roots, source_limits, None)
+                .expect("the real Std metadata fits the source defaults")
+                .into_complete()
+                .expect("metadata preflight completes");
+            assert_eq!(prepared.reports.len(), artifacts.len());
+            assert_eq!(
+                prepared.reports.last().map(|report| &report.module),
+                Some(&roots[0])
+            );
+            drop(prepared);
+
+            let mut former_limit = source_limits;
+            former_limit.metadata.max_entries = 65_536;
+            let failure = match prepare_source_metadata(&modules, &roots, former_limit, None) {
+                Err(failure) => failure,
+                Ok(_) => panic!("the former entry cap must still refuse the same real metadata"),
+            };
+            assert!(failure.metadata_resource_exhausted(), "{failure}");
+            assert!(matches!(
+                failure,
+                SourceOleanImportError::Limit("metadata entries")
+                    | SourceOleanImportError::Decode(metadata::DecodeError::Limit {
+                        resource: "entries"
+                    })
+            ));
         });
     }
 
