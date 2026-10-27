@@ -318,22 +318,13 @@ pub(super) fn known_status(
     declaration: &Name,
     meter: &mut Meter,
 ) -> Result<Option<crate::reducibility::Reducibility>, SimpSetError> {
-    // Charge every journal consumed by the cached effective table, even on a
-    // cache hit. Hints alone do not establish an imported declaration's status.
-    for (journal, version) in [
-        ("sourceReducibility", "v1"),
-        ("sourceInstances", "v1"),
-        ("importedInstances", "v2"),
-    ] {
-        if let Some(state) =
-            env.extension(&Name::from_components(["FrankenLean", journal, version]))
-        {
-            for row in state.entries() {
-                meter.work(1 + row.payload.len())?;
-                meter.bytes(row.payload.len())?;
-            }
-        }
-    }
+    // One lookup in the environment's effective table, which `reducibility::table` reads once
+    // per change of the journals it consumes, within their own row and entry limits. Hints alone
+    // do not establish an imported declaration's status. The lookup is this declaration's work;
+    // the journals are the library's. Charging their bytes here refused every equation
+    // preparation and simp registration once an import world's journals outgrew one
+    // declaration's allowance, as full `Init`'s do (fln-simp-equation-set-limit-regression-re4l).
+    meter.work(1)?;
     let table = crate::reducibility::table(env).map_err(|error| match error {
         crate::reducibility::ReducibilityError::Limit => SimpSetError::Limit,
         crate::reducibility::ReducibilityError::Instances(error) => codec(error),
@@ -828,5 +819,48 @@ mod tests {
             registrations(&base, &malformed, usize::MAX),
             Err(SimpSetError::Malformed)
         );
+    }
+
+    /// A status lookup costs the declaration one unit, however large the journals behind the
+    /// table are. Before, every row was charged to the caller's allowance (2^20 for an equation
+    /// preparation or a simp snapshot), and full `Init`'s journals exhausted it on their own
+    /// (fln-simp-equation-set-limit-regression-re4l).
+    #[test]
+    fn a_status_lookup_charges_the_declaration_not_the_library_journals() {
+        let long = n(&"x".repeat(1024));
+        let env = Environment::new()
+            .add_decl(ConstantInfo::Axiom(AxiomVal {
+                base: ConstantVal {
+                    name: long.clone(),
+                    level_params: vec![],
+                    type_: Expr::sort(Level::one()),
+                },
+                is_unsafe: false,
+            }))
+            .unwrap();
+        let reducible = crate::reducibility::Reducibility::Reducible;
+        let small = crate::reducibility::register(&env, &long, reducible).unwrap();
+        let mut large = small.clone();
+        for _ in 0..1100 {
+            large = crate::reducibility::register(&large, &long, reducible).unwrap();
+        }
+        let journal = Name::from_components(["FrankenLean", "sourceReducibility", "v1"]);
+        let rows: usize = large
+            .extension(&journal)
+            .unwrap()
+            .entries()
+            .map(|row| 1 + row.payload.len())
+            .sum();
+        assert!(rows > 1 << 20, "{rows}");
+        let price = |env: &Environment| {
+            let mut meter = Meter {
+                remaining: 1 << 20,
+                bytes: 0,
+            };
+            let status = known_status(env, &long, &mut meter);
+            (status, (1 << 20) - meter.remaining)
+        };
+        assert_eq!(price(&small), (Ok(Some(reducible)), 1));
+        assert_eq!(price(&large), (Ok(Some(reducible)), 1));
     }
 }
