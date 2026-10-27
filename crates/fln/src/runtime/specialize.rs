@@ -959,12 +959,6 @@ impl Preparation<'_> {
         head: &Expr,
         mut args: Vec<Expr>,
     ) -> Result<Vec<Expr>, IngressError> {
-        if matches!(head.node(), ExprNode::Const { name, .. } if self.is_partial_stage(name)) {
-            // Private Partial entries already selected their callbacks' real
-            // interfaces. Their logical Pi domains retain the flat telescope;
-            // expanding against it would undo the selected application stages.
-            return Ok(args);
-        }
         if !args.iter().any(|arg| annotated_lambda(arg).is_some()) {
             return Ok(args);
         }

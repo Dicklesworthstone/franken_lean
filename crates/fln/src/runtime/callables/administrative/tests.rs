@@ -65,6 +65,33 @@ fn a_checked_local_spine_exposes_only_its_own_inert_return_gap() {
 }
 
 #[test]
+fn literal_beta_gaps_match_preparation_without_discarding_strict_operands() {
+    let environment = Environment::new();
+    let mut preparation = Preparation::new(&environment, IngressLimits::default());
+    let unused = lam(lam(b(0)));
+    for argument in [b(0), nat::literal(7)] {
+        let input = alias(Expr::app(unused.clone(), argument));
+        assert_eq!(
+            preparation.administrative_callable_gap(&input).unwrap(),
+            Some(lam(b(0)))
+        );
+    }
+    for input in [
+        alias(Expr::app(unused, Expr::app(constant("spend"), b(0)))),
+        alias(Expr::app(lam(lam(b(1))), b(0))),
+        alias(Expr::app(constant("computeCallback"), b(0))),
+    ] {
+        assert!(
+            preparation
+                .administrative_callable_gap(&input)
+                .unwrap()
+                .is_none(),
+            "a computed operand, used slot, or named factory retains its stage: {input:?}"
+        );
+    }
+}
+
+#[test]
 fn dead_value_aliases_preserve_open_capture_indices_and_binder_types() {
     let environment = Environment::new();
     // One outer Nat is captured across three administrative slots. The

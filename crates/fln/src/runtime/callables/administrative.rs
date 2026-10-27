@@ -1,8 +1,9 @@
 //! Recover a literal lambda hidden by value-only administrative bindings.
 //!
 //! This does not eta-expand a computed callback. A successful result removes
-//! only identity lets and unused variable/literal aliases; every application,
-//! projection, used alias, and other strict initializer remains a stage boundary.
+//! only identity lets and unused variable/literal aliases, including those
+//! exposed by a literal lambda application. Computed initializers, projections,
+//! and used aliases remain strict stage boundaries.
 use super::*;
 
 impl Preparation<'_> {
@@ -175,6 +176,21 @@ impl Preparation<'_> {
                         reserve(&mut work, self.limits.max_nodes)?;
                         work.push(Work::Visit(value.clone(), depth));
                         continue;
+                    }
+                    ExprNode::App { .. } => {
+                        let (head, arguments) = self.spine(&expr)?;
+                        if matches!(head.node(), ExprNode::Lam { .. })
+                            && let Some(applied) = self.static_apply(&head, &arguments)?
+                        {
+                            // Use the same strict beta step as expression
+                            // preparation before selecting a callback ABI.
+                            // Computed operands stay in lets; only the inert,
+                            // unused slots below may subsequently disappear.
+                            reserve(&mut work, self.limits.max_nodes)?;
+                            work.push(Work::Visit(applied, depth));
+                            continue;
+                        }
+                        expr
                     }
                     // A lambda is already a value. In particular, never walk
                     // its body to call a global or search for a later lambda.

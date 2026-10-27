@@ -16,6 +16,24 @@ const HEADER: &str =
 /// (name, program, the pin's output).
 const PROGRAMS: &[(&str, &str, &str)] = &[
     (
+        "unused_elements",
+        "def count (xs : List Nat) : Nat := Id.run do\n\
+         \x20 let mut total := 0\n\
+         \x20 for _ in xs do\n\
+         \x20   total := total + 1\n\
+         \x20 return total\n\
+         def pairs (xs ys : List Nat) : Nat := Id.run do\n\
+         \x20 let mut total := 0\n\
+         \x20 for _ in xs do\n\
+         \x20   for _ in ys do\n\
+         \x20     total := total + 1\n\
+         \x20 return total\n\
+         #eval count [1, 2, 3]\n\
+         #eval count []\n\
+         #eval pairs [10, 20] [30, 40, 50]\n",
+        "3\n0\n6",
+    ),
+    (
         "for_in",
         "def f (xs : List Nat) : Id Nat := forIn xs 0 (fun x s => pure (ForInStep.yield (s + x)))\n\
          #eval (f [5, 6]).run\n",
