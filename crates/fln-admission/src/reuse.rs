@@ -369,6 +369,20 @@ pub struct ImportReuseRecord {
     pub modules: Vec<RecordedModule>,
 }
 
+/// A record before metadata activation: every field but the result root, which only the
+/// activated import can supply ([`ImportReuseRecord::draft`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordDraft(ImportReuseRecord);
+
+impl RecordDraft {
+    pub fn complete(self, result_root: LogicalRoot) -> ImportReuseRecord {
+        ImportReuseRecord {
+            result_root: result_root.0,
+            ..self.0
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordedModule {
     /// Canonical bytes of the module name.
@@ -620,7 +634,20 @@ impl ImportReuseRecord {
         options: &KVMap,
         import: &I,
     ) -> std::result::Result<Self, ImportReuseRefusal> {
-        let checked = import.checked();
+        Ok(Self::draft(key, checker, options, import.checked())?
+            .complete(import.result_logical_root()))
+    }
+
+    /// Everything a record says about the council's admission, read from the checked set
+    /// this module produced, before the host activates metadata over it. Only the result
+    /// root, which a reuse re-proves against the host's own activation, is left to the host:
+    /// a host never supplies what a record attests about declarations.
+    pub fn draft<E>(
+        key: ImportClosureKey,
+        checker: CheckerIdentity,
+        options: &KVMap,
+        checked: &CheckedOleanSet<E>,
+    ) -> std::result::Result<RecordDraft, ImportReuseRefusal> {
         if checked.base_logical_root != Environment::new().logical_root(options) {
             return Err(ImportReuseRefusal::Unrecordable(
                 "the admission was not over an empty base",
@@ -636,14 +663,15 @@ impl ImportReuseRecord {
                 module.result_logical_root,
             )?);
         }
-        Ok(ImportReuseRecord {
+        Ok(RecordDraft(ImportReuseRecord {
             key: key.0,
             checker: checker.0,
             base_root: checked.base_logical_root.0,
             declaration_root: checked.result_logical_root.0,
-            result_root: import.result_logical_root().0,
+            // Replaced by `RecordDraft::complete`; a draft is never stored.
+            result_root: checked.result_logical_root.0,
             modules,
-        })
+        }))
     }
 
     pub fn key(&self) -> ImportClosureKey {
@@ -1196,27 +1224,23 @@ impl Admitted {
             Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
         };
-        let (admitted, module_records, unrecordable, reused_modules) = match composed {
+        // The whole-closure record is drafted here, from the set this module checked or
+        // composed, before the host sees it; only the result root comes from activation.
+        let (checked, module_records, unrecordable, reused_modules) = match composed {
             Some(composed) => (
-                host.activate(composed.checked, modules, roots, options, cancellation)?,
+                composed.checked,
                 composed.records,
                 composed.unrecordable,
                 composed.reused,
             ),
-            None => (
-                self.import_olean_modules_for_source_with_cancel(
-                    host,
-                    modules,
-                    roots,
-                    options,
-                    limits,
-                    cancellation,
-                )?,
-                Vec::new(),
-                None,
-                0,
-            ),
+            None => match self.council_checked(modules, roots, options, limits, cancellation)? {
+                Outcome::Complete(checked) => (checked, Vec::new(), None, 0),
+                Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+            },
         };
+        let draft = ImportReuseRecord::draft(key, reuse.checker, options, &checked);
+        let admitted = host.activate(checked, modules, roots, options, cancellation)?;
         let import = match admitted {
             Outcome::Complete(import) => import,
             Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
@@ -1229,14 +1253,16 @@ impl Admitted {
         }
         // No module memo escapes an unsuccessful import or incomplete metadata
         // activation. Storage is optional; failures do not change its logical result.
-        let mut record_write =
-            match ImportReuseRecord::from_admission(key, reuse.checker, options, &import) {
-                Err(refusal) => RecordWrite::Unrecordable(refusal),
-                Ok(made) => match reuse.store.save(key, &made.to_bytes()) {
+        let mut record_write = match draft {
+            Err(refusal) => RecordWrite::Unrecordable(refusal),
+            Ok(draft) => {
+                let made = draft.complete(import.result_logical_root());
+                match reuse.store.save(key, &made.to_bytes()) {
                     Ok(()) => RecordWrite::Stored,
                     Err(error) => RecordWrite::Failed(error),
-                },
-            };
+                }
+            }
+        };
         for (module_key, made) in module_records {
             if let Err(error) = reuse.store.save(module_key, &made.to_bytes()) {
                 record_write = RecordWrite::Failed(error);
@@ -2268,6 +2294,24 @@ impl Admitted {
         limits: ImportCouncilLimits,
         cancellation: Option<&dyn CancellationProbe>,
     ) -> ImportResult<Outcome<H::Import>, H::Error> {
+        match self.council_checked(modules, roots, options, limits, cancellation)? {
+            Outcome::Complete(checked) => {
+                host.activate(checked, modules, roots, options, cancellation)
+            }
+            Outcome::Inconclusive(reason) => Ok(Outcome::Inconclusive(reason)),
+            Outcome::InternalFault(fault) => Ok(Outcome::InternalFault(fault)),
+        }
+    }
+
+    /// The council's admission of the closure, before any metadata activation.
+    fn council_checked<Error: From<ImportCouncilError>>(
+        &self,
+        modules: &[OleanModuleInput<'_>],
+        roots: &[Name],
+        options: &KVMap,
+        limits: ImportCouncilLimits,
+        cancellation: Option<&dyn CancellationProbe>,
+    ) -> ImportResult<Outcome<CheckedOleanSet>, Error> {
         if roots.is_empty() {
             return Err(ImportCouncilError::EmptyRoots.into());
         }
@@ -2290,12 +2334,12 @@ impl Admitted {
                 limits.jobs,
                 cancellation,
             )
-            .map_err(|e| H::Error::from(ImportCouncilError::Check(Box::new(e))))?
+            .map_err(|e| Error::from(ImportCouncilError::Check(Box::new(e))))?
         {
             Outcome::Complete(checked) => checked,
             Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
         };
-        host.activate(checked, modules, roots, options, cancellation)
+        Ok(Outcome::Complete(checked))
     }
 }
