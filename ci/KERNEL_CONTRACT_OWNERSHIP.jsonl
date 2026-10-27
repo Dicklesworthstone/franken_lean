@@ -1,4 +1,4 @@
-{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":721,"projection_hash":"6bd2813c21b8c685ce493ed613ab776e381df2c046c3cafad1f8cc7a7a2ea292"}
+{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":724,"projection_hash":"87e7c6f2914ba91fb5b071aacf1e4f6d3aad8bdc9df78625f91c1dcdd70fec9b"}
 {"id":"fln-0bw5"}
 {"id":"fln-0eq8"}
 {"id":"fln-0rxm"}
@@ -173,6 +173,7 @@
 {"id":"fln-fmt-check-at-commit-time-ofo5"}
 {"id":"fln-freeze-gate-blind-spot-bi3q"}
 {"id":"fln-front-door-residuals-0f6x"}
+{"id":"fln-frontier-k1-step-stops-since-s25-uvm6"}
 {"id":"fln-frontier-oom-abort-w9dx"}
 {"id":"fln-frontier-rows-depend-on-jobs-2g96"}
 {"id":"fln-fur"}
@@ -319,6 +320,7 @@
 {"id":"fln-q944"}
 {"id":"fln-qb5"}
 {"id":"fln-qpkj"}
+{"id":"fln-quoted-capture-kinds-red-since-a70bf51b-mvsb"}
 {"id":"fln-qw78"}
 {"id":"fln-r0yh"}
 {"id":"fln-r15-decision-vgwl"}
@@ -356,6 +358,7 @@
 {"id":"fln-simp-only-unchanged-goal-progress-wkcj"}
 {"id":"fln-simp-permutation-lemmas-95hc"}
 {"id":"fln-simp-quantified-true-false-accept-70o1"}
+{"id":"fln-simp-registered-projection-scans-all-structures-2udy"}
 {"id":"fln-simp-suggest-kbyk"}
 {"id":"fln-simp-unfold-indexed-4v9t"}
 {"id":"fln-small-tactics-6y6l"}
