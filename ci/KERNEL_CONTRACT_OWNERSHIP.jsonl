@@ -1,4 +1,4 @@
-{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":726,"projection_hash":"41e994d59d9508ddbb0e081c18b1991ebccbbd28daaf4e6e690ba217b2f857bc"}
+{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":729,"projection_hash":"258c1b9754f1b1b5492b919356ea2dd8ebb05a3ad90aed2177e018f49054ced9"}
 {"id":"fln-0bw5"}
 {"id":"fln-0eq8"}
 {"id":"fln-0rxm"}
@@ -164,7 +164,9 @@
 {"id":"fln-file-scale-t2-differential-5f1b"}
 {"id":"fln-first-order-approximation-context-locals-6esd"}
 {"id":"fln-fixture-retention-unbounded-evit"}
+{"id":"fln-fln-cli-untracked-reds-seed-world-8tad"}
 {"id":"fln-fln-definition-auxiliary-names-lv0n"}
+{"id":"fln-fln-elab-lib-reds-since-7dd7aa5d-2kxu"}
 {"id":"fln-fln-extended-60-modules-council-8485-27jb"}
 {"id":"fln-fln-let-rec-opacity-and-lifting-thb4"}
 {"id":"fln-fln-main-red-three-unowned-h823"}
@@ -210,6 +212,7 @@
 {"id":"fln-i9so"}
 {"id":"fln-identity-path-mutant-recovery-mbco"}
 {"id":"fln-import-reuse-composes-4ngt"}
+{"id":"fln-import-std-metadata-entry-cap-rzwa"}
 {"id":"fln-in1"}
 {"id":"fln-index-proof-omega-fallback-ov8v"}
 {"id":"fln-inductive-inferred-sort-normalization-f178"}
