@@ -584,17 +584,6 @@ mod tests {
     #[test]
     fn explicit_validation_failure_or_exhaustion_never_becomes_an_untagged_success() {
         let initial = publish(&Environment::new(), crate::seed::eq_seed_declaration());
-        let checked = publish(&initial, reflexivity_declaration("rule", true, true));
-        assert!(
-            infer(
-                &checked,
-                &name("rule"),
-                budget().narrowed(0, budget().depth)
-            )
-            .is_err()
-        );
-        assert!(read(&checked, || Ok(())).unwrap().is_empty());
-
         let data = publish(
             &initial,
             Declaration::Defn(DefinitionVal {
@@ -609,6 +598,69 @@ mod tests {
                 all: vec![name("data")],
             }),
         );
+        // `unfolds : data = Prop := Eq.refl Prop`. Its sides meet only once
+        // `data` is unfolded, so the comparison must take unifier steps.
+        let two = Level::one().succ().unwrap();
+        let unfolds = publish(
+            &data,
+            Declaration::Thm(TheoremVal {
+                base: ConstantVal {
+                    name: name("unfolds"),
+                    level_params: vec![],
+                    type_: Expr::app(
+                        Expr::app(
+                            Expr::app(
+                                Expr::const_(name("Eq"), vec![two.clone()]),
+                                Expr::sort(Level::one()),
+                            ),
+                            Expr::const_(name("data"), vec![]),
+                        ),
+                        Expr::sort(Level::zero()),
+                    ),
+                },
+                value: Expr::app(
+                    Expr::app(
+                        Expr::const_(name("Eq.refl"), vec![two]),
+                        Expr::sort(Level::one()),
+                    ),
+                    Expr::sort(Level::zero()),
+                ),
+                all: vec![name("unfolds")],
+            }),
+        );
+        // The comparison is metavariable-free, so it makes no kernel check and
+        // `infer`'s kernel budget never runs out on it. What it spends are the
+        // transaction's heartbeats, which also cap the unifier's steps. Starved
+        // of them it is a resource error: never untagged success, never a
+        // verdict that the rule is unsupported.
+        let type_ = unfolds
+            .find(&name("unfolds"))
+            .unwrap()
+            .constant_val()
+            .type_
+            .clone();
+        let mut starved = Context::new(&unfolds, budget());
+        starved.txn.budget.max_heartbeats = 1;
+        let exhausted = starved.dsimp_generic_defeq(&type_, &[]);
+        assert!(
+            matches!(
+                exhausted,
+                Err(NatDefinitionElabError::Inference(
+                    SourceInferenceError::ResourceLimit
+                )) | Err(NatDefinitionElabError::Inference(
+                    SourceInferenceError::Unification(_)
+                ))
+            ),
+            "{exhausted:?}"
+        );
+        assert_eq!(
+            Context::new(&unfolds, budget()).dsimp_generic_defeq(&type_, &[]),
+            Ok(true)
+        );
+        // The control: the same rule with the full budget is tagged.
+        let tagged = infer(&unfolds, &name("unfolds"), budget()).unwrap();
+        assert!(read(&tagged, || Ok(())).unwrap().contains(&name("unfolds")));
+
         assert!(matches!(
             infer(&data, &name("data"), budget()),
             Err(NatDefinitionElabError::Inference(

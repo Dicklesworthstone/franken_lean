@@ -1597,7 +1597,10 @@ mod tests {
     fn source_no_index_survives_and_only_exact_annotation_is_a_wildcard() {
         let env = environment();
         let parsed =
-            fln_parse::parse_definition(b"def flagged : Nat := no_index Nat.zero").unwrap();
+            // This model's `Nat.zero` is an axiom, so a definition over it is
+            // noncomputable here as at the pin.
+            fln_parse::parse_definition(b"noncomputable def flagged : Nat := no_index Nat.zero")
+                .unwrap();
         let Declaration::Defn(definition) =
             crate::elaborate_definition_in(parsed.syntax(), &env).unwrap()
         else {
