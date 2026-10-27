@@ -500,6 +500,29 @@ impl Context {
         arities: &[usize],
         names: &[Name],
     ) -> Result<Option<usize>, NatDefinitionElabError> {
+        self.mutual_fixed_prefix_core(values, arities, names, false)
+    }
+
+    /// Structural product motives can generalize unchanged trailing arguments as well as
+    /// changing ones. Preserve only the common leading fixed prefix, without imposing the
+    /// well-founded packer's stronger `fixedArePrefix` restriction on every argument.
+    pub(in crate::source) fn mutual_structural_fixed_prefix(
+        &mut self,
+        values: &[Expr],
+        arities: &[usize],
+        names: &[Name],
+    ) -> Result<usize, NatDefinitionElabError> {
+        self.mutual_fixed_prefix_core(values, arities, names, true)?
+            .ok_or_else(scope)
+    }
+
+    fn mutual_fixed_prefix_core(
+        &mut self,
+        values: &[Expr],
+        arities: &[usize],
+        names: &[Name],
+        generalize_trailing: bool,
+    ) -> Result<Option<usize>, NatDefinitionElabError> {
         let mut reverse_dependencies = Vec::new();
         let mut bodies = Vec::new();
         for (value, &arity) in values.iter().zip(arities) {
@@ -600,6 +623,22 @@ impl Context {
                     _ => {}
                 }
             }
+        }
+        if generalize_trailing {
+            let mut prefix = arities.iter().copied().min().ok_or_else(scope)?;
+            for parameters in &info.graph {
+                let leading = parameters
+                    .iter()
+                    .enumerate()
+                    .take_while(|(position, callers)| {
+                        callers
+                            .as_ref()
+                            .is_some_and(|callers| callers[0] == Some(*position))
+                    })
+                    .count();
+                prefix = prefix.min(leading);
+            }
+            return Ok(Some(prefix));
         }
         // `getFixedParamPerms`, then `fixedArePrefix`.
         let mut first = Vec::new();

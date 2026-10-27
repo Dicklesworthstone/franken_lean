@@ -316,12 +316,42 @@ fn malformed_existing_journals_cannot_be_hidden_by_per_rule_validation() {
     assert_eq!(native::read(&valid).unwrap().len(), 1);
 }
 
+fn index(parents: Vec<Vec<usize>>, work_left: u64) -> ScopeIndex {
+    ScopeIndex {
+        parents,
+        owners: BTreeMap::new(),
+        closures: Vec::new(),
+        work_left,
+    }
+}
+
 fn graph() -> ScopeIndex {
     ScopeIndex {
-        parents: vec![vec![], vec![0], vec![0]],
         owners: BTreeMap::from([(n("origin"), vec![0]), (n("proof"), vec![2])]),
-        work_left: 100,
+        ..index(vec![vec![], vec![0], vec![0]], 100)
     }
+}
+
+fn members(reach: &Reach, modules: usize) -> BTreeSet<usize> {
+    (0..modules)
+        .filter(|&index| reach.contains(index))
+        .collect()
+}
+
+/// The closure a plain walk finds, and the work the former per-module walk
+/// charged for it: one unit per pop and one per pushed import edge.
+fn walk(parents: &[Vec<usize>], module: usize) -> (BTreeSet<usize>, u64) {
+    let mut seen = BTreeSet::new();
+    let mut pending = vec![module];
+    let mut work = 0;
+    while let Some(index) = pending.pop() {
+        work += 1;
+        if seen.insert(index) {
+            work += parents[index].len() as u64;
+            pending.extend(&parents[index]);
+        }
+    }
+    (seen, work)
 }
 
 #[test]
@@ -329,7 +359,7 @@ fn imported_siblings_cannot_supply_proofs_but_real_dependencies_can() {
     let env = model();
     let mut graph = graph();
     let left = graph.closure(1).unwrap();
-    assert_eq!(left, BTreeSet::from([0, 1]));
+    assert_eq!(members(&left, 3), BTreeSet::from([0, 1]));
     graph
         .authorize(&Environment::new(), &env, &left, &n("Left"), &n("origin"))
         .unwrap();
@@ -376,6 +406,141 @@ fn import_scope_budget_stops_are_typed_resource_errors() {
     let error = graph.closure(1).unwrap_err();
     assert!(error.metadata_resource_exhausted());
     assert!(matches!(error, SourceOleanImportError::Limit(_)));
+}
+
+#[test]
+fn shared_imports_are_closed_once_not_rewalked_per_module() {
+    // A diamond closed root-first, then its members from the memo.
+    let mut diamond = index(vec![vec![], vec![0], vec![0], vec![1, 2]], 1_000);
+    let top = diamond.closure(3).unwrap();
+    assert_eq!(members(&top, 4), BTreeSet::from([0, 1, 2, 3]));
+    let spent = 1_000 - diamond.work_left;
+    let left = diamond.closure(1).unwrap();
+    assert_eq!(members(&left, 4), BTreeSet::from([0, 1]));
+    assert_eq!(
+        1_000 - diamond.work_left - spent,
+        1,
+        "a memo hit costs its one word"
+    );
+
+    // A 512-module chain where every module carries simp entries. Closing all
+    // of them costs (open + edge + two words + one word copied) per module.
+    let modules = 512;
+    let parents: Vec<Vec<usize>> = (0..modules)
+        .map(|index| if index == 0 { vec![] } else { vec![index - 1] })
+        .collect();
+    let former: u64 = (0..modules).map(|module| walk(&parents, module).1).sum();
+    let linear = 26 * modules as u64;
+    assert!(
+        former > 10 * linear,
+        "the former walk is quadratic: {former}"
+    );
+    let mut chain = index(parents.clone(), linear);
+    for module in 0..modules {
+        let reach = chain.closure(module).unwrap();
+        assert_eq!(members(&reach, modules), walk(&parents, module).0);
+    }
+    assert_eq!(
+        chain.work_left, 9,
+        "the root has no import edge and unions no parent"
+    );
+    let mut short = index(parents, linear - 26);
+    let error = (0..modules)
+        .try_for_each(|module| short.closure(module).map(drop))
+        .unwrap_err();
+    assert!(error.metadata_resource_exhausted(), "{error}");
+}
+
+#[test]
+fn malformed_import_graphs_are_internal_errors_not_loops_or_panics() {
+    // Two-cycle, self-import, and a cycle below an acyclic leaf.
+    for (parents, cyclic) in [
+        (vec![vec![1], vec![0]], vec![0, 1]),
+        (vec![vec![0]], vec![0]),
+        (vec![vec![], vec![2, 0], vec![1]], vec![1, 2]),
+    ] {
+        let mut graph = index(parents, 1_000);
+        for module in cyclic {
+            assert!(matches!(
+                graph.closure(module),
+                Err(SourceOleanImportError::Internal(
+                    "simp import graph is cyclic"
+                ))
+            ));
+        }
+        assert_eq!(graph.closure(0).is_ok(), graph.parents[0].is_empty());
+    }
+    let mut outside = index(vec![vec![5]], 1_000);
+    assert!(matches!(
+        outside.closure(0),
+        Err(SourceOleanImportError::Internal(
+            "simp module index is outside its graph"
+        ))
+    ));
+    assert!(matches!(
+        outside.closure(1),
+        Err(SourceOleanImportError::Internal(
+            "simp module index is outside its graph"
+        ))
+    ));
+}
+
+/// The pinned Std import graph, every module treated as carrying simp
+/// entries: each memoized closure is exactly the walked one, and closing all
+/// 965 costs a small part of the default budget the former walk exceeded.
+#[test]
+fn pinned_std_import_closures_fit_the_default_budget_and_match_a_walk() {
+    let Some(lib) = pinned_lib() else {
+        eprintln!("SKIP: pinned Reference lib/lean absent");
+        return;
+    };
+    let mut names = Vec::new();
+    let mut imports = Vec::new();
+    let mut pending = vec![n("Std")];
+    let mut seen = BTreeSet::new();
+    while let Some(name) = pending.pop() {
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        let path = lib
+            .join(name.to_display_string().replace('.', "/"))
+            .with_extension("olean");
+        let bytes = std::fs::read(&path).unwrap();
+        let direct = olean_module_imports(&bytes, OleanDecodeLimits::new(bytes.len())).unwrap();
+        pending.extend(direct.iter().cloned());
+        names.push(name);
+        imports.push(direct);
+    }
+    assert_eq!(names.len(), 965, "the measured pinned Std closure");
+    let at: BTreeMap<&Name, usize> = names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| (name, i))
+        .collect();
+    let parents: Vec<Vec<usize>> = imports
+        .iter()
+        .map(|direct| direct.iter().map(|name| at[name]).collect())
+        .collect();
+    let budget = limits(1).metadata.max_objects;
+    let former: u64 = (0..names.len())
+        .map(|module| walk(&parents, module).1)
+        .sum();
+    let mut graph = index(parents.clone(), budget);
+    for module in 0..names.len() {
+        let reach = graph.closure(module).unwrap();
+        assert_eq!(members(&reach, names.len()), walk(&parents, module).0);
+    }
+    let spent = budget - graph.work_left;
+    eprintln!("Std closures: {spent} work units; the former walk charged {former}");
+    assert!(former > budget, "the former walk alone exceeded the budget");
+    // Each module is opened once (one unit and one per import edge), closed
+    // once (a word per parent and its own) and copied once to its caller:
+    // linear in modules and edges (102,378 units at the pin, 4,149 edges).
+    let modules = names.len() as u64;
+    let words = names.len().div_ceil(64) as u64;
+    let edges: u64 = parents.iter().map(|direct| direct.len() as u64).sum();
+    assert_eq!(spent, modules * (1 + 2 * words) + edges * (1 + words));
+    assert!(spent < budget / 8, "{spent} of {budget}");
 }
 
 #[test]

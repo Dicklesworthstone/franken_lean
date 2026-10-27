@@ -15,10 +15,14 @@ on:
         description: 'Fixed validation command; negative controls are expected to fail'
         required: true
         type: choice
-        options: [range, cli, reference, missing-reference, flush-mutant, ingress]
+        options: [range, cli, reference, missing-reference, flush-mutant, ingress, mutual-structural]
   push:
     branches: [main]
-    paths: ['.github/workflows/fln-source-workbench.yml']
+    paths:
+      - '.github/workflows/fln-source-workbench.yml'
+      - 'crates/fln-elab/src/source/recursion/**'
+      - 'crates/fln-elab/src/source/partial/group/ordinary.rs'
+      - 'crates/fln/tests/source_mutual_ordinary.rs'
 permissions:
   contents: read
 jobs:
@@ -26,7 +30,7 @@ jobs:
   # RCH transport failures. This never publishes code or changes a test verdict.
   # Retire when those candidates land and the ordinary executor covers them.
   candidate:
-    if: github.event_name == 'workflow_dispatch' && github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main'
+    if: github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && (github.event_name == 'workflow_dispatch' || github.event_name == 'push')
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     permissions:
@@ -36,9 +40,9 @@ jobs:
       CARGO_INCREMENTAL: '0'
       CARGO_BUILD_JOBS: '2'
       CARGO_PROFILE_RELEASE_DEBUG: '0'
-      CANDIDATE_BASE: ${{ inputs.base }}
-      CANDIDATE_CHANGES: ${{ inputs.changes }}
-      CANDIDATE_SUITE: ${{ inputs.suite }}
+      CANDIDATE_BASE: ${{ inputs.base || github.sha }}
+      CANDIDATE_CHANGES: ${{ inputs.changes || '{}' }}
+      CANDIDATE_SUITE: ${{ inputs.suite || 'mutual-structural' }}
       WORKFLOW_SHA: ${{ github.sha }}
     steps:
       - name: Validate immutable source identifiers before checkout
@@ -63,11 +67,11 @@ jobs:
               assert isinstance(blobs, list) and len(blobs) == 2
               assert all(isinstance(s, str) and re.fullmatch('[0-9a-f]{40}', s) for s in blobs)
           assert os.environ['CANDIDATE_SUITE'] in {
-              'range', 'cli', 'reference', 'missing-reference', 'flush-mutant', 'ingress',
+              'range', 'cli', 'reference', 'missing-reference', 'flush-mutant', 'ingress', 'mutual-structural',
           }
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: ${{ inputs.base }}
+          ref: ${{ inputs.base || github.sha }}
           fetch-depth: 0
           persist-credentials: false
       - name: Require a main ancestor and materialize exact existing source blobs
@@ -141,6 +145,18 @@ jobs:
         run: |
           set -euo pipefail
           case "$CANDIDATE_SUITE" in
+            mutual-structural)
+              rustfmt --edition 2024 --config skip_children=true --check crates/fln-elab/src/source.rs crates/fln-elab/src/source/partial/group/ordinary.rs crates/fln-elab/src/source/recursion.rs crates/fln-elab/src/source/recursion/course.rs crates/fln-elab/src/source/recursion/matrix.rs crates/fln-elab/src/source/recursion/well_founded/mutual.rs crates/fln-elab/src/source/local_functions/lifting.rs crates/fln/tests/source_mutual_ordinary.rs crates/fln-elab/src/source/recursion/mutual_structural.rs
+              cargo test --locked -p fln --test source_mutual_ordinary -- --nocapture --test-threads=1
+              cargo test --locked --no-fail-fast -p fln \
+                --test source_mutual_well_founded --test source_course_of_values \
+                --test source_course_reduction --test source_matrix_recursion \
+                --test source_partial_definitions --test source_mutual_partial \
+                --test source_mutual_unsafe --test runtime_mutual_recursion \
+                -- --test-threads=1
+              cargo clippy --locked -p fln-elab --lib -- -D warnings
+              cargo check --locked --workspace --all-targets
+              ;;
             ingress)
               cargo check --locked --all-targets
               cargo clippy --locked --all-targets -- -D warnings
@@ -2318,7 +2334,7 @@ jobs:
   # Diagnostic traces do not change a limit or publish implementation files.
   source-node-diagnostic:
     if: >-
-      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(import): validate measured Std defaults and trace remaining source failures'
+      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && contains(github.event.head_commit.message, 'mutual structural recursion')
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
@@ -2366,76 +2382,42 @@ jobs:
           printf 'ELAN_HOME=%s\nFLN_REFERENCE_LIB=%s/lib/lean\nFLN_REFERENCE_LEAN=%s/bin/lean\nFLN_REQUIRE_REFERENCE=1\n' \
             "$ELAN_HOME" "$toolchain_root" "$toolchain_root" >> "$GITHUB_ENV"
           printf '%s\n' "$ELAN_HOME/bin" >> "$GITHUB_PATH"
-      - name: Trace producer node exhaustion in this temporary candidate copy
+      - name: Materialize the isolated runtime preparation diagnostic
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: python
+        run: |
+          import base64, hashlib, json, os, subprocess, urllib.request
+          expected = 'f2b5000e8f7ea0a68dba50b223bde8e2adde7803'
+          before = {
+              'crates/fln/src/runtime.rs': 'b415e2c1fae1f9e0a17c76d131d390306179f230',
+              'crates/fln/src/lib.rs': 'bd07c3e9817aea8211ddb83f1e11fad979507899',
+              'crates/fln/tests/runtime_io_evaluation.rs': '35248c717e6818c9f537369b6bdf06c0cf37b57a',
+              'crates/fln/tests/runtime_io_evaluation/actual.rs': 'e82fb3a7f7010ee5799e66df99c55e2a8364a654',
+          }
+          for path, sha in before.items():
+              assert subprocess.check_output(['git', 'hash-object', path], text=True).strip() == sha, path
+          request = urllib.request.Request(
+              'https://api.github.com/repos/Dicklesworthstone/franken_lean/git/blobs/' + expected,
+              headers={'Accept': 'application/vnd.github+json',
+                       'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
+                       'User-Agent': 'franken_lean-agent (+https://github.com/Dicklesworthstone/franken_lean)'})
+          with urllib.request.urlopen(request, timeout=60) as response:
+              record = json.load(response)
+          assert record['sha'] == expected and record['encoding'] == 'base64'
+          patch = base64.b64decode(record['content'])
+          assert hashlib.sha1(('blob ' + str(len(patch)) + '\0').encode() + patch).hexdigest() == expected
+          subprocess.run(['git', 'apply', '--check', '-'], input=patch, check=True)
+          subprocess.run(['git', 'apply', '-'], input=patch, check=True)
+      - name: Trace actual iterator preparation without repeating module admission
         shell: bash
         run: |
           set -euo pipefail
-          cat > "$RUNNER_TEMP/node-diagnostic.patch" <<'PATCH'
-          diff --git a/crates/fln/src/runtime.rs b/crates/fln/src/runtime.rs
-          --- a/crates/fln/src/runtime.rs
-          +++ b/crates/fln/src/runtime.rs
-          @@ -233,3 +233,18 @@
-          +    #[track_caller]
-               fn tick(&mut self) -> Result<(), IngressError> {
-          +        if self.visited >= self.limits.max_nodes {
-          +            eprintln!(
-          +                "FLN_PREPARATION_NODE_LIMIT visited={} limit={} instances={} lambdas={} cases={} data_shapes={} caller={}",
-          +                self.visited,
-          +                self.limits.max_nodes,
-          +                self.specializations.instances.len(),
-          +                self.lambdas.len(),
-          +                self.cases.len(),
-          +                self.data_shapes.len(),
-          +                std::panic::Location::caller(),
-          +            );
-          +            eprintln!("{}", std::backtrace::Backtrace::force_capture());
-          +        }
-                   charge_catalog_node(&mut self.visited, self.limits)
-               }
-          diff --git a/crates/fln/src/lib.rs b/crates/fln/src/lib.rs
-          --- a/crates/fln/src/lib.rs
-          +++ b/crates/fln/src/lib.rs
-          @@ -7095,8 +7095,9 @@
-           fn charge_catalog_node(
-               visited_nodes: &mut usize,
-               limits: IngressLimits,
-           ) -> Result<(), IngressError> {
-               let observed = visited_nodes.saturating_add(1);
-               if observed > limits.max_nodes {
-          +        eprintln!("FLN_CATALOG_NODE_LIMIT {}", std::backtrace::Backtrace::force_capture());
-                   return Err(IngressError::ResourceLimit {
-                       resource: IngressResource::Nodes,
-          PATCH
-          git apply --recount --check "$RUNNER_TEMP/node-diagnostic.patch"
-          git apply --recount "$RUNNER_TEMP/node-diagnostic.patch"
-      - name: Build native lean and reproduce the same inputs under both toolchains
-        shell: bash
-        run: |
-          set -euo pipefail
-          cargo build --locked --release -p fln-cli --bin lean --jobs 2
-          native="$(realpath target/release/lean)"
           probe_dir="$RUNNER_TEMP/fln-node-diagnostic"
-          mkdir -p "$probe_dir/reuse"
-          cat > "$probe_dir/slice.lean" <<'LEAN'
-          prelude
-          import Init.Data.String.Slice
-          #eval ("42".toSlice.toNat?).getD 0
-          LEAN
-          cat > "$probe_dir/filepath.lean" <<'LEAN'
-          prelude
-          import Init.System.FilePath
-          #eval if System.FilePath.isAbsolute ⟨"/tmp"⟩ then 1 else 0
-          LEAN
-          for file in slice.lean filepath.lean; do
-            for runtime in reference native; do
-              if [ "$runtime" = reference ]; then executable="$FLN_REFERENCE_LEAN"; else executable="$native"; fi
-              status=0
-              (cd "$probe_dir" && env LEAN_PATH="$FLN_REFERENCE_LIB" FLN_IMPORT_REUSE_DIR="$probe_dir/reuse" RUST_BACKTRACE=full timeout --signal=TERM --kill-after=30s 10m "$executable" -j 2 "$file") > "$probe_dir/$file.$runtime.stdout" 2> "$probe_dir/$file.$runtime.stderr" || status=$?
-              printf '%s %s exit=%s\n' "$runtime" "$file" "$status" | tee -a "$probe_dir/exits.txt"
-              cat "$probe_dir/$file.$runtime.stdout"
-              cat "$probe_dir/$file.$runtime.stderr"
-            done
-          done
+          mkdir -p "$probe_dir"
+          cargo test --locked --release -p fln --test runtime_io_evaluation \
+            raw_actual_string_iterator_ingress_diagnostic_is_not_module_admission \
+            -- --ignored --nocapture --test-threads=1 2>&1 | tee "$probe_dir/iterator.log"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()
         with:

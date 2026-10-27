@@ -38,7 +38,10 @@ impl Context {
         // Those compiler-local closures retain the existing inline behavior;
         // they are not a sound owner.helper interface without closure of the
         // enclosing recursive group. Do not publish a specialized impostor.
-        if self.recursion.is_some() || self.well_founded.is_some() {
+        if self.recursion.is_some()
+            || self.well_founded.is_some()
+            || self.mutual_structural_member.is_some()
+        {
             return Ok(None);
         }
         let Some(parent) = &self.local_function_lifting.parent else {

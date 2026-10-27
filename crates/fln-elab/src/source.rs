@@ -709,6 +709,8 @@ struct Context {
     // Set while one member of a mutual well-founded group is elaborated against
     // the group's shared fixpoint (`recursion::well_founded::mutual`).
     mutual_member: Option<recursion::MutualMember>,
+    /// One member of a shared-family structural SCC, using a checked below dictionary.
+    mutual_structural_member: Option<recursion::StructuralMember>,
     // Set only after a top-level well-founded lowering succeeds. The source
     // declaration result carries this status to post-admission metadata.
     well_founded_definition: bool,
@@ -845,6 +847,7 @@ impl Context {
             recursion: None,
             well_founded: None,
             mutual_member: None,
+            mutual_structural_member: None,
             well_founded_definition: false,
             recursive_definition: false,
             course_definitions: Vec::new(),
@@ -945,6 +948,13 @@ impl Context {
     }
 
     fn constant(&mut self, name: &Name) -> Result<Typed, NatDefinitionElabError> {
+        if let Some(reference) = self
+            .mutual_structural_member
+            .as_ref()
+            .and_then(|member| member.target(name))
+        {
+            return Ok(reference.clone());
+        }
         // A mutual well-founded member's peers are the group's private recursive
         // references, however they are spelled, never the group's header locals.
         if let Some(recursion) = &self.well_founded

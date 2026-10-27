@@ -8,7 +8,10 @@ use super::*;
 use fln_env::constants::{ConstantInfo, DefinitionSafety};
 
 impl Context {
-    fn course_spine(&mut self, value: &Expr) -> Result<(Expr, Vec<Expr>), NatDefinitionElabError> {
+    pub(super) fn course_spine(
+        &mut self,
+        value: &Expr,
+    ) -> Result<(Expr, Vec<Expr>), NatDefinitionElabError> {
         let mut head = value.clone();
         let mut args = Vec::new();
         loop {
@@ -101,7 +104,7 @@ impl Context {
         Ok(parameters)
     }
 
-    fn course_apply(
+    pub(super) fn course_apply(
         &mut self,
         function: Typed,
         value: Expr,
@@ -411,10 +414,39 @@ impl Context {
             );
         }
         requested.push(argument);
+        let mut result = self.select_course_entry(
+            &below,
+            &recursion.family.as_ref().unwrap().0,
+            parameters,
+            &requested,
+        )?;
+        for position in &recursion.varying {
+            if let Some(argument) = arguments.get(*position) {
+                self.tick()?;
+                result = Expr::app(result, argument.clone());
+            }
+        }
+        for argument in arguments.iter().skip(recursion.parameters.len()) {
+            self.tick()?;
+            result = Expr::app(result, argument.clone());
+        }
+        Ok(result)
+    }
+
+    /// Find the entry for the actual smaller major (and all its indices), with an opaque
+    /// motive preventing equal result types from identifying different subterms. Both single
+    /// and mutual structural recursion use this same admission-independent selection.
+    pub(super) fn select_course_entry(
+        &mut self,
+        below: &LocalDecl,
+        family: &Name,
+        parameters: usize,
+        requested: &[Expr],
+    ) -> Result<Expr, NatDefinitionElabError> {
         let (head, mut args) = self.course_spine(&below.type_)?;
-        let expected_head = Name::str(recursion.family.as_ref().unwrap().0.clone(), "below");
+        let expected_head = Name::str(family.clone(), "below");
         if !matches!(head.node(), ExprNode::Const { name, .. } if name == &expected_head)
-            || args.len() != parameters + recursion.indices.len() + 2
+            || args.len() != parameters + requested.len() + 1
         {
             return Err(error(RecursionError::NotDecreasing));
         }
@@ -435,29 +467,18 @@ impl Context {
         // generalize; the rigid stand-ins never outlive this search.
         let universes = self.txn.universes.clone();
         let mut terms = vec![&dictionary];
-        terms.extend(&requested);
+        terms.extend(requested);
         let selected = self.rigid_open_universes(&terms).and_then(|_| {
             self.search_course_dictionary(
                 dictionary.clone(),
-                Expr::fvar(below.id),
+                Expr::fvar(below.id.clone()),
                 &canary,
-                &requested,
+                requested,
             )
         });
         self.txn.universes = universes;
         self.txn.lctx = saved;
-        let mut result = selected?.ok_or_else(|| error(RecursionError::NotDecreasing))?;
-        for position in &recursion.varying {
-            if let Some(argument) = arguments.get(*position) {
-                self.tick()?;
-                result = Expr::app(result, argument.clone());
-            }
-        }
-        for argument in arguments.iter().skip(recursion.parameters.len()) {
-            self.tick()?;
-            result = Expr::app(result, argument.clone());
-        }
-        Ok(result)
+        selected?.ok_or_else(|| error(RecursionError::NotDecreasing))
     }
 
     fn search_course_dictionary(
