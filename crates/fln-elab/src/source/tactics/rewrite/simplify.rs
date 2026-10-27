@@ -17,7 +17,7 @@ mod unfold;
 use super::matching::RigidTypeHead;
 use super::*;
 use crate::lctx::LocalContext;
-use aclt::{SimpPlace, SimpReach, SimpRewrite, simp_rules_keyed};
+use aclt::{SimpPlace, SimpReach, SimpRewrite};
 pub(in crate::source) use config::SimpConfig;
 use fln_core::expr::BinderInfo;
 use fln_env::environment::Environment;
@@ -394,8 +394,8 @@ impl Context {
     /// transparency and unifies only those; trying all of `Init`'s ~10,000
     /// registered rules at every step exhausted the elaboration budget on ordinary
     /// files (fln-simp-default-set-a4nb). A rule's key is memoized per environment
-    /// and charges nothing: it reads only the rule's admitted type. Explicit and
-    /// local rules, unfolded definitions and every shape not keyed here may match.
+    /// and charges nothing: it reads only the rule's admitted type. A term or local
+    /// rule, an unfolded definition and every shape not keyed here may match.
     fn simp_rule_admitted(
         &self,
         rule: &SimpRule<'_>,
@@ -447,8 +447,8 @@ impl Context {
     /// The key `rule` rewrites at. The pin's simp retrieves a rule at a node only when
     /// the node's own key matches, so the occurrence search tries no other node: before
     /// this, every admitted rule inferred the type of, and unified against, every
-    /// subterm of the target. `None` (every node) for explicit and local rules,
-    /// unfolded definitions and every shape not keyed here.
+    /// subterm of the target. `None` (every node) for term and local rules, unfolded
+    /// definitions and every shape not keyed here.
     pub(super) fn simp_rule_node_key(
         &mut self,
         rule: &SimpRule<'_>,
@@ -1398,7 +1398,6 @@ impl Context {
         let mut history = vec![current.clone()];
         let mut steps = 0usize;
         let permute = self.simp_rules_permute(&rules)?;
-        let rules = simp_rules_keyed(&rules, permute);
         loop {
             self.tick()?;
             let next = if let Some(normalized) = self.simp_normalize(&current)? {
@@ -1524,8 +1523,6 @@ impl Context {
     ) -> Result<(), NatDefinitionElabError> {
         let mut history = vec![self.instantiate(&goal.target)?];
         let permute = self.simp_rules_permute(rules)?;
-        let keyed = simp_rules_keyed(rules, permute);
-        let rules = &keyed[..];
         loop {
             self.tick()?;
             self.txn.lctx = goal.lctx.clone();
@@ -1832,6 +1829,9 @@ fn simp_pattern_key(
     table: &crate::reducibility::ReducibilityTable,
     pattern: &Expr,
 ) -> Option<SimpKey> {
+    if simp_key_noindex(pattern) {
+        return None;
+    }
     let pattern = simp_key_head_beta(pattern);
     let (head, args) = simp_key_spine(&pattern);
     match head.node() {
@@ -2186,6 +2186,9 @@ fn simp_rule_arg_key(
     arg: &Expr,
     level: usize,
 ) -> SimpArgKey {
+    if simp_key_noindex(arg) {
+        return SimpArgKey::Any;
+    }
     if let Some(value) = simp_key_numeral(arg) {
         return SimpArgKey::Lit(value);
     }
@@ -2210,6 +2213,13 @@ fn simp_rule_arg_key(
         }
         _ => SimpArgKey::Any,
     }
+}
+
+/// A `no_index` term: the pin's `DiscrTree.hasNoindexAnnotation`, an `mdata` holding exactly
+/// `noindex := true`, which its key path reads as a star (`pushArgs`).
+fn simp_key_noindex(expr: &Expr) -> bool {
+    matches!(expr.node(), ExprNode::MData { data, .. }
+        if data.len() == 1 && data.get_bool(&Name::from_components(["noindex"]), false))
 }
 
 /// The value of a numeral as the pin's `DiscrTree` reads one (`isNumeral`,
