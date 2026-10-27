@@ -439,9 +439,9 @@ fn metadata_and_encoding_budgets_remain_aggregate_and_unsupported_exports_refuse
             .compile_source_modules(&inputs, &n("Main"), &KVMap::new(), limits(), budget)
             .is_err()
     );
-    // Instance rows are exported now; a scoped one still has no `.olean` writer.
-    let source =
-        b"prelude\nimport A\nnamespace Scope\nnoncomputable scoped instance localChoice : Class := a\nend Scope\n";
+    // Scoped instances are exported now (fd22c5dc). A simp erasure still has no
+    // `.olean` writer, so the export refuses after elaboration succeeds.
+    let source = b"prelude\nimport A\n@[simp] def ident (T : Type) (x : T) : T := x\nattribute [-simp] ident\n";
     let inputs = [SourceModuleInput {
         name: &names[0],
         source,
