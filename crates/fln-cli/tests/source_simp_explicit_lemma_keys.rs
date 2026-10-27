@@ -98,21 +98,25 @@ fn workspace() -> PathBuf {
 fn check(lib: &Path, root: &Path, name: &str, program: &str) -> (i32, String, Option<i32>) {
     let entry = root.join(format!("{name}.lean"));
     std::fs::write(&entry, format!("{HEADER}{DEFINITIONS}{program}")).unwrap();
-    let theirs = lib
+    let pinned = lib
         .parent()
         .and_then(Path::parent)
         .map(|toolchain| toolchain.join("bin/lean"))
-        .filter(|lean| lean.is_file())
-        .map(|pinned| {
-            Command::new(pinned)
-                .arg(&entry)
-                .env("LEAN_PATH", lib)
-                .output()
-                .expect("run the pinned lean")
-                .status
-                .code()
-                .expect("normal pinned exit")
-        });
+        .filter(|lean| lean.is_file());
+    assert!(
+        pinned.is_some() || std::env::var_os("FLN_REQUIRE_REFERENCE").is_none(),
+        "the pinned Reference binary is required"
+    );
+    let theirs = pinned.map(|pinned| {
+        Command::new(pinned)
+            .arg(&entry)
+            .env("LEAN_PATH", lib)
+            .output()
+            .expect("run the pinned lean")
+            .status
+            .code()
+            .expect("normal pinned exit")
+    });
     let ours = Command::new(env!("CARGO_BIN_EXE_fln"))
         .arg("check-source")
         .arg(&entry)
@@ -148,4 +152,34 @@ fn an_explicit_global_lemma_is_retrieved_by_its_keys() {
         );
         assert_ne!(pinned.unwrap_or(1), 0, "{name}: the pinned lean accepts it");
     }
+}
+
+#[test]
+fn a_required_reference_without_its_binary_is_refused_before_comparison() {
+    let Some(lib) = pinned_lib() else {
+        return;
+    };
+    let root = workspace();
+    let partial_lib = root.join("lib/lean");
+    let prerequisite = Path::new("Init/Data/Nat/Basic.olean");
+    std::fs::create_dir_all(partial_lib.join(prerequisite).parent().unwrap()).unwrap();
+    // Preserve the real artifact that pinned_lib checks. The executable is
+    // deliberately absent; the child must refuse before invoking either prover.
+    std::fs::copy(lib.join(prerequisite), partial_lib.join(prerequisite)).unwrap();
+    let output = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "an_explicit_global_lemma_is_retrieved_by_its_keys",
+            "--nocapture",
+        ])
+        .env("FLN_REQUIRE_REFERENCE", "1")
+        .env("FLN_REFERENCE_LIB", partial_lib)
+        .output()
+        .expect("run the actual comparison with the oracle executable absent");
+    assert!(!output.status.success(), "a required oracle was absent");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("the pinned Reference binary is required"),
+        "the child failed for another reason: {stderr}"
+    );
 }
