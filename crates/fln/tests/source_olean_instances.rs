@@ -522,10 +522,28 @@ fn limits_and_final_cancellation_preserve_the_original_engine() {
             self.calls.fetch_add(1, Ordering::Relaxed) >= self.at
         }
     }
-    // before council, capture, before decode, class, instance, publication.
+    // Measure the complete import rather than guessing a checkpoint count:
+    // metadata preflight adds checks before the council, and cancellation here
+    // must still exercise the final boundary after metadata activation.
+    let completed = Cancel {
+        calls: AtomicUsize::new(0),
+        at: usize::MAX,
+    };
+    let outcome = base
+        .import_olean_modules_for_source_with_cancel(
+            &modules,
+            std::slice::from_ref(&name),
+            &KVMap::new(),
+            limits(),
+            Some(&completed),
+        )
+        .unwrap();
+    assert!(matches!(outcome, Outcome::Complete(_)));
+    let final_check = completed.calls.load(Ordering::Relaxed);
+    assert!(final_check > 0);
     let cancel = Cancel {
         calls: AtomicUsize::new(0),
-        at: 5,
+        at: final_check - 1,
     };
     let outcome = base
         .import_olean_modules_for_source_with_cancel(
@@ -537,7 +555,7 @@ fn limits_and_final_cancellation_preserve_the_original_engine() {
         )
         .unwrap();
     assert!(matches!(outcome, Outcome::Inconclusive(_)));
-    assert_eq!(cancel.calls.load(Ordering::Relaxed), 6);
+    assert_eq!(cancel.calls.load(Ordering::Relaxed), final_check);
     assert_eq!(base.logical_root(&KVMap::new()), before);
     assert!(!base.environment().contains(&n("Pick")));
     import(&base, &bytes);

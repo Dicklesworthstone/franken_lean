@@ -42,8 +42,13 @@ impl Engine {
         posture: ImportPostureRequest<'_>,
         cancellation: Option<&dyn CancellationProbe>,
     ) -> ImportResult<Outcome<(SourceOleanImport, ImportPostureReport)>> {
+        let host = match SourceImportHost::prepare(self, modules, roots, limits, cancellation)? {
+            Outcome::Complete(host) => host,
+            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+        };
         self.admitted().import_olean_modules_with_posture(
-            &SourceImportHost::new(self, limits),
+            &host,
             modules,
             roots,
             options,

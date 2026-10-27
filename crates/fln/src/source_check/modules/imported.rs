@@ -10,6 +10,7 @@ use fln_admission::reuse::{AdmittedImport, ImportCouncilError, ImportCouncilLimi
 use fln_elab::instances::{self, InstanceRegistryError};
 use fln_olean::region::{OleanView, OpaqueExtensionBlock};
 use fln_olean::source_extensions::{self as metadata, DecodeLimits};
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 #[path = "imported/implemented_by.rs"]
 mod implemented_by;
@@ -330,11 +331,36 @@ impl AdmittedImport for SourceOleanImport {
 pub(super) struct SourceImportHost<'a> {
     engine: &'a Engine,
     limits: SourceOleanImportLimits,
+    prepared: RefCell<Option<PreparedMetadata>>,
 }
 
 impl<'a> SourceImportHost<'a> {
+    #[cfg(test)]
     pub(super) fn new(engine: &'a Engine, limits: SourceOleanImportLimits) -> Self {
-        Self { engine, limits }
+        Self {
+            engine,
+            limits,
+            prepared: RefCell::new(None),
+        }
+    }
+
+    /// Reject malformed or over-budget metadata before paying for a council or
+    /// rebuilding a reused closure. This reads data only: activation still needs
+    /// the council's checked set. Keep the decoded rows for that later step.
+    pub(super) fn prepare(
+        engine: &'a Engine,
+        modules: &[OleanModuleInput<'_>],
+        roots: &[Name],
+        limits: SourceOleanImportLimits,
+        cancellation: Option<&dyn CancellationProbe>,
+    ) -> Result<Outcome<Self>> {
+        prepare_source_metadata(modules, roots, limits, cancellation).map(|outcome| {
+            outcome.map_complete(|prepared| Self {
+                engine,
+                limits,
+                prepared: RefCell::new(Some(prepared)),
+            })
+        })
     }
 }
 
@@ -349,19 +375,31 @@ impl ImportHost for SourceImportHost<'_> {
         options: &KVMap,
         cancellation: Option<&dyn CancellationProbe>,
     ) -> Result<Outcome<SourceOleanImport>> {
-        self.engine.activate_source_metadata(
-            checked.map_engine(|engine| self.engine.with_admitted(engine)),
-            modules,
-            roots,
-            options,
-            self.limits,
-            cancellation,
-        )
+        let prepared = match self.prepared.borrow_mut().take() {
+            Some(prepared) => prepared,
+            // A reused closure whose final root fails verification can invoke
+            // the host again after an ordinary council. Re-prepare from the same
+            // immutable inputs under the same bounds; never keep partial state.
+            None => match prepare_source_metadata(modules, roots, self.limits, cancellation)? {
+                Outcome::Complete(prepared) => prepared,
+                Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+            },
+        };
+        self.engine
+            .activate_prepared_source_metadata_with::<instances::imported::ImportActivation>(
+                checked.map_engine(|engine| self.engine.with_admitted(engine)),
+                roots,
+                options,
+                self.limits,
+                cancellation,
+                prepared,
+            )
     }
 }
 
 impl Engine {
-    /// Recheck a complete artifact closure, then activate its native class,
+    /// Preflight source metadata, recheck the complete artifact closure, then activate its native class,
     /// instance and default-instance journals. Roots are in source import order.
     /// No partially checked or partially activated successor is ever returned.
     ///
@@ -390,8 +428,13 @@ impl Engine {
         limits: SourceOleanImportLimits,
         cancellation: Option<&dyn CancellationProbe>,
     ) -> Result<Outcome<SourceOleanImport>> {
+        let host = match SourceImportHost::prepare(self, modules, roots, limits, cancellation)? {
+            Outcome::Complete(host) => host,
+            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+        };
         self.admitted().import_olean_modules_for_source_with_cancel(
-            &SourceImportHost::new(self, limits),
+            &host,
             modules,
             roots,
             options,
@@ -405,6 +448,7 @@ impl Engine {
     /// here: `recheck` with the set the council just admitted, `reuse-verified`
     /// ([`super::reuse`]) with the set it rebuilt and proved identical by root.
     /// Metadata grants no declaration authority either way.
+    #[cfg(test)]
     pub(super) fn activate_source_metadata(
         &self,
         checked: CheckedOleanSet,
@@ -425,6 +469,7 @@ impl Engine {
     }
 
     /// [`Self::activate_source_metadata`] with the registrations made by `R`.
+    #[cfg(test)]
     fn activate_source_metadata_with<R: Registrar>(
         &self,
         checked: CheckedOleanSet,
@@ -434,6 +479,252 @@ impl Engine {
         limits: SourceOleanImportLimits,
         cancellation: Option<&dyn CancellationProbe>,
     ) -> Result<Outcome<SourceOleanImport>> {
+        let prepared = match prepare_source_metadata(modules, roots, limits, cancellation)? {
+            Outcome::Complete(prepared) => prepared,
+            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+        };
+        self.activate_prepared_source_metadata_with::<R>(
+            checked,
+            roots,
+            options,
+            limits,
+            cancellation,
+            prepared,
+        )
+    }
+}
+
+struct PreparedMetadata {
+    reports: Vec<SourceMetadataReport>,
+    decoded: metadata::SourceExtensions,
+}
+
+struct MetadataModule {
+    name: Name,
+    is_module: bool,
+    imports: Vec<fln_olean::region::ModuleImport>,
+}
+
+fn prepare_source_metadata(
+    modules: &[OleanModuleInput<'_>],
+    roots: &[Name],
+    limits: SourceOleanImportLimits,
+    cancellation: Option<&dyn CancellationProbe>,
+) -> Result<Outcome<PreparedMetadata>> {
+    macro_rules! cancelled {
+        ($at:literal) => {
+            if cancellation.is_some_and(CancellationProbe::is_cancelled) {
+                return Ok(Outcome::Inconclusive(Inconclusive::cancelled($at)));
+            }
+        };
+    }
+    if roots.is_empty() {
+        return Err(SourceOleanImportError::EmptyRoots);
+    }
+    if roots.len() > limits.max_roots {
+        return Err(SourceOleanImportError::Limit("import roots"));
+    }
+    cancelled!("source-olean/before-metadata-preflight");
+    let metadata_modules = match metadata_modules(modules, limits.check, cancellation)? {
+        Outcome::Complete(modules) => modules,
+        Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+        Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+    };
+    let order = replay_order(
+        metadata_modules
+            .iter()
+            .map(|module| (&module.name, module.imports.as_slice())),
+        roots,
+    )?;
+    let inputs: BTreeMap<_, _> = modules.iter().map(|m| (m.name, m)).collect();
+    let selected = [
+        metadata::CLASS_EXTENSION,
+        metadata::INSTANCE_EXTENSION,
+        metadata::DEFAULT_EXTENSION,
+        metadata::ALIAS_EXTENSION,
+        metadata::PROTECTED_EXTENSION,
+        metadata::REDUCIBILITY_EXTENSION,
+        metadata::EXTERN_EXTENSION,
+        metadata::IMPLEMENTED_BY_EXTENSION,
+        metadata::AUX_RECURSOR_EXTENSION,
+        fln_olean::initializers::REGULAR_INIT_EXTENSION,
+        fln_olean::initializers::BUILTIN_INIT_EXTENSION,
+    ]
+    .map(|name| Name::from_components(name.split('.')));
+    let selected: Vec<_> = selected
+        .into_iter()
+        .chain([
+            metadata::structure_extension_name(),
+            Name::from_components(metadata::NONCOMPUTABLE_EXTENSION.split('.')),
+            Name::from_components(metadata::SIMP_EXTENSION.split('.')),
+            Name::from_components(metadata::DEFEQ_EXTENSION.split('.')),
+            Name::from_components(metadata::PP_ANONYMOUS_CONSTRUCTOR_EXTENSION.split('.')),
+            Name::from_components(metadata::PP_NODOT_EXTENSION.split('.')),
+            Name::from_components(metadata::APP_UNEXPANDER_EXTENSION.split('.')),
+            Name::from_components(metadata::INLINE_EXTENSION.split('.')),
+            metadata::namespace_extension_name(),
+            Name::from_components(metadata::DEPRECATED_EXTENSION.split('.')),
+            Name::from_components(metadata::BACKWARD_DEFEQ_EXTENSION.split('.')),
+        ])
+        .collect();
+    let mut blocks: Vec<_> = selected
+        .iter()
+        .map(|name| OpaqueExtensionBlock {
+            name: name.clone(),
+            entries: Vec::new(),
+        })
+        .collect();
+    let mut reports = Vec::new();
+    let mut capture_left = limits.max_capture_bytes;
+    let mut entries_left = limits.metadata.max_entries;
+    let mut defeq_tags = ReflexivityTags::default();
+    let mut backward_defeq_tags = ReflexivityTags::default();
+    let mut metadata_decoder = metadata::Decoder::new(limits.metadata);
+    // Each module's capture reads only its own parts, so the walks run
+    // `limits.read_jobs` at once; the cumulative byte allowance is charged below
+    // in replay order, exactly as when one walk followed another.
+    cancelled!("source-olean/capture");
+    let mut captures = capture_modules(&metadata_modules, &order, &inputs, &limits).into_iter();
+    for &index in &order {
+        cancelled!("source-olean/capture");
+        let module = &metadata_modules[index];
+        let captured = captures.next().ok_or(SourceOleanImportError::Internal(
+            "a replayed module has no capture",
+        ))??;
+        let mut report = SourceMetadataReport {
+            module: module.name.clone(),
+            classes: 0,
+            instances: 0,
+            defaults: 0,
+            scoped_instances: 0,
+            aliases: 0,
+            namespaces: 0,
+            protected: 0,
+            aux_recursors: 0,
+            noncomputable: 0,
+            defeq: 0,
+            backward_defeq: 0,
+            structures: 0,
+            reducibility: 0,
+            externs: 0,
+            implemented_by: 0,
+            inline: 0,
+            regular_initializers: 0,
+            builtin_initializers: 0,
+            simps: 0,
+            activated_simps: 0,
+            deferred_simps: 0,
+            pp_anonymous_constructor: 0,
+            pp_nodot: 0,
+            app_unexpanders: 0,
+            deprecations: 0,
+            uninterpreted: Vec::new(),
+        };
+        let mut seen = BTreeSet::new();
+        for block in captured {
+            if !seen.insert(block.name.clone()) {
+                return Err(SourceOleanImportError::Metadata {
+                    module: module.name.clone(),
+                    declaration: block.name,
+                    reason: "duplicate extension block",
+                });
+            }
+            for payload in &block.entries {
+                capture_left = capture_left
+                    .checked_sub(payload.len())
+                    .ok_or(SourceOleanImportError::Limit("captured extension bytes"))?;
+            }
+            if let Some(kind) = selected.iter().position(|name| name == &block.name) {
+                let entries = block.entries;
+                if kind == 14 || kind == 21 {
+                    // A realized equation can carry the same tag in several
+                    // modules with different compacted object layouts. Compare
+                    // decoded names, retaining the first module's registration.
+                    // Cached byte-identical entries keep their old zero decode
+                    // cost; a same-module name repeat still refuses.
+                    let tags = if kind == 14 {
+                        &mut defeq_tags
+                    } else {
+                        &mut backward_defeq_tags
+                    };
+                    let before = metadata_decoder.remaining_limits().max_entries;
+                    let count =
+                        tags.capture(&module.name, &block.name, entries, &mut metadata_decoder)?;
+                    entries_left = entries_left
+                        .checked_sub(before - metadata_decoder.remaining_limits().max_entries)
+                        .ok_or(SourceOleanImportError::Limit("metadata entries"))?;
+                    if kind == 14 {
+                        report.defeq = count;
+                    } else {
+                        report.backward_defeq = count;
+                    }
+                    continue;
+                }
+                entries_left = entries_left
+                    .checked_sub(entries.len())
+                    .ok_or(SourceOleanImportError::Limit("metadata entries"))?;
+                match kind {
+                    0 => report.classes = entries.len(),
+                    1 => report.instances = entries.len(),
+                    2 => report.defaults = entries.len(),
+                    3 => report.aliases = entries.len(),
+                    4 => report.protected = entries.len(),
+                    5 => report.reducibility = entries.len(),
+                    6 => report.externs = entries.len(),
+                    7 => report.implemented_by = entries.len(),
+                    8 => report.aux_recursors = entries.len(),
+                    9 => report.regular_initializers = entries.len(),
+                    10 => report.builtin_initializers = entries.len(),
+                    11 => report.structures = entries.len(),
+                    12 => report.noncomputable = entries.len(),
+                    13 => report.simps = entries.len(),
+                    14 => report.defeq = entries.len(),
+                    15 => report.pp_anonymous_constructor = entries.len(),
+                    16 => report.pp_nodot = entries.len(),
+                    17 => report.app_unexpanders = entries.len(),
+                    18 => report.inline = entries.len(),
+                    19 => report.namespaces = entries.len(),
+                    20 => report.deprecations = entries.len(),
+                    21 => report.backward_defeq = entries.len(),
+                    _ => {
+                        return Err(SourceOleanImportError::Internal(
+                            "unknown selected metadata kind",
+                        ));
+                    }
+                }
+                // Move payloads, not copies. The remaining allowances include
+                // every tag already decoded across the module boundaries.
+                blocks[kind].entries.extend(entries);
+            } else if !block.entries.is_empty() {
+                report.uninterpreted.push(block.name);
+            }
+        }
+        reports.push(report);
+    }
+    cancelled!("source-olean/before-metadata-decode");
+    let mut decoded = metadata_decoder
+        .decode(&blocks)
+        .map_err(SourceOleanImportError::Decode)?;
+    decoded.defeq = defeq_tags.declarations;
+    decoded.backward_defeq = backward_defeq_tags.declarations;
+    cancelled!("source-olean/after-metadata-preflight");
+    Ok(Outcome::Complete(PreparedMetadata { reports, decoded }))
+}
+
+impl Engine {
+    /// Bind preflighted rows to the council's replay order before activating any
+    /// registration. Neither decoded metadata nor a successful preflight admits
+    /// declarations or publishes an environment.
+    fn activate_prepared_source_metadata_with<R: Registrar>(
+        &self,
+        checked: CheckedOleanSet,
+        roots: &[Name],
+        options: &KVMap,
+        limits: SourceOleanImportLimits,
+        cancellation: Option<&dyn CancellationProbe>,
+        prepared: PreparedMetadata,
+    ) -> Result<Outcome<SourceOleanImport>> {
         macro_rules! cancelled {
             ($at:literal) => {
                 if cancellation.is_some_and(CancellationProbe::is_cancelled) {
@@ -441,182 +732,28 @@ impl Engine {
                 }
             };
         }
-        let order = replay_order(&checked, roots)?;
-        let inputs: BTreeMap<_, _> = modules.iter().map(|m| (m.name, m)).collect();
-        let selected = [
-            metadata::CLASS_EXTENSION,
-            metadata::INSTANCE_EXTENSION,
-            metadata::DEFAULT_EXTENSION,
-            metadata::ALIAS_EXTENSION,
-            metadata::PROTECTED_EXTENSION,
-            metadata::REDUCIBILITY_EXTENSION,
-            metadata::EXTERN_EXTENSION,
-            metadata::IMPLEMENTED_BY_EXTENSION,
-            metadata::AUX_RECURSOR_EXTENSION,
-            fln_olean::initializers::REGULAR_INIT_EXTENSION,
-            fln_olean::initializers::BUILTIN_INIT_EXTENSION,
-        ]
-        .map(|name| Name::from_components(name.split('.')));
-        let selected: Vec<_> = selected
-            .into_iter()
-            .chain([
-                metadata::structure_extension_name(),
-                Name::from_components(metadata::NONCOMPUTABLE_EXTENSION.split('.')),
-                Name::from_components(metadata::SIMP_EXTENSION.split('.')),
-                Name::from_components(metadata::DEFEQ_EXTENSION.split('.')),
-                Name::from_components(metadata::PP_ANONYMOUS_CONSTRUCTOR_EXTENSION.split('.')),
-                Name::from_components(metadata::PP_NODOT_EXTENSION.split('.')),
-                Name::from_components(metadata::APP_UNEXPANDER_EXTENSION.split('.')),
-                Name::from_components(metadata::INLINE_EXTENSION.split('.')),
-                metadata::namespace_extension_name(),
-                Name::from_components(metadata::DEPRECATED_EXTENSION.split('.')),
-                Name::from_components(metadata::BACKWARD_DEFEQ_EXTENSION.split('.')),
-            ])
-            .collect();
-        let mut blocks: Vec<_> = selected
-            .iter()
-            .map(|name| OpaqueExtensionBlock {
-                name: name.clone(),
-                entries: Vec::new(),
-            })
-            .collect();
-        let mut reports = Vec::new();
-        let mut capture_left = limits.max_capture_bytes;
-        let mut entries_left = limits.metadata.max_entries;
-        let mut defeq_tags = ReflexivityTags::default();
-        let mut backward_defeq_tags = ReflexivityTags::default();
-        let mut metadata_decoder = metadata::Decoder::new(limits.metadata);
-        // Each module's capture reads only its own parts, so the walks run
-        // `limits.read_jobs` at once; the cumulative byte allowance is charged below
-        // in replay order, exactly as when one walk followed another.
-        cancelled!("source-olean/capture");
-        let mut captures = capture_modules(&checked, &order, &inputs, &limits).into_iter();
-        for &index in &order {
-            cancelled!("source-olean/capture");
-            let module = &checked.modules[index];
-            let captured = captures.next().ok_or(SourceOleanImportError::Internal(
-                "a replayed module has no capture",
-            ))??;
-            let mut report = SourceMetadataReport {
-                module: module.name.clone(),
-                classes: 0,
-                instances: 0,
-                defaults: 0,
-                scoped_instances: 0,
-                aliases: 0,
-                namespaces: 0,
-                protected: 0,
-                aux_recursors: 0,
-                noncomputable: 0,
-                defeq: 0,
-                backward_defeq: 0,
-                structures: 0,
-                reducibility: 0,
-                externs: 0,
-                implemented_by: 0,
-                inline: 0,
-                regular_initializers: 0,
-                builtin_initializers: 0,
-                simps: 0,
-                activated_simps: 0,
-                deferred_simps: 0,
-                pp_anonymous_constructor: 0,
-                pp_nodot: 0,
-                app_unexpanders: 0,
-                deprecations: 0,
-                uninterpreted: Vec::new(),
-            };
-            let mut seen = BTreeSet::new();
-            for block in captured {
-                if !seen.insert(block.name.clone()) {
-                    return Err(SourceOleanImportError::Metadata {
-                        module: module.name.clone(),
-                        declaration: block.name,
-                        reason: "duplicate extension block",
-                    });
-                }
-                for payload in &block.entries {
-                    capture_left = capture_left
-                        .checked_sub(payload.len())
-                        .ok_or(SourceOleanImportError::Limit("captured extension bytes"))?;
-                }
-                if let Some(kind) = selected.iter().position(|name| name == &block.name) {
-                    let entries = block.entries;
-                    if kind == 14 || kind == 21 {
-                        // A realized equation can carry the same tag in several
-                        // modules with different compacted object layouts. Compare
-                        // decoded names, retaining the first module's registration.
-                        // Cached byte-identical entries keep their old zero decode
-                        // cost; a same-module name repeat still refuses.
-                        let tags = if kind == 14 {
-                            &mut defeq_tags
-                        } else {
-                            &mut backward_defeq_tags
-                        };
-                        let before = metadata_decoder.remaining_limits().max_entries;
-                        let count = tags.capture(
-                            &module.name,
-                            &block.name,
-                            entries,
-                            &mut metadata_decoder,
-                        )?;
-                        entries_left = entries_left
-                            .checked_sub(before - metadata_decoder.remaining_limits().max_entries)
-                            .ok_or(SourceOleanImportError::Limit("metadata entries"))?;
-                        if kind == 14 {
-                            report.defeq = count;
-                        } else {
-                            report.backward_defeq = count;
-                        }
-                        continue;
-                    }
-                    entries_left = entries_left
-                        .checked_sub(entries.len())
-                        .ok_or(SourceOleanImportError::Limit("metadata entries"))?;
-                    match kind {
-                        0 => report.classes = entries.len(),
-                        1 => report.instances = entries.len(),
-                        2 => report.defaults = entries.len(),
-                        3 => report.aliases = entries.len(),
-                        4 => report.protected = entries.len(),
-                        5 => report.reducibility = entries.len(),
-                        6 => report.externs = entries.len(),
-                        7 => report.implemented_by = entries.len(),
-                        8 => report.aux_recursors = entries.len(),
-                        9 => report.regular_initializers = entries.len(),
-                        10 => report.builtin_initializers = entries.len(),
-                        11 => report.structures = entries.len(),
-                        12 => report.noncomputable = entries.len(),
-                        13 => report.simps = entries.len(),
-                        14 => report.defeq = entries.len(),
-                        15 => report.pp_anonymous_constructor = entries.len(),
-                        16 => report.pp_nodot = entries.len(),
-                        17 => report.app_unexpanders = entries.len(),
-                        18 => report.inline = entries.len(),
-                        19 => report.namespaces = entries.len(),
-                        20 => report.deprecations = entries.len(),
-                        21 => report.backward_defeq = entries.len(),
-                        _ => {
-                            return Err(SourceOleanImportError::Internal(
-                                "unknown selected metadata kind",
-                            ));
-                        }
-                    }
-                    // Move payloads, not copies. The remaining allowances include
-                    // every tag already decoded across the module boundaries.
-                    blocks[kind].entries.extend(entries);
-                } else if !block.entries.is_empty() {
-                    report.uninterpreted.push(block.name);
-                }
-            }
-            reports.push(report);
+        cancelled!("source-olean/before-metadata-activation");
+        let order = replay_order(
+            checked
+                .modules
+                .iter()
+                .map(|module| (&module.name, module.decoded.module.imports.as_slice())),
+            roots,
+        )?;
+        let PreparedMetadata {
+            mut reports,
+            decoded,
+        } = prepared;
+        if reports.len() != order.len()
+            || reports
+                .iter()
+                .zip(&order)
+                .any(|(report, &index)| report.module != checked.modules[index].name)
+        {
+            return Err(SourceOleanImportError::Internal(
+                "preflighted metadata differs from the checked replay order",
+            ));
         }
-        cancelled!("source-olean/before-metadata-decode");
-        let mut decoded = metadata_decoder
-            .decode(&blocks)
-            .map_err(SourceOleanImportError::Decode)?;
-        decoded.defeq = defeq_tags.declarations;
-        decoded.backward_defeq = backward_defeq_tags.declarations;
         let mut implementation_scopes = implemented_by::Scopes::new(
             &checked,
             &decoded.implemented_by,
@@ -1313,27 +1450,135 @@ impl Engine {
     }
 }
 
+/// Read only the public module headers and import graph. Whole-input and per-file
+/// byte bounds apply before any payload capture; declaration decoding and every
+/// council check remain on the ordinary admission path.
+fn metadata_modules(
+    inputs: &[OleanModuleInput<'_>],
+    limits: OleanCheckLimits,
+    cancellation: Option<&dyn CancellationProbe>,
+) -> Result<Outcome<Vec<MetadataModule>>> {
+    let check = || -> std::result::Result<Outcome<Vec<MetadataModule>>, OleanCheckError> {
+        if inputs.is_empty() {
+            return Err(OleanCheckError::EmptyModuleSet);
+        }
+        if inputs.len() > limits.max_modules {
+            return Err(OleanCheckError::ModuleLimit {
+                observed: inputs.len(),
+                limit: limits.max_modules,
+            });
+        }
+        let mut total_bytes = 0usize;
+        let mut names = BTreeSet::new();
+        for input in inputs {
+            for bytes in [
+                Some(input.artifact),
+                input.server_artifact,
+                input.private_artifact,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                total_bytes = total_bytes.checked_add(bytes.len()).ok_or(
+                    OleanCheckError::TotalBytesLimit {
+                        observed: usize::MAX,
+                        limit: limits.max_total_bytes,
+                    },
+                )?;
+            }
+            if total_bytes > limits.max_total_bytes {
+                return Err(OleanCheckError::TotalBytesLimit {
+                    observed: total_bytes,
+                    limit: limits.max_total_bytes,
+                });
+            }
+            if !names.insert(input.name) {
+                return Err(OleanCheckError::DuplicateModule {
+                    module: input.name.clone(),
+                });
+            }
+        }
+        let mut modules = Vec::new();
+        for input in inputs {
+            if cancellation.is_some_and(CancellationProbe::is_cancelled) {
+                return Ok(Outcome::Inconclusive(Inconclusive::cancelled(
+                    "source-olean/metadata-header",
+                )));
+            }
+            let read = || -> std::result::Result<OleanModuleData, OleanDecodeError> {
+                let bytes = [
+                    Some(input.artifact),
+                    input.server_artifact,
+                    input.private_artifact,
+                ]
+                .into_iter()
+                .flatten()
+                .map(<[u8]>::len)
+                .sum::<usize>();
+                if bytes > limits.decode.max_bytes {
+                    return Err(OleanDecodeError::ArtifactTooLarge {
+                        bytes,
+                        limit: limits.decode.max_bytes,
+                    });
+                }
+                let view = OleanView::parse(input.artifact)?;
+                fln_olean::pin::check_pinned_header(input.artifact).map_err(|mismatch| {
+                    OleanDecodeError::HeaderNotPinned {
+                        part: None,
+                        mismatch,
+                    }
+                })?;
+                Ok(view.module_data(limits.decode.module)?)
+            };
+            let module = read().map_err(|error| OleanCheckError::ModuleDecode {
+                module: input.name.clone(),
+                error,
+            })?;
+            if module.is_module {
+                if input.server_artifact.is_none() || input.private_artifact.is_none() {
+                    return Err(OleanCheckError::MissingCompanionParts {
+                        module: Some(input.name.clone()),
+                        missing_server: input.server_artifact.is_none(),
+                        missing_private: input.private_artifact.is_none(),
+                    });
+                }
+            } else if input.server_artifact.is_some() || input.private_artifact.is_some() {
+                return Err(OleanCheckError::Decode(
+                    OleanDecodeError::UnexpectedCompanionParts,
+                ));
+            }
+            modules.push(MetadataModule {
+                name: input.name.clone(),
+                is_module: module.is_module,
+                imports: module.imports,
+            });
+        }
+        Ok(Outcome::Complete(modules))
+    };
+    check().map_err(|error| SourceOleanImportError::Check(Box::new(error)))
+}
+
 /// Every module's extension payloads, in replay `order`, `limits.read_jobs` modules
 /// at once. Each walk may use the whole capture allowance; the caller charges the
 /// cumulative allowance in order, so a closure over it is still refused.
 fn capture_modules(
-    checked: &CheckedOleanSet,
+    modules: &[MetadataModule],
     order: &[usize],
     inputs: &BTreeMap<&Name, &OleanModuleInput<'_>>,
     limits: &SourceOleanImportLimits,
 ) -> Vec<Result<Vec<OpaqueExtensionBlock>>> {
     let capture = |index: usize| -> Result<Vec<OpaqueExtensionBlock>> {
-        let module = &checked.modules[index];
+        let module = &modules[index];
         let input = inputs
             .get(&module.name)
             .ok_or(SourceOleanImportError::Internal(
-                "checked module lost its artifact",
+                "preflight module lost its artifact",
             ))?;
-        let view = if module.decoded.module.is_module {
+        let view = if module.is_module {
             let (Some(server), Some(private)) = (input.server_artifact, input.private_artifact)
             else {
                 return Err(SourceOleanImportError::Internal(
-                    "checked module lost its companions",
+                    "preflight module lost its companions",
                 ));
             };
             OleanView::parse_with_dependencies(private, &[input.artifact, server])
@@ -1839,14 +2084,17 @@ fn registry_error(
 
 /// Import-order postorder, with each shared dependency replayed once. A caller
 /// cannot smuggle unrelated module metadata in through an oversized input set.
-fn replay_order(checked: &CheckedOleanSet, roots: &[Name]) -> Result<Vec<usize>> {
-    let indices: BTreeMap<_, _> = checked
-        .modules
+fn replay_order<'a>(
+    modules: impl Iterator<Item = (&'a Name, &'a [OleanModuleImport])>,
+    roots: &[Name],
+) -> Result<Vec<usize>> {
+    let modules: Vec<_> = modules.collect();
+    let indices: BTreeMap<_, _> = modules
         .iter()
         .enumerate()
-        .map(|(i, m)| (&m.name, i))
+        .map(|(i, (name, _))| (*name, i))
         .collect();
-    let mut colors = vec![0u8; checked.modules.len()];
+    let mut colors = vec![0u8; modules.len()];
     let mut order = Vec::new();
     for root in roots {
         let &index = indices
@@ -1858,23 +2106,34 @@ fn replay_order(checked: &CheckedOleanSet, roots: &[Name]) -> Result<Vec<usize>>
         colors[index] = 1;
         let mut stack = vec![(index, 0usize)];
         while let Some((index, next)) = stack.last_mut() {
-            if let Some(import) = checked.modules[*index].decoded.module.imports.get(*next) {
+            if let Some(import) = modules[*index].1.get(*next) {
                 *next += 1;
-                let &dependency =
-                    indices
-                        .get(&import.module)
-                        .ok_or(SourceOleanImportError::Internal(
-                            "checked import closure is incomplete",
-                        ))?;
+                let &dependency = indices.get(&import.module).ok_or_else(|| {
+                    SourceOleanImportError::Check(Box::new(OleanCheckError::MissingModuleImports {
+                        module: modules[*index].0.clone(),
+                        imports: modules[*index]
+                            .1
+                            .iter()
+                            .filter(|import| !indices.contains_key(&import.module))
+                            .map(|import| import.module.clone())
+                            .collect(),
+                    }))
+                })?;
                 match colors[dependency] {
                     0 => {
                         colors[dependency] = 1;
                         stack.push((dependency, 0));
                     }
                     1 => {
-                        return Err(SourceOleanImportError::Internal(
-                            "checked import graph has a cycle",
-                        ));
+                        return Err(SourceOleanImportError::Check(Box::new(
+                            OleanCheckError::ModuleImportCycle {
+                                modules: stack
+                                    .iter()
+                                    .skip_while(|(index, _)| *index != dependency)
+                                    .map(|(index, _)| modules[*index].0.clone())
+                                    .collect(),
+                            },
+                        )));
                     }
                     _ => {}
                 }
@@ -1885,7 +2144,7 @@ fn replay_order(checked: &CheckedOleanSet, roots: &[Name]) -> Result<Vec<usize>>
             }
         }
     }
-    if order.len() != checked.modules.len() {
+    if order.len() != modules.len() {
         let index =
             colors
                 .iter()
@@ -1894,7 +2153,7 @@ fn replay_order(checked: &CheckedOleanSet, roots: &[Name]) -> Result<Vec<usize>>
                     "module order count mismatch",
                 ))?;
         return Err(SourceOleanImportError::UnreachableModule(
-            checked.modules[index].name.clone(),
+            modules[index].0.clone(),
         ));
     }
     Ok(order)
@@ -2015,6 +2274,296 @@ pub(super) mod tests {
                 .join()
                 .expect("the import thread does not panic")
         })
+    }
+
+    fn namespace_fixture(imports: &[Name], namespaces: &[Name], declaration: bool) -> Vec<u8> {
+        use fln_env::constants::{ConstantVal, DefinitionVal, ReducibilityHints};
+        use fln_olean::write::source::{SourceMetadata, encode_module_with_source_metadata};
+        let imports: Vec<_> = imports
+            .iter()
+            .map(|module| OleanModuleImport {
+                module: module.clone(),
+                import_all: false,
+                is_exported: false,
+                is_meta: false,
+            })
+            .collect();
+        let constants: Vec<_> = declaration
+            .then(|| {
+                ConstantInfo::Defn(DefinitionVal {
+                    base: ConstantVal {
+                        name: n("sortAlias"),
+                        level_params: vec![],
+                        type_: Expr::sort(Level::one()),
+                    },
+                    value: Expr::sort(Level::zero()),
+                    hints: ReducibilityHints::Abbrev,
+                    safety: DefinitionSafety::Safe,
+                    all: vec![n("sortAlias")],
+                })
+            })
+            .into_iter()
+            .collect();
+        encode_module_with_source_metadata(
+            OleanModuleWriteInput {
+                is_module: false,
+                imports: &imports,
+                constants: &constants,
+                extra_const_names: &[],
+            },
+            &SourceMetadata {
+                namespaces: namespaces.to_vec(),
+                ..SourceMetadata::default()
+            },
+            OleanWriteHeader {
+                version: OLEAN_ACCEPTED_VERSIONS[0],
+                flags: 1,
+                lean_version: OLEAN_PIN_TAG.strip_prefix('v').unwrap(),
+                githash: OLEAN_PIN_COMMIT,
+                base_addr: (OLEAN_REGION_ALIGN as u64) * 2,
+            },
+            OleanWriteBudget::default(),
+        )
+        .unwrap()
+        .bytes
+    }
+
+    #[test]
+    fn metadata_preflight_refuses_aggregate_limits_before_council_work() {
+        on_import_stack(|| {
+            let base = n("Base");
+            let main = n("Main");
+            let closure = vec![
+                (
+                    main.clone(),
+                    [
+                        namespace_fixture(std::slice::from_ref(&base), &[n("Second")], false),
+                        vec![],
+                        vec![],
+                    ],
+                ),
+                (
+                    base.clone(),
+                    [namespace_fixture(&[], &[n("First")], true), vec![], vec![]],
+                ),
+            ];
+            let input = inputs(&closure);
+            let roots = [main];
+            let captured_bytes = input
+                .iter()
+                .map(|input| {
+                    OleanView::parse(input.artifact)
+                        .unwrap()
+                        .extension_payloads(OleanWalkBudget::default(), 1 << 20)
+                        .unwrap()
+                        .into_iter()
+                        .flat_map(|block| block.entries)
+                        .map(|entry| entry.len())
+                        .sum::<usize>()
+                })
+                .sum::<usize>();
+            for threads in [1, 3] {
+                let mut bounded = limits(threads);
+                // A council cannot finish even this one valid definition. An
+                // earlier metadata error therefore proves no council ran first.
+                bounded.check.admission.kernel.steps = 0;
+                bounded.metadata.max_entries = 1;
+                assert!(matches!(
+                    import(&input, &roots, bounded),
+                    Err(SourceOleanImportError::Limit("metadata entries"))
+                ));
+                bounded.metadata.max_entries = 2;
+                bounded.max_capture_bytes = captured_bytes - 1;
+                assert!(matches!(
+                    import(&input, &roots, bounded),
+                    Err(SourceOleanImportError::Limit("captured extension bytes"))
+                ));
+                bounded.max_capture_bytes = captured_bytes;
+                assert!(
+                    matches!(
+                        import(&input, &roots, bounded),
+                        Ok(Outcome::Inconclusive(_))
+                    ),
+                    "successful preflight must still run the council"
+                );
+                bounded.check.admission.kernel = Budget::for_stack_bytes(STACK);
+                let imported = import(&input, &roots, bounded)
+                    .unwrap()
+                    .into_complete()
+                    .unwrap();
+                assert_eq!(
+                    imported
+                        .modules
+                        .iter()
+                        .map(|report| &report.module)
+                        .collect::<Vec<_>>(),
+                    vec![&base, &roots[0]]
+                );
+                assert!(imported.modules.iter().all(|report| report.namespaces == 1));
+                let engine = Engine::from_environment(Environment::new());
+                let checked = engine
+                    .check_olean_modules_scheduled(
+                        &input,
+                        &KVMap::new(),
+                        bounded.check,
+                        bounded.jobs,
+                        None,
+                    )
+                    .unwrap()
+                    .into_complete()
+                    .unwrap();
+                let replayed = engine
+                    .activate_source_metadata_with::<Sequential>(
+                        checked,
+                        &input,
+                        &roots,
+                        &KVMap::new(),
+                        bounded,
+                        None,
+                    )
+                    .unwrap()
+                    .into_complete()
+                    .unwrap();
+                crate::assert_checked_sets_identical(
+                    &imported.checked,
+                    &replayed.checked,
+                    "preflight council",
+                );
+                crate::assert_engines_identical(
+                    &imported.engine,
+                    &replayed.engine,
+                    "preflight activation",
+                );
+                assert_eq!(imported.modules, replayed.modules);
+                assert_eq!(imported.result_logical_root, replayed.result_logical_root);
+                imported
+                    .contexts
+                    .assert_identical(&replayed.contexts, "preflight contexts");
+            }
+        });
+    }
+
+    #[test]
+    fn metadata_preflight_cancellation_interrupts_public_header_scan() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct CancelSecondHeader(AtomicUsize);
+        impl CancellationProbe for CancelSecondHeader {
+            fn is_cancelled(&self) -> bool {
+                self.0.fetch_add(1, Ordering::Relaxed) >= 1
+            }
+        }
+        let first = n("First");
+        let second = n("Second");
+        let artifact = namespace_fixture(&[], &[], false);
+        let modules = [
+            OleanModuleInput {
+                name: &first,
+                artifact: &artifact,
+                server_artifact: None,
+                private_artifact: None,
+            },
+            OleanModuleInput {
+                name: &second,
+                artifact: b"not an olean header",
+                server_artifact: None,
+                private_artifact: None,
+            },
+        ];
+        let cancel = CancelSecondHeader(AtomicUsize::new(0));
+        assert!(matches!(
+            metadata_modules(&modules, limits(1).check, Some(&cancel)),
+            Ok(Outcome::Inconclusive(_))
+        ));
+        assert_eq!(cancel.0.load(Ordering::Relaxed), 2);
+        assert!(
+            matches!(metadata_modules(&modules, limits(1).check, None),
+            Err(SourceOleanImportError::Check(error))
+                if matches!(&*error, OleanCheckError::ModuleDecode { module, .. } if module == &second)),
+            "without cancellation the second public header must be read and refused"
+        );
+    }
+
+    #[test]
+    fn malformed_metadata_preflight_never_reads_or_writes_reuse_records() {
+        use super::super::reuse::{
+            CheckerIdentity, ImportClosureKey, ImportPostureRequest, ImportReuseStore,
+            ReuseVerified,
+        };
+        use fln_olean::extension_write::{ModuleExtensionInput, encode_module_with_extensions};
+        use fln_rt::obj::Obj;
+        struct NoStoreAccess;
+        impl ImportReuseStore for NoStoreAccess {
+            fn load(&self, _: ImportClosureKey) -> std::result::Result<Option<Vec<u8>>, String> {
+                panic!("malformed metadata must be refused before a reuse lookup")
+            }
+            fn save(&self, _: ImportClosureKey, _: &[u8]) -> std::result::Result<(), String> {
+                panic!("malformed metadata must never publish an admission record")
+            }
+        }
+        let artifact = encode_module_with_extensions(
+            OleanModuleWriteInput {
+                is_module: false,
+                imports: &[],
+                constants: &[],
+                extra_const_names: &[],
+            },
+            &[ModuleExtensionInput {
+                name: &metadata::namespace_extension_name(),
+                entries: &[Obj::mk_string("not a namespace Name")],
+            }],
+            OleanWriteHeader {
+                version: OLEAN_ACCEPTED_VERSIONS[0],
+                flags: 1,
+                lean_version: OLEAN_PIN_TAG.strip_prefix('v').unwrap(),
+                githash: OLEAN_PIN_COMMIT,
+                base_addr: (OLEAN_REGION_ALIGN as u64) * 2,
+            },
+            OleanWriteBudget::default(),
+        )
+        .unwrap();
+        let root = n("Main");
+        let input = [OleanModuleInput {
+            name: &root,
+            artifact: &artifact.bytes,
+            server_artifact: None,
+            private_artifact: None,
+        }];
+        let engine = Engine::from_environment(Environment::new());
+        let before = engine.logical_root(&KVMap::new());
+        for posture in [
+            ImportPostureRequest::Recheck,
+            ImportPostureRequest::ReuseVerified(ReuseVerified {
+                checker: CheckerIdentity::of_executable(b"metadata-preflight"),
+                store: &NoStoreAccess,
+            }),
+        ] {
+            assert!(matches!(
+                engine.import_olean_modules_with_posture(
+                    &input,
+                    std::slice::from_ref(&root),
+                    &KVMap::new(),
+                    limits(1),
+                    posture,
+                    None
+                ),
+                Err(SourceOleanImportError::Decode(_))
+            ));
+        }
+        assert_eq!(engine.logical_root(&KVMap::new()), before);
+        let cancelled = std::sync::atomic::AtomicBool::new(true);
+        assert!(
+            matches!(
+                engine.import_olean_modules_for_source_with_cancel(
+                    &input,
+                    std::slice::from_ref(&root),
+                    &KVMap::new(),
+                    limits(1),
+                    Some(&cancelled)
+                ),
+                Ok(Outcome::Inconclusive(_))
+            ),
+            "cancellation must stop before decoding even malformed metadata"
+        );
     }
 
     /// The receipt the parallel council produces is the serial one: the same
