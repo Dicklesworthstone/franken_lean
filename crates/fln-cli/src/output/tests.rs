@@ -37,6 +37,11 @@ fn native_stdout_publication_child() {
     let Ok(mode) = std::env::var(CHILD) else {
         return;
     };
+    #[cfg(unix)]
+    if mode == "broken-driver" {
+        assert_broken_pipe_flush_failure();
+        std::process::exit(0);
+    }
     let broken = mode == "broken";
     if !broken {
         let mut out = std::io::stdout().lock();
@@ -103,8 +108,7 @@ fn native_stdout_precedes_cli_results_and_survives_silent_failure() {
 }
 
 #[cfg(unix)]
-#[test]
-fn native_stdout_flush_failure_is_not_success_with_empty_cli_output() {
+fn assert_broken_pipe_flush_failure() {
     let mut child = child("broken")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -126,5 +130,19 @@ fn native_stdout_flush_failure_is_not_success_with_empty_cli_output() {
     child.stdin.take().unwrap().write_all(&[1]).unwrap();
     let output = child.wait_with_output().expect("wait for flush refusal");
     assert_eq!(output.status.code(), Some(1));
+    assert!(output.stderr.is_empty(), "{:?}", output.stderr);
+}
+
+#[cfg(unix)]
+#[test]
+fn native_stdout_flush_failure_is_not_success_with_empty_cli_output() {
+    // Create the measured pipe only after this driver's exec. A concurrently
+    // spawning test can otherwise fork with its reader still open: CLOEXEC
+    // closes that copy at exec, but not during the fork-to-exec interval.
+    // The driver runs exactly one test and retains the original EPIPE probe.
+    let output = child("broken-driver")
+        .output()
+        .expect("run isolated flush probe");
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
     assert!(output.stderr.is_empty(), "{:?}", output.stderr);
 }

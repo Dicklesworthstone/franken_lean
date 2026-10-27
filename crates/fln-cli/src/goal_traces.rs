@@ -200,6 +200,10 @@ mod tests {
         let pin = std::env::var_os("FLN_REFERENCE_LEAN")
             .map(std::path::PathBuf::from)
             .or_else(|| {
+                std::env::var_os("FLN_REFERENCE_LIB")
+                    .map(|lib| std::path::PathBuf::from(lib).join("../../bin/lean"))
+            })
+            .or_else(|| {
                 std::env::var_os("HOME").map(|home| {
                     std::path::PathBuf::from(home)
                         .join(".elan/toolchains/leanprover--lean4---v4.32.0/bin/lean")

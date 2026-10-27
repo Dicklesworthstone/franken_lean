@@ -975,12 +975,15 @@ mod tests {
     /// resource refusal that no flag can lift.
     #[test]
     fn the_source_import_capture_ceiling_holds_the_pinned_init_closure() {
-        let Some(lib) = std::env::var_os("HOME")
+        let Some(lib) = std::env::var_os("FLN_REFERENCE_LIB")
             .map(std::path::PathBuf::from)
-            .map(|home| {
-                home.join(".elan/toolchains")
-                    .join(format!("leanprover--lean4---{}", fln::OLEAN_PIN_TAG))
-                    .join("lib/lean")
+            .or_else(|| {
+                std::env::var_os("HOME").map(|home| {
+                    std::path::PathBuf::from(home)
+                        .join(".elan/toolchains")
+                        .join(format!("leanprover--lean4---{}", fln::OLEAN_PIN_TAG))
+                        .join("lib/lean")
+                })
             })
             .filter(|lib| lib.join("Init/Prelude.olean").is_file())
         else {
