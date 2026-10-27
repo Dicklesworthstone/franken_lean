@@ -3735,45 +3735,54 @@ fn bounded_term_layout(
     Ok(None)
 }
 
-/// Keep quotation construction's temporaries off every ordinary token's stack.
-/// The dispatch order remains the term driver's; only a quotation enters here.
+/// Contextual keywords take precedence over identifiers. Build their prefix
+/// separately so its temporaries are gone before an ordinary atom is read.
 #[inline(never)]
-fn push_quotation(
+fn bounded_term_prefix(
     leaves: &Leaves,
     view: &SourceView,
     tokens: &[LexedToken],
-    lists: &collections::Lists,
-    frames: &mut [BoundedTermFrame],
+    frames: &[BoundedTermFrame],
     index: usize,
+    cursor: &mut usize,
     end: usize,
-) -> Result<usize, NatDefinitionParseError> {
-    let read = match lists.repetition_splice(leaves, view, tokens, frames, index, end)? {
-        Some(read) => read,
-        None => match quotations::quotation(leaves, view, tokens, index, end)? {
-            Some(read) => read,
-            None => quotations::antiquotation(
-                leaves,
-                view,
-                tokens,
-                index,
-                end,
-                quotations::Position::Term,
-            )?
-            .ok_or_else(|| NatDefinitionParseError::OutsideSeedGrammar {
-                at: original_position(view, tokens, index),
-                expected: DefinitionGrammar::Scalar.value_expectation(),
-            })?,
-        },
+) -> Result<Option<term_locals::Prefix>, NatDefinitionParseError> {
+    let prefix = if term_locals::word(tokens, index, "do")
+        || term_locals::word(tokens, index, "unless")
+        || term_locals::word(tokens, index, "for")
+        || repeat_keyword(frames, index)
+    {
+        let prefix = if term_locals::word(tokens, index, "do") {
+            term_do::Prefix::start(view, tokens, index, cursor, end)
+        } else if term_locals::word(tokens, index, "repeat") {
+            term_do::Prefix::repeat_body(view, tokens, index, cursor, end)
+        } else {
+            *cursor = index;
+            term_do::Prefix::element(view, tokens, cursor, end)
+        }?;
+        term_locals::Prefix::Do(Box::new(prefix))
+    } else if term_locals::word(tokens, index, "dbg_trace")
+        || term_locals::word(tokens, index, "assert!")
+    {
+        term_locals::Prefix::debug_trace(leaves, view, tokens, index, cursor, end)?
+    } else if term_locals::word(tokens, index, "set_option") {
+        term_locals::Prefix::set_option(leaves, view, tokens, index, cursor, end)?
+    } else if term_locals::word(tokens, index, "let")
+        || term_locals::word(tokens, index, "have")
+        || term_locals::word(tokens, index, "letI")
+        || term_locals::word(tokens, index, "haveI")
+        || term_locals::word(tokens, index, "show")
+        || term_locals::word(tokens, index, "suffices")
+    {
+        term_locals::Prefix::assertion(leaves, view, tokens, index, cursor, end)?
+    } else {
+        return Ok(None);
     };
-    frames
-        .last_mut()
-        .expect("the root term frame remains live")
-        .application
-        .push((read.0, index));
-    Ok(read.1)
+    Ok(Some(prefix))
 }
 
-/// A token's own meaning on the frame stack: the next cursor.
+/// A token's own meaning on the frame stack: the next cursor. Ordinary
+/// identifiers and literals never allocate the compound dispatcher's frame.
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
 fn bounded_term_token(
@@ -3789,72 +3798,46 @@ fn bounded_term_token(
     index: usize,
     mut cursor: usize,
 ) -> Result<usize, NatDefinitionParseError> {
+    if grammar == DefinitionGrammar::Scalar
+        && let Some(prefix) =
+            bounded_term_prefix(leaves, view, tokens, frames, index, &mut cursor, range.end)?
+    {
+        frames.push(term_binders::frame(prefix));
+        return Ok(cursor);
+    }
+    let kind = tokens.get(index).map(|token| &token.kind);
+    if matches!(kind, Some(TokenKind::Ident(_) | TokenKind::Literal(_)))
+        && is_bounded_term_atom(kind, grammar)
+    {
+        let term = bounded_term_leaf(leaves, view, tokens, index, grammar)?;
+        frames
+            .last_mut()
+            .expect("the root term frame remains live")
+            .application
+            .push((term, index));
+        return Ok(cursor);
+    }
+    bounded_term_compound_token(
+        leaves, view, tokens, range, grammar, splices, updates, lists, frames, index, cursor,
+    )
+}
+
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn bounded_term_compound_token(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    range: &std::ops::Range<usize>,
+    grammar: DefinitionGrammar,
+    splices: &mut matching::Splices,
+    updates: &std::collections::HashSet<usize>,
+    lists: &mut collections::Lists,
+    frames: &mut Vec<BoundedTermFrame>,
+    index: usize,
+    mut cursor: usize,
+) -> Result<usize, NatDefinitionParseError> {
     match tokens.get(index).map(|token| &token.kind) {
-        // `unless`/`for` in term position are one do element on the same heap frames. One arm
-        // with `do`'s, for the driver's stack budget.
-        _ if grammar == DefinitionGrammar::Scalar
-            && (term_locals::word(tokens, index, "do")
-                || term_locals::word(tokens, index, "unless")
-                || term_locals::word(tokens, index, "for")
-                || repeat_keyword(frames, index)) =>
-        {
-            let prefix = if term_locals::word(tokens, index, "do") {
-                term_do::Prefix::start(view, tokens, index, &mut cursor, range.end)
-            } else if term_locals::word(tokens, index, "repeat") {
-                term_do::Prefix::repeat_body(view, tokens, index, &mut cursor, range.end)
-            } else {
-                cursor = index;
-                term_do::Prefix::element(view, tokens, &mut cursor, range.end)
-            }?;
-            frames.push(term_binders::frame(term_locals::Prefix::Do(Box::new(
-                prefix,
-            ))));
-        }
-        _ if grammar == DefinitionGrammar::Scalar
-            && (term_locals::word(tokens, index, "dbg_trace")
-                || term_locals::word(tokens, index, "assert!")) =>
-        {
-            let prefix = term_locals::Prefix::debug_trace(
-                leaves,
-                view,
-                tokens,
-                index,
-                &mut cursor,
-                range.end,
-            )?;
-            frames.push(term_binders::frame(prefix));
-        }
-        _ if grammar == DefinitionGrammar::Scalar
-            && term_locals::word(tokens, index, "set_option") =>
-        {
-            let prefix = term_locals::Prefix::set_option(
-                leaves,
-                view,
-                tokens,
-                index,
-                &mut cursor,
-                range.end,
-            )?;
-            frames.push(term_binders::frame(prefix));
-        }
-        _ if grammar == DefinitionGrammar::Scalar
-            && (term_locals::word(tokens, index, "let")
-                || term_locals::word(tokens, index, "have")
-                || term_locals::word(tokens, index, "letI")
-                || term_locals::word(tokens, index, "haveI")
-                || term_locals::word(tokens, index, "show")
-                || term_locals::word(tokens, index, "suffices")) =>
-        {
-            let prefix = term_locals::Prefix::assertion(
-                leaves,
-                view,
-                tokens,
-                index,
-                &mut cursor,
-                range.end,
-            )?;
-            frames.push(term_binders::frame(prefix));
-        }
         Some(TokenKind::Symbol(symbol))
             if grammar == DefinitionGrammar::Scalar && symbol == "[" =>
         {
@@ -4147,7 +4130,33 @@ fn bounded_term_token(
             if grammar == DefinitionGrammar::Scalar
                 && (quotations::opens(symbol) || (symbol == "$" && quotations::inside())) =>
         {
-            return push_quotation(leaves, view, tokens, lists, frames, index, range.end);
+            let read =
+                match lists.repetition_splice(leaves, view, tokens, frames, index, range.end)? {
+                    Some(read) => read,
+                    None => match quotations::quotation(leaves, view, tokens, index, range.end)? {
+                        Some(read) => read,
+                        None => quotations::antiquotation(
+                            leaves,
+                            view,
+                            tokens,
+                            index,
+                            range.end,
+                            quotations::Position::Term,
+                        )?
+                        .ok_or_else(|| {
+                            NatDefinitionParseError::OutsideSeedGrammar {
+                                at: original_position(view, tokens, index),
+                                expected: grammar.value_expectation(),
+                            }
+                        })?,
+                    },
+                };
+            frames
+                .last_mut()
+                .expect("the root term frame remains live")
+                .application
+                .push((read.0, index));
+            return Ok(read.1);
         }
         kind if is_bounded_term_atom(kind, grammar) => {
             let term = bounded_term_leaf(leaves, view, tokens, index, grammar)?;

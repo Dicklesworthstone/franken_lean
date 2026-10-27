@@ -271,6 +271,7 @@ fn closing(tokens: &[LexedToken], open: usize, end: usize) -> Option<usize> {
 }
 
 /// The quotation at `start`, if one opens there: its tree and the token after its `)`.
+#[inline(never)]
 pub(crate) fn quotation(
     leaves: &Leaves,
     view: &SourceView,
@@ -281,6 +282,20 @@ pub(crate) fn quotation(
     let Some(open) = text(tokens, start).filter(|symbol| opens(symbol)) else {
         return Ok(None);
     };
+    read_quotation(leaves, view, tokens, start, end, open)
+}
+
+// Ordinary patterns probe this entry too. Allocate construction temporaries
+// only after the opening token has actually identified a quotation.
+#[inline(never)]
+fn read_quotation(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    start: usize,
+    end: usize,
+    open: &str,
+) -> Result<Option<(Syntax, usize)>, NatDefinitionParseError> {
     let close = closing(tokens, start, end).ok_or_else(|| refuse(view, tokens, start))?;
     if close == start + 1 || DEPTH.with(|depth| depth.get()) >= MAX_DEPTH {
         return Err(refuse(view, tokens, start));
