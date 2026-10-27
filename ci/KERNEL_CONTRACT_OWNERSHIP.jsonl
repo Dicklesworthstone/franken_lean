@@ -1,4 +1,4 @@
-{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":729,"projection_hash":"258c1b9754f1b1b5492b919356ea2dd8ebb05a3ad90aed2177e018f49054ced9"}
+{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":730,"projection_hash":"f7e719b35832e3041d7c0dc5b93c02f4605e47c68d94fcd3283a3e97b533f15f"}
 {"id":"fln-0bw5"}
 {"id":"fln-0eq8"}
 {"id":"fln-0rxm"}
@@ -217,6 +217,7 @@
 {"id":"fln-index-proof-omega-fallback-ov8v"}
 {"id":"fln-inductive-inferred-sort-normalization-f178"}
 {"id":"fln-infoview-rpc-procedures-my8l"}
+{"id":"fln-ingress-node-budget-tonat-filepath-8hyq"}
 {"id":"fln-ingress-string-field-projection-funz"}
 {"id":"fln-init-bnh-council-4444-b443"}
 {"id":"fln-init-chain-council-3116-kipb"}
