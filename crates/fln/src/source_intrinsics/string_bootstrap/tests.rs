@@ -1310,8 +1310,8 @@ fn execute_unchecked(
 /// operand is not a `Pos.Raw` record. Each stops at preparation, before FIR
 /// ingress, with its own typed refusal. The control projects a computed
 /// record through the same path, so each refusal is about the malformed
-/// projection, not the harness. (`String.toByteArray`, field 0 of a real
-/// String, stays on its body fallback and is not pinned here.)
+/// projection, not the harness. Valid String byte views are exercised below
+/// through both checked source and direct projection ingress.
 #[test]
 fn malformed_string_projections_stay_typed_refusals_below_the_checkers() {
     with_fixture(|fixture| {
@@ -1362,5 +1362,151 @@ fn malformed_string_projections_stay_typed_refusals_below_the_checkers() {
                 "{structure} field {field}"
             );
         }
+    });
+}
+
+#[test]
+fn native_string_byte_views_feed_logical_consumers_and_replay() {
+    with_fixture(|fixture| {
+        let engine = Engine::from_environment(fixture.environment.clone());
+        let options = KVMap::new();
+        let root = engine.logical_root(&options);
+        let source = r#"
+def byteView (s : String) : ByteArray := s.toByteArray
+def byteFingerprint (bytes : ByteArray) : Nat :=
+  List.foldl (fun (total : Nat) (byte : UInt8) => total * 257 + UInt8.toNat byte)
+    0 (Array.toList (ByteArray.data bytes))
+#eval byteFingerprint (byteView "")
+#eval byteFingerprint (byteView "abc")
+#eval byteFingerprint (byteView "A\x00λ")
+#eval byteFingerprint (byteView "😀")
+#eval let view := String.toByteArray; byteFingerprint (view "é")
+#eval byteFingerprint (ByteArray.push ("é".toByteArray) (UInt8.ofNat 0))
+#eval (String.toByteArray "λ").size
+"#;
+        let run = engine
+            .execute_source_commands_with_checks(
+                source.as_bytes(),
+                &options,
+                EngineExecutionLimits::new(Budget::for_stack_bytes(STACK)),
+            )
+            .unwrap_or_else(|error| panic!("checked String byte view: {error:?}"))
+            .into_complete()
+            .unwrap();
+        let fingerprint = |bytes: &[u8]| {
+            bytes
+                .iter()
+                .fold(0usize, |total, byte| total * 257 + usize::from(*byte))
+        };
+        let expected = [
+            fingerprint(b""),
+            fingerprint(b"abc"),
+            fingerprint("A\0λ".as_bytes()),
+            fingerprint("😀".as_bytes()),
+            fingerprint("é".as_bytes()),
+            fingerprint("é\0".as_bytes()),
+            2,
+        ];
+        assert_eq!(run.batch.source_evaluation_indices.len(), expected.len());
+        for (&index, expected) in run.batch.source_evaluation_indices.iter().zip(expected) {
+            let execution = &run.batch.executions[index];
+            assert_eq!(
+                closed_vm_value(&execution.exit).unwrap(),
+                Some(ClosedVmValue::Scalar(expected))
+            );
+            let replay =
+                execute_flbc_artifact(&execution.flbc_artifact, &options, Default::default())
+                    .unwrap()
+                    .into_complete()
+                    .unwrap();
+            assert_eq!(
+                closed_vm_value(&replay).unwrap(),
+                Some(ClosedVmValue::Scalar(expected))
+            );
+        }
+        // Direct Expr::Proj ingress must take the same bridge as named and
+        // first-class String.toByteArray, without reading a native field.
+        for text in ["", "é", "A\0λ", "😀"] {
+            let field = Expr::proj(name("String"), 0, Expr::lit(Literal::Str(text.to_owned())));
+            let size = Expr::app(Expr::const_(name("ByteArray.size"), vec![]), field);
+            assert_eq!(
+                execute_unchecked(
+                    &fixture.environment,
+                    &size,
+                    &Expr::const_(name("Nat"), vec![]),
+                )
+                .unwrap(),
+                ClosedVmValue::Scalar(text.len())
+            );
+        }
+        assert_eq!(engine.logical_root(&options), root);
+    });
+}
+
+#[test]
+fn string_byte_view_preserves_strict_input_and_resource_refusal() {
+    with_fixture(|fixture| {
+        let engine = Engine::from_environment(fixture.environment.clone());
+        let options = KVMap::new();
+        let limits = EngineExecutionLimits::new(Budget::for_stack_bytes(STACK));
+        let source = |cost: u64| {
+            format!(
+                "def spend (n : Nat) : Nat := match n with | .zero => 0 | .succ k => spend k + 1\n\
+                 #eval (let prepared : Nat := spend {cost}; \"\").toByteArray.size\n"
+            )
+        };
+        let run = |cost, limits| {
+            engine
+                .execute_source_commands_with_checks(source(cost).as_bytes(), &options, limits)
+                .unwrap()
+        };
+        let idle = run(0, limits).into_complete().unwrap();
+        let index = idle.batch.source_evaluation_indices[0];
+        let VmExit::Returned(result) = &idle.batch.executions[index].exit else {
+            panic!("the empty byte view must return its logical size");
+        };
+        let idle_steps = result.usage.steps;
+        let busy = run(30, limits).into_complete().unwrap();
+        let index = busy.batch.source_evaluation_indices[0];
+        assert_eq!(
+            closed_vm_value(&busy.batch.executions[index].exit).unwrap(),
+            Some(ClosedVmValue::Scalar(0))
+        );
+        let VmExit::Returned(result) = &busy.batch.executions[index].exit else {
+            panic!("the strict byte view must return its logical size");
+        };
+        assert!(result.usage.steps > idle_steps + 30);
+        let mut bounded = limits;
+        bounded.vm.max_steps = idle_steps;
+        assert!(matches!(run(30, bounded), Outcome::Inconclusive(_)));
+        assert!(run(30, limits).into_complete().is_ok());
+    });
+}
+
+#[test]
+fn string_byte_view_refuses_a_foreign_projection_extern() {
+    with_fixture(|fixture| {
+        let environment = externs::register(
+            &fixture.environment,
+            &name("String.toByteArray"),
+            vec![ExternEntry::Standard {
+                backend: name("all"),
+                symbol: "foreign_string_bytes".to_owned(),
+            }],
+        )
+        .unwrap();
+        let engine = Engine::from_environment(environment);
+        let options = KVMap::new();
+        let root = engine.logical_root(&options);
+        assert!(
+            engine
+                .execute_source_commands_with_checks(
+                    b"#eval (String.toByteArray \"hello\").size",
+                    &options,
+                    EngineExecutionLimits::new(Budget::for_stack_bytes(STACK)),
+                )
+                .is_err()
+        );
+        assert_eq!(engine.logical_root(&options), root);
     });
 }
