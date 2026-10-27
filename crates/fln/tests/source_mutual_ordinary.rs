@@ -113,6 +113,79 @@ fn mutual_structural_generalizes_trailing_parameters_and_preserves_abbrev() {
 }
 
 #[test]
+fn mutual_structural_single_member_remains_reducible_and_executable() {
+    let base = check(
+        "mutual\n\
+         def half : Nat -> Nat\n | 0 => 0\n | 1 => 0\n | n+2 => half n + 1\n\
+         termination_by structural n => n\n\
+         end\n\
+         example : half 8 = 4 := rfl\n\
+         example (n : Nat) : half (n+2) = half n + 1 := rfl\n",
+    );
+    run(&base, "#eval half 8", "4");
+}
+
+#[test]
+fn mutual_structural_self_recursive_components_keep_acyclic_dependencies() {
+    let base = check(
+        "mutual\n\
+         def answer : Nat := grow 4\n\
+         def grow : Nat -> Nat\n | 0 => initial\n | n+1 => grow n + 2\n\
+         def initial : Nat := 3\n\
+         end\n\
+         example : answer = 11 := rfl\n\
+         example (n : Nat) : grow (n+1) = grow n + 2 := rfl\n",
+    );
+    run(&base, "#eval answer", "11");
+}
+
+#[test]
+fn mutual_structural_preserves_polymorphic_fixed_list_parameters() {
+    // As in the course-of-values regressions, Prod enables the native family's below
+    // generator. The bounded seed's built-in List intentionally has no brecOn.
+    let (base, limits) = engine();
+    let base = base
+        .check_source_files(
+            &[b"structure Prod (A : Type u) (B : Type v) where\n fst : A\n snd : B\n"],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap()
+        .engine;
+    let source = "inductive MutualList (A : Type u) where\n | nil : MutualList A\n | cons : A -> MutualList A -> MutualList A\n\
+         mutual\n\
+         def listLeft.{u} {A : Type u} : MutualList A -> Nat\n | .nil => 0\n | .cons _ tail => listRight tail + 1\n\
+         def listRight.{u} {A : Type u} : MutualList A -> Nat\n | .nil => 0\n | .cons _ tail => listLeft tail + 2\n\
+         end\n\
+         example : listLeft (.cons 1 (.cons 2 (.cons 3 .nil))) = 4 := rfl\n\
+         example : listRight (.cons 1 (.cons 2 (.cons 3 .nil))) = 5 := rfl\n\
+         example (A : Type u) (a : A) (tail : MutualList A) : listLeft (.cons a tail) = listRight tail + 1 := rfl\n";
+    oracle(source, true);
+    let base = base
+        .check_source_files(
+            &[source.as_bytes()],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits),
+        )
+        .unwrap_or_else(|error| panic!("{source}\n{error:?}"))
+        .into_complete()
+        .expect("both checkers complete")
+        .engine;
+    run(
+        &base,
+        "#eval listLeft (.cons 1 (.cons 2 (.cons 3 .nil)))",
+        "4",
+    );
+    run(
+        &base,
+        "#eval listRight (.cons 1 (.cons 2 (.cons 3 .nil)))",
+        "5",
+    );
+}
+
+#[test]
 fn mutual_structural_checks_unused_initializers_and_escaping_peers() {
     let (base, limits) = engine();
     let root = base.logical_root(&KVMap::new());

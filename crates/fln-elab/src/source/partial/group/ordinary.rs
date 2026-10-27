@@ -298,10 +298,9 @@ fn elaborate_with_meter(
                 headers: &headers,
                 level_names: level_names.as_deref().unwrap_or_default(),
             };
-            let structural = component.len() > 1
-                && component.iter().all(|&index| {
-                    matches!(hints[index], MemberHint::None | MemberHint::Structural)
-                });
+            let structural = component
+                .iter()
+                .all(|&index| matches!(hints[index], MemberHint::None | MemberHint::Structural));
             let compiled = if structural {
                 match mutual_structural(
                     &mut meter,

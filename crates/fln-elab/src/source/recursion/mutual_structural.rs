@@ -200,7 +200,7 @@ impl Context {
         fixed: usize,
         level_params: Vec<Name>,
     ) -> Result<StructuralPlan, NatDefinitionElabError> {
-        if names.len() < 2
+        if names.is_empty()
             || types.len() != names.len()
             || arities.len() != names.len()
             || arities.iter().any(|arity| *arity <= fixed)
