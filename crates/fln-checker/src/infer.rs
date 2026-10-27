@@ -3693,6 +3693,34 @@ impl<'a> InferenceEngine<'a> {
         }
 
         let first = function.instantiations.len() - needed;
+        if needed > 1 {
+            let mut names = Vec::with_capacity(needed);
+            for replacement in &function.instantiations[first..] {
+                self.control
+                    .poll(self.cancelled, phase, root.index())
+                    .map_err(LeafHalt::stop)?;
+                let term = inference_arena(self.input, &self.generated, replacement.source)?;
+                let Some(ExprNode::Free { name }) = term.node(replacement.root) else {
+                    break;
+                };
+                names.push(name);
+            }
+            if names.len() == needed {
+                // Exactly the same outer-to-inner free locals as binder
+                // materialization: open the active suffix in one traversal.
+                // Arbitrary concrete arguments retain the ordinary path below.
+                return map_materialization(
+                    open_bound_telescope_with(
+                        &result,
+                        &names,
+                        self.control.budget.materialization,
+                        self.cancelled,
+                    ),
+                    phase,
+                    self.control.progress,
+                );
+            }
+        }
         for replacement in function.instantiations[first..].iter().rev() {
             let replacement_term =
                 inference_arena(self.input, &self.generated, replacement.source)?;

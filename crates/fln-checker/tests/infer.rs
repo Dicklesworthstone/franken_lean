@@ -1975,6 +1975,81 @@ fn application_checking_instantiates_dependent_and_nondependent_codomains() {
 }
 
 #[test]
+fn application_free_telescope_preserves_order_under_binders_and_concrete_fallback() {
+    let free = |text| Expr::fvar(FVarId(primary_name(text)));
+    let bound = |index| Expr::bvar(index).expect("small telescope index");
+    let pi = |domain, body| Expr::forall_e(primary_name("x"), domain, body, BinderInfo::Default);
+    let type_ = Expr::sort(Level::one());
+    // (A B : Type) -> A -> B -> (x : A) -> B. The result's A and B
+    // cross four application binders and one retained codomain binder.
+    let function_type = pi(
+        type_.clone(),
+        pi(
+            type_.clone(),
+            pi(bound(1), pi(bound(1), pi(bound(3), bound(3)))),
+        ),
+    );
+    let context = built_context(
+        vec![
+            LocalDeclaration::assumption(checker_name("A"), decoded(&type_)),
+            LocalDeclaration::assumption(checker_name("B"), decoded(&type_)),
+            LocalDeclaration::assumption(checker_name("a"), decoded(&free("A"))),
+            LocalDeclaration::assumption(checker_name("b"), decoded(&free("B"))),
+            LocalDeclaration::assumption(checker_name("p"), sort(Level::zero())),
+            LocalDeclaration::assumption(checker_name("f"), decoded(&function_type)),
+        ],
+        vec![],
+        vec![],
+    );
+    let apply = |arguments: Vec<Expr>| arguments.into_iter().fold(free("f"), Expr::app);
+    let checking = InferenceMode::Checking {
+        declaration_safety: DefinitionSafety::Safe,
+    };
+    for mode in [InferenceMode::InferOnly, checking] {
+        for (arguments, domain) in [
+            (vec![free("A"), free("B"), free("a"), free("b")], free("A")),
+            (
+                vec![Expr::sort(Level::zero()), free("B"), free("p"), free("b")],
+                Expr::sort(Level::zero()),
+            ),
+        ] {
+            let result = complete(infer(
+                &decoded(&apply(arguments)),
+                &context,
+                mode,
+                InferenceBudget::unlimited(),
+            ));
+            assert_eq!(result.type_, decoded(&pi(domain, free("B"))));
+            assert_eq!(result.progress.application_arguments, 4);
+        }
+    }
+    let wrong_argument = infer(
+        // B := Prop makes the final argument require a proof. A itself is a
+        // type, so this is a definite sort mismatch rather than an open A/B
+        // conversion query that the independent checker may leave deferred.
+        &decoded(&apply(vec![
+            free("A"),
+            Expr::sort(Level::zero()),
+            free("a"),
+            free("A"),
+        ])),
+        &context,
+        checking,
+        InferenceBudget::unlimited(),
+    );
+    assert!(
+        matches!(
+            wrong_argument,
+            InferenceOutcome::Refused {
+                refusal: InferenceRefusal::ApplicationTypeMismatch { argument: 3, .. },
+                ..
+            }
+        ),
+        "wrong argument must be refused: {wrong_argument:?}"
+    );
+}
+
+#[test]
 fn infer_only_peels_the_spine_without_inferring_or_converting_arguments() {
     let sort_one = Expr::sort(Level::one());
     let dependent_type = Expr::forall_e(
