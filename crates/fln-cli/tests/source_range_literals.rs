@@ -36,11 +36,25 @@ def stepped (a b : Nat) : Nat := Id.run do
     total := total + i
   return total
 #eval stepped 1 10
+def count (n : Nat) : Nat := Id.run do
+  let mut acc := 0
+  for _ in [0:n] do
+    acc := acc + 1
+  return acc
+#eval count 10
+#eval count 0
+def nestedCount : Nat := Id.run do
+  let mut acc := 0
+  for _ in [0:3] do
+    for _ in [0:2] do
+      acc := acc + 1
+  return acc
+#eval nestedCount
 ";
 
-/// The pin's output for [`PROGRAM`]. Every loop reads its index: a body that ignores it is refused
-/// at runtime ingress here (a closure-type mismatch), which is recorded separately.
-const EXPECTED: &str = "5050\n0\n10\n20\n12\n";
+/// The pin's output for [`PROGRAM`], including unused indices and captured state
+/// shared by nested loops.
+const EXPECTED: &str = "5050\n0\n10\n20\n12\n10\n0\n6\n";
 
 /// Refused at the pin, and here: a range never ends at its colon, never mixes `,` and `:`, and a
 /// written step must be decidably positive.
