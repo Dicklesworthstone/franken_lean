@@ -88,6 +88,18 @@ fn checked_recursive_consumer_preserves_callback_stages_and_runtime_captures() {
 }
 
 #[test]
+fn recursive_consumers_keep_application_tail_callback_stages() {
+    let engine = admit(consumer());
+    returned(
+        &engine,
+        b"#eval stageConsume (fun n => Nat.add n) 3 2\n\
+          #eval stageConsume (fun n state => Nat.add n state) 3 2\n\
+          #eval let f : Nat -> Nat -> Nat := fun n => Nat.add n; stageConsume f 3 2",
+        &["14", "14", "14"],
+    );
+}
+
+#[test]
 fn a_callback_prefix_cannot_be_delayed_when_its_returned_action_is_ignored() {
     let engine = admit(pair(
         "stageSpin",
