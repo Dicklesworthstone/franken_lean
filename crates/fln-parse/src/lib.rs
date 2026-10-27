@@ -3735,6 +3735,44 @@ fn bounded_term_layout(
     Ok(None)
 }
 
+/// Keep quotation construction's temporaries off every ordinary token's stack.
+/// The dispatch order remains the term driver's; only a quotation enters here.
+#[inline(never)]
+fn push_quotation(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    lists: &collections::Lists,
+    frames: &mut [BoundedTermFrame],
+    index: usize,
+    end: usize,
+) -> Result<usize, NatDefinitionParseError> {
+    let read = match lists.repetition_splice(leaves, view, tokens, frames, index, end)? {
+        Some(read) => read,
+        None => match quotations::quotation(leaves, view, tokens, index, end)? {
+            Some(read) => read,
+            None => quotations::antiquotation(
+                leaves,
+                view,
+                tokens,
+                index,
+                end,
+                quotations::Position::Term,
+            )?
+            .ok_or_else(|| NatDefinitionParseError::OutsideSeedGrammar {
+                at: original_position(view, tokens, index),
+                expected: DefinitionGrammar::Scalar.value_expectation(),
+            })?,
+        },
+    };
+    frames
+        .last_mut()
+        .expect("the root term frame remains live")
+        .application
+        .push((read.0, index));
+    Ok(read.1)
+}
+
 /// A token's own meaning on the frame stack: the next cursor.
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
@@ -4109,33 +4147,7 @@ fn bounded_term_token(
             if grammar == DefinitionGrammar::Scalar
                 && (quotations::opens(symbol) || (symbol == "$" && quotations::inside())) =>
         {
-            let read =
-                match lists.repetition_splice(leaves, view, tokens, frames, index, range.end)? {
-                    Some(read) => read,
-                    None => match quotations::quotation(leaves, view, tokens, index, range.end)? {
-                        Some(read) => read,
-                        None => quotations::antiquotation(
-                            leaves,
-                            view,
-                            tokens,
-                            index,
-                            range.end,
-                            quotations::Position::Term,
-                        )?
-                        .ok_or_else(|| {
-                            NatDefinitionParseError::OutsideSeedGrammar {
-                                at: original_position(view, tokens, index),
-                                expected: grammar.value_expectation(),
-                            }
-                        })?,
-                    },
-                };
-            frames
-                .last_mut()
-                .expect("the root term frame remains live")
-                .application
-                .push((read.0, index));
-            return Ok(read.1);
+            return push_quotation(leaves, view, tokens, lists, frames, index, range.end);
         }
         kind if is_bounded_term_atom(kind, grammar) => {
             let term = bounded_term_leaf(leaves, view, tokens, index, grammar)?;
