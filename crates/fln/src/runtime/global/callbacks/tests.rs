@@ -660,3 +660,62 @@ fn first_order_functions_result_anchors_and_unknown_producers_keep_their_binding
             .is_none()
     );
 }
+
+#[test]
+fn reannotating_an_anchored_callback_adds_no_alias() {
+    let environment = environment(DefinitionSafety::Safe);
+    let mut preparation = Preparation::new(&environment, IngressLimits::default());
+    let Some(result @ ValueType::Closure(_)) = preparation.value_type(&callback_type()).unwrap()
+    else {
+        panic!("a function type has a closure interface");
+    };
+    for value in [
+        staged(),
+        local("paid", call("observe", [nat::literal(0)]), staged()),
+    ] {
+        let once = preparation
+            .typed_callable_result(value.clone(), callback_type(), result)
+            .unwrap();
+        assert_ne!(once, value, "the first annotation places an anchor");
+        let twice = preparation
+            .typed_callable_result(once.clone(), callback_type(), result)
+            .unwrap();
+        assert_eq!(twice, once, "an anchored value is not anchored again");
+    }
+    // A different type is a different annotation, never silently dropped.
+    let other = pi(nat(), pi(nat(), pi(nat(), nat())));
+    let Some(other_result @ ValueType::Closure(_)) = preparation.value_type(&other).unwrap() else {
+        panic!("a function type has a closure interface");
+    };
+    let once = preparation
+        .typed_callable_result(staged(), callback_type(), result)
+        .unwrap();
+    let retyped = preparation
+        .typed_callable_result(once.clone(), other.clone(), other_result)
+        .unwrap();
+    assert_ne!(retyped, once);
+}
+
+#[test]
+fn a_doubly_anchored_staged_callback_does_not_cycle_through_exposure() {
+    // `let _ : T := callback; let _ : T := #0; #0` is what annotating an
+    // already anchored branch produced. Its first binding's body is no longer
+    // `#0`, so exposure fired, re-annotated, and rebuilt the same shape with
+    // one more alias inside the callback, without end.
+    let environment = environment(DefinitionSafety::Safe);
+    let input = Expr::let_e(
+        Name::anonymous(),
+        callback_type(),
+        staged(),
+        Expr::let_e(Name::anonymous(), callback_type(), b(0), b(0), false),
+        false,
+    );
+    let limits = IngressLimits {
+        max_nodes: 100_000,
+        ..IngressLimits::default()
+    };
+    let mut preparation = Preparation::new(&environment, limits);
+    let prepared = preparation.expression(&input);
+    assert!(prepared.is_ok(), "{prepared:?}");
+    assert!(preparation.visited < 10_000, "{}", preparation.visited);
+}
