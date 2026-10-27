@@ -12,12 +12,15 @@ const STRING: &str = include_str!("string_dependencies.txt");
 const CHARACTER: &str = include_str!("char_dependencies.txt");
 const NATURAL: &str = include_str!("nat_dependencies.txt");
 const PRIMITIVE: &str = "_fln_runtime_text_equality_abi";
+/// The checked `String.decEq` as a first-class decision, over [`PRIMITIVE`].
+const STRING_DECISION: &str = "_fln_runtime_string_decEq";
 
 #[derive(Default)]
 pub(in crate::runtime) struct Store {
     string_checked: bool,
     char_checked: bool,
     string_primitive: Option<IntrinsicBinding>,
+    string_decision: bool,
     pub(super) natural_primitives: [Option<IntrinsicBinding>; 3],
 }
 
@@ -205,6 +208,18 @@ impl Preparation<'_> {
                     .fold(Expr::const_(name("Nat.beq"), vec![]), Expr::app),
             ));
         }
+        self.text_string_primitive()?;
+        Ok(Some(
+            operands
+                .iter()
+                .cloned()
+                .fold(Expr::const_(name(PRIMITIVE), vec![]), Expr::app),
+        ))
+    }
+
+    /// One native row per program: the applied decision and the first-class
+    /// one call the same private primitive.
+    fn text_string_primitive(&mut self) -> Result<(), IngressError> {
         if self.text_decisions.string_primitive.is_none() {
             let primitive = name(PRIMITIVE);
             if self.environment.contains(&primitive) {
@@ -221,12 +236,119 @@ impl Preparation<'_> {
             binding.name = primitive;
             self.text_decisions.string_primitive = Some(binding);
         }
-        Ok(Some(
-            operands
-                .iter()
-                .cloned()
-                .fold(Expr::const_(name(PRIMITIVE), vec![]), Expr::app),
-        ))
+        Ok(())
+    }
+
+    /// `String.decEq` passed as a value (an instance argument, a `BEq` built
+    /// by `instBEqOfDecidableEq`) has no `decide` around it to select the
+    /// applied adapter. Under the same complete pinned model and extern check,
+    /// rebuild its `Decidable` from the native Boolean, as `Nat.decEq` does;
+    /// otherwise its body would match on the String structure itself.
+    pub(super) fn native_string_decision_target(
+        &mut self,
+        requested: &Name,
+    ) -> Result<Option<Name>, IngressError> {
+        let target = name(STRING_DECISION);
+        if self.text_decisions.string_decision {
+            self.tick()?;
+            return Ok(Some(target));
+        }
+        source_intrinsics::read_extern_attributes(
+            self.environment,
+            &mut self.externs,
+            &mut self.visited,
+            self.limits,
+        )?;
+        if !self
+            .externs
+            .as_ref()
+            .is_some_and(|table| table.get(requested).is_some())
+        {
+            return Ok(None);
+        }
+        source_intrinsics::check_selected_extern_attribute(
+            self.environment,
+            requested,
+            &mut self.externs,
+            &mut self.visited,
+            self.limits,
+        )?;
+        // Callable-type and companion lookups consult this target for any
+        // String.decEq they meet, including in an environment holding only
+        // part of the pinned model. A model that is absent or different grants
+        // no native authority and leaves the ordinary path in force; only a
+        // budget stop is an answer here.
+        match self.text_equality_model(false) {
+            Ok(true) => {}
+            Ok(false) | Err(IngressError::UnsupportedNode { .. }) => return Ok(None),
+            Err(error) => return Err(error),
+        }
+        let decision = Expr::app(
+            Expr::const_(name("Decidable"), vec![]),
+            Expr::const_(name("True"), vec![]),
+        );
+        if self.value_type(&decision)? != Some(ValueType::Constructor) {
+            return Err(unsupported("native decision constructor representation"));
+        }
+        self.text_string_primitive()?;
+        let mut branches = Vec::new();
+        for constructor in ["Decidable.isFalse", "Decidable.isTrue"] {
+            let value = self
+                .specialize_constructor(
+                    &Expr::const_(name(constructor), vec![]),
+                    &[Expr::const_(name("True"), vec![]), proofs::erased_value()],
+                )?
+                .ok_or_else(|| unsupported("native decision constructor adapter"))?;
+            branches.push(value);
+        }
+        let string = Expr::const_(name("String"), vec![]);
+        let mut value = Expr::const_(name(PRIMITIVE), vec![]);
+        for index in [1, 0] {
+            value = Expr::app(
+                value,
+                Expr::bvar(index).expect("fixed native decision argument"),
+            );
+        }
+        let motive = Expr::lam(
+            Name::anonymous(),
+            Expr::const_(name("Bool"), vec![]),
+            decision.clone(),
+            BinderInfo::Default,
+        );
+        value = [motive, branches.remove(0), branches.remove(0), value]
+            .into_iter()
+            .fold(
+                Expr::const_(name("Bool.rec"), vec![Level::one()]),
+                Expr::app,
+            );
+        let mut type_ = decision;
+        for _ in 0..2 {
+            value = Expr::lam(
+                Name::anonymous(),
+                string.clone(),
+                value,
+                BinderInfo::Default,
+            );
+            type_ = Expr::forall_e(
+                Name::anonymous(),
+                string.clone(),
+                type_,
+                BinderInfo::Default,
+            );
+        }
+        self.remember_native_scalar_adapter_definition(DefinitionVal {
+            base: fln_env::constants::ConstantVal {
+                name: target.clone(),
+                level_params: Vec::new(),
+                type_,
+            },
+            value,
+            hints: fln_env::constants::ReducibilityHints::Abbrev,
+            safety: fln_env::constants::DefinitionSafety::Safe,
+            all: Vec::new(),
+        })?;
+        self.text_decisions.string_decision = true;
+        Ok(Some(target))
     }
 }
 
@@ -379,6 +501,175 @@ def chooseStored (n m : Nat) : Bool :=
                 [1, 0, 1, 0, 1, 1, 0, 1, 0, 1, 0, 1, 1, 0, 1, 0, 1, 0]
                     .map(crate::ClosedVmValue::Scalar)
             );
+        });
+    }
+
+    /// `String.decEq` used as a value — a partial application, a stored field,
+    /// a `BEq` built from the instance — has no `decide` around it. It still
+    /// runs the native row through the same model, and shares one intrinsic
+    /// declaration with the applied decision in the same program.
+    #[test]
+    fn pinned_string_decisions_execute_as_values_and_share_one_native_row() {
+        on_stack(|| {
+            let definitions = r#"
+def chooseString (a b : String) : Bool := if _h : a = b then true else false
+def stringPartial (a b : String) : Bool :=
+  let f := String.decEq a
+  match f b with
+  | .isFalse _ => false
+  | .isTrue _ => true
+structure StringDecision where
+  run : (a b : String) → Decidable (a = b)
+def stringStored (a b : String) : Bool :=
+  let box : StringDecision := ⟨String.decEq⟩
+  match box.run a b with
+  | .isFalse _ => false
+  | .isTrue _ => true
+def stringBoth (a b : String) : Bool :=
+  let f := String.decEq a
+  match f b with
+  | .isFalse _ => decide (a = b)
+  | .isTrue _ => decide (b = a)
+"#;
+            let checked = engine()
+                .check_source_files(
+                    &[definitions.as_bytes()],
+                    &KVMap::new(),
+                    crate::SourceCheckLimits::new(crate::EngineAdmissionLimits::new(
+                        Budget::for_stack_bytes(STACK),
+                    )),
+                )
+                .unwrap()
+                .into_complete()
+                .expect("the actual source definitions pass both checkers");
+            let source = "#eval chooseString \"λ😀\" \"λ😀\"\n\
+                #eval chooseString \"λ😀\" \"λ\"\n\
+                #eval stringPartial \"λ😀\" \"λ😀\"\n\
+                #eval stringPartial \"\" \"x\"\n\
+                #eval stringStored \"abc\" \"abc\"\n\
+                #eval stringStored \"abc\" \"abd\"\n\
+                #eval stringBoth \"abc\" \"abc\"\n\
+                #eval stringBoth \"abc\" \"ab\"\n";
+            let result = checked
+                .engine
+                .execute_source_definitions(
+                    &[source.as_bytes()],
+                    &KVMap::new(),
+                    crate::EngineExecutionLimits::new(Budget::for_stack_bytes(STACK)),
+                )
+                .unwrap()
+                .into_complete()
+                .expect("the checked source evaluation completes");
+            let values: Vec<_> = result
+                .executions
+                .iter()
+                .map(|execution| crate::closed_vm_value(&execution.exit).unwrap().unwrap())
+                .collect();
+            assert_eq!(
+                values,
+                [1, 0, 1, 0, 1, 0, 1, 0].map(crate::ClosedVmValue::Scalar)
+            );
+
+            let mut prep = Preparation::new(environment(), IngressLimits::default());
+            let target = prep
+                .native_natural_decision_target(&name("String.decEq"))
+                .unwrap()
+                .expect("the pinned String decision binds as a value");
+            assert_eq!(target, name(STRING_DECISION));
+            let binding = prep
+                .text_equality_intrinsic_binding(&name(PRIMITIVE))
+                .expect("the shared native row");
+            assert_eq!(binding.row, "extern:String.decEq");
+            assert_eq!(
+                binding.argument_ownership,
+                [ArgumentOwnership::Borrowed, ArgumentOwnership::Borrowed]
+            );
+            assert_eq!(binding.result_ownership, ResultOwnership::Scalar);
+
+            // A foreign extern is refused, a selected replacement is never
+            // bypassed, and an altered model never fills the success cache.
+            let foreign = fln_elab::externs::register(
+                environment(),
+                &name("String.decEq"),
+                vec![fln_elab::externs::ExternEntry::Standard {
+                    backend: name("all"),
+                    symbol: "foreign_text_equality".to_owned(),
+                }],
+            )
+            .unwrap();
+            let mut prep = Preparation::new(&foreign, IngressLimits::default());
+            assert!(
+                prep.native_natural_decision_target(&name("String.decEq"))
+                    .is_err()
+            );
+            let ConstantInfo::Defn(mut replacement) =
+                environment().find(&name("String.decEq")).unwrap().clone()
+            else {
+                unreachable!();
+            };
+            replacement.base.name = name("replacementStringDecision");
+            replacement.all = vec![name("replacementStringDecision")];
+            let replaced = environment()
+                .add_decl(ConstantInfo::Defn(replacement))
+                .unwrap();
+            let replaced = fln_elab::implemented_by::register(
+                &replaced,
+                &name("String.decEq"),
+                &name("replacementStringDecision"),
+            )
+            .unwrap();
+            let mut prep = Preparation::new(&replaced, IngressLimits::default());
+            assert!(
+                prep.native_natural_decision_target(&name("String.decEq"))
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(!prep.text_decisions.string_decision);
+            let changed = altered("String.decEq", |mut info| {
+                let ConstantInfo::Defn(value) = &mut info else {
+                    unreachable!()
+                };
+                value.value = natural(13);
+                Some(info)
+            });
+            let mut prep = Preparation::new(&changed, IngressLimits::default());
+            assert!(
+                prep.native_natural_decision_target(&name("String.decEq"))
+                    .unwrap()
+                    .is_none(),
+                "an altered model grants no native authority"
+            );
+            assert!(!prep.text_decisions.string_decision);
+            assert!(prep.text_decisions.string_primitive.is_none());
+            // So does a model the environment holds only part of.
+            let partial = altered("String.decEq.match_1", |_| None);
+            let mut prep = Preparation::new(&partial, IngressLimits::default());
+            assert!(
+                prep.native_natural_decision_target(&name("String.decEq"))
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(!prep.text_decisions.string_decision);
+            // A budget stop is still an answer, never a silent fallback.
+            let mut complete = Preparation::new(environment(), IngressLimits::default());
+            assert!(
+                complete
+                    .native_natural_decision_target(&name("String.decEq"))
+                    .unwrap()
+                    .is_some()
+            );
+            let mut stopped = Preparation::new(
+                environment(),
+                IngressLimits {
+                    max_nodes: complete.visited - 1,
+                    ..IngressLimits::default()
+                },
+            );
+            assert!(matches!(
+                stopped.native_natural_decision_target(&name("String.decEq")),
+                Err(IngressError::ResourceLimit { .. })
+            ));
+            assert!(!stopped.text_decisions.string_decision);
         });
     }
 

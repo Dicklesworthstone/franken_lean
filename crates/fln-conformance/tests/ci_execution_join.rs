@@ -373,6 +373,19 @@ const IGNORED_PRODUCER_ALLOWANCE: &[(&str, &str, &str)] = &[
          the real closure, so no coverage row may cite this test for a per-commit claim",
     ),
     (
+        "crates/fln-cli/tests/string_extern_probes.rs",
+        "string_extern_probe_programs_agree_with_the_pin_or_refuse_typed",
+        "an on-demand lane (bead fln-ingress-string-field-projection-funz): the installed \
+         `lean` and the pinned `lean` on nine held-out String programs with their implicit \
+         whole Init, whose council admission is far too slow per push. Per commit, the pin-gated \
+         fln lib tests `positioned_adapters_execute_checked_source_and_replay_bytecode` and \
+         `actual_string_inventories_close_the_pin_and_share_only_successful_checks` hold the \
+         native String rows these programs reach against the pin's own values and declaration \
+         closures, and fln-vm's `positioned_string_rows_port_the_pin_runtime` holds the rows' \
+         runtime semantics. Nothing per commit runs the nine programs end to end, and no \
+         coverage row may cite this function as a CI run",
+    ),
+    (
         "crates/fln-cli/tests/upstream_suite_scoreboard.rs",
         "upstream_suite_scoreboard_measures_the_drop_in_against_the_pin",
         "an on-demand pin-gated lane over 3,379 upstream files, run by contract-drift with \
@@ -726,7 +739,11 @@ const IGNORED_PRODUCER_ALLOWANCE: &[(&str, &str, &str)] = &[
 /// 1,077 files is minutes on first use, and the entry names what holds the corpus per commit.
 /// 27 -> 28 for `crates/fln-parse/tests/pin_syntax_frontier.rs`'s frontier A, in the same change:
 /// a measurement over that corpus's cache, which no CI host holds.
-const IGNORED_PRODUCER_CEILING: usize = 28;
+/// 28 -> 29 for `crates/fln-cli/tests/string_extern_probes.rs`'s pin differential over the nine
+/// held-out String programs (bead `fln-ingress-string-field-projection-funz`), declared in the
+/// commit that adds it: each needs the whole pinned Init admitted, and the entry names the
+/// pin-gated unit tests that hold the native String rows per commit.
+const IGNORED_PRODUCER_CEILING: usize = 29;
 
 /// Scenario tokens that name a gate stage rather than an `fln.e2e/2` lane.
 const NON_E2E_SCENARIOS: &[&str] = &["quality_gate", "gate_self_test"];
@@ -2143,7 +2160,11 @@ fn judge_granularity(d: &Derivation, allowance: &[&str], ceiling: usize) -> Vec<
     // `the_ignored_producer_citation_census_matches_the_measured_population` fails in BOTH
     // directions when any field moves without the population, or the population without it:
     //
-    // ignored-producer-citation-census: surfaces=15 rows=13 citations=14 all-rows-declared=true
+    // ignored-producer-citation-census: surfaces=16 rows=13 citations=14 all-rows-declared=true
+    //
+    // `surfaces` rose 15 -> 16 with the declaration of the String extern probe differential in
+    // crates/fln-cli/tests/string_extern_probes.rs (2026-10-26). `rows` and `citations` are
+    // unmoved: no terminal row cites that surface.
     //
     // `surfaces` rose 13 -> 15 with the declarations of the pin syntax corpus's pinned lane in
     // crates/fln-syntax/tests/pin_syntax_corpus.rs and its frontier A in
