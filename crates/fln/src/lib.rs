@@ -7119,6 +7119,7 @@ fn collect_executable_constants(
     use fln_core::expr::ExprNode;
 
     let mut pending = Vec::new();
+    let mut visited = std::collections::HashSet::new();
     pending
         .try_reserve(1)
         .map_err(|_| IngressError::AllocationFailure {
@@ -7128,6 +7129,21 @@ fn collect_executable_constants(
     pending.push(source);
     while let Some(expression) = pending.pop() {
         charge_catalog_node(visited_nodes, limits)?;
+        // The borrowed root keeps every allocation alive for this walk. This
+        // set is local, has no ordering role, and never enters an artifact.
+        // Repeated pending edges still cost one inspection; only revisiting
+        // their already-discovered descendants is avoided.
+        let identity = expression.allocation_identity();
+        if visited.contains(&identity) {
+            continue;
+        }
+        visited
+            .try_reserve(1)
+            .map_err(|_| IngressError::AllocationFailure {
+                resource: IngressResource::ProgramTables,
+                requested: visited.len().saturating_add(1),
+            })?;
+        visited.insert(identity);
         match expression.node() {
             ExprNode::Const { name, .. } => {
                 names.insert(name.clone());
@@ -7179,6 +7195,9 @@ fn collect_executable_constants(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod executable_dependency_tests;
 
 /// Independent caller-supplied bounds for every bounded stage of one execution.
 ///
