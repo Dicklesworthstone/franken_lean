@@ -15,7 +15,7 @@ on:
         description: 'Fixed validation command; negative controls are expected to fail'
         required: true
         type: choice
-        options: [range, cli, missing-reference, flush-mutant]
+        options: [range, cli, reference, missing-reference, flush-mutant]
   push:
     branches: [main]
     paths: ['.github/workflows/fln-source-workbench.yml']
@@ -63,7 +63,7 @@ jobs:
               assert isinstance(blobs, list) and len(blobs) == 2
               assert all(isinstance(s, str) and re.fullmatch('[0-9a-f]{40}', s) for s in blobs)
           assert os.environ['CANDIDATE_SUITE'] in {
-              'range', 'cli', 'missing-reference', 'flush-mutant',
+              'range', 'cli', 'reference', 'missing-reference', 'flush-mutant',
           }
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -147,9 +147,11 @@ jobs:
             cli)
               cargo test --locked --release -p fln-cli --lib -- --nocapture
               ;;
-            missing-reference)
+            reference|missing-reference)
               unset FLN_REFERENCE_LEAN
-              export FLN_REFERENCE_LIB="$RUNNER_TEMP/absent-reference/lib/lean"
+              if [ "$CANDIDATE_SUITE" = missing-reference ]; then
+                export FLN_REFERENCE_LIB="$RUNNER_TEMP/absent-reference/lib/lean"
+              fi
               cargo test --locked --release -p fln-cli --lib -- \
                 goal_traces::tests::guard_literals_agree_with_the_pin_or_refuse \
                 source_check::imports::tests::the_source_import_capture_ceiling_holds_the_pinned_init_closure \
