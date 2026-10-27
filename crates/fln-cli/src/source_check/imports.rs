@@ -879,22 +879,52 @@ mod tests {
     use super::*;
     use fln_olean::region::OleanView;
 
+    struct Directory(PathBuf);
+
+    impl Directory {
+        fn create(path: PathBuf) -> std::io::Result<Self> {
+            std::fs::create_dir(&path)?;
+            Ok(Self(path))
+        }
+    }
+
+    impl Drop for Directory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn failed_fixture_creation_preserves_an_existing_directory() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let directory = Directory::create(std::env::temp_dir().join(format!(
+            "fln-main-import-owner-{}-{stamp}",
+            std::process::id()
+        )))
+        .unwrap();
+        let marker = directory.0.join("retained");
+        std::fs::write(&marker, b"original owner").unwrap();
+        let error = Directory::create(directory.0.clone())
+            .err()
+            .expect("an existing directory cannot become a new fixture's property");
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&marker).unwrap(), b"original owner");
+    }
+
     #[test]
     fn main_loader_keeps_original_sources_and_implicit_init_edges_per_module() {
         // This checks filesystem discovery only. The empty local Init module
         // supplies no declarations and is never used as a native IO fixture.
-        struct Directory(PathBuf);
-        impl Drop for Directory {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_dir_all(&self.0);
-            }
-        }
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let directory = Directory(std::env::temp_dir().join(format!("fln-main-import-{nonce}")));
-        std::fs::create_dir(&directory.0).unwrap();
+        let directory =
+            Directory::create(std::env::temp_dir().join(format!("fln-main-import-{nonce}")))
+                .unwrap();
         let path = directory.0.join("Main.lean");
         let init = b"prelude\n".to_vec();
         let local = b"-- ordinary dependency\n".to_vec();
