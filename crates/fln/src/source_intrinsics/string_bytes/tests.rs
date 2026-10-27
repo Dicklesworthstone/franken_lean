@@ -208,6 +208,14 @@ fn fixture() -> Option<&'static Fixture> {
                     // Nat.pow. Complete native arithmetic recognition binds
                     // the literal dictionary's recursor as well as its fields.
                     "OfNat.rec",
+                    // Char conversion's execution contract also binds the
+                    // actual native companions, which are not references in
+                    // these definitions' logical type/body dependency cone.
+                    "Nat.add._unsafe_rec",
+                    "Nat.beq._unsafe_rec",
+                    "Nat.ble._unsafe_rec",
+                    "Nat.mul._unsafe_rec",
+                    "Nat.pow._unsafe_rec",
                 ])
                 .collect();
             let needed = dependencies(|label| constants.get(label).cloned(), &roots);
