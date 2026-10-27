@@ -1,0 +1,56 @@
+{
+ "bead": "fln-r0yh",
+ "run": "S26",
+ "why": "the combined stdlib + Mathlib frontier on main a3ee77e6 with S25's exact parameters, the first since S25 (2026-10-06) and the first over the corpus restored on 2026-10-26; it is the reality check's G1 measurement and shows both the gain (9,131 accepted against 8,973) and a regression (three modules S25 accepted now stop at K1's 10M execution steps)",
+ "command": "fln check-olean --continue --jobs 24 --progress --json --max-bytes 17179869184 /home/ubuntu/.elan/toolchains/leanprover--lean4---v4.32.0/lib/lean /data/corpus/restored-20261026/mathlib4-v4.32.0/.lake/build/lib/lean /data/corpus/restored-20261026/mathlib4-v4.32.0/.lake/packages/LeanSearchClient/.lake/build/lib/lean /data/corpus/restored-20261026/mathlib4-v4.32.0/.lake/packages/Qq/.lake/build/lib/lean /data/corpus/restored-20261026/mathlib4-v4.32.0/.lake/packages/aesop/.lake/build/lib/lean /data/corpus/restored-20261026/mathlib4-v4.32.0/.lake/packages/batteries/.lake/build/lib/lean /data/corpus/restored-20261026/mathlib4-v4.32.0/.lake/packages/importGraph/.lake/build/lib/lean /data/corpus/restored-20261026/mathlib4-v4.32.0/.lake/packages/plausible/.lake/build/lib/lean /data/corpus/restored-20261026/mathlib4-v4.32.0/.lake/packages/proofwidgets/.lake/build/lib/lean",
+ "limits": "ulimit -v 104857600 (KiB: 100 GiB)",
+ "corpus": "/data/corpus/restored-20261026/mathlib4-v4.32.0, restored 2026-10-26 from the off-host archive, archive sha256 da255177... verified before use (bead franken_lean-z8j.1.15)",
+ "binary": {
+  "sha256": "398aa0ab6bd3d4794514d1b9415d1e43c1f416956527e63f0553685d0980db72",
+  "build_command": "cargo build -j 16 --release --offline -p fln-cli --bins",
+  "source_commit": "a3ee77e6",
+  "profile": "release"
+ },
+ "launched_utc": "2026-10-26T22:19:12Z",
+ "exit": "exit=1 elapsed=9267s",
+ "peak_maxrss_gib": 92.8,
+ "result": {
+  "schema": "fln.check-olean-frontier/1",
+  "outcome": "frontier",
+  "authority": true,
+  "trust": "recheck",
+  "modules": 11083,
+  "accepted": 9131,
+  "failed": 0,
+  "inconclusive": 12,
+  "internalFault": 0,
+  "blocked": 1940,
+  "acceptedDeclarations": 695958
+ },
+ "result_sha256": "dc64a51d715296d9f30ad1fa714fc0c258c48c771cd13ec55e59a55a81f92adf",
+ "result_file": "S26.json (the run's --json, verbatim)",
+ "against_S25": {
+  "transitions": {
+   "accepted->accepted": 8885,
+   "blocked->accepted": 245,
+   "inconclusive->accepted": 1,
+   "accepted->blocked": 85,
+   "accepted->inconclusive": 3,
+   "blocked->blocked": 1853,
+   "inconclusive->inconclusive": 8,
+   "inconclusive->blocked": 2,
+   "blocked->inconclusive": 1
+  },
+  "new_roots_at_k1_execution_steps": [
+   "Mathlib.Algebra.Category.ModuleCat.Monoidal.Basic",
+   "Mathlib.RingTheory.Morita.Matrix",
+   "Mathlib.Algebra.Polynomial.Derivative"
+  ],
+  "s25_root_now_accepted": "Mathlib.RingTheory.Ideal.Quotient.Operations"
+ },
+ "not_established": [
+  "the cause of the three new K1 execution-step stops is attributed by candidate only: 68429a1a (fix(kernel): compare regular application arguments in pin order, after S25's 0a44e720) changes comparison order and so step counts; no bisect was run",
+  "peak_maxrss_gib is /usr/bin/time -v's maximum resident set size, the same quantity S25 reported as VmHWM",
+  "wall time is this host's under concurrent load (S25: 6,610 s), not a throughput figure"
+ ]
+}
