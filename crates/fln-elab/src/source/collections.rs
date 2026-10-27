@@ -48,11 +48,19 @@ fn cons(head: Syntax, tail: Syntax) -> Syntax {
 /// The index notations of `Init/GetElem.lean`.
 const INDEX_KINDS: [&str; 4] = ["term__[_]", "term__[_]'_", "term__[_]_?", "term__[_]_!"];
 
+/// `Std.Legacy.Range`'s range literals (`Init/Data/Range/Basic.lean:69-72`).
+const RANGE_KINDS: [&str; 4] = ["term[:_]", "term[_:_]", "term[:_:_]", "term[_:_:_]"];
+
+fn range_kind(form: &str) -> Name {
+    Name::from_components(["Std", "Legacy", "Range", form])
+}
+
 pub(super) fn is_notation(syntax: &Syntax) -> bool {
     syntax.kind().is_some_and(|kind| {
         INDEX_KINDS
             .iter()
             .any(|index| kind == &Name::from_components([*index]))
+            || RANGE_KINDS.iter().any(|form| kind == &range_kind(form))
             || kind == &Name::from_components(["term[_]"])
             || kind == &Name::from_components(["term#[_,]"])
             || kind == &Name::from_components(["term{_:_//_}"])
@@ -189,6 +197,95 @@ fn expand_index(
     Ok(application(root_ident(&["GetElem?", method]), vec![x, i]))
 }
 
+/// The range literals' macros (`Init/Data/Range/Basic.lean:74-78`) build a `Range` structure
+/// instance, with `start` and `step` at their declared defaults (`0` and `1`) when omitted and
+/// `step_pos` given as `Nat.zero_lt_one`, or `by decide` when a step is written. Here that is
+/// `Std.Legacy.Range.mk start stop step step_pos` directly, the term the instance elaborates
+/// to: the pin prints `[1:5]` under `pp.all` as `Std.Legacy.Range.mk 1 5 1 Nat.zero_lt_one`.
+/// Not a pattern.
+fn expand_range(
+    kind: &Name,
+    args: Vec<Syntax>,
+    pattern: bool,
+) -> Result<Syntax, NatDefinitionElabError> {
+    if pattern {
+        return Err(failure(SourceInferenceError::Scope));
+    }
+    let numeral = |text: &str| Syntax::node(Name::from_components(["num"]), vec![atom(text)]);
+    fn colon(syntax: &Syntax) -> Result<(), NatDefinitionElabError> {
+        expect_atom(syntax, ":", "range separator").map(|_| ())
+    }
+    let (start, stop, step) = if kind == &range_kind("term[:_]") {
+        let Ok([open, c, stop, close]) = <[Syntax; 4]>::try_from(args) else {
+            return Err(failure(SourceInferenceError::Scope));
+        };
+        expect_atom(&open, "[", "range opener")?;
+        colon(&c)?;
+        expect_atom(&close, "]", "range closer")?;
+        (numeral("0"), stop, None)
+    } else if kind == &range_kind("term[_:_]") {
+        let Ok([open, start, c, stop, close]) = <[Syntax; 5]>::try_from(args) else {
+            return Err(failure(SourceInferenceError::Scope));
+        };
+        expect_atom(&open, "[", "range opener")?;
+        colon(&c)?;
+        expect_atom(&close, "]", "range closer")?;
+        (start, stop, None)
+    } else if kind == &range_kind("term[:_:_]") {
+        let Ok([open, c, stop, d, step, close]) = <[Syntax; 6]>::try_from(args) else {
+            return Err(failure(SourceInferenceError::Scope));
+        };
+        expect_atom(&open, "[", "range opener")?;
+        colon(&c)?;
+        colon(&d)?;
+        expect_atom(&close, "]", "range closer")?;
+        (numeral("0"), stop, Some(step))
+    } else {
+        let Ok([open, start, c, stop, d, step, close]) = <[Syntax; 7]>::try_from(args) else {
+            return Err(failure(SourceInferenceError::Scope));
+        };
+        expect_atom(&open, "[", "range opener")?;
+        colon(&c)?;
+        colon(&d)?;
+        expect_atom(&close, "]", "range closer")?;
+        (start, stop, Some(step))
+    };
+    let (step, positive) = match step {
+        None => (numeral("1"), root_ident(&["Nat", "zero_lt_one"])),
+        Some(step) => {
+            // `by decide`: `syntax (name := decide) "decide" optConfig : tactic`.
+            let decide = Syntax::node(
+                parser_kind(&["Tactic", "decide"]),
+                vec![
+                    atom("decide"),
+                    Syntax::node(
+                        parser_kind(&["Tactic", "optConfig"]),
+                        vec![null(Vec::new())],
+                    ),
+                ],
+            );
+            let proof = Syntax::node(
+                parser_kind(&["Term", "byTactic"]),
+                vec![
+                    atom("by"),
+                    Syntax::node(
+                        parser_kind(&["Tactic", "tacticSeq"]),
+                        vec![Syntax::node(
+                            parser_kind(&["Tactic", "tacticSeq1Indented"]),
+                            vec![null(vec![decide])],
+                        )],
+                    ),
+                ],
+            );
+            (step, proof)
+        }
+    };
+    Ok(application(
+        root_ident(&["Std", "Legacy", "Range", "mk"]),
+        vec![start, stop, step, positive],
+    ))
+}
+
 /// `{x // p}` is `Subtype (fun (x : _) => p)` and `{x : T // p}` is `Subtype (fun (x : T) =>
 /// p)`, the macro's quoted `Subtype` resolved where it is defined (`Init/Core.lean`). Not a
 /// pattern here.
@@ -306,6 +403,9 @@ impl Context {
             .any(|index| kind == &Name::from_components([*index]))
         {
             return expand_index(kind, std::mem::take(args), pattern);
+        }
+        if RANGE_KINDS.iter().any(|form| kind == &range_kind(form)) {
+            return expand_range(kind, std::mem::take(args), pattern);
         }
         if args.len() != 3 {
             return Err(failure(SourceInferenceError::Scope));

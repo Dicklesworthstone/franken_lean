@@ -4,6 +4,7 @@
 //! Nothing here is mocked: every refusal is planted in real bytes on disk.
 #![forbid(unsafe_code)]
 
+use fln::source_check::modules::reuse::{CheckerIdentity, ImportReuseRecord};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -83,6 +84,24 @@ fn without_imports(text: &str) -> String {
         .expect("an oleanImports object");
     let end = text[start..].find('}').expect("its end") + start + 1;
     format!("{}{}", &text[..start], &text[end..])
+}
+
+/// A copy of `binary` at `relative` with bytes appended: the same program built from the
+/// same admission authority, with other executable bytes. `fs::copy` carries the
+/// executable bits; the appended bytes are never read.
+fn appended_copy(scratch: &Scratch, binary: &Path, relative: &str) -> PathBuf {
+    let copy = scratch.0.join(relative);
+    std::fs::create_dir_all(copy.parent().unwrap()).unwrap();
+    std::fs::copy(binary, &copy).unwrap();
+    std::io::Write::write_all(
+        &mut std::fs::OpenOptions::new()
+            .append(true)
+            .open(&copy)
+            .unwrap(),
+        b"\0fln-uyuz another executable\0",
+    )
+    .unwrap();
+    copy
 }
 
 fn prelude_records(scratch: &Scratch, closure_key: &str) -> Vec<String> {
@@ -204,9 +223,11 @@ fn check_source_reuses_its_recorded_prelude_closure_and_says_so() {
 ///
 /// * one changed byte (inside a docstring, so every declaration is unchanged and only
 ///   the key can tell) misses the record and the council admits again;
-/// * a different checker binary (the same executable with bytes appended, so a
-///   different identity) misses too, and a record of the first binary planted under
-///   the second binary's key is refused as another checker's.
+/// * another executable built from the same admission authority (the same program with
+///   bytes appended) finds the record under the same key: import records are keyed by
+///   the authority, not by executable bytes (bead `fln-import-reuse-composes-4ngt`);
+/// * a record of another authority, planted under this authority's key, is refused as
+///   another checker's.
 #[test]
 fn a_changed_olean_byte_or_another_checker_forces_readmission() {
     let Some(lib) = pinned_lib() else {
@@ -261,56 +282,53 @@ fn a_changed_olean_byte_or_another_checker_forces_readmission() {
     assert_eq!(without_imports(&first), without_imports(&flipped));
     install(&original);
 
-    // Another checker identity: the same program with bytes appended.
-    // `fs::copy` carries the executable bits; the appended bytes change only the identity.
-    let other = scratch.0.join("bin/fln-other");
-    std::fs::create_dir_all(other.parent().unwrap()).unwrap();
-    std::fs::copy(&fln, &other).unwrap();
-    std::io::Write::write_all(
-        &mut std::fs::OpenOptions::new()
-            .append(true)
-            .open(&other)
-            .unwrap(),
-        b"\0fln-uyuz another checker identity\0",
-    )
-    .unwrap();
+    // Another executable with the same admission authority answers from the first
+    // binary's record, under the same key.
+    let other = appended_copy(&scratch, &fln, "bin/fln");
     let elsewhere = run(&other).stdout();
-    assert_eq!(member(&elsewhere, "record"), Some("absent"), "{elsewhere}");
+    assert_eq!(member(&elsewhere, "record"), Some("hit"), "{elsewhere}");
     assert_eq!(
         member(&elsewhere, "admission"),
-        Some("council"),
+        Some("reused"),
         "{elsewhere}"
     );
-    let other_key = member(&elsewhere, "closureKey").unwrap().to_owned();
-    assert_ne!(other_key, key);
+    assert_eq!(
+        member(&elsewhere, "closureKey"),
+        Some(key.as_str()),
+        "{elsewhere}"
+    );
+    assert_eq!(without_imports(&first), without_imports(&elsewhere));
 
-    // The first binary's record, planted where the second binary looks.
-    std::fs::copy(
-        store.join(format!("{key}.record")),
-        store.join(format!("{other_key}.record")),
-    )
-    .unwrap();
-    let planted = run(&other).stdout();
+    // Another authority's record, planted where this one looks: the stored record with
+    // its checker identity replaced and its seal recomputed, so only the identity differs.
+    let path = store.join(format!("{key}.record"));
+    let mut foreign =
+        ImportReuseRecord::parse(&std::fs::read(&path).unwrap()).expect("the stored record");
+    foreign.checker = CheckerIdentity::of_authority("another admission authority").digest();
+    std::fs::write(&path, foreign.to_bytes()).unwrap();
+    let planted = run(&fln).stdout();
     assert_eq!(
         member(&planted, "record"),
         Some("refused:checker-identity"),
         "{planted}"
     );
-    // The exact record is foreign, but the second binary already admitted its
-    // own Prelude module above. That independently bound memo recovers the
-    // closure without another council and repairs the foreign closure record.
+    // The closure record is foreign, but this authority's own Prelude module record,
+    // stored by the first run, is independently bound: it recovers the closure without
+    // another council and repairs the closure record.
     assert_eq!(member(&planted, "admission"), Some("reused"), "{planted}");
     assert!(
         planted.contains("\"reusedModules\":1,\"councilModules\":0"),
         "{planted}"
     );
     assert_eq!(member(&planted, "recordWrite"), Some("stored"), "{planted}");
-    assert_eq!(without_imports(&elsewhere), without_imports(&planted));
+    assert_eq!(without_imports(&first), without_imports(&planted));
     assert_eq!(member(&run(&other).stdout(), "record"), Some("hit"));
 }
 
 /// `lake build` takes the same posture for the external closure it imports, and its
-/// report names it per closure.
+/// report names it per closure. Another executable built from the same admission
+/// authority reuses the import record but not the module's source record, which binds
+/// the module's source to what that executable elaborated it to.
 #[test]
 fn lake_build_reuses_its_recorded_import_closure_and_says_so() {
     let Some(_) = pinned_lib() else {
@@ -324,9 +342,9 @@ fn lake_build_reuses_its_recorded_import_closure_and_says_so() {
     );
     scratch.write("pkg/Lib.lean", PRELUDE_SOURCE);
     let store = scratch.0.join("records");
-    let build = || {
+    let build = |lake: &Path| {
         let started = Instant::now();
-        let output = Command::new(env!("CARGO_BIN_EXE_lake"))
+        let output = Command::new(lake)
             .arg("--dir")
             .arg(scratch.0.join("pkg"))
             .args(["--json", "build", "+Lib:olean"])
@@ -338,7 +356,8 @@ fn lake_build_reuses_its_recorded_import_closure_and_says_so() {
             seconds: started.elapsed().as_secs_f64(),
         }
     };
-    let first = build();
+    let lake = PathBuf::from(env!("CARGO_BIN_EXE_lake"));
+    let first = build(&lake);
     let first_out = first.stdout();
     assert!(
         first_out.contains("\"import_posture\":\"reuse-verified\",\"imports\":[{\"trust\":\"reuse-verified\",\"admission\":\"council\",\"reusedModules\":0,\"councilModules\":1,\"closureKey\":\""),
@@ -353,12 +372,14 @@ fn lake_build_reuses_its_recorded_import_closure_and_says_so() {
     let artifact = scratch.0.join("pkg/.lake/build/lib/lean/Lib.olean");
     let first_artifact = std::fs::read(&artifact).unwrap();
 
-    let second = build();
+    let second = build(&lake);
     let second_out = second.stdout();
+    let reused = format!(
+        "\"imports\":[{{\"trust\":\"reuse-verified\",\"admission\":\"reused\",\"reusedModules\":1,\"councilModules\":0,\"closureKey\":\"{key}\",\"record\":\"hit\"}}]"
+    );
+    assert!(second_out.contains(&reused), "{second_out}");
     assert!(
-        second_out.contains(&format!(
-            "\"imports\":[{{\"trust\":\"reuse-verified\",\"admission\":\"reused\",\"reusedModules\":1,\"councilModules\":0,\"closureKey\":\"{key}\",\"record\":\"hit\"}}]"
-        )),
+        second_out.contains("\"modules_cached\":1,\"module_elaborations\":0"),
         "{second_out}"
     );
     assert_eq!(
@@ -370,6 +391,15 @@ fn lake_build_reuses_its_recorded_import_closure_and_says_so() {
         "lake build over Init.Prelude: council {:.2} s, reuse-verified {:.2} s",
         first.seconds, second.seconds
     );
+
+    let other = appended_copy(&scratch, &lake, "bin/lake");
+    let third_out = build(&other).stdout();
+    assert!(third_out.contains(&reused), "{third_out}");
+    assert!(
+        third_out.contains("\"modules_cached\":0,\"module_elaborations\":1"),
+        "{third_out}"
+    );
+    assert_eq!(std::fs::read(&artifact).unwrap(), first_artifact);
 }
 
 /// A local module's own `@[defeq]` tag (a naked `:= rfl` theorem's) and `noncomputable` tag

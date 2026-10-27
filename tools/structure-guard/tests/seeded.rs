@@ -1545,6 +1545,22 @@ fn planned_admission_is_refused_outside_the_allowlisted_kernel_files() {
     assert_eq!(codes(&ws.run()), vec!["FLN-STRUCT-039"]);
 }
 
+/// `plan_measured_decl` is the same surface: `plan_add_decl` is a measurement followed by
+/// it, and its plan commits like any other. D6's carve-out plans through it, so a scan
+/// of `plan_add_decl` alone would leave both the carve-out and any copy of it unconfined.
+#[test]
+fn a_measured_plan_is_the_same_admission_surface() {
+    let ws = TempWs::new("admission-measured");
+    base(&ws);
+    admission_dependent(&ws);
+    ws.write(
+        "crates/fln-kernel/src/lib.rs",
+        "//! stub\n#![forbid(unsafe_code)]\n\npub fn plan(env: &Env, content: M) -> P {\n    \
+         env.plan_measured_decl(content, collisions)\n}\n",
+    );
+    assert_eq!(codes(&ws.run()), vec!["FLN-STRUCT-039"]);
+}
+
 /// D6's one named carve-out (bead `fln-uyuz`) is exactly ONE FILE wide: the
 /// `reuse-verified` import rebuild may plan an admission, and the same call one
 /// directory entry over, in the same crate, is still the violation. Without the
@@ -1554,37 +1570,29 @@ fn the_reuse_verified_carve_out_admits_one_file_and_not_its_siblings() {
     let call = "//! stub\n#![forbid(unsafe_code)]\n\npub fn plan(env: &Env, info: Info) -> P {\n    \
                 env.plan_add_decl(\n        info,\n        budget,\n        collisions,\n        cancellation,\n    )\n}\n";
     let dependent = |ws: &TempWs| {
-        ws.write("crates/fln/Cargo.toml", &manifest("fln", &["fln-env"]));
+        ws.write(
+            "crates/fln-admission/Cargo.toml",
+            &manifest("fln-admission", &["fln-env"]),
+        );
         ws.write(
             "Cargo.lock",
-            &fixture_cargo_lock_with_dependencies(&[("fln", &["fln-env"])]),
+            &fixture_cargo_lock_with_dependencies(&[("fln-admission", &["fln-env"])]),
         );
         ws.write(
             "ci/WORKSPACE_GRAPH.txt",
-            &graph_with_edges(&["fln -> fln-env"]),
+            &graph_with_edges(&["fln-admission -> fln-env"]),
         );
         ws.write(
-            "crates/fln/src/lib.rs",
-            "//! stub\n#![forbid(unsafe_code)]\npub mod source_check;\n",
+            "crates/fln-admission/src/lib.rs",
+            "//! stub\n#![forbid(unsafe_code)]\npub mod olean_imports;\npub mod reuse;\n",
         );
-        ws.write(
-            "crates/fln/src/source_check.rs",
-            "//! stub\npub mod modules;\n",
-        );
-        ws.write(
-            "crates/fln/src/source_check/modules.rs",
-            "//! stub\npub mod imported;\npub mod reuse;\n",
-        );
-        ws.write(
-            "crates/fln/src/source_check/modules/imported.rs",
-            "//! stub\n",
-        );
+        ws.write("crates/fln-admission/src/olean_imports.rs", "//! stub\n");
     };
 
     let carve_out = TempWs::new("admission-carve-out");
     base(&carve_out);
     dependent(&carve_out);
-    carve_out.write("crates/fln/src/source_check/modules/reuse.rs", call);
+    carve_out.write("crates/fln-admission/src/reuse.rs", call);
     let out = carve_out.run();
     assert!(
         out.findings.is_empty(),
@@ -1595,14 +1603,14 @@ fn the_reuse_verified_carve_out_admits_one_file_and_not_its_siblings() {
     let sibling = TempWs::new("admission-carve-out-sibling");
     base(&sibling);
     dependent(&sibling);
-    sibling.write("crates/fln/src/source_check/modules/reuse.rs", "//! stub\n");
-    sibling.write("crates/fln/src/source_check/modules/imported.rs", call);
+    sibling.write("crates/fln-admission/src/reuse.rs", "//! stub\n");
+    sibling.write("crates/fln-admission/src/olean_imports.rs", call);
     let out = sibling.run();
     assert_eq!(codes(&out), vec!["FLN-STRUCT-039"], "{:?}", out.findings);
     assert!(
         out.findings[0]
             .path
-            .starts_with("crates/fln/src/source_check/modules/imported.rs:"),
+            .starts_with("crates/fln-admission/src/olean_imports.rs:"),
         "{:?}",
         out.findings
     );

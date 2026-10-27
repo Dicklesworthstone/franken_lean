@@ -168,10 +168,8 @@ use std::fmt;
 // compiler, VM or runtime. Every name it had here is still `fln::<name>`; the
 // result records that carry a successor engine carry an `Engine` here.
 use fln_admission::{
-    Admitted, ArtifactReadings, CheckerReading, ConstantReferenceCollectionError, FrontierAccepted,
-    FrontierEngines, FrontierJob, ReadingCheck, ScheduledOleanModule, collect_constant_references,
-    display_names, frontier_base_of, frontier_checker_entries, frontier_unwound,
-    merge_frontier_entry, plan_olean_declarations, serial_olean_rows,
+    Admitted, ArtifactReadings, ConstantReferenceCollectionError, ReadingCheck,
+    collect_constant_references, display_names, merge_frontier_entry, plan_olean_declarations,
 };
 pub use fln_admission::{
     CheckedOleanModule, CheckerAgreement, CheckerExecutionLimits, DecodedOlean,
@@ -185,10 +183,11 @@ pub use fln_admission::{
 // Council internals that `fln`'s own unit tests still drive through an `Engine`.
 #[cfg(test)]
 use fln_admission::{
-    ArtifactReadingsError, FrontierDone, FrontierRetained, ReadingObjection,
-    checked_olean_declaration, checker_name_text, decode_checker_name, decode_olean_module_input,
-    decode_olean_module_input_with, decode_olean_module_inputs_using, frontier_error_verdict,
-    frontier_guarded, olean_host_memory_refusal,
+    ArtifactReadingsError, CheckerReading, FrontierAccepted, FrontierDone, FrontierEngines,
+    FrontierJob, FrontierRetained, ReadingObjection, checked_olean_declaration, checker_name_text,
+    decode_checker_name, decode_olean_module_input, decode_olean_module_input_with,
+    decode_olean_module_inputs_using, frontier_base_of, frontier_error_verdict, frontier_guarded,
+    olean_host_memory_refusal,
 };
 
 /// Authoritative result of checking every decoded declaration in one
@@ -1955,6 +1954,7 @@ impl Engine {
             imported_environment: self.imported_environment.clone(),
             imported_module_dependencies: std::sync::Arc::clone(&self.imported_module_dependencies),
             executable_opaques: std::sync::Arc::clone(&self.executable_opaques),
+            runtime_initializers: std::sync::Arc::clone(&self.runtime_initializers),
             options: self.options.clone(),
         }
     }
@@ -1970,7 +1970,7 @@ impl Engine {
             imported_environment: admitted.imported_environment,
             imported_module_dependencies: admitted.imported_module_dependencies,
             executable_opaques: admitted.executable_opaques,
-            runtime_initializers: std::sync::Arc::clone(&self.runtime_initializers),
+            runtime_initializers: admitted.runtime_initializers,
             epoch: self.epoch.clone(),
             mode: self.mode,
             reproducibility: self.reproducibility,
@@ -2093,39 +2093,6 @@ impl Engine {
                 outcome
                     .map_complete(|checked| checked.map_engine(|engine| self.with_admitted(engine)))
             })
-    }
-
-    /// [`Admitted::reassemble_olean_module_set`] on this engine.
-    fn reassemble_olean_module_set(
-        &self,
-        names: Vec<Name>,
-        scheduled: Vec<ScheduledOleanModule>,
-        bound_base: bool,
-        options: &KVMap,
-        limits: OleanCheckLimits,
-    ) -> Result<CheckedOleanSet, OleanCheckError> {
-        self.admitted()
-            .reassemble_olean_module_set(names, scheduled, bound_base, options, limits)
-            .map(|checked| checked.map_engine(|engine| self.with_admitted(engine)))
-    }
-
-    /// [`Admitted::frontier_closure_engine`] on this engine.
-    fn frontier_closure_engine(&self, job: &FrontierJob) -> Result<Engine, OleanCheckError> {
-        self.admitted()
-            .frontier_closure_engine(job)
-            .map(|engine| self.with_admitted(engine))
-    }
-
-    /// [`Admitted::decode_olean_module_set`] on this engine.
-    fn decode_olean_module_set(
-        &self,
-        modules: &[OleanModuleInput<'_>],
-        limits: OleanCheckLimits,
-        reading: CheckerReading,
-        jobs: OleanFrontierJobs,
-    ) -> Result<Vec<(Name, DecodedOlean)>, OleanCheckError> {
-        self.admitted()
-            .decode_olean_module_set(modules, limits, reading, jobs)
     }
 
     /// Check one decoded `.olean` against this engine's environment:

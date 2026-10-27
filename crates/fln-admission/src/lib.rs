@@ -20,12 +20,26 @@
 //! [`Admitted`] is the state the council reads and writes: the part of
 //! `fln::Engine` that admission touches. Every other `Engine` field is carried
 //! through unchanged by `fln`.
+//!
+//! [`AUTHORITY`] is that digest: `build.rs` reads this crate's dependency closure from
+//! the `Cargo.toml` files and hashes every file of every crate in it, with the
+//! workspace manifest, lock and toolchain file and the compiler's own `-vV` report.
+//! `reuse::CheckerIdentity::admission_authority` keys import-reuse records by it, so a
+//! rebuild that changes no code an admission depends on keeps its records.
 
 #![forbid(unsafe_code)]
 // Allocation failure unwinds to the import frontier's per-module guard.
 #![feature(alloc_error_hook)]
 
 pub mod olean_imports;
+pub mod reuse;
+
+/// The admission authority: a SHA-256 digest, made by `build.rs`, over every crate in this
+/// crate's dependency closure and the toolchain that compiles them.
+pub const AUTHORITY: &str = env!("FLN_ADMISSION_AUTHORITY");
+
+/// The crates [`AUTHORITY`] digests, by directory name, comma separated.
+pub const AUTHORITY_CLOSURE: &str = env!("FLN_ADMISSION_CLOSURE");
 
 pub use fln_checker::admit::{
     AdmissionBudget as CheckerAdmissionBudget, AdmissionGround as CheckerAdmissionGround,
@@ -85,9 +99,10 @@ use std::fmt;
 /// `fln::Engine` keeps its own fields; it hands the council these, by value, and
 /// takes them back. The persistent environments and the `Arc`-shared sets make
 /// that a reference-count copy, not a deep one. `options` is here because a
-/// council successor records the options it was admitted under, and
+/// council successor records the options it was admitted under,
 /// `executable_opaques` because admitting a handed opaque marks its value
-/// executable.
+/// executable, and `runtime_initializers` because a rebuilt import closure
+/// ([`reuse`]) starts it empty while a council successor carries it on.
 #[derive(Debug, Clone)]
 pub struct Admitted {
     pub environment: Environment,
@@ -101,6 +116,8 @@ pub struct Admitted {
     pub imported_module_dependencies: std::sync::Arc<BTreeMap<Name, Vec<Name>>>,
     /// Admitted opaques whose stored values have executable meaning.
     pub executable_opaques: std::sync::Arc<BTreeSet<Name>>,
+    /// Imported globals whose initializer supplies the runtime value.
+    pub runtime_initializers: std::sync::Arc<BTreeSet<Name>>,
     pub options: KVMap,
 }
 
@@ -4172,6 +4189,7 @@ impl Admitted {
             imported_environment,
             imported_module_dependencies: std::sync::Arc::new(dependencies),
             executable_opaques: std::sync::Arc::clone(&self.executable_opaques),
+            runtime_initializers: std::sync::Arc::clone(&self.runtime_initializers),
             options: if admitted_any {
                 options.clone()
             } else {
@@ -4918,6 +4936,7 @@ impl Admitted {
                     &self.imported_module_dependencies,
                 ),
                 executable_opaques: std::sync::Arc::clone(&self.executable_opaques),
+                runtime_initializers: std::sync::Arc::clone(&self.runtime_initializers),
                 options: options.clone(),
             },
             declaration,

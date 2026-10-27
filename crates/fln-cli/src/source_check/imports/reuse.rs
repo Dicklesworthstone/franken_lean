@@ -12,7 +12,7 @@ use std::sync::OnceLock;
 
 /// The largest record read back. `Init`'s is well under a megabyte.
 const MAX_RECORD_BYTES: usize = 64 * 1024 * 1024;
-/// The largest executable hashed for the checker identity.
+/// The largest executable hashed for the source module records' identity.
 const MAX_EXECUTABLE_BYTES: usize = 1 << 30;
 
 /// Records as files named by their key, in one directory: `FLN_IMPORT_REUSE_DIR`,
@@ -111,7 +111,7 @@ pub(crate) struct ModuleRecords(Resolved);
 
 impl ModuleRecords {
     pub(in crate::source_check) fn new(posture: ImportPosture) -> Self {
-        ModuleRecords(Resolved::new(posture))
+        ModuleRecords(Resolved::with(posture, executable_identity))
     }
 
     pub(crate) fn persisted(&self) -> Option<PersistedModules<'_>> {
@@ -144,7 +144,11 @@ impl ModuleRecords {
 
 /// The digest of this process's own executable bytes, read once. `/proc/self/exe`
 /// names the running image even if its path was replaced since it started.
-fn checker_identity() -> Result<CheckerIdentity, String> {
+///
+/// Source module records keep this identity, not the admission authority import
+/// records use: re-admission re-proves a recorded module's declarations but not that
+/// its source elaborates to them, so any rebuild, the elaborator's included, must miss.
+fn executable_identity() -> Result<CheckerIdentity, String> {
     static IDENTITY: OnceLock<Result<CheckerIdentity, String>> = OnceLock::new();
     IDENTITY
         .get_or_init(|| {
@@ -172,11 +176,22 @@ pub(in crate::source_check) enum Resolved {
 }
 
 impl Resolved {
+    /// Import records, keyed by the admission authority this binary was built with
+    /// (`fln_admission::AUTHORITY`, digested at build time over the council's crate
+    /// closure and toolchain): every step of an import admission and of its re-proof runs
+    /// inside that closure, so a rebuild that changes none of it keeps its records.
     pub(in crate::source_check) fn new(posture: ImportPosture) -> Self {
+        Self::with(posture, || Ok(CheckerIdentity::admission_authority()))
+    }
+
+    fn with(
+        posture: ImportPosture,
+        identity: impl FnOnce() -> Result<CheckerIdentity, String>,
+    ) -> Self {
         match posture {
             ImportPosture::Recheck => Resolved::Recheck,
             ImportPosture::ReuseVerified => {
-                match (checker_identity(), RecordDirectory::from_environment()) {
+                match (identity(), RecordDirectory::from_environment()) {
                     (Ok(identity), Ok(directory)) => Resolved::Reuse(identity, directory),
                     (Err(reason), _) | (_, Err(reason)) => Resolved::Unavailable(reason),
                 }
@@ -243,7 +258,7 @@ pub(in crate::source_check) fn sentence(report: &ImportPostureReport) -> String 
             "each admitted by K1 and the independent checker in this run"
         }
         fln::source_check::modules::reuse::ImportAdmission::Reused => {
-            "reused from this binary's earlier K1 and independent-checker admission of the identical bytes, re-proved by logical root"
+            "reused from an earlier K1 and independent-checker admission of the identical bytes by this admission authority, re-proved by logical root"
         }
         fln::source_check::modules::reuse::ImportAdmission::Composed => {
             "composed from re-proved module admissions and modules checked by K1 and the independent checker in this run"

@@ -95,6 +95,16 @@ pub(super) fn list_kind() -> Name {
     Name::from_components(["term[_]"])
 }
 
+/// One of `Std.Legacy.Range`'s range-literal kinds, `Std.Legacy.Range.«term[_:_]»` and its
+/// siblings.
+fn range_kind(form: &str) -> Name {
+    Name::from_components(["Std", "Legacy", "Range", form])
+}
+
+fn is_atom(syntax: &Syntax, text: &str) -> bool {
+    matches!(syntax, Syntax::Atom { val, .. } if val == text)
+}
+
 /// Whether the tokens at `left` and `right` touch: the pin's `noWs`.
 fn touching(tokens: &[LexedToken], left: usize, right: usize) -> bool {
     tokens[left].extent.end() == tokens[right].extent.start()
@@ -179,7 +189,8 @@ impl Lists {
     }
 
     /// Whether `symbol` is a delimiter of the innermost open bracket: `,` or its own close;
-    /// for a subtype, its `//` while the type is open, and its `}`.
+    /// for a subtype, its `//` while the type is open, and its `}`; and for a list bracket,
+    /// a range's `:` (`[a:b]`, `Init/Data/Range/Basic.lean`).
     pub(super) fn delimits(&self, symbol: &str) -> bool {
         self.active.last().is_some_and(|list| match &list.subtype {
             Some(subtype) => symbol == "}" || (symbol == "//" && subtype.separator.is_none()),
@@ -187,6 +198,7 @@ impl Lists {
                 symbol == ","
                     || symbol == list.bracket.close()
                     || (list.bracket == Bracket::Index && symbol == "]'")
+                    || (list.bracket == Bracket::List && symbol == ":")
             }
         })
     }
@@ -440,7 +452,12 @@ impl Lists {
                 .active
                 .last()
                 .is_some_and(|list| list.bracket == Bracket::Index);
-        if symbol != "," && symbol != close && !proved {
+        let ranged_colon = symbol == ":"
+            && self
+                .active
+                .last()
+                .is_some_and(|list| list.bracket == Bracket::List);
+        if symbol != "," && symbol != close && !proved && !ranged_colon {
             return Err(refusal());
         }
         let current = frames.pop().expect("validated list element frame");
@@ -455,10 +472,26 @@ impl Lists {
         if list.bracket == Bracket::Index && (symbol == "," || empty) {
             return Err(refusal());
         }
+        // A range separates its terms with `:`, a list with `,`: never both.
+        let ranged = list
+            .elements_and_separators
+            .iter()
+            .any(|part| is_atom(part, ":"));
+        if (symbol == "," && ranged)
+            || (symbol == ":"
+                && list
+                    .elements_and_separators
+                    .iter()
+                    .any(|part| is_atom(part, ",")))
+        {
+            return Err(refusal());
+        }
         if empty {
             // [] and [a,] are valid; [,], [a,,b] and [a,,] are not (and so for ⟨⟩).
-            // Every noninitial empty frame follows exactly one consumed comma.
-            if symbol != close {
+            // Every noninitial empty frame follows exactly one consumed comma. A range may
+            // start at its colon (`[:b]`) but never ends at one (`[a:]`, `[:]`).
+            let leading_colon = symbol == ":" && list.elements_and_separators.is_empty();
+            if !(leading_colon || (symbol == close && !ranged)) {
                 return Err(refusal());
             }
         } else {
@@ -466,7 +499,7 @@ impl Lists {
                 finish_bounded_frame(view, tokens, current, DefinitionGrammar::Scalar, at)?;
             list.elements_and_separators.push(element);
         }
-        if symbol == "," {
+        if symbol == "," || symbol == ":" {
             list.elements_and_separators.push(leaves.leaf(at)?);
             frames.push(frame(list.open));
             return Ok(at + 1);
@@ -548,6 +581,33 @@ impl Lists {
                     ),
                     list.open,
                 )
+            }
+            None if list
+                .elements_and_separators
+                .iter()
+                .any(|part| is_atom(part, ":")) =>
+            {
+                // `Std.Legacy.Range`'s four `syntax:max "[" withoutPosition(…) "]"` forms
+                // (`Init/Data/Range/Basic.lean:69-72`). Their trees are flat: the brackets, the
+                // terms and the colons as one row, no `null` node.
+                let parts = list.elements_and_separators;
+                let colon = |part: &Syntax| is_atom(part, ":");
+                let kind = match parts.as_slice() {
+                    [c, b] if colon(c) && !colon(b) => "term[:_]",
+                    [a, c, b] if !colon(a) && colon(c) && !colon(b) => "term[_:_]",
+                    [c, b, d, s] if colon(c) && !colon(b) && colon(d) && !colon(s) => "term[:_:_]",
+                    [a, c, b, d, s]
+                        if !colon(a) && colon(c) && !colon(b) && colon(d) && !colon(s) =>
+                    {
+                        "term[_:_:_]"
+                    }
+                    _ => return Err(refusal()),
+                };
+                let mut args = Vec::with_capacity(parts.len() + 2);
+                args.push(leaves.leaf(list.open)?);
+                args.extend(parts);
+                args.push(leaves.leaf(at)?);
+                (Syntax::node(range_kind(kind), args), list.open)
             }
             None => (
                 Syntax::node(
