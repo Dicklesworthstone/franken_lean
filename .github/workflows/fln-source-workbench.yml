@@ -1932,3 +1932,92 @@ jobs:
               'base': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),
               'files': result,
           }), flush=True)
+
+  # Count metadata from the exact pinned artifacts without re-running councils.
+  # This job is diagnostic only: it changes no product limits and publishes no refs.
+  std-metadata-measurement:
+    if: >-
+      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(import): measure pinned Init and Std metadata resource requirements'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: never
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Install the repository-pinned Rust toolchain
+        run: rustup show active-toolchain
+      - name: Install and verify the SUITE.lock Reference
+        shell: bash
+        run: |
+          set -euo pipefail
+          tool_root="$RUNNER_TEMP/string-source-elan-bin"
+          archive="$RUNNER_TEMP/string-source-elan.tar.gz"
+          mkdir "$tool_root"
+          curl --user-agent 'franken_lean-agent (+https://github.com/Dicklesworthstone/franken_lean)' \
+            --fail --location --retry 3 --output "$archive" \
+            https://github.com/leanprover/elan/releases/download/v4.2.1/elan-x86_64-unknown-linux-gnu.tar.gz
+          printf '%s  %s\n' \
+            4e717523217af592fa2d7b9c479410a31816c065d66ccbf0c2149337cfec0f5c \
+            "$archive" | sha256sum --check
+          tar -xzf "$archive" -C "$tool_root"
+          export ELAN_HOME="$RUNNER_TEMP/string-source-elan"
+          "$tool_root/elan-init" -y --no-modify-path --default-toolchain none
+          export PATH="$ELAN_HOME/bin:$PATH"
+          mapfile -t reference_rows < <(grep -E '^reference ' SUITE.lock)
+          test "${#reference_rows[@]}" -eq 1
+          pin_tag="$(sed -nE 's/.* tag=([^ ]+).*/\1/p' <<<"${reference_rows[0]}")"
+          pin_commit="$(sed -nE 's/.* commit=([0-9a-f]{40}).*/\1/p' <<<"${reference_rows[0]}")"
+          [[ "$pin_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$ ]]
+          test -n "$pin_commit"
+          elan toolchain install "leanprover/lean4:$pin_tag"
+          elan default "leanprover/lean4:$pin_tag"
+          toolchain_root="$ELAN_HOME/toolchains/leanprover--lean4---$pin_tag"
+          test "$("$toolchain_root/bin/lean" --githash)" = "$pin_commit"
+          for suffix in olean olean.server olean.private; do
+            test -s "$toolchain_root/lib/lean/Init/Prelude.$suffix"
+            test -s "$toolchain_root/lib/lean/Init/Data/Repr.$suffix"
+          done
+          printf 'ELAN_HOME=%s\nFLN_REFERENCE_LIB=%s/lib/lean\nFLN_REFERENCE_LEAN=%s/bin/lean\nFLN_REQUIRE_REFERENCE=1\n' \
+            "$ELAN_HOME" "$toolchain_root" "$toolchain_root" >> "$GITHUB_ENV"
+          printf '%s\n' "$ELAN_HOME/bin" >> "$GITHUB_PATH"
+      - name: Materialize the count-only probe from its immutable source blob
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: python
+        run: |
+          import base64, hashlib, json, os, pathlib, urllib.request
+          expected = 'f42e3395183410ade12daf4e87dae8db9b8abe01'
+          request = urllib.request.Request(
+              'https://api.github.com/repos/Dicklesworthstone/franken_lean/git/blobs/' + expected,
+              headers={
+                  'Accept': 'application/vnd.github+json',
+                  'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
+                  'User-Agent': 'franken_lean-agent (+https://github.com/Dicklesworthstone/franken_lean)',
+              })
+          with urllib.request.urlopen(request, timeout=60) as response:
+              record = json.load(response)
+          assert record['sha'] == expected and record['encoding'] == 'base64'
+          data = base64.b64decode(record['content'])
+          assert hashlib.sha1(('blob ' + str(len(data)) + '\0').encode() + data).hexdigest() == expected
+          file = pathlib.Path('crates/fln-olean/examples/measure_source_metadata.rs')
+          assert not file.exists()
+          file.parent.mkdir(exist_ok=True)
+          file.write_bytes(data)
+      - name: Measure all selected metadata allowances in the real Init and Std closures
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo run --locked --release -p fln-olean --example measure_source_metadata -- Init Std 2>&1 | tee "$RUNNER_TEMP/std-metadata-measurement.log"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: std-metadata-measurement-${{ github.sha }}
+          path: ${{ runner.temp }}/std-metadata-measurement.log
+          retention-days: 14
+          if-no-files-found: warn
