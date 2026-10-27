@@ -417,6 +417,22 @@ pub(crate) enum Resolution {
     Unchecked,
 }
 
+/// Structural name components, including an exact match. A quoted identifier
+/// containing a dot is one component and cannot capture a similarly spelled root.
+fn name_has_prefix(name: &Name, prefix: &Name) -> bool {
+    if prefix.is_anonymous() {
+        return false;
+    }
+    let mut candidate = name.clone();
+    while !candidate.is_anonymous() {
+        if &candidate == prefix {
+            return true;
+        }
+        candidate = candidate.parent();
+    }
+    false
+}
+
 /// Name resolution as the elaborator resolves a global (`resolveGlobalName`, with the
 /// environment's aliases and protected names) in `scope`.
 pub(crate) fn resolver<'e>(
@@ -432,7 +448,7 @@ pub(crate) fn resolver<'e>(
             .declared()
             .iter()
             .rev()
-            .any(|local| &local.user_name == name)
+            .any(|local| name_has_prefix(name, &local.user_name))
         {
             return Resolution::SectionVariable;
         }

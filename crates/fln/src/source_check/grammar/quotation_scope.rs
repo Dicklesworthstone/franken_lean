@@ -4,7 +4,7 @@
 //! The worklist normalizes shared domains while preserving source locations and
 //! binder order. It does not elaborate, assign metavariables or admit declarations.
 
-use super::{BINDING, Resolution, TACTIC_BINDING};
+use super::{BINDING, Resolution, TACTIC_BINDING, name_has_prefix};
 use crate::EngineExecutionError;
 use fln_core::name::Name;
 use fln_parse::extensions::NotationRule;
@@ -691,6 +691,19 @@ pub(super) fn preresolve(
                     built.push(ident.clone());
                     continue;
                 }
+                if locals.iter().rev().any(|local| name_has_prefix(val, local))
+                    || rule
+                        .variables
+                        .iter()
+                        .any(|(_, variable)| name_has_prefix(val, variable))
+                {
+                    // A dotted use needs lexical field handling, not a global
+                    // with the same qualified spelling. Exact bound names were
+                    // retained above; their field paths are not represented yet.
+                    return Err(EngineExecutionError::NotImplemented {
+                        feature: "quotation field access through a bound name",
+                    });
+                }
                 match resolve(val) {
                     Resolution::Global(global) | Resolution::Constructor(global) => {
                         built.push(Syntax::Ident {
@@ -846,6 +859,15 @@ mod tests {
             })
         ));
         assert!(preresolve(&rule("notation \"bound\" => fun x : Nat => x"), &resolve).is_ok());
+        assert!(matches!(
+            preresolve(
+                &rule("notation \"boundField\" => fun x : Nat => x.val"),
+                &resolve
+            ),
+            Err(EngineExecutionError::NotImplemented {
+                feature: "quotation field access through a bound name"
+            })
+        ));
     }
 
     #[test]

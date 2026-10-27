@@ -1,6 +1,9 @@
 //! Explicit quotation capture kinds choose clauses, not just capture names.
 #![forbid(unsafe_code)]
-use fln::{Budget, Engine, EngineAdmissionLimits, KVMap, SourceCheckLimits};
+use fln::{
+    Budget, Engine, EngineAdmissionLimits, EngineExecutionLimits, KVMap, Name, SourceCheckLimits,
+};
+use fln_env::constants::ConstantInfo;
 
 fn check(source: &str) -> Result<usize, String> {
     let admission = EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024));
@@ -37,6 +40,46 @@ fn quotation_section_capture_cannot_fall_back_to_a_shadowed_global() {
             "def x : Nat := 1\nsection\n{variables}\nnotation \"globalValue!\" => _root_.x\nend\ntheorem globalMeaning : globalValue! = 1 := rfl\n"
         );
         assert_eq!(check(&source).unwrap(), 1);
+    }
+}
+
+#[test]
+fn quotation_field_captures_do_not_fall_back_to_a_shadowed_namespace() {
+    let head = "structure Box where\n  val : Nat\nnamespace box\ndef val : Nat := 1\nend box\n";
+    let cases = [
+        (
+            "section variable",
+            "section\nvariable (box : Box)\nnotation \"fieldSection!\" => box.val\nend\ntheorem escaped : fieldSection! = 1 := rfl\n",
+            "quotation capture of a section variable",
+        ),
+        (
+            "quotation binder",
+            "notation \"fieldFn!\" => fun box : Box => box.val\ntheorem escaped : fieldFn! ({ val := 2 } : Box) = 1 := rfl\n",
+            "quotation field access through a bound name",
+        ),
+        (
+            "notation parameter",
+            "notation \"fieldArg!\" box => box.val\ntheorem escaped : fieldArg! ({ val := 2 } : Box) = 2 := rfl\n",
+            "",
+        ),
+    ];
+    let results: Vec<_> = cases
+        .iter()
+        .map(|(label, source, feature)| (*label, check(&format!("{head}{source}")), *feature))
+        .collect();
+    for (label, result, feature) in &results {
+        let error = result.as_ref().expect_err(&format!(
+            "{label} must not accept the pin-refused quotation: {results:?}"
+        ));
+        if !feature.is_empty() {
+            assert!(error.contains(feature), "{label}: {error}");
+        }
+    }
+    for (body, expected) in [("_root_.box.val", 1), ("boxcar.val", 3), ("«box.val»", 4)] {
+        let source = format!(
+            "{head}namespace boxcar\ndef val : Nat := 3\nend boxcar\ndef «box.val» : Nat := 4\nsection\nvariable (box : Box)\nnotation \"globalField!\" => {body}\nend\ntheorem globalMeaning : globalField! = {expected} := rfl\n"
+        );
+        assert_eq!(check(&source).unwrap(), 1, "{body}");
     }
 }
 
@@ -247,6 +290,7 @@ def untouched : String := "not marked"
 #[test]
 fn identifier_rules_preserve_binder_declaration_and_field_names() {
     let source = r#"
+inductive Exists.{u} {A : Sort u} (P : A -> Prop) : Prop where | intro (w : A) (h : P w)
 macro_rules | `(magic) => `(7)
 def magic : Nat := 9
 def binder (magic : Nat) : Nat := 3
@@ -371,7 +415,44 @@ macro_rules | `($n:num) => `("number")
 theorem congruent : "number" = "number" := by
   congr 1
 "#;
-    assert_eq!(check(source).unwrap(), 2);
+    let budget = Budget::for_stack_bytes(2 * 1024 * 1024);
+    let engine = Engine::with_source_seed(EngineAdmissionLimits::new(budget))
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    // A raw trace needs an observation owner. Declaration-only checking
+    // deliberately refuses it instead of silently discarding the diagnostic.
+    let result = engine
+        .execute_source_commands_with_checks(
+            source.as_bytes(),
+            &KVMap::new(),
+            EngineExecutionLimits::new(budget),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let theorems = ["traced", "congruent"]
+        .into_iter()
+        .filter(|name| {
+            matches!(
+                result
+                    .batch
+                    .engine
+                    .environment()
+                    .find(&Name::from_components([*name])),
+                Some(ConstantInfo::Thm(_))
+            )
+        })
+        .count();
+    assert_eq!(theorems, 2);
+    assert_eq!(result.traces.len(), 1);
+    assert_eq!(result.traces[0].message, "diagnostic");
+    assert_eq!(
+        result.traces[0].at.0,
+        source.find("trace \"diagnostic\"").unwrap()
+    );
+    assert!(!result.traces[0].is_goal_state);
+    assert!(!result.traces[0].is_info);
 }
 
 #[test]

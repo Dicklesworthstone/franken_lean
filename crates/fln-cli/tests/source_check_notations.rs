@@ -259,18 +259,37 @@ fn an_application_an_undecided_notation_may_print_is_refused() {
 fn a_section_capture_never_resolves_to_an_unrelated_global() {
     let lib = pinned_lib().expect("the pinned Reference is required for the capture comparison");
     let root = workspace();
-    let source = "prelude\nimport Init.Core\ndef x : Nat := 1\nsection\nvariable (x : Nat)\nnotation \"capturedValue!\" => x\nend\n#check capturedValue!\n";
-    let (code, stdout, stderr) = ours(&lib, &root, source);
-    assert_eq!(code, Some(5), "stdout: {stdout}\nstderr: {stderr}");
-    assert!(stdout.is_empty(), "{stdout}");
-    assert!(
-        stderr.contains("quotation capture of a section variable"),
-        "{stderr}"
-    );
-    let (code, output) = pinned(&lib, &root.join("Notations.lean"))
-        .expect("the pinned Reference binary is required for the capture comparison");
-    assert_eq!(code, 1, "{output}");
-    assert!(output.contains("Unknown constant"), "{output}");
+    let cases = [
+        (
+            "prelude\nimport Init.Core\ndef x : Nat := 1\nsection\nvariable (x : Nat)\nnotation \"capturedValue!\" => x\nend\n#check capturedValue!\n",
+            "quotation capture of a section variable",
+            "Unknown constant",
+        ),
+        (
+            "prelude\nimport Init.Core\nstructure Box where\n  val : Nat\nnamespace box\ndef val : Nat := 1\nend box\nsection\nvariable (box : Box)\nnotation \"capturedBox!\" => box.val\nend\n#check capturedBox!\n",
+            "quotation capture of a section variable",
+            "Unknown constant",
+        ),
+        (
+            "prelude\nimport Init.Core\nstructure Box where\n  val : Nat\nnamespace box\ndef val : Nat := 1\nend box\nnotation \"fieldFn!\" => fun box : Box => box.val\ntheorem escaped : fieldFn! ({ val := 2 } : Box) = 1 := rfl\n",
+            "quotation field access through a bound name",
+            "Not a definitional equality",
+        ),
+    ];
+    for (source, feature, pin_message) in cases {
+        let (code, stdout, stderr) = ours(&lib, &root, source);
+        assert_eq!(code, Some(5), "stdout: {stdout}\nstderr: {stderr}");
+        assert!(stdout.is_empty(), "{stdout}");
+        assert!(stderr.contains(feature), "{stderr}");
+        let (code, output) = pinned(&lib, &root.join("Notations.lean"))
+            .expect("the pinned Reference binary is required for the capture comparison");
+        assert_eq!(code, 1, "{output}");
+        assert!(output.contains(pin_message), "{output}");
+        assert_eq!(
+            std::fs::read_to_string(root.join("Notations.lean")).unwrap(),
+            source
+        );
+    }
 }
 
 #[test]
