@@ -62,8 +62,8 @@
 //! * `FLN-STRUCT-038` `Environment::add_decl` — admission with no kernel check — is
 //!   called from production source in a crate that depends on fln-env. Allowlist is
 //!   empty: a first production caller is the violation (bead `franken_lean-oof9`).
-//! * `FLN-STRUCT-039` `Environment::plan_add_decl` is reachable outside the two
-//!   reviewed fln-kernel call sites and D6's single named carve-out, the
+//! * `FLN-STRUCT-039` `Environment::plan_add_decl` or `plan_measured_decl` is reachable
+//!   outside the two reviewed fln-kernel call sites and D6's single named carve-out, the
 //!   `reuse-verified` import rebuild (bead `fln-uyuz`). D6 reserves admission to the
 //!   kernel, and no type-level guarantee is available at this boundary because fln-env
 //!   sits BELOW fln-kernel and cannot name it (bead `franken_lean-oof9`).
@@ -1139,17 +1139,17 @@ fn audit_checker_independence_boundary(text: &str, source_rel: &str, findings: &
 /// file appearing is a loud failure rather than a quiet spread of the raw surface.
 ///
 /// The third entry is D6's single named exception, decided on bead `fln-uyuz` (route 1):
-/// the `reuse-verified` import posture, which rebuilds an `.olean` closure that this
-/// binary's council admitted earlier from the identical bytes, and keeps it only if it
-/// reaches every logical root that admission reached. It is the only non-kernel file,
-/// one function in it calls the method, and `recheck` doors (`check-olean`, its
-/// frontier and receipts) never reach it. A fourth entry is a new decision.
+/// the `reuse-verified` import posture, which rebuilds an `.olean` closure that a council
+/// of the same admission authority admitted earlier from the identical bytes, and keeps it
+/// only if it reaches every logical root that admission reached. It is the only non-kernel
+/// file, two functions in it plan through `plan_measured_decl`, and `recheck` doors
+/// (`check-olean`, its frontier and receipts) never reach it. A fourth entry is a decision.
 const PLANNED_ADMISSION_ALLOWLIST: [&str; 3] = [
     "crates/fln-kernel/src/admit.rs",
     "crates/fln-kernel/src/capability.rs",
     "crates/fln-admission/src/reuse.rs",
 ];
-
+const ADMISSION_METHODS: [&str; 3] = ["add_decl", "plan_add_decl", "plan_measured_decl"];
 /// Keep declaration admission unreachable outside the kernel, not merely unused
 /// (bead `franken_lean-oof9`).
 ///
@@ -1180,7 +1180,7 @@ const PLANNED_ADMISSION_ALLOWLIST: [&str; 3] = [
 /// See [`ledger::method_call_sites`]. A bare name match is wrong here, not merely
 /// imprecise: `fln-hash`'s unrelated `LogicalRootBuilder::add_decl` shares the name.
 fn audit_declaration_admission_surface(text: &str, source_rel: &str, findings: &mut Vec<Finding>) {
-    for site in ledger::method_call_sites(text, &["add_decl", "plan_add_decl"]) {
+    for site in ledger::method_call_sites(text, &ADMISSION_METHODS) {
         if site.name == "add_decl" {
             // Arity 2 is `fln_hash::LogicalRootBuilder::add_decl(name, digest)`, an
             // unrelated method in a crate that cannot even depend on fln-env. Only the
@@ -1207,7 +1207,7 @@ fn audit_declaration_admission_surface(text: &str, source_rel: &str, findings: &
             code: "FLN-STRUCT-039",
             path: format!("{source_rel}:{}", site.line),
             detail: format!(
-                "`Environment::plan_add_decl` is reachable outside the two reviewed \
+                "`plan_add_decl`/`plan_measured_decl` is reachable outside the two reviewed \
                  kernel call sites and D6's one named carve-out{}. The allowlist is {} \
                  and a fourth entry is a decision, not an edit.",
                 unresolved_suffix(site.arity),

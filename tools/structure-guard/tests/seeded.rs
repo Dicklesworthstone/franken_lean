@@ -1545,6 +1545,22 @@ fn planned_admission_is_refused_outside_the_allowlisted_kernel_files() {
     assert_eq!(codes(&ws.run()), vec!["FLN-STRUCT-039"]);
 }
 
+/// `plan_measured_decl` is the same surface: `plan_add_decl` is a measurement followed by
+/// it, and its plan commits like any other. D6's carve-out plans through it, so a scan
+/// of `plan_add_decl` alone would leave both the carve-out and any copy of it unconfined.
+#[test]
+fn a_measured_plan_is_the_same_admission_surface() {
+    let ws = TempWs::new("admission-measured");
+    base(&ws);
+    admission_dependent(&ws);
+    ws.write(
+        "crates/fln-kernel/src/lib.rs",
+        "//! stub\n#![forbid(unsafe_code)]\n\npub fn plan(env: &Env, content: M) -> P {\n    \
+         env.plan_measured_decl(content, collisions)\n}\n",
+    );
+    assert_eq!(codes(&ws.run()), vec!["FLN-STRUCT-039"]);
+}
+
 /// D6's one named carve-out (bead `fln-uyuz`) is exactly ONE FILE wide: the
 /// `reuse-verified` import rebuild may plan an admission, and the same call one
 /// directory entry over, in the same crate, is still the violation. Without the
