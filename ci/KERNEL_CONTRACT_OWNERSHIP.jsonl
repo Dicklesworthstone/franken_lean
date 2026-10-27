@@ -1,4 +1,4 @@
-{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":724,"projection_hash":"87e7c6f2914ba91fb5b071aacf1e4f6d3aad8bdc9df78625f91c1dcdd70fec9b"}
+{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":726,"projection_hash":"41e994d59d9508ddbb0e081c18b1991ebccbbd28daaf4e6e690ba217b2f857bc"}
 {"id":"fln-0bw5"}
 {"id":"fln-0eq8"}
 {"id":"fln-0rxm"}
@@ -139,6 +139,7 @@
 {"id":"fln-elp6"}
 {"id":"fln-env-merge-resource-envelope-9m74"}
 {"id":"fln-eq4k"}
+{"id":"fln-equation-capture-add-decl-d6-guard-red-dymw"}
 {"id":"fln-equation-lemmas-generation-silo"}
 {"id":"fln-ersf"}
 {"id":"fln-euo"}
@@ -406,6 +407,7 @@
 {"id":"fln-wgp"}
 {"id":"fln-wgz"}
 {"id":"fln-wh2j"}
+{"id":"fln-with-reducible-rfl-closed-numeral-offset-wx21"}
 {"id":"fln-workflow-python-isolation-1gl3"}
 {"id":"fln-wwvr"}
 {"id":"fln-wxr6"}
