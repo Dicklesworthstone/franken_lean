@@ -104,6 +104,9 @@ write_policy() {
 run_policy() {
   local name="$1"
   local expected_exit="$2"
+  # Mutations above deliberately suppress export. Publish the isolated tracker before the
+  # read-only judge consumes its authoritative JSONL, including after each state transition.
+  br sync --flush-only --json > "$SCRATCH/$name.sync.json"
   local stdout="$SCRATCH/$name.stdout"
   local stderr="$SCRATCH/$name.stderr"
   local retained_report="$SCRATCH/$name.report.ndjson"

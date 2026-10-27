@@ -52,9 +52,10 @@ success** — one line, revert, next lever, no retraction narrative.
 
 ## Branch Policy
 
-- Primary branch is `main`.
-- Do not reference `master` in docs/scripts.
-- If release instructions require sync, push `main:master` after `main`.
+- `main` is the only development branch; `master` is its exact mirror.
+- Do not create other branches, linked worktrees, or pull requests. Integrate reviewed changes directly into canonical `main`, preserving concurrent work.
+- Keep local and remote `master` synchronized with `main` without force-pushing.
+- This policy supersedes the historical worktree verification advice below. Preserve retired checkouts as recovery archives rather than deleting their files.
 
 ---
 

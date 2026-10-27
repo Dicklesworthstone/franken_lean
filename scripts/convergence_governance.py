@@ -6,7 +6,8 @@ derives authority from a title, label, PageRank, or a ``bv`` recommendation.  Th
 versioned registry is the sole classifier.  ``bv`` is sampled only as advisory telemetry and its
 absence is recorded rather than promoted into an admission failure.
 
-The live mode obtains the issue and dependency snapshots from ``br``'s JSON surfaces twice.  A
+The live mode obtains the issue and dependency snapshots from ``br``'s JSONL-only surfaces twice,
+so an older SQLite cache cannot replace the work graph's authoritative JSONL.  A
 change between the snapshots is an inconclusive result: a recommendation over moving inputs is
 not permission to claim more work.  Fixture mode accepts those same normalized inputs from files;
 it exists for the deterministic model tests and never mutates a production tracker.
@@ -111,7 +112,7 @@ def exact_explicit_executable(value, label):
 
 def issues_from_br(root, br_bin):
     envelope = command(
-        [br_bin, "list", "--all", "--format", "json", "--no-auto-flush", "--no-auto-import"], root
+        [br_bin, "list", "--all", "--format", "json", "--no-db", "--no-auto-flush", "--no-auto-import"], root
     )
     if isinstance(envelope, list):
         issues = envelope
@@ -129,7 +130,7 @@ def edges_from_br(root, issues, br_bin):
     # tracker-owned, non-TUI graph projection for the mutable (open/in-progress/blocked)
     # surface; unlike bv it is authoritative here.  Its pair is [dependent, prerequisite].
     graph = command(
-        [br_bin, "graph", "--all", "--json", "--no-auto-flush", "--no-auto-import"], root
+        [br_bin, "graph", "--all", "--json", "--no-db", "--no-auto-flush", "--no-auto-import"], root
     )
     components = graph.get("components") if isinstance(graph, dict) else None
     if not isinstance(components, list):
