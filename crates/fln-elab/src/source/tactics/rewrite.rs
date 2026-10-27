@@ -204,6 +204,14 @@ impl Context {
         let right_nf = self.whnf_with_transparency(&right, transparency, zeta_delta)?;
         let mut budget = UnificationBudget::new(self.kernel);
         budget.zeta_delta = zeta_delta;
+        // The pin compares Nat offsets and literals under any head before reducing either side
+        // (`offsetCnstrs`, true by default, vendored Lean/Meta/Basic.lean:145; `isDefEqOffset`,
+        // Lean/Meta/Offset.lean:116),
+        // so `rw`'s closing `rfl` and simp's `eq_self` both close `g (1 + 1) = g 2` and
+        // `g (x + 1) = g (Nat.succ x)` at reducible transparency. Without it only a top-level
+        // offset was read (`automatic_nat_offset_reflexivity`). The `HEq` branch above is left
+        // as it is: the pin's `simp only` carries no `heq_self`.
+        budget.offset_constraints = true;
         if !self.proof_types_match_with_budget(&left_nf, &right_nf, budget)?
             && !self.automatic_nat_offset_reflexivity(&alpha, &left, &right, zeta_delta)?
             && !self.rewrite_arithmetic_reflexivity(goal, &left, &right)?

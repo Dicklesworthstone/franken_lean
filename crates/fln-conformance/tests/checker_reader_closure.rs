@@ -13,7 +13,9 @@
 //! `fln::independent_reading`, and the linker keeps exactly the functions reachable from it
 //! (the method `tests/tcb_inventory.rs` uses for `fln_kernel::check`). Every `fln_*` function
 //! it kept must belong to the checker's own crate, to `fln_hash`'s hashing, or to the one
-//! `fln` function that hands the bytes over.
+//! `fln` function that hands the bytes over. Since bead `fln-import-reuse-composes-4ngt` that
+//! function forwards to `fln_admission::independent_reading`, the reading the import council
+//! itself consults, so that one function is permitted too.
 #![forbid(unsafe_code)]
 
 use fln_conformance::tcb_inventory;
@@ -25,10 +27,14 @@ use fln_conformance::tcb_inventory;
 /// every exported symbol, with its callees, in any binary that links `fln`. A function kept
 /// that way can only add a refusal here, never hide one, so permitting it is safe; it is
 /// IEEE arithmetic and constructs no term.
-const PERMITTED: [(&str, &str); 4] = [
+const PERMITTED: [(&str, &str); 5] = [
     (
         "fln",
         "only `independent_reading` itself, which hands the bytes over",
+    ),
+    (
+        "fln_admission",
+        "only `independent_reading` itself, the council's reading `fln`'s forwards to",
     ),
     (
         "fln_checker",
@@ -85,6 +91,7 @@ fn the_checker_reading_path_reaches_nothing_of_the_primary_decoder() {
     };
     for (crate_name, needle) in [
         ("fln", "fln::independent_reading"),
+        ("fln_admission", "fln_admission::independent_reading"),
         ("fln_checker", "fln_checker::olean::read_constants"),
         ("fln_checker", "<fln_checker::olean::OleanReader>::expr"),
         ("fln_checker", "<fln_checker::olean::OleanReader>::constant"),
@@ -119,6 +126,7 @@ fn the_checker_reading_path_reaches_nothing_of_the_primary_decoder() {
         for item in items {
             let permitted = match crate_name.as_str() {
                 "fln" => item.starts_with("fln::independent_reading"),
+                "fln_admission" => item.starts_with("fln_admission::independent_reading"),
                 "fln_hash" => PERMITTED_HASH_MODULES
                     .iter()
                     .any(|module| item.contains(&format!("{module}::"))),

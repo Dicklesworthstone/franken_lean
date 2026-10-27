@@ -154,7 +154,72 @@ fn an_explicit_global_lemma_is_retrieved_by_its_keys() {
     }
 }
 
+/// Closed at the pin and here: the sides agree up to Nat offsets under the head, which the pin's
+/// `isDefEq` compares before reducing (`offsetCnstrs`, `isDefEqOffset`, vendored
+/// `Lean/Meta/Offset.lean`). simp's `eq_self` and `rw`'s closing `rfl` both use it, at reducible
+/// transparency.
+const OFFSET_CLOSED: &[(&str, &str)] = &[
+    ("numeral", "example : g (1 + 1) = g 2 := by simp only\n"),
+    (
+        "successor",
+        "example (x : Nat) : g (x + 1) = g (Nat.succ x) := by simp only\n",
+    ),
+    (
+        "nested",
+        "example (x : Nat) : g (x + 1 + 1) = g (x + 2) := by simp only\n",
+    ),
+    (
+        "rw_numeral",
+        "example (a : Nat) (h : a = 1 + 1) : g a = g 2 := by rw [h]\n",
+    ),
+    (
+        "rw_successor",
+        "example (x a : Nat) (h : a = x + 1) : g a = g (Nat.succ x) := by rw [h]\n",
+    ),
+];
+
+/// Left open at the pin and here: the offsets differ, or the heads do.
+const OFFSET_OPEN: &[(&str, &str)] = &[
+    (
+        "other_numeral",
+        "example : g (1 + 1) = g 3 := by simp only\n",
+    ),
+    (
+        "other_successor",
+        "example (x : Nat) : g (x + 2) = g (Nat.succ x) := by simp only\n",
+    ),
+    (
+        "rw_other_numeral",
+        "example (a : Nat) (h : a = 1 + 1) : g a = g 3 := by rw [h]\n",
+    ),
+    (
+        "other_head",
+        "def k (n : Nat) : Nat := n\nexample : g 2 = k 2 := by simp only\n",
+    ),
+];
+
 #[test]
+fn a_reflexive_close_compares_nat_offsets_under_any_head() {
+    let Some(lib) = pinned_lib() else {
+        return;
+    };
+    let root = workspace();
+    for (name, program) in OFFSET_CLOSED {
+        let (code, stderr, pinned) = check(&lib, &root, name, program);
+        assert_eq!(code, 0, "{name}: {program}\n{stderr}");
+        assert_eq!(pinned.unwrap_or(0), 0, "{name}: the pinned lean rejects it");
+    }
+    for (name, program) in OFFSET_OPEN {
+        let (code, stderr, pinned) = check(&lib, &root, name, program);
+        assert_ne!(code, 0, "{name}: accepted {program}");
+        assert!(
+            stderr.contains("made no progress") || stderr.contains("unsolved goals"),
+            "{name}: not the tactic's own failure\n{stderr}"
+        );
+        assert_ne!(pinned.unwrap_or(1), 0, "{name}: the pinned lean accepts it");
+    }
+}
+
 fn a_required_reference_without_its_binary_is_refused_before_comparison() {
     let Some(lib) = pinned_lib() else {
         return;

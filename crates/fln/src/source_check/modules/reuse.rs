@@ -946,7 +946,7 @@ impl ComposedModuleContext {
         let checker_entries = if reused {
             BTreeMap::new()
         } else {
-            frontier_checker_entries(&checked.engine, &admitted, limits)
+            frontier_checker_entries(&checked.engine.admitted(), &admitted, limits)
         };
         let mut engine = checked.engine;
         let mut imported = (*engine.imported_modules).clone();
@@ -1438,7 +1438,7 @@ impl Engine {
                         let kept =
                             context.retain(checked, from_record, reuse.checker, limits.check)?;
                         accepted[index] = Some(std::sync::Arc::clone(&kept.scheduled.module));
-                        engines.keep(index, Some(kept.engine));
+                        engines.keep(index, Some(kept.engine.admitted()));
                         scheduled[index] = Some(kept.scheduled);
                         module_records[index] = kept.record;
                         reused += usize::from(from_record);

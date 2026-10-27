@@ -578,7 +578,7 @@ pub const CLAIM_MATRIX: [ClaimRow; 24] = [
                    projection. This row remains TARGETED because the raw fln-elab seed fixture \
                    and reflected-theorem publisher still name empty councils, no \
                    sampled/release/paranoid policy dispatcher exists, and the canonical \
-                   Judgment substrate from plan §8.3c is absent.",
+                   Judgment substrate from plan §8.3c is absent. Moved 2026-10-26 (bead fln-import-reuse-composes-4ngt): that facade council and its `convene` call now live verbatim in crates/fln-admission, which fln::Engine wraps.",
         enforcement: Enforcement::Acknowledged,
     },
     ClaimRow {
@@ -608,7 +608,10 @@ pub const CLAIM_MATRIX: [ClaimRow; 24] = [
                    is recorded by the fln-hfch verification-manifest row. Corrected 2026-07-25 \
                    (franken_lean-4o3n) from \
                    'a separate, Supported row', which named a row that has never existed: \
-                   B3-KERNEL-LOC-COVENANT is the only Supported row here.",
+                   B3-KERNEL-LOC-COVENANT is the only Supported row here. Moved 2026-10-26 \
+                   (bead fln-import-reuse-composes-4ngt): the facade's checker seat, its \
+                   projection and the IndependentImplementation seat it presents now live \
+                   verbatim in crates/fln-admission, which fln::Engine wraps.",
         enforcement: Enforcement::Acknowledged,
     },
     ClaimRow {
@@ -984,7 +987,7 @@ pub const EVIDENCE_CITATIONS: [(&str, Citation); 27] = [
     (
         "B3-INDEPENDENT-CHECKER",
         Citation::OccursExactly {
-            path: "crates/fln/src/lib.rs",
+            path: "crates/fln-admission/src/lib.rs",
             needle: "SeatOrigin::IndependentImplementation",
             count: 1,
         },
@@ -993,7 +996,7 @@ pub const EVIDENCE_CITATIONS: [(&str, Citation); 27] = [
     (
         "B3-CONSENSUS-HALTS",
         Citation::OccursExactly {
-            path: "crates/fln/src/lib.rs",
+            path: "crates/fln-admission/src/lib.rs",
             needle: "convene(&checker_review.council, admitted)",
             count: 1,
         },
