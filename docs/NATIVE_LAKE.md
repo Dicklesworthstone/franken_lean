@@ -120,8 +120,11 @@ report names it per closure (`import_posture`, and `imports[]` with `trust`,
   for editor sessions (`fln serve-lsp`, `lean --server`; see
   NATIVE_EDITOR_PROOFS.md).
   The closure is keyed by one digest over every byte of every imported part, the
-  import roots, the options and the running binary's own bytes. If this binary
-  admitted those exact bytes before, its record is read back, the closure is
+  import roots, the options and the admission authority: a build-time digest of
+  the kernel, checker and decoder crates and the toolchain the binary was built
+  from (`fln_admission::AUTHORITY`), so a rebuild that changes only the
+  elaborator keeps its records. If a binary with that authority admitted those
+  exact bytes before, its record is read back, the closure is
   rebuilt from the bytes, and it is used only if it reaches every logical root
   that admission reached (each module's, the declarations', and the result after
   metadata); otherwise both checkers admit it and the admission is recorded.
