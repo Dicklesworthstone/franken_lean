@@ -52,24 +52,86 @@ fn byte_array_string_conversion_bounds_bytes_before_utf8_and_allocation() {
     for (bytes, limit) in [(&b"\xff"[..], 0), (&b"ok\xff"[..], 2)] {
         let input = Obj::mk_sarray(1, bytes);
         assert!(matches!(string_from_byte_array(&input, limit),
-            Err(IntrinsicFailure::StringFromBytesResource(strings::ResourceError::OutputLimit { allowed, observed }))
+            Err(IntrinsicFailure::StringBytesResource {
+                operation: "String.ofByteArray",
+                error: strings::ResourceError::OutputLimit { allowed, observed },
+            })
                 if allowed == limit as u64 && observed == bytes.len() as u64));
     }
-    let oversized = Obj::mk_sarray(1, &vec![b'x'; MAX_STRING_FROM_BYTES + 1]);
+    let oversized = Obj::mk_sarray(1, &vec![b'x'; MAX_STRING_CONVERSION_BYTES + 1]);
     let error = match invoke_intrinsic(
         IntrinsicImplementation::for_row(ROW),
         ROW,
         vec![oversized],
         1024,
     ) {
-        Err(IntrinsicFailure::StringFromBytesResource(error)) => error,
+        Err(IntrinsicFailure::StringBytesResource {
+            operation: "String.ofByteArray",
+            error,
+        }) => error,
         _ => panic!("real dispatch must enforce the production byte ceiling"),
     };
     assert!(
-        matches!(string_from_bytes_exhausted(error, "test"), Stop::Inconclusive(inconclusive)
+        matches!(string_bytes_exhausted("String.ofByteArray", error, "test"), Stop::Inconclusive(inconclusive)
         if matches!(&inconclusive.cause, InconclusiveCause::ResourceExhausted { usage }
-            if usage.reason == ResourceReason::Memory { limit_bytes: MAX_STRING_FROM_BYTES as u64 }
-                && usage.allowed == MAX_STRING_FROM_BYTES as u64
-                && usage.observed == MAX_STRING_FROM_BYTES as u64 + 1))
+            if usage.reason == ResourceReason::Memory { limit_bytes: MAX_STRING_CONVERSION_BYTES as u64 }
+                && usage.allowed == MAX_STRING_CONVERSION_BYTES as u64
+                && usage.observed == MAX_STRING_CONVERSION_BYTES as u64 + 1))
     );
+}
+
+#[test]
+fn string_byte_array_output_budget_counts_payload_bytes_without_the_sentinel() {
+    let text = Obj::mk_string("é");
+    let result = string_to_byte_array(&text, 2)
+        .unwrap_or_else(|_| panic!("two UTF-8 bytes must fit the exact output budget"));
+    assert_eq!(
+        result.value.try_borrow_sarray_view().unwrap().3,
+        b"\xc3\xa9"
+    );
+    assert!(matches!(
+        string_to_byte_array(&text, 1),
+        Err(IntrinsicFailure::StringBytesResource {
+            operation: "String.toByteArray",
+            error: strings::ResourceError::OutputLimit {
+                allowed: 1,
+                observed: 2,
+            },
+        })
+    ));
+    let empty = string_to_byte_array(&Obj::mk_string(""), 0)
+        .unwrap_or_else(|_| panic!("an empty String needs no payload bytes"));
+    assert_eq!(empty.value.try_borrow_sarray_view().unwrap().3, b"");
+    assert!(matches!(
+        string_to_byte_array(&Obj::mk_nat(0), 0),
+        Err(IntrinsicFailure::Refused(VmRefusal::TypeMismatch { .. }))
+    ));
+}
+
+#[test]
+fn string_byte_array_conversion_dispatch_preserves_typed_memory_stops() {
+    for row in ["extern:String.toByteArray", "extern:String.toUTF8"] {
+        let oversized = Obj::mk_string(&"x".repeat(MAX_STRING_CONVERSION_BYTES + 1));
+        let error = match invoke_intrinsic(
+            IntrinsicImplementation::for_row(row),
+            row,
+            vec![oversized],
+            1024,
+        ) {
+            Err(IntrinsicFailure::StringBytesResource {
+                operation: "String.toByteArray",
+                error,
+            }) => error,
+            _ => panic!("real dispatch must enforce the conversion output ceiling"),
+        };
+        assert!(matches!(
+            string_bytes_exhausted("String.toByteArray", error, "test"),
+            Stop::Inconclusive(inconclusive)
+                if matches!(&inconclusive.cause, InconclusiveCause::ResourceExhausted { usage }
+                    if usage.reason == ResourceReason::Memory {
+                        limit_bytes: MAX_STRING_CONVERSION_BYTES as u64,
+                    } && usage.allowed == MAX_STRING_CONVERSION_BYTES as u64
+                        && usage.observed == MAX_STRING_CONVERSION_BYTES as u64 + 1)
+        ));
+    }
 }

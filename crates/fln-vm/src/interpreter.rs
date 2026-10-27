@@ -818,6 +818,7 @@ enum IntrinsicImplementation {
     ISizeToWidth,
     StringAppend,
     StringOfByteArray,
+    StringToByteArray,
     StringAtEnd,
     StringCompare,
     StringDecEq,
@@ -1181,6 +1182,7 @@ impl IntrinsicImplementation {
             "extern:String.Internal.length" => Self::StringLength,
             "extern:String.append" => Self::StringAppend,
             "extern:String.ofByteArray" => Self::StringOfByteArray,
+            "extern:String.toByteArray" | "extern:String.toUTF8" => Self::StringToByteArray,
             "extern:String.atEnd" | "extern:String.Pos.Raw.atEnd" => Self::StringAtEnd,
             "extern:String.compare" => Self::StringCompare,
             "extern:String.decEq" => Self::StringDecEq,
@@ -1881,10 +1883,16 @@ struct IntrinsicResult {
 
 enum IntrinsicFailure {
     Refused(VmRefusal),
-    NatMagnitudeLimit { allowed: u64, observed: u64 },
+    NatMagnitudeLimit {
+        allowed: u64,
+        observed: u64,
+    },
     FileReadResource(FileReadError),
     StringResource(strings::ResourceError),
-    StringFromBytesResource(strings::ResourceError),
+    StringBytesResource {
+        operation: &'static str,
+        error: strings::ResourceError,
+    },
 }
 
 impl From<VmRefusal> for IntrinsicFailure {
@@ -2718,8 +2726,12 @@ fn run(
                         Err(IntrinsicFailure::StringResource(error)) => {
                             return Err(strings::resource_exhausted(error, &location.to_string()));
                         }
-                        Err(IntrinsicFailure::StringFromBytesResource(error)) => {
-                            return Err(string_from_bytes_exhausted(error, &location.to_string()));
+                        Err(IntrinsicFailure::StringBytesResource { operation, error }) => {
+                            return Err(string_bytes_exhausted(
+                                operation,
+                                error,
+                                &location.to_string(),
+                            ));
                         }
                     }
                 }
@@ -6267,7 +6279,11 @@ fn dispatch_intrinsic(
             // native ABI call. The generated borrowed/owned ownership rule
             // remains in force; a fresh String preserves every input alias.
             expect_arity(row, args, 1)?;
-            string_from_byte_array(&args[0], MAX_STRING_FROM_BYTES)
+            string_from_byte_array(&args[0], MAX_STRING_CONVERSION_BYTES)
+        }
+        IntrinsicImplementation::StringToByteArray => {
+            expect_arity(row, args, 1)?;
+            string_to_byte_array(&args[0], MAX_STRING_CONVERSION_BYTES)
         }
         IntrinsicImplementation::StringAtEnd => {
             expect_arity(row, args, 2)?;
@@ -7175,6 +7191,7 @@ fn closure_intrinsic_application(
         | IntrinsicImplementation::NatXor
         | IntrinsicImplementation::StringAppend
         | IntrinsicImplementation::StringOfByteArray
+        | IntrinsicImplementation::StringToByteArray
         | IntrinsicImplementation::StringAtEnd
         | IntrinsicImplementation::StringCompare
         | IntrinsicImplementation::StringDecEq
@@ -7990,7 +8007,7 @@ fn mk_byte_array(bytes: &[u8]) -> Obj {
 
 // A Golem conversion-output ceiling, independent of Lean heartbeats. Check
 // it on the borrowed native payload before scanning UTF-8 or copying bytes.
-const MAX_STRING_FROM_BYTES: usize = 16 * 1024 * 1024;
+const MAX_STRING_CONVERSION_BYTES: usize = 16 * 1024 * 1024;
 
 fn string_from_byte_array(
     value: &Obj,
@@ -8003,27 +8020,70 @@ fn string_from_byte_array(
         return Err(VmRefusal::InvalidByteArrayObject.into());
     };
     if bytes.len() > max_bytes {
-        return Err(IntrinsicFailure::StringFromBytesResource(
-            strings::ResourceError::OutputLimit {
+        return Err(IntrinsicFailure::StringBytesResource {
+            operation: "String.ofByteArray",
+            error: strings::ResourceError::OutputLimit {
                 allowed: max_bytes as u64,
                 observed: bytes.len() as u64,
             },
-        ));
+        });
     }
     // Trusted source ingress checks the logical validity proof. A malformed
     // direct FLBC caller still cannot mint a lossy or noncanonical String.
     let text = std::str::from_utf8(bytes).map_err(|_| VmRefusal::InvalidStringObject)?;
     let mut output = String::new();
-    output.try_reserve_exact(text.len()).map_err(|_| {
-        IntrinsicFailure::StringFromBytesResource(strings::ResourceError::Allocation {
-            requested: text.len(),
-        })
-    })?;
+    output
+        .try_reserve_exact(text.len())
+        .map_err(|_| IntrinsicFailure::StringBytesResource {
+            operation: "String.ofByteArray",
+            error: strings::ResourceError::Allocation {
+                requested: text.len(),
+            },
+        })?;
     output.push_str(text);
     Ok(IntrinsicResult::owned(Obj::mk_string(&output)))
 }
 
-fn string_from_bytes_exhausted(error: strings::ResourceError, location: &str) -> Stop {
+fn string_to_byte_array(
+    value: &Obj,
+    max_bytes: usize,
+) -> Result<IntrinsicResult, IntrinsicFailure> {
+    const OPERATION: &str = "String.toByteArray";
+    if value_kind(value) != ValueKind::String {
+        return Err(type_mismatch(OPERATION, 0, "String", value).into());
+    }
+    let (size, _, _, bytes) = value
+        .try_borrow_string_view()
+        .ok_or(VmRefusal::InvalidStringObject)?;
+    // The native String buffer ends in a sentinel NUL. Embedded NULs are
+    // payload, and must survive both conversions unchanged.
+    let bytes = &bytes[..size - 1];
+    if bytes.len() > max_bytes {
+        return Err(IntrinsicFailure::StringBytesResource {
+            operation: OPERATION,
+            error: strings::ResourceError::OutputLimit {
+                allowed: max_bytes as u64,
+                observed: bytes.len() as u64,
+            },
+        });
+    }
+    std::str::from_utf8(bytes).map_err(|_| VmRefusal::InvalidStringObject)?;
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(bytes.len())
+        .map_err(|_| IntrinsicFailure::StringBytesResource {
+            operation: OPERATION,
+            error: strings::ResourceError::Allocation {
+                requested: bytes.len(),
+            },
+        })?;
+    output.extend_from_slice(bytes);
+    // The extern borrows the String and returns an independently owned byte
+    // array. Reusing the String buffer would expose its terminator and aliases.
+    Ok(IntrinsicResult::owned(mk_byte_array(&output)))
+}
+
+fn string_bytes_exhausted(operation: &str, error: strings::ResourceError, location: &str) -> Stop {
     match error {
         strings::ResourceError::OutputLimit { allowed, observed } => Stop::Inconclusive(
             Inconclusive::resource(ResourceUsage {
@@ -8033,11 +8093,11 @@ fn string_from_bytes_exhausted(error: strings::ResourceError, location: &str) ->
                 allowed,
                 observed,
             })
-            .with_progress(format!("String.ofByteArray output at {location}")),
+            .with_progress(format!("{operation} output at {location}")),
         ),
         strings::ResourceError::Allocation { requested } => {
             Stop::Inconclusive(Inconclusive::dependency_unavailable(format!(
-                "host buffer allocation for String.ofByteArray: requested {requested} bytes at {location}"
+                "host buffer allocation for {operation}: requested {requested} bytes at {location}"
             )))
         }
     }

@@ -268,3 +268,212 @@ fn byte_array_string_conversion_budget_stops_publish_nothing_and_replay() {
     assert_text(&returned(&program), text);
     assert_clean_shadow();
 }
+
+fn to_byte_array(row: &str, arguments: &[u16]) -> Instruction {
+    Instruction::Intrinsic {
+        dst: r(3),
+        row: row.to_owned(),
+        args: arguments.iter().copied().map(r).collect(),
+        argument_ownership: vec![ArgumentOwnership::Borrowed; arguments.len()],
+        result_ownership: ResultOwnership::Owned,
+    }
+}
+
+#[test]
+fn string_byte_array_conversion_roundtrips_unicode_nul_and_borrowed_aliases() {
+    let _guard = TEST_LOCK.lock().unwrap();
+    shadow::enable();
+    for row in ["extern:String.toByteArray", "extern:String.toUTF8"] {
+        for text in ["", "a\0z", "héllo∀🦀", "\0é\0🦀\0", "e\u{301}"] {
+            let program = replay(vec![
+                Instruction::String {
+                    dst: r(0),
+                    value: text.to_owned(),
+                },
+                Instruction::Copy {
+                    dst: r(1),
+                    src: r(0),
+                },
+                to_byte_array(row, &[0]),
+                Instruction::Copy {
+                    dst: r(2),
+                    src: r(3),
+                },
+                to_byte_array(row, &[1]),
+                Instruction::Intrinsic {
+                    dst: r(4),
+                    row: ROW.to_owned(),
+                    args: vec![r(3)],
+                    argument_ownership: vec![ArgumentOwnership::Borrowed],
+                    result_ownership: ResultOwnership::Owned,
+                },
+                Instruction::Array {
+                    dst: r(5),
+                    items: vec![r(0), r(1), r(2), r(3), r(4)],
+                },
+                Instruction::Return { src: r(5) },
+            ]);
+            for _ in 0..2 {
+                let result = returned(&program);
+                let source = result.array_child(0);
+                let source_alias = result.array_child(1);
+                assert_eq!(source.identity_token(), source_alias.identity_token());
+                assert_text(&source, text);
+                assert_text(&source_alias, text);
+                let first = result.array_child(2);
+                let second = result.array_child(3);
+                for bytes in [&first, &second] {
+                    let (width, size, capacity, payload) =
+                        bytes.try_borrow_sarray_view().expect("native ByteArray");
+                    assert_eq!(width, 1);
+                    assert_eq!(size, text.len());
+                    assert!(capacity >= size);
+                    assert_eq!(payload, text.as_bytes(), "the sentinel is not payload");
+                    assert_ne!(source.identity_token(), bytes.identity_token());
+                }
+                assert_ne!(first.identity_token(), second.identity_token());
+                assert_text(&result.array_child(4), text);
+            }
+        }
+    }
+    assert_clean_shadow();
+}
+
+#[test]
+fn string_byte_array_conversion_checks_generated_arity_ownership_and_receiver() {
+    let _guard = TEST_LOCK.lock().unwrap();
+    for row in ["extern:String.toByteArray", "extern:String.toUTF8"] {
+        let generated = EXTERN_ROWS.iter().find(|entry| entry.id == row).unwrap();
+        assert_eq!((generated.kind, generated.arity), ("defn", 1));
+        assert_eq!(generated.symbol, "lean_string_to_utf8");
+        assert_eq!(generated.ownership, "rule(borrowed-args,owned-result)");
+        let program = |operation| {
+            replay(vec![
+                Instruction::String {
+                    dst: r(0),
+                    value: "é\0".to_owned(),
+                },
+                operation,
+                Instruction::Return { src: r(3) },
+            ])
+        };
+        for arguments in [vec![], vec![0, 0]] {
+            assert!(matches!(
+                execute(&program(to_byte_array(row, &arguments)), ExecutionLimits::default(), None),
+                Outcome::Complete(VmExit::Refused {
+                    refusal: VmRefusal::IntrinsicArity { row: actual_row, expected: 1, actual },
+                    ..
+                }) if actual_row == row && actual == arguments.len()
+            ));
+        }
+        for ownership in [
+            ArgumentOwnership::Owned,
+            ArgumentOwnership::Unique,
+            ArgumentOwnership::Scalar,
+        ] {
+            let mut operation = to_byte_array(row, &[0]);
+            if let Instruction::Intrinsic {
+                argument_ownership, ..
+            } = &mut operation
+            {
+                *argument_ownership = vec![ownership];
+            }
+            assert!(matches!(
+                execute(&program(operation), ExecutionLimits::default(), None),
+                Outcome::Complete(VmExit::Refused {
+                    refusal: VmRefusal::IntrinsicOwnershipMismatch {
+                        expected: ArgumentOwnership::Borrowed, actual, ..
+                    },
+                    ..
+                }) if actual == ownership
+            ));
+        }
+        for ownership in [
+            ResultOwnership::Borrowed,
+            ResultOwnership::Scalar,
+            ResultOwnership::RawObject,
+        ] {
+            let mut operation = to_byte_array(row, &[0]);
+            if let Instruction::Intrinsic {
+                result_ownership, ..
+            } = &mut operation
+            {
+                *result_ownership = ownership;
+            }
+            assert!(matches!(
+                execute(&program(operation), ExecutionLimits::default(), None),
+                Outcome::Complete(VmExit::Refused {
+                    refusal: VmRefusal::IntrinsicResultOwnershipMismatch {
+                        expected: ResultOwnership::Owned, actual, ..
+                    },
+                    ..
+                }) if actual == ownership
+            ));
+        }
+        for input in [
+            Instruction::Nat {
+                dst: r(0),
+                value: 0,
+            },
+            Instruction::Array {
+                dst: r(0),
+                items: vec![],
+            },
+        ] {
+            let malformed = replay(vec![
+                input,
+                to_byte_array(row, &[0]),
+                Instruction::Return { src: r(3) },
+            ]);
+            assert!(matches!(
+                execute(&malformed, ExecutionLimits::default(), None),
+                Outcome::Complete(VmExit::Refused {
+                    refusal: VmRefusal::TypeMismatch {
+                        operation: "String.toByteArray",
+                        argument: 0,
+                        expected: "String",
+                        ..
+                    },
+                    ..
+                })
+            ));
+        }
+    }
+}
+
+#[test]
+fn string_byte_array_conversion_budget_stops_are_non_authoritative_and_replayable() {
+    let _guard = TEST_LOCK.lock().unwrap();
+    shadow::enable();
+    for row in ["extern:String.toByteArray", "extern:String.toUTF8"] {
+        let program = replay(vec![
+            Instruction::String {
+                dst: r(0),
+                value: "é\0".to_owned(),
+            },
+            to_byte_array(row, &[0]),
+            Instruction::Return { src: r(3) },
+        ]);
+        for max_steps in [1, 2] {
+            let outcome = execute(
+                &program,
+                ExecutionLimits {
+                    max_steps,
+                    ..ExecutionLimits::default()
+                },
+                None,
+            );
+            assert_eq!(outcome.authority(), Authority::NonAuthoritative);
+            assert!(matches!(
+                outcome,
+                Outcome::Inconclusive(inconclusive)
+                    if matches!(&inconclusive.cause, InconclusiveCause::ResourceExhausted { usage }
+                        if usage.reason == ResourceReason::ExecutionSteps
+                            && usage.allowed == max_steps && usage.observed == max_steps + 1)
+            ));
+        }
+        let bytes = returned(&program);
+        assert_eq!(bytes.try_borrow_sarray_view().unwrap().3, "é\0".as_bytes());
+    }
+    assert_clean_shadow();
+}
