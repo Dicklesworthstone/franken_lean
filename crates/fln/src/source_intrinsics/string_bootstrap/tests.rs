@@ -12,10 +12,98 @@ use std::sync::OnceLock;
 
 const STACK: usize = 256 * 1024 * 1024;
 
+/// Every pinned module that defines a constant of the inventory. The closure
+/// walk below refuses any omission, so this list cannot silently narrow it.
+const MODULES: [&str; 81] = [
+    "Init/ByCases",
+    "Init/Classical",
+    "Init/Control/Id",
+    "Init/Control/Lawful/Basic",
+    "Init/Core",
+    "Init/Data/Array/Basic",
+    "Init/Data/Array/Bootstrap",
+    "Init/Data/Array/Extract",
+    "Init/Data/Array/Lemmas",
+    "Init/Data/Array/Set",
+    "Init/Data/BEq",
+    "Init/Data/BitVec/Basic",
+    "Init/Data/BitVec/BasicAux",
+    "Init/Data/BitVec/Bootstrap",
+    "Init/Data/BitVec/Lemmas",
+    "Init/Data/Bool",
+    "Init/Data/ByteArray/Basic",
+    "Init/Data/ByteArray/Bootstrap",
+    "Init/Data/ByteArray/Lemmas",
+    "Init/Data/Cast",
+    "Init/Data/Char/Basic",
+    "Init/Data/Int/Basic",
+    "Init/Data/Int/DivMod/Basic",
+    "Init/Data/Int/DivMod/Bootstrap",
+    "Init/Data/Int/Lemmas",
+    "Init/Data/Int/Order",
+    "Init/Data/Int/Pow",
+    "Init/Data/List/Basic",
+    "Init/Data/List/BasicAux",
+    "Init/Data/List/Control",
+    "Init/Data/List/Lemmas",
+    "Init/Data/List/Nat/TakeDrop",
+    "Init/Data/List/Sublist",
+    "Init/Data/List/TakeDrop",
+    "Init/Data/List/ToArray",
+    "Init/Data/Nat/Basic",
+    "Init/Data/Nat/Bitwise/Basic",
+    "Init/Data/Nat/Bitwise/Lemmas",
+    "Init/Data/Nat/Div/Basic",
+    "Init/Data/Nat/Div/Lemmas",
+    "Init/Data/Nat/Dvd",
+    "Init/Data/Nat/Gcd",
+    "Init/Data/Nat/Lemmas",
+    "Init/Data/Nat/Linear",
+    "Init/Data/Nat/MinMax",
+    "Init/Data/Nat/Order",
+    "Init/Data/NeZero",
+    "Init/Data/Option/Basic",
+    "Init/Data/Option/Instances",
+    "Init/Data/Option/Lemmas",
+    "Init/Data/Order/Classes",
+    "Init/Data/Order/Factories",
+    "Init/Data/Order/Lemmas",
+    "Init/Data/RArray",
+    "Init/Data/Repr",
+    "Init/Data/String/Basic",
+    "Init/Data/String/Bootstrap",
+    "Init/Data/String/Decode",
+    "Init/Data/String/Defs",
+    "Init/Data/String/Modify",
+    "Init/Data/String/PosRaw",
+    "Init/Data/ToString/Basic",
+    "Init/Data/UInt/Basic",
+    "Init/Data/UInt/BasicAux",
+    "Init/Data/UInt/Bitwise",
+    "Init/Data/UInt/Lemmas",
+    "Init/Ext",
+    "Init/GetElem",
+    "Init/Omega/Coeffs",
+    "Init/Omega/Constraint",
+    "Init/Omega/Int",
+    "Init/Omega/IntList",
+    "Init/Omega/LinearCombo",
+    "Init/Omega/Logic",
+    "Init/Prelude",
+    "Init/PropLemmas",
+    "Init/SimpLemmas",
+    "Init/SizeOf",
+    "Init/Tactics",
+    "Init/Util",
+    "Init/WF",
+];
+
 struct Fixture {
     environment: Environment,
     prelude: Environment,
     externs: BTreeMap<Name, Vec<ExternEntry>>,
+    /// Every loaded module whose artifacts carry each constant.
+    owners: BTreeMap<Name, BTreeSet<&'static str>>,
 }
 
 fn fixture() -> Option<&'static Fixture> {
@@ -34,7 +122,8 @@ fn fixture() -> Option<&'static Fixture> {
             let mut actual_externs = BTreeMap::new();
             let mut prelude_names = BTreeSet::new();
             let mut prelude_externs = BTreeMap::new();
-            for module in ["Init/Prelude", "Init/Core", "Init/Data/String/Bootstrap"] {
+            let mut owners = BTreeMap::new();
+            for module in MODULES {
                 let path = library.join(module).with_extension("olean");
                 let parts = [
                     std::fs::read(&path).unwrap(),
@@ -83,16 +172,22 @@ fn fixture() -> Option<&'static Fixture> {
                             metadata::ExternEntry::Opaque => ExternEntry::Opaque,
                         })
                         .collect::<Vec<_>>();
+                    if module == "Init/Prelude" {
+                        prelude_externs.insert(row.declaration.clone(), entries.clone());
+                    }
                     if let Some(previous) = actual_externs.insert(row.declaration, entries.clone())
                     {
                         assert_eq!(previous, entries);
                     }
                 }
                 if module == "Init/Prelude" {
-                    prelude_externs = actual_externs.clone();
                     prelude_names.extend(decoded.constants.iter().map(|info| info.name().clone()));
                 }
                 for info in decoded.constants {
+                    owners
+                        .entry(info.name().clone())
+                        .or_insert_with(BTreeSet::new)
+                        .insert(module);
                     if let Some(previous) = constants.insert(info.name().clone(), info.clone()) {
                         assert_eq!(
                             previous, info,
@@ -121,9 +216,52 @@ fn fixture() -> Option<&'static Fixture> {
                 environment,
                 prelude,
                 externs: actual_externs,
+                owners,
             })
         })
         .as_ref()
+}
+
+/// The original Prelude and Bootstrap rows, every argument borrowed.
+const BOOTSTRAP: [Operation; 8] = [
+    Operation::ByteSize,
+    Operation::PosOf,
+    Operation::OffsetOfPos,
+    Operation::Extract,
+    Operation::Next,
+    Operation::Pushn,
+    Operation::Foldl,
+    Operation::IsEmpty,
+];
+
+/// The ownership the generated census row requires of an FLBC call.
+fn generated_ownership(row: &str, arguments: usize) -> (Vec<ArgumentOwnership>, ResultOwnership) {
+    use fln_vm::extern_row::{
+        ArgumentOwnership as Contract, Ownership, ResultOwnership as ContractResult,
+    };
+    let generated = fln_vm::extern_table_generated::EXTERN_ROWS
+        .iter()
+        .find(|generated| generated.id == row)
+        .unwrap();
+    let ownership = Ownership::parse(generated.ownership).unwrap();
+    let arguments = ownership
+        .argument_ownership(arguments)
+        .unwrap()
+        .into_iter()
+        .map(|ownership| match ownership {
+            Contract::Borrowed => ArgumentOwnership::Borrowed,
+            Contract::Owned => ArgumentOwnership::Owned,
+            Contract::Scalar => ArgumentOwnership::Scalar,
+            Contract::Unique => ArgumentOwnership::Unique,
+        })
+        .collect();
+    let result = match ownership.result_ownership().unwrap() {
+        ContractResult::Owned => ResultOwnership::Owned,
+        ContractResult::Scalar => ResultOwnership::Scalar,
+        ContractResult::Borrowed => ResultOwnership::Borrowed,
+        ContractResult::RawObject => ResultOwnership::RawObject,
+    };
+    (arguments, result)
 }
 
 fn with_fixture(test: impl FnOnce(&Fixture) + Send + 'static) {
@@ -272,10 +410,25 @@ fn actual_string_inventories_close_the_pin_and_share_only_successful_checks() {
         let mut verified = VerifiedDependencies::default();
         let mut externs = None;
         let mut work = 0;
-        for (operation, count) in Operation::ALL
-            .into_iter()
-            .zip([325, 325, 325, 326, 325, 323, 323, 324])
-        {
+        // The Basic-, PosRaw- and Modify-level closures are a different order
+        // of magnitude from Bootstrap's, as measured with the pin itself.
+        let counts = [
+            325, 325, 325, 326, 325, 323, 323, 324, 351, 3413, 3413, 2318, 369, 3416, 3416, 4040,
+            3653, 3396,
+        ];
+        assert_eq!(counts.len(), Operation::ALL.len());
+        let mut defining = BTreeSet::new();
+        for line in DEPENDENCIES.lines() {
+            let (_, encoded, _) = inventory_row(line);
+            let label = dependency_name(encoded, &mut 0, IngressLimits::default()).unwrap();
+            defining.extend(fixture.owners[&label].iter().copied());
+        }
+        assert_eq!(
+            defining,
+            MODULES.into_iter().collect(),
+            "the fixture loads exactly the modules defining the inventory"
+        );
+        for (operation, count) in Operation::ALL.into_iter().zip(counts) {
             let rows = inventory(operation);
             assert_eq!(rows.len(), count);
             assert_eq!(
@@ -423,6 +576,146 @@ def advance (s : String) (p : String.Pos.Raw) : String.Pos.Raw := String.Interna
                             .all(|ownership| *ownership == ArgumentOwnership::Borrowed)
                     );
                     assert_eq!(*result_ownership, ResultOwnership::Owned);
+                    assert_eq!(
+                        (argument_ownership.clone(), *result_ownership),
+                        generated_ownership(row, argument_ownership.len())
+                    );
+                    selected.insert(row.clone());
+                }
+            }
+            let replay =
+                execute_flbc_artifact(&execution.flbc_artifact, &options, Default::default())
+                    .unwrap()
+                    .into_complete()
+                    .unwrap();
+            assert_eq!(closed_vm_value(&replay).unwrap().as_ref(), Some(expected));
+        }
+        assert_eq!(
+            selected,
+            BOOTSTRAP
+                .map(|operation| format!("extern:{}", operation.label()))
+                .into_iter()
+                .collect()
+        );
+        let repeated = run();
+        for &index in indices {
+            assert_eq!(
+                first.batch.executions[index].flbc_artifact,
+                repeated.batch.executions[index].flbc_artifact
+            );
+        }
+        assert_eq!(engine.logical_root(&options), root);
+    });
+}
+
+/// The position-indexed rows on "aλ😀z" (a@0, λ@1, 😀@3, z@7, size 8): a
+/// multi-byte character, a position inside one, the end, and partial use.
+/// Each expected value is the pinned v4.32.0 runtime's own answer. A proof
+/// is a logical argument the native row never receives, so one axiom supplies
+/// every hypothesis; evaluation never inspects it.
+#[test]
+fn positioned_adapters_execute_checked_source_and_replay_bytecode() {
+    with_fixture(|fixture| {
+        let engine = Engine::from_environment(fixture.environment.clone());
+        let options = KVMap::new();
+        let root = engine.logical_root(&options);
+        let limits = EngineExecutionLimits::new(Budget::for_stack_bytes(STACK));
+        let source = r#"
+axiom proof {p : Prop} : p
+#eval (String.Pos.Raw.get "aλ😀z" (String.Pos.Raw.mk 1)).toNat
+#eval (String.Pos.Raw.get "aλ😀z" (String.Pos.Raw.mk 2)).toNat
+#eval (String.Pos.Raw.get "aλ😀z" (String.Pos.Raw.mk 8)).toNat
+#eval (String.Internal.get "aλ😀z" (String.Pos.Raw.mk 3)).toNat
+#eval String.Pos.Raw.set "aλ😀z" (String.Pos.Raw.mk 3) 'é'
+#eval String.Pos.Raw.set "aλ😀z" (String.Pos.Raw.mk 2) 'X'
+#eval String.Pos.Raw.set "aλ😀z" (String.Pos.Raw.mk 8) 'X'
+#eval (String.decodeChar "aλ😀z" 3 proof).toNat
+#eval (String.decodeChar "aλ😀z" 8 proof).toNat
+#eval (String.getUTF8Byte "aλ😀z" (String.Pos.Raw.mk 1) proof).toNat
+#eval (String.Pos.Raw.next' "aλ😀z" (String.Pos.Raw.mk 3) proof).byteIdx
+#eval (String.Pos.Raw.next' "aλ😀z" (String.Pos.Raw.mk 4) proof).byteIdx
+#eval String.Pos.Raw.extract "aλ😀z" (String.Pos.Raw.mk 1) (String.Pos.Raw.mk 7)
+#eval @String.Pos.set "aλ😀z" (String.Pos.mk (String.Pos.Raw.mk 1) proof) 'X' proof
+#eval @String.extract "aλ😀z" (String.Pos.mk (String.Pos.Raw.mk 1) proof) (String.Pos.mk (String.Pos.Raw.mk 7) proof)
+#eval (String.toList "aλ😀z").length
+#eval (String.toList "").length
+#eval String.Internal.foldl String.push "" (String.ofList (String.toList "aλ😀z"))
+#eval let get := String.Pos.Raw.get "aλ😀z"; (get (String.Pos.Raw.mk 7)).toNat
+#eval let set := String.Pos.Raw.set; set "abc" (String.Pos.Raw.mk 1) 'B'
+"#;
+        let run = || {
+            engine
+                .execute_source_commands_with_checks(source.as_bytes(), &options, limits)
+                .unwrap_or_else(|error| panic!("checked positioned String adapters: {error:?}"))
+                .into_complete()
+                .unwrap()
+        };
+        let text = |value: &str| ClosedVmValue::String(value.to_owned());
+        let expected = [
+            ClosedVmValue::Scalar(955),
+            ClosedVmValue::Scalar(65),
+            ClosedVmValue::Scalar(65),
+            ClosedVmValue::Scalar(128_512),
+            text("aλéz"),
+            text("aλ😀z"),
+            text("aλ😀z"),
+            ClosedVmValue::Scalar(128_512),
+            ClosedVmValue::Scalar(0),
+            ClosedVmValue::Scalar(206),
+            ClosedVmValue::Scalar(7),
+            ClosedVmValue::Scalar(5),
+            text("λ😀"),
+            text("aX😀z"),
+            text("λ😀"),
+            ClosedVmValue::Scalar(4),
+            ClosedVmValue::Scalar(0),
+            text("aλ😀z"),
+            ClosedVmValue::Scalar(122),
+            text("aBc"),
+        ];
+        let first = run();
+        let indices = &first.batch.source_evaluation_indices;
+        assert_eq!(indices.len(), expected.len());
+        let mut selected = BTreeSet::new();
+        for (&index, expected) in indices.iter().zip(&expected) {
+            let execution = &first.batch.executions[index];
+            assert_eq!(
+                execution.checker.ground,
+                CheckerAdmissionGround::UnsafeQuarantine
+            );
+            assert_eq!(
+                closed_vm_value(&execution.exit).unwrap().as_ref(),
+                Some(expected)
+            );
+            let program =
+                flbc::decode_canonical(&execution.flbc_artifact, flbc::CodecLimits::default())
+                    .unwrap();
+            assert_eq!(
+                flbc::encode_canonical(&program, flbc::CodecLimits::default()).unwrap(),
+                execution.flbc_artifact
+            );
+            for instruction in program
+                .functions()
+                .iter()
+                .flat_map(|function| &function.code)
+            {
+                if let Instruction::Intrinsic {
+                    row,
+                    argument_ownership,
+                    result_ownership,
+                    ..
+                } = instruction
+                    && Operation::ALL
+                        .iter()
+                        .any(|operation| *row == format!("extern:{}", operation.label()))
+                {
+                    // Each operand keeps its own row's disposition: `set`'s
+                    // String is owned and its Char a `value`; `get` returns one.
+                    assert_eq!(
+                        (argument_ownership.clone(), *result_ownership),
+                        generated_ownership(row, argument_ownership.len()),
+                        "{row}"
+                    );
                     selected.insert(row.clone());
                 }
             }
@@ -436,8 +729,10 @@ def advance (s : String) (p : String.Pos.Raw) : String.Pos.Raw := String.Interna
         assert_eq!(
             selected,
             Operation::ALL
-                .map(|operation| format!("extern:{}", operation.label()))
                 .into_iter()
+                .filter(|operation| !BOOTSTRAP.contains(operation))
+                .map(|operation| format!("extern:{}", operation.label()))
+                .chain(["extern:String.Internal.foldl".to_owned()])
                 .collect()
         );
         let repeated = run();
@@ -448,6 +743,36 @@ def advance (s : String) (p : String.Pos.Raw) : String.Pos.Raw := String.Interna
             );
         }
         assert_eq!(engine.logical_root(&options), root);
+
+        // Past the terminator the pin's fast reads are undefined behavior.
+        // Here they stop with a typed range refusal, never a guessed value.
+        for call in [
+            "(String.decodeChar \"aλ😀z\" 9 proof).toNat",
+            "(String.getUTF8Byte \"aλ😀z\" (String.Pos.Raw.mk 9) proof).toNat",
+            "(String.Pos.Raw.next' \"aλ😀z\" (String.Pos.Raw.mk 9) proof).byteIdx",
+        ] {
+            let source = format!("axiom proof {{p : Prop}} : p\n#eval {call}\n");
+            let complete = engine
+                .execute_source_commands_with_checks(source.as_bytes(), &options, limits)
+                .unwrap()
+                .into_complete()
+                .unwrap();
+            let execution = &complete.batch.executions[complete.batch.source_evaluation_indices[0]];
+            assert!(
+                matches!(
+                    &execution.exit,
+                    VmExit::Refused {
+                        refusal: fln_vm::interpreter::VmRefusal::ArrayIndexOutOfBounds {
+                            index: 9,
+                            size: 9
+                        },
+                        ..
+                    }
+                ),
+                "{call}: {:?}",
+                execution.exit
+            );
+        }
     });
 }
 
@@ -786,15 +1111,43 @@ fn changed_body(operation: Operation, info: ConstantInfo) -> Declaration {
         Domain::String => Expr::lit(Literal::Str("counterfeit".to_owned())),
         Domain::Position => Expr::app(c("String.Pos.Raw.mk"), answer),
         Domain::Bool => c("Bool.true"),
+        Domain::Char => Expr::app(c("Char.ofNat"), answer),
+        Domain::Byte => Expr::app(c("UInt8.ofNat"), answer),
+        Domain::CharList => Expr::app(
+            Expr::const_(name("List.nil"), vec![Level::zero()]),
+            c("Char"),
+        ),
         _ => unreachable!(),
     };
-    for domain in operation.domains().iter().rev() {
-        body = Expr::lam(
-            Name::anonymous(),
-            domain.source_type(),
-            body,
-            BinderInfo::Default,
-        );
+    if operation.dependent() {
+        // Positions and proofs mention earlier binders: keep the telescope.
+        let mut binders = Vec::new();
+        let mut telescope = &info.constant_val().type_;
+        for _ in operation.domains() {
+            let ExprNode::ForallE {
+                binder_name,
+                binder_type,
+                body,
+                binder_info,
+            } = telescope.node()
+            else {
+                unreachable!("the checked telescope binds every domain")
+            };
+            binders.push((binder_name.clone(), binder_type.clone(), *binder_info));
+            telescope = body;
+        }
+        for (binder_name, binder_type, binder_info) in binders.into_iter().rev() {
+            body = Expr::lam(binder_name, binder_type, body, binder_info);
+        }
+    } else {
+        for domain in operation.domains().iter().rev() {
+            body = Expr::lam(
+                Name::anonymous(),
+                domain.source_type(),
+                body,
+                BinderInfo::Default,
+            );
+        }
     }
     match info {
         ConstantInfo::Defn(mut value) => {
@@ -837,7 +1190,9 @@ fn well_typed_counterfeit_bodies_and_reserved_native_names_are_refused() {
             );
             assert!(matches(changed.environment(), operation).is_err());
             let root = changed.logical_root(&options);
-            let source = format!("def refusedNative := {}", operation.label());
+            // `@` keeps an implicit String an argument of the reference.
+            let explicit = if operation.dependent() { "@" } else { "" };
+            let source = format!("def refusedNative := {explicit}{}", operation.label());
             assert!(
                 changed
                     .execute_source_commands_with_checks(source.as_bytes(), &options, limits)

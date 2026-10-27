@@ -217,6 +217,7 @@ impl Preparation<'_> {
         self.tick()?;
         let name = &definition.base.name;
         if !(name == &super::name("_fln_runtime_char_ofNatAux")
+            || name == &super::name("_fln_runtime_string_decEq")
             || ["decEq", "decLe", "decLt"]
                 .into_iter()
                 .any(|suffix| name == &super::name(&format!("_fln_runtime_nat_{suffix}"))))

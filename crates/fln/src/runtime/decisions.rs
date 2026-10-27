@@ -45,6 +45,11 @@ impl Preparation<'_> {
         &mut self,
         requested: &Name,
     ) -> Result<Option<Name>, IngressError> {
+        // The String decision's applied `decide` form has its own adapter;
+        // this is the same contract for the decision used as a value.
+        if requested == &name("String.decEq") {
+            return self.native_string_decision_target(requested);
+        }
         let (index, suffix) = match requested.leaf_view() {
             LeafView::Str("decEq") => (0, "decEq"),
             LeafView::Str("decLe") => (1, "decLe"),

@@ -1,18 +1,21 @@
 //! Native ABI contracts for the pin's String traversal and position helpers.
 //!
 //! Bootstrap's safe opaques contain Inhabited fallbacks, not executable
-//! implementations. Prelude's utf8ByteSize instead exposes the logical byte
-//! array representation. The native operations require their explicit extern
-//! and their complete pinned declaration closure before crossing either boundary.
-//! The fixed inventory binds every ConstantInfo, including proof dependencies,
-//! dictionaries, recursor rules, metadata and safety. Membership bits keep a
-//! Prelude-only byte-size call independent of the Bootstrap module.
+//! implementations. Prelude's utf8ByteSize and the position-indexed Basic,
+//! PosRaw and Modify definitions instead expose the logical byte array
+//! representation, which a native String does not have. The native operations
+//! require their explicit extern and their complete pinned declaration closure
+//! before crossing either boundary. The fixed inventory binds every
+//! ConstantInfo, including proof dependencies, dictionaries, recursor rules,
+//! metadata and safety. Membership bits keep a Prelude-only byte-size call
+//! independent of the Bootstrap module, and a Bootstrap call independent of
+//! the larger Basic and Modify closures.
 //! These comparison data never install declarations or confer admission.
 
 use super::*;
 
 const DEPENDENCIES: &str = include_str!("string_bootstrap/dependencies.txt");
-const DEPENDENCY_COUNT: usize = 343;
+const DEPENDENCY_COUNT: usize = 4078;
 
 /// Successful dependency checks shared only within one immutable Preparation.
 /// Membership and each selected root's extern still belong to its operation.
@@ -24,7 +27,7 @@ impl Default for VerifiedDependencies {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 #[repr(u8)]
 pub(crate) enum Operation {
     ByteSize,
@@ -35,7 +38,20 @@ pub(crate) enum Operation {
     Pushn,
     Foldl,
     IsEmpty,
+    InternalGet,
+    RawGet,
+    RawSet,
+    DecodeChar,
+    GetUtf8Byte,
+    RawNextFast,
+    RawExtract,
+    PosSet,
+    PosExtract,
+    ToList,
 }
+
+/// One bit per operation in the inventory's membership column.
+type Membership = u32;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Domain {
@@ -45,9 +61,19 @@ pub(crate) enum Domain {
     Nat,
     Bool,
     StringCallback,
+    /// `String.Pos s`, the checked `Pos.Raw` record over the earlier String.
+    StringPosition,
+    /// A checked proof argument, which the native ABI never receives.
+    Proof,
+    /// `UInt8`, as a result only.
+    Byte,
+    /// `List Char`, as a result only.
+    CharList,
 }
 
 impl Domain {
+    /// The closed source type of a non-dependent domain. Dependent positions
+    /// and proofs take their binder types from the checked telescope instead.
     pub(crate) fn source_type(self) -> Expr {
         let c = |label| Expr::const_(name(label), Vec::new());
         match self {
@@ -56,6 +82,8 @@ impl Domain {
             Self::Position => c("String.Pos.Raw"),
             Self::Nat => c("Nat"),
             Self::Bool => c("Bool"),
+            Self::Byte => c("UInt8"),
+            Self::CharList => Expr::app(Expr::const_(name("List"), vec![Level::zero()]), c("Char")),
             Self::StringCallback => Expr::forall_e(
                 Name::anonymous(),
                 c("String"),
@@ -67,12 +95,15 @@ impl Domain {
                 ),
                 BinderInfo::Default,
             ),
+            Self::StringPosition | Self::Proof => {
+                unreachable!("dependent String domains use the checked telescope")
+            }
         }
     }
 }
 
 impl Operation {
-    pub(crate) const ALL: [Self; 8] = [
+    pub(crate) const ALL: [Self; 18] = [
         Self::ByteSize,
         Self::PosOf,
         Self::OffsetOfPos,
@@ -81,13 +112,23 @@ impl Operation {
         Self::Pushn,
         Self::Foldl,
         Self::IsEmpty,
+        Self::InternalGet,
+        Self::RawGet,
+        Self::RawSet,
+        Self::DecodeChar,
+        Self::GetUtf8Byte,
+        Self::RawNextFast,
+        Self::RawExtract,
+        Self::PosSet,
+        Self::PosExtract,
+        Self::ToList,
     ];
 
     pub(crate) fn index(self) -> usize {
         self as usize
     }
 
-    fn mask(self) -> u8 {
+    fn mask(self) -> Membership {
         1 << self.index()
     }
 
@@ -101,6 +142,16 @@ impl Operation {
             Self::Pushn => "String.Internal.pushn",
             Self::Foldl => "String.Internal.foldl",
             Self::IsEmpty => "String.Internal.isEmpty",
+            Self::InternalGet => "String.Internal.get",
+            Self::RawGet => "String.Pos.Raw.get",
+            Self::RawSet => "String.Pos.Raw.set",
+            Self::DecodeChar => "String.decodeChar",
+            Self::GetUtf8Byte => "String.getUTF8Byte",
+            Self::RawNextFast => "String.Pos.Raw.next'",
+            Self::RawExtract => "String.Pos.Raw.extract",
+            Self::PosSet => "String.Pos.set",
+            Self::PosExtract => "String.extract",
+            Self::ToList => "String.toList",
         }
     }
 
@@ -114,29 +165,80 @@ impl Operation {
             .find(|operation| requested == &operation.source_name())
     }
 
-    pub(crate) fn domains(self) -> &'static [Domain] {
-        use Domain::{Char, Nat, Position, String, StringCallback};
+    /// The generated census row's declaration kind and defining module.
+    pub(crate) fn declaration(self) -> (&'static str, &'static str) {
         match self {
-            Self::ByteSize | Self::IsEmpty => &[String],
-            Self::PosOf => &[String, Char],
-            Self::OffsetOfPos | Self::Next => &[String, Position],
-            Self::Extract => &[String, Position, Position],
-            Self::Pushn => &[String, Char, Nat],
-            Self::Foldl => &[StringCallback, String, String],
+            Self::ByteSize => ("defn", "Init.Prelude"),
+            Self::PosOf
+            | Self::OffsetOfPos
+            | Self::Extract
+            | Self::Next
+            | Self::Pushn
+            | Self::Foldl
+            | Self::IsEmpty
+            | Self::InternalGet => ("opaque", "Init.Data.String.Bootstrap"),
+            Self::RawGet
+            | Self::DecodeChar
+            | Self::RawNextFast
+            | Self::RawExtract
+            | Self::PosExtract
+            | Self::ToList => ("defn", "Init.Data.String.Basic"),
+            Self::GetUtf8Byte => ("defn", "Init.Data.String.PosRaw"),
+            Self::RawSet | Self::PosSet => ("defn", "Init.Data.String.Modify"),
         }
     }
 
+    /// The checked telescope, in source order. Proofs are logical arguments
+    /// that the native row does not receive.
+    pub(crate) fn domains(self) -> &'static [Domain] {
+        use Domain::{Char, Nat, Position, Proof, String, StringCallback, StringPosition};
+        match self {
+            Self::ByteSize | Self::IsEmpty | Self::ToList => &[String],
+            Self::PosOf => &[String, Char],
+            Self::OffsetOfPos | Self::Next | Self::InternalGet | Self::RawGet => {
+                &[String, Position]
+            }
+            Self::Extract | Self::RawExtract => &[String, Position, Position],
+            Self::Pushn => &[String, Char, Nat],
+            Self::Foldl => &[StringCallback, String, String],
+            Self::RawSet => &[String, Position, Char],
+            Self::DecodeChar => &[String, Nat, Proof],
+            Self::GetUtf8Byte | Self::RawNextFast => &[String, Position, Proof],
+            Self::PosSet => &[String, StringPosition, Char, Proof],
+            Self::PosExtract => &[String, StringPosition, StringPosition],
+        }
+    }
+
+    /// Whether the adapter's binders follow the declaration's own dependent
+    /// telescope. The original rows keep their closed source types.
+    pub(crate) fn dependent(self) -> bool {
+        self.domains()
+            .iter()
+            .any(|domain| matches!(domain, Domain::StringPosition | Domain::Proof))
+    }
+
+    /// Whether the adapter reads or rebuilds a record whose proof field it
+    /// erases to the checked `Bool` placeholder: `Char`, `UInt8`, `String.Pos`.
     #[cfg(test)]
     pub(crate) fn uses_character(self) -> bool {
-        matches!(self, Self::PosOf | Self::Pushn | Self::Foldl)
+        matches!(self, Self::PosOf | Self::Pushn | Self::Foldl) || self >= Self::InternalGet
     }
 
     pub(crate) fn result(self) -> Domain {
         match self {
             Self::ByteSize | Self::OffsetOfPos => Domain::Nat,
-            Self::PosOf | Self::Next => Domain::Position,
-            Self::Extract | Self::Pushn | Self::Foldl => Domain::String,
+            Self::PosOf | Self::Next | Self::RawNextFast => Domain::Position,
+            Self::Extract
+            | Self::Pushn
+            | Self::Foldl
+            | Self::RawSet
+            | Self::RawExtract
+            | Self::PosSet
+            | Self::PosExtract => Domain::String,
             Self::IsEmpty => Domain::Bool,
+            Self::InternalGet | Self::RawGet | Self::DecodeChar => Domain::Char,
+            Self::GetUtf8Byte => Domain::Byte,
+            Self::ToList => Domain::CharList,
         }
     }
 
@@ -173,7 +275,7 @@ fn dependency_name(
     Ok(result)
 }
 
-fn inventory_row(line: &str) -> (u8, &str, &str) {
+fn inventory_row(line: &str) -> (Membership, &str, &str) {
     let (mask, rest) = line
         .split_once('\t')
         .expect("fixed String bootstrap membership");
@@ -181,10 +283,27 @@ fn inventory_row(line: &str) -> (u8, &str, &str) {
         .split_once('\t')
         .expect("fixed String bootstrap dependency");
     (
-        u8::from_str_radix(mask, 16).expect("fixed String bootstrap membership bits"),
+        Membership::from_str_radix(mask, 16).expect("fixed String bootstrap membership bits"),
         encoded,
         digest,
     )
+}
+
+/// The inventory's spelling of a name, for comparing a row without decoding it.
+fn encoded_name(label: &Name) -> String {
+    use fln_core::name::LeafView;
+    let mut components = Vec::new();
+    let mut current = label.clone();
+    loop {
+        match current.leaf_view() {
+            LeafView::Anonymous => break,
+            LeafView::Str(text) => components.push(format!("s:{text}")),
+            LeafView::Num(number) => components.push(format!("n:{number}")),
+        }
+        current = current.parent();
+    }
+    components.reverse();
+    components.join("/")
 }
 
 pub(crate) fn contract_matches(
@@ -199,6 +318,7 @@ pub(crate) fn contract_matches(
     if !extern_attribute_matches(environment, &requested, true, externs, visited, limits)? {
         return Ok(false);
     }
+    let root = encoded_name(&requested);
     let mut root_seen = false;
     for (index, line) in DEPENDENCIES.lines().enumerate() {
         charge_catalog_node(visited, limits)?;
@@ -206,17 +326,19 @@ pub(crate) fn contract_matches(
         if mask & operation.mask() == 0 {
             continue;
         }
-        let dependency = dependency_name(encoded, visited, limits)?;
-        root_seen |= dependency == requested;
+        root_seen |= encoded == root;
         let checked = verified
             .0
             .get_mut(index)
             .ok_or(IngressError::UnsupportedNode {
                 kind: "String bootstrap dependency inventory length",
             })?;
+        // A row another operation already proved is charged, not re-decoded:
+        // a Basic-level closure shares thousands of rows with its siblings.
         if *checked {
             continue;
         }
+        let dependency = dependency_name(encoded, visited, limits)?;
         if environment
             .entry(&dependency)
             .is_none_or(|entry| entry.digest().to_hex() != digest)

@@ -6384,10 +6384,23 @@ fn dispatch_intrinsic(
             expect_arity(row, args, 2)?;
             let bytes = string_bytes(&args[0], "String.next", 0)?;
             match nat_as_usize(&args[1], "String.next", 1)? {
-                None => Ok(IntrinsicResult::owned(args[1].clone_ref())),
-                Some(index) if index >= bytes.len() => {
-                    Ok(IntrinsicResult::owned(args[1].clone_ref()))
+                // The pin adds one at arbitrary precision; positions beyond
+                // the machine word are outside this VM's Nat ceiling.
+                None => Err(VmRefusal::NatOverflow {
+                    operation: "String.next",
                 }
+                .into()),
+                // `lean_string_utf8_next` (`object.cpp:2329`) answers `i + 1`
+                // at and past the end: the default Char is one byte wide.
+                Some(index) if index >= bytes.len() => index
+                    .checked_add(1)
+                    .map(|next| IntrinsicResult::owned(nat_from_u64(next as u64)))
+                    .ok_or_else(|| {
+                        VmRefusal::NatOverflow {
+                            operation: "String.next",
+                        }
+                        .into()
+                    }),
                 Some(index) => {
                     let next = index + utf8_first_byte_width(bytes[index]);
                     Ok(IntrinsicResult::owned(Obj::mk_nat(next)))
@@ -8581,9 +8594,15 @@ mod tests {
             owned_usize(invoke("extern:String.next", &[text.clone_ref(), n(1)])),
             3
         );
+        // At the end the pin advances by the default Char's one byte
+        // (`object.cpp:2341`; the pin's `("héllo".next ⟨6⟩).byteIdx` is 7).
         assert_eq!(
             owned_usize(invoke("extern:String.next", &[text.clone_ref(), n(6)])),
-            6
+            7
+        );
+        assert_eq!(
+            owned_usize(invoke("extern:String.next", &[text.clone_ref(), n(99)])),
+            100
         );
         assert_eq!(
             owned_usize(invoke("extern:String.prev", &[text.clone_ref(), n(3)])),
@@ -8598,6 +8617,127 @@ mod tests {
             owned_usize(invoke("extern:String.prev", &[text, n(99)])),
             98
         );
+    }
+
+    /// Every value is the pinned v4.32.0 runtime's own answer, measured with
+    /// `#eval`/`#eval!` over the same string and positions.
+    #[test]
+    fn positioned_string_rows_port_the_pin_runtime() {
+        // "aλ😀z": a@0, λ@1..3 (CE BB), 😀@3..7 (F0 9F 98 80), z@7; size 8.
+        let text = || s("aλ😀z");
+        let big = || Obj::mk_mpz(&[0, 64], false);
+        for row in [
+            "extern:String.Pos.Raw.get",
+            "extern:String.Internal.get",
+            "extern:String.get",
+        ] {
+            let got: Vec<usize> = (0..10)
+                .map(|index| owned_usize(invoke(row, &[text(), n(index)])))
+                .collect();
+            assert_eq!(
+                got,
+                [97, 955, 65, 128_512, 65, 65, 65, 122, 65, 65],
+                "{row}"
+            );
+            assert_eq!(owned_usize(invoke(row, &[text(), big()])), 65, "{row}");
+        }
+        for row in [
+            "extern:String.decodeChar",
+            "extern:String.Pos.Raw.get'",
+            "extern:String.get'",
+        ] {
+            let got: Vec<usize> = (0..9)
+                .map(|index| owned_usize(invoke(row, &[text(), n(index)])))
+                .collect();
+            // The terminator itself is a defined read; it decodes to '\0'.
+            assert_eq!(got, [97, 955, 65, 128_512, 65, 65, 65, 122, 0], "{row}");
+        }
+        for row in [
+            "extern:String.getUTF8Byte",
+            "extern:String.getUtf8Byte",
+            "extern:String.Internal.getUTF8Byte",
+        ] {
+            let got: Vec<usize> = (0..9)
+                .map(|index| owned_usize(invoke(row, &[text(), n(index)])))
+                .collect();
+            assert_eq!(got, [97, 206, 187, 240, 159, 152, 128, 122, 0], "{row}");
+        }
+        for row in [
+            "extern:String.Pos.Raw.next'",
+            "extern:String.next'",
+            "extern:String.Pos.next",
+        ] {
+            let got: Vec<usize> = (0..9)
+                .map(|index| owned_usize(invoke(row, &[text(), n(index)])))
+                .collect();
+            assert_eq!(got, [1, 3, 3, 7, 5, 6, 7, 8, 9], "{row}");
+        }
+        // Past the terminator the pin reads out of bounds: undefined there,
+        // a typed range refusal here, for a word or a non-scalar position.
+        for row in [
+            "extern:String.decodeChar",
+            "extern:String.getUTF8Byte",
+            "extern:String.Pos.Raw.next'",
+        ] {
+            assert_eq!(
+                invoke(row, &[text(), n(9)]).map(|_| ()),
+                Err(VmRefusal::ArrayIndexOutOfBounds { index: 9, size: 9 }),
+                "{row}"
+            );
+            assert!(
+                matches!(
+                    invoke(row, &[text(), big()]),
+                    Err(VmRefusal::ArrayIndexOutOfBounds { size: 9, .. })
+                ),
+                "{row}"
+            );
+        }
+        for row in [
+            "extern:String.Pos.Raw.set",
+            "extern:String.set",
+            "extern:String.Pos.set",
+        ] {
+            let set = |index: Obj, character: char| {
+                owned_string(invoke(row, &[text(), index, n(character as usize)]))
+            };
+            let got: Vec<String> = (0..10).map(|index| set(n(index), 'X')).collect();
+            assert_eq!(
+                got,
+                [
+                    "Xλ😀z", "aX😀z", "aλ😀z", "aλXz", "aλ😀z", "aλ😀z", "aλ😀z", "aλ😀X", "aλ😀z",
+                    "aλ😀z"
+                ],
+                "{row}"
+            );
+            assert_eq!(set(n(3), 'é'), "aλéz", "{row}");
+            assert_eq!(set(n(0), '😀'), "😀λ😀z", "{row}");
+            assert_eq!(set(n(7), 'λ'), "aλ😀λ", "{row}");
+            assert_eq!(set(big(), 'X'), "aλ😀z", "{row}");
+            assert_eq!(
+                invoke(row, &[text(), n(1), n(0xD800)]).map(|_| ()),
+                Err(VmRefusal::NatOverflow {
+                    operation: "String.Pos.Raw.set"
+                }),
+                "{row}"
+            );
+        }
+    }
+
+    #[test]
+    fn string_data_lists_scalars_with_compiled_list_constructors() {
+        for row in ["extern:String.toList", "extern:String.data"] {
+            let mut cell = invoke(row, &[s("aλ😀z")]).expect("the intrinsic answers");
+            let mut scalars = Vec::new();
+            while value_kind(&cell) == ValueKind::Ctor(1) {
+                scalars.push(owned_usize(Ok(cell.ctor_child(0))));
+                cell = cell.ctor_child(1);
+            }
+            assert_eq!(scalars, [97, 955, 128_512, 122], "{row}");
+            assert_eq!(value_kind(&cell), ValueKind::Ctor(0), "{row}");
+            assert_eq!(cell.header().other, 0, "{row}: List.nil is fieldless");
+            let empty = invoke(row, &[s("")]).expect("the intrinsic answers");
+            assert_eq!(value_kind(&empty), ValueKind::Ctor(0), "{row}");
+        }
     }
 
     #[test]
@@ -8780,6 +8920,23 @@ mod tests {
             "extern:String.next",
             "extern:String.prev",
             "extern:String.push",
+            "extern:String.Internal.get",
+            "extern:String.Pos.Raw.get",
+            "extern:String.get",
+            "extern:String.decodeChar",
+            "extern:String.Pos.Raw.get'",
+            "extern:String.get'",
+            "extern:String.getUTF8Byte",
+            "extern:String.getUtf8Byte",
+            "extern:String.Internal.getUTF8Byte",
+            "extern:String.Pos.Raw.next'",
+            "extern:String.next'",
+            "extern:String.Pos.next",
+            "extern:String.Pos.Raw.set",
+            "extern:String.set",
+            "extern:String.Pos.set",
+            "extern:String.toList",
+            "extern:String.data",
         ];
         for row in rows {
             assert_ne!(
