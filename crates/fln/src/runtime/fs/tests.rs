@@ -158,6 +158,42 @@ fn activate_source_metadata(
         "the actual output-marker reducibility journal"
     );
     let mut activation = imported::ImportActivation::new(environment);
+    if module == "Init/Prelude" {
+        // Array observers now validate their complete execution dependencies.
+        // Keep the observers themselves unregistered here: each filesystem
+        // fixture still controls their presence and its wrong-provider tests.
+        let dependencies = ["Array.mk", "Array.toList", "Nat.add", "Nat.beq", "Nat.pred"].map(name);
+        let rows: Vec<_> = decoded
+            .externs
+            .into_iter()
+            .filter(|row| dependencies.contains(&row.declaration))
+            .collect();
+        assert_eq!(
+            rows.len(),
+            dependencies.len(),
+            "actual Array dependency externs"
+        );
+        for row in rows {
+            use fln_elab::externs::ExternEntry;
+            let entries = row
+                .entries
+                .into_iter()
+                .map(|entry| match entry {
+                    metadata::ExternEntry::Adhoc { backend } => ExternEntry::Adhoc { backend },
+                    metadata::ExternEntry::Inline { backend, pattern } => {
+                        ExternEntry::Inline { backend, pattern }
+                    }
+                    metadata::ExternEntry::Standard { backend, symbol } => {
+                        ExternEntry::Standard { backend, symbol }
+                    }
+                    metadata::ExternEntry::Opaque => ExternEntry::Opaque,
+                })
+                .collect();
+            activation = activation
+                .register_extern(&row.declaration, entries)
+                .unwrap();
+        }
+    }
     for row in reducibility {
         use fln_elab::reducibility::Reducibility;
         // The pin's markers are ordinary definitions with imported reducible
