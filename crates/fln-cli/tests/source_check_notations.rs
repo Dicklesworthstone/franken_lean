@@ -257,7 +257,7 @@ fn an_application_an_undecided_notation_may_print_is_refused() {
 
 #[test]
 fn a_section_capture_never_resolves_to_an_unrelated_global() {
-    let Some(lib) = pinned_lib() else { return };
+    let lib = pinned_lib().expect("the pinned Reference is required for the capture comparison");
     let root = workspace();
     let source = "prelude\nimport Init.Core\ndef x : Nat := 1\nsection\nvariable (x : Nat)\nnotation \"capturedValue!\" => x\nend\n#check capturedValue!\n";
     let (code, stdout, stderr) = ours(&lib, &root, source);
@@ -267,10 +267,10 @@ fn a_section_capture_never_resolves_to_an_unrelated_global() {
         stderr.contains("quotation capture of a section variable"),
         "{stderr}"
     );
-    if let Some((code, output)) = pinned(&lib, &root.join("Notations.lean")) {
-        assert_eq!(code, 1, "{output}");
-        assert!(output.contains("Unknown constant"), "{output}");
-    }
+    let (code, output) = pinned(&lib, &root.join("Notations.lean"))
+        .expect("the pinned Reference binary is required for the capture comparison");
+    assert_eq!(code, 1, "{output}");
+    assert!(output.contains("Unknown constant"), "{output}");
 }
 
 #[test]
@@ -288,13 +288,34 @@ fn upstream_notation_printing_regressions_match_the_pin() {
     let records = root.join("records");
     std::fs::create_dir(&records).unwrap();
     let cases = [
-        ("1367", include_str!("../../../vendor/lean4-src/tests/elab/1367.lean")),
-        ("2045", include_str!("../../../vendor/lean4-src/tests/elab/2045.lean")),
-        ("469", include_str!("../../../vendor/lean4-src/tests/elab/469.lean")),
-        ("constDelab", include_str!("../../../vendor/lean4-src/tests/elab/constDelab.lean")),
-        ("scopedParsers", include_str!("../../../vendor/lean4-src/tests/elab/scopedParsers.lean")),
-        ("infixprio", include_str!("../../../vendor/lean4-src/tests/elab/infixprio.lean")),
-        ("localParsers", include_str!("../../../vendor/lean4-src/tests/elab/localParsers.lean")),
+        (
+            "1367",
+            include_str!("../../../vendor/lean4-src/tests/elab/1367.lean"),
+        ),
+        (
+            "2045",
+            include_str!("../../../vendor/lean4-src/tests/elab/2045.lean"),
+        ),
+        (
+            "469",
+            include_str!("../../../vendor/lean4-src/tests/elab/469.lean"),
+        ),
+        (
+            "constDelab",
+            include_str!("../../../vendor/lean4-src/tests/elab/constDelab.lean"),
+        ),
+        (
+            "scopedParsers",
+            include_str!("../../../vendor/lean4-src/tests/elab/scopedParsers.lean"),
+        ),
+        (
+            "infixprio",
+            include_str!("../../../vendor/lean4-src/tests/elab/infixprio.lean"),
+        ),
+        (
+            "localParsers",
+            include_str!("../../../vendor/lean4-src/tests/elab/localParsers.lean"),
+        ),
     ];
     for (name, source) in cases {
         let entry = root.join(format!("{name}.lean"));
@@ -318,4 +339,34 @@ fn upstream_notation_printing_regressions_match_the_pin() {
         assert!(native.stderr.is_empty(), "{name}: {native:?}");
         assert_eq!(std::fs::read_to_string(&entry).unwrap(), source);
     }
+    // Preserve the original false-accept witness too, with its polymorphic
+    // section variable and escaping uses. Until lexical capture is supported,
+    // the native command must give a typed non-answer before printing a global.
+    let source = include_str!("../../../vendor/lean4-src/tests/elab_fail/255.lean");
+    let entry = root.join("255.lean");
+    std::fs::write(&entry, source).unwrap();
+    eprintln!("upstream notation comparison: elab_fail/255.lean");
+    let oracle = Command::new(&reference)
+        .arg(&entry)
+        .env("LEAN_PATH", &lib)
+        .output()
+        .unwrap();
+    assert_eq!(oracle.status.code(), Some(1), "{oracle:?}");
+    assert!(
+        String::from_utf8_lossy(&oracle.stdout).contains("Unknown constant"),
+        "{oracle:?}"
+    );
+    let native = Command::new(env!("CARGO_BIN_EXE_lean"))
+        .arg(&entry)
+        .env("LEAN_PATH", &lib)
+        .env("FLN_IMPORT_REUSE_DIR", &records)
+        .output()
+        .unwrap();
+    assert_eq!(native.status.code(), Some(5), "{native:?}");
+    assert!(native.stdout.is_empty(), "{native:?}");
+    assert!(
+        String::from_utf8_lossy(&native.stderr).contains("quotation capture of a section variable"),
+        "{native:?}"
+    );
+    assert_eq!(std::fs::read_to_string(&entry).unwrap(), source);
 }
