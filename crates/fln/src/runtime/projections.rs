@@ -606,6 +606,15 @@ impl Preparation<'_> {
                                 // parameters still refer to an existential type field.
                                 // Select the uniform layout before discarding that context.
                                 let runtime_type = self.erase_hidden_types(&type_, &locals)?;
+                                if let Some(factory) = self.string_byte_projection_factory(
+                                    &runtime_type,
+                                    struct_name,
+                                    *idx,
+                                )? {
+                                    tasks.push(ProjectionFrame::NativeField(factory));
+                                    tasks.push(ProjectionFrame::Visit(receiver.clone()));
+                                    continue;
+                                }
                                 if let Some(factory) =
                                     self.thunk_projection_factory(&runtime_type, struct_name, *idx)?
                                 {

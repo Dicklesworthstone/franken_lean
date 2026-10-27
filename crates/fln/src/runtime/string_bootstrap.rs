@@ -26,6 +26,7 @@ pub(super) struct Store {
     position: Option<(Name, Name)>,
     string_position: Option<(Name, Name)>,
     byte: Option<[Name; 3]>,
+    byte_view: Option<Expr>,
     verified: string_bootstrap::VerifiedDependencies,
 }
 
@@ -398,6 +399,135 @@ impl Preparation<'_> {
         ))
     }
 
+    /// A native String has no logical constructor fields. Materialize its
+    /// byte view with the verified byte-size and byte-read rows, then rebuild
+    /// ByteArray/Array/List/UInt8 using their checked constructors. The String
+    /// and its size are each evaluated once. The recursive continuation
+    /// visits n-1 .. 0 and prepends, preserving byte order without a second
+    /// buffer or quadratic list append.
+    fn string_byte_view(&mut self) -> Result<Option<Expr>, IngressError> {
+        self.tick()?;
+        if let Some(adapter) = &self.string_bootstrap.byte_view {
+            return Ok(Some(adapter.clone()));
+        }
+        for operation in [Operation::ByteSize, Operation::InternalGetUtf8Byte] {
+            // ByteSize's exact dependency closure includes String.toByteArray
+            // and its selected extern. The byte reader also binds the actual
+            // UInt8 representation; a foreign root or helper never acquires
+            // authority merely because its name resembles this projection.
+            if !string_bootstrap::contract_matches(
+                self.environment,
+                operation,
+                &mut self.string_bootstrap.verified,
+                &mut self.externs,
+                &mut self.visited,
+                self.limits,
+            )? {
+                return Ok(None);
+            }
+            self.string_bootstrap_bind(operation)?;
+        }
+        let bytes = self.io_checked_shape(c("ByteArray"))?;
+        let [bytes_ctor] = bytes.constructors.as_slice() else {
+            return Err(unsupported("String byte view ByteArray constructor"));
+        };
+        if bytes_ctor.tag != 0 || bytes_ctor.fields.len() != 1 {
+            return Err(unsupported("String byte view ByteArray fields"));
+        }
+        let array = self.io_checked_shape(bytes_ctor.fields[0].clone())?;
+        let [array_ctor] = array.constructors.as_slice() else {
+            return Err(unsupported("String byte view Array constructor"));
+        };
+        if array_ctor.tag != 0 || array_ctor.fields.len() != 1 {
+            return Err(unsupported("String byte view Array fields"));
+        }
+        let list = self.io_checked_shape(array_ctor.fields[0].clone())?;
+        if list.constructors.len() != 2
+            || list.constructors[0].tag != 0
+            || !list.constructors[0].fields.is_empty()
+            || list.constructors[1].tag != 1
+            || list.constructors[1].fields != [c("UInt8"), list.source.clone()]
+        {
+            return Err(unsupported("String byte view checked list layout"));
+        }
+        // Inside the successor: #0=accumulator, #1=IH, #2=index,
+        // #3=size, #4=String. Every index is below the captured byte size,
+        // so the proof-erased native read cannot reach the trailing NUL.
+        let read = Expr::app(
+            Expr::app(
+                Expr::const_(Operation::InternalGetUtf8Byte.primitive(), vec![]),
+                b(4)?,
+            ),
+            b(2)?,
+        );
+        let byte = self.string_bootstrap_byte_from_scalar(read)?;
+        let cons = Expr::app(
+            Expr::app(
+                Expr::const_(list.constructors[1].name.clone(), vec![]),
+                byte,
+            ),
+            b(0)?,
+        );
+        let accumulator = function(std::slice::from_ref(&list.source), list.source.clone());
+        let lambda = |domain, body| Expr::lam(Name::anonymous(), domain, body, BinderInfo::Default);
+        let step = lambda(
+            c("Nat"),
+            lambda(
+                accumulator.clone(),
+                lambda(list.source.clone(), Expr::app(b(1)?, cons)),
+            ),
+        );
+        let values = [
+            lambda(c("Nat"), accumulator),
+            lambda(list.source.clone(), b(0)?),
+            step,
+            b(0)?,
+            Expr::const_(list.constructors[0].name.clone(), vec![]),
+        ]
+        .into_iter()
+        .fold(Expr::const_(name("Nat.rec"), vec![Level::one()]), Expr::app);
+        let result = Expr::app(
+            Expr::const_(bytes_ctor.name.clone(), vec![]),
+            Expr::app(Expr::const_(array_ctor.name.clone(), vec![]), values),
+        );
+        let body = Expr::let_e(
+            self.string_bootstrap_adapter_name()?,
+            c("Nat"),
+            Expr::app(Expr::const_(Operation::ByteSize.primitive(), vec![]), b(0)?),
+            result,
+            false,
+        );
+        let adapter = Expr::let_e(
+            self.string_bootstrap_adapter_name()?,
+            function(&[c("String")], c("ByteArray")),
+            lambda(c("String"), body),
+            b(0)?,
+            false,
+        );
+        self.string_bootstrap.byte_view = Some(adapter.clone());
+        Ok(Some(adapter))
+    }
+
+    pub(super) fn string_byte_projection_factory(
+        &mut self,
+        receiver_type: &Expr,
+        family: &Name,
+        index: u64,
+    ) -> Result<Option<Expr>, IngressError> {
+        if family != &name("String") || index != 0 || receiver_type != &c("String") {
+            return Ok(None);
+        }
+        // Keep the ordinary family/telescope validation before replacing a
+        // field access, including for unchecked direct ingress callers.
+        let Some((_, field)) = self.projection_slot(receiver_type, family, index)? else {
+            return Ok(None);
+        };
+        if field != c("ByteArray") {
+            return Err(unsupported("String byte view projection result"));
+        }
+        self.string_byte_view()
+    }
+
     /// The binder types of a dependent adapter, and its own type, follow the
     /// checked declaration's telescope: a `String.Pos` mentions the earlier
     /// String. Indices line up because the adapter's lambdas bind the
@@ -468,6 +598,14 @@ impl Preparation<'_> {
         else {
             return Ok(None);
         };
+        if requested == &name("String.toByteArray") && levels.is_empty() && arguments.len() <= 1 {
+            if let Some(replacement) = self.implemented_by_call(head, arguments)? {
+                return Ok(Some(replacement));
+            }
+            return Ok(self
+                .string_byte_view()?
+                .map(|adapter| arguments.iter().cloned().fold(adapter, Expr::app)));
+        }
         let Some(operation) = Operation::from_name(requested) else {
             return Ok(None);
         };
