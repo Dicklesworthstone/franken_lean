@@ -2184,3 +2184,257 @@ jobs:
           path: ${{ runner.temp }}/std-metadata-measurement.log
           retention-days: 14
           if-no-files-found: warn
+
+  std-metadata-default:
+    if: >-
+      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(import): validate measured Std defaults and trace remaining source failures'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: write
+    env:
+      CARGO_TERM_COLOR: never
+      CARGO_INCREMENTAL: '0'
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Install the repository-pinned Rust toolchain
+        run: rustup show active-toolchain
+      - name: Install and verify the SUITE.lock Reference
+        shell: bash
+        run: |
+          set -euo pipefail
+          tool_root="$RUNNER_TEMP/string-source-elan-bin"
+          archive="$RUNNER_TEMP/string-source-elan.tar.gz"
+          mkdir "$tool_root"
+          curl --user-agent 'franken_lean-agent (+https://github.com/Dicklesworthstone/franken_lean)' \
+            --fail --location --retry 3 --output "$archive" \
+            https://github.com/leanprover/elan/releases/download/v4.2.1/elan-x86_64-unknown-linux-gnu.tar.gz
+          printf '%s  %s\n' \
+            4e717523217af592fa2d7b9c479410a31816c065d66ccbf0c2149337cfec0f5c \
+            "$archive" | sha256sum --check
+          tar -xzf "$archive" -C "$tool_root"
+          export ELAN_HOME="$RUNNER_TEMP/string-source-elan"
+          "$tool_root/elan-init" -y --no-modify-path --default-toolchain none
+          export PATH="$ELAN_HOME/bin:$PATH"
+          mapfile -t reference_rows < <(grep -E '^reference ' SUITE.lock)
+          test "${#reference_rows[@]}" -eq 1
+          pin_tag="$(sed -nE 's/.* tag=([^ ]+).*/\1/p' <<<"${reference_rows[0]}")"
+          pin_commit="$(sed -nE 's/.* commit=([0-9a-f]{40}).*/\1/p' <<<"${reference_rows[0]}")"
+          [[ "$pin_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$ ]]
+          test -n "$pin_commit"
+          elan toolchain install "leanprover/lean4:$pin_tag"
+          elan default "leanprover/lean4:$pin_tag"
+          toolchain_root="$ELAN_HOME/toolchains/leanprover--lean4---$pin_tag"
+          test "$("$toolchain_root/bin/lean" --githash)" = "$pin_commit"
+          for suffix in olean olean.server olean.private; do
+            test -s "$toolchain_root/lib/lean/Init/Prelude.$suffix"
+            test -s "$toolchain_root/lib/lean/Init/Data/Repr.$suffix"
+          done
+          printf 'ELAN_HOME=%s\nFLN_REFERENCE_LIB=%s/lib/lean\nFLN_REFERENCE_LEAN=%s/bin/lean\nFLN_REQUIRE_REFERENCE=1\n' \
+            "$ELAN_HOME" "$toolchain_root" "$toolchain_root" >> "$GITHUB_ENV"
+          printf '%s\n' "$ELAN_HOME/bin" >> "$GITHUB_PATH"
+      - name: Materialize the exact measured Std limit candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: python
+        run: |
+          import base64, hashlib, json, os, pathlib, urllib.request
+          changes = {"crates/fln/src/source_check/modules/imported.rs":["04a1f57280c801e426c6b23a921586df99e51b00","b4f6a5173e3182efbb7d102425c529938fc76f3a"]}
+          api = 'https://api.github.com/repos/Dicklesworthstone/franken_lean'
+          headers = {
+              'Accept': 'application/vnd.github+json',
+              'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
+              'User-Agent': 'franken_lean-agent (+https://github.com/Dicklesworthstone/franken_lean)',
+          }
+          def blob(data):
+              return hashlib.sha1(('blob ' + str(len(data)) + '\0').encode() + data).hexdigest()
+          for path, (before, after) in changes.items():
+              file = pathlib.Path(path)
+              assert not file.is_symlink() and blob(file.read_bytes()) == before, path
+              request = urllib.request.Request(api + '/git/blobs/' + after, headers=headers)
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  record = json.load(response)
+              assert record['encoding'] == 'base64' and record['sha'] == after
+              data = base64.b64decode(record['content'])
+              assert blob(data) == after, path
+              file.write_bytes(data)
+          (pathlib.Path(os.environ['RUNNER_TEMP']) / 'std-default-candidate.json').write_text(json.dumps(changes))
+      - name: Check real Std metadata, retry behavior and String integration
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustfmt --edition 2024 --config skip_children=true --check crates/fln/src/source_check/modules/imported.rs
+          git diff --check
+          cargo test --locked -p fln-admission --no-fail-fast
+          cargo test --locked -p fln --lib source_check::modules::reuse -- --test-threads=1
+          cargo test --locked -p fln --lib metadata_preflight -- --test-threads=1
+          cargo test --locked -p fln --test source_olean_instances -- --test-threads=1
+          cargo test --locked -p fln --lib string_byte_view -- --test-threads=1
+          cargo test --locked -p fln --test runtime_imported_string_from_bytes -- --test-threads=1
+          cargo clippy --locked -p fln-admission -p fln --all-targets -- -D warnings
+          cargo check --locked --workspace --all-targets
+      - name: Expose only the exact successfully checked source blobs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: python
+        run: |
+          import base64, hashlib, json, os, pathlib, subprocess, urllib.request
+          changes = json.loads((pathlib.Path(os.environ['RUNNER_TEMP']) / 'std-default-candidate.json').read_text())
+          changed = subprocess.check_output(['git', 'diff', '--name-only'], text=True).splitlines()
+          assert sorted(changed) == sorted(changes), changed
+          result = {}
+          for path, (before, candidate) in changes.items():
+              data = pathlib.Path(path).read_bytes()
+              expected = hashlib.sha1(('blob ' + str(len(data)) + '\0').encode() + data).hexdigest()
+              request = urllib.request.Request(
+                  'https://api.github.com/repos/Dicklesworthstone/franken_lean/git/blobs',
+                  data=json.dumps({'content': base64.b64encode(data).decode('ascii'), 'encoding': 'base64'}).encode(),
+                  headers={
+                      'Accept': 'application/vnd.github+json',
+                      'Content-Type': 'application/json',
+                      'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
+                      'User-Agent': 'franken_lean-agent (+https://github.com/Dicklesworthstone/franken_lean)',
+                  })
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  stored = json.load(response)
+              assert stored['sha'] == expected, path
+              result[path] = {'before': before, 'candidate': candidate, 'verified': expected}
+          print('STD_DEFAULT_VERIFIED=' + json.dumps({
+              'base': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),
+              'files': result,
+          }), flush=True)
+
+  # Diagnostic traces do not change a limit or publish implementation files.
+  source-node-diagnostic:
+    if: >-
+      github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'test(import): validate measured Std defaults and trace remaining source failures'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_TERM_COLOR: never
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_RELEASE_DEBUG: '1'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Install the repository-pinned Rust toolchain
+        run: rustup show active-toolchain
+      - name: Install and verify the SUITE.lock Reference
+        shell: bash
+        run: |
+          set -euo pipefail
+          tool_root="$RUNNER_TEMP/string-source-elan-bin"
+          archive="$RUNNER_TEMP/string-source-elan.tar.gz"
+          mkdir "$tool_root"
+          curl --user-agent 'franken_lean-agent (+https://github.com/Dicklesworthstone/franken_lean)' \
+            --fail --location --retry 3 --output "$archive" \
+            https://github.com/leanprover/elan/releases/download/v4.2.1/elan-x86_64-unknown-linux-gnu.tar.gz
+          printf '%s  %s\n' \
+            4e717523217af592fa2d7b9c479410a31816c065d66ccbf0c2149337cfec0f5c \
+            "$archive" | sha256sum --check
+          tar -xzf "$archive" -C "$tool_root"
+          export ELAN_HOME="$RUNNER_TEMP/string-source-elan"
+          "$tool_root/elan-init" -y --no-modify-path --default-toolchain none
+          export PATH="$ELAN_HOME/bin:$PATH"
+          mapfile -t reference_rows < <(grep -E '^reference ' SUITE.lock)
+          test "${#reference_rows[@]}" -eq 1
+          pin_tag="$(sed -nE 's/.* tag=([^ ]+).*/\1/p' <<<"${reference_rows[0]}")"
+          pin_commit="$(sed -nE 's/.* commit=([0-9a-f]{40}).*/\1/p' <<<"${reference_rows[0]}")"
+          [[ "$pin_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$ ]]
+          test -n "$pin_commit"
+          elan toolchain install "leanprover/lean4:$pin_tag"
+          elan default "leanprover/lean4:$pin_tag"
+          toolchain_root="$ELAN_HOME/toolchains/leanprover--lean4---$pin_tag"
+          test "$("$toolchain_root/bin/lean" --githash)" = "$pin_commit"
+          for suffix in olean olean.server olean.private; do
+            test -s "$toolchain_root/lib/lean/Init/Prelude.$suffix"
+            test -s "$toolchain_root/lib/lean/Init/Data/Repr.$suffix"
+          done
+          printf 'ELAN_HOME=%s\nFLN_REFERENCE_LIB=%s/lib/lean\nFLN_REFERENCE_LEAN=%s/bin/lean\nFLN_REQUIRE_REFERENCE=1\n' \
+            "$ELAN_HOME" "$toolchain_root" "$toolchain_root" >> "$GITHUB_ENV"
+          printf '%s\n' "$ELAN_HOME/bin" >> "$GITHUB_PATH"
+      - name: Trace producer node exhaustion in this temporary candidate copy
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/node-diagnostic.patch" <<'PATCH'
+          diff --git a/crates/fln/src/runtime.rs b/crates/fln/src/runtime.rs
+          --- a/crates/fln/src/runtime.rs
+          +++ b/crates/fln/src/runtime.rs
+          @@ -233,3 +233,18 @@
+          +    #[track_caller]
+               fn tick(&mut self) -> Result<(), IngressError> {
+          +        if self.visited >= self.limits.max_nodes {
+          +            eprintln!(
+          +                "FLN_PREPARATION_NODE_LIMIT visited={} limit={} instances={} lambdas={} cases={} data_shapes={} caller={}",
+          +                self.visited,
+          +                self.limits.max_nodes,
+          +                self.specializations.instances.len(),
+          +                self.lambdas.len(),
+          +                self.cases.len(),
+          +                self.data_shapes.len(),
+          +                std::panic::Location::caller(),
+          +            );
+          +            eprintln!("{}", std::backtrace::Backtrace::force_capture());
+          +        }
+                   charge_catalog_node(&mut self.visited, self.limits)
+               }
+          diff --git a/crates/fln/src/lib.rs b/crates/fln/src/lib.rs
+          --- a/crates/fln/src/lib.rs
+          +++ b/crates/fln/src/lib.rs
+          @@ -7095,8 +7095,9 @@
+           fn charge_catalog_node(
+               visited_nodes: &mut usize,
+               limits: IngressLimits,
+           ) -> Result<(), IngressError> {
+               let observed = visited_nodes.saturating_add(1);
+               if observed > limits.max_nodes {
+          +        eprintln!("FLN_CATALOG_NODE_LIMIT {}", std::backtrace::Backtrace::force_capture());
+                   return Err(IngressError::ResourceLimit {
+                       resource: IngressResource::Nodes,
+          PATCH
+          git apply --recount --check "$RUNNER_TEMP/node-diagnostic.patch"
+          git apply --recount "$RUNNER_TEMP/node-diagnostic.patch"
+      - name: Build native lean and reproduce the same inputs under both toolchains
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --locked --release -p fln-cli --bin lean --jobs 2
+          native="$(realpath target/release/lean)"
+          probe_dir="$RUNNER_TEMP/fln-node-diagnostic"
+          mkdir -p "$probe_dir/reuse"
+          cat > "$probe_dir/slice.lean" <<'LEAN'
+          prelude
+          import Init.Data.String.Slice
+          #eval ("42".toSlice.toNat?).getD 0
+          LEAN
+          cat > "$probe_dir/filepath.lean" <<'LEAN'
+          prelude
+          import Init.System.FilePath
+          #eval if System.FilePath.isAbsolute ⟨"/tmp"⟩ then 1 else 0
+          LEAN
+          for file in slice.lean filepath.lean; do
+            for runtime in reference native; do
+              if [ "$runtime" = reference ]; then executable="$FLN_REFERENCE_LEAN"; else executable="$native"; fi
+              status=0
+              (cd "$probe_dir" && env LEAN_PATH="$FLN_REFERENCE_LIB" FLN_IMPORT_REUSE_DIR="$probe_dir/reuse" RUST_BACKTRACE=full timeout --signal=TERM --kill-after=30s 10m "$executable" -j 2 "$file") > "$probe_dir/$file.$runtime.stdout" 2> "$probe_dir/$file.$runtime.stderr" || status=$?
+              printf '%s %s exit=%s\n' "$runtime" "$file" "$status" | tee -a "$probe_dir/exits.txt"
+              cat "$probe_dir/$file.$runtime.stdout"
+              cat "$probe_dir/$file.$runtime.stderr"
+            done
+          done
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: source-node-diagnostic-${{ github.sha }}
+          path: ${{ runner.temp }}/fln-node-diagnostic
+          retention-days: 14
+          if-no-files-found: warn
