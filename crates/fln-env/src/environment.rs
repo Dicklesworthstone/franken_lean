@@ -1287,7 +1287,7 @@ impl Environment {
     /// ("nothing but the kernel may admit a constant") the only legitimate production
     /// callers are in `fln-kernel`, and today there are exactly two:
     /// `fln-kernel/src/admit.rs` and `fln-kernel/src/capability.rs`. D6 has one named
-    /// carve-out beside them (bead `fln-uyuz`): `fln/src/source_check/modules/reuse.rs`
+    /// carve-out beside them (bead `fln-uyuz`): `fln-admission/src/reuse.rs`
     /// rebuilds an `.olean` closure the council admitted earlier and keeps it only if
     /// it reaches every logical root that admission reached.
     ///

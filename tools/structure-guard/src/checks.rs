@@ -1147,7 +1147,7 @@ fn audit_checker_independence_boundary(text: &str, source_rel: &str, findings: &
 const PLANNED_ADMISSION_ALLOWLIST: [&str; 3] = [
     "crates/fln-kernel/src/admit.rs",
     "crates/fln-kernel/src/capability.rs",
-    "crates/fln/src/source_check/modules/reuse.rs",
+    "crates/fln-admission/src/reuse.rs",
 ];
 
 /// Keep declaration admission unreachable outside the kernel, not merely unused

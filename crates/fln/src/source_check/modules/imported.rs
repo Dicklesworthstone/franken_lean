@@ -6,6 +6,7 @@
 //! inventory. Companion journals are cumulative; only the final private part is
 //! replayed. Unknown extensions are reported, not treated as understood.
 use crate::*;
+use fln_admission::reuse::{AdmittedImport, ImportCouncilError, ImportCouncilLimits, ImportHost};
 use fln_elab::instances::{self, InstanceRegistryError};
 use fln_olean::region::{OleanView, OpaqueExtensionBlock};
 use fln_olean::source_extensions::{self as metadata, DecodeLimits};
@@ -289,6 +290,76 @@ impl SourceOleanImportError {
 
 type Result<T> = std::result::Result<T, SourceOleanImportError>;
 
+impl SourceOleanImportLimits {
+    /// The limits `fln_admission`'s import orchestration reads; the rest are this
+    /// host's own, for its metadata activation.
+    pub fn council_limits(&self) -> ImportCouncilLimits {
+        ImportCouncilLimits {
+            check: self.check,
+            max_roots: self.max_roots,
+            jobs: self.jobs,
+            read_jobs: self.read_jobs,
+        }
+    }
+}
+
+impl From<ImportCouncilError> for SourceOleanImportError {
+    fn from(error: ImportCouncilError) -> Self {
+        match error {
+            ImportCouncilError::Check(error) => Self::Check(error),
+            ImportCouncilError::EmptyRoots => Self::EmptyRoots,
+            ImportCouncilError::Limit(resource) => Self::Limit(resource),
+        }
+    }
+}
+
+impl AdmittedImport for SourceOleanImport {
+    type Engine = Engine;
+    fn checked(&self) -> &CheckedOleanSet {
+        &self.checked
+    }
+    fn result_logical_root(&self) -> LogicalRoot {
+        self.result_logical_root
+    }
+}
+
+/// `fln`'s host for `fln_admission`'s import orchestration: the metadata activation
+/// that runs strictly after the council, under the caller's full source-import limits.
+/// A checked set comes back as this engine's successor, its other fields copied from
+/// `engine` exactly as the council's own successors carry them.
+pub(super) struct SourceImportHost<'a> {
+    engine: &'a Engine,
+    limits: SourceOleanImportLimits,
+}
+
+impl<'a> SourceImportHost<'a> {
+    pub(super) fn new(engine: &'a Engine, limits: SourceOleanImportLimits) -> Self {
+        Self { engine, limits }
+    }
+}
+
+impl ImportHost for SourceImportHost<'_> {
+    type Import = SourceOleanImport;
+    type Error = SourceOleanImportError;
+    fn activate(
+        &self,
+        checked: fln_admission::CheckedOleanSet,
+        modules: &[OleanModuleInput<'_>],
+        roots: &[Name],
+        options: &KVMap,
+        cancellation: Option<&dyn CancellationProbe>,
+    ) -> Result<Outcome<SourceOleanImport>> {
+        self.engine.activate_source_metadata(
+            checked.map_engine(|engine| self.engine.with_admitted(engine)),
+            modules,
+            roots,
+            options,
+            self.limits,
+            cancellation,
+        )
+    }
+}
+
 impl Engine {
     /// Recheck a complete artifact closure, then activate its native class,
     /// instance and default-instance journals. Roots are in source import order.
@@ -319,35 +390,14 @@ impl Engine {
         limits: SourceOleanImportLimits,
         cancellation: Option<&dyn CancellationProbe>,
     ) -> Result<Outcome<SourceOleanImport>> {
-        if roots.is_empty() {
-            return Err(SourceOleanImportError::EmptyRoots);
-        }
-        if roots.len() > limits.max_roots {
-            return Err(SourceOleanImportError::Limit("import roots"));
-        }
-        macro_rules! cancelled {
-            ($at:literal) => {
-                if cancellation.is_some_and(CancellationProbe::is_cancelled) {
-                    return Ok(Outcome::Inconclusive(Inconclusive::cancelled($at)));
-                }
-            };
-        }
-        cancelled!("source-olean/before-council");
-        let checked = match self
-            .check_olean_modules_scheduled(
-                modules,
-                options,
-                limits.check,
-                limits.jobs,
-                cancellation,
-            )
-            .map_err(|e| SourceOleanImportError::Check(Box::new(e)))?
-        {
-            Outcome::Complete(checked) => checked,
-            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
-            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
-        };
-        self.activate_source_metadata(checked, modules, roots, options, limits, cancellation)
+        self.admitted().import_olean_modules_for_source_with_cancel(
+            &SourceImportHost::new(self, limits),
+            modules,
+            roots,
+            options,
+            limits.council_limits(),
+            cancellation,
+        )
     }
 
     /// Activate the native class, instance and default-instance journals of a

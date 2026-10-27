@@ -26,6 +26,7 @@
 #![feature(alloc_error_hook)]
 
 pub mod olean_imports;
+pub mod reuse;
 
 pub use fln_checker::admit::{
     AdmissionBudget as CheckerAdmissionBudget, AdmissionGround as CheckerAdmissionGround,
@@ -85,9 +86,10 @@ use std::fmt;
 /// `fln::Engine` keeps its own fields; it hands the council these, by value, and
 /// takes them back. The persistent environments and the `Arc`-shared sets make
 /// that a reference-count copy, not a deep one. `options` is here because a
-/// council successor records the options it was admitted under, and
+/// council successor records the options it was admitted under,
 /// `executable_opaques` because admitting a handed opaque marks its value
-/// executable.
+/// executable, and `runtime_initializers` because a rebuilt import closure
+/// ([`reuse`]) starts it empty while a council successor carries it on.
 #[derive(Debug, Clone)]
 pub struct Admitted {
     pub environment: Environment,
@@ -101,6 +103,8 @@ pub struct Admitted {
     pub imported_module_dependencies: std::sync::Arc<BTreeMap<Name, Vec<Name>>>,
     /// Admitted opaques whose stored values have executable meaning.
     pub executable_opaques: std::sync::Arc<BTreeSet<Name>>,
+    /// Imported globals whose initializer supplies the runtime value.
+    pub runtime_initializers: std::sync::Arc<BTreeSet<Name>>,
     pub options: KVMap,
 }
 
@@ -4172,6 +4176,7 @@ impl Admitted {
             imported_environment,
             imported_module_dependencies: std::sync::Arc::new(dependencies),
             executable_opaques: std::sync::Arc::clone(&self.executable_opaques),
+            runtime_initializers: std::sync::Arc::clone(&self.runtime_initializers),
             options: if admitted_any {
                 options.clone()
             } else {
@@ -4918,6 +4923,7 @@ impl Admitted {
                     &self.imported_module_dependencies,
                 ),
                 executable_opaques: std::sync::Arc::clone(&self.executable_opaques),
+                runtime_initializers: std::sync::Arc::clone(&self.runtime_initializers),
                 options: options.clone(),
             },
             declaration,
