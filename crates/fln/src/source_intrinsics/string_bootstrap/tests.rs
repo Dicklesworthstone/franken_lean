@@ -414,7 +414,7 @@ fn actual_string_inventories_close_the_pin_and_share_only_successful_checks() {
         // of magnitude from Bootstrap's, as measured with the pin itself.
         let counts = [
             325, 325, 325, 326, 325, 323, 323, 324, 351, 3413, 3413, 2318, 369, 3416, 3416, 4040,
-            3653, 3396,
+            3653, 3396, 3413, 3415, 3415, 3416, 3935, 3413, 370, 341, 3396,
         ];
         assert_eq!(counts.len(), Operation::ALL.len());
         let mut defining = BTreeSet::new();
@@ -642,6 +642,19 @@ axiom proof {p : Prop} : p
 #eval String.Internal.foldl String.push "" (String.ofList (String.toList "aλ😀z"))
 #eval let get := String.Pos.Raw.get "aλ😀z"; (get (String.Pos.Raw.mk 7)).toNat
 #eval let set := String.Pos.Raw.set; set "abc" (String.Pos.Raw.mk 1) 'B'
+#eval (String.get "aλ😀z" (String.Pos.Raw.mk 3)).toNat
+#eval (String.get' "aλ😀z" (String.Pos.Raw.mk 1) proof).toNat
+#eval (String.Pos.Raw.get' "aλ😀z" (String.Pos.Raw.mk 7) proof).toNat
+#eval (String.next' "aλ😀z" (String.Pos.Raw.mk 1) proof).byteIdx
+#eval (@String.Pos.next "aλ😀z" (String.Pos.mk (String.Pos.Raw.mk 3) proof) proof).offset.byteIdx
+#eval (@String.Pos.next "aλ😀z" (String.Pos.mk (String.Pos.Raw.mk 4) proof) proof).offset.byteIdx
+#eval String.set "aλ😀z" (String.Pos.Raw.mk 1) 'L'
+#eval String.set "aλ😀z" (String.Pos.Raw.mk 4) 'L'
+#eval (String.getUtf8Byte "aλ😀z" (String.Pos.Raw.mk 3) proof).toNat
+#eval (String.Internal.getUTF8Byte "aλ😀z" 2 proof).toNat
+#eval (String.data "aλ😀z").length
+#eval String.Internal.foldl String.push "" (String.ofList (String.data "aλ😀z"))
+#eval let next := @String.Pos.next "aλ😀z"; (next (String.Pos.mk (String.Pos.Raw.mk 0) proof) proof).offset.byteIdx
 "#;
         let run = || {
             engine
@@ -672,6 +685,20 @@ axiom proof {p : Prop} : p
             text("aλ😀z"),
             ClosedVmValue::Scalar(122),
             text("aBc"),
+            // The deprecated aliases, each its own declaration and row.
+            ClosedVmValue::Scalar(128_512),
+            ClosedVmValue::Scalar(955),
+            ClosedVmValue::Scalar(122),
+            ClosedVmValue::Scalar(3),
+            ClosedVmValue::Scalar(7),
+            ClosedVmValue::Scalar(5),
+            text("aL😀z"),
+            text("aλ😀z"),
+            ClosedVmValue::Scalar(240),
+            ClosedVmValue::Scalar(187),
+            ClosedVmValue::Scalar(4),
+            text("aλ😀z"),
+            ClosedVmValue::Scalar(1),
         ];
         let first = run();
         let indices = &first.batch.source_evaluation_indices;
@@ -750,6 +777,12 @@ axiom proof {p : Prop} : p
             "(String.decodeChar \"aλ😀z\" 9 proof).toNat",
             "(String.getUTF8Byte \"aλ😀z\" (String.Pos.Raw.mk 9) proof).toNat",
             "(String.Pos.Raw.next' \"aλ😀z\" (String.Pos.Raw.mk 9) proof).byteIdx",
+            "(String.get' \"aλ😀z\" (String.Pos.Raw.mk 9) proof).toNat",
+            "(String.Pos.Raw.get' \"aλ😀z\" (String.Pos.Raw.mk 9) proof).toNat",
+            "(String.next' \"aλ😀z\" (String.Pos.Raw.mk 9) proof).byteIdx",
+            "(@String.Pos.next \"aλ😀z\" (String.Pos.mk (String.Pos.Raw.mk 9) proof) proof).offset.byteIdx",
+            "(String.getUtf8Byte \"aλ😀z\" (String.Pos.Raw.mk 9) proof).toNat",
+            "(String.Internal.getUTF8Byte \"aλ😀z\" 9 proof).toNat",
         ] {
             let source = format!("axiom proof {{p : Prop}} : p\n#eval {call}\n");
             let complete = engine
@@ -1117,6 +1150,8 @@ fn changed_body(operation: Operation, info: ConstantInfo) -> Declaration {
             Expr::const_(name("List.nil"), vec![Level::zero()]),
             c("Char"),
         ),
+        // `String.Pos.next` under its `s`, `pos` and `h` binders: `pos` itself.
+        Domain::StringPosition => Expr::bvar(1).unwrap(),
         _ => unreachable!(),
     };
     if operation.dependent() {
@@ -1226,6 +1261,105 @@ fn well_typed_counterfeit_bodies_and_reserved_native_names_are_refused() {
                     .execute_source_commands_with_checks(source.as_bytes(), &options, limits)
                     .is_err(),
                 "a user declaration cannot impersonate the private scalar primitive"
+            );
+        }
+    });
+}
+
+/// Compile a closed term along the runtime's own path after admission:
+/// preparation, the executable closure, callable interfaces, FIR ingress and
+/// the VM. Checked source cannot contain a malformed projection, so the
+/// term is built here and never reaches a checker or an environment.
+fn execute_unchecked(
+    environment: &Environment,
+    term: &Expr,
+    type_: &Expr,
+) -> Result<ClosedVmValue, IngressError> {
+    let limits = IngressLimits::default();
+    let mut preparation = crate::runtime::Preparation::new(environment, limits);
+    let runtime_type = preparation.normalize_type(type_)?;
+    let root = preparation.root_result(&runtime_type);
+    let expression = preparation.expression_at_type(term, Some(type_.clone()))?;
+    let mut catalog =
+        crate::executable_dependencies(environment, &expression, limits, &mut preparation)?;
+    preparation.refine_expression_captures(&expression)?;
+    let interfaces =
+        preparation.finalize_callables(&mut catalog.functions, &mut catalog.intrinsics)?;
+    let ingress = fln_comp::ingress::lower_closed_expr_at_result(
+        &expression,
+        &catalog.scalar_constructors,
+        &catalog.intrinsics,
+        &preparation.constructors,
+        preparation.callables(&catalog.functions),
+        &interfaces,
+        root,
+        limits,
+    )?;
+    let lowered = fln_comp::fir::lower_to_flbc(ingress.fir()).unwrap();
+    let artifact = flbc::encode_canonical(&lowered, flbc::CodecLimits::default()).unwrap();
+    let exit = execute_flbc_artifact(&artifact, &KVMap::new(), Default::default())
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    Ok(closed_vm_value(&exit).unwrap().unwrap())
+}
+
+/// `String` keeps its native representation, so no projection of it is read
+/// as a field, and a malformed projection must not reach any lowering:
+/// `String` has no field 2, a `Nat` operand is not a `String`, and a String
+/// operand is not a `Pos.Raw` record. Each stops at preparation, before FIR
+/// ingress, with its own typed refusal. The control projects a computed
+/// record through the same path, so each refusal is about the malformed
+/// projection, not the harness. (`String.toByteArray`, field 0 of a real
+/// String, stays on its body fallback and is not pinned here.)
+#[test]
+fn malformed_string_projections_stay_typed_refusals_below_the_checkers() {
+    with_fixture(|fixture| {
+        let environment = &fixture.environment;
+        let c = |label| Expr::const_(name(label), vec![]);
+        let nat = Expr::lit(Literal::Nat(NatLit::from_u64(5)));
+        let text = Expr::lit(Literal::Str("aλ".to_owned()));
+        let advanced = Expr::app(
+            Expr::app(c("String.Internal.next"), text.clone()),
+            Expr::app(
+                c("String.Pos.Raw.mk"),
+                Expr::lit(Literal::Nat(NatLit::from_u64(1))),
+            ),
+        );
+        assert_eq!(
+            execute_unchecked(
+                environment,
+                &Expr::proj(name("String.Pos.Raw"), 0, advanced),
+                &c("Nat"),
+            )
+            .unwrap(),
+            ClosedVmValue::Scalar(3)
+        );
+        for (structure, field, operand, refusal) in [
+            (
+                "String",
+                2,
+                text.clone(),
+                "projection field outside constructor telescope",
+            ),
+            ("String", 0, nat, "projection receiver family mismatch"),
+            (
+                "String.Pos.Raw",
+                0,
+                text,
+                "projection receiver family mismatch",
+            ),
+        ] {
+            assert!(
+                matches!(
+                    execute_unchecked(
+                        environment,
+                        &Expr::proj(name(structure), field, operand),
+                        &c("Nat"),
+                    ),
+                    Err(IngressError::UnsupportedNode { kind }) if kind == refusal
+                ),
+                "{structure} field {field}"
             );
         }
     });

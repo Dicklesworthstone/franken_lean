@@ -9,21 +9,26 @@
 //! ConstantInfo, including proof dependencies, dictionaries, recursor rules,
 //! metadata and safety. Membership bits keep a Prelude-only byte-size call
 //! independent of the Bootstrap module, and a Bootstrap call independent of
-//! the larger Basic and Modify closures.
+//! the larger Basic and Modify closures. A deprecated alias (`String.get`,
+//! `set`, `data`, ...) shares its target's extern symbol but is a separate
+//! declaration: it has its own row, extern check and closure, never its
+//! target's.
 //! These comparison data never install declarations or confer admission.
 
 use super::*;
 
 const DEPENDENCIES: &str = include_str!("string_bootstrap/dependencies.txt");
-const DEPENDENCY_COUNT: usize = 4078;
+const DEPENDENCY_COUNT: usize = 4089;
 
 /// Successful dependency checks shared only within one immutable Preparation.
 /// Membership and each selected root's extern still belong to its operation.
-pub(crate) struct VerifiedDependencies([bool; DEPENDENCY_COUNT]);
+/// One flag per inventory row, kept on the heap: every Preparation carries
+/// this table, and Preparations live on small host stacks.
+pub(crate) struct VerifiedDependencies(Box<[bool]>);
 
 impl Default for VerifiedDependencies {
     fn default() -> Self {
-        Self([false; DEPENDENCY_COUNT])
+        Self(vec![false; DEPENDENCY_COUNT].into_boxed_slice())
     }
 }
 
@@ -48,6 +53,15 @@ pub(crate) enum Operation {
     PosSet,
     PosExtract,
     ToList,
+    Get,
+    GetFast,
+    RawGetFast,
+    NextFast,
+    PosNext,
+    Set,
+    GetUtf8ByteAlias,
+    InternalGetUtf8Byte,
+    Data,
 }
 
 /// One bit per operation in the inventory's membership column.
@@ -62,6 +76,7 @@ pub(crate) enum Domain {
     Bool,
     StringCallback,
     /// `String.Pos s`, the checked `Pos.Raw` record over the earlier String.
+    /// As a result it is rebuilt over the same String.
     StringPosition,
     /// A checked proof argument, which the native ABI never receives.
     Proof,
@@ -103,7 +118,7 @@ impl Domain {
 }
 
 impl Operation {
-    pub(crate) const ALL: [Self; 18] = [
+    pub(crate) const ALL: [Self; 27] = [
         Self::ByteSize,
         Self::PosOf,
         Self::OffsetOfPos,
@@ -122,6 +137,15 @@ impl Operation {
         Self::PosSet,
         Self::PosExtract,
         Self::ToList,
+        Self::Get,
+        Self::GetFast,
+        Self::RawGetFast,
+        Self::NextFast,
+        Self::PosNext,
+        Self::Set,
+        Self::GetUtf8ByteAlias,
+        Self::InternalGetUtf8Byte,
+        Self::Data,
     ];
 
     pub(crate) fn index(self) -> usize {
@@ -152,6 +176,15 @@ impl Operation {
             Self::PosSet => "String.Pos.set",
             Self::PosExtract => "String.extract",
             Self::ToList => "String.toList",
+            Self::Get => "String.get",
+            Self::GetFast => "String.get'",
+            Self::RawGetFast => "String.Pos.Raw.get'",
+            Self::NextFast => "String.next'",
+            Self::PosNext => "String.Pos.next",
+            Self::Set => "String.set",
+            Self::GetUtf8ByteAlias => "String.getUtf8Byte",
+            Self::InternalGetUtf8Byte => "String.Internal.getUTF8Byte",
+            Self::Data => "String.data",
         }
     }
 
@@ -176,15 +209,22 @@ impl Operation {
             | Self::Pushn
             | Self::Foldl
             | Self::IsEmpty
-            | Self::InternalGet => ("opaque", "Init.Data.String.Bootstrap"),
+            | Self::InternalGet
+            | Self::InternalGetUtf8Byte => ("opaque", "Init.Data.String.Bootstrap"),
             Self::RawGet
             | Self::DecodeChar
             | Self::RawNextFast
             | Self::RawExtract
             | Self::PosExtract
-            | Self::ToList => ("defn", "Init.Data.String.Basic"),
-            Self::GetUtf8Byte => ("defn", "Init.Data.String.PosRaw"),
-            Self::RawSet | Self::PosSet => ("defn", "Init.Data.String.Modify"),
+            | Self::ToList
+            | Self::Get
+            | Self::GetFast
+            | Self::RawGetFast
+            | Self::NextFast
+            | Self::PosNext
+            | Self::Data => ("defn", "Init.Data.String.Basic"),
+            Self::GetUtf8Byte | Self::GetUtf8ByteAlias => ("defn", "Init.Data.String.PosRaw"),
+            Self::RawSet | Self::PosSet | Self::Set => ("defn", "Init.Data.String.Modify"),
         }
     }
 
@@ -193,17 +233,23 @@ impl Operation {
     pub(crate) fn domains(self) -> &'static [Domain] {
         use Domain::{Char, Nat, Position, Proof, String, StringCallback, StringPosition};
         match self {
-            Self::ByteSize | Self::IsEmpty | Self::ToList => &[String],
+            Self::ByteSize | Self::IsEmpty | Self::ToList | Self::Data => &[String],
             Self::PosOf => &[String, Char],
-            Self::OffsetOfPos | Self::Next | Self::InternalGet | Self::RawGet => {
+            Self::OffsetOfPos | Self::Next | Self::InternalGet | Self::RawGet | Self::Get => {
                 &[String, Position]
             }
             Self::Extract | Self::RawExtract => &[String, Position, Position],
             Self::Pushn => &[String, Char, Nat],
             Self::Foldl => &[StringCallback, String, String],
-            Self::RawSet => &[String, Position, Char],
-            Self::DecodeChar => &[String, Nat, Proof],
-            Self::GetUtf8Byte | Self::RawNextFast => &[String, Position, Proof],
+            Self::RawSet | Self::Set => &[String, Position, Char],
+            Self::DecodeChar | Self::InternalGetUtf8Byte => &[String, Nat, Proof],
+            Self::GetUtf8Byte
+            | Self::RawNextFast
+            | Self::GetFast
+            | Self::RawGetFast
+            | Self::NextFast
+            | Self::GetUtf8ByteAlias => &[String, Position, Proof],
+            Self::PosNext => &[String, StringPosition, Proof],
             Self::PosSet => &[String, StringPosition, Char, Proof],
             Self::PosExtract => &[String, StringPosition, StringPosition],
         }
@@ -227,18 +273,25 @@ impl Operation {
     pub(crate) fn result(self) -> Domain {
         match self {
             Self::ByteSize | Self::OffsetOfPos => Domain::Nat,
-            Self::PosOf | Self::Next | Self::RawNextFast => Domain::Position,
+            Self::PosOf | Self::Next | Self::RawNextFast | Self::NextFast => Domain::Position,
+            Self::PosNext => Domain::StringPosition,
             Self::Extract
             | Self::Pushn
             | Self::Foldl
             | Self::RawSet
             | Self::RawExtract
             | Self::PosSet
-            | Self::PosExtract => Domain::String,
+            | Self::PosExtract
+            | Self::Set => Domain::String,
             Self::IsEmpty => Domain::Bool,
-            Self::InternalGet | Self::RawGet | Self::DecodeChar => Domain::Char,
-            Self::GetUtf8Byte => Domain::Byte,
-            Self::ToList => Domain::CharList,
+            Self::InternalGet
+            | Self::RawGet
+            | Self::DecodeChar
+            | Self::Get
+            | Self::GetFast
+            | Self::RawGetFast => Domain::Char,
+            Self::GetUtf8Byte | Self::GetUtf8ByteAlias | Self::InternalGetUtf8Byte => Domain::Byte,
+            Self::ToList | Self::Data => Domain::CharList,
         }
     }
 

@@ -19,7 +19,10 @@ use fln_comp::flbc::{ArgumentOwnership, ResultOwnership};
 #[derive(Default)]
 pub(super) struct Store {
     next_adapter: u64,
-    primitives: [Option<(IntrinsicBinding, Expr)>; Operation::ALL.len()],
+    /// One slot per operation, on the heap like the verified-row table: the
+    /// Store is part of every Preparation, and deep tests and recursive
+    /// callers keep Preparations on small host stacks.
+    primitives: Box<[Option<(IntrinsicBinding, Expr)>; Operation::ALL.len()]>,
     position: Option<(Name, Name)>,
     string_position: Option<(Name, Name)>,
     byte: Option<[Name; 3]>,
@@ -302,7 +305,11 @@ impl Preparation<'_> {
         }
         let result = match operation.result() {
             Domain::String => ValueType::String,
-            Domain::Nat | Domain::Position | Domain::Char | Domain::Byte => ValueType::Nat,
+            Domain::Nat
+            | Domain::Position
+            | Domain::StringPosition
+            | Domain::Char
+            | Domain::Byte => ValueType::Nat,
             Domain::Bool => {
                 if self.value_type(&c("Bool"))? != Some(ValueType::Bool) {
                     return Err(unsupported("String bootstrap checked Boolean result"));
@@ -323,7 +330,7 @@ impl Preparation<'_> {
                 }
                 ValueType::Constructor
             }
-            Domain::StringCallback | Domain::StringPosition | Domain::Proof => {
+            Domain::StringCallback | Domain::Proof => {
                 unreachable!("fixed String bootstrap result")
             }
         };
@@ -543,6 +550,21 @@ impl Preparation<'_> {
                 Expr::const_(self.string_bootstrap_position()?.1, Vec::new()),
                 body,
             ),
+            // `String.Pos s` over the argument String: the raw position and the
+            // validity proof's inert slot, as post-admission erasure leaves it.
+            Domain::StringPosition => {
+                let raw = Expr::app(
+                    Expr::const_(self.string_bootstrap_position()?.1, Vec::new()),
+                    body,
+                );
+                Expr::app(
+                    Expr::app(
+                        Expr::const_(self.string_bootstrap_string_position()?.1, Vec::new()),
+                        raw,
+                    ),
+                    proofs::erased_value(),
+                )
+            }
             Domain::Char => self.native_character_from_scalar(body)?,
             Domain::Byte => self.string_bootstrap_byte_from_scalar(body)?,
             Domain::CharList => self.string_bootstrap_characters(body)?,
