@@ -1,11 +1,174 @@
 name: Native source workbench
 on:
+  workflow_dispatch:
+    inputs:
+      base:
+        description: 'Full main-ancestor commit to validate'
+        required: true
+        type: string
+      changes:
+        description: 'JSON object: existing source path -> [base blob, candidate blob]'
+        required: true
+        default: '{}'
+        type: string
+      suite:
+        description: 'Fixed validation command; negative controls are expected to fail'
+        required: true
+        type: choice
+        options: [range, cli, missing-reference, flush-mutant, workspace]
   push:
     branches: [main]
     paths: ['.github/workflows/fln-source-workbench.yml']
 permissions:
   contents: read
 jobs:
+  # Consumer: loop ingress and CLI publication candidates blocked by observed
+  # RCH transport failures. This never publishes code or changes a test verdict.
+  # Retire when those candidates land and the ordinary executor covers them.
+  candidate:
+    if: github.event_name == 'workflow_dispatch' && github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    env:
+      CARGO_TERM_COLOR: never
+      CARGO_INCREMENTAL: '0'
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_RELEASE_DEBUG: '0'
+      CANDIDATE_BASE: ${{ inputs.base }}
+      CANDIDATE_CHANGES: ${{ inputs.changes }}
+      CANDIDATE_SUITE: ${{ inputs.suite }}
+      WORKFLOW_SHA: ${{ github.sha }}
+    steps:
+      - name: Validate immutable source identifiers before checkout
+        shell: python
+        run: |
+          import json, os, re
+          assert re.fullmatch('[0-9a-f]{40}', os.environ['CANDIDATE_BASE'])
+          changes = json.loads(os.environ['CANDIDATE_CHANGES'])
+          assert isinstance(changes, dict) and len(changes) <= 8
+          allowed = {
+              'crates/fln/src/runtime/callables/administrative.rs',
+              'crates/fln/src/runtime/callables/administrative/tests.rs',
+              'crates/fln/src/runtime/specialize.rs',
+              'crates/fln-cli/tests/source_stateful_loops.rs',
+              'crates/fln-cli/src/output.rs',
+              'crates/fln-cli/src/output/tests.rs',
+              'crates/fln-cli/src/goal_traces.rs',
+              'crates/fln-cli/src/source_check/imports.rs',
+          }
+          for path, blobs in changes.items():
+              assert path in allowed, path
+              assert isinstance(blobs, list) and len(blobs) == 2
+              assert all(isinstance(s, str) and re.fullmatch('[0-9a-f]{40}', s) for s in blobs)
+          assert os.environ['CANDIDATE_SUITE'] in {
+              'range', 'cli', 'missing-reference', 'flush-mutant', 'workspace',
+          }
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ inputs.base }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Require a main ancestor and materialize exact existing source blobs
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: python
+        run: |
+          import base64, hashlib, json, os, pathlib, subprocess, urllib.request
+          subprocess.run(['git', 'merge-base', '--is-ancestor', 'HEAD', os.environ['WORKFLOW_SHA']], check=True)
+          assert subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip() == os.environ['CANDIDATE_BASE']
+          def blob(data):
+              return hashlib.sha1(('blob ' + str(len(data)) + '\0').encode() + data).hexdigest()
+          changes = json.loads(os.environ['CANDIDATE_CHANGES'])
+          for path, (before, after) in changes.items():
+              file = pathlib.Path(path)
+              assert all(not parent.is_symlink() for parent in [file, *file.parents])
+              assert file.is_file() and blob(file.read_bytes()) == before, path
+              request = urllib.request.Request(
+                  'https://api.github.com/repos/Dicklesworthstone/franken_lean/git/blobs/' + after,
+                  headers={
+                      'Accept': 'application/vnd.github+json',
+                      'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
+                      'User-Agent': 'franken_lean-agent (+https://github.com/Dicklesworthstone/franken_lean)',
+                  })
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  record = json.load(response)
+              assert record['sha'] == after and record['encoding'] == 'base64'
+              data = base64.b64decode(record['content'], validate=False)
+              assert blob(data) == after, path
+              file.write_bytes(data)
+              print(path, before, after, hashlib.sha256(data).hexdigest(), flush=True)
+          subprocess.run(['git', 'diff', '--check'], check=True)
+          print('SOURCE_BASE=' + os.environ['CANDIDATE_BASE'], flush=True)
+          print('SOURCE_CHANGES=' + json.dumps(changes, sort_keys=True), flush=True)
+      - name: Install the repository-pinned Rust toolchain
+        run: rustup show active-toolchain
+      - name: Install and verify the SUITE.lock Reference
+        shell: bash
+        run: |
+          set -euo pipefail
+          tool_root="$RUNNER_TEMP/candidate-elan-bin"
+          archive="$RUNNER_TEMP/candidate-elan.tar.gz"
+          mkdir "$tool_root"
+          curl --user-agent 'franken_lean-agent (+https://github.com/Dicklesworthstone/franken_lean)' \
+            --fail --location --retry 3 --output "$archive" \
+            https://github.com/leanprover/elan/releases/download/v4.2.1/elan-x86_64-unknown-linux-gnu.tar.gz
+          printf '%s  %s\n' \
+            4e717523217af592fa2d7b9c479410a31816c065d66ccbf0c2149337cfec0f5c \
+            "$archive" | sha256sum --check
+          tar -xzf "$archive" -C "$tool_root"
+          export ELAN_HOME="$RUNNER_TEMP/candidate-elan"
+          "$tool_root/elan-init" -y --no-modify-path --default-toolchain none
+          export PATH="$ELAN_HOME/bin:$PATH"
+          mapfile -t reference_rows < <(grep -E '^reference ' SUITE.lock)
+          test "${#reference_rows[@]}" -eq 1
+          pin_tag="$(sed -nE 's/.* tag=([^ ]+).*/\1/p' <<<"${reference_rows[0]}")"
+          pin_commit="$(sed -nE 's/.* commit=([0-9a-f]{40}).*/\1/p' <<<"${reference_rows[0]}")"
+          [[ "$pin_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$ ]]
+          test -n "$pin_commit"
+          elan toolchain install "leanprover/lean4:$pin_tag"
+          toolchain_root="$ELAN_HOME/toolchains/leanprover--lean4---$pin_tag"
+          test "$("$toolchain_root/bin/lean" --githash)" = "$pin_commit"
+          for suffix in olean olean.server olean.private; do
+            test -s "$toolchain_root/lib/lean/Init/Prelude.$suffix"
+            test -s "$toolchain_root/lib/lean/Init/Data/Repr.$suffix"
+          done
+          printf 'FLN_REFERENCE_LIB=%s/lib/lean\nFLN_REFERENCE_LEAN=%s/bin/lean\nFLN_REQUIRE_REFERENCE=1\n' \
+            "$toolchain_root" "$toolchain_root" >> "$GITHUB_ENV"
+      - name: Execute the selected fixed probe without changing its verdict
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$CANDIDATE_SUITE" in
+            range)
+              cargo test --locked --release -p fln-cli --test source_range_literals -- --nocapture
+              ;;
+            cli)
+              cargo test --locked --release -p fln-cli --lib -- --nocapture
+              ;;
+            missing-reference)
+              unset FLN_REFERENCE_LEAN
+              export FLN_REFERENCE_LIB="$RUNNER_TEMP/absent-reference/lib/lean"
+              cargo test --locked --release -p fln-cli --lib -- \
+                goal_traces::tests::guard_literals_agree_with_the_pin_or_refuse \
+                source_check::imports::tests::the_source_import_capture_ceiling_holds_the_pinned_init_closure \
+                --exact --nocapture
+              ;;
+            flush-mutant)
+              cargo test --locked --release -p fln-cli --lib -- \
+                output::tests::native_stdout_flush_failure_is_not_success_with_empty_cli_output \
+                --exact --nocapture
+              ;;
+            workspace)
+              cargo fmt --check
+              cargo check --locked --all-targets
+              cargo clippy --locked --all-targets -- -D warnings
+              cargo test --locked
+              ;;
+            *) exit 2 ;;
+          esac
+
   inline-simp:
     if: >-
       github.repository == 'Dicklesworthstone/franken_lean' && github.ref == 'refs/heads/main' && github.event.head_commit.message == 'feat(source): finish inline simp attribute integration on current main'
