@@ -8,8 +8,9 @@
 //! scope, occurs, typing, resource and K1 barriers as an ordinary assignment.
 //!
 //! The pin's own first-order approximation, `processAssignmentFOApprox`, is
-//! [`Engine::first_order_approximation`]: it runs at once for an application whose
-//! arguments include a local of the hole's own context, and it unifies arguments.
+//! [`Engine::first_order_approximation`]: it runs for an application whose arguments are not
+//! distinct locals outside the hole's own context, at once for a local of that context and at
+//! the batch's fixed point otherwise, and it unifies arguments.
 use super::application_congruence::{CongruenceResult, MAX_CONGRUENCE_DEPTH};
 use super::*;
 
@@ -90,10 +91,10 @@ impl Engine<'_> {
                     (last.clone(), a.clone(), locals.clone()),
                     (function.clone(), f.clone(), locals.clone()),
                 ];
-                if matches!(
-                    self.try_congruence_equations(&equations, true)?,
-                    CongruenceResult::Solved
-                ) {
+                let outer = std::mem::replace(&mut self.first_order_trial, true);
+                let trial = self.try_congruence_equations(&equations, true);
+                self.first_order_trial = outer;
+                if matches!(trial?, CongruenceResult::Solved) {
                     return Ok(true);
                 }
             }

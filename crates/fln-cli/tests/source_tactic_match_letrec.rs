@@ -208,6 +208,15 @@ decreasing_by
 "#,
         r#""#,
     ),
+    (
+        r#"RefineHoleAssigned.lean"#,
+        r#"prelude
+import Init.Core
+theorem assigned : Exists fun n : Nat => n = 3 := by
+  refine ⟨_, rfl⟩
+"#,
+        r#""#,
+    ),
 ];
 
 /// Each program the pin accepts, run as `name`: the pin's output, which ours must equal.
@@ -265,7 +274,27 @@ example (hp : p) (hq : q) : p ∧ q := by
   exact hp
   exact hq
 "#,
-        r#"elaboration refused source: tactic has no remaining goal"#,
+        r#"elaboration refused source: refine left a placeholder it could not synthesize"#,
+    ),
+    (
+        r#"RefineWitnessHole.lean"#,
+        r#"prelude
+import Init.Core
+theorem witness : Exists fun n : Nat => n = 3 := by
+  refine ⟨_, ?_⟩
+  rfl
+"#,
+        r#"elaboration refused source: refine left a placeholder it could not synthesize"#,
+    ),
+    (
+        r#"RefineHeadHoles.lean"#,
+        r#"prelude
+import Init.Core
+theorem head : Exists fun F : Type → Type => Exists fun β : Type => F β = Option Nat := by
+  refine ⟨_, _, ?_⟩
+  rfl
+"#,
+        r#"elaboration refused source: refine left a placeholder it could not synthesize"#,
     ),
 ];
 

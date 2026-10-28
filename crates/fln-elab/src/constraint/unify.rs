@@ -583,6 +583,10 @@ struct Engine<'a> {
     residuals: Vec<MVarId>,
     awakened: Vec<Constraint>,
     kernel_checks: usize,
+    // Assignments a batch end has already K1-checked, here or in a committed trial. An
+    // assignment is never revised, and its check abstracts every residual it still reads, so a
+    // later instantiation cannot invalidate it: one check per assignment suffices.
+    checked_assignments: HashSet<MVarId>,
     // Facts describe immutable syntax, not its interpretation under assignments
     // or a local context. Pin every key's allocation until this batch ends so a
     // freed temporary cannot donate its address to an unrelated expression.
@@ -593,6 +597,9 @@ struct Engine<'a> {
     projection_registry: crate::instances::RegistryCache,
     pending: pending::PendingState<'a>,
     congruence_depth: u8,
+    // Inside a first-order approximation's trial, which has no fixed point to wait for: the
+    // pin's whole `processAssignment` rule applies at once, as its recursive `isDefEq` does.
+    first_order_trial: bool,
     // A speculative argument comparison that, like the pin's `isDefEqArgs`, answers each
     // argument outright: the first equation it cannot solve now refuses the trial, rather
     // than entering the worklist's retries, instance synthesis and head recovery.
@@ -856,6 +863,23 @@ impl Engine<'_> {
         Ok(true)
     }
 
+    /// Whether `compare` approximates `expr` first-order before the pattern rule. Outside a
+    /// first-order trial only a local of the hole's own context does: the pattern rule would
+    /// otherwise abstract it. Every other case the pin approximates at once waits for the
+    /// batch's fixed point, where ordinary constraints have first choice, since a batch keeps
+    /// no order of its own. A trial has no fixed point, so the pin's whole rule applies there.
+    fn eager_first_order(
+        &mut self,
+        expr: &Expr,
+        locals: &LocalContext,
+    ) -> Result<bool, UnificationError> {
+        if self.first_order_trial {
+            self.first_order_at_once(expr, locals)
+        } else {
+            self.context_local_argument(expr)
+        }
+    }
+
     /// Whether `expr` is an assignable metavariable applied to some local already in that
     /// metavariable's own context while `quasiPatternApprox` is off. The pin's
     /// `processAssignment` (vendored `Lean/Meta/ExprDefEq.lean:1307-1318`) reaches `useFOApprox`
@@ -890,6 +914,120 @@ impl Engine<'_> {
         Ok(arguments.iter().any(|argument| {
             matches!(argument.node(), ExprNode::FVar { id } if declaration.lctx.contains(id))
         }))
+    }
+
+    /// The pin's first-order approximation of a postponed equation, either side flexible: at
+    /// the batch's fixed point, the step the pin takes at once.
+    fn first_order_postponed(
+        &mut self,
+        (left, right, locals): &Equation,
+    ) -> Result<bool, UnificationError> {
+        let left = self.instantiate(left)?;
+        let right = self.instantiate(right)?;
+        if self.first_order_sides(&left, &right, locals)? {
+            return Ok(true);
+        }
+        // After `whnfCore` the pin's `isDefEq` reaches `processAssignment` again, before any
+        // outer definition is unfolded.
+        let reduced_left = self.whnf_with_lazy_outer_delta(&left, locals, true)?;
+        let reduced_right = self.whnf_with_lazy_outer_delta(&right, locals, true)?;
+        if same_terms(&left, &reduced_left, &mut self.meter)?
+            && same_terms(&right, &reduced_right, &mut self.meter)?
+        {
+            return Ok(false);
+        }
+        self.first_order_sides(&reduced_left, &reduced_right, locals)
+    }
+
+    fn first_order_sides(
+        &mut self,
+        left: &Expr,
+        right: &Expr,
+        locals: &LocalContext,
+    ) -> Result<bool, UnificationError> {
+        for (flexible, value) in [(left, right), (right, left)] {
+            if self.first_order_at_once(flexible, locals)?
+                && self.first_order_approximation(flexible, value, locals)?
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Whether the pin's `processAssignment` (vendored `Lean/Meta/ExprDefEq.lean:1301-1325`)
+    /// reaches `useFOApprox` for `expr`, an assignable metavariable applied to arguments,
+    /// before it has read them all; it then approximates first-order at once, with every
+    /// argument. Elaboration runs with `foApprox` on (`setElabConfig`,
+    /// `Lean/Elab/Config.lean:61`). The arguments are read in order, each instantiated when
+    /// its head holds a metavariable and zeta-expanded while it is a `let` local
+    /// (`simpAssignmentArg`), and the first one that is not a local, repeats an earlier one,
+    /// or is already in the metavariable's own context while `quasiPatternApprox` is off
+    /// stops the reading. So `?f ?β =?= m α` assigns `?f := m` and `?β := α`, and
+    /// `?m σ =?= StateT σ Id σ` assigns `?m := StateT σ Id`.
+    fn first_order_at_once(
+        &mut self,
+        expr: &Expr,
+        locals: &LocalContext,
+    ) -> Result<bool, UnificationError> {
+        let mut head = expr;
+        let mut arguments = Vec::new();
+        while let ExprNode::App { f, a } = head.node() {
+            self.meter.tick()?;
+            arguments.push(a.clone());
+            head = f;
+        }
+        let ExprNode::MVar { id } = head.node() else {
+            return Ok(false);
+        };
+        if arguments.is_empty() || self.work.mvars.is_assigned(id) {
+            return Ok(false);
+        }
+        let Some(declaration) = self.work.mvars.get_decl(id) else {
+            return Ok(false);
+        };
+        if declaration.kind == MetavarKind::SyntheticOpaque
+            || declaration.depth > self.budget.max_metavar_depth
+            || declaration.delayed.is_some()
+        {
+            return Ok(false);
+        }
+        arguments.reverse();
+        let mut read = HashSet::new();
+        for mut argument in arguments {
+            let mut argument_head = &argument;
+            while let ExprNode::App { f, .. } = argument_head.node() {
+                self.meter.tick()?;
+                argument_head = f;
+            }
+            if argument_head.has_expr_mvar() {
+                argument = self.instantiate(&argument)?;
+            }
+            loop {
+                self.meter.tick()?;
+                match argument.node() {
+                    ExprNode::MData { expr, .. } => argument = expr.clone(),
+                    ExprNode::FVar { id } => match locals.find(id).and_then(|d| d.value.clone()) {
+                        Some(value) => argument = value,
+                        None => break,
+                    },
+                    _ => break,
+                }
+            }
+            let ExprNode::FVar { id: local } = argument.node() else {
+                return Ok(true);
+            };
+            let own_context = !self.work.quasi_pattern_approx
+                && self
+                    .work
+                    .mvars
+                    .get_decl(id)
+                    .is_some_and(|declaration| declaration.lctx.contains(local));
+            if !read.insert(local.clone()) || own_context {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// `e`, or the function `e` applies, is an unassigned metavariable.
@@ -1192,7 +1330,7 @@ impl Engine<'_> {
             // a local of the hole's own context sends it to `useFOApprox` there, so
             // `?m σ =?= StateT δ (StateT σ Id) σ` assigns `?m := StateT δ (StateT σ Id)`
             // before `StateT` can unfold.
-            if self.context_local_argument(flex)?
+            if self.eager_first_order(flex, locals)?
                 && self.first_order_approximation(flex, rigid, locals)?
             {
                 return Ok(());
@@ -1248,7 +1386,7 @@ impl Engine<'_> {
         for (lhs, rhs) in [(&left, &right), (&right, &left)] {
             // `processAssignment'` after reduction: the same immediate first-order attempt
             // before the pattern rule, which leaves such an application unassigned.
-            if self.context_local_argument(lhs)?
+            if self.eager_first_order(lhs, locals)?
                 && self.first_order_approximation(lhs, rhs, locals)?
             {
                 return Ok(());
@@ -1602,6 +1740,18 @@ impl Engine<'_> {
                     }
                 }
                 if !progress {
+                    // An application whose arguments are not distinct fresh locals: the pin
+                    // approximates it first-order at once, unifying its arguments. Here that
+                    // comes after ordinary constraints and pending instances, and before head
+                    // recovery, which only aligns suffixes that are already equal.
+                    for equation in &postponed {
+                        if self.first_order_postponed(equation)? {
+                            progress = true;
+                            break;
+                        }
+                    }
+                }
+                if !progress {
                     // Rigid-argument applications are not Miller patterns.
                     // Recover an aligned head only after ordinary constraints
                     // and shared-residual intersections have had first choice.
@@ -1626,7 +1776,11 @@ impl Engine<'_> {
             pending.extend(postponed);
         }
         for id in self.assigned.clone() {
+            if self.checked_assignments.contains(&id) {
+                continue;
+            }
             self.check_assignment(&id)?;
+            self.checked_assignments.insert(id);
         }
         let mut checked_delayed = HashSet::new();
         for obligation in delayed {
@@ -1853,6 +2007,7 @@ impl ElabTxn {
             residuals: Vec::new(),
             awakened: Vec::new(),
             kernel_checks: 0,
+            checked_assignments: HashSet::new(),
             fact_cache: HashMap::new(),
             local_facts: local_facts::Cache::default(),
             nat_literals_valid: None,
@@ -1860,6 +2015,7 @@ impl ElabTxn {
             projection_registry: crate::instances::RegistryCache::default(),
             pending: pending::PendingState::new(pending, remaining),
             congruence_depth: 0,
+            first_order_trial: false,
             fail_fast: false,
         }
     }

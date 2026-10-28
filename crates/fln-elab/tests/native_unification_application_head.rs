@@ -404,38 +404,95 @@ fn cyclic_prefix_candidates_are_postponed_without_mutation() {
     unchanged(&txn, &before);
 }
 
+/// `?f ?a =?= ?f 7` unifies the arguments pairwise, as the pin's `isDefEqMVarSelf` does
+/// (vendored `Lean/Meta/ExprDefEq.lean:1777-1780`), and leaves `?f` open. Pinned lean v4.32.0
+/// accepts `⟨_, _, ⟨rfl, rfl⟩⟩ : PSigma fun f => PSigma fun a => PProd (f a = f 7) (f = Nat.succ)`
+/// and then `.2.1 = 7` by `rfl`.
 #[test]
-fn an_unknown_function_is_not_assumed_injective() {
+fn a_hole_applied_twice_unifies_its_arguments() {
     let mut txn = transaction();
     let f = hole(&mut txn, "f", pi(nat(), nat()));
     let a = hole(&mut txn, "a", nat());
-    let before = txn.clone();
-    assert!(matches!(
-        txn.unify(
-            &Expr::app(Expr::mvar(f.clone()), Expr::mvar(a)),
-            &Expr::app(Expr::mvar(f), number(7)),
-            budget(),
-        ),
-        Err(UnificationError::Deferred(_))
-    ));
-    unchanged(&txn, &before);
+    txn.unify(
+        &Expr::app(Expr::mvar(f.clone()), Expr::mvar(a.clone())),
+        &Expr::app(Expr::mvar(f.clone()), number(7)),
+        budget(),
+    )
+    .unwrap();
+    assert_eq!(txn.mvars.get_assigned_expr(&a), Some(&number(7)));
+    assert!(!txn.mvars.is_assigned(&f));
 }
 
+/// `?f ?a =?= Nat.succ 7`: an argument that is no local sends the pin's `processAssignment` to
+/// first-order approximation (vendored `Lean/Meta/ExprDefEq.lean:1320-1321`), which unifies
+/// `?a` with `7` and `?f` with `Nat.succ`. Pinned lean v4.32.0 accepts
+/// `⟨_, _, rfl⟩ : PSigma fun f => PSigma fun a => f a = Nat.succ 7` with `.2.1 = 7` and
+/// `.1 = Nat.succ` by `rfl`.
 #[test]
-fn mismatched_suffix_holes_are_not_assigned_to_force_an_alignment() {
+fn an_argument_hole_is_unified_by_first_order_approximation() {
     let mut txn = transaction();
     let f = hole(&mut txn, "f", pi(nat(), nat()));
     let a = hole(&mut txn, "a", nat());
-    let before = txn.clone();
-    assert!(matches!(
-        txn.unify(
-            &Expr::app(Expr::mvar(f), Expr::mvar(a)),
-            &Expr::app(succ(), number(7)),
-            budget(),
+    txn.unify(
+        &Expr::app(Expr::mvar(f.clone()), Expr::mvar(a.clone())),
+        &Expr::app(succ(), number(7)),
+        budget(),
+    )
+    .unwrap();
+    assert_eq!(txn.mvars.get_assigned_expr(&a), Some(&number(7)));
+    assert_eq!(txn.mvars.get_assigned_expr(&f), Some(&succ()));
+}
+
+/// `?f ?a ?b =?= g 7 9`: the pin's first-order approximation unifies `?b` with `9` and then
+/// `?f ?a` with `g 7` by the same rule, at once (vendored `Lean/Meta/ExprDefEq.lean:1172-1212`).
+/// Head recovery, which only aligns equal suffixes, cannot. Pinned lean v4.32.0 accepts
+/// `⟨_, _, _, rfl⟩ : PSigma fun f => PSigma fun a => PSigma fun b => f a b = Nat.add 7 9` with
+/// `.2.1 = 7`, `.2.2.1 = 9` and `.1 = Nat.add` by `rfl`.
+#[test]
+fn first_order_approximation_recurses_into_the_remaining_application() {
+    let mut txn = transaction();
+    let g = local(&mut txn, "g", pi(nat(), pi(nat(), nat())));
+    let f = hole(&mut txn, "f", pi(nat(), pi(nat(), nat())));
+    let a = hole(&mut txn, "a", nat());
+    let b = hole(&mut txn, "b", nat());
+    txn.unify(
+        &app(
+            Expr::mvar(f.clone()),
+            &[Expr::mvar(a.clone()), Expr::mvar(b.clone())],
         ),
-        Err(UnificationError::Deferred(_))
-    ));
-    unchanged(&txn, &before);
+        &app(g.clone(), &[number(7), number(9)]),
+        budget(),
+    )
+    .unwrap();
+    assert_eq!(txn.mvars.get_assigned_expr(&a), Some(&number(7)));
+    assert_eq!(txn.mvars.get_assigned_expr(&b), Some(&number(9)));
+    assert_eq!(txn.mvars.get_assigned_expr(&f), Some(&g));
+}
+
+/// `?f ?a =?= (let y := 0; Nat.succ 7)`: the first-order approximation fails on the `let`, and
+/// after `whnfCore` the pin's `isDefEq` reaches `processAssignment` again, now against
+/// `Nat.succ 7`. Pinned lean v4.32.0 accepts `⟨_, _, rfl⟩` for
+/// `PSigma fun f => PSigma fun a => f a = (let y := 0; Nat.succ 7)` with `.2.1 = 7` by `rfl`.
+#[test]
+fn first_order_approximation_is_retried_after_core_reduction() {
+    let mut txn = transaction();
+    let f = hole(&mut txn, "f", pi(nat(), nat()));
+    let a = hole(&mut txn, "a", nat());
+    let value = Expr::let_e(
+        name("y"),
+        nat(),
+        number(0),
+        Expr::app(succ(), number(7)),
+        false,
+    );
+    txn.unify(
+        &Expr::app(Expr::mvar(f.clone()), Expr::mvar(a.clone())),
+        &value,
+        budget(),
+    )
+    .unwrap();
+    assert_eq!(txn.mvars.get_assigned_expr(&a), Some(&number(7)));
+    assert_eq!(txn.mvars.get_assigned_expr(&f), Some(&succ()));
 }
 
 #[test]

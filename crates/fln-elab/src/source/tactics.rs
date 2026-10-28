@@ -90,6 +90,9 @@ pub enum TacticError {
     InvalidSearchArguments(&'static str),
     SyntheticHoleOutsideRefine,
     IncompatibleSyntheticHole,
+    /// `refine` left a `_` it made unassigned (the pin's "don't know how to synthesize
+    /// placeholder", `logUnassignedAndAbort`).
+    UnassignedNaturalHole,
     NoConstructor,
     ExpectedTwoConstructors,
     ApplyMismatch,
@@ -307,6 +310,9 @@ impl std::fmt::Display for TacticError {
             Self::NoGoals => write!(f, "tactic has no remaining goal"),
             Self::UnsolvedGoals { count } => write!(f, "proof script left {count} unsolved goals"),
             Self::SyntheticHoleOutsideRefine => write!(f, "synthetic proof holes require refine"),
+            Self::UnassignedNaturalHole => {
+                write!(f, "refine left a placeholder it could not synthesize")
+            }
             Self::IncompatibleSyntheticHole => {
                 write!(f, "named synthetic hole used at incompatible type or scope")
             }

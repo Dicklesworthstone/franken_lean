@@ -123,15 +123,39 @@ fn named_holes_cannot_capture_another_scope_or_take_incompatible_types() {
         "structure Pair where\n first : Nat\n second : String\ndef bad : Pair := by refine Pair.mk ?same ?same; exact 7",
     );
 }
+/// `Eq.trans`, which the source seed lacks (`Init/Prelude.lean`).
+const CHAIN: &str = "theorem chain {a b c : Nat} (h₁ : a = b) (h₂ : b = c) : a = c := h₂ ▸ h₁\n";
+/// The pin's `refine` aborts when an implicit argument it made is still unassigned, as when
+/// `chain ?_ ?_` leaves its middle term `b` open ("don't know how to synthesize implicit
+/// argument"); it never becomes a goal. Each program was judged by pinned lean v4.32.0 first.
+/// (`refine Eq.refl ?_; exact n` was here as accepted: the pin assigns `?_ := n` at the refine
+/// and refuses `exact n` with "No goals to be solved".)
 #[test]
 fn implicit_inference_holes_are_not_promoted_to_tactic_goals() {
-    check("theorem simple (n : Nat) : n = n := by refine Eq.refl ?_; exact n");
-    check(
-        "def identity {A : Type} (x : A) : A := x\ntheorem same (n : Nat) : identity n = n := by refine Eq.refl ?_; exact n",
-    );
+    check(&format!(
+        "{CHAIN}theorem simple (n : Nat) : n = n := by refine chain ?_ (Eq.refl n); exact Eq.refl n"
+    ));
+    check(&format!(
+        "{CHAIN}def identity {{A : Type}} (x : A) : A := x\ntheorem same (n : Nat) : identity n = n := by refine chain ?_ (Eq.refl n); exact Eq.refl n"
+    ));
+    check(&format!(
+        "{CHAIN}theorem named (n : Nat) : n = n := by refine chain (b := n) ?_ ?_; exact Eq.refl n; exact Eq.refl n"
+    ));
+    reject(&format!(
+        "{CHAIN}theorem unassigned (n : Nat) : n = n := by refine chain ?_ ?_; exact n; exact Eq.refl n; exact Eq.refl n"
+    ));
     reject(
         "def ignore (n : Nat) (h : 0 = 0) : 0 = 0 := h\ntheorem bad : 0 = 0 := by refine ignore _ ?_; rfl",
     );
+    // A witness `_` that only a later tactic could assign: the pin refuses at the refine ("don't
+    // know how to synthesize placeholder for argument `w`"); a given witness is accepted.
+    let ex = "inductive Ex (p : Nat -> Prop) : Prop where\n  | intro (w : Nat) (h : p w)\n";
+    reject(&format!(
+        "{ex}theorem witness : Ex (fun n => n = 3) := by refine Ex.intro _ ?_; rfl"
+    ));
+    check(&format!(
+        "{ex}theorem witness : Ex (fun n => n = 3) := by refine Ex.intro 3 ?_; rfl"
+    ));
 }
 #[test]
 fn malformed_synthetic_hole_spelling_refuses() {
@@ -273,7 +297,10 @@ fn refinement_exhaustion_and_failure_do_not_publish_a_prefix() {
         .into_complete()
         .unwrap();
     let root = engine.logical_root(&KVMap::new());
-    let source = "theorem same (n : Nat) : n = n := by refine Eq.refl ?_; exact n";
+    let source = format!(
+        "{CHAIN}theorem same (n : Nat) : n = n := by refine chain ?_ (Eq.refl n); exact Eq.refl n"
+    );
+    let source = source.as_str();
     let mut low = SourceCheckLimits::new(limits);
     low.admission.kernel = low.admission.kernel.narrowed(0, 32);
     match engine.check_source_files(&[source.as_bytes()], &KVMap::new(), low) {

@@ -356,6 +356,70 @@ theorem firstOrder (σ τ : Type) : (pair σ).1 τ = (σ × τ) := rfl
         .unwrap();
 }
 
+/// The pin's `processAssignment` reads a hole's arguments in order and approximates
+/// first-order at once at the first one that is no fresh local (vendored
+/// `Lean/Meta/ExprDefEq.lean:1301-1325`), under `apply` as in a term. So `?F ?β =?= Nat × Bool`
+/// assigns `?F := Prod Nat` and `?β := Bool`, and `Functor.map Prod.fst (x s)` finds `m` from
+/// `?f ?β =?= m (α × σ)` (upstream tests/elab/univIssue.lean). A theorem that needs another
+/// solution is refused, by the pin and here (bead
+/// fln-first-order-approximation-context-locals-6esd).
+#[test]
+fn a_metavariable_argument_is_approximated_first_order_at_once() {
+    let Some(lib) = pin() else {
+        return;
+    };
+    std::thread::Builder::new()
+        .stack_size(STACK)
+        .spawn(move || {
+            let base = imported_state(&lib);
+            let source = r#"
+universe u v
+def ex1 {σ : Type u} {m : Type u → Type v} [Functor m] {α : Type u} (x : StateT σ m α) (s : σ) : m α :=
+  Functor.map Prod.fst (x s)
+def ex2 {σ : Type u} {m : Type u → Type v} [Functor m] {α : Type u} (x : StateT σ m α) (s : σ) : m α :=
+  Prod.fst <$> x s
+theorem viaTerm : Exists fun F : Type → Type => Exists fun β : Type => F β = Option Nat := ⟨_, _, rfl⟩
+theorem viaApply : Exists fun F : Type → Type => Exists fun β : Type => F β = Option Nat := by
+  apply Exists.intro
+  apply Exists.intro
+  apply Eq.refl
+def pick : PSigma fun F : Type → Type => PSigma fun β : Type => F β = (Nat × Bool) := ⟨_, _, rfl⟩
+theorem picked : pick.2.1 = Bool := rfl
+def pickByApply : PSigma fun F : Type → Type => PSigma fun β : Type => F β = (Nat × Bool) := by
+  apply PSigma.mk
+  apply PSigma.mk
+  apply Eq.refl
+theorem pickedByApply : pickByApply.2.1 = Bool := rfl
+"#;
+            reference(
+                &lib,
+                &format!("prelude\nimport Init.Control.State\n{source}"),
+                true,
+            );
+            checked(&base, source);
+            let pick = "def pick : PSigma fun F : Type → Type => PSigma fun β : Type => F β = (Nat × Bool) := ⟨_, _, rfl⟩\n";
+            for bad in [
+                format!("{pick}theorem wrong : pick.2.1 = (Nat × Bool) := rfl"),
+                format!("{pick}theorem wrongHead : pick.1 = (fun _ => Nat × Bool) := rfl"),
+            ] {
+                reference(
+                    &lib,
+                    &format!("prelude\nimport Init.Control.State\n{bad}"),
+                    false,
+                );
+                let root = base.logical_root(&KVMap::new());
+                let error = base
+                    .check_source_files(&[bad.as_bytes()], &KVMap::new(), limits())
+                    .unwrap_err();
+                assert_eq!(error.disposition().0, "elaboration", "{bad}\n{error:?}");
+                assert_eq!(base.logical_root(&KVMap::new()), root);
+            }
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
 #[test]
 fn exhausted_admission_can_retry_without_publishing_a_definition_prefix() {
     let base = seed()

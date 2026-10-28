@@ -154,30 +154,40 @@ fn eta_suffixes_open_dependent_telescopes_without_capture() {
     assert!(!txn.mvars.get_assigned_expr(&f).unwrap().has_loose_bvars());
 }
 
+/// Head recovery never solves an argument function hole, but the pin's first-order
+/// approximation, which runs first, unifies `wrap (fun x => h x)` with `wrap ?argument`
+/// (vendored `Lean/Meta/ExprDefEq.lean:1172-1212`) and so assigns `?argument`.
 #[test]
-fn eta_suffixes_do_not_solve_an_argument_function_hole() {
+fn first_order_approximation_solves_an_argument_function_hole() {
     let mut txn = transaction();
     let h = local(&mut txn, "h", pi(nat(), nat()));
     let argument = hole(&mut txn, "argument", pi(nat(), nat()), MetavarKind::Natural);
     let expanded = lam(nat(), Expr::app(h, Expr::bvar(0).unwrap()));
-    let (_, _, lhs, rhs) =
-        wrapped_equation(&mut txn, pi(nat(), nat()), expanded, Expr::mvar(argument));
-    let before = txn.clone();
-    assert!(txn.unify(&lhs, &rhs, budget()).is_err());
-    assert_unchanged(&txn, &before);
+    let (f, g, lhs, rhs) = wrapped_equation(
+        &mut txn,
+        pi(nat(), nat()),
+        expanded,
+        Expr::mvar(argument.clone()),
+    );
+    txn.unify(&lhs, &rhs, budget()).unwrap();
+    assert!(txn.mvars.is_assigned(&argument));
+    assert_eq!(txn.mvars.get_assigned_expr(&f), Some(&g));
 }
 
+/// On a deliberately ill-typed pair (h expects Type, not Nat), the pin's first-order
+/// approximation runs before head recovery's domain check is reached, and its `etaEq` compares
+/// `fun x => h x` with `h` structurally, as the pin's `isDefEq` does on input it assumes
+/// well-typed. The only assignment it publishes, `?f := g`, is well-typed and K1-checked.
 #[test]
-fn eta_suffixes_check_the_neutral_functions_domain() {
+fn first_order_approximation_publishes_only_a_checked_head_on_ill_typed_eta() {
     let mut txn = transaction();
     let h = local(&mut txn, "h", pi(Expr::sort(Level::one()), nat()));
-    // Deliberately ill-typed: h expects Type, not Nat. The expanded and neutral
-    // bodies would be syntactically identical after blindly eta-expanding h.
     let expanded = lam(nat(), Expr::app(h.clone(), Expr::bvar(0).unwrap()));
-    let (_, _, lhs, rhs) = wrapped_equation(&mut txn, pi(nat(), nat()), expanded, h);
-    let before = txn.clone();
-    assert!(txn.unify(&lhs, &rhs, budget()).is_err());
-    assert_unchanged(&txn, &before);
+    let (f, g, lhs, rhs) = wrapped_equation(&mut txn, pi(nat(), nat()), expanded, h);
+    let report = txn.unify(&lhs, &rhs, budget()).unwrap();
+    assert_eq!(report.expression_assignments, vec![f.clone()]);
+    assert_eq!(txn.mvars.get_assigned_expr(&f), Some(&g));
+    assert!(report.kernel_checks > 0);
 }
 
 #[test]

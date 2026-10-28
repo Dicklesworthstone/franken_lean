@@ -13,12 +13,18 @@ pub(in crate::source) struct RefinementFrame {
     /// (`withCollectingNewGoalsFrom` with `allowNaturalHoles`, vendored
     /// src/Lean/Elab/Tactic/ElabTerm.lean:140-180).
     placeholders: bool,
+    /// The first fresh name this refinement's elaboration can take: a hole named from it on
+    /// was made by the refinement (the pin's `mvarCounterSaved`).
+    first_name: u64,
 }
 
 impl Context {
     pub(in crate::source) fn begin_refinement(&mut self) -> usize {
         let depth = self.refinements.len();
-        self.refinements.push(RefinementFrame::default());
+        self.refinements.push(RefinementFrame {
+            first_name: self.next,
+            ..RefinementFrame::default()
+        });
         depth
     }
 
@@ -28,6 +34,7 @@ impl Context {
         self.refinements.push(RefinementFrame {
             holes: Vec::new(),
             placeholders: true,
+            first_name: self.next,
         });
         depth
     }
@@ -483,6 +490,9 @@ impl Context {
         self.txn.lctx = goal.lctx.clone();
         self.resolve_instances(false)?;
         self.flush(false)?;
+        if !frame.placeholders {
+            self.refuse_new_natural_holes(&term.value, frame.first_name)?;
+        }
         let suffix = if frame.placeholders {
             "refine'"
         } else {
@@ -499,6 +509,32 @@ impl Context {
                 .rev()
                 .map(|(_, goal)| Work::Goal(goal)),
         );
+        Ok(())
+    }
+
+    /// The pin's `withCollectingNewGoalsFrom` without `allowNaturalHoles` (vendored
+    /// src/Lean/Elab/Tactic/ElabTerm.lean:160-169): a natural hole the refinement made that is
+    /// still unassigned in its term aborts the tactic (`logUnassignedAndAbort`), so
+    /// `refine ⟨_, ?_⟩` cannot leave its witness to a later tactic. A hole made before the
+    /// refinement, or one deferred to a delayed assignment, is no new natural hole.
+    fn refuse_new_natural_holes(
+        &mut self,
+        value: &Expr,
+        first_name: u64,
+    ) -> Result<(), NatDefinitionElabError> {
+        let value = self.instantiate(value)?;
+        let source = Name::from_components(["_fln_source"]);
+        let unassigned = self.txn.mvars.collect_mvars(&value);
+        let fresh_natural = unassigned.iter().any(|id| {
+            matches!(id.0.leaf_view(), LeafView::Num(index) if index >= first_name)
+                && id.0.parent() == source
+                && self.txn.mvars.get_decl(id).is_some_and(|declaration| {
+                    declaration.kind == MetavarKind::Natural && declaration.delayed.is_none()
+                })
+        });
+        if fresh_natural {
+            return Err(error(TacticError::UnassignedNaturalHole));
+        }
         Ok(())
     }
 }

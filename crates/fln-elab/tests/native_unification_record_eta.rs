@@ -916,28 +916,33 @@ fn empty_record_eta_suffix_checks_the_complete_parameterized_type() {
     assert_eq!(txn.mvars.get_assigned_expr(&f), Some(&g));
 }
 
+/// Head recovery never solves a field or singleton receiver hole, but the pin's first-order
+/// approximation, which runs first, unifies the wrapped records, solving the hole by structure
+/// eta (vendored `Lean/Meta/ExprDefEq.lean:1172-1212`). Pinned lean v4.32.0 accepts both
+/// shapes: `f (wrap ⟨x, r.b⟩) = g (wrap r)` with `.2.1 = r.a` by `rfl`, and
+/// `f (wrap r.val) = g (wrap 7)` for `r : Box Nat`.
 #[test]
-fn record_eta_suffix_does_not_solve_a_field_or_singleton_receiver_hole() {
+fn first_order_approximation_solves_a_field_or_singleton_receiver_hole() {
     for singleton in [false, true] {
         let mut txn = transaction();
-        let (type_, lhs, rhs) = if singleton {
+        let (type_, hole, lhs, rhs) = if singleton {
             let type_ = apply(constant("Box"), [constant("Nat")]);
             let record = goal(&mut txn, "record", type_);
-            (
-                constant("Nat"),
-                proj("Box", 0, &Expr::mvar(record)),
-                numeral(7),
-            )
+            let receiver = proj("Box", 0, &Expr::mvar(record.clone()));
+            (constant("Nat"), record, receiver, numeral(7))
         } else {
             let record = local(&mut txn, "record", constant("PairN"));
             let field = goal(&mut txn, "field", constant("Nat"));
-            let expanded = mk("PairN", [Expr::mvar(field), proj("PairN", 1, &record)]);
-            (constant("PairN"), expanded, record)
+            let expanded = mk(
+                "PairN",
+                [Expr::mvar(field.clone()), proj("PairN", 1, &record)],
+            );
+            (constant("PairN"), field, expanded, record)
         };
-        let (_, _, lhs, rhs) = record_suffix_problem(&mut txn, type_, lhs, rhs);
-        let before = txn.clone();
-        assert!(txn.unify(&lhs, &rhs, budget()).is_err());
-        unchanged(&txn, &before);
+        let (f, g, lhs, rhs) = record_suffix_problem(&mut txn, type_, lhs, rhs);
+        txn.unify(&lhs, &rhs, budget()).unwrap();
+        assert!(txn.mvars.is_assigned(&hole), "singleton {singleton}");
+        assert_eq!(txn.mvars.get_assigned_expr(&f), Some(&g));
     }
 }
 

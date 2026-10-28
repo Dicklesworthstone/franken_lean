@@ -144,18 +144,26 @@ fn unequal_nested_arguments_do_not_select_a_head() {
     assert!(txn.budget.heartbeats_consumed > before.budget.heartbeats_consumed);
 }
 
+/// `?f (h ?argument) =?= g (h 7)`: head recovery never assigns an argument hole, but the pin's
+/// first-order approximation, which runs first, unifies `h ?argument` with `h 7` (vendored
+/// `Lean/Meta/ExprDefEq.lean:1172-1212`). Pinned lean v4.32.0 accepts
+/// `⟨_, _, rfl⟩ : PSigma fun f => PSigma fun a => f (h a) = g (h 7)` with `.2.1 = 7` and
+/// `.1 = g` by `rfl`.
 #[test]
-fn recovery_does_not_assign_an_argument_hole_to_make_a_suffix_equal() {
+fn first_order_approximation_assigns_a_nested_argument_hole() {
     let mut txn = transaction();
     let h = local(&mut txn, "h", pi(nat(), nat()));
     let g = local(&mut txn, "g", pi(nat(), nat()));
     let argument = hole(&mut txn, "argument", nat(), MetavarKind::Natural);
     let f = hole(&mut txn, "f", pi(nat(), nat()), MetavarKind::Natural);
-    let left = Expr::app(Expr::mvar(f), Expr::app(h.clone(), Expr::mvar(argument)));
-    let right = Expr::app(g, Expr::app(h, numeral(7)));
-    let before = txn.clone();
-    assert!(txn.unify(&left, &right, budget()).is_err());
-    assert_unchanged(&txn, &before);
+    let left = Expr::app(
+        Expr::mvar(f.clone()),
+        Expr::app(h.clone(), Expr::mvar(argument.clone())),
+    );
+    let right = Expr::app(g.clone(), Expr::app(h, numeral(7)));
+    txn.unify(&left, &right, budget()).unwrap();
+    assert_eq!(txn.mvars.get_assigned_expr(&argument), Some(&numeral(7)));
+    assert_eq!(txn.mvars.get_assigned_expr(&f), Some(&g));
 }
 
 #[test]

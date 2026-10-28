@@ -123,6 +123,7 @@ impl Engine<'_> {
             + self.assigned_levels.len()
             + self.residuals.len()
             + self.awakened.len()
+            + self.checked_assignments.len()
         {
             self.meter.node()?;
         }
@@ -144,6 +145,7 @@ impl Engine<'_> {
             residuals: self.residuals.clone(),
             awakened: self.awakened.clone(),
             kernel_checks: self.kernel_checks,
+            checked_assignments: self.checked_assignments.clone(),
             fact_cache: HashMap::new(),
             local_facts: local_facts::Cache::default(),
             nat_literals_valid: self.nat_literals_valid,
@@ -155,6 +157,7 @@ impl Engine<'_> {
             // outer owner and can ask it against the surviving equations.
             pending: pending::PendingState::new(None, u64::MAX),
             congruence_depth: self.congruence_depth + 1,
+            first_order_trial: self.first_order_trial,
             fail_fast: self.fail_fast || fail_fast,
         };
         let generation = self.generation();
@@ -174,6 +177,7 @@ impl Engine<'_> {
                 self.assigned_levels = trial.assigned_levels;
                 self.residuals = trial.residuals;
                 self.awakened = trial.awakened;
+                self.checked_assignments = trial.checked_assignments;
                 self.fact_cache = trial.fact_cache;
                 self.local_facts = trial.local_facts;
                 self.nat_literals_valid = trial.nat_literals_valid;

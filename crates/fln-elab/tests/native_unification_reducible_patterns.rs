@@ -505,8 +505,14 @@ fn normalized_dependent_pruning_does_not_invent_an_inhabitant() {
     unchanged(&txn, &before);
 }
 
+/// Alone, `?f ((fun x => x) ?a) =?= ?f ?b` unifies the arguments, as the pin's
+/// `isDefEqMVarSelf` does (vendored `Lean/Meta/ExprDefEq.lean:1777-1780`): `?a` and `?b` are
+/// made equal and `?f` stays open. (Which of the two is assigned is this unifier's
+/// hole-to-hole orientation after beta; the pin assigns `?b`.) Beside an ordinary constraint
+/// that fixes `?f` as a constant function, that constraint has first choice, and neither
+/// argument hole is assigned.
 #[test]
-fn normalization_never_assumes_an_unknown_function_is_injective() {
+fn a_hole_applied_twice_unifies_its_normalized_arguments() {
     let mut txn = transaction();
     let f = hole(&mut txn, "f", pi(nat(), nat()), MetavarKind::Natural);
     let a = hole(&mut txn, "a", nat(), MetavarKind::Natural);
@@ -514,11 +520,14 @@ fn normalization_never_assumes_an_unknown_function_is_injective() {
     let left = Expr::app(Expr::mvar(f.clone()), beta(nat(), Expr::mvar(a.clone())));
     let right = Expr::app(Expr::mvar(f.clone()), Expr::mvar(b.clone()));
     let before = txn.clone();
-    assert!(matches!(
-        txn.unify(&left, &right, budget()),
-        Err(UnificationError::Deferred(_))
-    ));
-    unchanged(&txn, &before);
+    txn.unify(&left, &right, budget()).unwrap();
+    assert!(!txn.mvars.is_assigned(&f));
+    assert!(txn.mvars.is_assigned(&a) || txn.mvars.is_assigned(&b));
+    assert_eq!(
+        txn.mvars.instantiate(&Expr::mvar(a.clone())),
+        txn.mvars.instantiate(&Expr::mvar(b.clone()))
+    );
+    let mut txn = before;
     let report = txn
         .unify_many_with(
             &[
