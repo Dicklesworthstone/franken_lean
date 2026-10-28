@@ -215,7 +215,7 @@ fn diamonds_copy_the_overlapping_parent_as_at_the_pin() {
 fn diamonds_refuse_a_mismatched_field() {
     let Some(lib) = pinned_lib() else { return };
     let root = workspace();
-    for (program, refusal) in [(
+    let (program, refusal) = (
         r#"prelude
 import Init.Core
 structure Bar (α : Type) where
@@ -228,11 +228,10 @@ set_option structureDiamondWarning false in
 structure Foo (α : Type) extends Bar α, Baz α
 "#,
         "Field type mismatch",
-    )] {
-        let (code, stdout, stderr) = ours(&lib, &root, program);
-        assert_ne!(code, Some(0), "{program}\nstdout: {stdout}");
-        assert!(stderr.contains(refusal), "{program}\nstderr: {stderr}");
-    }
+    );
+    let (code, stdout, stderr) = ours(&lib, &root, program);
+    assert_ne!(code, Some(0), "{program}\nstdout: {stdout}");
+    assert!(stderr.contains(refusal), "{program}\nstderr: {stderr}");
 }
 
 #[test]
