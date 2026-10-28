@@ -6211,6 +6211,15 @@ impl Engine {
             .and_then(|optimized| fln_comp::fir::lower_to_flbc(&optimized).ok())
             .map_or_else(|| fln_comp::fir::lower_to_flbc(ingress.fir()), Ok)
             .map_err(EngineExecutionError::Lowering)?;
+        // Ingress keeps aliases for reusable source locals, and the FIR
+        // optimizer may transfer array parameters through internal calls.
+        // Retire each alias only after the independent ownership validator
+        // proves its final use; otherwise every update observes a shared
+        // reference even when the source no longer uses the original value.
+        let lowered = fln_comp::flbc::insert_ownership(&lowered, limits.ownership)
+            .map_err(LoweringError::OwnershipInsertion)
+            .map_err(EngineExecutionError::Lowering)?
+            .into_program();
         let flbc_artifact = fln_comp::flbc::encode_canonical(&lowered, limits.flbc_codec)
             .map_err(EngineExecutionError::Codec)?;
         let executable = fln_comp::flbc::decode_canonical(&flbc_artifact, limits.flbc_codec)
@@ -7211,6 +7220,8 @@ pub struct EngineExecutionLimits {
     pub declaration: DeclarationBudget,
     pub collisions: CollisionBudget,
     pub ingress: IngressLimits,
+    /// Bounded last-use transfer, eager release, and independent validation.
+    pub ownership: fln_comp::flbc::OwnershipLimits,
     pub flbc_codec: CodecLimits,
     pub vm: VmExecutionLimits,
     pub source_modules: SourceModuleLimits,
@@ -7228,6 +7239,7 @@ impl EngineExecutionLimits {
             declaration: DeclarationBudget::default(),
             collisions: CollisionBudget::default(),
             ingress: IngressLimits::default(),
+            ownership: fln_comp::flbc::OwnershipLimits::default(),
             flbc_codec: CodecLimits::default(),
             vm: VmExecutionLimits::default(),
             source_modules: SourceModuleLimits::default(),
@@ -16356,6 +16368,117 @@ mod tests {
                 matches!(instruction, Instruction::Intrinsic { row, .. } if row == append_row)
             })
         }));
+    }
+
+    #[test]
+    fn source_execution_transfers_last_uses_and_preserves_shared_values() {
+        let options = KVMap::new();
+        let engine = Engine::with_source_seed(EngineAdmissionLimits::new(test_budget()))
+            .expect("the source seed passes the dual-checker council")
+            .into_complete()
+            .expect("the bounded source seed answers completely");
+        let before = engine.logical_root(&options);
+        for (source, expected, shared) in [
+            (
+                "def unique := let saved := String.append \"a\" \"b\"; String.append saved \"c\"",
+                "abc",
+                false,
+            ),
+            (
+                "def shared := let saved := String.append \"a\" \"b\"; let longer := String.append saved \"c\"; String.append saved longer",
+                "ababc",
+                true,
+            ),
+        ] {
+            let completed = engine
+                .execute_source_definition(source.as_bytes(), &options, test_limits())
+                .expect("consuming calls preserve source-local ownership")
+                .into_complete()
+                .expect("bounded source execution completes");
+            let expected = Some(ClosedVmValue::String(expected.to_owned()));
+            assert_eq!(closed_vm_value(&completed.exit), Ok(expected.clone()));
+            let executable =
+                fln_comp::flbc::decode_canonical(&completed.flbc_artifact, CodecLimits::default())
+                    .expect("the executed artifact independently validates");
+            assert!(
+                executable.functions().iter().any(|function| {
+                    function
+                        .code
+                        .iter()
+                        .any(|instruction| matches!(instruction, Instruction::Move { .. }))
+                }),
+                "a source local's final consuming use must transfer its existing reference"
+            );
+            if shared {
+                assert!(
+                    executable.functions().iter().any(|function| {
+                        function
+                            .code
+                            .iter()
+                            .any(|instruction| matches!(instruction, Instruction::Copy { .. }))
+                    }),
+                    "a live source alias must retain its own reference"
+                );
+            }
+            let replay = execute_flbc_artifact(
+                &completed.flbc_artifact,
+                &options,
+                FlbcExecutionLimits::default(),
+            )
+            .expect("the ownership-bearing artifact replays")
+            .into_complete()
+            .expect("bounded replay completes");
+            assert_eq!(closed_vm_value(&replay), Ok(expected));
+        }
+        assert_eq!(engine.logical_root(&options), before);
+    }
+
+    #[test]
+    fn source_ownership_limits_refuse_before_execution_and_preserve_the_engine() {
+        let options = KVMap::new();
+        let engine = Engine::with_source_seed(EngineAdmissionLimits::new(test_budget()))
+            .expect("the source seed passes the dual-checker council")
+            .into_complete()
+            .expect("the bounded source seed answers completely");
+        let before = engine.logical_root(&options);
+        let mut limits = test_limits();
+        limits.ownership.max_source_instructions = 0;
+        let source = b"def withheld := String.append \"a\" \"b\"";
+        let error = engine
+            .execute_source_definition(source, &options, limits)
+            .expect_err("ownership work cannot escape its caller's allowance");
+        assert!(matches!(
+            &error,
+            EngineExecutionError::Lowering(
+                fln_comp::fir::LoweringError::OwnershipInsertion(
+                    fln_comp::flbc::OwnershipError::ResourceLimit {
+                        resource: fln_comp::flbc::OwnershipResource::SourceInstructions,
+                        limit: 0,
+                        observed,
+                    }
+                )
+            ) if *observed > 0
+        ));
+        assert_eq!(
+            super::source_check::classify(&error),
+            ("resource", false, 3)
+        );
+        assert_eq!(engine.logical_root(&options), before);
+        assert!(
+            !engine
+                .environment()
+                .contains(&Name::from_components(["withheld"]))
+        );
+        let recovered = engine
+            .execute_source_definition(source, &options, test_limits())
+            .expect("the unchanged source succeeds with an adequate allowance")
+            .into_complete()
+            .expect("bounded recovery completes");
+        assert_eq!(
+            closed_vm_value(&recovered.exit),
+            Ok(Some(ClosedVmValue::String("ab".to_owned())))
+        );
+        assert_eq!(engine.logical_root(&options), before);
     }
 
     #[test]
