@@ -67,6 +67,7 @@ impl Engine {
             local_instance: None,
         };
         let mut equations = Vec::new();
+        let mut pattern_equations = false;
         if let Some((_, false)) = rule {
             let preparation = if source_owned {
                 source_simp::equations::prepare_owned(
@@ -134,6 +135,7 @@ impl Engine {
                                 return Ok(Outcome::InternalFault(fault));
                             }
                         };
+                    pattern_equations = !candidates.is_empty();
                     for (candidate, existing) in candidates {
                         let Declaration::Thm(theorem) = &candidate else {
                             return Err(EngineExecutionError::UnexpectedPublication {
@@ -184,6 +186,16 @@ impl Engine {
             }
         }
         if activate {
+            if pattern_equations {
+                // These source-only entries share one attribute priority.
+                // Keep the unfolding fallback behind the pattern equations:
+                // expanding the definition first can hide their left-hand
+                // side under a stuck recursor. Its unsupported export
+                // snapshot remains unchanged.
+                batch.engine.environment =
+                    source_simp::update(batch.engine.environment(), name, rule)
+                        .map_err(metadata_error)?;
+            }
             if let Some((priority, false)) = rule {
                 for equation in &equations {
                     batch.engine.environment = source_simp::update(
@@ -202,8 +214,11 @@ impl Engine {
                     .map_err(metadata_error)?;
                 }
             }
-            batch.engine.environment = source_simp::update(batch.engine.environment(), name, rule)
-                .map_err(metadata_error)?;
+            if !pattern_equations {
+                batch.engine.environment =
+                    source_simp::update(batch.engine.environment(), name, rule)
+                        .map_err(metadata_error)?;
+            }
         } else {
             // Validate the same requested rule without retaining its global
             // activation. The lexical scope driver owns the local SimpEntry.
