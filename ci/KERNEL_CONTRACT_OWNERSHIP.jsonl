@@ -1,4 +1,4 @@
-{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":730,"projection_hash":"f7e719b35832e3041d7c0dc5b93c02f4605e47c68d94fcd3283a3e97b533f15f"}
+{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":731,"projection_hash":"3e1b118df00d79cee405adc5699a618d0f93f0c562657e53cc9c10e6bf4d6259"}
 {"id":"fln-0bw5"}
 {"id":"fln-0eq8"}
 {"id":"fln-0rxm"}
@@ -167,6 +167,7 @@
 {"id":"fln-fln-cli-untracked-reds-seed-world-8tad"}
 {"id":"fln-fln-definition-auxiliary-names-lv0n"}
 {"id":"fln-fln-elab-lib-reds-since-7dd7aa5d-2kxu"}
+{"id":"fln-fln-equation-tests-red-since-8c0b2cd3-b8zv"}
 {"id":"fln-fln-extended-60-modules-council-8485-27jb"}
 {"id":"fln-fln-let-rec-opacity-and-lifting-thb4"}
 {"id":"fln-fln-main-red-three-unowned-h823"}
