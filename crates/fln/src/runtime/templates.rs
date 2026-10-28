@@ -52,9 +52,40 @@ fn type_producing_functions_are_not_run_as_scalar_programs() {
 }
 
 #[test]
+fn higher_rank_callback_parameters_are_templates_at_every_prefix_position() {
+    let identity = pi(
+        Expr::sort(Level::one()),
+        pi(
+            Expr::bvar(0).unwrap(),
+            Expr::bvar(1).unwrap(),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
+    for callback in [
+        identity.clone(),
+        pi(scalar("Nat"), identity, BinderInfo::Default),
+    ] {
+        let consumer = pi(callback, scalar("Nat"), BinderInfo::Default);
+        assert!(template(consumer.clone()));
+        assert!(template(pi(
+            scalar("String"),
+            consumer,
+            BinderInfo::Default,
+        )));
+    }
+}
+
+#[test]
 fn ordinary_callback_and_scalar_parameters_still_require_execution() {
     let callback = pi(scalar("Nat"), scalar("Nat"), BinderInfo::Default);
-    assert!(!template(pi(callback, scalar("Nat"), BinderInfo::Default)));
+    assert!(!template(pi(
+        callback.clone(),
+        scalar("Nat"),
+        BinderInfo::Default,
+    )));
+    let consumer = pi(callback, scalar("Nat"), BinderInfo::Default);
+    assert!(!template(pi(consumer, scalar("Nat"), BinderInfo::Default)));
     assert!(!template(pi(
         scalar("Nat"),
         pi(scalar("String"), scalar("Bool"), BinderInfo::Default),
@@ -100,7 +131,10 @@ fn long_parameter_telescopes_do_not_recurse_on_the_host_stack() {
             for _ in 0..4000 {
                 type_ = pi(scalar("Nat"), type_, BinderInfo::Default);
             }
-            assert!(template(type_));
+            // Both the definition's outer telescope and a callback's own
+            // generic prefix remain iterative on this deliberately small stack.
+            assert!(template(type_.clone()));
+            assert!(template(pi(type_, scalar("Nat"), BinderInfo::Default)));
         })
         .unwrap()
         .join()

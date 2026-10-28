@@ -372,6 +372,50 @@ impl Preparation<'_> {
         Ok(used)
     }
 
+    /// A checked polymorphic literal is a template whose type parameters must
+    /// reach actual call sites before selecting a runtime closure interface.
+    /// Inspect only its existing lambda prefix; computed code never becomes a
+    /// literal merely because its result has a generic function type.
+    fn generic_callable_literal(
+        &mut self,
+        input: &Expr,
+        type_: &Expr,
+    ) -> Result<bool, IngressError> {
+        let mut value = input.clone();
+        let mut type_ = self.type_head(type_)?;
+        let mut depth = 0usize;
+        loop {
+            self.tick()?;
+            if let ExprNode::MData { expr, .. } = value.node() {
+                value = expr.clone();
+                continue;
+            }
+            let (
+                ExprNode::Lam {
+                    binder_type, body, ..
+                },
+                ExprNode::ForallE {
+                    binder_type: domain,
+                    body: result,
+                    ..
+                },
+            ) = (value.node(), type_.node())
+            else {
+                return Ok(false);
+            };
+            depth = depth.saturating_add(1);
+            self.producer_depth(depth)?;
+            if self.normalize_type(binder_type)? != self.normalize_type(domain)? {
+                return Ok(false);
+            }
+            if self.type_parameter(domain)? {
+                return Ok(true);
+            }
+            value = body.clone();
+            type_ = self.type_head(result)?;
+        }
+    }
+
     pub(in crate::runtime) fn staged_callback(
         &mut self,
         input: &Expr,
@@ -400,10 +444,11 @@ impl Preparation<'_> {
         }
     }
 
-    /// This is a bounded higher-order specialization, not a general closure
-    /// conversion between different interfaces. An opaque/dynamic callback is
-    /// never reinterpreted, and a strict callback-producing operand is not
-    /// treated as an inert lambda. The normal FIR checker still sees every call.
+    /// Known staged and polymorphic literals can be substituted into a safe
+    /// consumer before closure conversion. This bounded specialization does
+    /// not invent a generic runtime ABI or convert between closure interfaces.
+    /// Opaque/dynamic callbacks are never reinterpreted, and strict producers
+    /// are not inert lambdas. The normal FIR checker still sees every call.
     pub(super) fn specialize_staged_callback(
         &mut self,
         head: &Expr,
@@ -481,6 +526,9 @@ impl Preparation<'_> {
                 break;
             };
             selected |= self.staged_callback(argument, binder_type)?;
+            if !selected && let Some(literal) = self.inert_callable(argument)? {
+                selected = self.generic_callable_literal(&literal, binder_type)?;
+            }
             type_ = self.substitution(body, argument)?;
             value = next.clone();
         }
@@ -543,14 +591,30 @@ impl Preparation<'_> {
             if self.normalize_type(binder_type)? != self.normalize_type(domain)?
                 || domain.has_loose_bvars()
                 || result.has_loose_bvars()
-                || self.value_type(domain)?.is_none()
             {
                 return Ok(None);
             }
             let offset = self.producer_depth(bindings.len())?;
             let argument = self.lift(argument, offset)?;
-            if let Some(lambda) = self.inert_callable(&argument)? {
-                let lambda = self.retain_substituted_callable_type(lambda, domain, body)?;
+            let literal = self.inert_callable(&argument)?;
+            let generic = match &literal {
+                Some(lambda) => self.generic_callable_literal(lambda, domain)?,
+                None => false,
+            };
+            if !generic && self.value_type(domain)?.is_none() {
+                return Ok(None);
+            }
+            if let Some(lambda) = literal {
+                // A known generic lambda is syntax, not an unrepresentable
+                // runtime value. Its actual type arguments are supplied by the
+                // copied consumer body, where ordinary static application can
+                // specialize them. Every nonliteral operand still has a strict
+                // binding, and monomorphic callbacks retain their checked ABI.
+                let lambda = if generic {
+                    lambda
+                } else {
+                    self.retain_substituted_callable_type(lambda, domain, body)?
+                };
                 // Captures already name runtime values, not initializer code.
                 // The charged capture-avoiding substitution adjusts both the
                 // removed parameter and all retained strict argument slots.

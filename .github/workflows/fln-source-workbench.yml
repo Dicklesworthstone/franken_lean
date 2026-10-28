@@ -146,8 +146,9 @@ jobs:
           set -euo pipefail
           case "$CANDIDATE_SUITE" in
             polymorphic-callbacks)
-              rustfmt --edition 2024 --config skip_children=true --check crates/fln/src/runtime.rs crates/fln/src/runtime/templates.rs crates/fln/src/runtime/specialize/arguments.rs crates/fln/src/runtime/specialize/arguments/factories.rs crates/fln/src/runtime/specialize/arguments/tests.rs crates/fln/tests/runtime_parameterized_data.rs
+              rustfmt --edition 2024 --config skip_children=true --check crates/fln/src/runtime.rs crates/fln/src/runtime/templates.rs crates/fln/src/runtime/specialize/arguments.rs crates/fln/src/runtime/specialize/arguments/factories.rs crates/fln/src/runtime/specialize/arguments/tests.rs crates/fln/tests/runtime_parameterized_data.rs crates/fln/src/runtime/global/callbacks.rs crates/fln/tests/runtime_polymorphic_callbacks.rs
               cargo test --locked --release -p fln --test runtime_parameterized_data -- --test-threads=1
+              cargo test --locked --release -p fln --test runtime_polymorphic_callbacks -- --test-threads=1
               cargo test --locked --release -p fln --lib runtime::specialize::arguments -- --test-threads=1
               cargo test --locked --release -p fln --lib runtime::templates -- --test-threads=1
               cargo test --locked --release -p fln --lib runtime::global::callbacks -- --test-threads=1
