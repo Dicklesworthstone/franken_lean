@@ -637,7 +637,7 @@ impl Context {
                 .clone();
             let major_value = Expr::fvar(major.id.clone());
             let (recursor, functional_type, below_type) =
-                self.structural_recursor_at(&plan, &fixed_values, major_value.clone())?;
+                self.structural_recursor_at(plan, &fixed_values, major_value.clone())?;
             let below_id = FVarId(self.fresh_name()?);
             let below = self
                 .txn

@@ -210,17 +210,13 @@ fn diamonds_copy_the_overlapping_parent_as_at_the_pin() {
     }
 }
 
-/// A shared field at two different types, which the pin refuses too ("Field type mismatch"),
-/// and a field only the later parent gives a default, which the pin fills from it: here that
-/// default is not carried, so an instance omitting the field is refused rather than given
-/// another value.
+/// A shared field at two different types remains a rigid mismatch.
 #[test]
-fn diamonds_refuse_a_mismatched_field_and_an_uncarried_default() {
+fn diamonds_refuse_a_mismatched_field() {
     let Some(lib) = pinned_lib() else { return };
     let root = workspace();
-    for (program, refusal) in [
-        (
-            r#"prelude
+    for (program, refusal) in [(
+        r#"prelude
 import Init.Core
 structure Bar (α : Type) where
   a : α
@@ -231,10 +227,19 @@ structure Baz (α : Type) where
 set_option structureDiamondWarning false in
 structure Foo (α : Type) extends Bar α, Baz α
 "#,
-            "Field type mismatch",
-        ),
-        (
-            r#"prelude
+        "Field type mismatch",
+    )] {
+        let (code, stdout, stderr) = ours(&lib, &root, program);
+        assert_ne!(code, Some(0), "{program}\nstdout: {stdout}");
+        assert!(stderr.contains(refusal), "{program}\nstderr: {stderr}");
+    }
+}
+
+#[test]
+fn diamonds_take_the_only_default_from_a_copied_parent() {
+    let Some(lib) = pinned_lib() else { return };
+    let root = workspace();
+    let program = r#"prelude
 import Init.Core
 structure B where
   x : Nat
@@ -245,13 +250,11 @@ set_option structureDiamondWarning false in
 structure D extends B, C
 def d : D := { y := 0 }
 example : d.x = 2 := rfl
-"#,
-            "missing record field x",
-        ),
-    ] {
-        let (code, stdout, stderr) = ours(&lib, &root, program);
-        assert_ne!(code, Some(0), "{program}\nstdout: {stdout}");
-        assert!(stderr.contains(refusal), "{program}\nstderr: {stderr}");
+"#;
+    let (code, stdout, stderr) = ours(&lib, &root, program);
+    assert_eq!((code, stdout.as_str()), (Some(0), ""), "{stderr}");
+    if let Some((code, stdout)) = pinned(&lib, &root.join("Diamonds.lean")) {
+        assert_eq!((code, stdout.as_str()), (0, ""), "the pin moved");
     }
 }
 

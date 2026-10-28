@@ -110,14 +110,11 @@ impl Context {
         sections: usize,
     ) -> Option<Record> {
         let (discriminants, alternatives) = match_parts(under_lambdas(body))?;
-        let environment = self
-            .txn
-            .env
-            .add_decl(ConstantInfo::Defn(definition.clone()))
-            .ok()?;
+        // The definition is not admitted yet, and nothing here may admit it: its own name
+        // is bound to a local while the alternatives elaborate (see `capture`).
         let mut scope = self.source_scope.clone();
         scope.variables = Default::default();
-        let mut cx = Context::scoped(&environment, self.kernel, &scope);
+        let mut cx = Context::scoped(&self.txn.env, self.kernel, &scope);
         cx.txn.lctx = LocalContext::new();
         cx.level_params = definition.base.level_params.clone();
         cx.capture(definition, &discriminants, &alternatives, sections)
@@ -136,6 +133,8 @@ impl Context {
         let mut value = definition.value.clone();
         let mut type_ = definition.base.type_.clone();
         let mut parameters = Vec::new();
+        // The type of the definition applied to its section variables.
+        let mut applied = (sections == 0).then(|| type_.clone());
         while let ExprNode::Lam {
             binder_name,
             binder_type,
@@ -161,47 +160,48 @@ impl Context {
             type_ = self.substitute(codomain, &local)?;
             value = self.substitute(body, &local)?;
             parameters.push(id);
+            if parameters.len() == sections {
+                applied = Some(type_.clone());
+            }
         }
         let result = type_;
-        // Inside a section the body names the definition without the section variables it is
-        // closed over: the pin's `withFunLocalDecls` binds the short name to a local, which
-        // its pre-definition replaces by the constant applied to them. A `let` of that
-        // application stands for it while the alternatives elaborate.
-        let recursion = match (sections, definition.base.name.leaf_view()) {
-            (0, _) => None,
-            (sections, LeafView::Str(short)) if sections <= parameters.len() => {
-                let levels = definition
-                    .base
-                    .level_params
-                    .iter()
-                    .cloned()
-                    .map(Level::param)
-                    .collect();
-                let value = parameters[..sections].iter().fold(
-                    Expr::const_(definition.base.name.clone(), levels),
-                    |head, id| Expr::app(head, Expr::fvar(id.clone())),
-                );
-                let Some(type_) = self.known_type(&value)? else {
-                    return Ok(None);
-                };
-                // The pin's auxiliary declaration answers to the full name too
-                // (`auxDeclToFullName`, Lean/Elab/Term.lean).
-                let mut names = vec![Name::from_components([short])];
-                if names[0] != definition.base.name {
-                    names.push(definition.base.name.clone());
-                }
-                let mut ids = Vec::new();
-                for name in names {
-                    let id = FVarId(self.fresh_name()?);
-                    self.txn
-                        .lctx
-                        .add_let(id.clone(), name, type_.clone(), value.clone());
-                    ids.push(id);
-                }
-                Some((ids, value))
-            }
-            _ => return Ok(None),
+        // The pin's `withFunLocalDecls` binds the definition's name to a local while its body
+        // elaborates; inside a section, to the definition without the section variables it is
+        // closed over. Its pre-definition then replaces that local by the constant applied to
+        // them. A local of that application's type stands for it here, so a recursive
+        // alternative elaborates without the definition entering any environment before the
+        // kernel admits it.
+        let Some(applied) = applied else {
+            return Ok(None);
         };
+        let levels = definition
+            .base
+            .level_params
+            .iter()
+            .cloned()
+            .map(Level::param)
+            .collect();
+        let value = parameters[..sections].iter().fold(
+            Expr::const_(definition.base.name.clone(), levels),
+            |head, id| Expr::app(head, Expr::fvar(id.clone())),
+        );
+        // The pin's auxiliary declaration answers to the full name too
+        // (`auxDeclToFullName`, Lean/Elab/Term.lean).
+        let mut names = Vec::new();
+        if let LeafView::Str(short) = definition.base.name.leaf_view() {
+            names.push(Name::from_components([short]));
+        }
+        if names.first() != Some(&definition.base.name) {
+            names.push(definition.base.name.clone());
+        }
+        let mut recursion = Vec::new();
+        for name in names {
+            let id = FVarId(self.fresh_name()?);
+            self.txn
+                .lctx
+                .add_param(id.clone(), name, applied.clone(), BinderInfo::Default);
+            recursion.push(id);
+        }
         let mut positions = Vec::new();
         for name in discriminants {
             let Some(position) = parameters.iter().rposition(|id| {
@@ -232,14 +232,12 @@ impl Context {
             elaborated.push(alternative);
             self.txn.lctx.truncate(opened);
         }
-        if let Some((ids, value)) = &recursion {
-            for alternative in &mut elaborated {
-                for id in ids {
-                    let Some(rhs) = replace_fvar(&alternative.rhs, id, value) else {
-                        return Ok(None);
-                    };
-                    alternative.rhs = rhs;
-                }
+        for alternative in &mut elaborated {
+            for id in &recursion {
+                let Some(rhs) = replace_fvar(&alternative.rhs, id, &value) else {
+                    return Ok(None);
+                };
+                alternative.rhs = rhs;
             }
         }
         // Rebuild the alternatives' locals to close them.

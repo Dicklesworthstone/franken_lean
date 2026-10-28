@@ -3,7 +3,7 @@
 use super::*;
 mod flat;
 mod parents;
-use crate::records::defaults::{RecordDefault, helper_name};
+use crate::records::defaults::{RecordDefault, helper_name, inherited_helper_name};
 use crate::records::imported::{StructureEntry, StructureField, StructureParent};
 use crate::records::inheritance::RecordParent;
 use crate::records::{RecordBudget, RecordSpec, record_declarations};
@@ -230,9 +230,9 @@ pub(super) fn elaborate_record_scoped(
         })?;
     context.refuse_auto_bound_dependencies(&autos, &parameters)?;
     parameters.splice(0..0, autos);
-    let inheritance = context.record_parents(&parts[3], name, is_class, budget)?;
-    let mut labels = inheritance.labels;
-    let mut inferred = inheritance.level;
+    let mut inheritance = context.record_parents(&parts[3], name, is_class, budget)?;
+    let mut labels = std::mem::take(&mut inheritance.labels);
+    let mut inferred = inheritance.level.clone();
     let fields = match expect_null_args(&parts[4], "record body")? {
         [] => &[][..],
         [keyword, ctor, fields] => {
@@ -258,7 +258,7 @@ pub(super) fn elaborate_record_scoped(
             crate::records::RecordError::ResourceLimit,
         )));
     }
-    let mut output = inheritance.fields;
+    let mut output = std::mem::take(&mut inheritance.fields);
     let parent_count = output.len();
     let mut defaults = Vec::new();
     let mut helpers = Vec::new();
@@ -296,7 +296,7 @@ pub(super) fn elaborate_record_scoped(
             value = Expr::lam(local.user_name.clone(), local_type.clone(), value, style);
             type_ = Expr::forall_e(local.user_name.clone(), local_type, type_, style);
         }
-        let helper = helper_name(name, &field.user_name);
+        let helper = inherited_helper_name(name, &field.user_name);
         helpers.push(Declaration::Defn(DefinitionVal {
             base: ConstantVal {
                 name: helper.clone(),
@@ -546,6 +546,11 @@ pub(super) fn elaborate_record_scoped(
         .map(|p| p.type_.clone())
         .collect();
     roots.push(Expr::sort(result_level.clone()));
+    // A wholly overlapping parent can retain a section parameter only through
+    // its default. Its reconstructed type/value must participate in closure too.
+    for parent in &inheritance.copied {
+        roots.extend([parent.type_.clone(), parent.value.clone()]);
+    }
     for helper in &helpers {
         if let Declaration::Defn(definition) = helper {
             roots.extend([definition.base.type_.clone(), definition.value.clone()]);
@@ -577,12 +582,13 @@ pub(super) fn elaborate_record_scoped(
     // header mentions). A hole only a field mentions is fitted or defaulted there, never
     // generalized: generalizing it accepted `structure S where β : Type _` with `⟨Type⟩`,
     // which the pin rejects. It stays refused here.
-    let header: Vec<Expr> = parameters
+    let mut header: Vec<Expr> = parameters
         .iter()
         .chain(&section)
         .chain(&output[..parent_count])
         .map(|local| local.type_.clone())
         .collect();
+    header.extend(inheritance.copied.iter().map(|parent| parent.type_.clone()));
     context.generalize_declaration_universes(&header)?;
     for root in &roots {
         context.tick()?;
@@ -618,6 +624,12 @@ pub(super) fn elaborate_record_scoped(
         .map(|p| p.type_.clone())
         .collect();
     roots.push(Expr::sort(result_level.clone()));
+    for parent in &inheritance.copied {
+        roots.extend([
+            context.instantiate(&parent.type_)?,
+            context.instantiate(&parent.value)?,
+        ]);
+    }
     for helper in &helpers {
         if let Declaration::Defn(definition) = helper {
             roots.extend([definition.base.type_.clone(), definition.value.clone()]);
@@ -652,7 +664,7 @@ pub(super) fn elaborate_record_scoped(
     };
     let mut declarations =
         record_declarations(&spec, budget).map_err(|e| failure(SourceInferenceError::Record(e)))?;
-    declarations.push(context.record_flat_constructor(&spec, &inheritance.parents, budget)?);
+    declarations.extend(context.record_flat_constructor(&spec, &inheritance, &defaults, budget)?);
     let (copied, copied_instances) = context.copied_parent_projections(
         &spec,
         inheritance.copied,

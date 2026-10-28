@@ -326,10 +326,10 @@ impl Context {
                 .and_then(|index| defaults.helper(parent, index))
                 .cloned();
             let value = if result.labels.contains(&field) {
-                // A field (or a parent's own parent) already present is reused at its type. Its
-                // default stays the earlier parent's, as at the pin; where that has none the pin
-                // takes this parent's, which is not carried here, so an instance omitting the
-                // field is refused for a missing field rather than given another value.
+                // Reuse an existing field or parent subobject at its checked type.
+                // Default selection is separate:
+                // flat helper generation resolves declared defaults over the complete
+                // parent order, including a later parent's otherwise missing default.
                 let existing = self
                     .txn
                     .lctx

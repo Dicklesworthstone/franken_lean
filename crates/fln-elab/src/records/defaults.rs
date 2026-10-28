@@ -102,6 +102,12 @@ pub fn helper_name(record: &Name, field: &Name) -> Name {
     Name::str(record.append_core(field), "_default")
 }
 
+/// Native physical-prefix compatibility for a copied field. This is distinct
+/// from a declared default, so a later diamond cannot mistake it for an override.
+pub fn inherited_helper_name(record: &Name, field: &Name) -> Name {
+    Name::str(record.append_core(field), "_fln_inherited_default")
+}
+
 /// Independently bind registration to the constructor's field telescope. This
 /// checks metadata identity; it does not check or admit a candidate definition.
 fn validate(
@@ -166,7 +172,9 @@ fn validate(
     else {
         return Err(RecordError::InvalidTelescope);
     };
-    if row.helper != helper_name(&row.record, binder_name) {
+    if row.helper != helper_name(&row.record, binder_name)
+        && row.helper != inherited_helper_name(&row.record, binder_name)
+    {
         return Err(RecordError::InvalidName);
     }
     let mut expected = binder_type.clone();

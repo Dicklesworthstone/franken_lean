@@ -36,6 +36,99 @@ fn checked(source: &str) -> Engine {
         .engine
 }
 
+fn checked_callback_rejection_consumers() -> Engine {
+    use std::fmt::Write;
+
+    let mut source = DECLARATIONS.to_owned();
+    for (label, bindings) in [("callbackSmallBody", 0), ("callbackLargeBody", 128)] {
+        writeln!(
+            source,
+            "def {label}.{{u}} (A : Type u) (sample : A) (value : Nat) : Nat :="
+        )
+        .unwrap();
+        for index in 0..bindings {
+            writeln!(source, "  let phantom{index} : Type u := A").unwrap();
+        }
+        source.push_str("  value\n");
+    }
+    checked(&source)
+}
+
+#[test]
+fn rejected_computed_candidates_do_not_prepare_polymorphic_bodies() {
+    let engine = checked_callback_rejection_consumers();
+    let options = KVMap::new();
+    let root = engine.logical_root(&options);
+    let constant = |label: &str| crate::Expr::const_(super::name(label), Vec::new());
+    let arguments = [
+        constant("Nat"),
+        crate::Expr::app(constant("callbackMap"), super::nat::literal(3)),
+        super::nat::literal(5),
+    ];
+    for label in ["callbackSmallBody", "callbackLargeBody"] {
+        let head = crate::Expr::const_(super::name(label), vec![crate::Level::zero()]);
+        let ingress = IngressLimits {
+            max_nodes: 256,
+            ..limits().ingress
+        };
+        assert!(
+            super::Preparation::new(engine.environment(), ingress)
+                .specialize_computed_callback(&head, &arguments)
+                .unwrap_or_else(|error| panic!("{label}: {error:?}"))
+                .is_none(),
+            "a scalar operand cannot select staged-callback specialization",
+        );
+    }
+    // The selected path remains live, including actual execution and canonical replay.
+    assert_nat(
+        &engine,
+        "#eval callbackBind (fun (world : Nat) => world + 5) (callbackCompose callbackPure callbackMap) 3",
+        "12",
+    );
+    assert_eq!(engine.logical_root(&options), root);
+}
+
+#[test]
+fn rejected_literal_candidates_do_not_prepare_polymorphic_bodies() {
+    let engine = checked_callback_rejection_consumers();
+    let options = KVMap::new();
+    let root = engine.logical_root(&options);
+    let nat = crate::Expr::const_(super::name("Nat"), Vec::new());
+    let function_type = crate::Expr::forall_e(
+        crate::Name::anonymous(),
+        nat.clone(),
+        nat.clone(),
+        crate::BinderInfo::Default,
+    );
+    let identity = crate::Expr::lam(
+        crate::Name::anonymous(),
+        nat,
+        crate::Expr::bvar(0).unwrap(),
+        crate::BinderInfo::Default,
+    );
+    let arguments = [function_type, identity, super::nat::literal(5)];
+    for label in ["callbackSmallBody", "callbackLargeBody"] {
+        let head = crate::Expr::const_(super::name(label), vec![crate::Level::zero()]);
+        let ingress = IngressLimits {
+            max_nodes: 256,
+            ..limits().ingress
+        };
+        assert!(
+            super::Preparation::new(engine.environment(), ingress)
+                .specialize_staged_callback(&head, &arguments)
+                .unwrap_or_else(|error| panic!("{label}: {error:?}"))
+                .is_none(),
+            "a complete single-stage lambda keeps the ordinary callback path",
+        );
+    }
+    assert_nat(
+        &engine,
+        "#eval callbackLargeBody (Nat -> Nat) (fun n => n) 5",
+        "5",
+    );
+    assert_eq!(engine.logical_root(&options), root);
+}
+
 #[test]
 fn computed_composition_callback_reaches_its_consumer_with_real_stages() {
     let engine = checked(DECLARATIONS);

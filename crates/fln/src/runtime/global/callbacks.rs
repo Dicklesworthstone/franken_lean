@@ -457,11 +457,10 @@ impl Preparation<'_> {
             &definition.base.level_params,
             levels,
         )?;
-        definition.value =
-            self.universe_instance(&definition.value, &definition.base.level_params, levels)?;
-        definition.base.level_params.clear();
         // Detect against original source types first. Ordinary flat callbacks
         // keep the existing catalog path and need no body/layout preparation.
+        // Only Lam/MData constructors are read from the body here. Their shape
+        // is unchanged by universe substitution, which can wait for selection.
         let mut type_ = definition.base.type_.clone();
         let mut value = definition.value.clone();
         let mut selected = false;
@@ -500,6 +499,9 @@ impl Preparation<'_> {
         if self.has_extern_attribute(name)? {
             return Ok(None);
         }
+        definition.value =
+            self.universe_instance(&definition.value, &definition.base.level_params, levels)?;
+        definition.base.level_params.clear();
         let definition = self.normalize_definition_signature(&definition)?;
         self.inline_callback_arguments(definition, args)
     }
