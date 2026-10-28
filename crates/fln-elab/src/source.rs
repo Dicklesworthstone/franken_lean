@@ -3148,8 +3148,10 @@ impl Context {
                                 }
                                 // `f <| a` and `a |> f` are the application `f a`
                                 // (`Init/Notation.lean:522`). The pin's macros also flatten
-                                // `f x <| a` and `a |> f x` into `f x a`; that form is refused
-                                // here rather than read as `(f x) a`.
+                                // `f x <| a` and `a |> f x` into `f x a`, which the macro pass
+                                // (`patterns.rs`, `expand_pipeline`) does before this driver;
+                                // one that reaches it unlowered is refused rather than read as
+                                // `(f x) a`.
                                 let pipeline = if kind == &Name::from_components(["term_<|_"]) {
                                     Some(("<|", 0, 2))
                                 } else if kind == &Name::from_components(["term_$__"]) {

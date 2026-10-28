@@ -394,6 +394,56 @@ fn expand_let_pattern(mut syntax: Syntax, pattern: bool) -> Syntax {
 }
 
 /// `‹T›` is `(by assumption : T)` (`macro "‹" type:term "›" : term`, `Init/Tactics.lean`).
+/// The pin's `<|`, `$` and `|>` macros (vendored `Init/Notation.lean:522-570`) flatten an
+/// application function: `f x <| a` and `f x $ a` are `f x a`, and `a |> f x` is `f x a`, not
+/// `(f x) a`. A pipeline whose function is no application is read by the term driver itself.
+fn pipeline_parts(syntax: &Syntax) -> Option<(usize, usize)> {
+    let Syntax::Node { kind, args, .. } = syntax else {
+        return None;
+    };
+    let (function, argument) = if kind == &Name::from_components(["term_<|_"])
+        || kind == &Name::from_components(["term_$__"])
+    {
+        (0, 2)
+    } else if kind == &Name::from_components(["term_|>_"]) {
+        (2, 0)
+    } else {
+        return None;
+    };
+    (args.len() == 3 && args[function].kind() == Some(&parser_kind(&["Term", "app"])))
+        .then_some((function, argument))
+}
+
+fn expand_pipeline(mut syntax: Syntax, pattern: bool) -> Syntax {
+    let Some((function, argument)) = pipeline_parts(&syntax).filter(|_| !pattern) else {
+        return syntax;
+    };
+    let Syntax::Node { info, args, .. } = &mut syntax else {
+        unreachable!("checked notation");
+    };
+    let value = std::mem::replace(&mut args[argument], null(vec![]));
+    let Syntax::Node {
+        args: application, ..
+    } = &mut args[function]
+    else {
+        unreachable!("checked application");
+    };
+    let head = std::mem::replace(&mut application[0], null(vec![]));
+    let Syntax::Node {
+        args: arguments, ..
+    } = &mut application[1]
+    else {
+        return syntax;
+    };
+    let mut arguments = std::mem::take(arguments);
+    arguments.push(value);
+    Syntax::Node {
+        info: *info,
+        kind: parser_kind(&["Term", "app"]),
+        args: vec![head, null(arguments)],
+    }
+}
+
 fn expand_assumption(mut syntax: Syntax, pattern: bool) -> Syntax {
     let rewrite = !pattern
         && matches!(&syntax, Syntax::Node { kind, args, .. }
@@ -1485,7 +1535,8 @@ impl Context {
                 || node.kind() == Some(&Name::from_components(["Lean", "term_Matches_|"]))
                 || node.kind() == Some(&parser_kind(&["Term", "structInstFieldEqns"]))
                 || node.kind() == Some(&parser_kind(&["Term", "do"]))
-                || do_notation::is_term_block(node);
+                || do_notation::is_term_block(node)
+                || pipeline_parts(node).is_some();
             if let Syntax::Node { args, .. } = node {
                 if node.kind() == Some(&parser_kind(&["Term", "letrec"])) {
                     let binding = self.let_parts(args, false, true)?;
@@ -1584,6 +1635,7 @@ impl Context {
                     let node = expand_if_let(node, pattern);
                     let node = expand_let_pattern(node, pattern);
                     let node = expand_matches(node, pattern);
+                    let node = expand_pipeline(node, pattern);
                     let mut required = Vec::new();
                     let node = if local_roots.contains(&std::ptr::from_ref(original))
                         && complex(&node, &self.txn.env)

@@ -260,18 +260,24 @@ fn the_empty_collection_notation_is_its_class_constant() {
     );
 }
 
-/// `f <| a` is the application `f a` (`Init/Notation.lean:522`). The pin's macro also flattens
-/// `f x <| a` into `f x a`; that form is refused rather than read as `(f x) a`.
+/// `f <| a` is the application `f a` (`Init/Notation.lean:522`), and the pin's macros flatten
+/// an applied function: `f x <| a`, `f x $ a` and `a |> f x` are all `f x a`, so the piped
+/// value is the last argument. Each program was judged by pinned lean v4.32.0 first.
 #[test]
-fn the_pipeline_applies_its_function_and_refuses_an_applied_one() {
+fn the_pipeline_applies_its_function_and_flattens_an_applied_one() {
     check(
         "theorem pipe : (Nat.succ <| Nat.succ <| 0) = 2 := rfl\n\
-         theorem pipe_right : (0 |> Nat.succ |> Nat.succ) = 2 := rfl\n",
+         theorem pipe_right : (0 |> Nat.succ |> Nat.succ) = 2 := rfl\n\
+         theorem applied : (Nat.add 1 <| 1) = 2 := rfl\n\
+         theorem applied_right : (1 |> Nat.add 1) = 2 := rfl\n\
+         theorem dollar : (Nat.add 1 $ Nat.add 1 1) = 3 := rfl\n\
+         theorem last : (2 |> Nat.sub 5) = 3 := rfl\n\
+         theorem last_left : (Nat.sub 5 <| 2) = 3 := rfl\n",
     );
     let (engine, limits) = engine();
     for source in [
-        "theorem applied : (Nat.add 1 <| 1) = 2 := rfl\n",
-        "theorem applied : (1 |> Nat.add 1) = 2 := rfl\n",
+        "theorem first : (2 |> Nat.sub 5) = 0 := rfl\n",
+        "theorem first : (Nat.sub 5 <| 2) = 0 := rfl\n",
     ] {
         assert!(
             !matches!(
