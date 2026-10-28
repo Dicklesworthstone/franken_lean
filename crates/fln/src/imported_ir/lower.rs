@@ -4,7 +4,8 @@ use fln_comp::fir::{
     Function, FunctionId, IntrinsicDecl, IntrinsicId, Operation, ProjectionDecl, ProjectionId,
     Terminator, ValueId, ValueType,
 };
-use fln_olean::ir::{IrAlt, IrArg, IrCtorInfo, IrExpr, IrLit};
+use fln_olean::ir::{IrAlt, IrArg, IrCtorInfo, IrExpr, IrLit, IrParam};
+use std::sync::Arc;
 
 type Result<T> = std::result::Result<T, IrExecutionError>;
 
@@ -75,6 +76,12 @@ pub(super) fn compile(
             .iter()
             .map(|(name, native)| (name.clone(), native.arguments.len())),
     );
+    let function_count = names
+        .len()
+        .checked_add(1)
+        .filter(|count| *count <= limits.fir.max_functions)
+        .and_then(|count| u32::try_from(count).ok())
+        .ok_or(IrExecutionError::Limit("lowered functions"))?;
     let targets: BTreeMap<_, _> = names
         .iter()
         .enumerate()
@@ -126,8 +133,13 @@ pub(super) fn compile(
         limits,
         bindings: 0,
         blocks: 0,
+        next_function: function_count,
+        helper_functions: Vec::new(),
+        helper_provenance: Vec::new(),
+        scope_work: 0,
+        capture_operands: 0,
     };
-    let mut wrapper = Builder::new(entry, 0, &mut tables);
+    let mut wrapper = Builder::new(entry, 0, &mut tables)?;
     let block = wrapper.block()?;
     let args = arguments
         .iter()
@@ -146,7 +158,7 @@ pub(super) fn compile(
     let mut reference_functions = Vec::new();
     for (name, arity) in &names {
         let id = tables.targets[name].0;
-        let mut builder = Builder::new(name, *arity, &mut tables);
+        let mut builder = Builder::new(name, *arity, &mut tables)?;
         if supplied_natives.contains_key(name) {
             let block = builder.block()?;
             let args = (0..*arity).map(|i| ValueId::new(i as u32)).collect();
@@ -169,7 +181,7 @@ pub(super) fn compile(
                     )
                 })
                 .collect();
-            builder.body(body, vars)?;
+            builder.body(body, vars, Joins::new())?;
             reference_functions.push(ReferenceFunction {
                 name: name.clone(),
                 function: flbc::FunctionId::new(id.get()),
@@ -177,6 +189,10 @@ pub(super) fn compile(
         }
         functions.push(builder.finish(id));
     }
+    functions.append(&mut tables.helper_functions);
+    functions.sort_by_key(|function| function.id);
+    reference_functions.append(&mut tables.helper_provenance);
+    reference_functions.sort_by_key(|function| function.function);
     let program = fir::Program {
         schema_version: fir::FIR_SCHEMA_VERSION,
         entry: FunctionId::new(0),
@@ -224,6 +240,43 @@ struct Tables {
     limits: IrExecutionLimits,
     bindings: usize,
     blocks: usize,
+    next_function: u32,
+    helper_functions: Vec<Function>,
+    helper_provenance: Vec<ReferenceFunction>,
+    scope_work: u64,
+    capture_operands: usize,
+}
+
+impl Tables {
+    fn helper_id(&mut self) -> Result<FunctionId> {
+        if self.next_function as usize >= self.limits.fir.max_functions {
+            return Err(IrExecutionError::Limit("lowered functions"));
+        }
+        let id = FunctionId::new(self.next_function);
+        self.next_function = self
+            .next_function
+            .checked_add(1)
+            .ok_or(IrExecutionError::Limit("function ids"))?;
+        Ok(id)
+    }
+
+    // Scope snapshots and lifted arguments can be much larger than the source
+    // body. Bound them before allocation, as well as validating the final FIR.
+    fn scope_work(&mut self, count: usize) -> Result<()> {
+        self.scope_work = self.scope_work.saturating_add(count as u64);
+        if self.scope_work > self.limits.ir.max_work {
+            return Err(IrExecutionError::Limit("lowering scope work"));
+        }
+        Ok(())
+    }
+
+    fn capture_operands(&mut self, count: usize) -> Result<()> {
+        self.capture_operands = self.capture_operands.saturating_add(count);
+        if self.capture_operands > self.limits.fir.max_operands {
+            return Err(IrExecutionError::Limit("join capture operands"));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -234,6 +287,16 @@ struct Local {
 
 type Locals = BTreeMap<u64, Local>;
 
+struct Join {
+    function: FunctionId,
+    parameters: usize,
+    captures: Vec<u64>,
+}
+
+// Sharing descriptors prevents a chain of joins from recursively copying all
+// preceding captures whenever a lexical scope is copied.
+type Joins = BTreeMap<u64, Arc<Join>>;
+
 struct Builder<'a> {
     name: &'a Name,
     arity: usize,
@@ -243,14 +306,20 @@ struct Builder<'a> {
 }
 
 impl<'a> Builder<'a> {
-    fn new(name: &'a Name, arity: usize, tables: &'a mut Tables) -> Self {
-        Self {
+    fn new(name: &'a Name, arity: usize, tables: &'a mut Tables) -> Result<Self> {
+        tables.bindings = tables.bindings.saturating_add(arity);
+        if tables.bindings > tables.limits.fir.max_values {
+            return Err(IrExecutionError::Limit("lowered values"));
+        }
+        let next_value =
+            u32::try_from(arity).map_err(|_| IrExecutionError::Limit("parameter ids"))?;
+        Ok(Self {
             name,
             arity,
-            next_value: arity as u32,
+            next_value,
             blocks: Vec::new(),
             tables,
-        }
+        })
     }
 
     fn block(&mut self) -> Result<BlockId> {
@@ -513,33 +582,41 @@ impl<'a> Builder<'a> {
                     let local = locals
                         .get(x)
                         .ok_or_else(|| unsupported(self.name, "out-of-scope projection"))?;
-                    let id = local.constructor.ok_or_else(|| {
-                        unsupported(self.name, "projection without a known constructor shape")
-                    })?;
                     let field = u16::try_from(*i)
                         .map_err(|_| unsupported(self.name, "projection width"))?;
-                    if self.tables.projections.len() >= self.tables.limits.fir.max_projections {
-                        return Err(IrExecutionError::Limit("projections"));
+                    if let Some(id) = local.constructor {
+                        if self.tables.projections.len() >= self.tables.limits.fir.max_projections {
+                            return Err(IrExecutionError::Limit("projections"));
+                        }
+                        let projection = ProjectionId::new(self.tables.projections.len() as u32);
+                        self.tables.projections.push(ProjectionDecl {
+                            id: projection,
+                            constructor: id,
+                            field,
+                        });
+                        let value = self.emit(
+                            block,
+                            ValueType::Constructor,
+                            Operation::Unbox {
+                                value: local.value,
+                                ty: ValueType::Constructor,
+                            },
+                        )?;
+                        self.emit(
+                            block,
+                            ValueType::Abi,
+                            Operation::Project { projection, value },
+                        )?
+                    } else {
+                        self.emit(
+                            block,
+                            ValueType::Abi,
+                            Operation::ProjectObject {
+                                value: local.value,
+                                field,
+                            },
+                        )?
                     }
-                    let projection = ProjectionId::new(self.tables.projections.len() as u32);
-                    self.tables.projections.push(ProjectionDecl {
-                        id: projection,
-                        constructor: id,
-                        field,
-                    });
-                    let value = self.emit(
-                        block,
-                        ValueType::Constructor,
-                        Operation::Unbox {
-                            value: local.value,
-                            ty: ValueType::Constructor,
-                        },
-                    )?;
-                    self.emit(
-                        block,
-                        ValueType::Abi,
-                        Operation::Project { projection, value },
-                    )?
                 }
                 IrExpr::Reset { .. } | IrExpr::Reuse { .. } | IrExpr::IsShared { .. } => {
                     return Err(unsupported(
@@ -554,7 +631,89 @@ impl<'a> Builder<'a> {
         Ok(Local { value, constructor })
     }
 
-    fn body(&mut self, body: &IrBody, mut locals: Locals) -> Result<BlockId> {
+    fn join(
+        &mut self,
+        j: u64,
+        params: &[IrParam],
+        body: &IrBody,
+        locals: &Locals,
+        joins: &mut Joins,
+    ) -> Result<()> {
+        let arity = locals
+            .len()
+            .checked_add(params.len())
+            .ok_or(IrExecutionError::Limit("join parameters"))?;
+        if arity > usize::from(u16::MAX)
+            || arity
+                > self
+                    .tables
+                    .limits
+                    .fir
+                    .max_values
+                    .saturating_sub(self.tables.bindings)
+        {
+            return Err(IrExecutionError::Limit("join parameters"));
+        }
+        let function = self.tables.helper_id()?;
+        self.tables.scope_work(
+            locals
+                .len()
+                .saturating_mul(2)
+                .saturating_add(joins.len())
+                .saturating_add(params.len()),
+        )?;
+        self.tables.capture_operands(locals.len())?;
+
+        // Lambda lifting gives each join a normal checked FIR function. Capture
+        // lexical values in structural index order, followed by explicit jump
+        // arguments. Known constructor shapes survive the parameter remapping.
+        let captures: Vec<_> = locals.keys().copied().collect();
+        let mut helper_locals: Locals = locals
+            .iter()
+            .enumerate()
+            .map(|(i, (x, local))| {
+                (
+                    *x,
+                    Local {
+                        value: ValueId::new(i as u32),
+                        constructor: local.constructor,
+                    },
+                )
+            })
+            .collect();
+        for (i, param) in params.iter().enumerate() {
+            helper_locals.insert(
+                param.x,
+                Local {
+                    value: ValueId::new((captures.len() + i) as u32),
+                    constructor: None,
+                },
+            );
+        }
+        let prior_joins = joins.clone();
+        let mut helper = Builder::new(self.name, arity, self.tables)?;
+        helper.body(body, helper_locals, prior_joins)?;
+        let lowered = helper.finish(function);
+        self.tables.helper_functions.push(lowered);
+        self.tables.helper_provenance.push(ReferenceFunction {
+            name: self.name.clone(),
+            function: flbc::FunctionId::new(function.get()),
+        });
+
+        // The Reference validator makes a join visible only after its body.
+        // In particular it cannot jump to itself, or to a later declaration.
+        joins.insert(
+            j,
+            Arc::new(Join {
+                function,
+                parameters: params.len(),
+                captures,
+            }),
+        );
+        Ok(())
+    }
+
+    fn body(&mut self, body: &IrBody, mut locals: Locals, mut joins: Joins) -> Result<BlockId> {
         let block = self.block()?;
         for stmt in &body.stmts {
             match stmt {
@@ -562,10 +721,13 @@ impl<'a> Builder<'a> {
                     let value = self.expression(block, ty, expr, &locals)?;
                     locals.insert(*x, value);
                 }
+                IrStmt::JDecl { j, params, value } => {
+                    self.join(*j, params, value, &locals, &mut joins)?;
+                }
                 // The immutable subset is lowered to managed values. The
                 // independent ownership pass reconstructs actual final uses.
                 IrStmt::Inc { .. } | IrStmt::Dec { .. } | IrStmt::Del { .. } => {}
-                _ => return Err(unsupported(self.name, "mutable IR statement or join point")),
+                _ => return Err(unsupported(self.name, "mutable IR statement")),
             }
         }
         match body.terminal.as_ref() {
@@ -575,9 +737,35 @@ impl<'a> Builder<'a> {
             }
             IrTerminal::Case {
                 x, x_type, alts, ..
-            } => self.case(block, *x, x_type, alts, locals)?,
+            } => self.case(block, *x, x_type, alts, locals, joins)?,
             IrTerminal::Unreachable => self.unreachable(block)?,
-            IrTerminal::Jmp { .. } => return Err(unsupported(self.name, "join-point jump")),
+            IrTerminal::Jmp { j, args } => {
+                let join = joins
+                    .get(j)
+                    .ok_or_else(|| unsupported(self.name, "out-of-scope join point"))?;
+                if args.len() != join.parameters {
+                    return Err(unsupported(self.name, "join-point arity"));
+                }
+                self.tables
+                    .capture_operands(join.captures.len().saturating_add(args.len()))?;
+                let mut values = join
+                    .captures
+                    .iter()
+                    .map(|x| self.argument(block, &IrArg::Var(*x), &locals))
+                    .collect::<Result<Vec<_>>>()?;
+                values.extend(self.arguments(block, args, &locals)?);
+                let value = self.emit(
+                    block,
+                    ValueType::Abi,
+                    Operation::Call {
+                        function: join.function,
+                        args: values,
+                    },
+                )?;
+                // FIR lowers this exact call/return pair to a frame-transferring
+                // tail call. A chain of joins does not grow the VM call stack.
+                self.finish_block(block, Terminator::Return { value });
+            }
         }
         Ok(block)
     }
@@ -602,6 +790,7 @@ impl<'a> Builder<'a> {
         ty: &IrType,
         alts: &[IrAlt],
         locals: Locals,
+        joins: Joins,
     ) -> Result<()> {
         let value = locals
             .get(&x)
@@ -633,7 +822,7 @@ impl<'a> Builder<'a> {
                 ));
             }
         }
-        self.case_arm(block, x, value, &arms, default, locals)
+        self.case_arm(block, x, value, &arms, default, (locals, joins))
     }
 
     fn case_arm(
@@ -643,11 +832,12 @@ impl<'a> Builder<'a> {
         value: ValueId,
         arms: &[(&IrCtorInfo, &IrBody)],
         default: Option<&IrBody>,
-        locals: Locals,
+        scope: (Locals, Joins),
     ) -> Result<()> {
+        let (locals, joins) = scope;
         let Some(((info, body), rest)) = arms.split_first() else {
             if let Some(body) = default {
-                let target = self.body(body, locals)?;
+                let target = self.body(body, locals, joins)?;
                 self.finish_block(block, Terminator::Jump { target });
             } else {
                 self.unreachable(block)?;
@@ -688,6 +878,8 @@ impl<'a> Builder<'a> {
                 },
             )?
         };
+        self.tables
+            .scope_work(locals.len().saturating_add(joins.len()))?;
         let mut matching = locals.clone();
         matching.insert(
             x,
@@ -696,9 +888,9 @@ impl<'a> Builder<'a> {
                 constructor: Some(constructor),
             },
         );
-        let nonzero = self.body(body, matching)?;
+        let nonzero = self.body(body, matching, joins.clone())?;
         let zero = self.block()?;
-        self.case_arm(zero, x, value, rest, default, locals)?;
+        self.case_arm(zero, x, value, rest, default, (locals, joins))?;
         self.finish_block(
             block,
             Terminator::BranchZero {

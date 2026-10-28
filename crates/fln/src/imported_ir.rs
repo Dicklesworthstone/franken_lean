@@ -3,8 +3,9 @@
 //!
 //! The input remains untrusted: selection, IR validation, FIR validation and
 //! FLBC's independent ownership pass all precede execution. The first supported
-//! slice is immutable, pure code: calls, closures, constructor cases and scalar
-//! primitives. Mutation, reset/reuse and reference-count observations are refused.
+//! slice is immutable, pure code: calls, closures, acyclic join points,
+//! constructor cases and scalar primitives. Mutation, reset/reuse and
+//! reference-count observations are refused.
 //! Its RC annotations are replaced by Golem's checked managed ownership, not
 //! executed as additional retains/releases on already managed values.
 //!
@@ -445,7 +446,16 @@ fn inspect_body(
                         check_type(name, ty)?;
                     }
                 }
-                IrStmt::JDecl { .. } => return Err(unsupported(name, "join point")),
+                IrStmt::JDecl { params, value, .. } => {
+                    *work = work.saturating_add(params.len() as u64);
+                    if *work > limits.ir.max_work {
+                        return Err(IrExecutionError::Limit("IR selection work"));
+                    }
+                    for param in params {
+                        check_type(name, &param.ty)?;
+                    }
+                    pending.push((value, depth + 1));
+                }
                 IrStmt::Inc { .. } | IrStmt::Dec { .. } | IrStmt::Del { .. } => {}
                 _ => return Err(unsupported(name, "constructor mutation")),
             }
