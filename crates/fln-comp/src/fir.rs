@@ -34,8 +34,9 @@ pub use optimize::optimize;
 /// carries canonical arbitrary-precision Nat literal limbs through lowering;
 /// version 16 adds exact constructor-shape tests for native case dispatch;
 /// version 17 distinguishes Float, Float32, UInt32 and UInt64 scalar types;
-/// version 18 adds an erased callable result contract restricted to ABI values.
-pub const FIR_SCHEMA_VERSION: u16 = 18;
+/// version 18 adds an erased callable result contract restricted to ABI values;
+/// version 19 projects object fields whose constructor layout is known at runtime.
+pub const FIR_SCHEMA_VERSION: u16 = 19;
 
 /// Explicit ceilings for FIR validation work.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -432,6 +433,13 @@ pub enum Operation {
         projection: ProjectionId,
         value: ValueId,
     },
+    /// Read an object field from an erased constructor value. The VM checks
+    /// the actual object kind and field count before retaining the child.
+    /// Both operand and result remain in the erased ABI value domain.
+    ProjectObject {
+        value: ValueId,
+        field: u16,
+    },
     Array {
         items: Vec<ValueId>,
     },
@@ -500,6 +508,7 @@ impl Operation {
             | Self::Box(value)
             | Self::Unbox { value, .. }
             | Self::Project { value, .. }
+            | Self::ProjectObject { value, .. }
             | Self::CtorTest { value, .. }
             | Self::CheckSystemValue { module_name: value } => OperationReads {
                 first: Some(*value),
@@ -1205,6 +1214,16 @@ pub enum ValidationError {
         block: BlockId,
         projection: ProjectionId,
         actual: ValueType,
+    },
+    ObjectProjectionOperandType {
+        function: FunctionId,
+        block: BlockId,
+        actual: ValueType,
+    },
+    ObjectProjectionFieldOutOfRange {
+        function: FunctionId,
+        block: BlockId,
+        field: u16,
     },
     JumpOutOfBounds {
         function: FunctionId,
@@ -1944,6 +1963,26 @@ impl fmt::Display for ValidationError {
                 function.get(),
                 block.get(),
                 projection.get()
+            ),
+            Self::ObjectProjectionOperandType {
+                function,
+                block,
+                actual,
+            } => write!(
+                formatter,
+                "function {} block {} object projection expects Abi, got {actual:?}",
+                function.get(),
+                block.get()
+            ),
+            Self::ObjectProjectionFieldOutOfRange {
+                function,
+                block,
+                field,
+            } => write!(
+                formatter,
+                "function {} block {} object projection field {field} exceeds the ABI constructor limit",
+                function.get(),
+                block.get()
             ),
             Self::JumpOutOfBounds {
                 function,
@@ -2841,6 +2880,24 @@ fn infer_operation_type(
                     field: declaration.field,
                     field_count: constructor.fields.len(),
                 })
+        }
+        Operation::ProjectObject { value, field } => {
+            let actual = value_type(function, block, value_types, *value)?;
+            if actual != ValueType::Abi {
+                return Err(ValidationError::ObjectProjectionOperandType {
+                    function: function.id,
+                    block: block.id,
+                    actual,
+                });
+            }
+            if usize::from(*field) >= abi::MAX_CTOR_FIELDS - 1 {
+                return Err(ValidationError::ObjectProjectionFieldOutOfRange {
+                    function: function.id,
+                    block: block.id,
+                    field: *field,
+                });
+            }
+            Ok(ValueType::Abi)
         }
         Operation::Array { items } => {
             for value in items {
@@ -3809,6 +3866,11 @@ fn lower_single_binding(
                 field: projection.field,
             })
         }
+        Operation::ProjectObject { value, field } => Ok(flbc::Instruction::CtorFieldDynamic {
+            dst,
+            src: lower_register(*value)?,
+            field: *field,
+        }),
         Operation::Array { items } => Ok(flbc::Instruction::Array {
             dst,
             items: lower_registers(items)?,
@@ -4069,6 +4131,9 @@ fn write_operation(output: &mut impl fmt::Write, operation: &Operation) -> fmt::
         }
         Operation::Project { projection, value } => {
             write!(output, "project p{} v{}", projection.get(), value.get())
+        }
+        Operation::ProjectObject { value, field } => {
+            write!(output, "project-object v{} field={field}", value.get())
         }
         Operation::Array { items } => {
             output.write_str("array ")?;
@@ -5028,7 +5093,7 @@ mod tests {
         assert_eq!(
             validated.canonical_text(),
             concat!(
-                "fir/18 entry=f0\n",
+                "fir/19 entry=f0\n",
                 "function f0 params=[] ownership=[] result=nat result_ownership=scalar\n",
                 " block b0\n",
                 "  v0:nat = nat 41\n",
@@ -5560,6 +5625,138 @@ mod tests {
                 inferred: ValueType::String,
                 ..
             }) if value == v(8)
+        ));
+    }
+
+    fn object_projection_program(field: u16) -> Program {
+        Program::new(
+            f(0),
+            vec![ConstructorDecl {
+                id: c(0),
+                tag: 7,
+                fields: vec![ValueType::String],
+                static_scalar_bytes: Vec::new(),
+            }],
+            Vec::new(),
+            Vec::new(),
+            vec![Function {
+                id: f(0),
+                parameters: Vec::new(),
+                parameter_ownership: Vec::new(),
+                result: ValueType::Abi,
+                result_ownership: flbc::CallableResultOwnership::Erased,
+                blocks: vec![Block {
+                    id: b(0),
+                    bindings: vec![
+                        Binding {
+                            id: v(0),
+                            ty: ValueType::String,
+                            operation: Operation::String("field λ 🦀".to_string()),
+                        },
+                        Binding {
+                            id: v(1),
+                            ty: ValueType::Constructor,
+                            operation: Operation::Ctor {
+                                constructor: c(0),
+                                fields: vec![v(0)],
+                            },
+                        },
+                        Binding {
+                            id: v(2),
+                            ty: ValueType::Abi,
+                            operation: Operation::Box(v(1)),
+                        },
+                        Binding {
+                            id: v(3),
+                            ty: ValueType::Abi,
+                            operation: Operation::Alias(v(2)),
+                        },
+                        Binding {
+                            id: v(4),
+                            ty: ValueType::Abi,
+                            operation: Operation::ProjectObject { value: v(3), field },
+                        },
+                    ],
+                    terminator: Terminator::Return { value: v(4) },
+                }],
+            }],
+        )
+    }
+
+    #[test]
+    fn object_projection_lowers_and_survives_optimization_with_erased_types() {
+        let checked = validate(object_projection_program(0), ValidationLimits::default())
+            .expect("erased object projection validates");
+        assert!(
+            checked
+                .canonical_text()
+                .contains("project-object v3 field=0")
+        );
+        for source in [
+            checked.clone(),
+            optimize(&checked, ValidationLimits::default()).expect("rewrite projection operands"),
+        ] {
+            let lowered = lower_to_flbc(&source).expect("lower dynamic projection");
+            assert!(
+                lowered.functions()[0]
+                    .code
+                    .iter()
+                    .any(|instruction| matches!(
+                        instruction,
+                        flbc::Instruction::CtorFieldDynamic { field: 0, .. }
+                    ))
+            );
+            let bytes = encode_canonical(&lowered, CodecLimits::default()).expect("encode");
+            assert_eq!(
+                flbc::decode_canonical(&bytes, CodecLimits::default()).expect("decode"),
+                lowered
+            );
+        }
+    }
+
+    #[test]
+    fn object_projection_checks_input_output_index_and_initialization() {
+        let mut wrong_input = object_projection_program(0);
+        wrong_input.functions[0].blocks[0].bindings[4].operation = Operation::ProjectObject {
+            value: v(0),
+            field: 0,
+        };
+        assert!(matches!(
+            validate(wrong_input, ValidationLimits::default()),
+            Err(ValidationError::ObjectProjectionOperandType {
+                actual: ValueType::String,
+                ..
+            })
+        ));
+        let mut wrong_output = object_projection_program(0);
+        wrong_output.functions[0].blocks[0].bindings[4].ty = ValueType::String;
+        assert!(matches!(
+            validate(wrong_output, ValidationLimits::default()),
+            Err(ValidationError::BindingType {
+                declared: ValueType::String,
+                inferred: ValueType::Abi,
+                ..
+            })
+        ));
+        let max_field = u16::try_from(abi::MAX_CTOR_FIELDS - 2).expect("ABI index fits u16");
+        validate(
+            object_projection_program(max_field),
+            ValidationLimits::default(),
+        )
+        .expect("last possible object index remains representable");
+        assert!(matches!(
+            validate(object_projection_program(max_field + 1), ValidationLimits::default()),
+            Err(ValidationError::ObjectProjectionFieldOutOfRange { field, .. })
+                if field == max_field + 1
+        ));
+        let mut uninitialized = object_projection_program(0);
+        uninitialized.functions[0].blocks[0].bindings[4].operation = Operation::ProjectObject {
+            value: v(4),
+            field: 0,
+        };
+        assert!(matches!(
+            validate(uninitialized, ValidationLimits::default()),
+            Err(ValidationError::ReadBeforeDefinition { value, .. }) if value == v(4)
         ));
     }
 

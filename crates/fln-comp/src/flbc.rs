@@ -30,15 +30,16 @@ use std::fmt;
 /// version 13 carries canonical arbitrary-precision Nat literal limbs;
 /// version 14 adds borrowed, shape-checked constructor discrimination;
 /// version 15 adds terminal direct and closure calls with frame ownership transfer;
-/// version 16 distinguishes erased ABI results from the Nat-specific union.
-pub const FLBC_SCHEMA_VERSION: u16 = 16;
+/// version 16 distinguishes erased ABI results from the Nat-specific union;
+/// version 17 adds object-field projection checked against the runtime layout.
+pub const FLBC_SCHEMA_VERSION: u16 = 17;
 
 /// Canonical binary envelope version for persisted FLBC artifacts.
 ///
 /// This is independent of [`FLBC_SCHEMA_VERSION`]: the envelope freezes byte
 /// framing and opcode numbers, while the embedded schema version freezes the
 /// program model accepted by [`validate`].
-pub const FLBC_WIRE_VERSION: u16 = 11;
+pub const FLBC_WIRE_VERSION: u16 = 12;
 
 /// Canonical witness schema for the bounded ownership pass.
 ///
@@ -56,8 +57,9 @@ pub const FLBC_WIRE_VERSION: u16 = 11;
 /// result ownership plus exact owned/scalar invocation counts; version 14
 /// admits cyclic CFG register reuse and binds its redefinition count; version
 /// 15 recognizes terminal calls as releasing the caller's remaining handles;
-/// version 16 counts erased callable results as potentially owned handles.
-pub const OWNERSHIP_WITNESS_VERSION: u16 = 16;
+/// version 16 counts erased callable results as potentially owned handles;
+/// version 17 retains dynamic constructor projection results as owned handles.
+pub const OWNERSHIP_WITNESS_VERSION: u16 = 17;
 
 const FLBC_MAGIC: [u8; 8] = *b"FLNFLBC\0";
 
@@ -83,6 +85,7 @@ const OP_NAT_BIG: u8 = 18;
 const OP_CTOR_TEST: u8 = 19;
 const OP_TAIL_CALL: u8 = 20;
 const OP_TAIL_APPLY: u8 = 21;
+const OP_CTOR_FIELD_DYNAMIC: u8 = 22;
 
 /// Explicit allocation and work ceilings for canonical FLBC artifacts.
 ///
@@ -500,6 +503,14 @@ pub enum Instruction {
         expected_fields: u16,
         field: u16,
     },
+    /// Read an object field without a statically known constructor shape.
+    /// The interpreter checks the actual kind and object-slot count before
+    /// retaining the child; scalar fields are not accessed by this instruction.
+    CtorFieldDynamic {
+        dst: Register,
+        src: Register,
+        field: u16,
+    },
     Array {
         dst: Register,
         items: Vec<Register>,
@@ -595,6 +606,7 @@ impl Instruction {
             | Self::Move { src, .. }
             | Self::Drop { src }
             | Self::CtorField { src, .. }
+            | Self::CtorFieldDynamic { src, .. }
             | Self::CtorTest { src, .. }
             | Self::CheckSystemValue { module_name: src } => {
                 vec![*src]
@@ -626,6 +638,7 @@ impl Instruction {
             | Self::Move { dst, .. }
             | Self::Ctor { dst, .. }
             | Self::CtorField { dst, .. }
+            | Self::CtorFieldDynamic { dst, .. }
             | Self::CtorTest { dst, .. }
             | Self::Array { dst, .. }
             | Self::Intrinsic { dst, .. }
@@ -1520,6 +1533,11 @@ pub enum ValidationError {
         expected_fields: u16,
         field: u16,
     },
+    CtorFieldIndexOutOfRange {
+        function: FunctionId,
+        pc: Pc,
+        field: u16,
+    },
     Fallthrough {
         function: FunctionId,
         pc: Pc,
@@ -1991,6 +2009,16 @@ impl fmt::Display for ValidationError {
                 function.get(),
                 pc.get()
             ),
+            Self::CtorFieldIndexOutOfRange {
+                function,
+                pc,
+                field,
+            } => write!(
+                f,
+                "function {} pc {} projection field {field} exceeds the ABI constructor limit",
+                function.get(),
+                pc.get()
+            ),
             Self::Fallthrough { function, pc } => write!(
                 f,
                 "function {} falls through after pc {}",
@@ -2235,6 +2263,12 @@ fn encode_instruction(encoder: &mut Encoder, instruction: &Instruction) -> Resul
             encoder.u16(*expected_fields)?;
             encoder.u16(*field)
         }
+        Instruction::CtorFieldDynamic { dst, src, field } => {
+            encoder.u8(OP_CTOR_FIELD_DYNAMIC)?;
+            encoder.register(*dst)?;
+            encoder.register(*src)?;
+            encoder.u16(*field)
+        }
         Instruction::CtorTest {
             dst,
             src,
@@ -2401,6 +2435,11 @@ fn decode_instruction(decoder: &mut Decoder<'_>) -> Result<Instruction, CodecErr
             src: decoder.register()?,
             expected_tag: decoder.u8()?,
             expected_fields: decoder.u16()?,
+            field: decoder.u16()?,
+        }),
+        OP_CTOR_FIELD_DYNAMIC => Ok(Instruction::CtorFieldDynamic {
+            dst: decoder.register()?,
+            src: decoder.register()?,
             field: decoder.u16()?,
         }),
         OP_CTOR_TEST => Ok(Instruction::CtorTest {
@@ -3141,6 +3180,15 @@ fn validate_function(program: &Program, function: &Function) -> Result<(), Valid
                     });
                 }
             }
+            Instruction::CtorFieldDynamic { field, .. } => {
+                if usize::from(*field) >= abi::MAX_CTOR_FIELDS - 1 {
+                    return Err(ValidationError::CtorFieldIndexOutOfRange {
+                        function: function.id,
+                        pc,
+                        field: *field,
+                    });
+                }
+            }
             Instruction::CtorTest {
                 expected_tag,
                 expected_fields,
@@ -3632,6 +3680,7 @@ fn ownership_reads<E>(
         | Instruction::Move { src, .. }
         | Instruction::Drop { src }
         | Instruction::CtorField { src, .. }
+        | Instruction::CtorFieldDynamic { src, .. }
         | Instruction::CtorTest { src, .. }
         | Instruction::CheckSystemValue { module_name: src } => visit(*src)?,
         Instruction::Ctor { fields, .. } => {
@@ -3861,6 +3910,7 @@ fn ownership_operand_count(instruction: &Instruction) -> usize {
         | Instruction::Move { .. }
         | Instruction::Drop { .. }
         | Instruction::CtorField { .. }
+        | Instruction::CtorFieldDynamic { .. }
         | Instruction::CtorTest { .. }
         | Instruction::CheckSystemValue { .. }
         | Instruction::JumpIfZero { .. }
@@ -3940,6 +3990,7 @@ fn ownership_payload_bytes(instruction: &Instruction) -> usize {
         | Instruction::Move { .. }
         | Instruction::Drop { .. }
         | Instruction::CtorField { .. }
+        | Instruction::CtorFieldDynamic { .. }
         | Instruction::CtorTest { .. }
         | Instruction::Array { .. }
         | Instruction::Call { .. }
@@ -4137,6 +4188,11 @@ fn ownership_clone_instruction(instruction: &Instruction) -> Result<Instruction,
             src: *src,
             expected_tag: *expected_tag,
             expected_fields: *expected_fields,
+            field: *field,
+        },
+        Instruction::CtorFieldDynamic { dst, src, field } => Instruction::CtorFieldDynamic {
+            dst: *dst,
+            src: *src,
             field: *field,
         },
         Instruction::CtorTest {
@@ -7024,6 +7080,11 @@ mod codec_tests {
                             module_name: "Every.Opcode".to_string(),
                         },
                         Instruction::CheckSystemValue { module_name: r(1) },
+                        Instruction::CtorFieldDynamic {
+                            dst: r(10),
+                            src: r(4),
+                            field: 1,
+                        },
                         Instruction::Return { src: r(9) },
                     ],
                 ),
@@ -7295,7 +7356,7 @@ mod codec_tests {
         assert_eq!(
             inserted.witness().canonical_text(),
             concat!(
-                "flbc-ownership/16\n",
+                "flbc-ownership/17\n",
                 "function f0 mode=inserted-acyclic-cfg result=scalar source=8 emitted=16 drops=4 moves=1 redefs=0 edges=4 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
             )
         );
@@ -7495,7 +7556,7 @@ mod codec_tests {
         assert_eq!(
             inserted.witness().canonical_text(),
             concat!(
-                "flbc-ownership/16\n",
+                "flbc-ownership/17\n",
                 "function f0 mode=inserted-acyclic-cfg result=scalar source=5 emitted=8 drops=1 moves=0 redefs=0 edges=2 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
             )
         );
@@ -7557,7 +7618,7 @@ mod codec_tests {
         assert_eq!(
             inserted.witness().canonical_text(),
             concat!(
-                "flbc-ownership/16\n",
+                "flbc-ownership/17\n",
                 "function f0 mode=inserted-acyclic-cfg result=scalar source=6 emitted=12 drops=4 moves=0 redefs=0 edges=2 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
             )
         );
@@ -7701,7 +7762,7 @@ mod codec_tests {
         assert_eq!(
             inserted.witness().canonical_text(),
             concat!(
-                "flbc-ownership/16\n",
+                "flbc-ownership/17\n",
                 "function f0 mode=inserted-cyclic-cfg result=scalar source=7 emitted=13 drops=3 moves=0 redefs=0 edges=3 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
                 "function f1 mode=inserted-cyclic-cfg result=scalar source=1 emitted=2 drops=0 moves=0 redefs=0 edges=1 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
                 "function f2 mode=validated-existing-ownership result=scalar source=3 emitted=3 drops=0 moves=0 existing_drops=1 existing_moves=0 redefs=0 edges=0 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
@@ -7834,7 +7895,7 @@ mod codec_tests {
         assert_eq!(
             backedge_inserted.witness().canonical_text(),
             concat!(
-                "flbc-ownership/16\n",
+                "flbc-ownership/17\n",
                 "function f0 mode=inserted-cyclic-cfg result=scalar source=7 emitted=14 drops=4 moves=1 redefs=0 edges=3 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
             )
         );
@@ -8167,7 +8228,7 @@ mod codec_tests {
         assert_eq!(
             inserted.witness().canonical_text(),
             concat!(
-                "flbc-ownership/16\n",
+                "flbc-ownership/17\n",
                 "function f0 mode=inserted-linear result=scalar source=5 emitted=7 drops=2 moves=1 redefs=0 edges=0 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
                 "function f1 mode=inserted-linear result=scalar source=2 emitted=3 drops=1 moves=1 redefs=0 edges=0 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
                 "function f2 mode=inserted-acyclic-cfg result=scalar source=3 emitted=5 drops=0 moves=0 redefs=0 edges=2 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
@@ -8322,7 +8383,7 @@ mod codec_tests {
         assert_eq!(
             inserted.witness().canonical_text(),
             concat!(
-                "flbc-ownership/16\n",
+                "flbc-ownership/17\n",
                 "function f0 mode=inserted-linear result=scalar source=2 emitted=2 drops=0 moves=0 redefs=0 edges=0 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
                 "function f1 mode=inserted-linear-reuse result=scalar source=6 emitted=8 drops=2 moves=3 redefs=3 edges=0 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
             )
@@ -8489,7 +8550,7 @@ mod codec_tests {
         assert_eq!(
             preserved.witness().canonical_text(),
             concat!(
-                "flbc-ownership/16\n",
+                "flbc-ownership/17\n",
                 "function f0 mode=preserved-non-ssa result=scalar source=3 emitted=3 drops=0 moves=0 redefs=0 edges=0 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
             )
         );
@@ -8555,7 +8616,7 @@ mod codec_tests {
         assert_eq!(
             inserted.witness().canonical_text(),
             concat!(
-                "flbc-ownership/16\n",
+                "flbc-ownership/17\n",
                 "function f0 mode=inserted-acyclic-cfg-reuse result=scalar source=8 emitted=14 drops=3 moves=1 redefs=2 edges=3 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
             )
         );
@@ -8758,7 +8819,7 @@ mod codec_tests {
         assert_eq!(
             entry_owned.witness().canonical_text(),
             concat!(
-                "flbc-ownership/16\n",
+                "flbc-ownership/17\n",
                 "function f0 mode=inserted-linear result=scalar source=2 emitted=2 drops=0 moves=0 redefs=0 edges=0 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
                 "function f1 mode=inserted-acyclic-cfg-reuse result=scalar source=6 emitted=12 drops=3 moves=0 redefs=2 edges=3 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
             )
@@ -8824,7 +8885,7 @@ mod codec_tests {
         assert_eq!(
             inserted_cycle.witness().canonical_text(),
             concat!(
-                "flbc-ownership/16\n",
+                "flbc-ownership/17\n",
                 "function f0 mode=inserted-cyclic-cfg-reuse result=scalar source=5 emitted=9 drops=1 moves=0 redefs=1 edges=3 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
             )
         );
@@ -8875,7 +8936,7 @@ mod codec_tests {
         assert_eq!(
             inserted.witness().canonical_text(),
             concat!(
-                "flbc-ownership/16\n",
+                "flbc-ownership/17\n",
                 "function f0 mode=inserted-cyclic-cfg-reuse result=scalar source=7 emitted=13 drops=3 moves=0 redefs=2 edges=3 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
             )
         );
@@ -9169,7 +9230,7 @@ mod codec_tests {
         assert_eq!(
             inserted.witness().canonical_text(),
             concat!(
-                "flbc-ownership/16\n",
+                "flbc-ownership/17\n",
                 "function f0 mode=validated-existing-ownership result=scalar source=3 emitted=3 drops=0 moves=0 existing_drops=0 existing_moves=1 redefs=0 edges=0 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
                 "function f1 mode=validated-existing-ownership result=scalar source=4 emitted=4 drops=0 moves=0 existing_drops=1 existing_moves=0 redefs=0 edges=0 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
                 "function f2 mode=validated-existing-ownership result=scalar source=3 emitted=3 drops=0 moves=0 existing_drops=0 existing_moves=1 redefs=0 edges=0 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
@@ -9691,7 +9752,7 @@ mod codec_tests {
         assert_eq!(
             inserted.witness().canonical_text(),
             concat!(
-                "flbc-ownership/16\n",
+                "flbc-ownership/17\n",
                 "function f0 mode=inserted-linear result=scalar source=4 emitted=5 drops=1 moves=0 redefs=0 edges=0 extern_consumes=1 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
             )
         );
@@ -11551,8 +11612,8 @@ mod codec_tests {
             bytes,
             vec![
                 70, 76, 78, 70, 76, 66, 67, 0, // magic
-                11, 0, // wire version: erased callable result tag 3
-                16, 0, // schema version: erased ABI result ownership
+                12, 0, // wire version: dynamic object-field projection opcode 22
+                17, 0, // schema version: runtime-checked object-field projection
                 0, 0, 0, 0, // entry
                 1, 0, 0, 0, // function count
                 0, 0, 0, 0, // function id
@@ -11718,6 +11779,62 @@ mod codec_tests {
                 field: 1,
                 ..
             })
+        ));
+    }
+
+    #[test]
+    fn dynamic_projection_validates_bounds_and_definite_initialization() {
+        let program = |dst, src, field| {
+            let mut entry = function(
+                0,
+                0,
+                2,
+                vec![
+                    Instruction::Nat {
+                        dst: r(0),
+                        value: 7,
+                    },
+                    Instruction::CtorFieldDynamic { dst, src, field },
+                    Instruction::Return { src: r(1) },
+                ],
+            );
+            entry.result_ownership = CallableResultOwnership::Erased;
+            Program::new(f(0), vec![entry])
+        };
+        let max_field = u16::try_from(abi::MAX_CTOR_FIELDS - 2).expect("ABI index fits u16");
+        for field in [0, max_field] {
+            let checked = validate(program(r(1), r(0), field)).expect("representable field");
+            let bytes = encode_canonical(&checked, CodecLimits::default()).expect("encode");
+            assert_eq!(
+                decode_canonical(&bytes, CodecLimits::default()).expect("decode"),
+                checked
+            );
+            let inserted = insert_ownership(&checked, OwnershipLimits::default())
+                .expect("dynamic projection participates in ownership insertion");
+            validate_ownership_candidate(
+                &checked,
+                inserted.program().clone(),
+                inserted.witness().clone(),
+                OwnershipLimits::default(),
+            )
+            .expect("independent ownership verifier accepts projection");
+        }
+        assert!(matches!(
+            validate(program(r(1), r(0), max_field + 1)),
+            Err(ValidationError::CtorFieldIndexOutOfRange { field, .. })
+                if field == max_field + 1
+        ));
+        assert!(matches!(
+            validate(program(r(2), r(0), 0)),
+            Err(ValidationError::RegisterOutOfBounds { register, .. }) if register == r(2)
+        ));
+        assert!(matches!(
+            validate(program(r(1), r(2), 0)),
+            Err(ValidationError::RegisterOutOfBounds { register, .. }) if register == r(2)
+        ));
+        assert!(matches!(
+            validate(program(r(1), r(1), 0)),
+            Err(ValidationError::ReadBeforeWrite { register, .. }) if register == r(1)
         ));
     }
 

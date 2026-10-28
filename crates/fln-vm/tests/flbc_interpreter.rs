@@ -213,6 +213,9 @@ fn fixture_register_result(
             Instruction::CtorField { dst, .. } if *dst == register => {
                 return CallableResultOwnership::Owned;
             }
+            Instruction::CtorFieldDynamic { dst, .. } if *dst == register => {
+                return CallableResultOwnership::Erased;
+            }
             _ => {}
         }
     }
@@ -2852,7 +2855,7 @@ fn core_linear_ownership_drops_dead_heap_values_at_their_final_use() {
     assert_eq!(
         owned.witness().canonical_text(),
         concat!(
-            "flbc-ownership/16\n",
+            "flbc-ownership/17\n",
             "function f0 mode=inserted-linear result=owned source=3 emitted=4 drops=1 moves=0 redefs=0 edges=0 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
         )
     );
@@ -2968,7 +2971,7 @@ fn straight_line_register_reuse_releases_each_value_epoch_without_leaking() {
     assert_eq!(
         owned.witness().canonical_text(),
         concat!(
-            "flbc-ownership/16\n",
+            "flbc-ownership/17\n",
             "function f0 mode=inserted-linear-reuse result=owned source=7 emitted=9 drops=2 moves=3 redefs=3 edges=0 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
         )
     );
@@ -3101,7 +3104,7 @@ fn acyclic_cfg_register_reuse_executes_both_value_epochs_without_leaking() {
         assert_eq!(
             owned.witness().canonical_text(),
             concat!(
-                "flbc-ownership/16\n",
+                "flbc-ownership/17\n",
                 "function f0 mode=inserted-acyclic-cfg-reuse result=owned source=8 emitted=14 drops=3 moves=1 redefs=2 edges=3 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
             )
         );
@@ -3199,7 +3202,7 @@ fn cyclic_cfg_register_reuse_executes_zero_one_and_bounded_many_iterations() {
         assert_eq!(
             owned.witness().canonical_text(),
             concat!(
-                "flbc-ownership/16\n",
+                "flbc-ownership/17\n",
                 "function f0 mode=inserted-cyclic-cfg-reuse result=owned source=7 emitted=13 drops=3 moves=0 redefs=2 edges=3 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
             )
         );
@@ -3365,7 +3368,7 @@ fn preowned_flbc_is_checked_before_golem_and_preserves_transfer_events() {
     assert_eq!(
         owned.witness().canonical_text(),
         concat!(
-            "flbc-ownership/16\n",
+            "flbc-ownership/17\n",
             "function f0 mode=validated-existing-ownership result=owned source=7 emitted=7 drops=0 moves=0 existing_drops=2 existing_moves=1 redefs=0 edges=0 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
         )
     );
@@ -3562,7 +3565,7 @@ fn fir_acyclic_cfg_ownership_executes_both_edges_with_balanced_marrow() {
         assert_eq!(
             owned.witness().canonical_text(),
             concat!(
-                "flbc-ownership/16\n",
+                "flbc-ownership/17\n",
                 "function f0 mode=inserted-acyclic-cfg result=owned source=9 emitted=18 drops=5 moves=1 redefs=0 edges=4 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
             )
         );
@@ -3703,7 +3706,7 @@ fn fir_cyclic_cfg_ownership_returns_or_stops_bounded_without_leaking() {
         assert_eq!(
             owned.witness().canonical_text(),
             concat!(
-                "flbc-ownership/16\n",
+                "flbc-ownership/17\n",
                 "function f0 mode=inserted-cyclic-cfg result=owned source=8 emitted=15 drops=3 moves=0 redefs=0 edges=4 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
             )
         );
@@ -9710,6 +9713,189 @@ fn control_flow_copy_move_drop_and_constructor_ownership_are_executable() {
 }
 
 #[test]
+fn dynamic_constructor_projection_retains_heap_children_through_parent_release_and_replay() {
+    let _guard = lock();
+    for tag in [0, 7, abi::TAG_MAX_CTOR_TAG] {
+        for same_register in [false, true] {
+            let destination = if same_register { r(2) } else { r(3) };
+            let source = validated(vec![function_with_callable_result(
+                0,
+                Vec::new(),
+                CallableResultOwnership::Erased,
+                4,
+                vec![
+                    Instruction::String {
+                        dst: r(0),
+                        value: "retained λ 🦀".to_string(),
+                    },
+                    Instruction::Nat {
+                        dst: r(1),
+                        value: 19,
+                    },
+                    Instruction::Ctor {
+                        dst: r(2),
+                        tag,
+                        fields: vec![r(1), r(0)],
+                        scalar_bytes: vec![0xA5, 0x5A],
+                    },
+                    Instruction::CtorFieldDynamic {
+                        dst: destination,
+                        src: r(2),
+                        field: 1,
+                    },
+                    Instruction::Return { src: destination },
+                ],
+            )]);
+            let owned = insert_ownership(&source, OwnershipLimits::default())
+                .expect("projection retains its child independently of the parent");
+            let bytes = encode_canonical(owned.program(), CodecLimits::default())
+                .expect("encode dynamic projection");
+            let replay = decode_canonical(&bytes, CodecLimits::default())
+                .expect("replay dynamic projection");
+            for program in [&source, owned.program(), &replay] {
+                shadow::enable();
+                let completed = returned(execute(program, ExecutionLimits::default(), None));
+                assert_eq!(string_contents(&completed.value), "retained λ 🦀");
+                drop(completed);
+                let (events, live) = shadow::disable_and_drain();
+                assert_eq!(
+                    live, 0,
+                    "projection must release the parent and child exactly once"
+                );
+                assert!(events.iter().all(|event| {
+                    event.kind != shadow::EventKind::DoubleRelease
+                        && event.kind != shadow::EventKind::ForeignPointer
+                }));
+            }
+        }
+    }
+}
+
+#[test]
+fn dynamic_constructor_projection_preserves_scalar_children() {
+    let _guard = lock();
+    let source = validated(vec![function_with_callable_result(
+        0,
+        Vec::new(),
+        CallableResultOwnership::Erased,
+        3,
+        vec![
+            Instruction::Nat {
+                dst: r(0),
+                value: 42,
+            },
+            Instruction::Ctor {
+                dst: r(1),
+                tag: 3,
+                fields: vec![r(0)],
+                scalar_bytes: Vec::new(),
+            },
+            Instruction::CtorFieldDynamic {
+                dst: r(2),
+                src: r(1),
+                field: 0,
+            },
+            Instruction::Drop { src: r(1) },
+            Instruction::Return { src: r(2) },
+        ],
+    )]);
+    let completed = returned(execute(&source, ExecutionLimits::default(), None));
+    assert_eq!(value_kind(&completed.value), ValueKind::Scalar);
+    assert_eq!(completed.value.unbox(), 42);
+}
+
+#[test]
+fn dynamic_constructor_projection_refuses_nonconstructors_and_actual_field_overflow() {
+    let _guard = lock();
+    let cases = [
+        (
+            vec![Instruction::Nat {
+                dst: r(0),
+                value: 7,
+            }],
+            0,
+            VmRefusal::TypeMismatch {
+                operation: "constructor object projection",
+                argument: 0,
+                expected: "constructor",
+                actual: ValueKind::Scalar,
+            },
+        ),
+        (
+            vec![Instruction::String {
+                dst: r(0),
+                value: "not a constructor".to_string(),
+            }],
+            0,
+            VmRefusal::TypeMismatch {
+                operation: "constructor object projection",
+                argument: 0,
+                expected: "constructor",
+                actual: ValueKind::String,
+            },
+        ),
+        (
+            vec![Instruction::Ctor {
+                dst: r(0),
+                tag: 4,
+                fields: Vec::new(),
+                scalar_bytes: vec![0; 16],
+            }],
+            0,
+            VmRefusal::ConstructorProjectionIndex {
+                field: 0,
+                actual_fields: 0,
+            },
+        ),
+        (
+            vec![
+                Instruction::String {
+                    dst: r(0),
+                    value: "only object field".to_string(),
+                },
+                Instruction::Ctor {
+                    dst: r(0),
+                    tag: 8,
+                    fields: vec![r(0)],
+                    scalar_bytes: vec![0; 16],
+                },
+            ],
+            1,
+            VmRefusal::ConstructorProjectionIndex {
+                field: 1,
+                actual_fields: 1,
+            },
+        ),
+    ];
+    for (mut code, field, expected) in cases {
+        code.push(Instruction::CtorFieldDynamic {
+            dst: r(1),
+            src: r(0),
+            field,
+        });
+        code.push(Instruction::Return { src: r(1) });
+        let program = validated(vec![function_with_callable_result(
+            0,
+            Vec::new(),
+            CallableResultOwnership::Erased,
+            2,
+            code,
+        )]);
+        shadow::enable();
+        assert!(matches!(
+            execute(&program, ExecutionLimits::default(), None),
+            Outcome::Complete(VmExit::Refused { refusal, .. }) if refusal == expected
+        ));
+        let (events, live) = shadow::disable_and_drain();
+        assert_eq!(live, 0, "projection refusal releases every object");
+        assert!(events.iter().all(|event| {
+            event.kind != shadow::EventKind::DoubleRelease
+                && event.kind != shadow::EventKind::ForeignPointer
+        }));
+    }
+}
+
+#[test]
 fn constructor_projection_refuses_scalar_wrong_tag_and_wrong_shape_before_reading() {
     let scalar = validated(vec![function(
         0,
@@ -9859,7 +10045,7 @@ fn generated_array_ownership_transfers_exactly_and_refuses_drift_before_executio
     assert_eq!(
         owned.witness().canonical_text(),
         concat!(
-            "flbc-ownership/16\n",
+            "flbc-ownership/17\n",
             "function f0 mode=inserted-linear result=owned source=6 emitted=8 drops=2 moves=0 redefs=0 edges=0 extern_consumes=2 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=2 owned_callable_results=0 scalar_callable_results=0\n",
         )
     );

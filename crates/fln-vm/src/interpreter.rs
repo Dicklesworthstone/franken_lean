@@ -1502,6 +1502,10 @@ pub enum VmRefusal {
         expected_fields: usize,
         actual_fields: usize,
     },
+    ConstructorProjectionIndex {
+        field: usize,
+        actual_fields: usize,
+    },
     InvalidStringObject,
     InvalidArrayObject,
     InvalidByteArrayObject,
@@ -1674,6 +1678,13 @@ impl fmt::Display for VmRefusal {
             } => write!(
                 f,
                 "constructor projection expected {expected_fields} object fields, got {actual_fields}"
+            ),
+            Self::ConstructorProjectionIndex {
+                field,
+                actual_fields,
+            } => write!(
+                f,
+                "constructor projection field {field} is outside {actual_fields} object fields"
             ),
             Self::InvalidStringObject => write!(f, "Marrow String object is not canonical UTF-8"),
             Self::InvalidArrayObject => write!(f, "Marrow Array object header is inconsistent"),
@@ -2383,6 +2394,45 @@ fn run(
                     };
                     projected
                 };
+                set_register(current_frame_mut(&mut stack)?, dst, projected)?;
+                advance(current_frame_mut(&mut stack)?)?;
+            }
+            Instruction::CtorFieldDynamic { dst, src, field } => {
+                let projected = {
+                    let value = register(current_frame(&stack)?, src)?;
+                    let actual = value_kind(value);
+                    if !matches!(actual, ValueKind::Ctor(_)) {
+                        return Ok(VmExit::Refused {
+                            refusal: VmRefusal::TypeMismatch {
+                                operation: "constructor object projection",
+                                argument: 0,
+                                expected: "constructor",
+                                actual,
+                            },
+                            usage: usage(steps, peak_stack_depth),
+                        });
+                    }
+                    let actual_fields = usize::from(value.header().other);
+                    let field = usize::from(field);
+                    if field >= actual_fields {
+                        return Ok(VmExit::Refused {
+                            refusal: VmRefusal::ConstructorProjectionIndex {
+                                field,
+                                actual_fields,
+                            },
+                            usage: usage(steps, peak_stack_depth),
+                        });
+                    }
+                    let Some(projected) = value.try_ctor_child(field) else {
+                        return Ok(VmExit::Refused {
+                            refusal: VmRefusal::InvalidCtorObject,
+                            usage: usage(steps, peak_stack_depth),
+                        });
+                    };
+                    projected
+                };
+                // Retain the child before replacing dst: dst may also be src,
+                // in which case replacement releases the parent constructor.
                 set_register(current_frame_mut(&mut stack)?, dst, projected)?;
                 advance(current_frame_mut(&mut stack)?)?;
             }

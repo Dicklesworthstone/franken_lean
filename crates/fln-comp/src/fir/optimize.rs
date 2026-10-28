@@ -823,6 +823,7 @@ fn rename_operation(operation: &mut Operation, rename: &impl Fn(ValueId) -> Valu
         | Operation::Unbox { value, .. }
         | Operation::CtorTest { value, .. }
         | Operation::Project { value, .. }
+        | Operation::ProjectObject { value, .. }
         | Operation::CheckSystemValue { module_name: value } => *value = rename(*value),
         Operation::Ctor { fields: values, .. }
         | Operation::Array { items: values }
