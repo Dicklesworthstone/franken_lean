@@ -156,6 +156,7 @@ fn field_receivers_wait_for_later_local_function_arguments() {
         "let project (x : _) := x.identity.identity; project receiver",
         "let project (x : _) := let y := x; y.identity; project receiver",
         "let project (x : _) := fun (_ : Nat) => x.identity; project receiver 3",
+        "let A := Nat; let project (z : A) (x : _) := x.identity; project receiver receiver",
     ] {
         accepted(
             &environment,

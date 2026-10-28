@@ -28,10 +28,9 @@ pub(super) fn compile(
                         expr: IrExpr::Unbox { .. },
                         ..
                     } = stmt
+                        && let Some(name) = unbox_intrinsic(ty)
                     {
-                        if let Some(name) = unbox_intrinsic(ty) {
-                            insert_helper(&mut helper_natives, name)?;
-                        }
+                        insert_helper(&mut helper_natives, name)?;
                     }
                 }
             }

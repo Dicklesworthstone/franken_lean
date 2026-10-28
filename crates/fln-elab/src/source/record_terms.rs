@@ -128,8 +128,9 @@ pub(super) enum FieldReceiver<'a> {
 
 /// A projection whose receiver's carrier will be determined by later source
 /// constraints. Both the value and its result type explicitly apply their
-/// captured locals, so closing a lambda cannot hide a free variable in a
-/// metavariable assignment made after that lambda has left the worklist.
+/// captured parameters. Lexical lets are expanded before abstraction, so an
+/// unrelated let cannot add a cyclic type dependency to the pending value.
+/// Closing a lambda cannot hide a free variable in a later assignment.
 #[derive(Clone)]
 pub(super) struct PostponedField {
     id: MVarId,
@@ -175,7 +176,16 @@ impl Context {
         path: &Name,
         at: Option<&Syntax>,
     ) -> Result<FieldResolution, NatDefinitionElabError> {
-        let locals = self.txn.lctx.decls().to_vec();
+        let mut locals = Vec::new();
+        for mut local in self.txn.lctx.decls().to_vec() {
+            self.tick()?;
+            if local.is_let() {
+                continue;
+            }
+            let type_ = self.instantiate(&local.type_)?;
+            local.type_ = self.zeta_locals(&type_)?;
+            locals.push(local);
+        }
         let sort = self.type_expected()?;
         let type_type = self.forall_captured(&locals, sort)?;
         let type_name = self.fresh_name()?;
@@ -254,14 +264,19 @@ impl Context {
                     false,
                     record.at.as_ref(),
                 )?;
-                let term = self.field_value(field, Some(&record.expected))?;
+                let mut term = self.field_value(field, Some(&record.expected))?;
+                let type_ = self.instantiate(&term.type_)?;
+                term.type_ = self.zeta_locals(&type_)?;
                 let term = self.finish_optional_term(term, Some(&record.expected))?;
-                let mut value = self.instantiate(&term.value)?;
+                let value = self.instantiate(&term.value)?;
+                let mut value = self.zeta_locals(&value)?;
                 for local in record.locals.iter().rev() {
                     self.tick()?;
+                    let domain = self.instantiate(&local.type_)?;
+                    let domain = self.zeta_locals(&domain)?;
                     value = Expr::lam(
                         local.user_name.clone(),
-                        self.instantiate(&local.type_)?,
+                        domain,
                         value
                             .abstract_fvar(&local.id, 0)
                             .map_err(|_| failure(SourceInferenceError::Scope))?,
