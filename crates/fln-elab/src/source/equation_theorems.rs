@@ -1142,6 +1142,33 @@ pub fn realize(
     })
 }
 
+/// Reconstruct nonrecursive pattern equations even when their names already
+/// exist. A consumer must check or compare the candidates before reusing them;
+/// an existing `eq_1` name alone is not realization provenance.
+pub fn pattern_equation_candidates(
+    env: &Environment,
+    declaration: &Name,
+    kernel: Budget,
+) -> Result<Option<Vec<Declaration>>, NatDefinitionElabError> {
+    let Some(definition) = safe_definition(env, declaration) else {
+        return Ok(None);
+    };
+    if is_matcher_name(declaration)
+        || unsupported_reason(env, declaration, &definition.value)
+            != Some(Unsupported::CompiledMatch)
+    {
+        return Ok(None);
+    }
+    let Some(record) = journal::find(env, declaration)? else {
+        return Ok(None);
+    };
+    let mut context = Context::new(env, kernel);
+    if context.proposition_typed(definition)? {
+        return Ok(None);
+    }
+    context.matched_equations(definition, &record).map(Some)
+}
+
 /// The shared simple-equation producer, without the already-generated-name
 /// shortcut used by lazy realization. Simp registration uses this same proof
 /// construction, then checks/adopts it through ordinary engine admission.

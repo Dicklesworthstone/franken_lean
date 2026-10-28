@@ -589,6 +589,53 @@ pub fn prepare_owned(
     prepare_inner(env, origin, kernel, true)
 }
 
+/// Default, source-owned nonrecursive matches use their checked pattern
+/// equations too. These candidates never acquire simple-equation provenance:
+/// the persistent writer still has to account for their distinct shape.
+pub fn prepare_pattern_owned(
+    env: &Environment,
+    origin: &Name,
+    kernel: Budget,
+) -> Result<Vec<(Declaration, bool)>, NatDefinitionElabError> {
+    let mut meter = super::export::Meter {
+        remaining: MAX_WORK,
+        bytes: 0,
+    };
+    let state = read(env, &mut meter.remaining).map_err(failure_set)?;
+    // Nondefault definition-time policies need their own pattern producer.
+    // An unsupported simple preparation must not erase one of those policies.
+    if state.definitions.contains_key(origin)
+        || state.generated.contains_key(origin)
+        || super::export::known_status(env, origin, &mut meter).map_err(failure_set)?
+            == Some(crate::reducibility::Reducibility::Irreducible)
+    {
+        return Ok(Vec::new());
+    }
+    let Some(candidates) =
+        crate::source::equation_theorems::pattern_equation_candidates(env, origin, kernel)?
+    else {
+        return Ok(Vec::new());
+    };
+    let mut prepared = Vec::new();
+    for candidate in candidates {
+        charge(&mut meter.remaining, 1).map_err(failure_set)?;
+        let Declaration::Thm(theorem) = &candidate else {
+            return Err(failure_set(SimpSetError::Malformed));
+        };
+        let existing = match env.find(&theorem.base.name) {
+            None => false,
+            Some(ConstantInfo::Thm(actual)) if actual.base == theorem.base => true,
+            Some(_) => {
+                return Err(failure_set(SimpSetError::UnsupportedDeclaration(
+                    theorem.base.name.clone(),
+                )));
+            }
+        };
+        prepared.push((candidate, existing));
+    }
+    Ok(prepared)
+}
+
 fn prepare_inner(
     env: &Environment,
     origin: &Name,

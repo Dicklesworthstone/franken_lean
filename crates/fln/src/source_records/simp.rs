@@ -66,7 +66,7 @@ impl Engine {
             admissions: Vec::new(),
             local_instance: None,
         };
-        let mut equation = None;
+        let mut equations = Vec::new();
         if let Some((_, false)) = rule {
             let preparation = if source_owned {
                 source_simp::equations::prepare_owned(
@@ -84,7 +84,7 @@ impl Engine {
                             detail: "a source simp equation candidate must be a theorem",
                         });
                     };
-                    equation = Some(theorem.base.name.clone());
+                    equations.push(theorem.base.name.clone());
                     if !candidate.existing {
                         let admitted = match batch.engine.admit_declaration(
                             candidate.declaration.clone(),
@@ -117,6 +117,61 @@ impl Engine {
                             }
                         };
                 }
+                Outcome::Complete(source_simp::equations::Preparation::Unsupported)
+                    if source_owned && activate =>
+                {
+                    let candidates =
+                        match elaboration_outcome(source_simp::equations::prepare_pattern_owned(
+                            batch.engine.environment(),
+                            name,
+                            limits.kernel,
+                        ))? {
+                            Outcome::Complete(candidates) => candidates,
+                            Outcome::Inconclusive(reason) => {
+                                return Ok(Outcome::Inconclusive(reason));
+                            }
+                            Outcome::InternalFault(fault) => {
+                                return Ok(Outcome::InternalFault(fault));
+                            }
+                        };
+                    for (candidate, existing) in candidates {
+                        let Declaration::Thm(theorem) = &candidate else {
+                            return Err(EngineExecutionError::UnexpectedPublication {
+                                detail: "a source pattern equation candidate must be a theorem",
+                            });
+                        };
+                        let equation = theorem.base.name.clone();
+                        if !existing {
+                            let admitted =
+                                match batch.engine.admit_declaration(candidate, options, limits)? {
+                                    Outcome::Complete(admitted) => admitted,
+                                    Outcome::Inconclusive(reason) => {
+                                        return Ok(Outcome::Inconclusive(reason));
+                                    }
+                                    Outcome::InternalFault(fault) => {
+                                        return Ok(Outcome::InternalFault(fault));
+                                    }
+                                };
+                            batch.engine = admitted.engine.clone();
+                            batch.admissions.push(admitted);
+                        }
+                        batch.engine.environment =
+                            match elaboration_outcome(source_simp::defeq::infer_generated(
+                                batch.engine.environment(),
+                                &equation,
+                                limits.kernel,
+                            ))? {
+                                Outcome::Complete(environment) => environment,
+                                Outcome::Inconclusive(reason) => {
+                                    return Ok(Outcome::Inconclusive(reason));
+                                }
+                                Outcome::InternalFault(fault) => {
+                                    return Ok(Outcome::InternalFault(fault));
+                                }
+                            };
+                        equations.push(equation);
+                    }
+                }
                 // Keep the existing source simplifier's supported unfolding
                 // behavior for shapes whose exact equation export is not yet
                 // implemented. Their export snapshot remains unsupported.
@@ -129,19 +184,23 @@ impl Engine {
             }
         }
         if activate {
-            if let (Some(equation), Some((priority, false))) = (equation, rule) {
-                batch.engine.environment = source_simp::update(
-                    batch.engine.environment(),
-                    &equation,
-                    Some((priority, false)),
-                )
-                .map_err(metadata_error)?;
-                batch.engine.environment = source_simp::register_unfold_theorems(
-                    batch.engine.environment(),
-                    name,
-                    &[equation],
-                )
-                .map_err(metadata_error)?;
+            if let Some((priority, false)) = rule {
+                for equation in &equations {
+                    batch.engine.environment = source_simp::update(
+                        batch.engine.environment(),
+                        equation,
+                        Some((priority, false)),
+                    )
+                    .map_err(metadata_error)?;
+                }
+                if !equations.is_empty() {
+                    batch.engine.environment = source_simp::register_unfold_theorems(
+                        batch.engine.environment(),
+                        name,
+                        &equations,
+                    )
+                    .map_err(metadata_error)?;
+                }
             }
             batch.engine.environment = source_simp::update(batch.engine.environment(), name, rule)
                 .map_err(metadata_error)?;
