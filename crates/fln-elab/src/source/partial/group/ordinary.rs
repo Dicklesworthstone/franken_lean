@@ -172,7 +172,7 @@ fn elaborate_with_meter(
         meter.txn.budget = context.txn.budget;
         headers.push(header.base);
     }
-    let group = Group {
+    let mut group = Group {
         names: names.clone(),
         headers: headers.clone(),
         ..Group::default()
@@ -225,7 +225,13 @@ fn elaborate_with_meter(
         bodies.push(definition);
     }
     if !scope.variables.is_empty() {
-        close_shared_captures(&mut meter, &headers, &mut bodies, &universes, &fixed_levels)?;
+        group.shared = Some(close_shared_captures(
+            &mut meter,
+            &headers,
+            &mut bodies,
+            &universes,
+            &fixed_levels,
+        )?);
     }
     let mut edges = vec![vec![false; names.len()]; names.len()];
     for (from, body) in bodies.iter().enumerate() {
@@ -400,18 +406,29 @@ fn mutual_structural(
             recursion::RecursionError::MutualStructuralUnsupported(shape),
         ))
     };
-    if !scope.variables.is_empty() {
-        return Err(unsupported(
-            "section captures outside a common parameter prefix",
-        ));
-    }
+    let captures = parts
+        .group
+        .shared
+        .as_ref()
+        .map_or_else(Vec::new, |shared| shared.locals.clone());
     let names: Vec<_> = component
         .iter()
         .map(|&index| parts.names[index].clone())
         .collect();
     let levels = parts.bodies[component[0]].base.level_params.clone();
+    let header_levels: Vec<_> = levels
+        .iter()
+        .filter(|level| {
+            !parts
+                .group
+                .shared
+                .as_ref()
+                .is_some_and(|shared| shared.fixed_levels.contains(*level))
+        })
+        .cloned()
+        .collect();
     if component.iter().any(|&index| {
-        parts.headers[index].level_params != levels
+        parts.headers[index].level_params != header_levels
             || parts.bodies[index].base.level_params != levels
     }) {
         return Err(unsupported("one universe telescope for all members"));
@@ -433,6 +450,9 @@ fn mutual_structural(
         types.push(parts.bodies[index].base.type_.clone());
     }
     let fixed = meter.mutual_structural_fixed_prefix(&values, &arities, &names)?;
+    if fixed < captures.len() {
+        return Err(unsupported("section captures in the common fixed prefix"));
+    }
     let auxiliary = Name::str(names[0].clone(), "_mutual");
     if std::iter::once(auxiliary)
         .chain(
@@ -460,8 +480,11 @@ fn mutual_structural(
             ordinary: true,
             ..State::default()
         });
-        context.mutual_structural_member =
-            Some(recursion::StructuralMember::new(plan.clone(), position));
+        context.mutual_structural_member = Some(recursion::StructuralMember::new(
+            plan.clone(),
+            position,
+            captures.clone(),
+        ));
         let elaborated = definition_in_context(&parts.members[index], &mut context);
         meter.txn.budget = context.txn.budget.clone();
         let Declaration::Mutual(mut definitions) = elaborated? else {

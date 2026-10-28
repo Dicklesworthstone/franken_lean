@@ -33,6 +33,7 @@ pub(in crate::source) struct StructuralPlan {
 pub(in crate::source) struct StructuralMember {
     plan: Arc<StructuralPlan>,
     index: usize,
+    captures: Vec<LocalDecl>,
     active: Option<Active>,
     piece: Option<Expr>,
 }
@@ -46,10 +47,15 @@ struct Active {
 }
 
 impl StructuralMember {
-    pub(in crate::source) fn new(plan: Arc<StructuralPlan>, index: usize) -> Self {
+    pub(in crate::source) fn new(
+        plan: Arc<StructuralPlan>,
+        index: usize,
+        captures: Vec<LocalDecl>,
+    ) -> Self {
         Self {
             plan,
             index,
+            captures,
             active: None,
             piece: None,
         }
@@ -416,6 +422,14 @@ impl Context {
         let mut parameters = parameters.to_vec();
         let (body, expected, lambdas) =
             self.open_recursive_lambdas(syntax, expected, &mut parameters)?;
+        // Captures are implicit in source peer references, but explicit fixed
+        // arguments of the shared recursor. Keep their original identities;
+        // a written parameter can shadow the same section variable's name.
+        let captures = member.captures;
+        let header_parameters = header_parameters
+            .checked_add(captures.len())
+            .ok_or_else(scope)?;
+        parameters.splice(0..0, captures.iter().cloned());
         let expected = expected.ok_or_else(|| error(RecursionError::ResultTypeRequired))?;
         if parameters.len() != plan.arities[member.index] || parameters.len() <= plan.fixed {
             return Err(unsupported("the same body telescope as its planned header"));
@@ -465,10 +479,14 @@ impl Context {
                 type_.clone(),
                 BinderInfo::Default,
             );
-            references.push(Typed {
+            let mut reference = Typed {
                 value: Expr::fvar(marker.clone()),
                 type_: type_.clone(),
-            });
+            };
+            for capture in &captures {
+                reference = self.course_apply(reference, Expr::fvar(capture.id.clone()))?;
+            }
+            references.push(reference);
             markers.push(marker);
         }
         self.mutual_structural_member
@@ -486,7 +504,14 @@ impl Context {
             self.resume_postponed_eliminators(true)?;
             self.flush(true)?;
             self.complete_local_functions()?;
-            let mut value = self.instantiate(&term.value)?;
+            let mut piece = Typed {
+                value: self.instantiate(&term.value)?,
+                type_: expected.clone(),
+            };
+            // Peers outside this SCC receive the same common section closure.
+            // Close their references before abstracting that capture prefix.
+            self.close_partial_group_references(&mut piece)?;
+            let mut value = piece.value;
             let reads = self.elimination_reads(&value)?;
             if markers.iter().any(|marker| reads.contains(marker)) {
                 return Err(error(RecursionError::PartialApplication));
@@ -495,21 +520,11 @@ impl Context {
             value = self.structural_close(&value, std::slice::from_ref(&below), true)?;
             value = self.structural_close(&value, std::slice::from_ref(major), true)?;
             value = self.structural_close(&value, &fixed, true)?;
-            let mut piece = Typed {
-                value,
-                type_: expected.clone(),
-            };
-            // Peers outside this SCC retain the ordinary group's header references until
-            // closed. They are not recursive targets of this below dictionary.
-            self.close_partial_group_references(&mut piece)?;
-            self.require_resolved_terms(std::slice::from_ref(&piece.value))?;
-            if piece.value.has_fvar()
-                || piece.value.has_loose_bvars()
-                || piece.value.has_level_mvar()
-            {
+            self.require_resolved_terms(std::slice::from_ref(&value))?;
+            if value.has_fvar() || value.has_loose_bvars() || value.has_level_mvar() {
                 return Err(scope());
             }
-            Ok(piece.value)
+            Ok(value)
         })();
         self.mutual_structural_member
             .as_mut()

@@ -15,6 +15,52 @@ pub(in crate::source) struct Group {
     /// The exact identities closed by the current declaration, never guessed
     /// from binder names (which may be shadowed by ordinary parameters).
     pub captures: Vec<LocalDecl>,
+    /// The first pass's common closure, used when a recursive component is
+    /// elaborated again. Its source references still have the open headers.
+    shared: Option<SharedCaptures>,
+}
+
+#[derive(Clone)]
+struct SharedCaptures {
+    locals: Vec<LocalDecl>,
+    levels: Vec<Vec<Name>>,
+    fixed_levels: BTreeSet<Name>,
+}
+
+impl SharedCaptures {
+    fn reference(
+        &self,
+        context: &mut Context,
+        header: &ConstantVal,
+        target: usize,
+        name: Name,
+        levels: &[Level],
+    ) -> Result<Expr, NatDefinitionElabError> {
+        if levels.len() != header.level_params.len() {
+            return Err(failure(SourceInferenceError::Scope));
+        }
+        let mut actual = Vec::new();
+        for parameter in &self.levels[target] {
+            context.tick()?;
+            let level = if self.fixed_levels.contains(parameter) {
+                Level::param(parameter.clone())
+            } else {
+                let index = header
+                    .level_params
+                    .iter()
+                    .position(|name| name == parameter)
+                    .ok_or_else(|| refusal("peer universes determined by the mutual header"))?;
+                levels[index].clone()
+            };
+            actual.push(level);
+        }
+        let mut value = Expr::const_(name, actual);
+        for local in &self.locals {
+            context.tick()?;
+            value = Expr::app(value, Expr::fvar(local.id.clone()));
+        }
+        Ok(value)
+    }
 }
 
 fn refusal(expected: &'static str) -> NatDefinitionElabError {
@@ -340,12 +386,18 @@ impl Context {
         &mut self,
         name: &Name,
     ) -> Result<Option<Typed>, NatDefinitionElabError> {
-        let Some(header) = self
+        let Some((index, header)) = self
             .partial
             .as_ref()
             .and_then(|state| state.group.as_ref())
-            .and_then(|group| group.headers.iter().find(|header| &header.name == name))
-            .cloned()
+            .and_then(|group| {
+                group
+                    .headers
+                    .iter()
+                    .enumerate()
+                    .find(|(_, header)| &header.name == name)
+            })
+            .map(|(index, header)| (index, header.clone()))
         else {
             return Ok(None);
         };
@@ -370,12 +422,22 @@ impl Context {
         } else {
             Name::str(name.clone(), "_unsafe_rec")
         };
+        let shared = self
+            .partial
+            .as_ref()
+            .and_then(|state| state.group.as_ref())
+            .and_then(|group| group.shared.clone());
+        let executable = if let Some(shared) = shared {
+            shared.reference(self, &header, index, executable, &levels)?
+        } else {
+            Expr::const_(executable, levels)
+        };
         self.partial
             .as_mut()
             .and_then(|state| state.group.as_mut())
             .expect("group exists")
             .calls
-            .push((marker.clone(), Expr::const_(executable, levels)));
+            .push((marker.clone(), executable));
         Ok(Some(Typed {
             value: Expr::fvar(marker),
             type_,
@@ -460,7 +522,7 @@ fn close_shared_captures(
     bodies: &mut [DefinitionVal],
     universes: &[(Vec<Name>, usize)],
     fixed_levels: &BTreeSet<Name>,
-) -> Result<(), NatDefinitionElabError> {
+) -> Result<SharedCaptures, NatDefinitionElabError> {
     let mut roots = Vec::new();
     for body in bodies.iter() {
         context.tick()?;
@@ -477,6 +539,14 @@ fn close_shared_captures(
         body.base.level_params = context.declaration_levels(&roots)?;
     }
     let signatures: Vec<_> = bodies.iter().map(|body| body.base.clone()).collect();
+    let shared = SharedCaptures {
+        locals: captures.clone(),
+        levels: signatures
+            .iter()
+            .map(|signature| signature.level_params.clone())
+            .collect(),
+        fixed_levels: fixed_levels.clone(),
+    };
     for body in bodies {
         body.value = map(context, &body.value, &|context, expr| {
             let ExprNode::Const { name, levels } = expr.node() else {
@@ -485,31 +555,9 @@ fn close_shared_captures(
             let Some(target) = signatures.iter().position(|base| &base.name == name) else {
                 return Ok(None);
             };
-            let header = &headers[target];
-            if levels.len() != header.level_params.len() {
-                return Err(failure(SourceInferenceError::Scope));
-            }
-            let mut actual = Vec::new();
-            for parameter in &signatures[target].level_params {
-                context.tick()?;
-                let level = if fixed_levels.contains(parameter) {
-                    Level::param(parameter.clone())
-                } else {
-                    let index = header
-                        .level_params
-                        .iter()
-                        .position(|name| name == parameter)
-                        .ok_or_else(|| refusal("peer universes determined by the mutual header"))?;
-                    levels[index].clone()
-                };
-                actual.push(level);
-            }
-            let mut replacement = Expr::const_(name.clone(), actual);
-            for local in &captures {
-                context.tick()?;
-                replacement = Expr::app(replacement, Expr::fvar(local.id.clone()));
-            }
-            Ok(Some(replacement))
+            shared
+                .reference(context, &headers[target], target, name.clone(), levels)
+                .map(Some)
         })?;
         for local in captures.iter().rev() {
             context.tick()?;
@@ -538,7 +586,7 @@ fn close_shared_captures(
             return Err(failure(SourceInferenceError::Scope));
         }
     }
-    Ok(())
+    Ok(shared)
 }
 
 fn children(expr: &Expr) -> Vec<&Expr> {

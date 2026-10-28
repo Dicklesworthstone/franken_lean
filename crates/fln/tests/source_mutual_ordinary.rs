@@ -309,6 +309,178 @@ fn shared_section_captures_include_peer_only_dependencies() {
     run(&base, "#eval second 7 13 5", "18");
     run(&base, "#eval independent 7 13 5", "5");
 }
+
+#[test]
+fn recursive_section_captures_include_acyclic_peer_dependencies() {
+    let base = check(
+        "section\n\
+         variable (unused : String) (left right : Nat)\n\
+         mutual\n\
+          def capturedLeft : Nat -> Nat\n\
+          | 0 => left\n\
+          | n+1 => capturedRight n + capturedHelper n\n\
+          def capturedRight : Nat -> Nat\n\
+          | 0 => right\n\
+          | n+1 => capturedLeft n\n\
+          def capturedHelper (n : Nat) : Nat := n + right\n\
+         end\nend\n\
+         example : capturedLeft 7 13 2 = 21 := rfl\n\
+         example : capturedRight 7 13 2 = 26 := rfl\n",
+    );
+    run(&base, "#eval capturedLeft 7 13 2", "21");
+    run(&base, "#eval capturedRight 7 13 2", "26");
+    run(&base, "#eval capturedHelper 7 13 5", "18");
+}
+
+#[test]
+fn recursive_section_captures_preserve_universes_and_structural_hint_aliases() {
+    let base = check(
+        "universe u\nsection\n\
+         variable (unused : String) (A : Type u) (left right : A)\n\
+         mutual\n\
+          def capturedPickLeft : Nat -> A\n\
+          | 0 => left\n\
+          | n+1 => capturedPickRight n\n\
+          termination_by structural n => n\n\
+          def capturedPickRight : Nat -> A\n\
+          | 0 => right\n\
+          | n+1 => capturedPickLeft n\n\
+          termination_by structural n => n\n\
+         end\nend\n\
+         example : capturedPickLeft Nat 7 13 2 = 7 := rfl\n\
+         example : capturedPickRight Nat 7 13 2 = 13 := rfl\n",
+    );
+    run(&base, "#eval capturedPickLeft Nat 7 13 3", "13");
+    run(&base, "#eval capturedPickRight Nat 7 13 3", "7");
+}
+
+#[test]
+fn recursive_section_captures_include_instance_dictionaries() {
+    let base = check(
+        "universe u\nsection\n\
+         variable {A : Type u} [Inhabited A]\n\
+         mutual\n\
+          def capturedDefaultLeft : Nat -> A\n\
+          | 0 => default\n\
+          | n+1 => capturedDefaultRight n\n\
+          def capturedDefaultRight : Nat -> A\n\
+          | 0 => default\n\
+          | n+1 => capturedDefaultLeft n\n\
+         end\nend\n\
+         example : (capturedDefaultLeft 2 : Nat) = 0 := rfl\n",
+    );
+    run(&base, "#eval (capturedDefaultRight 3 : Nat)", "0");
+}
+
+#[test]
+fn recursive_section_captures_preserve_singletons_and_shadowed_parameters() {
+    let singleton = check(
+        "section\nvariable (offset : Nat)\n\
+         mutual\n\
+          def capturedSelf : Nat -> Nat\n\
+          | 0 => offset\n\
+          | n+1 => capturedSelf n + 1\n\
+         end\nend\n\
+         example : capturedSelf 7 3 = 10 := rfl\n",
+    );
+    run(&singleton, "#eval capturedSelf 7 3", "10");
+    let shadowed = check(
+        "section\nvariable (value : Nat)\n\
+         mutual\n\
+          def capturedShadow (value : Nat) : Nat := match value with\n\
+          | 0 => 0\n\
+          | n+1 => capturedPeer n\n\
+          def capturedPeer : Nat -> Nat\n\
+          | 0 => value\n\
+          | n+1 => capturedShadow n\n\
+         end\nend\n\
+         example : capturedShadow 7 3 = 7 := rfl\n",
+    );
+    run(&shadowed, "#eval capturedShadow 7 3", "7");
+}
+
+#[test]
+fn recursive_section_captures_include_body_only_universes() {
+    let base = check(
+        "universe u\nsection\n\
+         variable (A : Type u) (project : A -> Nat) (value : A)\n\
+         mutual\n\
+          def capturedBodyLeft : Nat -> Nat\n\
+          | 0 => capturedBodyHelper 0\n\
+          | n+1 => capturedBodyRight n + 1\n\
+          def capturedBodyRight : Nat -> Nat\n\
+          | 0 => capturedBodyHelper 1\n\
+          | n+1 => capturedBodyLeft n + 2\n\
+          def capturedBodyHelper (n : Nat) : Nat := project value + n\n\
+         end\nend\n\
+         example : capturedBodyLeft Nat (fun n => n) 40 2 = 43 := rfl\n",
+    );
+    for label in [
+        "capturedBodyLeft",
+        "capturedBodyRight",
+        "capturedBodyHelper",
+    ] {
+        let Some(fln_env::constants::ConstantInfo::Defn(definition)) =
+            base.environment().find(&name(label))
+        else {
+            panic!("checked definition");
+        };
+        assert_eq!(definition.base.level_params.len(), 1);
+        assert!(!definition.base.type_.has_fvar());
+        assert!(!definition.value.has_fvar());
+    }
+    run(&base, "#eval capturedBodyLeft Nat (fun n => n) 40 2", "43");
+}
+
+#[test]
+fn invalid_recursive_section_captures_leave_predecessor_unchanged() {
+    let (base, limits) = engine();
+    let before = base.logical_root(&KVMap::new());
+    for source in [
+        "section\nvariable (offset : Nat)\nmutual\n\
+         def capturedBadLeft : Nat -> Nat\n | 0 => offset\n\
+         | n+1 => let invalid : Bool := offset; capturedBadRight n\n\
+         def capturedBadRight : Nat -> Nat\n | 0 => offset\n\
+         | n+1 => capturedBadLeft n\nend\nend\n",
+        "section\nvariable (offset : Nat)\nmutual\n\
+         def capturedBadLeft (n : Nat) : Nat := if n == 0 then offset else capturedBadRight n\n\
+         termination_by structural n\n\
+         def capturedBadRight (n : Nat) : Nat := capturedBadLeft n\n\
+         termination_by structural n\nend\nend\n",
+        "section\nvariable (offset : Nat)\nend\nmutual\n\
+         def capturedBadLeft : Nat -> Nat\n | 0 => offset\n\
+         | n+1 => capturedBadRight n\n\
+         def capturedBadRight : Nat -> Nat\n | 0 => 0\n\
+         | n+1 => capturedBadLeft n\nend\n",
+    ] {
+        oracle(source, false);
+        assert!(
+            base.check_source_files(
+                &[source.as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits),
+            )
+            .is_err(),
+            "invalid source must not acquire a section closure: {source}"
+        );
+        assert_eq!(base.logical_root(&KVMap::new()), before);
+        assert!(!base.environment().contains(&name("capturedBadLeft")));
+    }
+    let source = "def recoveredSection : Nat := 42\n";
+    oracle(source, true);
+    let recovered = base
+        .check_source_files(
+            &[source.as_bytes()],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap()
+        .engine;
+    run(&recovered, "#eval recoveredSection", "42");
+}
+
 #[test]
 fn namespace_and_shadowed_parameters_do_not_create_false_cycles() {
     let base = check(
