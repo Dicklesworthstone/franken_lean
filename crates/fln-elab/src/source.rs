@@ -2130,7 +2130,12 @@ impl Context {
                 Option<Expr>,
             ),
             ProofSpecialize(tactics::ProofState<'a>, tactics::ProofGoal),
-            ProofTerm(tactics::ProofState<'a>, tactics::ProofGoal, Option<usize>),
+            ProofTerm(
+                tactics::ProofState<'a>,
+                tactics::ProofGoal,
+                Option<usize>,
+                Option<usize>,
+            ),
             RefineTerm(tactics::ProofState<'a>, tactics::ProofGoal, usize),
         }
         let mut tasks = vec![match initial_proof {
@@ -3642,7 +3647,13 @@ impl Context {
                                 // Written arguments can insert implicit dictionaries
                                 // before apply starts opening the remaining telescope.
                                 let instance_start = apply.then_some(self.instance_goals.len());
-                                tasks.push(Task::ProofTerm(proof, goal, instance_start));
+                                let refinement_depth = (!apply).then(|| self.begin_refinement());
+                                tasks.push(Task::ProofTerm(
+                                    proof,
+                                    goal,
+                                    instance_start,
+                                    refinement_depth,
+                                ));
                                 tasks.push(Task::Visit(syntax, expected, true));
                             }
                             tactics::ProofAction::Complete(term) => values.push(term),
@@ -3705,11 +3716,16 @@ impl Context {
                             self.finish_refinement(&mut proof, goal, term, depth)?;
                             tasks.push(Task::Proof(proof));
                         }
-                        Task::ProofTerm(mut proof, goal, instance_start) => {
+                        Task::ProofTerm(mut proof, goal, instance_start, refinement_depth) => {
                             let term = values.pop().expect("tactic term visit");
                             if let Some(instance_start) = instance_start {
                                 self.apply_proof_term(&mut proof, goal, term, instance_start)?;
                             } else {
+                                self.finish_exact_refinement(
+                                    &goal,
+                                    &term,
+                                    refinement_depth.expect("exact refinement frame"),
+                                )?;
                                 // A speculative `exact` must not select an alternative
                                 // merely because its implicit arguments deferred. On
                                 // a fixed goal, validate its candidate before dropping
@@ -5961,12 +5977,14 @@ fn definition_elaboration(
                 .ok_or_else(|| failure(SourceInferenceError::ExpectedType))?,
         )?;
     }
+    // ubs:ignore[rust.security.constant-time-compare] Public parser-node kinds carry no secret.
     let equations = definition[3].kind() == Some(&parser_kind(&["Command", "declValEqns"]));
     let struct_instance;
     let empty_suffix;
     let empty_where;
     // `whereStructInst` is any declaration's value (`declVal`, `Lean/Parser/Command.lean`).
     let (body, termination, where_clause) =
+        // ubs:ignore[rust.security.constant-time-compare] Public parser-node kinds carry no secret.
         if definition[3].kind() == Some(&parser_kind(&["Command", "whereStructInst"])) {
             struct_instance = where_struct_instance(&definition[3])?;
             empty_suffix = Syntax::node(
@@ -6165,6 +6183,7 @@ fn definition_elaboration(
     };
     if is_theorem || proof_instance {
         if let Some(signature) = &context.public_theorem_signature {
+            // ubs:ignore[rust.security.constant-time-compare] These are public declaration names and universe parameters, not cryptographic signatures.
             if base.name != signature.name || base.level_params != signature.level_params {
                 return Err(NatDefinitionElabError::UnexpectedSyntax {
                     expected: "a public theorem proof preserving its closed signature",

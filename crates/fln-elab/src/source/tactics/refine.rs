@@ -19,6 +19,94 @@ pub(in crate::source) struct RefinementFrame {
 }
 
 impl Context {
+    /// The final tactic comparison in the pin's `elabTermEnsuringType` permits
+    /// synthetic opaque assignments. Keep that permission local to this one
+    /// equation: neither pending elaboration equations nor instance selection
+    /// run with the widened policy, and persistent metavariable kinds survive.
+    pub(in crate::source) fn ensure_tactic_term_type(
+        &mut self,
+        actual: &Expr,
+        expected: &Expr,
+    ) -> Result<(), NatDefinitionElabError> {
+        let mut trial = self.clone();
+        let result = (|| {
+            let mut declarations: Vec<_> = trial.txn.mvars.decls().keys().cloned().collect();
+            declarations.sort_by(|left, right| left.0.cmp(&right.0));
+            let mut holes = Vec::new();
+            for id in declarations {
+                trial.tick()?;
+                if trial
+                    .txn
+                    .mvars
+                    .get_decl(&id)
+                    .expect("existing declaration")
+                    .kind
+                    != MetavarKind::SyntheticOpaque
+                {
+                    continue;
+                }
+                trial
+                    .txn
+                    .mvars
+                    .set_kind(&id, MetavarKind::Synthetic)
+                    .map_err(|e| {
+                        failure(SourceInferenceError::Unification(Box::new(
+                            UnificationError::Metavariable(e),
+                        )))
+                    })?;
+                holes.push(id);
+            }
+            trial
+                .unify_source_batch(&[(actual.clone(), expected.clone())], true)
+                .map_err(|e| failure(SourceInferenceError::Unification(Box::new(e))))?;
+            for id in &holes {
+                trial.tick()?;
+                trial
+                    .txn
+                    .mvars
+                    .set_kind(id, MetavarKind::SyntheticOpaque)
+                    .map_err(|e| {
+                        failure(SourceInferenceError::Unification(Box::new(
+                            UnificationError::Metavariable(e),
+                        )))
+                    })?;
+            }
+            Ok(())
+        })();
+        self.txn.budget.heartbeats_consumed = trial.txn.budget.heartbeats_consumed;
+        result?;
+        *self = trial;
+        Ok(())
+    }
+
+    /// `exact` elaborates holes too, but unlike `refine` cannot leave any of
+    /// its new holes to a later tactic (`closeMainGoalUsing`).
+    pub(in crate::source) fn finish_exact_refinement(
+        &mut self,
+        goal: &ProofGoal,
+        term: &Typed,
+        depth: usize,
+    ) -> Result<(), NatDefinitionElabError> {
+        if self.refinements.len() != depth + 1 {
+            return Err(error(TacticError::MalformedScript));
+        }
+        self.txn.lctx = goal.lctx.clone();
+        self.resolve_instances(false)?;
+        self.flush(false)?;
+        self.ensure_tactic_term_type(&term.type_, &goal.target)?;
+        let frame = self.refinements.pop().expect("checked refinement depth");
+        self.refuse_new_natural_holes(&term.value, frame.first_name)?;
+        let count = frame
+            .holes
+            .iter()
+            .filter(|(_, hole)| !self.txn.mvars.is_assigned(&hole.id))
+            .count();
+        if count != 0 {
+            return Err(error(TacticError::UnsolvedGoals { count }));
+        }
+        Ok(())
+    }
+
     pub(in crate::source) fn begin_refinement(&mut self) -> usize {
         let depth = self.refinements.len();
         self.refinements.push(RefinementFrame {
@@ -490,6 +578,7 @@ impl Context {
         self.txn.lctx = goal.lctx.clone();
         self.resolve_instances(false)?;
         self.flush(false)?;
+        self.ensure_tactic_term_type(&term.type_, &goal.target)?;
         if !frame.placeholders {
             self.refuse_new_natural_holes(&term.value, frame.first_name)?;
         }
@@ -536,5 +625,80 @@ impl Context {
             return Err(error(TacticError::UnassignedNaturalHole));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture() -> (Context, Expr, MVarId) {
+        let budget = Budget::for_stack_bytes(2 * 1024 * 1024);
+        let env = crate::seed::bootstrap_nat_environment(budget).unwrap();
+        let mut context = Context::new(&env, budget);
+        context.begin_refinement();
+        let hole = context
+            .synthetic_proof_hole(None, Some(&Expr::sort(Level::one())))
+            .unwrap();
+        let ExprNode::MVar { id } = hole.value.node() else {
+            panic!("fixture hole is not a metavariable");
+        };
+        (context, hole.value.clone(), id.clone())
+    }
+
+    #[test]
+    fn final_tactic_comparison_assigns_without_changing_persistent_policy() {
+        let (mut context, hole, id) = fixture();
+        let unrelated = context
+            .synthetic_proof_hole(None, Some(&Expr::sort(Level::one())))
+            .unwrap();
+        let nat = Expr::const_(Name::from_components(["Nat"]), vec![]);
+        assert!(
+            context
+                .unify_source_batch(&[(hole.clone(), nat.clone())], true)
+                .is_err()
+        );
+        context.ensure_tactic_term_type(&hole, &nat).unwrap();
+        assert_eq!(context.txn.mvars.get_assigned_expr(&id), Some(&nat));
+        for declaration in context.txn.mvars.decls().values() {
+            assert_eq!(declaration.kind, MetavarKind::SyntheticOpaque);
+        }
+        assert!(
+            context
+                .unify_source_batch(&[(unrelated.value, nat)], true)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn failed_final_comparison_keeps_no_assignment_or_policy_change() {
+        let (mut context, hole, _) = fixture();
+        let before = context.clone();
+        let impossible = Expr::app(hole, Expr::sort(Level::zero()));
+        assert!(
+            context
+                .ensure_tactic_term_type(&impossible, &Expr::sort(Level::zero()))
+                .is_err()
+        );
+        assert_eq!(context.txn.mvars, before.txn.mvars);
+        assert_eq!(context.txn.universes, before.txn.universes);
+        assert_eq!(context.txn.constraints, before.txn.constraints);
+        assert_eq!(context.txn.lctx, before.txn.lctx);
+        assert!(context.txn.budget.heartbeats_consumed > before.txn.budget.heartbeats_consumed);
+    }
+
+    #[test]
+    fn exhaustion_during_policy_restoration_discards_the_assignment() {
+        let (initial, hole, _) = fixture();
+        let nat = Expr::const_(Name::from_components(["Nat"]), vec![]);
+        let mut control = initial.clone();
+        control.ensure_tactic_term_type(&hole, &nat).unwrap();
+        let mut limited = initial.clone();
+        limited.txn.budget.max_heartbeats = control.txn.budget.heartbeats_consumed - 1;
+        assert!(limited.ensure_tactic_term_type(&hole, &nat).is_err());
+        assert_eq!(limited.txn.mvars, initial.txn.mvars);
+        assert_eq!(limited.txn.universes, initial.txn.universes);
+        assert_eq!(limited.txn.constraints, initial.txn.constraints);
+        assert!(limited.txn.budget.heartbeats_consumed > initial.txn.budget.heartbeats_consumed);
     }
 }

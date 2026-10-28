@@ -24,6 +24,34 @@ fn reject(source: &str) {
     assert!(run(source).is_err(), "accepted {source}");
 }
 const BOTH: &str = "inductive Both (P Q : Prop) : Prop where | intro (left : P) (right : Q)\n";
+/// Each program was executed by the actual v4.32.0 pin before changing the
+/// native path. Its final tactic comparison assigns the opaque `?_`; ordinary
+/// term elaboration must still leave that same kind of hole opaque.
+#[test]
+fn final_tactic_unification_assigns_refine_and_exact_holes() {
+    for tactic in ["refine", "exact"] {
+        check(&format!(
+            "theorem simple (n : Nat) : n = n := by {tactic} Eq.refl ?_"
+        ));
+        check(&format!(
+            "def identity {{A : Type}} (x : A) : A := x\ntheorem same (n : Nat) : identity n = n := by {tactic} Eq.refl ?_"
+        ));
+    }
+    reject("theorem bad (n : Nat) : n = n := Eq.refl ?_");
+    reject("theorem bad (n m : Nat) : n = m := by exact Eq.refl ?_");
+}
+
+#[test]
+fn a_refinement_that_assigned_its_hole_leaves_no_goal_for_the_next_tactic() {
+    for source in [
+        "theorem simple (n : Nat) : n = n := by refine Eq.refl ?_; exact n",
+        "def identity {A : Type} (x : A) : A := x\ntheorem same (n : Nat) : identity n = n := by refine Eq.refl ?_; exact n",
+    ] {
+        let error = run(source).expect_err(source);
+        assert!(error.contains("NoGoals"), "{source}\n{error}");
+    }
+}
+
 #[test]
 fn partial_proof_terms_expose_only_the_requested_holes() {
     check(&format!(
@@ -174,9 +202,12 @@ fn later_explicit_goals_cannot_be_solved_by_inference_or_ignored_by_conversion()
 
 #[test]
 fn holes_in_annotations_are_real_type_obligations() {
-    check(
-        "def annotated : Nat := by refine (7 : ?_); exact Nat\ntheorem computes : annotated = 7 := by rfl",
-    );
+    // The pin's final comparison assigns this annotation hole to Nat. The
+    // original source with `exact Nat` is retained as the no-goals control.
+    check("def annotated : Nat := by refine (7 : ?_)\ntheorem computes : annotated = 7 := by rfl");
+    let original = "def annotated : Nat := by refine (7 : ?_); exact Nat\ntheorem computes : annotated = 7 := by rfl";
+    let error = run(original).expect_err(original);
+    assert!(error.contains("NoGoals"), "{original}\n{error}");
     reject("def bad : Nat := by refine (7 : ?_); exact String");
 }
 
