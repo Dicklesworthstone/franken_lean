@@ -66,6 +66,10 @@ jobs:
               'crates/fln-elab/src/source.rs',
               'crates/fln-elab/src/source/tactics/refine.rs',
               'crates/fln/tests/source_refinement.rs',
+              'crates/fln-elab/src/lib.rs',
+              'crates/fln-elab/src/source/tactics.rs',
+              'crates/fln-elab/src/source/tactics/control.rs',
+              'crates/fln-elab/src/source/tactics/conv/congr.rs',
           }
           for path, blobs in changes.items():
               assert path in allowed, path
