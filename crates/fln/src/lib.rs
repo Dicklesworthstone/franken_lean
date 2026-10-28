@@ -30,6 +30,7 @@
 #![feature(allocator_api)]
 
 pub mod capsule;
+pub mod imported_ir;
 mod olean_imports;
 pub mod pretty;
 pub mod source_check;

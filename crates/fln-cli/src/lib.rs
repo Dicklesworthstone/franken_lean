@@ -16,6 +16,7 @@ mod guard_filter_tests;
 mod guard_messages;
 #[cfg(test)]
 mod guard_spec_tests;
+mod imported_ir;
 mod lake_build;
 mod output;
 mod source_check;
@@ -230,6 +231,7 @@ const USAGE: &str = concat!(
     "  fln olean verify-rebuild [--json] [--max-bytes BYTES] PATH\n",
     "  fln ilean inspect [--json] [--max-bytes BYTES] PATH\n",
     "  fln ir inspect [--json] [--declarations] [--max-bytes BYTES] PATH\n",
+    "  fln ir run --entry NAME --partition PATH [--nat N | --string TEXT | --erased] [--user NAME] [--json] [--max-bytes BYTES] [--fln-max-steps N] [--fln-max-frames N] IR_PATH...\n",
     "  fln audit --tcb [--json] [--max-bytes BYTES] PATH\n",
     "  fln why-trusts [--json] [--max-bytes BYTES] [--max-nodes N] NAME PATH\n",
     "  fln identity [--json]\n",
@@ -291,6 +293,11 @@ const USAGE: &str = concat!(
     "how many there are, which are extern, and which names they call;\n",
     "--declarations lists them. It executes nothing and does not establish\n",
     "that FrankenLean can run any of them.\n",
+    "`ir run` executes a bounded pure closure decoded from supplied IR files on\n",
+    "Golem. The partition must match the pinned census digest; toolchain APIs\n",
+    "are refused, native externs retain native precedence, and --user explicitly\n",
+    "names declarations outside the census. Linked interpreted functions carry\n",
+    "producer: reference. This does not grant kernel admission authority.\n",
     "`check-olean` checks every declaration in one import-free pinned-format\n",
     ".olean, or a directory containing a closed import set, through K1 and the\n",
     "independent checker, atomically. It reconstructs non-safe mutual definition\n",
@@ -557,6 +564,7 @@ enum MultiplexerCommand {
         json: bool,
         declarations: bool,
     },
+    IrRun(imported_ir::Arguments),
     Identity {
         json: bool,
     },
@@ -1866,7 +1874,7 @@ fn parse_command(
     if command == "ir" {
         let Some(subcommand) = arguments.next() else {
             return Err(UsageError(
-                "ir requires the `inspect` subcommand".to_owned(),
+                "ir requires the `inspect` or `run` subcommand".to_owned(),
             ));
         };
         if subcommand == "--help" || subcommand == "-h" || subcommand == "help" {
@@ -1874,6 +1882,9 @@ fn parse_command(
         }
         if subcommand == "inspect" {
             return parse_ir_inspect(arguments.collect());
+        }
+        if subcommand == "run" {
+            return imported_ir::parse(arguments.collect());
         }
         return Err(UsageError(format!(
             "unknown ir subcommand {:?}",
@@ -14439,6 +14450,7 @@ pub fn run(arguments: impl IntoIterator<Item = OsString>) -> MultiplexerOutput {
             json,
             declarations,
         }) => inspect_ir(&path, max_bytes, json, declarations),
+        Ok(MultiplexerCommand::IrRun(arguments)) => imported_ir::run(arguments),
         Ok(MultiplexerCommand::ServeLsp) => serve_lsp(),
         Ok(MultiplexerCommand::Goals {
             path,
@@ -16431,12 +16443,15 @@ mod tests {
         let missing = run([OsString::from("ir"), OsString::from("inspect")]);
         assert_eq!(missing.exit_code, 2);
         assert!(missing.stderr.contains("ir inspect requires PATH"));
-        let unknown = run([OsString::from("ir"), OsString::from("run")]);
+        let unknown = run([OsString::from("ir"), OsString::from("unknown")]);
         assert_eq!(unknown.exit_code, 2);
-        assert!(unknown.stderr.contains("unknown ir subcommand \"run\""));
+        assert!(unknown.stderr.contains("unknown ir subcommand \"unknown\""));
         let bare = run([OsString::from("ir")]);
         assert_eq!(bare.exit_code, 2);
-        assert!(bare.stderr.contains("ir requires the `inspect` subcommand"));
+        assert!(
+            bare.stderr
+                .contains("ir requires the `inspect` or `run` subcommand")
+        );
     }
 
     #[test]
