@@ -1406,16 +1406,28 @@ impl Context {
         // dictionary projections. Instance matching keeps its narrower policy.
         let actual = self.instantiate(actual)?;
         let expected = self.instantiate(expected)?;
+        // A side headed by a hole is unified with the other side as written, as
+        // the pin's `isDefEq` does (vendored `Lean/Meta/ExprDefEq.lean`): its
+        // first-order approximation unfolds that side one definition at a time,
+        // so `?f ?α =?= N` with `abbrev N := Id Nat` gives `?f := Id`, where
+        // reducing `N` to `Nat` first leaves nothing to align.
+        let hole_headed = |expr: &Expr| {
+            let mut head = expr;
+            while let ExprNode::App { f, .. } = head.node() {
+                head = f;
+            }
+            matches!(head.node(), ExprNode::MVar { .. })
+        };
         // Assign an unknown expected type before reducing the actual carrier.
         // This includes dependent projection applications: unfolding their
         // semireducible receiver here can change later instance selection.
-        let actual = if matches!(expected.node(), ExprNode::MVar { .. }) {
+        let actual = if hole_headed(&expected) {
             actual
         } else {
             self.whnf(&actual)?
         };
         // Preserve the original target for the reverse assignment as well.
-        let expected = if matches!(actual.node(), ExprNode::MVar { .. }) {
+        let expected = if hole_headed(&actual) {
             expected
         } else {
             self.whnf(&expected)?

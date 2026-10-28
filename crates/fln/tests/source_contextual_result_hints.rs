@@ -420,6 +420,57 @@ theorem pickedByApply : pickByApply.2.1 = Bool := rfl
         .unwrap();
 }
 
+/// An expected type that names an abbreviation is unified as written: the pin's first-order
+/// approximation unfolds it one definition at a time, so `pure 1 : N` with `abbrev N := Id Nat`
+/// finds `?f := Id` (upstream tests/elab/121.lean). Reducing `N` to `Nat` first left nothing to
+/// align. With `abbrev P := Prod Nat Bool` the same rule picks `?α := Bool`, and the numeral is
+/// refused at `OfNat Bool 1`, by the pin and here (bead
+/// fln-first-order-approximation-context-locals-6esd).
+#[test]
+fn an_abbreviated_expected_type_is_approximated_as_written() {
+    let Some(lib) = pin() else {
+        return;
+    };
+    std::thread::Builder::new()
+        .stack_size(STACK)
+        .spawn(move || {
+            let base = imported_state(&lib);
+            let source = r#"
+abbrev DelabM := Id
+abbrev Delab := DelabM Nat
+example : DelabM Nat := pure 1
+example : Delab := pure 1
+abbrev N := Id Nat
+def viaAbbrev : N := pure 1
+theorem viaAbbrev_eq : viaAbbrev = (1 : Nat) := rfl
+abbrev S := StateT Nat Id Nat
+def viaState : S := pure 5
+theorem viaState_eq : viaState.run 0 = (5, 0) := rfl
+"#;
+            reference(
+                &lib,
+                &format!("prelude\nimport Init.Control.State\n{source}"),
+                true,
+            );
+            checked(&base, source);
+            let bad = "abbrev P := Prod Nat Bool\nexample : P := pure 1";
+            reference(
+                &lib,
+                &format!("prelude\nimport Init.Control.State\n{bad}"),
+                false,
+            );
+            let root = base.logical_root(&KVMap::new());
+            let error = base
+                .check_source_files(&[bad.as_bytes()], &KVMap::new(), limits())
+                .unwrap_err();
+            assert_eq!(error.disposition().0, "elaboration", "{error:?}");
+            assert_eq!(base.logical_root(&KVMap::new()), root);
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
 #[test]
 fn exhausted_admission_can_retry_without_publishing_a_definition_prefix() {
     let base = seed()
