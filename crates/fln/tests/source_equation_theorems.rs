@@ -162,6 +162,7 @@ fn previously_realized_pattern_equations_keep_source_simp_fallback() {
 
     let base = engine();
     for proof in [
+        "",
         "theorem first : pred' 0 = 0 := pred'.eq_1",
         "theorem first : pred' 0 = 0 := by rw [pred']",
     ] {
@@ -200,6 +201,49 @@ fn previously_realized_pattern_equations_keep_source_simp_fallback() {
             Err(simp::SimpSetError::UnsupportedDeclaration(owner)) if owner == name("pred'")
         ));
     }
+}
+
+#[test]
+fn pattern_simp_does_not_adopt_an_existing_theorem_with_an_unrelated_type() {
+    use fln_elab::NatDefinitionElabError;
+    use fln_elab::source::SourceInferenceError;
+    use fln_elab::source::scope::simp;
+    use fln_env::constants::{ConstantVal, TheoremVal};
+
+    let base = check(&engine(), "def pred' : Nat → Nat\n  | 0 => 0\n  | n+1 => n");
+    // This is a genuine kernel-checked theorem, but not pred's first equation.
+    // Bypass only source reserved-name syntax to exercise the candidate reuse
+    // boundary directly; its type must be re-derived from the recorded match.
+    let after = base
+        .admit_declaration(
+            fln::Declaration::Thm(TheoremVal {
+                base: ConstantVal {
+                    name: name("pred'.eq_1"),
+                    level_params: Vec::new(),
+                    type_: fln::Expr::const_(name("True"), Vec::new()),
+                },
+                value: fln::Expr::const_(name("True.intro"), Vec::new()),
+                all: vec![name("pred'.eq_1")],
+            }),
+            &KVMap::new(),
+            limits().admission,
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap()
+        .engine;
+    let root = after.logical_root(&KVMap::new());
+    assert!(matches!(
+        simp::equations::prepare_pattern_owned(
+            after.environment(),
+            &name("pred'"),
+            limits().admission.kernel
+        ),
+        Err(NatDefinitionElabError::Inference(SourceInferenceError::SimpSet(
+            simp::SimpSetError::UnsupportedDeclaration(found)
+        ))) if found == name("pred'.eq_1")
+    ));
+    assert_eq!(after.logical_root(&KVMap::new()), root);
 }
 
 #[test]

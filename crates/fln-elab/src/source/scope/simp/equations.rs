@@ -606,16 +606,25 @@ pub fn prepare_pattern_owned(
     // An unsupported simple preparation must not erase one of those policies.
     if state.definitions.contains_key(origin)
         || state.generated.contains_key(origin)
+        || !env.contains(&Name::from_components(["Eq"]))
+        || !env.contains(&Name::from_components(["Eq", "refl"]))
         || super::export::known_status(env, origin, &mut meter).map_err(failure_set)?
             == Some(crate::reducibility::Reducibility::Irreducible)
     {
         return Ok(Vec::new());
     }
-    let Some(candidates) =
-        crate::source::equation_theorems::pattern_equation_candidates(env, origin, kernel)?
-    else {
-        return Ok(Vec::new());
-    };
+    let candidates =
+        match crate::source::equation_theorems::pattern_equation_candidates(env, origin, kernel) {
+            Ok(Some(candidates)) => candidates,
+            // The recorded matcher may still be outside the existing producer's
+            // capability. Preserve source unfolding in that case; resource and
+            // malformed-state errors are not optional capabilities.
+            Ok(None)
+            | Err(NatDefinitionElabError::Inference(SourceInferenceError::EquationTheorem(_))) => {
+                return Ok(Vec::new());
+            }
+            Err(error) => return Err(error),
+        };
     let mut prepared = Vec::new();
     for candidate in candidates {
         charge(&mut meter.remaining, 1).map_err(failure_set)?;
