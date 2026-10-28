@@ -1,8 +1,8 @@
 //! Rebuild native directory entries in their admitted logical data shapes.
 //!
-//! Native Array and two-String entries remain compiler-private. Every entry
-//! is read once, then becomes FilePath.mk / DirEntry.mk / List / Array through
-//! ordinary constructors and metered Nat recursion in the deferred IO action.
+//! The native two-String entries remain compiler-private. Every entry is read
+//! once, then becomes FilePath.mk / DirEntry.mk in the checked Array storage
+//! through ordinary constructors and metered recursion in the deferred action.
 use super::*;
 
 const NATIVE_ARRAY: &str = "_fln_runtime_fs_native_directory_array";
@@ -19,7 +19,7 @@ pub(super) fn result_type() -> Expr {
 pub(super) struct Layout {
     native_array: Expr,
     native_entry: Expr,
-    array: records::ShapeConstructor,
+    array_from_list: Expr,
     list: records::Shape,
     path: records::ShapeConstructor,
     entry: records::ShapeConstructor,
@@ -116,8 +116,24 @@ impl Preparation<'_> {
         if path.fields != [c("String")] || entry.fields != [c("System.FilePath"), c("String")] {
             return Err(unsupported("directory checked entry and path layout"));
         }
-        let array = self.io_checked_single_constructor(result_type(), 1)?;
-        let list = self.io_checked_shape(array.fields[0].clone())?;
+        let (array_from_list, list_source) = if self.native_arrays_enabled()? {
+            let entry_type = c("IO.FS.DirEntry");
+            let levels = vec![Level::zero()];
+            (
+                Expr::app(
+                    Expr::const_(name("Array.mk"), levels.clone()),
+                    entry_type.clone(),
+                ),
+                Expr::app(Expr::const_(name("List"), levels), entry_type),
+            )
+        } else {
+            let array = self.io_checked_single_constructor(result_type(), 1)?;
+            (
+                Expr::const_(array.name, Vec::new()),
+                array.fields[0].clone(),
+            )
+        };
+        let list = self.io_checked_shape(list_source)?;
         if list.constructors.len() != 2
             || list.constructors[0].tag != 0
             || !list.constructors[0].fields.is_empty()
@@ -133,7 +149,7 @@ impl Preparation<'_> {
         let layout = Layout {
             native_array,
             native_entry,
-            array,
+            array_from_list,
             list,
             path,
             entry,
@@ -183,7 +199,7 @@ impl Preparation<'_> {
         // Descending indices prepended to the accumulator preserve the native
         // order; getInternal retains its own bounds check. No sort or path
         // normalization occurs and no error placeholder reaches this branch.
-        let result = constructor(&layout.array, [values]);
+        let result = Expr::app(layout.array_from_list, values);
         let size_binding = Expr::let_e(
             self.fs_adapter_name()?,
             c("Nat"),

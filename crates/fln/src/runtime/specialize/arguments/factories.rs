@@ -64,6 +64,14 @@ impl Preparation<'_> {
                         if self.has_implementation(name)? {
                             return Ok(None);
                         }
+                        // Native Array values own runtime storage. Keep
+                        // construction and access on their checked execution
+                        // path instead of exposing the logical List field.
+                        if crate::source_intrinsics::arrays::Operation::from_name(name).is_some()
+                            && self.array_record_forbidden(&Name::from_components(["Array"]))?
+                        {
+                            return Ok(None);
+                        }
                         // A cached Thunk is a runtime allocation, not an inert
                         // dictionary. Unfolding pure/get here could duplicate
                         // that allocation or expose its nonmemoized field.

@@ -1,6 +1,6 @@
 //! The checked String constructor consumes logical bytes, while its native
 //! extern consumes a packed buffer. Keep those representations separate:
-//! fold the exact ByteArray/Array/List/UInt8 records into private native bytes,
+//! fold the checked ByteArray, Array view, and UInt8 records into private bytes,
 //! then invoke the selected UTF-8 constructor. Source operands remain strict
 //! and shared; the checked validity proof occupies only its usual inert slot.
 use super::*;
@@ -24,8 +24,21 @@ pub(super) struct Store {
 struct Layout {
     packed: Expr,
     list: Expr,
-    // ByteArray -> Array -> List; UInt8 -> BitVec -> Fin -> Nat.
-    projections: [Name; 5],
+    array_to_list: Expr,
+    // ByteArray -> Array; UInt8 -> BitVec -> Fin -> Nat.
+    projections: [Name; 4],
+}
+
+/// The logical List view of a byte array's storage. A checked native Array
+/// has no constructor field to read: its public constructor and projection
+/// must pass through the same representation adapters as ordinary source.
+/// Closed callables also retain the element type when an adapter is generated
+/// after lexical projection lowering, with an open byte-array receiver.
+#[derive(Clone)]
+pub(super) struct ByteArrayStorage {
+    pub(super) list: records::Shape,
+    pub(super) from_list: Expr,
+    pub(super) to_list: Expr,
 }
 
 #[derive(Clone, Copy)]
@@ -88,6 +101,60 @@ fn lambda(domain: Expr, body: Expr) -> Expr {
 }
 
 impl Preparation<'_> {
+    pub(super) fn byte_array_storage(
+        &mut self,
+        source: Expr,
+    ) -> Result<ByteArrayStorage, IngressError> {
+        self.tick()?;
+        let source = self.erase_runtime_type(&source)?;
+        let byte = c("UInt8");
+        let levels = vec![Level::zero()];
+        let expected = Expr::app(Expr::const_(name("Array"), levels.clone()), byte.clone());
+        if source != expected {
+            return Err(unsupported("checked byte storage requires Array UInt8"));
+        }
+        let (from_list, to_list, list_source) = if self.native_arrays_enabled()? {
+            (
+                Expr::app(Expr::const_(name("Array.mk"), levels.clone()), byte.clone()),
+                Expr::app(
+                    Expr::const_(name("Array.toList"), levels.clone()),
+                    byte.clone(),
+                ),
+                Expr::app(Expr::const_(name("List"), levels), byte.clone()),
+            )
+        } else {
+            let shape = self.io_checked_shape(source)?;
+            let [constructor] = shape.constructors.as_slice() else {
+                return Err(unsupported("checked byte storage Array constructor"));
+            };
+            if constructor.tag != 0 || constructor.fields.len() != 1 {
+                return Err(unsupported("checked byte storage Array fields"));
+            }
+            (
+                Expr::const_(constructor.name.clone(), Vec::new()),
+                lambda(
+                    shape.source.clone(),
+                    Expr::proj(shape.projection(constructor), 0, b(0)?),
+                ),
+                constructor.fields[0].clone(),
+            )
+        };
+        let list = self.io_checked_shape(list_source)?;
+        if list.constructors.len() != 2
+            || list.constructors[0].tag != 0
+            || !list.constructors[0].fields.is_empty()
+            || list.constructors[1].tag != 1
+            || list.constructors[1].fields != [byte, list.source.clone()]
+        {
+            return Err(unsupported("checked byte storage List UInt8 layout"));
+        }
+        Ok(ByteArrayStorage {
+            list,
+            from_list,
+            to_list,
+        })
+    }
+
     pub(crate) fn string_bytes_intrinsic_binding(
         &self,
         requested: &Name,
@@ -325,17 +392,7 @@ impl Preparation<'_> {
             return Ok(layout.clone());
         }
         let (bytes_projection, bytes_fields) = self.string_bytes_record(c("ByteArray"), 1)?;
-        let (array_projection, array_fields) =
-            self.string_bytes_record(bytes_fields[0].clone(), 1)?;
-        let list = self.io_checked_shape(array_fields[0].clone())?;
-        if list.constructors.len() != 2
-            || list.constructors[0].tag != 0
-            || !list.constructors[0].fields.is_empty()
-            || list.constructors[1].tag != 1
-            || list.constructors[1].fields != [c("UInt8"), list.source.clone()]
-        {
-            return Err(unsupported("String byte checked list layout"));
-        }
+        let storage = self.byte_array_storage(bytes_fields[0].clone())?;
         let (byte_projection, byte_fields) = self.string_bytes_record(c("UInt8"), 1)?;
         let (bits_projection, bits_fields) = self.string_bytes_record(byte_fields[0].clone(), 1)?;
         let (fin_projection, fin_fields) = self.string_bytes_record(bits_fields[0].clone(), 2)?;
@@ -349,10 +406,10 @@ impl Preparation<'_> {
         }
         let layout = Layout {
             packed,
-            list: list.source,
+            list: storage.list.source,
+            array_to_list: storage.to_list,
             projections: [
                 bytes_projection,
-                array_projection,
                 byte_projection,
                 bits_projection,
                 fin_projection,
@@ -368,7 +425,7 @@ impl Preparation<'_> {
         // Under the cons minor: #0=packed accumulator, #1=IH, #2=tail,
         // #3=head. Only the exact checked Fin.val reaches native byte boxing.
         let mut natural = b(3)?;
-        for projection in &layout.projections[2..] {
+        for projection in &layout.projections[1..] {
             self.tick()?;
             natural = Expr::proj(projection.clone(), 0, natural);
         }
@@ -385,7 +442,7 @@ impl Preparation<'_> {
             ),
         );
         let array = Expr::proj(layout.projections[0].clone(), 0, value);
-        let list = Expr::proj(layout.projections[1].clone(), 0, array);
+        let list = Expr::app(layout.array_to_list.clone(), array);
         let empty = Expr::app(
             Expr::const_(Helper::Empty.name(), Vec::new()),
             nat::literal(0),

@@ -205,6 +205,66 @@ fn binary_write_checked_sources_preserve_raw_bytes_and_replay_live_effects() {
 }
 
 #[test]
+fn binary_io_preserves_bytes_through_native_array_storage_and_replay() {
+    let Some(raw) = raw_bytes_environment() else {
+        return;
+    };
+    let environment = ["Array.mk", "Array.toList"]
+        .into_iter()
+        .fold(write_environment(&raw, None), |environment, helper| {
+            helper_extern(&environment, helper, false)
+        });
+    let engine = Engine::from_environment(environment);
+    let options = KVMap::new();
+    let root = engine.logical_root(&options);
+    let directory = directory("native-array-byte-storage");
+    let input = directory.join("input.bin");
+    let output = directory.join("output.bin");
+    std::fs::write(&input, EXPECTED).unwrap();
+    let source = format!(
+        "#eval (show IO ByteArray from do\n  let input ← IO.FS.Handle.mk {} IO.FS.Mode.read\n  let bytes ← input.read 99\n  IO.FS.writeBinFile {} bytes\n  (EST.pure (ByteArray.mk (Array.mk bytes.data.toList)) : IO ByteArray))",
+        quoted(&input),
+        quoted(&output),
+    );
+    let batch = run(&engine, &source);
+    let execution = evaluation(&batch);
+    assert_bytes(&execution.exit, EXPECTED);
+    let program = assert_rows(
+        execution,
+        &[Operation::Open, Operation::Read, Operation::Write],
+    );
+    for row in ["extern:Array.mk", "extern:Array.toList"] {
+        assert!(
+            program
+                .functions()
+                .iter()
+                .flat_map(|function| &function.code)
+                .any(
+                    |instruction| matches!(instruction, Instruction::Intrinsic { row: selected, .. }
+                    if selected == row)
+                ),
+            "the binary IO roundtrip must execute {row}"
+        );
+    }
+    let bytes = child(returned(&execution.exit), 0);
+    assert_eq!(
+        child(&bytes, 0).try_array_view().map(|(size, _)| size),
+        Some(EXPECTED.len()),
+        "the returned ByteArray must retain native Array storage"
+    );
+    assert_eq!(std::fs::read(&output).unwrap(), EXPECTED);
+    let changed = [255, 0, 254, 128];
+    std::fs::write(&input, changed).unwrap();
+    std::fs::write(&output, b"stale suffix must be truncated").unwrap();
+    let replay = execute_golem_with_options(&program, &options, VmExecutionLimits::default())
+        .into_complete()
+        .unwrap();
+    assert_bytes(&replay, &changed);
+    assert_eq!(std::fs::read(&output).unwrap(), changed);
+    assert_eq!(engine.logical_root(&options), root);
+}
+
+#[test]
 fn binary_write_saved_actions_aliases_and_repeated_invocations_defer_effects() {
     let Some(raw) = raw_bytes_environment() else {
         return;

@@ -154,6 +154,7 @@ impl Preparation<'_> {
             "_fln_runtime_array_forIn",
             "_fln_runtime_array_size",
             "_fln_runtime_array_get",
+            "_fln_runtime_array_modifyM",
         ]
         .into_iter()
         .any(|label| name == &Name::from_components([label]))
@@ -256,6 +257,8 @@ impl Preparation<'_> {
             || self.nat_primitive_intrinsic_type(name).is_some()
             || self.diagnostic_intrinsic_type(name).is_some()
             || self.st_intrinsic_type(name).is_some()
+            || self.array_intrinsic_type(name).is_some()
+            || self.array_function_type(name).is_some()
             || self.thunk_intrinsic_type(name).is_some()
             || self.thunk_function_type(name).is_some()
             || self.task_intrinsic_type(name).is_some()
@@ -626,7 +629,8 @@ impl Preparation<'_> {
                     {
                         // Native allocation retains object identity even when
                         // the payload is syntactically inert.
-                        if self.thunk_record_forbidden(&ctor.induct)?
+                        if self.array_record_forbidden(&ctor.induct)?
+                            || self.thunk_record_forbidden(&ctor.induct)?
                             || self.task_record_forbidden(&ctor.induct)?
                         {
                             return Ok(false);
@@ -685,6 +689,7 @@ impl Preparation<'_> {
         // source constructor/projection cannot relabel a raw opaque carrier as
         // a cell whose contents received the checked Nat representation.
         if self.st_ref_record_forbidden(family)?
+            || self.array_record_forbidden(family)?
             || self.thunk_record_forbidden(family)?
             || self.task_record_forbidden(family)?
         {
@@ -1078,6 +1083,8 @@ impl Preparation<'_> {
                 .nat_primitive_intrinsic_type(name)
                 .or_else(|| self.diagnostic_intrinsic_type(name))
                 .or_else(|| self.st_intrinsic_type(name))
+                .or_else(|| self.array_intrinsic_type(name))
+                .or_else(|| self.array_function_type(name))
                 .or_else(|| self.thunk_intrinsic_type(name))
                 .or_else(|| self.thunk_function_type(name))
                 .or_else(|| self.task_intrinsic_type(name))
@@ -1103,7 +1110,7 @@ impl Preparation<'_> {
                 )
                 .map(Some);
         }
-        if let Some(target) = self.native_array_access_target(name)? {
+        if let Some(target) = self.legacy_array_access_target(name)? {
             let definition = self
                 .specialized_definition(&target)
                 .ok_or_else(|| unsupported("missing checked Array access adapter"))?;
@@ -1173,6 +1180,7 @@ impl Preparation<'_> {
         // Their remaining Pi is a returned closure, not missing arguments.
         if matches!(head.node(), ExprNode::Const { name, .. }
             if self.is_partial_stage(name)
+                || self.array_function_type(name).is_some()
                 || self.thunk_function_type(name).is_some()
                 || self.task_function_type(name).is_some())
         {

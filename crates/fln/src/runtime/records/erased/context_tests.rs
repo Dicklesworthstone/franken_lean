@@ -70,6 +70,60 @@ fn nodes_error<T>(result: Result<T, IngressError>, limit: usize) {
 }
 
 #[test]
+fn native_arrays_share_only_compatible_hidden_element_interfaces() {
+    crate::runtime::array_iteration::tests::with_fixture(|environment| {
+        let mut preparation = Preparation::new(environment, IngressLimits::default());
+        assert!(preparation.native_arrays_enabled().unwrap());
+        let boxed = preparation.enable_boxed_type().unwrap();
+        let array = |element| Expr::app(Expr::const_(name("Array"), vec![Level::zero()]), element);
+        let mut actual = pi("value", c("Nat"), c("Nat"));
+        let mut expected = pi("value", boxed.clone(), c("Nat"));
+        for _ in 0..3 {
+            actual = array(actual);
+            expected = array(expected);
+            assert_eq!(
+                preparation.value_type(&actual).unwrap(),
+                Some(ValueType::Array)
+            );
+            assert_eq!(
+                preparation.value_type(&expected).unwrap(),
+                Some(ValueType::Array)
+            );
+            assert!(
+                !preparation
+                    .shared_erased_storage(&actual, &expected)
+                    .unwrap(),
+                "an equal Array carrier does not establish equal callback interfaces"
+            );
+            assert!(
+                preparation
+                    .erased_adapter(&actual, &expected)
+                    .unwrap()
+                    .is_some(),
+                "nested native Arrays must rebuild every changed callback interface"
+            );
+        }
+        let mut actual = c("Nat");
+        let mut expected = boxed;
+        for _ in 0..3 {
+            actual = array(actual);
+            expected = array(expected);
+            assert!(
+                preparation
+                    .shared_erased_storage(&actual, &expected)
+                    .unwrap()
+            );
+            assert!(
+                preparation
+                    .erased_adapter(&actual, &expected)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+    });
+}
+
+#[test]
 fn unrelated_caller_slots_need_no_copy_for_hidden_type_erasure() {
     let engine = engine();
     let root = engine.logical_root(&KVMap::new());

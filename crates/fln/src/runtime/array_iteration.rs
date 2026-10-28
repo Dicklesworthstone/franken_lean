@@ -64,6 +64,20 @@ fn application(head: Expr, arguments: impl IntoIterator<Item = Expr>) -> Expr {
 }
 
 impl Preparation<'_> {
+    /// Source-only Array records still use the checked List adapters. Once
+    /// the native family is authenticated, all production callers preserve
+    /// its representation; the explicit logical recognizer remains available
+    /// to exercise its independent compatibility contract.
+    pub(super) fn legacy_array_access_target(
+        &mut self,
+        requested: &Name,
+    ) -> Result<Option<Name>, IngressError> {
+        if Access::from_name(requested).is_none() || self.native_arrays_enabled()? {
+            return Ok(None);
+        }
+        self.native_array_access_target(requested)
+    }
+
     /// The admitted Array is a List wrapper. Authorize explicit representation
     /// templates only after checking the complete logical and selected models.
     /// No constructor is passed to the native Array ABI, and no failed native
@@ -227,7 +241,7 @@ impl Preparation<'_> {
         if let Some(replacement) = self.implemented_by_call(head, arguments)? {
             return Ok(Some(replacement));
         }
-        Ok(self.native_array_access_target(requested)?.map(|target| {
+        Ok(self.legacy_array_access_target(requested)?.map(|target| {
             application(
                 Expr::const_(target, levels.clone()),
                 arguments.iter().cloned(),
@@ -402,4 +416,4 @@ impl Preparation<'_> {
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

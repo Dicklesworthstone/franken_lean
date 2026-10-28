@@ -5,6 +5,7 @@
 //! alone. Unsupported dependent result representations remain typed refusals.
 mod array_fold;
 mod array_iteration;
+mod arrays;
 mod callables;
 mod conditionals;
 mod data_recursion;
@@ -91,6 +92,7 @@ pub(super) struct Preparation<'a> {
     text_decisions: decisions::Store,
     array_fold: array_fold::Store,
     array_iteration: array_iteration::Store,
+    arrays: arrays::Store,
     diagnostics: diagnostics::Store,
     st: st::Store,
     tasks: tasks::Store,
@@ -201,6 +203,7 @@ impl<'a> Preparation<'a> {
             text_decisions: decisions::Store::default(),
             array_fold: array_fold::Store::default(),
             array_iteration: array_iteration::Store::default(),
+            arrays: arrays::Store::default(),
             diagnostics: diagnostics::Store::default(),
             st: st::Store::default(),
             tasks: tasks::Store::default(),
@@ -301,6 +304,7 @@ impl<'a> Preparation<'a> {
             ValueType::Float32 => u64::MAX - 1,
             ValueType::UInt32 => u64::MAX - 2,
             ValueType::UInt64 => u64::MAX - 3,
+            ValueType::Array => u64::MAX - 4,
             ValueType::Closure(id) => 4 + u64::from(id.get()),
             _ => return Err(unsupported("conditional result representation")),
         };
@@ -567,6 +571,10 @@ impl<'a> Preparation<'a> {
                             continue;
                         }
                         if let Some(value) = self.char_of_nat_call(&head, &args)? {
+                            tasks.push(Task::Visit(value));
+                            continue;
+                        }
+                        if let Some(value) = self.array_call(&head, &args)? {
                             tasks.push(Task::Visit(value));
                             continue;
                         }
@@ -946,6 +954,10 @@ impl<'a> Preparation<'a> {
                             tasks.push(Task::Visit(expr.clone()));
                         }
                         ExprNode::Const { name, levels } => {
+                            if let Some(value) = self.array_call(&expr, &[])? {
+                                tasks.push(Task::Visit(value));
+                                continue;
+                            }
                             if let Some(value) = self.array_access_call(&expr, &[])? {
                                 tasks.push(Task::Visit(value));
                                 continue;

@@ -6437,6 +6437,7 @@ fn executable_dependencies(
         }
         let intrinsic = match preparation
             .nat_primitive_intrinsic_binding(&name)
+            .or_else(|| preparation.array_intrinsic_binding(&name))
             .or_else(|| preparation.st_intrinsic_binding(&name))
             .or_else(|| preparation.thunk_intrinsic_binding(&name))
             .or_else(|| preparation.task_intrinsic_binding(&name))
@@ -6456,6 +6457,7 @@ fn executable_dependencies(
         };
         if let Some(binding) = intrinsic {
             if preparation.nat_primitive_intrinsic_alias(&binding, &intrinsics, &mut functions)?
+                || preparation.array_intrinsic_alias(&binding, &mut intrinsics, &mut functions)?
                 || preparation.string_bytes_intrinsic_alias(
                     &binding,
                     &intrinsics,
@@ -6473,11 +6475,14 @@ fn executable_dependencies(
             intrinsics.push(binding);
             continue;
         }
-        let private_signature = match preparation.thunk_function_signature(&name)? {
+        let private_signature = match preparation.array_function_signature(&name)? {
             Some(signature) => Some(signature),
-            None => match preparation.task_function_signature(&name)? {
+            None => match preparation.thunk_function_signature(&name)? {
                 Some(signature) => Some(signature),
-                None => preparation.partial_stage_signature(&name)?,
+                None => match preparation.task_function_signature(&name)? {
+                    Some(signature) => Some(signature),
+                    None => preparation.partial_stage_signature(&name)?,
+                },
             },
         };
         let mut signature = match private_signature {

@@ -25,6 +25,12 @@ struct Container {
     minors: Vec<Minor>,
 }
 
+struct NativeArray {
+    list: Pair,
+    to_list: Expr,
+    from_list: Expr,
+}
+
 enum Work {
     Visit(Pair),
     Function {
@@ -35,6 +41,10 @@ enum Work {
     Container {
         pair: Pair,
         container: Container,
+    },
+    Array {
+        pair: Pair,
+        array: NativeArray,
     },
 }
 
@@ -155,6 +165,12 @@ impl Preparation<'_> {
                                 }
                                 Work::Container { pair, container }
                             }
+                            (Some(ValueType::Array), Some(ValueType::Array)) => {
+                                let array = self.hidden_array(&pair)?;
+                                reserve(&mut dependencies, self.limits.max_nodes)?;
+                                dependencies.push(array.list.clone());
+                                Work::Array { pair, array }
+                            }
                             _ => return Err(unsupported("nonuniform hidden field representation")),
                         };
                         reserve(&mut work, self.limits.max_nodes)?;
@@ -221,6 +237,15 @@ impl Preparation<'_> {
                     }
                     (pair, Some(Expr::app(body, variable(0)?)))
                 }
+                Work::Array { pair, array } => {
+                    // Reuse the checked List converter for element callbacks
+                    // and nested containers. The strict outer value binder
+                    // and one projection preserve evaluation and sharing;
+                    // only a changed element interface requires this rebuild.
+                    let values = Expr::app(array.to_list, variable(0)?);
+                    let values = converted(&adapters, &array.list, values)?;
+                    (pair, Some(Expr::app(array.from_list, values)))
+                }
             };
             active.remove(&pair);
             adapters
@@ -234,6 +259,29 @@ impl Preparation<'_> {
         adapters
             .remove(&root)
             .ok_or_else(|| unsupported("hidden adapter result"))
+    }
+
+    fn hidden_array(&mut self, pair: &Pair) -> Result<NativeArray, IngressError> {
+        let (Some((actual_level, actual)), Some((expected_level, expected))) = (
+            self.array_element_type(&pair.0)?,
+            self.array_element_type(&pair.1)?,
+        ) else {
+            return Err(unsupported("hidden native Array element interface"));
+        };
+        let apply = |label, level: &Level, element: &Expr| {
+            Expr::app(
+                Expr::const_(name(label), vec![level.clone()]),
+                element.clone(),
+            )
+        };
+        Ok(NativeArray {
+            list: (
+                apply("List", &actual_level, &actual),
+                apply("List", &expected_level, &expected),
+            ),
+            to_list: apply("Array.toList", &actual_level, &actual),
+            from_list: apply("Array.mk", &expected_level, &expected),
+        })
     }
 
     /// Derive a map from the actual admitted family and its exact constructor

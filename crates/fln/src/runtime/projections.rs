@@ -57,6 +57,9 @@ impl Preparation<'_> {
         if let Some(replacement) = self.implemented_by_call(head, arguments)? {
             return Ok(Some(replacement));
         }
+        if let Some(value) = self.array_call(head, arguments)? {
+            return Ok(Some(value));
+        }
         if let Some(getter) = self.thunk_call(head, arguments)? {
             return Ok(Some(getter));
         }
@@ -165,6 +168,14 @@ impl Preparation<'_> {
         receiver: &Expr,
     ) -> Result<Option<Expr>, IngressError> {
         self.tick()?;
+        if self.array_record_forbidden(family)? {
+            let Some(type_) = self.projection_receiver_type(receiver, &[])? else {
+                return Ok(None);
+            };
+            return self
+                .array_projection_factory(&type_, family, index)
+                .map(|factory| factory.map(|factory| Expr::app(factory, receiver.clone())));
+        }
         if self.thunk_record_forbidden(family)? {
             let Some(type_) = self.projection_receiver_type(receiver, &[])? else {
                 return Ok(None);
@@ -609,6 +620,13 @@ impl Preparation<'_> {
                                 // parameters still refer to an existential type field.
                                 // Select the uniform layout before discarding that context.
                                 let runtime_type = self.erase_hidden_types(&type_, &locals)?;
+                                if let Some(factory) =
+                                    self.array_projection_factory(&runtime_type, struct_name, *idx)?
+                                {
+                                    tasks.push(ProjectionFrame::NativeField(factory));
+                                    tasks.push(ProjectionFrame::Visit(receiver.clone()));
+                                    continue;
+                                }
                                 if let Some(factory) = self.string_byte_projection_factory(
                                     &runtime_type,
                                     struct_name,

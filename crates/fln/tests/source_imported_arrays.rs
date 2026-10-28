@@ -497,6 +497,282 @@ fn actual_imported_array_size_executes_replays_and_preserves_authority() {
 }
 
 #[test]
+fn actual_imported_arrays_use_native_storage_and_preserve_shared_updates() {
+    use fln::{EngineExecutionLimits, FlbcExecutionLimits, VmExit};
+    use fln_comp::flbc::{ArgumentOwnership, CodecLimits, Instruction, decode_canonical};
+
+    with_actual_import(false, |engine| {
+        let options = KVMap::new();
+        let before = engine.logical_root(&options);
+        let mut failures = Vec::new();
+        collect_case_failure(&mut failures, "native Array push loop", || {
+            let completed = engine
+                .execute_source_definitions(
+                    &[br#"
+def nativePushLoop : Nat -> Array Nat -> Array Nat
+  | 0, values => values
+  | n + 1, values => nativePushLoop n (values.push n)
+def nativeArray : Array Nat := nativePushLoop 128 #[]
+"#],
+                    &options,
+                    EngineExecutionLimits::new(Budget::for_stack_bytes(STACK)),
+                )
+                .expect("the admitted Array operations compile through the native bridge")
+                .into_complete()
+                .expect("the bounded native Array program completes");
+            let execution = completed.executions.last().expect("nativeArray executes");
+            let assert_array = |exit: &VmExit| {
+                let VmExit::Returned(result) = exit else {
+                    panic!("the native Array program must return: {exit:?}");
+                };
+                assert_eq!(
+                    result.value.try_array_view().map(|(size, _)| size),
+                    Some(128),
+                    "Array values must use native storage, not a record wrapping a List"
+                );
+                for index in 0..128 {
+                    assert_eq!(result.value.array_child(index).unbox(), 127 - index);
+                }
+            };
+            assert_array(&execution.exit);
+            let program = decode_canonical(&execution.flbc_artifact, CodecLimits::default())
+                .expect("the exact Array artifact independently validates");
+            assert!(program.functions().iter().any(|function| {
+                function.code.iter().any(|instruction| {
+                    matches!(instruction, Instruction::Intrinsic { row, .. } if row == "extern:Array.push")
+                })
+            }), "the source push loop must execute the native Array primitive");
+            assert!(
+                program.functions().iter().any(|function| {
+                    function
+                        .parameter_ownership
+                        .contains(&ArgumentOwnership::Owned)
+                }),
+                "the loop must transfer Array parameters through internal calls"
+            );
+            assert!(
+                program.functions().iter().any(|function| {
+                    function
+                        .code
+                        .iter()
+                        .any(|instruction| matches!(instruction, Instruction::Move { .. }))
+                }),
+                "last-use Array aliases must transfer their existing references"
+            );
+            let replay = fln::execute_flbc_artifact(
+                &execution.flbc_artifact,
+                &options,
+                FlbcExecutionLimits::default(),
+            )
+            .expect("the native Array artifact replays independently")
+            .into_complete()
+            .expect("the bounded Array replay completes");
+            assert_array(&replay);
+        });
+        collect_case_failure(&mut failures, "native Array pop", || {
+            let execution = engine
+                .execute_source_definition(
+                    b"def nativePoppedArray : Array Nat := (#[11, 22] : Array Nat).pop",
+                    &options,
+                    EngineExecutionLimits::new(Budget::for_stack_bytes(STACK)),
+                )
+                .expect("Array.pop compiles through its native bridge")
+                .into_complete()
+                .expect("the bounded native Array pop completes");
+            let assert_array = |exit: &VmExit| {
+                let VmExit::Returned(result) = exit else {
+                    panic!("the native Array pop must return: {exit:?}");
+                };
+                assert_eq!(result.value.try_array_view().map(|(size, _)| size), Some(1));
+                assert_eq!(result.value.array_child(0).unbox(), 11);
+            };
+            assert_array(&execution.exit);
+            let program = decode_canonical(&execution.flbc_artifact, CodecLimits::default())
+                .expect("the exact Array.pop artifact independently validates");
+            assert!(program.functions().iter().any(|function| {
+                function.code.iter().any(|instruction| {
+                    matches!(instruction, Instruction::Intrinsic { row, .. } if row == "extern:Array.pop")
+                })
+            }), "source Array.pop must execute the native primitive");
+            let replay = fln::execute_flbc_artifact(
+                &execution.flbc_artifact,
+                &options,
+                FlbcExecutionLimits::default(),
+            )
+            .expect("the native Array.pop artifact replays independently")
+            .into_complete()
+            .expect("the bounded Array.pop replay completes");
+            assert_array(&replay);
+        });
+        collect_case_failure(
+            &mut failures,
+            "shared Array updates and logical views",
+            || {
+                execution::program(
+                    engine,
+                    "native Array updates, aliases, and List views",
+                    r#"
+def arrayTotal (values : Array Nat) : Nat :=
+  List.foldl (fun total value => total + value) 0 values.toList
+-- FLN_EXPECT_NAT 203
+#eval let original := #[11, 22]; let changed := original.push 33; original.size * 100 + changed.size
+-- FLN_EXPECT_NAT 3329
+#eval let original := #[11, 22]; let changed := original.set! 0 7; arrayTotal original * 100 + arrayTotal changed
+-- FLN_EXPECT_NAT 3338
+#eval let original := #[11, 22]; let changed := original.modify 0 (fun value => value + 5); arrayTotal original * 100 + arrayTotal changed
+-- FLN_EXPECT_NAT 2
+#eval (#[11, 22].modify 99 (fun (_ : Nat) => panic! "out-of-bounds callback must not run")).size
+-- FLN_EXPECT_NAT 3311
+#eval let original := #[11, 22]; let changed := original.pop; arrayTotal original * 100 + arrayTotal changed
+-- FLN_EXPECT_NAT 0
+#eval ((#[] : Array Nat).pop).size
+-- FLN_EXPECT_NAT 15
+#eval arrayTotal (Array.mk [3, 5, 7])
+-- FLN_EXPECT_NAT 3
+#eval Array.casesOn (motive := fun _ => Nat) #[3, 5, 7] (fun values => values.length)
+-- FLN_EXPECT_NAT 0
+#eval (Array.toList (Array.mk ([] : List Nat))).length
+-- FLN_EXPECT_NAT 1024
+#eval (Array.range 1024).size
+-- FLN_EXPECT_NAT 6
+#eval (#[1, 2, 3] : Array Nat).foldl (fun (total value : Nat) => total + value) 0
+-- FLN_EXPECT_NAT 6
+#eval Id.run do
+  let mut total : Nat := 0
+  for value in (#[1, 2, 3] : Array Nat) do
+    total := total + value
+  return total
+"#,
+                    12,
+                );
+            },
+        );
+        collect_case_failure(
+            &mut failures,
+            "Array modify callbacks and monadic sequencing",
+            || {
+                execution::program(
+                    engine,
+                    "checked Array.modifyM preserves callbacks and monadic effects",
+                    r#"
+structure ModifyTraceResult (A : Type) where
+  value : A
+  trace : Nat
+def ModifyTrace (A : Type) : Type := Nat -> ModifyTraceResult A
+def modifyTracePure {A : Type} (value : A) : ModifyTrace A :=
+  fun state => { value := value, trace := state * 10 + 8 }
+def modifyTraceBind {A B : Type}
+    (action : ModifyTrace A) (next : A -> ModifyTrace B) : ModifyTrace B :=
+  fun state =>
+    let result := action (state * 10 + 7)
+    next result.value result.trace
+instance modifyTraceMonad : Monad ModifyTrace :=
+  { pure := fun value => modifyTracePure value,
+    bind := fun action next => modifyTraceBind action next }
+def tracedModify (values : Array Nat) (index : Nat) : ModifyTrace (Array Nat) :=
+  Array.modifyM (m := ModifyTrace) values index
+    (fun (value : Nat) (state : Nat) => { value := value + 5, trace := state * 10 + 1 })
+def modifyTraceCode (index : Nat) : Nat :=
+  let result := tracedModify #[11, 22] index 0
+  let total := result.value.toList.foldl (fun (sum value : Nat) => sum + value) 0
+  total * 1000 + result.trace
+-- FLN_EXPECT_NAT 38718
+#eval modifyTraceCode 0
+-- FLN_EXPECT_NAT 33008
+#eval modifyTraceCode 99
+"#,
+                    2,
+                );
+            },
+        );
+        collect_case_failure(
+            &mut failures,
+            "typed Array elements and partial primitives",
+            || {
+                execution::program(
+                    engine,
+                    "native Array data, callbacks, nested aliases, and partial applications",
+                    r#"
+def applyArrayPush (push : Array Nat -> Nat -> Array Nat) : Nat :=
+  (push #[3] 5).size
+-- FLN_EXPECT_NAT 12
+#eval let offset : Nat := 7; let values : Array (Nat -> Nat) := #[fun (value : Nat) => value + offset]; (Array.getInternal values 0 (by decide)) 5
+-- FLN_EXPECT_NAT 12
+#eval let get := Array.getInternal (#[fun (value : Nat) => value + 7] : Array (Nat -> Nat)) 0; get (by decide) 5
+-- FLN_EXPECT_NAT 15
+#eval List.foldl (fun total value => total + value) 0 (Array.getInternal (#[[3, 5, 7]] : Array (List Nat)) 0 (by decide))
+-- FLN_EXPECT_NAT 2
+#eval (Array.getInternal (#[#[3, 5], #[7]] : Array (Array Nat)) 0 (by decide)).size
+-- FLN_EXPECT_NAT 23
+#eval let original : Array (Array Nat) := #[#[1, 2]]; let inner := Array.getInternal original 0 (by decide); let changed := inner.push 3; (Array.getInternal original 0 (by decide)).size * 10 + changed.size
+-- FLN_EXPECT_NAT 2
+#eval applyArrayPush Array.push
+-- FLN_EXPECT_NAT 2
+#eval let push : Nat -> Array Nat := Array.push #[3]; (push 7).size
+"#,
+                    7,
+                );
+            },
+        );
+        collect_case_failure(
+            &mut failures,
+            "Arrays of callbacks with hidden carriers",
+            || {
+                execution::program(
+                    engine,
+                    "native Array callbacks adapt checked hidden element types",
+                    r#"
+structure ArrayHandlers where
+  carrier : Type
+  value : carrier
+  values : Array (carrier -> Nat)
+def totalArrayHandlers (p : ArrayHandlers) : Nat :=
+  p.values.toList.foldl (fun (n : Nat) (f : p.carrier -> Nat) => n + f p.value) 0
+def makeArrayHandlers (offset : Nat) : ArrayHandlers :=
+  { carrier := Nat, value := 20, values := #[fun n => n + offset, fun n => n] }
+-- FLN_EXPECT_NAT 42
+#eval totalArrayHandlers (makeArrayHandlers 2)
+structure NestedArrayHandlers where
+  carrier : Type
+  value : carrier
+  values : Array (Array (carrier -> Nat))
+def totalNestedArrayHandlers (p : NestedArrayHandlers) : Nat :=
+  p.values.toList.foldl (fun (n : Nat) (fs : Array (p.carrier -> Nat)) =>
+    fs.toList.foldl (fun (k : Nat) (f : p.carrier -> Nat) => k + f p.value) n) 0
+def makeNestedArrayHandlers (offset : Nat) : NestedArrayHandlers :=
+  { carrier := Nat, value := 20, values := #[#[fun n => n + offset], #[fun n => n]] }
+-- FLN_EXPECT_NAT 42
+#eval totalNestedArrayHandlers (makeNestedArrayHandlers 2)
+"#,
+                    2,
+                );
+            },
+        );
+        collect_case_failure(&mut failures, "Arrays with erased type elements", || {
+            execution::program(
+                engine,
+                "native Array shape survives erased Type and Prop elements",
+                r#"
+-- FLN_EXPECT_NAT 3
+#eval (#[Nat, Bool, String] : Array Type).size
+-- FLN_EXPECT_NAT 3
+#eval ((#[True, False] : Array Prop).push (True ∧ True)).size
+-- FLN_EXPECT_NAT 3
+#eval ((Array.mk [Nat, Bool] : Array Type).push String).toList.length
+"#,
+                3,
+            );
+        });
+        assert_eq!(engine.logical_root(&options), before);
+        assert!(
+            failures.is_empty(),
+            "native Array storage, ownership, alias preservation, and views must agree:\n{}",
+            failures.join("\n")
+        );
+    });
+}
+
+#[test]
 fn actual_imported_array_get_executes_replays_and_preserves_authority() {
     with_actual_import(false, |engine| {
         let implementations =

@@ -82,23 +82,17 @@ fn logical_entries(exit: &VmExit) -> Vec<(String, String)> {
     assert_constructor(result, 0, 2);
     assert_eq!(child(result, 1).unbox(), 0);
     let array = child(result, 0);
-    assert_constructor(&array, 0, 1);
-    let mut list = child(&array, 0);
-    let mut entries = Vec::new();
-    loop {
-        assert!(!list.is_scalar(), "a logical List, never a native Array");
-        if list.header().tag == 0 {
-            assert_constructor(&list, 0, 0);
-            break;
-        }
-        assert_constructor(&list, 1, 2);
-        let entry = child(&list, 0);
+    let (size, _) = array
+        .try_array_view()
+        .expect("checked directory entries use native Array storage");
+    assert!(size <= 1000, "bounded retained directory fixture");
+    let mut entries = Vec::with_capacity(size);
+    for index in 0..size {
+        let entry = array.array_child(index);
         assert_constructor(&entry, 0, 2);
         let root = child(&entry, 0);
         assert_constructor(&root, 0, 1);
         entries.push((string(&child(&root, 0)), string(&child(&entry, 1))));
-        assert!(entries.len() <= 1000, "bounded retained directory fixture");
-        list = child(&list, 1);
     }
     entries
 }
@@ -306,7 +300,11 @@ fn directory_sources_preserve_logical_paths_names_and_native_order() {
         expected_entries(&supplied)
     );
     let program = assert_rows(execution, &[Operation::ReadDir]);
-    for wanted in ["extern:Array.size", "extern:Array.getInternal"] {
+    for wanted in [
+        "extern:Array.mk",
+        "extern:Array.size",
+        "extern:Array.getInternal",
+    ] {
         assert!(program.functions().iter().flat_map(|function| &function.code).any(|instruction| matches!(instruction, Instruction::Intrinsic { row, .. } if row == wanted)));
     }
     for (value, expected) in [("entries.size", "4"), ("entries.toList.length", "4")] {

@@ -1,8 +1,8 @@
 //! Convert between native file buffers and checked logical byte records.
 //!
-//! Packed bytes and native arrays never acquire the source ByteArray/Array
-//! representation. A single native ByteArray.data conversion supplies a
-//! private array, then metered Nat recursion builds exact logical constructors.
+//! Packed bytes never acquire the source ByteArray representation. A single
+//! native ByteArray.data conversion supplies a private array of native bytes;
+//! metered Nat recursion rebuilds logical UInt8 elements in checked Array storage.
 //! The native counted read refuses more than 64 KiB before touching the file;
 //! the conversion additionally obeys the caller's instruction/stack budgets.
 //! Writes fold the logical List in source order into a private packed buffer;
@@ -35,7 +35,8 @@ pub(super) struct Layout {
     pub(super) packed: Expr,
     native_array: Expr,
     byte_array: records::ShapeConstructor,
-    array: records::ShapeConstructor,
+    array_from_list: Expr,
+    array_to_list: Expr,
     list: records::Shape,
     byte: records::ShapeConstructor,
     bits: records::ShapeConstructor,
@@ -291,16 +292,7 @@ impl Preparation<'_> {
         // not grant authority to enter this separate file-buffer path.
         let word = self.fs_word_layout()?;
         let byte_array = self.io_checked_single_constructor(c("ByteArray"), 1)?;
-        let array = self.io_checked_single_constructor(byte_array.fields[0].clone(), 1)?;
-        let list = self.io_checked_shape(array.fields[0].clone())?;
-        if list.constructors.len() != 2
-            || list.constructors[0].tag != 0
-            || !list.constructors[0].fields.is_empty()
-            || list.constructors[1].tag != 1
-            || list.constructors[1].fields != [c("UInt8"), list.source.clone()]
-        {
-            return Err(unsupported("filesystem checked byte list layout"));
-        }
+        let storage = self.byte_array_storage(byte_array.fields[0].clone())?;
         let byte = self.io_checked_single_constructor(c("UInt8"), 1)?;
         let bits = self.io_checked_single_constructor(byte.fields[0].clone(), 1)?;
         let fin = self.io_checked_single_constructor(bits.fields[0].clone(), 2)?;
@@ -343,8 +335,9 @@ impl Preparation<'_> {
             packed,
             native_array,
             byte_array,
-            array,
-            list,
+            array_from_list: storage.from_list,
+            array_to_list: storage.to_list,
+            list: storage.list,
             byte,
             bits,
             fin,
@@ -696,7 +689,10 @@ impl Preparation<'_> {
         // Descending k=n-1..0, prepended to the accumulator, preserves byte
         // order. Every k is below the one immutable native Array.size, and
         // Array.getInternal additionally performs its normal runtime check.
-        let result = constructor(&layout.byte_array, [constructor(&layout.array, [values])]);
+        let result = constructor(
+            &layout.byte_array,
+            [Expr::app(layout.array_from_list, values)],
+        );
         let size_binding = Expr::let_e(
             self.fs_adapter_name()?,
             c("Nat"),
@@ -789,11 +785,8 @@ impl Preparation<'_> {
         let bytes_projection = self
             .io_checked_shape(c("ByteArray"))?
             .projection(&layout.byte_array);
-        let array_projection = self
-            .io_checked_shape(layout.byte_array.fields[0].clone())?
-            .projection(&layout.array);
         let logical_array = Expr::proj(bytes_projection, 0, value);
-        let list = Expr::proj(array_projection, 0, logical_array);
+        let list = Expr::app(layout.array_to_list, logical_array);
         let empty = Expr::app(Expr::const_(write.empty, Vec::new()), nat::literal(0));
         Ok(apply(
             Expr::const_(name("List.rec"), vec![Level::one(), Level::zero()]),

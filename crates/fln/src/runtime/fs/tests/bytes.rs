@@ -156,20 +156,30 @@ fn environment(raw: &Environment) -> Environment {
 }
 
 fn logical_bytes(value: &Obj) -> Vec<u8> {
-    // ByteArray.mk (Array.mk (List UInt8)): no packed array or scalar-byte
-    // object is accepted under the public logical types.
+    // ByteArray retains its checked record and every array element remains a
+    // logical UInt8. Both the native Array and the unselected logical Array
+    // route preserve those byte wrappers; neither accepts a packed buffer.
     assert_constructor(value, 0, 1);
     let array = child(value, 0);
-    assert_constructor(&array, 0, 1);
-    let mut list = child(&array, 0);
-    let mut result = Vec::new();
-    loop {
-        if !list.is_scalar() && list.header().tag == 0 {
-            assert_constructor(&list, 0, 0);
-            break;
+    let values = if let Some((size, _)) = array.try_array_view() {
+        (0..size).map(|index| array.array_child(index)).collect()
+    } else {
+        assert_constructor(&array, 0, 1);
+        let mut list = child(&array, 0);
+        let mut values = Vec::new();
+        loop {
+            if !list.is_scalar() && list.header().tag == 0 {
+                assert_constructor(&list, 0, 0);
+                break;
+            }
+            assert_constructor(&list, 1, 2);
+            values.push(child(&list, 0));
+            list = child(&list, 1);
         }
-        assert_constructor(&list, 1, 2);
-        let byte = child(&list, 0);
+        values
+    };
+    let mut result = Vec::new();
+    for byte in values {
         assert_constructor(&byte, 0, 1);
         let bits = child(&byte, 0);
         assert_constructor(&bits, 0, 1);
@@ -178,7 +188,6 @@ fn logical_bytes(value: &Obj) -> Vec<u8> {
         let natural = child(&finite, 0);
         assert!(natural.is_scalar());
         result.push(u8::try_from(natural.unbox()).unwrap());
-        list = child(&list, 1);
     }
     result
 }

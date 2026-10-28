@@ -127,6 +127,9 @@ impl Preparation<'_> {
             if array_fold::canonical_pair(&target, &next) {
                 return self.array_fold_target().map(Some);
             }
+            if arrays::canonical_modify_pair(&target, &next) {
+                return self.array_modify_target().map(Some);
+            }
             replaced = true;
             target = next;
         }
@@ -172,7 +175,8 @@ impl Preparation<'_> {
         let native = self.native_intrinsic_binding(&target)?.is_some()
             || self.native_natural_decision_target(&target)?.is_some()
             || self.native_char_of_nat_target(&target)?.is_some()
-            || self.native_array_access_target(&target)?.is_some()
+            || self.native_array_operation(&target)?
+            || self.legacy_array_access_target(&target)?.is_some()
             || self.bounded_word_contract(&target)?
             || match source_intrinsics::io::fs::Operation::from_name(&target) {
                 Some(operation) => source_intrinsics::io::fs::primitive_matches(

@@ -149,7 +149,7 @@ fn fixture() -> &'static Environment {
 /// The actual pinned model is the only model these tests accept; without it they take the
 /// typed skip every other pin-gated test takes, and `FLN_REQUIRE_REFERENCE` (set by the
 /// lane that installs the pin) turns that skip into a failure.
-fn with_fixture(test: impl FnOnce(&Environment) + Send + 'static) {
+pub(in crate::runtime) fn with_fixture(test: impl FnOnce(&Environment) + Send + 'static) {
     if pinned_library().is_none() {
         assert!(
             std::env::var_os("FLN_REQUIRE_REFERENCE").is_none(),
@@ -192,11 +192,11 @@ fn inventory_names(inventory: &str) -> BTreeSet<Name> {
     names
 }
 
-fn replace(environment: &Environment, info: ConstantInfo) -> Environment {
+pub(in crate::runtime) fn replace(environment: &Environment, info: ConstantInfo) -> Environment {
     without(environment, info.name()).add_decl(info).unwrap()
 }
 
-fn without(environment: &Environment, target: &Name) -> Environment {
+pub(in crate::runtime) fn without(environment: &Environment, target: &Name) -> Environment {
     let mut result = Environment::new();
     for (label, _) in environment.constants() {
         if label != target {

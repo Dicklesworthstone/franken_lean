@@ -401,7 +401,7 @@ impl Preparation<'_> {
 
     /// A native String has no logical constructor fields. Materialize its
     /// byte view with the verified byte-size and byte-read rows, then rebuild
-    /// ByteArray/Array/List/UInt8 using their checked constructors. The String
+    /// ByteArray and UInt8 records around the checked Array representation. The String
     /// and its size are each evaluated once. The recursive continuation
     /// visits n-1 .. 0 and prepends, preserving byte order without a second
     /// buffer or quadratic list append.
@@ -434,22 +434,8 @@ impl Preparation<'_> {
         if bytes_ctor.tag != 0 || bytes_ctor.fields.len() != 1 {
             return Err(unsupported("String byte view ByteArray fields"));
         }
-        let array = self.io_checked_shape(bytes_ctor.fields[0].clone())?;
-        let [array_ctor] = array.constructors.as_slice() else {
-            return Err(unsupported("String byte view Array constructor"));
-        };
-        if array_ctor.tag != 0 || array_ctor.fields.len() != 1 {
-            return Err(unsupported("String byte view Array fields"));
-        }
-        let list = self.io_checked_shape(array_ctor.fields[0].clone())?;
-        if list.constructors.len() != 2
-            || list.constructors[0].tag != 0
-            || !list.constructors[0].fields.is_empty()
-            || list.constructors[1].tag != 1
-            || list.constructors[1].fields != [c("UInt8"), list.source.clone()]
-        {
-            return Err(unsupported("String byte view checked list layout"));
-        }
+        let storage = self.byte_array_storage(bytes_ctor.fields[0].clone())?;
+        let list = &storage.list;
         // Inside the successor: #0=accumulator, #1=IH, #2=index,
         // #3=size, #4=String. Every index is below the captured byte size,
         // so the proof-erased native read cannot reach the trailing NUL.
@@ -488,7 +474,7 @@ impl Preparation<'_> {
         .fold(Expr::const_(name("Nat.rec"), vec![Level::one()]), Expr::app);
         let result = Expr::app(
             Expr::const_(bytes_ctor.name.clone(), vec![]),
-            Expr::app(Expr::const_(array_ctor.name.clone(), vec![]), values),
+            Expr::app(storage.from_list, values),
         );
         let body = Expr::let_e(
             self.string_bootstrap_adapter_name()?,

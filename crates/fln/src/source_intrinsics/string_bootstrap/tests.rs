@@ -1376,6 +1376,8 @@ def byteView (s : String) : ByteArray := s.toByteArray
 def byteFingerprint (bytes : ByteArray) : Nat :=
   List.foldl (fun (total : Nat) (byte : UInt8) => total * 257 + UInt8.toNat byte)
     0 (Array.toList (ByteArray.data bytes))
+def rebuildBytes (bytes : ByteArray) : ByteArray :=
+  ByteArray.mk (Array.mk bytes.data.toList)
 #eval byteFingerprint (byteView "")
 #eval byteFingerprint (byteView "abc")
 #eval byteFingerprint (byteView "A\x00λ")
@@ -1383,6 +1385,7 @@ def byteFingerprint (bytes : ByteArray) : Nat :=
 #eval let view := String.toByteArray; byteFingerprint (view "é")
 #eval byteFingerprint (ByteArray.push ("é".toByteArray) (UInt8.ofNat 0))
 #eval (String.toByteArray "λ").size
+#eval byteFingerprint (rebuildBytes "A\x00λ".toByteArray)
 "#;
         let run = engine
             .execute_source_commands_with_checks(
@@ -1406,6 +1409,7 @@ def byteFingerprint (bytes : ByteArray) : Nat :=
             fingerprint("é".as_bytes()),
             fingerprint("é\0".as_bytes()),
             2,
+            fingerprint("A\0λ".as_bytes()),
         ];
         assert_eq!(run.batch.source_evaluation_indices.len(), expected.len());
         for (&index, expected) in run.batch.source_evaluation_indices.iter().zip(expected) {
@@ -1438,6 +1442,79 @@ def byteFingerprint (bytes : ByteArray) : Nat :=
                 .unwrap(),
                 ClosedVmValue::Scalar(text.len())
             );
+        }
+        assert_eq!(engine.logical_root(&options), root);
+    });
+}
+
+#[test]
+fn string_byte_views_use_native_arrays_of_checked_uint8_values() {
+    with_fixture(|fixture| {
+        let engine = Engine::from_environment(fixture.environment.clone());
+        let options = KVMap::new();
+        let root = engine.logical_root(&options);
+        let source = r#"
+#eval "".toByteArray
+#eval "A\x00λ".toByteArray
+#eval "😀".toByteArray
+"#;
+        let completed = engine
+            .execute_source_commands_with_checks(
+                source.as_bytes(),
+                &options,
+                EngineExecutionLimits::new(Budget::for_stack_bytes(STACK)),
+            )
+            .unwrap_or_else(|error| panic!("checked native Array byte views: {error:?}"))
+            .into_complete()
+            .unwrap();
+        let expected = ["", "A\0λ", "😀"];
+        assert_eq!(
+            completed.batch.source_evaluation_indices.len(),
+            expected.len()
+        );
+        for (&index, expected) in completed
+            .batch
+            .source_evaluation_indices
+            .iter()
+            .zip(expected)
+        {
+            let execution = &completed.batch.executions[index];
+            let program =
+                flbc::decode_canonical(&execution.flbc_artifact, Default::default()).unwrap();
+            assert!(
+                program
+                    .functions()
+                    .iter()
+                    .flat_map(|function| &function.code)
+                    .any(
+                        |instruction| matches!(instruction, Instruction::Intrinsic { row, .. }
+                        if row == "extern:Array.mk")
+                    ),
+                "the byte view must construct native Array storage"
+            );
+            let replay =
+                execute_flbc_artifact(&execution.flbc_artifact, &options, Default::default())
+                    .unwrap()
+                    .into_complete()
+                    .unwrap();
+            for exit in [&execution.exit, &replay] {
+                let VmExit::Returned(returned) = exit else {
+                    panic!("checked byte view must return: {exit:?}");
+                };
+                let bytes = &returned.value;
+                assert_eq!(bytes.header().tag, 0);
+                assert_eq!(bytes.header().other, 1);
+                let array = bytes.try_ctor_child(0).expect("ByteArray storage field");
+                let (size, _) = array.try_array_view().expect("native Array UInt8 storage");
+                assert_eq!(size, expected.len());
+                for (index, expected) in expected.bytes().enumerate() {
+                    let byte = array.array_child(index);
+                    let bits = byte.try_ctor_child(0).expect("logical UInt8.ofBitVec");
+                    let finite = bits.try_ctor_child(0).expect("logical BitVec.ofFin");
+                    let natural = finite.try_ctor_child(0).expect("logical Fin.val");
+                    assert_eq!(natural.unbox(), usize::from(expected));
+                }
+            }
         }
         assert_eq!(engine.logical_root(&options), root);
     });

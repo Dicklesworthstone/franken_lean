@@ -75,6 +75,7 @@ impl Preparation<'_> {
         // differently instantiated source Ref never receives an object-field
         // layout that could be confused with the VM's reference handle.
         if self.st_ref_record_forbidden(name)?
+            || self.array_record_forbidden(name)?
             || self.thunk_record_forbidden(name)?
             || self.task_record_forbidden(name)?
         {
@@ -320,6 +321,7 @@ impl Preparation<'_> {
             return Ok(Some(ValueType::Constructor));
         }
         let source = self.erase_data_indices(source)?;
+        self.array_value_type(&source)?;
         self.thunk_value_type(&source)?;
         self.task_value_type(&source)?;
         if let Some((value, _)) = executable_value_type(&source, &self.value_types) {
@@ -370,6 +372,7 @@ impl Preparation<'_> {
             self.tick()?;
             match task {
                 Task::Enter(source) => {
+                    self.array_value_type(&source)?;
                     self.thunk_value_type(&source)?;
                     self.task_value_type(&source)?;
                     if executable_value_type(&source, &self.value_types).is_some() {

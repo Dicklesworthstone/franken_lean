@@ -415,6 +415,24 @@ impl Preparation<'_> {
             if a == ValueType::Abi || e == ValueType::Abi {
                 continue;
             }
+            if a == ValueType::Array || e == ValueType::Array {
+                if a != ValueType::Array || e != ValueType::Array {
+                    return Ok(false);
+                }
+                // The native carrier erases its element interface. Sharing
+                // that carrier cannot cast stored closures to another call
+                // signature, including closures inside nested Arrays. Keep
+                // the same element comparison the logical List layout used.
+                let (Some((_, actual_element)), Some((_, expected_element))) = (
+                    self.array_element_type(&actual)?,
+                    self.array_element_type(&expected)?,
+                ) else {
+                    return Ok(false);
+                };
+                reserve(&mut work, self.limits.max_nodes)?;
+                work.push((actual_element, expected_element));
+                continue;
+            }
             if a != ValueType::Constructor || e != ValueType::Constructor {
                 if !self.equal_runtime_classes(a, e)? {
                     return Ok(false);
