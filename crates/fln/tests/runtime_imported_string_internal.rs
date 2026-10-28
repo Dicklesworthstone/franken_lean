@@ -231,6 +231,17 @@ fn admitted_bootstrap_strings_execute_unicode_and_refuse_changed_opaque_contract
             ("String.Internal.pushn", "lean_string_pushn"),
             ("String.Internal.foldl", "lean_string_foldl"),
             ("String.Internal.isEmpty", "lean_string_isempty"),
+            ("String.Internal.front", "lean_string_front"),
+            ("String.Pos.Raw.Internal.min", "lean_string_pos_min"),
+            ("String.Pos.Raw.Internal.sub", "lean_string_pos_sub"),
+            ("Substring.Raw.Internal.toString", "lean_substring_tostring"),
+            ("Substring.Raw.Internal.drop", "lean_substring_drop"),
+            ("Substring.Raw.Internal.front", "lean_substring_front"),
+            ("Substring.Raw.Internal.extract", "lean_substring_extract"),
+            ("Substring.Raw.Internal.beq", "lean_substring_beq"),
+            ("Substring.Raw.Internal.isEmpty", "lean_substring_isempty"),
+            ("Substring.Raw.Internal.get", "lean_substring_get"),
+            ("Substring.Raw.Internal.prev", "lean_substring_prev"),
         ] {
             assert_eq!(externs.get(&name(declaration)), Some([fln_elab::externs::ExternEntry::Standard { backend: name("all"), symbol: symbol.to_owned() }].as_slice()), "the real artifact supplies execution metadata");
         }
@@ -266,6 +277,18 @@ import Init.Data.String.Bootstrap
 #eval let count := String.Internal.length; count "λ😀"
 #eval let consume (f : String -> String) : String := f "λ"; consume (String.Internal.append "pre")
 #eval let measure (f : String -> Nat) : Nat := f "é😀a"; measure String.Internal.length
+#eval (String.Internal.front "λ😀").toNat
+#eval (String.Pos.Raw.Internal.min (String.Pos.Raw.mk 8) (String.Pos.Raw.mk 3)).byteIdx
+#eval (String.Pos.Raw.Internal.sub (String.Pos.Raw.mk 3) (String.Pos.Raw.mk 8)).byteIdx
+#eval Substring.Raw.Internal.toString (Substring.Raw.mk "aλ😀z" (String.Pos.Raw.mk 1) (String.Pos.Raw.mk 7))
+#eval let ss := Substring.Raw.mk "aλ😀z" (String.Pos.Raw.mk 1) (String.Pos.Raw.mk 7); Substring.Raw.Internal.toString (Substring.Raw.Internal.drop ss 1)
+#eval (Substring.Raw.Internal.front (Substring.Raw.mk "aλ😀z" (String.Pos.Raw.mk 3) (String.Pos.Raw.mk 3))).toNat
+#eval let ss := Substring.Raw.mk "aλ😀z" (String.Pos.Raw.mk 1) (String.Pos.Raw.mk 7); Substring.Raw.Internal.toString (Substring.Raw.Internal.extract ss (String.Pos.Raw.mk 2) (String.Pos.Raw.mk 6))
+#eval let ss := Substring.Raw.mk "aλ😀z" (String.Pos.Raw.mk 1) (String.Pos.Raw.mk 7); if Substring.Raw.Internal.beq ss (Substring.Raw.mk "λ😀" (String.Pos.Raw.mk 0) (String.Pos.Raw.mk 6)) then 42 else 0
+#eval if Substring.Raw.Internal.isEmpty (Substring.Raw.mk "aλ😀z" (String.Pos.Raw.mk 7) (String.Pos.Raw.mk 1)) then 42 else 0
+#eval (Substring.Raw.Internal.get (Substring.Raw.mk "aλ😀z" (String.Pos.Raw.mk 1) (String.Pos.Raw.mk 3)) (String.Pos.Raw.mk 6)).toNat
+#eval (Substring.Raw.Internal.prev (Substring.Raw.mk "aλ😀z" (String.Pos.Raw.mk 1) (String.Pos.Raw.mk 7)) (String.Pos.Raw.mk 6)).byteIdx
+#eval let ss := Substring.Raw.mk "aλ😀z" (String.Pos.Raw.mk 1) (String.Pos.Raw.mk 7); let drop := Substring.Raw.Internal.drop ss; (drop 1).str
 "#;
         let entry = name("Main");
         let modules = [SourceModuleInput { name: &entry, source: source.as_bytes() }];
@@ -289,6 +312,18 @@ import Init.Data.String.Bootstrap
             Some(ClosedVmValue::Scalar(2)),
             Some(ClosedVmValue::String("preλ".to_owned())),
             Some(ClosedVmValue::Scalar(3)),
+            Some(ClosedVmValue::Scalar(955)),
+            Some(ClosedVmValue::Scalar(3)),
+            Some(ClosedVmValue::Scalar(0)),
+            Some(ClosedVmValue::String("λ😀".to_owned())),
+            Some(ClosedVmValue::String("😀".to_owned())),
+            Some(ClosedVmValue::Scalar(128_512)),
+            Some(ClosedVmValue::String("😀".to_owned())),
+            Some(ClosedVmValue::Scalar(42)),
+            Some(ClosedVmValue::Scalar(42)),
+            Some(ClosedVmValue::Scalar(122)),
+            Some(ClosedVmValue::Scalar(2)),
+            Some(ClosedVmValue::String("aλ😀z".to_owned())),
         ]);
         assert_eq!("é😀a".len(), 7, "the native length result counts codepoints, not bytes");
         // Replay the actual bytes emitted after both imported-module and
@@ -301,7 +336,7 @@ import Init.Data.String.Bootstrap
             assert_eq!(fln_comp::flbc::encode_canonical(&decoded, Default::default()).unwrap(), execution.flbc_artifact);
             for instruction in decoded.functions().iter().flat_map(|function| &function.code) {
                 if let fln_comp::flbc::Instruction::Intrinsic { row, .. } = instruction
-                    && row.starts_with("extern:String.")
+                    && (row.starts_with("extern:String.") || row.starts_with("extern:Substring."))
                 {
                     string_rows.insert(row.clone());
                 }
@@ -309,8 +344,11 @@ import Init.Data.String.Bootstrap
             let replay = fln::execute_flbc_artifact(&execution.flbc_artifact, &options, Default::default()).unwrap().into_complete().unwrap();
             assert_eq!(fln::closed_vm_value(&replay).unwrap(), fln::closed_vm_value(&execution.exit).unwrap());
         }
-        for operation in ["utf8ByteSize", "Internal.posOf", "Internal.offsetOfPos", "Internal.extract", "Internal.next", "Internal.pushn", "Internal.foldl", "Internal.isEmpty"] {
+        for operation in ["utf8ByteSize", "Internal.posOf", "Internal.offsetOfPos", "Internal.extract", "Internal.next", "Internal.pushn", "Internal.foldl", "Internal.isEmpty", "Internal.front", "Pos.Raw.Internal.min", "Pos.Raw.Internal.sub"] {
             assert!(string_rows.contains(&format!("extern:String.{operation}")), "the admitted source must select {operation}'s actual native row");
+        }
+        for operation in ["toString", "drop", "front", "extract", "beq", "isEmpty", "get", "prev"] {
+            assert!(string_rows.contains(&format!("extern:Substring.Raw.Internal.{operation}")), "the admitted source must select {operation}'s actual native row");
         }
         let mut tight = limits;
         tight.execution.ingress.max_nodes = 1;

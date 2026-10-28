@@ -1,4 +1,4 @@
-//! Convert checked Char and Pos.Raw records at the private native String ABI.
+//! Convert checked Char, Pos.Raw and Substring.Raw at the private String ABI.
 //!
 //! Strings retain their dedicated VM representation. Char remains the ordinary
 //! UInt32/BitVec/Fin constructor chain and Pos.Raw remains a one-field record;
@@ -16,7 +16,6 @@ use crate::source_intrinsics::string_bootstrap::{self, Domain, Operation};
 use fln_comp::fir::EffectClass;
 use fln_comp::flbc::{ArgumentOwnership, ResultOwnership};
 
-#[derive(Default)]
 pub(super) struct Store {
     next_adapter: u64,
     /// One slot per operation, on the heap like the verified-row table: the
@@ -25,10 +24,28 @@ pub(super) struct Store {
     primitives: Box<[Option<(IntrinsicBinding, Expr)>; Operation::ALL.len()]>,
     position: Option<(Name, Name)>,
     string_position: Option<(Name, Name)>,
+    substring: Option<(Name, Name)>,
     byte: Option<[Name; 3]>,
     byte_view: Option<Expr>,
     verified: string_bootstrap::VerifiedDependencies,
 }
+
+impl Default for Store {
+    fn default() -> Self {
+        Self {
+            next_adapter: 0,
+            primitives: Box::new(std::array::from_fn(|_| None)),
+            position: None,
+            string_position: None,
+            substring: None,
+            byte: None,
+            byte_view: None,
+            verified: string_bootstrap::VerifiedDependencies::default(),
+        }
+    }
+}
+
+const NATIVE_SUBSTRING: &str = "_fln_runtime_string_substring";
 
 fn c(label: &str) -> Expr {
     Expr::const_(name(label), Vec::new())
@@ -51,6 +68,7 @@ fn nat_list() -> Expr {
 fn native_type(domain: Domain) -> Expr {
     match domain {
         Domain::String => c("String"),
+        Domain::Substring => c(NATIVE_SUBSTRING),
         // The native traversal returns its scalars; the adapter rebuilds Chars.
         Domain::CharList => nat_list(),
         Domain::Bool => c("Bool"),
@@ -138,6 +156,76 @@ impl Preparation<'_> {
         let layout = (shape.projection(constructor), constructor.name.clone());
         self.string_bootstrap.position = Some(layout.clone());
         Ok(layout)
+    }
+
+    /// Keep the logical String and Pos.Raw fields intact outside the adapter.
+    /// The native VM consumes a private three-field record with Nat offsets;
+    /// its shape is never installed in the checked logical environment.
+    fn string_bootstrap_substring(&mut self) -> Result<(Name, Name), IngressError> {
+        if let Some(layout) = &self.string_bootstrap.substring {
+            return Ok(layout.clone());
+        }
+        let source = self.erase_runtime_type(&c("Substring.Raw"))?;
+        if self.value_type(&source)? != Some(ValueType::Constructor) {
+            return Err(unsupported(
+                "String bootstrap requires the checked Substring.Raw record",
+            ));
+        }
+        let shape = self
+            .record_shape(&source)?
+            .ok_or_else(|| unsupported("String bootstrap Substring.Raw layout"))?;
+        let [constructor] = shape.constructors.as_slice() else {
+            return Err(unsupported("String bootstrap Substring.Raw structure"));
+        };
+        if constructor.tag != 0
+            || constructor.fields != [c("String"), c("String.Pos.Raw"), c("String.Pos.Raw")]
+            || constructor.type_fields != [false, false, false]
+        {
+            return Err(unsupported("String bootstrap Substring.Raw fields"));
+        }
+        let layout = (shape.projection(constructor), constructor.name.clone());
+        self.string_bootstrap_position()?;
+        self.io_private_record(NATIVE_SUBSTRING, vec![c("String"), c("Nat"), c("Nat")])?;
+        self.string_bootstrap.substring = Some(layout.clone());
+        Ok(layout)
+    }
+
+    fn string_bootstrap_pack_substring(&mut self, value: Expr) -> Result<Expr, IngressError> {
+        let (projection, _) = self.string_bootstrap_substring()?;
+        let (position, _) = self.string_bootstrap_position()?;
+        let mut result = Expr::const_(Name::str(name(NATIVE_SUBSTRING), "mk"), Vec::new());
+        for index in 0..3 {
+            self.tick()?;
+            let mut field = Expr::proj(projection.clone(), index, value.clone());
+            if index > 0 {
+                field = Expr::proj(position.clone(), 0, field);
+            }
+            result = Expr::app(result, field);
+        }
+        Ok(result)
+    }
+
+    fn string_bootstrap_unpack_substring(&mut self, value: Expr) -> Result<Expr, IngressError> {
+        let (_, constructor) = self.string_bootstrap_substring()?;
+        let (_, position) = self.string_bootstrap_position()?;
+        let mut result = Expr::const_(constructor, Vec::new());
+        for index in 0..3 {
+            self.tick()?;
+            let mut field = Expr::proj(name(NATIVE_SUBSTRING), index, b(0)?);
+            if index > 0 {
+                field = Expr::app(Expr::const_(position.clone(), Vec::new()), field);
+            }
+            result = Expr::app(result, field);
+        }
+        // All three projections share the one evaluated native result. Moving
+        // `value` into each projection would execute drop/extract three times.
+        Ok(Expr::let_e(
+            self.string_bootstrap_adapter_name()?,
+            c(NATIVE_SUBSTRING),
+            value,
+            result,
+            false,
+        ))
     }
 
     /// `String.Pos s` is one checked `Pos.Raw` field and an erased validity
@@ -246,6 +334,9 @@ impl Preparation<'_> {
             .copied()
             .filter(|domain| *domain != Domain::Proof)
             .collect();
+        if runtime.contains(&Domain::Substring) || operation.result() == Domain::Substring {
+            self.string_bootstrap_substring()?;
+        }
         let (kind, module) = operation.declaration();
         if row.id != format!("extern:{}", operation.label())
             || row.kind != kind
@@ -272,14 +363,15 @@ impl Preparation<'_> {
             _ => return Err(unsupported("String bootstrap generated result ownership")),
         };
         // Only the native character may cross as an unboxed `value`; String,
-        // callback and Nat-valued operands are objects. Char and UInt8 results
-        // are the row's `value` scalar, every other result an owned object.
+        // callback and Nat-valued operands are objects. C character/byte reads
+        // return `value` scalars; Bootstrap's exported Lean helpers return
+        // owned objects, including their boxed character results.
         for (domain, disposition) in runtime.iter().zip(&argument_ownership) {
             if *disposition == ArgumentOwnership::Scalar && *domain != Domain::Char {
                 return Err(unsupported("String bootstrap scalar operand ownership"));
             }
         }
-        let scalar_result = matches!(operation.result(), Domain::Char | Domain::Byte);
+        let scalar_result = operation.scalar_result();
         if scalar_result != (result_ownership == ResultOwnership::Scalar) {
             return Err(unsupported("String bootstrap scalar result ownership"));
         }
@@ -289,6 +381,7 @@ impl Preparation<'_> {
             self.tick()?;
             arguments.push(match domain {
                 Domain::String => ValueType::String,
+                Domain::Substring => ValueType::Constructor,
                 Domain::Char | Domain::Position | Domain::Nat | Domain::StringPosition => {
                     ValueType::Nat
                 }
@@ -306,6 +399,7 @@ impl Preparation<'_> {
         }
         let result = match operation.result() {
             Domain::String => ValueType::String,
+            Domain::Substring => ValueType::Constructor,
             Domain::Nat
             | Domain::Position
             | Domain::StringPosition
@@ -643,6 +737,9 @@ impl Preparation<'_> {
                     argument = Expr::proj(self.string_bootstrap_string_position()?.0, 0, argument);
                     argument = Expr::proj(self.string_bootstrap_position()?.0, 0, argument);
                 }
+                Domain::Substring => {
+                    argument = self.string_bootstrap_pack_substring(argument)?;
+                }
                 Domain::StringCallback => {
                     // The native fold supplies scalar codepoints, while the
                     // source function keeps its checked Char parameter. This
@@ -692,6 +789,7 @@ impl Preparation<'_> {
             Domain::Char => self.native_character_from_scalar(body)?,
             Domain::Byte => self.string_bootstrap_byte_from_scalar(body)?,
             Domain::CharList => self.string_bootstrap_characters(body)?,
+            Domain::Substring => self.string_bootstrap_unpack_substring(body)?,
             _ => body,
         };
         let (binders, type_) = if operation.dependent() {

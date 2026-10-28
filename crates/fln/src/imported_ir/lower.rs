@@ -822,7 +822,7 @@ impl<'a> Builder<'a> {
                 ));
             }
         }
-        self.case_arm(block, x, value, &arms, default, (locals, joins))
+        self.case_arm(block, x, value, &arms, default, (locals, joins, scalar))
     }
 
     fn case_arm(
@@ -832,9 +832,9 @@ impl<'a> Builder<'a> {
         value: ValueId,
         arms: &[(&IrCtorInfo, &IrBody)],
         default: Option<&IrBody>,
-        scope: (Locals, Joins),
+        scope: (Locals, Joins, bool),
     ) -> Result<()> {
-        let (locals, joins) = scope;
+        let (locals, joins, scalar) = scope;
         let Some(((info, body), rest)) = arms.split_first() else {
             if let Some(body) = default {
                 let target = self.body(body, locals, joins)?;
@@ -845,7 +845,7 @@ impl<'a> Builder<'a> {
             return Ok(());
         };
         let constructor = self.constructor(info)?;
-        let condition = if info.size == 0 {
+        let condition = if info.size == 0 && scalar {
             let tag = self.nat(block, &IrNat::Small(info.cidx))?;
             let equal = self.native_call(
                 block,
@@ -890,7 +890,45 @@ impl<'a> Builder<'a> {
         );
         let nonzero = self.body(body, matching, joins.clone())?;
         let zero = self.block()?;
-        self.case_arm(zero, x, value, rest, default, (locals, joins))?;
+        if info.size == 0 && !scalar {
+            // Native data bridges can return a fieldless heap constructor,
+            // while Reference IR boxes the same nullary tag as a scalar.
+            // Both representations enter the same body without evaluating
+            // the receiver or its continuation a second time.
+            let tag = self.nat(zero, &IrNat::Small(info.cidx))?;
+            let equal = self.native_call(
+                zero,
+                &Name::from_components(["Nat", "beq"]),
+                vec![value, tag],
+            )?;
+            let scalar_condition = self.emit(
+                zero,
+                ValueType::Bool,
+                Operation::Unbox {
+                    value: equal,
+                    ty: ValueType::Bool,
+                },
+            )?;
+            let scalar_miss = self.block()?;
+            self.case_arm(
+                scalar_miss,
+                x,
+                value,
+                rest,
+                default,
+                (locals, joins, scalar),
+            )?;
+            self.finish_block(
+                zero,
+                Terminator::BranchZero {
+                    condition: scalar_condition,
+                    zero: scalar_miss,
+                    nonzero,
+                },
+            );
+        } else {
+            self.case_arm(zero, x, value, rest, default, (locals, joins, scalar))?;
+        }
         self.finish_block(
             block,
             Terminator::BranchZero {

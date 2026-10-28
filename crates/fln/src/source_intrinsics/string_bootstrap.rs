@@ -18,7 +18,7 @@
 use super::*;
 
 const DEPENDENCIES: &str = include_str!("string_bootstrap/dependencies.txt");
-const DEPENDENCY_COUNT: usize = 4089;
+const DEPENDENCY_COUNT: usize = 4101;
 
 /// Successful dependency checks shared only within one immutable Preparation.
 /// Membership and each selected root's extern still belong to its operation.
@@ -62,16 +62,29 @@ pub(crate) enum Operation {
     GetUtf8ByteAlias,
     InternalGetUtf8Byte,
     Data,
+    Front,
+    PosMin,
+    PosSub,
+    SubstringToString,
+    SubstringDrop,
+    SubstringFront,
+    SubstringExtract,
+    SubstringBeq,
+    SubstringIsEmpty,
+    SubstringGet,
+    SubstringPrev,
 }
 
 /// One bit per operation in the inventory's membership column.
-type Membership = u32;
+type Membership = u64;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Domain {
     String,
     Char,
     Position,
+    /// The checked `Substring.Raw` record: String and two raw positions.
+    Substring,
     Nat,
     Bool,
     StringCallback,
@@ -95,6 +108,7 @@ impl Domain {
             Self::String => c("String"),
             Self::Char => c("Char"),
             Self::Position => c("String.Pos.Raw"),
+            Self::Substring => c("Substring.Raw"),
             Self::Nat => c("Nat"),
             Self::Bool => c("Bool"),
             Self::Byte => c("UInt8"),
@@ -118,7 +132,7 @@ impl Domain {
 }
 
 impl Operation {
-    pub(crate) const ALL: [Self; 27] = [
+    pub(crate) const ALL: [Self; 38] = [
         Self::ByteSize,
         Self::PosOf,
         Self::OffsetOfPos,
@@ -146,6 +160,17 @@ impl Operation {
         Self::GetUtf8ByteAlias,
         Self::InternalGetUtf8Byte,
         Self::Data,
+        Self::Front,
+        Self::PosMin,
+        Self::PosSub,
+        Self::SubstringToString,
+        Self::SubstringDrop,
+        Self::SubstringFront,
+        Self::SubstringExtract,
+        Self::SubstringBeq,
+        Self::SubstringIsEmpty,
+        Self::SubstringGet,
+        Self::SubstringPrev,
     ];
 
     pub(crate) fn index(self) -> usize {
@@ -185,6 +210,17 @@ impl Operation {
             Self::GetUtf8ByteAlias => "String.getUtf8Byte",
             Self::InternalGetUtf8Byte => "String.Internal.getUTF8Byte",
             Self::Data => "String.data",
+            Self::Front => "String.Internal.front",
+            Self::PosMin => "String.Pos.Raw.Internal.min",
+            Self::PosSub => "String.Pos.Raw.Internal.sub",
+            Self::SubstringToString => "Substring.Raw.Internal.toString",
+            Self::SubstringDrop => "Substring.Raw.Internal.drop",
+            Self::SubstringFront => "Substring.Raw.Internal.front",
+            Self::SubstringExtract => "Substring.Raw.Internal.extract",
+            Self::SubstringBeq => "Substring.Raw.Internal.beq",
+            Self::SubstringIsEmpty => "Substring.Raw.Internal.isEmpty",
+            Self::SubstringGet => "Substring.Raw.Internal.get",
+            Self::SubstringPrev => "Substring.Raw.Internal.prev",
         }
     }
 
@@ -210,6 +246,17 @@ impl Operation {
             | Self::Foldl
             | Self::IsEmpty
             | Self::InternalGet
+            | Self::Front
+            | Self::PosMin
+            | Self::PosSub
+            | Self::SubstringToString
+            | Self::SubstringDrop
+            | Self::SubstringFront
+            | Self::SubstringExtract
+            | Self::SubstringBeq
+            | Self::SubstringIsEmpty
+            | Self::SubstringGet
+            | Self::SubstringPrev
             | Self::InternalGetUtf8Byte => ("opaque", "Init.Data.String.Bootstrap"),
             Self::RawGet
             | Self::DecodeChar
@@ -231,9 +278,11 @@ impl Operation {
     /// The checked telescope, in source order. Proofs are logical arguments
     /// that the native row does not receive.
     pub(crate) fn domains(self) -> &'static [Domain] {
-        use Domain::{Char, Nat, Position, Proof, String, StringCallback, StringPosition};
+        use Domain::{
+            Char, Nat, Position, Proof, String, StringCallback, StringPosition, Substring,
+        };
         match self {
-            Self::ByteSize | Self::IsEmpty | Self::ToList | Self::Data => &[String],
+            Self::ByteSize | Self::IsEmpty | Self::ToList | Self::Data | Self::Front => &[String],
             Self::PosOf => &[String, Char],
             Self::OffsetOfPos | Self::Next | Self::InternalGet | Self::RawGet | Self::Get => {
                 &[String, Position]
@@ -252,6 +301,12 @@ impl Operation {
             Self::PosNext => &[String, StringPosition, Proof],
             Self::PosSet => &[String, StringPosition, Char, Proof],
             Self::PosExtract => &[String, StringPosition, StringPosition],
+            Self::PosMin | Self::PosSub => &[Position, Position],
+            Self::SubstringToString | Self::SubstringFront | Self::SubstringIsEmpty => &[Substring],
+            Self::SubstringDrop => &[Substring, Nat],
+            Self::SubstringExtract => &[Substring, Position, Position],
+            Self::SubstringBeq => &[Substring, Substring],
+            Self::SubstringGet | Self::SubstringPrev => &[Substring, Position],
         }
     }
 
@@ -273,7 +328,13 @@ impl Operation {
     pub(crate) fn result(self) -> Domain {
         match self {
             Self::ByteSize | Self::OffsetOfPos => Domain::Nat,
-            Self::PosOf | Self::Next | Self::RawNextFast | Self::NextFast => Domain::Position,
+            Self::PosOf
+            | Self::Next
+            | Self::RawNextFast
+            | Self::NextFast
+            | Self::PosMin
+            | Self::PosSub
+            | Self::SubstringPrev => Domain::Position,
             Self::PosNext => Domain::StringPosition,
             Self::Extract
             | Self::Pushn
@@ -282,17 +343,32 @@ impl Operation {
             | Self::RawExtract
             | Self::PosSet
             | Self::PosExtract
-            | Self::Set => Domain::String,
-            Self::IsEmpty => Domain::Bool,
+            | Self::Set
+            | Self::SubstringToString => Domain::String,
+            Self::IsEmpty | Self::SubstringBeq | Self::SubstringIsEmpty => Domain::Bool,
             Self::InternalGet
             | Self::RawGet
             | Self::DecodeChar
             | Self::Get
             | Self::GetFast
-            | Self::RawGetFast => Domain::Char,
+            | Self::RawGetFast
+            | Self::Front
+            | Self::SubstringFront
+            | Self::SubstringGet => Domain::Char,
             Self::GetUtf8Byte | Self::GetUtf8ByteAlias | Self::InternalGetUtf8Byte => Domain::Byte,
             Self::ToList | Self::Data => Domain::CharList,
+            Self::SubstringDrop | Self::SubstringExtract => Domain::Substring,
         }
+    }
+
+    /// C character readers return an unboxed scalar. Bootstrap's exported
+    /// Lean helpers instead return an owned, boxed character payload.
+    pub(crate) fn scalar_result(self) -> bool {
+        matches!(self.result(), Domain::Char | Domain::Byte)
+            && !matches!(
+                self,
+                Self::Front | Self::SubstringFront | Self::SubstringGet
+            )
     }
 
     pub(crate) fn primitive(self) -> Name {
