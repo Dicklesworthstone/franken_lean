@@ -96,7 +96,7 @@ examples/native_option_decide.lean	accept	accept	match	agree	drop-in lean accept
 examples/native_parameterized_recursion.lean	accept	accept	match	agree	valid Lean since its inductive is named `Sequence`: `Seq` is an Init class at the Reference ("has already been declared"); FrankenLean's seed lacks it, so a file redefining it is still accepted there (franken_lean-z8j.1.8)
 examples/native_pattern_functions.lean	accept	accept	match	agree	
 examples/native_pattern_matching.lean	reject	reject	n/a	agree	Reference 37: failed to synthesize instance of type class | FrankenLean: command 13, native instance search could not resolve all instance arguments
-examples/native_pattern_matrices.lean	reject	reject	n/a	agree	fixed: both doors refuse at the Reference's first error, 28: Type mismatch: `second`'s named fields where the discriminant fixes the index to the literal 2 (the pin's pattern typing, franken_lean-z8j.1.6.3; FrankenLean reports the nested `.cons j y rest` against `Vec Nat k`, which the pin postpones behind the outer pattern)
+examples/native_pattern_matrices.lean	accept	accept	match	agree	agrees since `second` and `sumHeads` leave the length fields the index fixes as wildcards (both doors refused the named fields at 28:4, franken_lean-z8j.1.6)
 examples/native_proof_data.lean	accept	accept	match	agree	
 examples/native_proof_erasure.lean	accept	accept	match	agree	
 examples/native_proof_indices.lean	accept	accept	match	agree	

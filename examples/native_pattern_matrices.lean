@@ -25,11 +25,11 @@ inductive Vec (A : Type) : Nat -> Type where
   | cons (n : Nat) (head : A) (tail : Vec A n) : Vec A (Nat.succ n)
 
 def second (xs : Vec Nat 2) : Nat := match xs with
-  | .cons k x (.cons j y rest) => y
+  | .cons _ x (.cons _ y rest) => y
 
 def sumHeads (n : Nat) (xs ys : Vec Nat n) : Nat := match xs, ys with
   | .nil, .nil => 0
-  | .cons k x xt, .cons j y yt => x + y
+  | .cons _ x xt, .cons _ y yt => x + y
 
 theorem second_value : second (Vec.cons 1 7 (Vec.cons 0 9 Vec.nil)) = 9 := by rfl
 theorem heads_value : sumHeads 1 (Vec.cons 0 3 Vec.nil) (Vec.cons 0 7 Vec.nil) = 10 := by rfl
