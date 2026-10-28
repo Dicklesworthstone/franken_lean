@@ -62,6 +62,7 @@ jobs:
               'crates/fln-cli/src/goal_traces.rs',
               'crates/fln-cli/src/source_check/imports.rs',
               'crates/fln-cli/tests/source_check.rs',
+              'crates/fln-cli/src/source_check/imports/execution.rs',
               'crates/fln/src/source_records/simp.rs',
               'crates/fln-elab/src/source/tactics/rewrite/simplify/binders.rs',
               'crates/fln-elab/src/source.rs',
