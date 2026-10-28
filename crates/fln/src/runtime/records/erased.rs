@@ -3,6 +3,98 @@
 //! shared only after checking every nested layout; callable signatures are
 //! adapted by real closures, never by relabelling an existing closure.
 use super::*;
+use std::collections::HashMap;
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct Generation {
+    definitions: usize,
+    shapes: usize,
+    native: usize,
+    boxed: bool,
+}
+
+impl Generation {
+    fn current(preparation: &Preparation<'_>) -> Self {
+        Self {
+            definitions: preparation.canonical_definition_generation(),
+            shapes: preparation.data_shapes.len(),
+            native: preparation.value_types.native.len(),
+            boxed: preparation.value_types.boxed.is_some(),
+        }
+    }
+}
+
+type Key = (Expr, usize);
+
+struct Entry {
+    generation: Generation,
+    value: Expr,
+}
+
+/// One invocation's original lexical scopes and completed transformations. The borrowed
+/// caller is fixed at scope zero. Interning each original domain under its parent retains
+/// exact dependent contexts without copying that caller or confusing equal-depth siblings.
+#[derive(Default)]
+struct Memo {
+    scopes: HashMap<(usize, Expr), usize>,
+    entries: HashMap<Key, Entry>,
+}
+
+impl Memo {
+    fn scope(&mut self, parent: usize, domain: Expr, limit: usize) -> Result<usize, IngressError> {
+        let key = (parent, domain);
+        if let Some(scope) = self.scopes.get(&key) {
+            return Ok(*scope);
+        }
+        let observed = self.scopes.len().saturating_add(1);
+        if observed > limit {
+            return Err(IngressError::ResourceLimit {
+                resource: IngressResource::Nodes,
+                limit,
+                observed,
+            });
+        }
+        self.scopes
+            .try_reserve(1)
+            .map_err(|_| IngressError::AllocationFailure {
+                resource: IngressResource::Nodes,
+                requested: observed,
+            })?;
+        self.scopes.insert(key, observed);
+        Ok(observed)
+    }
+
+    fn remember(
+        &mut self,
+        preparation: &Preparation<'_>,
+        key: Key,
+        generation: Generation,
+        value: Expr,
+    ) -> Result<(), IngressError> {
+        // Layout discovery can register a new descriptive family during a projection.
+        // Only a complete answer derived without changing that authority is reusable.
+        if Generation::current(preparation) != generation {
+            return Ok(());
+        }
+        let additional = usize::from(!self.entries.contains_key(&key));
+        let observed = self.entries.len().saturating_add(additional);
+        if observed > preparation.limits.max_nodes {
+            return Err(IngressError::ResourceLimit {
+                resource: IngressResource::Nodes,
+                limit: preparation.limits.max_nodes,
+                observed,
+            });
+        }
+        self.entries
+            .try_reserve(additional)
+            .map_err(|_| IngressError::AllocationFailure {
+                resource: IngressResource::Nodes,
+                requested: observed,
+            })?;
+        self.entries.insert(key, Entry { generation, value });
+        Ok(())
+    }
+}
 
 impl Preparation<'_> {
     /// A minor's type binder denotes metadata, not its inert object slot.
@@ -68,9 +160,9 @@ impl Preparation<'_> {
     ) -> Result<Expr, IngressError> {
         enum Work {
             Visit(Expr),
-            Apply,
-            Domain(Name, Expr, Expr, BinderInfo, bool),
-            Body(Name, Expr, BinderInfo, bool),
+            Apply(Key, Generation),
+            Domain(Key, Generation),
+            Body(Key, Generation, Expr),
         }
         // Scalar indices are representation-irrelevant. Remove them before
         // traversing their children, just as ordinary layout discovery does;
@@ -91,87 +183,110 @@ impl Preparation<'_> {
             });
         }
         let mut locals = Vec::new();
+        let mut memo = Memo::default();
+        let mut scope = 0;
         while let Some(task) = work.pop() {
             self.tick()?;
             match task {
-                Work::Visit(source) => match source.node() {
-                    ExprNode::App { f, a } => {
-                        for task in [Work::Apply, Work::Visit(a.clone()), Work::Visit(f.clone())] {
-                            reserve(&mut work, self.limits.max_nodes)?;
-                            work.push(task);
+                Work::Visit(source) => {
+                    // A visit already meters this lookup. Leaves whose result is the input
+                    // need no row; completed applications, binders and projections do.
+                    let key = (source.clone(), scope);
+                    let generation = Generation::current(self);
+                    if let Some(entry) = memo.entries.get(&key)
+                        && entry.generation == generation
+                    {
+                        reserve(&mut values, self.limits.max_nodes)?;
+                        values.push(entry.value.clone());
+                        continue;
+                    }
+                    match source.node() {
+                        ExprNode::App { f, a } => {
+                            for task in [
+                                Work::Apply(key, generation),
+                                Work::Visit(a.clone()),
+                                Work::Visit(f.clone()),
+                            ] {
+                                reserve(&mut work, self.limits.max_nodes)?;
+                                work.push(task);
+                            }
                         }
-                    }
-                    ExprNode::ForallE {
-                        binder_name,
-                        binder_type,
-                        body,
-                        binder_info,
-                    }
-                    | ExprNode::Lam {
-                        binder_name,
-                        binder_type,
-                        body,
-                        binder_info,
-                    } => {
-                        reserve(&mut work, self.limits.max_nodes)?;
-                        work.push(Work::Domain(
-                            binder_name.clone(),
-                            binder_type.clone(),
-                            body.clone(),
-                            *binder_info,
-                            matches!(source.node(), ExprNode::Lam { .. }),
-                        ));
-                        reserve(&mut work, self.limits.max_nodes)?;
-                        work.push(Work::Visit(binder_type.clone()));
-                    }
-                    ExprNode::Proj {
-                        struct_name,
-                        idx,
-                        expr,
-                    } => {
-                        let mut receiver_type =
-                            self.projection_receiver_type_in(expr, context, &locals, 0)?;
-                        if receiver_type.is_none()
-                            && matches!(self.environment.find(struct_name),
+                        ExprNode::ForallE { binder_type, .. }
+                        | ExprNode::Lam { binder_type, .. } => {
+                            reserve(&mut work, self.limits.max_nodes)?;
+                            work.push(Work::Domain(key, generation));
+                            reserve(&mut work, self.limits.max_nodes)?;
+                            work.push(Work::Visit(binder_type.clone()));
+                        }
+                        ExprNode::Proj {
+                            struct_name,
+                            idx,
+                            expr,
+                        } => {
+                            let mut receiver_type =
+                                self.projection_receiver_type_in(expr, context, &locals, 0)?;
+                            if receiver_type.is_none()
+                                && matches!(self.environment.find(struct_name),
                                 Some(ConstantInfo::Induct(family))
                                 if family.num_params == 0 && family.base.level_params.is_empty())
-                        {
-                            // A checked primitive projection already identifies
-                            // this unparameterized family, even after catalog
-                            // extraction removes the surrounding local context.
-                            receiver_type = Some(Expr::const_(struct_name.clone(), vec![]));
+                            {
+                                // A checked primitive projection already identifies
+                                // this unparameterized family, even after catalog
+                                // extraction removes the surrounding local context.
+                                receiver_type = Some(Expr::const_(struct_name.clone(), vec![]));
+                            }
+                            let mut result = source.clone();
+                            if let Some(receiver_type) = receiver_type
+                                && let Some(original) = self.original_projection_type(
+                                    &receiver_type,
+                                    struct_name,
+                                    *idx,
+                                    expr,
+                                )?
+                                && matches!(
+                                    self.type_head(&original)?.node(),
+                                    ExprNode::Sort { .. }
+                                )
+                                && let Some((shape, _)) =
+                                    self.projection_slot(&receiver_type, struct_name, *idx)?
+                                && usize::try_from(*idx).ok().is_some_and(|index| {
+                                    shape.constructors[0].type_fields.get(index) == Some(&true)
+                                })
+                            {
+                                result = self.enable_boxed_type()?;
+                            }
+                            reserve(&mut values, self.limits.max_nodes)?;
+                            memo.remember(self, key, generation, result.clone())?;
+                            values.push(result);
                         }
-                        let mut result = source.clone();
-                        if let Some(receiver_type) = receiver_type
-                            && let Some(original) = self.original_projection_type(
-                                &receiver_type,
-                                struct_name,
-                                *idx,
-                                expr,
-                            )?
-                            && matches!(self.type_head(&original)?.node(), ExprNode::Sort { .. })
-                            && let Some((shape, _)) =
-                                self.projection_slot(&receiver_type, struct_name, *idx)?
-                            && usize::try_from(*idx).ok().is_some_and(|index| {
-                                shape.constructors[0].type_fields.get(index) == Some(&true)
-                            })
-                        {
-                            result = self.enable_boxed_type()?;
+                        _ => {
+                            reserve(&mut values, self.limits.max_nodes)?;
+                            values.push(source);
                         }
-                        reserve(&mut values, self.limits.max_nodes)?;
-                        values.push(result);
                     }
-                    _ => {
-                        reserve(&mut values, self.limits.max_nodes)?;
-                        values.push(source);
-                    }
-                },
-                Work::Apply => {
+                }
+                Work::Apply(key, generation) => {
                     let argument = pop(&mut values)?;
                     let function = pop(&mut values)?;
-                    values.push(Expr::app(function, argument));
+                    let result = Expr::app(function, argument);
+                    memo.remember(self, key, generation, result.clone())?;
+                    values.push(result);
                 }
-                Work::Domain(name, original, body, info, lambda) => {
+                Work::Domain(key, generation) => {
+                    let (ExprNode::ForallE {
+                        binder_type: original,
+                        body,
+                        ..
+                    }
+                    | ExprNode::Lam {
+                        binder_type: original,
+                        body,
+                        ..
+                    }) = key.0.node()
+                    else {
+                        return Err(unsupported("hidden type domain stack"));
+                    };
+                    let body = body.clone();
                     let domain = pop(&mut values)?;
                     let observed = context.len().saturating_add(locals.len()).saturating_add(1);
                     if observed > self.limits.max_context_depth {
@@ -187,24 +302,36 @@ impl Preparation<'_> {
                             resource: IngressResource::ProgramTables,
                             requested: observed,
                         })?;
-                    locals.push(original);
+                    scope = memo.scope(scope, original.clone(), self.limits.max_nodes)?;
+                    locals.push(original.clone());
                     reserve(&mut work, self.limits.max_nodes)?;
-                    work.push(Work::Body(name, domain, info, lambda));
+                    work.push(Work::Body(key, generation, domain));
                     reserve(&mut work, self.limits.max_nodes)?;
                     work.push(Work::Visit(body));
                 }
-                Work::Body(name, domain, info, lambda) => {
+                Work::Body(key, generation, domain) => {
                     locals.pop();
+                    scope = key.1;
                     let body = pop(&mut values)?;
-                    values.push(if lambda {
-                        Expr::lam(name, domain, body, info)
-                    } else {
-                        Expr::forall_e(name, domain, body, info)
-                    });
+                    let result = match key.0.node() {
+                        ExprNode::Lam {
+                            binder_name,
+                            binder_info,
+                            ..
+                        } => Expr::lam(binder_name.clone(), domain, body, *binder_info),
+                        ExprNode::ForallE {
+                            binder_name,
+                            binder_info,
+                            ..
+                        } => Expr::forall_e(binder_name.clone(), domain, body, *binder_info),
+                        _ => return Err(unsupported("hidden type body stack")),
+                    };
+                    memo.remember(self, key, generation, result.clone())?;
+                    values.push(result);
                 }
             }
         }
-        if values.len() != 1 || !locals.is_empty() {
+        if values.len() != 1 || !locals.is_empty() || scope != 0 {
             return Err(unsupported("hidden type representation stack"));
         }
         pop(&mut values)

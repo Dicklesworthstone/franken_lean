@@ -254,3 +254,102 @@ fn borrowed_context_work_is_still_metered_and_failed_erasure_can_retry() {
     assert_eq!(retry.visited, required);
     assert_eq!(engine.logical_root(&KVMap::new()), root);
 }
+
+fn shared_product_type(mut leaf: Expr, depth: usize) -> Expr {
+    let product = Expr::const_(name("PProd"), vec![Level::one(), Level::one()]);
+    for _ in 0..depth {
+        leaf = Expr::app(Expr::app(product.clone(), leaf.clone()), leaf);
+    }
+    leaf
+}
+
+#[test]
+fn hidden_type_erasure_preserves_shared_closed_and_open_type_dags() {
+    let engine = engine();
+    let root = engine.logical_root(&KVMap::new());
+    let limits = IngressLimits {
+        max_nodes: 8192,
+        ..IngressLimits::default()
+    };
+    let package = Expr::app(c("BorrowedPackage"), c("Nat"));
+    for (source, expected) in [
+        (
+            shared_product_type(c("Nat"), 12),
+            shared_product_type(c("Nat"), 12),
+        ),
+        (
+            pi("p", package.clone(), shared_product_type(carrier(b(0)), 12)),
+            pi("p", package, shared_product_type(boxed_slot_type(), 12)),
+        ),
+    ] {
+        // There are over 24,000 traversal work items when sharing is expanded into
+        // occurrences. Completed analysis of this small DAG must fit a smaller quota.
+        let mut measured = Preparation::new(&engine.environment, limits);
+        let output = measured.erase_hidden_types(&source, &[]).unwrap();
+        assert_eq!(output, expected);
+        let required = measured.visited;
+        assert!(required < limits.max_nodes);
+        if let ExprNode::App { f, a: right } = output.node() {
+            let ExprNode::App { a: left, .. } = f.node() else {
+                panic!("product arguments");
+            };
+            assert_eq!(left.allocation_identity(), right.allocation_identity());
+        }
+        for max_nodes in [0, required - 1] {
+            let mut stopped = Preparation::new(
+                &engine.environment,
+                IngressLimits {
+                    max_nodes,
+                    ..limits
+                },
+            );
+            nodes_error(stopped.erase_hidden_types(&source, &[]), max_nodes);
+        }
+        let mut retry = Preparation::new(
+            &engine.environment,
+            IngressLimits {
+                max_nodes: required,
+                ..limits
+            },
+        );
+        assert_eq!(retry.erase_hidden_types(&source, &[]).unwrap(), expected);
+        assert_eq!(retry.visited, required);
+    }
+    assert_eq!(engine.logical_root(&KVMap::new()), root);
+}
+
+#[test]
+fn shared_hidden_projection_keeps_distinct_same_depth_binder_domains() {
+    let engine = engine();
+    let projection = carrier(b(0));
+    let concrete = pi(
+        "p",
+        Expr::app(c("BorrowedPackage"), c("Nat")),
+        projection.clone(),
+    );
+    let generic = pi("p", Expr::app(c("BorrowedPackage"), b(0)), projection);
+    let concrete_result = pi(
+        "p",
+        Expr::app(c("BorrowedPackage"), c("Nat")),
+        boxed_slot_type(),
+    );
+    let product = Expr::const_(name("PProd"), vec![Level::one(), Level::one()]);
+    let context = [Expr::sort(Level::one())];
+    for reverse in [false, true] {
+        let (left, right, expected_left, expected_right) = if reverse {
+            (&generic, &concrete, &generic, &concrete_result)
+        } else {
+            (&concrete, &generic, &concrete_result, &generic)
+        };
+        let source = Expr::app(Expr::app(product.clone(), left.clone()), right.clone());
+        let expected = Expr::app(
+            Expr::app(product.clone(), expected_left.clone()),
+            expected_right.clone(),
+        );
+        let mut preparation = Preparation::new(&engine.environment, IngressLimits::default());
+        assert_eq!(
+            preparation.erase_hidden_types(&source, &context).unwrap(),
+            expected
+        );
+    }
+}
