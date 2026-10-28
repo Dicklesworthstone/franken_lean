@@ -1053,3 +1053,167 @@ fn pinned_compiler_join_and_projection_ir_matches_reference_results() {
         Some(crate::ClosedVmValue::String("retained λ 🦀".to_owned()))
     );
 }
+
+fn native_list_sum() -> IrDecl {
+    use fln_olean::ir::{IrAlt, IrCtorInfo};
+
+    let nil = IrCtorInfo {
+        name: name("List.nil"),
+        cidx: 0,
+        size: 0,
+        usize: 0,
+        ssize: 0,
+    };
+    let cons = IrCtorInfo {
+        name: name("List.cons"),
+        cidx: 1,
+        size: 2,
+        usize: 0,
+        ssize: 0,
+    };
+    body_function(
+        "NativeLists.sum",
+        1,
+        ir_body(
+            vec![],
+            IrTerminal::Case {
+                type_name: name("List"),
+                x: 1,
+                x_type: IrType::TObject,
+                alts: vec![
+                    IrAlt::Ctor {
+                        info: nil,
+                        body: ir_body(vec![number(2, 0)], IrTerminal::Ret(IrArg::Var(2))),
+                    },
+                    IrAlt::Ctor {
+                        info: cons,
+                        body: ir_body(
+                            vec![
+                                binding(3, IrExpr::Proj { i: 0, x: 1 }),
+                                binding(4, IrExpr::Proj { i: 1, x: 1 }),
+                                call(5, "NativeLists.sum", &[4]),
+                                call(6, "Nat.add", &[3, 5]),
+                            ],
+                            IrTerminal::Ret(IrArg::Var(6)),
+                        ),
+                    },
+                ],
+            },
+        ),
+    )
+}
+
+fn native_array_extern(text: &str, arity: u64) -> IrDecl {
+    IrDecl::Extern {
+        name: name(text),
+        params: (1..=arity)
+            .map(|x| IrParam {
+                x,
+                borrow: text == "Array.emptyWithCapacity",
+                ty: IrType::TObject,
+            })
+            .collect(),
+        result: IrType::TObject,
+        entries: Vec::new(),
+    }
+}
+
+#[test]
+fn native_arrays_feed_imported_list_recursion_and_preserve_shared_inputs() {
+    let entry = body_function(
+        "NativeLists.roundTrip",
+        0,
+        ir_body(
+            vec![
+                number(1, 0),
+                call(2, "Array.emptyWithCapacity", &[1]),
+                number(3, 19),
+                call(4, "Array.push", &[2, 3]),
+                number(5, 23),
+                call(6, "Array.push", &[4, 5]),
+                call(7, "Array.toList", &[6]),
+                call(8, "NativeLists.sum", &[7]),
+                call(9, "NativeLists.sum", &[7]),
+                call(10, "Nat.add", &[8, 9]),
+                call(11, "Array.toList", &[2]),
+                call(12, "NativeLists.sum", &[11]),
+                call(13, "Array.toList", &[4]),
+                call(14, "NativeLists.sum", &[13]),
+                call(15, "Nat.add", &[10, 12]),
+                call(16, "Nat.add", &[15, 14]),
+            ],
+            IrTerminal::Ret(IrArg::Var(16)),
+        ),
+    );
+    // These are erased executable arities, checked against the generated ABI
+    // contracts; the source telescope also contains a static element type.
+    let modules = [module(vec![
+        native_list_sum(),
+        entry,
+        native_array_extern("Array.emptyWithCapacity", 1),
+        native_array_extern("Array.push", 2),
+        native_array_extern("Array.toList", 1),
+    ])];
+    let compiled = compile(
+        &modules,
+        &name("NativeLists.roundTrip"),
+        &[],
+        &bounded_partition(&[]),
+        &BTreeSet::from([name("NativeLists.sum"), name("NativeLists.roundTrip")]),
+        IrExecutionLimits::default(),
+    )
+    .unwrap();
+    // Two reads of [19, 23], then the original empty and one-element arrays.
+    assert_eq!(returned(&compiled), "103");
+    assert!(
+        compiled
+            .native_externs()
+            .iter()
+            .any(|row| row == "extern:Array.toList")
+    );
+    let bytes = flbc::encode_canonical(compiled.program.program(), flbc::CodecLimits::default())
+        .expect("encode the native Array/List bridge");
+    let replay = flbc::decode_canonical(&bytes, flbc::CodecLimits::default())
+        .expect("decode the native Array/List bridge");
+    let outcome = fln_vm::interpreter::execute(&replay, ExecutionLimits::default(), None);
+    let Outcome::Complete(VmExit::Returned(value)) = outcome else {
+        panic!("Array/List replay did not return: {outcome:?}");
+    };
+    assert_eq!(
+        crate::nat_decimal(&value.value).expect("Nat replay result"),
+        "103"
+    );
+}
+
+#[test]
+fn imported_list_recursion_still_accepts_scalar_nil() {
+    let entry = function(
+        "NativeLists.scalarNil",
+        0,
+        vec![
+            binding(
+                1,
+                IrExpr::Ctor {
+                    info: fln_olean::ir::IrCtorInfo {
+                        name: name("List.nil"),
+                        cidx: 0,
+                        size: 0,
+                        usize: 0,
+                        ssize: 0,
+                    },
+                    args: vec![],
+                },
+            ),
+            call(2, "NativeLists.sum", &[1]),
+        ],
+        IrArg::Var(2),
+    );
+    let compiled = compile_users(
+        vec![native_list_sum(), entry],
+        "NativeLists.scalarNil",
+        &[],
+        IrExecutionLimits::default(),
+    )
+    .unwrap();
+    assert_eq!(returned(&compiled), "0");
+}
