@@ -78,14 +78,25 @@ impl Context {
     /// rewritten goal: `Eq.refl` and `HEq.refl` at reducible transparency, and `Iff.refl` for
     /// an `↔` goal where the environment declares it (`@[refl]` and `exact Iff.rfl`,
     /// Init/Core.lean:1035,1042; `Lean.MVarId.applyRfl`, Lean/Meta/Tactic/Rfl.lean:67).
+    ///
+    /// That `rfl` is the whole macro chain: `exact Iff.rfl` and `eq_refl` compare the sides
+    /// under the elaborator's configuration, then `apply_rfl` under `approxDefEq`, with
+    /// quasi-patterns (`Lean/Meta/Tactic/Rfl.lean:86`). Both comparisons here are transactional,
+    /// so a goal holding a hole is retried with quasi-patterns when the first answer is no.
     pub(super) fn rewrite_reflexivity(
         &mut self,
         goal: &ProofGoal,
     ) -> Result<bool, NatDefinitionElabError> {
-        let value = match self.rewrite_iff_reflexivity(goal)? {
-            Some(value) => Some(value),
-            None => self.automatic_reflexivity_candidate(goal, true)?,
-        };
+        let mut value = self.rewrite_reflexivity_candidate(goal)?;
+        if value.is_none()
+            && !self.txn.quasi_pattern_approx
+            && self.instantiate(&goal.target)?.has_expr_mvar()
+        {
+            self.txn.quasi_pattern_approx = true;
+            let approximate = self.rewrite_reflexivity_candidate(goal);
+            self.txn.quasi_pattern_approx = false;
+            value = approximate?;
+        }
         let Some(value) = value else {
             return Ok(false);
         };
@@ -105,6 +116,16 @@ impl Context {
                 )))
             })?;
         Ok(true)
+    }
+
+    fn rewrite_reflexivity_candidate(
+        &mut self,
+        goal: &ProofGoal,
+    ) -> Result<Option<Expr>, NatDefinitionElabError> {
+        match self.rewrite_iff_reflexivity(goal)? {
+            Some(value) => Ok(Some(value)),
+            None => self.automatic_reflexivity_candidate(goal, true),
+        }
     }
 
     /// `Iff.refl a` for a goal `a ↔ b` whose sides agree at reducible transparency, the

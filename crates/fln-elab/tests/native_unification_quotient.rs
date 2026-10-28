@@ -606,8 +606,11 @@ fn quotient_computation_does_not_unfold_closed_local_lets() {
 #[test]
 fn quotient_branches_feed_ordinary_higher_order_pattern_inference() {
     let mut txn = transaction();
-    let x = local(&mut txn, "x", constant("Nat"));
+    // `?f` is declared before `x`, so `?f x` is a Miller pattern. A local already in `?f`'s own
+    // context would be no pattern variable without `quasiPatternApprox` (vendored
+    // `Lean/Meta/ExprDefEq.lean:1317`), which term elaboration leaves off.
     let f = goal(&mut txn, "f", pi("n", constant("Nat"), constant("Nat")));
+    let x = local(&mut txn, "x", constant("Nat"));
     let function = Expr::mvar(f.clone());
     let compatibility = pi(
         "a",

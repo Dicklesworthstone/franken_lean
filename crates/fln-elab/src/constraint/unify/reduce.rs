@@ -654,6 +654,41 @@ impl Engine<'_> {
         }))
     }
 
+    /// The pin's `unfoldDefinition?` (vendored `Lean/Meta/WHNF.lean`) at this batch's
+    /// transparency: `expr` with its head definition unfolded once and its arguments kept,
+    /// or `None` when that head is no definition this transparency opens.
+    pub(super) fn unfold_definition_step(
+        &mut self,
+        expr: &Expr,
+        locals: &LocalContext,
+    ) -> Result<Option<Expr>, UnificationError> {
+        let Some(candidate) = self.delta_candidate(expr)? else {
+            return Ok(None);
+        };
+        let permitted = match self.budget.transparency {
+            UnificationTransparency::None => false,
+            UnificationTransparency::Abbreviations => crate::reducibility::table(&self.work.env)
+                .map_err(UnificationError::Reducibility)?
+                .get(&candidate.name)
+                .map_or(candidate.hints == ReducibilityHints::Abbrev, |status| {
+                    status == crate::reducibility::Reducibility::Reducible
+                }),
+            UnificationTransparency::Instances => crate::reducibility::table(&self.work.env)
+                .map_err(UnificationError::Reducibility)?
+                .get(&candidate.name)
+                .map_or(
+                    candidate.hints == ReducibilityHints::Abbrev,
+                    crate::reducibility::Reducibility::unfolds_at_instances,
+                ),
+            // `delta_candidate` has already refused an irreducible definition.
+            UnificationTransparency::Default | UnificationTransparency::SafeDefinitions => true,
+        };
+        if !permitted {
+            return Ok(None);
+        }
+        self.unfold_delta(candidate, locals).map(Some)
+    }
+
     fn unfold_delta(
         &mut self,
         candidate: DeltaCandidate,

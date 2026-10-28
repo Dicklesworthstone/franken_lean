@@ -474,7 +474,12 @@ impl Context {
             else {
                 return Err(eliminator("insufficient number of arguments"));
             };
-            self.constrain_type(binder_type, expected_domain)?;
+            // Under `fullApproxDefEq` at the pin (vendored `Lean/Elab/App.lean:1215`), so with
+            // quasi-patterns.
+            let saved = std::mem::replace(&mut self.txn.quasi_pattern_approx, true);
+            let domain = self.constrain_type(binder_type, expected_domain);
+            self.txn.quasi_pattern_approx = saved;
+            domain?;
             let id = FVarId(self.fresh_name()?);
             self.txn.lctx.add_param(
                 id.clone(),

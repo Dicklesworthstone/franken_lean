@@ -76,9 +76,18 @@ impl Engine<'_> {
             applied = Expr::app(applied, argument);
         }
         self.scan(&applied)?;
-        if !self.work.mvars.is_assigned(&obligation.mvar)
-            && !self.pattern(&applied, &obligation.val, &locals, &mut staged)?
-        {
+        // The requested output is `fun fvars => val` (the pin's `mkLambdaFVars`), an
+        // abstraction rather than a `processAssignment`: whether `quasiPatternApprox` is set
+        // does not decide which locals it abstracts.
+        let assigned = if self.work.mvars.is_assigned(&obligation.mvar) {
+            true
+        } else {
+            let saved = std::mem::replace(&mut self.work.quasi_pattern_approx, true);
+            let assigned = self.pattern(&applied, &obligation.val, &locals, &mut staged);
+            self.work.quasi_pattern_approx = saved;
+            assigned?
+        };
+        if !assigned {
             return Err(UnificationError::Deferred(
                 UnificationDeferred::UnresolvedDelayedAssignment(obligation.id),
             ));

@@ -543,3 +543,139 @@ fn constructor_spelling_cannot_authorize_a_head_in_the_opaque_nat_bootstrap() {
     ));
     unchanged(&txn, &before);
 }
+
+/// `σ : Type` and a two-parameter type family `C`, then a hole `?m : Type → Type` declared
+/// after both, so `σ` is in the hole's own context (bead
+/// fln-first-order-approximation-context-locals-6esd).
+fn captured_state_family() -> (ElabTxn, MVarId, Expr, Expr) {
+    let mut txn = transaction();
+    let type_ = Expr::sort(Level::one());
+    let family = local(
+        &mut txn,
+        "C",
+        pi(type_.clone(), pi(type_.clone(), type_.clone())),
+    );
+    let state = local(&mut txn, "sigma", type_.clone());
+    let m = hole(&mut txn, "m", pi(type_.clone(), type_));
+    (txn, m, family, state)
+}
+
+#[test]
+fn a_local_of_the_holes_own_context_is_approximated_first_order() {
+    // The pin's `processAssignment` (vendored Lean/Meta/ExprDefEq.lean:1317) under the
+    // elaborator's configuration: `?m σ =?= C σ σ` gives `?m := C σ`, not `fun x => C x x`.
+    for reverse in [false, true] {
+        let (mut txn, m, family, state) = captured_state_family();
+        let flexible = Expr::app(Expr::mvar(m.clone()), state.clone());
+        let rigid = app(family.clone(), &[state.clone(), state.clone()]);
+        let (left, right) = if reverse {
+            (rigid, flexible)
+        } else {
+            (flexible, rigid)
+        };
+        txn.unify(&left, &right, budget()).unwrap();
+        assert_eq!(
+            txn.mvars.get_assigned_expr(&m),
+            Some(&Expr::app(family, state))
+        );
+    }
+}
+
+#[test]
+fn quasi_pattern_approximation_abstracts_a_captured_local() {
+    // `approxDefEq` (vendored Lean/Meta/Basic.lean:2076) sets `quasiPatternApprox`: the same
+    // equation is then a quasi-pattern and abstracts every occurrence of `σ`.
+    let (mut txn, m, family, state) = captured_state_family();
+    txn.quasi_pattern_approx = true;
+    txn.unify(
+        &Expr::app(Expr::mvar(m.clone()), state.clone()),
+        &app(family.clone(), &[state.clone(), state]),
+        budget(),
+    )
+    .unwrap();
+    let value = txn.mvars.get_assigned_expr(&m).unwrap().clone();
+    assert!(matches!(value.node(), ExprNode::Lam { .. }), "{value:?}");
+    let other = local(&mut txn, "tau", Expr::sort(Level::one()));
+    txn.unify(
+        &Expr::app(value, other.clone()),
+        &app(family, &[other.clone(), other]),
+        budget(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_local_created_after_the_hole_stays_a_pattern_variable() {
+    let mut txn = transaction();
+    let type_ = Expr::sort(Level::one());
+    let family = local(
+        &mut txn,
+        "C",
+        pi(type_.clone(), pi(type_.clone(), type_.clone())),
+    );
+    let m = hole(&mut txn, "m", pi(type_.clone(), type_.clone()));
+    let state = local(&mut txn, "sigma", type_);
+    txn.unify(
+        &Expr::app(Expr::mvar(m.clone()), state.clone()),
+        &app(family, &[state.clone(), state]),
+        budget(),
+    )
+    .unwrap();
+    assert!(matches!(
+        txn.mvars.get_assigned_expr(&m).unwrap().node(),
+        ExprNode::Lam { .. }
+    ));
+}
+
+#[test]
+fn a_failed_first_order_approximation_assigns_nothing() {
+    // `?m σ =?= C σ τ`: first-order unification would need `σ =?= τ`, and abstracting `σ`
+    // is a quasi-pattern solution term elaboration does not take. The pin's elaborator
+    // refuses (`app (α := σ) ((s, 0) : σ × Nat)`); so does this one, without mutation.
+    let mut txn = transaction();
+    let type_ = Expr::sort(Level::one());
+    let family = local(
+        &mut txn,
+        "C",
+        pi(type_.clone(), pi(type_.clone(), type_.clone())),
+    );
+    let state = local(&mut txn, "sigma", type_.clone());
+    let other = local(&mut txn, "tau", type_.clone());
+    let m = hole(&mut txn, "m", pi(type_.clone(), type_));
+    let equation = (
+        Expr::app(Expr::mvar(m.clone()), state.clone()),
+        app(family.clone(), &[state.clone(), other.clone()]),
+    );
+    let before = txn.clone();
+    assert!(matches!(
+        txn.unify(&equation.0, &equation.1, budget()),
+        Err(UnificationError::Deferred(_))
+    ));
+    unchanged(&txn, &before);
+    assert!(txn.budget.heartbeats_consumed > before.budget.heartbeats_consumed);
+    // The same equation is a quasi-pattern under `approxDefEq`.
+    txn.quasi_pattern_approx = true;
+    txn.unify(&equation.0, &equation.1, budget()).unwrap();
+    let value = txn.mvars.get_assigned_expr(&m).unwrap().clone();
+    assert!(matches!(value.node(), ExprNode::Lam { .. }), "{value:?}");
+}
+
+#[test]
+fn first_order_approximation_unifies_its_arguments() {
+    // `?m σ =?= C σ ?b`: `processAssignmentFOApproxAux` unifies `σ =?= ?b` (assigning `?b`)
+    // and then `?m =?= C σ`. Head recovery's conversion-only suffix check would not assign
+    // `?b`; this approximation is the pin's, which does.
+    let (mut txn, m, family, state) = captured_state_family();
+    let b = hole(&mut txn, "b", Expr::sort(Level::one()));
+    txn.unify(
+        &Expr::app(Expr::mvar(m.clone()), state.clone()),
+        &app(family.clone(), &[state.clone(), Expr::mvar(b.clone())]),
+        budget(),
+    )
+    .unwrap();
+    assert_eq!(
+        txn.mvars.get_assigned_expr(&m),
+        Some(&Expr::app(family, state.clone()))
+    );
+    assert_eq!(txn.mvars.get_assigned_expr(&b), Some(&state));
+}

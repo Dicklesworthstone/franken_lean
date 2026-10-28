@@ -291,6 +291,71 @@ def genericLift {σ δ : Type u} {m : Type u -> Type v} [Monad m] : StateT δ (S
         .unwrap();
 }
 
+/// Term elaboration runs without `quasiPatternApprox` (vendored `Lean/Elab/Config.lean`'s
+/// `setElabConfig`); `apply` runs with it (`Lean/Meta/Tactic/Apply.lean:162`), and `rfl` takes
+/// it only after `eq_refl` fails (`Init/Tactics.lean:427-430`, `Lean/Meta/Tactic/Rfl.lean:86`).
+/// So a hole applied to a local of its own context is solved first-order in a term and by
+/// `rfl` when it can be, and as a quasi-pattern under `apply` or `rfl`'s fallback; a term that
+/// only the quasi-pattern solution would type is refused, by the pin and here (bead
+/// fln-first-order-approximation-context-locals-6esd).
+#[test]
+fn only_apply_and_rfl_take_a_quasi_pattern_solution_for_a_captured_local() {
+    let Some(lib) = pin() else {
+        return;
+    };
+    std::thread::Builder::new()
+        .stack_size(STACK)
+        .spawn(move || {
+            let base = imported_state(&lib);
+            let source = r#"
+def lifted {σ δ : Type} : StateT δ (StateT σ Id) σ := do
+  let s : σ ← monadLift (get : StateT σ Id σ)
+  pure s
+theorem keep {F : Type → Prop} {α : Type} (h : F α) : F α := h
+theorem viaApply (σ : Type) : (σ × Nat) = (σ × Nat) := by
+  apply keep (α := σ)
+  exact rfl
+theorem viaRfl (σ : Type) : Exists fun F : Type → Type => F σ = (σ × Nat) := by
+  apply Exists.intro
+  rfl
+def pair (σ : Type) : PSigma fun F : Type → Type => F σ = (σ × σ) := by
+  apply PSigma.mk
+  rfl
+theorem firstOrder (σ τ : Type) : (pair σ).1 τ = (σ × τ) := rfl
+"#;
+            reference(
+                &lib,
+                &format!("prelude\nimport Init.Control.State\n{source}"),
+                true,
+            );
+            checked(&base, source);
+            let keep = "theorem keep {F : Type → Prop} {α : Type} (h : F α) : F α := h\n";
+            let pair = "def pair (σ : Type) : PSigma fun F : Type → Type => F σ = (σ × σ) := by\n  apply PSigma.mk\n  rfl\n";
+            for bad in [
+                "theorem viaExactRfl (σ : Type) : Exists fun F : Type → Type => F σ = (σ × Nat) := by\n  apply Exists.intro\n  exact rfl".to_string(),
+                format!("{pair}theorem abstracted (σ τ : Type) : (pair σ).1 τ = (τ × τ) := rfl"),
+                "def app {F : Type → Type} {α : Type} (x : F α) : F α := x\ndef t {σ : Type} (s : σ) : σ × Nat := app (α := σ) ((s, 0) : σ × Nat)".to_string(),
+                format!("{keep}theorem viaTerm (σ : Type) : (σ × Nat) = (σ × Nat) := keep (α := σ) rfl"),
+                format!("{keep}theorem viaRefine (σ : Type) : (σ × Nat) = (σ × Nat) := by\n  refine keep (α := σ) ?_\n  exact rfl"),
+            ] {
+                reference(
+                    &lib,
+                    &format!("prelude\nimport Init.Control.State\n{bad}"),
+                    false,
+                );
+                let root = base.logical_root(&KVMap::new());
+                let error = base
+                    .check_source_files(&[bad.as_bytes()], &KVMap::new(), limits())
+                    .unwrap_err();
+                assert_eq!(error.disposition().0, "elaboration", "{bad}\n{error:?}");
+                assert_eq!(base.logical_root(&KVMap::new()), root);
+            }
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
 #[test]
 fn exhausted_admission_can_retry_without_publishing_a_definition_prefix() {
     let base = seed()

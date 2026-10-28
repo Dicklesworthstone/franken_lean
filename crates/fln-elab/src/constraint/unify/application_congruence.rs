@@ -7,7 +7,7 @@ use super::*;
 // Nested argument comparisons can expose further definition applications.
 // At this depth the optional heuristic yields to the ordinary worklist rather
 // than growing the Rust stack with the expression's unbounded nesting depth.
-const MAX_CONGRUENCE_DEPTH: u8 = 16;
+pub(super) const MAX_CONGRUENCE_DEPTH: u8 = 16;
 
 pub(super) enum CongruenceResult {
     Solved,

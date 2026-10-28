@@ -711,11 +711,18 @@ impl Engine<'_> {
         // arguments, `?F (n - 99) =?= Nat` giving `?F := fun _ => Nat`.
         let mut constant_suffix = Vec::new();
         for argument in &arguments {
+            // A local already in the metavariable's own context is no pattern variable unless
+            // `quasiPatternApprox` is set (`processAssignment`, vendored
+            // `Lean/Meta/ExprDefEq.lean:1317`). Term elaboration runs without it, so
+            // `?m σ =?= StateT σ Id σ` is left to first-order approximation, `?m := StateT σ Id`,
+            // and never becomes `?m := fun σ => StateT σ Id σ`.
             let pattern_argument = match argument.node() {
                 ExprNode::FVar { id: local_id }
                     if constant_suffix.is_empty()
                         && !distinct.contains(local_id)
-                        && locals.contains(local_id) =>
+                        && locals.contains(local_id)
+                        && (self.work.quasi_pattern_approx
+                            || !declaration.lctx.contains(local_id)) =>
                 {
                     Some(local_id.clone())
                 }
@@ -809,6 +816,42 @@ impl Engine<'_> {
             pending.push_front(equation);
         }
         Ok(true)
+    }
+
+    /// Whether `expr` is an assignable metavariable applied to some local already in that
+    /// metavariable's own context while `quasiPatternApprox` is off. The pin's
+    /// `processAssignment` (vendored `Lean/Meta/ExprDefEq.lean:1307-1318`) reaches `useFOApprox`
+    /// for such an application at or before that argument, whatever precedes it, and calls it
+    /// with every argument: the equation is approximated first-order at once.
+    fn context_local_argument(&mut self, expr: &Expr) -> Result<bool, UnificationError> {
+        if self.work.quasi_pattern_approx {
+            return Ok(false);
+        }
+        let mut head = expr;
+        let mut arguments = Vec::new();
+        while let ExprNode::App { f, a } = head.node() {
+            self.meter.tick()?;
+            arguments.push(a);
+            head = f;
+        }
+        let ExprNode::MVar { id } = head.node() else {
+            return Ok(false);
+        };
+        if arguments.is_empty() || self.work.mvars.is_assigned(id) {
+            return Ok(false);
+        }
+        let Some(declaration) = self.work.mvars.get_decl(id) else {
+            return Ok(false);
+        };
+        if declaration.kind == MetavarKind::SyntheticOpaque
+            || declaration.depth > self.budget.max_metavar_depth
+            || declaration.delayed.is_some()
+        {
+            return Ok(false);
+        }
+        Ok(arguments.iter().any(|argument| {
+            matches!(argument.node(), ExprNode::FVar { id } if declaration.lctx.contains(id))
+        }))
     }
 
     /// `e`, or the function `e` applies, is an unassigned metavariable.
@@ -1085,6 +1128,15 @@ impl Engine<'_> {
             _ => None,
         };
         if let Some((flex, rigid)) = quick {
+            // `isDefEqQuickOther` reaches `processAssignment` before either side is reduced;
+            // a local of the hole's own context sends it to `useFOApprox` there, so
+            // `?m σ =?= StateT δ (StateT σ Id) σ` assigns `?m := StateT δ (StateT σ Id)`
+            // before `StateT` can unfold.
+            if self.context_local_argument(flex)?
+                && self.first_order_approximation(flex, rigid, locals)?
+            {
+                return Ok(());
+            }
             match self.pattern(flex, rigid, locals, pending) {
                 Ok(true) => return Ok(()),
                 Ok(false)
@@ -1134,6 +1186,13 @@ impl Engine<'_> {
         }
         let mut reason = UnificationDeferred::UnsupportedEquation;
         for (lhs, rhs) in [(&left, &right), (&right, &left)] {
+            // `processAssignment'` after reduction: the same immediate first-order attempt
+            // before the pattern rule, which leaves such an application unassigned.
+            if self.context_local_argument(lhs)?
+                && self.first_order_approximation(lhs, rhs, locals)?
+            {
+                return Ok(());
+            }
             match self.pattern(lhs, rhs, locals, pending) {
                 Ok(true) => return Ok(()),
                 Err(UnificationError::Deferred(found))

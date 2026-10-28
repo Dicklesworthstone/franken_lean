@@ -1024,13 +1024,12 @@ impl Context {
                 .is_some_and(|info| info.constant_val().level_params.is_empty())
             {
                 let (left, right) = (left.clone(), right.clone());
-                self.constrain(&left, &right)?;
+                self.constrain_reflexive(&[(left.clone(), right)])?;
                 return self.close_proof_goal(goal, Expr::app(Expr::const_(rfl, Vec::new()), left));
             }
         }
         if let Some((level, alpha, left, beta, right)) = equality::heterogeneous_target(&target) {
-            self.constrain(&alpha, &beta)?;
-            self.constrain(&left, &right)?;
+            self.constrain_reflexive(&[(alpha.clone(), beta), (left.clone(), right)])?;
             let value = [alpha, left].into_iter().fold(
                 Expr::const_(Name::from_components(["HEq", "refl"]), vec![level]),
                 Expr::app,
@@ -1039,7 +1038,7 @@ impl Context {
         }
         let (level, alpha, left, right) =
             equality_target(&target).ok_or_else(|| error(TacticError::ApplyMismatch))?;
-        self.constrain(&left, &right)?;
+        self.constrain_reflexive(&[(left.clone(), right)])?;
         let value = Expr::app(
             Expr::app(
                 Expr::const_(Name::from_components(["Eq", "refl"]), vec![level]),
@@ -1048,6 +1047,52 @@ impl Context {
             left,
         );
         self.close_proof_goal(goal, value)
+    }
+
+    /// The two sides of an `Iff`, `Eq` or `HEq` goal under `rfl`'s own order. The pin's `rfl`
+    /// macro tries `exact Iff.rfl`, `exact HEq.rfl` and `eq_refl` (vendored
+    /// `Init/Core.lean:1042`, `Init/Tactics.lean:430-432`), which compare the sides under the
+    /// elaborator's configuration, before `apply_rfl` (`Init/Tactics.lean:427`), whose
+    /// `MVarId.applyRfl` compares them under `approxDefEq` (`Lean/Meta/Tactic/Rfl.lean:86`),
+    /// with quasi-patterns. The first attempt counts only when it decides every side now: an
+    /// equation it leaves pending is the pin's failed `isDefEq`, and the second attempt runs
+    /// from the state before the first.
+    fn constrain_reflexive(
+        &mut self,
+        sides: &[(Expr, Expr)],
+    ) -> Result<(), NatDefinitionElabError> {
+        // Without an expression hole the configuration cannot matter; decide once.
+        let mut open = false;
+        for (left, right) in sides {
+            open |=
+                self.instantiate(left)?.has_expr_mvar() || self.instantiate(right)?.has_expr_mvar();
+        }
+        if !open {
+            return sides
+                .iter()
+                .try_for_each(|(left, right)| self.constrain(left, right));
+        }
+        let mut trial = self.clone();
+        let pending = trial.equations.len();
+        let first = sides
+            .iter()
+            .try_for_each(|(left, right)| trial.constrain(left, right));
+        self.txn.budget.heartbeats_consumed = trial.txn.budget.heartbeats_consumed;
+        match first {
+            Ok(()) if trial.equations.len() <= pending => {
+                *self = trial;
+                return Ok(());
+            }
+            Ok(()) => {}
+            Err(error) if super::instances::nonmatch(&error) => {}
+            Err(error) => return Err(error),
+        }
+        let saved = std::mem::replace(&mut self.txn.quasi_pattern_approx, true);
+        let second = sides
+            .iter()
+            .try_for_each(|(left, right)| self.constrain(left, right));
+        self.txn.quasi_pattern_approx = saved;
+        second
     }
 
     pub(super) fn close_proof_goal(
@@ -2265,6 +2310,23 @@ impl Context {
         }
     }
 
+    /// `isDefEqApply` (vendored `Lean/Meta/Tactic/Apply.lean:160-164`): `apply` compares the
+    /// conclusion with the target under `approxDefEq` (`ApplyConfig.approx`, on by default), so
+    /// a hole applied to locals of its own context is a quasi-pattern there. Equations the
+    /// surrounding term left pending are flushed first, under the term's own configuration.
+    fn apply_conclusion_matches(
+        &mut self,
+        conclusion: &Expr,
+        target: &Expr,
+        budget: UnificationBudget,
+    ) -> Result<bool, NatDefinitionElabError> {
+        self.flush(false)?;
+        let saved = std::mem::replace(&mut self.txn.quasi_pattern_approx, true);
+        let matched = self.proof_types_match_with_budget(conclusion, target, budget);
+        self.txn.quasi_pattern_approx = saved;
+        matched
+    }
+
     pub(super) fn apply_proof_term(
         &mut self,
         proof: &mut ProofState<'_>,
@@ -2322,9 +2384,7 @@ impl Context {
             }
             let premise_left =
                 rigid_target && matches!(term.type_.node(), ExprNode::ForallE { .. });
-            if !premise_left
-                && self.proof_types_match_with_budget(&term.type_, &goal.target, budget)?
-            {
+            if !premise_left && self.apply_conclusion_matches(&term.type_, &goal.target, budget)? {
                 break;
             }
             term.type_ = self.whnf(&term.type_)?;

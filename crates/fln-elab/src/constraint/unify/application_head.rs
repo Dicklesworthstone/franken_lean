@@ -6,6 +6,11 @@
 //! candidate, NOT an injectivity rule: unequal arguments are never equated.
 //! The original application is replayed, and the candidate crosses the same
 //! scope, occurs, typing, resource and K1 barriers as an ordinary assignment.
+//!
+//! The pin's own first-order approximation, `processAssignmentFOApprox`, is
+//! [`Engine::first_order_approximation`]: it runs at once for an application whose
+//! arguments include a local of the hole's own context, and it unifies arguments.
+use super::application_congruence::{CongruenceResult, MAX_CONGRUENCE_DEPTH};
 use super::*;
 
 struct SuffixEta {
@@ -39,6 +44,85 @@ impl Engine<'_> {
             return Ok(true);
         }
         self.align_application_head(&right, &left, locals, pending)
+    }
+
+    /// The pin's `processAssignmentFOApprox` (vendored `Lean/Meta/ExprDefEq.lean:1172-1212`)
+    /// for `?m a₁ … aₙ =?= v`: head-beta `v`; when it is an application `f a`, unify `aₙ`
+    /// with `a` and then `?m a₁ … aₙ₋₁` with `f`, as one trial that commits only a complete
+    /// solution (`checkpointDefEq`); otherwise, or when that trial fails, unfold `v`'s head
+    /// definition once (`unfoldDefinition?`, `Lean/Meta/WHNF.lean:871`) and try again. `v`
+    /// is not reduced first, so `?m σ =?= StateT σ Id σ` gives `?m := StateT σ Id`, and the
+    /// arguments are unified, not merely compared as [`Self::recover_application_head`]
+    /// compares them. A failed attempt makes no assignment, though its work stays spent.
+    pub(super) fn first_order_approximation(
+        &mut self,
+        flexible: &Expr,
+        value: &Expr,
+        locals: &LocalContext,
+    ) -> Result<bool, UnificationError> {
+        // Each attempt nests a trial, and its function equation may approximate again.
+        if self.congruence_depth >= MAX_CONGRUENCE_DEPTH {
+            return Ok(false);
+        }
+        let mut flexible = flexible;
+        while let ExprNode::MData { expr, .. } = flexible.node() {
+            self.meter.node()?;
+            flexible = expr;
+        }
+        let ExprNode::App {
+            f: function,
+            a: last,
+        } = flexible.node()
+        else {
+            return Ok(false);
+        };
+        let mut value = self.instantiate(value)?;
+        loop {
+            self.meter.tick()?;
+            value = self.first_order_head_beta(value)?;
+            let mut candidate = &value;
+            while let ExprNode::MData { expr, .. } = candidate.node() {
+                self.meter.node()?;
+                candidate = expr;
+            }
+            if let ExprNode::App { f, a } = candidate.node() {
+                let equations = [
+                    (last.clone(), a.clone(), locals.clone()),
+                    (function.clone(), f.clone(), locals.clone()),
+                ];
+                if matches!(
+                    self.try_congruence_equations(&equations, true)?,
+                    CongruenceResult::Solved
+                ) {
+                    return Ok(true);
+                }
+            }
+            match self.unfold_definition_step(&value, locals)? {
+                Some(unfolded) => value = unfolded,
+                None => return Ok(false),
+            }
+        }
+    }
+
+    /// `Expr.headBeta`: `(fun x => b) a …` reduced at its head until it is no such redex.
+    fn first_order_head_beta(&mut self, mut expr: Expr) -> Result<Expr, UnificationError> {
+        loop {
+            let mut head = &expr;
+            let mut arguments = Vec::new();
+            while let ExprNode::App { f, a } = head.node() {
+                self.meter.node()?;
+                arguments.push(a.clone());
+                head = f;
+            }
+            let ExprNode::Lam { body, .. } = head.node() else {
+                return Ok(expr);
+            };
+            let Some(argument) = arguments.pop() else {
+                return Ok(expr);
+            };
+            let reduced = self.substitute(body, &argument)?;
+            expr = arguments.into_iter().rev().fold(reduced, Expr::app);
+        }
     }
 
     fn align_application_head(

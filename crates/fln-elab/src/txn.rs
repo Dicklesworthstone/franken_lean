@@ -148,6 +148,13 @@ pub struct ElabTxn {
     pub budget: ElabBudget,
     /// The most recent exposed candidate, consumed with `take_exposed_candidate`.
     pub exposed_candidate: Option<ExposedCandidate>,
+    /// The pin's `quasiPatternApprox` (vendored `Lean/Meta/Basic.lean`, `Config`): when set, a
+    /// metavariable applied to distinct locals is abstracted over them even when they are
+    /// already in its own context. Off by default and in term elaboration, as the pin's
+    /// `setElabConfig` (vendored `Lean/Elab/Config.lean`) leaves it, so `?m σ =?= StateT σ Id σ`
+    /// is solved first-order, `?m := StateT σ Id`. `apply`, `rfl`'s `apply_rfl` step and
+    /// eliminator under-application set it, as the pin's `approxDefEq`/`fullApproxDefEq` do.
+    pub quasi_pattern_approx: bool,
     pub(crate) nat_sub_model_cache: crate::constraint::unify::NatSubModelCache,
 }
 
@@ -169,6 +176,7 @@ impl PartialEq for ElabTxn {
             seed,
             budget,
             exposed_candidate,
+            quasi_pattern_approx,
             nat_sub_model_cache: _,
         } = self;
         env == &other.env
@@ -183,6 +191,7 @@ impl PartialEq for ElabTxn {
             && seed == &other.seed
             && budget == &other.budget
             && exposed_candidate == &other.exposed_candidate
+            && quasi_pattern_approx == &other.quasi_pattern_approx
     }
 }
 
@@ -201,6 +210,7 @@ impl ElabTxn {
             seed,
             budget: ElabBudget::default(),
             exposed_candidate: None,
+            quasi_pattern_approx: false,
             nat_sub_model_cache: crate::constraint::unify::NatSubModelCache::default(),
         }
     }
