@@ -1,9 +1,10 @@
 //! List/Array representation bridges and empty-array construction.
 //!
-//! The List runtime shape is nil = scalar 0, cons = tag 1 with two object
-//! fields. Validate the entire spine; a malformed tail must not turn into a
-//! successful, truncated array. Both directions are iterative and retain each
-//! payload before the input container can be released.
+//! Compiled lists use a fieldless tag-0 constructor for nil and tag 1 with two
+//! object fields for cons. The ABI's scalar-0 nil is also accepted on input;
+//! output always uses the constructor shape that compiled case analysis reads.
+//! Validate the entire spine so a malformed tail cannot publish a truncated
+//! array. Both directions retain payloads before releasing their input.
 
 use super::{
     IntrinsicFailure, IntrinsicResult, Obj, VmRefusal, array_value, expect_arity, with_nat_view,
@@ -44,6 +45,9 @@ impl Intrinsic {
                         return Err(VmRefusal::InvalidCtorObject.into());
                     }
                     let header = cursor.header();
+                    if header.tag == 0 && header.other == 0 {
+                        break;
+                    }
                     if header.tag != 1 || header.other != 2 {
                         return Err(VmRefusal::InvalidCtorObject.into());
                     }
@@ -60,7 +64,7 @@ impl Intrinsic {
             }
             Self::ToList => {
                 let (size, _) = array_value(&args[0], "Array.toList", 0)?;
-                let mut result = Obj::mk_nat(0);
+                let mut result = Obj::mk_ctor(0, Vec::new(), &[]);
                 for index in (0..size).rev() {
                     result = Obj::mk_ctor(1, vec![args[0].array_child(index), result], &[]);
                 }

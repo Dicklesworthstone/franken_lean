@@ -12718,7 +12718,7 @@ fn array_construction_roundtrip_retains_order_aliases_and_payload_lifetimes() {
     assert_eq!(array_update_strings(&rebuilt), ["first", "second", "first"]);
     let mut cursor = list.clone_ref();
     let mut count = 0;
-    while !cursor.is_scalar() {
+    while cursor.header().tag == 1 {
         assert_eq!(cursor.header().tag, 1);
         assert_eq!(cursor.header().other, 2);
         let child = cursor.ctor_child(0);
@@ -12729,7 +12729,9 @@ fn array_construction_roundtrip_retains_order_aliases_and_payload_lifetimes() {
         cursor = cursor.ctor_child(1);
         count += 1;
     }
-    assert_eq!(cursor.unbox(), 0);
+    assert!(!cursor.is_scalar());
+    assert_eq!(cursor.header().tag, 0);
+    assert_eq!(cursor.header().other, 0);
     assert_eq!(count, 3);
     let survivor = rebuilt.array_child(0);
     drop(completed);
@@ -12741,26 +12743,37 @@ fn array_construction_roundtrip_retains_order_aliases_and_payload_lifetimes() {
 }
 
 #[test]
-fn array_construction_empty_roundtrip_uses_the_scalar_nil_representation() {
+fn array_construction_empty_roundtrip_uses_compiled_nil_for_both_input_shapes() {
     let _guard = lock();
-    let program = validated(vec![function_with_callable_result(
-        0,
-        Vec::new(),
-        CallableResultOwnership::Erased,
-        3,
-        vec![
-            Instruction::Nat {
-                dst: r(0),
-                value: 0,
-            },
-            intrinsic(r(1), "extern:Array.mk", vec![r(0)]),
-            intrinsic(r(2), "extern:Array.toList", vec![r(1)]),
-            Instruction::Return { src: r(2) },
-        ],
-    )]);
-    let completed = returned(execute(&program, ExecutionLimits::default(), None));
-    assert!(completed.value.is_scalar());
-    assert_eq!(completed.value.unbox(), 0);
+    for nil in [
+        Instruction::Nat {
+            dst: r(0),
+            value: 0,
+        },
+        Instruction::Ctor {
+            dst: r(0),
+            tag: 0,
+            fields: Vec::new(),
+            scalar_bytes: Vec::new(),
+        },
+    ] {
+        let program = validated(vec![function_with_callable_result(
+            0,
+            Vec::new(),
+            CallableResultOwnership::Owned,
+            3,
+            vec![
+                nil,
+                intrinsic(r(1), "extern:Array.mk", vec![r(0)]),
+                intrinsic(r(2), "extern:Array.toList", vec![r(1)]),
+                Instruction::Return { src: r(2) },
+            ],
+        )]);
+        let completed = returned(execute(&program, ExecutionLimits::default(), None));
+        assert!(!completed.value.is_scalar());
+        assert_eq!(completed.value.header().tag, 0);
+        assert_eq!(completed.value.header().other, 0);
+    }
 }
 
 #[test]
