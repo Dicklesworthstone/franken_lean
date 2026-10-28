@@ -75,6 +75,46 @@ const EXPLICIT: &str = "example (bs : Array Bool) (n : Nat) (h : n < bs.size) : 
   @GetElem.getElem _ _ _ _ _ bs n h
 ";
 
+/// The second example of the pin's `dotNotationAndDefaultInstance.lean`, plus
+/// named, chained, dependent and coercing projections. The local helper's
+/// argument type is determined only when its caller is elaborated.
+const DELAYED_FIELDS: &str = "namespace Ex
+class Get (Cont : Type u) (Idx : Type v) (Elem : outParam (Type w)) where
+  get (xs : Cont) (i : Idx) : Elem
+export Get (get)
+instance [Inhabited α] : Get (Array α) Nat α where
+  get xs i := xs[i]!
+def delayed (as : Array (Nat × Bool)) : Bool :=
+  let r1 (as : _) := (get as 0).2
+  r1 as
+#print delayed
+def delayedNamed (as : Array (Nat × Bool)) : Bool :=
+  let r1 (as : _) := (get as 0).snd
+  r1 as
+#print delayedNamed
+def delayedCoerced (as : Array (Nat × Bool)) : Option Bool :=
+  let r1 (as : _) : Option Bool := (get as 0).2
+  r1 as
+#print delayedCoerced
+end Ex
+def anonymousReceiver (pair : Nat × Bool) : Bool :=
+  let getSecond (x : _) := x.2
+  getSecond pair
+#print anonymousReceiver
+def nestedReceiver (pair : Nat × (Nat × Bool)) : Bool :=
+  let getSecond (x : _) := x.2.2
+  getSecond pair
+#print nestedReceiver
+def dependentReceiver (α : Type) (pair : α × Bool) : Bool :=
+  let getSecond (x : _) := x.2
+  getSecond pair
+#print dependentReceiver
+def callCoerced (pair : Nat × Bool) : Option Bool :=
+  let getSecond (x : _) := x.2
+  getSecond pair
+#print callCoerced
+";
+
 fn pinned_lib() -> Option<PathBuf> {
     let lib = std::env::var_os("FLN_REFERENCE_LIB")
         .map(PathBuf::from)
@@ -169,4 +209,31 @@ fn an_explicit_application_propagates_its_expected_type_and_is_refused() {
         assert_eq!(pinned.status.code(), Some(1), "the pin accepts it");
     }
     assert_ne!(ours.status.code(), Some(0), "accepted {EXPLICIT}");
+}
+
+#[test]
+fn field_notation_waits_for_the_receivers_inferred_type_across_local_binders() {
+    let Some(lib) = pinned_lib() else {
+        return;
+    };
+    let root = workspace();
+    let (ours, pinned) = runs(&lib, &root, "delayed", DELAYED_FIELDS);
+    assert_eq!(
+        ours.status.code(),
+        Some(0),
+        "{}\n{}",
+        String::from_utf8_lossy(&ours.stdout),
+        String::from_utf8_lossy(&ours.stderr),
+    );
+    let pinned = pinned.expect("the field-notation differential requires the pinned executable");
+    assert_eq!(
+        pinned.status.code(),
+        Some(0),
+        "the pin refuses the delayed projection controls: {}",
+        String::from_utf8_lossy(&pinned.stdout),
+    );
+    assert_eq!(
+        ours.stdout, pinned.stdout,
+        "delayed projections changed their checked bodies"
+    );
 }

@@ -742,6 +742,8 @@ struct Context {
     // Eliminator applications waiting for their expected type (`elabAsElim`'s
     // postponement), resumed after default instances run.
     postponed_eliminators: Vec<eliminator::PostponedEliminator>,
+    // Field notation whose receiver type is awaiting a later constraint.
+    postponed_fields: Vec<record_terms::PostponedField>,
     // Coercions whose value was still open (`mkCoe`'s `.undef`), resumed by
     // instance synthesis and refused, as they were found, on its final pass.
     postponed_coercions: Vec<coercions::PostponedCoercion>,
@@ -857,6 +859,7 @@ impl Context {
             tactic_transparency: None,
             enclosing_recursions: Vec::new(),
             postponed_eliminators: Vec::new(),
+            postponed_fields: Vec::new(),
             postponed_coercions: Vec::new(),
             postponed_application_errors: Vec::new(),
             pending_source_arguments: false,

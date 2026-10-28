@@ -94,7 +94,7 @@ fn fixture() -> Environment {
         .unwrap()
 }
 
-fn accepted(environment: &Environment, source: &str) {
+fn accepted(environment: &Environment, source: &str) -> DefinitionVal {
     let checked = crate::check_definition_source(source.as_bytes(), environment, budget())
         .unwrap_or_else(|error| panic!("{source}: {error:?}"));
     assert!(matches!(
@@ -106,6 +106,7 @@ fn accepted(environment: &Environment, source: &str) {
     };
     assert!(!definition.value.has_expr_mvar());
     assert!(!definition.value.has_level_mvar());
+    definition
 }
 
 #[test]
@@ -144,4 +145,74 @@ fn an_unhinted_method_cannot_publish_its_unresolved_constructor() {
         )
         .is_err()
     );
+}
+
+#[test]
+fn field_receivers_wait_for_later_local_function_arguments() {
+    let environment = fixture();
+    for body in [
+        "let project (x : _) := x.identity; project receiver",
+        "let project (x : _) := (x).identity; project receiver",
+        "let project (x : _) := x.identity.identity; project receiver",
+        "let project (x : _) := let y := x; y.identity; project receiver",
+        "let project (x : _) := fun (_ : Nat) => x.identity; project receiver 3",
+    ] {
+        accepted(
+            &environment,
+            &format!("def inferred (receiver : Nat) : Nat := {body}"),
+        );
+    }
+}
+
+#[test]
+fn postponed_fields_keep_captured_locals_distinct_and_do_not_escape() {
+    let environment = fixture();
+    let definition = accepted(
+        &environment,
+        "def captures (left right : Nat) : Nat :=
+          let first (x : _) := x.identity
+          let second (x : _) := x.identity
+          first (second right)",
+    );
+    let expected = Expr::lam(
+        name("left"),
+        nat_const(),
+        Expr::lam(
+            name("right"),
+            nat_const(),
+            Expr::bvar(0).unwrap(),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
+    assert!(matches!(
+        fln_kernel::check_def_eq(
+            &environment,
+            &definition.base.level_params,
+            &definition.value,
+            &expected,
+            budget(),
+        ),
+        Outcome::Complete(Verdict::Accepted { .. })
+    ));
+}
+
+#[test]
+fn postponed_field_errors_remain_errors_after_the_receiver_is_known() {
+    let environment = fixture();
+    for body in [
+        "let project (x : _) := x.missing; project receiver",
+        "let project (x : _) := x.2; project receiver",
+        "let project (x : _) := x.identity; project",
+    ] {
+        assert!(
+            crate::check_definition_source(
+                format!("def refused (receiver : Nat) : Nat := {body}").as_bytes(),
+                &environment,
+                budget(),
+            )
+            .is_err(),
+            "accepted {body}",
+        );
+    }
 }

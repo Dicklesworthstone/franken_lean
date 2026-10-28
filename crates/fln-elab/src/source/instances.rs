@@ -578,6 +578,7 @@ impl Context {
             .iter()
             .all(|id| self.txn.mvars.is_assigned(id))
             && self.postponed_coercions.is_empty()
+            && self.postponed_fields.is_empty()
         {
             return Ok(());
         }
@@ -638,6 +639,10 @@ impl Context {
                     self.flush(false)?;
                     continue;
                 }
+                if self.resume_postponed_fields()? {
+                    self.flush(false)?;
+                    continue;
+                }
                 if final_pass && self.resolve_default_instance(&registry)? {
                     // As after an ordinary answer: the default's assignments may decide
                     // suspended equations (`?β × ?γ =?= Nat × Nat`) that block other goals.
@@ -655,6 +660,7 @@ impl Context {
             // What is still open is refused as it was found, before any
             // instance goal it left unsolved is reported instead.
             self.finish_postponed_coercions()?;
+            self.finish_postponed_fields()?;
         }
         if final_pass
             && self

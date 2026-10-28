@@ -126,6 +126,23 @@ pub(super) enum FieldReceiver<'a> {
     Elaborated(Typed, Name, &'a Syntax),
 }
 
+/// A projection whose receiver's carrier will be determined by later source
+/// constraints. Both the value and its result type explicitly apply their
+/// captured locals, so closing a lambda cannot hide a free variable in a
+/// metavariable assignment made after that lambda has left the worklist.
+#[derive(Clone)]
+pub(super) struct PostponedField {
+    id: MVarId,
+    expected: Expr,
+    receiver: Typed,
+    path: Name,
+    at: Option<Syntax>,
+    locals: Vec<LocalDecl>,
+    lctx: LocalContext,
+    options: KVMap,
+    scope: SourceScope,
+}
+
 /// Field methods are syntax sugar for a checked lambda. A field's result
 /// annotation belongs inside that lambda, where its binders are in scope.
 pub(super) fn is_field_notation(syntax: &Syntax) -> bool {
@@ -152,6 +169,144 @@ fn owned_args(mut syntax: Syntax) -> Result<Vec<Syntax>, NatDefinitionElabError>
 }
 
 impl Context {
+    fn postpone_field(
+        &mut self,
+        receiver: Typed,
+        path: &Name,
+        at: Option<&Syntax>,
+    ) -> Result<FieldResolution, NatDefinitionElabError> {
+        let locals = self.txn.lctx.decls().to_vec();
+        let sort = self.type_expected()?;
+        let type_type = self.forall_captured(&locals, sort)?;
+        let type_name = self.fresh_name()?;
+        let type_id = MVarId(type_name.clone());
+        self.txn.mvars.declare(
+            type_id.clone(),
+            type_name,
+            type_type,
+            LocalContext::new(),
+            MetavarKind::Natural,
+            0,
+            None,
+        );
+        let mut expected = Expr::mvar(type_id);
+        for local in &locals {
+            self.tick()?;
+            expected = Expr::app(expected, Expr::fvar(local.id.clone()));
+        }
+        let type_ = self.forall_captured(&locals, expected.clone())?;
+        let name = self.fresh_name()?;
+        let id = MVarId(name.clone());
+        self.txn.mvars.declare(
+            id.clone(),
+            name,
+            type_,
+            LocalContext::new(),
+            MetavarKind::SyntheticOpaque,
+            0,
+            None,
+        );
+        let mut value = Expr::mvar(id.clone());
+        for local in &locals {
+            self.tick()?;
+            value = Expr::app(value, Expr::fvar(local.id.clone()));
+        }
+        self.postponed_fields.push(PostponedField {
+            id,
+            expected: expected.clone(),
+            receiver,
+            path: path.clone(),
+            at: at.cloned(),
+            locals,
+            lctx: self.txn.lctx.clone(),
+            options: self.txn.options.clone(),
+            scope: self.source_scope.clone(),
+        });
+        Ok(FieldResolution::Value(Typed {
+            value,
+            type_: expected,
+        }))
+    }
+
+    /// The pin's `resolveLValLoop` postpones field notation while its receiver
+    /// type is unknown. Retry at the synthetic-constraint fixed point, in the
+    /// original lexical context, after ordinary instance search has propagated
+    /// output parameters. An unready receiver never chooses a record by name.
+    pub(super) fn resume_postponed_fields(&mut self) -> Result<bool, NatDefinitionElabError> {
+        let pending = std::mem::take(&mut self.postponed_fields);
+        let mut waiting = Vec::new();
+        let mut progressed = false;
+        for record in pending {
+            self.tick()?;
+            let saved = std::mem::replace(&mut self.txn.lctx, record.lctx.clone());
+            let options = std::mem::replace(&mut self.txn.options, record.options.clone());
+            let scope = std::mem::replace(&mut self.source_scope, record.scope.clone());
+            let result = (|| {
+                if self
+                    .application_type_unavailable(&record.receiver.type_)?
+                    .is_some()
+                {
+                    return Ok(false);
+                }
+                let field = self.resolve_field_path(
+                    record.receiver.clone(),
+                    &record.path,
+                    false,
+                    record.at.as_ref(),
+                )?;
+                let term = self.field_value(field, Some(&record.expected))?;
+                let term = self.finish_optional_term(term, Some(&record.expected))?;
+                let mut value = self.instantiate(&term.value)?;
+                for local in record.locals.iter().rev() {
+                    self.tick()?;
+                    value = Expr::lam(
+                        local.user_name.clone(),
+                        self.instantiate(&local.type_)?,
+                        value
+                            .abstract_fvar(&local.id, 0)
+                            .map_err(|_| failure(SourceInferenceError::Scope))?,
+                        local.binder_info,
+                    );
+                }
+                self.txn
+                    .assign_mvar(
+                        record.id.clone(),
+                        value,
+                        AssignmentJustification::SyntheticHole,
+                    )
+                    .map_err(|error| {
+                        failure(SourceInferenceError::Unification(Box::new(
+                            UnificationError::Metavariable(error),
+                        )))
+                    })?;
+                Ok(true)
+            })();
+            self.txn.lctx = saved;
+            self.txn.options = options;
+            self.source_scope = scope;
+            if result? {
+                progressed = true;
+            } else {
+                waiting.push(record);
+            }
+        }
+        self.postponed_fields.extend(waiting);
+        Ok(progressed)
+    }
+
+    pub(super) fn finish_postponed_fields(&self) -> Result<(), NatDefinitionElabError> {
+        match self.postponed_fields.first() {
+            None => Ok(()),
+            Some(record) => Err(error(
+                if matches!(record.path.leaf_view(), LeafView::Num(_)) {
+                    RecordTermError::ProjectionNotStructure
+                } else {
+                    RecordTermError::ExpectedRecordType
+                },
+            )),
+        }
+    }
+
     /// Part of the ordinary inside-out source expansion. Moving the field body
     /// preserves heap-bounded traversal even when methods contain other records.
     pub(super) fn expand_record_field_node(
@@ -414,6 +569,14 @@ impl Context {
         has_arguments: bool,
         at: Option<&Syntax>,
     ) -> Result<FieldResolution, NatDefinitionElabError> {
+        if !has_arguments
+            && self.overload_depth == 0
+            && self
+                .application_type_unavailable(&receiver.type_)?
+                .is_some()
+        {
+            return self.postpone_field(receiver, path, at);
+        }
         if let LeafView::Num(index) = path.leaf_view()
             && path.parent().is_anonymous()
         {
@@ -497,6 +660,9 @@ impl Context {
             }
             let base = match head.node() {
                 ExprNode::MVar { .. } => {
+                    if !has_arguments && self.overload_depth == 0 {
+                        return self.postpone_field(receiver, field, None);
+                    }
                     // The pin defaults unresolved receiver types here (for
                     // example `(2).succ` and `(1.5).abs`) without demanding
                     // that unrelated synthetic goals are already solvable.

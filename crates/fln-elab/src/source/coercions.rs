@@ -533,6 +533,7 @@ impl Context {
     ) -> Result<bool, NatDefinitionElabError> {
         if self.pending_source_arguments
             || !self.postponed_eliminators.is_empty()
+            || !self.postponed_fields.is_empty()
             || !self.postponed_coercions.is_empty()
             || !self.equations.is_empty()
             || self.application_type_unavailable(type_)?.is_none()
