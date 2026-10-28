@@ -170,7 +170,9 @@ pub(in crate::source) fn recoverable(problem: &NatDefinitionElabError) -> bool {
             | SourceInferenceError::Option(scope::options::OptionRefusal::WrongType { .. })
             // The pin's `throwTypeMismatchError` is an ordinary elaboration error: `first`
             // catches it and tries its next alternative.
-            | SourceInferenceError::TypeMismatch { .. },
+            | SourceInferenceError::TypeMismatch { .. }
+            // So is each of `elabSubst`'s `▸` refusals (Lean/Elab/BuiltinNotation.lean).
+            | SourceInferenceError::Subst(_),
         ) => true,
         NatDefinitionElabError::Inference(SourceInferenceError::Unification(reason)) => {
             match reason.as_ref() {

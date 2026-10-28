@@ -57,6 +57,29 @@ fn an_unmentioned_equality_is_refused_with_the_pins_message() {
     );
 }
 
+/// A refused `▸` is an ordinary elaboration error, so `first` and `try` recover from it. The
+/// pin accepts the three recoveries and refuses the bare `exact` (checked 2026-10-28).
+#[test]
+fn a_refused_substitution_is_a_failure_that_first_and_try_recover_from() {
+    for source in [
+        "theorem t (x y : Nat) (h : x = y) : 1 = 1 := by\n  first | exact h ▸ (rfl : 2 = 2) | rfl",
+        "theorem t (x y : Nat) (h : x = y) : 1 = 1 := by\n  first | exact x ▸ (rfl : 1 = 1) | rfl",
+        "theorem t (x y : Nat) (h : x = y) : 1 = 1 := by\n  try exact h ▸ (rfl : 2 = 2)\n  rfl",
+    ] {
+        assert!(
+            matches!(check(source), Ok(Outcome::Complete(_))),
+            "{source}: {:?}",
+            check(source)
+        );
+    }
+    let source = "theorem t (x y : Nat) (h : x = y) : 1 = 1 := by\n  exact h ▸ (rfl : 2 = 2)";
+    let error = check(source).expect_err(source);
+    assert!(
+        error.to_string().contains("invalid `▸` notation"),
+        "{error}"
+    );
+}
+
 /// The cast's result supplies the arguments of a quantified equality. The
 /// abstraction must unify matching heads, and retain the first successful
 /// assignment when another occurrence has different arguments.
