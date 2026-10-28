@@ -105,6 +105,210 @@ fn defaults_use_explicit_record_instance_parameters() {
         "structure Box (A : Type) [Inhabited A] where\n  value : A := default\ndef make {A : Type} [Inhabited A] : Box A := {}\ninstance chosen : Inhabited Nat := Inhabited.mk 17\ndef b : Box Nat := {}\ntheorem ok : b.value = 17 := by rfl",
     );
 }
+
+#[test]
+fn copied_parent_defaults_fill_shared_fields_and_keep_explicit_values() {
+    let checked = check(
+        &engine(),
+        r#"
+structure B where
+  x : Nat
+structure C where
+  x : Nat := 2
+  y : Nat
+structure D extends B, C
+def omitted : D := { y := 0 }
+def supplied : D := { x := 3, y := 0 }
+example : omitted.x = 2 := by rfl
+example : supplied.x = 3 := by rfl
+"#,
+    );
+    let environment = checked.engine.environment();
+    let mut printer = fln::pretty::Printer::new(environment);
+    for (name, expected) in [
+        ("omitted", "{ y := 0 }"),
+        ("supplied", "{ x := 3, y := 0 }"),
+    ] {
+        let Some(fln::ConstantInfo::Defn(definition)) =
+            environment.find(&Name::from_components([name]))
+        else {
+            panic!("missing checked record value {name}");
+        };
+        // The frozen helper's marker must neither hide an override nor prevent
+        // printing an ordinary record whose inherited value equals its default.
+        assert_eq!(printer.expr(&definition.value, 0).unwrap(), expected);
+    }
+}
+
+#[test]
+fn inherited_defaults_use_declared_relaxed_c3_precedence() {
+    check(
+        &engine(),
+        r#"
+structure A where
+  x : Nat := 1
+structure B extends A
+structure C where
+  x : Nat := 2
+structure D extends B, C
+def inherited : D := {}
+example : inherited.x = 2 := by rfl
+
+structure First where
+  x : Nat := 3
+structure Earlier extends First, C
+def earlier : Earlier := {}
+example : earlier.x = 3 := by rfl
+
+structure Required where
+  x : Nat
+structure WithCopied where
+  x : Nat
+  y : Nat := 4
+structure Middle extends Required, WithCopied
+structure Override where
+  y : Nat := 5
+structure Bottom extends Middle, Override
+def copied : Bottom := { x := 0 }
+example : copied.y = 5 := by rfl
+"#,
+    );
+}
+
+#[test]
+fn inherited_defaults_follow_real_dependencies_even_later_flat_fields() {
+    check(
+        &engine(),
+        r#"
+structure B where
+  x : Nat
+structure C where
+  z : Nat
+  x : Nat := z
+structure D extends B, C
+def d : D := { z := 5 }
+example : d.x = 5 := by rfl
+
+structure NeedsMethod where
+  f : Nat → Nat
+  n : Nat
+structure ProvidesMethod where
+  n : Nat
+  f (n : Nat) : Nat := n + 1
+structure Method extends NeedsMethod, ProvidesMethod
+def method : Method := { n := 8 }
+example : method.f 4 = 5 := by rfl
+"#,
+    );
+}
+
+#[test]
+fn inherited_defaults_instantiate_owner_parameters_and_universes() {
+    check(
+        &engine(),
+        r#"
+universe u
+structure Needed (A : Type u) where
+  value : A
+structure Fallback (n : Nat) (A : Type u) (a : A) where
+  value : A := a
+  count : Nat := n
+  copy : A := value
+structure Combined (A : Type u) (a : A) (n : Nat) extends Needed A, Fallback n A a
+def natural : Combined Nat 17 4 := {}
+def higher : Combined Type Nat 6 := {}
+example : natural.value = 17 := by rfl
+example : natural.count = 4 := by rfl
+example : natural.copy = 17 := by rfl
+example : higher.value = Nat := by rfl
+example : higher.copy = Nat := by rfl
+"#,
+    );
+}
+
+#[test]
+fn inherited_defaults_capture_section_parameters_of_fully_copied_parents() {
+    check(
+        &engine(),
+        r#"
+section
+variable (n : Nat)
+structure Needs where
+  x : Nat
+structure Provides where
+  x : Nat := n
+structure Both extends Needs, Provides n
+end
+def result : Both 7 := {}
+example : result.x = 7 := by rfl
+"#,
+    );
+}
+
+#[test]
+fn native_defaults_keep_physical_parent_literals_and_flat_own_defaults() {
+    check(
+        &engine(),
+        r#"
+structure B where
+  x : Nat := 2
+structure C where
+  x : Nat
+  z : Nat := 5
+structure D extends B, C where
+  total : Nat := x + z
+def flat : D := {}
+def parent : B := { x := 11 }
+def physical : D := { toB := parent }
+example : flat.x = 2 := by rfl
+example : flat.z = 5 := by rfl
+example : flat.total = 7 := by rfl
+example : physical.x = 11 := by rfl
+example : physical.z = 5 := by rfl
+example : physical.total = 16 := by rfl
+
+structure Native extends Inhabited Nat
+structure DerivedNative extends Native
+def native : DerivedNative := { default := 8 }
+example : native.default = 8 := by rfl
+"#,
+    );
+}
+
+#[test]
+fn inherited_defaults_are_frozen_before_later_parent_helpers() {
+    let e = check(
+        &engine(),
+        r#"
+structure B where
+  x : Nat
+structure C where
+  x : Nat
+structure D extends B, C
+def C.x._default : Nat := 9
+"#,
+    )
+    .engine;
+    check(&e, "def own : C := {}\nexample : own.x = 9 := by rfl");
+    let before = e.logical_root(&KVMap::new());
+    let refusal = e
+        .check_source_files(
+            &[b"def absent : D := {}"],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits()),
+        )
+        .expect_err("a later ancestor helper must not retroactively alter D");
+    assert!(
+        format!("{refusal:?}").contains("MissingField"),
+        "{refusal:?}"
+    );
+    assert_eq!(e.logical_root(&KVMap::new()), before);
+    check(
+        &e,
+        "def supplied : D := { x := 4 }\nexample : supplied.x = 4 := by rfl",
+    );
+}
+
 #[test]
 fn class_dictionaries_can_be_constructed_entirely_from_defaults() {
     check(

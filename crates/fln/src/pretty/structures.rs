@@ -236,6 +236,13 @@ impl<'a> Printer<'a> {
             && args.len() == 2
         {
             default = args[1].clone();
+        } else if let ExprNode::Lam { body, .. } = head.node()
+            && matches!(body.node(), ExprNode::BVar { idx: 0 })
+            && args.len() == 1
+        {
+            // Native frozen defaults use a checked beta-identity marker when
+            // the minimal source seed has no canonical identity declaration.
+            default = args[0].clone();
         }
         if default == *value {
             return Ok(true);

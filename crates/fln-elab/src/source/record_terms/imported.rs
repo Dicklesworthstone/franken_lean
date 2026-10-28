@@ -6,7 +6,7 @@
 //! extending the separate SourceRecordDefaults constructor-prefix contract.
 use super::*;
 use crate::records::imported::{ImportedStructures, StructureEntry};
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 #[derive(Clone)]
 struct Projection {
@@ -57,7 +57,6 @@ struct Field<'a> {
 pub(super) struct ImportedRecord<'a> {
     frame: RecordFrame<'a>,
     layout: ImportedLayout,
-    parameters: Vec<Expr>,
     fields: Vec<Field<'a>>,
     cursor: usize,
     defaults_done: bool,
@@ -104,11 +103,12 @@ impl Context {
         if structures.get(&root).is_none() {
             return Ok(None);
         }
-        // Native source defaults bind a physical constructor prefix. Preserve
-        // that checked contract for this record and its ancestors; the imported
-        // default path instead consumes the pin's flattened field dependencies.
+        // Preserve the physical path for older native records. A newly frozen
+        // inherited helper opts into flat dependency ordering; native declared
+        // defaults in that record are adapted by their checked prefix length.
         let defaults = crate::records::defaults::RecordDefaults::read(&self.txn.env)
             .map_err(|problem| failure(SourceInferenceError::Record(problem)))?;
+        let mut native = false;
         let mut pending = vec![root.clone()];
         let mut seen = BTreeSet::new();
         while let Some(record) = pending.pop() {
@@ -129,7 +129,7 @@ impl Context {
                 self.tick()?;
                 let index = u32::try_from(index).map_err(|_| limit())?;
                 if defaults.helper(&record, index).is_some() {
-                    return Ok(None);
+                    native = true;
                 }
             }
             for parent in row.parents.iter().map(|parent| &parent.name).chain(
@@ -141,8 +141,18 @@ impl Context {
                 pending.push(parent.clone());
             }
         }
-        let order = self.imported_parent_order(&structures, &root)?;
+        let order = self.imported_parent_order(&structures, &root, None)?;
         let leaves = self.imported_record_leaves(&structures, &root)?;
+        if native
+            && !leaves.iter().any(|field| {
+                self.txn.env.contains(&Name::str(
+                    root.append_core(&field.name),
+                    "_inherited_default",
+                ))
+            })
+        {
+            return Ok(None);
+        }
         // Whole-parent syntax keeps the existing physical constructor path.
         // In particular, it keeps its checked once-only source bindings and
         // does not decompose a parent value whose dependent fields may matter.
@@ -274,7 +284,6 @@ impl Context {
         let mut state = ImportedRecord {
             frame,
             layout,
-            parameters,
             fields,
             cursor: 0,
             defaults_done: false,
@@ -426,6 +435,237 @@ impl Context {
 }
 
 impl Context {
+    /// Instantiate a declared native prefix or the pin's named flat dependencies.
+    /// The receiver supplies the owner's actual universe and datatype parameters;
+    /// these need not have the child's order, arity, or universe names.
+    pub(in crate::source) fn instantiate_record_default(
+        &mut self,
+        helper: &Name,
+        receiver: &Typed,
+        fields: &[(Name, Expr)],
+    ) -> Result<Option<Typed>, NatDefinitionElabError> {
+        let Some(ConstantInfo::Defn(definition)) = self.txn.env.find(helper).cloned() else {
+            return if self.txn.env.contains(helper) {
+                Err(malformed())
+            } else {
+                Ok(None)
+            };
+        };
+        let target = self.whnf(&receiver.type_)?;
+        let (head, parameters) = operators::spine(&target);
+        let ExprNode::Const { name, levels } = head.node() else {
+            return Err(malformed());
+        };
+        let Some(ConstantInfo::Induct(family)) = self.txn.env.find(name).cloned() else {
+            return Err(malformed());
+        };
+        if definition.safety != DefinitionSafety::Safe
+            || definition.base.level_params != family.base.level_params
+            || parameters.len() != family.num_params as usize
+        {
+            return Err(malformed());
+        }
+        let defaults = crate::records::defaults::RecordDefaults::read(&self.txn.env)
+            .map_err(|problem| failure(SourceInferenceError::Record(problem)))?;
+        let Some(ConstantInfo::Ctor(ctor)) = family
+            .ctors
+            .first()
+            .and_then(|ctor| self.txn.env.find(ctor))
+            .cloned()
+        else {
+            return Err(malformed());
+        };
+        let native =
+            (0..ctor.num_fields).find(|index| defaults.helper(name, *index) == Some(helper));
+        let mut value = Typed {
+            value: self.instantiate_params(
+                &definition.value,
+                &definition.base.level_params,
+                levels,
+            )?,
+            type_: self.instantiate_params(
+                &definition.base.type_,
+                &definition.base.level_params,
+                levels,
+            )?,
+        };
+        for parameter in parameters {
+            self.apply_imported_record_body(&mut value, &parameter)?;
+        }
+        if let Some(prefix) = native {
+            // Stop at the fixed prefix even when the field itself is a function.
+            for index in 0..prefix {
+                self.tick()?;
+                let argument = self.reduce_record_projections(&Expr::proj(
+                    name.clone(),
+                    u64::from(index),
+                    receiver.value.clone(),
+                ))?;
+                self.apply_imported_record_body(&mut value, &argument)?;
+            }
+        } else {
+            while let ExprNode::Lam { binder_name, .. } = value.value.node() {
+                self.tick()?;
+                let Some((_, argument)) = fields.iter().find(|(name, _)| name == binder_name)
+                else {
+                    return Ok(None);
+                };
+                self.apply_imported_record_body(&mut value, argument)?;
+            }
+            // An identity application marks the end of field dependencies.
+            let (head, arguments) = operators::spine(&value.value);
+            if matches!(head.node(), ExprNode::Const { name, .. }
+                if name == &Name::from_components(["id"]))
+                && arguments.len() == 2
+            {
+                value.value = arguments[1].clone();
+            } else if matches!(head.node(), ExprNode::Lam { body, .. }
+                if matches!(body.node(), ExprNode::BVar { idx: 0 }))
+                && arguments.len() == 1
+            {
+                value.value = arguments[0].clone();
+            }
+        }
+        value.value = self.reduce_record_projections(&value.value)?;
+        value.type_ = self.reduce_record_projections(&value.type_)?;
+        Ok(Some(value))
+    }
+
+    /// Reduce only projections of explicit admitted constructors, including
+    /// beneath binders. This removes spurious dependencies on the rest of a
+    /// reconstructed parent without unfolding arbitrary user definitions.
+    pub(in crate::source) fn reduce_record_projections(
+        &mut self,
+        expression: &Expr,
+    ) -> Result<Expr, NatDefinitionElabError> {
+        let mut work = vec![(expression, false)];
+        let mut done: HashMap<usize, Expr> = HashMap::new();
+        while let Some((term, finish)) = work.pop() {
+            self.tick()?;
+            if done.contains_key(&term.allocation_identity()) {
+                continue;
+            }
+            if !finish {
+                work.push((term, true));
+                match term.node() {
+                    ExprNode::App { f, a } => work.extend([(f, false), (a, false)]),
+                    ExprNode::Lam {
+                        binder_type, body, ..
+                    }
+                    | ExprNode::ForallE {
+                        binder_type, body, ..
+                    } => {
+                        work.extend([(binder_type, false), (body, false)]);
+                    }
+                    ExprNode::LetE {
+                        type_, value, body, ..
+                    } => {
+                        work.extend([(type_, false), (value, false), (body, false)]);
+                    }
+                    ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => {
+                        work.push((expr, false));
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+            let get = |expr: &Expr| done[&expr.allocation_identity()].clone();
+            let result = match term.node() {
+                ExprNode::App { f, a } => Expr::app(get(f), get(a)),
+                ExprNode::Lam {
+                    binder_name,
+                    binder_type,
+                    body,
+                    binder_info,
+                } => Expr::lam(
+                    binder_name.clone(),
+                    get(binder_type),
+                    get(body),
+                    *binder_info,
+                ),
+                ExprNode::ForallE {
+                    binder_name,
+                    binder_type,
+                    body,
+                    binder_info,
+                } => Expr::forall_e(
+                    binder_name.clone(),
+                    get(binder_type),
+                    get(body),
+                    *binder_info,
+                ),
+                ExprNode::LetE {
+                    decl_name,
+                    type_,
+                    value,
+                    body,
+                    non_dep,
+                } => Expr::let_e(
+                    decl_name.clone(),
+                    get(type_),
+                    get(value),
+                    get(body),
+                    *non_dep,
+                ),
+                ExprNode::MData { data, expr } => Expr::mdata(data.clone(), get(expr)),
+                ExprNode::Proj {
+                    struct_name,
+                    idx,
+                    expr,
+                } => {
+                    let receiver = get(expr);
+                    let (head, arguments) = operators::spine(&receiver);
+                    let selected = if let ExprNode::Const { name, .. } = head.node()
+                        && let Some(ConstantInfo::Ctor(ctor)) = self.txn.env.find(name)
+                        && ctor.induct == *struct_name
+                        && arguments.len() == (ctor.num_params as usize + ctor.num_fields as usize)
+                        && *idx < u64::from(ctor.num_fields)
+                    {
+                        Some(arguments[ctor.num_params as usize + *idx as usize].clone())
+                    } else {
+                        None
+                    };
+                    selected.unwrap_or_else(|| Expr::proj(struct_name.clone(), *idx, receiver))
+                }
+                _ => term.clone(),
+            };
+            done.insert(term.allocation_identity(), result);
+        }
+        done.remove(&expression.allocation_identity())
+            .ok_or_else(malformed)
+    }
+
+    pub(in crate::source) fn source_record_parent_view(
+        &mut self,
+        structures: &ImportedStructures,
+        parents: &[(Name, Typed)],
+        wanted: &Name,
+    ) -> Result<Typed, NatDefinitionElabError> {
+        for (name, receiver) in parents {
+            self.tick()?;
+            if self
+                .imported_parent_order(structures, name, None)?
+                .contains(wanted)
+            {
+                let path = self.imported_parent_path(structures, name, wanted)?;
+                return self.imported_project_path(receiver.clone(), &path);
+            }
+        }
+        Err(malformed())
+    }
+
+    pub(in crate::source) fn record_has_flat_field(
+        &mut self,
+        structures: &ImportedStructures,
+        record: &Name,
+        field: &Name,
+    ) -> Result<bool, NatDefinitionElabError> {
+        Ok(self
+            .imported_record_leaves(structures, record)?
+            .iter()
+            .any(|leaf| &leaf.name == field))
+    }
+
     fn imported_field_default(
         &mut self,
         state: &ImportedRecord<'_>,
@@ -455,50 +695,26 @@ impl Context {
         } else {
             return Ok(None);
         };
-        let Some(ConstantInfo::Defn(definition)) = self.txn.env.find(&helper).cloned() else {
-            return Err(malformed());
+        let arguments: Vec<_> = state
+            .fields
+            .iter()
+            .map(|field| (field.name.clone(), field.hole.clone()))
+            .collect();
+        let Some(mut value) =
+            self.instantiate_record_default(&helper, &state.frame.constructor, &arguments)?
+        else {
+            return Ok(None);
         };
-        let Some(ConstantInfo::Induct(family)) = self.txn.env.find(&state.layout.root) else {
-            return Err(malformed());
-        };
-        if definition.safety != DefinitionSafety::Safe
-            || definition.base.level_params != family.base.level_params
-        {
-            return Err(malformed());
-        }
-        let mut value = Typed {
-            value: self.instantiate_params(
-                &definition.value,
-                &definition.base.level_params,
-                &state.frame.levels,
-            )?,
-            type_: self.instantiate_params(
-                &definition.base.type_,
-                &definition.base.level_params,
-                &state.frame.levels,
-            )?,
-        };
-        for parameter in &state.parameters {
-            self.apply_imported_record_body(&mut value, parameter)?;
-        }
+        let mut mentioned = self.txn.mvars.collect_mvars(&value.value);
+        mentioned.extend(self.txn.mvars.collect_mvars(&value.type_));
         let mut dependencies = BTreeSet::new();
-        while let ExprNode::Lam { binder_name, .. } = value.value.node() {
+        for argument in &state.fields {
             self.tick()?;
-            let name = binder_name.clone();
-            let Some(argument) = state.fields.iter().find(|field| field.name == name) else {
-                return Ok(None);
-            };
-            dependencies.insert(name);
-            self.apply_imported_record_body(&mut value, &argument.hole)?;
-        }
-        // addDefaults wraps a method in id so its own lambda parameters are
-        // not mistaken for further field dependencies.
-        if let ExprNode::App { f, a } = value.value.node()
-            && let ExprNode::App { f: head, .. } = f.node()
-            && matches!(head.node(), ExprNode::Const { name, .. }
-                if name == &Name::from_components(["id"]))
-        {
-            value.value = a.clone();
+            if let ExprNode::MVar { id } = argument.hole.node()
+                && mentioned.contains(id)
+            {
+                dependencies.insert(argument.name.clone());
+            }
         }
         let actual_type = self.known_type(&value.value)?.ok_or_else(malformed)?;
         self.constrain(&actual_type, &field.type_)?;
@@ -856,10 +1072,11 @@ impl Context {
 
     /// The pin's relaxed C3 merge gives the direct parent list first priority.
     /// A completed order is memoized only within this immutable metadata read.
-    fn imported_parent_order(
+    pub(in crate::source) fn imported_parent_order(
         &mut self,
         structures: &ImportedStructures,
         root: &Name,
+        source_parents: Option<&[Name]>,
     ) -> Result<Vec<Name>, NatDefinitionElabError> {
         let mut orders: BTreeMap<Name, Vec<Name>> = BTreeMap::new();
         let mut visiting = BTreeSet::new();
@@ -869,7 +1086,17 @@ impl Context {
             if orders.contains_key(&name) {
                 continue;
             }
-            let entry = self.checked_imported_structure(structures, &name)?.clone();
+            let direct: Vec<_> = if &name == root
+                && let Some(parents) = source_parents
+            {
+                parents.to_vec()
+            } else {
+                self.checked_imported_structure(structures, &name)?
+                    .parents
+                    .iter()
+                    .map(|parent| parent.name.clone())
+                    .collect()
+            };
             if !finish {
                 if !visiting.insert(name.clone()) {
                     return Err(malformed());
@@ -878,19 +1105,14 @@ impl Context {
                     return Err(limit());
                 }
                 work.push((name, true));
-                for parent in entry.parents.iter().rev() {
+                for parent in direct.iter().rev() {
                     self.tick()?;
-                    if !orders.contains_key(&parent.name) {
-                        work.push((parent.name.clone(), false));
+                    if !orders.contains_key(parent) {
+                        work.push((parent.clone(), false));
                     }
                 }
                 continue;
             }
-            let direct: Vec<_> = entry
-                .parents
-                .iter()
-                .map(|parent| parent.name.clone())
-                .collect();
             let mut rows = vec![direct.clone()];
             for parent in direct {
                 self.tick()?;
