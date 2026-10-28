@@ -710,6 +710,157 @@ end
     });
 }
 
+#[test]
+fn section_captures_flow_through_measures_and_acyclic_peers() {
+    let source = "section\nvariable (unused : String) (offset : Nat)\nmutual\n\
+        def wfCapturedLeft (n : Nat) : Nat := if h : n = 0 then wfCapturedHelper 0 else wfCapturedRight (n-1) + 1\n\
+        termination_by n + offset\ndecreasing_by omega\n\
+        def wfCapturedRight (n : Nat) : Nat := if h : n = 0 then wfCapturedHelper 1 else wfCapturedLeft (n-1) + 2\n\
+        termination_by n + offset\ndecreasing_by omega\n\
+        def wfCapturedHelper (n : Nat) : Nat := offset + n\nend\nend\n";
+    on_large_stack(move |base| {
+        let printed = oracle(
+            &format!("{source}#eval wfCapturedLeft 7 2\n#eval wfCapturedRight 7 2\n"),
+            true,
+        );
+        for expected in ["10", "11"] {
+            assert!(printed.lines().any(|line| line == expected), "{printed}");
+        }
+        let engine = check(base, source);
+        assert_member(
+            &engine,
+            "wfCapturedLeft",
+            &["wfCapturedLeft", "wfCapturedRight"],
+            "(fun (fun (wfCapturedLeft._mutual #1 (PSum.inl Nat Nat #0))))",
+        );
+        assert_auxiliary(&engine, "wfCapturedLeft._mutual");
+        assert_companions(&engine, &["wfCapturedLeft", "wfCapturedRight"]);
+        assert_eq!(
+            evaluate(&engine, "#eval wfCapturedLeft 7 2"),
+            ClosedVmValue::Scalar(10)
+        );
+        assert_eq!(
+            evaluate(&engine, "#eval wfCapturedRight 7 2"),
+            ClosedVmValue::Scalar(11)
+        );
+    });
+}
+
+#[test]
+fn section_captures_preserve_polymorphic_values_and_instance_dictionaries() {
+    let values = "universe u\nsection\nvariable (A : Type u) (left right : A)\nmutual\n\
+        def wfPickLeft (n : Nat) : A := if h : n = 0 then left else wfPickRight (n-1)\n\
+        termination_by n\ndecreasing_by omega\n\
+        def wfPickRight (n : Nat) : A := if h : n = 0 then right else wfPickLeft (n-1)\n\
+        termination_by n\ndecreasing_by omega\nend\nend\n";
+    let instance = "universe u\nsection\nvariable {A : Type u} [Inhabited A]\nmutual\n\
+        def wfDefaultLeft (n : Nat) : A := if h : n = 0 then default else wfDefaultRight (n-1)\n\
+        termination_by n\ndecreasing_by omega\n\
+        def wfDefaultRight (n : Nat) : A := if h : n = 0 then default else wfDefaultLeft (n-1)\n\
+        termination_by n\ndecreasing_by omega\nend\nend\n";
+    on_large_stack(move |base| {
+        for (source, member, peer, query, expected) in [
+            (
+                values,
+                "wfPickLeft",
+                "wfPickRight",
+                "#eval wfPickLeft Nat 7 13 3",
+                13,
+            ),
+            (
+                instance,
+                "wfDefaultLeft",
+                "wfDefaultRight",
+                "#eval (wfDefaultRight 3 : Nat)",
+                0,
+            ),
+        ] {
+            oracle(&format!("{source}{query}\n"), true);
+            let engine = check(base, source);
+            let definition = definition(&engine, member);
+            assert_eq!(definition.base.level_params, vec![n("u")]);
+            assert!(!definition.base.type_.has_fvar());
+            assert!(!definition.value.has_fvar());
+            assert_eq!(
+                table(engine.environment()).unwrap().status(&n(member)),
+                Reducibility::Irreducible
+            );
+            assert_companions(&engine, &[member, peer]);
+            assert_eq!(evaluate(&engine, query), ClosedVmValue::Scalar(expected));
+        }
+    });
+}
+
+#[test]
+fn section_captures_preserve_shadowed_parameters_and_measure_aliases() {
+    let source = "section\nvariable (value : Nat)\nmutual\n\
+        def wfShadow (value : Nat) : Nat := match value with\n\
+        | 0 => 0\n| n+1 => wfPeer n\ntermination_by value\n\
+        def wfPeer : Nat -> Nat\n| 0 => value\n| n+1 => wfShadow n\n\
+        termination_by n => n\nend\nend\n";
+    on_large_stack(move |base| {
+        oracle(
+            &format!("{source}#eval wfShadow 7 3\n#eval wfPeer 7 3\n"),
+            true,
+        );
+        let engine = check(base, source);
+        assert_companions(&engine, &["wfShadow", "wfPeer"]);
+        assert_eq!(
+            evaluate(&engine, "#eval wfShadow 7 3"),
+            ClosedVmValue::Scalar(7)
+        );
+        assert_eq!(
+            evaluate(&engine, "#eval wfPeer 7 3"),
+            ClosedVmValue::Scalar(0)
+        );
+    });
+}
+
+#[test]
+fn section_captures_exclude_hint_only_variables_and_nondecreasing_calls() {
+    let measure_only = "section\nvariable (offset : Nat)\nmutual\n\
+        def measureLeft (n : Nat) : Nat := if h : n = 0 then 0 else measureRight (n-1) + 1\n\
+        termination_by n + offset\ndecreasing_by omega\n\
+        def measureRight (n : Nat) : Nat := if h : n = 0 then 1 else measureLeft (n-1) + 2\n\
+        termination_by n + offset\ndecreasing_by omega\nend\nend\n";
+    let unused_measure_value = "section\nvariable (offset : Nat)\nmutual\n\
+        def measureLeft (n : Nat) : Nat := if h : n = 0 then 0 else measureRight (n-1) + 1\n\
+        termination_by let unused := offset; n\ndecreasing_by omega\n\
+        def measureRight (n : Nat) : Nat := if h : n = 0 then 1 else measureLeft (n-1) + 2\n\
+        termination_by n\ndecreasing_by omega\nend\nend\n";
+    let nondecreasing = "section\nvariable (offset : Nat)\nmutual\n\
+        def wfBadLeft (n : Nat) : Nat := if h : n = 0 then offset else wfBadRight n\n\
+        termination_by n\ndecreasing_by omega\n\
+        def wfBadRight (n : Nat) : Nat := wfBadLeft n\n\
+        termination_by n\ndecreasing_by omega\nend\nend\n";
+    let proof_only = "section\nvariable (secret : Nat)\nmutual\n\
+        def proofScopeLeft (n : Nat) : Nat := if h : n = 0 then 0 else proofScopeRight (n-1) + 1\n\
+        termination_by n\ndecreasing_by\n  let unused := secret\n  omega\n\
+        def proofScopeRight (n : Nat) : Nat := if h : n = 0 then 1 else proofScopeLeft (n-1) + 2\n\
+        termination_by n\ndecreasing_by omega\nend\nend\n";
+    on_large_stack(move |base| {
+        for source in [
+            measure_only,
+            unused_measure_value,
+            nondecreasing,
+            proof_only,
+        ] {
+            oracle(source, false);
+            refuse(base, source);
+            assert!(!base.environment().contains(&n("measureLeft")));
+            assert!(!base.environment().contains(&n("wfBadLeft")));
+        }
+        let recovery = proof_only.replace("  let unused := secret\n", "");
+        let printed = oracle(&format!("{recovery}#eval proofScopeLeft 2\n"), true);
+        assert!(printed.lines().any(|line| line == "3"), "{printed}");
+        let engine = check(base, &recovery);
+        assert_eq!(
+            evaluate(&engine, "#eval proofScopeLeft 2"),
+            ClosedVmValue::Scalar(3)
+        );
+    });
+}
+
 /// Outside the supported slice a group stays a typed refusal: never a resource
 /// stop, a fault, or a partial publication. The pin's verdict is recorded for
 /// each; where it accepts, this is a known gap, not parity.

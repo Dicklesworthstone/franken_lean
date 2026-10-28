@@ -728,11 +728,44 @@ fn mutual_well_founded(
             "a Nat measure under a WellFoundedRelation other than Nat.lt_wfRel",
         ));
     }
-    if !scope.variables.is_empty() {
-        return Err(unsupported("section variables"));
+    let captures = group
+        .shared
+        .as_ref()
+        .map_or_else(Vec::new, |shared| shared.locals.clone());
+    // MutualClosure selects variables from the bodies, before elaborating
+    // termination hints. A hint cannot add a parameter the source body omitted,
+    // even if an unused let would erase its occurrence during reduction.
+    let mut captured = HashSet::new();
+    for capture in &captures {
+        meter.tick()?;
+        captured.insert(capture.id.clone());
     }
+    for member in &measured {
+        for id in &member.section_captures {
+            meter.tick()?;
+            if !captured.contains(id) {
+                return Err(unsupported(
+                    "termination measures over captured section variables",
+                ));
+            }
+        }
+    }
+    let levels = bodies[component[0]].base.level_params.clone();
+    let written_levels: Vec<_> = levels
+        .iter()
+        .filter(|level| {
+            !group
+                .shared
+                .as_ref()
+                .is_some_and(|shared| shared.fixed_levels.contains(*level))
+        })
+        .cloned()
+        .collect();
     for &index in component {
-        if headers[index].level_params != level_names {
+        if headers[index].level_params != level_names
+            || written_levels != level_names
+            || bodies[index].base.level_params != levels
+        {
             return Err(unsupported(
                 "universe parameters written identically on every member",
             ));
@@ -742,7 +775,15 @@ fn mutual_well_founded(
         .iter()
         .map(|&index| names[index].clone())
         .collect();
-    let arities: Vec<_> = measured.iter().map(|member| member.arity).collect();
+    let arities: Vec<_> = measured
+        .iter()
+        .map(|member| {
+            member
+                .arity
+                .checked_add(captures.len())
+                .ok_or_else(|| failure(SourceInferenceError::Scope))
+        })
+        .collect::<Result<_, _>>()?;
     let values: Vec<_> = component
         .iter()
         .map(|&index| bodies[index].value.clone())
@@ -752,6 +793,9 @@ fn mutual_well_founded(
         .ok_or_else(|| {
             unsupported("fixed parameters that are not one common unreordered prefix")
         })?;
+    if fixed < captures.len() {
+        return Err(unsupported("section captures in the common fixed prefix"));
+    }
     let auxiliary = Name::str(component_names[0].clone(), "_mutual");
     let executable: Vec<_> = component_names
         .iter()
@@ -765,12 +809,12 @@ fn mutual_well_founded(
     }
     let types: Vec<_> = component
         .iter()
-        .map(|&index| headers[index].type_.clone())
+        .map(|&index| bodies[index].base.type_.clone())
         .collect();
     let measures: Vec<_> = measured
         .iter()
-        .map(|member| member.measure.clone())
-        .collect();
+        .map(|member| meter.close_mutual_fixed(&member.measure, &captures, true))
+        .collect::<Result<_, _>>()?;
     let mut planner = Context::scoped(environment, kernel, scope);
     planner.txn.budget = meter.txn.budget.clone();
     let plan = std::sync::Arc::new(planner.mutual_well_founded_plan(
@@ -779,7 +823,7 @@ fn mutual_well_founded(
         arities,
         &measures,
         fixed,
-        level_names.to_vec(),
+        levels,
     )?);
     meter.txn.budget = planner.txn.budget;
     let mut wrappers = Vec::new();
@@ -788,13 +832,24 @@ fn mutual_well_founded(
         let member = &members[index];
         let mut context = Context::scoped(environment, kernel, scope);
         context.txn.budget = meter.txn.budget.clone();
+        // Termination proofs run after MutualClosure. Unused section locals
+        // are no longer in scope, even when their names could solve a goal.
+        context.txn.lctx = LocalContext::new();
+        for capture in &captures {
+            context.tick()?;
+            tactics::eliminate::add_local(&mut context.txn.lctx, capture);
+        }
         context.partial = Some(State {
             kind: Kind::Unsafe,
             group: Some(group.clone()),
             ordinary: true,
             ..State::default()
         });
-        context.mutual_member = Some(recursion::MutualMember::new(plan.clone(), position));
+        context.mutual_member = Some(recursion::MutualMember::new(
+            plan.clone(),
+            position,
+            captures.clone(),
+        ));
         let Declaration::Mutual(mut definitions) = definition_in_context(member, &mut context)?
         else {
             return Err(refusal("one ordinary body per mutual header"));

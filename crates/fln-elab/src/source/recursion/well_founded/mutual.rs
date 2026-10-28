@@ -20,8 +20,8 @@
 //!
 //! Supported: Nat-valued measures with the canonical relation (so the fixpoint
 //! is `WellFounded.Nat.fix`), fixed parameters forming one common unreordered
-//! prefix (`fixedArePrefix`), no section variables, identical written universe
-//! parameters. Every other recursive component is a typed refusal, never a
+//! prefix (`fixedArePrefix`), including the common section closure, and identical
+//! written universe parameters. Every other recursive component is a typed refusal, never a
 //! partial or unsafe fallback.
 use super::*;
 use std::sync::Arc;
@@ -45,8 +45,10 @@ pub(in crate::source) struct Measured {
     /// The parameters the measure and the packing range over: the header's,
     /// the equations', and the body's written leading lambdas.
     pub arity: usize,
-    /// `fun params => e`, closed.
+    /// `fun params => e`, closed over the written parameters. The group's
+    /// body-derived section closure is applied after dependency partitioning.
     pub measure: Expr,
+    pub section_captures: Vec<FVarId>,
     /// `T` is `Nat` at default transparency.
     pub nat: bool,
     /// ... and its active `WellFoundedRelation` is `Nat.lt_wfRel` (`isNatLtWF`).
@@ -78,14 +80,16 @@ pub(in crate::source) struct Plan {
 pub(in crate::source) struct MutualMember {
     plan: Arc<Plan>,
     index: usize,
+    captures: Vec<LocalDecl>,
     piece: Option<Expr>,
 }
 
 impl MutualMember {
-    pub(in crate::source) fn new(plan: Arc<Plan>, index: usize) -> Self {
+    pub(in crate::source) fn new(plan: Arc<Plan>, index: usize, captures: Vec<LocalDecl>) -> Self {
         Self {
             plan,
             index,
+            captures,
             piece: None,
         }
     }
@@ -425,12 +429,15 @@ impl Context {
             );
         }
         self.require_resolved_terms(std::slice::from_ref(&value))?;
-        if value.has_fvar() || value.has_level_mvar() {
+        let captures = self.section_parameters(std::slice::from_ref(&value), false)?;
+        let closed = self.close_mutual_fixed(&value, &captures, true)?;
+        if closed.has_fvar() || closed.has_level_mvar() {
             return Err(unsupported("a closed termination measure"));
         }
         Ok(Measured {
             arity: parameters.len(),
             measure: value,
+            section_captures: captures.into_iter().map(|capture| capture.id).collect(),
             nat,
             natural,
         })
@@ -755,7 +762,7 @@ impl Context {
     }
 
     /// `fun fixed => body`, from a term over the fixed locals.
-    fn close_mutual_fixed(
+    pub(in crate::source) fn close_mutual_fixed(
         &mut self,
         body: &Expr,
         fixed: &[LocalDecl],
@@ -1206,6 +1213,10 @@ impl Context {
         let mut parameters = parameters.to_vec();
         let (body, expected, lambdas) =
             self.open_recursive_lambdas(syntax, expected, &mut parameters)?;
+        let header_parameters = header_parameters
+            .checked_add(member.captures.len())
+            .ok_or_else(scope)?;
+        parameters.splice(0..0, member.captures.iter().cloned());
         let expected = expected.ok_or_else(|| error(RecursionError::ResultTypeRequired))?;
         if parameters.len() != plan.arities[index] || parameters.len() <= plan.fixed {
             return Err(unsupported(
@@ -1279,13 +1290,17 @@ impl Context {
                 plan.types[target].clone(),
                 BinderInfo::Default,
             );
+            let mut reference = Typed {
+                value: Expr::fvar(marker.clone()),
+                type_: plan.types[target].clone(),
+            };
+            for capture in &member.captures {
+                reference = self.course_apply(reference, Expr::fvar(capture.id.clone()))?;
+            }
             entries.push(Target {
                 name: member_name.clone(),
-                marker: marker.clone(),
-                reference: Typed {
-                    value: Expr::fvar(marker),
-                    type_: plan.types[target].clone(),
-                },
+                marker,
+                reference,
                 arity: plan.arities[target],
                 fixed: plan.fixed,
                 domain: domains[target].clone(),
