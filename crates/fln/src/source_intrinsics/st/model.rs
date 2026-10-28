@@ -5,12 +5,13 @@
 use super::*;
 use fln_env::constants::{RecursorRule, RecursorVal};
 
-pub(super) const PRIMITIVES: [&str; 5] = [
+pub(super) const PRIMITIVES: [&str; 6] = [
     "Void.mk",
     "ST.Prim.mkRef",
     "ST.Prim.Ref.get",
     "ST.Prim.Ref.set",
     "ST.Prim.Ref.swap",
+    "ST.Prim.Ref.take",
 ];
 
 pub(super) fn name(label: &str) -> Name {
@@ -586,7 +587,9 @@ pub(super) fn primitive(label: &str) -> OpaqueVal {
                 ),
             )
         }
-        "ST.Prim.Ref.get" => (
+        // `take` is `get`'s declaration marked `unsafe opaque` (vendored
+        // `Init/System/ST.lean:195`): `Ref.modifyUnsafe` reads the cell through it.
+        "ST.Prim.Ref.get" | "ST.Prim.Ref.take" => (
             p(reference(b(1), b(0)), state_action(b(2), b(1))),
             l(
                 reference(b(1), b(0)),
@@ -635,13 +638,15 @@ pub(super) fn primitive(label: &str) -> OpaqueVal {
                 ),
             ),
         ),
-        _ => unreachable!("fixed safe ST primitive"),
+        _ => unreachable!("fixed ST primitive"),
     };
-    opaque(
+    let mut primitive = opaque(
         label,
         parameters(2, type_, BinderInfo::Implicit, false),
         parameters(2, value, BinderInfo::Implicit, true),
-    )
+    );
+    primitive.is_unsafe = label == "ST.Prim.Ref.take";
+    primitive
 }
 
 pub(super) fn runner(requested: &Name) -> Option<ConstantInfo> {

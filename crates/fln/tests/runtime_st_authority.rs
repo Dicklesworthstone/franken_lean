@@ -384,6 +384,29 @@ def liftState {sigma alpha : Type} (action : ST sigma alpha) : EST Nat sigma alp
                 (Nat.sub current base)))))))))
 "#;
 
+/// `Ref.modify` and `Ref.modifyGet` run as their `implemented_by` targets, which read the cell
+/// with `take` (vendored `Init/System/ST.lean:195-215`); the last program keeps an `Array` in the
+/// cell. The raw fixture registers no executable extensions, `implemented_by` included, so only
+/// the admitted run executes these.
+const MODIFY_PROGRAM: &str = r#"
+#eval runST (fun sigma =>
+  ST.bind (ST.Prim.mkRef (σ := sigma) (α := Nat) 5) (fun reference =>
+    ST.bind (ST.Prim.Ref.modify reference (fun value => Nat.add value 2)) (fun _ =>
+      ST.Prim.Ref.get reference)))
+
+#eval runST (fun sigma =>
+  ST.bind (ST.Prim.mkRef (σ := sigma) (α := Nat) 10) (fun reference =>
+    ST.bind (ST.Prim.Ref.modifyGet reference (fun value => (Nat.mul value 2, Nat.add value 1))) (fun result =>
+      ST.bind (ST.Prim.Ref.get reference) (fun current =>
+        ST.pure (Nat.add (Nat.mul result 100) current)))))
+
+#eval runST (fun sigma =>
+  ST.bind (ST.Prim.mkRef (σ := sigma) (α := Array Nat) (Array.mkEmpty 0)) (fun reference =>
+    ST.bind (ST.Prim.Ref.modify reference (fun values => Array.push values 4)) (fun _ =>
+      ST.bind (ST.Prim.Ref.modify reference (fun values => Array.push values 5)) (fun _ =>
+        ST.bind (ST.Prim.Ref.get reference) (fun values => ST.pure (Array.size values))))))
+"#;
+
 /// Debugging fixture only: these imported declarations have NOT passed the
 /// module council. The authoritative integration test below never calls this
 /// helper and still reads and admits the complete artifact closure itself.
@@ -648,9 +671,10 @@ fn admitted_st_and_est_execute_reference_actions_in_order_and_refuse_counterfeit
 
             let root = imported.engine.logical_root(&options);
             let entry = name("STAuthority");
+            let source = format!("{PROGRAM}{MODIFY_PROGRAM}");
             let modules = [SourceModuleInput {
                 name: &entry,
-                source: PROGRAM.as_bytes(),
+                source: source.as_bytes(),
             }];
             let limits = SourceProgramLimits::new(EngineExecutionLimits::new(
                 Budget::for_stack_bytes(STACK),
@@ -670,7 +694,7 @@ fn admitted_st_and_est_execute_reference_actions_in_order_and_refuse_counterfeit
                 .iter()
                 .map(|&index| &batch.executions[index])
                 .collect();
-            let expected = [42, 2022, 4207, 1020, 0, 42, 1007, 42, 705, 41, 202042];
+            let expected = [42, 2022, 4207, 1020, 0, 42, 1007, 42, 705, 41, 202042, 7, 2011, 2];
             assert_eq!(evaluations.len(), expected.len());
             for (execution, expected) in evaluations.iter().zip(expected) {
                 assert_scalar(execution, expected, CheckerAdmissionGround::UnsafeQuarantine);
@@ -686,6 +710,18 @@ fn admitted_st_and_est_execute_reference_actions_in_order_and_refuse_counterfeit
                         .windows(row.len())
                         .any(|bytes| bytes == row.as_bytes()),
                     "the compiled program must invoke {target}"
+                );
+            }
+            // `Ref.modify` and `Ref.modifyGet` are implemented by the `unsafe` defs that read the
+            // cell with `take` (vendored `Init/System/ST.lean:195-215`).
+            for execution in &evaluations[11..] {
+                let row = "extern:ST.Prim.Ref.take";
+                assert!(
+                    execution
+                        .flbc_artifact
+                        .windows(row.len())
+                        .any(|bytes| bytes == row.as_bytes()),
+                    "the compiled program must invoke {row}"
                 );
             }
             let query = evaluations[1].declaration.clone();

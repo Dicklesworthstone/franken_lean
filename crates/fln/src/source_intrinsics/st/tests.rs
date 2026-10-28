@@ -128,7 +128,8 @@ fn changed_opaque_body_kind_telescope_or_safety_cannot_gain_st_authority() {
                         )
                     }
                     1 => value.base.type_ = Expr::const_(name("Nat"), vec![]),
-                    2 => value.is_unsafe = true,
+                    // `take` is the one primitive the pin declares `unsafe`.
+                    2 => value.is_unsafe = !value.is_unsafe,
                     3 => value.all.push(name("foreignMember")),
                     4 => value.base.level_params.push(name("u")),
                     5 => {

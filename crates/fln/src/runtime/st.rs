@@ -29,11 +29,14 @@ enum Operation {
     Get,
     Set,
     Swap,
+    /// `Ref.modifyUnsafe` and `Ref.modifyGetUnsafe`, which `Ref.modify` and `Ref.modifyGet`
+    /// are implemented by, read the cell with `take`.
+    Take,
 }
 
 impl Operation {
     fn from_name(name: &Name) -> Option<Self> {
-        [Self::New, Self::Get, Self::Set, Self::Swap]
+        [Self::New, Self::Get, Self::Set, Self::Swap, Self::Take]
             .into_iter()
             .find(|operation| name == &operation.source_name())
     }
@@ -44,6 +47,7 @@ impl Operation {
             Self::Get => "ST.Prim.Ref.get",
             Self::Set => "ST.Prim.Ref.set",
             Self::Swap => "ST.Prim.Ref.swap",
+            Self::Take => "ST.Prim.Ref.take",
         })
     }
 
@@ -54,7 +58,7 @@ impl Operation {
     fn argument_types(self) -> Vec<Expr> {
         match self {
             Self::New => vec![payload_type()],
-            Self::Get => vec![ref_type()],
+            Self::Get | Self::Take => vec![ref_type()],
             Self::Set | Self::Swap => vec![ref_type(), payload_type()],
         }
     }
@@ -62,7 +66,7 @@ impl Operation {
     fn capture_types(self, payload: &Expr) -> Vec<Expr> {
         match self {
             Self::New => vec![payload.clone()],
-            Self::Get => vec![ref_type()],
+            Self::Get | Self::Take => vec![ref_type()],
             Self::Set | Self::Swap => vec![ref_type(), payload.clone()],
         }
     }
@@ -70,7 +74,7 @@ impl Operation {
     fn argument_values(self) -> Vec<ValueType> {
         match self {
             Self::New => vec![ValueType::Abi],
-            Self::Get => vec![ValueType::Ref],
+            Self::Get | Self::Take => vec![ValueType::Ref],
             Self::Set | Self::Swap => vec![ValueType::Ref, ValueType::Abi],
         }
     }
@@ -78,7 +82,7 @@ impl Operation {
     fn raw_result(self) -> (Expr, ValueType) {
         match self {
             Self::New => (ref_type(), ValueType::Ref),
-            Self::Get | Self::Swap => (payload_type(), ValueType::Abi),
+            Self::Get | Self::Swap | Self::Take => (payload_type(), ValueType::Abi),
             Self::Set => (unit_type(), ValueType::Unit),
         }
     }
@@ -421,7 +425,9 @@ impl Preparation<'_> {
         if !specialize::closed(&payload)
             || !matches!(
                 self.value_type(&payload)?,
-                Some(ValueType::Nat | ValueType::String | ValueType::Constructor)
+                Some(
+                    ValueType::Nat | ValueType::String | ValueType::Constructor | ValueType::Array
+                )
             )
         {
             return Ok(None);
@@ -452,7 +458,7 @@ impl Preparation<'_> {
         let result_type = match operation {
             Operation::New => apply("ST.Ref", [sigma.clone(), args[1].clone()]),
             Operation::Set => Expr::const_(name("Unit"), vec![]),
-            Operation::Get | Operation::Swap => args[1].clone(),
+            Operation::Get | Operation::Swap | Operation::Take => args[1].clone(),
         };
         let action_type = Expr::forall_e(
             Name::anonymous(),
