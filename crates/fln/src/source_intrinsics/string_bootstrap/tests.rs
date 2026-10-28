@@ -234,6 +234,20 @@ const BOOTSTRAP: [Operation; 8] = [
     Operation::IsEmpty,
 ];
 
+const SUBSTRING: [Operation; 11] = [
+    Operation::Front,
+    Operation::PosMin,
+    Operation::PosSub,
+    Operation::SubstringToString,
+    Operation::SubstringDrop,
+    Operation::SubstringFront,
+    Operation::SubstringExtract,
+    Operation::SubstringBeq,
+    Operation::SubstringIsEmpty,
+    Operation::SubstringGet,
+    Operation::SubstringPrev,
+];
+
 /// The ownership the generated census row requires of an FLBC call.
 fn generated_ownership(row: &str, arguments: usize) -> (Vec<ArgumentOwnership>, ResultOwnership) {
     use fln_vm::extern_row::{
@@ -414,7 +428,8 @@ fn actual_string_inventories_close_the_pin_and_share_only_successful_checks() {
         // of magnitude from Bootstrap's, as measured with the pin itself.
         let counts = [
             325, 325, 325, 326, 325, 323, 323, 324, 351, 3413, 3413, 2318, 369, 3416, 3416, 4040,
-            3653, 3396, 3413, 3415, 3415, 3416, 3935, 3413, 370, 341, 3396,
+            3653, 3396, 3413, 3415, 3415, 3416, 3935, 3413, 370, 341, 3396, 349, 17, 18, 328, 328,
+            353, 328, 328, 328, 354, 328,
         ];
         assert_eq!(counts.len(), Operation::ALL.len());
         let mut defining = BTreeSet::new();
@@ -757,7 +772,9 @@ axiom proof {p : Prop} : p
             selected,
             Operation::ALL
                 .into_iter()
-                .filter(|operation| !BOOTSTRAP.contains(operation))
+                .filter(|operation| {
+                    !BOOTSTRAP.contains(operation) && !SUBSTRING.contains(operation)
+                })
                 .map(|operation| format!("extern:{}", operation.label()))
                 .chain(["extern:String.Internal.foldl".to_owned()])
                 .collect()
@@ -806,6 +823,184 @@ axiom proof {p : Prop} : p
                 execution.exit
             );
         }
+    });
+}
+
+/// These answers follow the pinned exported Lean helpers, including the
+/// surprising empty-slice front, invalid byte positions, and reads beyond the
+/// slice stop. Source records keep Pos.Raw fields; only the private native
+/// record has plain Nat offsets.
+#[test]
+fn substring_adapters_preserve_unicode_bounds_partial_calls_and_replay() {
+    with_fixture(|fixture| {
+        let engine = Engine::from_environment(fixture.environment.clone());
+        let options = KVMap::new();
+        let root = engine.logical_root(&options);
+        let limits = EngineExecutionLimits::new(Budget::for_stack_bytes(STACK));
+        let source = r#"
+def middle : Substring.Raw := Substring.Raw.mk "aλ😀z" (String.Pos.Raw.mk 1) (String.Pos.Raw.mk 7)
+def first : Substring.Raw := Substring.Raw.mk "aλ😀z" (String.Pos.Raw.mk 1) (String.Pos.Raw.mk 3)
+def empty : Substring.Raw := Substring.Raw.mk "aλ😀z" (String.Pos.Raw.mk 3) (String.Pos.Raw.mk 3)
+def badStart : Substring.Raw := Substring.Raw.mk "aλ😀z" (String.Pos.Raw.mk 2) (String.Pos.Raw.mk 7)
+def badStop : Substring.Raw := Substring.Raw.mk "aλ😀z" (String.Pos.Raw.mk 1) (String.Pos.Raw.mk 4)
+#eval (String.Internal.front "λ😀").toNat
+#eval (String.Internal.front "").toNat
+#eval (String.Internal.front "\x00z").toNat
+#eval (String.Pos.Raw.Internal.min (String.Pos.Raw.mk 8) (String.Pos.Raw.mk 3)).byteIdx
+#eval (String.Pos.Raw.Internal.min (String.Pos.Raw.mk 3000000000000000000000000000000) (String.Pos.Raw.mk 3)).byteIdx
+#eval (String.Pos.Raw.Internal.sub (String.Pos.Raw.mk 8) (String.Pos.Raw.mk 3)).byteIdx
+#eval (String.Pos.Raw.Internal.sub (String.Pos.Raw.mk 3) (String.Pos.Raw.mk 8)).byteIdx
+#eval Substring.Raw.Internal.toString middle
+#eval Substring.Raw.Internal.toString badStart
+#eval Substring.Raw.Internal.toString badStop
+#eval Substring.Raw.Internal.toString (Substring.Raw.mk "aλ😀z" (String.Pos.Raw.mk 7) (String.Pos.Raw.mk 1))
+#eval Substring.Raw.Internal.toString (Substring.Raw.mk "aλ😀z" (String.Pos.Raw.mk 99) (String.Pos.Raw.mk 100))
+#eval Substring.Raw.Internal.toString (Substring.Raw.Internal.drop middle 0)
+#eval Substring.Raw.Internal.toString (Substring.Raw.Internal.drop middle 1)
+#eval Substring.Raw.Internal.toString (Substring.Raw.Internal.drop middle 100)
+#eval (Substring.Raw.Internal.drop middle 1).startPos.byteIdx
+#eval (Substring.Raw.Internal.drop middle 1).stopPos.byteIdx
+#eval (Substring.Raw.Internal.drop middle 1).str
+#eval (Substring.Raw.Internal.front middle).toNat
+#eval (Substring.Raw.Internal.front empty).toNat
+#eval (Substring.Raw.Internal.front badStart).toNat
+#eval Substring.Raw.Internal.toString (Substring.Raw.Internal.extract middle (String.Pos.Raw.mk 2) (String.Pos.Raw.mk 6))
+#eval (Substring.Raw.Internal.extract middle (String.Pos.Raw.mk 4) (String.Pos.Raw.mk 2)).str
+#eval Substring.Raw.Internal.toString (Substring.Raw.Internal.extract middle (String.Pos.Raw.mk 0) (String.Pos.Raw.mk 99))
+#eval if Substring.Raw.Internal.beq middle (Substring.Raw.mk "λ😀" (String.Pos.Raw.mk 0) (String.Pos.Raw.mk 6)) then 42 else 0
+#eval if Substring.Raw.Internal.beq badStart empty then 42 else 0
+#eval if Substring.Raw.Internal.beq middle first then 0 else 42
+#eval if Substring.Raw.Internal.isEmpty middle then 0 else 42
+#eval if Substring.Raw.Internal.isEmpty empty then 42 else 0
+#eval if Substring.Raw.Internal.isEmpty (Substring.Raw.mk "aλ😀z" (String.Pos.Raw.mk 7) (String.Pos.Raw.mk 1)) then 42 else 0
+#eval (Substring.Raw.Internal.get first (String.Pos.Raw.mk 0)).toNat
+#eval (Substring.Raw.Internal.get first (String.Pos.Raw.mk 1)).toNat
+#eval (Substring.Raw.Internal.get first (String.Pos.Raw.mk 2)).toNat
+#eval (Substring.Raw.Internal.get first (String.Pos.Raw.mk 6)).toNat
+#eval (Substring.Raw.Internal.get first (String.Pos.Raw.mk 99)).toNat
+#eval (Substring.Raw.Internal.prev middle (String.Pos.Raw.mk 0)).byteIdx
+#eval (Substring.Raw.Internal.prev middle (String.Pos.Raw.mk 6)).byteIdx
+#eval (Substring.Raw.Internal.prev middle (String.Pos.Raw.mk 7)).byteIdx
+#eval (Substring.Raw.Internal.prev middle (String.Pos.Raw.mk 99)).byteIdx
+#eval let drop := Substring.Raw.Internal.drop middle; Substring.Raw.Internal.toString (drop 1)
+#eval let extract := Substring.Raw.Internal.extract middle (String.Pos.Raw.mk 2); Substring.Raw.Internal.toString (extract (String.Pos.Raw.mk 6))
+#eval let get := Substring.Raw.Internal.get first; (get (String.Pos.Raw.mk 2)).toNat
+#eval let same := Substring.Raw.Internal.beq middle; if same middle then 42 else 0
+"#;
+        let text = |value: &str| ClosedVmValue::String(value.to_owned());
+        let scalar = ClosedVmValue::Scalar;
+        let expected = [
+            scalar(955),
+            scalar(65),
+            scalar(0),
+            scalar(3),
+            scalar(3),
+            scalar(5),
+            scalar(0),
+            text("λ😀"),
+            text(""),
+            text("λ😀z"),
+            text(""),
+            text(""),
+            text("λ😀"),
+            text("😀"),
+            text(""),
+            scalar(3),
+            scalar(7),
+            text("aλ😀z"),
+            scalar(955),
+            scalar(128_512),
+            scalar(65),
+            text("😀"),
+            text(""),
+            text("λ😀"),
+            scalar(42),
+            scalar(42),
+            scalar(42),
+            scalar(42),
+            scalar(42),
+            scalar(42),
+            scalar(955),
+            scalar(65),
+            scalar(128_512),
+            scalar(122),
+            scalar(65),
+            scalar(0),
+            scalar(2),
+            scalar(6),
+            scalar(98),
+            text("😀"),
+            text("😀"),
+            scalar(128_512),
+            scalar(42),
+        ];
+        let complete = engine
+            .execute_source_commands_with_checks(source.as_bytes(), &options, limits)
+            .unwrap_or_else(|error| panic!("checked native Substring adapters: {error:?}"))
+            .into_complete()
+            .unwrap();
+        let indices = &complete.batch.source_evaluation_indices;
+        assert_eq!(indices.len(), expected.len());
+        let mut selected = BTreeSet::new();
+        for (&index, expected) in indices.iter().zip(&expected) {
+            let execution = &complete.batch.executions[index];
+            assert_eq!(
+                execution.checker.ground,
+                CheckerAdmissionGround::UnsafeQuarantine
+            );
+            assert_eq!(
+                closed_vm_value(&execution.exit).unwrap().as_ref(),
+                Some(expected)
+            );
+            let program =
+                flbc::decode_canonical(&execution.flbc_artifact, flbc::CodecLimits::default())
+                    .unwrap();
+            assert_eq!(
+                flbc::encode_canonical(&program, flbc::CodecLimits::default()).unwrap(),
+                execution.flbc_artifact
+            );
+            for instruction in program
+                .functions()
+                .iter()
+                .flat_map(|function| &function.code)
+            {
+                if let Instruction::Intrinsic {
+                    row,
+                    argument_ownership,
+                    result_ownership,
+                    ..
+                } = instruction
+                    && SUBSTRING
+                        .iter()
+                        .any(|operation| *row == format!("extern:{}", operation.label()))
+                {
+                    assert_eq!(
+                        (argument_ownership.clone(), *result_ownership),
+                        generated_ownership(row, argument_ownership.len())
+                    );
+                    assert_eq!(
+                        *result_ownership,
+                        ResultOwnership::Owned,
+                        "Bootstrap helpers box their results"
+                    );
+                    selected.insert(row.clone());
+                }
+            }
+            let replay =
+                execute_flbc_artifact(&execution.flbc_artifact, &options, Default::default())
+                    .unwrap()
+                    .into_complete()
+                    .unwrap();
+            assert_eq!(closed_vm_value(&replay).unwrap().as_ref(), Some(expected));
+        }
+        assert_eq!(
+            selected,
+            SUBSTRING
+                .map(|operation| format!("extern:{}", operation.label()))
+                .into_iter()
+                .collect()
+        );
+        assert_eq!(engine.logical_root(&options), root);
     });
 }
 
@@ -971,11 +1166,23 @@ fn missing_foreign_and_changed_dependencies_never_acquire_native_authority() {
             )
             .unwrap();
             assert!(matches(&changed, operation).is_err());
-            for target in [
-                requested.clone(),
-                name("String.ofByteArray"),
-                name("Nat.succ"),
-            ] {
+            let position_only = matches!(operation, Operation::PosMin | Operation::PosSub);
+            let representation = if position_only {
+                // These two rows operate on raw offsets alone. Their exact
+                // pin closures bind Pos.Raw's constructor, not any String.
+                assert!(
+                    matches(
+                        &rebuild(fixture, Some(&name("String.ofByteArray")), None),
+                        operation
+                    )
+                    .unwrap(),
+                    "raw position arithmetic does not depend on a String representation"
+                );
+                name("String.Pos.Raw.mk")
+            } else {
+                name("String.ofByteArray")
+            };
+            for target in [requested.clone(), representation, name("Nat.succ")] {
                 let result = matches(&rebuild(fixture, Some(&target), None), operation);
                 if target == requested {
                     assert!(
@@ -1143,6 +1350,13 @@ fn changed_body(operation: Operation, info: ConstantInfo) -> Declaration {
         Domain::Nat => answer,
         Domain::String => Expr::lit(Literal::Str("counterfeit".to_owned())),
         Domain::Position => Expr::app(c("String.Pos.Raw.mk"), answer),
+        Domain::Substring => [
+            Expr::lit(Literal::Str("counterfeit".to_owned())),
+            Expr::app(c("String.Pos.Raw.mk"), answer.clone()),
+            Expr::app(c("String.Pos.Raw.mk"), answer),
+        ]
+        .into_iter()
+        .fold(c("Substring.Raw.mk"), Expr::app),
         Domain::Bool => c("Bool.true"),
         Domain::Char => Expr::app(c("Char.ofNat"), answer),
         Domain::Byte => Expr::app(c("UInt8.ofNat"), answer),
