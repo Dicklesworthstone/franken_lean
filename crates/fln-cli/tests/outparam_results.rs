@@ -6,9 +6,10 @@
 //! is `some (getElem bs n)`; unifying `?Elem := Option Bool` first asked for an instance no
 //! declaration provides. Under `@` the support is off, and the pin refuses.
 //!
-//! Through the drop-in `lean` over `prelude` with `Init.Data.Int.Basic`, `Init.Data.Array.Basic`
-//! and `Init.Data.Option.Coe`. Every program here was run through the pinned `lean` v4.32.0 with
-//! the same header first (2026-10-24), and is compared with the pinned binary again when present.
+//! Full-library cases use the drop-in `lean` over `prelude` with `Init.Data.Int.Basic`,
+//! `Init.Data.Array.Basic` and `Init.Data.Option.Coe`, and compare with the pinned executable
+//! when present. The delayed-field proof and refusal control also run without imports, so
+//! native coverage does not depend on cold import admission.
 #![forbid(unsafe_code)]
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -78,7 +79,7 @@ const EXPLICIT: &str = "example (bs : Array Bool) (n : Nat) (h : n < bs.size) : 
 /// The second example of the pin's `dotNotationAndDefaultInstance.lean`, plus
 /// named, chained, dependent and coercing projections. The local helper's
 /// argument type is determined only when its caller is elaborated.
-const DELAYED_FIELDS: &str = "namespace Ex
+const DELAYED_FIELDS: &str = r#"namespace Ex
 class Get (Cont : Type u) (Idx : Type v) (Elem : outParam (Type w)) where
   get (xs : Cont) (i : Idx) : Elem
 export Get (get)
@@ -87,33 +88,40 @@ instance [Inhabited α] : Get (Array α) Nat α where
 def delayed (as : Array (Nat × Bool)) : Bool :=
   let r1 (as : _) := (get as 0).2
   r1 as
-#print delayed
+example (as : Array (Nat × Bool)) : delayed as = (get as 0).2 :=
+  Eq.refl ((get as 0).2)
 def delayedNamed (as : Array (Nat × Bool)) : Bool :=
   let r1 (as : _) := (get as 0).snd
   r1 as
-#print delayedNamed
+example (as : Array (Nat × Bool)) : delayedNamed as = (get as 0).2 :=
+  Eq.refl ((get as 0).2)
 def delayedCoerced (as : Array (Nat × Bool)) : Option Bool :=
   let r1 (as : _) : Option Bool := (get as 0).2
   r1 as
-#print delayedCoerced
+example (as : Array (Nat × Bool)) : delayedCoerced as = some ((get as 0).2) :=
+  Eq.refl (some ((get as 0).2))
 end Ex
 def anonymousReceiver (pair : Nat × Bool) : Bool :=
   let getSecond (x : _) := x.2
   getSecond pair
-#print anonymousReceiver
+example (pair : Nat × Bool) : anonymousReceiver pair = pair.2 :=
+  Eq.refl (pair.2)
 def nestedReceiver (pair : Nat × (Nat × Bool)) : Bool :=
   let getSecond (x : _) := x.2.2
   getSecond pair
-#print nestedReceiver
+example (pair : Nat × (Nat × Bool)) : nestedReceiver pair = pair.2.2 :=
+  Eq.refl (pair.2.2)
 def dependentReceiver (α : Type) (pair : α × Bool) : Bool :=
   let getSecond (x : _) := x.2
   getSecond pair
-#print dependentReceiver
+example (α : Type) (pair : α × Bool) : dependentReceiver α pair = pair.2 :=
+  Eq.refl (pair.2)
 def callCoerced (pair : Nat × Bool) : Option Bool :=
   let getSecond (x : _) := x.2
   getSecond pair
-#print callCoerced
-";
+example (pair : Nat × Bool) : callCoerced pair = some (pair.2) :=
+  Eq.refl (some (pair.2))
+"#;
 
 fn pinned_lib() -> Option<PathBuf> {
     let lib = std::env::var_os("FLN_REFERENCE_LIB")
@@ -234,6 +242,87 @@ fn field_notation_waits_for_the_receivers_inferred_type_across_local_binders() {
     );
     assert_eq!(
         ours.stdout, pinned.stdout,
-        "delayed projections changed their checked bodies"
+        "delayed projection proofs produced different command output"
     );
+}
+
+/// Keep the delayed-receiver path executable without a cold Init import.
+/// The equality constructor checks the resulting body through the kernel;
+/// declaration printing has a separate let-to-have capability boundary.
+#[test]
+fn delayed_fields_preserve_lexical_helpers_without_imports() {
+    const SOURCE: &str = r#"prelude
+inductive Token where
+  | mk
+def Token.identity (value : Token) : Token := value
+def delayed (left right : Token) : Token :=
+  let A := Token
+  let first (_tag : A) (x : _) := x.identity
+  let second (x : _) := x.identity
+  first left (second right)
+inductive Same (x : Token) : Token → Prop where
+  | refl : Same x x
+theorem delayed_correct (left right : Token) : Same (delayed left right) right :=
+  @Same.refl right
+"#;
+    let root = workspace();
+    std::fs::write(root.join("delayed.lean"), SOURCE).unwrap();
+    std::fs::write(
+        root.join("missing.lean"),
+        SOURCE.replacen(
+            "let second (x : _) := x.identity",
+            "let second (x : _) := x.missing",
+            1,
+        ),
+    )
+    .unwrap();
+    let run = |binary: &Path, source: &str| {
+        Command::new(binary)
+            .arg(source)
+            .current_dir(&root)
+            .env("FLN_IMPORT_REUSE_DIR", root.join("records"))
+            .output()
+            .expect("run import-free delayed-field probe")
+    };
+    let native = Path::new(env!("CARGO_BIN_EXE_lean"));
+    let accepted = run(native, "delayed.lean");
+    assert_eq!(accepted.status.code(), Some(0), "{accepted:?}");
+    assert!(accepted.stdout.is_empty(), "{accepted:?}");
+    assert!(accepted.stderr.is_empty(), "{accepted:?}");
+    let refused = run(native, "missing.lean");
+    assert_eq!(refused.status.code(), Some(1), "{refused:?}");
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("unknown record field missing"),
+        "{refused:?}"
+    );
+
+    // The native controls above always run, including without Reference data.
+    let pinned = std::env::var_os("FLN_REFERENCE_LEAN")
+        .map(PathBuf::from)
+        .or_else(|| {
+            pinned_lib()
+                .and_then(|lib| {
+                    lib.parent()
+                        .and_then(Path::parent)
+                        .map(|toolchain| toolchain.join("bin/lean"))
+                })
+                .filter(|lean| lean.is_file())
+        });
+    assert!(
+        pinned.is_some() || std::env::var_os("FLN_REQUIRE_REFERENCE").is_none(),
+        "the pinned Reference executable is required"
+    );
+    if let Some(pinned) = pinned {
+        let reference = run(&pinned, "delayed.lean");
+        assert_eq!(reference.status.code(), Some(0), "{reference:?}");
+        assert_eq!(accepted.stdout, reference.stdout, "{reference:?}");
+        assert_eq!(accepted.stderr, reference.stderr, "{reference:?}");
+        let reference = run(&pinned, "missing.lean");
+        assert_eq!(reference.status.code(), Some(1), "{reference:?}");
+        let diagnostic = String::from_utf8_lossy(&reference.stdout);
+        assert!(
+            diagnostic.contains("Invalid field") && diagnostic.contains("Token.missing"),
+            "{reference:?}"
+        );
+    }
 }
