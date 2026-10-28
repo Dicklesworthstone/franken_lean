@@ -62,6 +62,7 @@ jobs:
               'crates/fln-cli/src/goal_traces.rs',
               'crates/fln-cli/src/source_check/imports.rs',
               'crates/fln/src/source_records/simp.rs',
+              'crates/fln-elab/src/source/tactics/rewrite/simplify/binders.rs',
           }
           for path, blobs in changes.items():
               assert path in allowed, path
