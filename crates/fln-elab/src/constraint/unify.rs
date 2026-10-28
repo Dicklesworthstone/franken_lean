@@ -29,9 +29,9 @@ mod residual;
 
 use crate::constraint::{Constraint, ConstraintId};
 use crate::lctx::LocalContext;
-use crate::mvar::{AssignmentJustification, MetavarError, MetavarKind};
+use crate::mvar::{AssignmentJustification, MetavarError, MetavarKind, MetavarStore};
 use crate::txn::ElabTxn;
-use crate::universe::UniverseInstantiationError;
+use crate::universe::{UniverseInstantiationError, UniverseStore};
 use fln_core::expr::{Expr, ExprNode, FVarId, Literal, MVarId};
 use fln_core::level::{LMVarId, Level, LevelView};
 use fln_core::name::Name;
@@ -340,9 +340,25 @@ fn simplify_level(level: &Level, meter: &mut Meter<'_>) -> Result<Level, Unifica
     normalize::simplify(level, meter)
 }
 
+/// The assignments [`same_terms_with`] reads through: an assigned hole is its value, as
+/// the pin's `isDefEq` sees it, so two sides equal up to assignment are the same term.
+struct Assigned<'a> {
+    mvars: &'a MetavarStore,
+    universes: &'a UniverseStore,
+}
+
 fn same_levels(
     left: &Level,
     right: &Level,
+    meter: &mut Meter<'_>,
+) -> Result<bool, UnificationError> {
+    same_levels_with(left, right, None, meter)
+}
+
+fn same_levels_with<'a>(
+    left: &'a Level,
+    right: &'a Level,
+    assigned: Option<&Assigned<'a>>,
     meter: &mut Meter<'_>,
 ) -> Result<bool, UnificationError> {
     let mut pending = vec![(left, right)];
@@ -352,10 +368,16 @@ fn same_levels(
             continue;
         }
         meter.node()?;
+        let value = |level: &Level| match level.view() {
+            LevelView::MVar(id) => assigned.and_then(|stores| stores.universes.get_assignment(id)),
+            _ => None,
+        };
         match (left.view(), right.view()) {
             (LevelView::Zero, LevelView::Zero) => {}
             (LevelView::Param(a), LevelView::Param(b)) if a == b => {}
             (LevelView::MVar(a), LevelView::MVar(b)) if a == b => {}
+            _ if let Some(left) = value(left) => pending.push((left, right)),
+            _ if let Some(right) = value(right) => pending.push((left, right)),
             (LevelView::Succ(a), LevelView::Succ(b)) => pending.push((a, b)),
             (LevelView::Max(a, b), LevelView::Max(c, d))
             | (LevelView::IMax(a, b), LevelView::IMax(c, d)) => {
@@ -372,6 +394,16 @@ fn same_levels(
 /// Binder names/styles and metadata do not affect this equality. Pair memoization
 /// prevents exponentially shared terms from becoming exponentially many tasks.
 fn same_terms(left: &Expr, right: &Expr, meter: &mut Meter<'_>) -> Result<bool, UnificationError> {
+    same_terms_with(left, right, None, meter)
+}
+
+/// [`same_terms`], reading through `assigned` when it is given.
+fn same_terms_with<'a>(
+    left: &'a Expr,
+    right: &'a Expr,
+    assigned: Option<&Assigned<'a>>,
+    meter: &mut Meter<'_>,
+) -> Result<bool, UnificationError> {
     let mut pending = vec![(left, right)];
     let mut seen = HashSet::new();
     while let Some((left, right)) = pending.pop() {
@@ -385,15 +417,21 @@ fn same_terms(left: &Expr, right: &Expr, meter: &mut Meter<'_>) -> Result<bool, 
         if std::ptr::eq(left.node(), right.node()) {
             continue;
         }
+        let value = |term: &Expr| match term.node() {
+            ExprNode::MVar { id } => assigned.and_then(|stores| stores.mvars.get_assigned_expr(id)),
+            _ => None,
+        };
         match (left.node(), right.node()) {
             (ExprNode::MData { expr, .. }, _) => pending.push((expr, right)),
             (_, ExprNode::MData { expr, .. }) => pending.push((left, expr)),
             (ExprNode::BVar { idx: a }, ExprNode::BVar { idx: b }) if a == b => {}
             (ExprNode::FVar { id: a }, ExprNode::FVar { id: b }) if a == b => {}
             (ExprNode::MVar { id: a }, ExprNode::MVar { id: b }) if a == b => {}
+            _ if let Some(left) = value(left) => pending.push((left, right)),
+            _ if let Some(right) = value(right) => pending.push((left, right)),
             (ExprNode::Lit { literal: a }, ExprNode::Lit { literal: b }) if a == b => {}
             (ExprNode::Sort { level: a }, ExprNode::Sort { level: b }) => {
-                if !same_levels(a, b, meter)? {
+                if !same_levels_with(a, b, assigned, meter)? {
                     return Ok(false);
                 }
             }
@@ -408,7 +446,7 @@ fn same_terms(left: &Expr, right: &Expr, meter: &mut Meter<'_>) -> Result<bool, 
                 },
             ) if a == b && ua.len() == ub.len() => {
                 for (a, b) in ua.iter().zip(ub) {
-                    if !same_levels(a, b, meter)? {
+                    if !same_levels_with(a, b, assigned, meter)? {
                         return Ok(false);
                     }
                 }
@@ -1077,6 +1115,28 @@ impl Engine<'_> {
         }
     }
 
+    /// [`same_terms`], reading through this batch's assignments when either side has a
+    /// hole. A side whose holes are assigned but not yet instantiated is otherwise never the
+    /// same as its instantiated twin, and each comparison below would walk the whole pair
+    /// again before decomposing it: a stuck `List.rec` reached through `Array.size` with a
+    /// universe hole on each side spent the 100,000-step limit on equal motives and minor
+    /// premises before it reached the major premises that differ.
+    fn same_up_to_assignment(
+        &mut self,
+        left: &Expr,
+        right: &Expr,
+    ) -> Result<bool, UnificationError> {
+        let holes = left.has_expr_mvar()
+            || right.has_expr_mvar()
+            || left.has_level_mvar()
+            || right.has_level_mvar();
+        let assigned = holes.then_some(Assigned {
+            mvars: &self.work.mvars,
+            universes: &self.work.universes,
+        });
+        same_terms_with(left, right, assigned.as_ref(), &mut self.meter)
+    }
+
     fn compare(
         &mut self,
         equation: &Equation,
@@ -1084,7 +1144,7 @@ impl Engine<'_> {
     ) -> Result<(), UnificationError> {
         let (left, right, locals) = equation;
         self.meter.tick()?;
-        if same_terms(left, right, &mut self.meter)? {
+        if self.same_up_to_assignment(left, right)? {
             return Ok(());
         }
         // The pin's `isDefEqQuickOther` (vendored Meta/ExprDefEq.lean) assigns a
@@ -1167,7 +1227,7 @@ impl Engine<'_> {
         }
         let left = self.whnf_for_comparison(left, locals)?;
         let right = self.whnf_for_comparison(right, locals)?;
-        if same_terms(&left, &right, &mut self.meter)? {
+        if self.same_up_to_assignment(&left, &right)? {
             return Ok(());
         }
         if self.budget.offset_constraints

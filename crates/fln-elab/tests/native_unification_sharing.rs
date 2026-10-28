@@ -2,7 +2,7 @@
 #![forbid(unsafe_code)]
 
 use fln_core::expr::{BinderInfo, Expr, Literal, MVarId, NatLit};
-use fln_core::level::Level;
+use fln_core::level::{LMVarId, Level};
 use fln_core::name::Name;
 use fln_core::options::KVMap;
 use fln_elab::constraint::unify::{UnificationBudget, UnificationError};
@@ -160,4 +160,42 @@ fn a_new_batch_cannot_inherit_a_warm_cache_or_refund_failed_work() {
         txn.budget.heartbeats_consumed - before.budget.heartbeats_consumed,
         8
     );
+}
+
+#[test]
+fn an_assigned_hole_is_its_value_so_its_telescope_is_walked_once() {
+    // A hole assigned but not instantiated used to differ syntactically from its value, so
+    // each comparison under a binder rewalked the rest of the telescope down to it: about
+    // DEPTH²/2 visits, past the default 100,000-step limit here, where one walk is about 8
+    // steps a binder. The pin's `isDefEq` sees an assigned hole as its value.
+    const DEPTH: usize = 400;
+    let telescope = |end: Expr| {
+        (0..DEPTH).fold(end, |body, _| {
+            Expr::forall_e(Name::anonymous(), nat(), body, BinderInfo::Default)
+        })
+    };
+    let universe = LMVarId(name("shared_universe"));
+    for level in [false, true] {
+        let mut txn = transaction();
+        let (end, value) = if level {
+            let end = Expr::sort(Level::mvar(universe.clone()));
+            txn.unify(&end, &Expr::sort(Level::zero()), budget())
+                .unwrap();
+            (end, Expr::sort(Level::zero()))
+        } else {
+            let id = hole(&mut txn, 0, Expr::sort(Level::one()));
+            txn.unify(&Expr::mvar(id.clone()), &nat(), budget())
+                .unwrap();
+            (Expr::mvar(id), nat())
+        };
+        let before = txn.clone();
+        let report = txn
+            .unify(&telescope(end), &telescope(value), budget())
+            .unwrap();
+        assert!(report.expression_assignments.is_empty(), "{report:?}");
+        assert!(report.universe_assignments.is_empty(), "{report:?}");
+        assert!(report.unifier_steps < 10 * DEPTH as u64, "{report:?}");
+        assert_eq!(txn.mvars, before.mvars);
+        assert_eq!(txn.universes, before.universes);
+    }
 }
