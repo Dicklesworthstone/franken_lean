@@ -97,7 +97,11 @@ impl Preparation<'_> {
         index: u64,
         receiver: &Expr,
     ) -> Result<Option<Expr>, IngressError> {
-        let source = self.normalize_type(receiver_type)?;
+        // Recover only the admitted family head. Its original value and proof
+        // parameters must survive verbatim: normalizing their children here
+        // can unfold large runtime computations merely to classify a field.
+        // The constructor telescope below supplies the exact dependent type.
+        let source = self.type_head(receiver_type)?;
         let (head, parameters) = self.spine(&source)?;
         let ExprNode::Const { name, levels } = head.node() else {
             return Ok(None);

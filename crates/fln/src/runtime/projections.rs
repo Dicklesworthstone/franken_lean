@@ -419,7 +419,10 @@ impl Preparation<'_> {
         structure: &Name,
         index: u64,
     ) -> Result<Option<(records::Shape, Expr)>, IngressError> {
-        let source = self.normalize_type(receiver_type)?;
+        // Only the family head is needed here. Layout discovery erases value
+        // parameters before normalizing the represented type; traversing their
+        // computations first would defeat that boundary.
+        let source = self.type_head(receiver_type)?;
         let (head, _) = self.spine(&source)?;
         let ExprNode::Const { name, .. } = head.node() else {
             return Ok(None);
