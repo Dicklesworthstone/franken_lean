@@ -562,11 +562,13 @@ impl<'a> Builder<'a> {
                     )?
                 }
                 IrExpr::Ctor { info, args } => {
-                    let id = self.constructor(info)?;
-                    constructor = Some(id);
-                    if info.size == 0 {
+                    if info.size == 0 && info.usize == 0 && info.ssize == 0 {
+                        // Fieldless constructors are scalar tags. Their index
+                        // does not occupy the bounded heap-header tag field.
                         self.nat(block, &IrNat::Small(info.cidx))?
                     } else {
+                        let id = self.constructor(info)?;
+                        constructor = Some(id);
                         let fields = self.arguments(block, args, locals)?;
                         self.boxed(
                             block,
@@ -844,53 +846,56 @@ impl<'a> Builder<'a> {
             }
             return Ok(());
         };
-        let constructor = self.constructor(info)?;
-        let condition = if info.size == 0 && scalar {
-            let tag = self.nat(block, &IrNat::Small(info.cidx))?;
-            let equal = self.native_call(
-                block,
-                &Name::from_components(["Nat", "beq"]),
-                vec![value, tag],
-            )?;
-            self.emit(
-                block,
-                ValueType::Bool,
-                Operation::Unbox {
-                    value: equal,
-                    ty: ValueType::Bool,
-                },
-            )?
+        let fieldless = info.size == 0 && info.usize == 0 && info.ssize == 0;
+        let heap_tag = info.cidx <= u64::from(fln_rt::abi::TAG_MAX_CTOR_TAG);
+        let constructor = if fieldless && (scalar || !heap_tag) {
+            None
         } else {
-            let object = self.emit(
-                block,
-                ValueType::Constructor,
-                Operation::Unbox {
-                    value,
-                    ty: ValueType::Constructor,
-                },
-            )?;
-            self.emit(
-                block,
-                ValueType::Bool,
-                Operation::CtorTest {
-                    constructor,
-                    value: object,
-                },
-            )?
+            Some(self.constructor(info)?)
+        };
+        let condition = match constructor {
+            Some(constructor) => {
+                let object = self.emit(
+                    block,
+                    ValueType::Constructor,
+                    Operation::Unbox {
+                        value,
+                        ty: ValueType::Constructor,
+                    },
+                )?;
+                self.emit(
+                    block,
+                    ValueType::Bool,
+                    Operation::CtorTest {
+                        constructor,
+                        value: object,
+                    },
+                )?
+            }
+            None => {
+                let tag = self.nat(block, &IrNat::Small(info.cidx))?;
+                let equal = self.native_call(
+                    block,
+                    &Name::from_components(["Nat", "beq"]),
+                    vec![value, tag],
+                )?;
+                self.emit(
+                    block,
+                    ValueType::Bool,
+                    Operation::Unbox {
+                        value: equal,
+                        ty: ValueType::Bool,
+                    },
+                )?
+            }
         };
         self.tables
             .scope_work(locals.len().saturating_add(joins.len()))?;
         let mut matching = locals.clone();
-        matching.insert(
-            x,
-            Local {
-                value,
-                constructor: Some(constructor),
-            },
-        );
+        matching.insert(x, Local { value, constructor });
         let nonzero = self.body(body, matching, joins.clone())?;
         let zero = self.block()?;
-        if info.size == 0 && !scalar {
+        if fieldless && !scalar && constructor.is_some() {
             // Native data bridges can return a fieldless heap constructor,
             // while Reference IR boxes the same nullary tag as a scalar.
             // Both representations enter the same body without evaluating
