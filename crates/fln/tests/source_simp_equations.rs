@@ -441,25 +441,20 @@ fn private_and_hidden_public_proofs_publish_equations_once_before_later_simp() {
                 source: main.as_bytes(),
             },
         ];
-        let checked = initial
-            .check_source_modules(&modules, &main_name, &KVMap::new(), module_limits)
-            .unwrap_or_else(|error| panic!("{api}\n{error:?}"))
-            .into_complete()
-            .unwrap();
-        let exported = checked.checked.engine.environment();
-        assert!(matches!(
-            exported.find(&name("wrap.eq_1")),
-            Some(fln::ConstantInfo::Thm(_))
-        ));
-        assert_eq!(exported.contains(&name("first")), !visibility.is_empty());
-        if !visibility.is_empty() {
-            assert!(matches!(
-                exported.find(&name("first")),
-                Some(fln::ConstantInfo::Axiom(_))
-            ));
-        }
-        assert_eq!(simp::read(exported).unwrap().len(), 2);
-
+        // The plain checking API deliberately refuses a raw trace: it has no
+        // observation owner. The command-stream API below retains the trace
+        // while checking and publishing the same module declarations.
+        let checked = if proof.contains("trace") {
+            None
+        } else {
+            Some(
+                initial
+                    .check_source_modules(&modules, &main_name, &KVMap::new(), module_limits)
+                    .unwrap_or_else(|error| panic!("{api}\n{error:?}"))
+                    .into_complete()
+                    .unwrap(),
+            )
+        };
         let executed =
             fln::source_check::modules::imported::SourceOleanImport::empty(&KVMap::new())
                 .execute_source_modules(
@@ -472,6 +467,30 @@ fn private_and_hidden_public_proofs_publish_equations_once_before_later_simp() {
                 .unwrap_or_else(|error| panic!("{api}\n{error:?}"))
                 .into_complete()
                 .unwrap();
+        let main = executed
+            .modules
+            .iter()
+            .find(|module| module.module == main_name)
+            .unwrap();
+        let exported = main.commands.batch.engine.environment();
+        assert!(matches!(
+            exported.find(&name("wrap.eq_1")),
+            Some(fln::ConstantInfo::Thm(_))
+        ));
+        assert_eq!(exported.contains(&name("first")), !visibility.is_empty());
+        if !visibility.is_empty() {
+            assert!(matches!(
+                exported.find(&name("first")),
+                Some(fln::ConstantInfo::Axiom(_))
+            ));
+        }
+        assert_eq!(simp::read(exported).unwrap().len(), 2);
+        if let Some(checked) = checked {
+            assert_eq!(
+                checked.checked.engine.logical_root(&KVMap::new()),
+                main.commands.batch.engine.logical_root(&KVMap::new())
+            );
+        }
         let api = executed
             .modules
             .iter()
