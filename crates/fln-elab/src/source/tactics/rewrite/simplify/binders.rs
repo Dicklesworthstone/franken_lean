@@ -60,8 +60,12 @@ impl Context {
                 .simp_binder_rule(target, rule, premises)?
                 .map(|evidence| (evidence, target.clone(), false, place)));
         }
-        let mut term = self.selected_simp_term(rule)?;
-        term.type_ = self.simp_premise_target(&term.type_, premises)?;
+        // The admitted statement is the rule's pattern. Unfolding selected
+        // definitions here can erase that pattern before it ever meets the
+        // target (for example, a generated equation for a matched definition).
+        // Only instantiated premises go through simp_premise_target; the pin's
+        // tryTheoremCore likewise matches the original lhs before discharge.
+        let term = self.selected_simp_term(rule)?;
         let key = self.simp_rule_node_key(rule)?;
         if let Some(found) =
             self.instantiate_simp_rule(term, target, rule.reverse(), premises, key.as_ref())?
