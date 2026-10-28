@@ -1,4 +1,4 @@
-{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":732,"projection_hash":"83ccc291ef5bbbcf52a5aecba6ed705ef53b32733a98341dda3d6118f539cdf3"}
+{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":734,"projection_hash":"491fe7d7851a6655ecd6ece049093e168d219beab8190ee9a6608ae0a3a315f2"}
 {"id":"fln-0bw5"}
 {"id":"fln-0eq8"}
 {"id":"fln-0rxm"}
@@ -206,6 +206,7 @@
 {"id":"fln-hgl"}
 {"id":"fln-history-rewrite-evidence-anchor-reachability-vdi4"}
 {"id":"fln-history-rewrite-evidence-anchor-reachability-vdi4.1"}
+{"id":"fln-hole-hole-orientation-false-accept-dvvn"}
 {"id":"fln-hoqd"}
 {"id":"fln-hq6i"}
 {"id":"fln-hqn"}
@@ -336,6 +337,7 @@
 {"id":"fln-reality-check-1017-9l76"}
 {"id":"fln-recursor-motive-elab-as-elim-3jsg"}
 {"id":"fln-reduce-command-crqm"}
+{"id":"fln-refine-final-unification-synthetic-holes-n15v"}
 {"id":"fln-registry-batch-preflight-sszd"}
 {"id":"fln-repr-ingress-lambda-application-xchs"}
 {"id":"fln-rewrite-goal-universe-metavariables-0p10"}
