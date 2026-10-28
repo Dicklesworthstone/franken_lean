@@ -4,14 +4,18 @@
 //! order. List.rec builds the same traversal using the existing checked
 //! String.push ABI bridge. Neither List nor Char acquires a packed native
 //! representation, and the source list stays outside the closed typed wrapper.
+//! The deprecated `String.mk` names the same extern and runs the same
+//! traversal, but only after its own exact contract has been checked.
 
 use super::*;
-use crate::source_intrinsics::string_from_list;
+use crate::source_intrinsics::string_from_list::{self, Root};
 
 #[derive(Default)]
 pub(super) struct Store {
     next_adapter: u64,
-    verified: bool,
+    /// One flag per root: a verified `String.ofList` never vouches for
+    /// `String.mk`, nor the reverse.
+    verified: [bool; Root::ALL.len()],
 }
 
 fn c(label: &str) -> Expr {
@@ -19,7 +23,7 @@ fn c(label: &str) -> Expr {
 }
 
 fn b(index: u32) -> Result<Expr, IngressError> {
-    Expr::bvar(index).map_err(|_| unsupported("String.ofList adapter binder scope"))
+    Expr::bvar(index).map_err(|_| unsupported("lean_string_mk adapter binder scope"))
 }
 
 fn lambda(domain: Expr, body: Expr) -> Expr {
@@ -36,10 +40,10 @@ impl Preparation<'_> {
         let serial = self.string_from_list.next_adapter;
         self.string_from_list.next_adapter = serial
             .checked_add(1)
-            .ok_or_else(|| unsupported("String.ofList adapter identity"))?;
+            .ok_or_else(|| unsupported("lean_string_mk adapter identity"))?;
         let name = Name::num(name("_fln_runtime_string_from_list_scope"), serial);
         if self.environment.contains(&name) {
-            return Err(unsupported("String.ofList adapter name collision"));
+            return Err(unsupported("lean_string_mk adapter name collision"));
         }
         Ok(name)
     }
@@ -56,10 +60,10 @@ impl Preparation<'_> {
         else {
             return Ok(None);
         };
-        if requested != &string_from_list::source_name()
-            || !levels.is_empty()
-            || arguments.len() > 1
-        {
+        let Some(root) = Root::from_name(requested) else {
+            return Ok(None);
+        };
+        if !levels.is_empty() || arguments.len() > 1 {
             return Ok(None);
         }
         // Bare function constants reach this adapter before generic executable
@@ -69,7 +73,7 @@ impl Preparation<'_> {
             return Ok(Some(replacement));
         }
         self.tick()?;
-        if !self.string_from_list.verified
+        if !self.string_from_list.verified[root.index()]
             && !string_from_list::contract_matches(
                 self.environment,
                 requested,
@@ -83,14 +87,14 @@ impl Preparation<'_> {
 
         // The cons minor has #0=String accumulator, #1=IH, #2=tail,
         // #3=Char head. Preparing this helper directly selects the checked
-        // primitive used to implement String.ofList; it is not a call to a
+        // primitive used to implement `lean_string_mk`; it is not a call to a
         // separately replaceable logical helper from the original definition.
         let pushed = self
             .string_push_call(&c("String.push"), &[b(0)?, b(3)?])?
             .ok_or_else(|| {
-                unsupported("String.ofList requires the checked String.push primitive")
+                unsupported("lean_string_mk requires the checked String.push primitive")
             })?;
-        self.string_from_list.verified = true;
+        self.string_from_list.verified[root.index()] = true;
 
         let list = Expr::app(Expr::const_(name("List"), vec![Level::zero()]), c("Char"));
         let accumulator = arrow(c("String"), c("String"));
