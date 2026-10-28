@@ -15,7 +15,7 @@ on:
         description: 'Fixed validation command; negative controls are expected to fail'
         required: true
         type: choice
-        options: [range, cli, reference, missing-reference, flush-mutant, ingress, mutual-structural, polymorphic-callbacks, pattern-simp]
+        options: [range, cli, reference, missing-reference, flush-mutant, ingress, mutual-structural, polymorphic-callbacks, pattern-simp, refinement]
   push:
     branches: [main]
     paths:
@@ -63,13 +63,16 @@ jobs:
               'crates/fln-cli/src/source_check/imports.rs',
               'crates/fln/src/source_records/simp.rs',
               'crates/fln-elab/src/source/tactics/rewrite/simplify/binders.rs',
+              'crates/fln-elab/src/source.rs',
+              'crates/fln-elab/src/source/tactics/refine.rs',
+              'crates/fln/tests/source_refinement.rs',
           }
           for path, blobs in changes.items():
               assert path in allowed, path
               assert isinstance(blobs, list) and len(blobs) == 2
               assert all(isinstance(s, str) and re.fullmatch('[0-9a-f]{40}', s) for s in blobs)
           assert os.environ['CANDIDATE_SUITE'] in {
-              'range', 'cli', 'reference', 'missing-reference', 'flush-mutant', 'ingress', 'mutual-structural', 'polymorphic-callbacks', 'pattern-simp',
+              'range', 'cli', 'reference', 'missing-reference', 'flush-mutant', 'ingress', 'mutual-structural', 'polymorphic-callbacks', 'pattern-simp', 'refinement',
           }
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -147,6 +150,16 @@ jobs:
         run: |
           set -euo pipefail
           case "$CANDIDATE_SUITE" in
+            refinement)
+              # n15v: retire when the ordinary full product gate covers this cut.
+              cargo check --locked --all-targets
+              cargo clippy --locked --all-targets -- -D warnings
+              cargo test --locked --no-fail-fast -p fln \
+                --test source_refinement --test source_index_refinement \
+                --test source_core_closing_tactics --test source_backtracking \
+                -- --nocapture
+              cargo test --locked -p fln-elab --lib source::tactics::refine::tests -- --nocapture
+              ;;
             pattern-simp)
               # b8zv: retire when the ordinary full product gate covers this cut.
               cargo check --locked --all-targets
