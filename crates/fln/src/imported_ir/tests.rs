@@ -1281,7 +1281,11 @@ fn scalar_constructor_tags_do_not_consume_the_heap_tag_namespace() {
             // These values never allocate a heap constructor or need its table.
             limits.fir.max_constructors = 0;
             let compiled = compile_users(vec![declaration], "User.enumCase", &[], limits).unwrap();
-            assert_eq!(returned(&compiled), expected, "scalar constructor tag {tag}");
+            assert_eq!(
+                returned(&compiled),
+                expected,
+                "scalar constructor tag {tag}"
+            );
         }
     }
 }
@@ -1414,7 +1418,10 @@ fn scalar_tag_lowering_keeps_packed_and_heap_layout_refusals() {
         IrExecutionLimits::default(),
     )
     .unwrap_err();
-    assert!(matches!(error, IrExecutionError::IrValidation(_)), "{error:?}");
+    assert!(
+        matches!(error, IrExecutionError::IrValidation(_)),
+        "{error:?}"
+    );
     assert!(!error.is_resource());
 }
 

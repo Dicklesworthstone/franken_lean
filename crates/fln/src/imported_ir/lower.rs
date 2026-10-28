@@ -577,186 +577,184 @@ impl<'a> Builder<'a> {
         locals: &Locals,
     ) -> Result<Local> {
         let mut constructor = None;
-        let value =
-            match expr {
-                IrExpr::Lit(IrLit::Num(n)) => {
-                    if let Some(wide) = wide_scalar(ty) {
-                        self.wide_literal(block, wide, n)?
-                    } else {
-                        let mask = match ty {
-                            IrType::UInt8 => Some(0xff),
-                            IrType::UInt16 => Some(0xffff),
-                            IrType::UInt32 => Some(0xffff_ffff),
-                            _ => None,
+        let value = match expr {
+            IrExpr::Lit(IrLit::Num(n)) => {
+                if let Some(wide) = wide_scalar(ty) {
+                    self.wide_literal(block, wide, n)?
+                } else {
+                    let mask = match ty {
+                        IrType::UInt8 => Some(0xff),
+                        IrType::UInt16 => Some(0xffff),
+                        IrType::UInt32 => Some(0xffff_ffff),
+                        _ => None,
+                    };
+                    if let Some(mask) = mask {
+                        let low = match n {
+                            IrNat::Small(n) => *n,
+                            IrNat::Big(limbs) => limbs.first().copied().unwrap_or(0),
                         };
-                        if let Some(mask) = mask {
-                            let low = match n {
-                                IrNat::Small(n) => *n,
-                                IrNat::Big(limbs) => limbs.first().copied().unwrap_or(0),
-                            };
-                            self.nat(block, &IrNat::Small(low & mask))?
-                        } else {
-                            self.nat(block, n)?
-                        }
-                    }
-                }
-                IrExpr::Lit(IrLit::Str(text)) => {
-                    self.boxed(block, ValueType::String, Operation::String(text.clone()))?
-                }
-                IrExpr::Fap { function, args } => {
-                    let args = self.arguments(block, args, locals)?;
-                    if self.tables.intrinsic_ids.contains_key(function) {
-                        self.native_call(block, function, args)?
+                        self.nat(block, &IrNat::Small(low & mask))?
                     } else {
-                        let (function, _) =
-                            self.tables.targets.get(function).copied().ok_or_else(|| {
-                                IrExecutionError::MissingDeclaration(function.clone())
-                            })?;
-                        self.emit(block, ValueType::Abi, Operation::Call { function, args })?
+                        self.nat(block, n)?
                     }
                 }
-                IrExpr::Pap { function, args } => {
-                    let (function, arity) =
+            }
+            IrExpr::Lit(IrLit::Str(text)) => {
+                self.boxed(block, ValueType::String, Operation::String(text.clone()))?
+            }
+            IrExpr::Fap { function, args } => {
+                let args = self.arguments(block, args, locals)?;
+                if self.tables.intrinsic_ids.contains_key(function) {
+                    self.native_call(block, function, args)?
+                } else {
+                    let (function, _) =
                         self.tables.targets.get(function).copied().ok_or_else(|| {
                             IrExecutionError::MissingDeclaration(function.clone())
                         })?;
-                    let remaining = arity
-                        .checked_sub(args.len())
-                        .filter(|n| *n > 0)
-                        .ok_or_else(|| unsupported(self.name, "saturated partial application"))?;
-                    let captures = self.arguments(block, args, locals)?;
-                    let closure_type = ClosureTypeId::new(remaining as u32 - 1);
-                    let capture_ownership = vec![flbc::ArgumentOwnership::Borrowed; captures.len()];
+                    self.emit(block, ValueType::Abi, Operation::Call { function, args })?
+                }
+            }
+            IrExpr::Pap { function, args } => {
+                let (function, arity) = self
+                    .tables
+                    .targets
+                    .get(function)
+                    .copied()
+                    .ok_or_else(|| IrExecutionError::MissingDeclaration(function.clone()))?;
+                let remaining = arity
+                    .checked_sub(args.len())
+                    .filter(|n| *n > 0)
+                    .ok_or_else(|| unsupported(self.name, "saturated partial application"))?;
+                let captures = self.arguments(block, args, locals)?;
+                let closure_type = ClosureTypeId::new(remaining as u32 - 1);
+                let capture_ownership = vec![flbc::ArgumentOwnership::Borrowed; captures.len()];
+                self.boxed(
+                    block,
+                    ValueType::Closure(closure_type),
+                    Operation::Closure {
+                        closure_type,
+                        function,
+                        captures,
+                        capture_ownership,
+                    },
+                )?
+            }
+            IrExpr::Ap { x, args } => {
+                if args.is_empty() {
+                    return Err(unsupported(self.name, "empty closure application"));
+                }
+                let closure = self.argument(block, &IrArg::Var(*x), locals)?;
+                let ty = ValueType::Closure(ClosureTypeId::new(args.len() as u32 - 1));
+                let closure = self.emit(block, ty, Operation::Unbox { value: closure, ty })?;
+                let args = self.arguments(block, args, locals)?;
+                let argument_ownership = vec![flbc::ArgumentOwnership::Borrowed; args.len()];
+                self.emit(
+                    block,
+                    ValueType::Abi,
+                    Operation::Apply {
+                        closure,
+                        args,
+                        argument_ownership,
+                        result_ownership: flbc::CallableResultOwnership::Erased,
+                    },
+                )?
+            }
+            IrExpr::Box { ty, x } => {
+                let value = self.argument(block, &IrArg::Var(*x), locals)?;
+                if let Some(wide) = wide_scalar(ty) {
+                    self.canonicalize_wide(block, wide, value)?
+                } else if matches!(ty, IrType::UInt8 | IrType::UInt16 | IrType::UInt32) {
+                    value
+                } else {
+                    return Err(unsupported(self.name, "scalar boxing representation"));
+                }
+            }
+            IrExpr::Unbox { x } => {
+                let value = self.argument(block, &IrArg::Var(*x), locals)?;
+                if let Some(wide) = wide_scalar(ty) {
+                    self.canonicalize_wide(block, wide, value)?
+                } else {
+                    let helper = unbox_intrinsic(ty)
+                        .ok_or_else(|| unsupported(self.name, "scalar unboxing representation"))?;
+                    self.native_call(
+                        block,
+                        &Name::from_components(helper.split('.')),
+                        vec![value],
+                    )?
+                }
+            }
+            IrExpr::Ctor { info, args } => {
+                if info.size == 0 && info.usize == 0 && info.ssize == 0 {
+                    // Fieldless constructors are scalar tags. Their index
+                    // does not occupy the bounded heap-header tag field.
+                    match wide_scalar(ty) {
+                        Some(wide) => self.wide_literal(block, wide, &IrNat::Small(info.cidx))?,
+                        None => self.nat(block, &IrNat::Small(info.cidx))?,
+                    }
+                } else {
+                    let id = self.constructor(info)?;
+                    constructor = Some(id);
+                    let fields = self.arguments(block, args, locals)?;
                     self.boxed(
                         block,
-                        ValueType::Closure(closure_type),
-                        Operation::Closure {
-                            closure_type,
-                            function,
-                            captures,
-                            capture_ownership,
+                        ValueType::Constructor,
+                        Operation::Ctor {
+                            constructor: id,
+                            fields,
                         },
                     )?
                 }
-                IrExpr::Ap { x, args } => {
-                    if args.is_empty() {
-                        return Err(unsupported(self.name, "empty closure application"));
+            }
+            IrExpr::Proj { i, x } => {
+                let local = locals
+                    .get(x)
+                    .ok_or_else(|| unsupported(self.name, "out-of-scope projection"))?;
+                let field =
+                    u16::try_from(*i).map_err(|_| unsupported(self.name, "projection width"))?;
+                if let Some(id) = local.constructor {
+                    if self.tables.projections.len() >= self.tables.limits.fir.max_projections {
+                        return Err(IrExecutionError::Limit("projections"));
                     }
-                    let closure = self.argument(block, &IrArg::Var(*x), locals)?;
-                    let ty = ValueType::Closure(ClosureTypeId::new(args.len() as u32 - 1));
-                    let closure = self.emit(block, ty, Operation::Unbox { value: closure, ty })?;
-                    let args = self.arguments(block, args, locals)?;
-                    let argument_ownership = vec![flbc::ArgumentOwnership::Borrowed; args.len()];
+                    let projection = ProjectionId::new(self.tables.projections.len() as u32);
+                    self.tables.projections.push(ProjectionDecl {
+                        id: projection,
+                        constructor: id,
+                        field,
+                    });
+                    let value = self.emit(
+                        block,
+                        ValueType::Constructor,
+                        Operation::Unbox {
+                            value: local.value,
+                            ty: ValueType::Constructor,
+                        },
+                    )?;
                     self.emit(
                         block,
                         ValueType::Abi,
-                        Operation::Apply {
-                            closure,
-                            args,
-                            argument_ownership,
-                            result_ownership: flbc::CallableResultOwnership::Erased,
+                        Operation::Project { projection, value },
+                    )?
+                } else {
+                    self.emit(
+                        block,
+                        ValueType::Abi,
+                        Operation::ProjectObject {
+                            value: local.value,
+                            field,
                         },
                     )?
                 }
-                IrExpr::Box { ty, x } => {
-                    let value = self.argument(block, &IrArg::Var(*x), locals)?;
-                    if let Some(wide) = wide_scalar(ty) {
-                        self.canonicalize_wide(block, wide, value)?
-                    } else if matches!(ty, IrType::UInt8 | IrType::UInt16 | IrType::UInt32) {
-                        value
-                    } else {
-                        return Err(unsupported(self.name, "scalar boxing representation"));
-                    }
-                }
-                IrExpr::Unbox { x } => {
-                    let value = self.argument(block, &IrArg::Var(*x), locals)?;
-                    if let Some(wide) = wide_scalar(ty) {
-                        self.canonicalize_wide(block, wide, value)?
-                    } else {
-                        let helper = unbox_intrinsic(ty).ok_or_else(|| {
-                            unsupported(self.name, "scalar unboxing representation")
-                        })?;
-                        self.native_call(
-                            block,
-                            &Name::from_components(helper.split('.')),
-                            vec![value],
-                        )?
-                    }
-                }
-                IrExpr::Ctor { info, args } => {
-                    if info.size == 0 && info.usize == 0 && info.ssize == 0 {
-                        // Fieldless constructors are scalar tags. Their index
-                        // does not occupy the bounded heap-header tag field.
-                        match wide_scalar(ty) {
-                            Some(wide) => {
-                                self.wide_literal(block, wide, &IrNat::Small(info.cidx))?
-                            }
-                            None => self.nat(block, &IrNat::Small(info.cidx))?,
-                        }
-                    } else {
-                        let id = self.constructor(info)?;
-                        constructor = Some(id);
-                        let fields = self.arguments(block, args, locals)?;
-                        self.boxed(
-                            block,
-                            ValueType::Constructor,
-                            Operation::Ctor {
-                                constructor: id,
-                                fields,
-                            },
-                        )?
-                    }
-                }
-                IrExpr::Proj { i, x } => {
-                    let local = locals
-                        .get(x)
-                        .ok_or_else(|| unsupported(self.name, "out-of-scope projection"))?;
-                    let field = u16::try_from(*i)
-                        .map_err(|_| unsupported(self.name, "projection width"))?;
-                    if let Some(id) = local.constructor {
-                        if self.tables.projections.len() >= self.tables.limits.fir.max_projections {
-                            return Err(IrExecutionError::Limit("projections"));
-                        }
-                        let projection = ProjectionId::new(self.tables.projections.len() as u32);
-                        self.tables.projections.push(ProjectionDecl {
-                            id: projection,
-                            constructor: id,
-                            field,
-                        });
-                        let value = self.emit(
-                            block,
-                            ValueType::Constructor,
-                            Operation::Unbox {
-                                value: local.value,
-                                ty: ValueType::Constructor,
-                            },
-                        )?;
-                        self.emit(
-                            block,
-                            ValueType::Abi,
-                            Operation::Project { projection, value },
-                        )?
-                    } else {
-                        self.emit(
-                            block,
-                            ValueType::Abi,
-                            Operation::ProjectObject {
-                                value: local.value,
-                                field,
-                            },
-                        )?
-                    }
-                }
-                IrExpr::Reset { .. } | IrExpr::Reuse { .. } | IrExpr::IsShared { .. } => {
-                    return Err(unsupported(
-                        self.name,
-                        "reference-count observation or constructor reuse",
-                    ));
-                }
-                IrExpr::UProj { .. } | IrExpr::SProj { .. } => {
-                    return Err(unsupported(self.name, "packed scalar projection"));
-                }
-            };
+            }
+            IrExpr::Reset { .. } | IrExpr::Reuse { .. } | IrExpr::IsShared { .. } => {
+                return Err(unsupported(
+                    self.name,
+                    "reference-count observation or constructor reuse",
+                ));
+            }
+            IrExpr::UProj { .. } | IrExpr::SProj { .. } => {
+                return Err(unsupported(self.name, "packed scalar projection"));
+            }
+        };
         Ok(Local { value, constructor })
     }
 
@@ -1046,14 +1044,7 @@ impl<'a> Builder<'a> {
                 },
             )?;
             let scalar_miss = self.block()?;
-            self.case_arm(
-                scalar_miss,
-                x,
-                value,
-                rest,
-                default,
-                (locals, joins, ty),
-            )?;
+            self.case_arm(scalar_miss, x, value, rest, default, (locals, joins, ty))?;
             self.finish_block(
                 zero,
                 Terminator::BranchZero {
