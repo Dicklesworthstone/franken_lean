@@ -418,7 +418,9 @@ fn check_type(name: &Name, ty: &IrType) -> Result<(), IrExecutionError> {
         | IrType::Erased
         | IrType::UInt8
         | IrType::UInt16
-        | IrType::UInt32 => Ok(()),
+        | IrType::UInt32
+        | IrType::UInt64
+        | IrType::USize => Ok(()),
         _ => Err(unsupported(name, "packed/unboxed IR representation")),
     }
 }

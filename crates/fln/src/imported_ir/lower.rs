@@ -16,22 +16,52 @@ pub(super) fn compile(
     arguments: &[EntryArgument],
     limits: IrExecutionLimits,
 ) -> Result<CompiledIr> {
+    let entry_parameters: &[IrParam] = match declarations.get(entry) {
+        Some(IrDecl::Function { params, .. }) => params,
+        _ => &[],
+    };
     let mut helper_natives = BTreeMap::new();
+    for param in entry_parameters {
+        if let Some(wide) = wide_scalar(&param.ty) {
+            insert_helper(&mut helper_natives, wide.of_nat)?;
+        }
+    }
     for declaration in declarations.values() {
         if let IrDecl::Function { body, .. } = declaration {
             for body in body.bodies() {
-                if matches!(body.terminal.as_ref(), IrTerminal::Case { .. }) {
-                    insert_helper(&mut helper_natives, "Nat.beq")?;
+                if let IrTerminal::Case { x_type, .. } = body.terminal.as_ref() {
+                    if let Some(wide) = wide_scalar(x_type) {
+                        insert_helper(&mut helper_natives, wide.of_nat)?;
+                        insert_helper(&mut helper_natives, wide.equal)?;
+                    } else {
+                        insert_helper(&mut helper_natives, "Nat.beq")?;
+                    }
                 }
                 for stmt in &body.stmts {
-                    if let IrStmt::VDecl {
-                        ty,
-                        expr: IrExpr::Unbox { .. },
-                        ..
-                    } = stmt
-                        && let Some(name) = unbox_intrinsic(ty)
-                    {
-                        insert_helper(&mut helper_natives, name)?;
+                    let IrStmt::VDecl { ty, expr, .. } = stmt else {
+                        continue;
+                    };
+                    match expr {
+                        IrExpr::Unbox { .. } => {
+                            if let Some(wide) = wide_scalar(ty) {
+                                insert_helper(&mut helper_natives, wide.to_nat)?;
+                                insert_helper(&mut helper_natives, wide.of_nat)?;
+                            } else if let Some(name) = unbox_intrinsic(ty) {
+                                insert_helper(&mut helper_natives, name)?;
+                            }
+                        }
+                        IrExpr::Box { ty, .. } => {
+                            if let Some(wide) = wide_scalar(ty) {
+                                insert_helper(&mut helper_natives, wide.to_nat)?;
+                                insert_helper(&mut helper_natives, wide.of_nat)?;
+                            }
+                        }
+                        IrExpr::Lit(IrLit::Num(_)) | IrExpr::Ctor { .. } => {
+                            if let Some(wide) = wide_scalar(ty) {
+                                insert_helper(&mut helper_natives, wide.of_nat)?;
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -143,7 +173,22 @@ pub(super) fn compile(
     let block = wrapper.block()?;
     let args = arguments
         .iter()
-        .map(|arg| wrapper.argument_literal(block, arg))
+        .enumerate()
+        .map(|(index, arg)| {
+            let value = wrapper.argument_literal(block, arg)?;
+            if let Some(wide) = entry_parameters
+                .get(index)
+                .and_then(|param| wide_scalar(&param.ty))
+            {
+                wrapper.native_call(
+                    block,
+                    &Name::from_components(wide.of_nat.split('.')),
+                    vec![value],
+                )
+            } else {
+                Ok(value)
+            }
+        })
         .collect::<Result<Vec<_>>>()?;
     let value = wrapper.emit(
         block,
@@ -230,6 +275,40 @@ fn unbox_intrinsic(ty: &IrType) -> Option<&'static str> {
         IrType::UInt32 => Some("UInt32.ofNat"),
         _ => None,
     }
+}
+
+struct WideScalar {
+    of_nat: &'static str,
+    to_nat: &'static str,
+    equal: &'static str,
+}
+
+fn wide_scalar(ty: &IrType) -> Option<WideScalar> {
+    match ty {
+        IrType::UInt64 => Some(WideScalar {
+            of_nat: "UInt64.ofNat",
+            to_nat: "UInt64.toNat",
+            equal: "UInt64.decEq",
+        }),
+        IrType::USize => Some(WideScalar {
+            of_nat: "USize.ofNat",
+            to_nat: "USize.toNat",
+            equal: "USize.decEq",
+        }),
+        _ => None,
+    }
+}
+
+fn is_scalar_case(ty: &IrType) -> bool {
+    matches!(
+        ty,
+        IrType::UInt8
+            | IrType::UInt16
+            | IrType::UInt32
+            | IrType::UInt64
+            | IrType::USize
+            | IrType::Tagged
+    )
 }
 
 struct Tables {
@@ -383,6 +462,36 @@ impl<'a> Builder<'a> {
         self.boxed(block, ValueType::Nat, operation)
     }
 
+    fn wide_literal(&mut self, block: BlockId, wide: WideScalar, n: &IrNat) -> Result<ValueId> {
+        let value = self.nat(block, n)?;
+        self.native_call(
+            block,
+            &Name::from_components(wide.of_nat.split('.')),
+            vec![value],
+        )
+    }
+
+    fn canonicalize_wide(
+        &mut self,
+        block: BlockId,
+        wide: WideScalar,
+        value: ValueId,
+    ) -> Result<ValueId> {
+        // Golem stores wide scalars in checked boxes containing all 64 bits.
+        // A Nat intermediate checks the input carrier before rebuilding that
+        // box; an ordinary object must never be reinterpreted as scalar bits.
+        let value = self.native_call(
+            block,
+            &Name::from_components(wide.to_nat.split('.')),
+            vec![value],
+        )?;
+        self.native_call(
+            block,
+            &Name::from_components(wide.of_nat.split('.')),
+            vec![value],
+        )
+    }
+
     fn argument_literal(&mut self, block: BlockId, argument: &EntryArgument) -> Result<ValueId> {
         match argument {
             EntryArgument::Nat(value) => self.nat(block, value),
@@ -471,20 +580,24 @@ impl<'a> Builder<'a> {
         let value =
             match expr {
                 IrExpr::Lit(IrLit::Num(n)) => {
-                    let mask = match ty {
-                        IrType::UInt8 => Some(0xff),
-                        IrType::UInt16 => Some(0xffff),
-                        IrType::UInt32 => Some(0xffff_ffff),
-                        _ => None,
-                    };
-                    if let Some(mask) = mask {
-                        let low = match n {
-                            IrNat::Small(n) => *n,
-                            IrNat::Big(limbs) => limbs.first().copied().unwrap_or(0),
-                        };
-                        self.nat(block, &IrNat::Small(low & mask))?
+                    if let Some(wide) = wide_scalar(ty) {
+                        self.wide_literal(block, wide, n)?
                     } else {
-                        self.nat(block, n)?
+                        let mask = match ty {
+                            IrType::UInt8 => Some(0xff),
+                            IrType::UInt16 => Some(0xffff),
+                            IrType::UInt32 => Some(0xffff_ffff),
+                            _ => None,
+                        };
+                        if let Some(mask) = mask {
+                            let low = match n {
+                                IrNat::Small(n) => *n,
+                                IrNat::Big(limbs) => limbs.first().copied().unwrap_or(0),
+                            };
+                            self.nat(block, &IrNat::Small(low & mask))?
+                        } else {
+                            self.nat(block, n)?
+                        }
                     }
                 }
                 IrExpr::Lit(IrLit::Str(text)) => {
@@ -546,26 +659,40 @@ impl<'a> Builder<'a> {
                     )?
                 }
                 IrExpr::Box { ty, x } => {
-                    if !matches!(ty, IrType::UInt8 | IrType::UInt16 | IrType::UInt32) {
+                    let value = self.argument(block, &IrArg::Var(*x), locals)?;
+                    if let Some(wide) = wide_scalar(ty) {
+                        self.canonicalize_wide(block, wide, value)?
+                    } else if matches!(ty, IrType::UInt8 | IrType::UInt16 | IrType::UInt32) {
+                        value
+                    } else {
                         return Err(unsupported(self.name, "scalar boxing representation"));
                     }
-                    self.argument(block, &IrArg::Var(*x), locals)?
                 }
                 IrExpr::Unbox { x } => {
-                    let helper = unbox_intrinsic(ty)
-                        .ok_or_else(|| unsupported(self.name, "scalar unboxing representation"))?;
                     let value = self.argument(block, &IrArg::Var(*x), locals)?;
-                    self.native_call(
-                        block,
-                        &Name::from_components(helper.split('.')),
-                        vec![value],
-                    )?
+                    if let Some(wide) = wide_scalar(ty) {
+                        self.canonicalize_wide(block, wide, value)?
+                    } else {
+                        let helper = unbox_intrinsic(ty).ok_or_else(|| {
+                            unsupported(self.name, "scalar unboxing representation")
+                        })?;
+                        self.native_call(
+                            block,
+                            &Name::from_components(helper.split('.')),
+                            vec![value],
+                        )?
+                    }
                 }
                 IrExpr::Ctor { info, args } => {
                     if info.size == 0 && info.usize == 0 && info.ssize == 0 {
                         // Fieldless constructors are scalar tags. Their index
                         // does not occupy the bounded heap-header tag field.
-                        self.nat(block, &IrNat::Small(info.cidx))?
+                        match wide_scalar(ty) {
+                            Some(wide) => {
+                                self.wide_literal(block, wide, &IrNat::Small(info.cidx))?
+                            }
+                            None => self.nat(block, &IrNat::Small(info.cidx))?,
+                        }
                     } else {
                         let id = self.constructor(info)?;
                         constructor = Some(id);
@@ -798,10 +925,7 @@ impl<'a> Builder<'a> {
             .get(&x)
             .ok_or_else(|| unsupported(self.name, "case variable"))?
             .value;
-        let scalar = matches!(
-            ty,
-            IrType::UInt8 | IrType::UInt16 | IrType::UInt32 | IrType::Tagged
-        );
+        let scalar = is_scalar_case(ty);
         let mut arms: Vec<_> = alts
             .iter()
             .filter_map(|alt| match alt {
@@ -824,7 +948,7 @@ impl<'a> Builder<'a> {
                 ));
             }
         }
-        self.case_arm(block, x, value, &arms, default, (locals, joins, scalar))
+        self.case_arm(block, x, value, &arms, default, (locals, joins, ty))
     }
 
     fn case_arm(
@@ -834,9 +958,10 @@ impl<'a> Builder<'a> {
         value: ValueId,
         arms: &[(&IrCtorInfo, &IrBody)],
         default: Option<&IrBody>,
-        scope: (Locals, Joins, bool),
+        scope: (Locals, Joins, &IrType),
     ) -> Result<()> {
-        let (locals, joins, scalar) = scope;
+        let (locals, joins, ty) = scope;
+        let scalar = is_scalar_case(ty);
         let Some(((info, body), rest)) = arms.split_first() else {
             if let Some(body) = default {
                 let target = self.body(body, locals, joins)?;
@@ -873,10 +998,16 @@ impl<'a> Builder<'a> {
                 )?
             }
             None => {
-                let tag = self.nat(block, &IrNat::Small(info.cidx))?;
+                let (tag, equal) = if let Some(wide) = wide_scalar(ty) {
+                    let equal = wide.equal;
+                    let tag = self.wide_literal(block, wide, &IrNat::Small(info.cidx))?;
+                    (tag, equal)
+                } else {
+                    (self.nat(block, &IrNat::Small(info.cidx))?, "Nat.beq")
+                };
                 let equal = self.native_call(
                     block,
-                    &Name::from_components(["Nat", "beq"]),
+                    &Name::from_components(equal.split('.')),
                     vec![value, tag],
                 )?;
                 self.emit(
@@ -921,7 +1052,7 @@ impl<'a> Builder<'a> {
                 value,
                 rest,
                 default,
-                (locals, joins, scalar),
+                (locals, joins, ty),
             )?;
             self.finish_block(
                 zero,
@@ -932,7 +1063,7 @@ impl<'a> Builder<'a> {
                 },
             );
         } else {
-            self.case_arm(zero, x, value, rest, default, (locals, joins, scalar))?;
+            self.case_arm(zero, x, value, rest, default, (locals, joins, ty))?;
         }
         self.finish_block(
             block,

@@ -1417,3 +1417,338 @@ fn scalar_tag_lowering_keeps_packed_and_heap_layout_refusals() {
     assert!(matches!(error, IrExecutionError::IrValidation(_)), "{error:?}");
     assert!(!error.is_resource());
 }
+
+fn wide_ir_binding(x: u64, ty: &IrType, expr: IrExpr) -> IrStmt {
+    IrStmt::VDecl {
+        x,
+        ty: ty.clone(),
+        expr,
+    }
+}
+
+fn wide_ir_entry(mut declaration: IrDecl, ty: &IrType) -> IrDecl {
+    let IrDecl::Function { params, .. } = &mut declaration else {
+        unreachable!()
+    };
+    params[0].ty = ty.clone();
+    declaration
+}
+
+fn assert_wide_ir_result(compiled: &CompiledIr, expected: u64) {
+    assert_eq!(returned(compiled), expected.to_string());
+    let bytes = flbc::encode_canonical(compiled.program.program(), flbc::CodecLimits::default())
+        .expect("encode wide scalar program");
+    let replay = flbc::decode_canonical(&bytes, flbc::CodecLimits::default())
+        .expect("decode wide scalar program");
+    let outcome = fln_vm::interpreter::execute(&replay, ExecutionLimits::default(), None);
+    let Outcome::Complete(VmExit::Returned(value)) = outcome else {
+        panic!("wide scalar replay did not return: {outcome:?}");
+    };
+    assert_eq!(
+        crate::nat_decimal(&value.value).expect("Nat replay result"),
+        expected.to_string()
+    );
+}
+
+#[test]
+fn wide_ir_literals_and_entry_arguments_preserve_high_bits_and_wrap_large_naturals() {
+    for (ty, family) in [(IrType::UInt64, "UInt64"), (IrType::USize, "USize")] {
+        for (literal, low) in [
+            (IrNat::Small((1u64 << 63) - 1), (1u64 << 63) - 1),
+            (IrNat::Small(1u64 << 63), 1u64 << 63),
+            (IrNat::Small(u64::MAX), u64::MAX),
+            (IrNat::Big(vec![17, 1]), 17),
+            (IrNat::Big(vec![u64::MAX, u64::MAX]), u64::MAX),
+        ] {
+            let expected = if ty == IrType::USize {
+                low as usize as u64
+            } else {
+                low
+            };
+            let literal_program = compile_users(
+                vec![function(
+                    "Wide.literal",
+                    0,
+                    vec![
+                        wide_ir_binding(1, &ty, IrExpr::Lit(IrLit::Num(literal.clone()))),
+                        call(2, &format!("{family}.toNat"), &[1]),
+                    ],
+                    IrArg::Var(2),
+                )],
+                "Wide.literal",
+                &[],
+                IrExecutionLimits::default(),
+            )
+            .expect("typed wide literals compile");
+            assert_wide_ir_result(&literal_program, expected);
+            let entry_program = compile_users(
+                vec![wide_ir_entry(
+                    function(
+                        "Wide.entry",
+                        1,
+                        vec![call(2, &format!("{family}.toNat"), &[1])],
+                        IrArg::Var(2),
+                    ),
+                    &ty,
+                )],
+                "Wide.entry",
+                &[EntryArgument::Nat(literal)],
+                IrExecutionLimits::default(),
+            )
+            .expect("wide entry parameters canonicalize through their native ABI");
+            assert_wide_ir_result(&entry_program, expected);
+            assert!(
+                entry_program
+                    .native_externs()
+                    .iter()
+                    .any(|row| row == &format!("extern:{family}.ofNat"))
+            );
+        }
+    }
+}
+
+#[test]
+fn boxed_wide_values_survive_constructor_join_and_captured_closure_boundaries() {
+    use fln_olean::ir::IrCtorInfo;
+
+    for (ty, family) in [(IrType::UInt64, "UInt64"), (IrType::USize, "USize")] {
+        let callback = function(
+            "Wide.callback",
+            2,
+            vec![
+                wide_ir_binding(3, &ty, IrExpr::Unbox { x: 1 }),
+                binding(
+                    4,
+                    IrExpr::Box {
+                        ty: ty.clone(),
+                        x: 3,
+                    },
+                ),
+                wide_ir_binding(5, &ty, IrExpr::Unbox { x: 4 }),
+                call(6, &format!("{family}.toNat"), &[5]),
+            ],
+            IrArg::Var(6),
+        );
+        let entry = body_function(
+            "Wide.boundaries",
+            0,
+            ir_body(
+                vec![
+                    wide_ir_binding(10, &ty, IrExpr::Lit(IrLit::Num(IrNat::Small(u64::MAX)))),
+                    binding(
+                        11,
+                        IrExpr::Box {
+                            ty: ty.clone(),
+                            x: 10,
+                        },
+                    ),
+                    binding(
+                        12,
+                        IrExpr::Ctor {
+                            info: IrCtorInfo {
+                                name: name("Wide.payload"),
+                                cidx: 0,
+                                size: 1,
+                                usize: 0,
+                                ssize: 0,
+                            },
+                            args: vec![IrArg::Var(11)],
+                        },
+                    ),
+                    join(
+                        20,
+                        &[21],
+                        ir_body(
+                            vec![
+                                binding(22, IrExpr::Proj { i: 0, x: 21 }),
+                                binding(
+                                    23,
+                                    IrExpr::Pap {
+                                        function: name("Wide.callback"),
+                                        args: vec![IrArg::Var(22)],
+                                    },
+                                ),
+                                number(24, 0),
+                                binding(
+                                    25,
+                                    IrExpr::Ap {
+                                        x: 23,
+                                        args: vec![IrArg::Var(24)],
+                                    },
+                                ),
+                            ],
+                            IrTerminal::Ret(IrArg::Var(25)),
+                        ),
+                    ),
+                ],
+                jump(20, &[12]),
+            ),
+        );
+        let compiled = compile_users(
+            vec![callback, entry],
+            "Wide.boundaries",
+            &[],
+            IrExecutionLimits::default(),
+        )
+        .expect("boxed words cross object, join, and closure boundaries");
+        let expected = if ty == IrType::USize {
+            usize::MAX as u64
+        } else {
+            u64::MAX
+        };
+        assert_wide_ir_result(&compiled, expected);
+        assert_eq!(compiled.reference_functions().len(), 3);
+    }
+}
+
+#[test]
+fn wide_ir_cases_compare_the_full_word_and_keep_the_default_arm() {
+    use fln_olean::ir::{IrAlt, IrCtorInfo};
+
+    for (ty, family) in [(IrType::UInt64, "UInt64"), (IrType::USize, "USize")] {
+        let mut alts: Vec<_> = [(1u64 << 63, 2, 11), (u64::MAX, 3, 22)]
+            .into_iter()
+            .map(|(tag, x, result)| IrAlt::Ctor {
+                info: IrCtorInfo {
+                    name: name("Wide.tag"),
+                    cidx: tag,
+                    size: 0,
+                    usize: 0,
+                    ssize: 0,
+                },
+                body: ir_body(vec![number(x, result)], IrTerminal::Ret(IrArg::Var(x))),
+            })
+            .collect();
+        alts.push(IrAlt::Default {
+            body: ir_body(vec![number(4, 33)], IrTerminal::Ret(IrArg::Var(4))),
+        });
+        let declaration = wide_ir_entry(
+            body_function(
+                "Wide.case",
+                1,
+                ir_body(
+                    vec![],
+                    IrTerminal::Case {
+                        type_name: name(family),
+                        x: 1,
+                        x_type: ty.clone(),
+                        alts,
+                    },
+                ),
+            ),
+            &ty,
+        );
+        for (input, expected) in [(1u64 << 63, 11), (u64::MAX, 22), (7, 33)] {
+            let compiled = compile_users(
+                vec![declaration.clone()],
+                "Wide.case",
+                &[nat(input)],
+                IrExecutionLimits::default(),
+            )
+            .expect("wide case tags do not require constructor header tags");
+            assert_wide_ir_result(&compiled, expected);
+            assert!(
+                compiled
+                    .native_externs()
+                    .iter()
+                    .any(|row| row == &format!("extern:{family}.decEq"))
+            );
+        }
+    }
+}
+
+#[test]
+fn wide_ir_unboxing_refuses_strings_and_object_field_constructors() {
+    for (ty, family) in [(IrType::UInt64, "UInt64"), (IrType::USize, "USize")] {
+        let decode = function(
+            "Wide.decode",
+            1,
+            vec![
+                wide_ir_binding(2, &ty, IrExpr::Unbox { x: 1 }),
+                call(3, &format!("{family}.toNat"), &[2]),
+            ],
+            IrArg::Var(3),
+        );
+        let string = compile_users(
+            vec![decode.clone()],
+            "Wide.decode",
+            &[EntryArgument::String("not a wide scalar".to_owned())],
+            IrExecutionLimits::default(),
+        )
+        .unwrap();
+        let constructor = compile_users(
+            vec![
+                decode,
+                function(
+                    "Wide.badConstructor",
+                    0,
+                    vec![
+                        number(1, 42),
+                        binding(
+                            2,
+                            IrExpr::Ctor {
+                                info: fln_olean::ir::IrCtorInfo {
+                                    name: name("Wide.objectField"),
+                                    cidx: 0,
+                                    size: 1,
+                                    usize: 0,
+                                    ssize: 0,
+                                },
+                                args: vec![IrArg::Var(1)],
+                            },
+                        ),
+                        call(3, "Wide.decode", &[2]),
+                    ],
+                    IrArg::Var(3),
+                ),
+            ],
+            "Wide.badConstructor",
+            &[],
+            IrExecutionLimits::default(),
+        )
+        .unwrap();
+        for compiled in [string, constructor] {
+            assert!(
+                matches!(
+                    compiled.execute(ExecutionLimits::default(), None).outcome,
+                    Outcome::Complete(VmExit::Refused {
+                        refusal: fln_vm::interpreter::VmRefusal::TypeMismatch { .. },
+                        ..
+                    })
+                ),
+                "wrong wide scalar carriers must refuse without fabricating a value"
+            );
+        }
+    }
+}
+
+#[test]
+fn wide_ir_native_arithmetic_wraps_without_losing_the_high_bit() {
+    for (ty, family) in [(IrType::UInt64, "UInt64"), (IrType::USize, "USize")] {
+        let compiled = compile_users(
+            vec![function(
+                "Wide.wrapAdd",
+                0,
+                vec![
+                    wide_ir_binding(1, &ty, IrExpr::Lit(IrLit::Num(IrNat::Small(u64::MAX)))),
+                    wide_ir_binding(2, &ty, IrExpr::Lit(IrLit::Num(IrNat::Small(1)))),
+                    wide_ir_binding(
+                        3,
+                        &ty,
+                        IrExpr::Fap {
+                            function: name(&format!("{family}.add")),
+                            args: vec![IrArg::Var(1), IrArg::Var(2)],
+                        },
+                    ),
+                    call(4, &format!("{family}.toNat"), &[3]),
+                ],
+                IrArg::Var(4),
+            )],
+            "Wide.wrapAdd",
+            &[],
+            IrExecutionLimits::default(),
+        )
+        .expect("wide scalar arguments obey their native arithmetic contracts");
+        assert_wide_ir_result(&compiled, 0);
+    }
+}
