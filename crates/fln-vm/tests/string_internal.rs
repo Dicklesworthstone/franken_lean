@@ -28,7 +28,14 @@ fn r(index: u16) -> Register {
 }
 
 fn nat(dst: u16, value: u64) -> I {
-    I::Nat { dst: r(dst), value }
+    if value <= (usize::MAX >> 1) as u64 {
+        I::Nat { dst: r(dst), value }
+    } else {
+        I::NatBig {
+            dst: r(dst),
+            limbs_le: vec![value],
+        }
+    }
 }
 
 fn string(dst: u16, value: &str) -> I {
@@ -343,5 +350,302 @@ fn string_execution_stops_and_retries_without_publishing_or_leaking_outputs() {
             if matches!(inconclusive.cause, InconclusiveCause::Cancelled { .. })
     ));
     assert_eq!(text(&returned(&program)), "prefixééé");
+    assert_clean_shadow();
+}
+
+fn substring_program(row: &str, begin: u64, end: u64, operands: Vec<I>) -> ValidatedProgram {
+    let count = u16::try_from(operands.len()).unwrap();
+    let mut code = vec![
+        string(0, "aλ😀z"),
+        nat(1, begin),
+        nat(2, end),
+        I::Ctor {
+            dst: r(3),
+            tag: 0,
+            fields: vec![r(0), r(1), r(2)],
+            scalar_bytes: vec![],
+        },
+    ];
+    code.extend(operands);
+    let args: Vec<_> = std::iter::once(3).chain(4..4 + count).collect();
+    code.push(call(8, row, &args));
+    code.push(I::Return { src: r(8) });
+    replay(code)
+}
+
+fn substring(row: &str, begin: u64, end: u64, operands: &[u64]) -> Obj {
+    returned(&substring_program(
+        row,
+        begin,
+        end,
+        operands
+            .iter()
+            .enumerate()
+            .map(|(i, value)| nat(i as u16 + 4, *value))
+            .collect(),
+    ))
+}
+
+fn raw_positions(value: &Obj) -> (String, String, String) {
+    (
+        text(&value.try_ctor_child(0).expect("substring string")),
+        fln_vm::interpreter::nat_decimal(&value.try_ctor_child(1).expect("substring start"))
+            .unwrap(),
+        fln_vm::interpreter::nat_decimal(&value.try_ctor_child(2).expect("substring stop"))
+            .unwrap(),
+    )
+}
+
+/// Expected values were measured by the pinned v4.32.0 exported Lean
+/// implementations, including the unusual invalid/interior byte positions.
+#[test]
+fn native_substrings_copy_and_navigate_relative_utf8_positions() {
+    let _guard = lock();
+    shadow::enable();
+    for (begin, end, expected) in [
+        (0, 1, "a"),
+        (1, 3, "λ"),
+        (3, 7, "😀"),
+        (1, 7, "λ😀"),
+        (3, 3, ""),
+        (2, 7, ""),
+        (1, 4, "λ😀z"),
+        (99, 100, ""),
+        (7, 1, ""),
+    ] {
+        assert_eq!(
+            text(&substring(
+                "extern:Substring.Raw.Internal.toString",
+                begin,
+                end,
+                &[]
+            )),
+            expected
+        );
+    }
+    for (begin, end, expected) in [(1, 7, 955), (3, 3, 128512), (8, 8, 65), (2, 7, 65)] {
+        assert_eq!(
+            substring("extern:Substring.Raw.Internal.front", begin, end, &[]).unbox(),
+            expected
+        );
+    }
+    for (position, expected) in [(0, 955), (1, 65), (2, 128512), (6, 122), (7, 65), (99, 65)] {
+        // get deliberately reads past the substring's end in the backing string.
+        assert_eq!(
+            substring("extern:Substring.Raw.Internal.get", 1, 3, &[position]).unbox(),
+            expected
+        );
+    }
+    for (position, expected) in [(0, 0), (1, 0), (2, 0), (3, 2), (6, 2), (7, 6), (99, 98)] {
+        assert_eq!(
+            substring("extern:Substring.Raw.Internal.prev", 1, 7, &[position]).unbox(),
+            expected
+        );
+    }
+    for (source, expected) in [("", 65), ("λ😀", 955), ("\0z", 0)] {
+        assert_eq!(
+            invoke("extern:String.Internal.front", source, &[]).unbox(),
+            expected
+        );
+    }
+    assert_clean_shadow();
+}
+
+#[test]
+fn native_substring_slices_keep_the_backing_string_and_clamp_at_the_stop() {
+    let _guard = lock();
+    shadow::enable();
+    for (count, expected) in [(0, 1), (1, 3), (2, 7), (3, 7), (100, 7)] {
+        let value = substring("extern:Substring.Raw.Internal.drop", 1, 7, &[count]);
+        assert_eq!(
+            raw_positions(&value),
+            ("aλ😀z".to_owned(), expected.to_string(), "7".to_owned())
+        );
+    }
+    for (begin, end, backing, expected_begin, expected_end) in [
+        (0, 6, "aλ😀z", 1, 7),
+        (1, 6, "aλ😀z", 2, 7),
+        (0, 99, "aλ😀z", 1, 7),
+        (4, 2, "", 0, 0),
+        (99, 100, "aλ😀z", 7, 7),
+    ] {
+        let value = substring("extern:Substring.Raw.Internal.extract", 1, 7, &[begin, end]);
+        assert_eq!(
+            raw_positions(&value),
+            (
+                backing.to_owned(),
+                expected_begin.to_string(),
+                expected_end.to_string()
+            )
+        );
+    }
+    for (begin, end, empty) in [(1, 7, false), (3, 3, true), (7, 1, true)] {
+        assert_eq!(
+            substring("extern:Substring.Raw.Internal.isEmpty", begin, end, &[]).unbox(),
+            usize::from(empty)
+        );
+    }
+    // The count is a Nat, never a truncated machine integer. A finite slice
+    // can saturate without visiting that enormous count on the host stack.
+    {
+        let program = substring_program(
+            "extern:Substring.Raw.Internal.drop",
+            1,
+            7,
+            vec![I::NatBig {
+                dst: r(4),
+                limbs_le: vec![0, 1 << 36],
+            }],
+        );
+        assert_eq!(
+            raw_positions(&returned(&program)),
+            ("aλ😀z".to_owned(), "7".to_owned(), "7".to_owned())
+        );
+    }
+    assert_clean_shadow();
+}
+
+#[test]
+fn native_substring_equality_repairs_positions_and_compares_contents() {
+    let _guard = lock();
+    shadow::enable();
+    for (begin, end, other, a, b, expected) in [
+        (1, 7, "λ😀", 0, 6, true),
+        (1, 7, "λX", 0, 3, false),
+        (2, 7, "", 0, 0, true),
+        (7, 1, "", 0, 0, true),
+    ] {
+        let program = replay(vec![
+            string(0, "aλ😀z"),
+            nat(1, begin),
+            nat(2, end),
+            I::Ctor {
+                dst: r(3),
+                tag: 0,
+                fields: vec![r(0), r(1), r(2)],
+                scalar_bytes: vec![],
+            },
+            string(4, other),
+            nat(5, a),
+            nat(6, b),
+            I::Ctor {
+                dst: r(7),
+                tag: 0,
+                fields: vec![r(4), r(5), r(6)],
+                scalar_bytes: vec![],
+            },
+            call(8, "extern:Substring.Raw.Internal.beq", &[3, 7]),
+            I::Return { src: r(8) },
+        ]);
+        assert_eq!(returned(&program).unbox(), usize::from(expected));
+    }
+    assert_clean_shadow();
+}
+
+#[test]
+fn raw_position_arithmetic_keeps_arbitrary_precision_and_truncated_subtraction() {
+    let _guard = lock();
+    for (row, expected) in [
+        ("extern:String.Pos.Raw.Internal.sub", "17"),
+        (
+            "extern:String.Pos.Raw.Internal.min",
+            "1267650600228229401496703205376",
+        ),
+    ] {
+        let program = replay(vec![
+            I::NatBig {
+                dst: r(0),
+                limbs_le: vec![17, 1 << 36],
+            },
+            I::NatBig {
+                dst: r(1),
+                limbs_le: vec![0, 1 << 36],
+            },
+            call(2, row, &[0, 1]),
+            I::Return { src: r(2) },
+        ]);
+        assert_eq!(
+            fln_vm::interpreter::nat_decimal(&returned(&program)).as_deref(),
+            Some(expected)
+        );
+    }
+    let program = replay(vec![
+        nat(0, 3),
+        nat(1, 7),
+        call(2, "extern:String.Pos.Raw.Internal.sub", &[0, 1]),
+        I::Return { src: r(2) },
+    ]);
+    assert_eq!(returned(&program).unbox(), 0);
+}
+
+#[test]
+fn substring_copy_uses_the_pin_scalar_tag_boundary_for_each_endpoint() {
+    let _guard = lock();
+    // 2^63 fits usize on the pin but is already a heap Nat. The native
+    // extractor returns the complete backing string if either endpoint is
+    // heap-valued, including when the other endpoint would select a suffix.
+    for (begin, end) in [(1u64 << 63, (1u64 << 63) + 1), (1, 1u64 << 63)] {
+        assert_eq!(
+            text(&substring(
+                "extern:Substring.Raw.Internal.toString",
+                begin,
+                end,
+                &[]
+            )),
+            "aλ😀z"
+        );
+    }
+}
+
+#[test]
+fn malformed_substring_records_are_refused_and_nat_limits_remain_nonanswers() {
+    let _guard = lock();
+    shadow::enable();
+    for value in [
+        nat(3, 0),
+        I::Ctor {
+            dst: r(3),
+            tag: 1,
+            fields: vec![],
+            scalar_bytes: vec![],
+        },
+        I::Ctor {
+            dst: r(3),
+            tag: 0,
+            fields: vec![],
+            scalar_bytes: vec![],
+        },
+    ] {
+        let program = replay(vec![
+            value,
+            call(8, "extern:Substring.Raw.Internal.toString", &[3]),
+            I::Return { src: r(8) },
+        ]);
+        assert!(matches!(
+            execute(&program, ExecutionLimits::default(), None),
+            Outcome::Complete(VmExit::Refused {
+                refusal: VmRefusal::TypeMismatch { .. },
+                ..
+            })
+        ));
+    }
+    let program = substring_program(
+        "extern:Substring.Raw.Internal.drop",
+        1,
+        7,
+        vec![I::NatBig {
+            dst: r(4),
+            limbs_le: vec![0, 1 << 36],
+        }],
+    );
+    let limits = ExecutionLimits {
+        max_nat_magnitude_bytes: 8,
+        ..ExecutionLimits::default()
+    };
+    assert!(matches!(
+        execute(&program, limits, None),
+        Outcome::Inconclusive(_)
+    ));
+    assert_eq!(raw_positions(&returned(&program)).1, "7");
     assert_clean_shadow();
 }

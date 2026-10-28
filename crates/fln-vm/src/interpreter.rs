@@ -4429,7 +4429,9 @@ fn dispatch_intrinsic(
             unreachable!("owned array operations are dispatched before borrowing arguments")
         }
         IntrinsicImplementation::Float(intrinsic) => intrinsic.invoke(row, args),
-        IntrinsicImplementation::StringInternal(intrinsic) => intrinsic.invoke(row, args),
+        IntrinsicImplementation::StringInternal(intrinsic) => {
+            intrinsic.invoke(row, args, max_nat_magnitude_bytes)
+        }
         IntrinsicImplementation::NatAdd => {
             expect_arity(row, args, 2)?;
             let sum = with_nat_views(

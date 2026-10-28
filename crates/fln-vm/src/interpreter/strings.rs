@@ -14,9 +14,10 @@
 //! NUL-terminated buffer in place, so one character costs O(1), never a copy.
 
 use super::{
-    Inconclusive, IntrinsicFailure, IntrinsicResult, Obj, ResourceReason, ResourceUsage, Stop,
-    ValueKind, VmRefusal, expect_arity, nat_as_usize, scalar_code_point, string_value,
-    type_mismatch, value_kind,
+    BigNat, Inconclusive, IntrinsicFailure, IntrinsicResult, Obj, ResourceReason, ResourceUsage,
+    Stop, ValueKind, VmRefusal, ensure_nat_bits, expect_arity, extract_utf8, finish_nat_result,
+    nat_as_usize, nat_from_big_nat, scalar_code_point, string_value, type_mismatch, value_kind,
+    with_nat_view, with_nat_views,
 };
 
 // Bound this count-driven allocation before reserving or repeating. This is
@@ -40,6 +41,17 @@ pub(super) enum Intrinsic {
     Utf8Set,
     /// `lean_string_data`: the string's scalars, in order, as a list.
     Data,
+    Front,
+    PosMin,
+    PosSub,
+    SubstringToString,
+    SubstringDrop,
+    SubstringFront,
+    SubstringExtract,
+    SubstringBeq,
+    SubstringIsEmpty,
+    SubstringGet,
+    SubstringPrev,
 }
 
 #[derive(Debug)]
@@ -70,6 +82,17 @@ impl Intrinsic {
                 Self::Utf8Set
             }
             "extern:String.toList" | "extern:String.data" => Self::Data,
+            "extern:String.Internal.front" => Self::Front,
+            "extern:String.Pos.Raw.Internal.min" => Self::PosMin,
+            "extern:String.Pos.Raw.Internal.sub" => Self::PosSub,
+            "extern:Substring.Raw.Internal.toString" => Self::SubstringToString,
+            "extern:Substring.Raw.Internal.drop" => Self::SubstringDrop,
+            "extern:Substring.Raw.Internal.front" => Self::SubstringFront,
+            "extern:Substring.Raw.Internal.extract" => Self::SubstringExtract,
+            "extern:Substring.Raw.Internal.beq" => Self::SubstringBeq,
+            "extern:Substring.Raw.Internal.isEmpty" => Self::SubstringIsEmpty,
+            "extern:Substring.Raw.Internal.get" => Self::SubstringGet,
+            "extern:Substring.Raw.Internal.prev" => Self::SubstringPrev,
             _ => return None,
         })
     }
@@ -85,6 +108,17 @@ impl Intrinsic {
             Self::Utf8NextFast => "String.Pos.Raw.next'",
             Self::Utf8Set => "String.Pos.Raw.set",
             Self::Data => "String.toList",
+            Self::Front => "String.Internal.front",
+            Self::PosMin => "String.Pos.Raw.Internal.min",
+            Self::PosSub => "String.Pos.Raw.Internal.sub",
+            Self::SubstringToString => "Substring.Raw.Internal.toString",
+            Self::SubstringDrop => "Substring.Raw.Internal.drop",
+            Self::SubstringFront => "Substring.Raw.Internal.front",
+            Self::SubstringExtract => "Substring.Raw.Internal.extract",
+            Self::SubstringBeq => "Substring.Raw.Internal.beq",
+            Self::SubstringIsEmpty => "Substring.Raw.Internal.isEmpty",
+            Self::SubstringGet => "Substring.Raw.Internal.get",
+            Self::SubstringPrev => "Substring.Raw.Internal.prev",
         }
     }
 
@@ -92,19 +126,57 @@ impl Intrinsic {
         self,
         row: &str,
         args: &[Obj],
+        max_nat_magnitude_bytes: u64,
     ) -> Result<IntrinsicResult, IntrinsicFailure> {
         expect_arity(
             row,
             args,
             match self {
-                Self::Pushn | Self::Utf8Set => 3,
-                Self::Data => 1,
+                Self::Pushn | Self::Utf8Set | Self::SubstringExtract => 3,
+                Self::Data
+                | Self::Front
+                | Self::SubstringToString
+                | Self::SubstringFront
+                | Self::SubstringIsEmpty => 1,
                 _ => 2,
             },
         )?;
         let operation = self.operation();
         match self {
             Self::Data => return data(&args[0], operation),
+            Self::Front => {
+                let buffer = string_buffer(&args[0], operation, 0)?;
+                let code = if buffer.len() == 1 {
+                    CHAR_DEFAULT_VALUE
+                } else {
+                    utf8_get_core(&buffer[..buffer.len() - 1], 0)
+                        .ok_or(VmRefusal::InvalidStringObject)?
+                };
+                // Bootstrap's exported Lean implementation returns a boxed
+                // character, unlike the C runtime's unboxed utf8_get row.
+                return Ok(IntrinsicResult::owned(Obj::mk_nat(code as usize)));
+            }
+            Self::PosMin => {
+                let left = with_nat_views(&args[0], &args[1], operation, |a, b| a.ble(b))?;
+                return Ok(IntrinsicResult::owned(args[usize::from(!left)].clone_ref()));
+            }
+            Self::PosSub => {
+                let difference = with_nat_views(&args[0], &args[1], operation, |a, b| {
+                    ensure_nat_bits(max_nat_magnitude_bytes, u128::from(a.bit_length()))?;
+                    Ok::<_, IntrinsicFailure>(a.sub(b))
+                })??;
+                return finish_nat_result(difference, max_nat_magnitude_bytes);
+            }
+            Self::SubstringToString
+            | Self::SubstringDrop
+            | Self::SubstringFront
+            | Self::SubstringExtract
+            | Self::SubstringBeq
+            | Self::SubstringIsEmpty
+            | Self::SubstringGet
+            | Self::SubstringPrev => {
+                return self.invoke_substring(args, max_nat_magnitude_bytes);
+            }
             Self::Utf8Get
             | Self::Utf8GetFast
             | Self::GetByteFast
@@ -152,7 +224,18 @@ impl Intrinsic {
             | Self::GetByteFast
             | Self::Utf8NextFast
             | Self::Utf8Set
-            | Self::Data => unreachable!("positioned rows return above"),
+            | Self::Data
+            | Self::Front
+            | Self::PosMin
+            | Self::PosSub
+            | Self::SubstringToString
+            | Self::SubstringDrop
+            | Self::SubstringFront
+            | Self::SubstringExtract
+            | Self::SubstringBeq
+            | Self::SubstringIsEmpty
+            | Self::SubstringGet
+            | Self::SubstringPrev => unreachable!("specialized rows return above"),
         };
         // The generated census specifies borrowed operands and an owned result
         // for all three rows, even when a small Nat uses an immediate object.
@@ -216,10 +299,190 @@ impl Intrinsic {
                 let text = String::from_utf8(bytes).map_err(|_| VmRefusal::InvalidStringObject)?;
                 Ok(IntrinsicResult::owned(Obj::mk_string(&text)))
             }
-            Self::PosOf | Self::OffsetOfPos | Self::Pushn | Self::Data => {
+            _ => {
                 unreachable!("only positioned rows reach this port")
             }
         }
+    }
+
+    /// Native ports of the exports in Init.Data.String.Substring. The
+    /// compiled Raw record has three object fields: String, start Nat, stop
+    /// Nat. Pos.Raw's single-field wrapper is erased by the Reference ABI.
+    fn invoke_substring(
+        self,
+        args: &[Obj],
+        max_nat_magnitude_bytes: u64,
+    ) -> Result<IntrinsicResult, IntrinsicFailure> {
+        let operation = self.operation();
+        let raw = Substring::read(&args[0], operation, 0)?;
+        let bytes = string_buffer(&raw.string, operation, 0)?;
+        let bytes = &bytes[..bytes.len() - 1];
+        let position = |value: &Obj, argument| {
+            with_nat_view(value, operation, argument, |value| {
+                ensure_nat_bits(max_nat_magnitude_bytes, u128::from(value.bit_length()))?;
+                Ok::<_, IntrinsicFailure>(value.to_owned())
+            })?
+        };
+        let start = position(&raw.start, 0)?;
+        let stop = position(&raw.stop, 0)?;
+        let word = |value: &BigNat| value.to_u64().and_then(|v| usize::try_from(v).ok());
+        let sum = |a: &BigNat, b: &BigNat| {
+            let bits = if a.is_zero() && b.is_zero() {
+                0
+            } else {
+                u128::from(a.bit_length().max(b.bit_length())) + 1
+            };
+            ensure_nat_bits(max_nat_magnitude_bytes, bits)?;
+            Ok::<_, IntrinsicFailure>(a.add(b))
+        };
+        let result = match self {
+            Self::SubstringToString => {
+                // lean_string_utf8_extract tests the ABI tag, not whether
+                // the mathematical Nat fits a host usize. On a 64-bit pin,
+                // 2^63 is already a heap Nat and selects the whole string.
+                let begin = raw.start.is_scalar().then(|| raw.start.unbox());
+                let end = raw.stop.is_scalar().then(|| raw.stop.unbox());
+                let text = extract_utf8(bytes, begin, end).ok_or(VmRefusal::InvalidStringObject)?;
+                Obj::mk_string(&text)
+            }
+            Self::SubstringIsEmpty => Obj::mk_nat(usize::from(stop <= start)),
+            Self::SubstringFront | Self::SubstringGet => {
+                let offset = if self == Self::SubstringFront {
+                    start
+                } else {
+                    sum(&start, &position(&args[1], 1)?)?
+                };
+                // The stop is intentionally not consulted: get/front are
+                // relative to the backing String, even for empty substrings.
+                let code = word(&offset)
+                    .filter(|index| *index < bytes.len())
+                    .and_then(|index| utf8_get_core(bytes, index))
+                    .unwrap_or(CHAR_DEFAULT_VALUE);
+                Obj::mk_nat(code as usize)
+            }
+            Self::SubstringPrev => {
+                let relative = position(&args[1], 1)?;
+                if relative.is_zero() {
+                    Obj::mk_nat(0)
+                } else {
+                    let absolute = sum(&start, &relative)?;
+                    let previous = match word(&absolute) {
+                        Some(index) if index <= bytes.len() => {
+                            let mut previous = index.saturating_sub(1);
+                            while previous > 0 && utf8_first_byte_size(bytes[previous]).is_none() {
+                                previous -= 1;
+                            }
+                            BigNat::from_u64(previous as u64).sub(&start)
+                        }
+                        // Outside the buffer the pin decrements the absolute
+                        // position once; subtraction of start leaves p - 1.
+                        _ => relative.sub(&BigNat::from_u64(1)),
+                    };
+                    nat_from_big_nat(&previous)
+                }
+            }
+            Self::SubstringDrop => {
+                let count = position(&args[1], 1)?;
+                let mut advanced = start;
+                let mut consumed = 0u64;
+                let bound = count.to_u64().unwrap_or(u64::MAX);
+                // At most one pass over the backing bytes. Once outside the
+                // buffer, next advances by one: finish that suffix with Nat
+                // arithmetic, so a huge count never creates a host loop.
+                if let Some(mut index) = word(&advanced) {
+                    while index < bytes.len() && consumed < bound && advanced != stop {
+                        index += utf8_fast_width(bytes[index]);
+                        advanced = BigNat::from_u64(index as u64);
+                        consumed += 1;
+                    }
+                }
+                if advanced != stop && consumed < bound {
+                    let mut remaining = count.sub(&BigNat::from_u64(consumed));
+                    if advanced < stop {
+                        remaining = remaining.min(stop.sub(&advanced));
+                    }
+                    advanced = sum(&advanced, &remaining)?;
+                }
+                Substring::make(
+                    raw.string.clone_ref(),
+                    nat_from_big_nat(&advanced),
+                    raw.stop,
+                )
+            }
+            Self::SubstringExtract => {
+                let begin = position(&args[1], 1)?;
+                let end = position(&args[2], 2)?;
+                if begin >= end {
+                    Substring::make(Obj::mk_string(""), Obj::mk_nat(0), Obj::mk_nat(0))
+                } else {
+                    let begin = sum(&start, &begin)?.min(stop.clone());
+                    let end = sum(&start, &end)?.min(stop);
+                    Substring::make(
+                        raw.string.clone_ref(),
+                        nat_from_big_nat(&begin),
+                        nat_from_big_nat(&end),
+                    )
+                }
+            }
+            Self::SubstringBeq => {
+                let other = Substring::read(&args[1], operation, 1)?;
+                let other_buffer = string_buffer(&other.string, operation, 1)?;
+                let other_bytes = &other_buffer[..other_buffer.len() - 1];
+                // repair replaces invalid positions by the backing string's
+                // end before the byte-length and contents comparison.
+                let repaired = |bytes: &[u8], a: Option<usize>, b: Option<usize>| {
+                    let valid = |p: Option<usize>| {
+                        p.filter(|p| {
+                            *p == bytes.len()
+                                || (*p < bytes.len() && utf8_first_byte_size(bytes[*p]).is_some())
+                        })
+                        .unwrap_or(bytes.len())
+                    };
+                    let a = valid(a);
+                    let b = valid(b);
+                    (a, b.saturating_sub(a))
+                };
+                let (a, size) = repaired(bytes, word(&start), word(&stop));
+                let (b, other_size) = repaired(
+                    other_bytes,
+                    nat_as_usize(&other.start, operation, 1)?,
+                    nat_as_usize(&other.stop, operation, 1)?,
+                );
+                Obj::mk_nat(usize::from(
+                    size == other_size && bytes[a..a + size] == other_bytes[b..b + other_size],
+                ))
+            }
+            _ => unreachable!("only substring rows reach this port"),
+        };
+        Ok(IntrinsicResult::owned(result))
+    }
+}
+
+struct Substring {
+    string: Obj,
+    start: Obj,
+    stop: Obj,
+}
+
+impl Substring {
+    fn read(value: &Obj, operation: &'static str, argument: usize) -> Result<Self, VmRefusal> {
+        if value_kind(value) != ValueKind::Ctor(0) || value.header().other != 3 {
+            return Err(type_mismatch(operation, argument, "Substring.Raw", value));
+        }
+        let child = |index| {
+            value
+                .try_ctor_child(index)
+                .ok_or_else(|| type_mismatch(operation, argument, "Substring.Raw", value))
+        };
+        Ok(Self {
+            string: child(0)?,
+            start: child(1)?,
+            stop: child(2)?,
+        })
+    }
+
+    fn make(string: Obj, start: Obj, stop: Obj) -> Obj {
+        Obj::mk_ctor(0, vec![string, start, stop], &[])
     }
 }
 
