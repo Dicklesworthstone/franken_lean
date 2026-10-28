@@ -36,6 +36,7 @@ fn type_local(index: u32, scopes: [&[Expr]; 3]) -> Option<&Expr> {
 
 enum ProjectionFrame {
     Visit(Expr),
+    Keep(Expr),
     Remember(Expr, usize),
     Apply,
     Lambda(Name, Expr, BinderInfo),
@@ -564,6 +565,7 @@ impl Preparation<'_> {
                 })?;
             reserve(&mut values, self.limits.max_nodes)?;
             match task {
+                ProjectionFrame::Keep(expr) => values.push(expr),
                 ProjectionFrame::Visit(expr) if !affected.contains(&expr) => values.push(expr),
                 ProjectionFrame::Visit(expr) => {
                     if specialize::closed(&expr) {
@@ -575,8 +577,30 @@ impl Preparation<'_> {
                     }
                     match expr.node() {
                         ExprNode::App { f, a } => {
+                            // Proof erasure retains admitted propositions and predicates
+                            // as exact static arguments. Their logical projections must
+                            // not reenter executable layout discovery here. Recover this
+                            // argument's domain from the original function prefix, so
+                            // earlier actual arguments and the lexical context still
+                            // determine it. Unknown and Type-valued operands keep the
+                            // ordinary traversal, including hidden carrier projections.
+                            let mut predicate = false;
+                            if affected.contains(a)
+                                && let Some(type_) = self.projection_receiver_type(f, &locals)?
+                            {
+                                let normal = self.type_head(&type_)?;
+                                if let ExprNode::ForallE { binder_type, .. } = normal.node() {
+                                    predicate = self
+                                        .type_parameter_sort(binder_type)?
+                                        .is_some_and(|level| level.is_zero());
+                                }
+                            }
                             tasks.push(ProjectionFrame::Apply);
-                            tasks.push(ProjectionFrame::Visit(a.clone()));
+                            tasks.push(if predicate {
+                                ProjectionFrame::Keep(a.clone())
+                            } else {
+                                ProjectionFrame::Visit(a.clone())
+                            });
                             tasks.push(ProjectionFrame::Visit(f.clone()));
                         }
                         ExprNode::Lam {
