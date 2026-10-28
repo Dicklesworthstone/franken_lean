@@ -127,7 +127,7 @@ impl Context {
             Syntax::Ident { val, .. } => val.erase_macro_scopes(),
             hole if hole.kind() == Some(&parser_kind(&["Term", "hole"])) => {
                 return if goals.is_empty() {
-                    Err(error(TacticError::NoGoals))
+                    Err(no_goals(Some(hole)))
                 } else {
                     Ok(0)
                 };
@@ -344,7 +344,7 @@ impl Context {
         scope: OptionScope<'a>,
     ) -> Result<(), NatDefinitionElabError> {
         if proof.cursor != proof.instructions.len() {
-            return Err(error(TacticError::NoGoals));
+            return Err(no_goals(proof.instructions.get(proof.cursor).copied()));
         }
         self.txn.options = scope.options;
         self.source_scope.instance_scopes = scope.instance_scopes;
@@ -652,7 +652,7 @@ impl Context {
         }
         self.skip_empty_goal_controls(proof)?;
         if proof.cursor != proof.instructions.len() {
-            return Err(error(TacticError::NoGoals));
+            return Err(no_goals(proof.instructions.get(proof.cursor).copied()));
         }
         let mut frame = proof.controls.pop().expect("validated control depth");
         if let Some(tag) = frame.retag.clone() {

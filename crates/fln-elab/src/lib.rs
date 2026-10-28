@@ -138,13 +138,15 @@ impl NatDefinitionFrontendError {
     /// user-facing position is available.
     ///
     /// Parse refusals delegate to [`NatDefinitionParseError::primary_offset`].
-    /// Elaboration refusals return `None`: [`NatDefinitionElabError`] does not
-    /// yet capture the offending token's position (the `Syntax` node carries it,
-    /// but the error type discards it), so a type error cannot be located in the
-    /// source until that variant is extended.
+    /// A no-goals tactic refusal retains the offending instruction's original
+    /// position. Other elaboration refusals still return `None` when their
+    /// error does not carry a source position.
     pub fn primary_offset(&self) -> Option<BytePos> {
         match self {
             Self::Parse(error) => error.primary_offset(),
+            Self::Elaborate(NatDefinitionElabError::Inference(
+                source::SourceInferenceError::Tactic(source::TacticError::NoGoals { offset }),
+            )) => *offset,
             Self::Elaborate(_) => None,
         }
     }

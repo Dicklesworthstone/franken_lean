@@ -53,6 +53,45 @@ fn a_refinement_that_assigned_its_hole_leaves_no_goal_for_the_next_tactic() {
 }
 
 #[test]
+fn the_first_no_goals_error_points_at_the_extra_tactic() {
+    let limits = EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024));
+    let engine = Engine::with_source_seed(limits)
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    for source in [
+        "theorem simple (n : Nat) : n = n := by refine Eq.refl ?_; exact n",
+        "def identity {A : Type} (x : A) : A := x\ntheorem same (n : Nat) : identity n = n := by refine Eq.refl ?_; exact n",
+        "def annotated : Nat := by refine (7 : ?_); exact Nat\ntheorem computes : annotated = 7 := by rfl",
+    ] {
+        let problem = engine
+            .check_source_files(
+                &[source.as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits),
+            )
+            .expect_err(source);
+        assert_eq!(
+            problem.disposition(),
+            ("elaboration", false, 1),
+            "{problem:?}"
+        );
+        let fln::SourceCheckError::Command { offset, error, .. } = problem else {
+            panic!("expected a located tactic error: {problem:?}");
+        };
+        assert_eq!(
+            offset,
+            source.find("exact ").unwrap(),
+            "{source}\n{error:?}"
+        );
+        assert!(
+            error.to_string().contains("tactic has no remaining goal"),
+            "{error:?}"
+        );
+    }
+}
+
+#[test]
 fn partial_proof_terms_expose_only_the_requested_holes() {
     check(&format!(
         "{BOTH} theorem pair (P Q : Prop) (p : P) (q : Q) : Both P Q := by refine Both.intro p ?_; exact q"

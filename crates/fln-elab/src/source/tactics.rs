@@ -82,7 +82,9 @@ pub enum TacticError {
         decision: Expr,
         metavariables: bool,
     },
-    NoGoals,
+    NoGoals {
+        offset: Option<BytePos>,
+    },
     UnsolvedGoals {
         count: usize,
     },
@@ -307,7 +309,7 @@ impl std::fmt::Display for TacticError {
                     "free variables"
                 }
             ),
-            Self::NoGoals => write!(f, "tactic has no remaining goal"),
+            Self::NoGoals { .. } => write!(f, "tactic has no remaining goal"),
             Self::UnsolvedGoals { count } => write!(f, "proof script left {count} unsolved goals"),
             Self::SyntheticHoleOutsideRefine => write!(f, "synthetic proof holes require refine"),
             Self::UnassignedNaturalHole => {
@@ -579,6 +581,14 @@ impl std::fmt::Display for TacticError {
 }
 fn error(reason: TacticError) -> NatDefinitionElabError {
     failure(SourceInferenceError::Tactic(reason))
+}
+
+fn no_goals(instruction: Option<&Syntax>) -> NatDefinitionElabError {
+    error(TacticError::NoGoals {
+        offset: instruction
+            .and_then(deprecated::syntax_span)
+            .map(|(start, _)| BytePos(start)),
+    })
 }
 
 /// The hints the pin's `split` adds to a failure (vendored src/Lean/Elab/Tactic/Split.lean):
@@ -1218,7 +1228,7 @@ impl Context {
             let Some(work) = proof.work.pop() else {
                 self.skip_empty_goal_controls(proof)?;
                 if proof.cursor != proof.instructions.len() {
-                    return Err(error(TacticError::NoGoals));
+                    return Err(no_goals(proof.instructions.get(proof.cursor).copied()));
                 }
                 self.observe_proof_end(proof.extent.as_deref(), &[])?;
                 self.txn.lctx = proof.saved.clone();
@@ -1232,7 +1242,7 @@ impl Context {
                 Work::EndAttempt(index) => {
                     self.skip_empty_goal_controls(proof)?;
                     if proof.cursor != proof.instructions.len() {
-                        return Err(error(TacticError::NoGoals));
+                        return Err(no_goals(proof.instructions.get(proof.cursor).copied()));
                     }
                     return Ok(ProofAction::AttemptComplete(index));
                 }
@@ -1262,7 +1272,7 @@ impl Context {
                 Work::EndScript(instructions, cursor) => {
                     self.skip_empty_goal_controls(proof)?;
                     if proof.cursor != proof.instructions.len() {
-                        return Err(error(TacticError::NoGoals));
+                        return Err(no_goals(proof.instructions.get(proof.cursor).copied()));
                     }
                     proof.instructions = instructions;
                     proof.cursor = cursor;

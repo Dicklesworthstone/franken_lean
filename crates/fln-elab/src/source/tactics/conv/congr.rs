@@ -852,7 +852,7 @@ impl Context {
                         return Err(error(TacticError::MalformedScript));
                     };
                     let mut rest = goals.split_off(1);
-                    let main = goals.pop().ok_or_else(|| error(TacticError::NoGoals))?;
+                    let main = goals.pop().ok_or_else(|| no_goals(Some(inner)))?;
                     let mut produced = if inner.kind() == Some(&conv_kind("argArg")) {
                         let (index, explicit) = arg_index(inner)?;
                         self.conv_arg(main, "arg", index, explicit, &mut deferred)?
