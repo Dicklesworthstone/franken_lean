@@ -77,6 +77,77 @@ fn explicit_instance_arguments_are_consumed_not_synthesized() {
     );
 }
 
+/// Under `@`, a bare `_` given for an instance parameter is still synthesized (the pin's
+/// `processInstImplicitArg`), in the ordinary and the named-argument path alike. The pin
+/// accepts each of these (checked 2026-10-28).
+#[test]
+fn explicit_holes_for_instance_parameters_are_synthesized() {
+    let base = check(
+        &engine(),
+        "class Pick (α : Type) where\n  pick : α\ninstance : Pick Nat := ⟨7⟩\ndef choose (α : Type) [Pick α] (x : α) : α := Pick.pick",
+    )
+    .engine;
+    for value in [
+        "@choose Nat _ 0",
+        "@choose Nat _ (x := 0)",
+        "@HAdd.hAdd Nat Nat Nat _ 3 4",
+    ] {
+        let result = check(
+            &base,
+            &format!("theorem synthesized : ({value}) = 7 := by rfl"),
+        );
+        assert_eq!(result.theorems, 1);
+    }
+}
+
+/// Such a hole is one of the application's own instance arguments (App.lean's local
+/// `mkInstMVar`). Under `@` the pin propagates the expected result before each written argument
+/// that is not a hole, once the result depends on none of the arguments left, and never before
+/// a hole. So an output an instance would fix and the expected type would fix is fixed by
+/// whichever comes first. `Get Nat Bool` and `Coe Bool Box` make the difference observable:
+/// - `solved`: the class input is written, so the instance fixes `Bool` and it is coerced;
+/// - `stuck`: `Box` is propagated before `(3 : Nat)`, and `Get Nat Box` is refused;
+/// - `midway`: as `stuck` with one more argument, which an earlier synthesis would precede;
+/// - `dependent`: the result depends on the last argument, so nothing is propagated;
+/// - `last`: the last argument is the instance hole, before which nothing is propagated.
+///
+/// The pin accepts `solved`, `dependent` and `last` and refuses `stuck` and `midway` with
+/// "failed to synthesize instance" (checked 2026-10-28).
+#[test]
+fn an_explicit_instance_hole_meets_the_expected_type_where_the_pin_propagates_it() {
+    let coercions = Engine::with_coercion_seed(limits().admission)
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let base = check(
+        &coercions,
+        "class Get (c : Type) (e : outParam Type) where\n  get : c → e\ninstance : Get Nat Bool := ⟨fun _ => true⟩\nclass Get2 (c : Type) (e : outParam Type) where\n  get2 : c → Nat → e\ninstance : Get2 Nat Bool := ⟨fun _ _ => true⟩\nstructure Box where\n  value : Bool\ninstance : Coe Bool Box := ⟨Box.mk⟩\ndef tagged (c e : Type) [Get c e] (x : c) : (k : Nat) → (fun _ => e) k := fun _ => Get.get x\ndef viaLast (c : Type) (x : c) (e : Type) [Get c e] : e := Get.get x",
+    )
+    .engine;
+    for accepted in [
+        "def solved : Box := @Get.get Nat _ _ (3 : Nat)\ntheorem solved_value : solved.value = true := rfl",
+        "def dependent : Box := @tagged _ _ _ (3 : Nat) 0\ntheorem dependent_value : dependent.value = true := rfl",
+        "def last : Box := @viaLast Nat 3 _ _\ntheorem last_value : last.value = true := rfl",
+    ] {
+        assert_eq!(check(&base, accepted).theorems, 1, "{accepted}");
+    }
+    let root = base.logical_root(&KVMap::new());
+    for refused in [
+        "def stuck : Box := @Get.get _ _ _ (3 : Nat)",
+        "def midway : Box := @Get2.get2 _ _ _ (3 : Nat) 0",
+    ] {
+        let error = base
+            .check_source_files(&[refused.as_bytes()], &KVMap::new(), limits())
+            .err()
+            .unwrap_or_else(|| panic!("accepted {refused}"));
+        assert!(
+            format!("{error:?}").contains("InstanceSynthesisRequired"),
+            "{refused}: {error:?}"
+        );
+        assert_eq!(base.logical_root(&KVMap::new()), root);
+    }
+}
+
 #[test]
 fn explicit_local_functions_and_strict_implicits_remain_typed() {
     check(

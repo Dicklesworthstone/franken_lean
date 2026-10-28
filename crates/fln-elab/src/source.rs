@@ -1887,6 +1887,19 @@ impl Context {
         Ok(term)
     }
 
+    /// The result of `type_` after `count` more binders, when it depends on none of them. As
+    /// the pin's `getForallBody`, the binders are read as written.
+    fn independent_result(type_: &Expr, count: usize) -> Option<Expr> {
+        let mut result = type_;
+        for _ in 0..count {
+            let ExprNode::ForallE { body, .. } = result.node() else {
+                return None;
+            };
+            result = body;
+        }
+        (!result.has_loose_bvars()).then(|| result.clone())
+    }
+
     /// Explicit application is a property of this syntactic head, not of a
     /// value or its binder types. It must not leak into argument elaboration.
     fn explicit_application_head<'a>(
@@ -1993,6 +2006,14 @@ impl Context {
             }
             fn is_empty(self) -> bool {
                 self.split_first().is_none()
+            }
+            fn len(self) -> usize {
+                let (mut count, mut rest) = (0, self);
+                while let Some((_, next)) = rest.split_first() {
+                    count += 1;
+                    rest = next;
+                }
+                count
             }
         }
         enum Task<'a> {
@@ -3932,19 +3953,50 @@ impl Context {
                                 }
                                 let function = coerced?;
                                 let ExprNode::ForallE {
-                                    binder_type, body, ..
+                                    binder_type,
+                                    body,
+                                    binder_info,
+                                    ..
                                 } = function.type_.node()
                                 else {
                                     return Err(failure(SourceInferenceError::ExpectedFunction));
                                 };
+                                let instance = *binder_info == BinderInfo::InstImplicit;
                                 let domain = self.projection_domain(binder_type.clone())?;
                                 let codomain = body.clone();
+                                // Under `@`, a hole, `?x` or `by` never carries the expected
+                                // result into the telescope (`shouldPropagateExpectedTypeFor`).
+                                let propagates = !explicit
+                                    || ![
+                                        ["Term", "hole"],
+                                        ["Term", "syntheticHole"],
+                                        ["Term", "byTactic"],
+                                    ]
+                                    .iter()
+                                    .any(|kind| first.kind() == Some(&parser_kind(kind)));
+                                // Under `@`, the pin propagates the expected result before
+                                // every other written argument until it unifies, once the
+                                // result depends on none of the arguments left
+                                // (`propagateExpectedType`, vendored Lean/Elab/App.lean:563). So
+                                // `@GetElem.getElem _ _ _ _ _ xs i h` fixes its output before
+                                // `xs`, ahead of the instance its holes leave pending.
+                                if explicit
+                                    && propagates
+                                    && !rest.is_empty()
+                                    && let Some(expected) = &expected
+                                    && let Some(result) =
+                                        Self::independent_result(&codomain, rest.len())
+                                    && self.instantiate(expected)? != Expr::sort(Level::zero())
+                                {
+                                    self.constrain_result_hint(&result, expected)?;
+                                }
                                 // Propagate a known result before checking the last
                                 // explicit argument when the codomain does not depend
                                 // on that argument (e.g. Inhabited.mk (fun x => ...)),
                                 // unless it is an instance's output, which the pin
                                 // leaves to the instance (`resultIsOutParamSupport`).
                                 if rest.is_empty()
+                                    && propagates
                                     && !codomain.has_loose_bvar(0)
                                     && let Some(expected) = &expected
                                     && self
@@ -3957,7 +4009,21 @@ impl Context {
                                 tasks.push(Task::Argument(
                                     function, codomain, rest, expected, explicit,
                                 ));
-                                tasks.push(Task::CheckArgument(first, domain, false));
+                                // Under `@`, the pin still synthesizes a bare `_` given for an
+                                // instance parameter (`processInstImplicitArg`, vendored
+                                // Lean/Elab/App.lean:903); `(_)` stays an ordinary hole.
+                                if explicit
+                                    && instance
+                                    && first.kind() == Some(&parser_kind(&["Term", "hole"]))
+                                {
+                                    let value = self.instance_hole(domain.clone())?;
+                                    values.push(Typed {
+                                        value,
+                                        type_: domain,
+                                    });
+                                } else {
+                                    tasks.push(Task::CheckArgument(first, domain, false));
+                                }
                             } else {
                                 values.push(if explicit {
                                     self.finish_explicit_term(function, expected.as_ref())?

@@ -223,6 +223,16 @@ impl Context {
                 };
                 self.append_named_value(state, &codomain, argument)?;
                 continue;
+            } else if style == BinderInfo::InstImplicit
+                && matches!(state.positional.front(), Some(ApplicationValue::Syntax(syntax))
+                    if syntax.kind() == Some(&parser_kind(&["Term", "hole"])))
+            {
+                // Under `@`, a bare `_` for an instance parameter is still synthesized
+                // (`processInstImplicitArg`), as in the ordinary application path.
+                state.positional.pop_front();
+                let argument = self.instance_hole(argument_domain)?;
+                self.append_named_value(state, &codomain, argument)?;
+                continue;
             } else {
                 state.positional.pop_front()
             };
