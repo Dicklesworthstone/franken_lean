@@ -15,7 +15,7 @@ on:
         description: 'Fixed validation command; negative controls are expected to fail'
         required: true
         type: choice
-        options: [range, cli, reference, missing-reference, flush-mutant, ingress, mutual-structural, polymorphic-callbacks]
+        options: [range, cli, reference, missing-reference, flush-mutant, ingress, mutual-structural, polymorphic-callbacks, pattern-simp]
   push:
     branches: [main]
     paths:
@@ -61,13 +61,14 @@ jobs:
               'crates/fln-cli/src/output/tests.rs',
               'crates/fln-cli/src/goal_traces.rs',
               'crates/fln-cli/src/source_check/imports.rs',
+              'crates/fln/src/source_records/simp.rs',
           }
           for path, blobs in changes.items():
               assert path in allowed, path
               assert isinstance(blobs, list) and len(blobs) == 2
               assert all(isinstance(s, str) and re.fullmatch('[0-9a-f]{40}', s) for s in blobs)
           assert os.environ['CANDIDATE_SUITE'] in {
-              'range', 'cli', 'reference', 'missing-reference', 'flush-mutant', 'ingress', 'mutual-structural', 'polymorphic-callbacks',
+              'range', 'cli', 'reference', 'missing-reference', 'flush-mutant', 'ingress', 'mutual-structural', 'polymorphic-callbacks', 'pattern-simp',
           }
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -145,6 +146,16 @@ jobs:
         run: |
           set -euo pipefail
           case "$CANDIDATE_SUITE" in
+            pattern-simp)
+              # b8zv: retire when the ordinary full product gate covers this cut.
+              cargo check --locked --all-targets
+              cargo clippy --locked --all-targets -- -D warnings
+              cargo test --locked --release --no-fail-fast -p fln \
+                --test source_equation_theorems --test source_simp_equations \
+                --test source_default_simp --test source_simp_locations \
+                --test source_simp_hypotheses --test source_simp_quantifiers \
+                --test source_dsimp -- --nocapture
+              ;;
             polymorphic-callbacks)
               rustfmt --edition 2024 --config skip_children=true --check crates/fln/src/runtime.rs crates/fln/src/runtime/templates.rs crates/fln/src/runtime/specialize/arguments.rs crates/fln/src/runtime/specialize/arguments/factories.rs crates/fln/src/runtime/specialize/arguments/tests.rs crates/fln/tests/runtime_parameterized_data.rs crates/fln/src/runtime/global/callbacks.rs crates/fln/tests/runtime_polymorphic_callbacks.rs
               cargo test --locked --release -p fln --test runtime_parameterized_data -- --test-threads=1
