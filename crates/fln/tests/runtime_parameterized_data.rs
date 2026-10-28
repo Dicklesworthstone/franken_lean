@@ -46,6 +46,90 @@ fn builtin_collections_execute_their_real_recursors() {
 }
 
 #[test]
+fn closed_polymorphic_callbacks_execute_at_distinct_types() {
+    let definitions = "def polyId (A : Type) (x : A) : A := x\n\
+        def polyUse (n : Nat) (f : (A : Type) -> A -> A) (s : String) : Nat :=\n\
+          Nat.add (f Nat n) (String.length (f String s))\n";
+    for callback in ["(fun A x => x)", "(fun A => polyId A)", "polyId"] {
+        run(
+            &format!("{definitions}#eval polyUse 36 {callback} \"answer\""),
+            "42",
+        );
+    }
+    run(
+        "def polyCount (n : Nat) (f : (A : Type) -> A -> Nat) : Nat := f Nat n + f String \"x\"\n#eval polyCount 7 (fun A x => 20) + polyCount 9 (fun A x => 1)",
+        "42",
+    );
+}
+
+#[test]
+fn polymorphic_callback_initializers_remain_strict_and_shared() {
+    let definitions = "def expensive (n : Nat) : Nat := Nat.rec (motive := fun _ => Nat) 0 (fun k ih => ih) n\n\
+        def polyOnce (f : (A : Type) -> A -> A) : Nat := f Nat 42\n\
+        def polyTwice (f : (A : Type) -> A -> A) : Nat := f Nat 36 + String.length (f String \"answer\")\n";
+    let mut deltas = Vec::new();
+    for body in ["polyOnce saved", "polyTwice saved", "42"] {
+        let source = format!(
+            "{definitions}def use (cost : Nat) : Nat := let saved : (A : Type) -> A -> A := (by let paid := expensive cost; intro A x; exact x); {body}\n"
+        );
+        deltas.push(
+            run(&format!("{source}#eval use 100"), "42")
+                - run(&format!("{source}#eval use 0"), "42"),
+        );
+    }
+    assert!(deltas[0] > 100, "callback initialization was erased");
+    assert!(
+        deltas.iter().all(|delta| *delta == deltas[0]),
+        "callback initialization was duplicated or dropped: {deltas:?}"
+    );
+    for (domain, tail, body) in [
+        (
+            "A -> A",
+            "fun x => x",
+            "let saved : Nat -> Nat := f Nat; saved 20 + saved 22",
+        ),
+        (
+            "A -> A",
+            "fun x => x",
+            "let saved : Nat -> Nat := f Nat; 42",
+        ),
+        ("Nat", "42", "f Nat"),
+    ] {
+        let source = |cost| {
+            format!(
+                "{definitions}def stage (f : (A : Type) -> {domain}) : Nat := {body}\n#eval stage (fun A => let paid := expensive {cost}; {tail})"
+            )
+        };
+        let delta = run(&source(100), "42") - run(&source(0), "42");
+        assert_eq!(delta, deltas[0], "a strict type-application stage changed");
+    }
+}
+
+#[test]
+fn polymorphic_callback_specialization_keeps_lazy_bodies_and_extern_authority() {
+    let definitions = "def expensive (n : Nat) : Nat := Nat.rec (motive := fun _ => Nat) 0 (fun k ih => ih) n\n\
+        def ignore (f : (A : Type) -> A -> A) : Nat := 42\n\
+        def ignoreNat (f : (A : Type) -> Nat) : Nat := 42\n";
+    let source =
+        |cost| format!("{definitions}#eval ignore (fun A x => let paid := expensive {cost}; x)");
+    assert_eq!(run(&source(0), "42"), run(&source(100000), "42"));
+    let source =
+        |cost| format!("{definitions}#eval ignoreNat (fun A => let paid := expensive {cost}; 42)");
+    assert_eq!(run(&source(0), "42"), run(&source(100000), "42"));
+    let source = b"@[extern \"missing_polymorphic_callback\"] def blocked (A : Type) (x : A) : A := x\ndef use (f : (A : Type) -> A -> A) : Nat := f Nat 42\n#eval use blocked";
+    let base = engine();
+    let root = base.logical_root(&KVMap::new());
+    let error = base
+        .execute_source_definitions(&[source], &KVMap::new(), limits())
+        .expect_err("an extern callback must not execute its logical fallback");
+    assert!(
+        format!("{error:?}").contains("native extern attribute does not match the supported ABI"),
+        "{error:?}"
+    );
+    assert_eq!(base.logical_root(&KVMap::new()), root);
+}
+
+#[test]
 fn named_intrinsics_and_scalar_constructors_are_first_class_callbacks() {
     for (source, value) in [
         ("#eval List.foldl Nat.sub 10 [5, 2]", "3"),

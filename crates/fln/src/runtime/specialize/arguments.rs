@@ -40,6 +40,28 @@ struct PreparedArguments {
 }
 
 impl Preparation<'_> {
+    /// A runtime callback with a type parameter cannot use a single ground ABI.
+    /// Classify its admitted telescope without evaluating the supplied value.
+    fn polymorphic_callback_type(&mut self, input: &Expr) -> Result<bool, IngressError> {
+        let mut type_ = self.type_head(input)?;
+        let mut depth = 0usize;
+        loop {
+            self.tick()?;
+            let ExprNode::ForallE {
+                binder_type, body, ..
+            } = type_.node()
+            else {
+                return Ok(false);
+            };
+            depth = depth.saturating_add(1);
+            self.producer_depth(depth)?;
+            if self.type_parameter(binder_type)? {
+                return Ok(true);
+            }
+            type_ = self.type_head(body)?;
+        }
+    }
+
     fn specialize_arguments(
         &mut self,
         initial_type: Expr,
@@ -122,8 +144,8 @@ impl Preparation<'_> {
             else {
                 break;
             };
-            // A dictionary indexed by an earlier retained value is not a
-            // global specialization, even when this caller supplies a literal.
+            // A dictionary or callback indexed by an earlier retained value
+            // is not a global specialization, even for a literal argument.
             // A type-valued motive can mention that value only in domains
             // which disappear under the checked representation erasure (for
             // example `fuel -> x < fuel -> Type`). Its represented domain must
@@ -150,7 +172,14 @@ impl Preparation<'_> {
                 None
             } else if let Some(type_) = runtime_type {
                 closed(&type_).then_some(type_)
-            } else if *binder_info == BinderInfo::InstImplicit && closed(argument) {
+            } else if closed(argument)
+                && (*binder_info == BinderInfo::InstImplicit
+                    || self.polymorphic_callback_type(binder_type)?)
+            {
+                // Explicit polymorphic callbacks need the same private static
+                // substitution as dictionaries. Only an independently closed,
+                // inert value may enter a global body; computed producers and
+                // captured runtime locals keep their original strict slots.
                 self.instance_factory_value(argument)?
             } else {
                 None
@@ -161,7 +190,7 @@ impl Preparation<'_> {
                 reserve(&mut static_arguments, self.limits.max_application_args)?;
                 // Hidden-type arguments use their verified closed form, never
                 // context-relative receiver indices in a global key. Ordinary
-                // dictionary factories retain their original cache identity.
+                // dictionaries and callbacks retain their original cache identity.
                 static_arguments.push((
                     index,
                     if is_proposition || type_argument {
@@ -245,9 +274,9 @@ impl Preparation<'_> {
         })
     }
 
-    /// Erase closed type and inert dictionary arguments without requiring them
-    /// to precede every runtime parameter. Argument positions are part of the
-    /// cache identity; ordinary argument values never are.
+    /// Specialize closed types, dictionaries and polymorphic callbacks at
+    /// their actual positions. Static positions and original inert callback
+    /// syntax identify the cache; retained runtime values never enter its key.
     pub(in crate::runtime) fn specialize_call(
         &mut self,
         head: &Expr,

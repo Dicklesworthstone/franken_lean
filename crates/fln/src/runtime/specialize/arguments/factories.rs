@@ -26,8 +26,8 @@ fn push(tasks: &mut Vec<Task>, task: Task, limit: usize) -> Result<(), IngressEr
 
 impl Preparation<'_> {
     /// Return an inert value, not a kernel normal form. This private result is
-    /// substituted only for a static instance argument after source admission;
-    /// the specialization key retains the caller's exact original argument.
+    /// substituted only for a static instance or polymorphic callback after
+    /// admission. The key retains the caller's exact original argument.
     pub(in crate::runtime) fn instance_factory_value(
         &mut self,
         input: &Expr,

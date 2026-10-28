@@ -1411,7 +1411,7 @@ fn result_ownership(result: ValueType) -> CallableResultOwnership {
 }
 
 /// Purely syntactic template classification. Inspect the whole parameter
-/// telescope: a static type/dictionary argument need not be its first binder.
+/// telescope, including type parameters accepted by a runtime callback.
 /// This does not turn a compilation refusal into success. Every template is
 /// still admitted, and each concrete evaluation must compile and execute.
 pub(super) fn is_template(definition: &DefinitionVal) -> bool {
@@ -1429,7 +1429,26 @@ pub(super) fn is_template(definition: &DefinitionVal) -> bool {
                 body,
                 ..
             } => {
-                if *binder_info == BinderInfo::InstImplicit || type_constructor_kind(binder_type) {
+                if *binder_info == BinderInfo::InstImplicit
+                    || type_constructor_kind(binder_type)
+                    || polymorphic_callback_kind(binder_type)
+                {
+                    return true;
+                }
+                type_ = body;
+            }
+            _ => return false,
+        }
+    }
+}
+fn polymorphic_callback_kind(mut type_: &Expr) -> bool {
+    loop {
+        match type_.node() {
+            ExprNode::MData { expr, .. } => type_ = expr,
+            ExprNode::ForallE {
+                binder_type, body, ..
+            } => {
+                if type_constructor_kind(binder_type) {
                     return true;
                 }
                 type_ = body;

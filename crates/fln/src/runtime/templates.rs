@@ -64,6 +64,30 @@ fn ordinary_callback_and_scalar_parameters_still_require_execution() {
 }
 
 #[test]
+fn explicit_polymorphic_callbacks_require_concrete_call_site_templates() {
+    let identity = pi(
+        Expr::sort(Level::one()),
+        pi(
+            Expr::bvar(0).unwrap(),
+            Expr::bvar(1).unwrap(),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
+    for callback in [
+        identity.clone(),
+        pi(scalar("Nat"), identity, BinderInfo::Default),
+        pi(Expr::sort(Level::one()), scalar("Nat"), BinderInfo::Default),
+    ] {
+        assert!(template(pi(
+            scalar("Nat"),
+            pi(callback, scalar("Nat"), BinderInfo::Default),
+            BinderInfo::Default,
+        )));
+    }
+}
+
+#[test]
 fn long_parameter_telescopes_do_not_recurse_on_the_host_stack() {
     std::thread::Builder::new()
         .stack_size(128 * 1024)

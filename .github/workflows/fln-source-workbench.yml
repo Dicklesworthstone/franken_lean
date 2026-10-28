@@ -15,7 +15,7 @@ on:
         description: 'Fixed validation command; negative controls are expected to fail'
         required: true
         type: choice
-        options: [range, cli, reference, missing-reference, flush-mutant, ingress, mutual-structural]
+        options: [range, cli, reference, missing-reference, flush-mutant, ingress, mutual-structural, polymorphic-callbacks]
   push:
     branches: [main]
     paths:
@@ -42,7 +42,7 @@ jobs:
       CARGO_PROFILE_RELEASE_DEBUG: '0'
       CANDIDATE_BASE: ${{ inputs.base || github.sha }}
       CANDIDATE_CHANGES: ${{ inputs.changes || '{}' }}
-      CANDIDATE_SUITE: ${{ inputs.suite || 'mutual-structural' }}
+      CANDIDATE_SUITE: ${{ inputs.suite || (contains(github.event.head_commit.message, 'polymorphic callbacks') && 'polymorphic-callbacks') || 'mutual-structural' }}
       WORKFLOW_SHA: ${{ github.sha }}
     steps:
       - name: Validate immutable source identifiers before checkout
@@ -67,7 +67,7 @@ jobs:
               assert isinstance(blobs, list) and len(blobs) == 2
               assert all(isinstance(s, str) and re.fullmatch('[0-9a-f]{40}', s) for s in blobs)
           assert os.environ['CANDIDATE_SUITE'] in {
-              'range', 'cli', 'reference', 'missing-reference', 'flush-mutant', 'ingress', 'mutual-structural',
+              'range', 'cli', 'reference', 'missing-reference', 'flush-mutant', 'ingress', 'mutual-structural', 'polymorphic-callbacks',
           }
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -145,6 +145,16 @@ jobs:
         run: |
           set -euo pipefail
           case "$CANDIDATE_SUITE" in
+            polymorphic-callbacks)
+              rustfmt --edition 2024 --config skip_children=true --check crates/fln/src/runtime.rs crates/fln/src/runtime/templates.rs crates/fln/src/runtime/specialize/arguments.rs crates/fln/src/runtime/specialize/arguments/factories.rs crates/fln/src/runtime/specialize/arguments/tests.rs crates/fln/tests/runtime_parameterized_data.rs
+              cargo test --locked --release -p fln --test runtime_parameterized_data -- --test-threads=1
+              cargo test --locked --release -p fln --lib runtime::specialize::arguments -- --test-threads=1
+              cargo test --locked --release -p fln --lib runtime::templates -- --test-threads=1
+              cargo test --locked --release -p fln --lib runtime::global::callbacks -- --test-threads=1
+              cargo test --locked --release -p fln --lib runtime::records -- --test-threads=1
+              cargo clippy --locked -p fln --lib -- -D warnings
+              cargo check --locked --workspace --all-targets
+              ;;
             mutual-structural)
               rustfmt --edition 2024 --config skip_children=true --check crates/fln-elab/src/source.rs crates/fln-elab/src/source/partial/group/ordinary.rs crates/fln-elab/src/source/recursion.rs crates/fln-elab/src/source/recursion/course.rs crates/fln-elab/src/source/recursion/matrix.rs crates/fln-elab/src/source/recursion/well_founded/mutual.rs crates/fln-elab/src/source/local_functions/lifting.rs crates/fln/tests/source_mutual_ordinary.rs crates/fln-elab/src/source/recursion/mutual_structural.rs
               cargo test --locked -p fln --test source_mutual_ordinary -- --nocapture --test-threads=1

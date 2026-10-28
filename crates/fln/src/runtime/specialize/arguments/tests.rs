@@ -224,6 +224,51 @@ fn generic() -> (Expr, Expr) {
 }
 
 #[test]
+fn polymorphic_callback_selection_rejects_open_and_computed_values() {
+    let callback_binders = [
+        (Expr::sort(Level::one()), BinderInfo::Default),
+        (b(0), BinderInfo::Default),
+    ];
+    let callback_type = telescope(&callback_binders, ty("Nat"), false);
+    let callback = telescope(&callback_binders, nat::literal(42), true);
+    let consumer_binders = [
+        (ty("Nat"), BinderInfo::Default),
+        (callback_type, BinderInfo::Default),
+    ];
+    let type_ = telescope(&consumer_binders, ty("Nat"), false);
+    let body = telescope(&consumer_binders, b(1), true);
+    let captured = telescope(&callback_binders, b(2), true);
+    let computed = Expr::let_e(
+        name("paid"),
+        ty("Nat"),
+        Expr::app(ty("compute"), nat::literal(1)),
+        callback.clone(),
+        true,
+    );
+    for argument in [callback.clone(), captured, b(0), computed] {
+        let environment = Environment::new();
+        let prepared = Preparation::new(&environment, IngressLimits::default())
+            .specialize_arguments(type_.clone(), body.clone(), &[b(0), argument.clone()])
+            .unwrap();
+        if argument == callback {
+            assert_eq!(prepared.static_arguments, vec![(1, callback.clone())]);
+            assert_eq!(prepared.runtime_arguments, vec![b(0)]);
+            assert!(closed(&prepared.type_));
+            assert!(closed(&prepared.value));
+            assert_eq!(
+                prepared.value,
+                telescope(&consumer_binders[..1], b(0), true)
+            );
+        } else {
+            assert!(prepared.static_arguments.is_empty());
+            assert_eq!(prepared.type_, type_);
+            assert_eq!(prepared.value, body);
+            assert_eq!(prepared.runtime_arguments, vec![b(0), argument]);
+        }
+    }
+}
+
+#[test]
 fn type_arguments_after_runtime_parameters_are_erased_without_substituting_values() {
     let environment = Environment::new();
     let mut preparation = Preparation::new(&environment, IngressLimits::default());
