@@ -1217,3 +1217,203 @@ fn imported_list_recursion_still_accepts_scalar_nil() {
     .unwrap();
     assert_eq!(returned(&compiled), "0");
 }
+
+#[test]
+fn scalar_constructor_tags_do_not_consume_the_heap_tag_namespace() {
+    use fln_olean::ir::{IrAlt, IrCtorInfo};
+
+    let info = |tag| IrCtorInfo {
+        name: name("User.WideEnum"),
+        cidx: tag,
+        size: 0,
+        usize: 0,
+        ssize: 0,
+    };
+    let heap_max = u64::from(fln_rt::abi::TAG_MAX_CTOR_TAG);
+    for ty in [IrType::Tagged, IrType::UInt32] {
+        for (tag, expected) in [
+            (heap_max, "11"),
+            (255, "22"),
+            (256, "33"),
+            (0x1f980, "44"),
+            (0x110000, "55"),
+        ] {
+            let mut alts: Vec<_> = [(heap_max, 11), (255, 22), (256, 33), (0x1f980, 44)]
+                .into_iter()
+                .enumerate()
+                .map(|(index, (tag, answer))| {
+                    let x = index as u64 + 2;
+                    IrAlt::Ctor {
+                        info: info(tag),
+                        body: ir_body(vec![number(x, answer)], IrTerminal::Ret(IrArg::Var(x))),
+                    }
+                })
+                .collect();
+            alts.push(IrAlt::Default {
+                body: ir_body(vec![number(6, 55)], IrTerminal::Ret(IrArg::Var(6))),
+            });
+            let expr = if matches!(&ty, IrType::UInt32) {
+                IrExpr::Lit(IrLit::Num(IrNat::Small(tag)))
+            } else {
+                IrExpr::Ctor {
+                    info: info(tag),
+                    args: vec![],
+                }
+            };
+            let declaration = body_function(
+                "User.enumCase",
+                0,
+                ir_body(
+                    vec![IrStmt::VDecl {
+                        x: 1,
+                        ty: ty.clone(),
+                        expr,
+                    }],
+                    IrTerminal::Case {
+                        type_name: name("User.WideEnum"),
+                        x: 1,
+                        x_type: ty.clone(),
+                        alts,
+                    },
+                ),
+            );
+            let mut limits = IrExecutionLimits::default();
+            // These values never allocate a heap constructor or need its table.
+            limits.fir.max_constructors = 0;
+            let compiled = compile_users(vec![declaration], "User.enumCase", &[], limits).unwrap();
+            assert_eq!(returned(&compiled), expected, "scalar constructor tag {tag}");
+        }
+    }
+}
+
+#[test]
+fn large_scalar_tags_still_match_after_erasing_their_representation() {
+    use fln_olean::ir::{IrAlt, IrCtorInfo};
+
+    let info = IrCtorInfo {
+        name: name("User.WideEnum.last"),
+        cidx: 256,
+        size: 0,
+        usize: 0,
+        ssize: 0,
+    };
+    let declaration = body_function(
+        "User.erasedEnum",
+        0,
+        ir_body(
+            vec![binding(
+                1,
+                IrExpr::Ctor {
+                    info: info.clone(),
+                    args: vec![],
+                },
+            )],
+            IrTerminal::Case {
+                type_name: name("User.WideEnum"),
+                x: 1,
+                x_type: IrType::TObject,
+                alts: vec![IrAlt::Ctor {
+                    info,
+                    body: ir_body(vec![number(2, 42)], IrTerminal::Ret(IrArg::Var(2))),
+                }],
+            },
+        ),
+    );
+    let mut limits = IrExecutionLimits::default();
+    limits.fir.max_constructors = 0;
+    let compiled = compile_users(vec![declaration], "User.erasedEnum", &[], limits).unwrap();
+    assert_eq!(returned(&compiled), "42");
+}
+
+#[test]
+fn scalar_tag_lowering_keeps_packed_and_heap_layout_refusals() {
+    use fln_olean::ir::{IrAlt, IrCtorInfo};
+
+    for (usize, ssize) in [(1, 0), (0, 8)] {
+        let info = IrCtorInfo {
+            name: name("User.Packed.mk"),
+            cidx: 0,
+            size: 0,
+            usize,
+            ssize,
+        };
+        let declaration = function(
+            "User.packedConstructor",
+            0,
+            vec![binding(
+                1,
+                IrExpr::Ctor {
+                    info: info.clone(),
+                    args: vec![],
+                },
+            )],
+            IrArg::Var(1),
+        );
+        let case = body_function(
+            "User.packedCase",
+            1,
+            ir_body(
+                vec![],
+                IrTerminal::Case {
+                    type_name: name("User.Packed"),
+                    x: 1,
+                    x_type: IrType::TObject,
+                    alts: vec![IrAlt::Ctor {
+                        info,
+                        body: ir_body(vec![], IrTerminal::Ret(IrArg::Var(1))),
+                    }],
+                },
+            ),
+        );
+        for (declaration, entry, args) in [
+            (declaration, "User.packedConstructor", vec![]),
+            (case, "User.packedCase", vec![nat(42)]),
+        ] {
+            let error = compile_users(
+                vec![declaration],
+                entry,
+                &args,
+                IrExecutionLimits::default(),
+            )
+            .unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    IrExecutionError::Unsupported {
+                        form: "packed constructor fields",
+                        ..
+                    }
+                ),
+                "{error:?}"
+            );
+        }
+    }
+
+    let declaration = function(
+        "User.invalidHeap",
+        1,
+        vec![binding(
+            2,
+            IrExpr::Ctor {
+                info: IrCtorInfo {
+                    name: name("User.Invalid.mk"),
+                    cidx: u64::from(fln_rt::abi::TAG_MAX_CTOR_TAG) + 1,
+                    size: 1,
+                    usize: 0,
+                    ssize: 0,
+                },
+                args: vec![IrArg::Var(1)],
+            },
+        )],
+        IrArg::Var(2),
+    );
+    let error = compile_users(
+        vec![declaration],
+        "User.invalidHeap",
+        &[nat(42)],
+        IrExecutionLimits::default(),
+    )
+    .unwrap_err();
+    assert!(matches!(error, IrExecutionError::IrValidation(_)), "{error:?}");
+    assert!(!error.is_resource());
+}
