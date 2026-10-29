@@ -4,7 +4,8 @@
 //! The input remains untrusted: selection, IR validation, FIR validation and
 //! FLBC's independent ownership pass all precede execution. The first supported
 //! slice is immutable, pure code: calls, closures, acyclic join points,
-//! constructor cases and scalar primitives. Mutation, reset/reuse and
+//! constructor cases, fresh packed integer fields and scalar primitives.
+//! Mutation after a constructor is read or captured, reset/reuse and
 //! reference-count observations are refused.
 //! Its RC annotations are replaced by Golem's checked managed ownership, not
 //! executed as additional retains/releases on already managed values.
@@ -459,6 +460,10 @@ fn inspect_body(
                     pending.push((value, depth + 1));
                 }
                 IrStmt::Inc { .. } | IrStmt::Dec { .. } | IrStmt::Del { .. } => {}
+                // Lowering admits these only while filling a fresh, unread
+                // constructor. The IR never acquires a mutable runtime handle.
+                IrStmt::USet { .. } => {}
+                IrStmt::SSet { ty, .. } => check_type(name, ty)?,
                 _ => return Err(unsupported(name, "constructor mutation")),
             }
         }

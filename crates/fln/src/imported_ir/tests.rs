@@ -1054,6 +1054,61 @@ fn pinned_compiler_join_and_projection_ir_matches_reference_results() {
     );
 }
 
+#[test]
+fn pinned_compiler_packed_records_match_reference_results_and_replay() {
+    // Generated from PackedModule.lean by the v4.32.0 Reference at
+    // 8c9756b28d64dab099da31a4c09229a9e6a2ef35. The same Reference evaluated
+    // these three results. Decode its binary IR so source-order setters,
+    // physical integer offsets, and the compiler's boxed closure are covered.
+    let module = crate::decode_ir_artifact(
+        include_bytes!("../../../fln-olean/fixtures/ir/PackedModule.ir"),
+        32 * 1024 * 1024,
+    )
+    .expect("pinned compiler packed-record fixture decodes");
+    let users = module
+        .decls
+        .iter()
+        .map(|decl| decl.name().clone())
+        .collect();
+    let modules = [module];
+    let policy = bounded_partition(&[]);
+    for (entry, args, expected) in [
+        ("packedAnswer", vec![], "18446744077445529267"),
+        ("packedClosureAnswer", vec![], "18446744077445529272"),
+        // This input wraps the UInt8 field while preserving all wider fields.
+        ("packedResult", vec![nat(85)], "18446744077445529436"),
+    ] {
+        let compiled = compile(
+            &modules,
+            &name(entry),
+            &args,
+            &policy,
+            &users,
+            IrExecutionLimits::default(),
+        )
+        .unwrap_or_else(|error| panic!("pinned packed entry {entry} {args:?}: {error:?}"));
+        assert_native_owned_result(&compiled, expected);
+        assert!(
+            compiled
+                .program
+                .program()
+                .functions()
+                .iter()
+                .flat_map(|function| &function.code)
+                .any(|instruction| matches!(instruction, flbc::Instruction::CtorPacked { .. }))
+        );
+        assert!(
+            compiled
+                .program
+                .program()
+                .functions()
+                .iter()
+                .flat_map(|function| &function.code)
+                .any(|instruction| matches!(instruction, flbc::Instruction::CtorScalar { .. }))
+        );
+    }
+}
+
 fn native_list_sum() -> IrDecl {
     use fln_olean::ir::{IrAlt, IrCtorInfo};
 
@@ -1474,7 +1529,7 @@ fn large_scalar_tags_still_match_after_erasing_their_representation() {
 }
 
 #[test]
-fn scalar_tag_lowering_keeps_packed_and_heap_layout_refusals() {
+fn scalar_tag_lowering_keeps_uninitialized_and_invalid_heap_layout_refusals() {
     use fln_olean::ir::{IrAlt, IrCtorInfo};
 
     for (usize, ssize) in [(1, 0), (0, 8)] {
@@ -1513,28 +1568,37 @@ fn scalar_tag_lowering_keeps_packed_and_heap_layout_refusals() {
                 },
             ),
         );
-        for (declaration, entry, args) in [
-            (declaration, "User.packedConstructor", vec![]),
-            (case, "User.packedCase", vec![nat(42)]),
-        ] {
-            let error = compile_users(
-                vec![declaration],
-                entry,
-                &args,
-                IrExecutionLimits::default(),
-            )
-            .unwrap_err();
-            assert!(
-                matches!(
-                    error,
-                    IrExecutionError::Unsupported {
-                        form: "packed constructor fields",
-                        ..
-                    }
-                ),
-                "{error:?}"
-            );
-        }
+        let error = compile_users(
+            vec![declaration],
+            "User.packedConstructor",
+            &[],
+            IrExecutionLimits::default(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                IrExecutionError::Unsupported {
+                    form: "uninitialized packed constructor",
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+        // Packed cases now execute, but a scalar is still not their heap
+        // constructor. The existing unreachable arm must never return it.
+        let compiled = compile_users(
+            vec![case],
+            "User.packedCase",
+            &[nat(42)],
+            IrExecutionLimits::default(),
+        )
+        .unwrap();
+        assert!(matches!(
+            compiled.execute(ExecutionLimits::default(), None).outcome,
+            Outcome::Complete(VmExit::Panicked { message, .. })
+                if message == "unreachable imported IR in User.packedCase"
+        ));
     }
 
     let declaration = function(
@@ -1567,6 +1631,731 @@ fn scalar_tag_lowering_keeps_packed_and_heap_layout_refusals() {
         "{error:?}"
     );
     assert!(!error.is_resource());
+}
+
+fn packed_test_info(objects: u64, usize: u64, bytes: u64) -> fln_olean::ir::IrCtorInfo {
+    fln_olean::ir::IrCtorInfo {
+        name: name("Packed.Record.mk"),
+        cidx: 0,
+        size: objects,
+        usize,
+        ssize: bytes,
+    }
+}
+
+#[test]
+fn packed_integer_fields_cross_calls_joins_and_closure_captures() {
+    for (ty, family, bytes, expected) in [
+        (IrType::UInt8, "UInt8", 1, 0xfe),
+        (IrType::UInt16, "UInt16", 2, 0xfedc),
+        (IrType::UInt32, "UInt32", 4, 0xfedc_ba98),
+        (IrType::UInt64, "UInt64", 8, (1u64 << 63) + 17),
+        (IrType::USize, "USize", 0, (1u64 << 63) + 23),
+    ] {
+        let info = packed_test_info(1, u64::from(ty == IrType::USize), bytes);
+        let projection = if ty == IrType::USize {
+            IrExpr::UProj { i: 1, x: 1 }
+        } else {
+            IrExpr::SProj {
+                n: 1,
+                offset: 0,
+                x: 1,
+            }
+        };
+        let store = if ty == IrType::USize {
+            IrStmt::USet { x: 2, i: 1, y: 3 }
+        } else {
+            IrStmt::SSet {
+                x: 2,
+                i: 1,
+                offset: 0,
+                y: 3,
+                ty: ty.clone(),
+            }
+        };
+        let read = function(
+            "Packed.read",
+            2,
+            vec![
+                wide_ir_binding(3, &ty, projection),
+                call(4, &format!("{family}.toNat"), &[3]),
+            ],
+            IrArg::Var(4),
+        );
+        let entry = body_function(
+            "Packed.entry",
+            1,
+            ir_body(
+                vec![
+                    binding(
+                        2,
+                        IrExpr::Ctor {
+                            info,
+                            args: vec![IrArg::Var(1)],
+                        },
+                    ),
+                    // A real compiler sequence may compute/unbox the scalar
+                    // after allocating the constructor, before its first use.
+                    wide_ir_binding(3, &ty, IrExpr::Lit(IrLit::Num(IrNat::Small(expected)))),
+                    store,
+                    binding(
+                        4,
+                        IrExpr::Pap {
+                            function: name("Packed.read"),
+                            args: vec![IrArg::Var(2)],
+                        },
+                    ),
+                    join(
+                        5,
+                        &[6],
+                        ir_body(
+                            vec![binding(
+                                7,
+                                IrExpr::Ap {
+                                    x: 4,
+                                    args: vec![IrArg::Var(6)],
+                                },
+                            )],
+                            IrTerminal::Ret(IrArg::Var(7)),
+                        ),
+                    ),
+                    number(8, 0),
+                ],
+                jump(5, &[8]),
+            ),
+        );
+        let compiled = compile_users(
+            vec![read, entry],
+            "Packed.entry",
+            &[EntryArgument::String("retained λ 🦀".to_owned())],
+            IrExecutionLimits::default(),
+        )
+        .unwrap();
+        assert_native_owned_result(&compiled, &expected.to_string());
+        assert!(
+            compiled
+                .program
+                .program()
+                .functions()
+                .iter()
+                .flat_map(|function| &function.code)
+                .any(|instruction| matches!(instruction, flbc::Instruction::CtorPacked { .. }))
+        );
+        assert!(
+            compiled
+                .program
+                .program()
+                .functions()
+                .iter()
+                .flat_map(|function| &function.code)
+                .any(|instruction| matches!(instruction, flbc::Instruction::CtorScalar { .. }))
+        );
+    }
+}
+
+#[test]
+fn packed_mixed_fields_keep_source_order_object_fields_and_case_defaults() {
+    use fln_olean::ir::IrAlt;
+
+    let info = packed_test_info(1, 1, 15);
+    let scalars = [
+        (IrType::UInt8, "UInt8", 14, 0xab),
+        (IrType::USize, "USize", 0, (1u64 << 63) + 23),
+        (IrType::UInt32, "UInt32", 8, 0xdead_beef),
+        (IrType::UInt64, "UInt64", 0, (1u64 << 63) + 17),
+        (IrType::UInt16, "UInt16", 12, 0xbeef),
+    ];
+    let mut make = vec![binding(
+        2,
+        IrExpr::Ctor {
+            info: info.clone(),
+            args: vec![IrArg::Var(1)],
+        },
+    )];
+    let mut read = vec![
+        binding(2, IrExpr::Proj { i: 0, x: 1 }),
+        call(3, "String.length", &[2]),
+    ];
+    let mut sum = 3;
+    for (index, (ty, family, offset, value)) in scalars.iter().enumerate() {
+        let variable = index as u64 + 3;
+        make.push(wide_ir_binding(
+            variable,
+            ty,
+            IrExpr::Lit(IrLit::Num(IrNat::Small(*value))),
+        ));
+        make.push(if *ty == IrType::USize {
+            IrStmt::USet {
+                x: 2,
+                i: 1,
+                y: variable,
+            }
+        } else {
+            IrStmt::SSet {
+                x: 2,
+                i: 2,
+                offset: *offset,
+                y: variable,
+                ty: ty.clone(),
+            }
+        });
+        let variable = index as u64 * 3 + 4;
+        let projection = if *ty == IrType::USize {
+            IrExpr::UProj { i: 1, x: 1 }
+        } else {
+            IrExpr::SProj {
+                n: 2,
+                offset: *offset,
+                x: 1,
+            }
+        };
+        read.push(wide_ir_binding(variable, ty, projection));
+        read.push(call(variable + 1, &format!("{family}.toNat"), &[variable]));
+        read.push(call(variable + 2, "Nat.add", &[sum, variable + 1]));
+        sum = variable + 2;
+    }
+    make.push(call(8, "Packed.inspect", &[2]));
+    let inspect = body_function(
+        "Packed.inspect",
+        1,
+        ir_body(
+            vec![],
+            IrTerminal::Case {
+                type_name: name("Packed.Record"),
+                x: 1,
+                x_type: IrType::TObject,
+                alts: vec![
+                    IrAlt::Ctor {
+                        info,
+                        body: ir_body(read, IrTerminal::Ret(IrArg::Var(sum))),
+                    },
+                    IrAlt::Default {
+                        body: ir_body(vec![number(30, 7)], IrTerminal::Ret(IrArg::Var(30))),
+                    },
+                ],
+            },
+        ),
+    );
+    let make = function("Packed.mixed", 1, make, IrArg::Var(8));
+    let mut other_info = packed_test_info(1, 0, 0);
+    other_info.cidx = 1;
+    let other = function(
+        "Packed.other",
+        1,
+        vec![
+            binding(
+                2,
+                IrExpr::Ctor {
+                    info: other_info,
+                    args: vec![IrArg::Var(1)],
+                },
+            ),
+            call(3, "Packed.inspect", &[2]),
+        ],
+        IrArg::Var(3),
+    );
+    let expected = scalars
+        .iter()
+        .map(|(_, _, _, value)| u128::from(*value))
+        .sum::<u128>()
+        + 2;
+    for (entry, expected) in [
+        ("Packed.mixed", expected.to_string()),
+        ("Packed.other", "7".to_owned()),
+    ] {
+        let compiled = compile_users(
+            vec![make.clone(), inspect.clone(), other.clone()],
+            entry,
+            &[EntryArgument::String("λ🦀".to_owned())],
+            IrExecutionLimits::default(),
+        )
+        .unwrap();
+        assert_native_owned_result(&compiled, &expected);
+    }
+}
+
+#[test]
+fn packed_scalar_only_cases_keep_heap_tags_and_default_arms() {
+    use fln_olean::ir::IrAlt;
+
+    let mut info = packed_test_info(0, 0, 1);
+    info.cidx = 3;
+    let inspect = body_function(
+        "Packed.scalarCase",
+        1,
+        ir_body(
+            vec![],
+            IrTerminal::Case {
+                type_name: name("Packed.Record"),
+                x: 1,
+                x_type: IrType::TObject,
+                alts: vec![
+                    IrAlt::Ctor {
+                        info: info.clone(),
+                        body: ir_body(
+                            vec![
+                                wide_ir_binding(
+                                    2,
+                                    &IrType::UInt8,
+                                    IrExpr::SProj {
+                                        n: 0,
+                                        offset: 0,
+                                        x: 1,
+                                    },
+                                ),
+                                call(3, "UInt8.toNat", &[2]),
+                            ],
+                            IrTerminal::Ret(IrArg::Var(3)),
+                        ),
+                    },
+                    IrAlt::Default {
+                        body: ir_body(vec![number(4, 99)], IrTerminal::Ret(IrArg::Var(4))),
+                    },
+                ],
+            },
+        ),
+    );
+    for (tag, expected) in [(3, "42"), (4, "99")] {
+        let mut info = info.clone();
+        info.cidx = tag;
+        let entry = function(
+            "Packed.scalarEntry",
+            0,
+            vec![
+                binding(1, IrExpr::Ctor { info, args: vec![] }),
+                wide_ir_binding(2, &IrType::UInt8, IrExpr::Lit(IrLit::Num(IrNat::Small(42)))),
+                IrStmt::SSet {
+                    x: 1,
+                    i: 0,
+                    offset: 0,
+                    y: 2,
+                    ty: IrType::UInt8,
+                },
+                call(3, "Packed.scalarCase", &[1]),
+            ],
+            IrArg::Var(3),
+        );
+        let compiled = compile_users(
+            vec![inspect.clone(), entry],
+            "Packed.scalarEntry",
+            &[],
+            IrExecutionLimits::default(),
+        )
+        .unwrap();
+        assert_native_owned_result(&compiled, expected);
+    }
+}
+
+#[test]
+fn packed_initialization_refuses_gaps_overlap_object_slots_and_overflow() {
+    let store = |i, offset, ty| IrStmt::SSet {
+        x: 2,
+        i,
+        offset,
+        y: 3,
+        ty,
+    };
+    for (stores, expected) in [
+        (vec![], "uninitialized packed constructor"),
+        (
+            vec![store(1, 0, IrType::UInt16)],
+            "uninitialized packed constructor",
+        ),
+        (
+            vec![store(1, 0, IrType::UInt32), store(1, 0, IrType::UInt32)],
+            "packed scalar initialization layout",
+        ),
+        (
+            vec![store(1, 1, IrType::UInt32)],
+            "packed scalar initialization layout",
+        ),
+        (
+            vec![store(0, 0, IrType::UInt32)],
+            "packed scalar initialization layout",
+        ),
+        (
+            vec![IrStmt::USet { x: 2, i: 1, y: 3 }],
+            "packed scalar initialization layout",
+        ),
+        (
+            vec![store(u64::MAX, 0, IrType::UInt32)],
+            "packed scalar offset",
+        ),
+    ] {
+        let mut stmts = vec![
+            binding(
+                2,
+                IrExpr::Ctor {
+                    info: packed_test_info(1, 0, 4),
+                    args: vec![IrArg::Var(1)],
+                },
+            ),
+            wide_ir_binding(
+                3,
+                &IrType::UInt32,
+                IrExpr::Lit(IrLit::Num(IrNat::Small(42))),
+            ),
+        ];
+        stmts.extend(stores);
+        let error = compile_users(
+            vec![function("Packed.invalid", 1, stmts, IrArg::Var(2))],
+            "Packed.invalid",
+            &[EntryArgument::String("retained".to_owned())],
+            IrExecutionLimits::default(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, IrExecutionError::Unsupported { form, .. } if form == expected),
+            "{error:?}"
+        );
+        assert!(!error.is_resource());
+    }
+}
+
+#[test]
+fn packed_initializers_validate_before_intervening_native_calls() {
+    use fln_rt::obj::StdoutCapture;
+    use fln_vm::interpreter::VmRefusal;
+
+    for (ty, family, bytes) in [
+        (IrType::UInt8, "UInt8", 1),
+        (IrType::UInt16, "UInt16", 2),
+        (IrType::UInt32, "UInt32", 4),
+        (IrType::UInt64, "UInt64", 8),
+        (IrType::USize, "USize", 0),
+    ] {
+        for valid in [false, true] {
+            // Keep the entry parameter erased so malformed wide operands
+            // reach the setter itself, instead of failing entry adaptation.
+            let mut stmts = Vec::new();
+            if valid {
+                stmts.push(wide_ir_binding(
+                    2,
+                    &ty,
+                    IrExpr::Lit(IrLit::Num(IrNat::Small(42))),
+                ));
+            }
+            stmts.push(binding(
+                3,
+                IrExpr::Ctor {
+                    info: packed_test_info(0, u64::from(ty == IrType::USize), bytes),
+                    args: vec![],
+                },
+            ));
+            let y = if valid { 2 } else { 1 };
+            stmts.push(if ty == IrType::USize {
+                IrStmt::USet { x: 3, i: 0, y }
+            } else {
+                IrStmt::SSet {
+                    x: 3,
+                    i: 0,
+                    offset: 0,
+                    y,
+                    ty: ty.clone(),
+                }
+            });
+            stmts.extend([
+                binding(
+                    4,
+                    IrExpr::Lit(IrLit::Str("packed field initialized".to_owned())),
+                ),
+                binding(
+                    5,
+                    IrExpr::Pap {
+                        function: name("Packed.continue"),
+                        args: vec![],
+                    },
+                ),
+                call(6, "dbgTrace", &[4, 5]),
+                wide_ir_binding(
+                    7,
+                    &ty,
+                    if ty == IrType::USize {
+                        IrExpr::UProj { i: 0, x: 3 }
+                    } else {
+                        IrExpr::SProj {
+                            n: 0,
+                            offset: 0,
+                            x: 3,
+                        }
+                    },
+                ),
+                call(8, &format!("{family}.toNat"), &[7]),
+            ]);
+            let modules = [module(vec![
+                function("Packed.ordered", 1, stmts, IrArg::Var(8)),
+                function("Packed.continue", 1, vec![number(2, 0)], IrArg::Var(2)),
+                // The source telescope has a static type argument; the
+                // generated native contract has two executable arguments.
+                native_array_extern("dbgTrace", 2),
+            ])];
+            let compiled = compile(
+                &modules,
+                &name("Packed.ordered"),
+                &[EntryArgument::String("invalid scalar carrier".to_owned())],
+                &bounded_partition(&[]),
+                &BTreeSet::from([name("Packed.ordered"), name("Packed.continue")]),
+                IrExecutionLimits::default(),
+            )
+            .unwrap();
+            let encoded =
+                flbc::encode_canonical(compiled.program.program(), flbc::CodecLimits::default())
+                    .unwrap();
+            let replay = flbc::decode_canonical(&encoded, flbc::CodecLimits::default()).unwrap();
+            for program in [compiled.program.program(), &replay] {
+                let capture = StdoutCapture::begin_evaluation(1024).unwrap();
+                let outcome =
+                    fln_vm::interpreter::execute(program, ExecutionLimits::default(), None);
+                let captured = capture.finish();
+                assert_eq!(captured.error, None);
+                if valid {
+                    let Outcome::Complete(VmExit::Returned(value)) = outcome else {
+                        panic!("valid {family} interleaving did not return: {outcome:?}");
+                    };
+                    assert_eq!(crate::nat_decimal(&value.value).as_deref(), Some("42"));
+                    assert_eq!(captured.bytes, b"packed field initialized\n");
+                } else {
+                    assert!(
+                        matches!(
+                            outcome,
+                            Outcome::Complete(VmExit::Refused {
+                                refusal: VmRefusal::TypeMismatch { operation, .. },
+                                ..
+                            }) if operation == format!("{family}.toNat")
+                        ),
+                        "malformed {family} initializer: {outcome:?}"
+                    );
+                    assert!(captured.bytes.is_empty(), "{family}: {captured:?}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn packed_scalar_stores_are_refused_after_reads_calls_or_captures() {
+    let store = IrStmt::SSet {
+        x: 1,
+        i: 0,
+        offset: 0,
+        y: 2,
+        ty: IrType::UInt8,
+    };
+    for escape in [
+        wide_ir_binding(
+            3,
+            &IrType::UInt8,
+            IrExpr::SProj {
+                n: 0,
+                offset: 0,
+                x: 1,
+            },
+        ),
+        call(3, "Packed.identity", &[1, 2]),
+        binding(
+            3,
+            IrExpr::Pap {
+                function: name("Packed.identity"),
+                args: vec![IrArg::Var(1)],
+            },
+        ),
+        binding(
+            3,
+            IrExpr::Ctor {
+                info: packed_test_info(1, 0, 0),
+                args: vec![IrArg::Var(1)],
+            },
+        ),
+    ] {
+        let entry = function(
+            "Packed.mutate",
+            0,
+            vec![
+                binding(
+                    1,
+                    IrExpr::Ctor {
+                        info: packed_test_info(0, 0, 1),
+                        args: vec![],
+                    },
+                ),
+                wide_ir_binding(2, &IrType::UInt8, IrExpr::Lit(IrLit::Num(IrNat::Small(42)))),
+                store.clone(),
+                escape,
+                store.clone(),
+            ],
+            IrArg::Var(1),
+        );
+        let error = compile_users(
+            vec![entry, function("Packed.identity", 2, vec![], IrArg::Var(1))],
+            "Packed.mutate",
+            &[],
+            IrExecutionLimits::default(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                IrExecutionError::Unsupported {
+                    form: "packed mutation after read or escape",
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+        assert!(!error.is_resource());
+    }
+}
+
+#[test]
+fn packed_projections_refuse_wrong_objects_and_full_width_bounds() {
+    use fln_vm::interpreter::VmRefusal;
+
+    let decode = function(
+        "Packed.decode",
+        1,
+        vec![
+            wide_ir_binding(
+                2,
+                &IrType::UInt64,
+                IrExpr::SProj {
+                    n: 0,
+                    offset: 1,
+                    x: 1,
+                },
+            ),
+            call(3, "UInt64.toNat", &[2]),
+        ],
+        IrArg::Var(3),
+    );
+    for argument in [
+        nat(42),
+        EntryArgument::String("not a packed constructor".to_owned()),
+    ] {
+        let compiled = compile_users(
+            vec![decode.clone()],
+            "Packed.decode",
+            &[argument],
+            IrExecutionLimits::default(),
+        )
+        .unwrap();
+        assert!(matches!(
+            compiled.execute(ExecutionLimits::default(), None).outcome,
+            Outcome::Complete(VmExit::Refused {
+                refusal: VmRefusal::TypeMismatch { .. },
+                ..
+            })
+        ));
+    }
+    for (objects, bytes) in [(1, 0), (0, 1)] {
+        let mut stmts = vec![
+            number(1, 42),
+            binding(
+                2,
+                IrExpr::Ctor {
+                    info: packed_test_info(objects, 0, bytes),
+                    args: if objects == 0 {
+                        vec![]
+                    } else {
+                        vec![IrArg::Var(1)]
+                    },
+                },
+            ),
+        ];
+        if bytes != 0 {
+            stmts.push(wide_ir_binding(
+                3,
+                &IrType::UInt8,
+                IrExpr::Lit(IrLit::Num(IrNat::Small(42))),
+            ));
+            stmts.push(IrStmt::SSet {
+                x: 2,
+                i: 0,
+                offset: 0,
+                y: 3,
+                ty: IrType::UInt8,
+            });
+        }
+        stmts.push(call(4, "Packed.decode", &[2]));
+        let compiled = compile_users(
+            vec![
+                decode.clone(),
+                function("Packed.bounds", 0, stmts, IrArg::Var(4)),
+            ],
+            "Packed.bounds",
+            &[],
+            IrExecutionLimits::default(),
+        )
+        .unwrap();
+        assert!(matches!(
+            compiled.execute(ExecutionLimits::default(), None).outcome,
+            Outcome::Complete(VmExit::Refused {
+                refusal: VmRefusal::ConstructorScalarBounds { .. },
+                ..
+            })
+        ));
+    }
+}
+
+#[test]
+fn packed_constructor_limits_stop_before_publication_and_allow_retry() {
+    let make = function(
+        "Packed.bounded",
+        0,
+        vec![
+            binding(
+                1,
+                IrExpr::Ctor {
+                    info: packed_test_info(0, 0, 1),
+                    args: vec![],
+                },
+            ),
+            wide_ir_binding(2, &IrType::UInt8, IrExpr::Lit(IrLit::Num(IrNat::Small(42)))),
+            IrStmt::SSet {
+                x: 1,
+                i: 0,
+                offset: 0,
+                y: 2,
+                ty: IrType::UInt8,
+            },
+            wide_ir_binding(
+                3,
+                &IrType::UInt8,
+                IrExpr::SProj {
+                    n: 0,
+                    offset: 0,
+                    x: 1,
+                },
+            ),
+            call(4, "UInt8.toNat", &[3]),
+        ],
+        IrArg::Var(4),
+    );
+    for resource in [
+        "packed constructor bytes",
+        "packed constructor operands",
+        "lowered values",
+    ] {
+        let mut limits = IrExecutionLimits::default();
+        match resource {
+            "packed constructor bytes" => limits.fir.max_literal_bytes = 0,
+            "packed constructor operands" => limits.fir.max_operands = 0,
+            _ => limits.fir.max_values = 2,
+        }
+        let error = compile_users(vec![make.clone()], "Packed.bounded", &[], limits).unwrap_err();
+        assert!(
+            matches!(error, IrExecutionError::Limit(name) if name == resource),
+            "{error:?}"
+        );
+        assert!(error.is_resource());
+    }
+    let compiled = compile_users(
+        vec![make],
+        "Packed.bounded",
+        &[],
+        IrExecutionLimits::default(),
+    )
+    .unwrap();
+    assert_native_owned_result(&compiled, "42");
 }
 
 fn wide_ir_binding(x: u64, ty: &IrType, expr: IrExpr) -> IrStmt {

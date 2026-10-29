@@ -38,6 +38,14 @@ pub(super) fn compile(
                     }
                 }
                 for stmt in &body.stmts {
+                    let setter_kind = match stmt {
+                        IrStmt::USet { .. } => Some(flbc::ScalarKind::USize),
+                        IrStmt::SSet { ty, .. } => packed_scalar_kind(ty),
+                        _ => None,
+                    };
+                    if let Some(kind) = setter_kind {
+                        insert_helper(&mut helper_natives, packed_scalar_to_nat(kind))?;
+                    }
                     let IrStmt::VDecl { ty, expr, .. } = stmt else {
                         continue;
                     };
@@ -169,6 +177,8 @@ pub(super) fn compile(
         helper_provenance: Vec::new(),
         scope_work: 0,
         capture_operands: 0,
+        packed_operands: 0,
+        packed_scalar_bytes: 0,
     };
     let mut wrapper = Builder::new(entry, 0, &mut tables)?;
     let block = wrapper.block()?;
@@ -312,6 +322,31 @@ fn is_scalar_case(ty: &IrType) -> bool {
     )
 }
 
+fn packed_scalar_kind(ty: &IrType) -> Option<flbc::ScalarKind> {
+    match ty {
+        IrType::UInt8 => Some(flbc::ScalarKind::UInt8),
+        IrType::UInt16 => Some(flbc::ScalarKind::UInt16),
+        IrType::UInt32 => Some(flbc::ScalarKind::UInt32),
+        IrType::UInt64 => Some(flbc::ScalarKind::UInt64),
+        IrType::USize => Some(flbc::ScalarKind::USize),
+        _ => None,
+    }
+}
+
+fn packed_scalar_to_nat(kind: flbc::ScalarKind) -> &'static str {
+    match kind {
+        flbc::ScalarKind::UInt8 => "UInt8.toNat",
+        flbc::ScalarKind::UInt16 => "UInt16.toNat",
+        flbc::ScalarKind::UInt32 => "UInt32.toNat",
+        flbc::ScalarKind::UInt64 => "UInt64.toNat",
+        flbc::ScalarKind::USize => "USize.toNat",
+    }
+}
+
+fn fieldless_constructor(info: &IrCtorInfo) -> bool {
+    info.size == 0 && info.usize == 0 && info.ssize == 0
+}
+
 struct Tables {
     targets: BTreeMap<Name, (FunctionId, usize)>,
     intrinsic_ids: BTreeMap<Name, IntrinsicId>,
@@ -326,6 +361,8 @@ struct Tables {
     helper_provenance: Vec<ReferenceFunction>,
     scope_work: u64,
     capture_operands: usize,
+    packed_operands: usize,
+    packed_scalar_bytes: usize,
 }
 
 impl Tables {
@@ -358,6 +395,14 @@ impl Tables {
         }
         Ok(())
     }
+
+    fn packed_operands(&mut self, count: usize) -> Result<()> {
+        self.packed_operands = self.packed_operands.saturating_add(count);
+        if self.packed_operands > self.limits.fir.max_operands {
+            return Err(IrExecutionError::Limit("packed constructor operands"));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -367,6 +412,16 @@ struct Local {
 }
 
 type Locals = BTreeMap<u64, Local>;
+
+struct PendingConstructor {
+    constructor: ConstructorId,
+    fields: Vec<ValueId>,
+    scalars: BTreeMap<u16, flbc::PackedScalar<ValueId>>,
+    object_bytes: usize,
+    scalar_bytes: usize,
+}
+
+type PendingConstructors = BTreeMap<u64, PendingConstructor>;
 
 struct Join {
     function: FunctionId,
@@ -383,6 +438,7 @@ struct Builder<'a> {
     arity: usize,
     next_value: u32,
     blocks: Vec<Block>,
+    pending_values: usize,
     tables: &'a mut Tables,
 }
 
@@ -399,6 +455,7 @@ impl<'a> Builder<'a> {
             arity,
             next_value,
             blocks: Vec::new(),
+            pending_values: 0,
             tables,
         })
     }
@@ -421,7 +478,9 @@ impl<'a> Builder<'a> {
 
     fn emit(&mut self, block: BlockId, ty: ValueType, operation: Operation) -> Result<ValueId> {
         self.tables.bindings = self.tables.bindings.saturating_add(1);
-        if self.tables.bindings > self.tables.limits.fir.max_values {
+        if self.tables.bindings.saturating_add(self.pending_values)
+            > self.tables.limits.fir.max_values
+        {
             return Err(IrExecutionError::Limit("lowered values"));
         }
         let id = ValueId::new(self.next_value);
@@ -559,35 +618,245 @@ impl<'a> Builder<'a> {
     }
 
     fn constructor(&mut self, info: &IrCtorInfo) -> Result<ConstructorId> {
-        if info.usize != 0 || info.ssize != 0 {
-            return Err(unsupported(self.name, "packed constructor fields"));
-        }
         let tag =
             u8::try_from(info.cidx).map_err(|_| unsupported(self.name, "constructor tag width"))?;
         let fields = usize::try_from(info.size)
             .map_err(|_| IrExecutionError::Limit("constructor fields"))?;
-        if fields >= fln_rt::abi::MAX_CTOR_FIELDS || tag > fln_rt::abi::TAG_MAX_CTOR_TAG {
+        let scalar_bytes = info
+            .usize
+            .checked_mul(std::mem::size_of::<usize>() as u64)
+            .and_then(|bytes| bytes.checked_add(info.ssize))
+            .and_then(|bytes| usize::try_from(bytes).ok())
+            .ok_or_else(|| unsupported(self.name, "packed constructor size"))?;
+        if fields >= fln_rt::abi::MAX_CTOR_FIELDS
+            || scalar_bytes >= fln_rt::abi::MAX_CTOR_SCALARS_SIZE
+            || tag > fln_rt::abi::TAG_MAX_CTOR_TAG
+        {
             return Err(unsupported(self.name, "constructor layout"));
         }
-        if let Some(existing) = self
-            .tables
-            .constructors
-            .iter()
-            .find(|c| c.tag == tag && c.fields.len() == fields)
-        {
+        if let Some(existing) = self.tables.constructors.iter().find(|c| {
+            c.tag == tag && c.fields.len() == fields && c.static_scalar_bytes.len() == scalar_bytes
+        }) {
             return Ok(existing.id);
         }
         if self.tables.constructors.len() >= self.tables.limits.fir.max_constructors {
             return Err(IrExecutionError::Limit("constructors"));
+        }
+        self.tables.packed_scalar_bytes =
+            self.tables.packed_scalar_bytes.saturating_add(scalar_bytes);
+        if self.tables.packed_scalar_bytes > self.tables.limits.fir.max_literal_bytes {
+            return Err(IrExecutionError::Limit("packed constructor bytes"));
         }
         let id = ConstructorId::new(self.tables.constructors.len() as u32);
         self.tables.constructors.push(ConstructorDecl {
             id,
             tag,
             fields: vec![ValueType::Abi; fields],
-            static_scalar_bytes: Vec::new(),
+            static_scalar_bytes: vec![0; scalar_bytes],
         });
         Ok(id)
+    }
+
+    fn packed_offset(&self, slots: u64, bytes: u64) -> Result<u16> {
+        slots
+            .checked_mul(std::mem::size_of::<usize>() as u64)
+            .and_then(|offset| offset.checked_add(bytes))
+            .and_then(|offset| u16::try_from(offset).ok())
+            .ok_or_else(|| unsupported(self.name, "packed scalar offset"))
+    }
+
+    fn begin_packed_constructor(
+        &mut self,
+        block: BlockId,
+        x: u64,
+        info: &IrCtorInfo,
+        args: &[IrArg],
+        locals: &Locals,
+        pending: &mut PendingConstructors,
+    ) -> Result<()> {
+        let constructor = self.constructor(info)?;
+        self.pending_values = self.pending_values.saturating_add(2);
+        if self.tables.bindings.saturating_add(self.pending_values)
+            > self.tables.limits.fir.max_values
+        {
+            return Err(IrExecutionError::Limit("lowered values"));
+        }
+        self.tables.packed_operands(args.len())?;
+        let fields = self.arguments(block, args, locals)?;
+        let declaration = &self.tables.constructors[constructor.get() as usize];
+        pending.insert(
+            x,
+            PendingConstructor {
+                constructor,
+                fields,
+                scalars: BTreeMap::new(),
+                object_bytes: declaration.fields.len() * std::mem::size_of::<usize>(),
+                scalar_bytes: declaration.static_scalar_bytes.len(),
+            },
+        );
+        Ok(())
+    }
+
+    fn initialize_packed_scalar(
+        &mut self,
+        block: BlockId,
+        x: u64,
+        scalar: flbc::PackedScalar<u64>,
+        locals: &Locals,
+        pending: &mut PendingConstructors,
+    ) -> Result<()> {
+        let flbc::PackedScalar {
+            offset,
+            kind,
+            value: y,
+        } = scalar;
+        let constructor = pending
+            .get_mut(&x)
+            .ok_or_else(|| unsupported(self.name, "packed mutation after read or escape"))?;
+        let end = usize::from(offset).saturating_add(kind.width());
+        if usize::from(offset) < constructor.object_bytes
+            || end
+                > constructor
+                    .object_bytes
+                    .saturating_add(constructor.scalar_bytes)
+            || constructor
+                .scalars
+                .range(..offset)
+                .next_back()
+                .is_some_and(|(_, prior)| {
+                    usize::from(offset) < usize::from(prior.offset) + prior.kind.width()
+                })
+            || constructor
+                .scalars
+                .range(offset..)
+                .next()
+                .is_some_and(|(_, next)| usize::from(next.offset) < end)
+        {
+            return Err(unsupported(
+                self.name,
+                "packed scalar initialization layout",
+            ));
+        }
+        let value = locals
+            .get(&y)
+            .ok_or_else(|| unsupported(self.name, "packed scalar initializer"))?
+            .value;
+        self.tables.packed_operands(1)?;
+        // Validate the carrier at the original store, before any intervening
+        // call can produce effects or a different refusal. Only allocation is
+        // deferred; the checked original operand remains the packed value.
+        self.native_call(
+            block,
+            &Name::from_components(packed_scalar_to_nat(kind).split('.')),
+            vec![value],
+        )?;
+        constructor.scalars.insert(
+            offset,
+            flbc::PackedScalar {
+                offset,
+                kind,
+                value,
+            },
+        );
+        Ok(())
+    }
+
+    fn materialize_packed_constructor(
+        &mut self,
+        block: BlockId,
+        x: u64,
+        locals: &mut Locals,
+        pending: &mut PendingConstructors,
+    ) -> Result<()> {
+        let Some(constructor) = pending.remove(&x) else {
+            return Ok(());
+        };
+        // The pin packs integer fields without interior padding, but emits
+        // their stores in source order. Evaluate values in that order, then
+        // arrange the disjoint writes by their physical byte positions.
+        let mut initialized = constructor.object_bytes;
+        for scalar in constructor.scalars.values() {
+            if usize::from(scalar.offset) != initialized {
+                return Err(unsupported(self.name, "uninitialized packed constructor"));
+            }
+            initialized += scalar.kind.width();
+        }
+        if initialized != constructor.object_bytes + constructor.scalar_bytes {
+            return Err(unsupported(self.name, "uninitialized packed constructor"));
+        }
+        self.pending_values -= 2;
+        let value = self.boxed(
+            block,
+            ValueType::Constructor,
+            Operation::CtorPacked {
+                constructor: constructor.constructor,
+                fields: constructor.fields,
+                scalars: constructor.scalars.into_values().collect(),
+            },
+        )?;
+        locals.insert(
+            x,
+            Local {
+                value,
+                constructor: Some(constructor.constructor),
+            },
+        );
+        Ok(())
+    }
+
+    fn materialize_packed_arguments(
+        &mut self,
+        block: BlockId,
+        args: &[IrArg],
+        locals: &mut Locals,
+        pending: &mut PendingConstructors,
+    ) -> Result<()> {
+        for arg in args {
+            if let IrArg::Var(x) = arg {
+                self.materialize_packed_constructor(block, *x, locals, pending)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn materialize_packed_reads(
+        &mut self,
+        block: BlockId,
+        expr: &IrExpr,
+        locals: &mut Locals,
+        pending: &mut PendingConstructors,
+    ) -> Result<()> {
+        match expr {
+            IrExpr::Ctor { args, .. } | IrExpr::Fap { args, .. } | IrExpr::Pap { args, .. } => {
+                self.materialize_packed_arguments(block, args, locals, pending)
+            }
+            IrExpr::Ap { x, args } | IrExpr::Reuse { x, args, .. } => {
+                self.materialize_packed_constructor(block, *x, locals, pending)?;
+                self.materialize_packed_arguments(block, args, locals, pending)
+            }
+            IrExpr::Proj { x, .. }
+            | IrExpr::UProj { x, .. }
+            | IrExpr::SProj { x, .. }
+            | IrExpr::Box { x, .. }
+            | IrExpr::Unbox { x }
+            | IrExpr::Reset { x, .. }
+            | IrExpr::IsShared { x } => {
+                self.materialize_packed_constructor(block, *x, locals, pending)
+            }
+            IrExpr::Lit(_) => Ok(()),
+        }
+    }
+
+    fn materialize_all_packed(
+        &mut self,
+        block: BlockId,
+        locals: &mut Locals,
+        pending: &mut PendingConstructors,
+    ) -> Result<()> {
+        while let Some(x) = pending.keys().next().copied() {
+            self.materialize_packed_constructor(block, x, locals, pending)?;
+        }
+        Ok(())
     }
 
     fn expression(
@@ -705,7 +974,7 @@ impl<'a> Builder<'a> {
                 }
             }
             IrExpr::Ctor { info, args } => {
-                if info.size == 0 && info.usize == 0 && info.ssize == 0 {
+                if fieldless_constructor(info) {
                     // Fieldless constructors are scalar tags. Their index
                     // does not occupy the bounded heap-header tag field.
                     match wide_scalar(ty) {
@@ -772,8 +1041,34 @@ impl<'a> Builder<'a> {
                     "reference-count observation or constructor reuse",
                 ));
             }
-            IrExpr::UProj { .. } | IrExpr::SProj { .. } => {
-                return Err(unsupported(self.name, "packed scalar projection"));
+            IrExpr::UProj { i, x } => {
+                let value = self.argument(block, &IrArg::Var(*x), locals)?;
+                let offset = self.packed_offset(*i, 0)?;
+                self.emit(
+                    block,
+                    ValueType::Abi,
+                    Operation::ProjectScalar {
+                        value,
+                        offset,
+                        kind: flbc::ScalarKind::USize,
+                    },
+                )?
+            }
+            IrExpr::SProj { n, offset, x } => {
+                let kind = packed_scalar_kind(ty)
+                    .filter(|kind| *kind != flbc::ScalarKind::USize)
+                    .ok_or_else(|| unsupported(self.name, "packed scalar projection type"))?;
+                let value = self.argument(block, &IrArg::Var(*x), locals)?;
+                let offset = self.packed_offset(*n, *offset)?;
+                self.emit(
+                    block,
+                    ValueType::Abi,
+                    Operation::ProjectScalar {
+                        value,
+                        offset,
+                        kind,
+                    },
+                )?
             }
         };
         Ok(Local { value, constructor })
@@ -863,14 +1158,69 @@ impl<'a> Builder<'a> {
 
     fn body(&mut self, body: &IrBody, mut locals: Locals, mut joins: Joins) -> Result<BlockId> {
         let block = self.block()?;
+        let mut pending = PendingConstructors::new();
         for stmt in &body.stmts {
             match stmt {
                 IrStmt::VDecl { x, ty, expr } => {
-                    let value = self.expression(block, ty, expr, &locals)?;
-                    locals.insert(*x, value);
+                    self.materialize_packed_reads(block, expr, &mut locals, &mut pending)?;
+                    if let IrExpr::Ctor { info, args } = expr
+                        && (info.usize != 0 || info.ssize != 0)
+                    {
+                        self.begin_packed_constructor(
+                            block,
+                            *x,
+                            info,
+                            args,
+                            &locals,
+                            &mut pending,
+                        )?;
+                    } else {
+                        let value = self.expression(block, ty, expr, &locals)?;
+                        locals.insert(*x, value);
+                    }
                 }
                 IrStmt::JDecl { j, params, value } => {
+                    // Lifted joins capture their lexical scope. Complete any
+                    // pending value before it becomes part of that capture.
+                    self.materialize_all_packed(block, &mut locals, &mut pending)?;
                     self.join(*j, params, value, &locals, &mut joins)?;
+                }
+                IrStmt::USet { x, i, y } => {
+                    let offset = self.packed_offset(*i, 0)?;
+                    self.initialize_packed_scalar(
+                        block,
+                        *x,
+                        flbc::PackedScalar {
+                            offset,
+                            kind: flbc::ScalarKind::USize,
+                            value: *y,
+                        },
+                        &locals,
+                        &mut pending,
+                    )?;
+                }
+                IrStmt::SSet {
+                    x,
+                    i,
+                    offset,
+                    y,
+                    ty,
+                } => {
+                    let kind = packed_scalar_kind(ty)
+                        .filter(|kind| *kind != flbc::ScalarKind::USize)
+                        .ok_or_else(|| unsupported(self.name, "packed scalar initializer type"))?;
+                    let offset = self.packed_offset(*i, *offset)?;
+                    self.initialize_packed_scalar(
+                        block,
+                        *x,
+                        flbc::PackedScalar {
+                            offset,
+                            kind,
+                            value: *y,
+                        },
+                        &locals,
+                        &mut pending,
+                    )?;
                 }
                 // The immutable subset is lowered to managed values. The
                 // independent ownership pass reconstructs actual final uses.
@@ -878,6 +1228,7 @@ impl<'a> Builder<'a> {
                 _ => return Err(unsupported(self.name, "mutable IR statement")),
             }
         }
+        self.materialize_all_packed(block, &mut locals, &mut pending)?;
         match body.terminal.as_ref() {
             IrTerminal::Ret(arg) => {
                 let value = self.argument(block, arg, &locals)?;
@@ -959,8 +1310,8 @@ impl<'a> Builder<'a> {
         if !scalar {
             // Check object cases before scalar nullary constructors. No
             // reference-count test or guessed object-to-number conversion.
-            arms.sort_by_key(|(info, _)| info.size == 0);
-            if default.is_some() && arms.iter().any(|(info, _)| info.size == 0) {
+            arms.sort_by_key(|(info, _)| fieldless_constructor(info));
+            if default.is_some() && arms.iter().any(|(info, _)| fieldless_constructor(info)) {
                 return Err(unsupported(
                     self.name,
                     "mixed scalar/object case with a default",
@@ -990,7 +1341,7 @@ impl<'a> Builder<'a> {
             }
             return Ok(());
         };
-        let fieldless = info.size == 0 && info.usize == 0 && info.ssize == 0;
+        let fieldless = fieldless_constructor(info);
         let heap_tag = info.cidx <= u64::from(fln_rt::abi::TAG_MAX_CTOR_TAG);
         let constructor = if fieldless && (scalar || !heap_tag) {
             None
