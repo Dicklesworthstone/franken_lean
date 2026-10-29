@@ -132,9 +132,46 @@ fn failure_with_evaluation_output(
     failed
 }
 
-fn module_error(error: fln::source_check::modules::SourceModuleCheckError) -> Failure {
+fn module_failure(
+    error: fln::source_check::modules::SourceModuleCheckError,
+    presentation: Presentation,
+    entry: &Name,
+    source: &[u8],
+    display: &str,
+) -> MultiplexerOutput {
     let (class, authority, exit) = error.disposition();
-    Failure::new(class, &error.to_string(), authority, exit)
+    // A frontend's token position is lost if the typed error is flattened into
+    // Failure first. Only the entry's own source can locate it here; imported
+    // modules and nonanswers retain their ordinary typed failure presentation.
+    if matches!(presentation, Presentation::Lean)
+        && class == "elaboration"
+        && let fln::source_check::modules::SourceModuleCheckError::Source {
+            module,
+            error:
+                fln::SourceCheckError::Command {
+                    offset: command_start,
+                    error: cause,
+                    ..
+                },
+        } = &error
+        && module == entry
+        && let fln::EngineExecutionError::Frontend(frontend) = cause.as_ref()
+        && let Some(relative) = frontend.primary_offset()
+        && let Some(offset) = command_start.checked_add(relative.0)
+        && let Some(position) = crate::source_position_at(source, offset)
+    {
+        return MultiplexerOutput::failure(
+            format!(
+                "{display}:{}:{}: error: {cause}\n",
+                position.line, position.column
+            ),
+            exit,
+        );
+    }
+    failure(
+        Failure::new(class, &error.to_string(), authority, exit),
+        presentation,
+    )
 }
 
 fn evaluation_error(error: source_evaluation::Error) -> Failure {
@@ -308,6 +345,11 @@ fn run_loaded(
             let inputs: Vec<_> = names.iter().zip(sources).map(|(name, source)| {
                 SourceModuleInput { name, source }
             }).collect();
+            // The pin names the file as the command line did, and standard input `<stdin>`.
+            let display = match origin {
+                EntryOrigin::StandardInput => "<stdin>".to_owned(),
+                EntryOrigin::File => paths[0].display().to_string(),
+            };
             let mut limits = SourceProgramLimits::new(fln::EngineExecutionLimits::for_user_program(
                 fln::Budget::for_stack_bytes(OLEAN_CHECK_KERNEL_STACK_BYTES),
             ));
@@ -319,7 +361,7 @@ fn run_loaded(
                 preflight_source_program(&inputs, limits.modules)
             };
             if let Err(error) = preflight {
-                return Some(failure(module_error(error), presentation));
+                return Some(module_failure(error, presentation, &names[0], &sources[0], &display));
             }
             let (_, base) = match loaded.base_engine(
                 || Ok(fln::Engine::from_environment(fln::Environment::new())),
@@ -347,7 +389,7 @@ fn run_loaded(
                 )
                 .map_err(|error| match error {
                     fln::source_check::modules::execution::SourceProgramExecutionError::Source(error) => {
-                        failure(module_error(error), presentation)
+                        module_failure(error, presentation, &names[0], &sources[0], &display)
                     }
                     fln::source_check::modules::execution::SourceProgramExecutionError::Validation { error, .. } => error,
                 })
@@ -355,7 +397,7 @@ fn run_loaded(
                 receipt.execute_source_modules_with_presentation(
                     &inputs, &names[0], &fln::KVMap::new(), limits, None, evaluation_presentation,
                 )
-                .map_err(|error| failure(module_error(error), presentation))
+                .map_err(|error| module_failure(error, presentation, &names[0], &sources[0], &display))
             };
             let completed = match execution {
                 Ok(Outcome::Complete(completed)) => completed,
@@ -366,11 +408,6 @@ fn run_loaded(
                     "internal-fault", &format!("source program faulted: {fault:?}"), false, 4,
                 ), presentation)),
                 Err(output) => return Some(output),
-            };
-            // The pin names the file as the command line did, and standard input `<stdin>`.
-            let display = match origin {
-                EntryOrigin::StandardInput => "<stdin>".to_owned(),
-                EntryOrigin::File => paths[0].display().to_string(),
             };
             Some(match presentation {
                 Presentation::Lean => match lean_output(

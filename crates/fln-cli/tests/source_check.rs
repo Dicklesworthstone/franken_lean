@@ -2537,6 +2537,132 @@ fn installed_refinement_checks_scoped_holes_and_preserves_failure_isolation() {
 }
 
 #[test]
+fn installed_refinement_final_unification_agrees_with_the_pin() {
+    let lib = std::env::var_os("FLN_REFERENCE_LIB")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| {
+                PathBuf::from(home)
+                    .join(".elan/toolchains")
+                    .join(format!("leanprover--lean4---{}", fln::OLEAN_PIN_TAG))
+                    .join("lib/lean")
+            })
+        })
+        .filter(|lib| lib.join("Init.olean").is_file());
+    assert!(
+        lib.is_some() || std::env::var_os("FLN_REQUIRE_REFERENCE").is_none(),
+        "the pinned Reference library is required"
+    );
+    let Some(lib) = lib else {
+        eprintln!("SKIP: pinned Reference lib/lean absent");
+        return;
+    };
+    let pinned = lib.parent().unwrap().parent().unwrap().join("bin/lean");
+    assert!(pinned.is_file(), "missing pinned oracle: {pinned:?}");
+    // Headerless inputs exercise the installed command's implicit Init import,
+    // rather than the source engine's seed environment or an explicit prelude.
+    let accepted = "theorem simple (n : Nat) : n = n := by refine Eq.refl ?_";
+    let path = file(accepted);
+    let root = path.parent().unwrap();
+    let programs = [
+        (accepted, 0, false),
+        (
+            "def identity {A : Type} (x : A) : A := x\ntheorem same (n : Nat) : identity n = n := by refine Eq.refl ?_",
+            0,
+            false,
+        ),
+        (
+            "theorem simple (n : Nat) : n = n := by exact Eq.refl ?_",
+            0,
+            false,
+        ),
+        (
+            "def identity {A : Type} (x : A) : A := x\ntheorem same (n : Nat) : identity n = n := by exact Eq.refl ?_",
+            0,
+            false,
+        ),
+        (
+            "def annotated : Nat := by refine (7 : ?_)\ntheorem computes : annotated = 7 := by rfl",
+            0,
+            false,
+        ),
+        (
+            "theorem simple (n : Nat) : n = n := by refine Eq.refl ?_; exact n",
+            1,
+            true,
+        ),
+        (
+            "def identity {A : Type} (x : A) : A := x\ntheorem same (n : Nat) : identity n = n := by refine Eq.refl ?_; exact n",
+            1,
+            true,
+        ),
+        (
+            "def annotated : Nat := by refine (7 : ?_); exact Nat\ntheorem computes : annotated = 7 := by rfl",
+            1,
+            true,
+        ),
+        ("theorem bad (n : Nat) : n = n := Eq.refl ?_", 1, false),
+        (
+            "theorem bad (n m : Nat) : n = m := by exact Eq.refl ?_",
+            1,
+            false,
+        ),
+        // The final acceptance follows all five refusals, with the same import
+        // reuse directory. Neither a failed file nor its holes may leak into it.
+        (accepted, 0, false),
+    ];
+    for (index, (source, expected, no_goals)) in programs.into_iter().enumerate() {
+        let name = format!("case{index}.lean");
+        let source_path = root.join(&name);
+        std::fs::write(&source_path, source).unwrap();
+        for (mut command, oracle) in [
+            (Command::new(&pinned), true),
+            (Command::new(env!("CARGO_BIN_EXE_lean")), false),
+        ] {
+            let executable = command.get_program().to_owned();
+            let output = command
+                .arg(&name)
+                .current_dir(root)
+                .env("LEAN_PATH", &lib)
+                .env("FLN_IMPORT_REUSE_DIR", root.join("records"))
+                .env("LEAN_BACKTRACE", "0")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            eprintln!(
+                "{executable:?} {name}: exit={:?}\n{stdout}{stderr}",
+                output.status.code()
+            );
+            assert_eq!(
+                output.status.code(),
+                Some(expected),
+                "{executable:?} {name}:\n{stdout}{stderr}"
+            );
+            if expected == 0 {
+                assert!(stdout.is_empty() && stderr.is_empty(), "{stdout}{stderr}");
+            } else if no_goals {
+                let before = &source[..source.find("exact ").unwrap()];
+                let line = before.bytes().filter(|byte| *byte == b'\n').count() + 1;
+                let column = before.rsplit('\n').next().unwrap().chars().count();
+                let diagnostic = if oracle { &stdout } else { &stderr };
+                assert!(
+                    diagnostic.starts_with(&format!("{name}:{line}:{column}:")),
+                    "wrong first error position: {stdout}{stderr}"
+                );
+                let message = if oracle {
+                    "No goals to be solved"
+                } else {
+                    "tactic has no remaining goal"
+                };
+                assert!(diagnostic.contains(message), "{stdout}{stderr}");
+            }
+            assert_eq!(std::fs::read(&source_path).unwrap(), source.as_bytes());
+        }
+    }
+}
+
+#[test]
 fn installed_goal_controls_check_scopes_and_isolate_failed_suffixes() {
     let prefix = file(include_str!("../../../examples/native_goal_control.lean"));
     let invalid = file(
