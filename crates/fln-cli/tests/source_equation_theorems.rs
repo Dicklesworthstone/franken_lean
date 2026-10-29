@@ -478,6 +478,61 @@ decreasing_by exact Nat.lt_succ_of_le (Nat.div_le_self n 2)
     ),
 ];
 
+/// A definition by pattern matching keeps its type as the header wrote it (`declValEqns`): the
+/// pattern columns are the value's `fun`s, so the type's binder names and a function type named
+/// by a definition survive, and `#check` prints them. The pin's stdout.
+const SIGNATURES: (&str, &str) = (
+    "def f : (n : Nat) → Nat
+  | 0 => 0
+  | k + 1 => k
+#check f
+def F := Nat → Nat
+def g : F
+  | 0 => 0
+  | _ => 1
+#check g
+def h (m : Nat) : (n : Nat) → Nat
+  | 0 => m
+  | _ => 1
+#check h
+theorem t : (n : Nat) → n + 0 = n
+  | 0 => rfl
+  | _ + 1 => rfl
+#check t
+def isZero : Nat → Bool | 0 => true | _ => false
+#check isZero
+",
+    "f (n : Nat) : Nat
+g : F
+h (m n : Nat) : Nat
+t (n : Nat) : n + 0 = n
+isZero : Nat → Bool
+",
+);
+
+#[test]
+fn a_definition_by_pattern_matching_keeps_its_written_type() {
+    let Some(lib) = pinned_lib() else {
+        return;
+    };
+    let root = workspace();
+    let (program, expected) = SIGNATURES;
+    let (ours, pinned) = run(&lib, &root, HEADER, "signatures", program);
+    assert_eq!(
+        (ours.code, ours.stdout.as_str()),
+        (0, expected),
+        "{}",
+        ours.stderr
+    );
+    if let Some(pinned) = pinned {
+        assert_eq!(
+            (pinned.code, pinned.stdout.as_str()),
+            (0, expected),
+            "the pin moved"
+        );
+    }
+}
+
 fn pinned_lib() -> Option<PathBuf> {
     let lib = std::env::var_os("FLN_REFERENCE_LIB")
         .map(PathBuf::from)

@@ -6068,10 +6068,15 @@ fn definition_elaboration(
     }
     let header_parameters = parameters.len();
     let generated;
+    // The pin keeps an equation definition's type as its header wrote it (`declValEqns`): the
+    // alternatives' pattern columns are the value's `fun`s, not binders of the type. So neither
+    // their generated names nor a function type unfolded to open them reach the declaration.
+    let mut written_type = None;
     let body = if equations {
         let declared_type = expected
             .as_ref()
             .ok_or_else(|| failure(SourceInferenceError::ExpectedType))?;
+        written_type = Some(declared_type.clone());
         let (syntax, result_type) =
             context.equation_function(body, declared_type, &mut parameters)?;
         generated = syntax;
@@ -6097,6 +6102,13 @@ fn definition_elaboration(
     }
     if let Some(expected) = expected {
         term.type_ = expected;
+    }
+    let columns: std::collections::HashSet<_> = parameters[header_parameters..]
+        .iter()
+        .map(|local| local.id.clone())
+        .collect();
+    if let Some(written) = written_type {
+        term.type_ = written;
     }
     // Section variables are fixed during recursion, not recursive arguments.
     // Only after body elaboration are their used dependencies prepended.
@@ -6155,7 +6167,10 @@ fn definition_elaboration(
             .abstract_fvar(&id, 0)
             .map_err(|_| failure(SourceInferenceError::Scope))?;
         term.value = Expr::lam(name.clone(), domain.clone(), term.value, style);
-        term.type_ = Expr::forall_e(name, domain, term.type_, style);
+        // A pattern column binds only the value (`written_type` above).
+        if !columns.contains(&id) {
+            term.type_ = Expr::forall_e(name, domain, term.type_, style);
+        }
     }
     let term = context.finish(term)?;
     if term.value.has_fvar()
