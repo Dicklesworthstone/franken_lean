@@ -117,29 +117,71 @@ fn ours(lib: &Path, root: &Path, entry: &Path) -> (i32, String, String) {
     )
 }
 
+/// Each program must be accepted silently by the pin and here.
+fn accepted(lib: &Path, root: &Path, tag: &str, programs: &[&str]) {
+    for (index, program) in programs.iter().enumerate() {
+        let entry = root.join(format!("{tag}{index}.lean"));
+        std::fs::write(&entry, format!("{HEADER}{program}")).unwrap();
+        if let Some((code, stdout)) = pinned(lib, &entry) {
+            assert_eq!((code, stdout.as_str()), (0, ""), "the pin moved: {program}");
+        }
+        let (code, stdout, stderr) = ours(lib, root, &entry);
+        assert_eq!((code, stdout.as_str()), (0, ""), "{program}: {stderr}");
+    }
+}
+
+/// Each program must be rejected by the pin and refused here.
+fn refused(lib: &Path, root: &Path, tag: &str, programs: &[&str]) {
+    for (index, program) in programs.iter().enumerate() {
+        let entry = root.join(format!("{tag}{index}.lean"));
+        std::fs::write(&entry, format!("{HEADER}{program}")).unwrap();
+        if let Some((code, _)) = pinned(lib, &entry) {
+            assert_eq!(code, 1, "the pin rejects {program}");
+        }
+        let (code, stdout, stderr) = ours(lib, root, &entry);
+        assert_ne!(code, 0, "{program}: {stdout}");
+        assert!(stderr.contains("refused"), "{program}: {stderr}");
+    }
+}
+
 #[test]
 fn nat_procedures_fold_decide_and_cancel_as_at_the_pin() {
     let Some(lib) = pinned_lib() else {
         return;
     };
     let root = workspace();
-    for (index, program) in ACCEPTED.iter().enumerate() {
-        let entry = root.join(format!("Accepted{index}.lean"));
-        std::fs::write(&entry, format!("{HEADER}{program}")).unwrap();
-        if let Some((code, stdout)) = pinned(&lib, &entry) {
-            assert_eq!((code, stdout.as_str()), (0, ""), "the pin moved: {program}");
-        }
-        let (code, stdout, stderr) = ours(&lib, &root, &entry);
-        assert_eq!((code, stdout.as_str()), (0, ""), "{program}: {stderr}");
-    }
-    for (index, program) in REFUSED.iter().enumerate() {
-        let entry = root.join(format!("Refused{index}.lean"));
-        std::fs::write(&entry, format!("{HEADER}{program}")).unwrap();
-        if let Some((code, _)) = pinned(&lib, &entry) {
-            assert_eq!(code, 1, "the pin rejects {program}");
-        }
-        let (code, stdout, stderr) = ours(&lib, &root, &entry);
-        assert_ne!(code, 0, "{program}: {stdout}");
-        assert!(stderr.contains("refused"), "{program}: {stderr}");
-    }
+    accepted(&lib, &root, "Accepted", ACCEPTED);
+    refused(&lib, &root, "Refused", REFUSED);
+}
+
+/// simp closes a goal whose sides are closed `Nat` arithmetic that the pin's reducible `isDefEq`
+/// folds (`eq_self`, a `simp only` builtin). A source ascription `(10 : Nat)` is the numeral itself
+/// there; this elaborator keeps it as `let _ : Nat := 10; _`, and the closer did not read through
+/// it, so `10 - 6 = 4` stayed open and a second `simp only` closed it where the pin reports "No
+/// goals to be solved" (bead fln-simp-closer-literal-folding-lyh4).
+#[test]
+fn an_ascribed_numeral_equation_closes_as_at_the_pin() {
+    let Some(lib) = pinned_lib() else {
+        return;
+    };
+    let root = workspace();
+    accepted(
+        &lib,
+        &root,
+        "Closed",
+        &[
+            "example : (10 : Nat) - 6 = 4 := by\n  simp only []\n",
+            "example : (10 : Nat) - 3 * 2 = 4 := by\n  simp only [Nat.reduceMul]\n",
+        ],
+    );
+    refused(
+        &lib,
+        &root,
+        "Open",
+        &[
+            "example : (10 : Nat) - 3 * 2 = 4 := by\n  simp only [Nat.reduceMul]\n  \
+             simp only [Nat.reduceSub]\n",
+            "example : (10 : Nat) - 6 = 5 := by\n  simp only []\n",
+        ],
+    );
 }

@@ -300,6 +300,13 @@ impl Context {
                     literal: Literal::Nat(_),
                 } if arguments.is_empty() => {}
                 ExprNode::MData { expr, .. } if arguments.is_empty() => work.push(expr.clone()),
+                // A source ascription `(10 : Nat)` is the numeral itself at the pin; this
+                // elaborator keeps it as `let _ : T := e; _`, which zeta-free WHNF leaves.
+                ExprNode::LetE { value, .. }
+                    if arguments.is_empty() && matching::is_ascription(&term) =>
+                {
+                    work.push(value.clone());
+                }
                 ExprNode::Const { name, levels }
                     if levels.is_empty() && self.exact_nat_intrinsic(name) =>
                 {
