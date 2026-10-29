@@ -226,6 +226,43 @@ fn structure_instance_fields_and_arguments_respect_the_first_fields_column() {
     judge(&lib, &workspace(), RECORD_REFUSED, RECORD_ACCEPTED);
 }
 
+/// `matchAlt` checks a right-hand side against its `|` before any right-hand-side parser runs
+/// (`checkColGe`, vendored `Lean/Parser/Term.lean:269`): "expected alternative right-hand-side to
+/// start in a column greater than or equal to the corresponding '|'". The first program is the
+/// pin's own `tests/elab_fail/matchAltIndent.lean`, and the second is its right-hand side one
+/// column left of the `|`. Columns are characters, and `→` is one, so the `|` is at column 29
+/// (bead `fln-match-alt-column-false-accept-u3fv`).
+const ALTERNATIVE_REFUSED: &[&str] = &[
+    "partial def frob : Nat → Nat | i =>\nif i > 10 then frob 5 else frob (i-1)\n",
+    "partial def frob : Nat → Nat | i =>\n                            if i > 10 then frob 5 else frob (i-1)\n",
+];
+
+/// Programs the pin accepts, printing nothing: the right-hand side at the `|`'s column, and on
+/// the `|`'s own line.
+const ALTERNATIVE_ACCEPTED: &[(&str, &str)] = &[
+    (
+        "partial def frob : Nat → Nat | i =>\n                             if i > 10 then frob 5 else frob (i-1)\n",
+        "",
+    ),
+    (
+        "partial def frob : Nat → Nat | i => if i > 10 then frob 5 else frob (i-1)\n",
+        "",
+    ),
+];
+
+#[test]
+fn a_right_hand_side_left_of_its_pipe_is_refused_as_at_the_pin() {
+    let Some(lib) = pinned_lib() else {
+        return;
+    };
+    judge(
+        &lib,
+        &workspace(),
+        ALTERNATIVE_REFUSED,
+        ALTERNATIVE_ACCEPTED,
+    );
+}
+
 /// Each refused program is rejected by the pin and refused here; each accepted one prints the
 /// pin's stdout in both.
 fn judge(lib: &Path, root: &Path, refused: &[&str], accepted: &[(&str, &str)]) {
