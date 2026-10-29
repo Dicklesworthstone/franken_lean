@@ -79,6 +79,8 @@ jobs:
               'crates/fln-elab/src/constraint/unify.rs',
               'crates/fln-elab/src/constraint/unify/pattern_spine.rs',
               'crates/fln-elab/tests/native_unification_reducible_patterns.rs',
+              'crates/fln-parse/src/lib.rs',
+              'crates/fln-parse/src/proofs.rs',
           }
           for path, blobs in changes.items():
               assert path in allowed, path
@@ -182,6 +184,7 @@ jobs:
                 -- --nocapture || refinement_exit=$?
               cargo test --locked -p fln-elab --lib source::tactics::refine::tests -- --nocapture || refinement_exit=$?
               cargo test --locked -p fln-elab --test native_unification_reducible_patterns -- --nocapture || refinement_exit=$?
+              cargo test --locked -p fln-parse --lib proofs::construction_refinement_tests -- --nocapture || refinement_exit=$?
               exit "$refinement_exit"
               ;;
             pattern-simp)
