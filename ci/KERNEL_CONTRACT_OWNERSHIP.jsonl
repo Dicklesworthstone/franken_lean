@@ -1,4 +1,4 @@
-{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":737,"projection_hash":"14f0dcfef69815cbc079e3b95f0ad65a988372fb7ee7fcbd36254c6020e83efa"}
+{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":743,"projection_hash":"2a913fad190ad9cefee477b5137fde723fd7e044e6bf96ece4076ce177310d50"}
 {"id":"fln-0bw5"}
 {"id":"fln-0eq8"}
 {"id":"fln-0rxm"}
@@ -215,6 +215,7 @@
 {"id":"fln-hvrk"}
 {"id":"fln-i9so"}
 {"id":"fln-identity-path-mutant-recovery-mbco"}
+{"id":"fln-implicit-lambda-qzra"}
 {"id":"fln-import-reuse-composes-4ngt"}
 {"id":"fln-import-std-metadata-entry-cap-rzwa"}
 {"id":"fln-in1"}
@@ -285,6 +286,7 @@
 {"id":"fln-named-argument-patterns-wouu"}
 {"id":"fln-named-monad-argument-match-6egz"}
 {"id":"fln-narm"}
+{"id":"fln-nat-simplification-procedures-g9wu"}
 {"id":"fln-nested-actions-e60c"}
 {"id":"fln-nested-call-decreasing-goals-vzq4"}
 {"id":"fln-nested-inductive-source-59sb"}
@@ -319,6 +321,7 @@
 {"id":"fln-pp-options-wvin"}
 {"id":"fln-prelude-cdot-tactic-false-accept-3ti6"}
 {"id":"fln-prelude-list-literal-false-accept-uvga"}
+{"id":"fln-print-instance-fun-binder-oh5z"}
 {"id":"fln-private-index-worktree-sync-mbh9"}
 {"id":"fln-provisional-frontier-vf32"}
 {"id":"fln-pu6i"}
@@ -340,6 +343,7 @@
 {"id":"fln-reality-check-1017-9l76"}
 {"id":"fln-recursor-motive-elab-as-elim-3jsg"}
 {"id":"fln-reduce-command-crqm"}
+{"id":"fln-refine-default-instances-5byo"}
 {"id":"fln-refine-final-unification-synthetic-holes-n15v"}
 {"id":"fln-registry-batch-preflight-sszd"}
 {"id":"fln-repr-ingress-lambda-application-xchs"}
@@ -359,6 +363,7 @@
 {"id":"fln-simp-add-zero-pattern-overmatch-5jie"}
 {"id":"fln-simp-arith-normalization-0qnk"}
 {"id":"fln-simp-at-hypothesis-order-vyxf"}
+{"id":"fln-simp-closer-literal-folding-lyh4"}
 {"id":"fln-simp-closer-reducible-i2ja"}
 {"id":"fln-simp-configuration-slot-v4b7"}
 {"id":"fln-simp-cost-full-init-set-82hy"}
@@ -406,6 +411,7 @@
 {"id":"fln-user-partial-unsafe-def-c3hh"}
 {"id":"fln-uuuz"}
 {"id":"fln-uyuz"}
+{"id":"fln-variable-binder-hole-types-4u1e"}
 {"id":"fln-variable-binder-update-shadowing-7h8o"}
 {"id":"fln-vm35"}
 {"id":"fln-vneu"}
