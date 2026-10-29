@@ -55,7 +55,7 @@ jobs:
           import json, os, re
           assert re.fullmatch('[0-9a-f]{40}', os.environ['CANDIDATE_BASE'])
           changes = json.loads(os.environ['CANDIDATE_CHANGES'])
-          assert isinstance(changes, dict) and len(changes) <= 8
+          assert isinstance(changes, dict) and len(changes) <= 9
           allowed = {
               'crates/fln/src/runtime/callables/administrative.rs',
               'crates/fln/src/runtime/callables/administrative/tests.rs',
@@ -81,6 +81,7 @@ jobs:
               'crates/fln-elab/tests/native_unification_reducible_patterns.rs',
               'crates/fln-parse/src/lib.rs',
               'crates/fln-parse/src/proofs.rs',
+              'crates/fln-parse/src/command_scope.rs',
           }
           for path, blobs in changes.items():
               assert path in allowed, path
@@ -185,6 +186,7 @@ jobs:
               cargo test --locked -p fln-elab --lib source::tactics::refine::tests -- --nocapture || refinement_exit=$?
               cargo test --locked -p fln-elab --test native_unification_reducible_patterns -- --nocapture || refinement_exit=$?
               cargo test --locked -p fln-parse --lib proofs::construction_refinement_tests -- --nocapture || refinement_exit=$?
+              cargo test --locked --no-fail-fast -p fln-parse -p fln-elab --tests -- --nocapture || refinement_exit=$?
               exit "$refinement_exit"
               ;;
             pattern-simp)
