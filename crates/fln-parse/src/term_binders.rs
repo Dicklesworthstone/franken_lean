@@ -89,6 +89,7 @@ pub(super) fn frame(prefix: impl Into<term_locals::Prefix>) -> BoundedTermFrame 
         application: Vec::new(),
         operands: Vec::new(),
         operators: Vec::new(),
+        argument_floor: None,
     }
 }
 

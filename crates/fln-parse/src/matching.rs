@@ -734,6 +734,7 @@ fn plan(
             }
             "=>" | "↦" if active.last().is_some_and(|p| p.depth == depth) => {
                 let current = active.last_mut().expect("matching depth");
+                let first_pipe = current.alternatives.first().map(|first| first.pipe);
                 if let Some(alt) = current.alternatives.last_mut()
                     && alt.arrow.is_none()
                 {
@@ -749,6 +750,24 @@ fn plan(
                             < character_column(view, tokens, alt.pipe)
                     {
                         return Err(refuse(view, tokens, at + 1));
+                    }
+                    // `by` reads its tactics with `tacticSeqIndentGt` (vendored
+                    // `Lean/Parser/Term/Basic.lean:90`): unless they are braced, the first
+                    // starts right of the saved position, which `matchAlts` saves at the first
+                    // pipe (`withPosition`, `Lean/Parser/Term.lean:280`). A first tactic on a
+                    // later line at or left of that column leaves the pin's sequence empty, so
+                    // the alternative is "unsolved goals" there, or the alternatives end before
+                    // the next one ("Missing cases").
+                    if is_symbol(tokens, at + 1, "by")
+                        && at + 2 < range.end
+                        && !is_symbol(tokens, at + 2, "{")
+                        && later_line(view, tokens, at + 2, at + 1)
+                        && first_pipe.is_some_and(|pipe| {
+                            character_column(view, tokens, at + 2)
+                                <= character_column(view, tokens, pipe)
+                        })
+                    {
+                        return Err(refuse(view, tokens, at + 2));
                     }
                     if current.statement {
                         do_scopes.open(view, tokens, at, depth, Some(current.start), range.end)?;

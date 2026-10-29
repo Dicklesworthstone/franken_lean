@@ -37,6 +37,7 @@ fn frame(record: RecordFrame) -> BoundedTermFrame {
         application: Vec::new(),
         operands: Vec::new(),
         operators: Vec::new(),
+        argument_floor: None,
     }
 }
 fn push_field(
@@ -58,9 +59,13 @@ fn push_field(
     if name >= end || !matches!(tokens[name].kind, TokenKind::Ident(_)) {
         return Err(refuse(view, tokens, name));
     }
-    record
-        .field_column
-        .get_or_insert(column(view, tokens, name));
+    // `sepByIndent` checks each field against the first field's position (`checkColGe`), so a
+    // later field left of it is no field: the pin expects `}` there, after a `,` too.
+    let at = column(view, tokens, name);
+    if record.field_column.is_some_and(|first| at < first) {
+        return Err(refuse(view, tokens, name));
+    }
+    let floor = *record.field_column.get_or_insert(at);
     *cursor += 1;
     // A name alone on its line is an abbreviation too: the next line starts the next field.
     let line_ends = *cursor < end
@@ -81,7 +86,10 @@ fn push_field(
         let prefix = term_binders::Prefix::field(leaves, view, tokens, name, cursor, end)?;
         record.field = Some(Field::Definition);
         frames.push(frame(record));
-        frames.push(term_binders::frame(prefix));
+        // The value's arguments start right of the first field (`checkColGt`).
+        let mut value = term_binders::frame(prefix);
+        value.argument_floor = Some(floor);
+        frames.push(value);
     }
     Ok(())
 }
@@ -433,7 +441,7 @@ pub(super) fn line_break(
     Ok(cursor)
 }
 
-fn column(view: &SourceView, tokens: &[LexedToken], at: usize) -> usize {
+pub(super) fn column(view: &SourceView, tokens: &[LexedToken], at: usize) -> usize {
     let pos = tokens[at].extent.start();
     pos.0
         - view
@@ -449,7 +457,8 @@ mod tests {
     #[test]
     fn literal_syntax_preserves_all_source_leaves() {
         for text in [
-            "-- comment\r\ndef x : Point := { y := 2, -- between\r\n x := 1, }\r\n",
+            // The second field is aligned with the first: left of it the pin expects `}`.
+            "-- comment\r\ndef x : Point := { y := 2, -- between\r\n                   x := 1, }\r\n",
             "def x := { inner := { value := 3 : Box Nat } : Outer }",
             "def x := ({ value := 7 } : Box Nat)",
             "def x (value : Nat) : Box Nat := { value }",

@@ -299,6 +299,11 @@ struct BoundedTermFrame {
     application: Vec<(Syntax, usize)>,
     operands: Vec<(Syntax, usize)>,
     operators: Vec<BoundedInfixToken>,
+    /// The column an application argument in this frame starts right of, when a construct saved
+    /// one for this frame (`checkColGt` against its `withPosition`): a structure instance's
+    /// first field, for a field's value. A bracket opens its own frame without one
+    /// (`withoutPosition`).
+    argument_floor: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2209,6 +2214,20 @@ fn push_bounded_operand(
             }
         }
     }
+    // A structure instance saves its first field's position (`structInstFields (sepByIndent …)`,
+    // vendored `Lean/Parser/Term.lean:353`), so an argument in a field's value starts right of it
+    // too: `{ a := f` with `2` on the next line left of `a` ends the field before `2`, and the
+    // pin then expects `}`.
+    if let Some(floor) = frame.argument_floor {
+        for (_, at) in application.iter().skip(1) {
+            if record_terms::column(view, tokens, *at) <= floor {
+                return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                    at: original_position(view, tokens, *at),
+                    expected: NatDefinitionExpectation::RecordField,
+                });
+            }
+        }
+    }
     let first_at = application.first().map_or(empty_at, |(_, at)| *at);
     let term = finish_bounded_application(view, tokens, application, grammar, empty_at)?;
     frame.operands.push((term, first_at));
@@ -3230,6 +3249,7 @@ fn initial_bounded_frames(
         application: Vec::new(),
         operands: Vec::new(),
         operators: Vec::new(),
+        argument_floor: None,
     }];
     let mut cursor = range.start;
     if sequence {
@@ -4121,6 +4141,7 @@ fn bounded_term_compound_token(
                 application: Vec::new(),
                 operands: Vec::new(),
                 operators: Vec::new(),
+                argument_floor: None,
             });
         }
         // A syntax quotation, and inside one an antiquotation, as an operand
@@ -4281,6 +4302,7 @@ fn bounded_term_compound_token(
                     application: Vec::new(),
                     operands: Vec::new(),
                     operators: Vec::new(),
+                    argument_floor: None,
                 });
             } else {
                 return Err(NatDefinitionParseError::OutsideSeedGrammar {
@@ -4323,6 +4345,7 @@ fn bounded_term_compound_token(
                 application: Vec::new(),
                 operands: Vec::new(),
                 operators: Vec::new(),
+                argument_floor: None,
             });
         }
         Some(TokenKind::Symbol(symbol)) if symbol == ")" => {

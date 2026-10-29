@@ -106,24 +106,146 @@ fn an_argument_at_the_commands_column_ends_the_term_as_at_the_pin() {
     let Some(lib) = pinned_lib() else {
         return;
     };
-    let root = workspace();
-    for (index, program) in REFUSED.iter().enumerate() {
+    judge(&lib, &workspace(), REFUSED, ACCEPTED);
+}
+
+/// Programs the pin rejects: `by` reads its tactics with `tacticSeqIndentGt` (vendored
+/// `Lean/Parser/Term/Basic.lean:90`), so an unbraced first tactic starts right of the saved
+/// position, which a match's alternatives save at their first `|`. At or left of that column
+/// the pin's tactic sequence is empty: "Missing cases" when the alternatives then end, "unsolved
+/// goals" for the last one.
+const BY_REFUSED: &[&str] = &[
+    "theorem t : (n : Nat) → n + 0 = n\n  | 0 => by\n  rfl\n  | k + 1 => rfl\n",
+    "theorem t (n : Nat) : n + 0 = n :=\n  match n with\n  | 0 => by\n  rfl\n  | k + 1 => rfl\n",
+    "theorem t : (n : Nat) → n + 0 = n\n  | 0 => by rfl\n  | k + 1 => by\n  rfl\n",
+    "theorem t : (n : Nat) → n + 0 = n\n  | 0 => by\n rfl\n  | k + 1 => rfl\n",
+];
+
+/// Programs the pin accepts, printing nothing: the tactic indented past the alternatives, braced
+/// (`tacticSeqBracketed` checks no column), and inside parentheses, which clear the saved
+/// position (`withoutPosition`).
+const BY_ACCEPTED: &[(&str, &str)] = &[
+    (
+        "theorem t : (n : Nat) → n + 0 = n\n  | 0 => by\n    rfl\n  | k + 1 => rfl\n",
+        "",
+    ),
+    (
+        "theorem t (n : Nat) : n + 0 = n :=\n  match n with\n  | 0 => by\n   rfl\n  | k + 1 => rfl\n",
+        "",
+    ),
+    (
+        "theorem t : (n : Nat) → n + 0 = n\n  | 0 => by {\n  rfl }\n  | k + 1 => rfl\n",
+        "",
+    ),
+    (
+        "theorem t : (n : Nat) → n + 0 = n\n  | 0 => (by\n  rfl)\n  | k + 1 => rfl\n",
+        "",
+    ),
+];
+
+#[test]
+fn a_tactic_at_the_alternatives_column_leaves_by_empty_as_at_the_pin() {
+    let Some(lib) = pinned_lib() else {
+        return;
+    };
+    judge(&lib, &workspace(), BY_REFUSED, BY_ACCEPTED);
+}
+
+/// Programs the pin rejects with "expected '}'": a structure instance's fields are
+/// `sepByIndent`, saving the first field's position (vendored `Lean/Parser/Term.lean:353`). A
+/// later field starts at or right of it (`checkColGe`), and an argument in a field's value
+/// starts right of it (`checkColGt`).
+const RECORD_REFUSED: &[&str] = &[
+    "structure Q where\n  a : Nat\n  b : Nat\ndef f (n : Nat) : Nat := n\n\
+     def q : Q := { a := f\n  2, b := 3 }\ntheorem e : q.a = 2 := rfl\n",
+    "structure Q where\n  a : Nat\n  b : Nat\ndef f (n : Nat) : Nat := n\n\
+     def q : Q := { a :=\n  f 2, b := 3 }\ntheorem e : q.a = 2 := rfl\n",
+    "structure Q where\n  a : Nat\n  b : Nat\ndef q : Q := { a := 1,\n  b := 2 }\n",
+    "structure Q where\n  a : Nat\n  b : Nat\ndef q : Q := { a := 1\n  , b := 2 }\n",
+    "structure Q where\n  a : Nat\n  b : Nat\ndef q : Q := { a := 1\n  + 1, b := 3 }\n",
+    "structure Q where\n  a : Nat\n  b : Nat\ndef f (n : Nat) : Nat := n\n\
+     def q : Q := { a := (f\n  2), b := 3 }\n",
+    // One field: only the argument rule applies, with no later field to refuse instead.
+    "structure Q where\n  a : Nat\ndef f (n : Nat) : Nat := n\n\
+     def q : Q := { a := f\n  2 }\ntheorem e : q.a = 2 := rfl\n",
+    "structure Q where\n  a : Nat\ndef f (n : Nat) : Nat := n\n\
+     def q : Q := { a :=\n  f 2 }\ntheorem e : q.a = 2 := rfl\n",
+];
+
+/// Programs the pin accepts, printing nothing: the argument and the later field right of the
+/// first field or aligned with it, and a record opened on its own line.
+const RECORD_ACCEPTED: &[(&str, &str)] = &[
+    (
+        "structure Q where\n  a : Nat\n  b : Nat\ndef f (n : Nat) : Nat := n\n\
+         def q : Q := { a := f\n                    2, b := 3 }\ntheorem e : q.a = 2 := rfl\n",
+        "",
+    ),
+    (
+        "structure Q where\n  a : Nat\n  b : Nat\ndef f (n : Nat) : Nat := n\n\
+         def q : Q := { a :=\n                   f 2, b := 3 }\ntheorem e : q.a = 2 := rfl\n",
+        "",
+    ),
+    (
+        "structure Q where\n  a : Nat\n  b : Nat\ndef f (n : Nat) : Nat := n\n\
+         def q : Q := {\n  a := f\n   2\n  b := 3 }\ntheorem e : q.a = 2 := rfl\n",
+        "",
+    ),
+    (
+        "structure Q where\n  a : Nat\n  b : Nat\ndef q : Q := {\n  a := 1,\n  b := 2 }\n",
+        "",
+    ),
+    (
+        "structure Q where\n  a : Nat\n  b : Nat\ndef q : Q := { a := 1,\n               b := 2 }\n",
+        "",
+    ),
+    (
+        "structure Q where\n  a : Nat\n  b : Nat\ndef q : Q := { a := 1,\n                b := 2 }\n",
+        "",
+    ),
+    (
+        "structure Q where\n  a : Nat\n  b : Nat\ndef q : Q :=\n  { a := 1\n    b := 2 }\n",
+        "",
+    ),
+    (
+        "structure Q where\n  a : Nat\ndef f (n : Nat) : Nat := n\n\
+         def q : Q := { a := f\n                    2 }\ntheorem e : q.a = 2 := rfl\n",
+        "",
+    ),
+    (
+        "structure Q where\n  a : Nat\ndef f (n : Nat) : Nat := n\n\
+         def q : Q := {\n  a := f\n    2 }\ntheorem e : q.a = 2 := rfl\n",
+        "",
+    ),
+];
+
+#[test]
+fn structure_instance_fields_and_arguments_respect_the_first_fields_column() {
+    let Some(lib) = pinned_lib() else {
+        return;
+    };
+    judge(&lib, &workspace(), RECORD_REFUSED, RECORD_ACCEPTED);
+}
+
+/// Each refused program is rejected by the pin and refused here; each accepted one prints the
+/// pin's stdout in both.
+fn judge(lib: &Path, root: &Path, refused: &[&str], accepted: &[(&str, &str)]) {
+    for (index, program) in refused.iter().enumerate() {
         let entry = root.join(format!("Refused{index}.lean"));
         std::fs::write(&entry, format!("{HEADER}{program}")).unwrap();
-        if let Some((code, _)) = pinned(&lib, &entry) {
+        if let Some((code, _)) = pinned(lib, &entry) {
             assert_eq!(code, 1, "the pin rejects {program}");
         }
-        let (code, stdout, stderr) = ours(&lib, &root, &entry);
+        let (code, stdout, stderr) = ours(lib, root, &entry);
         assert_ne!(code, 0, "{program}: {stdout}");
         assert!(stderr.contains("refused"), "{program}: {stderr}");
     }
-    for (index, (program, expected)) in ACCEPTED.iter().enumerate() {
+    for (index, (program, expected)) in accepted.iter().enumerate() {
         let entry = root.join(format!("Accepted{index}.lean"));
         std::fs::write(&entry, format!("{HEADER}{program}")).unwrap();
-        if let Some((code, stdout)) = pinned(&lib, &entry) {
+        if let Some((code, stdout)) = pinned(lib, &entry) {
             assert_eq!((code, stdout.as_str()), (0, *expected), "the pin moved");
         }
-        let (code, stdout, stderr) = ours(&lib, &root, &entry);
+        let (code, stdout, stderr) = ours(lib, root, &entry);
         assert_eq!(code, 0, "{program}: {stderr}");
         assert_eq!(stdout, *expected, "{program}: {stderr}");
     }
