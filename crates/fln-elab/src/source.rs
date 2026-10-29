@@ -5597,6 +5597,303 @@ impl Context {
         }
         Ok(())
     }
+
+    /// The rest of `addAutoBoundImplicits` with `mkForallFVars'` (vendored
+    /// `Lean/Elab/Term/TermElabM.lean:1964-2058`, `Lean/Meta/ForEachExpr.lean:84-142`): a hole
+    /// the elaborated header leaves in an auto-bound implicit's type becomes one more implicit
+    /// binder, just before the first auto whose type mentions it. `(h : (a :: [b]).length = 3)`
+    /// leaves `a b : ?α` and binds `{α✝ : Type u_1} {a b : α✝}`. The binder is named after the
+    /// parameter the hole first fills (`List.length`'s `α`), or `x` when it fills none.
+    /// `parameters` starts with the `autos` auto-bound locals; the new locals join them there
+    /// and in the local context.
+    pub(super) fn generalize_auto_bound_holes(
+        &mut self,
+        parameters: &mut Vec<LocalDecl>,
+        autos: usize,
+        expected: &Expr,
+    ) -> Result<(), NatDefinitionElabError> {
+        // `collectUnassignedMVars` over each auto's type in turn: the holes it adds go before it.
+        let mut holes: Vec<MVarId> = Vec::new();
+        let mut before: Vec<usize> = Vec::new();
+        for (position, auto) in parameters[..autos].iter().enumerate() {
+            let type_ = self.instantiate(&auto.type_)?;
+            self.collect_unassigned_holes(&type_, &mut holes)?;
+            before.resize(holes.len(), position);
+        }
+        if holes.is_empty() {
+            return Ok(());
+        }
+        // `setMVarUserNamesAt` over the binder types, holes and autos first, then the type.
+        let mut terms = Vec::with_capacity(holes.len() + parameters.len() + 1);
+        for hole in &holes {
+            let decl = self.txn.mvars.get_decl(hole).cloned();
+            let decl = decl.ok_or_else(|| failure(SourceInferenceError::Scope))?;
+            terms.push(self.instantiate(&decl.type_)?);
+        }
+        for parameter in parameters.iter() {
+            let type_ = parameter.type_.clone();
+            terms.push(self.instantiate(&type_)?);
+        }
+        terms.push(self.instantiate(expected)?);
+        let mut stems: std::collections::HashMap<MVarId, Name> = std::collections::HashMap::new();
+        for term in &terms {
+            self.name_holes_by_parameter(term, &holes, &mut stems)?;
+        }
+        let mut locals = Vec::with_capacity(holes.len());
+        for hole in &holes {
+            let stem = stems
+                .get(hole)
+                .cloned()
+                .unwrap_or_else(|| Name::from_components(["x"]));
+            let user_name = self.fresh_inaccessible(&stem)?;
+            let decl = self.txn.mvars.get_decl(hole).cloned();
+            let decl = decl.ok_or_else(|| failure(SourceInferenceError::Scope))?;
+            let type_ = self.instantiate(&decl.type_)?;
+            let id = FVarId(self.fresh_name()?);
+            self.txn
+                .assign_mvar(
+                    hole.clone(),
+                    Expr::fvar(id.clone()),
+                    crate::mvar::AssignmentJustification::DirectDefEq,
+                )
+                .map_err(|error| {
+                    failure(SourceInferenceError::Unification(Box::new(
+                        UnificationError::Metavariable(error),
+                    )))
+                })?;
+            locals.push((id, user_name, type_));
+        }
+        // Rebuild the local context with each new local just before its auto.
+        let autos_ids: Vec<FVarId> = parameters[..autos]
+            .iter()
+            .map(|auto| auto.id.clone())
+            .collect();
+        let old = std::mem::take(&mut self.txn.lctx);
+        for decl in old.decls() {
+            self.tick()?;
+            if let Some(position) = autos_ids.iter().position(|id| id == &decl.id) {
+                for ((id, user_name, type_), _) in locals
+                    .iter()
+                    .zip(&before)
+                    .filter(|(_, auto)| **auto == position)
+                {
+                    self.txn.lctx.add_param(
+                        id.clone(),
+                        user_name.clone(),
+                        type_.clone(),
+                        BinderInfo::Implicit,
+                    );
+                }
+            }
+            match &decl.value {
+                Some(value) => {
+                    self.txn.lctx.add_let(
+                        decl.id.clone(),
+                        decl.user_name.clone(),
+                        decl.type_.clone(),
+                        value.clone(),
+                    );
+                }
+                None => {
+                    self.txn.lctx.add_param(
+                        decl.id.clone(),
+                        decl.user_name.clone(),
+                        decl.type_.clone(),
+                        decl.binder_info,
+                    );
+                }
+            }
+        }
+        let mut rebuilt = Vec::with_capacity(parameters.len() + locals.len());
+        for (position, parameter) in parameters.iter().enumerate() {
+            if position < autos {
+                for ((id, _, _), _) in locals
+                    .iter()
+                    .zip(&before)
+                    .filter(|(_, auto)| **auto == position)
+                {
+                    rebuilt.push(self.txn.lctx.find(id).expect("generalized local").clone());
+                }
+            }
+            let decl = self.txn.lctx.find(&parameter.id);
+            rebuilt.push(decl.expect("header parameter").clone());
+        }
+        *parameters = rebuilt;
+        Ok(())
+    }
+
+    /// The pin's `collectUnassignedMVars` (vendored `Lean/Elab/Term/TermElabM.lean:1964-1987`):
+    /// the unassigned holes of `type_` not yet in `found`, each after the holes of its own type,
+    /// in `getMVars` order (a function before its argument, a domain before its body).
+    fn collect_unassigned_holes(
+        &mut self,
+        type_: &Expr,
+        found: &mut Vec<MVarId>,
+    ) -> Result<(), NatDefinitionElabError> {
+        let mut visited = found.clone();
+        let mut todo: std::collections::VecDeque<MVarId> = ordered_holes(type_).into();
+        while let Some(hole) = todo.pop_front() {
+            self.tick()?;
+            visited.push(hole.clone());
+            if self.txn.mvars.is_assigned(&hole) || found.contains(&hole) {
+                continue;
+            }
+            let decl = self.txn.mvars.get_decl(&hole).cloned();
+            let decl = decl.ok_or_else(|| failure(SourceInferenceError::Scope))?;
+            let hole_type = self.instantiate(&decl.type_)?;
+            let fresh: Vec<MVarId> = ordered_holes(&hole_type)
+                .into_iter()
+                .filter(|inner| !visited.contains(inner))
+                .collect();
+            if fresh.is_empty() {
+                found.push(hole);
+            } else {
+                todo.push_front(hole);
+                for inner in fresh.into_iter().rev() {
+                    todo.push_front(inner);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The pin's `setMVarUserNamesAt` (vendored `Lean/Meta/ForEachExpr.lean:94-110`): each of
+    /// `holes` without a stem yet, found as an argument of an application in `term`, takes the
+    /// name of the parameter it fills. Applications are met outermost first, then the head,
+    /// then the arguments, left to right.
+    fn name_holes_by_parameter(
+        &mut self,
+        term: &Expr,
+        holes: &[MVarId],
+        stems: &mut std::collections::HashMap<MVarId, Name>,
+    ) -> Result<(), NatDefinitionElabError> {
+        let mut stack = vec![term.clone()];
+        while let Some(expr) = stack.pop() {
+            self.tick()?;
+            if !expr.has_expr_mvar() {
+                continue;
+            }
+            match expr.node() {
+                ExprNode::App { .. } => {
+                    let mut head = &expr;
+                    let mut arguments = Vec::new();
+                    while let ExprNode::App { f, a } = head.node() {
+                        arguments.push(a.clone());
+                        head = f;
+                    }
+                    arguments.reverse();
+                    for (index, argument) in arguments.iter().enumerate() {
+                        if let ExprNode::MVar { id } = argument.node()
+                            && holes.contains(id)
+                            && !stems.contains_key(id)
+                            && let Some(name) = self.parameter_name(head, index)?
+                        {
+                            stems.insert(id.clone(), name);
+                        }
+                    }
+                    for argument in arguments.into_iter().rev() {
+                        stack.push(argument);
+                    }
+                    stack.push(head.clone());
+                }
+                ExprNode::Lam {
+                    binder_type, body, ..
+                }
+                | ExprNode::ForallE {
+                    binder_type, body, ..
+                } => {
+                    stack.push(body.clone());
+                    stack.push(binder_type.clone());
+                }
+                ExprNode::LetE {
+                    type_, value, body, ..
+                } => {
+                    stack.push(body.clone());
+                    stack.push(value.clone());
+                    stack.push(type_.clone());
+                }
+                ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => {
+                    stack.push(expr.clone());
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// The name of `head`'s `index`th parameter, read off its type's binders.
+    fn parameter_name(
+        &mut self,
+        head: &Expr,
+        index: usize,
+    ) -> Result<Option<Name>, NatDefinitionElabError> {
+        let mut type_ = match head.node() {
+            ExprNode::Const { name, .. } => match self.txn.env.find(name) {
+                Some(info) => info.constant_val().type_.clone(),
+                None => return Ok(None),
+            },
+            ExprNode::FVar { id } => match self.txn.lctx.find(id) {
+                Some(decl) => decl.type_.clone(),
+                None => return Ok(None),
+            },
+            _ => return Ok(None),
+        };
+        for _ in 0..index {
+            self.tick()?;
+            let ExprNode::ForallE { body, .. } = type_.node() else {
+                return Ok(None);
+            };
+            type_ = body.clone();
+        }
+        Ok(match type_.node() {
+            ExprNode::ForallE { binder_name, .. } => Some(binder_name.clone()),
+            _ => None,
+        })
+    }
+}
+
+/// The holes of `expr` in the pin's `getMVars` order (vendored `Lean/Util/CollectMVars.lean`):
+/// a function before its argument, a domain before its body, each hole once.
+fn ordered_holes(expr: &Expr) -> Vec<MVarId> {
+    let mut holes = Vec::new();
+    let mut stack = vec![expr.clone()];
+    while let Some(expr) = stack.pop() {
+        if !expr.has_expr_mvar() {
+            continue;
+        }
+        match expr.node() {
+            ExprNode::MVar { id } => {
+                if !holes.contains(id) {
+                    holes.push(id.clone());
+                }
+            }
+            ExprNode::App { f, a } => {
+                stack.push(a.clone());
+                stack.push(f.clone());
+            }
+            ExprNode::Lam {
+                binder_type, body, ..
+            }
+            | ExprNode::ForallE {
+                binder_type, body, ..
+            } => {
+                stack.push(body.clone());
+                stack.push(binder_type.clone());
+            }
+            ExprNode::LetE {
+                type_, value, body, ..
+            } => {
+                stack.push(body.clone());
+                stack.push(value.clone());
+                stack.push(type_.clone());
+            }
+            ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => {
+                stack.push(expr.clone());
+            }
+            _ => {}
+        }
+    }
+    holes
 }
 
 /// A declaration's own short name, which its header never auto-binds (MutualDef.lean:213).
@@ -5893,6 +6190,7 @@ fn definition_elaboration(
             Ok((parameters, expected))
         })?;
     context.refuse_auto_bound_dependencies(&autos, &parameters)?;
+    let auto_count = autos.len();
     parameters.splice(0..0, autos);
     context.infer_level_params = false;
     // Later binders may determine earlier class inputs, but the body may not
@@ -5902,6 +6200,7 @@ fn definition_elaboration(
     context.resume_postponed_eliminators(true)?;
     if let Some(expected) = &expected {
         context.flush(true)?;
+        context.generalize_auto_bound_holes(&mut parameters, auto_count, expected)?;
         let mut types = Vec::with_capacity(parameters.len() + 1);
         for parameter in &parameters {
             types.push(context.instantiate(&parameter.type_)?);

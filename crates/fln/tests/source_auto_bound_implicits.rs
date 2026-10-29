@@ -105,6 +105,83 @@ fn unknown_header_names_become_leading_implicit_binders() {
     assert_eq!(vlen[1].2, constant("Nat"));
 }
 
+/// A hole the header leaves in auto-bound implicits' type becomes one more implicit binder, just
+/// before the first of them, named after the parameter it fills (`addAutoBoundImplicits` with
+/// `mkForallFVars'`, bead fln-auto-bound-type-metavariable-w1il). The pin's `#check` (2026-10-29):
+/// `@heqTrue : ∀ {α : Sort u_1} {a : α} {β : Sort u_1} {b : β}, a ≍ b → True`,
+/// `@eqSymm : ∀ {α : Sort u_1} {a b : α}, a = b → b = a` and
+/// `@EQ.trans : {α : Type} → {a b c : α} → EQ a b → EQ b c → EQ a c` (upstream
+/// `tests/elab/calcInType.lean`). The pin stores those names with macro scopes, and so does this
+/// engine.
+#[test]
+fn a_type_hole_of_auto_bound_implicits_becomes_a_binder_before_them() {
+    let engine = checked(
+        "theorem heqTrue (_h : HEq a b) : True := True.intro\n\
+         theorem eqSymm (h : a = b) : b = a := h ▸ rfl\n\
+         inductive EQ {α : Type} (a : α) : α → Type where\n  | refl : EQ a a\n\
+         def EQ.trans (h₁ : EQ a b) (h₂ : EQ b c) : EQ a c := by\n  cases h₁; cases h₂; constructor\n",
+    );
+    // A macro-scoped `α._@.…` as its stem and a mark; any other name as it is.
+    let shape = |name: &str, count: usize| {
+        binders(&engine, name, count)
+            .into_iter()
+            .map(|(name, style, type_)| {
+                let name = match name.split_once("._@.") {
+                    Some((stem, _)) => format!("{stem}✝"),
+                    None => name,
+                };
+                (name, style, type_)
+            })
+            .collect::<Vec<_>>()
+    };
+    let names = |found: &[(String, BinderInfo, Expr)]| {
+        found
+            .iter()
+            .map(|(name, style, _)| (name.clone(), *style))
+            .collect::<Vec<_>>()
+    };
+    let implicit = |name: &str| (name.to_owned(), BinderInfo::Implicit);
+    let bound = Expr::bvar(0).unwrap();
+    let heq = shape("heqTrue", 5);
+    assert_eq!(
+        names(&heq),
+        [
+            implicit("α✝"),
+            implicit("a"),
+            implicit("β✝"),
+            implicit("b"),
+            ("_h".to_owned(), BinderInfo::Default)
+        ]
+    );
+    assert!(
+        matches!(heq[0].2.node(), ExprNode::Sort { .. }),
+        "{:?}",
+        heq[0].2
+    );
+    assert_eq!(
+        heq[2].2, heq[0].2,
+        "both in the one universe `HEq` gives them"
+    );
+    assert_eq!((&heq[1].2, &heq[3].2), (&bound, &bound));
+    let symm = shape("eqSymm", 4);
+    assert_eq!(
+        names(&symm),
+        [
+            implicit("α✝"),
+            implicit("a"),
+            implicit("b"),
+            ("h".to_owned(), BinderInfo::Default)
+        ]
+    );
+    assert_eq!((&symm[1].2, &symm[2].2), (&bound, &Expr::bvar(1).unwrap()));
+    let trans = shape("EQ.trans", 6);
+    assert_eq!(
+        names(&trans)[..4],
+        [implicit("α✝"), implicit("a"), implicit("b"), implicit("c")]
+    );
+    assert_eq!(trans[0].2, Expr::sort(fln_core::level::Level::one()));
+}
+
 /// Strict names with a suffix of digits, subscripts, `_` or `'`, and a theorem's header.
 #[test]
 fn strict_names_with_suffixes_and_theorem_headers_are_bound() {
