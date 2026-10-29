@@ -77,6 +77,7 @@ jobs:
               'crates/fln-elab/src/source/tactics/control.rs',
               'crates/fln-elab/src/source/tactics/conv/congr.rs',
               'crates/fln-elab/src/constraint/unify.rs',
+              'crates/fln-elab/src/constraint/unify/pattern_spine.rs',
               'crates/fln-elab/tests/native_unification_reducible_patterns.rs',
           }
           for path, blobs in changes.items():
