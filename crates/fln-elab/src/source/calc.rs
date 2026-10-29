@@ -13,6 +13,9 @@ pub(super) struct Build<'a> {
     saved: LocalContext,
     bindings: Vec<(FVarId, Name, Expr, Expr)>,
     chain: Option<Typed>,
+    /// Step proofs written as `by` blocks, held as synthetic holes until the chain has met the
+    /// expected type (`defer_calculation_proof`).
+    pub deferred: Vec<(MVarId, &'a Syntax)>,
 }
 
 struct Relation {
@@ -100,7 +103,83 @@ impl Context {
             saved: self.txn.lctx.clone(),
             bindings: Vec::new(),
             chain: None,
+            deferred: Vec::new(),
         })
+    }
+
+    /// Whether a step's proof should wait for the expected type: a `by` block, against a relation
+    /// with holes. The pin elaborates such a block as a postponed synthetic hole, synthesized after
+    /// `elabCalc` has unified the composed relation with the expected type (`ensureHasType`,
+    /// vendored `Lean/Elab/Calc.lean`). So in `calc _ < 4 := by decide` against `3 < 5` the tactic
+    /// sees `3 < 4`, not `?a < 4`.
+    pub(super) fn deferred_calculation_proof(
+        &mut self,
+        relation: &Expr,
+        proof: &Syntax,
+    ) -> Result<bool, NatDefinitionElabError> {
+        Ok(proof.kind() == Some(&parser_kind(&["Term", "byTactic"]))
+            && self.instantiate(relation)?.has_expr_mvar())
+    }
+
+    /// Take a synthetic hole as the step's proof and remember the `by` block that fills it.
+    pub(super) fn defer_calculation_proof<'a>(
+        &mut self,
+        build: &mut Build<'a>,
+        relation: Expr,
+        proof: &'a Syntax,
+    ) -> Result<(), NatDefinitionElabError> {
+        let name = self.fresh_name()?;
+        let id = MVarId(name.clone());
+        self.txn.mvars.declare(
+            id.clone(),
+            name,
+            relation.clone(),
+            self.txn.lctx.clone(),
+            MetavarKind::SyntheticOpaque,
+            0,
+            None,
+        );
+        let hole = Typed {
+            value: Expr::mvar(id.clone()),
+            type_: relation.clone(),
+        };
+        self.add_calculation_step(build, relation, hole)?;
+        build.deferred.push((id, proof));
+        Ok(())
+    }
+
+    /// The type a deferred step proof is now elaborated against: its relation as instantiated after
+    /// the chain met the expected type.
+    pub(super) fn deferred_calculation_type(
+        &mut self,
+        hole: &MVarId,
+    ) -> Result<Expr, NatDefinitionElabError> {
+        let type_ = self
+            .txn
+            .mvars
+            .get_decl(hole)
+            .map(|declaration| declaration.type_.clone())
+            .ok_or_else(|| failure(SourceInferenceError::Scope))?;
+        self.instantiate(&type_)
+    }
+
+    /// Fill a deferred step's hole with its elaborated `by` block.
+    pub(super) fn assign_calculation_proof(
+        &mut self,
+        hole: MVarId,
+        proof: Typed,
+    ) -> Result<(), NatDefinitionElabError> {
+        let expected = self.deferred_calculation_type(&hole)?;
+        self.constrain_type(&proof.type_, &expected)?;
+        let value = self.instantiate(&proof.value)?;
+        self.txn
+            .assign_mvar(hole, value, AssignmentJustification::SyntheticHole)
+            .map_err(|error| {
+                failure(SourceInferenceError::Unification(Box::new(
+                    UnificationError::Metavariable(error),
+                )))
+            })?;
+        Ok(())
     }
 
     /// A first step `a` without a proof, as the pin reads it (`a = _ := rfl`, the hole then

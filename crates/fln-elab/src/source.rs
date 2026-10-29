@@ -2057,6 +2057,11 @@ impl Context {
             CalcProof(calc::Build<'a>, Expr),
             /// A first calculation step without a proof: the term it starts from.
             CalcStart(calc::Build<'a>),
+            /// A step's `by` block, elaborated once the chain has met the expected type.
+            CalcDeferredVisit(MVarId, &'a Syntax),
+            CalcDeferredAssign(MVarId),
+            /// The finished chain, instantiated after its deferred step proofs.
+            CalcDeferredFinish(Typed),
             MatrixScope(Vec<Name>),
             CaptureRecursiveContext,
             MatchDiscriminant(matching::MatchParts<'a>, Option<Expr>),
@@ -2324,7 +2329,7 @@ impl Context {
                                 false,
                             ));
                         }
-                        Task::CalcNext(build) => {
+                        Task::CalcNext(mut build) => {
                             if let Some(&(relation, proof)) = build.steps.get(build.cursor) {
                                 if proof.is_none() {
                                     tasks.push(Task::CalcStart(build));
@@ -2337,8 +2342,31 @@ impl Context {
                                 tasks.push(Task::CalcRelation(build));
                                 tasks.push(Task::Visit(relation, Some(expected), true));
                             } else {
-                                values.push(self.finish_calculation(build)?);
+                                let deferred = std::mem::take(&mut build.deferred);
+                                let chain = self.finish_calculation(build)?;
+                                if deferred.is_empty() {
+                                    values.push(chain);
+                                } else {
+                                    tasks.push(Task::CalcDeferredFinish(chain));
+                                    for (hole, proof) in deferred.into_iter().rev() {
+                                        tasks.push(Task::CalcDeferredVisit(hole, proof));
+                                    }
+                                }
                             }
+                        }
+                        Task::CalcDeferredVisit(hole, proof) => {
+                            let expected = self.deferred_calculation_type(&hole)?;
+                            tasks.push(Task::CalcDeferredAssign(hole));
+                            tasks.push(Task::Visit(proof, Some(expected), true));
+                        }
+                        Task::CalcDeferredAssign(hole) => {
+                            let proof = values.pop().expect("deferred calculation proof visit");
+                            self.assign_calculation_proof(hole, proof)?;
+                        }
+                        Task::CalcDeferredFinish(mut chain) => {
+                            chain.value = self.instantiate(&chain.value)?;
+                            chain.type_ = self.instantiate(&chain.type_)?;
+                            values.push(chain);
                         }
                         Task::CalcStart(mut build) => {
                             let start = values.pop().expect("calculation start visit");
@@ -2353,6 +2381,11 @@ impl Context {
                             let proof = build.steps[build.cursor]
                                 .1
                                 .ok_or_else(|| failure(SourceInferenceError::Scope))?;
+                            if self.deferred_calculation_proof(&relation, proof)? {
+                                self.defer_calculation_proof(&mut build, relation, proof)?;
+                                tasks.push(Task::CalcNext(build));
+                                continue;
+                            }
                             tasks.push(Task::CalcProof(build, relation.clone()));
                             tasks.push(Task::Visit(proof, Some(relation), true));
                         }
