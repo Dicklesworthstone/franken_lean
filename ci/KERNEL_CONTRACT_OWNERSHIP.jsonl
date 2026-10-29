@@ -1,4 +1,4 @@
-{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":736,"projection_hash":"ae36f29fdb1010c99c995a5536aaad53a90ad5cf617bc9cb1098ff3e6a841104"}
+{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":737,"projection_hash":"14f0dcfef69815cbc079e3b95f0ad65a988372fb7ee7fcbd36254c6020e83efa"}
 {"id":"fln-0bw5"}
 {"id":"fln-0eq8"}
 {"id":"fln-0rxm"}
@@ -98,6 +98,7 @@
 {"id":"fln-boundary-api-no-admission-argument-discarded-ez07"}
 {"id":"fln-bz4h"}
 {"id":"fln-c78c"}
+{"id":"fln-calc-by-before-expected-type-7561"}
 {"id":"fln-census-empty-referent-no-mock-krb0"}
 {"id":"fln-census-out-of-git-2ya9"}
 {"id":"fln-check-optparam-signature-isge"}
