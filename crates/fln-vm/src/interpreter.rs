@@ -62,6 +62,7 @@ mod array_construction;
 mod arrays;
 mod diagnostics;
 mod floats;
+mod packed_constructors;
 mod string_fold;
 mod strings;
 mod tail_calls;
@@ -1506,6 +1507,11 @@ pub enum VmRefusal {
         field: usize,
         actual_fields: usize,
     },
+    ConstructorScalarBounds {
+        offset: usize,
+        width: usize,
+        object_fields: usize,
+    },
     InvalidStringObject,
     InvalidArrayObject,
     InvalidByteArrayObject,
@@ -1685,6 +1691,14 @@ impl fmt::Display for VmRefusal {
             } => write!(
                 f,
                 "constructor projection field {field} is outside {actual_fields} object fields"
+            ),
+            Self::ConstructorScalarBounds {
+                offset,
+                width,
+                object_fields,
+            } => write!(
+                f,
+                "constructor scalar access of {width} bytes at offset {offset} is outside scalar storage after {object_fields} object fields"
             ),
             Self::InvalidStringObject => write!(f, "Marrow String object is not canonical UTF-8"),
             Self::InvalidArrayObject => write!(f, "Marrow Array object header is inconsistent"),
@@ -2314,6 +2328,61 @@ fn run(
                     dst,
                     Obj::mk_ctor(tag, values, scalar_bytes),
                 )?;
+                advance(current_frame_mut(&mut stack)?)?;
+            }
+            Instruction::CtorPacked {
+                dst,
+                tag,
+                ref fields,
+                ref scalar_bytes,
+                ref scalars,
+            } => {
+                let mut bytes = scalar_bytes.clone();
+                for (argument, scalar) in scalars.iter().enumerate() {
+                    let value = register(current_frame(&stack)?, scalar.value)?;
+                    if let Err(refusal) = packed_constructors::write_scalar(
+                        &mut bytes,
+                        fields.len(),
+                        scalar.offset,
+                        scalar.kind,
+                        value,
+                        argument,
+                    ) {
+                        return Ok(VmExit::Refused {
+                            refusal,
+                            usage: usage(steps, peak_stack_depth),
+                        });
+                    }
+                }
+                // Populate a fresh scalar payload before the constructor can
+                // escape. Existing objects and aliases are never mutated.
+                let values = clone_registers(current_frame(&stack)?, fields.iter().copied())?;
+                set_register(
+                    current_frame_mut(&mut stack)?,
+                    dst,
+                    Obj::mk_ctor(tag, values, &bytes),
+                )?;
+                advance(current_frame_mut(&mut stack)?)?;
+            }
+            Instruction::CtorScalar {
+                dst,
+                src,
+                offset,
+                kind,
+            } => {
+                let value = register(current_frame(&stack)?, src)?;
+                let projected = match packed_constructors::project(value, offset, kind) {
+                    Ok(value) => value,
+                    Err(refusal) => {
+                        return Ok(VmExit::Refused {
+                            refusal,
+                            usage: usage(steps, peak_stack_depth),
+                        });
+                    }
+                };
+                // Complete the scalar copy before replacing a possibly
+                // identical source register and releasing its constructor.
+                set_register(current_frame_mut(&mut stack)?, dst, projected)?;
                 advance(current_frame_mut(&mut stack)?)?;
             }
             Instruction::CtorTest {

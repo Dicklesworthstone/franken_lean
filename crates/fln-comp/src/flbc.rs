@@ -31,15 +31,16 @@ use std::fmt;
 /// version 14 adds borrowed, shape-checked constructor discrimination;
 /// version 15 adds terminal direct and closure calls with frame ownership transfer;
 /// version 16 distinguishes erased ABI results from the Nat-specific union;
-/// version 17 adds object-field projection checked against the runtime layout.
-pub const FLBC_SCHEMA_VERSION: u16 = 17;
+/// version 17 adds object-field projection checked against the runtime layout;
+/// version 18 adds immutable packed integer construction and checked projection.
+pub const FLBC_SCHEMA_VERSION: u16 = 18;
 
 /// Canonical binary envelope version for persisted FLBC artifacts.
 ///
 /// This is independent of [`FLBC_SCHEMA_VERSION`]: the envelope freezes byte
 /// framing and opcode numbers, while the embedded schema version freezes the
 /// program model accepted by [`validate`].
-pub const FLBC_WIRE_VERSION: u16 = 12;
+pub const FLBC_WIRE_VERSION: u16 = 13;
 
 /// Canonical witness schema for the bounded ownership pass.
 ///
@@ -58,8 +59,9 @@ pub const FLBC_WIRE_VERSION: u16 = 12;
 /// admits cyclic CFG register reuse and binds its redefinition count; version
 /// 15 recognizes terminal calls as releasing the caller's remaining handles;
 /// version 16 counts erased callable results as potentially owned handles;
-/// version 17 retains dynamic constructor projection results as owned handles.
-pub const OWNERSHIP_WITNESS_VERSION: u16 = 17;
+/// version 17 retains dynamic constructor projection results as owned handles;
+/// version 18 borrows packed scalar inputs and tracks their allocated results.
+pub const OWNERSHIP_WITNESS_VERSION: u16 = 18;
 
 const FLBC_MAGIC: [u8; 8] = *b"FLNFLBC\0";
 
@@ -86,6 +88,8 @@ const OP_CTOR_TEST: u8 = 19;
 const OP_TAIL_CALL: u8 = 20;
 const OP_TAIL_APPLY: u8 = 21;
 const OP_CTOR_FIELD_DYNAMIC: u8 = 22;
+const OP_CTOR_PACKED: u8 = 23;
+const OP_CTOR_SCALAR: u8 = 24;
 
 /// Explicit allocation and work ceilings for canonical FLBC artifacts.
 ///
@@ -170,6 +174,10 @@ pub enum CodecError {
         tag: u8,
         offset: usize,
     },
+    InvalidScalarKind {
+        tag: u8,
+        offset: usize,
+    },
     TrailingBytes {
         offset: usize,
         remaining: usize,
@@ -227,6 +235,10 @@ impl fmt::Display for CodecError {
             Self::InvalidCallableResultOwnership { tag, offset } => write!(
                 f,
                 "unknown FLBC callable result ownership tag {tag} at offset {offset}"
+            ),
+            Self::InvalidScalarKind { tag, offset } => write!(
+                f,
+                "unknown FLBC packed scalar kind {tag} at offset {offset}"
             ),
             Self::TrailingBytes { offset, remaining } => write!(
                 f,
@@ -448,6 +460,87 @@ impl CallableResultOwnership {
     }
 }
 
+/// Integer widths in a constructor's packed scalar payload. Values still travel
+/// between instructions as checked Marrow objects; these kinds describe bytes,
+/// not a second register representation.
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum ScalarKind {
+    UInt8,
+    UInt16,
+    UInt32,
+    UInt64,
+    USize,
+}
+
+impl ScalarKind {
+    pub const fn width(self) -> usize {
+        match self {
+            Self::UInt8 => 1,
+            Self::UInt16 => 2,
+            Self::UInt32 => 4,
+            Self::UInt64 => 8,
+            Self::USize => std::mem::size_of::<usize>(),
+        }
+    }
+
+    const fn wire_tag(self) -> u8 {
+        match self {
+            Self::UInt8 => 0,
+            Self::UInt16 => 1,
+            Self::UInt32 => 2,
+            Self::UInt64 => 3,
+            Self::USize => 4,
+        }
+    }
+
+    fn from_wire_tag(tag: u8, offset: usize) -> Result<Self, CodecError> {
+        match tag {
+            0 => Ok(Self::UInt8),
+            1 => Ok(Self::UInt16),
+            2 => Ok(Self::UInt32),
+            3 => Ok(Self::UInt64),
+            4 => Ok(Self::USize),
+            _ => Err(CodecError::InvalidScalarKind { tag, offset }),
+        }
+    }
+}
+
+/// One immutable initialization of a packed scalar field. `offset` is measured
+/// in bytes from the constructor data after its header, including object slots.
+/// Initializations are in increasing, nonoverlapping byte order.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PackedScalar<T> {
+    pub offset: u16,
+    pub kind: ScalarKind,
+    pub value: T,
+}
+
+pub(crate) fn invalid_packed_scalar<T>(
+    object_fields: usize,
+    scalar_bytes: usize,
+    scalars: &[PackedScalar<T>],
+) -> Option<(usize, u16)> {
+    let floor = object_fields.saturating_mul(std::mem::size_of::<usize>());
+    let limit = floor.saturating_add(scalar_bytes);
+    let mut previous_end = floor;
+    for (index, scalar) in scalars.iter().enumerate() {
+        let offset = usize::from(scalar.offset);
+        let end = offset.saturating_add(scalar.kind.width());
+        if offset < previous_end || end > limit {
+            return Some((index, scalar.offset));
+        }
+        previous_end = end;
+    }
+    None
+}
+
+pub(crate) fn scalar_projection_in_range(offset: u16, kind: ScalarKind) -> bool {
+    let limit = (abi::MAX_CTOR_FIELDS - 1)
+        .saturating_mul(std::mem::size_of::<usize>())
+        .saturating_add(abi::MAX_CTOR_SCALARS_SIZE - 1);
+    usize::from(offset).saturating_add(kind.width()) <= limit
+}
+
 /// Target-independent register bytecode.
 ///
 /// Every operand is an ABI-valued register at runtime. `Copy` retains an
@@ -486,6 +579,15 @@ pub enum Instruction {
         fields: Vec<Register>,
         scalar_bytes: Vec<u8>,
     },
+    /// Allocate a fresh constructor after borrowing and checking all scalar
+    /// operands. Untouched bytes retain the immutable scalar template.
+    CtorPacked {
+        dst: Register,
+        tag: u8,
+        fields: Vec<Register>,
+        scalar_bytes: Vec<u8>,
+        scalars: Vec<PackedScalar<Register>>,
+    },
     /// Return scalar 1 exactly when the borrowed object is a constructor with
     /// this tag and object-slot count, or 0 otherwise. No field is accessed.
     CtorTest {
@@ -510,6 +612,15 @@ pub enum Instruction {
         dst: Register,
         src: Register,
         field: u16,
+    },
+    /// Read a complete integer field after checking the actual constructor
+    /// kind, object-slot floor and scalar payload bounds. Wide integers retain
+    /// all bits in Marrow's checked wide carrier.
+    CtorScalar {
+        dst: Register,
+        src: Register,
+        offset: u16,
+        kind: ScalarKind,
     },
     Array {
         dst: Register,
@@ -607,11 +718,19 @@ impl Instruction {
             | Self::Drop { src }
             | Self::CtorField { src, .. }
             | Self::CtorFieldDynamic { src, .. }
+            | Self::CtorScalar { src, .. }
             | Self::CtorTest { src, .. }
             | Self::CheckSystemValue { module_name: src } => {
                 vec![*src]
             }
             Self::Ctor { fields, .. } => fields.clone(),
+            Self::CtorPacked {
+                fields, scalars, ..
+            } => fields
+                .iter()
+                .copied()
+                .chain(scalars.iter().map(|scalar| scalar.value))
+                .collect(),
             Self::Array { items, .. } => items.clone(),
             Self::Intrinsic { args, .. }
             | Self::Call { args, .. }
@@ -637,8 +756,10 @@ impl Instruction {
             | Self::Copy { dst, .. }
             | Self::Move { dst, .. }
             | Self::Ctor { dst, .. }
+            | Self::CtorPacked { dst, .. }
             | Self::CtorField { dst, .. }
             | Self::CtorFieldDynamic { dst, .. }
+            | Self::CtorScalar { dst, .. }
             | Self::CtorTest { dst, .. }
             | Self::Array { dst, .. }
             | Self::Intrinsic { dst, .. }
@@ -1522,6 +1643,18 @@ pub enum ValidationError {
         pc: Pc,
         count: usize,
     },
+    PackedScalarLayout {
+        function: FunctionId,
+        pc: Pc,
+        scalar: usize,
+        offset: u16,
+    },
+    ScalarProjectionOffsetOutOfRange {
+        function: FunctionId,
+        pc: Pc,
+        offset: u16,
+        kind: ScalarKind,
+    },
     CtorFieldShapeOutOfRange {
         function: FunctionId,
         pc: Pc,
@@ -1988,6 +2121,28 @@ impl fmt::Display for ValidationError {
                 function.get(),
                 pc.get()
             ),
+            Self::PackedScalarLayout {
+                function,
+                pc,
+                scalar,
+                offset,
+            } => write!(
+                f,
+                "function {} pc {} packed scalar {scalar} at byte {offset} is out of bounds, overlapping or unordered",
+                function.get(),
+                pc.get()
+            ),
+            Self::ScalarProjectionOffsetOutOfRange {
+                function,
+                pc,
+                offset,
+                kind,
+            } => write!(
+                f,
+                "function {} pc {} {kind:?} projection at byte {offset} exceeds the ABI constructor limit",
+                function.get(),
+                pc.get()
+            ),
             Self::CtorFieldShapeOutOfRange {
                 function,
                 pc,
@@ -2249,6 +2404,20 @@ fn encode_instruction(encoder: &mut Encoder, instruction: &Instruction) -> Resul
             encoder.registers(fields)?;
             encoder.bytes("constructor scalar bytes", scalar_bytes)
         }
+        Instruction::CtorPacked {
+            dst,
+            tag,
+            fields,
+            scalar_bytes,
+            scalars,
+        } => {
+            encoder.u8(OP_CTOR_PACKED)?;
+            encoder.register(*dst)?;
+            encoder.u8(*tag)?;
+            encoder.registers(fields)?;
+            encoder.bytes("constructor scalar bytes", scalar_bytes)?;
+            encoder.packed_scalars(scalars)
+        }
         Instruction::CtorField {
             dst,
             src,
@@ -2268,6 +2437,18 @@ fn encode_instruction(encoder: &mut Encoder, instruction: &Instruction) -> Resul
             encoder.register(*dst)?;
             encoder.register(*src)?;
             encoder.u16(*field)
+        }
+        Instruction::CtorScalar {
+            dst,
+            src,
+            offset,
+            kind,
+        } => {
+            encoder.u8(OP_CTOR_SCALAR)?;
+            encoder.register(*dst)?;
+            encoder.register(*src)?;
+            encoder.u16(*offset)?;
+            encoder.u8(kind.wire_tag())
         }
         Instruction::CtorTest {
             dst,
@@ -2430,6 +2611,13 @@ fn decode_instruction(decoder: &mut Decoder<'_>) -> Result<Instruction, CodecErr
             fields: decoder.registers()?,
             scalar_bytes: decoder.bytes("constructor scalar bytes")?,
         }),
+        OP_CTOR_PACKED => Ok(Instruction::CtorPacked {
+            dst: decoder.register()?,
+            tag: decoder.u8()?,
+            fields: decoder.registers()?,
+            scalar_bytes: decoder.bytes("constructor scalar bytes")?,
+            scalars: decoder.packed_scalars()?,
+        }),
         OP_CTOR_FIELD => Ok(Instruction::CtorField {
             dst: decoder.register()?,
             src: decoder.register()?,
@@ -2441,6 +2629,12 @@ fn decode_instruction(decoder: &mut Decoder<'_>) -> Result<Instruction, CodecErr
             dst: decoder.register()?,
             src: decoder.register()?,
             field: decoder.u16()?,
+        }),
+        OP_CTOR_SCALAR => Ok(Instruction::CtorScalar {
+            dst: decoder.register()?,
+            src: decoder.register()?,
+            offset: decoder.u16()?,
+            kind: decoder.scalar_kind()?,
         }),
         OP_CTOR_TEST => Ok(Instruction::CtorTest {
             dst: decoder.register()?,
@@ -2621,6 +2815,22 @@ impl Encoder {
         self.len("register vector", registers.len())?;
         for register in registers {
             self.u16(register.get())?;
+        }
+        Ok(())
+    }
+
+    fn packed_scalars(&mut self, scalars: &[PackedScalar<Register>]) -> Result<(), CodecError> {
+        self.operands = checked_total(
+            CodecResource::Operands,
+            self.operands,
+            scalars.len(),
+            self.limits.max_operands,
+        )?;
+        self.len("packed scalar operands", scalars.len())?;
+        for scalar in scalars {
+            self.u16(scalar.offset)?;
+            self.u8(scalar.kind.wire_tag())?;
+            self.u16(scalar.value.get())?;
         }
         Ok(())
     }
@@ -2814,6 +3024,38 @@ impl<'a> Decoder<'a> {
             registers.push(Register::new(self.u16()?));
         }
         Ok(registers)
+    }
+
+    fn scalar_kind(&mut self) -> Result<ScalarKind, CodecError> {
+        let offset = self.offset;
+        let tag = self.u8()?;
+        ScalarKind::from_wire_tag(tag, offset)
+    }
+
+    fn packed_scalars(&mut self) -> Result<Vec<PackedScalar<Register>>, CodecError> {
+        let count = self.len("packed scalar operands")?;
+        self.operands = checked_total(
+            CodecResource::Operands,
+            self.operands,
+            count,
+            self.limits.max_operands,
+        )?;
+        self.require_items(count, 5)?;
+        let mut scalars = Vec::new();
+        scalars
+            .try_reserve_exact(count)
+            .map_err(|_| CodecError::AllocationFailure {
+                resource: CodecResource::Operands,
+                requested: count,
+            })?;
+        for _ in 0..count {
+            scalars.push(PackedScalar {
+                offset: self.u16()?,
+                kind: self.scalar_kind()?,
+                value: Register::new(self.u16()?),
+            });
+        }
+        Ok(scalars)
     }
 
     fn argument_ownership(&mut self) -> Result<Vec<ArgumentOwnership>, CodecError> {
@@ -3128,6 +3370,12 @@ fn validate_function(program: &Program, function: &Function) -> Result<(), Valid
                 fields,
                 scalar_bytes,
                 ..
+            }
+            | Instruction::CtorPacked {
+                tag,
+                fields,
+                scalar_bytes,
+                ..
             } => {
                 if *tag > abi::TAG_MAX_CTOR_TAG {
                     return Err(ValidationError::CtorTagOutOfRange {
@@ -3148,6 +3396,17 @@ fn validate_function(program: &Program, function: &Function) -> Result<(), Valid
                         function: function.id,
                         pc,
                         count: scalar_bytes.len(),
+                    });
+                }
+                if let Instruction::CtorPacked { scalars, .. } = instruction
+                    && let Some((scalar, offset)) =
+                        invalid_packed_scalar(fields.len(), scalar_bytes.len(), scalars)
+                {
+                    return Err(ValidationError::PackedScalarLayout {
+                        function: function.id,
+                        pc,
+                        scalar,
+                        offset,
                     });
                 }
             }
@@ -3186,6 +3445,16 @@ fn validate_function(program: &Program, function: &Function) -> Result<(), Valid
                         function: function.id,
                         pc,
                         field: *field,
+                    });
+                }
+            }
+            Instruction::CtorScalar { offset, kind, .. } => {
+                if !scalar_projection_in_range(*offset, *kind) {
+                    return Err(ValidationError::ScalarProjectionOffsetOutOfRange {
+                        function: function.id,
+                        pc,
+                        offset: *offset,
+                        kind: *kind,
                     });
                 }
             }
@@ -3681,11 +3950,22 @@ fn ownership_reads<E>(
         | Instruction::Drop { src }
         | Instruction::CtorField { src, .. }
         | Instruction::CtorFieldDynamic { src, .. }
+        | Instruction::CtorScalar { src, .. }
         | Instruction::CtorTest { src, .. }
         | Instruction::CheckSystemValue { module_name: src } => visit(*src)?,
         Instruction::Ctor { fields, .. } => {
             for register in fields {
                 visit(*register)?;
+            }
+        }
+        Instruction::CtorPacked {
+            fields, scalars, ..
+        } => {
+            for register in fields {
+                visit(*register)?;
+            }
+            for scalar in scalars {
+                visit(scalar.value)?;
             }
         }
         Instruction::Array { items, .. } => {
@@ -3911,12 +4191,16 @@ fn ownership_operand_count(instruction: &Instruction) -> usize {
         | Instruction::Drop { .. }
         | Instruction::CtorField { .. }
         | Instruction::CtorFieldDynamic { .. }
+        | Instruction::CtorScalar { .. }
         | Instruction::CtorTest { .. }
         | Instruction::CheckSystemValue { .. }
         | Instruction::JumpIfZero { .. }
         | Instruction::Return { .. }
         | Instruction::Panic { .. } => 1,
         Instruction::Ctor { fields, .. } => fields.len(),
+        Instruction::CtorPacked {
+            fields, scalars, ..
+        } => fields.len().saturating_add(scalars.len()),
         Instruction::Array { items, .. } => items.len(),
         Instruction::Intrinsic {
             args,
@@ -3982,7 +4266,9 @@ fn ownership_payload_bytes(instruction: &Instruction) -> usize {
     match instruction {
         Instruction::NatBig { limbs_le, .. } => limbs_le.len().saturating_mul(8),
         Instruction::String { value, .. } => value.len(),
-        Instruction::Ctor { scalar_bytes, .. } => scalar_bytes.len(),
+        Instruction::Ctor { scalar_bytes, .. } | Instruction::CtorPacked { scalar_bytes, .. } => {
+            scalar_bytes.len()
+        }
         Instruction::Intrinsic { row, .. } => row.len(),
         Instruction::CheckSystem { module_name } => module_name.len(),
         Instruction::Nat { .. }
@@ -3991,6 +4277,7 @@ fn ownership_payload_bytes(instruction: &Instruction) -> usize {
         | Instruction::Drop { .. }
         | Instruction::CtorField { .. }
         | Instruction::CtorFieldDynamic { .. }
+        | Instruction::CtorScalar { .. }
         | Instruction::CtorTest { .. }
         | Instruction::Array { .. }
         | Instruction::Call { .. }
@@ -4177,6 +4464,19 @@ fn ownership_clone_instruction(instruction: &Instruction) -> Result<Instruction,
             fields: ownership_clone_copy(fields, OwnershipResource::Operands)?,
             scalar_bytes: ownership_clone_copy(scalar_bytes, OwnershipResource::PayloadBytes)?,
         },
+        Instruction::CtorPacked {
+            dst,
+            tag,
+            fields,
+            scalar_bytes,
+            scalars,
+        } => Instruction::CtorPacked {
+            dst: *dst,
+            tag: *tag,
+            fields: ownership_clone_copy(fields, OwnershipResource::Operands)?,
+            scalar_bytes: ownership_clone_copy(scalar_bytes, OwnershipResource::PayloadBytes)?,
+            scalars: ownership_clone_copy(scalars, OwnershipResource::Operands)?,
+        },
         Instruction::CtorField {
             dst,
             src,
@@ -4194,6 +4494,17 @@ fn ownership_clone_instruction(instruction: &Instruction) -> Result<Instruction,
             dst: *dst,
             src: *src,
             field: *field,
+        },
+        Instruction::CtorScalar {
+            dst,
+            src,
+            offset,
+            kind,
+        } => Instruction::CtorScalar {
+            dst: *dst,
+            src: *src,
+            offset: *offset,
+            kind: *kind,
         },
         Instruction::CtorTest {
             dst,
@@ -7002,7 +7313,7 @@ mod codec_tests {
                 function(
                     0,
                     0,
-                    11,
+                    13,
                     vec![
                         Instruction::Nat {
                             dst: r(0),
@@ -7084,6 +7395,23 @@ mod codec_tests {
                             dst: r(10),
                             src: r(4),
                             field: 1,
+                        },
+                        Instruction::CtorPacked {
+                            dst: r(11),
+                            tag: 2,
+                            fields: vec![r(1)],
+                            scalar_bytes: vec![0; 8],
+                            scalars: vec![PackedScalar {
+                                offset: std::mem::size_of::<usize>() as u16,
+                                kind: ScalarKind::UInt64,
+                                value: r(0),
+                            }],
+                        },
+                        Instruction::CtorScalar {
+                            dst: r(12),
+                            src: r(11),
+                            offset: std::mem::size_of::<usize>() as u16,
+                            kind: ScalarKind::UInt64,
                         },
                         Instruction::Return { src: r(9) },
                     ],
@@ -7356,7 +7684,7 @@ mod codec_tests {
         assert_eq!(
             inserted.witness().canonical_text(),
             concat!(
-                "flbc-ownership/17\n",
+                "flbc-ownership/18\n",
                 "function f0 mode=inserted-acyclic-cfg result=scalar source=8 emitted=16 drops=4 moves=1 redefs=0 edges=4 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
             )
         );
@@ -7556,7 +7884,7 @@ mod codec_tests {
         assert_eq!(
             inserted.witness().canonical_text(),
             concat!(
-                "flbc-ownership/17\n",
+                "flbc-ownership/18\n",
                 "function f0 mode=inserted-acyclic-cfg result=scalar source=5 emitted=8 drops=1 moves=0 redefs=0 edges=2 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
             )
         );
@@ -7618,7 +7946,7 @@ mod codec_tests {
         assert_eq!(
             inserted.witness().canonical_text(),
             concat!(
-                "flbc-ownership/17\n",
+                "flbc-ownership/18\n",
                 "function f0 mode=inserted-acyclic-cfg result=scalar source=6 emitted=12 drops=4 moves=0 redefs=0 edges=2 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
             )
         );
@@ -7762,7 +8090,7 @@ mod codec_tests {
         assert_eq!(
             inserted.witness().canonical_text(),
             concat!(
-                "flbc-ownership/17\n",
+                "flbc-ownership/18\n",
                 "function f0 mode=inserted-cyclic-cfg result=scalar source=7 emitted=13 drops=3 moves=0 redefs=0 edges=3 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
                 "function f1 mode=inserted-cyclic-cfg result=scalar source=1 emitted=2 drops=0 moves=0 redefs=0 edges=1 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
                 "function f2 mode=validated-existing-ownership result=scalar source=3 emitted=3 drops=0 moves=0 existing_drops=1 existing_moves=0 redefs=0 edges=0 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
@@ -7895,7 +8223,7 @@ mod codec_tests {
         assert_eq!(
             backedge_inserted.witness().canonical_text(),
             concat!(
-                "flbc-ownership/17\n",
+                "flbc-ownership/18\n",
                 "function f0 mode=inserted-cyclic-cfg result=scalar source=7 emitted=14 drops=4 moves=1 redefs=0 edges=3 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
             )
         );
@@ -8228,7 +8556,7 @@ mod codec_tests {
         assert_eq!(
             inserted.witness().canonical_text(),
             concat!(
-                "flbc-ownership/17\n",
+                "flbc-ownership/18\n",
                 "function f0 mode=inserted-linear result=scalar source=5 emitted=7 drops=2 moves=1 redefs=0 edges=0 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
                 "function f1 mode=inserted-linear result=scalar source=2 emitted=3 drops=1 moves=1 redefs=0 edges=0 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
                 "function f2 mode=inserted-acyclic-cfg result=scalar source=3 emitted=5 drops=0 moves=0 redefs=0 edges=2 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
@@ -8383,7 +8711,7 @@ mod codec_tests {
         assert_eq!(
             inserted.witness().canonical_text(),
             concat!(
-                "flbc-ownership/17\n",
+                "flbc-ownership/18\n",
                 "function f0 mode=inserted-linear result=scalar source=2 emitted=2 drops=0 moves=0 redefs=0 edges=0 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
                 "function f1 mode=inserted-linear-reuse result=scalar source=6 emitted=8 drops=2 moves=3 redefs=3 edges=0 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
             )
@@ -8550,7 +8878,7 @@ mod codec_tests {
         assert_eq!(
             preserved.witness().canonical_text(),
             concat!(
-                "flbc-ownership/17\n",
+                "flbc-ownership/18\n",
                 "function f0 mode=preserved-non-ssa result=scalar source=3 emitted=3 drops=0 moves=0 redefs=0 edges=0 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
             )
         );
@@ -8616,7 +8944,7 @@ mod codec_tests {
         assert_eq!(
             inserted.witness().canonical_text(),
             concat!(
-                "flbc-ownership/17\n",
+                "flbc-ownership/18\n",
                 "function f0 mode=inserted-acyclic-cfg-reuse result=scalar source=8 emitted=14 drops=3 moves=1 redefs=2 edges=3 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
             )
         );
@@ -8819,7 +9147,7 @@ mod codec_tests {
         assert_eq!(
             entry_owned.witness().canonical_text(),
             concat!(
-                "flbc-ownership/17\n",
+                "flbc-ownership/18\n",
                 "function f0 mode=inserted-linear result=scalar source=2 emitted=2 drops=0 moves=0 redefs=0 edges=0 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
                 "function f1 mode=inserted-acyclic-cfg-reuse result=scalar source=6 emitted=12 drops=3 moves=0 redefs=2 edges=3 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
             )
@@ -8885,7 +9213,7 @@ mod codec_tests {
         assert_eq!(
             inserted_cycle.witness().canonical_text(),
             concat!(
-                "flbc-ownership/17\n",
+                "flbc-ownership/18\n",
                 "function f0 mode=inserted-cyclic-cfg-reuse result=scalar source=5 emitted=9 drops=1 moves=0 redefs=1 edges=3 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
             )
         );
@@ -8936,7 +9264,7 @@ mod codec_tests {
         assert_eq!(
             inserted.witness().canonical_text(),
             concat!(
-                "flbc-ownership/17\n",
+                "flbc-ownership/18\n",
                 "function f0 mode=inserted-cyclic-cfg-reuse result=scalar source=7 emitted=13 drops=3 moves=0 redefs=2 edges=3 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
             )
         );
@@ -9230,7 +9558,7 @@ mod codec_tests {
         assert_eq!(
             inserted.witness().canonical_text(),
             concat!(
-                "flbc-ownership/17\n",
+                "flbc-ownership/18\n",
                 "function f0 mode=validated-existing-ownership result=scalar source=3 emitted=3 drops=0 moves=0 existing_drops=0 existing_moves=1 redefs=0 edges=0 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
                 "function f1 mode=validated-existing-ownership result=scalar source=4 emitted=4 drops=0 moves=0 existing_drops=1 existing_moves=0 redefs=0 edges=0 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
                 "function f2 mode=validated-existing-ownership result=scalar source=3 emitted=3 drops=0 moves=0 existing_drops=0 existing_moves=1 redefs=0 edges=0 extern_consumes=0 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
@@ -9752,7 +10080,7 @@ mod codec_tests {
         assert_eq!(
             inserted.witness().canonical_text(),
             concat!(
-                "flbc-ownership/17\n",
+                "flbc-ownership/18\n",
                 "function f0 mode=inserted-linear result=scalar source=4 emitted=5 drops=1 moves=0 redefs=0 edges=0 extern_consumes=1 call_consumes=0 closure_consumes=0 apply_consumes=0 borrowed_results=0 raw_results=0 owned_callable_results=0 scalar_callable_results=0\n",
             )
         );
@@ -11612,8 +11940,8 @@ mod codec_tests {
             bytes,
             vec![
                 70, 76, 78, 70, 76, 66, 67, 0, // magic
-                12, 0, // wire version: dynamic object-field projection opcode 22
-                17, 0, // schema version: runtime-checked object-field projection
+                13, 0, // wire version: packed constructor opcodes 23 and 24
+                18, 0, // schema version: immutable packed integer fields
                 0, 0, 0, 0, // entry
                 1, 0, 0, 0, // function count
                 0, 0, 0, 0, // function id
@@ -11835,6 +12163,256 @@ mod codec_tests {
         assert!(matches!(
             validate(program(r(1), r(1), 0)),
             Err(ValidationError::ReadBeforeWrite { register, .. }) if register == r(1)
+        ));
+    }
+
+    fn packed_program(kind: ScalarKind) -> Program {
+        let offset = u16::try_from(std::mem::size_of::<usize>() + 1).unwrap();
+        let mut entry = function(
+            0,
+            0,
+            7,
+            vec![
+                Instruction::String {
+                    dst: r(0),
+                    value: "borrowed child".to_owned(),
+                },
+                Instruction::Nat {
+                    dst: r(1),
+                    value: 42,
+                },
+                Instruction::CtorPacked {
+                    dst: r(2),
+                    tag: 3,
+                    fields: vec![r(0)],
+                    scalar_bytes: vec![0xa5; 16],
+                    scalars: vec![PackedScalar {
+                        offset,
+                        kind,
+                        value: r(1),
+                    }],
+                },
+                Instruction::Copy {
+                    dst: r(3),
+                    src: r(2),
+                },
+                Instruction::CtorScalar {
+                    dst: r(4),
+                    src: r(2),
+                    offset,
+                    kind,
+                },
+                Instruction::Array {
+                    dst: r(5),
+                    items: vec![r(0), r(1), r(2), r(3), r(4)],
+                },
+                Instruction::CtorScalar {
+                    dst: r(6),
+                    src: r(3),
+                    offset,
+                    kind,
+                },
+                Instruction::Return { src: r(6) },
+            ],
+        );
+        entry.result_ownership = CallableResultOwnership::Erased;
+        Program::new(f(0), vec![entry])
+    }
+
+    #[test]
+    fn packed_integer_instructions_round_trip_and_preserve_borrowed_inputs() {
+        for kind in [
+            ScalarKind::UInt8,
+            ScalarKind::UInt16,
+            ScalarKind::UInt32,
+            ScalarKind::UInt64,
+            ScalarKind::USize,
+        ] {
+            let source =
+                validate(packed_program(kind)).expect("unaligned packed byte offsets validate");
+            let bytes = encode_canonical(&source, CodecLimits::default()).unwrap();
+            assert_eq!(
+                decode_canonical(&bytes, CodecLimits::default()).unwrap(),
+                source
+            );
+            let inserted = insert_ownership(&source, OwnershipLimits::default()).unwrap();
+            validate_ownership_candidate(
+                &source, inserted.program().clone(), inserted.witness().clone(), OwnershipLimits::default(),
+            ).expect("scalar inputs, shared constructor and projected wide boxes have balanced lifetimes");
+            let code = &inserted.program().functions()[0].code;
+            let shared_use = code
+                .iter()
+                .position(|instruction| matches!(instruction, Instruction::Array { .. }))
+                .unwrap();
+            for register in [r(0), r(1), r(2), r(3), r(4)] {
+                assert!(
+                    !code[..shared_use]
+                        .iter()
+                        .any(|instruction| matches!(instruction,
+                    Instruction::Drop { src } if *src == register)),
+                    "packed reads cannot retire a still-shared input"
+                );
+            }
+            let encoded = encode_canonical(inserted.program(), CodecLimits::default()).unwrap();
+            assert_eq!(
+                decode_canonical(&encoded, CodecLimits::default()).unwrap(),
+                *inserted.program()
+            );
+        }
+    }
+
+    #[test]
+    fn packed_layout_checks_cover_object_floor_full_width_order_and_scope() {
+        let kind = ScalarKind::UInt64;
+        for offset in [0, std::mem::size_of::<usize>() as u16 + 15] {
+            let mut source = packed_program(kind);
+            let Instruction::CtorPacked { scalars, .. } = &mut source.functions[0].code[2] else {
+                panic!("packed constructor");
+            };
+            scalars[0].offset = offset;
+            assert!(matches!(
+                validate(source),
+                Err(ValidationError::PackedScalarLayout { scalar: 0, .. })
+            ));
+        }
+        for second_offset in [
+            std::mem::size_of::<usize>() as u16,
+            std::mem::size_of::<usize>() as u16 + 2,
+        ] {
+            let mut source = packed_program(kind);
+            let Instruction::CtorPacked { scalars, .. } = &mut source.functions[0].code[2] else {
+                panic!("packed constructor");
+            };
+            scalars.push(PackedScalar {
+                offset: second_offset,
+                kind: ScalarKind::UInt8,
+                value: r(1),
+            });
+            assert!(matches!(
+                validate(source),
+                Err(ValidationError::PackedScalarLayout { scalar: 1, .. })
+            ));
+        }
+        let mut uninitialized = packed_program(kind);
+        let Instruction::CtorPacked { scalars, .. } = &mut uninitialized.functions[0].code[2]
+        else {
+            panic!("packed constructor");
+        };
+        scalars[0].value = r(4);
+        assert!(
+            matches!(validate(uninitialized), Err(ValidationError::ReadBeforeWrite { register, .. }) if register == r(4))
+        );
+
+        let mut invalid_tag = packed_program(kind);
+        let Instruction::CtorPacked { tag, .. } = &mut invalid_tag.functions[0].code[2] else {
+            panic!("packed constructor");
+        };
+        *tag = abi::TAG_MAX_CTOR_TAG + 1;
+        assert!(matches!(
+            validate(invalid_tag),
+            Err(ValidationError::CtorTagOutOfRange { .. })
+        ));
+
+        let mut invalid_size = packed_program(kind);
+        let Instruction::CtorPacked { scalar_bytes, .. } = &mut invalid_size.functions[0].code[2]
+        else {
+            panic!("packed constructor");
+        };
+        *scalar_bytes = vec![0; abi::MAX_CTOR_SCALARS_SIZE];
+        assert!(matches!(
+            validate(invalid_size),
+            Err(ValidationError::TooManyCtorScalarBytes { .. })
+        ));
+
+        let mut invalid_projection = packed_program(kind);
+        let Instruction::CtorScalar { offset, .. } = &mut invalid_projection.functions[0].code[4]
+        else {
+            panic!("packed projection");
+        };
+        *offset = u16::MAX;
+        assert!(matches!(
+            validate(invalid_projection),
+            Err(ValidationError::ScalarProjectionOffsetOutOfRange { .. })
+        ));
+    }
+
+    #[test]
+    fn packed_wire_operands_are_bounded_before_allocation_and_kinds_are_checked() {
+        let mut encoder = Encoder::new(CodecLimits::default());
+        encoder
+            .packed_scalars(&[PackedScalar {
+                offset: 3,
+                kind: ScalarKind::UInt32,
+                value: r(2),
+            }])
+            .unwrap();
+        let bytes = encoder.finish();
+        assert_eq!(bytes, [1, 0, 0, 0, 3, 0, 2, 2, 0]);
+        for end in 0..bytes.len() {
+            assert!(
+                Decoder::new(&bytes[..end], CodecLimits::default())
+                    .packed_scalars()
+                    .is_err()
+            );
+        }
+        assert_eq!(
+            Decoder::new(&bytes, CodecLimits::default())
+                .packed_scalars()
+                .unwrap(),
+            [PackedScalar {
+                offset: 3,
+                kind: ScalarKind::UInt32,
+                value: r(2)
+            }]
+        );
+        let mut invalid_kind = bytes.clone();
+        invalid_kind[6] = 5;
+        assert!(matches!(
+            Decoder::new(&invalid_kind, CodecLimits::default()).packed_scalars(),
+            Err(CodecError::InvalidScalarKind { tag: 5, offset: 6 })
+        ));
+        let huge_count = u32::MAX.to_le_bytes();
+        assert!(matches!(
+            Decoder::new(
+                &huge_count,
+                CodecLimits {
+                    max_operands: 2,
+                    ..CodecLimits::default()
+                }
+            )
+            .packed_scalars(),
+            Err(CodecError::ResourceLimit {
+                resource: CodecResource::Operands,
+                ..
+            })
+        ));
+        assert!(matches!(
+            Decoder::new(
+                &bytes,
+                CodecLimits {
+                    max_operands: 0,
+                    ..CodecLimits::default()
+                }
+            )
+            .packed_scalars(),
+            Err(CodecError::ResourceLimit {
+                resource: CodecResource::Operands,
+                ..
+            })
+        ));
+        let source = validate(packed_program(ScalarKind::UInt64)).unwrap();
+        assert!(matches!(
+            insert_ownership(
+                &source,
+                OwnershipLimits {
+                    max_operands: 0,
+                    ..OwnershipLimits::default()
+                }
+            ),
+            Err(OwnershipError::ResourceLimit {
+                resource: OwnershipResource::Operands,
+                ..
+            })
         ));
     }
 
