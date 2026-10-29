@@ -1418,21 +1418,58 @@ impl Context {
             }
             matches!(head.node(), ExprNode::MVar { .. })
         };
+        // Two applications of one definition, with a hole on either side, also go to the
+        // unifier as written. It compares their arguments before unfolding either
+        // (`try_definition_congruence`, the pin's `tryHeuristic` in `isDefEqDeltaStep`,
+        // vendored `Lean/Meta/ExprDefEq.lean:1456-1513,2042-2047`). Reduced first, the
+        // `h : a < 4` of `calc _ < 4 := h` met its step's `@LT.lt ?α ?inst ?x 4` as
+        // `Nat.le (a + 1) 4`, which the open `?inst` cannot match, so `?α` stayed a hole
+        // and every later instance pass searched for its `OfNat ?α 4` and `LT ?α` again.
+        let unreduced = (actual.has_expr_mvar() || expected.has_expr_mvar())
+            && self.same_definition_head(&actual, &expected);
         // Assign an unknown expected type before reducing the actual carrier.
         // This includes dependent projection applications: unfolding their
         // semireducible receiver here can change later instance selection.
-        let actual = if hole_headed(&expected) {
+        let actual = if unreduced || hole_headed(&expected) {
             actual
         } else {
             self.whnf(&actual)?
         };
         // Preserve the original target for the reverse assignment as well.
-        let expected = if hole_headed(&actual) {
+        let expected = if unreduced || hole_headed(&actual) {
             expected
         } else {
             self.whnf(&expected)?
         };
         self.constrain(&actual, &expected)
+    }
+
+    /// Whether `left` and `right` are applications headed by the same definition
+    /// (`tryHeuristic`'s `isApp` and `.defnInfo` conditions).
+    fn same_definition_head(&self, left: &Expr, right: &Expr) -> bool {
+        let head = |expr: &Expr| {
+            let ExprNode::App { f, .. } = expr.node() else {
+                return None;
+            };
+            let mut head = f;
+            while let ExprNode::App { f, .. } = head.node() {
+                head = f;
+            }
+            match head.node() {
+                ExprNode::Const { name, .. } => Some(name.clone()),
+                _ => None,
+            }
+        };
+        match (head(left), head(right)) {
+            (Some(left), Some(right)) => {
+                left == right
+                    && matches!(
+                        self.txn.env.find(&left),
+                        Some(fln_env::constants::ConstantInfo::Defn(_))
+                    )
+            }
+            _ => false,
+        }
     }
 
     fn check_scoped_equation(

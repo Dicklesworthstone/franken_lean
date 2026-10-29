@@ -4,7 +4,8 @@
 //! unified the composed relation with the expected type (`ensureHasType`, vendored
 //! `Lean/Elab/Calc.lean`). So in `calc _ < 4 := by decide` against `3 < 5` the tactic sees `3 < 4`.
 //! Elaborated eagerly, the block met `?a < 4`, and the hole was left unresolved
-//! (upstream `tests/elab/2095.lean`).
+//! (upstream `tests/elab/2095.lean`). A second test judges steps proved by hypotheses against
+//! relations whose numerals have no type yet.
 //!
 //! Every program was run through the pinned `lean` v4.32.0 with the same header first (2026-10-29),
 //! and the pin is consulted again when it is present.
@@ -31,6 +32,18 @@ const REFUSED: &[&str] = &[
     "example : 3 < 5 :=\n  calc\n    _ < 4 := by decide\n    _ < 6 := by decide\n",
     "example : 3 < 5 :=\n  calc\n    _ < 2 := by decide\n    _ < _ := by decide\n",
     "example : 3 < 5 :=\n  calc\n    _ < 4 := by rfl\n    _ < _ := by decide\n",
+];
+
+/// Programs the pin accepts, printing nothing, whose steps are proved by hypotheses against
+/// relations with numerals: `_ < 4 := h` with `h : a < 4`, where the step's relation is
+/// `@LT.lt ?α ?inst ?x (OfNat.ofNat ?β 4 ?i)` until something fixes `?α` and `?β`.
+const HYPOTHESES: &[&str] = &[
+    "example (h : 3 < 4) (k : 4 < 5) : 3 < 5 :=\n  calc\n    _ < 4 := h\n    _ < _ := k\n",
+    "example (h : 3 < 4) (k : 4 < 5) : 3 < 5 :=\n  calc\n    3 < 4 := h\n    _ < 5 := k\n",
+    "example (a : Nat) (h : a < 4) (k : 4 < 5) : a < 5 :=\n  calc\n    _ < 4 := h\n    _ < _ := k\n",
+    "example (h : (3:Nat) < 4) (k : (4:Nat) < 5) : (3:Nat) < 5 :=\n  calc\n    _ < 4 := h\n    _ < _ := k\n",
+    "example (a : Nat) (h : a < 4) (k : 4 < 5) : a < 5 :=\n  calc\n    _ < 4 := h\n    (4 : Nat) < 5 := k\n",
+    "example (a : Nat) (h : a < 4) (k : 4 < 5) : a < 5 :=\n  calc\n    _ < 4 := h\n    _ < (5 : Nat) := k\n",
 ];
 
 fn pinned_lib() -> Option<PathBuf> {
@@ -124,5 +137,28 @@ fn calc_step_tactics_see_endpoints_the_expected_type_fixes() {
         let (code, stdout, stderr) = ours(&lib, &root, &entry);
         assert_ne!(code, 0, "{program}: {stdout}");
         assert!(stderr.contains("refused"), "{program}: {stderr}");
+    }
+}
+
+/// A hypothesis's type meets its step's relation argument by argument, as the pin's
+/// `tryHeuristic` compares two applications of one definition before unfolding either
+/// (vendored `Lean/Meta/ExprDefEq.lean`), so `h : a < 4` fixes `?α` and `?β` above. Each type was
+/// reduced first, to `Nat.le (a + 1) 4` against the stuck `@LT.lt ?α ?inst ..`, which left both
+/// open, and every later instance pass searched for `OfNat ?β 4` and `LT ?α` again. Five of
+/// these programs were refused, three by the heartbeat limit; the sixth passed.
+#[test]
+fn calc_steps_proved_by_hypotheses_fix_their_numerals() {
+    let Some(lib) = pinned_lib() else {
+        return;
+    };
+    let root = workspace();
+    for (index, program) in HYPOTHESES.iter().enumerate() {
+        let entry = root.join(format!("Hypotheses{index}.lean"));
+        std::fs::write(&entry, format!("{HEADER}{program}")).unwrap();
+        if let Some((code, stdout)) = pinned(&lib, &entry) {
+            assert_eq!((code, stdout.as_str()), (0, ""), "the pin moved: {program}");
+        }
+        let (code, stdout, stderr) = ours(&lib, &root, &entry);
+        assert_eq!((code, stdout.as_str()), (0, ""), "{program}: {stderr}");
     }
 }
