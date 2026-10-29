@@ -51,6 +51,16 @@ const REJECTED: &[(&str, &str)] = &[
         "zero_plus",
         "example : g (0 + 2) = 5 := by simp only [g2]\n",
     ),
+    // `Nat.add`'s `@&` binder leaves a `borrowed` annotation on the numerals' type; simp keeps
+    // it, so neither call changes the goal (bead fln-simp-only-unchanged-goal-progress-wkcj).
+    (
+        "raw_add_alone",
+        "example : g (Nat.add 1 1) = 5 := by simp only\n",
+    ),
+    (
+        "raw_add_no_candidate",
+        "example : g (Nat.add 1 1) = 5 := by simp only [g2]\n",
+    ),
     // `tests/elab/simpDecide.lean`'s `fail_if_success { simp only [fib_two] }`.
     (
         "rfl_theorem",

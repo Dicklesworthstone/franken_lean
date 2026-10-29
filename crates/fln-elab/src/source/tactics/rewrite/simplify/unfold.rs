@@ -375,7 +375,15 @@ impl Context {
                 }
                 _ => rebuilt,
             };
-            let normalized = self.simp_beta_zeta(&rebuilt)?;
+            // Metadata is kept, as the pin's `Simp.visit` keeps it (`mkMData m r.expr`): its child is
+            // already reduced, and reducing the node again would only strip the annotation. A
+            // `borrowed` mark that `Nat.add`'s `@&` binder leaves on a numeral's type then counted
+            // as progress where the pin's `simp only` makes none.
+            let normalized = if matches!(rebuilt.node(), ExprNode::MData { .. }) {
+                rebuilt
+            } else {
+                self.simp_beta_zeta(&rebuilt)?
+            };
             done.insert(key, normalized);
         }
         Ok(done
