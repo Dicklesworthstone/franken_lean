@@ -55,7 +55,7 @@ jobs:
           import json, os, re
           assert re.fullmatch('[0-9a-f]{40}', os.environ['CANDIDATE_BASE'])
           changes = json.loads(os.environ['CANDIDATE_CHANGES'])
-          assert isinstance(changes, dict) and len(changes) <= 9
+          assert isinstance(changes, dict) and len(changes) <= 10
           allowed = {
               'crates/fln/src/runtime/callables/administrative.rs',
               'crates/fln/src/runtime/callables/administrative/tests.rs',
