@@ -2,8 +2,45 @@
 #![forbid(unsafe_code)]
 use fln::{Budget, Engine, EngineAdmissionLimits, KVMap, SourceCheckLimits};
 fn run(source: &str) -> Result<(), String> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    // Re-judge each source the helper actually receives, including programs
+    // assembled from shared prefixes. A copied expectation is not an oracle.
+    let lib = std::env::var_os("FLN_REFERENCE_LIB").map(std::path::PathBuf::from);
+    let lib = lib.filter(|path| path.join("Init.olean").is_file());
+    assert!(
+        lib.is_some() || std::env::var_os("FLN_REQUIRE_REFERENCE").is_none(),
+        "the pinned Reference library is required"
+    );
+    if lib.is_none() {
+        eprintln!("REFERENCE_UNRUN: pinned SDK absent; checking only the native source path");
+    }
+    let oracle = lib.map(|lib| {
+        let pinned = lib.parent().unwrap().parent().unwrap().join("bin/lean");
+        let mut child = Command::new(pinned)
+            .arg("--stdin")
+            .env("LEAN_PATH", &lib)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(source.as_bytes())
+            .unwrap();
+        let output = child.wait_with_output().unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let code = output.status.code();
+        eprintln!("refinement oracle exit={code:?} source={source:?}\n{stdout}{stderr}");
+        assert!(matches!(code, Some(0 | 1)), "{stdout}{stderr}");
+        code.unwrap()
+    });
     let limits = EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024));
-    Engine::with_source_seed(limits)
+    let checked = Engine::with_source_seed(limits)
         .unwrap()
         .into_complete()
         .unwrap()
@@ -11,7 +48,16 @@ fn run(source: &str) -> Result<(), String> {
             &[source.as_bytes()],
             &KVMap::new(),
             SourceCheckLimits::new(limits),
-        )
+        );
+    if let Some(oracle) = oracle {
+        let native = match &checked {
+            Ok(fln::Outcome::Complete(_)) => Some(0),
+            Err(error) if error.disposition().2 == 1 => Some(1),
+            _ => None,
+        };
+        assert_eq!(native, Some(oracle), "source: {source}");
+    }
+    checked
         .map_err(|error| format!("{error:?}"))?
         .into_complete()
         .map(|_| ())
@@ -24,6 +70,30 @@ fn reject(source: &str) {
     assert!(run(source).is_err(), "accepted {source}");
 }
 const BOTH: &str = "inductive Both (P Q : Prop) : Prop where | intro (left : P) (right : Q)\n";
+
+#[test]
+fn refinement_keeps_its_new_implicit_hole_unassigned_against_an_older_goal() {
+    // All five programs were judged by the actual v4.32.0 pin before this test.
+    let prefix = "inductive Ex (p : Nat → Prop) : Prop where\n  | intro (w : Nat) (h : p w)\n";
+    let original = format!(
+        "{prefix}theorem older : Ex (fun n => n = n) := by apply Ex.intro; refine rfl; exact 0"
+    );
+    let error = run(&original).expect_err(&original);
+    assert!(error.contains("UnassignedNaturalHole"), "{error}");
+    reject(&format!(
+        "{prefix}theorem older : Ex (fun n => n = n) := by apply Ex.intro; exact Eq.refl ?_; exact 0"
+    ));
+    for body in [
+        "apply Ex.intro; refine Eq.refl ?_; exact 0",
+        "apply Ex.intro; refine' rfl; exact 0",
+        "refine Ex.intro ?_ ?_; exact 0; rfl",
+    ] {
+        check(&format!(
+            "{prefix}theorem older : Ex (fun n => n = n) := by {body}"
+        ));
+    }
+}
+
 /// Each program was executed by the actual v4.32.0 pin before changing the
 /// native path. Its final tactic comparison assigns the opaque `?_`; ordinary
 /// term elaboration must still leave that same kind of hole opaque.
@@ -138,8 +208,13 @@ fn refinement_composes_with_intro_constructor_and_nested_local_proofs() {
     check(&format!(
         "{BOTH} theorem nested (P Q : Prop) : P -> Q -> Both P (Both Q P) := by intro p q; refine Both.intro p ?_; constructor; exact q; exact p"
     ));
-    check(&format!(
+    // The original body is aligned with an indented command. The pin treats
+    // `have` as the start of another command, not this theorem's tactic body.
+    reject(&format!(
         "{BOTH} theorem loc (P : Prop) (p : P) : Both P P := by\n have h : Both P P := by\n  refine Both.intro ?_ ?_\n  exact p\n  exact p\n exact h"
+    ));
+    check(&format!(
+        "{BOTH}theorem loc (P : Prop) (p : P) : Both P P := by\n have h : Both P P := by\n  refine Both.intro ?_ ?_\n  exact p\n  exact p\n exact h"
     ));
 }
 #[test]
@@ -225,9 +300,13 @@ fn implicit_inference_holes_are_not_promoted_to_tactic_goals() {
     ));
 }
 #[test]
-fn malformed_synthetic_hole_spelling_refuses() {
-    for spelling in ["?", "? _", "?7", "?a.b"] {
+fn synthetic_hole_spelling_uses_the_pins_identifier_and_trivia_parser() {
+    for spelling in ["?", "?7"] {
         reject(&format!("def bad : Nat := by refine {spelling}; exact 7"));
+    }
+    // Preserve all four original programs; the live pin accepts these two.
+    for spelling in ["? _", "?a.b", "?/-gap-/_"] {
+        check(&format!("def bad : Nat := by refine {spelling}; exact 7"));
     }
 }
 
@@ -251,20 +330,50 @@ fn holes_in_annotations_are_real_type_obligations() {
 }
 
 #[test]
-fn distinct_refinement_frames_do_not_share_named_goals() {
-    check(&format!(
+fn named_refinement_goals_are_shared_across_frames() {
+    // Preserve the original program. The second use is already solved, so
+    // the pin refuses its extra `exact`; distinct names give two obligations.
+    reject(&format!(
         "{BOTH} theorem twice (P : Prop) (p : P) : Both P P := by\n constructor\n refine ?goal\n exact p\n refine ?goal\n exact p"
     ));
     reject(&format!(
+        "{BOTH}theorem twice (P : Prop) (p : P) : Both P P := by\n constructor\n refine ?goal\n exact p\n refine ?goal\n exact p"
+    ));
+    // This first distinct-name control had the same invalid indentation;
+    // retain it too and use the correctly aligned declaration for acceptance.
+    reject(&format!(
+        "{BOTH} theorem twice (P : Prop) (p : P) : Both P P := by\n constructor\n refine ?first\n exact p\n refine ?goal\n exact p"
+    ));
+    check(&format!(
+        "{BOTH}theorem twice (P : Prop) (p : P) : Both P P := by\n constructor\n refine ?first\n exact p\n refine ?goal\n exact p"
+    ));
+    check(&format!(
+        "{BOTH}theorem twice (P : Prop) (p : P) : Both P P := by\n constructor\n refine ?goal\n exact p\n refine ?goal"
+    ));
+    reject(&format!(
         "{BOTH} theorem bad : Both (0 = 0) (0 = 1) := by\n constructor\n refine ?goal\n rfl\n refine ?goal\n rfl"
+    ));
+    reject(&format!(
+        "{BOTH}theorem bad : Both (0 = 0) (0 = 1) := by\n constructor\n refine ?goal\n rfl\n refine ?goal\n rfl"
     ));
 }
 
 #[test]
 fn branch_scopes_do_not_leak_synthetic_holes_or_local_assumptions() {
-    check(
+    // Reusing the assigned name also reuses its proof and type. The original
+    // false-branch proof cannot prove the true branch's different equality.
+    reject(
         "theorem same (b : Bool) : b = b := by\n cases b with\n | false =>\n  refine ?same\n  rfl\n | true =>\n  refine ?same\n  rfl",
     );
+    check(
+        "theorem same (b : Bool) : b = b := by\n cases b with\n | false =>\n  refine ?first\n  rfl\n | true =>\n  refine ?same\n  rfl",
+    );
+    check(
+        "theorem same (P : Prop) (p : P) (b : Bool) : P := by\n cases b with\n | false =>\n  refine ?same\n  exact p\n | true =>\n  refine ?same",
+    );
+    check("def same : Nat := by refine (fun (n : Nat) => ?same) ?same; exact 7");
+    check("def same : Nat := by\n refine (fun (n : Nat) => ?same) ?same\n case same => exact 7");
+    reject("def same : Nat := by refine (fun (n : Nat) => ?same) ?same; exact n");
     reject(
         "theorem bad (b : Bool) : 0 = 0 := by\n cases b with\n | false =>\n  refine ?_\n  have secret : 0 = 0 := rfl\n  exact secret\n | true =>\n  refine ?_\n  exact secret",
     );

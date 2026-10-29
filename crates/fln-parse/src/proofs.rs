@@ -243,18 +243,11 @@ pub(super) fn parse(
         ));
     }
     let first_line = source.line_of(tokens[first].extent.start());
-    let first_column = tokens[first].extent.start().0
-        - source.line_start(first_line).expect("token line exists").0;
     let by_line = source.line_of(tokens[by].extent.start());
-    let by_column =
-        tokens[by].extent.start().0 - source.line_start(by_line).expect("by line exists").0;
-    if first_line != by_line && first_column <= by_column {
-        // For declaration bodies Lean compares indentation with the declaration
-        // baseline, not the inline `by` column. Accept the common indented body
-        // but reject a first tactic at the beginning of a fresh line.
-        if first_column == 0 {
-            return Err(refusal(view, tokens, first));
-        }
+    // An indented declaration saves its own column too. Comparing only with
+    // column zero accepts a tactic aligned with that declaration as its body.
+    if first_line != by_line && !right_of_command_start(view, tokens, first) {
+        return Err(refusal(view, tokens, first));
     }
     let sequence = elimination::sequence(leaves, view, tokens, first..end)?;
     Ok((
@@ -2352,6 +2345,10 @@ mod construction_refinement_tests {
             "theorem t : P := by\r\n  refine /- explicit goals -/ f ?named ?_\r\n  exact p\r\n  exact q\r\n",
             "theorem t : forall x : Nat, x = x := by refine fun x => ?_; rfl",
             "def annotated : Nat := by refine (7 : ?type); exact Nat",
+            "theorem t : 0 = 0 := by refine ? _",
+            "theorem t : 0 = 0 := by refine ?a.b",
+            "theorem t : 0 = 0 := by refine ?/-gap-/_",
+            " theorem t : 0 = 0 := by\n  rfl",
         ] {
             let parsed = parse_definition(source.as_bytes())
                 .unwrap_or_else(|error| panic!("{source}\n{error:?}"));
@@ -2458,16 +2455,15 @@ mod construction_refinement_tests {
 
     #[test]
     fn malformed_refinement_never_drops_trailing_tokens() {
+        let aligned = " theorem t : 0 = 0 := by\n rfl";
+        assert!(parse_definition(aligned.as_bytes()).is_err(), "{aligned}");
         for tail in [
             "constructor 1",
             "left h",
             "right h",
             "refine",
             "refine ?",
-            "refine ? _",
             "refine ?7",
-            "refine ?a.b",
-            "refine ?/-gap-/_",
         ] {
             let source = format!("theorem t : 0 = 0 := by {tail}");
             assert!(parse_definition(source.as_bytes()).is_err(), "{source}");

@@ -1290,8 +1290,8 @@ impl Engine<'_> {
         // reduced, so it never unfolds a definition in order to assign. Reducing
         // first assigned `?p := Nat.lt n 5` where the pin assigns `?p := n < 5`; at
         // `instances` transparency an instance subgoal then carries the unfolded
-        // form, which no stored instance path matches (bead fln-eeew). Only a
-        // constant-headed side is assigned here, the case where reducing first
+        // form, which no stored instance path matches (bead fln-eeew). For an
+        // applied hole, a constant-headed side is assigned here, where reducing first
         // would unfold a definition, and a local-headed one, where reducing first
         // zeta-delta-expands a `let` variable: `CoeT Bool b (Option Bool)` assigned
         // the instance's `a` the value of `let b := getElem bs n`, unfolded through
@@ -1304,9 +1304,9 @@ impl Engine<'_> {
         // argument as a star key and then zeta-reduces it while unifying, so an assigned
         // dependent `let` type found `OfNat` instances the pin's discrimination tree never
         // offers (source_record_literals' `nested 8`), and one still holding a hole (a
-        // `let rec` in a type) left the goal stuck. Other shapes keep the reducing path
-        // below: the pin also keeps an in-scope beta redex, but this elaborator does not yet
-        // accept every assignment of one. A refusal here mutates nothing.
+        // `let rec` in a type) left the goal stuck. Other applied-hole shapes keep
+        // the reducing path below. A bare hole also keeps an in-scope beta redex,
+        // before reduction can change its assignment. A refusal mutates nothing.
         let left_flex = self.flexible_head(left)?;
         let right_flex = self.flexible_head(right)?;
         let constant_headed = |expr: &Expr| {
@@ -1320,12 +1320,19 @@ impl Engine<'_> {
                 _ => false,
             }
         };
+        // `isDefEqQuickMVarMVar` prefers the bare right hole over an applied
+        // left hole; otherwise it tries the left first. Preserve that choice
+        // before WHNF can turn an application into a different bare hole.
+        let left_bare = matches!(left.node(), ExprNode::MVar { .. });
+        let right_bare = matches!(right.node(), ExprNode::MVar { .. });
         let quick = match (left_flex, right_flex) {
-            (true, false) if constant_headed(right) => Some((left, right)),
-            (false, true) if constant_headed(left) => Some((right, left)),
-            _ => None,
+            (true, true) if right_bare && !left_bare => [Some((right, left)), Some((left, right))],
+            (true, true) => [Some((left, right)), Some((right, left))],
+            (true, false) if left_bare || constant_headed(right) => [Some((left, right)), None],
+            (false, true) if right_bare || constant_headed(left) => [Some((right, left)), None],
+            _ => [None, None],
         };
-        if let Some((flex, rigid)) = quick {
+        for (flex, rigid) in quick.into_iter().flatten() {
             // `isDefEqQuickOther` reaches `processAssignment` before either side is reduced;
             // a local of the hole's own context sends it to `useFOApprox` there, so
             // `?m σ =?= StateT δ (StateT σ Id) σ` assigns `?m := StateT δ (StateT σ Id)`

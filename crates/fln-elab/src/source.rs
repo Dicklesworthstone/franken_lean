@@ -696,6 +696,9 @@ struct Context {
     // The declaration being elaborated, when it is `protected`.
     protected_declaration: Option<Name>,
     refinements: Vec<tactics::RefinementFrame>,
+    /// Synthetic-hole user names belong to the declaration's metavariable
+    /// context, not to one refine call (pin BuiltinTerm.lean:81).
+    named_refinement_holes: std::collections::HashMap<Name, tactics::ProofGoal>,
     // The declaration whose body is being elaborated (`definition_body`), so that field
     // notation naming it (`l.size` inside `T.size`) is recognized as a recursive reference
     // before the recursion context exists, as a direct `T.size l` already is.
@@ -844,6 +847,7 @@ impl Context {
             simp_reach_limit: None,
             protected_declaration: None,
             refinements: Vec::new(),
+            named_refinement_holes: std::collections::HashMap::new(),
             defining: None,
             omitted_results: Vec::new(),
             recursion: None,
@@ -1111,11 +1115,7 @@ impl Context {
                 expect_atom(question, "?", "synthetic hole")?;
                 let name = match label {
                     Syntax::Atom { val, .. } if val == "_" => None,
-                    Syntax::Ident { val, .. }
-                        if !val.is_anonymous() && val.parent().is_anonymous() =>
-                    {
-                        Some(val.clone())
-                    }
+                    Syntax::Ident { val, .. } if !val.is_anonymous() => Some(val.clone()),
                     _ => return Err(failure(SourceInferenceError::Scope)),
                 };
                 return self.synthetic_proof_hole(name, expected);
@@ -1887,6 +1887,18 @@ impl Context {
         // unification. Unknown class inputs still wait for the expected type.
         self.resolve_instances(false)?;
         if let Some(expected) = expected {
+            // App.finalize propagates the expected type before ensureHasType
+            // checks inferred type first (pin App.lean:651, TermElabM.lean:1310).
+            // That order decides which of two holes remains an obligation.
+            // A failed hint inserts no coercion and does not replace the check.
+            if matches!(term.value.node(), ExprNode::App { .. })
+                && (term.type_.has_expr_mvar()
+                    || expected.has_expr_mvar()
+                    || term.type_.has_level_mvar()
+                    || expected.has_level_mvar())
+            {
+                self.coercion_eq(expected, &term.type_)?;
+            }
             // The pin elaborates with first-order approximation on (`foApprox`): a result
             // `?m ?σ` that is no pattern meets `StateM Nat Nat` as `?m := StateM Nat`, `?σ := Nat`
             // (`processAssignmentFOApprox`), so `get`'s instance goal is known. The ordinary

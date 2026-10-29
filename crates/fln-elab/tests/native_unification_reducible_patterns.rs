@@ -507,8 +507,8 @@ fn normalized_dependent_pruning_does_not_invent_an_inhabitant() {
 
 /// Alone, `?f ((fun x => x) ?a) =?= ?f ?b` unifies the arguments, as the pin's
 /// `isDefEqMVarSelf` does (vendored `Lean/Meta/ExprDefEq.lean:1777-1780`): `?a` and `?b` are
-/// made equal and `?f` stays open. (Which of the two is assigned is this unifier's
-/// hole-to-hole orientation after beta; the pin assigns `?b`.) Beside an ordinary constraint
+/// made equal and `?f` stays open. The pin assigns the bare `?b` before beta.
+/// Beside an ordinary constraint
 /// that fixes `?f` as a constant function, that constraint has first choice, and neither
 /// argument hole is assigned.
 #[test]
@@ -522,11 +522,20 @@ fn a_hole_applied_twice_unifies_its_normalized_arguments() {
     let before = txn.clone();
     txn.unify(&left, &right, budget()).unwrap();
     assert!(!txn.mvars.is_assigned(&f));
-    assert!(txn.mvars.is_assigned(&a) || txn.mvars.is_assigned(&b));
+    assert!(!txn.mvars.is_assigned(&a));
     assert_eq!(
-        txn.mvars.instantiate(&Expr::mvar(a.clone())),
-        txn.mvars.instantiate(&Expr::mvar(b.clone()))
+        txn.mvars.get_assigned_expr(&b),
+        Some(&beta(nat(), Expr::mvar(a.clone())))
     );
+    // Instantiation preserves beta syntax; conversion, without assigning a,
+    // establishes equality of the residual arguments.
+    assert!(
+        txn.unify(&Expr::mvar(a.clone()), &Expr::mvar(b.clone()), budget())
+            .unwrap()
+            .expression_assignments
+            .is_empty()
+    );
+    assert!(!txn.mvars.is_assigned(&a));
     let mut txn = before;
     let report = txn
         .unify_many_with(
@@ -541,6 +550,183 @@ fn a_hole_applied_twice_unifies_its_normalized_arguments() {
     assert_eq!(report.expression_assignments, vec![f]);
     assert!(!txn.mvars.is_assigned(&a));
     assert!(!txn.mvars.is_assigned(&b));
+}
+
+#[test]
+fn a_bare_hole_keeps_a_beta_redex_before_reduction_in_both_orientations() {
+    for reverse in [false, true] {
+        let mut txn = transaction();
+        let a = hole(&mut txn, "a", nat(), MetavarKind::Natural);
+        let b = hole(&mut txn, "b", nat(), MetavarKind::Natural);
+        let redex = beta(nat(), Expr::mvar(a.clone()));
+        let bare = Expr::mvar(b.clone());
+        let (left, right) = if reverse {
+            (bare, redex.clone())
+        } else {
+            (redex.clone(), bare)
+        };
+        let before = txn.clone();
+        let report = txn.unify(&left, &right, budget()).unwrap();
+        assert_eq!(report.expression_assignments, vec![b.clone()]);
+        assert!(!txn.mvars.is_assigned(&a));
+        assert_eq!(txn.mvars.get_assigned_expr(&b), Some(&redex));
+        let mut refused = before.clone();
+        assert!(
+            refused
+                .unify_many_with(&[(left, right), (number(0), number(1))], budget(), &|| {
+                    false
+                },)
+                .is_err()
+        );
+        unchanged(&refused, &before);
+    }
+}
+
+#[test]
+fn flexible_pairs_respect_scope_and_opaque_reverse_orientation() {
+    for opaque in [false, true] {
+        for reverse in [false, true] {
+            let mut txn = transaction();
+            let f = hole(&mut txn, "f", pi(nat(), nat()), MetavarKind::Natural);
+            let b = hole(
+                &mut txn,
+                "b",
+                nat(),
+                if opaque {
+                    MetavarKind::SyntheticOpaque
+                } else {
+                    MetavarKind::Natural
+                },
+            );
+            let x = local(&mut txn, "x", nat());
+            let applied = Expr::app(Expr::mvar(f.clone()), x.clone());
+            let bare = Expr::mvar(b.clone());
+            let (left, right) = if reverse {
+                (bare, applied.clone())
+            } else {
+                (applied.clone(), bare)
+            };
+            let report = txn.unify(&left, &right, budget()).unwrap();
+            // b was created outside x's scope, so b := f x must be refused
+            // even when b is natural. The reverse, f := fun _ => b, is valid.
+            assert_eq!(report.expression_assignments, vec![f.clone()]);
+            assert!(!txn.mvars.is_assigned(&b));
+            assert_eq!(txn.mvars.instantiate(&applied), Expr::mvar(b.clone()));
+        }
+    }
+}
+
+#[test]
+fn two_bare_holes_keep_the_pins_left_first_assignment() {
+    for reverse in [false, true] {
+        let mut txn = transaction();
+        let a = hole(&mut txn, "a", nat(), MetavarKind::Natural);
+        let b = hole(&mut txn, "b", nat(), MetavarKind::Natural);
+        let (left, right) = if reverse { (b, a) } else { (a, b) };
+        let report = txn
+            .unify(
+                &Expr::mvar(left.clone()),
+                &Expr::mvar(right.clone()),
+                budget(),
+            )
+            .unwrap();
+        assert_eq!(report.expression_assignments, vec![left.clone()]);
+        assert_eq!(
+            txn.mvars.get_assigned_expr(&left),
+            Some(&Expr::mvar(right.clone()))
+        );
+        assert!(!txn.mvars.is_assigned(&right));
+    }
+}
+
+#[test]
+fn a_bare_hole_in_the_arguments_scope_gets_the_precise_assignment() {
+    for reverse in [false, true] {
+        let mut txn = transaction();
+        let f = hole(&mut txn, "f", pi(nat(), nat()), MetavarKind::Natural);
+        let x = local(&mut txn, "x", nat());
+        let b = hole(&mut txn, "b", nat(), MetavarKind::Natural);
+        let applied = Expr::app(Expr::mvar(f.clone()), x);
+        let bare = Expr::mvar(b.clone());
+        let (left, right) = if reverse {
+            (bare, applied.clone())
+        } else {
+            (applied.clone(), bare)
+        };
+        let report = txn.unify(&left, &right, budget()).unwrap();
+        assert_eq!(report.expression_assignments, vec![b.clone()]);
+        assert!(!txn.mvars.is_assigned(&f));
+        assert_eq!(txn.mvars.get_assigned_expr(&b), Some(&applied));
+    }
+}
+
+#[test]
+fn the_actual_pin_preserves_the_assignment_shapes_used_by_these_regressions() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let lib = std::env::var_os("FLN_REFERENCE_LIB").map(std::path::PathBuf::from);
+    let lib = lib.filter(|path| path.join("Lean.olean").is_file());
+    assert!(
+        lib.is_some() || std::env::var_os("FLN_REQUIRE_REFERENCE").is_none(),
+        "the full pinned Reference SDK is required"
+    );
+    let Some(lib) = lib else {
+        eprintln!("SKIP: full pinned Reference SDK absent");
+        return;
+    };
+    let pinned = lib.parent().unwrap().parent().unwrap().join("bin/lean");
+    let source = r#"import Lean
+open Lean Meta
+#eval show MetaM Unit from do
+  let nat := mkConst ``Nat
+  let beta := fun e => mkApp (mkLambda `x .default nat (mkBVar 0)) e
+  let m ← mkFreshExprMVar nat
+  let redex := beta (mkNatLit 37)
+  let ok ← isDefEq m redex
+  IO.println s!"closed-beta {ok} {(← getExprMVarAssignment? m.mvarId!) == some redex}"
+  for reverse in [false, true] do
+    let a ← mkFreshExprMVar nat
+    let b ← mkFreshExprMVar nat
+    let redex := beta a
+    let ok ← if reverse then isDefEq b redex else isDefEq redex b
+    IO.println s!"bare-beta {reverse} {ok} {!(← a.mvarId!.isAssigned)} {(← getExprMVarAssignment? b.mvarId!) == some redex}"
+  let f ← mkFreshExprMVar (mkForall `x .default nat nat)
+  let a ← mkFreshExprMVar nat
+  let b ← mkFreshExprMVar nat
+  let redex := beta a
+  let ok ← isDefEq (mkApp f redex) (mkApp f b)
+  IO.println s!"same-head {ok} {!(← a.mvarId!.isAssigned)} {(← getExprMVarAssignment? b.mvarId!) == some redex}"
+  let f ← mkFreshExprMVar (mkForall `x .default nat nat)
+  withLocalDeclD `x nat fun x => do
+    let b ← mkFreshExprMVar nat
+    let applied := mkApp f x
+    let ok ← isDefEq applied b
+    IO.println s!"scoped-bare {ok} {!(← f.mvarId!.isAssigned)} {(← getExprMVarAssignment? b.mvarId!) == some applied}"
+"#;
+    let mut child = Command::new(&pinned)
+        .arg("--stdin")
+        .env("LEAN_PATH", &lib)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(source.as_bytes())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    eprintln!("actual pin assignment probe:\n{stdout}{stderr}");
+    assert_eq!(output.status.code(), Some(0), "{stdout}{stderr}");
+    assert!(stderr.is_empty(), "{stderr}");
+    assert_eq!(
+        stdout,
+        "closed-beta true true\nbare-beta false true true true\nbare-beta true true true true\nsame-head true true true\nscoped-bare true true true\n"
+    );
 }
 
 #[test]
@@ -653,13 +839,19 @@ fn a_metavariable_is_assigned_a_let_variable_unexpanded() {
     assert!(!assigned.has_fvar(), "{assigned:?}");
 }
 
-/// The quick assignment is limited to a constant- or local-headed side: a beta redex still
-/// takes the reducing path, as it did before (the pin would keep an in-scope redex).
+/// The live pin probe above checks that a bare hole keeps a beta redex, including
+/// when it has no open argument. Later conversion still computes its value.
 #[test]
-fn a_beta_redex_is_still_reduced_before_it_is_assigned() {
+fn a_beta_redex_is_retained_in_a_bare_holes_assignment() {
     let (mut txn, _) = with_abbreviation();
     let m = hole(&mut txn, "m", nat(), MetavarKind::Natural);
     let redex = beta(nat(), number(37));
     txn.unify(&Expr::mvar(m.clone()), &redex, budget()).unwrap();
-    assert_eq!(txn.mvars.get_assigned_expr(&m), Some(&number(37)));
+    assert_eq!(txn.mvars.get_assigned_expr(&m), Some(&redex));
+    assert!(
+        txn.unify(&Expr::mvar(m), &number(37), budget())
+            .unwrap()
+            .expression_assignments
+            .is_empty()
+    );
 }

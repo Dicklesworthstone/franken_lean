@@ -1083,6 +1083,21 @@ pub fn partition(source: &[u8]) -> Result<Vec<(BytePos, &[u8])>, DefinitionParse
     let mut output = Vec::new();
     let mut start = 0;
     for next in starts.into_iter().skip(1) {
+        // A standalone command keeps its indentation. Starting its slice at
+        // the keyword resets that keyword to column zero and can turn an
+        // aligned, invalid tactic body into a valid indented one.
+        let line_start = source[..next]
+            .iter()
+            .rposition(|byte| matches!(byte, b'\n' | b'\r'))
+            .map_or(0, |newline| newline + 1);
+        let next = if source[line_start..next]
+            .iter()
+            .all(|byte| matches!(byte, b' ' | b'\t'))
+        {
+            line_start
+        } else {
+            next
+        };
         output.push((BytePos(start), &source[start..next]));
         start = next;
     }
@@ -1181,6 +1196,31 @@ mod tests {
             joined.extend_from_slice(bytes);
         }
         assert_eq!(joined, source);
+        for (source, accepted) in [
+            ("def n : Nat := 0\n theorem t : 0 = 0 := by\n rfl", false),
+            ("def n : Nat := 0\n theorem t : 0 = 0 := by\n  rfl", true),
+            (
+                "def n : Nat := 0\r\n theorem t : 0 = 0 := by\r\n  rfl",
+                true,
+            ),
+        ] {
+            let commands = partition(source.as_bytes()).unwrap();
+            assert_eq!(commands.len(), 2, "{source}");
+            assert_eq!(commands[1].0.0, source.find(" theorem").unwrap());
+            assert_eq!(
+                commands
+                    .iter()
+                    .flat_map(|(_, bytes)| *bytes)
+                    .copied()
+                    .collect::<Vec<_>>(),
+                source.as_bytes()
+            );
+            assert_eq!(
+                crate::parse_definition(commands[1].1).is_ok(),
+                accepted,
+                "{source}"
+            );
+        }
         assert_eq!(
             parse(commands[0].1).unwrap(),
             Some(ScopeCommand::Namespace(Name::from_components(["Real"])))

@@ -150,19 +150,75 @@ impl Context {
                 self.hole(sort)?
             }
         };
-        let existing = name.as_ref().and_then(|name| {
-            self.refinements.last().and_then(|frame| {
-                frame
-                    .holes
-                    .iter()
-                    .find(|(found, _)| found.as_ref() == Some(name))
-                    .map(|(_, goal)| goal.clone())
-            })
-        });
+        let existing = name
+            .as_ref()
+            .and_then(|name| self.named_refinement_holes.get(name).cloned());
         let goal = if let Some(goal) = existing {
-            // Reuse is intentionally scoped to an identical captured context.
-            // Equal spelling in different binder scopes cannot capture a local.
-            if goal.lctx != self.txn.lctx || !self.proof_types_match(&goal.target, &type_)? {
+            // The pin first reuses a hole whose captured context is a prefix.
+            // A name never silently becomes fresh in another branch/frame.
+            if !self.txn.lctx.decls().starts_with(goal.lctx.decls()) {
+                // An assigned value may retain locals shared with this scope. Our
+                // representation applies a closed telescope to captured locals,
+                // so expose that value before checking whether it still captures.
+                if self.txn.mvars.is_assigned(&goal.id) {
+                    let mut value = Expr::mvar(goal.id.clone());
+                    for local in goal.lctx.decls() {
+                        self.tick()?;
+                        if local.value.is_none() {
+                            value = Expr::app(value, Expr::fvar(local.id.clone()));
+                        }
+                    }
+                    let value = self.whnf(&value)?;
+                    let actual = self.instantiate(&goal.target)?;
+                    let mut scoped_value = value.clone();
+                    let mut scoped_type = actual.clone();
+                    for local in self.txn.lctx.decls().to_vec() {
+                        self.tick()?;
+                        scoped_value = scoped_value
+                            .abstract_fvar(&local.id, 0)
+                            .map_err(|_| failure(SourceInferenceError::Scope))?;
+                        scoped_type = scoped_type
+                            .abstract_fvar(&local.id, 0)
+                            .map_err(|_| failure(SourceInferenceError::Scope))?;
+                    }
+                    if !scoped_value.has_fvar() && !scoped_type.has_fvar() {
+                        self.constrain_type(&actual, &type_)?;
+                        return Ok(Typed {
+                            value,
+                            type_: actual,
+                        });
+                    }
+                } else if goal.lctx.decls().starts_with(self.txn.lctx.decls())
+                    && self
+                        .txn
+                        .mvars
+                        .get_decl(&goal.id)
+                        .is_some_and(|decl| decl.delayed.is_none())
+                {
+                    // The later occurrence has a smaller context. Replace the
+                    // unassigned hole there, then close the old telescope over
+                    // that replacement, as the pin's mvarId.assign does.
+                    let replacement = self.synthetic_proof_hole(None, Some(&type_))?;
+                    let (replacement_name, replacement_goal) = self
+                        .refinements
+                        .last_mut()
+                        .expect("active refinement")
+                        .holes
+                        .last_mut()
+                        .expect("fresh replacement");
+                    *replacement_name = name.clone();
+                    let replacement_goal = replacement_goal.clone();
+                    self.named_refinement_holes
+                        .insert(name.clone().expect("named existing hole"), replacement_goal);
+                    let current = self.txn.lctx.clone();
+                    let closed = self.close_proof_goal(goal, replacement.value.clone());
+                    self.txn.lctx = current;
+                    closed?;
+                    return Ok(replacement);
+                }
+                return Err(error(TacticError::IncompatibleSyntheticHole));
+            }
+            if !self.proof_types_match(&goal.target, &type_)? {
                 return Err(error(TacticError::IncompatibleSyntheticHole));
             }
             goal
@@ -207,6 +263,10 @@ impl Context {
                 lctx: self.txn.lctx.clone(),
                 introduced: locals,
             };
+            if let Some(name) = &name {
+                self.named_refinement_holes
+                    .insert(name.clone(), goal.clone());
+            }
             self.refinements
                 .last_mut()
                 .expect("active refinement")
@@ -574,13 +634,49 @@ impl Context {
         if self.refinements.len() != depth + 1 {
             return Err(error(TacticError::MalformedScript));
         }
-        let frame = self.refinements.pop().expect("checked refinement depth");
+        let mut frame = self.refinements.pop().expect("checked refinement depth");
         self.txn.lctx = goal.lctx.clone();
         self.resolve_instances(false)?;
         self.flush(false)?;
         self.ensure_tactic_term_type(&term.type_, &goal.target)?;
         if !frame.placeholders {
             self.refuse_new_natural_holes(&term.value, frame.first_name)?;
+        } else {
+            // `collectFreshMVars` includes implicit natural holes too, not
+            // only syntax holes recorded in the frame. In `refine' rfl` the
+            // expected-first application hint can assign an older goal to a
+            // new implicit hole, which must now become a goal in its own right.
+            let value = self.instantiate(&term.value)?;
+            let mut ids: Vec<_> = self.txn.mvars.collect_mvars(&value).into_iter().collect();
+            ids.sort_by(|left, right| left.0.cmp(&right.0));
+            let source = Name::from_components(["_fln_source"]);
+            for id in ids {
+                self.tick()?;
+                if !matches!(id.0.leaf_view(), LeafView::Num(index) if index >= frame.first_name)
+                    || id.0.parent() != source
+                    || frame.holes.iter().any(|(_, hole)| hole.id == id)
+                {
+                    continue;
+                }
+                let Some(declaration) = self.txn.mvars.get_decl(&id) else {
+                    continue;
+                };
+                if declaration.kind != MetavarKind::Natural || declaration.delayed.is_some() {
+                    continue;
+                }
+                frame.holes.push((
+                    None,
+                    ProofGoal {
+                        id,
+                        target: declaration.type_.clone(),
+                        lctx: declaration.lctx.clone(),
+                        introduced: Vec::new(),
+                    },
+                ));
+            }
+            frame
+                .holes
+                .sort_by(|(_, left), (_, right)| left.id.0.cmp(&right.id.0));
         }
         let suffix = if frame.placeholders {
             "refine'"

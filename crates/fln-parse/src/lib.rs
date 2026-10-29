@@ -4053,8 +4053,7 @@ fn bounded_term_compound_token(
             if grammar == DefinitionGrammar::Scalar && symbol == "?" =>
         {
             let valid = cursor < range.end
-                && tokens[index].extent.end() == tokens[cursor].extent.start()
-                && (matches!(&tokens[cursor].kind, TokenKind::Ident(name) if !name.is_anonymous() && name.parent().is_anonymous())
+                && (matches!(&tokens[cursor].kind, TokenKind::Ident(name) if !name.is_anonymous())
                     || matches!(&tokens[cursor].kind, TokenKind::Symbol(s) if s == "_"));
             if !valid {
                 return Err(NatDefinitionParseError::OutsideSeedGrammar {
