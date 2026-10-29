@@ -39,6 +39,10 @@ jobs:
       CARGO_TERM_COLOR: never
       CARGO_INCREMENTAL: '0'
       CARGO_BUILD_JOBS: '2'
+      # Reduce build artifacts after a hosted full-gate runner hit ENOSPC.
+      # These control symbols; debug assertions and all test cases stay enabled.
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
       CARGO_PROFILE_RELEASE_DEBUG: '0'
       CANDIDATE_BASE: ${{ inputs.base || github.sha }}
       CANDIDATE_CHANGES: ${{ inputs.changes || '{}' }}

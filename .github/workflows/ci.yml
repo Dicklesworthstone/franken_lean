@@ -23,6 +23,9 @@ on:
 env:
   CARGO_TERM_COLOR: always
   CARGO_TARGET_DIR: ${{ github.workspace }}/target/cargo
+  # Reduce full-gate artifacts after hosted-runner ENOSPC. Assertions stay on.
+  CARGO_PROFILE_DEV_DEBUG: '0'
+  CARGO_PROFILE_TEST_DEBUG: '0'
   FLN_REQUIRE_UBS: 1
   FLN_UBS_SCOPE: all-tracked
 
@@ -428,7 +431,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target/cargo
-          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          key: cargo-debuginfo0-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
 
       - name: ownership evidence — clean source-bound matrix
         id: ownership_e2e
