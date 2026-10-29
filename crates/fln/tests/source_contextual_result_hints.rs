@@ -471,6 +471,56 @@ theorem viaState_eq : viaState.run 0 = (5, 0) := rfl
         .unwrap();
 }
 
+/// An ordinary definition is no abbreviation, yet the pin's first-order approximation
+/// (`processAssignmentFOApprox`) still unfolds it: when `?f ?α` does not match the expected type
+/// as written, `unfoldDefinition?` opens its head once and the attempt is repeated. So
+/// `pure 1 : D` with `def D := Id Nat` finds `?f := Id`, through a chain of definitions as well,
+/// and `F 3` with `def F (_ : Nat) := Id Nat` is retried as `Id Nat` once `?α := 3` fails. An
+/// `@[irreducible]` definition is not unfolded at the default transparency, and its `pure 1` is
+/// refused, by the pin and here (bead fln-first-order-approximation-context-locals-6esd).
+#[test]
+fn a_definition_expected_type_is_unfolded_for_first_order_approximation() {
+    let Some(lib) = pin() else {
+        return;
+    };
+    std::thread::Builder::new()
+        .stack_size(STACK)
+        .spawn(move || {
+            let base = imported_state(&lib);
+            let source = r#"
+def D := Id Nat
+example : D := pure 1
+def E := D
+example : E := pure 1
+def F (_ : Nat) := Id Nat
+example : F 3 := pure 1
+def viaDef : D := bind (pure 1) pure
+theorem viaDef_eq : viaDef = (1 : Nat) := rfl
+"#;
+            reference(
+                &lib,
+                &format!("prelude\nimport Init.Control.State\n{source}"),
+                true,
+            );
+            checked(&base, source);
+            let bad = "@[irreducible] def I := Id Nat\nexample : I := pure 1";
+            reference(
+                &lib,
+                &format!("prelude\nimport Init.Control.State\n{bad}"),
+                false,
+            );
+            let root = base.logical_root(&KVMap::new());
+            let error = base
+                .check_source_files(&[bad.as_bytes()], &KVMap::new(), limits())
+                .unwrap_err();
+            assert_eq!(error.disposition().0, "elaboration", "{error:?}");
+            assert_eq!(base.logical_root(&KVMap::new()), root);
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
 #[test]
 fn exhausted_admission_can_retry_without_publishing_a_definition_prefix() {
     let base = seed()

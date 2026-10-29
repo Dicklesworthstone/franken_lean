@@ -2305,7 +2305,10 @@ impl Context {
     }
 
     /// `Expr.headBeta`: `(fun x => b) a …` reduced at the head until it is no such redex.
-    fn head_beta(&mut self, mut expr: Expr) -> Result<Expr, NatDefinitionElabError> {
+    pub(in crate::source) fn head_beta(
+        &mut self,
+        mut expr: Expr,
+    ) -> Result<Expr, NatDefinitionElabError> {
         loop {
             self.tick()?;
             let mut arguments = Vec::new();

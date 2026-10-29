@@ -137,6 +137,18 @@ impl Context {
         else {
             return Ok(());
         };
+        // A hole is assigned only a value of its own type (`checkTypesAndAssign`, vendored
+        // `Lean/Meta/ExprDefEq.lean:480`). Against `F 3` with `def F (_ : Nat) := Id Nat`, the
+        // monad hole cannot be `F : Nat → Type`, so this choice does not apply, and the first-order
+        // result hint unfolds `F 3` instead.
+        for (hole, value) in [(monad, expected_monad), (result, expected_result)] {
+            if matches!(hole.node(), ExprNode::MVar { .. })
+                && let (Some(left), Some(right)) = (self.known_type(hole)?, self.known_type(value)?)
+                && !self.coercion_eq(&left, &right)?
+            {
+                return Ok(());
+            }
+        }
         if matches!(monad.node(), ExprNode::MVar { .. }) {
             self.constrain_type(monad, expected_monad)?;
         } else if monad != expected_monad {

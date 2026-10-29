@@ -143,7 +143,7 @@ fn safe_definition<'e>(env: &'e Environment, name: &Name) -> Option<&'e Definiti
 }
 
 /// The pin's matchers and splitters are `f.match_<n>` and `f.match_<n>.splitter`.
-fn is_matcher_name(name: &Name) -> bool {
+pub(super) fn is_matcher_name(name: &Name) -> bool {
     match name.leaf_view() {
         LeafView::Str(leaf) => leaf
             .strip_prefix("match_")

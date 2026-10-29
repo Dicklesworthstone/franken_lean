@@ -2,30 +2,101 @@
 //!
 //! The ordinary unifier deliberately leaves non-pattern flexible applications
 //! suspended. Source application elaboration may additionally try the pin's
-//! first-order approximation (ExprDefEq.processAssignmentFOApproxAux): match
-//! arguments from the right, then the remaining function. This is a candidate
-//! assignment, not an injectivity rule. Publish it only when the whole original
-//! equation checks, and keep every failed attempt's spent work.
+//! first-order approximation (ExprDefEq.processAssignmentFOApprox): match
+//! arguments from the right, then the remaining function, and when that fails
+//! unfold the expected side's head definition once and try again. This is a
+//! candidate assignment, not an injectivity rule. Publish it only when the whole
+//! original equation checks, and keep every failed attempt's spent work.
 use super::*;
+use fln_env::constants::ReducibilityHints;
 
 impl Context {
+    /// `processAssignmentFOApprox` (vendored `Lean/Meta/ExprDefEq.lean:1172-1212`): an attempt
+    /// that fails against `expected` unfolds its head definition once (`unfoldDefinition?`) and
+    /// tries again, so `?f ?α` meets `def D := Id Nat` as `Id Nat` and chooses `?f := Id`. Each
+    /// attempt is its own trial, and only a complete solution is published.
     pub(in crate::source) fn first_order_result_hint(
         &mut self,
         actual: &Expr,
         expected: &Expr,
     ) -> Result<bool, NatDefinitionElabError> {
-        let mut trial = self.clone();
-        let result = trial.first_order_result_hint_trial(actual, expected);
-        self.txn.budget.heartbeats_consumed = trial.txn.budget.heartbeats_consumed;
-        match result {
-            Ok(true) => {
-                *self = trial;
-                Ok(true)
+        let mut value = expected.clone();
+        loop {
+            let mut trial = self.clone();
+            let result = trial.first_order_result_hint_trial(actual, &value);
+            self.txn.budget.heartbeats_consumed = trial.txn.budget.heartbeats_consumed;
+            match result {
+                Ok(Some(true)) => {
+                    *self = trial;
+                    return Ok(true);
+                }
+                // No applied hole: nothing to approximate, unfolded or not.
+                Ok(None) => return Ok(false),
+                Ok(Some(false)) => {}
+                Err(error) if nonmatch(&error) => {}
+                Err(error) => return Err(error),
             }
-            Ok(false) => Ok(false),
-            Err(error) if nonmatch(&error) => Ok(false),
-            Err(error) => Err(error),
+            let mut probe = self.clone();
+            let unfolded = probe.first_order_unfold(&value);
+            self.txn.budget.heartbeats_consumed = probe.txn.budget.heartbeats_consumed;
+            match unfolded? {
+                Some(next) => value = next,
+                None => return Ok(false),
+            }
         }
+    }
+
+    /// The pin's `unfoldDefinition?` (vendored `Lean/Meta/WHNF.lean:871`) at the ambient
+    /// transparency, then the loop's `headBeta`: `value` with its head definition unfolded once
+    /// and its arguments kept, or `None`. A matcher stays folded, and so does a structural
+    /// definition whose arguments reach no smart-unfolding alternative. Metadata also stops the
+    /// loop: `unfoldDefinition?` opens only an application or a constant.
+    fn first_order_unfold(&mut self, value: &Expr) -> Result<Option<Expr>, NatDefinitionElabError> {
+        let value = self.instantiate(value)?;
+        let (head, _) = operators::spine(&value);
+        let ExprNode::Const { name, levels } = head.node() else {
+            return Ok(None);
+        };
+        let Some(ConstantInfo::Defn(definition)) = self.txn.env.find(name).cloned() else {
+            return Ok(None);
+        };
+        if definition.base.level_params.len() != levels.len()
+            || crate::source::equation_theorems::is_matcher_name(name)
+        {
+            return Ok(None);
+        }
+        let table = crate::reducibility::table(&self.txn.env).map_err(|error| {
+            failure(SourceInferenceError::Unification(Box::new(
+                UnificationError::Reducibility(error),
+            )))
+        })?;
+        let abbreviation = definition.hints == ReducibilityHints::Abbrev;
+        let permitted = match self.ambient_transparency(UnificationTransparency::Default) {
+            UnificationTransparency::None => false,
+            UnificationTransparency::Abbreviations => {
+                table.get(name).map_or(abbreviation, |status| {
+                    status == crate::reducibility::Reducibility::Reducible
+                })
+            }
+            UnificationTransparency::Instances => table.get(name).map_or(
+                abbreviation,
+                crate::reducibility::Reducibility::unfolds_at_instances,
+            ),
+            UnificationTransparency::Default | UnificationTransparency::SafeDefinitions => {
+                table.status(name) != crate::reducibility::Reducibility::Irreducible
+            }
+        };
+        if !permitted {
+            return Ok(None);
+        }
+        // The `unfold` tactic's stuck-match refusal is that tactic's own; here a folded
+        // definition only ends the loop.
+        self.unfold_tactic = false;
+        let unfolded = self.unfold_selected_definition(&value, &definition)?;
+        if unfolded == value {
+            return Ok(None);
+        }
+        self.head_beta(unfolded).map(Some)
     }
 
     /// Term checking may put the unknown constructor on either side: a
@@ -86,11 +157,13 @@ impl Context {
         }))
     }
 
+    /// One attempt: `None` when `actual` is no applied hole, else whether it solved the
+    /// equation.
     fn first_order_result_hint_trial(
         &mut self,
         actual: &Expr,
         expected: &Expr,
-    ) -> Result<bool, NatDefinitionElabError> {
+    ) -> Result<Option<bool>, NatDefinitionElabError> {
         let actual = self.instantiate(actual)?;
         let expected = self.instantiate(expected)?;
         let mut head = &actual;
@@ -109,7 +182,7 @@ impl Context {
             }
         }
         if arguments == 0 || !matches!(head.node(), ExprNode::MVar { .. }) {
-            return Ok(false);
+            return Ok(None);
         }
         let mut left = actual.clone();
         let mut right = expected.clone();
@@ -126,18 +199,18 @@ impl Context {
             let (ExprNode::App { f: a, a: x }, ExprNode::App { f: b, a: y }) =
                 (left.node(), right.node())
             else {
-                return Ok(false);
+                return Ok(Some(false));
             };
             if !self.coercion_eq(x, y)? {
-                return Ok(false);
+                return Ok(Some(false));
             }
             left = a.clone();
             right = b.clone();
         }
         if !self.coercion_eq(&left, &right)? {
-            return Ok(false);
+            return Ok(Some(false));
         }
-        self.coercion_eq(&actual, &expected)
+        self.coercion_eq(&actual, &expected).map(Some)
     }
 }
 
