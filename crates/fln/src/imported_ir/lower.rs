@@ -158,6 +158,7 @@ pub(super) fn compile(
     let mut tables = Tables {
         targets,
         intrinsic_ids,
+        intrinsics,
         constructors: Vec::new(),
         projections: Vec::new(),
         limits,
@@ -244,7 +245,7 @@ pub(super) fn compile(
         constructors: tables.constructors,
         projections: tables.projections,
         closure_types,
-        intrinsics,
+        intrinsics: tables.intrinsics,
         functions,
     };
     let checked = fir::validate(program, limits.fir).map_err(IrExecutionError::FirValidation)?;
@@ -314,6 +315,7 @@ fn is_scalar_case(ty: &IrType) -> bool {
 struct Tables {
     targets: BTreeMap<Name, (FunctionId, usize)>,
     intrinsic_ids: BTreeMap<Name, IntrinsicId>,
+    intrinsics: Vec<IntrinsicDecl>,
     constructors: Vec<ConstructorDecl>,
     projections: Vec<ProjectionDecl>,
     limits: IrExecutionLimits,
@@ -523,13 +525,32 @@ impl<'a> Builder<'a> {
             .collect()
     }
 
-    fn native_call(&mut self, block: BlockId, name: &Name, args: Vec<ValueId>) -> Result<ValueId> {
+    fn native_call(
+        &mut self,
+        block: BlockId,
+        name: &Name,
+        mut args: Vec<ValueId>,
+    ) -> Result<ValueId> {
         let intrinsic = self
             .tables
             .intrinsic_ids
             .get(name)
             .copied()
             .ok_or_else(|| IrExecutionError::MissingDeclaration(name.clone()))?;
+        for (index, argument) in args.iter_mut().enumerate() {
+            if self.tables.intrinsics[intrinsic.get() as usize]
+                .argument_ownership
+                .get(index)
+                == Some(&flbc::ArgumentOwnership::Owned)
+            {
+                // Imported locals remain reusable after a consuming native
+                // call, including when one local supplies several operands.
+                // Give each owned operand a distinct reference; the checked
+                // ownership pass can turn its last-use copy into a move.
+                // Unique operands retain their separate exclusivity contract.
+                *argument = self.emit(block, ValueType::Abi, Operation::Alias(*argument))?;
+            }
+        }
         self.emit(
             block,
             ValueType::Abi,
