@@ -23,6 +23,10 @@ impl Context {
         rule: &SimpRule<'_>,
         target: &Expr,
     ) -> Result<UnfoldResult, NatDefinitionElabError> {
+        // A `dsimproc`'s rewrite is definitional, as an unfolding is (`simproc.rs`).
+        if let SimpRule::Simprocs(set) = rule {
+            return self.simp_procedure_unfold(target, *set);
+        }
         match self.simp_unfold_selection_for_rule(rule)? {
             Some(selection) => self.unfold_simp_selection(target, &selection),
             None => Ok(UnfoldResult::NotDefinition),
@@ -35,7 +39,9 @@ impl Context {
     pub(super) fn simp_rule_may_unfold(&self, rule: &SimpRule<'_>) -> bool {
         match rule {
             SimpRule::Explicit(_) => true,
-            SimpRule::Local(_) | SimpRule::Arith | SimpRule::Decide => false,
+            SimpRule::Local(_) | SimpRule::Arith | SimpRule::Decide | SimpRule::Simprocs(_) => {
+                false
+            }
             SimpRule::Global(rule) => {
                 rule.proof.is_none()
                     && match self.txn.env.find(&rule.declaration) {
@@ -57,7 +63,9 @@ impl Context {
             SimpRule::Explicit(rule) => {
                 self.simp_unfold_selection_for_term(rule.syntax, rule.reverse)
             }
-            SimpRule::Local(_) | SimpRule::Arith | SimpRule::Decide => Ok(None),
+            SimpRule::Local(_) | SimpRule::Arith | SimpRule::Decide | SimpRule::Simprocs(_) => {
+                Ok(None)
+            }
             SimpRule::Global(rule) => {
                 self.tick()?;
                 if rule.proof.is_some() {

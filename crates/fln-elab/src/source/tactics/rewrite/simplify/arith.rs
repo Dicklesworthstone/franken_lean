@@ -24,19 +24,19 @@ const EXPONENT_THRESHOLD: u32 = 256;
 const MAX_LINEAR_DEPTH: usize = 256;
 const MAX_LINEAR_NODES: usize = 1024;
 
-fn name(path: &str) -> Name {
+pub(super) fn name(path: &str) -> Name {
     Name::from_components(path.split('.'))
 }
 
-fn constant(path: &str) -> Expr {
+pub(super) fn constant(path: &str) -> Expr {
     Expr::const_(name(path), Vec::new())
 }
 
-fn nat_type() -> Expr {
+pub(super) fn nat_type() -> Expr {
     constant("Nat")
 }
 
-fn big(n: &NatLit) -> BigNat {
+pub(super) fn big(n: &NatLit) -> BigNat {
     BigNat::from_limbs_le(n.limbs_le().to_vec())
 }
 
@@ -44,12 +44,12 @@ fn raw_literal(n: &BigNat) -> Expr {
     Expr::lit(Literal::Nat(NatLit::from_limbs_le(n.limbs_le().to_vec())))
 }
 
-fn apply(head: Expr, args: impl IntoIterator<Item = Expr>) -> Expr {
+pub(super) fn apply(head: Expr, args: impl IntoIterator<Item = Expr>) -> Expr {
     args.into_iter().fold(head, Expr::app)
 }
 
 /// `mkNatLit`: `@OfNat.ofNat Nat n (instOfNatNat n)`.
-fn nat_literal(n: &BigNat) -> Expr {
+pub(super) fn nat_literal(n: &BigNat) -> Expr {
     apply(
         Expr::const_(name("OfNat.ofNat"), vec![Level::zero()]),
         [
@@ -60,7 +60,7 @@ fn nat_literal(n: &BigNat) -> Expr {
     )
 }
 
-fn nat_binary(class: &str, operation: &str, instance: &str, a: Expr, b: Expr) -> Expr {
+pub(super) fn nat_binary(class: &str, operation: &str, instance: &str, a: Expr, b: Expr) -> Expr {
     let levels = vec![Level::zero(), Level::zero(), Level::zero()];
     let instance = apply(
         Expr::const_(name(class), vec![Level::zero()]),
@@ -73,7 +73,7 @@ fn nat_binary(class: &str, operation: &str, instance: &str, a: Expr, b: Expr) ->
 }
 
 /// `mkNatAdd`.
-fn nat_add(a: Expr, b: Expr) -> Expr {
+pub(super) fn nat_add(a: Expr, b: Expr) -> Expr {
     nat_binary("instHAdd", "HAdd.hAdd", "instAddNat", a, b)
 }
 
@@ -83,24 +83,24 @@ fn nat_mul(a: Expr, b: Expr) -> Expr {
 }
 
 /// `mkNatLE`.
-fn nat_le(a: Expr, b: Expr) -> Expr {
+pub(super) fn nat_le(a: Expr, b: Expr) -> Expr {
     apply(
         Expr::const_(name("LE.le"), vec![Level::zero()]),
         [nat_type(), constant("instLENat"), a, b],
     )
 }
 
-fn equation(type_: Expr, a: Expr, b: Expr) -> Expr {
+pub(super) fn equation(type_: Expr, a: Expr, b: Expr) -> Expr {
     apply(Expr::const_(name("Eq"), vec![Level::one()]), [type_, a, b])
 }
 
 /// `mkNatEq`.
-fn nat_eq(a: Expr, b: Expr) -> Expr {
+pub(super) fn nat_eq(a: Expr, b: Expr) -> Expr {
     equation(nat_type(), a, b)
 }
 
 /// `mkPropEq`.
-fn prop_eq(a: Expr, b: Expr) -> Expr {
+pub(super) fn prop_eq(a: Expr, b: Expr) -> Expr {
     equation(Expr::sort(Level::zero()), a, b)
 }
 
@@ -113,7 +113,7 @@ fn expected_prop(proof: Expr, expected: Expr) -> Expr {
 }
 
 /// `eagerReflBoolTrue` (`Lean/Expr.lean:2416`).
-fn eager_refl_bool_true() -> Expr {
+pub(super) fn eager_refl_bool_true() -> Expr {
     let truth = constant("Bool.true");
     let bool_ = constant("Bool");
     apply(
@@ -424,12 +424,12 @@ fn is_application<'e>(e: &'e Expr, head: &str, arity: usize) -> Option<Vec<&'e E
     (args.len() == arity && found == &name(head)).then_some(args)
 }
 
-fn is_constant(e: &Expr, path: &str) -> bool {
+pub(super) fn is_constant(e: &Expr, path: &str) -> bool {
     matches!(const_application(e), Some((found, args)) if args.is_empty() && found == &name(path))
 }
 
 /// The pin's `Structural` instance testers (`Lean/Meta/NatInstTesters.lean`).
-fn is_heterogeneous_instance(e: &Expr, class: &str, homogeneous: &str) -> bool {
+pub(super) fn is_heterogeneous_instance(e: &Expr, class: &str, homogeneous: &str) -> bool {
     is_application(e, class, 2).is_some_and(|args| is_constant(args[1], homogeneous))
 }
 
@@ -863,7 +863,7 @@ impl Context {
     /// For each of `count` arguments of a function of type `type_`, whether simp rewrites it
     /// (`CongrArgKind.eq`): `getCongrSimpKinds` and `fixKindsForDependencies` over the
     /// declared telescope. An argument past the telescope is rewritten.
-    fn simp_arith_argument_kinds(&self, type_: &Expr, count: usize) -> Vec<bool> {
+    pub(super) fn simp_arith_argument_kinds(&self, type_: &Expr, count: usize) -> Vec<bool> {
         #[derive(Clone, Copy, PartialEq)]
         enum Kind {
             Eq,
@@ -921,7 +921,11 @@ impl Context {
 
     /// Whether a binder type is a proposition, so its argument is a proof (`isProp`): a
     /// predicate applied, a parameter whose type ends in `Prop` applied, or a `∀` of either.
-    fn simp_arith_is_proof_type(&self, type_: &Expr, outer: &[(&Expr, BinderInfo)]) -> bool {
+    pub(super) fn simp_arith_is_proof_type(
+        &self,
+        type_: &Expr,
+        outer: &[(&Expr, BinderInfo)],
+    ) -> bool {
         fn ends_in_prop(mut type_: &Expr) -> bool {
             while let ExprNode::ForallE { body, .. } = type_.node() {
                 type_ = body;

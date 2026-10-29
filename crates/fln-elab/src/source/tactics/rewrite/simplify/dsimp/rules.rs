@@ -13,9 +13,14 @@ impl Context {
             definitions: Vec::new(),
             rewrites: Vec::new(),
             tagged,
+            procedures: NatSimprocs::default(),
             fail_if_unchanged: config.fail_if_unchanged,
         };
         for rule in rules {
+            if let SimpRule::Simprocs(procedures) = rule {
+                set.procedures = procedures;
+                continue;
+            }
             // A named, admitted theorem already has a proposition telescope.
             // The pin's isRflProof classifies a constant by its defeq tag,
             // without instantiating universes or re-inferring that telescope.

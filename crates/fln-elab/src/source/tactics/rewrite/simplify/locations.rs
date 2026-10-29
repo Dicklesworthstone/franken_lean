@@ -44,10 +44,11 @@ impl Context {
         rule: &SimpRule<'_>,
         tagged: &mut Option<std::collections::BTreeSet<Name>>,
     ) -> Result<bool, NatDefinitionElabError> {
-        // A linear normalization's or a decision's proof is a reflection proof, not `rfl`.
+        // A linear normalization's or a decision's proof is a reflection proof, not `rfl`; a
+        // procedure's definitional rewrite comes as an unfolding, so one reaching here has a proof.
         if matches!(
             rule,
-            SimpRule::Local(_) | SimpRule::Arith | SimpRule::Decide
+            SimpRule::Local(_) | SimpRule::Arith | SimpRule::Decide | SimpRule::Simprocs(_)
         ) {
             return Ok(false);
         }
@@ -143,7 +144,15 @@ impl Context {
                 hypotheses.push(local.user_name.clone());
             }
         }
-        // `+arith`'s normalization stays after every rule, the context's facts included.
+        // The procedures and then `+arith`'s normalization stay after every rule, the context's
+        // facts included.
+        if let Some(index) = rules
+            .iter()
+            .position(|rule| matches!(rule, SimpRule::Simprocs(_)))
+        {
+            let procedures = rules.remove(index);
+            rules.push(procedures);
+        }
         if let Some(index) = rules
             .iter()
             .position(|rule| matches!(rule, SimpRule::Arith))

@@ -141,8 +141,8 @@ fn beta(function: &Expr, args: &[Expr]) -> Option<Expr> {
 /// `src/Lean/Meta/Tactic/Simp/Main.lean:654-686`) rewrites a node after its arguments, so
 /// occurrences come in post-order. An unfolded definition goes first (it is definitional and
 /// unfolds every occurrence at once); occurrences this engine finds only beneath a binder, after
-/// every other; `+arith`'s normalization, which the pin runs after the rules
-/// (`Rewrite.lean:542-546`), last.
+/// every other; the simplification procedures and then `+arith`'s normalization, which the pin
+/// runs after the rules in that order (`Rewrite.lean:542-546`), last.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub(super) enum SimpReach {
     /// `simpUsingDecide`, which runs before a node's other rewrites (`decide.rs`).
@@ -151,6 +151,8 @@ pub(super) enum SimpReach {
     /// The occurrence's one-based post-order ordinal in the target.
     Node(usize),
     Binder,
+    /// The `Nat` simplification procedures (`simproc.rs`), which run after every theorem.
+    Procedure,
     Arith,
 }
 
@@ -298,7 +300,10 @@ impl Context {
         }
         for rule in rules {
             let statement = match rule {
-                SimpRule::Arith | SimpRule::Decide | SimpRule::Global(_) => continue,
+                SimpRule::Arith
+                | SimpRule::Decide
+                | SimpRule::Simprocs(_)
+                | SimpRule::Global(_) => continue,
                 SimpRule::Explicit(explicit) if explicit.global.is_some() => continue,
                 SimpRule::Local(id) => {
                     let Some(local) = self.txn.lctx.find(id) else {

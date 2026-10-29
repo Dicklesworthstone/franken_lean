@@ -11,6 +11,7 @@ mod decide;
 mod dsimp;
 mod locations;
 mod simpa;
+mod simproc;
 mod suggest;
 mod unfold;
 
@@ -21,6 +22,7 @@ use aclt::{SimpPlace, SimpReach, SimpRewrite};
 pub(in crate::source) use config::SimpConfig;
 use fln_core::expr::BinderInfo;
 use fln_env::environment::Environment;
+use simproc::NatSimprocs;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, PoisonError};
 use unfold::UnfoldResult;
@@ -44,13 +46,17 @@ pub(in crate::source) enum SimpRule<'a> {
     /// pin's `simpUsingDecide` ends `preDefault` (`Rewrite.lean:536-540`), which runs at a node
     /// before its post rewrites.
     Decide,
+    /// The default `Nat` simplification procedures the call runs (`simproc.rs`), after every
+    /// theorem and before `+arith`'s normalization: the pin's `userPostSimprocs` follows
+    /// `rewritePost` and precedes `simpArith` (`Rewrite.lean:542-546`).
+    Simprocs(NatSimprocs),
 }
 impl SimpRule<'_> {
     fn reverse(&self) -> bool {
         match self {
             Self::Explicit(rule) => rule.reverse,
             Self::Global(rule) => rule.reverse,
-            Self::Local(_) | Self::Arith | Self::Decide => false,
+            Self::Local(_) | Self::Arith | Self::Decide | Self::Simprocs(_) => false,
         }
     }
 }
@@ -402,7 +408,10 @@ impl Context {
         index: Option<&SimpTargetIndex>,
         side: SimpKeySide,
     ) -> bool {
-        if matches!(rule, SimpRule::Arith | SimpRule::Decide) {
+        if matches!(
+            rule,
+            SimpRule::Arith | SimpRule::Decide | SimpRule::Simprocs(_)
+        ) {
             return matches!(side, SimpKeySide::Rewrite);
         }
         let (Some(index), Some(entry)) = (index, simp_rule_entry(rule)) else {
@@ -772,8 +781,11 @@ impl Context {
                     type_: local.type_.clone(),
                 })
             }
-            // Arithmetic normalization and decision have no single proof term to select.
-            SimpRule::Arith | SimpRule::Decide => Err(error(TacticError::MalformedScript)),
+            // Arithmetic normalization, decision and the procedures have no single proof term
+            // to select.
+            SimpRule::Arith | SimpRule::Decide | SimpRule::Simprocs(_) => {
+                Err(error(TacticError::MalformedScript))
+            }
         }
     }
 
@@ -964,6 +976,13 @@ impl Context {
         for _ in &defaults {
             self.tick()?;
         }
+        // The default set's procedures; `simp only` and `dsimp only` start with none
+        // (`mkSimpContext`, `Lean/Elab/Tactic/Simp.lean:568`).
+        let mut procedures = if use_default {
+            NatSimprocs::all()
+        } else {
+            NatSimprocs::default()
+        };
         let mut arguments = expect_null_args(arguments, "optional simp rule list")?;
         // `simpa`'s rule list is its own `simpArgs` node (`simpaArgsRest`); `simp`'s is inline.
         if let [Syntax::Node { kind, args, .. }] = arguments
@@ -972,7 +991,7 @@ impl Context {
             arguments = args.as_slice();
         }
         if arguments.is_empty() {
-            return Ok(defaults);
+            return Ok(self.simp_rules_with_procedures(defaults, procedures));
         }
         let [open, rows, close] = arguments else {
             return Err(error(TacticError::MalformedScript));
@@ -1035,6 +1054,11 @@ impl Context {
                 let Syntax::Ident { val, .. } = &parts[1] else {
                     return Err(error(TacticError::MalformedScript));
                 };
+                // `elabSimpArg`: a procedure's name erases the procedure (`.eraseSimproc`).
+                if let Some(procedure) = self.simp_procedure_argument(val)? {
+                    procedures.remove(procedure);
+                    continue;
+                }
                 let name = self.simp_erasure_name(val)?;
                 for _ in 0..rules.len().saturating_add(defaults.len()) {
                     self.tick()?;
@@ -1052,6 +1076,14 @@ impl Context {
                 [Syntax::Atom { val, .. }] if val == "←" || val == "<-" => true,
                 _ => return Err(error(TacticError::MalformedScript)),
             };
+            // A procedure's name adds the procedure, `post` and with any `←` unread
+            // (`resolveSimpIdTheorem?`'s `.simproc`, then `.addSimproc declName post`).
+            if let Syntax::Ident { val, .. } = &parts[2]
+                && let Some(procedure) = self.simp_procedure_argument(val)?
+            {
+                procedures.insert(procedure);
+                continue;
+            }
             // `term` below runs the normal heap-driven elaborator on the native
             // stack. Refuse a nested proof script in the rule, whether the
             // source parser or a direct Syntax caller built it, so this one
@@ -1092,11 +1124,25 @@ impl Context {
         }
         // Explicit arguments have precedence; registered rules follow in their
         // stable priority/registration order. `only` leaves this tail empty.
-        Ok(rules
+        let rules = rules
             .into_iter()
             .map(|(_, rule)| rule)
             .chain(defaults)
-            .collect())
+            .collect();
+        Ok(self.simp_rules_with_procedures(rules, procedures))
+    }
+
+    /// `rules` followed by the call's procedures, where there are any and this environment
+    /// declares what their results are built from (the source seed does not).
+    fn simp_rules_with_procedures<'a>(
+        &self,
+        mut rules: Vec<SimpRule<'a>>,
+        procedures: NatSimprocs,
+    ) -> Vec<SimpRule<'a>> {
+        if !procedures.is_empty() && self.simp_procedures_supported() {
+            rules.push(SimpRule::Simprocs(procedures));
+        }
+        rules
     }
 
     fn restore_simp_trial(&mut self, mut original: Self) {

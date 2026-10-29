@@ -98,7 +98,7 @@ impl Context {
 
     /// `term`'s `Decidable` instance, or `None` where the search finds none. Nothing the search
     /// assigns survives; the instance found is closed.
-    fn simp_decidable_dictionary(
+    pub(super) fn simp_decidable_dictionary(
         &mut self,
         term: &Expr,
     ) -> Result<Option<Expr>, NatDefinitionElabError> {

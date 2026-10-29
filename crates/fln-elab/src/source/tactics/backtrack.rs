@@ -136,6 +136,7 @@ pub(in crate::source) fn recoverable(problem: &NatDefinitionElabError) -> bool {
                     | TacticError::ArithmeticUnsupported
                     | TacticError::ArithmeticInvalidCertificate
                     | TacticError::SimpSuggestionUnsupported(_)
+                    | TacticError::SimprocUnsupported(_)
             )
         }
         // With a known expected type, these are ordinary elaboration errors.

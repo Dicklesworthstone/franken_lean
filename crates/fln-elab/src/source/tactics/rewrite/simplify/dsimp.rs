@@ -23,6 +23,8 @@ struct DsimpSet<'a> {
     rewrites: Vec<(SimpRule<'a>, std::cell::Cell<Option<bool>>)>,
     /// The `rfl`-tagged declarations a classification reads.
     tagged: std::collections::BTreeSet<Name>,
+    /// The call's procedures, of which `dsimp` runs the `dsimproc`s (`dpostDefault`).
+    procedures: super::NatSimprocs,
     /// `failIfUnchanged`: a call that changes nothing fails, rather than leaving its goal.
     fail_if_unchanged: bool,
 }
@@ -33,6 +35,7 @@ impl Default for DsimpSet<'_> {
             definitions: Vec::new(),
             rewrites: Vec::new(),
             tagged: std::collections::BTreeSet::new(),
+            procedures: super::NatSimprocs::default(),
             fail_if_unchanged: true,
         }
     }

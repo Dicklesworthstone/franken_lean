@@ -60,6 +60,20 @@ impl Context {
                 .simp_binder_rule(target, rule, premises)?
                 .map(|evidence| (evidence, target.clone(), false, place)));
         }
+        if let SimpRule::Simprocs(set) = rule {
+            // The procedures run after every theorem: a chosen theorem rewrite comes first.
+            if limited {
+                self.simp_reach_limit = None;
+                return Ok(None);
+            }
+            let place = SimpPlace::of(SimpReach::Procedure);
+            if let Some((evidence, occurrence)) = self.simp_procedure_evidence(target, *set)? {
+                return Ok(Some((evidence, occurrence, false, place)));
+            }
+            return Ok(self
+                .simp_binder_rule(target, rule, premises)?
+                .map(|evidence| (evidence, target.clone(), false, place)));
+        }
         // The admitted statement is the rule's pattern. Unfolding selected
         // definitions here can erase that pattern before it ever meets the
         // target (for example, a generated equation for a matched definition).
@@ -167,6 +181,14 @@ impl Context {
         }
         if matches!(rule, SimpRule::Arith) {
             let Some((evidence, occurrence)) = self.simp_arith_evidence(body)? else {
+                return Ok(None);
+            };
+            return self
+                .simp_occurrence_equality(body, &occurrence, evidence, false)
+                .map(Some);
+        }
+        if let SimpRule::Simprocs(set) = rule {
+            let Some((evidence, occurrence)) = self.simp_procedure_evidence(body, *set)? else {
                 return Ok(None);
             };
             return self

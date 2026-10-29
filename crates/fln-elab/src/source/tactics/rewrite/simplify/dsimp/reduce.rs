@@ -361,6 +361,10 @@ impl Context {
         if !self.rewrite_same(term, &rewritten)? {
             return Ok(rewritten);
         }
+        // The `dsimproc`s follow the theorems (`dpostDefault`, `Rewrite.lean:417-419`).
+        if let Some(folded) = self.dsimp_procedure(term, set.procedures)? {
+            return Ok(folded);
+        }
         let (head, arguments) = self.dsimp_spine(term)?;
         // Check saturated heads, never the function part of a partial call.
         if let Some(selection) = set.selection_for(&head) {

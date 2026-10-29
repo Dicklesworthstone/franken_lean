@@ -236,6 +236,10 @@ pub enum TacticError {
     /// order the pin's simplifier visits terms and selects rules, which is modeled here only
     /// for the named fragment. Never caught by `first`/`try`: the pin's tactic succeeds.
     SimpSuggestionUnsupported(&'static str),
+    /// A simplification procedure's case this engine does not reproduce (`Nat.reducePow`'s
+    /// warning above `exponentiation.threshold`, a decision without a `Decidable` instance).
+    /// Never caught by `first`/`try`: the pin does something else there.
+    SimprocUnsupported(&'static str),
 }
 impl std::fmt::Display for TacticError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -244,6 +248,10 @@ impl std::fmt::Display for TacticError {
             Self::SimpSuggestionUnsupported(reason) => write!(
                 f,
                 "simp suggestion outside the fragment this engine reproduces: {reason}"
+            ),
+            Self::SimprocUnsupported(reason) => write!(
+                f,
+                "simplification procedure outside what this engine reproduces: {reason}"
             ),
             Self::UnsupportedTactic(kind) => {
                 write!(f, "unsupported tactic `{}`", kind.to_display_string())
