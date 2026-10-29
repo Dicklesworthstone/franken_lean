@@ -824,6 +824,7 @@ fn rename_operation(operation: &mut Operation, rename: &impl Fn(ValueId) -> Valu
         | Operation::CtorTest { value, .. }
         | Operation::Project { value, .. }
         | Operation::ProjectObject { value, .. }
+        | Operation::ProjectScalar { value, .. }
         | Operation::CheckSystemValue { module_name: value } => *value = rename(*value),
         Operation::Ctor { fields: values, .. }
         | Operation::Array { items: values }
@@ -834,6 +835,16 @@ fn rename_operation(operation: &mut Operation, rename: &impl Fn(ValueId) -> Valu
         } => {
             for value in values {
                 *value = rename(*value);
+            }
+        }
+        Operation::CtorPacked {
+            fields, scalars, ..
+        } => {
+            for value in fields {
+                *value = rename(*value);
+            }
+            for scalar in scalars {
+                scalar.value = rename(scalar.value);
             }
         }
         Operation::Apply { closure, args, .. } => {

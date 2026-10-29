@@ -35,8 +35,9 @@ pub use optimize::optimize;
 /// version 16 adds exact constructor-shape tests for native case dispatch;
 /// version 17 distinguishes Float, Float32, UInt32 and UInt64 scalar types;
 /// version 18 adds an erased callable result contract restricted to ABI values;
-/// version 19 projects object fields whose constructor layout is known at runtime.
-pub const FIR_SCHEMA_VERSION: u16 = 19;
+/// version 19 projects object fields whose constructor layout is known at runtime;
+/// version 20 supports immutable packed integer construction and projection.
+pub const FIR_SCHEMA_VERSION: u16 = 20;
 
 /// Explicit ceilings for FIR validation work.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -424,6 +425,13 @@ pub enum Operation {
         constructor: ConstructorId,
         fields: Vec<ValueId>,
     },
+    /// Allocate the declared constructor with an immutable scalar template and
+    /// checked integer initializers. Inputs are borrowed and the result is owned.
+    CtorPacked {
+        constructor: ConstructorId,
+        fields: Vec<ValueId>,
+        scalars: Vec<flbc::PackedScalar<ValueId>>,
+    },
     /// Borrowed constructor discrimination; false on another tag or shape.
     CtorTest {
         constructor: ConstructorId,
@@ -439,6 +447,13 @@ pub enum Operation {
     ProjectObject {
         value: ValueId,
         field: u16,
+    },
+    /// Read packed integer bytes from an erased constructor. The VM checks its
+    /// actual layout before reading; the byte offset includes its object slots.
+    ProjectScalar {
+        value: ValueId,
+        offset: u16,
+        kind: flbc::ScalarKind,
     },
     Array {
         items: Vec<ValueId>,
@@ -481,13 +496,17 @@ pub enum Operation {
 struct OperationReads<'a> {
     first: Option<ValueId>,
     rest: std::slice::Iter<'a, ValueId>,
+    scalars: std::slice::Iter<'a, flbc::PackedScalar<ValueId>>,
 }
 
 impl Iterator for OperationReads<'_> {
     type Item = ValueId;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.first.take().or_else(|| self.rest.next().copied())
+        self.first
+            .take()
+            .or_else(|| self.rest.next().copied())
+            .or_else(|| self.scalars.next().map(|scalar| scalar.value))
     }
 }
 
@@ -503,36 +522,51 @@ impl Operation {
             | Self::CheckSystem { .. } => OperationReads {
                 first: None,
                 rest: empty,
+                scalars: [].iter(),
             },
             Self::Alias(value)
             | Self::Box(value)
             | Self::Unbox { value, .. }
             | Self::Project { value, .. }
             | Self::ProjectObject { value, .. }
+            | Self::ProjectScalar { value, .. }
             | Self::CtorTest { value, .. }
             | Self::CheckSystemValue { module_name: value } => OperationReads {
                 first: Some(*value),
                 rest: empty,
+                scalars: [].iter(),
             },
             Self::Ctor { fields, .. } => OperationReads {
                 first: None,
                 rest: fields.iter(),
+                scalars: [].iter(),
+            },
+            Self::CtorPacked {
+                fields, scalars, ..
+            } => OperationReads {
+                first: None,
+                rest: fields.iter(),
+                scalars: scalars.iter(),
             },
             Self::Array { items } => OperationReads {
                 first: None,
                 rest: items.iter(),
+                scalars: [].iter(),
             },
             Self::Intrinsic { args, .. } | Self::Call { args, .. } => OperationReads {
                 first: None,
                 rest: args.iter(),
+                scalars: [].iter(),
             },
             Self::Closure { captures, .. } => OperationReads {
                 first: None,
                 rest: captures.iter(),
+                scalars: [].iter(),
             },
             Self::Apply { closure, args, .. } => OperationReads {
                 first: Some(*closure),
                 rest: args.iter(),
+                scalars: [].iter(),
             },
         }
     }
@@ -1199,6 +1233,19 @@ pub enum ValidationError {
         expected: ValueType,
         actual: ValueType,
     },
+    PackedScalarOperandType {
+        function: FunctionId,
+        block: BlockId,
+        scalar: usize,
+        actual: ValueType,
+    },
+    PackedScalarLayout {
+        function: FunctionId,
+        block: BlockId,
+        constructor: ConstructorId,
+        scalar: usize,
+        offset: u16,
+    },
     MissingProjection {
         function: FunctionId,
         block: BlockId,
@@ -1224,6 +1271,17 @@ pub enum ValidationError {
         function: FunctionId,
         block: BlockId,
         field: u16,
+    },
+    ScalarProjectionOperandType {
+        function: FunctionId,
+        block: BlockId,
+        actual: ValueType,
+    },
+    ScalarProjectionOffsetOutOfRange {
+        function: FunctionId,
+        block: BlockId,
+        offset: u16,
+        kind: flbc::ScalarKind,
     },
     JumpOutOfBounds {
         function: FunctionId,
@@ -1931,6 +1989,30 @@ impl fmt::Display for ValidationError {
                 block.get(),
                 constructor.get()
             ),
+            Self::PackedScalarOperandType {
+                function,
+                block,
+                scalar,
+                actual,
+            } => write!(
+                formatter,
+                "function {} block {} packed scalar {scalar} expects Abi, got {actual:?}",
+                function.get(),
+                block.get()
+            ),
+            Self::PackedScalarLayout {
+                function,
+                block,
+                constructor,
+                scalar,
+                offset,
+            } => write!(
+                formatter,
+                "function {} block {} constructor {} scalar {scalar} at byte {offset} is out of bounds, overlapping or unordered",
+                function.get(),
+                block.get(),
+                constructor.get()
+            ),
             Self::MissingProjection {
                 function,
                 block,
@@ -1981,6 +2063,27 @@ impl fmt::Display for ValidationError {
             } => write!(
                 formatter,
                 "function {} block {} object projection field {field} exceeds the ABI constructor limit",
+                function.get(),
+                block.get()
+            ),
+            Self::ScalarProjectionOperandType {
+                function,
+                block,
+                actual,
+            } => write!(
+                formatter,
+                "function {} block {} scalar projection expects Abi, got {actual:?}",
+                function.get(),
+                block.get()
+            ),
+            Self::ScalarProjectionOffsetOutOfRange {
+                function,
+                block,
+                offset,
+                kind,
+            } => write!(
+                formatter,
+                "function {} block {} {kind:?} projection at byte {offset} exceeds the ABI constructor limit",
                 function.get(),
                 block.get()
             ),
@@ -2784,6 +2887,11 @@ fn infer_operation_type(
         Operation::Ctor {
             constructor,
             fields,
+        }
+        | Operation::CtorPacked {
+            constructor,
+            fields,
+            ..
         } => {
             let Some(declaration) = constructor
                 .index()
@@ -2816,6 +2924,32 @@ fn infer_operation_type(
                         expected: *expected,
                         actual,
                     });
+                }
+            }
+            if let Operation::CtorPacked { scalars, .. } = operation {
+                if let Some((scalar, offset)) = flbc::invalid_packed_scalar(
+                    fields.len(),
+                    declaration.static_scalar_bytes.len(),
+                    scalars,
+                ) {
+                    return Err(ValidationError::PackedScalarLayout {
+                        function: function.id,
+                        block: block.id,
+                        constructor: *constructor,
+                        scalar,
+                        offset,
+                    });
+                }
+                for (scalar, operand) in scalars.iter().enumerate() {
+                    let actual = value_type(function, block, value_types, operand.value)?;
+                    if actual != ValueType::Abi {
+                        return Err(ValidationError::PackedScalarOperandType {
+                            function: function.id,
+                            block: block.id,
+                            scalar,
+                            actual,
+                        });
+                    }
                 }
             }
             Ok(ValueType::Constructor)
@@ -2895,6 +3029,29 @@ fn infer_operation_type(
                     function: function.id,
                     block: block.id,
                     field: *field,
+                });
+            }
+            Ok(ValueType::Abi)
+        }
+        Operation::ProjectScalar {
+            value,
+            offset,
+            kind,
+        } => {
+            let actual = value_type(function, block, value_types, *value)?;
+            if actual != ValueType::Abi {
+                return Err(ValidationError::ScalarProjectionOperandType {
+                    function: function.id,
+                    block: block.id,
+                    actual,
+                });
+            }
+            if !flbc::scalar_projection_in_range(*offset, *kind) {
+                return Err(ValidationError::ScalarProjectionOffsetOutOfRange {
+                    function: function.id,
+                    block: block.id,
+                    offset: *offset,
+                    kind: *kind,
                 });
             }
             Ok(ValueType::Abi)
@@ -3818,6 +3975,42 @@ fn lower_single_binding(
                 )?,
             })
         }
+        Operation::CtorPacked {
+            constructor,
+            fields,
+            scalars,
+        } => {
+            let declaration = constructor
+                .index()
+                .and_then(|index| program.constructors.get(index))
+                .ok_or(LoweringError::InternalInvariant {
+                    reason: "validated packed constructor id disappeared",
+                })?;
+            let mut lowered_scalars = Vec::new();
+            lowered_scalars
+                .try_reserve_exact(scalars.len())
+                .map_err(|_| LoweringError::AllocationFailure {
+                    table: "packed scalar operands",
+                    requested: scalars.len(),
+                })?;
+            for scalar in scalars {
+                lowered_scalars.push(flbc::PackedScalar {
+                    offset: scalar.offset,
+                    kind: scalar.kind,
+                    value: lower_register(scalar.value)?,
+                });
+            }
+            Ok(flbc::Instruction::CtorPacked {
+                dst,
+                tag: declaration.tag,
+                fields: lower_registers(fields)?,
+                scalar_bytes: clone_bytes(
+                    &declaration.static_scalar_bytes,
+                    "constructor scalar bytes",
+                )?,
+                scalars: lowered_scalars,
+            })
+        }
         Operation::CtorTest { constructor, value } => {
             let constructor = constructor
                 .index()
@@ -3870,6 +4063,16 @@ fn lower_single_binding(
             dst,
             src: lower_register(*value)?,
             field: *field,
+        }),
+        Operation::ProjectScalar {
+            value,
+            offset,
+            kind,
+        } => Ok(flbc::Instruction::CtorScalar {
+            dst,
+            src: lower_register(*value)?,
+            offset: *offset,
+            kind: *kind,
         }),
         Operation::Array { items } => Ok(flbc::Instruction::Array {
             dst,
@@ -4126,6 +4329,28 @@ fn write_operation(output: &mut impl fmt::Write, operation: &Operation) -> fmt::
             write!(output, "ctor c{} fields=", constructor.get())?;
             write_values(output, fields)
         }
+        Operation::CtorPacked {
+            constructor,
+            fields,
+            scalars,
+        } => {
+            write!(output, "ctor-packed c{} fields=", constructor.get())?;
+            write_values(output, fields)?;
+            output.write_str(" scalars=[")?;
+            for (index, scalar) in scalars.iter().enumerate() {
+                if index != 0 {
+                    output.write_char(',')?;
+                }
+                write!(
+                    output,
+                    "{}:{:?}:v{}",
+                    scalar.offset,
+                    scalar.kind,
+                    scalar.value.get()
+                )?;
+            }
+            output.write_char(']')
+        }
         Operation::CtorTest { constructor, value } => {
             write!(output, "ctor-test c{} v{}", constructor.get(), value.get())
         }
@@ -4134,6 +4359,17 @@ fn write_operation(output: &mut impl fmt::Write, operation: &Operation) -> fmt::
         }
         Operation::ProjectObject { value, field } => {
             write!(output, "project-object v{} field={field}", value.get())
+        }
+        Operation::ProjectScalar {
+            value,
+            offset,
+            kind,
+        } => {
+            write!(
+                output,
+                "project-scalar v{} offset={offset} kind={kind:?}",
+                value.get()
+            )
         }
         Operation::Array { items } => {
             output.write_str("array ")?;
@@ -5093,7 +5329,7 @@ mod tests {
         assert_eq!(
             validated.canonical_text(),
             concat!(
-                "fir/19 entry=f0\n",
+                "fir/20 entry=f0\n",
                 "function f0 params=[] ownership=[] result=nat result_ownership=scalar\n",
                 " block b0\n",
                 "  v0:nat = nat 41\n",
@@ -5757,6 +5993,271 @@ mod tests {
         assert!(matches!(
             validate(uninitialized, ValidationLimits::default()),
             Err(ValidationError::ReadBeforeDefinition { value, .. }) if value == v(4)
+        ));
+    }
+
+    fn packed_scalar_program(kind: flbc::ScalarKind) -> Program {
+        let offset = u16::try_from(std::mem::size_of::<usize>() + 1).unwrap();
+        Program::new(
+            f(0),
+            vec![ConstructorDecl {
+                id: c(0),
+                tag: 7,
+                fields: vec![ValueType::String],
+                static_scalar_bytes: vec![0xa5; 16],
+            }],
+            Vec::new(),
+            Vec::new(),
+            vec![Function {
+                id: f(0),
+                parameters: Vec::new(),
+                parameter_ownership: Vec::new(),
+                result: ValueType::Abi,
+                result_ownership: flbc::CallableResultOwnership::Erased,
+                blocks: vec![Block {
+                    id: b(0),
+                    bindings: vec![
+                        Binding {
+                            id: v(0),
+                            ty: ValueType::String,
+                            operation: Operation::String("retained object field".to_owned()),
+                        },
+                        Binding {
+                            id: v(1),
+                            ty: ValueType::Nat,
+                            operation: Operation::Nat(42),
+                        },
+                        Binding {
+                            id: v(2),
+                            ty: ValueType::Abi,
+                            operation: Operation::Box(v(1)),
+                        },
+                        Binding {
+                            id: v(3),
+                            ty: ValueType::Abi,
+                            operation: Operation::Alias(v(2)),
+                        },
+                        Binding {
+                            id: v(4),
+                            ty: ValueType::Constructor,
+                            operation: Operation::CtorPacked {
+                                constructor: c(0),
+                                fields: vec![v(0)],
+                                scalars: vec![flbc::PackedScalar {
+                                    offset,
+                                    kind,
+                                    value: v(3),
+                                }],
+                            },
+                        },
+                        Binding {
+                            id: v(5),
+                            ty: ValueType::Abi,
+                            operation: Operation::Box(v(4)),
+                        },
+                        Binding {
+                            id: v(6),
+                            ty: ValueType::Abi,
+                            operation: Operation::Alias(v(5)),
+                        },
+                        Binding {
+                            id: v(7),
+                            ty: ValueType::Abi,
+                            operation: Operation::ProjectScalar {
+                                value: v(6),
+                                offset,
+                                kind,
+                            },
+                        },
+                    ],
+                    terminator: Terminator::Return { value: v(7) },
+                }],
+            }],
+        )
+    }
+
+    #[test]
+    fn packed_integer_operations_lower_and_keep_aliases_in_optimizer_scope() {
+        for kind in [
+            flbc::ScalarKind::UInt8,
+            flbc::ScalarKind::UInt16,
+            flbc::ScalarKind::UInt32,
+            flbc::ScalarKind::UInt64,
+            flbc::ScalarKind::USize,
+        ] {
+            let checked = validate(packed_scalar_program(kind), ValidationLimits::default())
+                .expect("mixed object and unaligned scalar layout validates");
+            assert!(checked.canonical_text().contains("ctor-packed c0"));
+            assert!(checked.canonical_text().contains("project-scalar v6"));
+            for source in [
+                checked.clone(),
+                optimize(&checked, ValidationLimits::default()).expect("packed alias rewriting"),
+            ] {
+                let lowered =
+                    lower_to_flbc_with_ownership(&source, flbc::OwnershipLimits::default())
+                        .expect("packed inputs are read before ownership retirement");
+                assert!(lowered.program().functions()[0].code.iter().any(|instruction| {
+                    matches!(instruction, flbc::Instruction::CtorPacked { scalars, scalar_bytes, .. }
+                        if scalars.len() == 1 && scalars[0].kind == kind && scalar_bytes == &[0xa5; 16])
+                }));
+                assert!(lowered.program().functions()[0].code.iter().any(|instruction| {
+                    matches!(instruction, flbc::Instruction::CtorScalar { kind: actual, .. } if *actual == kind)
+                }));
+                let bytes = encode_canonical(lowered.program(), CodecLimits::default()).unwrap();
+                assert_eq!(
+                    flbc::decode_canonical(&bytes, CodecLimits::default()).unwrap(),
+                    *lowered.program()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn packed_integer_validation_refuses_bad_layout_types_and_uninitialized_values() {
+        let kind = flbc::ScalarKind::UInt64;
+        for offset in [0, std::mem::size_of::<usize>() as u16 + 15] {
+            let mut source = packed_scalar_program(kind);
+            let Operation::CtorPacked { scalars, .. } =
+                &mut source.functions[0].blocks[0].bindings[4].operation
+            else {
+                panic!("packed construction");
+            };
+            scalars[0].offset = offset;
+            assert!(matches!(
+                validate(source, ValidationLimits::default()),
+                Err(ValidationError::PackedScalarLayout { scalar: 0, .. })
+            ));
+        }
+        let mut overlapping = packed_scalar_program(kind);
+        let Operation::CtorPacked { scalars, .. } =
+            &mut overlapping.functions[0].blocks[0].bindings[4].operation
+        else {
+            panic!("packed construction");
+        };
+        scalars.push(scalars[0]);
+        assert!(matches!(
+            validate(overlapping, ValidationLimits::default()),
+            Err(ValidationError::PackedScalarLayout { scalar: 1, .. })
+        ));
+
+        let mut wrong_scalar = packed_scalar_program(kind);
+        let Operation::CtorPacked { scalars, .. } =
+            &mut wrong_scalar.functions[0].blocks[0].bindings[4].operation
+        else {
+            panic!("packed construction");
+        };
+        scalars[0].value = v(1);
+        assert!(matches!(
+            validate(wrong_scalar, ValidationLimits::default()),
+            Err(ValidationError::PackedScalarOperandType {
+                actual: ValueType::Nat,
+                ..
+            })
+        ));
+
+        let mut unread = packed_scalar_program(kind);
+        let Operation::CtorPacked { scalars, .. } =
+            &mut unread.functions[0].blocks[0].bindings[4].operation
+        else {
+            panic!("packed construction");
+        };
+        scalars[0].value = v(5);
+        assert!(matches!(validate(unread, ValidationLimits::default()),
+            Err(ValidationError::ReadBeforeDefinition { value, .. }) if value == v(5)));
+
+        let mut wrong_receiver = packed_scalar_program(kind);
+        let Operation::ProjectScalar { value, .. } =
+            &mut wrong_receiver.functions[0].blocks[0].bindings[7].operation
+        else {
+            panic!("scalar projection");
+        };
+        *value = v(4);
+        assert!(matches!(
+            validate(wrong_receiver, ValidationLimits::default()),
+            Err(ValidationError::ScalarProjectionOperandType {
+                actual: ValueType::Constructor,
+                ..
+            })
+        ));
+
+        let mut wrong_offset = packed_scalar_program(kind);
+        let Operation::ProjectScalar { offset, .. } =
+            &mut wrong_offset.functions[0].blocks[0].bindings[7].operation
+        else {
+            panic!("scalar projection");
+        };
+        *offset = u16::MAX;
+        assert!(matches!(
+            validate(wrong_offset, ValidationLimits::default()),
+            Err(ValidationError::ScalarProjectionOffsetOutOfRange {
+                offset: u16::MAX,
+                ..
+            })
+        ));
+
+        let mut wrong_result = packed_scalar_program(kind);
+        wrong_result.functions[0].blocks[0].bindings[7].ty = ValueType::UInt64;
+        assert!(matches!(
+            validate(wrong_result, ValidationLimits::default()),
+            Err(ValidationError::BindingType {
+                inferred: ValueType::Abi,
+                declared: ValueType::UInt64,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn packed_scalar_operands_are_metered_and_checked_work_is_not_eliminated() {
+        let mut source = packed_scalar_program(flbc::ScalarKind::UInt32);
+        source.functions[0].blocks[0].bindings.push(Binding {
+            id: v(8),
+            ty: ValueType::Abi,
+            operation: Operation::Box(v(0)),
+        });
+        source.functions[0].blocks[0].bindings.push(Binding {
+            id: v(9),
+            ty: ValueType::Constructor,
+            operation: Operation::CtorPacked {
+                constructor: c(0),
+                fields: vec![v(0)],
+                scalars: vec![flbc::PackedScalar {
+                    offset: std::mem::size_of::<usize>() as u16,
+                    kind: flbc::ScalarKind::UInt32,
+                    value: v(8),
+                }],
+            },
+        });
+        let checked = validate(source.clone(), ValidationLimits::default()).unwrap();
+        let optimized = optimize(&checked, ValidationLimits::default()).unwrap();
+        assert_eq!(
+            optimized.functions()[0].blocks[0]
+                .bindings
+                .iter()
+                .filter(|binding| matches!(binding.operation, Operation::CtorPacked { .. }))
+                .count(),
+            2,
+            "the unused String-to-integer carrier check can refuse and must still run"
+        );
+        let operands = 1
+            + source.functions[0].blocks[0]
+                .bindings
+                .iter()
+                .map(|binding| binding.operation.operand_count())
+                .sum::<usize>()
+            + 1;
+        assert!(matches!(
+            validate(
+                source,
+                ValidationLimits {
+                    max_operands: operands - 1,
+                    ..ValidationLimits::default()
+                }
+            ),
+            Err(ValidationError::ResourceLimit {
+                resource: ValidationResource::Operands,
+                ..
+            })
         ));
     }
 

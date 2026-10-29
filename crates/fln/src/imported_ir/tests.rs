@@ -1185,6 +1185,150 @@ fn native_arrays_feed_imported_list_recursion_and_preserve_shared_inputs() {
     );
 }
 
+fn assert_native_owned_result(compiled: &CompiledIr, expected: &str) {
+    assert_eq!(returned(compiled), expected);
+    let bytes = flbc::encode_canonical(compiled.program.program(), flbc::CodecLimits::default())
+        .expect("encode native owned operands");
+    let replay = flbc::decode_canonical(&bytes, flbc::CodecLimits::default())
+        .expect("decode native owned operands");
+    let outcome = fln_vm::interpreter::execute(&replay, ExecutionLimits::default(), None);
+    let Outcome::Complete(VmExit::Returned(value)) = outcome else {
+        panic!("native owned operands replay did not return: {outcome:?}");
+    };
+    assert_eq!(
+        crate::nat_decimal(&value.value).expect("Nat replay result"),
+        expected
+    );
+}
+
+#[test]
+fn native_owned_operands_preserve_shared_strings_and_closure_captures() {
+    for through_closure in [false, true] {
+        let mut stmts = if through_closure {
+            vec![
+                binding(
+                    2,
+                    IrExpr::Pap {
+                        function: name("String.append"),
+                        args: vec![IrArg::Var(1)],
+                    },
+                ),
+                binding(
+                    3,
+                    IrExpr::Ap {
+                        x: 2,
+                        args: vec![IrArg::Var(1)],
+                    },
+                ),
+            ]
+        } else {
+            vec![call(3, "String.append", &[1, 1])]
+        };
+        // The same borrowed parameter supplies both the owned and borrowed
+        // native operands, then remains readable after the call returns.
+        stmts.extend([
+            call(4, "String.length", &[1]),
+            call(5, "String.length", &[3]),
+            call(6, "Nat.add", &[4, 5]),
+        ]);
+        let compiled = compile_users(
+            vec![function("User.sharedString", 1, stmts, IrArg::Var(6))],
+            "User.sharedString",
+            &[EntryArgument::String("λ🦀".to_owned())],
+            IrExecutionLimits::default(),
+        )
+        .unwrap();
+        assert_native_owned_result(&compiled, "6");
+    }
+}
+
+#[test]
+fn repeated_owned_native_operands_keep_distinct_references_and_move_last_uses() {
+    let entry = function(
+        "NativeLists.nested",
+        0,
+        vec![
+            number(1, 0),
+            call(2, "Array.emptyWithCapacity", &[1]),
+            // The empty array is both the updated container and its element.
+            // These two owned operands need distinct references to preserve
+            // the inner empty array when the outer one acquires an element.
+            call(3, "Array.push", &[2, 2]),
+            call(4, "Array.getInternal", &[3, 1]),
+            call(5, "Array.size", &[3]),
+            call(6, "Array.size", &[4]),
+            call(7, "Nat.add", &[5, 6]),
+        ],
+        IrArg::Var(7),
+    );
+    let modules = [module(vec![
+        entry,
+        native_array_extern("Array.emptyWithCapacity", 1),
+        native_array_extern("Array.push", 2),
+        native_array_extern("Array.getInternal", 2),
+        native_array_extern("Array.size", 1),
+    ])];
+    let users = BTreeSet::from([name("NativeLists.nested")]);
+    let compile_nested = |limits| {
+        compile(
+            &modules,
+            &name("NativeLists.nested"),
+            &[],
+            &bounded_partition(&[]),
+            &users,
+            limits,
+        )
+    };
+    let compiled = compile_nested(IrExecutionLimits::default()).unwrap();
+    assert_native_owned_result(&compiled, "1");
+    let function = compiled
+        .reference_functions()
+        .iter()
+        .find(|function| function.name == name("NativeLists.nested"))
+        .unwrap()
+        .function;
+    let code = &compiled.program.program().functions()[function.get() as usize].code;
+    let args = code
+        .iter()
+        .find_map(|instruction| match instruction {
+            flbc::Instruction::Intrinsic { row, args, .. } if row == "extern:Array.push" => {
+                Some(args)
+            }
+            _ => None,
+        })
+        .unwrap();
+    assert_ne!(args[0], args[1]);
+    let retained = code.iter().find_map(|instruction| match instruction {
+        flbc::Instruction::Copy { dst, src } if *dst == args[0] => Some(*src),
+        _ => None,
+    });
+    let moved = code.iter().find_map(|instruction| match instruction {
+        flbc::Instruction::Move { dst, src } if *dst == args[1] => Some(*src),
+        _ => None,
+    });
+    assert!(
+        retained.is_some(),
+        "the first operand retains its reference"
+    );
+    assert_eq!(moved, retained, "the final operand transfers the last use");
+
+    // Alias bindings count against the same bounded lowering budget as all
+    // other values, and a refused compilation cannot poison a later retry.
+    let values = compiled
+        .program
+        .program()
+        .functions()
+        .iter()
+        .map(|function| usize::from(function.register_count))
+        .sum::<usize>();
+    let mut limits = IrExecutionLimits::default();
+    limits.fir.max_values = values - 1;
+    let error = compile_nested(limits).unwrap_err();
+    assert!(matches!(error, IrExecutionError::Limit("lowered values")));
+    assert!(error.is_resource());
+    assert_native_owned_result(&compile_nested(IrExecutionLimits::default()).unwrap(), "1");
+}
+
 #[test]
 fn imported_list_recursion_still_accepts_scalar_nil() {
     let entry = function(
