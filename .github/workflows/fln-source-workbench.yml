@@ -76,6 +76,8 @@ jobs:
               'crates/fln-elab/src/source/tactics.rs',
               'crates/fln-elab/src/source/tactics/control.rs',
               'crates/fln-elab/src/source/tactics/conv/congr.rs',
+              'crates/fln-elab/src/constraint/unify.rs',
+              'crates/fln-elab/tests/native_unification_reducible_patterns.rs',
           }
           for path, blobs in changes.items():
               assert path in allowed, path
@@ -172,11 +174,14 @@ jobs:
               # n15v: retire when the ordinary full product gate covers this cut.
               cargo check --locked --all-targets
               cargo clippy --locked --all-targets -- -D warnings
+              refinement_exit=0
               cargo test --locked --no-fail-fast -p fln \
                 --test source_refinement --test source_index_refinement \
                 --test source_core_closing_tactics --test source_backtracking \
-                -- --nocapture
-              cargo test --locked -p fln-elab --lib source::tactics::refine::tests -- --nocapture
+                -- --nocapture || refinement_exit=$?
+              cargo test --locked -p fln-elab --lib source::tactics::refine::tests -- --nocapture || refinement_exit=$?
+              cargo test --locked -p fln-elab --test native_unification_reducible_patterns -- --nocapture || refinement_exit=$?
+              exit "$refinement_exit"
               ;;
             pattern-simp)
               # b8zv: retire when the ordinary full product gate covers this cut.
