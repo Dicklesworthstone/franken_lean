@@ -205,6 +205,17 @@ fn dependent_holes_schedule_type_and_witness_before_consumers() {
 }
 #[test]
 fn refinement_composes_with_intro_constructor_and_nested_local_proofs() {
+    // The pin accepts these. Exercise the complete source door alongside
+    // the direct introduction-frontier rollback tests.
+    for source in [
+        "theorem t : Nat → True := by intro (x : Nat); exact True.intro",
+        "theorem t : And True True → True := by intro ⟨p, q⟩; exact p",
+        "theorem t (f g : Nat → Nat) (h : ∀ n, f n = g n) : f = g := by funext (x : Nat); exact h x",
+        "theorem t : And True True → True := by refine fun ⟨p, q⟩ => ?_; exact p",
+        "theorem t (h : And True True) : True := by refine (match h with | And.intro p q => ?_); exact p",
+    ] {
+        check(source);
+    }
     check(&format!(
         "{BOTH} theorem nested (P Q : Prop) : P -> Q -> Both P (Both Q P) := by intro p q; refine Both.intro p ?_; constructor; exact q; exact p"
     ));
@@ -312,6 +323,10 @@ fn synthetic_hole_spelling_uses_the_pins_identifier_and_trivia_parser() {
 
 #[test]
 fn later_explicit_goals_cannot_be_solved_by_inference_or_ignored_by_conversion() {
+    // A match branch may expose holes to its enclosing refine. The same
+    // syntax under exact must still close every hole that exact owns.
+    reject("theorem t : And True True → True := by exact fun ⟨p, q⟩ => ?_");
+    reject("theorem t (h : And True True) : True := by exact (match h with | And.intro p q => ?_)");
     reject("theorem bad (n m : Nat) : n = n := by refine Eq.refl ?_; exact m");
     reject("def ignore (n : Nat) : 0 = 0 := rfl\ntheorem bad : 0 = 0 := by refine ignore ?_");
     check("theorem good (n : Nat) : n = n := by refine Eq.refl _");

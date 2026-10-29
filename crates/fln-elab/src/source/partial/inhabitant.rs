@@ -268,6 +268,7 @@ mod tests {
         saved.budget.heartbeats_consumed = spent;
         assert_eq!(complete.txn, saved);
         assert!(complete.next > 0);
+        eprintln!("inhabitant rollback sweep: every allowance in 1..{spent}");
         assert!(matches!(
             fln_kernel::check(
                 &env,
@@ -299,8 +300,20 @@ mod tests {
                 &result,
                 Err(NatDefinitionElabError::Inference(SourceInferenceError::Unification(error)))
                     if matches!(error.as_ref(), UnificationError::HeartbeatLimit)
+            ) || matches!(
+                &result,
+                Err(NatDefinitionElabError::Inference(SourceInferenceError::TypeObligation(outcome)))
+                    if matches!(outcome.as_ref(), Outcome::Inconclusive(problem)
+                        if matches!(&problem.cause,
+                            fln_core::outcome::InconclusiveCause::ResourceExhausted { usage }
+                                if usage.reason == fln_core::diag::ResourceReason::ExecutionSteps
+                                    && usage.observed > usage.allowed))
             );
             assert!(stopped, "allowance {allowance}: {result:?}");
+            assert!(
+                !crate::source::tactics::backtrack::recoverable(result.as_ref().unwrap_err()),
+                "a budget stop cannot select another proof alternative: {result:?}"
+            );
             saved.budget.heartbeats_consumed = limited.txn.budget.heartbeats_consumed;
             assert_eq!(limited.txn, saved, "allowance {allowance}");
             assert!(limited.txn.budget.heartbeats_consumed >= allowance);

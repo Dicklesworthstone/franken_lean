@@ -2190,6 +2190,7 @@ impl Context {
                 Option<usize>,
                 Option<usize>,
             ),
+            MatchTerm(tactics::ProofState<'a>, tactics::ProofGoal),
             RefineTerm(tactics::ProofState<'a>, tactics::ProofGoal, usize),
         }
         let mut tasks = vec![match initial_proof {
@@ -2223,6 +2224,7 @@ impl Context {
                                 | Task::DoBindJoinBody(..)
                                 | Task::DoBindJoinValue(..)
                                 | Task::ProofTerm(..)
+                                | Task::MatchTerm(..)
                                 | Task::RefineTerm(..)
                         )
                     );
@@ -2291,6 +2293,7 @@ impl Context {
                             | Task::DoBindJoinBody(..)
                             | Task::DoBindJoinValue(..)
                             | Task::ProofTerm(..)
+                            | Task::MatchTerm(..)
                             | Task::RefineTerm(..)
                     ) {
                         // Every still-unresolved argument keeps its original
@@ -3710,6 +3713,13 @@ impl Context {
                                     tasks.push(Task::Visit(rule.syntax, None, true));
                                 }
                             }
+                            tactics::ProofAction::MatchTerm { syntax, goal } => {
+                                self.txn.lctx = goal.lctx.clone();
+                                self.check_application_typing(syntax, &goal.target)?;
+                                let expected = Some(goal.target.clone());
+                                tasks.push(Task::MatchTerm(proof, goal));
+                                tasks.push(Task::Visit(syntax, expected, true));
+                            }
                             tactics::ProofAction::Term {
                                 syntax,
                                 goal,
@@ -3796,6 +3806,18 @@ impl Context {
                         Task::RefineTerm(mut proof, goal, depth) => {
                             let term = values.pop().expect("refinement term visit");
                             self.finish_refinement(&mut proof, goal, term, depth)?;
+                            tasks.push(Task::Proof(proof));
+                        }
+                        Task::MatchTerm(proof, goal) => {
+                            let term = values.pop().expect("match branch term visit");
+                            self.txn.lctx = goal.lctx.clone();
+                            self.resolve_instances(false)?;
+                            self.flush(false)?;
+                            self.ensure_tactic_term_type(&term.type_, &goal.target)?;
+                            // Holes were registered in the enclosing refine/exact
+                            // frame. Close this branch's telescope, then let that
+                            // owner decide whether its remaining goals may escape.
+                            self.close_proof_goal(goal, term.value)?;
                             tasks.push(Task::Proof(proof));
                         }
                         Task::ProofTerm(mut proof, goal, instance_start, refinement_depth) => {

@@ -776,6 +776,12 @@ pub(super) enum ProofAction<'a> {
         goal: ProofGoal,
         apply: bool,
     },
+    /// A term branch belongs to its enclosing term's refinement, rather than
+    /// introducing the independent hole-closure obligation of `exact`.
+    MatchTerm {
+        syntax: &'a Syntax,
+        goal: ProofGoal,
+    },
     Complete(Typed),
 }
 
@@ -1257,11 +1263,7 @@ impl Context {
                 Work::Term(mut goal, syntax) => {
                     self.txn.lctx = goal.lctx.clone();
                     goal.target = self.instantiate(&goal.target)?;
-                    return Ok(ProofAction::Term {
-                        syntax,
-                        goal,
-                        apply: false,
-                    });
+                    return Ok(ProofAction::MatchTerm { syntax, goal });
                 }
                 Work::Script(goal, instructions) => {
                     let parent = std::mem::replace(&mut proof.instructions, instructions);
