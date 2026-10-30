@@ -3,6 +3,8 @@
 use super::*;
 use fln_olean::ir::{IrArg, IrBody, IrExpr, IrLit, IrParam, IrTerminal};
 
+mod mixed_cases;
+
 fn name(text: &str) -> Name {
     Name::from_components(text.split('.'))
 }

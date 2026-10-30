@@ -2413,6 +2413,22 @@ fn run(
                 )?;
                 advance(current_frame_mut(&mut stack)?)?;
             }
+            Instruction::ScalarTagTest {
+                dst,
+                src,
+                expected_tag,
+            } => {
+                let matches = {
+                    let value = register(current_frame(&stack)?, src)?;
+                    value.is_scalar() && value.unbox() as u64 == expected_tag
+                };
+                set_register(
+                    current_frame_mut(&mut stack)?,
+                    dst,
+                    Obj::mk_nat(usize::from(matches)),
+                )?;
+                advance(current_frame_mut(&mut stack)?)?;
+            }
             Instruction::CtorField {
                 dst,
                 src,

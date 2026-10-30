@@ -1440,12 +1440,6 @@ impl<'a> Builder<'a> {
             // Check object cases before scalar nullary constructors. No
             // reference-count test or guessed object-to-number conversion.
             arms.sort_by_key(|(info, _)| fieldless_constructor(info));
-            if default.is_some() && arms.iter().any(|(info, _)| fieldless_constructor(info)) {
-                return Err(unsupported(
-                    self.name,
-                    "mixed scalar/object case with a default",
-                ));
-            }
         }
         self.case_arm(block, x, value, &arms, default, (locals, joins, ty))
     }
@@ -1496,6 +1490,14 @@ impl<'a> Builder<'a> {
                     },
                 )?
             }
+            None if !scalar => self.emit(
+                block,
+                ValueType::Bool,
+                Operation::ScalarTagTest {
+                    value,
+                    tag: info.cidx,
+                },
+            )?,
             None => {
                 let (tag, equal) = if let Some(wide) = wide_scalar(ty) {
                     let equal = wide.equal;
@@ -1530,18 +1532,12 @@ impl<'a> Builder<'a> {
             // while Reference IR boxes the same nullary tag as a scalar.
             // Both representations enter the same body without evaluating
             // the receiver or its continuation a second time.
-            let tag = self.nat(zero, &IrNat::Small(info.cidx))?;
-            let equal = self.native_call(
-                zero,
-                &Name::from_components(["Nat", "beq"]),
-                vec![value, tag],
-            )?;
             let scalar_condition = self.emit(
                 zero,
                 ValueType::Bool,
-                Operation::Unbox {
-                    value: equal,
-                    ty: ValueType::Bool,
+                Operation::ScalarTagTest {
+                    value,
+                    tag: info.cidx,
                 },
             )?;
             let scalar_miss = self.block()?;

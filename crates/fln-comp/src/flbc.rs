@@ -32,15 +32,16 @@ use std::fmt;
 /// version 15 adds terminal direct and closure calls with frame ownership transfer;
 /// version 16 distinguishes erased ABI results from the Nat-specific union;
 /// version 17 adds object-field projection checked against the runtime layout;
-/// version 18 adds immutable packed integer construction and checked projection.
-pub const FLBC_SCHEMA_VERSION: u16 = 18;
+/// version 18 adds immutable packed integer construction and checked projection;
+/// version 19 adds total, borrowed discrimination of tagged scalar constructors.
+pub const FLBC_SCHEMA_VERSION: u16 = 19;
 
 /// Canonical binary envelope version for persisted FLBC artifacts.
 ///
 /// This is independent of [`FLBC_SCHEMA_VERSION`]: the envelope freezes byte
 /// framing and opcode numbers, while the embedded schema version freezes the
 /// program model accepted by [`validate`].
-pub const FLBC_WIRE_VERSION: u16 = 13;
+pub const FLBC_WIRE_VERSION: u16 = 14;
 
 /// Canonical witness schema for the bounded ownership pass.
 ///
@@ -90,6 +91,7 @@ const OP_TAIL_APPLY: u8 = 21;
 const OP_CTOR_FIELD_DYNAMIC: u8 = 22;
 const OP_CTOR_PACKED: u8 = 23;
 const OP_CTOR_SCALAR: u8 = 24;
+const OP_SCALAR_TAG_TEST: u8 = 25;
 
 /// Explicit allocation and work ceilings for canonical FLBC artifacts.
 ///
@@ -596,6 +598,14 @@ pub enum Instruction {
         expected_tag: u8,
         expected_fields: u16,
     },
+    /// Return scalar 1 only when the borrowed operand is a tagged scalar with
+    /// this exact tag. Heap objects, including mpz numbers and fieldless heap
+    /// constructors, return 0 without reading their payload or invoking Nat.
+    ScalarTagTest {
+        dst: Register,
+        src: Register,
+        expected_tag: u64,
+    },
     /// Read one constructor object field after checking its complete runtime
     /// object-slot shape. Validation guarantees `field < expected_fields`.
     CtorField {
@@ -720,6 +730,7 @@ impl Instruction {
             | Self::CtorFieldDynamic { src, .. }
             | Self::CtorScalar { src, .. }
             | Self::CtorTest { src, .. }
+            | Self::ScalarTagTest { src, .. }
             | Self::CheckSystemValue { module_name: src } => {
                 vec![*src]
             }
@@ -761,6 +772,7 @@ impl Instruction {
             | Self::CtorFieldDynamic { dst, .. }
             | Self::CtorScalar { dst, .. }
             | Self::CtorTest { dst, .. }
+            | Self::ScalarTagTest { dst, .. }
             | Self::Array { dst, .. }
             | Self::Intrinsic { dst, .. }
             | Self::Call { dst, .. }
@@ -2462,6 +2474,16 @@ fn encode_instruction(encoder: &mut Encoder, instruction: &Instruction) -> Resul
             encoder.u8(*expected_tag)?;
             encoder.u16(*expected_fields)
         }
+        Instruction::ScalarTagTest {
+            dst,
+            src,
+            expected_tag,
+        } => {
+            encoder.u8(OP_SCALAR_TAG_TEST)?;
+            encoder.register(*dst)?;
+            encoder.register(*src)?;
+            encoder.u64(*expected_tag)
+        }
         Instruction::Array { dst, items } => {
             encoder.u8(OP_ARRAY)?;
             encoder.register(*dst)?;
@@ -2641,6 +2663,11 @@ fn decode_instruction(decoder: &mut Decoder<'_>) -> Result<Instruction, CodecErr
             src: decoder.register()?,
             expected_tag: decoder.u8()?,
             expected_fields: decoder.u16()?,
+        }),
+        OP_SCALAR_TAG_TEST => Ok(Instruction::ScalarTagTest {
+            dst: decoder.register()?,
+            src: decoder.register()?,
+            expected_tag: decoder.u64()?,
         }),
         OP_ARRAY => Ok(Instruction::Array {
             dst: decoder.register()?,
@@ -3479,6 +3506,7 @@ fn validate_function(program: &Program, function: &Function) -> Result<(), Valid
                 }
             }
             Instruction::String { .. }
+            | Instruction::ScalarTagTest { .. }
             | Instruction::Copy { .. }
             | Instruction::Move { .. }
             | Instruction::Drop { .. }
@@ -3952,6 +3980,7 @@ fn ownership_reads<E>(
         | Instruction::CtorFieldDynamic { src, .. }
         | Instruction::CtorScalar { src, .. }
         | Instruction::CtorTest { src, .. }
+        | Instruction::ScalarTagTest { src, .. }
         | Instruction::CheckSystemValue { module_name: src } => visit(*src)?,
         Instruction::Ctor { fields, .. } => {
             for register in fields {
@@ -4193,6 +4222,7 @@ fn ownership_operand_count(instruction: &Instruction) -> usize {
         | Instruction::CtorFieldDynamic { .. }
         | Instruction::CtorScalar { .. }
         | Instruction::CtorTest { .. }
+        | Instruction::ScalarTagTest { .. }
         | Instruction::CheckSystemValue { .. }
         | Instruction::JumpIfZero { .. }
         | Instruction::Return { .. }
@@ -4279,6 +4309,7 @@ fn ownership_payload_bytes(instruction: &Instruction) -> usize {
         | Instruction::CtorFieldDynamic { .. }
         | Instruction::CtorScalar { .. }
         | Instruction::CtorTest { .. }
+        | Instruction::ScalarTagTest { .. }
         | Instruction::Array { .. }
         | Instruction::Call { .. }
         | Instruction::TailCall { .. }
@@ -4516,6 +4547,15 @@ fn ownership_clone_instruction(instruction: &Instruction) -> Result<Instruction,
             src: *src,
             expected_tag: *expected_tag,
             expected_fields: *expected_fields,
+        },
+        Instruction::ScalarTagTest {
+            dst,
+            src,
+            expected_tag,
+        } => Instruction::ScalarTagTest {
+            dst: *dst,
+            src: *src,
+            expected_tag: *expected_tag,
         },
         Instruction::Array { dst, items } => Instruction::Array {
             dst: *dst,
@@ -7313,7 +7353,7 @@ mod codec_tests {
                 function(
                     0,
                     0,
-                    13,
+                    14,
                     vec![
                         Instruction::Nat {
                             dst: r(0),
@@ -7412,6 +7452,11 @@ mod codec_tests {
                             src: r(11),
                             offset: std::mem::size_of::<usize>() as u16,
                             kind: ScalarKind::UInt64,
+                        },
+                        Instruction::ScalarTagTest {
+                            dst: r(13),
+                            src: r(0),
+                            expected_tag: 0,
                         },
                         Instruction::Return { src: r(9) },
                     ],
@@ -11940,8 +11985,8 @@ mod codec_tests {
             bytes,
             vec![
                 70, 76, 78, 70, 76, 66, 67, 0, // magic
-                13, 0, // wire version: packed constructor opcodes 23 and 24
-                18, 0, // schema version: immutable packed integer fields
+                14, 0, // wire version: scalar tag predicate opcode 25
+                19, 0, // schema version: exact borrowed scalar discrimination
                 0, 0, 0, 0, // entry
                 1, 0, 0, 0, // function count
                 0, 0, 0, 0, // function id

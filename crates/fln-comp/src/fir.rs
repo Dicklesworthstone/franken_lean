@@ -36,8 +36,9 @@ pub use optimize::optimize;
 /// version 17 distinguishes Float, Float32, UInt32 and UInt64 scalar types;
 /// version 18 adds an erased callable result contract restricted to ABI values;
 /// version 19 projects object fields whose constructor layout is known at runtime;
-/// version 20 supports immutable packed integer construction and projection.
-pub const FIR_SCHEMA_VERSION: u16 = 20;
+/// version 20 supports immutable packed integer construction and projection;
+/// version 21 adds exact tagged-scalar tests over borrowed ABI values.
+pub const FIR_SCHEMA_VERSION: u16 = 21;
 
 /// Explicit ceilings for FIR validation work.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -437,6 +438,12 @@ pub enum Operation {
         constructor: ConstructorId,
         value: ValueId,
     },
+    /// Total tagged-scalar discrimination. Heap values are a nonmatch, without
+    /// a numeric conversion, allocation, or assumption about their layout.
+    ScalarTagTest {
+        value: ValueId,
+        tag: u64,
+    },
     Project {
         projection: ProjectionId,
         value: ValueId,
@@ -531,6 +538,7 @@ impl Operation {
             | Self::ProjectObject { value, .. }
             | Self::ProjectScalar { value, .. }
             | Self::CtorTest { value, .. }
+            | Self::ScalarTagTest { value, .. }
             | Self::CheckSystemValue { module_name: value } => OperationReads {
                 first: Some(*value),
                 rest: empty,
@@ -1252,6 +1260,11 @@ pub enum ValidationError {
         projection: ProjectionId,
     },
     ConstructorTestOperandType {
+        function: FunctionId,
+        block: BlockId,
+        actual: ValueType,
+    },
+    ScalarTagTestOperandType {
         function: FunctionId,
         block: BlockId,
         actual: ValueType,
@@ -2031,6 +2044,16 @@ impl fmt::Display for ValidationError {
             } => write!(
                 formatter,
                 "function {} block {} constructor test received {actual:?}",
+                function.get(),
+                block.get()
+            ),
+            Self::ScalarTagTestOperandType {
+                function,
+                block,
+                actual,
+            } => write!(
+                formatter,
+                "function {} block {} scalar tag test expects Abi, got {actual:?}",
                 function.get(),
                 block.get()
             ),
@@ -2969,6 +2992,17 @@ fn infer_operation_type(
             let actual = value_type(function, block, value_types, *value)?;
             if actual != ValueType::Constructor {
                 return Err(ValidationError::ConstructorTestOperandType {
+                    function: function.id,
+                    block: block.id,
+                    actual,
+                });
+            }
+            Ok(ValueType::Bool)
+        }
+        Operation::ScalarTagTest { value, .. } => {
+            let actual = value_type(function, block, value_types, *value)?;
+            if actual != ValueType::Abi {
+                return Err(ValidationError::ScalarTagTestOperandType {
                     function: function.id,
                     block: block.id,
                     actual,
@@ -4031,6 +4065,11 @@ fn lower_single_binding(
                 expected_fields,
             })
         }
+        Operation::ScalarTagTest { value, tag } => Ok(flbc::Instruction::ScalarTagTest {
+            dst,
+            src: lower_register(*value)?,
+            expected_tag: *tag,
+        }),
         Operation::Project { projection, value } => {
             let projection = projection
                 .index()
@@ -4353,6 +4392,9 @@ fn write_operation(output: &mut impl fmt::Write, operation: &Operation) -> fmt::
         }
         Operation::CtorTest { constructor, value } => {
             write!(output, "ctor-test c{} v{}", constructor.get(), value.get())
+        }
+        Operation::ScalarTagTest { value, tag } => {
+            write!(output, "scalar-tag-test v{} tag={tag}", value.get())
         }
         Operation::Project { projection, value } => {
             write!(output, "project p{} v{}", projection.get(), value.get())
@@ -5329,7 +5371,7 @@ mod tests {
         assert_eq!(
             validated.canonical_text(),
             concat!(
-                "fir/20 entry=f0\n",
+                "fir/21 entry=f0\n",
                 "function f0 params=[] ownership=[] result=nat result_ownership=scalar\n",
                 " block b0\n",
                 "  v0:nat = nat 41\n",
