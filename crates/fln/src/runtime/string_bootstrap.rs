@@ -1,10 +1,12 @@
-//! Convert checked Char, Pos.Raw and Substring.Raw at the private String ABI.
+//! Convert checked characters, words, positions and slices at the String ABI.
 //!
 //! Strings retain their dedicated VM representation. Char remains the ordinary
 //! UInt32/BitVec/Fin constructor chain and Pos.Raw remains a one-field record;
-//! `String.Pos s` is the checked record around a `Pos.Raw` and UInt8 the
-//! ordinary BitVec/Fin chain. Only these closed, typed adapters expose scalar
-//! payloads to the pinned pure native rows; Char, UInt8, position and
+//! `String.Pos s` is the checked record around a `Pos.Raw`, and UInt8/UInt64
+//! keep their ordinary BitVec/Fin chains. Slice proofs remain in logical data;
+//! only its String and byte offsets cross the native boundary. These closed,
+//! typed adapters expose scalar payloads to the pinned pure rows; word and
+//! character results, optional characters, native decisions, position and
 //! `String.Pos` results are reconstructed with their checked constructors, and
 //! proofs keep their usual inert slots without reaching the native call.
 //! Source operands stay outside the wrapper binding, preserving strict argument
@@ -25,7 +27,10 @@ pub(super) struct Store {
     position: Option<(Name, Name)>,
     string_position: Option<(Name, Name)>,
     substring: Option<(Name, Name)>,
+    slice: Option<Name>,
     byte: Option<[Name; 3]>,
+    word64: Option<[Name; 3]>,
+    word_to_nat: Option<(IntrinsicBinding, Expr)>,
     byte_view: Option<Expr>,
     verified: string_bootstrap::VerifiedDependencies,
 }
@@ -38,7 +43,10 @@ impl Default for Store {
             position: None,
             string_position: None,
             substring: None,
+            slice: None,
             byte: None,
+            word64: None,
+            word_to_nat: None,
             byte_view: None,
             verified: string_bootstrap::VerifiedDependencies::default(),
         }
@@ -46,6 +54,9 @@ impl Default for Store {
 }
 
 const NATIVE_SUBSTRING: &str = "_fln_runtime_string_substring";
+const NATIVE_SLICE: &str = "_fln_runtime_string_slice";
+const NATIVE_WORD64: &str = "_fln_runtime_string_word64";
+const NATIVE_WORD_TO_NAT: &str = "_fln_runtime_string_word_to_nat";
 
 fn c(label: &str) -> Expr {
     Expr::const_(name(label), Vec::new())
@@ -65,13 +76,20 @@ fn nat_list() -> Expr {
     Expr::app(Expr::const_(name("List"), vec![Level::zero()]), c("Nat"))
 }
 
+fn nat_option() -> Expr {
+    Expr::app(Expr::const_(name("Option"), vec![Level::zero()]), c("Nat"))
+}
+
 fn native_type(domain: Domain) -> Expr {
     match domain {
         Domain::String => c("String"),
         Domain::Substring => c(NATIVE_SUBSTRING),
+        Domain::Slice => c(NATIVE_SLICE),
         // The native traversal returns its scalars; the adapter rebuilds Chars.
         Domain::CharList => nat_list(),
-        Domain::Bool => c("Bool"),
+        Domain::OptionalChar => nat_option(),
+        Domain::Word64 => c(NATIVE_WORD64),
+        Domain::Bool | Domain::Decision => c("Bool"),
         Domain::StringCallback => function(&[c("String"), c("Nat")], c("String")),
         Domain::Char
         | Domain::Position
@@ -105,6 +123,7 @@ impl Preparation<'_> {
             .primitives
             .iter()
             .flatten()
+            .chain(self.string_bootstrap.word_to_nat.iter())
             .find(|(binding, _)| &binding.name == requested)
             .map(|(binding, _)| binding.clone())
     }
@@ -114,6 +133,7 @@ impl Preparation<'_> {
             .primitives
             .iter()
             .flatten()
+            .chain(self.string_bootstrap.word_to_nat.iter())
             .find(|(binding, _)| &binding.name == requested)
             .map(|(_, type_)| type_.clone())
     }
@@ -228,6 +248,55 @@ impl Preparation<'_> {
         ))
     }
 
+    fn string_bootstrap_slice(&mut self) -> Result<Name, IngressError> {
+        if let Some(projection) = &self.string_bootstrap.slice {
+            return Ok(projection.clone());
+        }
+        let shape = self.io_checked_shape(c("String.Slice"))?;
+        let [constructor] = shape.constructors.as_slice() else {
+            return Err(unsupported("String bootstrap Slice structure"));
+        };
+        let position = self.erase_runtime_type(&Expr::app(
+            c("String.Pos"),
+            Expr::lit(Literal::Str(String::new())),
+        ))?;
+        if constructor.tag != 0
+            || constructor.fields
+                != [
+                    c("String"),
+                    position.clone(),
+                    position,
+                    proofs::erased_type(),
+                ]
+            || constructor.type_fields != [false, false, false, false]
+        {
+            return Err(unsupported("String bootstrap Slice fields"));
+        }
+        self.string_bootstrap_position()?;
+        self.string_bootstrap_string_position()?;
+        self.io_private_record(NATIVE_SLICE, vec![c("String"), c("Nat"), c("Nat")])?;
+        let projection = shape.projection(constructor);
+        self.string_bootstrap.slice = Some(projection.clone());
+        Ok(projection)
+    }
+
+    fn string_bootstrap_pack_slice(&mut self, value: Expr) -> Result<Expr, IngressError> {
+        let projection = self.string_bootstrap_slice()?;
+        let (position, _) = self.string_bootstrap_string_position()?;
+        let (raw, _) = self.string_bootstrap_position()?;
+        let mut result = Expr::const_(Name::str(name(NATIVE_SLICE), "mk"), Vec::new());
+        for index in 0..3 {
+            self.tick()?;
+            let mut field = Expr::proj(projection.clone(), index, value.clone());
+            if index > 0 {
+                field = Expr::proj(position.clone(), 0, field);
+                field = Expr::proj(raw.clone(), 0, field);
+            }
+            result = Expr::app(result, field);
+        }
+        Ok(result)
+    }
+
     /// `String.Pos s` is one checked `Pos.Raw` field and an erased validity
     /// proof, for every `s`. Read its layout at the closed instance `""`.
     fn string_bootstrap_string_position(&mut self) -> Result<(Name, Name), IngressError> {
@@ -313,6 +382,76 @@ impl Preparation<'_> {
         Ok(result)
     }
 
+    /// Hashes return all 64 bits. A private scalar carrier and the existing
+    /// native UInt64-to-Nat adapter preserve the public UInt64/BitVec/Fin
+    /// records, including in Prelude-only environments. This helper is
+    /// compiler-owned representation code, not a call to a user declaration
+    /// named UInt64.toNat or a dependency on the unrelated Float model.
+    fn string_bootstrap_word64(&mut self) -> Result<(), IngressError> {
+        if self.string_bootstrap.word64.is_some() {
+            return Ok(());
+        }
+        let (word, word_fields) = self.string_bootstrap_record(c("UInt64"), 1)?;
+        let (bits, bits_fields) = self.string_bootstrap_record(word_fields[0].clone(), 1)?;
+        let (finite, finite_fields) = self.string_bootstrap_record(bits_fields[0].clone(), 2)?;
+        if finite_fields != [c("Nat"), proofs::erased_type()] {
+            return Err(unsupported("String hash checked UInt64 fields"));
+        }
+        if self.environment.contains(&name(NATIVE_WORD64))
+            || self.environment.contains(&name(NATIVE_WORD_TO_NAT))
+        {
+            return Err(unsupported("String hash private carrier name collision"));
+        }
+        let mut binding = generated_source_intrinsic_binding(&name("UInt64.toNat"))
+            .ok_or_else(|| unsupported("String hash native word conversion"))?;
+        if binding.row != "extern:UInt64.toNat"
+            || binding.arguments != [ValueType::UInt64]
+            || binding.argument_ownership != [ArgumentOwnership::Scalar]
+            || binding.result != ValueType::Nat
+            || binding.result_ownership != ResultOwnership::Owned
+            || binding.effect != EffectClass::Pure
+        {
+            return Err(unsupported(
+                "String hash generated word conversion contract",
+            ));
+        }
+        self.value_types
+            .native
+            .try_reserve(1)
+            .map_err(|_| IngressError::AllocationFailure {
+                resource: IngressResource::ProgramTables,
+                requested: self.value_types.native.len().saturating_add(1),
+            })?;
+        self.value_types.native.insert(
+            c(NATIVE_WORD64),
+            (ValueType::UInt64, CallableResultOwnership::Owned),
+        );
+        binding.name = name(NATIVE_WORD_TO_NAT);
+        self.string_bootstrap.word_to_nat =
+            Some((binding, function(&[c(NATIVE_WORD64)], c("Nat"))));
+        self.string_bootstrap.word64 = Some([word, bits, finite]);
+        Ok(())
+    }
+
+    fn string_bootstrap_word64_from_native(&mut self, value: Expr) -> Result<Expr, IngressError> {
+        self.string_bootstrap_word64()?;
+        let [word, bits, finite] = self
+            .string_bootstrap
+            .word64
+            .clone()
+            .expect("checked word layout");
+        let natural = Expr::app(c(NATIVE_WORD_TO_NAT), value);
+        let mut result = Expr::app(
+            Expr::app(Expr::const_(finite, vec![]), natural),
+            proofs::erased_value(),
+        );
+        for constructor in [bits, word] {
+            self.tick()?;
+            result = Expr::app(Expr::const_(constructor, vec![]), result);
+        }
+        Ok(result)
+    }
+
     fn string_bootstrap_bind(&mut self, operation: Operation) -> Result<(), IngressError> {
         if self.string_bootstrap.primitives[operation.index()].is_some() {
             return Ok(());
@@ -336,6 +475,12 @@ impl Preparation<'_> {
             .collect();
         if runtime.contains(&Domain::Substring) || operation.result() == Domain::Substring {
             self.string_bootstrap_substring()?;
+        }
+        if runtime.contains(&Domain::Slice) {
+            self.string_bootstrap_slice()?;
+        }
+        if operation.result() == Domain::Word64 {
+            self.string_bootstrap_word64()?;
         }
         let (kind, module) = operation.declaration();
         if row.id != format!("extern:{}", operation.label())
@@ -381,7 +526,7 @@ impl Preparation<'_> {
             self.tick()?;
             arguments.push(match domain {
                 Domain::String => ValueType::String,
-                Domain::Substring => ValueType::Constructor,
+                Domain::Substring | Domain::Slice => ValueType::Constructor,
                 Domain::Char | Domain::Position | Domain::Nat | Domain::StringPosition => {
                     ValueType::Nat
                 }
@@ -392,7 +537,12 @@ impl Preparation<'_> {
                     };
                     callback
                 }
-                Domain::Proof | Domain::Byte | Domain::CharList => {
+                Domain::Proof
+                | Domain::Byte
+                | Domain::CharList
+                | Domain::OptionalChar
+                | Domain::Word64
+                | Domain::Decision => {
                     unreachable!("fixed String bootstrap runtime operand")
                 }
             });
@@ -400,12 +550,13 @@ impl Preparation<'_> {
         let result = match operation.result() {
             Domain::String => ValueType::String,
             Domain::Substring => ValueType::Constructor,
+            Domain::Word64 => ValueType::UInt64,
             Domain::Nat
             | Domain::Position
             | Domain::StringPosition
             | Domain::Char
             | Domain::Byte => ValueType::Nat,
-            Domain::Bool => {
+            Domain::Bool | Domain::Decision => {
                 if self.value_type(&c("Bool"))? != Some(ValueType::Bool) {
                     return Err(unsupported("String bootstrap checked Boolean result"));
                 }
@@ -425,7 +576,21 @@ impl Preparation<'_> {
                 }
                 ValueType::Constructor
             }
-            Domain::StringCallback | Domain::Proof => {
+            Domain::OptionalChar => {
+                let option = self.io_checked_shape(nat_option())?;
+                if option.constructors.len() != 2
+                    || option.constructors[0].tag != 0
+                    || !option.constructors[0].fields.is_empty()
+                    || option.constructors[1].tag != 1
+                    || option.constructors[1].fields != [c("Nat")]
+                {
+                    return Err(unsupported(
+                        "String bootstrap checked optional scalar layout",
+                    ));
+                }
+                ValueType::Constructor
+            }
+            Domain::StringCallback | Domain::Proof | Domain::Slice => {
                 unreachable!("fixed String bootstrap result")
             }
         };
@@ -443,6 +608,60 @@ impl Preparation<'_> {
             function(&native_domains, native_type(operation.result())),
         ));
         Ok(())
+    }
+
+    fn string_bootstrap_optional_character(&mut self, value: Expr) -> Result<Expr, IngressError> {
+        let character = self.native_character_from_scalar(b(0)?)?;
+        let some = Expr::app(
+            Expr::app(
+                Expr::const_(name("Option.some"), vec![Level::zero()]),
+                c("Char"),
+            ),
+            character,
+        );
+        let some = Expr::lam(Name::anonymous(), c("Nat"), some, BinderInfo::Default);
+        let none = Expr::app(
+            Expr::const_(name("Option.none"), vec![Level::zero()]),
+            c("Char"),
+        );
+        let motive = Expr::lam(
+            Name::anonymous(),
+            nat_option(),
+            Domain::OptionalChar.source_type(),
+            BinderInfo::Default,
+        );
+        Ok([c("Nat"), motive, none, some, value].into_iter().fold(
+            Expr::const_(name("Option.rec"), vec![Level::one(), Level::zero()]),
+            Expr::app,
+        ))
+    }
+
+    fn string_bootstrap_decision(&mut self, value: Expr) -> Result<Expr, IngressError> {
+        let shape = self.io_checked_shape(Domain::Decision.source_type())?;
+        let [no, yes] = shape.constructors.as_slice() else {
+            return Err(unsupported("String slice checked decision constructors"));
+        };
+        if no.original != name("Decidable.isFalse")
+            || no.tag != 0
+            || no.fields != [proofs::erased_type()]
+            || yes.original != name("Decidable.isTrue")
+            || yes.tag != 1
+            || yes.fields != [proofs::erased_type()]
+        {
+            return Err(unsupported("String slice checked decision fields"));
+        }
+        let constructor = |name: &Name| {
+            Expr::app(
+                Expr::const_(name.clone(), Vec::new()),
+                proofs::erased_value(),
+            )
+        };
+        Ok(io_result::choose(
+            shape.source,
+            value,
+            constructor(&no.name),
+            constructor(&yes.name),
+        ))
     }
 
     /// Rebuild the checked `List Char` from the native scalar list in order:
@@ -740,6 +959,9 @@ impl Preparation<'_> {
                 Domain::Substring => {
                     argument = self.string_bootstrap_pack_substring(argument)?;
                 }
+                Domain::Slice => {
+                    argument = self.string_bootstrap_pack_slice(argument)?;
+                }
                 Domain::StringCallback => {
                     // The native fold supplies scalar codepoints, while the
                     // source function keeps its checked Char parameter. This
@@ -760,7 +982,11 @@ impl Preparation<'_> {
                 // A proof is a logical argument the native row never receives.
                 Domain::Proof => continue,
                 Domain::String | Domain::Nat | Domain::Bool => {}
-                Domain::Byte | Domain::CharList => {
+                Domain::Byte
+                | Domain::CharList
+                | Domain::OptionalChar
+                | Domain::Word64
+                | Domain::Decision => {
                     unreachable!("fixed String bootstrap result-only domain")
                 }
             }
@@ -789,6 +1015,9 @@ impl Preparation<'_> {
             Domain::Char => self.native_character_from_scalar(body)?,
             Domain::Byte => self.string_bootstrap_byte_from_scalar(body)?,
             Domain::CharList => self.string_bootstrap_characters(body)?,
+            Domain::OptionalChar => self.string_bootstrap_optional_character(body)?,
+            Domain::Word64 => self.string_bootstrap_word64_from_native(body)?,
+            Domain::Decision => self.string_bootstrap_decision(body)?,
             Domain::Substring => self.string_bootstrap_unpack_substring(body)?,
             _ => body,
         };

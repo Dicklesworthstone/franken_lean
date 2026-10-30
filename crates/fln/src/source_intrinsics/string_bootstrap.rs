@@ -13,12 +13,14 @@
 //! `set`, `data`, ...) shares its target's extern symbol but is a separate
 //! declaration: it has its own row, extern check and closure, never its
 //! target's.
+//! Representation conversion also binds its selected eliminators (Option.rec
+//! for native optional characters), even when absent from the logical body.
 //! These comparison data never install declarations or confer admission.
 
 use super::*;
 
 const DEPENDENCIES: &str = include_str!("string_bootstrap/dependencies.txt");
-const DEPENDENCY_COUNT: usize = 4101;
+const DEPENDENCY_COUNT: usize = 4166;
 
 /// Successful dependency checks shared only within one immutable Preparation.
 /// Membership and each selected root's extern still belong to its operation.
@@ -73,6 +75,15 @@ pub(crate) enum Operation {
     SubstringIsEmpty,
     SubstringGet,
     SubstringPrev,
+    Hash,
+    SliceHash,
+    SliceLt,
+    Memcmp,
+    IsValid,
+    RawGetOption,
+    GetOption,
+    RawGetBang,
+    GetBang,
 }
 
 /// One bit per operation in the inventory's membership column.
@@ -85,6 +96,8 @@ pub(crate) enum Domain {
     Position,
     /// The checked `Substring.Raw` record: String and two raw positions.
     Substring,
+    /// The proof-bearing `String.Slice` record, packed only after admission.
+    Slice,
     Nat,
     Bool,
     StringCallback,
@@ -97,6 +110,12 @@ pub(crate) enum Domain {
     Byte,
     /// `List Char`, as a result only.
     CharList,
+    /// `Option Char`, as a result only.
+    OptionalChar,
+    /// The full UInt64 hash, retaining the logical word's checked Fin record.
+    Word64,
+    /// A runtime decision whose proof payload remains erased.
+    Decision,
 }
 
 impl Domain {
@@ -109,10 +128,16 @@ impl Domain {
             Self::Char => c("Char"),
             Self::Position => c("String.Pos.Raw"),
             Self::Substring => c("Substring.Raw"),
+            Self::Slice => c("String.Slice"),
             Self::Nat => c("Nat"),
             Self::Bool => c("Bool"),
             Self::Byte => c("UInt8"),
             Self::CharList => Expr::app(Expr::const_(name("List"), vec![Level::zero()]), c("Char")),
+            Self::OptionalChar => {
+                Expr::app(Expr::const_(name("Option"), vec![Level::zero()]), c("Char"))
+            }
+            Self::Word64 => c("UInt64"),
+            Self::Decision => Expr::app(c("Decidable"), c("True")),
             Self::StringCallback => Expr::forall_e(
                 Name::anonymous(),
                 c("String"),
@@ -132,7 +157,7 @@ impl Domain {
 }
 
 impl Operation {
-    pub(crate) const ALL: [Self; 38] = [
+    pub(crate) const ALL: [Self; 47] = [
         Self::ByteSize,
         Self::PosOf,
         Self::OffsetOfPos,
@@ -171,6 +196,15 @@ impl Operation {
         Self::SubstringIsEmpty,
         Self::SubstringGet,
         Self::SubstringPrev,
+        Self::Hash,
+        Self::SliceHash,
+        Self::SliceLt,
+        Self::Memcmp,
+        Self::IsValid,
+        Self::RawGetOption,
+        Self::GetOption,
+        Self::RawGetBang,
+        Self::GetBang,
     ];
 
     pub(crate) fn index(self) -> usize {
@@ -221,6 +255,15 @@ impl Operation {
             Self::SubstringIsEmpty => "Substring.Raw.Internal.isEmpty",
             Self::SubstringGet => "Substring.Raw.Internal.get",
             Self::SubstringPrev => "Substring.Raw.Internal.prev",
+            Self::Hash => "String.hash",
+            Self::SliceHash => "String.Slice.hash",
+            Self::SliceLt => "String.Slice.instDecidableLt",
+            Self::Memcmp => "String.Slice.Pattern.Internal.memcmpStr",
+            Self::IsValid => "String.Pos.Raw.isValid",
+            Self::RawGetOption => "String.Pos.Raw.get?",
+            Self::GetOption => "String.get?",
+            Self::RawGetBang => "String.Pos.Raw.get!",
+            Self::GetBang => "String.get!",
         }
     }
 
@@ -238,6 +281,9 @@ impl Operation {
     pub(crate) fn declaration(self) -> (&'static str, &'static str) {
         match self {
             Self::ByteSize => ("defn", "Init.Prelude"),
+            Self::Hash => ("opaque", "Init.Prelude"),
+            Self::SliceHash | Self::SliceLt => ("defn", "Init.Data.String.Slice"),
+            Self::Memcmp => ("defn", "Init.Data.String.Pattern.Basic"),
             Self::PosOf
             | Self::OffsetOfPos
             | Self::Extract
@@ -269,7 +315,12 @@ impl Operation {
             | Self::RawGetFast
             | Self::NextFast
             | Self::PosNext
-            | Self::Data => ("defn", "Init.Data.String.Basic"),
+            | Self::Data
+            | Self::IsValid
+            | Self::RawGetOption
+            | Self::GetOption
+            | Self::RawGetBang
+            | Self::GetBang => ("defn", "Init.Data.String.Basic"),
             Self::GetUtf8Byte | Self::GetUtf8ByteAlias => ("defn", "Init.Data.String.PosRaw"),
             Self::RawSet | Self::PosSet | Self::Set => ("defn", "Init.Data.String.Modify"),
         }
@@ -279,10 +330,15 @@ impl Operation {
     /// that the native row does not receive.
     pub(crate) fn domains(self) -> &'static [Domain] {
         use Domain::{
-            Char, Nat, Position, Proof, String, StringCallback, StringPosition, Substring,
+            Char, Nat, Position, Proof, Slice, String, StringCallback, StringPosition, Substring,
         };
         match self {
-            Self::ByteSize | Self::IsEmpty | Self::ToList | Self::Data | Self::Front => &[String],
+            Self::ByteSize
+            | Self::IsEmpty
+            | Self::ToList
+            | Self::Data
+            | Self::Front
+            | Self::Hash => &[String],
             Self::PosOf => &[String, Char],
             Self::OffsetOfPos | Self::Next | Self::InternalGet | Self::RawGet | Self::Get => {
                 &[String, Position]
@@ -307,15 +363,25 @@ impl Operation {
             Self::SubstringExtract => &[Substring, Position, Position],
             Self::SubstringBeq => &[Substring, Substring],
             Self::SubstringGet | Self::SubstringPrev => &[Substring, Position],
+            Self::SliceHash => &[Slice],
+            Self::SliceLt => &[Slice, Slice],
+            Self::Memcmp => &[String, String, Position, Position, Position, Proof, Proof],
+            Self::IsValid
+            | Self::RawGetOption
+            | Self::GetOption
+            | Self::RawGetBang
+            | Self::GetBang => &[String, Position],
         }
     }
 
     /// Whether the adapter's binders follow the declaration's own dependent
     /// telescope. The original rows keep their closed source types.
     pub(crate) fn dependent(self) -> bool {
-        self.domains()
-            .iter()
-            .any(|domain| matches!(domain, Domain::StringPosition | Domain::Proof))
+        self == Self::SliceLt
+            || self
+                .domains()
+                .iter()
+                .any(|domain| matches!(domain, Domain::StringPosition | Domain::Proof))
     }
 
     /// Whether the adapter reads or rebuilds a record whose proof field it
@@ -355,19 +421,31 @@ impl Operation {
             | Self::Front
             | Self::SubstringFront
             | Self::SubstringGet => Domain::Char,
+            Self::RawGetBang | Self::GetBang => Domain::Char,
             Self::GetUtf8Byte | Self::GetUtf8ByteAlias | Self::InternalGetUtf8Byte => Domain::Byte,
             Self::ToList | Self::Data => Domain::CharList,
             Self::SubstringDrop | Self::SubstringExtract => Domain::Substring,
+            Self::Hash | Self::SliceHash => Domain::Word64,
+            Self::SliceLt => Domain::Decision,
+            Self::Memcmp | Self::IsValid => Domain::Bool,
+            Self::RawGetOption | Self::GetOption => Domain::OptionalChar,
         }
     }
 
     /// C character readers return an unboxed scalar. Bootstrap's exported
     /// Lean helpers instead return an owned, boxed character payload.
     pub(crate) fn scalar_result(self) -> bool {
-        matches!(self.result(), Domain::Char | Domain::Byte)
+        matches!(
+            self,
+            Self::Hash | Self::SliceHash | Self::SliceLt | Self::Memcmp
+        ) || matches!(self.result(), Domain::Char | Domain::Byte)
             && !matches!(
                 self,
-                Self::Front | Self::SubstringFront | Self::SubstringGet
+                Self::Front
+                    | Self::SubstringFront
+                    | Self::SubstringGet
+                    | Self::RawGetBang
+                    | Self::GetBang
             )
     }
 

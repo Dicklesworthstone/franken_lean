@@ -14,7 +14,7 @@ const STACK: usize = 256 * 1024 * 1024;
 
 /// Every pinned module that defines a constant of the inventory. The closure
 /// walk below refuses any omission, so this list cannot silently narrow it.
-const MODULES: [&str; 81] = [
+const MODULES: [&str; 83] = [
     "Init/ByCases",
     "Init/Classical",
     "Init/Control/Id",
@@ -75,7 +75,9 @@ const MODULES: [&str; 81] = [
     "Init/Data/String/Decode",
     "Init/Data/String/Defs",
     "Init/Data/String/Modify",
+    "Init/Data/String/Pattern/Basic",
     "Init/Data/String/PosRaw",
+    "Init/Data/String/Slice",
     "Init/Data/ToString/Basic",
     "Init/Data/UInt/Basic",
     "Init/Data/UInt/BasicAux",
@@ -248,6 +250,87 @@ const SUBSTRING: [Operation; 11] = [
     Operation::SubstringPrev,
 ];
 
+const CHECKED_TEXT: [Operation; 9] = [
+    Operation::Hash,
+    Operation::SliceHash,
+    Operation::SliceLt,
+    Operation::Memcmp,
+    Operation::IsValid,
+    Operation::RawGetOption,
+    Operation::GetOption,
+    Operation::RawGetBang,
+    Operation::GetBang,
+];
+
+/// The same source is evaluated by both engines below. These decimal answers
+/// were measured on the exact pinned executable, including hashes above 2^63.
+const CHECKED_TEXT_SOURCE: &str = r#"
+axiom proof {p : Prop} : p
+def middle : String.Slice := String.Slice.mk "aλ😀z" (String.Pos.mk (String.Pos.Raw.mk 1) proof) (String.Pos.mk (String.Pos.Raw.mk 7) proof) proof
+def emptySlice : String.Slice := String.Slice.mk "aλ😀z" (String.Pos.mk (String.Pos.Raw.mk 3) proof) (String.Pos.mk (String.Pos.Raw.mk 3) proof) proof
+def optionalCode (c : Option Char) : Nat := match c with | .none => 999 | .some c => c.toNat
+def lessCode (a b : String.Slice) : Nat := match String.Slice.instDecidableLt a b with | .isTrue _ => 1 | .isFalse _ => 0
+#eval (String.hash "").toNat
+#eval (String.hash "aλ😀z").toNat
+#eval (String.hash "a\x00z").toNat
+#eval (String.Slice.hash middle).toNat
+#eval (String.Slice.hash emptySlice).toNat
+#eval let digest := String.hash; (digest "λ😀").toNat
+#eval if String.Pos.Raw.isValid "aλ😀z" (String.Pos.Raw.mk 1) then 1 else 0
+#eval if String.Pos.Raw.isValid "aλ😀z" (String.Pos.Raw.mk 2) then 1 else 0
+#eval if String.Pos.Raw.isValid "aλ😀z" (String.Pos.Raw.mk 8) then 1 else 0
+#eval if String.Pos.Raw.isValid "aλ😀z" (String.Pos.Raw.mk 9) then 1 else 0
+#eval optionalCode (String.Pos.Raw.get? "aλ😀z" (String.Pos.Raw.mk 1))
+#eval optionalCode (String.Pos.Raw.get? "aλ😀z" (String.Pos.Raw.mk 2))
+#eval optionalCode (String.Pos.Raw.get? "aλ😀z" (String.Pos.Raw.mk 8))
+#eval optionalCode (String.get? "aλ😀z" (String.Pos.Raw.mk 3))
+#eval optionalCode (String.Pos.Raw.get? "a\x00z" (String.Pos.Raw.mk 1))
+#eval let lookup := String.Pos.Raw.get? "aλ😀z"; optionalCode (lookup (String.Pos.Raw.mk 7))
+#eval (String.Pos.Raw.get! "aλ😀z" (String.Pos.Raw.mk 3)).toNat
+#eval (String.get! "aλ😀z" (String.Pos.Raw.mk 1)).toNat
+#eval let lookup := String.get! "aλ😀z"; (lookup (String.Pos.Raw.mk 7)).toNat
+#eval lessCode middle (String.toSlice "λ😀z")
+#eval lessCode (String.toSlice "λ😀z") middle
+#eval lessCode middle middle
+#eval lessCode emptySlice middle
+#eval lessCode (String.toSlice "λ") (String.toSlice "😀")
+#eval if String.Slice.Pattern.Internal.memcmpStr "aλ😀z" "λ😀" (String.Pos.Raw.mk 1) (String.Pos.Raw.mk 0) (String.Pos.Raw.mk 6) proof proof then 1 else 0
+#eval if String.Slice.Pattern.Internal.memcmpStr "aλ😀z" "aμ😀z" (String.Pos.Raw.mk 2) (String.Pos.Raw.mk 2) (String.Pos.Raw.mk 1) proof proof then 1 else 0
+#eval if String.Slice.Pattern.Internal.memcmpStr "a\x00z" "\x00z" (String.Pos.Raw.mk 1) (String.Pos.Raw.mk 0) (String.Pos.Raw.mk 2) proof proof then 1 else 0
+#eval if String.Slice.Pattern.Internal.memcmpStr "aλ😀z" "" (String.Pos.Raw.mk 8) (String.Pos.Raw.mk 0) (String.Pos.Raw.mk 0) proof proof then 1 else 0
+"#;
+
+const CHECKED_TEXT_ANSWERS: [u64; 28] = [
+    9_877_294_847_684_254_529,
+    11_053_310_531_823_679_378,
+    2_486_644_977_613_361_457,
+    8_638_642_137_254_647_478,
+    9_877_294_847_684_254_529,
+    8_638_642_137_254_647_478,
+    1,
+    0,
+    1,
+    0,
+    955,
+    999,
+    999,
+    128_512,
+    0,
+    122,
+    128_512,
+    955,
+    122,
+    1,
+    0,
+    0,
+    1,
+    1,
+    1,
+    0,
+    1,
+    1,
+];
+
 /// The ownership the generated census row requires of an FLBC call.
 fn generated_ownership(row: &str, arguments: usize) -> (Vec<ArgumentOwnership>, ResultOwnership) {
     use fln_vm::extern_row::{
@@ -306,11 +389,22 @@ fn inventory(operation: Operation) -> BTreeMap<Name, &'static str> {
 
 /// Recompute the complete graph independently of the frozen membership table.
 fn actual_dependencies(environment: &Environment, operation: Operation) -> BTreeSet<Name> {
-    actual_dependencies_from(
+    let mut dependencies = actual_dependencies_from(
         environment,
         operation.source_name(),
         operation.uses_character(),
-    )
+    );
+    if operation.result() == Domain::OptionalChar {
+        // The representation bridge maps native Option Nat into the checked
+        // Option Char using this recursor; bind it even if the logical lookup
+        // happens not to mention its result type's eliminator.
+        dependencies.extend(actual_dependencies_from(
+            environment,
+            name("Option.rec"),
+            false,
+        ));
+    }
+    dependencies
 }
 
 fn actual_dependencies_from(
@@ -322,6 +416,18 @@ fn actual_dependencies_from(
     if character {
         pending.push(name("Bool"));
     }
+    walk_dependencies(pending, |label| {
+        environment
+            .find(label)
+            .unwrap_or_else(|| panic!("omitted actual dependency {}", label.to_display_string()))
+            .clone()
+    })
+}
+
+fn walk_dependencies(
+    mut pending: Vec<Name>,
+    mut lookup: impl FnMut(&Name) -> ConstantInfo,
+) -> BTreeSet<Name> {
     let mut found = BTreeSet::new();
     let mut seen_expressions = HashSet::new();
     while let Some(label) = pending.pop() {
@@ -329,11 +435,9 @@ fn actual_dependencies_from(
             continue;
         }
         assert!(found.len() <= 10_000);
-        let info = environment
-            .find(&label)
-            .unwrap_or_else(|| panic!("omitted actual dependency {}", label.to_display_string()));
+        let info = lookup(&label);
         let mut expressions = vec![&info.constant_val().type_];
-        match info {
+        match &info {
             ConstantInfo::Defn(value) => {
                 expressions.push(&value.value);
                 pending.extend(value.all.iter().cloned());
@@ -389,6 +493,149 @@ fn actual_dependencies_from(
     found
 }
 
+/// Explicit extraction from all actual imports, never from the frozen module
+/// list or an existing membership mask. The destination is supplied by the
+/// caller so ordinary tests cannot silently refresh their own expected data.
+#[test]
+#[ignore = "regenerates the pinned inventory at FLN_STRING_INVENTORY_OUTPUT"]
+fn extract_pinned_string_dependency_inventory() {
+    let library = PathBuf::from(std::env::var_os("FLN_REFERENCE_LIB").unwrap());
+    let destination = PathBuf::from(std::env::var_os("FLN_STRING_INVENTORY_OUTPUT").unwrap());
+    std::thread::Builder::new()
+        .stack_size(STACK)
+        .spawn(move || {
+            let read_parts = |module: &str| {
+                let path = library.join(module).with_extension("olean");
+                [
+                    std::fs::read(&path).unwrap(),
+                    std::fs::read(path.with_extension("olean.server")).unwrap(),
+                    std::fs::read(path.with_extension("olean.private")).unwrap(),
+                ]
+            };
+            let mut pending: Vec<_> = Operation::ALL
+                .into_iter()
+                .map(|operation| name(operation.declaration().1))
+                .collect();
+            let mut modules = BTreeSet::new();
+            let mut index: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+            while let Some(module) = pending.pop() {
+                if !modules.insert(module.clone()) {
+                    continue;
+                }
+                let module = module.to_display_string().replace('.', "/");
+                let parts = read_parts(&module);
+                pending.extend(
+                    crate::olean_module_imports(&parts[0], OleanDecodeLimits::new(STACK)).unwrap(),
+                );
+                let view = fln_olean::region::OleanView::parse_with_dependencies(
+                    &parts[2],
+                    &[&parts[0], &parts[1]],
+                )
+                .unwrap();
+                for label in view
+                    .module_data(OleanWalkBudget::default())
+                    .unwrap()
+                    .const_names
+                {
+                    index.entry(label).or_default().insert(module.clone());
+                }
+            }
+            eprintln!("indexed {} actual modules", modules.len());
+            // Decode bodies only when a reachable declaration needs them.
+            // Eagerly retaining every imported iterator/proof library is many
+            // times larger than this declaration closure.
+            let mut loaded = BTreeSet::new();
+            let mut constants = BTreeMap::new();
+            let mut conflicts = BTreeSet::new();
+            let mut owners: BTreeMap<Name, BTreeSet<String>> = BTreeMap::new();
+            let roots = Operation::ALL
+                .into_iter()
+                .map(Operation::source_name)
+                .chain([name("Bool"), name("Option.rec")])
+                .collect();
+            walk_dependencies(roots, |label| {
+                let candidates = index.get(&label.to_display_string()).unwrap_or_else(|| {
+                    panic!("unindexed actual dependency {}", label.to_display_string())
+                });
+                for module in candidates {
+                    if !loaded.insert(module.clone()) {
+                        continue;
+                    }
+                    let parts = read_parts(module);
+                    let decoded = decode_olean_module_artifacts(
+                        &parts[0],
+                        &parts[1],
+                        &parts[2],
+                        OleanDecodeLimits::new(STACK),
+                    )
+                    .unwrap();
+                    for info in decoded.constants {
+                        owners
+                            .entry(info.name().clone())
+                            .or_default()
+                            .insert(module.clone());
+                        if let Some(previous) = constants.get(info.name()) {
+                            if previous != &info {
+                                conflicts.insert(info.name().clone());
+                            }
+                        } else {
+                            constants.insert(info.name().clone(), info);
+                        }
+                    }
+                }
+                assert!(
+                    !conflicts.contains(label),
+                    "ambiguous actual dependency {}",
+                    label.to_display_string()
+                );
+                constants.get(label).unwrap().clone()
+            });
+            eprintln!("decoded {} dependency modules", loaded.len());
+            let mut environment = Environment::new();
+            for info in constants.into_values() {
+                environment = environment.add_decl(info).unwrap();
+            }
+            let mut memberships = BTreeMap::new();
+            let mut defining = BTreeSet::new();
+            for operation in Operation::ALL {
+                let dependencies = actual_dependencies(&environment, operation);
+                eprintln!("{}: {}", operation.label(), dependencies.len());
+                for label in dependencies {
+                    // Unrelated imported theorem copies can have different
+                    // proof bodies. No such ambiguity may enter an inventory:
+                    // do not select whichever variant fits an expected digest.
+                    assert!(
+                        !conflicts.contains(&label),
+                        "ambiguous actual dependency {} in {:?}",
+                        label.to_display_string(),
+                        owners[&label],
+                    );
+                    defining.extend(owners[&label].iter().cloned());
+                    *memberships.entry(label).or_insert(0) |= operation.mask();
+                }
+            }
+            let mut rows = BTreeMap::new();
+            for (label, mask) in memberships {
+                rows.insert(
+                    encoded_name(&label),
+                    (mask, environment.entry(&label).unwrap().digest().to_hex()),
+                );
+            }
+            let text: String = rows
+                .iter()
+                .map(|(label, (mask, digest))| format!("{mask:x}\t{label}\t{digest}\n"))
+                .collect();
+            eprintln!(
+                "{} dependencies; defining modules: {defining:#?}",
+                rows.len()
+            );
+            std::fs::write(destination, text).unwrap();
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
 fn matches(environment: &Environment, operation: Operation) -> Result<bool, IngressError> {
     contract_matches(
         environment,
@@ -429,7 +676,7 @@ fn actual_string_inventories_close_the_pin_and_share_only_successful_checks() {
         let counts = [
             325, 325, 325, 326, 325, 323, 323, 324, 351, 3413, 3413, 2318, 369, 3416, 3416, 4040,
             3653, 3396, 3413, 3415, 3415, 3416, 3935, 3413, 370, 341, 3396, 349, 17, 18, 328, 328,
-            353, 328, 328, 328, 354, 328,
+            353, 328, 328, 328, 354, 328, 336, 3667, 3697, 1509, 1034, 3413, 3413, 3413, 3413,
         ];
         assert_eq!(counts.len(), Operation::ALL.len());
         let mut defining = BTreeSet::new();
@@ -494,6 +741,141 @@ fn actual_string_inventories_close_the_pin_and_share_only_successful_checks() {
             Operation::from_name(&Name::str(Name::anonymous(), "String.Internal.posOf")).is_none()
         );
     });
+}
+
+#[test]
+fn hashes_slices_and_checked_positions_execute_checked_source_and_replay() {
+    with_fixture(|fixture| {
+        let engine = Engine::from_environment(fixture.environment.clone());
+        let options = KVMap::new();
+        let root = engine.logical_root(&options);
+        let limits = EngineExecutionLimits::new(Budget::for_stack_bytes(STACK));
+        let complete = engine
+            .execute_source_commands_with_checks(CHECKED_TEXT_SOURCE.as_bytes(), &options, limits)
+            .unwrap_or_else(|error| panic!("checked text adapters: {error:?}"))
+            .into_complete()
+            .unwrap();
+        let indices = &complete.batch.source_evaluation_indices;
+        assert_eq!(indices.len(), CHECKED_TEXT_ANSWERS.len());
+        let mut selected = BTreeSet::new();
+        for (&index, expected) in indices.iter().zip(CHECKED_TEXT_ANSWERS) {
+            let expected = if expected <= (usize::MAX >> 1) as u64 {
+                ClosedVmValue::Scalar(usize::try_from(expected).unwrap())
+            } else {
+                ClosedVmValue::NonnegativeMpz(expected.to_string())
+            };
+            let execution = &complete.batch.executions[index];
+            assert_eq!(
+                execution.checker.ground,
+                CheckerAdmissionGround::UnsafeQuarantine
+            );
+            assert_eq!(
+                closed_vm_value(&execution.exit).unwrap().as_ref(),
+                Some(&expected),
+                "source evaluation {index}"
+            );
+            let program =
+                flbc::decode_canonical(&execution.flbc_artifact, flbc::CodecLimits::default())
+                    .unwrap();
+            assert_eq!(
+                flbc::encode_canonical(&program, flbc::CodecLimits::default()).unwrap(),
+                execution.flbc_artifact
+            );
+            for instruction in program
+                .functions()
+                .iter()
+                .flat_map(|function| &function.code)
+            {
+                if let Instruction::Intrinsic {
+                    row,
+                    argument_ownership,
+                    result_ownership,
+                    ..
+                } = instruction
+                    && CHECKED_TEXT
+                        .iter()
+                        .any(|operation| *row == format!("extern:{}", operation.label()))
+                {
+                    assert_eq!(
+                        (argument_ownership.clone(), *result_ownership),
+                        generated_ownership(row, argument_ownership.len())
+                    );
+                    selected.insert(row.clone());
+                }
+            }
+            let replay =
+                execute_flbc_artifact(&execution.flbc_artifact, &options, Default::default())
+                    .unwrap()
+                    .into_complete()
+                    .unwrap();
+            assert_eq!(closed_vm_value(&replay).unwrap().as_ref(), Some(&expected));
+        }
+        assert_eq!(
+            selected,
+            CHECKED_TEXT
+                .map(|operation| format!("extern:{}", operation.label()))
+                .into_iter()
+                .collect()
+        );
+        assert_eq!(engine.logical_root(&options), root);
+    });
+}
+
+#[test]
+fn checked_text_answers_match_the_actual_pinned_executable() {
+    let Some(library) = std::env::var_os("FLN_REFERENCE_LIB").map(PathBuf::from) else {
+        assert!(std::env::var_os("FLN_REQUIRE_REFERENCE").is_none());
+        eprintln!("SKIP: pinned Reference lib/lean is absent");
+        return;
+    };
+    let reference = std::env::var_os("FLN_REFERENCE_LEAN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| library.parent().unwrap().parent().unwrap().join("bin/lean"));
+    if !reference.is_file() {
+        assert!(
+            std::env::var_os("FLN_REQUIRE_REFERENCE").is_none(),
+            "the actual pinned Reference executable is required"
+        );
+        eprintln!("SKIP: pinned Reference executable is absent");
+        return;
+    }
+    let version = std::process::Command::new(&reference)
+        .arg("--githash")
+        .output()
+        .unwrap();
+    assert!(version.status.success());
+    assert_eq!(
+        String::from_utf8(version.stdout).unwrap().trim(),
+        crate::OLEAN_PIN_COMMIT
+    );
+    let path = std::env::temp_dir().join(format!(
+        "fln-checked-text-{}-{}.lean",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(
+        &path,
+        format!(
+            "import Init.Data.String.Slice\nimport Init.Data.String.Pattern.Basic\n\
+             set_option linter.deprecated false\n{CHECKED_TEXT_SOURCE}"
+        ),
+    )
+    .unwrap();
+    let output = std::process::Command::new(reference)
+        .arg(path)
+        .env("LEAN_PATH", library)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let expected: String = CHECKED_TEXT_ANSWERS
+        .into_iter()
+        .map(|answer| format!("{answer}\n"))
+        .collect();
+    assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);
 }
 
 #[test]
@@ -773,7 +1155,9 @@ axiom proof {p : Prop} : p
             Operation::ALL
                 .into_iter()
                 .filter(|operation| {
-                    !BOOTSTRAP.contains(operation) && !SUBSTRING.contains(operation)
+                    !BOOTSTRAP.contains(operation)
+                        && !SUBSTRING.contains(operation)
+                        && !CHECKED_TEXT.contains(operation)
                 })
                 .map(|operation| format!("extern:{}", operation.label()))
                 .chain(["extern:String.Internal.foldl".to_owned()])
@@ -1217,6 +1601,33 @@ fn missing_foreign_and_changed_dependencies_never_acquire_native_authority() {
                 .unwrap();
             assert!(matches(&changed, Operation::PosOf).is_err());
         }
+        for (target, operation) in [
+            ("UInt64.ofBitVec", Operation::Hash),
+            ("String.Slice.mk", Operation::SliceHash),
+            ("Option.some", Operation::RawGetOption),
+            ("Decidable.isFalse", Operation::SliceLt),
+        ] {
+            let target = name(target);
+            let mut altered = fixture.environment.find(&target).unwrap().clone();
+            let ConstantInfo::Ctor(value) = &mut altered else {
+                unreachable!()
+            };
+            value.num_fields += 1;
+            let changed = rebuild(fixture, Some(&target), None)
+                .add_decl(altered)
+                .unwrap();
+            assert!(matches(&changed, operation).is_err());
+        }
+        for operation in [Operation::RawGetOption, Operation::GetOption] {
+            assert!(
+                matches(
+                    &rebuild(fixture, Some(&name("Option.rec")), None),
+                    operation,
+                )
+                .is_err(),
+                "the optional-character bridge pins its own eliminator"
+            );
+        }
         let foreign_helper = externs::register(
             &fixture.environment,
             &name("String.toByteArray"),
@@ -1229,16 +1640,23 @@ fn missing_foreign_and_changed_dependencies_never_acquire_native_authority() {
 }
 
 #[test]
-fn imported_byte_size_executes_with_the_actual_prelude_alone() {
+fn imported_byte_size_and_hash_execute_with_the_actual_prelude_alone() {
     with_fixture(|fixture| {
-        for operation in Operation::ALL.into_iter().skip(1) {
+        for operation in Operation::ALL
+            .into_iter()
+            .filter(|operation| !matches!(operation, Operation::ByteSize | Operation::Hash))
+        {
             assert!(!fixture.prelude.contains(&operation.source_name()));
         }
         assert!(matches(&fixture.prelude, Operation::ByteSize).unwrap());
+        assert!(matches(&fixture.prelude, Operation::Hash).unwrap());
         let engine = Engine::from_environment(fixture.prelude.clone());
         let options = KVMap::new();
         let root = engine.logical_root(&options);
-        let source = "#eval let bytes := String.utf8ByteSize; bytes \"é😀a\"";
+        // No UInt64.toNat declaration or broader numeric module is required:
+        // the word retains its own logical UInt64/BitVec/Fin representation.
+        let source = "#eval let bytes := String.utf8ByteSize; bytes \"é😀a\"\n\
+                      #eval (String.hash \"\").toBitVec.toFin.val";
         let run = engine
             .execute_source_commands_with_checks(
                 source.as_bytes(),
@@ -1261,6 +1679,16 @@ fn imported_byte_size_executes_with_the_actual_prelude_alone() {
             closed_vm_value(&replay).unwrap(),
             Some(ClosedVmValue::Scalar(7))
         );
+        let execution = &run.batch.executions[run.batch.source_evaluation_indices[1]];
+        let hash = Some(ClosedVmValue::NonnegativeMpz(
+            "9877294847684254529".to_owned(),
+        ));
+        assert_eq!(closed_vm_value(&execution.exit).unwrap(), hash);
+        let replay = execute_flbc_artifact(&execution.flbc_artifact, &options, Default::default())
+            .unwrap()
+            .into_complete()
+            .unwrap();
+        assert_eq!(closed_vm_value(&replay).unwrap(), hash);
         assert_eq!(engine.logical_root(&options), root);
     });
 }
@@ -1364,6 +1792,24 @@ fn changed_body(operation: Operation, info: ConstantInfo) -> Declaration {
             Expr::const_(name("List.nil"), vec![Level::zero()]),
             c("Char"),
         ),
+        Domain::OptionalChar => Expr::app(
+            Expr::const_(name("Option.none"), vec![Level::zero()]),
+            c("Char"),
+        ),
+        Domain::Word64 => Expr::app(c("UInt64.ofNat"), answer),
+        Domain::Decision => {
+            let mut telescope = &info.constant_val().type_;
+            for _ in operation.domains() {
+                let ExprNode::ForallE { body, .. } = telescope.node() else {
+                    unreachable!("the actual decision telescope")
+                };
+                telescope = body;
+            }
+            let ExprNode::App { a: proposition, .. } = telescope.node() else {
+                unreachable!("the actual Decidable result")
+            };
+            Expr::app(c("Classical.propDecidable"), proposition.clone())
+        }
         // `String.Pos.next` under its `s`, `pos` and `h` binders: `pos` itself.
         Domain::StringPosition => Expr::bvar(1).unwrap(),
         _ => unreachable!(),
