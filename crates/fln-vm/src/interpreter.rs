@@ -2100,10 +2100,33 @@ pub fn execute_function(
     limits: ExecutionLimits,
     cancellation: Option<&dyn CancellationProbe>,
 ) -> Outcome<VmExit> {
+    execute_function_with_context(
+        program,
+        function,
+        arguments,
+        limits,
+        CommandExecutionContext::UNLIMITED,
+        cancellation,
+    )
+}
+
+/// Invoke a validated function under an explicit command effect context.
+///
+/// The same arity and ownership checks as [`execute_function`] run before
+/// the first instruction. Initialization and the selected call can therefore
+/// share one execution budget and one bounded output capability.
+pub fn execute_function_with_context(
+    program: &ValidatedProgram,
+    function: FunctionId,
+    arguments: Vec<Obj>,
+    limits: ExecutionLimits,
+    context: CommandExecutionContext,
+    cancellation: Option<&dyn CancellationProbe>,
+) -> Outcome<VmExit> {
     finish_run(run(
         program,
         limits,
-        CommandExecutionContext::UNLIMITED,
+        context,
         cancellation,
         None,
         Some((function, arguments)),

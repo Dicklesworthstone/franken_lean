@@ -275,8 +275,10 @@ pub struct CompiledIr {
 ///
 /// Its canonical program has an ordinary zero-argument entry that returns the
 /// selected closure. Calling it never substitutes placeholder data for the
-/// actual arguments. The same selection, native-effect policy, IR validation,
-/// and independent bytecode ownership check apply as for [`compile`].
+/// actual arguments. With explicit initialization, that closure creates fresh
+/// global storage before entering user code. The same selection, native-effect
+/// policy, IR validation, and independent bytecode ownership check apply as
+/// for [`compile`].
 #[derive(Debug)]
 pub struct CompiledCallableIr {
     compiled: CompiledIr,
@@ -309,19 +311,30 @@ impl CompiledCallableIr {
         limits: ExecutionLimits,
         cancellation: Option<&dyn CancellationProbe>,
     ) -> IrExecution {
-        IrExecution {
-            outcome: fln_vm::interpreter::execute_function(
-                self.program(),
-                self.entry,
-                arguments,
-                limits,
-                cancellation,
+        let (outcome, captured_output) = match self.compiled.output_byte_limit {
+            Some(max_bytes) => {
+                let (outcome, output) = captured_output::execute_function(
+                    self.program(),
+                    self.entry,
+                    arguments,
+                    limits,
+                    cancellation,
+                    max_bytes,
+                );
+                (outcome, Some(output))
+            }
+            None => (
+                fln_vm::interpreter::execute_function(
+                    self.program(),
+                    self.entry,
+                    arguments,
+                    limits,
+                    cancellation,
+                ),
+                None,
             ),
-            reference_functions: self.compiled.reference_functions.clone(),
-            native_externs: self.compiled.native_externs.clone(),
-            captured_output: None,
-            initialization_failure: None,
-        }
+        };
+        self.compiled.finish_execution(outcome, captured_output)
     }
 }
 
@@ -402,6 +415,14 @@ impl CompiledIr {
                 None,
             ),
         };
+        self.finish_execution(outcome, captured_output)
+    }
+
+    fn finish_execution(
+        &self,
+        outcome: Outcome<VmExit>,
+        captured_output: Option<IrCapturedOutput>,
+    ) -> IrExecution {
         let (outcome, initialization_failure) = match &self.initialization {
             Some(plan) => globals::finish(outcome, plan),
             None => (outcome, None),
@@ -616,16 +637,38 @@ pub fn compile_callable(
     user_declarations: &BTreeSet<Name>,
     limits: IrExecutionLimits,
 ) -> Result<CompiledCallableIr, IrExecutionError> {
-    let compiled = compile_with_policy(
+    compile_callable_with_options(
         modules,
         entry,
-        &[],
         partition,
         user_declarations,
         IrExecutionOptions {
             limits,
             ..IrExecutionOptions::default()
         },
+    )
+}
+
+/// Compile an object-valued entry with explicit per-invocation capabilities.
+///
+/// Selected named globals initialize before the call, in the same VM run and
+/// under the same cancellation, step, stack and output limits. Each invocation
+/// owns fresh global storage and output; failed initialization never enters
+/// user code. Whole-module startup and other effects remain unavailable.
+pub fn compile_callable_with_options(
+    modules: &[IrModule],
+    entry: &Name,
+    partition: &VerifiedPartition,
+    user_declarations: &BTreeSet<Name>,
+    options: IrExecutionOptions,
+) -> Result<CompiledCallableIr, IrExecutionError> {
+    let compiled = compile_with_policy(
+        modules,
+        entry,
+        &[],
+        partition,
+        user_declarations,
+        options,
         true,
     )?;
     let (function, arity) = compiled

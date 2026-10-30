@@ -1,12 +1,13 @@
 //! Isolated output capability for explicitly selected Reference user/library IR.
 
 use super::{IrCapturedOutput, Outcome};
-use fln_comp::flbc::ValidatedProgram;
+use fln_comp::flbc::{FunctionId, ValidatedProgram};
 use fln_core::diag::ResourceReason;
 use fln_core::outcome::{Inconclusive, InternalFault, ResourceUsage};
-use fln_rt::obj::{StdoutCapture, StdoutCaptureError};
+use fln_rt::obj::{Obj, StdoutCapture, StdoutCaptureError};
 use fln_vm::interpreter::{
-    CancellationProbe, CommandExecutionContext, ExecutionLimits, VmExit, execute_with_context,
+    CancellationProbe, CommandExecutionContext, ExecutionLimits, VmExit,
+    execute_function_with_context, execute_with_context,
 };
 
 pub(super) fn execute(
@@ -14,6 +15,28 @@ pub(super) fn execute(
     limits: ExecutionLimits,
     cancellation: Option<&dyn CancellationProbe>,
     max_bytes: usize,
+) -> (Outcome<VmExit>, IrCapturedOutput) {
+    capture(max_bytes, |context| {
+        execute_with_context(program, limits, context, cancellation)
+    })
+}
+
+pub(super) fn execute_function(
+    program: &ValidatedProgram,
+    function: FunctionId,
+    arguments: Vec<Obj>,
+    limits: ExecutionLimits,
+    cancellation: Option<&dyn CancellationProbe>,
+    max_bytes: usize,
+) -> (Outcome<VmExit>, IrCapturedOutput) {
+    capture(max_bytes, |context| {
+        execute_function_with_context(program, function, arguments, limits, context, cancellation)
+    })
+}
+
+fn capture(
+    max_bytes: usize,
+    run: impl FnOnce(CommandExecutionContext) -> Outcome<VmExit>,
 ) -> (Outcome<VmExit>, IrCapturedOutput) {
     let empty = || IrCapturedOutput {
         bytes: Vec::new(),
@@ -27,12 +50,7 @@ pub(super) fn execute(
         Ok(capture) => capture,
         Err(error) => return (failure(error), empty()),
     };
-    let outcome = execute_with_context(
-        program,
-        limits,
-        CommandExecutionContext::UNLIMITED.with_captured_reference_output(),
-        cancellation,
-    );
+    let outcome = run(CommandExecutionContext::UNLIMITED.with_captured_reference_output());
     // Native diagnostics can fail their sink without a callback return. Check
     // the complete scope before accepting any VM result, including a refusal.
     let scope_error = StdoutCapture::current_error();

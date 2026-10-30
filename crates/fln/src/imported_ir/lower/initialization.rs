@@ -390,39 +390,69 @@ mod tests {
     }
 
     #[test]
-    fn callable_entries_cannot_bypass_the_initializer_wrapper() {
+    fn callable_entries_run_the_initializer_wrapper_with_real_arguments() {
         let declarations = [
             function("Global.value", 0, body(vec![num(1, 999)], 1)),
             initializer("Global.init", body(vec![num(2, 42), object(3, 0, &[2])], 3)),
             function(
                 "Global.entry",
                 1,
-                body(vec![call(2, "Global.value", &[])], 2),
+                body(
+                    vec![call(2, "Global.value", &[]), call(3, "Nat.add", &[1, 2])],
+                    3,
+                ),
             ),
         ];
         let declarations = declarations
             .iter()
             .map(|declaration| (declaration.name().clone(), declaration))
             .collect();
-        for initialization in [
-            globals::InitializationPlan::default(),
-            plan(&[("Global.value", "Global.init")]),
+        let mut natives = BTreeMap::new();
+        insert_helper(&mut natives, "Nat.add").unwrap();
+        for (initialization, expected) in [
+            (globals::InitializationPlan::default(), "1006"),
+            (plan(&[("Global.value", "Global.init")]), "49"),
         ] {
-            assert!(matches!(
-                super::super::compile(
-                    &declarations,
-                    &BTreeMap::new(),
-                    &name("Global.entry"),
-                    &[],
-                    IrExecutionLimits::default(),
-                    Some(&initialization),
-                    true,
+            let compiled = super::super::compile(
+                &declarations,
+                &natives,
+                &name("Global.entry"),
+                &[],
+                IrExecutionLimits::default(),
+                Some(&initialization),
+                true,
+            )
+            .unwrap();
+            let bytes =
+                flbc::encode_canonical(compiled.program.program(), flbc::CodecLimits::default())
+                    .unwrap();
+            let replay = flbc::decode_canonical(&bytes, flbc::CodecLimits::default()).unwrap();
+            let (entry, arity) = compiled.callable_entry.unwrap();
+            assert_eq!(arity, 1);
+            let Outcome::Complete(VmExit::Returned(closure)) =
+                execute(&replay, ExecutionLimits::default(), None)
+            else {
+                panic!("canonical entry did not return its callable")
+            };
+            assert_eq!(
+                fln_vm::interpreter::value_kind(&closure.value),
+                fln_vm::interpreter::ValueKind::Closure
+            );
+            let (outcome, failure) = globals::finish(
+                fln_vm::interpreter::execute_function(
+                    &replay,
+                    entry,
+                    vec![fln_rt::obj::Obj::mk_nat(7)],
+                    ExecutionLimits::default(),
+                    None,
                 ),
-                Err(IrExecutionError::Unsupported {
-                    form: "callable entry cannot initialize globals",
-                    ..
-                })
-            ));
+                &initialization,
+            );
+            assert!(failure.is_none());
+            let Outcome::Complete(VmExit::Returned(result)) = outcome else {
+                panic!("{outcome:?}")
+            };
+            assert_eq!(nat_decimal(&result.value).as_deref(), Some(expected));
         }
     }
 

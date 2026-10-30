@@ -2,8 +2,8 @@
 //! The Reference runs only as the test oracle; Golem executes the decoded IR.
 
 use crate::imported_ir::{
-    EntryArgument, IrExecutionLimits, IrExecutionOptions, VerifiedPartition, compile_with_options,
-    native_row,
+    EntryArgument, IrExecutionLimits, IrExecutionOptions, VerifiedPartition,
+    compile_callable_with_options, compile_with_options, native_row,
 };
 use fln_comp::flbc;
 use fln_core::name::Name;
@@ -115,7 +115,7 @@ fn live_pinned_named_globals_share_state_replay_and_recover_after_resource_stops
     // oracle process, like each Golem execution below, starts a fresh session.
     std::fs::write(
         dir.join("Oracle.lean"),
-        "import InitializedGlobalsModule\n#eval initializedGlobalsAnswer\n",
+        "import InitializedGlobalsModule\n#eval initializedGlobalsAnswer\n#eval initializedCallable 7\n",
     )
     .unwrap();
     for index in 0..2 {
@@ -133,7 +133,10 @@ fn live_pinned_named_globals_share_state_replay_and_recover_after_resource_stops
             String::from_utf8_lossy(&oracle.stdout),
             String::from_utf8_lossy(&oracle.stderr)
         );
-        assert_eq!(oracle.stdout, b"167\n", "actual Reference result; {dir:?}");
+        assert_eq!(
+            oracle.stdout, b"167\n47\n",
+            "actual Reference result; {dir:?}"
+        );
     }
 
     // This bounded unit-test partition classifies only the actual fixture's
@@ -150,6 +153,29 @@ fn live_pinned_named_globals_share_state_replay_and_recover_after_resource_stops
             _ => None,
         })
         .collect();
+    let callable = compile_callable_with_options(
+        std::slice::from_ref(&module),
+        &name("initializedCallable"),
+        &partition,
+        &users,
+        IrExecutionOptions {
+            initialize_globals: true,
+            ..IrExecutionOptions::default()
+        },
+    )
+    .unwrap_or_else(|error| panic!("actual initialized callable: {error:?}; {dir:?}"));
+    for _ in 0..2 {
+        let report = callable.execute(
+            vec![fln_rt::obj::Obj::mk_nat(7)],
+            ExecutionLimits::default(),
+            None,
+        );
+        assert!(report.initialization_failure.is_none());
+        let Outcome::Complete(VmExit::Returned(result)) = report.outcome else {
+            panic!("{report:?}; {dir:?}")
+        };
+        assert_eq!(nat_decimal(&result.value).as_deref(), Some("47"));
+    }
     let compiled = compile_with_options(
         std::slice::from_ref(&module),
         &name("initializedGlobalsAnswer"),

@@ -20,12 +20,7 @@ pub(super) fn compile(
     initialization: Option<&globals::InitializationPlan>,
     callable: bool,
 ) -> Result<CompiledIr> {
-    if callable && initialization.is_some() {
-        return Err(unsupported(
-            entry,
-            "callable entry cannot initialize globals",
-        ));
-    }
+    let callable_wrapper = callable && initialization.is_some();
     let entry_parameters: &[IrParam] = match declarations.get(entry) {
         Some(IrDecl::Function { params, .. }) => params,
         _ => &[],
@@ -172,7 +167,7 @@ pub(super) fn compile(
     let environment_parameters = usize::from(initialization.is_some());
     let function_count = names
         .len()
-        .checked_add(1)
+        .checked_add(1 + usize::from(callable_wrapper))
         .filter(|count| *count <= limits.fir.max_functions)
         .and_then(|count| u32::try_from(count).ok())
         .ok_or(IrExecutionError::Limit("lowered functions"))?;
@@ -185,6 +180,11 @@ pub(super) fn compile(
         .get(entry)
         .copied()
         .ok_or_else(|| IrExecutionError::MissingDeclaration(entry.clone()))?;
+    let callable_entry = if callable_wrapper {
+        FunctionId::new(function_count - 1)
+    } else {
+        entry_id
+    };
     if !callable && expected != arguments.len() {
         return Err(IrExecutionError::EntryArity {
             expected,
@@ -237,12 +237,16 @@ pub(super) fn compile(
         packed_scalar_bytes: 0,
         global_slots,
     };
-    let mut wrapper = Builder::new(entry, 0, &mut tables)?;
+    let mut wrapper = Builder::new(
+        entry,
+        if callable_wrapper { expected } else { 0 },
+        &mut tables,
+    )?;
     let mut block = wrapper.block()?;
     if let Some(plan) = initialization {
         block = wrapper.initialize_globals(block, plan)?;
     }
-    let value = if callable {
+    let value = if callable && !callable_wrapper {
         let closure_type = ClosureTypeId::new(expected as u32 - 1);
         wrapper.boxed(
             block,
@@ -255,30 +259,36 @@ pub(super) fn compile(
             },
         )?
     } else {
-        let mut args = arguments
-            .iter()
-            .enumerate()
-            .map(|(index, arg)| {
-                let value = wrapper.argument_literal(block, arg)?;
-                if let Some(wide) = entry_parameters
-                    .get(index)
-                    .and_then(|param| wide_scalar(&param.ty))
-                {
-                    wrapper.native_call(
-                        block,
-                        &Name::from_components(wide.of_nat.split('.')),
-                        vec![value],
-                    )
-                } else if let Some(float) = entry_parameters
-                    .get(index)
-                    .and_then(|param| floating_scalar(&param.ty))
-                {
-                    wrapper.validate_float(block, float, value)
-                } else {
-                    Ok(value)
-                }
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let mut args = if callable_wrapper {
+            (0..expected)
+                .map(|index| ValueId::new(index as u32))
+                .collect()
+        } else {
+            arguments
+                .iter()
+                .enumerate()
+                .map(|(index, arg)| {
+                    let value = wrapper.argument_literal(block, arg)?;
+                    if let Some(wide) = entry_parameters
+                        .get(index)
+                        .and_then(|param| wide_scalar(&param.ty))
+                    {
+                        wrapper.native_call(
+                            block,
+                            &Name::from_components(wide.of_nat.split('.')),
+                            vec![value],
+                        )
+                    } else if let Some(float) = entry_parameters
+                        .get(index)
+                        .and_then(|param| floating_scalar(&param.ty))
+                    {
+                        wrapper.validate_float(block, float, value)
+                    } else {
+                        Ok(value)
+                    }
+                })
+                .collect::<Result<Vec<_>>>()?
+        };
         wrapper.prepend_environment(&mut args)?;
         wrapper.emit(
             block,
@@ -295,7 +305,31 @@ pub(super) fn compile(
         value
     };
     wrapper.finish_block(block, Terminator::Return { value });
-    let mut functions = vec![wrapper.finish(FunctionId::new(0))];
+    let mut functions = vec![wrapper.finish(if callable_wrapper {
+        callable_entry
+    } else {
+        FunctionId::new(0)
+    })];
+    if callable_wrapper {
+        // The canonical zero-argument entry only returns the callable. The
+        // callable itself performs initialization, so preparing it cannot
+        // execute effects and every invocation receives fresh private cells.
+        let mut bootstrap = Builder::new(entry, 0, &mut tables)?;
+        let block = bootstrap.block()?;
+        let closure_type = ClosureTypeId::new(expected as u32 - 1);
+        let value = bootstrap.boxed(
+            block,
+            ValueType::Closure(closure_type),
+            Operation::Closure {
+                closure_type,
+                function: callable_entry,
+                captures: Vec::new(),
+                capture_ownership: Vec::new(),
+            },
+        )?;
+        bootstrap.finish_block(block, Terminator::Return { value });
+        functions.push(bootstrap.finish(FunctionId::new(0)));
+    }
     let mut reference_functions = Vec::new();
     for (name, arity) in &names {
         let id = tables.targets[name].0;
@@ -359,7 +393,7 @@ pub(super) fn compile(
         program,
         reference_functions,
         output_byte_limit: None,
-        callable_entry: callable.then_some((flbc::FunctionId::new(entry_id.get()), expected)),
+        callable_entry: callable.then_some((flbc::FunctionId::new(callable_entry.get()), expected)),
         initialization: None,
         native_externs: native_order
             .iter()

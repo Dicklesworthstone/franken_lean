@@ -1,6 +1,7 @@
 use super::*;
 use fln_olean::initializers::InitEntry;
 use fln_olean::ir::{IrArg, IrCtorInfo, IrExpr, IrLit, IrParam};
+use fln_rt::obj::Obj;
 
 mod policy;
 mod reference;
@@ -436,6 +437,211 @@ fn initializer_failure_and_capture_exhaustion_preserve_only_accepted_output() {
                 ));
             } else {
                 assert!(matches!(report.outcome, Outcome::Inconclusive(_)));
+            }
+        }
+    }
+}
+
+fn callable_module() -> IrModule {
+    let mut module = module();
+    module.decls.push(IrDecl::Function {
+        name: name("callable"),
+        params: vec![IrParam {
+            x: 0,
+            borrow: true,
+            ty: IrType::TObject,
+        }],
+        result: IrType::TObject,
+        body: IrBody {
+            stmts: vec![
+                binding(
+                    1,
+                    IrType::TObject,
+                    IrExpr::Fap {
+                        function: name("g"),
+                        args: vec![],
+                    },
+                ),
+                binding(
+                    2,
+                    IrType::TObject,
+                    IrExpr::Fap {
+                        function: name("Nat.add"),
+                        args: vec![IrArg::Var(0), IrArg::Var(1)],
+                    },
+                ),
+            ],
+            terminal: Box::new(IrTerminal::Ret(IrArg::Var(2))),
+        },
+        sorry_dep: None,
+    });
+    module
+}
+
+fn prepare_callable(module: &IrModule, max_output: Option<usize>) -> CompiledCallableIr {
+    compile_callable_with_options(
+        std::slice::from_ref(module),
+        &name("callable"),
+        &partition(),
+        &module
+            .decls
+            .iter()
+            .map(|decl| decl.name().clone())
+            .collect(),
+        IrExecutionOptions {
+            capture_output_bytes: max_output,
+            initialize_globals: true,
+            ..IrExecutionOptions::default()
+        },
+    )
+    .unwrap()
+}
+
+#[test]
+fn initialized_callable_preserves_capability_boundary_and_one_execution_budget() {
+    let module = callable_module();
+    assert!(matches!(
+        compile_callable(
+            std::slice::from_ref(&module),
+            &name("callable"),
+            &partition(),
+            &module
+                .decls
+                .iter()
+                .map(|decl| decl.name().clone())
+                .collect(),
+            IrExecutionLimits::default(),
+        ),
+        Err(IrExecutionError::InitializerContract {
+            detail: "requires explicit initialized-global capability",
+            ..
+        })
+    ));
+    let compiled = prepare_callable(&module, None);
+    let success = || {
+        let report = compiled.execute(vec![Obj::mk_nat(7)], ExecutionLimits::default(), None);
+        assert!(report.initialization_failure.is_none());
+        let Outcome::Complete(VmExit::Returned(result)) = report.outcome else {
+            panic!("{report:?}")
+        };
+        assert_eq!(crate::nat_decimal(&result.value).as_deref(), Some("49"));
+        result.usage.steps
+    };
+    let steps = success();
+    for max_steps in [0, 1, steps / 2, steps - 1] {
+        let report = compiled.execute(
+            vec![Obj::mk_nat(7)],
+            ExecutionLimits {
+                max_steps,
+                ..ExecutionLimits::default()
+            },
+            None,
+        );
+        assert!(
+            matches!(report.outcome, Outcome::Inconclusive(_)),
+            "{report:?}"
+        );
+        assert!(report.initialization_failure.is_none());
+        success();
+    }
+    let polls = std::cell::Cell::new(0u64);
+    let cancel = || {
+        let count = polls.get();
+        polls.set(count + 1);
+        count >= steps / 2
+    };
+    let report = compiled.execute(
+        vec![Obj::mk_nat(7)],
+        ExecutionLimits::default(),
+        Some(&cancel),
+    );
+    assert!(
+        matches!(report.outcome, Outcome::Inconclusive(_)),
+        "{report:?}"
+    );
+    assert!(report.initialization_failure.is_none());
+    success();
+}
+
+fn output_statements(text: &str) -> Vec<IrStmt> {
+    vec![
+        binding(
+            10,
+            IrType::TObject,
+            IrExpr::Fap {
+                function: name("IO.getStdout"),
+                args: vec![IrArg::Erased],
+            },
+        ),
+        binding(11, IrType::TObject, IrExpr::Proj { i: 4, x: 10 }),
+        binding(12, IrType::TObject, IrExpr::Lit(IrLit::Str(text.into()))),
+        binding(
+            13,
+            IrType::TObject,
+            IrExpr::Lit(IrLit::Num(IrNat::Small(0))),
+        ),
+        binding(
+            14,
+            IrType::TObject,
+            IrExpr::Ap {
+                x: 11,
+                args: vec![IrArg::Var(12), IrArg::Var(13)],
+            },
+        ),
+    ]
+}
+
+#[test]
+fn initialized_callable_shares_capture_and_stops_before_entry_on_failure() {
+    for (tag, max_bytes, expected, malformed) in [
+        (0, 8, b"initbody".as_slice(), None),
+        (0, 4, b"init".as_slice(), None),
+        (1, 8, b"init".as_slice(), Some(false)),
+        (2, 8, b"init".as_slice(), Some(true)),
+    ] {
+        let mut module = callable_module();
+        module.decls[1] = initializer("initG", None, tag);
+        for (index, text) in [(1, "init"), (2, "body")] {
+            let IrDecl::Function { body, .. } = &mut module.decls[index] else {
+                unreachable!()
+            };
+            body.stmts.splice(0..0, output_statements(text));
+        }
+        let compiled = prepare_callable(&module, Some(max_bytes));
+        let wrong_arity = compiled.execute(vec![], ExecutionLimits::default(), None);
+        assert!(matches!(
+            wrong_arity.outcome,
+            Outcome::Complete(VmExit::Refused {
+                refusal: VmRefusal::CallableEntry { .. },
+                ..
+            })
+        ));
+        assert!(wrong_arity.captured_output.unwrap().bytes.is_empty());
+        assert!(wrong_arity.initialization_failure.is_none());
+        for _ in 0..2 {
+            let report = compiled.execute(vec![Obj::mk_nat(7)], ExecutionLimits::default(), None);
+            assert_eq!(report.captured_output.unwrap().bytes, expected);
+            if let Some(malformed) = malformed {
+                assert!(matches!(
+                    report.outcome,
+                    Outcome::Complete(VmExit::Refused {
+                        refusal: VmRefusal::Initialization { .. },
+                        ..
+                    })
+                ));
+                let failure = report.initialization_failure.unwrap();
+                assert_eq!(failure.initializer, name("initG"));
+                assert_eq!(failure.malformed, malformed);
+                assert_eq!(failure.result.header().tag as u64, tag);
+            } else if max_bytes == 4 {
+                assert!(matches!(report.outcome, Outcome::Inconclusive(_)));
+                assert!(report.initialization_failure.is_none());
+            } else {
+                let Outcome::Complete(VmExit::Returned(result)) = report.outcome else {
+                    panic!("{:?}", report.outcome)
+                };
+                assert_eq!(crate::nat_decimal(&result.value).as_deref(), Some("49"));
+                assert!(report.initialization_failure.is_none());
             }
         }
     }
