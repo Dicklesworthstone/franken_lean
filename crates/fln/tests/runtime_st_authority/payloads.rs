@@ -3,6 +3,9 @@
 use super::*;
 use fln_rt::obj::Obj;
 
+#[path = "callable_payloads.rs"]
+mod callable;
+
 fn source() -> String {
     let declarations = r#"
 structure StoredPayload where
@@ -244,39 +247,49 @@ pub(super) fn check_payloads(engine: &Engine) {
             })
         ));
     }
-    // A completed function interface is not part of the ground-data slice.
-    // In particular, a previously used canonical New row cannot authorize it.
-    let unsupported = r#"
-def unsupportedCell : Nat := runST (fun sigma =>
-  ST.bind (ST.Prim.mkRef (σ := sigma) (α := Nat) 0) (fun _ =>
-    ST.bind (ST.Prim.mkRef (σ := sigma) (α := Nat -> Nat) (fun n => n))
-      (fun _ => ST.pure 0)))
-"#;
-    let checked = engine
-        .check_source_files(
-            &[unsupported.as_bytes()],
-            &options,
-            SourceCheckLimits::new(limits.admission()),
-        )
-        .unwrap()
-        .into_complete()
-        .unwrap()
-        .engine;
-    let query = Declaration::Defn(DefinitionVal {
-        base: ConstantVal {
-            name: name("unsupportedCellQuery"),
-            level_params: vec![],
-            type_: constant("Nat"),
-        },
-        value: constant("unsupportedCell"),
-        hints: ReducibilityHints::Abbrev,
-        safety: DefinitionSafety::Safe,
-        all: vec![name("unsupportedCellQuery")],
-    });
-    assert!(matches!(
-        rejected(&checked, &query, limits),
-        EngineExecutionError::Ingress(_)
-    ));
+    // A concrete closure is now admitted, but its entire interface must have
+    // a proved representation. An unused callback with an unknown domain is
+    // no more executable than an unknown payload itself. A preceding Nat
+    // allocation must not let either bypass discovery through the row cache.
+    for (payload, initial) in [
+        ("MissingCellPayload", "missingCellPayload"),
+        ("MissingCellPayload -> Nat", "fun _ => 0"),
+    ] {
+        let unsupported = format!(
+            "axiom MissingCellPayload : Type\n\
+             axiom missingCellPayload : MissingCellPayload\n\
+             def unsupportedCell : Nat := runST (fun sigma =>\n\
+               ST.bind (ST.Prim.mkRef (σ := sigma) (α := Nat) 0) (fun _ =>\n\
+                 ST.bind (ST.Prim.mkRef (σ := sigma) (α := {payload}) ({initial}))\n\
+                   (fun _ => ST.pure 0)))\n"
+        );
+        let checked = engine
+            .check_source_files(
+                &[unsupported.as_bytes()],
+                &options,
+                SourceCheckLimits::new(limits.admission()),
+            )
+            .unwrap()
+            .into_complete()
+            .unwrap()
+            .engine;
+        let query = Declaration::Defn(DefinitionVal {
+            base: ConstantVal {
+                name: name("unsupportedCellQuery"),
+                level_params: vec![],
+                type_: constant("Nat"),
+            },
+            value: constant("unsupportedCell"),
+            hints: ReducibilityHints::Abbrev,
+            safety: DefinitionSafety::Safe,
+            all: vec![name("unsupportedCellQuery")],
+        });
+        assert!(matches!(
+            rejected(&checked, &query, limits),
+            EngineExecutionError::Ingress(_)
+        ));
+    }
+    callable::check(engine);
     assert_eq!(engine.logical_root(&options), root);
 }
 

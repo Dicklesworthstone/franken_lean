@@ -422,11 +422,24 @@ impl Preparation<'_> {
             return Ok(None);
         }
         let payload = self.erase_runtime_type(&args[1])?;
+        // Discovery must finish the entire representation graph before a
+        // payload crosses the cell's erased ABI word. A closure carries its
+        // exact checked interface, and a nested reference remains an opaque
+        // checked handle. Neither is reconstructed from its source spelling.
+        // In particular, a generic Abi slot is not evidence of a payload
+        // layout, even after another payload has populated the primitive cache.
         if !specialize::closed(&payload)
             || !matches!(
                 self.value_type(&payload)?,
                 Some(
-                    ValueType::Nat | ValueType::String | ValueType::Constructor | ValueType::Array
+                    ValueType::Unit
+                        | ValueType::Bool
+                        | ValueType::Nat
+                        | ValueType::String
+                        | ValueType::Constructor
+                        | ValueType::Array
+                        | ValueType::Ref
+                        | ValueType::Closure(_)
                 )
             )
         {
