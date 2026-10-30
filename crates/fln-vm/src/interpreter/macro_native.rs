@@ -15,6 +15,12 @@ pub(super) enum Intrinsic {
     IsOfKind,
     GetArg,
     GetNumArgs,
+    GetKind,
+    SetKind,
+    GetArgs,
+    IsMissing,
+    IsIdent,
+    GetId,
 }
 
 impl Intrinsic {
@@ -24,6 +30,12 @@ impl Intrinsic {
             "mirror:Lean.Syntax.isOfKind" => Self::IsOfKind,
             "mirror:Lean.Syntax.getArg" => Self::GetArg,
             "mirror:Lean.Syntax.getNumArgs" => Self::GetNumArgs,
+            "mirror:Lean.Syntax.getKind" => Self::GetKind,
+            "mirror:Lean.Syntax.setKind" => Self::SetKind,
+            "mirror:Lean.Syntax.getArgs" => Self::GetArgs,
+            "mirror:Lean.Syntax.isMissing" => Self::IsMissing,
+            "mirror:Lean.Syntax.isIdent" => Self::IsIdent,
+            "mirror:Lean.Syntax.getId" => Self::GetId,
             _ => return None,
         })
     }
@@ -36,7 +48,7 @@ impl Intrinsic {
         expect_arity(
             row,
             args,
-            if matches!(self, Self::IsOfKind | Self::GetArg) {
+            if matches!(self, Self::IsOfKind | Self::GetArg | Self::SetKind) {
                 2
             } else {
                 1
@@ -94,6 +106,73 @@ impl Intrinsic {
                     0
                 };
                 Ok(IntrinsicResult::raw_object(Obj::mk_nat(size)))
+            }
+            Self::GetKind => {
+                let kind = match syntax_kind(&args[0])? {
+                    SyntaxKind::Missing => inject_name(&Name::str(Name::anonymous(), "missing")),
+                    SyntaxKind::Ident => inject_name(&Name::str(Name::anonymous(), "ident")),
+                    SyntaxKind::Atom => {
+                        let value = child(&args[0], 1)?;
+                        let text = string(&value)?;
+                        limit("name bytes", MAX_NAME_BYTES, text.len() as u64)?;
+                        inject_name(&Name::str(Name::anonymous(), text))
+                    }
+                    SyntaxKind::Node => {
+                        let kind = child(&args[0], 1)?;
+                        name(&kind)?;
+                        kind
+                    }
+                };
+                Ok(IntrinsicResult::raw_object(kind))
+            }
+            Self::SetKind => {
+                let value = if matches!(syntax_kind(&args[0])?, SyntaxKind::Node) {
+                    name(&args[1])?;
+                    let children = child(&args[0], 2)?;
+                    children
+                        .try_array_view()
+                        .ok_or(VmRefusal::InvalidArrayObject)?;
+                    // Preserve the original source information and exact child
+                    // handles. Rebuilding just the node cannot mutate an alias.
+                    Obj::mk_ctor(
+                        layout::SYNTAX_NODE.tag,
+                        vec![child(&args[0], 0)?, args[1].clone_ref(), children],
+                        &[],
+                    )
+                } else {
+                    args[0].clone_ref()
+                };
+                Ok(IntrinsicResult::raw_object(value))
+            }
+            Self::GetArgs => {
+                let children = if matches!(syntax_kind(&args[0])?, SyntaxKind::Node) {
+                    let children = child(&args[0], 2)?;
+                    children
+                        .try_array_view()
+                        .ok_or(VmRefusal::InvalidArrayObject)?;
+                    children
+                } else {
+                    Obj::mk_array(Vec::new())
+                };
+                Ok(IntrinsicResult::raw_object(children))
+            }
+            Self::IsMissing | Self::IsIdent => {
+                let kind = syntax_kind(&args[0])?;
+                let matches = matches!(
+                    (self, kind),
+                    (Self::IsMissing, SyntaxKind::Missing) | (Self::IsIdent, SyntaxKind::Ident)
+                );
+                Ok(IntrinsicResult::scalar(Obj::mk_nat(usize::from(matches))))
+            }
+            Self::GetId => {
+                let id = if matches!(syntax_kind(&args[0])?, SyntaxKind::Ident) {
+                    let id = child(&args[0], 2)?;
+                    name(&id)?;
+                    id
+                } else {
+                    inject_name(&Name::anonymous())
+                };
+                Ok(IntrinsicResult::raw_object(id))
             }
         }
     }

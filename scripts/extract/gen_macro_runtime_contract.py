@@ -44,6 +44,12 @@ FUNCTIONS = {
     "SYNTAX_IS_OF_KIND": "syntaxIsOfKind",
     "SYNTAX_GET_ARG": "syntaxGetArg",
     "SYNTAX_GET_NUM_ARGS": "syntaxGetNumArgs",
+    "SYNTAX_GET_KIND": "syntaxGetKind",
+    "SYNTAX_SET_KIND": "syntaxSetKind",
+    "SYNTAX_GET_ARGS": "syntaxGetArgs",
+    "SYNTAX_IS_MISSING": "syntaxIsMissing",
+    "SYNTAX_IS_IDENT": "syntaxIsIdent",
+    "SYNTAX_GET_ID": "syntaxGetId",
 }
 
 

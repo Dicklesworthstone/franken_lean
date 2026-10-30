@@ -71,4 +71,17 @@ def prod (name : Lean.Name) (value : String) : Lean.Name × String := (name, val
 
 @[noinline] def syntaxGetNumArgs (value : @& Lean.Syntax) : Nat := value.getNumArgs
 
+@[noinline] def syntaxGetKind (value : Lean.Syntax) : Lean.Name := value.getKind
+
+@[noinline] def syntaxSetKind (value : Lean.Syntax) (kind : Lean.Name) : Lean.Syntax :=
+  value.setKind kind
+
+@[noinline] def syntaxGetArgs (value : Lean.Syntax) : Array Lean.Syntax := value.getArgs
+
+@[noinline] def syntaxIsMissing (value : @& Lean.Syntax) : Bool := value.isMissing
+
+@[noinline] def syntaxIsIdent (value : @& Lean.Syntax) : Bool := value.isIdent
+
+@[noinline] def syntaxGetId (value : Lean.Syntax) : Lean.Name := value.getId
+
 end FrankenLean.MacroLayout

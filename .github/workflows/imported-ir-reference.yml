@@ -6,6 +6,11 @@ on:
       - '.github/workflows/imported-ir-reference.yml'
       - 'crates/fln/src/imported_ir.rs'
       - 'crates/fln/src/imported_ir/**'
+      - 'crates/fln/src/imported_macros.rs'
+      - 'crates/fln/src/imported_macros/**'
+      - 'crates/fln-rt/src/**'
+      - 'crates/fln-vm/src/**'
+      - 'scripts/extract/gen_macro_runtime_contract.py'
       - 'crates/fln-olean/fixtures/ir/**'
       - 'SUITE.lock'
       - 'rust-toolchain.toml'
@@ -65,19 +70,32 @@ jobs:
           test "$("$toolchain_root/bin/lean" --githash)" = "$pin_commit"
           printf 'FLN_REFERENCE_LIB=%s/lib/lean\nFLN_REFERENCE_LEAN=%s/bin/lean\n' \
             "$toolchain_root" "$toolchain_root" >> "$GITHUB_ENV"
-      - name: Execute imported IR, lint, and check formatting without hiding failures
+      - name: Execute imported IR and native macros, lint, and check formatting
         shell: bash
         run: |
           set -uo pipefail
           status=0
           cargo test --locked -p fln --lib imported_ir:: -- --nocapture \
             2>&1 | tee target/imported-ir-reference/tests.log || status=1
+          cargo test --locked -p fln --lib imported_macros:: -- --nocapture \
+            2>&1 | tee target/imported-ir-reference/macros.log || status=1
+          cargo test --locked -p fln-vm --lib macro_native -- --nocapture \
+            2>&1 | tee target/imported-ir-reference/macro-vm.log || status=1
+          python3 scripts/extract/gen_macro_runtime_contract.py \
+            --lean "$FLN_REFERENCE_LEAN" --check \
+            2>&1 | tee target/imported-ir-reference/macro-contract.log || status=1
           cargo clippy --locked -p fln --lib --tests -- -D warnings \
             2>&1 | tee target/imported-ir-reference/clippy.log || status=1
-          files=(crates/fln/src/imported_ir/constructor_updates.rs)
+          files=(crates/fln/src/imported_ir/constructor_updates.rs
+            crates/fln-vm/src/macro_native.rs
+            crates/fln-vm/src/interpreter/macro_native.rs
+            crates/fln-vm/src/interpreter/macro_native/tests.rs
+            crates/fln-rt/src/syntax_abi_generated.rs)
           while IFS= read -r path; do files+=("$path"); done < <(
             git ls-files 'crates/fln/src/imported_ir/constructor_updates/*.rs' \
-              'crates/fln/src/imported_ir/constructor_updates/**/*.rs')
+              'crates/fln/src/imported_ir/constructor_updates/**/*.rs' \
+              'crates/fln/src/imported_macros/*.rs' \
+              'crates/fln/src/imported_macros/**/*.rs')
           rustfmt --edition 2024 --config skip_children=true --check "${files[@]}" \
             2>&1 | tee target/imported-ir-reference/format.log || status=1
           # Developer artifacts are formatted copies, never changes to tested

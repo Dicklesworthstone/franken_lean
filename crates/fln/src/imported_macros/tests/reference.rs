@@ -313,6 +313,117 @@ fn live_pinned_macro_runs_native_syntax_methods_and_matches_complete_subtrees() 
             "{quotation}, {depth}/{maximum}"
         );
     }
+    let inspect = prepare(&name("inspectSyntaxMacro"));
+    let identify = prepare(&name("idSyntaxMacro"));
+    let rename = prepare(&name("replaceSyntaxKindMacro"));
+    let mut native_rows = BTreeSet::new();
+    let original_node = Syntax::Node {
+        info: SourceInfo::Synthetic {
+            pos: BytePos(1),
+            end_pos: BytePos(3),
+            canonical: true,
+        },
+        kind: name("branch"),
+        args: vec![leaf()],
+    };
+    for (input, expected_kind, expected_id, children, missing, ident) in [
+        (
+            Syntax::Missing,
+            name("missing"),
+            Name::anonymous(),
+            vec![],
+            true,
+            false,
+        ),
+        (
+            leaf(),
+            name("ident"),
+            Name::num(name("Main._hyg"), 17),
+            vec![],
+            false,
+            true,
+        ),
+        (
+            Syntax::atom(SourceInfo::None, "A.B\0🙂"),
+            Name::str(Name::anonymous(), "A.B\0🙂"),
+            Name::anonymous(),
+            vec![],
+            false,
+            false,
+        ),
+        (
+            original_node.clone(),
+            name("branch"),
+            Name::anonymous(),
+            vec![leaf()],
+            false,
+            false,
+        ),
+        (
+            Syntax::atom(SourceInfo::None, "ident"),
+            name("ident"),
+            Name::anonymous(),
+            vec![],
+            false,
+            false,
+        ),
+    ] {
+        let expected_inspection = if ident {
+            Syntax::node(expected_id.clone(), vec![input.clone()])
+        } else {
+            Syntax::node(expected_kind, children.clone())
+        };
+        let expected_replacement = match &input {
+            Syntax::Node { info, args, .. } => Syntax::Node {
+                info: *info,
+                kind: name("renamed"),
+                args: args.clone(),
+            },
+            _ => input.clone(),
+        };
+        for (compiled, expected) in [
+            (&inspect, expected_inspection),
+            (&identify, Syntax::node(expected_id, children)),
+            (&rename, expected_replacement),
+        ] {
+            let report = compiled.execute(
+                &input,
+                &source(),
+                &context(),
+                &MacroState::default(),
+                MacroLimits::default(),
+                None,
+            );
+            native_rows.extend(report.native_functions);
+            assert!(
+                report
+                    .reference_functions
+                    .iter()
+                    .all(|function| !function.name.to_display_string().starts_with("Lean.")),
+                "toolchain implementation must not execute as imported IR"
+            );
+            assert!(
+                matches!(report.outcome,
+                    Outcome::Complete(Ok(MacroResult::Expanded { syntax, state }))
+                    if syntax == expected && state == MacroState::default()),
+                "inspection/rewrite of {input:?} (missing={missing}, ident={ident})"
+            );
+        }
+    }
+    for row in [
+        "mirror:Lean.Syntax.getKind",
+        "mirror:Lean.Syntax.setKind",
+        "mirror:Lean.Syntax.getArgs",
+        "mirror:Lean.Syntax.isMissing",
+        "mirror:Lean.Syntax.isIdent",
+        "mirror:Lean.Syntax.getId",
+    ] {
+        assert!(
+            native_rows.contains(row),
+            "the real macro did not select {row}"
+        );
+    }
+
     let mut exhausted = MacroLimits::default();
     exhausted.vm.max_steps = 0;
     assert!(matches!(
@@ -383,7 +494,7 @@ fn live_pinned_macro_runs_native_syntax_methods_and_matches_complete_subtrees() 
     );
     assert_eq!(
         oracle.stdout,
-        b"[true, true, true, true, true, true, true, true, true, true]\n"
+        b"[true, true, true, true, true, true, true, true, true, true]\n[true, true, true, true, true, true, true, true, true, true, true, true, true, true, true]\n"
     );
     assert!(oracle.stderr.is_empty());
 
@@ -510,4 +621,40 @@ def contextNodeExact (expected : Lean.Name) : Lean.Syntax → Bool
     | .ok out state => leafExact out && state.macroScope == 0 && state.traceMsgs.isEmpty
     | _ => false
   [first, second, unsupported, scopedOk, diagnostic, scopeFirst, scopeSecond, fields, other, depth]
+
+def emptyNodeExact (expected : Lean.Name) : Lean.Syntax → Bool
+  | .node .none kind args => kind == expected && args.isEmpty
+  | _ => false
+def singletonLeafExact (expected : Lean.Name) : Lean.Syntax → Bool
+  | .node .none kind args => kind == expected && args.size == 1 && leafExact args[0]!
+  | _ => false
+def syntheticNodeExact (expected : Lean.Name) : Lean.Syntax → Bool
+  | .node (.synthetic start stop canonical) kind args =>
+    start.byteIdx == 1 && stop.byteIdx == 3 && canonical &&
+    kind == expected && args.size == 1 && leafExact args[0]!
+  | _ => false
+def inspectResult (macroFn : Lean.Syntax → Lean.MacroM Lean.Syntax)
+    (input : Lean.Syntax) (check : Lean.Syntax → Bool) : Bool :=
+  match macroFn input sampleContext default with
+  | .ok output state => check output && state.macroScope == 0 && state.traceMsgs.isEmpty
+  | _ => false
+#eval show List Bool from
+  let atom := Lean.Syntax.atom .none "A.B\x00🙂"
+  let identAtom := Lean.Syntax.atom .none "ident"
+  let original := Lean.Syntax.node (.synthetic ⟨1⟩ ⟨3⟩ true) `branch #[sampleLeaf]
+  [inspectResult inspectSyntaxMacro .missing (emptyNodeExact `missing),
+   inspectResult idSyntaxMacro .missing (emptyNodeExact .anonymous),
+   inspectResult replaceSyntaxKindMacro .missing (fun | .missing => true | _ => false),
+   inspectResult inspectSyntaxMacro sampleLeaf (singletonLeafExact (Lean.Name.num `Main._hyg 17)),
+   inspectResult idSyntaxMacro sampleLeaf (emptyNodeExact (Lean.Name.num `Main._hyg 17)),
+   inspectResult replaceSyntaxKindMacro sampleLeaf leafExact,
+   inspectResult inspectSyntaxMacro atom (emptyNodeExact (Lean.Name.mkStr1 "A.B\x00🙂")),
+   inspectResult idSyntaxMacro atom (emptyNodeExact .anonymous),
+   inspectResult replaceSyntaxKindMacro atom (fun | .atom .none s => s == "A.B\x00🙂" | _ => false),
+   inspectResult inspectSyntaxMacro original (singletonLeafExact `branch),
+   inspectResult idSyntaxMacro original (singletonLeafExact .anonymous),
+   inspectResult replaceSyntaxKindMacro original (syntheticNodeExact `renamed),
+   inspectResult inspectSyntaxMacro identAtom (emptyNodeExact `ident),
+   inspectResult idSyntaxMacro identAtom (emptyNodeExact .anonymous),
+   inspectResult replaceSyntaxKindMacro identAtom (fun | .atom .none s => s == "ident" | _ => false)]
 "#;

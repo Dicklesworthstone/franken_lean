@@ -29,3 +29,20 @@ macro (name := contextChoose) "contextTerm%" a:term "," b:term : term => do
     pure ctx.ref
   else
     pure (.node .none ctx.quotContext #[ctx.ref, stx])
+
+
+-- Structural inspection must use the native Mirror, including pseudo-kinds and
+-- hygienic identifier names. These functions deliberately need no environment.
+@[noinline] def inspectSyntaxMacro (stx : Lean.Syntax) : Lean.MacroM Lean.Syntax := do
+  if stx.isMissing then
+    pure (.node .none stx.getKind stx.getArgs)
+  else if stx.isIdent then
+    pure (.node .none stx.getId #[stx])
+  else
+    pure (.node .none stx.getKind stx.getArgs)
+
+@[noinline] def idSyntaxMacro (stx : Lean.Syntax) : Lean.MacroM Lean.Syntax :=
+  pure (.node .none stx.getId stx.getArgs)
+
+@[noinline] def replaceSyntaxKindMacro (stx : Lean.Syntax) : Lean.MacroM Lean.Syntax :=
+  pure (stx.setKind (Lean.Name.mkStr1 "renamed"))

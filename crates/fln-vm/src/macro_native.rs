@@ -72,6 +72,48 @@ pub const ROWS: &[MirrorRow] = &[
         parameters: generated::SYNTAX_IS_OF_KIND_PARAMETERS,
         result_type: generated::SYNTAX_IS_OF_KIND_RESULT,
     },
+    MirrorRow {
+        id: "mirror:Lean.Syntax.getKind",
+        name: "Lean.Syntax.getKind",
+        borrowed: generated::SYNTAX_GET_KIND_BORROWED,
+        parameters: generated::SYNTAX_GET_KIND_PARAMETERS,
+        result_type: generated::SYNTAX_GET_KIND_RESULT,
+    },
+    MirrorRow {
+        id: "mirror:Lean.Syntax.setKind",
+        name: "Lean.Syntax.setKind",
+        borrowed: generated::SYNTAX_SET_KIND_BORROWED,
+        parameters: generated::SYNTAX_SET_KIND_PARAMETERS,
+        result_type: generated::SYNTAX_SET_KIND_RESULT,
+    },
+    MirrorRow {
+        id: "mirror:Lean.Syntax.getArgs",
+        name: "Lean.Syntax.getArgs",
+        borrowed: generated::SYNTAX_GET_ARGS_BORROWED,
+        parameters: generated::SYNTAX_GET_ARGS_PARAMETERS,
+        result_type: generated::SYNTAX_GET_ARGS_RESULT,
+    },
+    MirrorRow {
+        id: "mirror:Lean.Syntax.isMissing",
+        name: "Lean.Syntax.isMissing",
+        borrowed: generated::SYNTAX_IS_MISSING_BORROWED,
+        parameters: generated::SYNTAX_IS_MISSING_PARAMETERS,
+        result_type: generated::SYNTAX_IS_MISSING_RESULT,
+    },
+    MirrorRow {
+        id: "mirror:Lean.Syntax.isIdent",
+        name: "Lean.Syntax.isIdent",
+        borrowed: generated::SYNTAX_IS_IDENT_BORROWED,
+        parameters: generated::SYNTAX_IS_IDENT_PARAMETERS,
+        result_type: generated::SYNTAX_IS_IDENT_RESULT,
+    },
+    MirrorRow {
+        id: "mirror:Lean.Syntax.getId",
+        name: "Lean.Syntax.getId",
+        borrowed: generated::SYNTAX_GET_ID_BORROWED,
+        parameters: generated::SYNTAX_GET_ID_PARAMETERS,
+        result_type: generated::SYNTAX_GET_ID_RESULT,
+    },
 ];
 
 pub fn row_for_name(name: &Name) -> Option<&'static MirrorRow> {
