@@ -70,6 +70,11 @@ fn live_pinned_local_state_matches_reference_and_canonical_replay() {
         ("localStateSharedAnswer", 19),
         ("localStateClosureAnswer", 23),
         ("localStateArrayAnswer", 42),
+        ("localStateModifyAnswer", 0),
+        ("localStateModifyAnswer", u64::MAX),
+        ("localStateArrayModifyAnswer", 42),
+        ("localStateModifyClosureAnswer", 19),
+        ("localStateModifyClosureAnswer", u64::MAX),
     ];
     let mut oracle_source = source.to_owned();
     for (entry, value) in cases {
@@ -112,11 +117,17 @@ fn live_pinned_local_state_matches_reference_and_canonical_replay() {
         )
         .unwrap_or_else(|error| panic!("{entry} {value}: {error:?}; artifacts {dir:?}"));
         assert_nat_replay(&compiled, expected);
+        if entry.contains("Modify") {
+            assert!(
+                compiled.native_externs().iter().any(|row| row == "extern:ST.Prim.Ref.take"),
+                "{entry} did not retain its take-based implementation; {dir:?}"
+            );
+        }
         observed.extend(compiled.native_externs().iter().cloned());
         eprintln!("live Reference and Golem: {entry} {value} = {expected}");
     }
     // Do not count an optimized-away program as native state coverage.
-    for operation in CELL_ROWS {
+    for operation in CELL_ROWS.into_iter().chain(["ST.Prim.Ref.take"]) {
         assert!(
             observed.contains(&format!("extern:{operation}")),
             "{operation}; {dir:?}"

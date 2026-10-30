@@ -145,7 +145,7 @@ fn state_sequence() -> IrModule {
 
 #[test]
 fn only_reviewed_local_cell_effects_are_newly_admitted() {
-    for text in CELL_ROWS {
+    for text in CELL_ROWS.into_iter().chain(["ST.Prim.Ref.take"]) {
         let row = native_row(&name(text)).unwrap();
         let arity = native_signature::inferred_arity(row).unwrap();
         let native = Native::new(row, arity).unwrap();
@@ -159,7 +159,7 @@ fn only_reviewed_local_cell_effects_are_newly_admitted() {
     }
     let mut refused = 0;
     for row in EXTERN_ROWS {
-        if row.effect == "pure" || CELL_ROWS.contains(&row.name) {
+        if row.effect == "pure" || CELL_ROWS.contains(&row.name) || row.name == "ST.Prim.Ref.take" {
             continue;
         }
         assert!(
@@ -328,3 +328,4 @@ fn local_state_preparation_is_bounded_and_does_not_mutate_input_ir() {
 }
 
 mod reference;
+mod take;

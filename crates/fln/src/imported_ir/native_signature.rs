@@ -2,8 +2,9 @@
 //!
 //! The census arity counts source binders, including erased types. A module's
 //! IR need not repeat declarations for imported native callees. In that case
-//! only the generated ABI, never the first observed call site, can supply the
-//! runtime arity. Explicit IR extern declarations are still checked separately.
+//! only the generated ABI or an explicitly reviewed native bridge, never the
+//! first observed call site, can supply the runtime arity. Explicit IR extern
+//! declarations are checked against the same authority.
 
 use super::{GeneratedExternRow, IrExecutionError, Name, Ownership, extern_row};
 
@@ -13,7 +14,38 @@ pub(super) fn inferred_arity(row: &GeneratedExternRow) -> Result<usize, IrExecut
         detail: error.to_string(),
     };
     let ownership = Ownership::parse(row.ownership).map_err(error)?;
-    executable_arity(&ownership, row.arity as usize).map_err(error)
+    let fallback = reviewed_rule_arity(row, &ownership).map_err(error)?;
+    executable_arity(&ownership, fallback).map_err(error)
+}
+
+fn reviewed_rule_arity(
+    row: &GeneratedExternRow,
+    ownership: &Ownership,
+) -> Result<usize, extern_row::ContractError> {
+    if row.id != "extern:ST.Prim.Ref.take" {
+        return Ok(row.arity as usize);
+    }
+    // Unlike get/set/swap, take is absent from the pin's lean.h declarations,
+    // so its generated ownership row is rule-only. The pinned ST declaration
+    // binds erased sigma/alpha before one borrowed reference. Golem's RefTake
+    // implementation checks that one handle and returns its owned occupant.
+    // This is a row-specific runtime bridge, not a general rule that erases
+    // binders by count or accepts an arity supplied by untrusted IR.
+    if row.name != "ST.Prim.Ref.take"
+        || row.module != "Init.System.ST"
+        || row.kind != "opaque"
+        || row.symbol != "lean_st_ref_take"
+        || row.levels != 0
+        || row.arity != 3
+        || row.effect != "state"
+        || row.safety != "unsafe"
+        || !matches!(ownership, Ownership::DefaultRuleOwnedResult)
+    {
+        return Err(extern_row::ContractError::new(
+            "ST.Prim.Ref.take differs from its reviewed erased runtime contract",
+        ));
+    }
+    Ok(1)
 }
 
 fn executable_arity(
@@ -35,8 +67,8 @@ fn executable_arity(
                 parameters.split(", ").count()
             }
         }
-        // A rule-only row has no independent erased telescope. Preserve the
-        // existing census-arity requirement rather than guessing from uses.
+        // Except for an explicitly reviewed bridge above, a rule-only row
+        // has no erased telescope. Preserve its census-arity requirement.
         _ => source_arity,
     };
     // Counting separators does not authorize an ABI. The existing canonical

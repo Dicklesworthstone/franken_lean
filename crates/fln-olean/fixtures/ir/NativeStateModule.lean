@@ -38,3 +38,31 @@ public section
   let old ← r.swap #[n, n + 1]
   let current ← r.get
   return n + old.size + current.size
+
+-- These public operations compile through the pin's take-based unsafe
+-- implementation, not the logical get/set bodies. Both updates must run.
+@[noinline] def localStateModifyAnswer (n : Nat) : Nat := runST fun _ => do
+  let r ← ST.mkRef n
+  r.modify fun value => value + 1
+  let old ← r.modifyGet fun value => (value, value + 2)
+  let current ← r.get
+  return old + current
+
+@[noinline] def localStateArrayModifyAnswer (n : Nat) : Nat := runST fun _ => do
+  let original : Array Nat := #[n]
+  let r ← ST.mkRef original
+  r.modify fun values => values.push (n + 1)
+  let previous ← r.modifyGet fun values => (values.size, values.push (n + 2))
+  let current ← r.get
+  return n + original.size + previous + current.size
+
+@[noinline] def localStateUpdateThrough {σ : Type}
+    (r : ST.Ref σ Nat) (f : Nat → Nat) : ST σ Unit :=
+  r.modify f
+
+@[noinline] def localStateModifyClosureAnswer (n : Nat) : Nat := runST fun _ => do
+  let r ← ST.mkRef n
+  let update := localStateUpdateThrough r
+  update fun value => value + n
+  update fun value => value + 1
+  r.get

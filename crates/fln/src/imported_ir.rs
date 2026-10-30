@@ -557,13 +557,13 @@ impl Native {
             detail: error.to_string(),
         };
         let contract = Ownership::parse(row.ownership).map_err(error)?;
-        // ABI signatures bind their own erased runtime arity. The rule-only
-        // contracts have no such telescope, so an untrusted IR extern may not
-        // choose a different one; the generated census is the only authority.
-        if !matches!(contract, Ownership::AbiSignature(_)) && arity != row.arity as usize {
+        // Explicit extern declarations and absent declarations use the same
+        // runtime authority. Rule-only rows retain census arity unless a
+        // reviewed native bridge binds their erased executable telescope.
+        if arity != native_signature::inferred_arity(row)? {
             return Err(IrExecutionError::NativeContract {
                 declaration: name.clone(),
-                detail: "extern arity differs from the generated census".to_owned(),
+                detail: "extern arity differs from the reviewed runtime signature".to_owned(),
             });
         }
         let arguments = contract
