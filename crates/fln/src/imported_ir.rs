@@ -5,8 +5,9 @@
 //! FLBC's independent ownership pass all precede execution. The supported
 //! slice includes calls, closures, acyclic join points, immutable constructors,
 //! packed scalar fields and checked native reference-cell operations.
-//! Reference cells retain State effects; host I/O and runtime-global effects
-//! remain refused. Equivalent object updates use fresh construction.
+//! Reference cells retain State effects. An explicit bounded output capability
+//! can additionally capture native stdout; other host I/O and runtime-global
+//! effects remain refused. Equivalent object updates use fresh construction.
 //! Other mutation, reset/reuse and observable reference counts are refused.
 //! Its RC annotations are replaced by Golem's checked managed ownership, not
 //! executed as additional retains/releases on already managed values.
@@ -30,6 +31,7 @@ use fln_vm::interpreter::{CancellationProbe, ExecutionLimits, VmExit};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
+mod captured_output;
 mod constructor_updates;
 mod lower;
 pub mod modules;
@@ -228,6 +230,18 @@ pub struct CompiledIr {
     program: flbc::OwnershipProgram,
     reference_functions: Vec<ReferenceFunction>,
     native_externs: Vec<String>,
+    output_byte_limit: Option<usize>,
+}
+
+/// The ordered bytes emitted into one isolated execution capture.
+///
+/// Native stdout and runtime diagnostics share this bound. On an inconclusive
+/// execution the accepted prefix is retained for inspection, never as a
+/// successful result or a claim that later writes occurred.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IrCapturedOutput {
+    pub bytes: Vec<u8>,
+    pub max_bytes: usize,
 }
 
 /// The execution result and the producer identities of its linked code.
@@ -236,6 +250,7 @@ pub struct IrExecution {
     pub outcome: Outcome<VmExit>,
     pub reference_functions: Vec<ReferenceFunction>,
     pub native_externs: Vec<String>,
+    pub captured_output: Option<IrCapturedOutput>,
 }
 
 impl CompiledIr {
@@ -247,15 +262,35 @@ impl CompiledIr {
         &self.native_externs
     }
 
+    pub const fn output_byte_limit(&self) -> Option<usize> {
+        self.output_byte_limit
+    }
+
     pub fn execute(
         &self,
         limits: ExecutionLimits,
         cancellation: Option<&dyn CancellationProbe>,
     ) -> IrExecution {
+        let (outcome, captured_output) = match self.output_byte_limit {
+            Some(max_bytes) => {
+                let (outcome, output) = captured_output::execute(
+                    self.program.program(),
+                    limits,
+                    cancellation,
+                    max_bytes,
+                );
+                (outcome, Some(output))
+            }
+            None => (
+                fln_vm::interpreter::execute(self.program.program(), limits, cancellation),
+                None,
+            ),
+        };
         IrExecution {
-            outcome: fln_vm::interpreter::execute(self.program.program(), limits, cancellation),
+            outcome,
             reference_functions: self.reference_functions.clone(),
             native_externs: self.native_externs.clone(),
+            captured_output,
         }
     }
 }
@@ -319,6 +354,54 @@ pub fn compile(
     user_declarations: &BTreeSet<Name>,
     limits: IrExecutionLimits,
 ) -> Result<CompiledIr, IrExecutionError> {
+    compile_with_output_policy(
+        modules,
+        entry,
+        arguments,
+        partition,
+        user_declarations,
+        limits,
+        None,
+    )
+}
+
+/// Compile with an explicit, per-execution native stdout capture allowance.
+///
+/// This admits only the exact native `IO.getStdout` row in addition to the
+/// effects allowed by [`compile`]. Native putStr callbacks require the capture
+/// and return the compiled Reference IO-result ABI. Stream reads, filesystem,
+/// process, network, and initializer effects remain unavailable. The allowance
+/// counts raw UTF-8 bytes, including NULs and newlines; a rejected write is not
+/// partially appended. Every execution starts a fresh isolated sink.
+pub fn compile_with_captured_output(
+    modules: &[IrModule],
+    entry: &Name,
+    arguments: &[EntryArgument],
+    partition: &VerifiedPartition,
+    user_declarations: &BTreeSet<Name>,
+    limits: IrExecutionLimits,
+    max_output_bytes: usize,
+) -> Result<CompiledIr, IrExecutionError> {
+    compile_with_output_policy(
+        modules,
+        entry,
+        arguments,
+        partition,
+        user_declarations,
+        limits,
+        Some(max_output_bytes),
+    )
+}
+
+fn compile_with_output_policy(
+    modules: &[IrModule],
+    entry: &Name,
+    arguments: &[EntryArgument],
+    partition: &VerifiedPartition,
+    user_declarations: &BTreeSet<Name>,
+    limits: IrExecutionLimits,
+    output_byte_limit: Option<usize>,
+) -> Result<CompiledIr, IrExecutionError> {
     let count = modules
         .iter()
         .try_fold(0usize, |n, m| n.checked_add(m.decls.len()))
@@ -378,9 +461,12 @@ pub fn compile(
         if let Some(row) = native_row(&name) {
             let arity = match declarations.get(&name) {
                 Some(IrDecl::Extern { params, .. }) => params.len(),
-                _ => native_signature::inferred_arity(row)?,
+                _ => native_signature::ir_arity(row)?,
             };
-            natives.insert(name, Native::new(row, arity)?);
+            natives.insert(
+                name,
+                Native::with_output(row, arity, output_byte_limit.is_some())?,
+            );
             continue;
         }
         authorize(partition, user_declarations, &name)?;
@@ -401,9 +487,18 @@ pub fn compile(
             return Err(unsupported(&name, "sorry-dependent executable"));
         }
         inspect_body(&name, body, &mut work, limits)?;
-        for ty in params.iter().map(|p| &p.ty).chain([result]) {
-            check_type(&name, ty)?;
+        for parameter in params {
+            // The pinned compiler retains a void RealWorld parameter on user
+            // IO functions, although each primitive call supplies Erased.
+            // It is an inert ABI slot, available only in the explicit output
+            // lane; void values, results, and packed representations remain
+            // outside the general imported-IR subset.
+            if output_byte_limit.is_some() && parameter.ty == IrType::Void {
+                continue;
+            }
+            check_type(&name, &parameter.ty)?;
         }
+        check_type(&name, result)?;
         for callee in declaration.callees() {
             pending.insert(callee.clone());
         }
@@ -415,7 +510,7 @@ pub fn compile(
     };
     let signatures = natives
         .iter()
-        .map(|(name, native)| (name.clone(), native.arguments.len()))
+        .map(|(name, native)| (name.clone(), native.ir_arity))
         .collect();
     // Validate and authorize the original closure before eliminating anything:
     // even an unchosen allocation branch cannot hide an invalid declaration.
@@ -425,7 +520,29 @@ pub fn compile(
         limits.ir,
     )
     .map_err(IrExecutionError::IrValidation)?;
-    if constructor_updates::normalize(&mut selected_module, limits)? {
+    if output_byte_limit.is_some() {
+        for declaration in &selected_module.decls {
+            if let IrDecl::Function {
+                name, params, body, ..
+            } = declaration
+            {
+                native_effects::validate_world_parameters(
+                    name,
+                    params,
+                    body,
+                    (name == entry).then_some(arguments),
+                )?;
+            }
+        }
+    }
+    let erased_worlds =
+        native_effects::erase_world_arguments(&mut selected_module, &natives, limits)?;
+    let updated_constructors = constructor_updates::normalize(&mut selected_module, limits)?;
+    if erased_worlds || updated_constructors {
+        let signatures = natives
+            .iter()
+            .map(|(name, native)| (name.clone(), native.arguments.len()))
+            .collect();
         validate_ir_types(
             std::slice::from_ref(&selected_module),
             &signatures,
@@ -438,7 +555,9 @@ pub fn compile(
         .iter()
         .map(|declaration| (declaration.name().clone(), declaration))
         .collect();
-    lower::compile(&selected, &natives, entry, arguments, limits)
+    let mut compiled = lower::compile(&selected, &natives, entry, arguments, limits)?;
+    compiled.output_byte_limit = output_byte_limit;
+    Ok(compiled)
 }
 
 fn check_type(name: &Name, ty: &IrType) -> Result<(), IrExecutionError> {
@@ -535,6 +654,7 @@ fn inspect_body(
 
 struct Native {
     row: &'static GeneratedExternRow,
+    ir_arity: usize,
     arguments: Vec<flbc::ArgumentOwnership>,
     result: flbc::ResultOwnership,
     effect: fir::EffectClass,
@@ -542,8 +662,16 @@ struct Native {
 
 impl Native {
     fn new(row: &'static GeneratedExternRow, arity: usize) -> Result<Self, IrExecutionError> {
+        Self::with_output(row, arity, false)
+    }
+
+    fn with_output(
+        row: &'static GeneratedExternRow,
+        arity: usize,
+        captured_output: bool,
+    ) -> Result<Self, IrExecutionError> {
         let name = Name::from_components(row.name.split('.'));
-        let effect = native_effects::classify(row)?;
+        let effect = native_effects::classify(row, captured_output)?;
         if matches!(
             row.id,
             "extern:isExclusiveUnsafe" | "extern:dbgTraceIfShared" | "extern:ptrAddrUnsafe"
@@ -559,16 +687,17 @@ impl Native {
         };
         let contract = Ownership::parse(row.ownership).map_err(error)?;
         // Explicit extern declarations and absent declarations use the same
-        // runtime authority. Rule-only rows retain census arity unless a
-        // reviewed native bridge binds their erased executable telescope.
-        if arity != native_signature::inferred_arity(row)? {
+        // runtime authority. A reviewed bridge may distinguish the original
+        // IR telescope from Golem's native operands; both remain independently
+        // validated rather than taking their shape from an observed call.
+        if arity != native_signature::ir_arity(row)? {
             return Err(IrExecutionError::NativeContract {
                 declaration: name.clone(),
-                detail: "extern arity differs from the reviewed runtime signature".to_owned(),
+                detail: "extern arity differs from the reviewed Reference IR signature".to_owned(),
             });
         }
         let arguments = contract
-            .argument_ownership(arity)
+            .argument_ownership(native_signature::inferred_arity(row)?)
             .map_err(error)?
             .into_iter()
             .map(|o| match o {
@@ -586,6 +715,7 @@ impl Native {
         };
         Ok(Self {
             row,
+            ir_arity: arity,
             arguments,
             result,
             effect,

@@ -282,6 +282,7 @@ pub(super) fn compile(
     Ok(CompiledIr {
         program,
         reference_functions,
+        output_byte_limit: None,
         native_externs: native_order
             .iter()
             .map(|(_, native)| native.row.id.to_owned())

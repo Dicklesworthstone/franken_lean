@@ -18,6 +18,32 @@ pub(super) fn inferred_arity(row: &GeneratedExternRow) -> Result<usize, IrExecut
     executable_arity(&ownership, fallback).map_err(error)
 }
 
+/// Reference IR keeps the erased RealWorld argument at a BaseIO call site;
+/// Golem's native stream getter receives no runtime operand. Bind the single
+/// supported difference to the complete reviewed row, never to input IR.
+pub(super) fn ir_arity(row: &GeneratedExternRow) -> Result<usize, IrExecutionError> {
+    if row.id != "extern:IO.getStdout" {
+        return inferred_arity(row);
+    }
+    if row.name != "IO.getStdout"
+        || row.module != "Init.System.IO"
+        || row.kind != "opaque"
+        || row.symbol != "lean_get_stdout"
+        || row.levels != 0
+        || row.arity != 0
+        || row.effect != "io"
+        || row.safety != "safe"
+        || row.ownership != "rule(borrowed-args,owned-result)"
+        || inferred_arity(row)? != 0
+    {
+        return Err(IrExecutionError::NativeContract {
+            declaration: Name::from_components(row.name.split('.')),
+            detail: "IO.getStdout differs from its reviewed erased-world bridge".to_owned(),
+        });
+    }
+    Ok(1)
+}
+
 fn reviewed_rule_arity(
     row: &GeneratedExternRow,
     ownership: &Ownership,

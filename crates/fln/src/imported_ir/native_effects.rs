@@ -10,9 +10,19 @@
 //! cell; it never invokes the assertion-based raw ABI entry point. Its erased
 //! runtime arity is separately bound in native_signature.
 
-use super::{GeneratedExternRow, IrExecutionError, Name, fir, unsupported};
+use super::{
+    EntryArgument, GeneratedExternRow, IrExecutionError, IrExecutionLimits, Name, Native, fir,
+    unsupported,
+};
+use fln_olean::ir::{
+    IrAlt, IrArg, IrBody, IrDecl, IrExpr, IrModule, IrParam, IrStmt, IrTerminal, IrType,
+};
+use std::collections::{BTreeMap, BTreeSet};
 
-pub(super) fn classify(row: &GeneratedExternRow) -> Result<fir::EffectClass, IrExecutionError> {
+pub(super) fn classify(
+    row: &GeneratedExternRow,
+    captured_output: bool,
+) -> Result<fir::EffectClass, IrExecutionError> {
     match (row.effect, row.id) {
         ("pure", _) => Ok(fir::EffectClass::Pure),
         (
@@ -23,11 +33,137 @@ pub(super) fn classify(row: &GeneratedExternRow) -> Result<fir::EffectClass, IrE
             | "extern:ST.Prim.Ref.swap"
             | "extern:ST.Prim.Ref.take",
         ) => Ok(fir::EffectClass::State),
+        ("io", "extern:IO.getStdout") if captured_output => Ok(fir::EffectClass::Io),
         _ => Err(unsupported(
             &Name::from_components(row.name.split('.')),
             "effectful native call",
         )),
     }
+}
+
+/// A Reference RealWorld slot has no executable data. Keep Void support
+/// confined to unused function parameters and explicit erased entry values;
+/// the general lowerer must never give those slots observable object meaning.
+pub(super) fn validate_world_parameters(
+    name: &Name,
+    params: &[IrParam],
+    body: &IrBody,
+    entry_arguments: Option<&[EntryArgument]>,
+) -> Result<(), IrExecutionError> {
+    let mut worlds = BTreeSet::new();
+    for (index, parameter) in params.iter().enumerate() {
+        if parameter.ty != IrType::Void {
+            continue;
+        }
+        if let Some(arguments) = entry_arguments
+            && arguments.get(index) != Some(&EntryArgument::Erased)
+        {
+            return Err(unsupported(name, "non-erased entry world"));
+        }
+        worlds.insert(parameter.x);
+    }
+    if worlds.is_empty() {
+        return Ok(());
+    }
+    let reads_arg = |arg: &IrArg| matches!(arg, IrArg::Var(x) if worlds.contains(x));
+    let reads_expr = |expr: &IrExpr| match expr {
+        IrExpr::Ctor { args, .. } | IrExpr::Fap { args, .. } | IrExpr::Pap { args, .. } => {
+            args.iter().any(reads_arg)
+        }
+        IrExpr::Ap { x, args } | IrExpr::Reuse { x, args, .. } => {
+            worlds.contains(x) || args.iter().any(reads_arg)
+        }
+        IrExpr::Reset { x, .. }
+        | IrExpr::Proj { x, .. }
+        | IrExpr::UProj { x, .. }
+        | IrExpr::SProj { x, .. }
+        | IrExpr::Box { x, .. }
+        | IrExpr::Unbox { x }
+        | IrExpr::IsShared { x } => worlds.contains(x),
+        IrExpr::Lit(_) => false,
+    };
+    for body in body.bodies() {
+        let statement_read = body.stmts.iter().any(|stmt| match stmt {
+            IrStmt::VDecl { expr, .. } => reads_expr(expr),
+            IrStmt::Set { x, y, .. } => worlds.contains(x) || reads_arg(y),
+            IrStmt::USet { x, y, .. } | IrStmt::SSet { x, y, .. } => {
+                worlds.contains(x) || worlds.contains(y)
+            }
+            IrStmt::SetTag { x, .. }
+            | IrStmt::Inc { x, .. }
+            | IrStmt::Dec { x, .. }
+            | IrStmt::Del { x } => worlds.contains(x),
+            IrStmt::JDecl { .. } => false,
+        });
+        let terminal_read = match body.terminal.as_ref() {
+            IrTerminal::Case { x, .. } => worlds.contains(x),
+            IrTerminal::Ret(arg) => reads_arg(arg),
+            IrTerminal::Jmp { args, .. } => args.iter().any(reads_arg),
+            IrTerminal::Unreachable => false,
+        };
+        if statement_read || terminal_read {
+            return Err(unsupported(name, "access to an erased world parameter"));
+        }
+    }
+    Ok(())
+}
+
+/// Remove only the pin's literal erased world from direct native stdout
+/// getter calls, after validating the original IR telescope. The rewritten
+/// graph is validated again against Golem's zero-argument native signature.
+/// A first-class getter or a data-bearing world is outside this narrow bridge.
+pub(super) fn erase_world_arguments(
+    module: &mut IrModule,
+    natives: &BTreeMap<Name, Native>,
+    limits: IrExecutionLimits,
+) -> Result<bool, IrExecutionError> {
+    let stdout = Name::from_components(["IO", "getStdout"]);
+    if !natives.contains_key(&stdout) {
+        return Ok(false);
+    }
+    let mut changed = false;
+    let mut work = 0u64;
+    for declaration in &mut module.decls {
+        let IrDecl::Function { name, body, .. } = declaration else {
+            continue;
+        };
+        let mut pending = vec![body];
+        while let Some(body) = pending.pop() {
+            work = work.saturating_add(body.stmts.len() as u64 + 1);
+            if work > limits.ir.max_work {
+                return Err(IrExecutionError::Limit("native erased-world adaptation"));
+            }
+            for statement in &mut body.stmts {
+                match statement {
+                    IrStmt::VDecl {
+                        expr: IrExpr::Fap { function, args },
+                        ..
+                    } if function == &stdout => {
+                        if args.as_slice() != [IrArg::Erased] {
+                            return Err(unsupported(name, "non-erased native stdout world"));
+                        }
+                        args.clear();
+                        changed = true;
+                    }
+                    IrStmt::VDecl {
+                        expr: IrExpr::Pap { function, .. },
+                        ..
+                    } if function == &stdout => {
+                        return Err(unsupported(name, "first-class native stdout getter"));
+                    }
+                    IrStmt::JDecl { value, .. } => pending.push(value),
+                    _ => {}
+                }
+            }
+            if let IrTerminal::Case { alts, .. } = body.terminal.as_mut() {
+                for alternative in alts {
+                    let (IrAlt::Ctor { body, .. } | IrAlt::Default { body }) = alternative;
+                    pending.push(body);
+                }
+            }
+        }
+    }
+    Ok(changed)
 }
 
 #[cfg(test)]
