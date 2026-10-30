@@ -4,7 +4,9 @@
 //! `reduceMul`, `reduceSub`, `reduceDiv`, `reduceMod`, `reducePow`), comparisons of numerals are
 //! decided (`reduceLT`, `reduceEqDiff`), and offsets are cancelled (`reduceEqDiff`,
 //! `reduceLeDiff`, `reduceSubDiff`), in a goal and at a hypothesis; `dsimp` folds numerals too.
-//! `simp only` and `dsimp only` run only the procedures they name, and `-` erases one.
+//! `simp only` and `dsimp only` run only the procedures they name, and `-` erases one. The core
+//! procedure `reduceCtorEq` (`BuiltinSimprocs/Core.lean`) makes an equation between two
+//! different constructors `False`.
 //!
 //! Every program was run through the pinned `lean` v4.32.0 with the same header first
 //! (2026-10-29), and the pin is consulted again when it is present.
@@ -184,4 +186,69 @@ fn an_ascribed_numeral_equation_closes_as_at_the_pin() {
             "example : (10 : Nat) - 6 = 5 := by\n  simp only []\n",
         ],
     );
+}
+
+const ENUMERATION: &str = "inductive T where\n  | one\n  | two\n\n";
+
+/// `reduceCtorEq`: an equation between two different constructors, read through literals, `Nat`
+/// offsets and reducible definitions, is `False` under `simp` and `simp only [reduceCtorEq]`.
+/// The pin leaves the equation where it is erased, where `simp only` does not name it, where a
+/// definition only default transparency unfolds hides a constructor, at a zero offset, between
+/// two applications of the same constructor (`-0` is `Int.ofNat`), and under `dsimp`: the
+/// procedure is not a `dsimproc`.
+#[test]
+fn constructor_equations_are_false_as_at_the_pin() {
+    let Some(lib) = pinned_lib() else {
+        return;
+    };
+    let root = workspace();
+    let accepted_programs = [
+        format!("{ENUMERATION}example : T.one ≠ T.two := by simp\n"),
+        format!(
+            "{ENUMERATION}example (h : False) : T.one = T.two := by\n  simp\n  \
+             guard_target =ₛ False\n  exact h\n"
+        ),
+        "example (h : some 1 = none) : False := by simp at h\n".to_owned(),
+        "example (h : (none : Option Nat) = some 0) : False := by simp at h\n".to_owned(),
+        format!(
+            "{ENUMERATION}example (h : T.one = T.two) : False := by\n  \
+             simp only [reduceCtorEq] at h\n"
+        ),
+        format!(
+            "{ENUMERATION}abbrev second := T.two\n\
+             example (h : T.one = second) : False := by simp at h\n"
+        ),
+        "example (a : Nat) (h : (Sum.inl a : Sum Nat Nat) = Sum.inr 1) : False := by simp at h\n"
+            .to_owned(),
+        "example (xs : List Nat) (h : [] = 1 :: xs) : False := by \
+         simp only [reduceCtorEq] at h\n"
+            .to_owned(),
+        "example (x : Nat) (h : x + 1 = 0) : False := by simp only [reduceCtorEq] at h\n"
+            .to_owned(),
+        "example (x : Nat) (h : 0 = Nat.succ x) : False := by simp only [reduceCtorEq] at h\n"
+            .to_owned(),
+        "example (h : true = false) : False := by simp only [reduceCtorEq] at h\n".to_owned(),
+        "example (h : (-1 : Int) = 2) : False := by simp only [reduceCtorEq] at h\n".to_owned(),
+    ];
+    let refused_programs = [
+        format!("{ENUMERATION}example (h : False) : T.one = T.two := by simp [-reduceCtorEq]\n"),
+        "example (h : some 1 = none) : False := by simp only [] at h\n".to_owned(),
+        format!(
+            "{ENUMERATION}def second := T.two\n\
+             example (h : T.one = second) : False := by simp only [reduceCtorEq] at h\n"
+        ),
+        format!("{ENUMERATION}example : T.one = T.two := by simp\n"),
+        "example (x : Nat) (h : x + 0 = 0) : False := by simp only [reduceCtorEq] at h\n"
+            .to_owned(),
+        "example (h : (some 1 : Option Nat) = some 2) : False := by \
+         simp only [reduceCtorEq] at h\n"
+            .to_owned(),
+        "example (h : (-0 : Int) = 2) : False := by simp only [reduceCtorEq] at h\n".to_owned(),
+        "example (h : (-2 : Int) = -3) : False := by simp only [reduceCtorEq] at h\n".to_owned(),
+        format!("{ENUMERATION}example (h : T.one = T.two) : False := by dsimp at h\n"),
+    ];
+    let accepted_programs: Vec<&str> = accepted_programs.iter().map(String::as_str).collect();
+    let refused_programs: Vec<&str> = refused_programs.iter().map(String::as_str).collect();
+    accepted(&lib, &root, "Clash", &accepted_programs);
+    refused(&lib, &root, "Kept", &refused_programs);
 }

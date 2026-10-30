@@ -7,7 +7,9 @@
 //! `Nat.reduceEqDiff`, `reduceBeqDiff`, `reduceBneDiff`, `reduceLeDiff` and `reduceSubDiff`, which
 //! cancel numeral offsets between two sides (`x + 2 = 5` is `x = 3`) through the `Nat.Simproc`
 //! lemmas (`src/Init/Data/Nat/Simproc.lean`), with `Nat.reduceDvd`. `Nat.isValue` is `seval`'s
-//! only and is not here.
+//! only and is not here. Beside them runs the core procedure `reduceCtorEq`
+//! (`BuiltinSimprocs/Core.lean:81-91`), which makes an equation between two different
+//! constructors `False`.
 //!
 //! The pin runs them after a node's rewrite theorems (`postDefault`, `Rewrite.lean:542-546`:
 //! `rewritePost >> userPostSimprocs`), so here they are one rule after every theorem and before
@@ -41,7 +43,7 @@ use fln_bignum::nat::BigNat;
 /// `exponentiation.threshold`'s default, read by `Nat.reducePow`'s `checkExponent`.
 const EXPONENT_THRESHOLD: u64 = 256;
 
-/// One of the pin's default `Nat` procedures.
+/// One of the pin's default `Nat` procedures, or `reduceCtorEq`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum NatSimproc {
     Succ,
@@ -67,10 +69,11 @@ pub(super) enum NatSimproc {
     LeDiff,
     SubDiff,
     Dvd,
+    CtorEq,
 }
 
 /// Each procedure with its declaration name, in the enumeration's order.
-const PROCEDURES: [(NatSimproc, &str); 23] = [
+const PROCEDURES: [(NatSimproc, &str); 24] = [
     (NatSimproc::Succ, "Nat.reduceSucc"),
     (NatSimproc::Add, "Nat.reduceAdd"),
     (NatSimproc::Mul, "Nat.reduceMul"),
@@ -94,6 +97,7 @@ const PROCEDURES: [(NatSimproc, &str); 23] = [
     (NatSimproc::LeDiff, "Nat.reduceLeDiff"),
     (NatSimproc::SubDiff, "Nat.reduceSubDiff"),
     (NatSimproc::Dvd, "Nat.reduceDvd"),
+    (NatSimproc::CtorEq, "reduceCtorEq"),
 ];
 
 /// The declarations every procedure's result or proof is built from, all in `Init.Prelude`. An
@@ -152,6 +156,7 @@ impl NatSimproc {
                 | Self::LeDiff
                 | Self::SubDiff
                 | Self::Dvd
+                | Self::CtorEq
         )
     }
 }
@@ -721,7 +726,8 @@ impl Context {
             ("GT.gt", 4) if nat(1) => &[Gt],
             ("BEq.beq", 4) if nat(1) => &[BEq, BeqDiff],
             ("bne", 4) if nat(1) => &[BNe, BneDiff],
-            ("Eq", 3) if nat(1) => &[EqDiff],
+            ("Eq", 3) if nat(1) => &[EqDiff, CtorEq],
+            ("Eq", 3) => &[CtorEq],
             ("LE.le", 4) if nat(1) => &[LeDiff],
             ("Dvd.dvd", 4) if nat(1) => &[Dvd],
             _ => &[],
@@ -957,7 +963,124 @@ impl Context {
                     carrier: proposition(),
                 }))
             }
+            CtorEq => self.simp_procedure_ctor_eq(node, args[1], args[2]),
         }
+    }
+
+    /// `reduceCtorEq` (`BuiltinSimprocs/Core.lean:81-91`): an equation between applications of
+    /// two different constructors is `False`, by `eq_false'` of a function refuting it. The pin
+    /// refutes it with `noConfusion`, which this elaborator does not build; the constructor
+    /// clash `injection` and `contradiction` build proves the same `False`, and only the kernel
+    /// reads the proof. Where no clash is built, the procedure leaves the equation.
+    fn simp_procedure_ctor_eq(
+        &mut self,
+        node: &Expr,
+        lhs: &Expr,
+        rhs: &Expr,
+    ) -> Result<Option<ProcedureStep>, NatDefinitionElabError> {
+        let Some(left) = self.simp_procedure_constructor(lhs)? else {
+            return Ok(None);
+        };
+        let Some(right) = self.simp_procedure_constructor(rhs)? else {
+            return Ok(None);
+        };
+        if left == right {
+            return Ok(None);
+        }
+        let local = self.equality_local(node.clone())?;
+        let enclosing = self.txn.lctx.clone();
+        eliminate::add_local(&mut self.txn.lctx, &local);
+        let refutation = self.constructor_clash_evidence(&Typed {
+            value: Expr::fvar(local.id.clone()),
+            type_: node.clone(),
+        });
+        self.txn.lctx = enclosing;
+        let Some(refutation) = refutation? else {
+            return Ok(None);
+        };
+        let body = refutation
+            .value
+            .abstract_fvar(&local.id, 0)
+            .map_err(|_| failure(SourceInferenceError::Scope))?;
+        let function = Expr::lam(name("h"), node.clone(), body, BinderInfo::Default);
+        Ok(Some(ProcedureStep {
+            replacement: truth(false),
+            proof: lemma("eq_false'", vec![term(node), Argument::Term(function)]),
+            carrier: proposition(),
+        }))
+    }
+
+    /// `constructorApp'?` (`CtorRecognizer.lean:105-122`) at `reduceCtorEq`'s reducible and
+    /// instance transparency, for the constructor's name: a `Nat` offset `e + k` is `Nat.succ`
+    /// when `k` is not zero and no constructor when it is; anything else is read as a literal or
+    /// a constructor application, first as it stands and then in weak head normal form.
+    fn simp_procedure_constructor(
+        &mut self,
+        e: &Expr,
+    ) -> Result<Option<Name>, NatDefinitionElabError> {
+        let e = without_metadata(e);
+        // `isOffset?`, its sum peeled as `NatOffset` peels one.
+        if self.simp_procedure_as_offset(e)?.is_some() {
+            let mut base = e.clone();
+            let mut total = BigNat::zero();
+            while let Some((next, n)) = self.simp_procedure_as_offset(&base)? {
+                self.tick()?;
+                total = total.add(&n);
+                base = without_metadata(&next).clone();
+            }
+            return Ok((!total.is_zero()).then(|| name("Nat.succ")));
+        }
+        if let Some(constructor) = self.simp_procedure_constructor_app(e)? {
+            return Ok(Some(constructor));
+        }
+        let reduced = self.whnf_with_transparency(e, UnificationTransparency::Instances, false)?;
+        self.simp_procedure_constructor_app(&reduced)
+    }
+
+    /// `constructorApp?` (`CtorRecognizer.lean:89-96`) after `litToCtor` (`LitValues.lean:
+    /// 176-197`), for the constructor's name: `Nat.zero` or `Nat.succ` for a `Nat` numeral,
+    /// `Int.ofNat` or `Int.negSucc` for an `Int` one or its negation, and the head of a
+    /// constructor application with all its parameters and fields. A `Fin` numeral, whose
+    /// `Fin.mk` is its type's only constructor, can clash with nothing and is not read.
+    fn simp_procedure_constructor_app(
+        &mut self,
+        e: &Expr,
+    ) -> Result<Option<Name>, NatDefinitionElabError> {
+        let e = without_metadata(e);
+        if let Some(n) = self.simp_procedure_literal(e)? {
+            return Ok(Some(name(if n.is_zero() {
+                "Nat.zero"
+            } else {
+                "Nat.succ"
+            })));
+        }
+        // `getIntValue?` (`LitValues.lean:46-51`).
+        let negated = application(e, "Neg.neg", 3).map(|args| without_metadata(args[2]));
+        if let Some(n) = self.simp_procedure_numeral(negated.unwrap_or(e), "Int")? {
+            let negative = negated.is_some() && !n.is_zero();
+            return Ok(Some(name(if negative {
+                "Int.negSucc"
+            } else {
+                "Int.ofNat"
+            })));
+        }
+        let mut head = e;
+        let mut count = 0usize;
+        while let ExprNode::App { f, .. } = head.node() {
+            count += 1;
+            head = f;
+        }
+        let ExprNode::Const {
+            name: constructor, ..
+        } = head.node()
+        else {
+            return Ok(None);
+        };
+        let Some(ConstantInfo::Ctor(value)) = self.txn.env.find(constructor) else {
+            return Ok(None);
+        };
+        let arity = value.num_params as usize + value.num_fields as usize;
+        Ok((count == arity).then(|| constructor.clone()))
     }
 
     /// `Nat.fromExpr?` (`getNatValue?`, `src/Lean/Meta/LitValues.lean:36-41`): a raw numeral, or
@@ -973,6 +1096,16 @@ impl Context {
         {
             return Ok(Some(big(n)));
         }
+        self.simp_procedure_numeral(e, "Nat")
+    }
+
+    /// `getOfNatValue?` (`src/Lean/Meta/LitValues.lean:30-35`): `OfNat.ofNat α n _` of a raw
+    /// numeral `n` where `α` reduces to an application of `type_name`.
+    fn simp_procedure_numeral(
+        &mut self,
+        e: &Expr,
+        type_name: &str,
+    ) -> Result<Option<BigNat>, NatDefinitionElabError> {
         let Some(args) = application(e, "OfNat.ofNat", 3) else {
             return Ok(None);
         };
@@ -983,7 +1116,7 @@ impl Context {
             return Ok(None);
         };
         let n = big(n);
-        if is_constant(args[0], "Nat") {
+        if is_constant(args[0], type_name) {
             return Ok(Some(n));
         }
         if args[0].has_loose_bvars() || args[0].has_expr_mvar() {
@@ -994,7 +1127,7 @@ impl Context {
         while let ExprNode::App { f, .. } = head.node() {
             head = f;
         }
-        Ok(is_constant(head, "Nat").then_some(n))
+        Ok(is_constant(head, type_name).then_some(n))
     }
 
     /// `matchesInstance` (`src/Lean/Meta/Offset.lean:70-72`): `instance` is `expected` at
