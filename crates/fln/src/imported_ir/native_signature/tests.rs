@@ -85,8 +85,8 @@ fn compile_declarations(decls: Vec<IrDecl>) -> Result<CompiledIr, IrExecutionErr
 }
 
 fn assert_nat(compiled: &CompiledIr, expected: &str) {
-    let bytes = flbc::encode_canonical(compiled.program.program(), flbc::CodecLimits::default())
-        .unwrap();
+    let bytes =
+        flbc::encode_canonical(compiled.program.program(), flbc::CodecLimits::default()).unwrap();
     let replay = flbc::decode_canonical(&bytes, flbc::CodecLimits::default()).unwrap();
     assert_eq!(
         flbc::encode_canonical(&replay, flbc::CodecLimits::default()).unwrap(),
@@ -211,7 +211,10 @@ fn supplied_extern_telescope_must_still_match_the_native_abi() {
         if arity == 2 {
             assert_nat(&compiled.unwrap(), "1");
         } else {
-            assert!(matches!(compiled, Err(IrExecutionError::NativeContract { .. })));
+            assert!(matches!(
+                compiled,
+                Err(IrExecutionError::NativeContract { .. })
+            ));
         }
     }
 }

@@ -26,7 +26,11 @@ fn update_sequence() -> IrModule {
 fn take_moves_the_occupant_and_refill_is_visible_through_the_original_handle() {
     let compiled = prepare(&update_sequence());
     assert_nat_replay(&compiled, "15");
-    assert!(compiled.native_externs().contains(&format!("extern:{TAKE}")));
+    assert!(
+        compiled
+            .native_externs()
+            .contains(&format!("extern:{TAKE}"))
+    );
     let row = native_row(&name(TAKE)).unwrap();
     assert_eq!(native_signature::inferred_arity(row).unwrap(), 1);
     let native = Native::new(row, 1).unwrap();
@@ -60,7 +64,10 @@ fn explicit_take_declarations_cannot_override_the_reviewed_runtime_arity() {
         if arity == 1 {
             assert_nat_replay(&compiled.unwrap(), "15");
         } else {
-            assert!(matches!(compiled, Err(IrExecutionError::NativeContract { .. })));
+            assert!(matches!(
+                compiled,
+                Err(IrExecutionError::NativeContract { .. })
+            ));
         }
     }
 }

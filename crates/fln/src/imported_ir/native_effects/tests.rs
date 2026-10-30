@@ -100,8 +100,8 @@ fn prepare(module: &IrModule) -> CompiledIr {
 }
 
 fn assert_nat_replay(compiled: &CompiledIr, expected: &str) {
-    let bytes = flbc::encode_canonical(compiled.program.program(), flbc::CodecLimits::default())
-        .unwrap();
+    let bytes =
+        flbc::encode_canonical(compiled.program.program(), flbc::CodecLimits::default()).unwrap();
     let replay = flbc::decode_canonical(&bytes, flbc::CodecLimits::default()).unwrap();
     assert_eq!(
         flbc::encode_canonical(&replay, flbc::CodecLimits::default()).unwrap(),
@@ -180,7 +180,11 @@ fn local_state_executes_in_order_and_unused_writes_survive_replay() {
     let compiled = prepare(&state_sequence());
     assert_nat_replay(&compiled, "42");
     for text in CELL_ROWS {
-        assert!(compiled.native_externs().contains(&format!("extern:{text}")));
+        assert!(
+            compiled
+                .native_externs()
+                .contains(&format!("extern:{text}"))
+        );
     }
 }
 

@@ -75,7 +75,10 @@ fn programs() -> Vec<(&'static str, String, usize)> {
                         "let action : ST sigma Nat",
                         "ST.bind (ST.Prim.Ref.get counter) (fun count => ST.bind (ST.Prim.Ref.set counter (Nat.succ count)) (fun _ => ST.pure count))",
                     ),
-                    ("actions", "ST.Prim.mkRef (σ := sigma) (α := ST sigma Nat) action"),
+                    (
+                        "actions",
+                        "ST.Prim.mkRef (σ := sigma) (α := ST sigma Nat) action",
+                    ),
                     ("before", "ST.Prim.Ref.get counter"),
                     ("firstAction", "ST.Prim.Ref.get actions"),
                     ("oldAction", "ST.Prim.Ref.swap actions (ST.pure 100)"),
@@ -96,7 +99,10 @@ fn programs() -> Vec<(&'static str, String, usize)> {
                 &[
                     ("left", "ST.Prim.mkRef (σ := sigma) (α := Nat) 7"),
                     ("right", "ST.Prim.mkRef (σ := sigma) (α := Nat) 11"),
-                    ("holder", "ST.Prim.mkRef (σ := sigma) (α := ST.Ref sigma Nat) left"),
+                    (
+                        "holder",
+                        "ST.Prim.mkRef (σ := sigma) (α := ST.Ref sigma Nat) left",
+                    ),
                     ("snapshot", "ST.Prim.Ref.get holder"),
                     ("old", "ST.Prim.Ref.swap holder right"),
                     ("_", "ST.Prim.Ref.set old 19"),
@@ -152,7 +158,11 @@ pub(super) fn check(engine: &Engine) {
         let first = run();
         assert_eq!(first.batch.source_evaluation_indices.len(), 1, "{label}");
         let execution = &first.batch.executions[first.batch.source_evaluation_indices[0]];
-        assert_scalar(execution, expected, CheckerAdmissionGround::UnsafeQuarantine);
+        assert_scalar(
+            execution,
+            expected,
+            CheckerAdmissionGround::UnsafeQuarantine,
+        );
         if callback_query.is_none() {
             callback_query = Some(execution.declaration.clone());
         }
@@ -200,7 +210,11 @@ pub(super) fn check(engine: &Engine) {
         let repeated = run();
         assert_eq!(repeated.batch.source_evaluation_indices.len(), 1, "{label}");
         let execution = &repeated.batch.executions[repeated.batch.source_evaluation_indices[0]];
-        assert_scalar(execution, expected, CheckerAdmissionGround::UnsafeQuarantine);
+        assert_scalar(
+            execution,
+            expected,
+            CheckerAdmissionGround::UnsafeQuarantine,
+        );
         assert_eq!(execution.flbc_artifact, bytes, "{label}");
         drop(repeated);
         assert_eq!(engine.logical_root(&options), root, "{label}");
@@ -210,11 +224,8 @@ pub(super) fn check(engine: &Engine) {
     // their callable interfaces or opaque handles have already been proved.
     let query = callback_query.unwrap();
     for (target, _) in &EXTERNS[1..] {
-        let missing = Engine::from_environment(rebuild_environment(
-            engine,
-            None,
-            Some(&name(target)),
-        ));
+        let missing =
+            Engine::from_environment(rebuild_environment(engine, None, Some(&name(target))));
         assert!(matches!(
             rejected(&missing, &query, limits),
             EngineExecutionError::Ingress(_)
@@ -244,7 +255,10 @@ fn callable_payload_sources_match_the_live_pinned_reference() {
     let pin = lock
         .lines()
         .find(|line| line.starts_with("reference "))
-        .and_then(|line| line.split_whitespace().find_map(|s| s.strip_prefix("commit=")))
+        .and_then(|line| {
+            line.split_whitespace()
+                .find_map(|s| s.strip_prefix("commit="))
+        })
         .expect("SUITE.lock Reference commit");
     let version = Command::new(&reference).arg("--githash").output().unwrap();
     assert!(version.status.success());

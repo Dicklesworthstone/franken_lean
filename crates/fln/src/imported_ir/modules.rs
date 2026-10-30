@@ -57,10 +57,7 @@ pub enum ModuleLoadError {
 
 impl ModuleLoadError {
     pub fn is_resource(&self) -> bool {
-        matches!(
-            self,
-            Self::Limit(_) | Self::Decode { resource: true, .. }
-        )
+        matches!(self, Self::Limit(_) | Self::Decode { resource: true, .. })
     }
 }
 

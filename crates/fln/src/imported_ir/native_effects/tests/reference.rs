@@ -25,7 +25,10 @@ fn live_pinned_local_state_matches_reference_and_canonical_replay() {
     let pin = lock
         .lines()
         .find(|line| line.starts_with("reference "))
-        .and_then(|line| line.split_whitespace().find_map(|s| s.strip_prefix("commit=")))
+        .and_then(|line| {
+            line.split_whitespace()
+                .find_map(|s| s.strip_prefix("commit="))
+        })
         .expect("SUITE.lock Reference commit");
     let version = Command::new(&reference).arg("--githash").output().unwrap();
     assert!(version.status.success());
@@ -119,7 +122,10 @@ fn live_pinned_local_state_matches_reference_and_canonical_replay() {
         assert_nat_replay(&compiled, expected);
         if entry.contains("Modify") {
             assert!(
-                compiled.native_externs().iter().any(|row| row == "extern:ST.Prim.Ref.take"),
+                compiled
+                    .native_externs()
+                    .iter()
+                    .any(|row| row == "extern:ST.Prim.Ref.take"),
                 "{entry} did not retain its take-based implementation; {dir:?}"
             );
         }
