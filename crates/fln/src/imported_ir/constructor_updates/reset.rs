@@ -16,22 +16,16 @@ pub(super) fn normalize(
     captures: &BTreeSet<u64>,
     meter: &mut Meter,
 ) -> Result<bool> {
-    let Some(shared_index) = equivalent(body, scope, captures, meter)? else {
+    let Some(choice) = equivalent(body, scope, captures, meter)? else {
         return Ok(false);
     };
     body.stmts.pop(); // The original isShared binding is no longer observable.
     let Some(IrStmt::JDecl { mut value, .. }) = body.stmts.pop() else {
         unreachable!("a verified reset region ends in a join and its guard");
     };
-    let IrTerminal::Case { alts, .. } = value.terminal.as_mut() else {
-        unreachable!("a verified reuse region ends in a sharing guard");
-    };
-    let replacement = match alts.swap_remove(shared_index) {
-        IrAlt::Ctor { body, .. } | IrAlt::Default { body } => body,
-    };
+    selection::apply(&mut value, choice, meter)?;
     body.stmts.extend(value.stmts);
-    body.stmts.extend(replacement.stmts);
-    body.terminal = replacement.terminal;
+    body.terminal = value.terminal;
     meter.changed = true;
     Ok(true)
 }
@@ -41,7 +35,7 @@ fn equivalent(
     scope: &Scope,
     captures: &BTreeSet<u64>,
     meter: &mut Meter,
-) -> Result<Option<usize>> {
+) -> Result<Option<selection::Selection>> {
     let [
         ..,
         IrStmt::JDecl { j, params, value },
@@ -98,7 +92,6 @@ fn equivalent(
     let IrTerminal::Case {
         x,
         x_type: IrType::UInt8,
-        alts,
         ..
     } = value.terminal.as_ref()
     else {
@@ -128,7 +121,7 @@ fn equivalent(
             *parent = token.x;
         }
     }
-    equivalent_branches(&token.x, &sharing.x, alts, &reuse_scope, captures, meter)
+    selection::select(value, &token.x, &sharing.x, &reuse_scope, captures, meter)
 }
 
 /// The reset-only branches can retain/release references, and the hot branch

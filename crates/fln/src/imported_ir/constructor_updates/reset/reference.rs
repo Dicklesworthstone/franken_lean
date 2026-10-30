@@ -76,9 +76,22 @@ fn live_pinned_recursive_updates_match_reference_and_canonical_replay() {
     // This is a real test of the new form, not an oracle case optimized into a
     // constant that never exercises reset/reuse or the recursive call.
     let mut expanded = 0;
+    let mut packed_continuations = 0;
     for decl in &module.decls {
         if let IrDecl::Function { body, .. } = decl {
             for body in body.bodies() {
+                for stmt in &body.stmts {
+                    if let IrStmt::JDecl { params, value, .. } = stmt
+                        && let [parameter] = params.as_slice()
+                    {
+                        let scalar_prefix = value.stmts.iter().take_while(|stmt| match stmt {
+                            IrStmt::Set { x, .. } | IrStmt::SetTag { x, .. }
+                            | IrStmt::USet { x, .. } | IrStmt::SSet { x, .. } => *x == parameter.x,
+                            _ => false,
+                        }).any(|stmt| matches!(stmt, IrStmt::USet { .. } | IrStmt::SSet { .. }));
+                        if scalar_prefix { packed_continuations += 1; }
+                    }
+                }
                 if matches!(body.stmts.as_slice(), [.., IrStmt::JDecl { params, .. },
                     IrStmt::VDecl { expr: IrExpr::IsShared { .. }, .. }]
                     if params.len() == 2)
@@ -90,6 +103,8 @@ fn live_pinned_recursive_updates_match_reference_and_canonical_replay() {
     }
     assert!(expanded > 0, "the pin emitted no expanded reset region; inspect {dir:?}");
 
+    assert!(packed_continuations > 0, "the pin emitted no common packed initialization; inspect {dir:?}");
+
     let cases = [
         ("resetAnswer", 0),
         ("resetAnswer", 7),
@@ -97,6 +112,10 @@ fn live_pinned_recursive_updates_match_reference_and_canonical_replay() {
         ("resetSharedAnswer", 7),
         ("resetClosureAnswer", 5),
         ("resetEmptyAnswer", 99),
+        ("resetPackedAnswer", 0),
+        ("resetPackedAnswer", 257),
+        ("resetPackedAnswer", u64::MAX),
+        ("resetPackedSharedAnswer", 7),
     ];
     let mut oracle_source = source.to_owned();
     for (entry, value) in cases {

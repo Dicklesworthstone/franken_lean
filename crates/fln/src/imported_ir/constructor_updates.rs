@@ -22,6 +22,7 @@ use std::collections::{BTreeMap, BTreeSet};
 mod fresh;
 mod packed;
 mod reset;
+mod selection;
 
 type Result<T> = std::result::Result<T, IrExecutionError>;
 
@@ -362,17 +363,9 @@ fn normalize_body(
     if reset::normalize(body, &scope, captures, meter)? {
         return Ok(());
     }
-    if let Some(index) = equivalent_update(body, &scope, captures, meter)? {
-        let IrTerminal::Case { alts, .. } = body.terminal.as_mut() else {
-            unreachable!("a verified update is a case");
-        };
-        let replacement = match alts.swap_remove(index) {
-            IrAlt::Ctor { body, .. } | IrAlt::Default { body } => body,
-        };
-        body.stmts.pop(); // The flag is used only by the eliminated discriminator.
-        body.stmts.extend(replacement.stmts);
-        body.terminal = replacement.terminal;
-        meter.changed = true;
+    if let Some(choice) = equivalent_update(body, &scope, captures, meter)? {
+        body.stmts.pop(); // Only the verified discriminator observes this flag.
+        selection::apply(body, choice, meter)?;
         return Ok(());
     }
     if let IrTerminal::Case {
@@ -413,7 +406,7 @@ fn equivalent_update(
     scope: &Scope,
     captures: &BTreeSet<u64>,
     meter: &mut Meter,
-) -> Result<Option<usize>> {
+) -> Result<Option<selection::Selection>> {
     let Some(IrStmt::VDecl {
         x: flag,
         ty: IrType::UInt8,
@@ -425,7 +418,6 @@ fn equivalent_update(
     let IrTerminal::Case {
         x,
         x_type: IrType::UInt8,
-        alts,
         ..
     } = body.terminal.as_ref()
     else {
@@ -434,7 +426,7 @@ fn equivalent_update(
     if x != flag {
         return Ok(None);
     }
-    equivalent_branches(receiver, flag, alts, scope, captures, meter)
+    selection::select(body, receiver, flag, scope, captures, meter)
 }
 
 // The caller proves that the discriminator is precisely an isShared bit for

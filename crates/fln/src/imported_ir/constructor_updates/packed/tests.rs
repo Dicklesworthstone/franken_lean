@@ -303,3 +303,5 @@ fn packed_update_preparation_is_bounded_failure_atomic_and_deterministic() {
     let second = check(&compile_module(&module, &args, IrExecutionLimits::default()).unwrap(), &expected);
     assert_eq!(first, second);
 }
+
+mod joined;

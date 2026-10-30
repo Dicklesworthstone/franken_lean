@@ -40,3 +40,32 @@ inductive ResetChain where
 
 @[noinline] def resetEmptyAnswer (delta : Nat) : Nat :=
   resetSum (resetMap delta .nil)
+
+-- Multiple constructors retain a checked incoming layout at the case split.
+-- The mixed payload forces the pin to initialize scalar fields in the reuse
+-- continuation, instead of testing only object stores in allocation branches.
+inductive PackedResetChain where
+  | nil
+  | cons (head : Nat) (wide : UInt64) (word : USize) (byte : UInt8) (tail : PackedResetChain)
+
+@[noinline] def resetPackedMap (delta : Nat) : PackedResetChain → PackedResetChain
+  | .nil => .nil
+  | .cons head wide word byte tail =>
+      .cons (head + delta) (wide + UInt64.ofNat delta)
+        (word + USize.ofNat delta) (byte + UInt8.ofNat delta) (resetPackedMap delta tail)
+
+@[noinline] def resetPackedSum : PackedResetChain → Nat
+  | .nil => 0
+  | .cons head wide word byte tail =>
+      head + wide.toNat + word.toNat + byte.toNat + resetPackedSum tail
+
+@[noinline] def resetPackedInput : PackedResetChain :=
+  .cons 19 9223372036854775825 13 251 (.cons 23 18446744073709551615 7 255 .nil)
+
+@[noinline] def resetPackedAnswer (delta : Nat) : Nat :=
+  resetPackedSum (resetPackedMap delta resetPackedInput)
+
+@[noinline] def resetPackedSharedAnswer (delta : Nat) : Nat :=
+  let xs := resetPackedInput
+  let ys := resetPackedMap delta xs
+  resetPackedSum ys + resetPackedSum xs
