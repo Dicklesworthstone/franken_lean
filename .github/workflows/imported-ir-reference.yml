@@ -1,0 +1,99 @@
+name: Imported IR live Reference
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/imported-ir-reference.yml'
+      - 'crates/fln/src/imported_ir.rs'
+      - 'crates/fln/src/imported_ir/**'
+      - 'crates/fln-olean/fixtures/ir/**'
+      - 'SUITE.lock'
+      - 'rust-toolchain.toml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      CARGO_TERM_COLOR: never
+      CARGO_INCREMENTAL: '0'
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      FLN_REQUIRE_REFERENCE: '1'
+      FLN_IR_REFERENCE_ARTIFACTS: ${{ github.workspace }}/target/imported-ir-reference/live
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Record source and install the pinned Rust compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p target/imported-ir-reference
+          git rev-parse HEAD > target/imported-ir-reference/commit.txt
+          git rev-parse 'HEAD^{tree}' > target/imported-ir-reference/tree.txt
+          rustup show active-toolchain
+          rustc -Vv > target/imported-ir-reference/rustc.txt
+      - name: Install the SUITE.lock Reference for test-only code generation
+        shell: bash
+        run: |
+          set -euo pipefail
+          tool_root="$RUNNER_TEMP/ir-elan-bin"
+          archive="$RUNNER_TEMP/ir-elan.tar.gz"
+          mkdir "$tool_root"
+          curl --user-agent 'franken_lean-agent (+https://github.com/Dicklesworthstone/franken_lean)' \
+            --fail --location --retry 3 --output "$archive" \
+            https://github.com/leanprover/elan/releases/download/v4.2.1/elan-x86_64-unknown-linux-gnu.tar.gz
+          printf '%s  %s\n' \
+            4e717523217af592fa2d7b9c479410a31816c065d66ccbf0c2149337cfec0f5c \
+            "$archive" | sha256sum --check
+          tar -xzf "$archive" -C "$tool_root"
+          export ELAN_HOME="$RUNNER_TEMP/ir-elan"
+          "$tool_root/elan-init" -y --no-modify-path --default-toolchain none
+          export PATH="$ELAN_HOME/bin:$PATH"
+          mapfile -t reference_rows < <(grep -E '^reference ' SUITE.lock)
+          test "${#reference_rows[@]}" -eq 1
+          pin_tag="$(sed -nE 's/.* tag=([^ ]+).*/\1/p' <<<"${reference_rows[0]}")"
+          pin_commit="$(sed -nE 's/.* commit=([0-9a-f]{40}).*/\1/p' <<<"${reference_rows[0]}")"
+          [[ "$pin_tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9.-]+)?$ ]]
+          test -n "$pin_commit"
+          elan toolchain install "leanprover/lean4:$pin_tag"
+          toolchain_root="$ELAN_HOME/toolchains/leanprover--lean4---$pin_tag"
+          test "$("$toolchain_root/bin/lean" --githash)" = "$pin_commit"
+          printf 'FLN_REFERENCE_LIB=%s/lib/lean\nFLN_REFERENCE_LEAN=%s/bin/lean\n' \
+            "$toolchain_root" "$toolchain_root" >> "$GITHUB_ENV"
+      - name: Execute imported IR, lint, and check formatting without hiding failures
+        shell: bash
+        run: |
+          set -uo pipefail
+          status=0
+          cargo test --locked -p fln --lib imported_ir:: -- --nocapture \
+            2>&1 | tee target/imported-ir-reference/tests.log || status=1
+          cargo clippy --locked -p fln --lib --tests -- -D warnings \
+            2>&1 | tee target/imported-ir-reference/clippy.log || status=1
+          files=(crates/fln/src/imported_ir/constructor_updates.rs)
+          while IFS= read -r path; do files+=("$path"); done < <(
+            git ls-files 'crates/fln/src/imported_ir/constructor_updates/*.rs' \
+              'crates/fln/src/imported_ir/constructor_updates/**/*.rs')
+          rustfmt --edition 2024 --config skip_children=true --check "${files[@]}" \
+            2>&1 | tee target/imported-ir-reference/format.log || status=1
+          # Developer artifacts are formatted copies, never changes to tested
+          # tracked bytes. Retain them so a formatter finding is reproducible.
+          for path in "${files[@]}"; do
+            copy="target/imported-ir-reference/formatted/$path"
+            mkdir -p "$(dirname "$copy")"
+            cp "$path" "$copy"
+            rustfmt --edition 2024 --config skip_children=true "$copy" || status=1
+          done
+          exit "$status"
+      - name: Retain exact generated artifacts and verification logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: imported-ir-reference-${{ github.sha }}
+          path: target/imported-ir-reference
+          retention-days: 7
+          if-no-files-found: error

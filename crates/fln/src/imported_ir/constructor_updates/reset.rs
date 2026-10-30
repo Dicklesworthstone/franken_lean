@@ -195,4 +195,6 @@ fn prefix_reads(body: &IrBody, forbidden: &[u64], meter: &mut Meter) -> Result<b
 }
 
 #[cfg(test)]
+mod reference;
+#[cfg(test)]
 mod tests;
