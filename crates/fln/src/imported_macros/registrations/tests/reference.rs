@@ -175,6 +175,23 @@ fn live_metadata_drives_ordered_macro_dispatch_state_diagnostics_and_authority()
         nested, expected_tree,
         "negative control: skipping the recursive consumer changes the tree"
     );
+    let root_first = choice(choice(branch("ten"), branch("twenty")), branch("winner"));
+    let root_report = registry.expand_tree(
+        &root_first,
+        &SourceText::from_utf8(b"").unwrap(),
+        &context(),
+        MacroState::default(),
+        MacroTreeLimits::default(),
+        None,
+    );
+    assert!(
+        matches!(root_report.outcome, Outcome::Complete(Ok(MacroTreeResult::Expanded { syntax, .. })) if syntax == branch("winner"))
+    );
+    assert_eq!(
+        root_report.attempts.len(),
+        2,
+        "expanding the discarded child first changes which branch wins"
+    );
 
     let oracle = r#"import Lean
 import NativeRegisteredMacroModule
@@ -190,6 +207,8 @@ run_cmd do
   let actual ← liftMacroM (expandMacros input)
   if reprStr actual != reprStr expected then throwError "recursive expansion mismatch: {repr actual}"
   if reprStr actual == reprStr input then throwError "wrong-expansion control survived"
+  let rootFirst ← liftMacroM (expandMacros (choice (choice (branch "ten") (branch "twenty")) (branch "winner")))
+  if reprStr rootFirst != reprStr (branch "winner") then throwError "root-before-children mismatch"
   logInfo "recursive tree identical; unchanged-tree control differs"
 "#;
     std::fs::write(dir.join("RecursiveOracle.lean"), oracle).unwrap();

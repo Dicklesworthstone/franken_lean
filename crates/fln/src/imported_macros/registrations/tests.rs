@@ -430,10 +430,10 @@ fn tree_self_expansion_diagnostics_malformed_output_and_cancellation_do_not_retu
             true
         }
     }
-    for behavior in [
-        Behavior::Identity,
-        Behavior::Diagnostic,
-        Behavior::Malformed,
+    for (behavior, expected) in [
+        (Behavior::Identity, "budget"),
+        (Behavior::Diagnostic, "diagnostic"),
+        (Behavior::Malformed, "malformed"),
     ] {
         let module = checked("User", &[owner("User.rule")], &[]);
         let rows = journal(&[("choice", "User.rule", None)]);
@@ -460,15 +460,19 @@ fn tree_self_expansion_diagnostics_malformed_output_and_cancellation_do_not_retu
             None,
         );
         match report.outcome {
-            Outcome::Inconclusive(_) => assert_eq!(report.attempts.len(), 3),
+            Outcome::Inconclusive(_) if expected == "budget" => {
+                assert_eq!(report.attempts.len(), 3)
+            }
             Outcome::Complete(Ok(MacroTreeResult::Error {
                 reference, message, ..
-            })) => {
+            })) if expected == "diagnostic" => {
                 assert_eq!(reference, input());
                 assert_eq!(message, "λ\0diagnostic");
                 assert_eq!(report.attempts.len(), 1);
             }
-            Outcome::Complete(Err(MacroExecutionError::Conversion(_))) => {
+            Outcome::Complete(Err(MacroExecutionError::Conversion(_)))
+                if expected == "malformed" =>
+            {
                 assert_eq!(report.attempts.len(), 1)
             }
             other => panic!("{other:?}"),
@@ -484,6 +488,88 @@ fn tree_self_expansion_diagnostics_malformed_output_and_cancellation_do_not_retu
         assert!(matches!(cancelled.outcome, Outcome::Inconclusive(_)));
         assert!(cancelled.attempts.is_empty());
     }
+}
+
+#[test]
+fn tree_assembled_siblings_share_the_output_size_limit_and_deep_trees_use_no_host_recursion() {
+    let module = checked("User", &[owner("User.grow")], &[]);
+    let rows = journal(&[("grow", "User.grow", None)]);
+    let mut grow = function("User.grow", Behavior::Identity);
+    let IrDecl::Function { body, .. } = &mut grow else {
+        unreachable!()
+    };
+    body.stmts = vec![
+        bind(
+            3,
+            IrExpr::Lit(IrLit::Num(IrNat::Small(layout::SOURCE_NONE_TAG as u64))),
+        ),
+        bind(4, IrExpr::Lit(IrLit::Str("x".repeat(60)))),
+        bind(5, ctor(layout::SYNTAX_ATOM, "Lean.Syntax.atom", &[3, 4])),
+        bind(6, ctor(layout::RESULT_OK, "EStateM.Result.ok", &[5, 2])),
+    ];
+    body.terminal = Box::new(IrTerminal::Ret(IrArg::Var(6)));
+    let registry = prepare(
+        &[MacroRegistrationModule {
+            checked: &module,
+            extensions: &rows,
+        }],
+        &code(vec![grow]),
+    );
+    let source = SourceText::from_utf8(b"").unwrap();
+    let input = Syntax::node(
+        name("container"),
+        vec![
+            Syntax::node(name("grow"), vec![]),
+            Syntax::node(name("grow"), vec![]),
+        ],
+    );
+    let execute = |limits| {
+        registry.expand_tree(
+            &input,
+            &source,
+            &context(),
+            MacroState::default(),
+            limits,
+            None,
+        )
+    };
+    assert!(matches!(
+        execute(MacroTreeLimits::default()).outcome,
+        Outcome::Complete(Ok(MacroTreeResult::Expanded { .. }))
+    ));
+    let mut small = MacroTreeLimits::default();
+    small.dispatch.execution.syntax.max_bytes = 100;
+    let report = execute(small);
+    assert_eq!(
+        report.attempts.len(),
+        2,
+        "both individual results fit before the assembled tree exhausts its allowance"
+    );
+    assert!(
+        matches!(report.outcome, Outcome::Inconclusive(_)),
+        "{report:?}"
+    );
+
+    let mut deep = Syntax::Missing;
+    for _ in 0..5000 {
+        deep = Syntax::node(name("layer"), vec![deep]);
+    }
+    let deep_context = MacroContext {
+        max_recursion_depth: 6000,
+        ..context()
+    };
+    let report = registry.expand_tree(
+        &deep,
+        &source,
+        &deep_context,
+        MacroState::default(),
+        MacroTreeLimits::default(),
+        None,
+    );
+    assert!(
+        matches!(report.outcome, Outcome::Complete(Ok(MacroTreeResult::Expanded { syntax, .. })) if syntax == deep)
+    );
+    assert!(report.attempts.is_empty());
 }
 
 fn context() -> MacroContext {
