@@ -7,11 +7,11 @@
 //! only in allocation, then retain the fresh-construction alternative.
 //!
 //! Fresh object-field initialization is folded before checking branches.
-//! This deliberately admits only object-field updates with a known incoming
-//! constructor shape. Packed updates, arbitrary mutation, observable sharing
-//! flags, and effectful/different alternatives remain unsupported. No mutable
-//! runtime handle, native refcount observation, or new execution authority is
-//! introduced. The original and rewritten IR both undergo type validation.
+//! Object and packed scalar updates require a known incoming constructor
+//! layout and exact field/byte equivalence. Arbitrary mutation, observable
+//! sharing flags, and effectful/different alternatives remain unsupported. No
+//! mutable runtime handle, native refcount observation, or new execution
+//! authority is introduced. The original and rewritten IR both undergo type validation.
 
 use super::{IrExecutionError, IrExecutionLimits};
 use fln_olean::ir::{
@@ -20,6 +20,7 @@ use fln_olean::ir::{
 use std::collections::{BTreeMap, BTreeSet};
 
 mod fresh;
+mod packed;
 mod reset;
 
 type Result<T> = std::result::Result<T, IrExecutionError>;
@@ -28,14 +29,26 @@ type Result<T> = std::result::Result<T, IrExecutionError>;
 struct Shape {
     tag: u64,
     fields: u64,
+    words: u64,
+    bytes: u64,
 }
 
 impl Shape {
-    fn object_only(info: &IrCtorInfo) -> Option<Self> {
-        (info.size > 0 && info.usize == 0 && info.ssize == 0).then_some(Self {
+    fn from_info(info: &IrCtorInfo) -> Option<Self> {
+        (info.size > 0 || info.usize > 0 || info.ssize > 0).then_some(Self {
             tag: info.cidx,
             fields: info.size,
+            words: info.usize,
+            bytes: info.ssize,
         })
+    }
+
+    fn object_only(info: &IrCtorInfo) -> Option<Self> {
+        if info.usize == 0 && info.ssize == 0 {
+            Self::from_info(info)
+        } else {
+            None
+        }
     }
 }
 
@@ -43,6 +56,7 @@ impl Shape {
 struct Scope {
     shapes: BTreeMap<u64, Shape>,
     projections: BTreeMap<u64, (u64, u64)>,
+    scalars: BTreeMap<u64, (u64, packed::Slot)>,
 }
 
 struct Meter {
@@ -65,10 +79,17 @@ impl Meter {
     }
 
     fn scope(&mut self, scope: &Scope) -> Result<Scope> {
-        self.charge(scope.shapes.len().saturating_add(scope.projections.len()))?;
+        self.charge(
+            scope
+                .shapes
+                .len()
+                .saturating_add(scope.projections.len())
+                .saturating_add(scope.scalars.len()),
+        )?;
         Ok(Scope {
             shapes: scope.shapes.clone(),
             projections: scope.projections.clone(),
+            scalars: scope.scalars.clone(),
         })
     }
 
@@ -315,7 +336,7 @@ fn normalize_body(
                 expr: IrExpr::Ctor { info, .. },
                 ..
             } => {
-                if let Some(shape) = Shape::object_only(info) {
+                if let Some(shape) = Shape::from_info(info) {
                     scope.shapes.insert(*x, shape);
                 }
             }
@@ -325,6 +346,11 @@ fn normalize_body(
                 ..
             } => {
                 scope.projections.insert(*x, (*receiver, *i));
+            }
+            IrStmt::VDecl { x, ty, expr } => {
+                if let Some(projection) = packed::projection(ty, expr) {
+                    scope.scalars.insert(*x, projection);
+                }
             }
             IrStmt::JDecl { value, .. } => {
                 let child_scope = meter.scope(&scope)?;
@@ -359,7 +385,7 @@ fn normalize_body(
             let child = match alt {
                 IrAlt::Ctor { info, body } => {
                     if matches!(x_type, IrType::Object | IrType::TObject)
-                        && let Some(shape) = Shape::object_only(info)
+                        && let Some(shape) = Shape::from_info(info)
                     {
                         child_scope.shapes.insert(*x, shape);
                     }
@@ -434,6 +460,7 @@ fn equivalent_branches(
     let shared = alt_body(&alts[shared_index]);
     meter.charge(exclusive.stmts.len().saturating_add(shared.stmts.len()))?;
     let mut writes = BTreeMap::new();
+    let mut scalar_writes = packed::Writes::default();
     let mut tag = shape.tag;
     let mut changed_tag = false;
     for stmt in &exclusive.stmts {
@@ -443,6 +470,14 @@ fn equivalent_branches(
                     || *y == IrArg::Var(*flag)
                     || writes.insert(*i, *y).is_some()
                 {
+                    return Ok(None);
+                }
+            }
+            IrStmt::USet { .. } | IrStmt::SSet { .. } => {
+                let Some((slot, value)) = packed::store(stmt, *receiver, *shape) else {
+                    return Ok(None);
+                };
+                if value == *receiver || value == *flag || !scalar_writes.insert(slot, value) {
                     return Ok(None);
                 }
             }
@@ -461,6 +496,7 @@ fn equivalent_branches(
         }
     }
     let mut allocation = None;
+    let mut scalar_initializers = packed::Writes::default();
     for stmt in &shared.stmts {
         match stmt {
             IrStmt::VDecl {
@@ -469,6 +505,17 @@ fn equivalent_branches(
                 expr: IrExpr::Ctor { info, args },
             } if matches!(ty, IrType::Object | IrType::TObject) && allocation.is_none() => {
                 allocation = Some((*x, info, args));
+            }
+            IrStmt::USet { .. } | IrStmt::SSet { .. } => {
+                let Some((fresh, _, _)) = allocation else {
+                    return Ok(None);
+                };
+                let Some((slot, value)) = packed::store(stmt, fresh, *shape) else {
+                    return Ok(None);
+                };
+                if value == *receiver || value == *flag || !scalar_initializers.insert(slot, value) {
+                    return Ok(None);
+                }
             }
             _ if rc_only(stmt) => {
                 let mut flag_read = false;
@@ -483,10 +530,14 @@ fn equivalent_branches(
     let Some((fresh, info, args)) = allocation else {
         return Ok(None);
     };
-    let Some(new_shape) = Shape::object_only(info) else {
+    let Some(new_shape) = Shape::from_info(info) else {
         return Ok(None);
     };
-    if new_shape.fields != shape.fields || new_shape.tag != tag || args.len() as u64 != shape.fields
+    if new_shape.fields != shape.fields
+        || new_shape.words != shape.words
+        || new_shape.bytes != shape.bytes
+        || new_shape.tag != tag
+        || args.len() as u64 != shape.fields
     {
         return Ok(None);
     }
@@ -507,6 +558,16 @@ fn equivalent_branches(
                 return Ok(None);
             }
         }
+    }
+    if !packed::equivalent(
+        *shape,
+        *receiver,
+        &scalar_writes,
+        &scalar_initializers,
+        &scope.scalars,
+        meter,
+    )? {
+        return Ok(None);
     }
     let same_result = match (exclusive.terminal.as_ref(), shared.terminal.as_ref()) {
         (IrTerminal::Ret(a), IrTerminal::Ret(b)) => {

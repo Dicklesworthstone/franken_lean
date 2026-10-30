@@ -123,6 +123,11 @@ fn equivalent(
             *parent = token.x;
         }
     }
+    for (parent, _) in reuse_scope.scalars.values_mut() {
+        if *parent == *receiver {
+            *parent = token.x;
+        }
+    }
     equivalent_branches(&token.x, &sharing.x, alts, &reuse_scope, captures, meter)
 }
 
