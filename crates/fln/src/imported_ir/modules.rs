@@ -241,7 +241,11 @@ pub fn load(
         };
         charge(
             &mut declarations_read,
-            module.decls.len(),
+            module
+                .decls
+                .len()
+                .checked_add(module.initializers.len())
+                .ok_or(ModuleLoadError::Limit("IR declarations and initializers"))?,
             limits.max_declarations,
             "declarations",
         )?;

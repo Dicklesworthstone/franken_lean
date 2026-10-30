@@ -1445,6 +1445,12 @@ pub enum VmRefusal {
         function: FunctionId,
         reason: &'static str,
     },
+    /// An imported executable initializer returned an IO error or a value that
+    /// does not satisfy the IO-result ABI. The entry was not executed.
+    Initialization {
+        initializer: String,
+        malformed_result: bool,
+    },
     UnknownIntrinsic {
         row: String,
     },
@@ -1576,6 +1582,18 @@ pub enum VmRefusal {
 impl fmt::Display for VmRefusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Initialization {
+                initializer,
+                malformed_result,
+            } => write!(
+                f,
+                "initializer {initializer} {}",
+                if *malformed_result {
+                    "returned a malformed IO result"
+                } else {
+                    "returned an IO error"
+                }
+            ),
             Self::CallableEntry { function, reason } => {
                 write!(f, "callable entry {}: {reason}", function.get())
             }

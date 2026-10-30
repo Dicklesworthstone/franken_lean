@@ -41,7 +41,7 @@ fn take_moves_the_occupant_and_refill_is_visible_through_the_original_handle() {
 
 #[test]
 fn explicit_take_declarations_cannot_override_the_reviewed_runtime_arity() {
-    for arity in 0..=3 {
+    for arity in 0..=5 {
         let mut module = update_sequence();
         module.decls.push(IrDecl::Extern {
             name: name(TAKE),
@@ -291,4 +291,279 @@ fn stopping_between_take_and_refill_does_not_publish_a_result_or_poison_a_retry(
         assert_nat_replay(&compiled, "15");
     }
     assert!(stopped && completed);
+}
+
+fn reference_cell_form(mut module: IrModule) -> IrModule {
+    for declaration in &mut module.decls {
+        let IrDecl::Function { body, .. } = declaration else {
+            continue;
+        };
+        for statement in &mut body.stmts {
+            let IrStmt::VDecl {
+                expr: IrExpr::Fap { function, args },
+                ..
+            } = statement
+            else {
+                continue;
+            };
+            let name = function.to_display_string();
+            if name != TAKE && !CELL_ROWS.contains(&name.as_str()) {
+                continue;
+            }
+            let mut full = vec![IrArg::Erased, IrArg::Erased];
+            full.append(args);
+            full.push(IrArg::Erased);
+            *args = full;
+        }
+    }
+    module
+}
+
+fn reference_cell_extern(operation: &str) -> IrDecl {
+    let runtime = if matches!(operation, "ST.Prim.Ref.set" | "ST.Prim.Ref.swap") {
+        2
+    } else {
+        1
+    };
+    IrDecl::Extern {
+        name: name(operation),
+        params: (0..runtime + 3)
+            .map(|index| IrParam {
+                x: index as u64,
+                borrow: index == 2 && operation != "ST.Prim.mkRef",
+                ty: if index < 2 {
+                    IrType::Erased
+                } else if index == runtime + 2 {
+                    IrType::Void
+                } else {
+                    IrType::TObject
+                },
+            })
+            .collect(),
+        result: if operation == "ST.Prim.Ref.set" {
+            IrType::Tagged
+        } else {
+            IrType::TObject
+        },
+        entries: vec![],
+    }
+}
+
+#[test]
+fn reference_cell_telescope_preserves_raw_values_and_native_operand_forms() {
+    for (module, expected) in [(state_sequence(), "42"), (update_sequence(), "15")] {
+        assert_nat_replay(&prepare(&module), expected);
+        let mut full = reference_cell_form(module);
+        assert_nat_replay(&prepare(&full), expected);
+        for operation in CELL_ROWS.into_iter().chain([TAKE]) {
+            full.decls.push(reference_cell_extern(operation));
+        }
+        assert_nat_replay(&prepare(&full), expected);
+    }
+}
+
+#[test]
+fn erased_cell_bridge_never_drops_data_or_hides_an_undefined_reference() {
+    for operation in CELL_ROWS.into_iter().chain([TAKE]) {
+        let source = || {
+            reference_cell_form(if operation == TAKE {
+                update_sequence()
+            } else {
+                state_sequence()
+            })
+        };
+        let runtime = if matches!(operation, "ST.Prim.Ref.set" | "ST.Prim.Ref.swap") {
+            2
+        } else {
+            1
+        };
+        for slot in [0, 1, runtime + 2] {
+            let mut module = source();
+            let IrDecl::Function { body, .. } = &mut module.decls[0] else {
+                unreachable!();
+            };
+            for statement in &mut body.stmts {
+                if let IrStmt::VDecl {
+                    expr: IrExpr::Fap { function, args },
+                    ..
+                } = statement
+                    && function == &name(operation)
+                {
+                    // This is a bound, ordinary data value, so the refusal
+                    // specifically tests erasure, not a missing-variable error.
+                    args[slot] = var(1);
+                }
+            }
+            assert!(matches!(
+                compile_module(
+                    &module,
+                    "LocalState.main",
+                    &[],
+                    IrExecutionLimits::default()
+                ),
+                Err(IrExecutionError::Unsupported {
+                    form: "non-erased native state type or world operand",
+                    ..
+                })
+            ));
+        }
+        let mut module = source();
+        let IrDecl::Function { body, .. } = &mut module.decls[0] else {
+            unreachable!();
+        };
+        for statement in &mut body.stmts {
+            if let IrStmt::VDecl {
+                expr: IrExpr::Fap { function, args },
+                ..
+            } = statement
+                && function == &name(operation)
+            {
+                args[2] = var(999_999);
+            }
+        }
+        assert!(matches!(
+            compile_module(
+                &module,
+                "LocalState.main",
+                &[],
+                IrExecutionLimits::default()
+            ),
+            Err(IrExecutionError::IrValidation(_))
+        ));
+    }
+}
+
+#[test]
+fn reference_cell_externs_bind_erasure_borrowing_and_result_representation() {
+    for operation in CELL_ROWS.into_iter().chain([TAKE]) {
+        for mutation in 0..5 {
+            let mut module = reference_cell_form(if operation == TAKE {
+                update_sequence()
+            } else {
+                state_sequence()
+            });
+            let mut external = reference_cell_extern(operation);
+            let IrDecl::Extern { params, result, .. } = &mut external else {
+                unreachable!();
+            };
+            match mutation {
+                0 => params[0].ty = IrType::TObject,
+                1 => params[1].ty = IrType::TObject,
+                2 => params.last_mut().unwrap().ty = IrType::TObject,
+                3 => params[2].borrow = !params[2].borrow,
+                4 => *result = IrType::UInt64,
+                _ => unreachable!(),
+            }
+            module.decls.push(external);
+            assert!(matches!(
+                compile_module(
+                    &module,
+                    "LocalState.main",
+                    &[],
+                    IrExecutionLimits::default()
+                ),
+                Err(IrExecutionError::NativeContract { .. })
+            ));
+        }
+    }
+}
+
+#[test]
+fn reference_cell_bridge_authority_is_bound_to_each_generated_row() {
+    for operation in CELL_ROWS.into_iter().chain([TAKE]) {
+        let row = *native_row(&name(operation)).unwrap();
+        let runtime = native_signature::inferred_arity(&row).unwrap();
+        assert_eq!(
+            native_signature::state_runtime_arity(&row).unwrap(),
+            Some(runtime)
+        );
+        assert_eq!(
+            native_signature::validated_ir_arity(&row, runtime).unwrap(),
+            runtime
+        );
+        assert_eq!(
+            native_signature::validated_ir_arity(&row, runtime + 3).unwrap(),
+            runtime
+        );
+        for changed in [
+            GeneratedExternRow {
+                module: "Other",
+                ..row
+            },
+            GeneratedExternRow {
+                symbol: "other_cell_operation",
+                ..row
+            },
+            GeneratedExternRow {
+                arity: row.arity + 1,
+                ..row
+            },
+            GeneratedExternRow {
+                ownership: "rule(borrowed-args,borrowed-result)",
+                ..row
+            },
+        ] {
+            assert!(matches!(
+                native_signature::state_runtime_arity(&changed),
+                Err(IrExecutionError::NativeContract { .. })
+            ));
+        }
+    }
+    assert_eq!(
+        native_signature::state_runtime_arity(native_row(&name("Nat.add")).unwrap()).unwrap(),
+        None
+    );
+}
+
+#[test]
+fn explicit_reference_cell_telescope_cannot_be_reinterpreted_as_native_calls_or_closures() {
+    for operation in CELL_ROWS.into_iter().chain([TAKE]) {
+        for partial in [false, true] {
+            let mut module = reference_cell_form(if operation == TAKE {
+                update_sequence()
+            } else {
+                state_sequence()
+            });
+            let IrDecl::Function { body, .. } = &mut module.decls[0] else {
+                unreachable!();
+            };
+            for statement in &mut body.stmts {
+                let IrStmt::VDecl { expr, .. } = statement else {
+                    continue;
+                };
+                let IrExpr::Fap { function, args } = expr else {
+                    continue;
+                };
+                if function != &name(operation) {
+                    continue;
+                }
+                if partial {
+                    let function = function.clone();
+                    *expr = IrExpr::Pap {
+                        function,
+                        args: vec![],
+                    };
+                } else {
+                    args.truncate(args.len() - 1);
+                    args.drain(..2).for_each(drop);
+                }
+            }
+            module.decls.push(reference_cell_extern(operation));
+            let error = compile_module(
+                &module,
+                "LocalState.main",
+                &[],
+                IrExecutionLimits::default(),
+            )
+            .unwrap_err();
+            assert!(matches!(
+                error,
+                IrExecutionError::Unsupported {
+                    form: "first-class erased native state primitive"
+                        | "native state call omits explicit erased telescope",
+                    ..
+                }
+            ));
+        }
+    }
 }

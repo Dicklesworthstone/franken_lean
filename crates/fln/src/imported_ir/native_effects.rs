@@ -19,6 +19,105 @@ use fln_olean::ir::{
 };
 use std::collections::{BTreeMap, BTreeSet};
 
+/// Adapt the pin's five cell primitives before arity validation. Only literal
+/// Erased sigma/alpha/world operands are removed; every data operand and every
+/// instruction remains for the ordinary scope/type validator. This cannot
+/// hide a world read, undefined variable, effect or unauthorized callee.
+/// Native one/two-operand calls retain their existing meaning and ownership.
+pub(super) fn erase_state_arguments(
+    module: &mut IrModule,
+    natives: &BTreeMap<Name, Native>,
+    limits: IrExecutionLimits,
+) -> Result<bool, IrExecutionError> {
+    let mut state = BTreeMap::new();
+    for (name, native) in natives {
+        if let Some(arity) = native.state_runtime_arity {
+            state.insert(name.clone(), (arity, native.reference_state_telescope));
+        }
+    }
+    if state.is_empty() {
+        return Ok(false);
+    }
+    let mut changed = false;
+    let mut work = 0u64;
+    for declaration in &mut module.decls {
+        let IrDecl::Function { name, body, .. } = declaration else {
+            continue;
+        };
+        let mut pending = vec![(body, 1usize)];
+        while let Some((body, depth)) = pending.pop() {
+            if depth > limits.ir.max_depth.min(128) {
+                return Err(IrExecutionError::Limit("native erased-state depth"));
+            }
+            work = work
+                .checked_add(body.stmts.len() as u64)
+                .and_then(|work| work.checked_add(1))
+                .ok_or(IrExecutionError::Limit("native erased-state adaptation"))?;
+            if work > limits.ir.max_work {
+                return Err(IrExecutionError::Limit("native erased-state adaptation"));
+            }
+            for statement in &mut body.stmts {
+                match statement {
+                    IrStmt::VDecl {
+                        expr: IrExpr::Fap { function, args },
+                        ..
+                    } => {
+                        let Some(&(runtime, reference_telescope)) = state.get(function) else {
+                            continue;
+                        };
+                        if args.len() == runtime {
+                            if reference_telescope {
+                                return Err(unsupported(
+                                    name,
+                                    "native state call omits explicit erased telescope",
+                                ));
+                            }
+                            continue;
+                        }
+                        if args.len() != runtime + 3 {
+                            return Err(unsupported(name, "unreviewed native state call arity"));
+                        }
+                        if args[0] != IrArg::Erased
+                            || args[1] != IrArg::Erased
+                            || args[runtime + 2] != IrArg::Erased
+                        {
+                            return Err(unsupported(
+                                name,
+                                "non-erased native state type or world operand",
+                            ));
+                        }
+                        args.truncate(runtime + 2);
+                        args.drain(..2).for_each(drop);
+                        changed = true;
+                    }
+                    IrStmt::VDecl {
+                        expr: IrExpr::Pap { function, args },
+                        ..
+                    } => {
+                        if let Some(&(runtime, reference_telescope)) = state.get(function)
+                            && (reference_telescope || args.len() > runtime)
+                        {
+                            return Err(unsupported(
+                                name,
+                                "first-class erased native state primitive",
+                            ));
+                        }
+                    }
+                    IrStmt::JDecl { value, .. } => pending.push((value, depth + 1)),
+                    _ => {}
+                }
+            }
+            if let IrTerminal::Case { alts, .. } = body.terminal.as_mut() {
+                for alternative in alts {
+                    let (IrAlt::Ctor { body, .. } | IrAlt::Default { body }) = alternative;
+                    pending.push((body, depth + 1));
+                }
+            }
+        }
+    }
+    Ok(changed)
+}
+
 pub(super) fn classify(
     row: &GeneratedExternRow,
     captured_output: bool,

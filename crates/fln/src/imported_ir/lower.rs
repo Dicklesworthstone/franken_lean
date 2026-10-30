@@ -7,6 +7,8 @@ use fln_comp::fir::{
 use fln_olean::ir::{IrAlt, IrArg, IrCtorInfo, IrExpr, IrLit, IrParam};
 use std::sync::Arc;
 
+mod initialization;
+
 type Result<T> = std::result::Result<T, IrExecutionError>;
 
 pub(super) fn compile(
@@ -15,8 +17,15 @@ pub(super) fn compile(
     entry: &Name,
     arguments: &[EntryArgument],
     limits: IrExecutionLimits,
+    initialization: Option<&globals::InitializationPlan>,
     callable: bool,
 ) -> Result<CompiledIr> {
+    if callable && initialization.is_some() {
+        return Err(unsupported(
+            entry,
+            "callable entry cannot initialize globals",
+        ));
+    }
     let entry_parameters: &[IrParam] = match declarations.get(entry) {
         Some(IrDecl::Function { params, .. }) => params,
         _ => &[],
@@ -33,6 +42,16 @@ pub(super) fn compile(
         ));
     }
     let mut helper_natives = BTreeMap::new();
+    if initialization.is_some() {
+        for name in [
+            "Array.getInternal",
+            "ST.Prim.mkRef",
+            "ST.Prim.Ref.get",
+            "ST.Prim.Ref.set",
+        ] {
+            insert_helper(&mut helper_natives, name)?;
+        }
+    }
     for argument in arguments {
         if matches!(argument, EntryArgument::FloatBits(_)) {
             insert_helper(&mut helper_natives, "UInt64.ofNat")?;
@@ -139,6 +158,18 @@ pub(super) fn compile(
             .iter()
             .map(|(name, native)| (name.clone(), native.arguments.len())),
     );
+    let global_slots: BTreeMap<_, _> = initialization
+        .into_iter()
+        .flat_map(|plan| plan.globals.iter().enumerate())
+        .map(|(slot, global)| (global.declaration.clone(), slot))
+        .collect();
+    for name in global_slots.keys() {
+        if names.get(name).is_some_and(|arity| *arity != 0) {
+            return Err(unsupported(name, "initialized global with parameters"));
+        }
+        names.insert(name.clone(), 0);
+    }
+    let environment_parameters = usize::from(initialization.is_some());
     let function_count = names
         .len()
         .checked_add(1)
@@ -204,9 +235,13 @@ pub(super) fn compile(
         capture_operands: 0,
         packed_operands: 0,
         packed_scalar_bytes: 0,
+        global_slots,
     };
     let mut wrapper = Builder::new(entry, 0, &mut tables)?;
-    let block = wrapper.block()?;
+    let mut block = wrapper.block()?;
+    if let Some(plan) = initialization {
+        block = wrapper.initialize_globals(block, plan)?;
+    }
     let value = if callable {
         let closure_type = ClosureTypeId::new(expected as u32 - 1);
         wrapper.boxed(
@@ -220,7 +255,7 @@ pub(super) fn compile(
             },
         )?
     } else {
-        let args = arguments
+        let mut args = arguments
             .iter()
             .enumerate()
             .map(|(index, arg)| {
@@ -244,6 +279,7 @@ pub(super) fn compile(
                 }
             })
             .collect::<Result<Vec<_>>>()?;
+        wrapper.prepend_environment(&mut args)?;
         wrapper.emit(
             block,
             ValueType::Abi,
@@ -253,15 +289,29 @@ pub(super) fn compile(
             },
         )?
     };
+    let value = if initialization.is_some() {
+        wrapper.initialization_envelope(block, 0, vec![value])?
+    } else {
+        value
+    };
     wrapper.finish_block(block, Terminator::Return { value });
     let mut functions = vec![wrapper.finish(FunctionId::new(0))];
     let mut reference_functions = Vec::new();
     for (name, arity) in &names {
         let id = tables.targets[name].0;
-        let mut builder = Builder::new(name, *arity, &mut tables)?;
-        if supplied_natives.contains_key(name) {
+        let mut builder = Builder::new(name, *arity + environment_parameters, &mut tables)?;
+        if initialization.is_some() {
+            builder.global_environment = Some(ValueId::new(0));
+        }
+        if builder.tables.global_slots.contains_key(name) {
             let block = builder.block()?;
-            let args = (0..*arity).map(|i| ValueId::new(i as u32)).collect();
+            let value = builder.global_value(block, name)?;
+            builder.finish_block(block, Terminator::Return { value });
+        } else if supplied_natives.contains_key(name) {
+            let block = builder.block()?;
+            let args = (0..*arity)
+                .map(|i| ValueId::new((i + environment_parameters) as u32))
+                .collect();
             let value = builder.native_call(block, name, args)?;
             builder.finish_block(block, Terminator::Return { value });
         } else {
@@ -275,7 +325,7 @@ pub(super) fn compile(
                     (
                         param.x,
                         Local {
-                            value: ValueId::new(i as u32),
+                            value: ValueId::new((i + environment_parameters) as u32),
                             constructor: None,
                         },
                     )
@@ -310,6 +360,7 @@ pub(super) fn compile(
         reference_functions,
         output_byte_limit: None,
         callable_entry: callable.then_some((flbc::FunctionId::new(entry_id.get()), expected)),
+        initialization: None,
         native_externs: native_order
             .iter()
             .map(|(_, native)| native.id.to_owned())
@@ -321,7 +372,7 @@ fn insert_helper(natives: &mut BTreeMap<Name, Native>, text: &str) -> Result<()>
     let name = Name::from_components(text.split('.'));
     let row =
         native_row(&name).ok_or_else(|| IrExecutionError::MissingDeclaration(name.clone()))?;
-    natives.insert(name, Native::new(row, row.arity as usize)?);
+    natives.insert(name, Native::new(row, native_signature::ir_arity(row)?)?);
     Ok(())
 }
 
@@ -425,6 +476,7 @@ struct Tables {
     capture_operands: usize,
     packed_operands: usize,
     packed_scalar_bytes: usize,
+    global_slots: BTreeMap<Name, usize>,
 }
 
 impl Tables {
@@ -501,6 +553,10 @@ struct Builder<'a> {
     next_value: u32,
     blocks: Vec<Block>,
     pending_values: usize,
+    /// The execution-local initialized globals. This is a hidden first
+    /// parameter of linked functions, and a local allocation in the entry
+    /// wrapper. It never becomes an IR variable or a native-call operand.
+    global_environment: Option<ValueId>,
     tables: &'a mut Tables,
 }
 
@@ -518,6 +574,7 @@ impl<'a> Builder<'a> {
             next_value,
             blocks: Vec::new(),
             pending_values: 0,
+            global_environment: None,
             tables,
         })
     }
@@ -1037,7 +1094,16 @@ impl<'a> Builder<'a> {
                 self.boxed(block, ValueType::String, Operation::String(text.clone()))?
             }
             IrExpr::Fap { function, args } => {
-                let args = self.arguments(block, args, locals)?;
+                if self.tables.global_slots.contains_key(function) {
+                    if !args.is_empty() {
+                        return Err(unsupported(function, "initialized global with arguments"));
+                    }
+                    return Ok(Local {
+                        value: self.global_value(block, function)?,
+                        constructor: None,
+                    });
+                }
+                let mut args = self.arguments(block, args, locals)?;
                 if self.tables.intrinsic_ids.contains_key(function) {
                     self.native_call(block, function, args)?
                 } else {
@@ -1045,6 +1111,7 @@ impl<'a> Builder<'a> {
                         self.tables.targets.get(function).copied().ok_or_else(|| {
                             IrExecutionError::MissingDeclaration(function.clone())
                         })?;
+                    self.prepend_environment(&mut args)?;
                     self.emit(block, ValueType::Abi, Operation::Call { function, args })?
                 }
             }
@@ -1059,7 +1126,8 @@ impl<'a> Builder<'a> {
                     .checked_sub(args.len())
                     .filter(|n| *n > 0)
                     .ok_or_else(|| unsupported(self.name, "saturated partial application"))?;
-                let captures = self.arguments(block, args, locals)?;
+                let mut captures = self.arguments(block, args, locals)?;
+                self.prepend_captured_environment(block, &mut captures)?;
                 let closure_type = ClosureTypeId::new(remaining as u32 - 1);
                 let capture_ownership = vec![flbc::ArgumentOwnership::Borrowed; captures.len()];
                 self.boxed(
@@ -1239,6 +1307,7 @@ impl<'a> Builder<'a> {
         let arity = locals
             .len()
             .checked_add(params.len())
+            .and_then(|arity| arity.checked_add(usize::from(self.global_environment.is_some())))
             .ok_or(IrExecutionError::Limit("join parameters"))?;
         if arity > usize::from(u16::MAX)
             || arity
@@ -1259,7 +1328,9 @@ impl<'a> Builder<'a> {
                 .saturating_add(joins.len())
                 .saturating_add(params.len()),
         )?;
-        self.tables.capture_operands(locals.len())?;
+        let environment_parameters = usize::from(self.global_environment.is_some());
+        self.tables
+            .capture_operands(locals.len() + environment_parameters)?;
 
         // Lambda lifting gives each join a normal checked FIR function. Capture
         // lexical values in structural index order, followed by explicit jump
@@ -1272,7 +1343,7 @@ impl<'a> Builder<'a> {
                 (
                     *x,
                     Local {
-                        value: ValueId::new(i as u32),
+                        value: ValueId::new((i + environment_parameters) as u32),
                         constructor: local.constructor,
                     },
                 )
@@ -1282,13 +1353,16 @@ impl<'a> Builder<'a> {
             helper_locals.insert(
                 param.x,
                 Local {
-                    value: ValueId::new((captures.len() + i) as u32),
+                    value: ValueId::new((captures.len() + i + environment_parameters) as u32),
                     constructor: None,
                 },
             );
         }
         let prior_joins = joins.clone();
         let mut helper = Builder::new(self.name, arity, self.tables)?;
+        if environment_parameters != 0 {
+            helper.global_environment = Some(ValueId::new(0));
+        }
         helper.body(body, helper_locals, prior_joins)?;
         let lowered = helper.finish(function);
         self.tables.helper_functions.push(lowered);
@@ -1409,6 +1483,7 @@ impl<'a> Builder<'a> {
                     .map(|x| self.argument(block, &IrArg::Var(*x), &locals))
                     .collect::<Result<Vec<_>>>()?;
                 values.extend(self.arguments(block, args, &locals)?);
+                self.prepend_environment(&mut values)?;
                 let value = self.emit(
                     block,
                     ValueType::Abi,

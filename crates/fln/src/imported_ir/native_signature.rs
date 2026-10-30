@@ -7,6 +7,134 @@
 //! declarations are checked against the same authority.
 
 use super::{GeneratedExternRow, IrExecutionError, Name, Ownership, extern_row};
+use fln_olean::ir::{IrParam, IrType};
+
+/// The pinned IR retains sigma, alpha and the world around these exact five
+/// cell operations. Their native ABI returns the raw value: the surrounding
+/// user IR constructs EST.Out.ok itself. Never add an IO-result wrapper here.
+pub(super) fn state_runtime_arity(
+    row: &GeneratedExternRow,
+) -> Result<Option<usize>, IrExecutionError> {
+    let (name, symbol, runtime, ownership, safety) = match row.id {
+        "extern:ST.Prim.mkRef" => (
+            "ST.Prim.mkRef",
+            "lean_st_mk_ref",
+            1,
+            "abi((owned_arg) -> owned_res)",
+            "safe",
+        ),
+        "extern:ST.Prim.Ref.get" => (
+            "ST.Prim.Ref.get",
+            "lean_st_ref_get",
+            1,
+            "abi((borrowed_arg) -> owned_res)",
+            "safe",
+        ),
+        "extern:ST.Prim.Ref.set" => (
+            "ST.Prim.Ref.set",
+            "lean_st_ref_set",
+            2,
+            "abi((borrowed_arg, owned_arg) -> owned_res)",
+            "safe",
+        ),
+        "extern:ST.Prim.Ref.swap" => (
+            "ST.Prim.Ref.swap",
+            "lean_st_ref_swap",
+            2,
+            "abi((borrowed_arg, owned_arg) -> owned_res)",
+            "safe",
+        ),
+        "extern:ST.Prim.Ref.take" => (
+            "ST.Prim.Ref.take",
+            "lean_st_ref_take",
+            1,
+            "rule(borrowed-args,owned-result)",
+            "unsafe",
+        ),
+        _ => return Ok(None),
+    };
+    if row.name != name
+        || row.symbol != symbol
+        || row.module != "Init.System.ST"
+        || row.kind != "opaque"
+        || row.levels != 0
+        || row.arity as usize != runtime + 2
+        || row.effect != "state"
+        || row.safety != safety
+        || row.ownership != ownership
+        || row.entry_class != "standard"
+        || row.entry_scope != "all"
+        || row.partition != "toolchain-api"
+        || inferred_arity(row)? != runtime
+    {
+        return Err(IrExecutionError::NativeContract {
+            declaration: Name::from_components(row.name.split('.')),
+            detail: "state primitive differs from its reviewed erased IR bridge".to_owned(),
+        });
+    }
+    Ok(Some(runtime))
+}
+
+/// Accept only the native operand form or the pin's explicitly reviewed
+/// erased form. The returned arity is the signature after normalization,
+/// independently of any call site's operand count.
+pub(super) fn validated_ir_arity(
+    row: &GeneratedExternRow,
+    arity: usize,
+) -> Result<usize, IrExecutionError> {
+    let expected = ir_arity(row)?;
+    if let Some(runtime) = state_runtime_arity(row)? {
+        if arity == runtime || arity == runtime + 3 {
+            return Ok(runtime);
+        }
+    } else if arity == expected {
+        return Ok(expected);
+    }
+    Err(IrExecutionError::NativeContract {
+        declaration: Name::from_components(row.name.split('.')),
+        detail: "extern arity differs from the reviewed Reference IR signature".to_owned(),
+    })
+}
+
+/// An explicit Reference extern cannot relabel the erased slots as data or
+/// change borrowing/result representation. Native-form declarations retain
+/// their existing ABI validation; only the newly admitted full telescope is
+/// checked against this additional pin-derived shape.
+pub(super) fn validate_extern_signature(
+    row: &GeneratedExternRow,
+    params: &[IrParam],
+    result: &IrType,
+) -> Result<(), IrExecutionError> {
+    let Some(runtime) = state_runtime_arity(row)? else {
+        return Ok(());
+    };
+    if params.len() != runtime + 3 {
+        return Ok(());
+    }
+    let borrowed_ref = row.name != "ST.Prim.mkRef";
+    let expected_result = if row.name == "ST.Prim.Ref.set" {
+        IrType::Tagged
+    } else {
+        IrType::TObject
+    };
+    let valid = params.iter().enumerate().all(|(index, parameter)| {
+        let (ty, borrow) = if index < 2 {
+            (IrType::Erased, false)
+        } else if index == params.len() - 1 {
+            (IrType::Void, false)
+        } else {
+            (IrType::TObject, borrowed_ref && index == 2)
+        };
+        parameter.ty == ty && parameter.borrow == borrow
+    });
+    if !valid || result != &expected_result {
+        return Err(IrExecutionError::NativeContract {
+            declaration: Name::from_components(row.name.split('.')),
+            detail: "state primitive extern differs from its reviewed erased telescope".to_owned(),
+        });
+    }
+    Ok(())
+}
 
 pub(super) fn inferred_arity(row: &GeneratedExternRow) -> Result<usize, IrExecutionError> {
     let error = |error: extern_row::ContractError| IrExecutionError::NativeContract {

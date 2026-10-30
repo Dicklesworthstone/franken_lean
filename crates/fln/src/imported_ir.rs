@@ -12,9 +12,11 @@
 //! Its RC annotations are replaced by Golem's checked managed ownership, not
 //! executed as additional retains/releases on already managed values.
 //!
-//! This does not admit kernel declarations, run import initializers or replace
-//! the sovereign compiler. Every linked interpreted function retains Reference
-//! provenance in the compiled object and its execution report.
+//! An explicit capability initializes the named globals needed by a selected
+//! executable, once per execution. This does not perform whole-module startup,
+//! admit kernel declarations or replace the sovereign compiler. Every linked
+//! interpreted function retains Reference provenance in the compiled object
+//! and its execution report.
 
 use fln_comp::{fir, flbc};
 use fln_core::name::Name;
@@ -33,6 +35,7 @@ use std::fmt;
 
 mod captured_output;
 mod constructor_updates;
+mod globals;
 mod lower;
 pub mod modules;
 mod native_effects;
@@ -114,6 +117,19 @@ impl Default for IrExecutionLimits {
     }
 }
 
+/// Explicit preparation capabilities for one isolated imported execution.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct IrExecutionOptions {
+    pub limits: IrExecutionLimits,
+    pub capture_output_bytes: Option<usize>,
+    /// Initialize only the named globals needed by the selected entry and
+    /// their initializer dependencies. This is not whole-module startup:
+    /// named globals are refused if any supplied module has standalone actions,
+    /// as are phase-sensitive runtime services in selected code. Unselected
+    /// named initializers are not run, including any effects they might perform.
+    pub initialize_globals: bool,
+}
+
 #[derive(Debug)]
 pub enum IrExecutionError {
     PartitionDigest,
@@ -124,6 +140,10 @@ pub enum IrExecutionError {
     Unclassified(Name),
     UserOverridesCensus(Name),
     UnknownUser(Name),
+    InitializerContract {
+        declaration: Name,
+        detail: &'static str,
+    },
     Unsupported {
         declaration: Name,
         form: &'static str,
@@ -178,6 +198,14 @@ impl fmt::Display for IrExecutionError {
                 f,
                 "IR user declaration {} is absent from the supplied modules",
                 name.to_display_string()
+            ),
+            Self::InitializerContract {
+                declaration,
+                detail,
+            } => write!(
+                f,
+                "IR initializer for {}: {detail}",
+                declaration.to_display_string()
             ),
             Self::Unsupported { declaration, form } => write!(
                 f,
@@ -239,6 +267,7 @@ pub struct CompiledIr {
     reference_functions: Vec<ReferenceFunction>,
     native_externs: Vec<String>,
     output_byte_limit: Option<usize>,
+    initialization: Option<globals::InitializationPlan>,
     callable_entry: Option<(flbc::FunctionId, usize)>,
 }
 
@@ -291,7 +320,31 @@ impl CompiledCallableIr {
             reference_functions: self.compiled.reference_functions.clone(),
             native_externs: self.compiled.native_externs.clone(),
             captured_output: None,
+            initialization_failure: None,
         }
+    }
+}
+
+/// The original IO-result object returned by a failed initializer. A malformed
+/// result is retained too; neither kind is exposed as a successful entry value.
+pub struct IrInitializationFailure {
+    pub declaration: Name,
+    pub initializer: Name,
+    pub result: fln_rt::obj::Obj,
+    pub malformed: bool,
+}
+
+impl fmt::Debug for IrInitializationFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("IrInitializationFailure")
+            .field("declaration", &self.declaration)
+            .field("initializer", &self.initializer)
+            .field(
+                "result_kind",
+                &fln_vm::interpreter::value_kind(&self.result),
+            )
+            .field("malformed", &self.malformed)
+            .finish()
     }
 }
 
@@ -313,6 +366,7 @@ pub struct IrExecution {
     pub reference_functions: Vec<ReferenceFunction>,
     pub native_externs: Vec<String>,
     pub captured_output: Option<IrCapturedOutput>,
+    pub initialization_failure: Option<IrInitializationFailure>,
 }
 
 impl CompiledIr {
@@ -348,11 +402,16 @@ impl CompiledIr {
                 None,
             ),
         };
+        let (outcome, initialization_failure) = match &self.initialization {
+            Some(plan) => globals::finish(outcome, plan),
+            None => (outcome, None),
+        };
         IrExecution {
             outcome,
             reference_functions: self.reference_functions.clone(),
             native_externs: self.native_externs.clone(),
             captured_output,
+            initialization_failure,
         }
     }
 }
@@ -416,15 +475,16 @@ pub fn compile(
     user_declarations: &BTreeSet<Name>,
     limits: IrExecutionLimits,
 ) -> Result<CompiledIr, IrExecutionError> {
-    compile_with_output_policy(
+    compile_with_options(
         modules,
         entry,
         arguments,
         partition,
         user_declarations,
-        limits,
-        None,
-        false,
+        IrExecutionOptions {
+            limits,
+            ..IrExecutionOptions::default()
+        },
     )
 }
 
@@ -445,15 +505,17 @@ pub fn compile_with_captured_output(
     limits: IrExecutionLimits,
     max_output_bytes: usize,
 ) -> Result<CompiledIr, IrExecutionError> {
-    compile_with_output_policy(
+    compile_with_options(
         modules,
         entry,
         arguments,
         partition,
         user_declarations,
-        limits,
-        Some(max_output_bytes),
-        false,
+        IrExecutionOptions {
+            limits,
+            capture_output_bytes: Some(max_output_bytes),
+            initialize_globals: false,
+        },
     )
 }
 
@@ -470,14 +532,16 @@ pub fn compile_callable(
     user_declarations: &BTreeSet<Name>,
     limits: IrExecutionLimits,
 ) -> Result<CompiledCallableIr, IrExecutionError> {
-    let compiled = compile_with_output_policy(
+    let compiled = compile_with_policy(
         modules,
         entry,
         &[],
         partition,
         user_declarations,
-        limits,
-        None,
+        IrExecutionOptions {
+            limits,
+            ..IrExecutionOptions::default()
+        },
         true,
     )?;
     let (function, arity) = compiled
@@ -490,19 +554,48 @@ pub fn compile_callable(
     })
 }
 
-fn compile_with_output_policy(
+/// Compile a selected user/library closure with explicit initialization and
+/// output capabilities. All code, including initializers, is authorized and
+/// validated before any initializer can run.
+pub fn compile_with_options(
     modules: &[IrModule],
     entry: &Name,
     arguments: &[EntryArgument],
     partition: &VerifiedPartition,
     user_declarations: &BTreeSet<Name>,
-    limits: IrExecutionLimits,
-    output_byte_limit: Option<usize>,
+    options: IrExecutionOptions,
+) -> Result<CompiledIr, IrExecutionError> {
+    compile_with_policy(
+        modules,
+        entry,
+        arguments,
+        partition,
+        user_declarations,
+        options,
+        false,
+    )
+}
+
+fn compile_with_policy(
+    modules: &[IrModule],
+    entry: &Name,
+    arguments: &[EntryArgument],
+    partition: &VerifiedPartition,
+    user_declarations: &BTreeSet<Name>,
+    options: IrExecutionOptions,
     callable: bool,
 ) -> Result<CompiledIr, IrExecutionError> {
+    let IrExecutionOptions {
+        limits,
+        capture_output_bytes: output_byte_limit,
+        initialize_globals,
+    } = options;
     let count = modules
         .iter()
-        .try_fold(0usize, |n, m| n.checked_add(m.decls.len()))
+        .try_fold(0usize, |n, m| {
+            n.checked_add(m.decls.len())?
+                .checked_add(m.initializers.len())
+        })
         .ok_or(IrExecutionError::Limit("input declarations"))?;
     if count > limits.ir.max_declarations || user_declarations.len() > limits.ir.max_declarations {
         return Err(IrExecutionError::Limit("input declarations"));
@@ -537,6 +630,7 @@ fn compile_with_output_policy(
             ));
         }
     }
+    let initializer_index = globals::index(modules, limits)?;
     for name in user_declarations {
         if native_row(name).is_some()
             || fln_vm::macro_native::row_for_name(name).is_some()
@@ -560,8 +654,17 @@ fn compile_with_output_policy(
             return Err(IrExecutionError::Limit("selected functions"));
         }
         if let Some(row) = native_row(&name) {
+            if initializer_index.named.contains_key(&name) {
+                return Err(globals::contract(
+                    &name,
+                    "initializer cannot replace a native declaration",
+                ));
+            }
             let arity = match declarations.get(&name) {
-                Some(IrDecl::Extern { params, .. }) => params.len(),
+                Some(IrDecl::Extern { params, result, .. }) => {
+                    native_signature::validate_extern_signature(row, params, result)?;
+                    params.len()
+                }
                 _ => native_signature::ir_arity(row)?,
             };
             natives.insert(
@@ -571,6 +674,12 @@ fn compile_with_output_policy(
             continue;
         }
         if let Some(row) = fln_vm::macro_native::row_for_name(&name) {
+            if initializer_index.named.contains_key(&name) {
+                return Err(globals::contract(
+                    &name,
+                    "initializer cannot replace a native declaration",
+                ));
+            }
             natives.insert(name, Native::mirror(row));
             continue;
         }
@@ -591,14 +700,34 @@ fn compile_with_output_policy(
         if sorry_dep.is_some() {
             return Err(unsupported(&name, "sorry-dependent executable"));
         }
+        // Placeholder global bodies are replaced below, but they must still
+        // satisfy structural budgets before the selected module is cloned.
         inspect_body(&name, body, &mut work, limits)?;
+        if let Some(initializer) = initializer_index.named.get(&name) {
+            if !initialize_globals {
+                return Err(globals::contract(
+                    &name,
+                    "requires explicit initialized-global capability",
+                ));
+            }
+            globals::validate_global(
+                &name,
+                declaration,
+                initializer,
+                &declarations,
+                &initializer_index,
+            )?;
+            pending.insert(initializer.clone());
+            selected.insert(name, *declaration);
+            continue;
+        }
         for parameter in params {
             // The pinned compiler retains a void RealWorld parameter on user
             // IO functions, although each primitive call supplies Erased.
-            // It is an inert ABI slot, available only in the explicit output
-            // lane; void values, results, and packed representations remain
-            // outside the general imported-IR subset.
-            if output_byte_limit.is_some() && parameter.ty == IrType::Void {
+            // It is an inert ABI slot, available only with an explicit output
+            // or initialization capability; void values, results, and packed
+            // representations remain outside the general imported-IR subset.
+            if (output_byte_limit.is_some() || initialize_globals) && parameter.ty == IrType::Void {
                 continue;
             }
             check_type(&name, &parameter.ty)?;
@@ -609,10 +738,17 @@ fn compile_with_output_policy(
         }
         selected.insert(name, *declaration);
     }
+    let initialization = initialize_globals
+        .then(|| globals::plan(&initializer_index, &selected, limits))
+        .transpose()?;
     let mut selected_module = IrModule {
         decls: selected.values().map(|decl| (*decl).clone()).collect(),
         ..IrModule::default()
     };
+    // The pin retains literal erased type/world slots on these reviewed
+    // native state calls. Only those literals are removed; all data uses and
+    // all instructions remain for the complete structural/type validation.
+    native_effects::erase_state_arguments(&mut selected_module, &natives, limits)?;
     let signatures = natives
         .iter()
         .map(|(name, native)| (name.clone(), native.ir_arity))
@@ -625,7 +761,7 @@ fn compile_with_output_policy(
         limits.ir,
     )
     .map_err(IrExecutionError::IrValidation)?;
-    if output_byte_limit.is_some() {
+    if output_byte_limit.is_some() || initialize_globals {
         for declaration in &selected_module.decls {
             if let IrDecl::Function {
                 name, params, body, ..
@@ -660,8 +796,17 @@ fn compile_with_output_policy(
         .iter()
         .map(|declaration| (declaration.name().clone(), declaration))
         .collect();
-    let mut compiled = lower::compile(&selected, &natives, entry, arguments, limits, callable)?;
+    let mut compiled = lower::compile(
+        &selected,
+        &natives,
+        entry,
+        arguments,
+        limits,
+        initialization.as_ref(),
+        callable,
+    )?;
     compiled.output_byte_limit = output_byte_limit;
+    compiled.initialization = initialization;
     Ok(compiled)
 }
 
@@ -760,6 +905,8 @@ fn inspect_body(
 struct Native {
     id: &'static str,
     ir_arity: usize,
+    reference_state_telescope: bool,
+    state_runtime_arity: Option<usize>,
     arguments: Vec<flbc::ArgumentOwnership>,
     result: flbc::ResultOwnership,
     effect: fir::EffectClass,
@@ -770,6 +917,8 @@ impl Native {
         Self {
             id: row.id,
             ir_arity: row.borrowed.len(),
+            reference_state_telescope: false,
+            state_runtime_arity: None,
             arguments: row.argument_ownership(),
             result: row.result_ownership(),
             effect: fir::EffectClass::Pure,
@@ -805,12 +954,10 @@ impl Native {
         // runtime authority. A reviewed bridge may distinguish the original
         // IR telescope from Golem's native operands; both remain independently
         // validated rather than taking their shape from an observed call.
-        if arity != native_signature::ir_arity(row)? {
-            return Err(IrExecutionError::NativeContract {
-                declaration: name.clone(),
-                detail: "extern arity differs from the reviewed Reference IR signature".to_owned(),
-            });
-        }
+        let ir_arity = native_signature::validated_ir_arity(row, arity)?;
+        let state_runtime_arity = native_signature::state_runtime_arity(row)?;
+        let reference_state_telescope =
+            state_runtime_arity.is_some_and(|runtime| arity == runtime + 3);
         let arguments = contract
             .argument_ownership(native_signature::inferred_arity(row)?)
             .map_err(error)?
@@ -830,7 +977,9 @@ impl Native {
         };
         Ok(Self {
             id: row.id,
-            ir_arity: arity,
+            ir_arity,
+            reference_state_telescope,
+            state_runtime_arity,
             arguments,
             result,
             effect,
