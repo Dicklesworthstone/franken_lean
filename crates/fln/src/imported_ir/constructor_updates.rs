@@ -20,6 +20,7 @@ use fln_olean::ir::{
 use std::collections::{BTreeMap, BTreeSet};
 
 mod fresh;
+mod reset;
 
 type Result<T> = std::result::Result<T, IrExecutionError>;
 
@@ -336,6 +337,9 @@ fn normalize_body(
             _ => {}
         }
     }
+    if reset::normalize(body, &scope, captures, meter)? {
+        return Ok(());
+    }
     if let Some(index) = equivalent_update(body, &scope, captures, meter)? {
         let IrTerminal::Case { alts, .. } = body.terminal.as_mut() else {
             unreachable!("a verified update is a case");
@@ -393,12 +397,6 @@ fn equivalent_update(
     else {
         return Ok(None);
     };
-    if captures.contains(receiver) || captures.contains(flag) {
-        return Ok(None);
-    }
-    let Some(shape) = scope.shapes.get(receiver) else {
-        return Ok(None);
-    };
     let IrTerminal::Case {
         x,
         x_type: IrType::UInt8,
@@ -408,42 +406,33 @@ fn equivalent_update(
     else {
         return Ok(None);
     };
-    if x != flag || alts.len() != 2 {
+    if x != flag {
         return Ok(None);
     }
-    let mut exclusive = None;
-    let mut shared = None;
-    let mut fallback = None;
-    for (index, alt) in alts.iter().enumerate() {
-        let (info, body) = match alt {
-            IrAlt::Ctor { info, body } => (info, body),
-            IrAlt::Default { body } if fallback.is_none() => {
-                fallback = Some((index, body));
-                continue;
-            }
-            _ => return Ok(None),
-        };
-        if info.size != 0 || info.usize != 0 || info.ssize != 0 {
-            return Ok(None);
-        }
-        match info.cidx {
-            0 if exclusive.is_none() => exclusive = Some(body),
-            1 if shared.is_none() => shared = Some((index, body)),
-            _ => return Ok(None),
-        }
+    equivalent_branches(receiver, flag, alts, scope, captures, meter)
+}
+
+// The caller proves that the discriminator is precisely an isShared bit for
+// this receiver (directly or through a checked reset-join parameter).
+fn equivalent_branches(
+    receiver: &u64,
+    flag: &u64,
+    alts: &[IrAlt],
+    scope: &Scope,
+    captures: &BTreeSet<u64>,
+    meter: &mut Meter,
+) -> Result<Option<usize>> {
+    if captures.contains(receiver) || captures.contains(flag) {
+        return Ok(None);
     }
-    // `isShared` is a closed Boolean operation, not an arbitrary UInt8
-    // producer. A single default alternative is exactly the missing bit.
-    if let Some((index, body)) = fallback {
-        match (exclusive.is_some(), shared.is_some()) {
-            (true, false) => shared = Some((index, body)),
-            (false, true) => exclusive = Some(body),
-            _ => return Ok(None),
-        }
-    }
-    let (Some(exclusive), Some((shared_index, shared))) = (exclusive, shared) else {
+    let Some(shape) = scope.shapes.get(receiver) else {
         return Ok(None);
     };
+    let Some((exclusive_index, shared_index)) = boolean_arms(alts) else {
+        return Ok(None);
+    };
+    let exclusive = alt_body(&alts[exclusive_index]);
+    let shared = alt_body(&alts[shared_index]);
     meter.charge(exclusive.stmts.len().saturating_add(shared.stmts.len()))?;
     let mut writes = BTreeMap::new();
     let mut tag = shape.tag;
@@ -545,6 +534,37 @@ fn equivalent_update(
         _ => false,
     };
     Ok(same_result.then_some(shared_index))
+}
+
+/// A single default denotes exactly the missing bit, never an arbitrary tag.
+fn boolean_arms(alts: &[IrAlt]) -> Option<(usize, usize)> {
+    if alts.len() != 2 {
+        return None;
+    }
+    let mut exclusive = None;
+    let mut shared = None;
+    let mut fallback = None;
+    for (index, alt) in alts.iter().enumerate() {
+        match alt {
+            IrAlt::Ctor { info, .. }
+                if info.size == 0 && info.usize == 0 && info.ssize == 0 =>
+            {
+                match info.cidx {
+                    0 if exclusive.is_none() => exclusive = Some(index),
+                    1 if shared.is_none() => shared = Some(index),
+                    _ => return None,
+                }
+            }
+            IrAlt::Default { .. } if fallback.is_none() => fallback = Some(index),
+            _ => return None,
+        }
+    }
+    match (exclusive, shared, fallback) {
+        (Some(exclusive), Some(shared), None)
+        | (Some(exclusive), None, Some(shared))
+        | (None, Some(shared), Some(exclusive)) => Some((exclusive, shared)),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
