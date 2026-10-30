@@ -32,6 +32,7 @@ use std::fmt;
 
 mod constructor_updates;
 mod lower;
+pub mod modules;
 mod native_effects;
 mod native_signature;
 mod sha256;
