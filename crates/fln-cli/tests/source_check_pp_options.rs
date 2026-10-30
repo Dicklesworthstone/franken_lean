@@ -327,6 +327,30 @@ set_option pp.raw true in
 #check Nat.succ
 ";
 
+/// `fun` with instance binders, binder types hidden (`delabLamAux`, vendored
+/// `PrettyPrinter/Delaborator/Builtins.lean:948-1006`): an instance binder is never grouped and
+/// prints `[T]`, or `[x : T]` when it is dependent and its name is printed in the body. `#print`
+/// refused such a value as a capability gap.
+const INSTANCE_FUN_BINDERS: &str = "prelude
+import Init.Tactics
+def d : ∀ {α : Type} [Inhabited α], α := fun {α} [Inhabited α] => default
+#print d
+def m : ∀ {α : Type} [Inhabited α] [Inhabited α], α := fun {α} [Inhabited α] [Inhabited α] => default
+#print m
+set_option linter.unusedVariables false in
+@[reducible] def k : ∀ {α : Type} [i : Inhabited α], Inhabited α := fun {α} [i : Inhabited α] => i
+#print k
+";
+
+/// The pinned `lean` v4.32.0's output for [`INSTANCE_FUN_BINDERS`] (2026-10-29).
+const INSTANCE_FUN_BINDERS_EXPECTED: &str = "def d : {α : Type} → [Inhabited α] → α :=
+fun {α} [Inhabited α] => default
+def m : {α : Type} → [Inhabited α] → [Inhabited α] → α :=
+fun {α} [Inhabited α] [Inhabited α] => default
+@[reducible] def k : {α : Type} → [i : Inhabited α] → Inhabited α :=
+fun {α} [i : Inhabited α] => i
+";
+
 fn pinned_lib() -> Option<PathBuf> {
     let lib = std::env::var_os("FLN_REFERENCE_LIB")
         .map(PathBuf::from)
@@ -452,4 +476,13 @@ fn an_option_this_door_does_not_reproduce_is_refused() {
             assert_eq!(code, 0, "{name}: the pin prints this program");
         }
     }
+}
+
+#[test]
+fn instance_fun_binders_print_as_the_pin() {
+    prints_as_the_pin(
+        "InstanceFunBinders",
+        INSTANCE_FUN_BINDERS,
+        INSTANCE_FUN_BINDERS_EXPECTED,
+    );
 }

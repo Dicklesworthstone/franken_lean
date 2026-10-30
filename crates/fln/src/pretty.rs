@@ -1463,8 +1463,13 @@ impl<'a> Printer<'a> {
                 // with binder types hidden: an explicit binder is its name, an implicit group
                 // `{a b}` and a strict one `⦃a b⦄`. `shouldGroupWithNext` groups a binder
                 // with the next when the binder infos agree and the domains are equal as
-                // terms. An instance binder shows its type, which is not reproduced.
+                // terms. An instance binder is never grouped and shows its type: `[T]`, or
+                // `[x : T]` when it is dependent and its name is printed in the body, which is
+                // known only once the body is printed.
                 let mut group: Vec<String> = Vec::new();
+                // Instance binders: their position in `binders`, name, slot, type and dependence.
+                let mut instances: Vec<(usize, String, usize, Format, bool)> = Vec::new();
+                let mut pieces: Vec<Format> = Vec::new();
                 while let ExprNode::Lam {
                     binder_name: name,
                     binder_type,
@@ -1472,19 +1477,33 @@ impl<'a> Printer<'a> {
                     binder_info,
                 } = body.node()
                 {
-                    if *binder_info == BinderInfo::InstImplicit {
-                        self.unbind_to(depth);
-                        return Err(Unsupported("an instance-implicit `fun` binder"));
-                    }
                     if internal_name(name) {
                         self.unbind_to(depth);
                         return Err(INTERNAL_BINDER);
+                    }
+                    if *binder_info == BinderInfo::InstImplicit {
+                        let type_ = match self
+                            .with_trailing(false, |printer| printer.doc(binder_type, 0))
+                        {
+                            Ok(type_) => type_,
+                            Err(error) => {
+                                self.unbind_to(depth);
+                                return Err(error);
+                            }
+                        };
+                        let slot = self.names.len();
+                        let shown = self.bound_name(name, inner);
+                        self.bind(shown.clone(), binder_type);
+                        instances.push((pieces.len(), shown, slot, type_, inner.has_loose_bvar(0)));
+                        pieces.push(Format::Nil);
+                        body = inner;
+                        continue;
                     }
                     let shown = self.bound_name(name, inner);
                     self.bind(shown.clone(), binder_type);
                     body = inner;
                     if *binder_info == BinderInfo::Default {
-                        binders = binders.then(Format::Line).then(Format::text(shown));
+                        pieces.push(Format::text(shown));
                         continue;
                     }
                     group.push(shown);
@@ -1501,14 +1520,25 @@ impl<'a> Printer<'a> {
                             ("⦃", "⦄")
                         };
                         let names = std::mem::take(&mut group).join(" ");
-                        binders = binders
-                            .then(Format::Line)
-                            .then(Format::text(format!("{open}{names}{close}")));
+                        pieces.push(Format::text(format!("{open}{names}{close}")));
                     }
                 }
                 let trailing = self.trailing && outer == 0;
                 let printed = self.with_trailing(trailing, |printer| printer.doc(body, 0));
+                let named: Vec<bool> = instances
+                    .iter()
+                    .map(|(_, _, slot, _, dependent)| {
+                        *dependent && self.shown.get(*slot) == Some(&true)
+                    })
+                    .collect();
                 self.unbind_to(depth);
+                for ((position, shown, _, type_, _), named) in instances.into_iter().zip(named) {
+                    pieces[position] =
+                        self.binder_group(BinderInfo::InstImplicit, &[shown], type_, !named, None);
+                }
+                for piece in pieces {
+                    binders = binders.then(Format::Line).then(piece);
+                }
                 let fun = Format::text("fun")
                     .then(node(binders.then(Format::text(" =>"))))
                     .then(Format::Line)
