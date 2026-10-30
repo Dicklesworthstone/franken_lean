@@ -220,6 +220,35 @@ captured closures, bit and precision conversions, and native string output. Run
 `fln run`; [the numeric source guide](docs/NATIVE_FLOATS.md) explains dictionary
 selection, exact literal rounding, and the remaining runtime boundaries.
 
+### Imported IR execution and named globals
+
+`fln ir run` executes an explicitly selected closure of pinned-format compiled
+IR on Golem. Supply `--partition contracts/builtin_partition.tsv` with the
+complete verified census, `--entry NAME`, and either explicit `.ir` files or
+`--module NAME --search-path DIR` for transitive module discovery. User
+declarations outside the census must be named with `--user NAME`; native
+externs retain precedence and toolchain API bodies remain refused.
+
+Add `--initialize-globals` when the selected entry depends on named initialized
+globals. It initializes those globals and their initializer dependency closure
+before the entry, in dependency order, with the same VM instruction and stack
+budgets. Each execution has isolated global values. Unselected named
+initializers, including their effects, are not run. This option does not run
+arbitrary module startup: named-global initialization refuses if any supplied
+module contains standalone actions, and phase-sensitive services such as
+`IO.initializing` remain unsupported.
+
+Initialization does not grant host I/O. `--capture-output BYTES` separately
+permits bounded native output capture, including a zero-byte allowance; it
+preserves the accepted prefix if execution stops. An initializer returning an
+IO error or a malformed result stops before the entry and exits with status 3.
+The JSON report retains `value:null` and identifies the global, initializer,
+failure kind (`io-error` or `malformed-result`), and physical result kind in
+`initializationFailure`. The library also retains the original failure object
+for inspection. Successful initialization preserves the ordinary entry result.
+All linked interpreted functions retain Reference provenance, and execution
+confers no kernel admission authority.
+
 ### Sealed declaration capsules
 
 `seal-capsule` reads a directory whose relative paths name modules: for example,

@@ -137,6 +137,51 @@ fn cli_rejects_missing_policy_and_malformed_arguments_before_running() {
     }
 }
 
+#[test]
+fn installed_global_initialization_requires_a_unique_flag_and_verified_policy() {
+    let duplicate = Command::new(env!("CARGO_BIN_EXE_fln"))
+        .args([
+            "ir",
+            "run",
+            "--entry",
+            "Nat.min",
+            "--partition",
+            "p.tsv",
+            "--initialize-globals",
+            "--initialize-globals",
+            "input.ir",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(duplicate.status.code(), Some(2));
+    assert!(duplicate.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&duplicate.stderr)
+            .contains("--initialize-globals may be supplied only once")
+    );
+
+    let root = module_root();
+    let unverified = root.join("unverified.tsv");
+    std::fs::write(&unverified, b"constant_count\t0\n").unwrap();
+    for capture in [vec![], vec!["--capture-output", "0"]] {
+        let mut args = vec!["--initialize-globals", "--nat", "7", "--nat", "3"];
+        args.extend(capture);
+        let output = command("Nat.min", &args, &unverified);
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stdout.is_empty());
+        let error = String::from_utf8(output.stderr).unwrap();
+        assert!(error.contains("\"class\":\"policy-refusal\""), "{error}");
+        assert!(!error.contains("\"outcome\":\"complete\""), "{error}");
+    }
+
+    let help = Command::new(env!("CARGO_BIN_EXE_fln"))
+        .args(["ir", "run", "--help"])
+        .output()
+        .unwrap();
+    assert!(help.status.success());
+    assert!(String::from_utf8_lossy(&help.stdout).contains("--initialize-globals"));
+}
+
 fn module_root() -> PathBuf {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let tick = std::time::SystemTime::now()
@@ -473,4 +518,102 @@ fn installed_capture_runs_pinned_io_preserving_output_raw_return_and_stopped_pre
         "{error}"
     );
     assert!(error.contains("\"data\":\"\",\"byteLength\":0"), "{error}");
+}
+
+#[test]
+fn installed_named_globals_execute_their_dependency_closure_only_when_requested() {
+    let Some(policy) = partition() else {
+        assert!(
+            std::env::var_os("FLN_REQUIRE_REFERENCE").is_none(),
+            "the pinned execution census is required for installed global initialization"
+        );
+        return;
+    };
+    let Some(reference) = live_output_reference() else {
+        eprintln!("SKIP installed named globals: requires the pinned Reference");
+        return;
+    };
+    let root = module_root();
+    let source = format!(
+        "{}\n@[noinline] def cliInitializedNat (n : Nat) : Nat := rememberedCounter + n\n",
+        include_str!("../../fln-olean/fixtures/ir/InitializedGlobalsModule.lean")
+    );
+    std::fs::write(root.join("InitializedGlobalsCli.lean"), source).unwrap();
+    let generated = Command::new(&reference)
+        .current_dir(&root)
+        .args([
+            "-o",
+            "InitializedGlobalsCli.olean",
+            "InitializedGlobalsCli.lean",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        generated.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&generated.stdout),
+        String::from_utf8_lossy(&generated.stderr)
+    );
+    let artifact = root.join("InitializedGlobalsCli.ir");
+    let module =
+        fln::decode_ir_artifact(&std::fs::read(&artifact).unwrap(), 32 * 1024 * 1024).unwrap();
+    let users: Vec<_> = module
+        .decls
+        .iter()
+        .filter_map(|declaration| match declaration {
+            fln_olean::ir::IrDecl::Function { name, .. } => {
+                let text = name.to_display_string();
+                assert_eq!(fln::Name::from_components(text.split('.')), *name);
+                Some(text)
+            }
+            _ => None,
+        })
+        .collect();
+    let run = |arguments: &[&str], capture| {
+        output_command(
+            &artifact,
+            &policy,
+            &users,
+            "cliInitializedNat",
+            arguments,
+            capture,
+        )
+    };
+    let denied = run(&["--nat", "2"], None);
+    assert_eq!(denied.status.code(), Some(3));
+    assert!(denied.stdout.is_empty());
+    assert!(!String::from_utf8_lossy(&denied.stderr).contains("\"outcome\":\"complete\""));
+
+    for capture in [None, Some(0)] {
+        let output = run(&["--initialize-globals", "--nat", "2"], capture);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stderr.is_empty());
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        for expected in [
+            "\"outcome\":\"complete\"",
+            "\"value\":42,",
+            "\"initializeGlobals\":true",
+            "\"initializationFailure\":null",
+            "\"name\":\"initializeSharedCounter\"",
+            "\"name\":\"initializeRememberedCounter\"",
+            "\"producer\":\"reference\"",
+            "\"authority\":false",
+        ] {
+            assert!(stdout.contains(expected), "{expected}: {stdout}");
+        }
+        if capture.is_some() {
+            assert!(
+                stdout.contains("\"byteLength\":0,\"maxBytes\":0"),
+                "{stdout}"
+            );
+        }
+        assert_eq!(
+            run(&["--initialize-globals", "--nat", "2"], capture).stdout,
+            stdout.as_bytes()
+        );
+    }
 }

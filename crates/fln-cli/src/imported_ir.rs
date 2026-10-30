@@ -5,7 +5,8 @@ use fln::imported_ir::modules::{
     LoadedModules, ModuleArtifacts, ModuleLoadError, ModuleLoadLimits,
 };
 use fln::imported_ir::{
-    EntryArgument, IrCapturedOutput, IrExecutionError, IrExecutionLimits, IrNat, VerifiedPartition,
+    EntryArgument, IrCapturedOutput, IrExecutionError, IrExecutionLimits, IrExecutionOptions,
+    IrInitializationFailure, IrNat, VerifiedPartition,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19,6 +20,7 @@ pub(super) struct Arguments {
     search_paths: Vec<PathBuf>,
     max_bytes: usize,
     capture_output: Option<usize>,
+    initialize_globals: bool,
     json: bool,
     vm: fln::VmExecutionLimits,
 }
@@ -50,6 +52,7 @@ pub(super) fn parse(arguments: Vec<OsString>) -> Result<MultiplexerCommand, Usag
     let mut search_paths = Vec::new();
     let mut max_bytes = OLEAN_INSPECT_DEFAULT_MAX_BYTES;
     let mut capture_output = None;
+    let mut initialize_globals = false;
     let mut json = false;
     let mut vm = fln::VmExecutionLimits::user_program();
     let mut options = true;
@@ -102,6 +105,14 @@ pub(super) fn parse(arguments: Vec<OsString>) -> Result<MultiplexerCommand, Usag
             "--string" => values.push(EntryArgument::String(text(value()?, "--string")?)),
             "--erased" => values.push(EntryArgument::Erased),
             "--max-bytes" => max_bytes = parse_byte_limit(&value()?)?,
+            "--initialize-globals" => {
+                if initialize_globals {
+                    return Err(UsageError(
+                        "--initialize-globals may be supplied only once".to_owned(),
+                    ));
+                }
+                initialize_globals = true;
+            }
             "--capture-output" => {
                 if capture_output.is_some() {
                     return Err(UsageError(
@@ -160,6 +171,7 @@ pub(super) fn parse(arguments: Vec<OsString>) -> Result<MultiplexerCommand, Usag
         search_paths,
         max_bytes,
         capture_output,
+        initialize_globals,
         json,
         vm,
     }))
@@ -368,6 +380,20 @@ fn captured_output_json(output: &IrCapturedOutput) -> String {
     )
 }
 
+fn initialization_failure_json(failure: &IrInitializationFailure) -> String {
+    format!(
+        "{{\"declaration\":{},\"initializer\":{},\"kind\":{},\"resultKind\":{}}}",
+        json_string(&failure.declaration.to_display_string()),
+        json_string(&failure.initializer.to_display_string()),
+        json_string(if failure.malformed {
+            "malformed-result"
+        } else {
+            "io-error"
+        }),
+        json_string(&vm_value_kind_name(fln::vm_value_kind(&failure.result))),
+    )
+}
+
 pub(super) fn run(arguments: Arguments) -> MultiplexerOutput {
     stdout_capture::json(arguments.json, "fln.ir-run/1", || run_uncaptured(arguments))
 }
@@ -424,25 +450,18 @@ fn run_uncaptured(arguments: Arguments) -> MultiplexerOutput {
         missing_ir = loaded.missing_ir_modules().to_vec();
         modules = loaded.into_modules();
     }
-    let compiled = match arguments.capture_output {
-        Some(max_bytes) => fln::imported_ir::compile_with_captured_output(
-            &modules,
-            &arguments.entry,
-            &arguments.values,
-            &policy,
-            &arguments.users,
-            IrExecutionLimits::default(),
-            max_bytes,
-        ),
-        None => fln::imported_ir::compile(
-            &modules,
-            &arguments.entry,
-            &arguments.values,
-            &policy,
-            &arguments.users,
-            IrExecutionLimits::default(),
-        ),
-    };
+    let compiled = fln::imported_ir::compile_with_options(
+        &modules,
+        &arguments.entry,
+        &arguments.values,
+        &policy,
+        &arguments.users,
+        IrExecutionOptions {
+            limits: IrExecutionLimits::default(),
+            capture_output_bytes: arguments.capture_output,
+            initialize_globals: arguments.initialize_globals,
+        },
+    );
     let compiled = match compiled {
         Ok(compiled) => compiled,
         Err(error) => return preparation_failure(error, arguments.json),
@@ -537,6 +556,18 @@ fn run_uncaptured(arguments: Arguments) -> MultiplexerOutput {
                 .collect::<Vec<_>>()
                 .join(",")
         };
+        let initialization_fields = if arguments.initialize_globals {
+            format!(
+                ",\"initializeGlobals\":true,\"initializationFailure\":{}",
+                execution
+                    .initialization_failure
+                    .as_ref()
+                    .map(initialization_failure_json)
+                    .unwrap_or_else(|| "null".to_owned())
+            )
+        } else {
+            String::new()
+        };
         let output_fields = execution
             .captured_output
             .as_ref()
@@ -551,7 +582,7 @@ fn run_uncaptured(arguments: Arguments) -> MultiplexerOutput {
                 )
             });
         format!(
-            "{{\"schema\":\"fln.ir-run/1\",\"outcome\":{},\"authority\":false,\"engine\":\"golem\",\"entry\":{},\"value\":{},\"detail\":{},\"steps\":{},\"peakStackDepth\":{},\"linkedReferenceFunctions\":[{}],\"nativeExterns\":[{}],\"loadedModules\":[{}],\"missingIrModules\":[{}],\"artifactBytes\":{}{}}}\n",
+            "{{\"schema\":\"fln.ir-run/1\",\"outcome\":{},\"authority\":false,\"engine\":\"golem\",\"entry\":{},\"value\":{},\"detail\":{},\"steps\":{},\"peakStackDepth\":{},\"linkedReferenceFunctions\":[{}],\"nativeExterns\":[{}],\"loadedModules\":[{}],\"missingIrModules\":[{}],\"artifactBytes\":{}{}{}}}\n",
             json_string(outcome),
             json_string(&arguments.entry.to_display_string()),
             value
@@ -572,6 +603,7 @@ fn run_uncaptured(arguments: Arguments) -> MultiplexerOutput {
             names(&loaded_names),
             names(&missing_ir),
             bytes_read,
+            initialization_fields,
             output_fields
         )
     } else {
@@ -590,6 +622,22 @@ fn run_uncaptured(arguments: Arguments) -> MultiplexerOutput {
                     module.to_display_string()
                 ));
             }
+        }
+        if arguments.initialize_globals {
+            text.push_str("global initialization: selected named dependency closure\n");
+        }
+        if let Some(failure) = &execution.initialization_failure {
+            text.push_str(&format!(
+                "initializer failure: {} (global: {}, kind: {}, result kind: {})\n",
+                failure.initializer.to_display_string(),
+                failure.declaration.to_display_string(),
+                if failure.malformed {
+                    "malformed-result"
+                } else {
+                    "io-error"
+                },
+                vm_value_kind_name(fln::vm_value_kind(&failure.result)),
+            ));
         }
         if let Some(value) = value {
             text.push_str(&format!("value: {value}\n"));
@@ -744,6 +792,101 @@ mod tests {
         assert_eq!(parsed.vm.max_steps, 42);
         assert_eq!(parsed.paths, vec![PathBuf::from("input.ir")]);
         assert_eq!(parsed.capture_output, None);
+        assert!(!parsed.initialize_globals);
+    }
+
+    #[test]
+    fn global_initialization_is_explicit_unique_and_composes_with_both_input_modes() {
+        for tail in [
+            vec!["input.ir"],
+            vec!["--module", "User.Main", "--search-path", "lib"],
+        ] {
+            let argv = [
+                "--entry",
+                "User.main",
+                "--partition",
+                "p.tsv",
+                "--initialize-globals",
+                "--capture-output",
+                "0",
+                "--erased",
+            ]
+            .into_iter()
+            .chain(tail)
+            .map(OsString::from)
+            .collect();
+            let MultiplexerCommand::IrRun(args) = parse(argv).unwrap() else {
+                panic!("IR run parser");
+            };
+            assert!(args.initialize_globals);
+            assert_eq!(args.capture_output, Some(0));
+            assert_eq!(args.values, [EntryArgument::Erased]);
+        }
+
+        let duplicate = [
+            "--entry",
+            "User.main",
+            "--partition",
+            "p.tsv",
+            "--initialize-globals",
+            "--initialize-globals",
+            "input.ir",
+        ];
+        let error = parse(duplicate.map(OsString::from).to_vec()).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "--initialize-globals may be supplied only once"
+        );
+
+        let literal_path = [
+            "--entry",
+            "User.main",
+            "--partition",
+            "p.tsv",
+            "--",
+            "--initialize-globals",
+        ];
+        let MultiplexerCommand::IrRun(args) =
+            parse(literal_path.map(OsString::from).to_vec()).unwrap()
+        else {
+            panic!("IR run parser");
+        };
+        assert!(!args.initialize_globals);
+        assert_eq!(args.paths, [PathBuf::from("--initialize-globals")]);
+    }
+
+    #[test]
+    fn initialization_failure_report_distinguishes_io_errors_from_malformed_results() {
+        use fln_rt::obj::Obj;
+
+        for (malformed, result, kind, result_kind) in [
+            (
+                false,
+                Obj::mk_ctor(1, vec![Obj::mk_string("stopped"), Obj::mk_nat(0)], &[]),
+                "io-error",
+                "constructor:1",
+            ),
+            (true, Obj::mk_nat(7), "malformed-result", "scalar"),
+        ] {
+            let failure = IrInitializationFailure {
+                declaration: name("User.global"),
+                initializer: fln::Name::str(name("User"), "quoted\"initializer\n"),
+                result,
+                malformed,
+            };
+            let json = initialization_failure_json(&failure);
+            assert!(json.contains("\"declaration\":\"User.global\""), "{json}");
+            assert!(
+                json.contains("\"initializer\":\"User.quoted\\\"initializer\\n\""),
+                "{json}"
+            );
+            assert!(json.contains(&format!("\"kind\":\"{kind}\"")), "{json}");
+            assert!(
+                json.contains(&format!("\"resultKind\":\"{result_kind}\"")),
+                "{json}"
+            );
+            assert!(!json.contains('\n'), "{json}");
+        }
     }
 
     #[test]
