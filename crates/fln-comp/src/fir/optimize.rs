@@ -695,6 +695,7 @@ fn movable(program: &Program, operation: &Operation) -> bool {
         | Operation::Unbox { .. }
         | Operation::Ctor { .. }
         | Operation::CtorTest { .. }
+        | Operation::CtorLayoutTest { .. }
         | Operation::ScalarTagTest { .. }
         | Operation::Array { .. }
         | Operation::Closure { .. } => true,
@@ -793,6 +794,7 @@ fn drop_dead(program: &Program, function: &mut Function) -> bool {
                         | Operation::Unbox { .. }
                         | Operation::Ctor { .. }
                         | Operation::CtorTest { .. }
+                        | Operation::CtorLayoutTest { .. }
                         | Operation::ScalarTagTest { .. }
                         | Operation::Array { .. }
                         | Operation::Closure { .. } => true,
@@ -824,6 +826,7 @@ fn rename_operation(operation: &mut Operation, rename: &impl Fn(ValueId) -> Valu
         | Operation::Box(value)
         | Operation::Unbox { value, .. }
         | Operation::CtorTest { value, .. }
+        | Operation::CtorLayoutTest { value, .. }
         | Operation::ScalarTagTest { value, .. }
         | Operation::Project { value, .. }
         | Operation::ProjectObject { value, .. }

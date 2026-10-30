@@ -37,8 +37,9 @@ pub use optimize::optimize;
 /// version 18 adds an erased callable result contract restricted to ABI values;
 /// version 19 projects object fields whose constructor layout is known at runtime;
 /// version 20 supports immutable packed integer construction and projection;
-/// version 21 adds exact tagged-scalar tests over borrowed ABI values.
-pub const FIR_SCHEMA_VERSION: u16 = 21;
+/// version 21 adds exact tagged-scalar tests over borrowed ABI values;
+/// version 22 checks complete constructor allocation layouts over ABI values.
+pub const FIR_SCHEMA_VERSION: u16 = 22;
 
 /// Explicit ceilings for FIR validation work.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -438,6 +439,13 @@ pub enum Operation {
         constructor: ConstructorId,
         value: ValueId,
     },
+    /// Total borrowed discrimination of a constructor's tag, object slots and
+    /// complete aligned allocation size. Unlike `CtorTest`, this accepts an
+    /// erased ABI value and checks the scalar extent as well.
+    CtorLayoutTest {
+        constructor: ConstructorId,
+        value: ValueId,
+    },
     /// Total tagged-scalar discrimination. Heap values are a nonmatch, without
     /// a numeric conversion, allocation, or assumption about their layout.
     ScalarTagTest {
@@ -538,6 +546,7 @@ impl Operation {
             | Self::ProjectObject { value, .. }
             | Self::ProjectScalar { value, .. }
             | Self::CtorTest { value, .. }
+            | Self::CtorLayoutTest { value, .. }
             | Self::ScalarTagTest { value, .. }
             | Self::CheckSystemValue { module_name: value } => OperationReads {
                 first: Some(*value),
@@ -1260,6 +1269,11 @@ pub enum ValidationError {
         projection: ProjectionId,
     },
     ConstructorTestOperandType {
+        function: FunctionId,
+        block: BlockId,
+        actual: ValueType,
+    },
+    ConstructorLayoutTestOperandType {
         function: FunctionId,
         block: BlockId,
         actual: ValueType,
@@ -2044,6 +2058,16 @@ impl fmt::Display for ValidationError {
             } => write!(
                 formatter,
                 "function {} block {} constructor test received {actual:?}",
+                function.get(),
+                block.get()
+            ),
+            Self::ConstructorLayoutTestOperandType {
+                function,
+                block,
+                actual,
+            } => write!(
+                formatter,
+                "function {} block {} constructor layout test expects Abi, got {actual:?}",
                 function.get(),
                 block.get()
             ),
@@ -2977,7 +3001,8 @@ fn infer_operation_type(
             }
             Ok(ValueType::Constructor)
         }
-        Operation::CtorTest { constructor, value } => {
+        Operation::CtorTest { constructor, value }
+        | Operation::CtorLayoutTest { constructor, value } => {
             if constructor
                 .index()
                 .and_then(|i| program.constructors.get(i))
@@ -2990,7 +3015,15 @@ fn infer_operation_type(
                 });
             }
             let actual = value_type(function, block, value_types, *value)?;
-            if actual != ValueType::Constructor {
+            if matches!(operation, Operation::CtorLayoutTest { .. }) {
+                if actual != ValueType::Abi {
+                    return Err(ValidationError::ConstructorLayoutTestOperandType {
+                        function: function.id,
+                        block: block.id,
+                        actual,
+                    });
+                }
+            } else if actual != ValueType::Constructor {
                 return Err(ValidationError::ConstructorTestOperandType {
                     function: function.id,
                     block: block.id,
@@ -4076,6 +4109,30 @@ fn lower_single_binding(
                 expected_fields,
             })
         }
+        Operation::CtorLayoutTest { constructor, value } => {
+            let declaration = constructor
+                .index()
+                .and_then(|i| program.constructors.get(i))
+                .ok_or(LoweringError::InternalInvariant {
+                    reason: "validated constructor layout test disappeared",
+                })?;
+            Ok(flbc::Instruction::CtorLayoutTest {
+                dst,
+                src: lower_register(*value)?,
+                expected_tag: declaration.tag,
+                expected_fields: u16::try_from(declaration.fields.len()).map_err(|_| {
+                    LoweringError::WidthOverflow {
+                        field: "constructor layout object slots",
+                        observed: declaration.fields.len(),
+                    }
+                })?,
+                expected_scalar_bytes: u16::try_from(declaration.static_scalar_bytes.len())
+                    .map_err(|_| LoweringError::WidthOverflow {
+                        field: "constructor layout scalar bytes",
+                        observed: declaration.static_scalar_bytes.len(),
+                    })?,
+            })
+        }
         Operation::ScalarTagTest { value, tag } => Ok(flbc::Instruction::ScalarTagTest {
             dst,
             src: lower_register(*value)?,
@@ -4403,6 +4460,14 @@ fn write_operation(output: &mut impl fmt::Write, operation: &Operation) -> fmt::
         }
         Operation::CtorTest { constructor, value } => {
             write!(output, "ctor-test c{} v{}", constructor.get(), value.get())
+        }
+        Operation::CtorLayoutTest { constructor, value } => {
+            write!(
+                output,
+                "ctor-layout-test c{} v{}",
+                constructor.get(),
+                value.get()
+            )
         }
         Operation::ScalarTagTest { value, tag } => {
             write!(output, "scalar-tag-test v{} tag={tag}", value.get())
@@ -5466,7 +5531,7 @@ mod tests {
         assert_eq!(
             validated.canonical_text(),
             concat!(
-                "fir/21 entry=f0\n",
+                "fir/22 entry=f0\n",
                 "function f0 params=[] ownership=[] result=nat result_ownership=scalar\n",
                 " block b0\n",
                 "  v0:nat = nat 41\n",

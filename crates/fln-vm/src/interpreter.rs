@@ -2489,6 +2489,32 @@ fn run(
                 )?;
                 advance(current_frame_mut(&mut stack)?)?;
             }
+            Instruction::CtorLayoutTest {
+                dst,
+                src,
+                expected_tag,
+                expected_fields,
+                expected_scalar_bytes,
+            } => {
+                let matches = {
+                    let value = register(current_frame(&stack)?, src)?;
+                    let word = std::mem::size_of::<usize>();
+                    let expected_bytes = (word
+                        + usize::from(expected_fields) * word
+                        + usize::from(expected_scalar_bytes))
+                    .div_ceil(word)
+                        * word;
+                    value_kind(value) == ValueKind::Ctor(expected_tag)
+                        && u16::from(value.header().other) == expected_fields
+                        && value.byte_size() == expected_bytes
+                };
+                set_register(
+                    current_frame_mut(&mut stack)?,
+                    dst,
+                    Obj::mk_nat(usize::from(matches)),
+                )?;
+                advance(current_frame_mut(&mut stack)?)?;
+            }
             Instruction::ScalarTagTest {
                 dst,
                 src,
