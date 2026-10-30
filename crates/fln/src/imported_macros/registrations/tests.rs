@@ -261,6 +261,231 @@ fn input() -> Syntax {
     Syntax::node(name("choice"), vec![Syntax::atom(SourceInfo::None, "α")])
 }
 
+fn peeling_registry() -> RegisteredMacros {
+    let module = checked("User", &[owner("User.peel")], &[]);
+    let rows = journal(&[("peel", "User.peel", None)]);
+    let mut peel = function("User.peel", Behavior::Identity);
+    let IrDecl::Function { body, .. } = &mut peel else {
+        unreachable!()
+    };
+    body.stmts = vec![
+        bind(3, IrExpr::Lit(IrLit::Num(IrNat::Small(0)))),
+        bind(
+            4,
+            IrExpr::Fap {
+                function: name("Lean.Syntax.getArg"),
+                args: vec![IrArg::Var(0), IrArg::Var(3)],
+            },
+        ),
+        bind(5, ctor(layout::RESULT_OK, "EStateM.Result.ok", &[4, 2])),
+    ];
+    body.terminal = Box::new(IrTerminal::Ret(IrArg::Var(5)));
+    prepare(
+        &[MacroRegistrationModule {
+            checked: &module,
+            extensions: &rows,
+        }],
+        &code(vec![peel]),
+    )
+}
+
+fn peel(child: Syntax) -> Syntax {
+    Syntax::node(name("peel"), vec![child])
+}
+
+#[test]
+fn tree_expands_roots_before_children_revisits_results_and_threads_sibling_state() {
+    let registry = peeling_registry();
+    let source = SourceText::from_utf8(b"x").unwrap();
+    let position = fln_syntax::source::BytePos(0);
+    let info = SourceInfo::Synthetic {
+        pos: position,
+        end_pos: fln_syntax::source::BytePos(1),
+        canonical: true,
+    };
+    let atom = Syntax::atom(info, "x");
+    let tree = Syntax::Node {
+        info,
+        kind: name("container"),
+        args: vec![peel(peel(atom.clone())), peel(atom.clone())],
+    };
+    let expected = Syntax::Node {
+        info,
+        kind: name("container"),
+        args: vec![atom.clone(), atom],
+    };
+    let execute = |limits| {
+        registry.expand_tree(
+            &tree,
+            &source,
+            &context(),
+            MacroState {
+                macro_scope: 17,
+                ..MacroState::default()
+            },
+            limits,
+            None,
+        )
+    };
+    let report = execute(MacroTreeLimits::default());
+    let Outcome::Complete(Ok(MacroTreeResult::Expanded { syntax, state })) = &report.outcome else {
+        panic!("{report:?}")
+    };
+    assert_eq!(syntax, &expected);
+    assert_ne!(
+        syntax, &tree,
+        "an unchanged or one-root-only result is wrong"
+    );
+    assert_eq!(state.macro_scope, 20);
+    assert_eq!(
+        state.expanded_macro_declarations,
+        vec![name("User.peel"); 3]
+    );
+    assert_eq!(report.attempts.len(), 3);
+    assert!(report.attempts.iter().all(|attempt| {
+        attempt
+            .native_functions
+            .iter()
+            .any(|id| id == "mirror:Lean.Syntax.getArg")
+    }));
+    let steps = report.completed_vm_usage.steps;
+    assert_eq!(
+        steps,
+        report
+            .attempts
+            .iter()
+            .map(|attempt| attempt.vm_usage.unwrap().steps)
+            .sum()
+    );
+    let mut exact = MacroTreeLimits::default();
+    exact.dispatch.execution.vm.max_steps = steps;
+    assert!(matches!(
+        execute(exact).outcome,
+        Outcome::Complete(Ok(MacroTreeResult::Expanded { .. }))
+    ));
+    exact.dispatch.execution.vm.max_steps -= 1;
+    let short = execute(exact);
+    assert!(
+        matches!(short.outcome, Outcome::Inconclusive(_)),
+        "{short:?}"
+    );
+    let mut short = MacroTreeLimits::default();
+    short.dispatch.max_attempts = 2;
+    let stopped = execute(short);
+    assert!(matches!(stopped.outcome, Outcome::Inconclusive(_)));
+    assert_eq!(stopped.attempts.len(), 2);
+    assert!(
+        matches!(execute(MacroTreeLimits::default()).outcome, Outcome::Complete(Ok(MacroTreeResult::Expanded { syntax, .. })) if syntax == expected)
+    );
+}
+
+#[test]
+fn tree_skips_tactic_blocks_and_leaves_and_checks_macro_free_depth_and_visits() {
+    let registry = peeling_registry();
+    let source = SourceText::from_utf8(b"").unwrap();
+    let tactic = Syntax::node(
+        name("Lean.Parser.Term.byTactic"),
+        vec![peel(Syntax::Missing)],
+    );
+    let execute = |tree: &Syntax, context: &MacroContext, limits| {
+        registry.expand_tree(tree, &source, context, MacroState::default(), limits, None)
+    };
+    let report = execute(&tactic, &context(), MacroTreeLimits::default());
+    assert!(
+        matches!(report.outcome, Outcome::Complete(Ok(MacroTreeResult::Expanded { syntax, .. })) if syntax == tactic)
+    );
+    assert!(report.attempts.is_empty());
+    let tree = Syntax::node(
+        name("outer"),
+        vec![Syntax::node(name("inner"), vec![Syntax::Missing])],
+    );
+    let shallow = MacroContext {
+        max_recursion_depth: 1,
+        ..context()
+    };
+    assert!(matches!(
+        execute(&tree, &shallow, MacroTreeLimits::default()).outcome,
+        Outcome::Inconclusive(_)
+    ));
+    let short = MacroTreeLimits {
+        max_visits: 2,
+        ..MacroTreeLimits::default()
+    };
+    assert!(matches!(
+        execute(&tree, &context(), short).outcome,
+        Outcome::Inconclusive(_)
+    ));
+    assert!(
+        matches!(execute(&tree, &context(), MacroTreeLimits::default()).outcome, Outcome::Complete(Ok(MacroTreeResult::Expanded { syntax, .. })) if syntax == tree)
+    );
+}
+
+#[test]
+fn tree_self_expansion_diagnostics_malformed_output_and_cancellation_do_not_return_partial_results()
+{
+    let source = SourceText::from_utf8(b"").unwrap();
+    struct Cancel;
+    impl CancellationProbe for Cancel {
+        fn is_cancelled(&self) -> bool {
+            true
+        }
+    }
+    for behavior in [
+        Behavior::Identity,
+        Behavior::Diagnostic,
+        Behavior::Malformed,
+    ] {
+        let module = checked("User", &[owner("User.rule")], &[]);
+        let rows = journal(&[("choice", "User.rule", None)]);
+        let registry = prepare(
+            &[MacroRegistrationModule {
+                checked: &module,
+                extensions: &rows,
+            }],
+            &code(vec![function("User.rule", behavior)]),
+        );
+        let limits = MacroTreeLimits {
+            dispatch: MacroDispatchLimits {
+                max_attempts: 3,
+                ..MacroDispatchLimits::default()
+            },
+            ..MacroTreeLimits::default()
+        };
+        let report = registry.expand_tree(
+            &input(),
+            &source,
+            &context(),
+            MacroState::default(),
+            limits,
+            None,
+        );
+        match report.outcome {
+            Outcome::Inconclusive(_) => assert_eq!(report.attempts.len(), 3),
+            Outcome::Complete(Ok(MacroTreeResult::Error {
+                reference, message, ..
+            })) => {
+                assert_eq!(reference, input());
+                assert_eq!(message, "λ\0diagnostic");
+                assert_eq!(report.attempts.len(), 1);
+            }
+            Outcome::Complete(Err(MacroExecutionError::Conversion(_))) => {
+                assert_eq!(report.attempts.len(), 1)
+            }
+            other => panic!("{other:?}"),
+        }
+        let cancelled = registry.expand_tree(
+            &input(),
+            &source,
+            &context(),
+            MacroState::default(),
+            limits,
+            Some(&Cancel),
+        );
+        assert!(matches!(cancelled.outcome, Outcome::Inconclusive(_)));
+        assert!(cancelled.attempts.is_empty());
+    }
+}
+
 fn context() -> MacroContext {
     MacroContext {
         quotation_context: name("Main"),

@@ -125,6 +125,93 @@ fn live_metadata_drives_ordered_macro_dispatch_state_diagnostics_and_authority()
         MacroRegistryLimits::default(),
     )
     .unwrap_or_else(|error| panic!("{error}; {dir:?}"));
+
+    // This is the same unchanged imported macro code as above, now used through
+    // the recursive consumer. The outer macro selects a still-unexpanded child;
+    // only then does that result select its own branch. A sibling checks that
+    // traversal order and the cumulative state survive the join.
+    let choice = |a, b| {
+        Syntax::node(
+            name("registeredChoice"),
+            vec![
+                Syntax::atom(SourceInfo::None, "registeredChoice%"),
+                a,
+                Syntax::atom(SourceInfo::None, ","),
+                b,
+            ],
+        )
+    };
+    let branch = |text| Syntax::node(name("branch"), vec![Syntax::atom(SourceInfo::None, text)]);
+    let nested = Syntax::node(
+        name("container"),
+        vec![
+            choice(
+                Syntax::atom(SourceInfo::None, "plain"),
+                choice(branch("ten"), branch("twenty")),
+            ),
+            choice(branch("thirty"), branch("forty")),
+        ],
+    );
+    let expected_tree = Syntax::node(name("container"), vec![branch("ten"), branch("thirty")]);
+    let tree_report = registry.expand_tree(
+        &nested,
+        &SourceText::from_utf8(b"").unwrap(),
+        &context(),
+        MacroState {
+            macro_scope: 17,
+            ..MacroState::default()
+        },
+        MacroTreeLimits::default(),
+        None,
+    );
+    assert!(
+        matches!(&tree_report.outcome, Outcome::Complete(Ok(MacroTreeResult::Expanded { syntax, state }))
+        if syntax == &expected_tree && state.macro_scope == 28
+        && state.expanded_macro_declarations == [expected_order[2].clone(), expected_order[2].clone(), expected_order[1].clone()]),
+        "{tree_report:?}; {dir:?}"
+    );
+    assert_eq!(tree_report.attempts.len(), 8);
+    assert_ne!(
+        nested, expected_tree,
+        "negative control: skipping the recursive consumer changes the tree"
+    );
+
+    let oracle = r#"import Lean
+import NativeRegisteredMacroModule
+open Lean Elab Command
+private def branch (text : String) : Syntax := .node .none `branch #[.atom .none text]
+private def choice (a b : Syntax) : Syntax :=
+  .node .none `registeredChoice #[.atom .none "registeredChoice%", a, .atom .none ",", b]
+run_cmd do
+  let input := Syntax.node .none `container #[
+    choice (.atom .none "plain") (choice (branch "ten") (branch "twenty")),
+    choice (branch "thirty") (branch "forty")]
+  let expected := Syntax.node .none `container #[branch "ten", branch "thirty"]
+  let actual ← liftMacroM (expandMacros input)
+  if reprStr actual != reprStr expected then throwError "recursive expansion mismatch: {repr actual}"
+  if reprStr actual == reprStr input then throwError "wrong-expansion control survived"
+  logInfo "recursive tree identical; unchanged-tree control differs"
+"#;
+    std::fs::write(dir.join("RecursiveOracle.lean"), oracle).unwrap();
+    let oracle_result = Command::new(&reference)
+        .current_dir(&dir)
+        .env("LEAN_PATH", &dir)
+        .arg("RecursiveOracle.lean")
+        .output()
+        .unwrap();
+    std::fs::write(dir.join("recursive-oracle.stdout"), &oracle_result.stdout).unwrap();
+    std::fs::write(dir.join("recursive-oracle.stderr"), &oracle_result.stderr).unwrap();
+    assert!(
+        oracle_result.status.success(),
+        "{dir:?}: {}{}",
+        String::from_utf8_lossy(&oracle_result.stdout),
+        String::from_utf8_lossy(&oracle_result.stderr)
+    );
+    assert_eq!(
+        oracle_result.stdout,
+        b"recursive tree identical; unchanged-tree control differs\n"
+    );
+    assert!(oracle_result.stderr.is_empty());
     assert_eq!(
         registry.declarations(&kind).cloned().collect::<Vec<_>>(),
         expected_order

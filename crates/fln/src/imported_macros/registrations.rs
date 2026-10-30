@@ -375,6 +375,198 @@ impl RegisteredMacros {
         report
     }
 
+    /// The pin's default `Init.Meta.Defs.expandMacros` traversal: expand a node
+    /// at its root first, revisit a successful result, otherwise visit children
+    /// left to right. Leaves and `Lean.Parser.Term.byTactic` are left alone.
+    /// Tactic alternatives require the tactic evaluator's backtracking semantics.
+    ///
+    /// This expands only this registry's supplied registration subset. It does
+    /// not install parsers or claim that every macro in an environment is known.
+    /// Attempts and VM steps are shared across the whole tree. Recursion depth
+    /// comes from `context`; `max_visits` additionally bounds repeated results
+    /// and macro-free trees. Stops publish neither a partial tree nor state.
+    pub fn expand_tree(
+        &self,
+        input: &Syntax,
+        source: &SourceText,
+        context: &MacroContext,
+        state: MacroState,
+        limits: MacroTreeLimits,
+        cancellation: Option<&dyn CancellationProbe>,
+    ) -> MacroTreeDispatch {
+        let mut report = MacroDispatch {
+            outcome: Outcome::Complete(Ok(RegisteredExpansion::Unsupported {
+                state: MacroState::default(),
+            })),
+            attempts: Vec::new(),
+            completed_vm_usage: ExecutionUsage {
+                steps: 0,
+                system_polls: 0,
+                peak_stack_depth: 0,
+            },
+        };
+        let outcome = self.expand_tree_impl(
+            input,
+            source,
+            context,
+            state,
+            limits,
+            cancellation,
+            &mut report,
+        );
+        MacroTreeDispatch {
+            outcome,
+            attempts: report.attempts,
+            completed_vm_usage: report.completed_vm_usage,
+        }
+    }
+
+    fn expand_tree_impl(
+        &self,
+        input: &Syntax,
+        source: &SourceText,
+        context: &MacroContext,
+        mut state: MacroState,
+        limits: MacroTreeLimits,
+        cancellation: Option<&dyn CancellationProbe>,
+        report: &mut MacroDispatch,
+    ) -> Outcome<Result<MacroTreeResult, MacroExecutionError>> {
+        if cancellation.is_some_and(CancellationProbe::is_cancelled) {
+            return Outcome::Inconclusive(Inconclusive::cancelled("before macro tree conversion"));
+        }
+        // Validate and bound the complete input before cloning it, including a
+        // macro-free tree. A root-only invocation would never inspect its leaves.
+        if let Err(error) = super::syntax::inject(input, source, limits.dispatch.execution.syntax) {
+            return conversion_outcome(error).map_complete(|result| {
+                result.map(|_| unreachable!("failed input conversion cannot produce a tree"))
+            });
+        }
+        enum Task {
+            Visit(Syntax, u64),
+            Finish(Syntax, usize),
+        }
+        let mut tasks = vec![Task::Visit(input.clone(), context.current_recursion_depth)];
+        let mut built = Vec::new();
+        let mut visits = 0u64;
+        let tactic = Name::from_components(["Lean", "Parser", "Term", "byTactic"]);
+        while let Some(task) = tasks.pop() {
+            if cancellation.is_some_and(CancellationProbe::is_cancelled) {
+                return Outcome::Inconclusive(Inconclusive::cancelled("macro tree traversal"));
+            }
+            match task {
+                Task::Finish(mut parent, start) => {
+                    let Syntax::Node { args, .. } = &mut parent else {
+                        unreachable!("only nodes have a finish task")
+                    };
+                    *args = built.split_off(start);
+                    built.push(parent);
+                }
+                Task::Visit(mut syntax, depth) => {
+                    if visits >= limits.max_visits {
+                        return stopped(
+                            "macro tree visits",
+                            limits.max_visits,
+                            visits.saturating_add(1),
+                        );
+                    }
+                    visits += 1;
+                    let Some(kind) = syntax.kind() else {
+                        built.push(syntax);
+                        continue;
+                    };
+                    if *kind == tactic {
+                        built.push(syntax);
+                        continue;
+                    }
+                    let mut current = context.clone();
+                    current.current_recursion_depth = depth;
+                    match self.expand(
+                        &syntax,
+                        source,
+                        &current,
+                        state,
+                        limits.dispatch,
+                        cancellation,
+                        report,
+                    ) {
+                        Outcome::Complete(Ok(RegisteredExpansion::Expanded {
+                            syntax: next,
+                            state: successor,
+                            ..
+                        })) => {
+                            state = successor;
+                            tasks.push(Task::Visit(next, depth));
+                            continue;
+                        }
+                        Outcome::Complete(Ok(RegisteredExpansion::Unsupported {
+                            state: successor,
+                        })) => {
+                            state = successor;
+                        }
+                        Outcome::Complete(Ok(RegisteredExpansion::Error {
+                            module,
+                            declaration,
+                            reference,
+                            message,
+                            state,
+                        })) => {
+                            return Outcome::Complete(Ok(MacroTreeResult::Error {
+                                module,
+                                declaration,
+                                reference,
+                                message,
+                                state,
+                            }));
+                        }
+                        Outcome::Complete(Err(error)) => return Outcome::Complete(Err(error)),
+                        Outcome::Inconclusive(reason) => return Outcome::Inconclusive(reason),
+                        Outcome::InternalFault(fault) => return Outcome::InternalFault(fault),
+                    }
+                    if depth >= context.max_recursion_depth {
+                        return Outcome::Inconclusive(
+                            Inconclusive::resource(ResourceUsage {
+                                reason: ResourceReason::RecursionDepth {
+                                    limit: context.max_recursion_depth,
+                                },
+                                allowed: context.max_recursion_depth,
+                                observed: depth.saturating_add(1),
+                            })
+                            .with_progress("macro tree children"),
+                        );
+                    }
+                    let Syntax::Node { args, .. } = &mut syntax else {
+                        unreachable!("Syntax::kind is present only on nodes")
+                    };
+                    if tasks.try_reserve(args.len().saturating_add(1)).is_err()
+                        || built.try_reserve(args.len().saturating_add(1)).is_err()
+                    {
+                        return Outcome::Inconclusive(Inconclusive::dependency_unavailable(
+                            "host allocation for macro tree traversal",
+                        ));
+                    }
+                    let children = std::mem::take(args);
+                    tasks.push(Task::Finish(syntax, built.len()));
+                    tasks.extend(
+                        children
+                            .into_iter()
+                            .rev()
+                            .map(|child| Task::Visit(child, depth + 1)),
+                    );
+                }
+            }
+        }
+        let syntax = built.pop().expect("one completed root");
+        // Individual VM results are bounded already, but siblings together can
+        // exceed that ceiling. Validate the assembled result before publishing.
+        if let Err(error) = super::syntax::inject(&syntax, source, limits.dispatch.execution.syntax)
+        {
+            return conversion_outcome(error).map_complete(|result| {
+                result.map(|_| unreachable!("failed output conversion cannot produce a tree"))
+            });
+        }
+        Outcome::Complete(Ok(MacroTreeResult::Expanded { syntax, state }))
+    }
+
     fn expand(
         &self,
         input: &Syntax,
@@ -509,6 +701,43 @@ impl RegisteredMacros {
 pub struct MacroDispatchLimits {
     pub max_attempts: u64,
     pub execution: MacroLimits,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct MacroTreeLimits {
+    pub dispatch: MacroDispatchLimits,
+    pub max_visits: u64,
+}
+
+impl Default for MacroTreeLimits {
+    fn default() -> Self {
+        Self {
+            dispatch: MacroDispatchLimits::default(),
+            max_visits: 1_000_000,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MacroTreeResult {
+    Expanded {
+        syntax: Syntax,
+        state: MacroState,
+    },
+    Error {
+        module: Name,
+        declaration: Name,
+        reference: Syntax,
+        message: String,
+        state: MacroState,
+    },
+}
+
+#[derive(Debug)]
+pub struct MacroTreeDispatch {
+    pub outcome: Outcome<Result<MacroTreeResult, MacroExecutionError>>,
+    pub attempts: Vec<MacroAttempt>,
+    pub completed_vm_usage: ExecutionUsage,
 }
 
 impl Default for MacroDispatchLimits {
