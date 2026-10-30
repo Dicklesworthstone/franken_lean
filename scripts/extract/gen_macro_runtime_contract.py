@@ -53,11 +53,12 @@ def generate(lean):
     if epoch is None:
         raise ValueError("SUITE.lock has no Lean Reference commit")
     pin = epoch.group(1)
-    actual = subprocess.run([lean, "--githash"], check=True, capture_output=True, text=True)
+    actual = subprocess.run([lean, "--githash"], check=True, capture_output=True, text=True,
+                            timeout=30)
     if actual.stdout.strip() != pin:
         raise ValueError(f"Reference commit mismatch: expected {pin}, got {actual.stdout.strip()}")
     compiled = subprocess.run([lean, "--stdin"], input=FIXTURE.read_text(),
-                              capture_output=True, text=True)
+                              capture_output=True, text=True, timeout=120)
     if compiled.returncode:
         sys.stderr.write(compiled.stdout + compiled.stderr)
         raise ValueError("macro layout fixture did not compile")
