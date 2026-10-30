@@ -24,6 +24,7 @@ use fln_syntax::tree::Syntax;
 use fln_vm::interpreter::{CancellationProbe, ExecutionLimits, ExecutionUsage, VmExit, VmRefusal};
 use std::collections::{BTreeSet, HashSet};
 
+pub mod registrations;
 mod syntax;
 pub use syntax::{SyntaxConversionError, SyntaxLimits};
 
