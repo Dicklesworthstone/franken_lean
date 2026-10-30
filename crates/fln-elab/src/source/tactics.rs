@@ -632,6 +632,10 @@ pub(super) struct ProofGoal {
     pub(super) target: Expr,
     pub(super) lctx: LocalContext,
     pub(in crate::source) introduced: Vec<LocalDecl>,
+    /// The goal's type carries the pin's `noImplicitLambda` annotation: it is the `?_` of a
+    /// `refine no_implicit_lambda% …` (`have`, `let`, `suffices`, `let rec`, `match`), so
+    /// `exact` and `refine` elaborate their term against it without the implicit lambda.
+    pub(in crate::source) no_implicit_lambda: bool,
 }
 #[derive(Clone)]
 enum Work<'a> {
@@ -801,6 +805,7 @@ impl Context {
         };
         let goal = ProofGoal {
             id: id.clone(),
+            no_implicit_lambda: self.implicit_lambda_blocked(&target)?,
             target,
             lctx: self.txn.lctx.clone(),
             introduced: Vec::new(),
@@ -2180,6 +2185,8 @@ impl Context {
         self.txn.lctx = goal.lctx.clone();
         let value = self.completed_local_value(value)?;
         self.add_proof_local(&mut goal, binding.name, value, binding.opaque, None)?;
+        // `refine_lift have …; ?_` (vendored src/Init/Tactics.lean:892,930): the continuation.
+        goal.no_implicit_lambda = true;
         match binding.replaces {
             Some(replaced) => self.try_clear_proof_local(proof, goal, replaced),
             None => {

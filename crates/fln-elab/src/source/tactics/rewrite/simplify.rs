@@ -1291,6 +1291,7 @@ impl Context {
             target,
             lctx: self.txn.lctx.clone(),
             introduced: Vec::new(),
+            no_implicit_lambda: false,
         };
         if let Some(value) = self.simp_reflexivity(&goal, rules)? {
             return Ok(Some(value));

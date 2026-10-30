@@ -369,6 +369,7 @@ impl Context {
                 target: type_,
                 lctx: extended.clone(),
                 introduced: locals.to_vec(),
+                no_implicit_lambda: false,
             },
             inner,
         ));

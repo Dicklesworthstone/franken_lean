@@ -262,6 +262,7 @@ impl Context {
             );
             let goal = ProofGoal {
                 id,
+                no_implicit_lambda: self.implicit_lambda_blocked(&type_)?,
                 target: type_.clone(),
                 lctx: self.txn.lctx.clone(),
                 introduced: locals,
@@ -312,7 +313,7 @@ impl Context {
         );
         self.txn.lctx = goal.lctx.clone();
         let depth = self.begin_refinement();
-        let term = self.term(&syntax, Some(goal.target.clone()))?;
+        let term = self.term_without_implicit_lambda(&syntax, Some(goal.target.clone()))?;
         self.finish_refinement(proof, goal, term, depth)
     }
 
@@ -538,7 +539,7 @@ impl Context {
         );
         self.txn.lctx = goal.lctx.clone();
         let depth = self.begin_refinement();
-        let term = self.term(&syntax, Some(goal.target.clone()))?;
+        let term = self.term_without_implicit_lambda(&syntax, Some(goal.target.clone()))?;
         self.finish_refinement(proof, goal, term, depth)?;
         // Each tactic alternative's goal, out of the refinement's goals, runs its block first,
         // in order, as the `case`s after the `refine` do; every other goal keeps its place.
@@ -552,15 +553,18 @@ impl Context {
                 // Solved by elaboration itself: `case` would find no goal.
                 return Err(error(TacticError::CaseTagNotFound(name)));
             };
-            let Work::Goal(hole) = proof.work.remove(position) else {
+            let Work::Goal(mut hole) = proof.work.remove(position) else {
                 return Err(error(TacticError::MalformedScript));
             };
             self.goal_tags.remove(&hole.id);
+            // Each alternative's type is the motive's, made from the annotated expected type.
+            hole.no_implicit_lambda = true;
             runs.push(Work::Script(hole, self.proof_instructions(body)?));
         }
         for (name, tag) in placeholders {
-            let found = proof.work.iter().find_map(|work| match work {
+            let found = proof.work.iter_mut().find_map(|work| match work {
                 Work::Goal(hole) if self.goal_tags.get(&hole.id) == Some(&name) => {
+                    hole.no_implicit_lambda = true;
                     Some(hole.id.clone())
                 }
                 _ => None,
@@ -610,7 +614,7 @@ impl Context {
         );
         self.txn.lctx = goal.lctx.clone();
         let depth = self.begin_refinement();
-        let term = self.term(&syntax, Some(goal.target.clone()))?;
+        let term = self.term_without_implicit_lambda(&syntax, Some(goal.target.clone()))?;
         let start = proof.work.len();
         self.finish_refinement(proof, goal, term, depth)?;
         // `rotate_right` among the refinement's goals: the last becomes the first.
@@ -675,6 +679,7 @@ impl Context {
                         target: declaration.type_.clone(),
                         lctx: declaration.lctx.clone(),
                         introduced: Vec::new(),
+                        no_implicit_lambda: false,
                     },
                 ));
             }

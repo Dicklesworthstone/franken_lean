@@ -1444,6 +1444,7 @@ impl Context {
                 target,
                 lctx: locals,
                 introduced: Vec::new(),
+                no_implicit_lambda: false,
             };
             let state = self.start_decreasing_proof(proof, vec![fresh])?;
             self.run_decreasing_proof(proof, state).map(|_| ())
@@ -2270,6 +2271,7 @@ impl Context {
             target,
             lctx: proof_lctx,
             introduced: Vec::new(),
+            no_implicit_lambda: false,
         };
         // Retain full captures even when proof-context cleanup later removes
         // an unrelated local. Let values can still depend on the hidden

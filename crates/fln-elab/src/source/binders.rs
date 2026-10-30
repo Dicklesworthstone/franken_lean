@@ -34,6 +34,49 @@ fn invalid() -> NatDefinitionElabError {
     failure(SourceInferenceError::Scope)
 }
 
+/// The pin's `blockImplicitLambda` (vendored `Lean/Elab/Term/TermElabM.lean:1647-1694`), on a
+/// term whose parentheses are already dropped: `@f`, `@f a…`, `fun` with an implicit or
+/// instance-implicit binder, a hole, a `by` block, `no_implicit_lambda% e` and a type ascription
+/// are elaborated without the implicit lambda.
+fn blocks_implicit_lambda(syntax: &Syntax) -> bool {
+    let Syntax::Node { kind, args, .. } = syntax else {
+        return false;
+    };
+    let term = |name: &str| kind == &parser_kind(&["Term", name]);
+    if [
+        "explicit",
+        "hole",
+        "syntheticHole",
+        "byTactic",
+        "byTactic'",
+        "noImplicitLambda",
+        "typeAscription",
+    ]
+    .into_iter()
+    .any(term)
+    {
+        return true;
+    }
+    if term("app") {
+        return args.first().and_then(Syntax::kind) == Some(&parser_kind(&["Term", "explicit"]));
+    }
+    if term("fun")
+        && let Some(Syntax::Node {
+            kind: basic,
+            args: parts,
+            ..
+        }) = args.get(1)
+        && basic == &parser_kind(&["Term", "basicFun"])
+        && let Some(Syntax::Node { args: binders, .. }) = parts.first()
+    {
+        return binders.iter().any(|binder| {
+            binder.kind() == Some(&parser_kind(&["Term", "implicitBinder"]))
+                || binder.kind() == Some(&parser_kind(&["Term", "instBinder"]))
+        });
+    }
+    false
+}
+
 fn binder_name(syntax: &Syntax) -> Result<Name, NatDefinitionElabError> {
     match syntax {
         Syntax::Ident { val, .. } if !val.is_anonymous() && val.parent().is_anonymous() => {
@@ -376,6 +419,78 @@ impl Context {
         }
         state.expected_body = Some(expected);
         Ok(())
+    }
+
+    /// The pin's implicit lambda (`useImplicitLambda`, `elabImplicitLambda`, vendored
+    /// `Lean/Elab/Term/TermElabM.lean:1704-1793`): a term whose expected type starts with an
+    /// implicit or instance-implicit binder is elaborated inside `fun {a…} =>`, one binder for
+    /// each leading non-explicit binder of that type, against the type that remains. The
+    /// telescope returned has no written binders and the term itself as its body; closing it
+    /// abstracts the binders and checks the result against `expected`. Nothing is returned
+    /// when the feature does not apply.
+    pub(super) fn start_implicit_lambda<'a>(
+        &mut self,
+        syntax: &'a Syntax,
+        expected: &Expr,
+    ) -> Result<Option<Telescope<'a>>, NatDefinitionElabError> {
+        let mut inner = syntax;
+        while let Some(next) = parenthesized_inner(inner)? {
+            self.tick()?;
+            inner = next;
+        }
+        if blocks_implicit_lambda(inner) || self.implicit_lambda_blocked(expected)? {
+            return Ok(None);
+        }
+        let reduced = self.whnf(expected)?;
+        if !matches!(
+            reduced.node(),
+            ExprNode::ForallE {
+                binder_info: BinderInfo::Implicit | BinderInfo::InstImplicit,
+                ..
+            }
+        ) {
+            return Ok(None);
+        }
+        // A local whose type is still a hole: the pin postpones the term and, once it cannot
+        // postpone any more, elaborates it without the feature. Here it never gets the feature.
+        if let Syntax::Ident { val, .. } = inner
+            && let Some(local) = self.txn.lctx.find_by_user_name(val)
+        {
+            let type_ = local.type_.clone();
+            let mut head = self.instantiate(&type_)?;
+            while let ExprNode::App { f, .. } = head.node() {
+                head = f.clone();
+            }
+            if matches!(head.node(), ExprNode::MVar { .. }) {
+                return Ok(None);
+            }
+        }
+        let mut state = Telescope {
+            binders: Vec::new(),
+            cursor: 0,
+            locals: Vec::new(),
+            levels: Vec::new(),
+            saved: self.txn.lctx.clone(),
+            expected: Some(expected.clone()),
+            expected_body: Some(reduced),
+            lambda: true,
+            body: syntax,
+        };
+        self.open_implicit_lambda_prefix(&mut state)?;
+        Ok(Some(state))
+    }
+
+    /// Whether `type_` is the expected type of a `no_implicit_lambda%` term being elaborated,
+    /// which at the pin carries the `noImplicitLambda` annotation (`hasNoImplicitLambdaAnnotation`).
+    pub(super) fn implicit_lambda_blocked(
+        &mut self,
+        type_: &Expr,
+    ) -> Result<bool, NatDefinitionElabError> {
+        if self.no_implicit_lambda_types.is_empty() {
+            return Ok(false);
+        }
+        let type_ = self.instantiate(type_)?;
+        Ok(self.no_implicit_lambda_types.contains(&type_))
     }
 
     /// Returns the next annotation to elaborate, or None once all binders are

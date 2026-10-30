@@ -865,6 +865,7 @@ impl Context {
                             target,
                             lctx: declaration.lctx,
                             introduced: Vec::new(),
+                            no_implicit_lambda: false,
                         });
                     }
                     // The pin's `synthesizeArgs` leaves a data argument to unification alone:
@@ -914,6 +915,7 @@ impl Context {
                             target,
                             lctx: declaration.lctx,
                             introduced: Vec::new(),
+                            no_implicit_lambda: false,
                         });
                     }
                 }
@@ -1032,6 +1034,7 @@ impl Context {
                     target: occurrence.clone(),
                     lctx: check.txn.lctx.clone(),
                     introduced: Vec::new(),
+                    no_implicit_lambda: false,
                 };
                 Ok(check
                     .automatic_reflexivity_candidate(&goal, false)?

@@ -170,6 +170,7 @@ impl Context {
                     target,
                     lctx: self.txn.lctx.clone(),
                     introduced: Vec::new(),
+                    no_implicit_lambda: false,
                 };
                 let Some(value) = self.automatic_reflexivity_candidate(&leaf, false)? else {
                     return Ok(None);

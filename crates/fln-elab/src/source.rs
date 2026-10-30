@@ -758,6 +758,14 @@ struct Context {
     // trials cannot own those queues, but must know that pending synthetic work
     // may still reveal a function type before establishing terminal failure.
     pending_source_arguments: bool,
+    // `no_implicit_lambda% e` around a term a tactic elaborates (`term_without_implicit_lambda`):
+    // read and cleared by the next term worklist, which visits its root term without it.
+    block_root_implicit_lambda: bool,
+    // The expected types of the `no_implicit_lambda%` terms being elaborated. The pin's
+    // annotation stays on that type (`mkNoImplicitLambdaAnnotation`, vendored
+    // `Lean/Elab/BuiltinTerm.lean:208-209`), so every term elaborated against it, and every goal
+    // made with it, goes without the implicit lambda.
+    no_implicit_lambda_types: Vec<Expr>,
     // Recursors the source names directly, which a compiled declaration may not apply
     // (`codegen.rs`). Rollback restores them with the rest of the context.
     source_recursors: Vec<Name>,
@@ -867,6 +875,8 @@ impl Context {
             postponed_coercions: Vec::new(),
             postponed_application_errors: Vec::new(),
             pending_source_arguments: false,
+            block_root_implicit_lambda: false,
+            no_implicit_lambda_types: Vec::new(),
             source_recursors: Vec::new(),
             native: None,
             native_axioms: Vec::new(),
@@ -1998,13 +2008,36 @@ impl Context {
         syntax: &Syntax,
         expected: Option<Expr>,
     ) -> Result<Typed, NatDefinitionElabError> {
+        self.root_term(syntax, expected, true)
+    }
+
+    /// A term a tactic elaborates as the pin's `refine no_implicit_lambda% t` (vendored
+    /// `Lean/Elab/Tactic/Match.lean:58`, `Init/Tactics.lean:832`): `t` itself gets no implicit
+    /// lambda (`Lean/Elab/BuiltinTerm.lean:208-209`), its subterms still do.
+    fn term_without_implicit_lambda(
+        &mut self,
+        syntax: &Syntax,
+        expected: Option<Expr>,
+    ) -> Result<Typed, NatDefinitionElabError> {
+        self.root_term(syntax, expected, false)
+    }
+
+    fn root_term(
+        &mut self,
+        syntax: &Syntax,
+        expected: Option<Expr>,
+        implicit_lambda: bool,
+    ) -> Result<Typed, NatDefinitionElabError> {
         // An application whose argument the pin postpones and then refuses (`pattern_typing`,
         // R1 of franken_lean-z8j.1.6.3).
         if let Some(expected) = &expected {
             self.check_application_typing(syntax, expected)?;
         }
         let syntax = self.lower_pattern_matrices(syntax)?;
-        self.term_prepared(&syntax, expected)
+        self.block_root_implicit_lambda = !implicit_lambda;
+        let result = self.term_prepared(&syntax, expected);
+        self.block_root_implicit_lambda = false;
+        result
     }
 
     fn term_prepared(
@@ -2017,9 +2050,11 @@ impl Context {
         // Speculative retries restore their own complete Context checkpoints.
         let options = self.txn.options.clone();
         let pending_source_arguments = self.pending_source_arguments;
+        let blocked = self.no_implicit_lambda_types.len();
         let result = self.term_prepared_scoped(syntax, expected, None);
         self.txn.options = options;
         self.pending_source_arguments = pending_source_arguments;
+        self.no_implicit_lambda_types.truncate(blocked);
         result
     }
 
@@ -2030,9 +2065,11 @@ impl Context {
     ) -> Result<Typed, NatDefinitionElabError> {
         let options = self.txn.options.clone();
         let pending_source_arguments = self.pending_source_arguments;
+        let blocked = self.no_implicit_lambda_types.len();
         let result = self.term_prepared_scoped(syntax, None, Some(proof));
         self.txn.options = options;
         self.pending_source_arguments = pending_source_arguments;
+        self.no_implicit_lambda_types.truncate(blocked);
         result
     }
 
@@ -2043,6 +2080,7 @@ impl Context {
         initial_proof: Option<tactics::ProofState<'a>>,
     ) -> Result<Typed, NatDefinitionElabError> {
         use application::postponed;
+        let without_implicit_lambda = std::mem::take(&mut self.block_root_implicit_lambda);
         /// An application's explicit arguments: a plain list (`Term.app`), or the elements of
         /// `⟨a, b, …⟩` interleaved with their `,` separators, which are skipped.
         #[derive(Clone, Copy)]
@@ -2118,6 +2156,9 @@ impl Context {
             RecordNext(record_terms::RecordBuild<'a>),
             RecordField(record_terms::RecordBuild<'a>, record_terms::RecordTarget),
             Visit(&'a Syntax, Option<Expr>, bool),
+            /// `no_implicit_lambda% e`: `e`, its expected type marked for as long as it is visited.
+            VisitWithoutImplicitLambda(&'a Syntax, Option<Expr>),
+            RestoreImplicitLambda(usize),
             Observe(&'a Syntax, LocalContext),
             Function(&'a [Syntax], Option<Expr>, bool),
             StartApplication(&'a Syntax, &'a [Syntax], Option<Expr>, bool),
@@ -2195,6 +2236,7 @@ impl Context {
         }
         let mut tasks = vec![match initial_proof {
             Some(proof) => Task::Proof(proof),
+            None if without_implicit_lambda => Task::VisitWithoutImplicitLambda(syntax, expected),
             None => Task::Visit(syntax, expected, true),
         }];
         let mut values: Vec<Typed> = Vec::new();
@@ -2452,7 +2494,30 @@ impl Context {
                             let value = values.pop().expect("contextual match visit");
                             values.push(self.capture_recursive_context(value)?);
                         }
+                        Task::VisitWithoutImplicitLambda(syntax, expected) => {
+                            tasks.push(Task::RestoreImplicitLambda(
+                                self.no_implicit_lambda_types.len(),
+                            ));
+                            if let Some(type_) = &expected {
+                                let type_ = self.instantiate(type_)?;
+                                self.no_implicit_lambda_types.push(type_);
+                            }
+                            tasks.push(Task::Visit(syntax, expected, true));
+                        }
+                        Task::RestoreImplicitLambda(length) => {
+                            self.no_implicit_lambda_types.truncate(length);
+                        }
                         Task::Visit(syntax, expected, finish) => {
+                            // The pin's implicit lambda (`binders::start_implicit_lambda`). The
+                            // body is this same term, visited again against the type that
+                            // remains, which starts with no implicit binder.
+                            if finish
+                                && let Some(type_) = &expected
+                                && let Some(state) = self.start_implicit_lambda(syntax, type_)?
+                            {
+                                tasks.push(Task::BinderNext(state));
+                                continue;
+                            }
                             if self.observes_term(syntax) {
                                 tasks.push(Task::Observe(syntax, self.txn.lctx.clone()));
                             }
@@ -3645,8 +3710,13 @@ impl Context {
                                 } else {
                                     self.begin_refinement()
                                 };
+                                let no_implicit_lambda = goal.no_implicit_lambda;
                                 tasks.push(Task::RefineTerm(proof, goal, depth));
-                                tasks.push(Task::Visit(syntax, Some(expected), true));
+                                tasks.push(if no_implicit_lambda {
+                                    Task::VisitWithoutImplicitLambda(syntax, Some(expected))
+                                } else {
+                                    Task::Visit(syntax, Some(expected), true)
+                                });
                             }
                             tactics::ProofAction::Binding {
                                 goal,
@@ -3740,13 +3810,18 @@ impl Context {
                                 // before apply starts opening the remaining telescope.
                                 let instance_start = apply.then_some(self.instance_goals.len());
                                 let refinement_depth = (!apply).then(|| self.begin_refinement());
+                                let no_implicit_lambda = goal.no_implicit_lambda;
                                 tasks.push(Task::ProofTerm(
                                     proof,
                                     goal,
                                     instance_start,
                                     refinement_depth,
                                 ));
-                                tasks.push(Task::Visit(syntax, expected, true));
+                                tasks.push(if no_implicit_lambda && expected.is_some() {
+                                    Task::VisitWithoutImplicitLambda(syntax, expected)
+                                } else {
+                                    Task::Visit(syntax, expected, true)
+                                });
                             }
                             tactics::ProofAction::Complete(term) => values.push(term),
                         },
