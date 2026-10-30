@@ -15,10 +15,58 @@ pub(super) fn normalize(
     scope: &Scope,
     captures: &BTreeSet<u64>,
     meter: &mut Meter,
+    depth: usize,
 ) -> Result<bool> {
-    let Some(choice) = equivalent(body, scope, captures, meter)? else {
+    if let Some(choice) = equivalent(body, scope, captures, meter)? {
+        apply(body, choice, meter)?;
+        return Ok(true);
+    }
+    let Some((receiver, info)) = object_candidate(body, scope, meter)? else {
         return Ok(false);
     };
+    // The fresh allocation is a candidate, never evidence about the input.
+    // Prove the entire reset/reuse region under that conditional layout, then
+    // establish it with an executable guard before moving any common work.
+    let mut guarded_scope = meter.scope(scope)?;
+    guarded_scope.shapes.insert(
+        receiver,
+        Shape::object_only(&info).expect("candidate is an object-only heap constructor"),
+    );
+    let Some(choice) = equivalent(body, &guarded_scope, captures, meter)? else {
+        return Ok(false);
+    };
+    meter.depth(depth + 1)?;
+    meter.charge(3)?;
+    // Keep every original strict prefix statement before the guard. Only the
+    // adjacent lexical join and its isShared binding move into the matching
+    // arm; neither the discarded reset arm nor common calls run on a mismatch.
+    let stmts = body.stmts.split_off(body.stmts.len() - 2);
+    let terminal = std::mem::replace(&mut body.terminal, Box::new(IrTerminal::Unreachable));
+    let mut matching = IrBody { stmts, terminal };
+    apply(&mut matching, choice, meter)?;
+    body.terminal = Box::new(IrTerminal::Case {
+        // This name is diagnostic metadata. The runtime witness comes from
+        // the complete CtorInfo layout, lowered to CtorLayoutTest.
+        type_name: info.name.clone(),
+        x: receiver,
+        x_type: IrType::TObject,
+        alts: vec![
+            IrAlt::Ctor {
+                info,
+                body: matching,
+            },
+            IrAlt::Default {
+                body: IrBody {
+                    stmts: Vec::new(),
+                    terminal: Box::new(IrTerminal::Unreachable),
+                },
+            },
+        ],
+    });
+    Ok(true)
+}
+
+fn apply(body: &mut IrBody, choice: selection::Selection, meter: &mut Meter) -> Result<()> {
     body.stmts.pop(); // The original isShared binding is no longer observable.
     let Some(IrStmt::JDecl { mut value, .. }) = body.stmts.pop() else {
         unreachable!("a verified reset region ends in a join and its guard");
@@ -27,7 +75,55 @@ pub(super) fn normalize(
     body.stmts.extend(value.stmts);
     body.terminal = value.terminal;
     meter.changed = true;
-    Ok(true)
+    Ok(())
+}
+
+/// Infer only a prospective object-only layout from one cold allocation.
+/// Packed layouts are excluded: aligned allocation size cannot distinguish a
+/// short scalar payload from padding. The existing equivalence checker still
+/// verifies all stores, unchanged projections, captures and continuations.
+fn object_candidate(
+    body: &IrBody,
+    scope: &Scope,
+    meter: &mut Meter,
+) -> Result<Option<(u64, IrCtorInfo)>> {
+    let [
+        ..,
+        IrStmt::JDecl { value, .. },
+        IrStmt::VDecl {
+            ty: IrType::UInt8,
+            expr: IrExpr::IsShared { x: receiver },
+            ..
+        },
+    ] = body.stmts.as_slice()
+    else {
+        return Ok(None);
+    };
+    if scope.shapes.contains_key(receiver) {
+        return Ok(None);
+    }
+    let IrTerminal::Case { alts, .. } = value.terminal.as_ref() else {
+        return Ok(None);
+    };
+    let Some((_, shared)) = boolean_arms(alts) else {
+        return Ok(None);
+    };
+    let cold = alt_body(&alts[shared]);
+    meter.charge(cold.stmts.len())?;
+    let mut candidate = None;
+    for stmt in &cold.stmts {
+        if let IrStmt::VDecl {
+            expr: IrExpr::Ctor { info, .. },
+            ..
+        } = stmt
+        {
+            if candidate.is_some() || Shape::object_only(info).is_none() {
+                return Ok(None);
+            }
+            candidate = Some(info);
+        }
+    }
+    Ok(candidate.map(|info| (*receiver, info.clone())))
 }
 
 fn equivalent(

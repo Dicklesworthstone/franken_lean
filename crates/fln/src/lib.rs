@@ -31,6 +31,7 @@
 
 pub mod capsule;
 pub mod imported_ir;
+pub mod imported_macros;
 mod olean_imports;
 pub mod pretty;
 pub mod source_check;

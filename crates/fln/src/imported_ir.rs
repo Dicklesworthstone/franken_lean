@@ -48,6 +48,14 @@ pub struct VerifiedPartition {
 }
 
 impl VerifiedPartition {
+    #[cfg(test)]
+    pub(crate) fn user_fixture() -> Self {
+        Self {
+            partition: CensusPartition::parse("constant_count\t0\n", GraphArchiveLimits::default())
+                .expect("empty test-only user partition"),
+        }
+    }
+
     pub fn from_pinned_tsv(text: &str) -> Result<Self, IrExecutionError> {
         let limits = GraphArchiveLimits::default();
         if text.len() > limits.max_bytes {
@@ -231,6 +239,60 @@ pub struct CompiledIr {
     reference_functions: Vec<ReferenceFunction>,
     native_externs: Vec<String>,
     output_byte_limit: Option<usize>,
+    callable_entry: Option<(flbc::FunctionId, usize)>,
+}
+
+/// A selected Reference function that accepts caller-supplied ABI values.
+///
+/// Its canonical program has an ordinary zero-argument entry that returns the
+/// selected closure. Calling it never substitutes placeholder data for the
+/// actual arguments. The same selection, native-effect policy, IR validation,
+/// and independent bytecode ownership check apply as for [`compile`].
+#[derive(Debug)]
+pub struct CompiledCallableIr {
+    compiled: CompiledIr,
+    entry: flbc::FunctionId,
+    arity: usize,
+}
+
+impl CompiledCallableIr {
+    pub const fn arity(&self) -> usize {
+        self.arity
+    }
+
+    pub fn program(&self) -> &flbc::ValidatedProgram {
+        self.compiled.program.program()
+    }
+
+    pub fn reference_functions(&self) -> &[ReferenceFunction] {
+        self.compiled.reference_functions()
+    }
+
+    pub fn native_externs(&self) -> &[String] {
+        self.compiled.native_externs()
+    }
+
+    /// Arguments transfer owned handles into a fresh invocation. Malformed
+    /// values remain runtime refusals; they acquire no declaration authority.
+    pub fn execute(
+        &self,
+        arguments: Vec<fln_rt::obj::Obj>,
+        limits: ExecutionLimits,
+        cancellation: Option<&dyn CancellationProbe>,
+    ) -> IrExecution {
+        IrExecution {
+            outcome: fln_vm::interpreter::execute_function(
+                self.program(),
+                self.entry,
+                arguments,
+                limits,
+                cancellation,
+            ),
+            reference_functions: self.compiled.reference_functions.clone(),
+            native_externs: self.compiled.native_externs.clone(),
+            captured_output: None,
+        }
+    }
 }
 
 /// The ordered bytes emitted into one isolated execution capture.
@@ -362,6 +424,7 @@ pub fn compile(
         user_declarations,
         limits,
         None,
+        false,
     )
 }
 
@@ -390,7 +453,41 @@ pub fn compile_with_captured_output(
         user_declarations,
         limits,
         Some(max_output_bytes),
+        false,
     )
+}
+
+/// Compile a callable user/library function with object-valued parameters.
+///
+/// This is the metaprogram input door: Syntax and immutable context/state
+/// objects may be supplied without serializing them as fake IR literals.
+/// Unboxed numeric and erased-world parameters use the literal entry API;
+/// this function deliberately accepts only Object/TObject parameters.
+pub fn compile_callable(
+    modules: &[IrModule],
+    entry: &Name,
+    partition: &VerifiedPartition,
+    user_declarations: &BTreeSet<Name>,
+    limits: IrExecutionLimits,
+) -> Result<CompiledCallableIr, IrExecutionError> {
+    let compiled = compile_with_output_policy(
+        modules,
+        entry,
+        &[],
+        partition,
+        user_declarations,
+        limits,
+        None,
+        true,
+    )?;
+    let (function, arity) = compiled
+        .callable_entry
+        .ok_or_else(|| unsupported(entry, "callable entry was not retained by lowering"))?;
+    Ok(CompiledCallableIr {
+        compiled,
+        entry: function,
+        arity,
+    })
 }
 
 fn compile_with_output_policy(
@@ -401,6 +498,7 @@ fn compile_with_output_policy(
     user_declarations: &BTreeSet<Name>,
     limits: IrExecutionLimits,
     output_byte_limit: Option<usize>,
+    callable: bool,
 ) -> Result<CompiledIr, IrExecutionError> {
     let count = modules
         .iter()
@@ -440,7 +538,10 @@ fn compile_with_output_policy(
         }
     }
     for name in user_declarations {
-        if native_row(name).is_some() || classified_ancestor(partition, name).is_some() {
+        if native_row(name).is_some()
+            || fln_vm::macro_native::row_for_name(name).is_some()
+            || classified_ancestor(partition, name).is_some()
+        {
             return Err(IrExecutionError::UserOverridesCensus(name.clone()));
         }
         if !declarations.contains_key(name) {
@@ -467,6 +568,10 @@ fn compile_with_output_policy(
                 name,
                 Native::with_output(row, arity, output_byte_limit.is_some())?,
             );
+            continue;
+        }
+        if let Some(row) = fln_vm::macro_native::row_for_name(&name) {
+            natives.insert(name, Native::mirror(row));
             continue;
         }
         authorize(partition, user_declarations, &name)?;
@@ -555,7 +660,7 @@ fn compile_with_output_policy(
         .iter()
         .map(|declaration| (declaration.name().clone(), declaration))
         .collect();
-    let mut compiled = lower::compile(&selected, &natives, entry, arguments, limits)?;
+    let mut compiled = lower::compile(&selected, &natives, entry, arguments, limits, callable)?;
     compiled.output_byte_limit = output_byte_limit;
     Ok(compiled)
 }
@@ -653,7 +758,7 @@ fn inspect_body(
 }
 
 struct Native {
-    row: &'static GeneratedExternRow,
+    id: &'static str,
     ir_arity: usize,
     arguments: Vec<flbc::ArgumentOwnership>,
     result: flbc::ResultOwnership,
@@ -661,6 +766,16 @@ struct Native {
 }
 
 impl Native {
+    fn mirror(row: &'static fln_vm::macro_native::MirrorRow) -> Self {
+        Self {
+            id: row.id,
+            ir_arity: row.borrowed.len(),
+            arguments: row.argument_ownership(),
+            result: row.result_ownership(),
+            effect: fir::EffectClass::Pure,
+        }
+    }
+
     fn new(row: &'static GeneratedExternRow, arity: usize) -> Result<Self, IrExecutionError> {
         Self::with_output(row, arity, false)
     }
@@ -714,7 +829,7 @@ impl Native {
             extern_row::ResultOwnership::RawObject => flbc::ResultOwnership::RawObject,
         };
         Ok(Self {
-            row,
+            id: row.id,
             ir_arity: arity,
             arguments,
             result,

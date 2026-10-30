@@ -8,7 +8,9 @@
 //!
 //! Fresh object-field initialization is folded before checking branches.
 //! Object and packed scalar updates require a known incoming constructor
-//! layout and exact field/byte equivalence. Arbitrary mutation, observable
+//! layout and exact field/byte equivalence. An object-only reset/reuse region
+//! can establish its incoming layout with an explicit runtime guard before
+//! entering the proven allocation-equivalent continuation. Arbitrary mutation, observable
 //! sharing flags, and effectful/different alternatives remain unsupported. No
 //! mutable runtime handle, native refcount observation, or new execution
 //! authority is introduced. The original and rewritten IR both undergo type validation.
@@ -360,7 +362,7 @@ fn normalize_body(
             _ => {}
         }
     }
-    if reset::normalize(body, &scope, captures, meter)? {
+    if reset::normalize(body, &scope, captures, meter, depth)? {
         return Ok(());
     }
     if let Some(choice) = equivalent_update(body, &scope, captures, meter)? {

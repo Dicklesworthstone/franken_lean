@@ -15,11 +15,23 @@ pub(super) fn compile(
     entry: &Name,
     arguments: &[EntryArgument],
     limits: IrExecutionLimits,
+    callable: bool,
 ) -> Result<CompiledIr> {
     let entry_parameters: &[IrParam] = match declarations.get(entry) {
         Some(IrDecl::Function { params, .. }) => params,
         _ => &[],
     };
+    if callable
+        && (entry_parameters.is_empty()
+            || entry_parameters
+                .iter()
+                .any(|parameter| !matches!(parameter.ty, IrType::Object | IrType::TObject)))
+    {
+        return Err(unsupported(
+            entry,
+            "callable entry requires object-valued parameters",
+        ));
+    }
     let mut helper_natives = BTreeMap::new();
     for argument in arguments {
         if matches!(argument, EntryArgument::FloatBits(_)) {
@@ -94,13 +106,13 @@ pub(super) fn compile(
         .map(|(name, value)| (name.clone(), value))
         .collect();
     let mut native_order: Vec<_> = native_map.iter().collect();
-    native_order.sort_by_key(|(_, native)| native.row.id);
+    native_order.sort_by_key(|(_, native)| native.id);
     let intrinsics: Vec<_> = native_order
         .iter()
         .enumerate()
         .map(|(index, (_, native))| IntrinsicDecl {
             id: IntrinsicId::new(index as u32),
-            row: native.row.id.to_owned(),
+            row: native.id.to_owned(),
             arguments: vec![ValueType::Abi; native.arguments.len()],
             argument_ownership: native.arguments.clone(),
             result: ValueType::Abi,
@@ -142,7 +154,7 @@ pub(super) fn compile(
         .get(entry)
         .copied()
         .ok_or_else(|| IrExecutionError::MissingDeclaration(entry.clone()))?;
-    if expected != arguments.len() {
+    if !callable && expected != arguments.len() {
         return Err(IrExecutionError::EntryArity {
             expected,
             actual: arguments.len(),
@@ -195,38 +207,52 @@ pub(super) fn compile(
     };
     let mut wrapper = Builder::new(entry, 0, &mut tables)?;
     let block = wrapper.block()?;
-    let args = arguments
-        .iter()
-        .enumerate()
-        .map(|(index, arg)| {
-            let value = wrapper.argument_literal(block, arg)?;
-            if let Some(wide) = entry_parameters
-                .get(index)
-                .and_then(|param| wide_scalar(&param.ty))
-            {
-                wrapper.native_call(
-                    block,
-                    &Name::from_components(wide.of_nat.split('.')),
-                    vec![value],
-                )
-            } else if let Some(float) = entry_parameters
-                .get(index)
-                .and_then(|param| floating_scalar(&param.ty))
-            {
-                wrapper.validate_float(block, float, value)
-            } else {
-                Ok(value)
-            }
-        })
-        .collect::<Result<Vec<_>>>()?;
-    let value = wrapper.emit(
-        block,
-        ValueType::Abi,
-        Operation::Call {
-            function: entry_id,
-            args,
-        },
-    )?;
+    let value = if callable {
+        let closure_type = ClosureTypeId::new(expected as u32 - 1);
+        wrapper.boxed(
+            block,
+            ValueType::Closure(closure_type),
+            Operation::Closure {
+                closure_type,
+                function: entry_id,
+                captures: Vec::new(),
+                capture_ownership: Vec::new(),
+            },
+        )?
+    } else {
+        let args = arguments
+            .iter()
+            .enumerate()
+            .map(|(index, arg)| {
+                let value = wrapper.argument_literal(block, arg)?;
+                if let Some(wide) = entry_parameters
+                    .get(index)
+                    .and_then(|param| wide_scalar(&param.ty))
+                {
+                    wrapper.native_call(
+                        block,
+                        &Name::from_components(wide.of_nat.split('.')),
+                        vec![value],
+                    )
+                } else if let Some(float) = entry_parameters
+                    .get(index)
+                    .and_then(|param| floating_scalar(&param.ty))
+                {
+                    wrapper.validate_float(block, float, value)
+                } else {
+                    Ok(value)
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+        wrapper.emit(
+            block,
+            ValueType::Abi,
+            Operation::Call {
+                function: entry_id,
+                args,
+            },
+        )?
+    };
     wrapper.finish_block(block, Terminator::Return { value });
     let mut functions = vec![wrapper.finish(FunctionId::new(0))];
     let mut reference_functions = Vec::new();
@@ -283,9 +309,10 @@ pub(super) fn compile(
         program,
         reference_functions,
         output_byte_limit: None,
+        callable_entry: callable.then_some((flbc::FunctionId::new(entry_id.get()), expected)),
         native_externs: native_order
             .iter()
-            .map(|(_, native)| native.row.id.to_owned())
+            .map(|(_, native)| native.id.to_owned())
             .collect(),
     })
 }
@@ -1472,24 +1499,14 @@ impl<'a> Builder<'a> {
             Some(self.constructor(info)?)
         };
         let condition = match constructor {
-            Some(constructor) => {
-                let object = self.emit(
-                    block,
-                    ValueType::Constructor,
-                    Operation::Unbox {
-                        value,
-                        ty: ValueType::Constructor,
-                    },
-                )?;
-                self.emit(
-                    block,
-                    ValueType::Bool,
-                    Operation::CtorTest {
-                        constructor,
-                        value: object,
-                    },
-                )?
-            }
+            // Case metadata is a complete Reference constructor layout.
+            // Check it before granting the matching arm a layout witness;
+            // tag/field count alone would accept hidden scalar payloads.
+            Some(constructor) => self.emit(
+                block,
+                ValueType::Bool,
+                Operation::CtorLayoutTest { constructor, value },
+            )?,
             None if !scalar => self.emit(
                 block,
                 ValueType::Bool,
