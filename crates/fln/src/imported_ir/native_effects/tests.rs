@@ -99,6 +99,77 @@ fn prepare(module: &IrModule) -> CompiledIr {
     compile_module(module, "LocalState.main", &[], IrExecutionLimits::default()).unwrap()
 }
 
+#[test]
+fn pure_local_world_parameters_are_inert_and_do_not_grant_io() {
+    let mut module = entry(vec![num(1, 42)], 1);
+    let IrDecl::Function { params, .. } = &mut module.decls[0] else {
+        unreachable!()
+    };
+    params.push(fln_olean::ir::IrParam {
+        x: 9,
+        borrow: false,
+        ty: IrType::Void,
+    });
+    let compiled = compile_module(
+        &module,
+        "LocalState.main",
+        &[EntryArgument::Erased],
+        IrExecutionLimits::default(),
+    )
+    .unwrap();
+    assert_nat_replay(&compiled, "42");
+    assert!(matches!(
+        compile_module(
+            &module,
+            "LocalState.main",
+            &[EntryArgument::Nat(IrNat::Small(0))],
+            IrExecutionLimits::default()
+        ),
+        Err(IrExecutionError::Unsupported {
+            form: "non-erased entry world",
+            ..
+        })
+    ));
+    for expr in [
+        IrExpr::Fap {
+            function: name("Nat.add"),
+            args: vec![var(1), var(9)],
+        },
+        IrExpr::Unbox { x: 9 },
+    ] {
+        let mut observed = module.clone();
+        let IrDecl::Function { body, .. } = &mut observed.decls[0] else {
+            unreachable!()
+        };
+        body.stmts.push(bind(2, expr));
+        assert!(
+            compile_module(
+                &observed,
+                "LocalState.main",
+                &[EntryArgument::Erased],
+                IrExecutionLimits::default()
+            )
+            .is_err()
+        );
+    }
+    let IrDecl::Function { body, .. } = &mut module.decls[0] else {
+        unreachable!()
+    };
+    body.stmts.push(call(2, "IO.getStdout", &[]));
+    assert!(matches!(
+        compile_module(
+            &module,
+            "LocalState.main",
+            &[EntryArgument::Erased],
+            IrExecutionLimits::default()
+        ),
+        Err(IrExecutionError::Unsupported {
+            form: "effectful native call",
+            ..
+        })
+    ));
+}
+
 fn assert_nat_replay(compiled: &CompiledIr, expected: &str) {
     let bytes =
         flbc::encode_canonical(compiled.program.program(), flbc::CodecLimits::default()).unwrap();

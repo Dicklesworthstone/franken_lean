@@ -460,6 +460,90 @@ fn authorize(
     }
 }
 
+// A compiler-generated reduced-arity body has no census row of its own.
+// Inherit only from a library declaration whose actual IR is the exact
+// erased-prefix forwarding wrapper. Select that wrapper too, so it receives
+// ordinary structural/type validation rather than becoming trusted metadata.
+fn reduced_arity_origin(
+    partition: &VerifiedPartition,
+    declarations: &BTreeMap<Name, &IrDecl>,
+    name: &Name,
+    limits: IrExecutionLimits,
+) -> Option<Name> {
+    use fln_olean::ir::{IrArg, IrExpr};
+    let origin = name.parent();
+    if Name::str(origin.clone(), "_redArg") != *name
+        || partition.classify(&origin) != Some(GraphClass::LibraryCode)
+        || native_row(&origin).is_some()
+        || fln_vm::macro_native::row_for_name(&origin).is_some()
+    {
+        return None;
+    }
+    let IrDecl::Function {
+        params,
+        result,
+        sorry_dep: None,
+        ..
+    } = *declarations.get(name)?
+    else {
+        return None;
+    };
+    let IrDecl::Function {
+        params: original,
+        result: original_result,
+        body,
+        sorry_dep: None,
+        ..
+    } = *declarations.get(&origin)?
+    else {
+        return None;
+    };
+    if original.len() as u64 > limits.ir.max_work
+        || params.len() >= original.len()
+        || check_type(name, result).is_err()
+        || check_type(&origin, original_result).is_err()
+        || result != original_result
+    {
+        return None;
+    }
+    let erased = original.len() - params.len();
+    if original[..erased]
+        .iter()
+        .any(|p| p.ty != IrType::Erased || p.borrow)
+        || !original[erased..].iter().zip(params).all(|(a, b)| {
+            check_type(&origin, &a.ty).is_ok()
+                && check_type(name, &b.ty).is_ok()
+                && a.ty == b.ty
+                && a.borrow == b.borrow
+        })
+    {
+        return None;
+    }
+    let [
+        IrStmt::VDecl {
+            x,
+            ty,
+            expr: IrExpr::Fap { function, args },
+        },
+    ] = body.stmts.as_slice()
+    else {
+        return None;
+    };
+    if check_type(&origin, ty).is_err()
+        || ty != result
+        || function != name
+        || args.len() != params.len()
+        || !args
+            .iter()
+            .zip(&original[erased..])
+            .all(|(arg, p)| *arg == IrArg::Var(p.x))
+        || body.terminal.as_ref() != &IrTerminal::Ret(IrArg::Var(*x))
+    {
+        return None;
+    }
+    Some(origin)
+}
+
 /// Compile only the statically reachable closure rooted at `entry`.
 ///
 /// The partition is cryptographically pinned; `user_declarations` names actual
@@ -683,7 +767,15 @@ fn compile_with_policy(
             natives.insert(name, Native::mirror(row));
             continue;
         }
-        authorize(partition, user_declarations, &name)?;
+        if let Err(error) = authorize(partition, user_declarations, &name) {
+            if matches!(error, IrExecutionError::Unclassified(_))
+                && let Some(origin) = reduced_arity_origin(partition, &declarations, &name, limits)
+            {
+                pending.insert(origin);
+            } else {
+                return Err(error);
+            }
+        }
         let declaration = declarations
             .get(&name)
             .ok_or_else(|| IrExecutionError::MissingDeclaration(name.clone()))?;
@@ -722,12 +814,10 @@ fn compile_with_policy(
             continue;
         }
         for parameter in params {
-            // The pinned compiler retains a void RealWorld parameter on user
-            // IO functions, although each primitive call supplies Erased.
-            // It is an inert ABI slot, available only with an explicit output
-            // or initialization capability; void values, results, and packed
-            // representations remain outside the general imported-IR subset.
-            if (output_byte_limit.is_some() || initialize_globals) && parameter.ty == IrType::Void {
+            // The pin retains inert world parameters on both ST and IO
+            // callbacks. The whole-body guard below refuses observations;
+            // actual IO still needs its independent explicit capability.
+            if parameter.ty == IrType::Void {
                 continue;
             }
             check_type(&name, &parameter.ty)?;
@@ -749,7 +839,7 @@ fn compile_with_policy(
     // native state calls. Only those literals are removed; all data uses and
     // all instructions remain for the complete structural/type validation.
     native_effects::erase_state_arguments(&mut selected_module, &natives, limits)?;
-    native_signature::erase_array_arguments(&mut selected_module, &natives, limits)?;
+    native_signature::erase_type_arguments(&mut selected_module, &natives, limits)?;
     let signatures = natives
         .iter()
         .map(|(name, native)| (name.clone(), native.ir_arity))
@@ -762,19 +852,17 @@ fn compile_with_policy(
         limits.ir,
     )
     .map_err(IrExecutionError::IrValidation)?;
-    if output_byte_limit.is_some() || initialize_globals {
-        for declaration in &selected_module.decls {
-            if let IrDecl::Function {
-                name, params, body, ..
-            } = declaration
-            {
-                native_effects::validate_world_parameters(
-                    name,
-                    params,
-                    body,
-                    (name == entry).then_some(arguments),
-                )?;
-            }
+    for declaration in &selected_module.decls {
+        if let IrDecl::Function {
+            name, params, body, ..
+        } = declaration
+        {
+            native_effects::validate_world_parameters(
+                name,
+                params,
+                body,
+                (name == entry).then_some(arguments),
+            )?;
         }
     }
     let erased_worlds =
@@ -846,7 +934,16 @@ fn inspect_body(
         for stmt in &body.stmts {
             match stmt {
                 IrStmt::VDecl { ty, expr, .. } => {
-                    check_type(name, ty)?;
+                    if *ty == IrType::Void
+                        && matches!(expr,
+                        fln_olean::ir::IrExpr::Fap { function, .. }
+                        if function == &Name::from_components(["Void", "mk"]))
+                    {
+                        // This native primitive returns the pin's inert zero
+                        // token. No other instruction may create a Void value.
+                    } else {
+                        check_type(name, ty)?;
+                    }
                     if matches!(ty, IrType::Float | IrType::Float32) {
                         match expr {
                             fln_olean::ir::IrExpr::Lit(fln_olean::ir::IrLit::Num(_)) => {

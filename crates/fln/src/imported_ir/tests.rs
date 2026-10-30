@@ -312,6 +312,94 @@ fn toolchain_api_unknown_names_and_wrappers_cannot_be_reclassified() {
 }
 
 #[test]
+fn library_reduced_arity_helpers_need_a_checked_erased_prefix_forwarder() {
+    let policy = bounded_partition(&[("Library.runner", "library-code")]);
+    let helper = function("Library.runner._redArg", 1, vec![], IrArg::Var(1));
+    let mut wrapper = function(
+        "Library.runner",
+        2,
+        vec![binding(
+            3,
+            IrExpr::Fap {
+                function: name("Library.runner._redArg"),
+                args: vec![IrArg::Var(2)],
+            },
+        )],
+        IrArg::Var(3),
+    );
+    let IrDecl::Function { params, .. } = &mut wrapper else {
+        unreachable!()
+    };
+    params[0].ty = IrType::Erased;
+    params[0].borrow = false;
+    let prepare = |decls: Vec<IrDecl>, policy: &VerifiedPartition| {
+        compile(
+            &[module(decls)],
+            &name("Library.runner._redArg"),
+            &[nat(42)],
+            policy,
+            &BTreeSet::new(),
+            IrExecutionLimits::default(),
+        )
+    };
+    let compiled = prepare(vec![wrapper.clone(), helper.clone()], &policy).unwrap();
+    assert_eq!(returned(&compiled), "42");
+    assert_eq!(compiled.reference_functions().len(), 2);
+    assert!(matches!(
+        prepare(vec![helper.clone()], &policy),
+        Err(IrExecutionError::Unclassified(_))
+    ));
+    for mutation in 0..6 {
+        let mut changed = wrapper.clone();
+        let IrDecl::Function {
+            params,
+            body,
+            result,
+            sorry_dep,
+            ..
+        } = &mut changed
+        else {
+            unreachable!()
+        };
+        match mutation {
+            0 => params[0].ty = IrType::TObject,
+            1 => params[1].borrow = false,
+            2 => *result = IrType::Tagged,
+            3 => *sorry_dep = Some(name("sorryAx")),
+            4 => *body.terminal = IrTerminal::Ret(IrArg::Var(2)),
+            5 => {
+                let IrStmt::VDecl {
+                    expr: IrExpr::Fap { args, .. },
+                    ..
+                } = &mut body.stmts[0]
+                else {
+                    unreachable!()
+                };
+                args[0] = IrArg::Var(1);
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            matches!(
+                prepare(vec![changed, helper.clone()], &policy),
+                Err(IrExecutionError::Unclassified(_))
+            ),
+            "mutation {mutation}"
+        );
+    }
+    for class in ["toolchain-api", "user-facing-data"] {
+        let denied = bounded_partition(&[("Library.runner", class)]);
+        assert!(prepare(vec![wrapper.clone(), helper.clone()], &denied).is_err());
+    }
+    // A forwarding-shaped function is still an ordinary validated IR body.
+    let IrDecl::Function { params, .. } = &mut wrapper else {
+        unreachable!()
+    };
+    params[0].x = 2;
+    assert!(prepare(vec![wrapper, helper], &policy).is_err());
+}
+
+#[test]
 fn native_rows_override_forged_input_bodies() {
     let forged = function(
         "Nat.add",

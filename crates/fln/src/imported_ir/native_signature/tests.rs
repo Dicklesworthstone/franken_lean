@@ -261,7 +261,13 @@ fn pinned_array_type_slots_are_erased_without_hiding_bad_data_or_authority() {
                         args: vec![IrArg::Erased, var(2), var(3)],
                     },
                 ),
-                call(5, "Array.size", &[4]),
+                bind(
+                    5,
+                    IrExpr::Fap {
+                        function: name("Array.size"),
+                        args: vec![IrArg::Erased, var(4)],
+                    },
+                ),
             ],
             5,
         )
@@ -273,6 +279,8 @@ fn pinned_array_type_slots_are_erased_without_hiding_bad_data_or_authority() {
         (1, 1, var(999)),
         (3, 1, var(999)),
         (3, 2, var(999)),
+        (4, 0, var(1)),
+        (4, 1, var(999)),
     ] {
         let mut mutated = declaration();
         let IrDecl::Function { body, .. } = &mut mutated else {
@@ -302,12 +310,17 @@ fn pinned_array_type_slots_are_erased_without_hiding_bad_data_or_authority() {
         compile_declarations(vec![first_class]),
         Err(IrExecutionError::Unsupported { .. })
     ));
-    for id in ["extern:Array.mkEmpty", "extern:Array.push"] {
+    for id in [
+        "extern:Array.mkEmpty",
+        "extern:Array.push",
+        "extern:Array.size",
+        "extern:Void.mk",
+    ] {
         let row = fln_vm::extern_table_generated::EXTERN_ROWS
             .iter()
             .find(|row| row.id == id)
             .unwrap();
-        assert!(array_runtime_arity(row).unwrap().is_some());
+        assert!(erased_type_runtime_arity(row).unwrap().is_some());
         for changed in [
             GeneratedExternRow {
                 symbol: "foreign_array",
@@ -326,9 +339,81 @@ fn pinned_array_type_slots_are_erased_without_hiding_bad_data_or_authority() {
                 ..*row
             },
         ] {
-            assert!(array_runtime_arity(&changed).is_err());
+            assert!(erased_type_runtime_arity(&changed).is_err());
         }
     }
+}
+
+#[test]
+fn void_token_type_erasure_keeps_its_generated_signature_and_real_native_call() {
+    let producer = || {
+        entry(
+            vec![
+                num(1, 7),
+                IrStmt::VDecl {
+                    x: 2,
+                    ty: IrType::Void,
+                    expr: IrExpr::Fap {
+                        function: name("Void.mk"),
+                        args: vec![IrArg::Erased, var(1)],
+                    },
+                },
+            ],
+            2,
+        )
+    };
+    assert_nat(&compile_declarations(vec![producer()]).unwrap(), "0");
+    let declaration = IrDecl::Extern {
+        name: name("Void.mk"),
+        params: vec![
+            IrParam {
+                x: 1,
+                borrow: false,
+                ty: IrType::Erased,
+            },
+            IrParam {
+                x: 2,
+                borrow: false,
+                ty: IrType::TObject,
+            },
+        ],
+        result: IrType::Void,
+        entries: vec![],
+    };
+    assert_nat(
+        &compile_declarations(vec![producer(), declaration.clone()]).unwrap(),
+        "0",
+    );
+    for mutation in 0..4 {
+        let mut changed = declaration.clone();
+        let IrDecl::Extern { params, result, .. } = &mut changed else {
+            unreachable!()
+        };
+        match mutation {
+            0 => params[0].ty = IrType::TObject,
+            1 => params[1].borrow = true,
+            2 => params[1].ty = IrType::Void,
+            3 => *result = IrType::TObject,
+            _ => unreachable!(),
+        }
+        assert!(matches!(
+            compile_declarations(vec![producer(), changed]),
+            Err(IrExecutionError::NativeContract { .. })
+        ));
+    }
+    let mut bad = producer();
+    let IrDecl::Function { body, .. } = &mut bad else {
+        unreachable!()
+    };
+    let IrStmt::VDecl {
+        expr: IrExpr::Fap { args, .. },
+        ..
+    } = &mut body.stmts[1]
+    else {
+        unreachable!()
+    };
+    args[0] = var(1);
+    assert!(compile_declarations(vec![bad]).is_err());
 }
 
 #[test]

@@ -65,6 +65,41 @@ fn live_pinned_local_state_matches_reference_and_canonical_replay() {
     let bytes = std::fs::read(dir.join("NativeStateModule.ir")).unwrap();
     let module = crate::decode_ir_artifact(&bytes, 32 * 1024 * 1024).unwrap();
     std::fs::write(dir.join("decoded-ir.txt"), format!("{module:#?}")).unwrap();
+    let library = std::env::var_os("FLN_REFERENCE_LIB")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            reference
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("lib/lean")
+        });
+    let state_bytes = std::fs::read(library.join("Init/System/ST.ir")).unwrap();
+    let state_module = crate::decode_ir_artifact(&state_bytes, 32 * 1024 * 1024).unwrap();
+    std::fs::write(
+        dir.join("state-library-ir.txt"),
+        format!("{state_module:#?}"),
+    )
+    .unwrap();
+    let partition_path = std::env::var_os("FLN_REFERENCE_PARTITION")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("contracts/builtin_partition.tsv"));
+    let partition = VerifiedPartition::from_pinned_tsv(
+        &std::fs::read_to_string(&partition_path).unwrap_or_else(|error| {
+            panic!("pinned partition {}: {error}", partition_path.display())
+        }),
+    )
+    .unwrap();
+    let users: BTreeSet<_> = module
+        .decls
+        .iter()
+        .filter_map(|decl| match decl {
+            IrDecl::Function { name, .. } => Some(name.clone()),
+            _ => None,
+        })
+        .collect();
+    let modules = [module, state_module];
 
     let cases = [
         ("localStateAnswer", 0),
@@ -112,14 +147,35 @@ fn live_pinned_local_state_matches_reference_and_canonical_replay() {
 
     let mut observed = BTreeSet::new();
     for ((entry, value), expected) in cases.into_iter().zip(expected) {
-        let compiled = compile_module(
-            &module,
-            entry,
+        let compiled = compile(
+            &modules,
+            &name(entry),
             &[EntryArgument::Nat(IrNat::Small(value))],
+            &partition,
+            &users,
             IrExecutionLimits::default(),
         )
         .unwrap_or_else(|error| panic!("{entry} {value}: {error:?}; artifacts {dir:?}"));
         assert_nat_replay(&compiled, expected);
+        let stopped = compiled.execute(
+            ExecutionLimits {
+                max_steps: 0,
+                ..ExecutionLimits::default()
+            },
+            None,
+        );
+        assert!(matches!(stopped.outcome, Outcome::Inconclusive(_)));
+        let cancel = || true;
+        let cancelled = compiled.execute(ExecutionLimits::default(), Some(&cancel));
+        assert!(matches!(cancelled.outcome, Outcome::Inconclusive(_)));
+        assert_nat_replay(&compiled, expected);
+        assert!(
+            compiled
+                .reference_functions()
+                .iter()
+                .any(|function| function.name == name("runST._redArg")
+                    && function.producer() == "reference")
+        );
         if entry.contains("Modify") {
             assert!(
                 compiled

@@ -13,15 +13,15 @@ use super::{
 use fln_olean::ir::{IrAlt, IrArg, IrDecl, IrExpr, IrModule, IrParam, IrStmt, IrTerminal, IrType};
 use std::collections::BTreeMap;
 
-/// The pin retains one literal erased element type on these direct array
-/// calls. Remove that slot only for the two reviewed generated rows, before
+/// The pin retains one literal erased type on these direct native
+/// calls. Remove that slot only for the reviewed generated rows, before
 /// validating all remaining operands. Never infer a signature from a call.
-pub(super) fn erase_array_arguments(
+pub(super) fn erase_type_arguments(
     module: &mut IrModule,
     natives: &BTreeMap<Name, Native>,
     limits: IrExecutionLimits,
 ) -> Result<(), IrExecutionError> {
-    let mut arrays = BTreeMap::new();
+    let mut bridges = BTreeMap::new();
     for (name, native) in natives {
         let Some(row) = fln_vm::extern_table_generated::EXTERN_ROWS
             .iter()
@@ -29,11 +29,11 @@ pub(super) fn erase_array_arguments(
         else {
             continue;
         };
-        if let Some(runtime) = array_runtime_arity(row)? {
-            arrays.insert(name.clone(), runtime);
+        if let Some(runtime) = erased_type_runtime_arity(row)? {
+            bridges.insert(name.clone(), runtime);
         }
     }
-    if arrays.is_empty() {
+    if bridges.is_empty() {
         return Ok(());
     }
     let mut work = 0u64;
@@ -44,14 +44,14 @@ pub(super) fn erase_array_arguments(
         let mut pending = vec![(body, 1usize)];
         while let Some((body, depth)) = pending.pop() {
             if depth > limits.ir.max_depth.min(128) {
-                return Err(IrExecutionError::Limit("native erased-array depth"));
+                return Err(IrExecutionError::Limit("native erased-type depth"));
             }
             work = work
                 .checked_add(body.stmts.len() as u64)
                 .and_then(|work| work.checked_add(1))
-                .ok_or(IrExecutionError::Limit("native erased-array adaptation"))?;
+                .ok_or(IrExecutionError::Limit("native erased-type adaptation"))?;
             if work > limits.ir.max_work {
-                return Err(IrExecutionError::Limit("native erased-array adaptation"));
+                return Err(IrExecutionError::Limit("native erased-type adaptation"));
             }
             for statement in &mut body.stmts {
                 match statement {
@@ -59,24 +59,24 @@ pub(super) fn erase_array_arguments(
                         expr: IrExpr::Fap { function, args },
                         ..
                     } => {
-                        let Some(&runtime) = arrays.get(function) else {
+                        let Some(&runtime) = bridges.get(function) else {
                             continue;
                         };
                         if args.len() == runtime {
                             continue;
                         }
                         if args.len() != runtime + 1 || args[0] != IrArg::Erased {
-                            return Err(unsupported(name, "unreviewed native array type operand"));
+                            return Err(unsupported(name, "unreviewed native erased type operand"));
                         }
                         args.remove(0);
                     }
                     IrStmt::VDecl {
                         expr: IrExpr::Pap { function, args },
                         ..
-                    } if arrays.contains_key(function) && args.first() == Some(&IrArg::Erased) => {
+                    } if bridges.contains_key(function) && args.first() == Some(&IrArg::Erased) => {
                         return Err(unsupported(
                             name,
-                            "first-class erased native array primitive",
+                            "first-class erased native type primitive",
                         ));
                     }
                     IrStmt::JDecl { value, .. } => pending.push((value, depth + 1)),
@@ -94,27 +94,51 @@ pub(super) fn erase_array_arguments(
     Ok(())
 }
 
-fn array_runtime_arity(row: &GeneratedExternRow) -> Result<Option<usize>, IrExecutionError> {
-    let (name, symbol, runtime, ownership) = match row.id {
+fn erased_type_runtime_arity(row: &GeneratedExternRow) -> Result<Option<usize>, IrExecutionError> {
+    let (name, symbol, module, kind, levels, runtime, ownership) = match row.id {
         "extern:Array.mkEmpty" => (
             "Array.mkEmpty",
             "lean_mk_empty_array_with_capacity",
+            "Init.Prelude",
+            "defn",
+            1,
             1,
             "abi((capacity: borrowed_arg) -> raw_object)",
         ),
         "extern:Array.push" => (
             "Array.push",
             "lean_array_push",
+            "Init.Prelude",
+            "defn",
+            1,
             2,
             "abi((a: owned_arg, v: owned_arg) -> raw_object)",
+        ),
+        "extern:Array.size" => (
+            "Array.size",
+            "lean_array_get_size",
+            "Init.Prelude",
+            "defn",
+            1,
+            1,
+            "abi((a: borrowed_arg) -> raw_object)",
+        ),
+        "extern:Void.mk" => (
+            "Void.mk",
+            "lean_void_mk",
+            "Init.System.ST",
+            "opaque",
+            0,
+            1,
+            "abi((a: owned_arg) -> owned_res)",
         ),
         _ => return Ok(None),
     };
     if row.name != name
         || row.symbol != symbol
-        || row.module != "Init.Prelude"
-        || row.kind != "defn"
-        || row.levels != 1
+        || row.module != module
+        || row.kind != kind
+        || row.levels != levels
         || row.arity as usize != runtime + 1
         || row.effect != "pure"
         || row.safety != "safe"
@@ -126,7 +150,7 @@ fn array_runtime_arity(row: &GeneratedExternRow) -> Result<Option<usize>, IrExec
     {
         return Err(IrExecutionError::NativeContract {
             declaration: Name::from_components(row.name.split('.')),
-            detail: "array primitive differs from its reviewed erased IR bridge".to_owned(),
+            detail: "native primitive differs from its reviewed erased type bridge".to_owned(),
         });
     }
     Ok(Some(runtime))
@@ -206,7 +230,11 @@ pub(super) fn validated_ir_arity(
     arity: usize,
 ) -> Result<usize, IrExecutionError> {
     let expected = ir_arity(row)?;
-    if let Some(runtime) = state_runtime_arity(row)? {
+    if let Some(runtime) = erased_type_runtime_arity(row)? {
+        if arity == runtime || (row.id == "extern:Void.mk" && arity == runtime + 1) {
+            return Ok(runtime);
+        }
+    } else if let Some(runtime) = state_runtime_arity(row)? {
         if arity == runtime || arity == runtime + 3 {
             return Ok(runtime);
         }
@@ -228,6 +256,21 @@ pub(super) fn validate_extern_signature(
     params: &[IrParam],
     result: &IrType,
 ) -> Result<(), IrExecutionError> {
+    if row.id == "extern:Void.mk" && params.len() == 2 {
+        erased_type_runtime_arity(row)?;
+        if params[0].ty != IrType::Erased
+            || params[0].borrow
+            || params[1].ty != IrType::TObject
+            || params[1].borrow
+            || result != &IrType::Void
+        {
+            return Err(IrExecutionError::NativeContract {
+                declaration: Name::from_components(row.name.split('.')),
+                detail: "Void.mk extern differs from its reviewed erased telescope".to_owned(),
+            });
+        }
+        return Ok(());
+    }
     let Some(runtime) = state_runtime_arity(row)? else {
         return Ok(());
     };
