@@ -897,6 +897,7 @@ enum IntrinsicImplementation {
     IoWaitAny,
     IoGetNumHeartbeats,
     IoSetNumHeartbeats,
+    VoidMk,
     RefNew,
     RefGet,
     RefTake,
@@ -1269,6 +1270,7 @@ impl IntrinsicImplementation {
             "extern:IO.waitAny" => Self::IoWaitAny,
             "extern:IO.getNumHeartbeats" => Self::IoGetNumHeartbeats,
             "extern:IO.setNumHeartbeats" => Self::IoSetNumHeartbeats,
+            "extern:Void.mk" => Self::VoidMk,
             "extern:ST.Prim.mkRef" => Self::RefNew,
             "extern:ST.Prim.Ref.get" => Self::RefGet,
             "extern:ST.Prim.Ref.take" => Self::RefTake,
@@ -4755,6 +4757,14 @@ fn invoke_intrinsic(
     args: Vec<Obj>,
     max_nat_magnitude_bytes: u64,
 ) -> Result<IntrinsicResult, IntrinsicFailure> {
+    if implementation == IntrinsicImplementation::VoidMk {
+        // The pin's lean_void_mk consumes any owned ABI value before returning
+        // lean_box(0). Keep its argument evaluation and ownership transfer;
+        // the resulting inert token does not retain the discarded object.
+        let [value] = exact_owned_args(row, args)?;
+        drop(value);
+        return Ok(IntrinsicResult::owned(Obj::mk_nat(0)));
+    }
     // The validated row has already transferred owned operands out of their
     // registers. Keep those handles owned here: borrowing and cloning them
     // again would make every unique array look shared at its mutation boundary.
@@ -4811,8 +4821,9 @@ fn dispatch_intrinsic(
         IntrinsicImplementation::ArrayConstruction(intrinsic) => intrinsic.invoke(row, args),
         IntrinsicImplementation::ArrayExtra(_)
         | IntrinsicImplementation::ArrayPush
-        | IntrinsicImplementation::ByteArrayPush => {
-            unreachable!("owned array operations are dispatched before borrowing arguments")
+        | IntrinsicImplementation::ByteArrayPush
+        | IntrinsicImplementation::VoidMk => {
+            unreachable!("owned operations are dispatched before borrowing arguments")
         }
         IntrinsicImplementation::Float(intrinsic) => intrinsic.invoke(row, args),
         IntrinsicImplementation::StringInternal(intrinsic) => {
@@ -7868,6 +7879,7 @@ fn closure_intrinsic_application(
         | IntrinsicImplementation::IoWaitAny
         | IntrinsicImplementation::IoGetNumHeartbeats
         | IntrinsicImplementation::IoSetNumHeartbeats
+        | IntrinsicImplementation::VoidMk
         | IntrinsicImplementation::RefNew
         | IntrinsicImplementation::RefGet
         | IntrinsicImplementation::RefTake
