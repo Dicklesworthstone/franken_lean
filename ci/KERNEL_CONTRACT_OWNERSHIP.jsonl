@@ -1,4 +1,4 @@
-{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":743,"projection_hash":"2a913fad190ad9cefee477b5137fde723fd7e044e6bf96ece4076ce177310d50"}
+{"schema":"fln.kernel-contract-ownership/1","source":".beads/issues.jsonl","projection":"sorted-canonical-issue-ids-v1","hash_algorithm":"fln-domain-registry-v1","hash_domain":"fln 2026 domain fixture/1","hash_preimage":"fln.kernel-contract-ownership.ids/1+nul+u64le-length-prefixed-utf8","record_count":748,"projection_hash":"4510bcf14329620be88004becfb4381738abe1153bb9bea3cc3edd79ddc1a513"}
 {"id":"fln-0bw5"}
 {"id":"fln-0eq8"}
 {"id":"fln-0rxm"}
@@ -85,6 +85,7 @@
 {"id":"fln-amv.9.2"}
 {"id":"fln-amv.9.3"}
 {"id":"fln-amv.9.4"}
+{"id":"fln-applicative-notations-unelaborated-3tv6"}
 {"id":"fln-atgf"}
 {"id":"fln-attribute-native-state-m7l"}
 {"id":"fln-attribute-real-fixtures-epj"}
@@ -307,6 +308,7 @@
 {"id":"fln-optparam-constructor-field-recursor-1b0b"}
 {"id":"fln-ordinary-lean-probe-g03u"}
 {"id":"fln-otk7"}
+{"id":"fln-outparam-field-notation-red-641z"}
 {"id":"fln-outparam-result-expected-type-6l9h"}
 {"id":"fln-panic-contract-seed-regression-q8iy"}
 {"id":"fln-panic-family-and-silent-panic-output-uyuk"}
@@ -343,6 +345,7 @@
 {"id":"fln-reality-check-1017-9l76"}
 {"id":"fln-recursor-motive-elab-as-elim-3jsg"}
 {"id":"fln-reduce-command-crqm"}
+{"id":"fln-reduce-ctor-eq-simproc-xq6u"}
 {"id":"fln-refine-default-instances-5byo"}
 {"id":"fln-refine-final-unification-synthetic-holes-n15v"}
 {"id":"fln-registry-batch-preflight-sszd"}
@@ -351,6 +354,7 @@
 {"id":"fln-rfl-for-step-limit-63a9"}
 {"id":"fln-rgha"}
 {"id":"fln-rk6"}
+{"id":"fln-runtime-specialization-catalog-dw08"}
 {"id":"fln-rw-def-head-overaccept-nwvf"}
 {"id":"fln-rw-offset-closing-false-accept-ruk6"}
 {"id":"fln-rwz"}
@@ -381,6 +385,7 @@
 {"id":"fln-sn0w"}
 {"id":"fln-snv7"}
 {"id":"fln-sorry-warning-per-declaration-zzlc"}
+{"id":"fln-source-if-elaborates-to-ite-ky0x"}
 {"id":"fln-source-notation-printing-regression-luf8"}
 {"id":"fln-source-notation-unexpanders-727b"}
 {"id":"fln-split-tactic-o28s"}
