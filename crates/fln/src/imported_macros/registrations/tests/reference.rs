@@ -250,7 +250,12 @@ run_cmd do
   let scopeInput := Syntax.node .none `registeredScope #[
     .atom .none "registeredScope%", .atom .none "first", .atom .none ",", .atom .none "second"]
   let scopeContext : Macro.Context := ⟨default, `Main, 999, 0, 512, scopeInput⟩
-  let firstState : Macro.State := { (default : Macro.State) with macroScope := 17 }
+  let seed : MacroM Unit := do
+    for _ in List.range 17 do
+      Macro.withFreshMacroScope (pure ())
+  let firstState ← match seed scopeContext default with
+    | .ok _ state => pure state
+    | _ => throwError "scope seed failed"
   match Lean.Elab.expandMacroImpl? env scopeInput scopeContext firstState with
   | .ok (some (_, .ok first)) state =>
     if reprStr first != reprStr (Syntax.atom .none "first") || state.macroScope != 18 then
