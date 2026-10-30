@@ -20,6 +20,7 @@ use std::sync::{Mutex, MutexGuard};
 const POS_OF: &str = "extern:String.Internal.posOf";
 const OFFSET_OF_POS: &str = "extern:String.Internal.offsetOfPos";
 const PUSHN: &str = "extern:String.Internal.pushn";
+const INTERCALATE: &str = "extern:String.Internal.intercalate";
 const OUTPUT_LIMIT: u64 = 16 * 1024 * 1024;
 static TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -138,6 +139,165 @@ fn assert_clean_shadow() {
         event.kind != shadow::EventKind::DoubleRelease
             && event.kind != shadow::EventKind::ForeignPointer
     }));
+}
+
+fn intercalate_program(separator: &str, entries: &[&str], scalar_nil: bool) -> ValidatedProgram {
+    let mut code = vec![string(0, separator)];
+    code.push(if scalar_nil {
+        nat(1, 0)
+    } else {
+        I::Ctor {
+            dst: r(1),
+            tag: 0,
+            fields: vec![],
+            scalar_bytes: vec![],
+        }
+    });
+    for entry in entries.iter().rev() {
+        code.push(string(2, entry));
+        code.push(I::Ctor {
+            dst: r(1),
+            tag: 1,
+            fields: vec![r(2), r(1)],
+            scalar_bytes: vec![],
+        });
+    }
+    code.extend([
+        call(8, INTERCALATE, &[0, 1]),
+        // The row borrows both inputs. A second call observes the same list,
+        // including each empty entry and embedded NUL in the first result.
+        call(9, INTERCALATE, &[0, 1]),
+        call(10, "extern:String.Internal.append", &[8, 9]),
+        I::Return { src: r(10) },
+    ]);
+    replay(code)
+}
+
+#[test]
+fn intercalate_keeps_unicode_empty_entries_and_embedded_nuls_in_list_order() {
+    let _guard = lock();
+    shadow::enable();
+    // Expected values observed on the exact pin; both forms of fieldless nil
+    // occur at the Golem/imported-IR boundary and retain the same list shape.
+    for scalar_nil in [false, true] {
+        for (separator, entries, expected) in [
+            ("λ", vec!["a", "", "😀\0", "z"], "aλλ😀\0λz"),
+            ("", vec!["", "a", ""], "a"),
+            ("x", vec![], ""),
+            ("not inserted", vec!["λ\0"], "λ\0"),
+            ("\0", vec!["", "", ""], "\0\0"),
+        ] {
+            let result = returned(&intercalate_program(separator, &entries, scalar_nil));
+            assert_eq!(text(&result), format!("{expected}{expected}"));
+        }
+    }
+    assert_clean_shadow();
+}
+
+#[test]
+fn intercalate_refuses_malformed_list_spines_and_non_string_elements() {
+    let _guard = lock();
+    shadow::enable();
+    for malformed in [
+        nat(1, 1),
+        I::Ctor {
+            dst: r(1),
+            tag: 2,
+            fields: vec![],
+            scalar_bytes: vec![],
+        },
+        I::Ctor {
+            dst: r(1),
+            tag: 1,
+            fields: vec![r(2)],
+            scalar_bytes: vec![],
+        },
+        I::Ctor {
+            dst: r(1),
+            tag: 1,
+            fields: vec![r(2), r(3)],
+            scalar_bytes: vec![],
+        },
+    ] {
+        let program = replay(vec![
+            string(0, ","),
+            nat(2, 0),
+            nat(3, 0),
+            malformed,
+            call(8, INTERCALATE, &[0, 1]),
+            I::Return { src: r(8) },
+        ]);
+        assert!(matches!(
+            execute(&program, ExecutionLimits::default(), None),
+            Outcome::Complete(VmExit::Refused {
+                refusal: VmRefusal::TypeMismatch { .. },
+                ..
+            })
+        ));
+    }
+    let late_tail = replay(vec![
+        string(0, ","),
+        string(2, "valid head"),
+        nat(3, 1),
+        I::Ctor {
+            dst: r(1),
+            tag: 1,
+            fields: vec![r(2), r(3)],
+            scalar_bytes: vec![],
+        },
+        call(8, INTERCALATE, &[0, 1]),
+        I::Return { src: r(8) },
+    ]);
+    assert!(matches!(
+        execute(&late_tail, ExecutionLimits::default(), None),
+        Outcome::Complete(VmExit::Refused {
+            refusal: VmRefusal::TypeMismatch { .. },
+            ..
+        })
+    ));
+    assert_clean_shadow();
+}
+
+#[test]
+fn intercalate_bounds_total_join_size_before_allocating_or_publishing_a_string() {
+    let _guard = lock();
+    let separator = "x".repeat(65_537);
+    let entries = vec![""; 257];
+    let program = intercalate_program(&separator, &entries, false);
+    shadow::enable();
+    let result = execute(&program, ExecutionLimits::default(), None);
+    assert_eq!(result.authority(), Authority::NonAuthoritative);
+    assert!(matches!(result, Outcome::Inconclusive(ref stop)
+        if matches!(&stop.cause, InconclusiveCause::ResourceExhausted { usage }
+            if usage.reason == ResourceReason::Memory { limit_bytes: OUTPUT_LIMIT }
+                && usage.allowed == OUTPUT_LIMIT && usage.observed == 65_537 * 256)));
+    assert_clean_shadow();
+}
+
+#[test]
+fn intercalate_bounds_empty_list_spines_independently_of_output_bytes() {
+    let _guard = lock();
+    let mut code = vec![string(0, ""), nat(1, 0), string(2, "")];
+    for _ in 0..65_537 {
+        code.push(I::Ctor {
+            dst: r(1),
+            tag: 1,
+            fields: vec![r(2), r(1)],
+            scalar_bytes: vec![],
+        });
+    }
+    code.extend([call(8, INTERCALATE, &[0, 1]), I::Return { src: r(8) }]);
+    let program = replay(code);
+    shadow::enable();
+    let outcome = execute(&program, ExecutionLimits::default(), None);
+    assert_eq!(outcome.authority(), Authority::NonAuthoritative);
+    assert!(matches!(outcome, Outcome::Inconclusive(ref stop)
+        if matches!(&stop.cause, InconclusiveCause::ResourceExhausted { usage }
+            if usage.reason == ResourceReason::ExecutionSteps
+                && usage.allowed == 65_536 && usage.observed == 65_537)
+            && stop.progress.as_ref().is_some_and(|progress|
+                progress.text().contains("String.Internal.intercalate native list traversal"))));
+    assert_clean_shadow();
 }
 
 #[test]

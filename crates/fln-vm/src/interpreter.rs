@@ -846,7 +846,7 @@ enum IntrinsicImplementation {
     StringDrop,
     StringDropRight,
     StringExtract,
-    StringInternalFoldl,
+    StringTraversal(string_fold::Intrinsic),
     StringInternalIsEmpty,
     StringInternalIsPrefixOf,
     StringNext,
@@ -1212,7 +1212,6 @@ impl IntrinsicImplementation {
             "extern:String.Internal.extract"
             | "extern:String.extract"
             | "extern:String.Pos.Raw.extract" => Self::StringExtract,
-            "extern:String.Internal.foldl" => Self::StringInternalFoldl,
             "extern:String.Internal.isEmpty" => Self::StringInternalIsEmpty,
             "extern:String.Internal.isPrefixOf" => Self::StringInternalIsPrefixOf,
             "extern:String.Internal.next" | "extern:String.next" | "extern:String.Pos.Raw.next" => {
@@ -1286,6 +1285,7 @@ impl IntrinsicImplementation {
                 })
                 .or_else(|| floats::Intrinsic::for_row(row).map(Self::Float))
                 .or_else(|| strings::Intrinsic::for_row(row).map(Self::StringInternal))
+                .or_else(|| string_fold::Intrinsic::for_row(row).map(Self::StringTraversal))
                 .unwrap_or(Self::Unsupported),
         }
     }
@@ -1866,6 +1866,7 @@ enum ReturnTo {
     CompleteStringFold {
         destination: Register,
         state: string_fold::State,
+        row: &'static str,
         result_ownership: ResultOwnership,
     },
     CompleteIntrinsicApplication {
@@ -2654,8 +2655,16 @@ fn run(
                             }
                         }
                     }
-                } else if plan.implementation == IntrinsicImplementation::StringInternalFoldl {
-                    match string_fold::start(program, values) {
+                } else if let IntrinsicImplementation::StringTraversal(intrinsic) =
+                    plan.implementation
+                {
+                    match string_fold::start(
+                        program,
+                        intrinsic,
+                        plan.row,
+                        values,
+                        limits.max_nat_magnitude_bytes,
+                    ) {
                         Ok(string_fold::Step::Complete(value)) => {
                             let value = match finish_intrinsic_result(
                                 plan.row,
@@ -2687,6 +2696,7 @@ fn run(
                                 ReturnTo::CompleteStringFold {
                                     destination: dst,
                                     state,
+                                    row: plan.row,
                                     result_ownership,
                                 },
                                 limits.max_stack_depth,
@@ -2694,11 +2704,23 @@ fn run(
                             )?;
                             peak_stack_depth = peak_stack_depth.max(next_depth);
                         }
-                        Err(refusal) => {
+                        Err(string_fold::Failure::Refused(
+                            refusal @ VmRefusal::NativeStdoutCapture { .. },
+                        )) => {
+                            return stdio_apply_failure(refusal, steps, peak_stack_depth);
+                        }
+                        Err(string_fold::Failure::Refused(refusal)) => {
                             return Ok(VmExit::Refused {
                                 refusal,
                                 usage: usage(steps, peak_stack_depth),
                             });
+                        }
+                        Err(string_fold::Failure::NatMagnitudeLimit { allowed, observed }) => {
+                            return Err(nat_magnitude_exhausted(
+                                allowed,
+                                observed,
+                                &location.to_string(),
+                            ));
                         }
                     }
                 } else if plan.implementation.is_managerless_task()
@@ -3316,11 +3338,12 @@ fn run(
                             ReturnTo::CompleteStringFold {
                                 destination,
                                 state,
+                                row,
                                 result_ownership,
                             } => match string_fold::resume(program, state, value) {
                                 Ok(string_fold::Step::Complete(value)) => {
                                     let value = match finish_intrinsic_result(
-                                        string_fold::ROW,
+                                        row,
                                         result_ownership,
                                         IntrinsicResult::owned(value),
                                     ) {
@@ -3351,6 +3374,7 @@ fn run(
                                         ReturnTo::CompleteStringFold {
                                             destination,
                                             state,
+                                            row,
                                             result_ownership,
                                         },
                                         limits.max_stack_depth,
@@ -3358,11 +3382,26 @@ fn run(
                                     )?;
                                     peak_stack_depth = peak_stack_depth.max(next_depth);
                                 }
-                                Err(refusal) => {
+                                Err(string_fold::Failure::Refused(
+                                    refusal @ VmRefusal::NativeStdoutCapture { .. },
+                                )) => {
+                                    return stdio_apply_failure(refusal, steps, peak_stack_depth);
+                                }
+                                Err(string_fold::Failure::Refused(refusal)) => {
                                     return Ok(VmExit::Refused {
                                         refusal,
                                         usage: usage(steps, peak_stack_depth),
                                     });
+                                }
+                                Err(string_fold::Failure::NatMagnitudeLimit {
+                                    allowed,
+                                    observed,
+                                }) => {
+                                    return Err(nat_magnitude_exhausted(
+                                        allowed,
+                                        observed,
+                                        &location.to_string(),
+                                    ));
                                 }
                             },
                             ReturnTo::CompleteIntrinsicApplication {
@@ -7117,7 +7156,7 @@ fn dispatch_intrinsic(
         | IntrinsicImplementation::TaskSpawn
         | IntrinsicImplementation::TaskMap
         | IntrinsicImplementation::TaskBind
-        | IntrinsicImplementation::StringInternalFoldl
+        | IntrinsicImplementation::StringTraversal(_)
         | IntrinsicImplementation::DbgTrace
         | IntrinsicImplementation::Unsupported => Err(VmRefusal::UnsupportedIntrinsic {
             row: row.to_string(),
@@ -7602,7 +7641,7 @@ fn closure_intrinsic_application(
         | IntrinsicImplementation::ByteArrayUset
         | IntrinsicImplementation::ByteArrayValidateUtf8
         | IntrinsicImplementation::StringNext
-        | IntrinsicImplementation::StringInternalFoldl
+        | IntrinsicImplementation::StringTraversal(_)
         | IntrinsicImplementation::StringPrev
         | IntrinsicImplementation::StringPush
         | IntrinsicImplementation::StringTrim
@@ -8239,6 +8278,14 @@ fn string_to_byte_array(
 
 fn string_bytes_exhausted(operation: &str, error: strings::ResourceError, location: &str) -> Stop {
     match error {
+        strings::ResourceError::TraversalLimit { allowed, observed } => Stop::Inconclusive(
+            Inconclusive::resource(ResourceUsage {
+                reason: ResourceReason::ExecutionSteps,
+                allowed,
+                observed,
+            })
+            .with_progress(format!("{operation} native list traversal at {location}")),
+        ),
         strings::ResourceError::OutputLimit { allowed, observed } => Stop::Inconclusive(
             Inconclusive::resource(ResourceUsage {
                 reason: ResourceReason::Memory {

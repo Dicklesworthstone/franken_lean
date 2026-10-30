@@ -20,9 +20,12 @@ use super::{
     value_kind, with_nat_view, with_nat_views,
 };
 
-// Bound this count-driven allocation before reserving or repeating. This is
+// Bound these output allocations before reserving, joining or repeating. This is
 // a Golem output-memory ceiling, separate from Nat storage and Lean heartbeats.
-const MAX_PUSHN_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
+const MAX_STRING_OUTPUT_BYTES: usize = 16 * 1024 * 1024;
+// Native list work is distinct from FLBC instructions. An output-byte limit
+// alone cannot stop a cyclic spine or a long list of empty strings.
+const MAX_INTERCALATE_LIST_NODES: usize = 65_536;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum Intrinsic {
@@ -59,11 +62,13 @@ pub(super) enum Intrinsic {
     IsValid,
     GetOption,
     GetBang,
+    Intercalate,
 }
 
 #[derive(Debug)]
 pub(super) enum ResourceError {
     OutputLimit { allowed: u64, observed: u64 },
+    TraversalLimit { allowed: u64, observed: u64 },
     Allocation { requested: usize },
 }
 
@@ -107,6 +112,7 @@ impl Intrinsic {
             "extern:String.Pos.Raw.isValid" => Self::IsValid,
             "extern:String.Pos.Raw.get?" | "extern:String.get?" => Self::GetOption,
             "extern:String.Pos.Raw.get!" | "extern:String.get!" => Self::GetBang,
+            "extern:String.Internal.intercalate" => Self::Intercalate,
             _ => return None,
         })
     }
@@ -140,6 +146,7 @@ impl Intrinsic {
             Self::IsValid => "String.Pos.Raw.isValid",
             Self::GetOption => "String.Pos.Raw.get?",
             Self::GetBang => "String.Pos.Raw.get!",
+            Self::Intercalate => "String.Internal.intercalate",
         }
     }
 
@@ -184,6 +191,7 @@ impl Intrinsic {
                 return self.invoke_slice(args);
             }
             Self::Memcmp => return memcmp(args),
+            Self::Intercalate => return intercalate(args),
             Self::Data => return data(&args[0], operation),
             Self::Front => {
                 let buffer = string_buffer(&args[0], operation, 0)?;
@@ -258,7 +266,7 @@ impl Intrinsic {
                     // when the already-existing source exceeds the ceiling.
                     args[0].clone_ref()
                 } else {
-                    let result = pushn(text, character, count, MAX_PUSHN_OUTPUT_BYTES)
+                    let result = pushn(text, character, count, MAX_STRING_OUTPUT_BYTES)
                         .map_err(IntrinsicFailure::StringResource)?;
                     Obj::mk_string(&result)
                 }
@@ -286,7 +294,8 @@ impl Intrinsic {
             | Self::Memcmp
             | Self::IsValid
             | Self::GetOption
-            | Self::GetBang => unreachable!("specialized rows return above"),
+            | Self::GetBang
+            | Self::Intercalate => unreachable!("specialized rows return above"),
         };
         // The generated census specifies borrowed operands and an owned result
         // for all three rows, even when a small Nat uses an immediate object.
@@ -638,14 +647,106 @@ fn memcmp(args: &[Obj]) -> Result<IntrinsicResult, IntrinsicFailure> {
     Ok(IntrinsicResult::scalar(Obj::mk_nat(usize::from(equal))))
 }
 
-struct Substring {
-    string: Obj,
-    start: Obj,
-    stop: Obj,
+fn intercalate(args: &[Obj]) -> Result<IntrinsicResult, IntrinsicFailure> {
+    const OPERATION: &str = "String.Internal.intercalate";
+    let separator = string_buffer(&args[0], OPERATION, 0)?;
+    let separator = std::str::from_utf8(&separator[..separator.len() - 1])
+        .map_err(|_| VmRefusal::InvalidStringObject)?;
+    let step = |list: &Obj| -> Result<Option<(Obj, Obj)>, VmRefusal> {
+        match value_kind(list) {
+            ValueKind::Scalar if list.unbox() == 0 => Ok(None),
+            ValueKind::Ctor(0) if list.header().other == 0 => Ok(None),
+            ValueKind::Ctor(1) if list.header().other == 2 => {
+                let child = |index| {
+                    list.try_ctor_child(index)
+                        .ok_or_else(|| type_mismatch(OPERATION, 1, "List String", list))
+                };
+                Ok(Some((child(0)?, child(1)?)))
+            }
+            _ => Err(type_mismatch(OPERATION, 1, "List String", list)),
+        }
+    };
+    // Inspect the complete spine before allocation: a malformed late tail or
+    // an oversized concatenation never publishes a partial answer. Borrowed
+    // list/string arguments remain usable by the caller after both passes.
+    let mut list = args[1].clone_ref();
+    let mut first = None;
+    let mut count = 0usize;
+    let mut size = 0usize;
+    while let Some((head, tail)) = step(&list)? {
+        if count == MAX_INTERCALATE_LIST_NODES {
+            return Err(IntrinsicFailure::StringBytesResource {
+                operation: OPERATION,
+                error: ResourceError::TraversalLimit {
+                    allowed: MAX_INTERCALATE_LIST_NODES as u64,
+                    observed: count as u64 + 1,
+                },
+            });
+        }
+        let buffer = string_buffer(&head, OPERATION, 1)?;
+        std::str::from_utf8(&buffer[..buffer.len() - 1])
+            .map_err(|_| VmRefusal::InvalidStringObject)?;
+        let extra = (buffer.len() - 1).saturating_add(if count == 0 { 0 } else { separator.len() });
+        size = size.saturating_add(extra);
+        if count > 0 && size > MAX_STRING_OUTPUT_BYTES {
+            return Err(IntrinsicFailure::StringBytesResource {
+                operation: OPERATION,
+                error: ResourceError::OutputLimit {
+                    allowed: MAX_STRING_OUTPUT_BYTES as u64,
+                    observed: u64::try_from(size).unwrap_or(u64::MAX),
+                },
+            });
+        }
+        if count == 0 {
+            first = Some(head);
+        }
+        count += 1;
+        list = tail;
+    }
+    if count == 0 {
+        return Ok(IntrinsicResult::owned(Obj::mk_string("")));
+    }
+    if count == 1 {
+        return Ok(IntrinsicResult::owned(
+            first.expect("the list has one element"),
+        ));
+    }
+    let mut output = String::new();
+    output
+        .try_reserve_exact(size)
+        .map_err(|_| IntrinsicFailure::StringBytesResource {
+            operation: OPERATION,
+            error: ResourceError::Allocation { requested: size },
+        })?;
+    let mut list = args[1].clone_ref();
+    let mut first = true;
+    while let Some((head, tail)) = step(&list)? {
+        if !first {
+            output.push_str(separator);
+        }
+        let buffer = string_buffer(&head, OPERATION, 1)?;
+        output.push_str(
+            std::str::from_utf8(&buffer[..buffer.len() - 1])
+                .map_err(|_| VmRefusal::InvalidStringObject)?,
+        );
+        first = false;
+        list = tail;
+    }
+    Ok(IntrinsicResult::owned(Obj::mk_string(&output)))
+}
+
+pub(super) struct Substring {
+    pub(super) string: Obj,
+    pub(super) start: Obj,
+    pub(super) stop: Obj,
 }
 
 impl Substring {
-    fn read(value: &Obj, operation: &'static str, argument: usize) -> Result<Self, VmRefusal> {
+    pub(super) fn read(
+        value: &Obj,
+        operation: &'static str,
+        argument: usize,
+    ) -> Result<Self, VmRefusal> {
         if value_kind(value) != ValueKind::Ctor(0) || value.header().other != 3 {
             return Err(type_mismatch(operation, argument, "Substring.Raw", value));
         }
@@ -661,7 +762,7 @@ impl Substring {
         })
     }
 
-    fn make(string: Obj, start: Obj, stop: Obj) -> Obj {
+    pub(super) fn make(string: Obj, start: Obj, stop: Obj) -> Obj {
         Obj::mk_ctor(0, vec![string, start, stop], &[])
     }
 }
@@ -683,7 +784,7 @@ fn data(value: &Obj, operation: &'static str) -> Result<IntrinsicResult, Intrins
 const CHAR_DEFAULT_VALUE: u32 = 'A' as u32;
 
 /// The string's complete NUL-terminated buffer, borrowed in place.
-fn string_buffer<'a>(
+pub(super) fn string_buffer<'a>(
     value: &'a Obj,
     operation: &'static str,
     argument: usize,
@@ -714,7 +815,7 @@ fn fast_index(position: Option<usize>, size: usize) -> Result<usize, VmRefusal> 
 
 /// `lean_string_utf8_get_core` (`object.cpp:2177`), over the payload without
 /// its terminator. Continuation bytes are not inspected, as at the pin.
-fn utf8_get_core(bytes: &[u8], index: usize) -> Option<u32> {
+pub(super) fn utf8_get_core(bytes: &[u8], index: usize) -> Option<u32> {
     let size = bytes.len();
     let lead = u32::from(bytes[index]);
     let at = |offset: usize| u32::from(bytes[index + offset]);
@@ -756,7 +857,7 @@ fn utf8_get_fast(buffer: &[u8], index: usize) -> u32 {
 
 /// `lean_string_utf8_next_fast` and its cold half (`object.cpp:2348`): an
 /// invalid lead byte, including a continuation byte, advances by one.
-fn utf8_fast_width(lead: u8) -> usize {
+pub(super) fn utf8_fast_width(lead: u8) -> usize {
     utf8_first_byte_size(lead).unwrap_or(1)
 }
 
@@ -801,6 +902,14 @@ fn pushn(
 
 pub(super) fn resource_exhausted(error: ResourceError, location: &str) -> Stop {
     match error {
+        ResourceError::TraversalLimit { allowed, observed } => Stop::Inconclusive(
+            Inconclusive::resource(ResourceUsage {
+                reason: ResourceReason::ExecutionSteps,
+                allowed,
+                observed,
+            })
+            .with_progress(format!("String native list traversal at {location}")),
+        ),
         ResourceError::OutputLimit { allowed, observed } => Stop::Inconclusive(
             Inconclusive::resource(ResourceUsage {
                 reason: ResourceReason::Memory {
@@ -843,11 +952,11 @@ mod tests {
         ));
         for count in [None, Some(usize::MAX)] {
             assert!(matches!(
-                pushn("prefix".to_owned(), '🦀', count, MAX_PUSHN_OUTPUT_BYTES),
+                pushn("prefix".to_owned(), '🦀', count, MAX_STRING_OUTPUT_BYTES),
                 Err(ResourceError::OutputLimit {
                     allowed,
                     observed: u64::MAX,
-                }) if allowed == MAX_PUSHN_OUTPUT_BYTES as u64
+                }) if allowed == MAX_STRING_OUTPUT_BYTES as u64
             ));
         }
     }
