@@ -825,15 +825,24 @@ fn tactic_fields_are_filled_by_their_tactic() {
     );
 }
 
-/// A local defined by equations (`let rec go : Nat → Nat | 0 => 0 | k + 1 => …`) parses as the
-/// pin's `letEqnsDecl`; the checker does not read it, so it refuses each file, which the pin
-/// accepts.
+/// A local defined by equations (`let rec go : Nat → Nat | 0 => 0 | k + 1 => …`) is the pin's
+/// `letEqnsDecl`, which `expandLetEqnsDecl` turns into `go : Nat → Nat := fun x => match x with …`
+/// (vendored `Lean/Elab/Binders.lean:885-889`). The pin accepts `le1 3 = 3`, `le2 0 = 1` and
+/// `le2 5 = 2` by `rfl`, and rejects `le1 3 = 4` and `le2 0 = 2`.
 #[test]
-fn local_equations_are_refused_not_misread() {
+fn local_equations_compute_as_the_pin_expands_them() {
+    let le1 = "def le1 (n : Nat) : Nat :=\n  let rec go : Nat → Nat\n    | 0 => 0\n    | k + 1 => go k + 1\n  go n\n";
+    let le2 =
+        "def le2 (n : Nat) : Nat :=\n  let f : Nat → Nat\n    | 0 => 1\n    | _ => 2\n  f n\n";
+    check(&format!(
+        "{le1}{le2}theorem le1_ok : le1 3 = 3 := rfl\n\
+         theorem le2_zero : le2 0 = 1 := rfl\n\
+         theorem le2_ok : le2 5 = 2 := rfl\n"
+    ));
     let (engine, limits) = engine();
     for source in [
-        "def le1 (n : Nat) : Nat :=\n  let rec go : Nat → Nat\n    | 0 => 0\n    | k + 1 => go k + 1\n  go n\n",
-        "def le2 (n : Nat) : Nat :=\n  let f : Nat → Nat\n    | 0 => 1\n    | _ => 2\n  f n\n",
+        format!("{le1}theorem le1_wrong : le1 3 = 4 := rfl\n"),
+        format!("{le2}theorem le2_wrong : le2 0 = 2 := rfl\n"),
     ] {
         assert!(
             !matches!(

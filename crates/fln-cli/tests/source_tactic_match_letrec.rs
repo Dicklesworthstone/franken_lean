@@ -349,12 +349,15 @@ example : Nat := by
   exact go 3
 "#,
         1,
-        r#"refused source: elaboration refused source: unexpected syntax; expected let binding"#,
+        r#"refused source: elaboration refused source: recursive call is not on an immediate recursive constructor field"#,
     ),
 ];
 
 /// Forms the pin runs and this engine refuses, typed: a goal display naming a local its
-/// `match` keeps inaccessible, and a `let rec` defined by equations.
+/// `match` keeps inaccessible, and a `let rec` defined by equations inside a tactic block. Its
+/// equations now expand as the pin's `expandLetEqnsDecl` does, and the structural-recursion
+/// check then refuses the tactic block's `go k` (a term-level `let rec` of the same shape is
+/// admitted: `fln`'s `local_equations_compute_as_the_pin_expands_them`).
 #[test]
 fn unsupported_match_and_let_rec_forms_are_refused_typed() {
     let Some(lib) = pinned_lib() else {

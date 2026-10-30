@@ -7557,8 +7557,69 @@ pub use record::{SourceRecord, elaborate_record, is_record};
 #[cfg(test)]
 mod conversion_tests;
 
-/// `body` under the `let rec` declarations of a `Term.whereDecls` block, first declaration
-/// outermost.
+/// The name a `where` declaration binds: `letRecDecl` → `letDecl` → `letIdDecl` or
+/// `letEqnsDecl` → `letId`.
+fn where_declaration_name(declaration: &Syntax) -> Option<&Name> {
+    let Syntax::Node { args, .. } = declaration else {
+        return None;
+    };
+    let Some(Syntax::Node { args: decl, .. }) = args.get(2) else {
+        return None;
+    };
+    let Some(Syntax::Node { args: inner, .. }) = decl.first() else {
+        return None;
+    };
+    let Some(Syntax::Node { args: id, .. }) = inner.first() else {
+        return None;
+    };
+    match id.first() {
+        Some(Syntax::Ident { val, .. }) => Some(val),
+        _ => None,
+    }
+}
+
+/// The order to nest a `where` block's declarations in, outermost first. The pin expands the
+/// block to one `let rec d₁, d₂, …; body` group, every declaration in scope of every other
+/// (`expandWhereDecls`, vendored `Lean/Elab/Binders.lean:472-476`), so `loop` may call a
+/// `swap` declared after it. Nested one by one, a declaration sees only those outside it: a
+/// declaration another one names goes first, and otherwise source order holds. Declarations
+/// naming each other keep their source order, mutual recursion this nesting cannot express.
+fn where_dependency_order(declarations: &[Syntax]) -> Vec<usize> {
+    let names: Vec<Option<&Name>> = declarations.iter().map(where_declaration_name).collect();
+    let mut uses = vec![Vec::new(); declarations.len()];
+    for (index, declaration) in declarations.iter().enumerate() {
+        let mut pending = vec![declaration];
+        while let Some(node) = pending.pop() {
+            match node {
+                Syntax::Ident { val, .. } => {
+                    for (other, name) in names.iter().enumerate() {
+                        if other != index && *name == Some(val) && !uses[index].contains(&other) {
+                            uses[index].push(other);
+                        }
+                    }
+                }
+                Syntax::Node { args, .. } => pending.extend(args),
+                _ => {}
+            }
+        }
+    }
+    let mut placed = vec![false; declarations.len()];
+    let mut order = Vec::with_capacity(declarations.len());
+    while order.len() < declarations.len() {
+        let ready = (0..declarations.len())
+            .find(|&index| !placed[index] && uses[index].iter().all(|&other| placed[other]));
+        let Some(index) = ready.or_else(|| (0..declarations.len()).find(|&index| !placed[index]))
+        else {
+            break;
+        };
+        placed[index] = true;
+        order.push(index);
+    }
+    order
+}
+
+/// `body` under the `let rec` declarations of a `Term.whereDecls` block, ordered by
+/// [`where_dependency_order`], the first outermost.
 fn where_body(where_decls: &Syntax, body: &Syntax) -> Result<Syntax, NatDefinitionElabError> {
     let parts = expect_node(
         where_decls,
@@ -7586,7 +7647,12 @@ fn where_body(where_decls: &Syntax, body: &Syntax) -> Result<Syntax, NatDefiniti
     let null = |args: Vec<Syntax>| Syntax::node(Name::from_components(["null"]), args);
     let atom = |text: &str| Syntax::atom(fln_syntax::source::SourceInfo::None, text);
     let mut result = body.clone();
-    for declaration in declarations.into_iter().rev() {
+    let order = where_dependency_order(&declarations);
+    for declaration in order
+        .into_iter()
+        .rev()
+        .map(|index| declarations[index].clone())
+    {
         result = Syntax::node(
             parser_kind(&["Term", "letrec"]),
             vec![

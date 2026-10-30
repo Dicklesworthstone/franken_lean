@@ -336,6 +336,12 @@ fn let_pattern(syntax: &Syntax) -> bool {
 
 /// `let p := v; b` with a pattern is `match v with | p => b`, and `let p : T := v; b` is
 /// `match (v : T) with | p => b` (`elabLetDeclCore`'s `letPatDecl` case, `Lean/Elab/Binders.lean`).
+/// A `let`, `let rec` or `where` declaration by equations, `go : T | p => e …` (`letEqnsDecl`).
+fn let_equations(syntax: &Syntax) -> bool {
+    matches!(syntax, Syntax::Node { kind, args, .. }
+        if kind == &parser_kind(&["Term", "letEqnsDecl"]) && args.len() == 4)
+}
+
 fn expand_let_pattern(mut syntax: Syntax, pattern: bool) -> Syntax {
     if pattern || !let_pattern(&syntax) {
         return syntax;
@@ -585,6 +591,125 @@ fn pattern_function(syntax: &Syntax) -> bool {
 }
 
 impl Context {
+    /// The pin's `expandLetEqnsDecl` (`Lean/Elab/Binders.lean:885-889`): the declaration
+    /// `go : T | p₁, p₂ => e …` is `go : T := fun x₁ x₂ => match x₁, x₂ with | p₁, p₂ => e …`,
+    /// one fresh argument per pattern of the first alternative (`expandMatchAltsIntoMatch`,
+    /// `:487-558`). The arguments are names no source can write, and the `match` is left to the
+    /// ordinary lowering, which reads a recursive local's root `match` as its recursion.
+    ///
+    /// The pin writes `@fun`, so an argument also takes a declared type's leading implicit
+    /// binder (`f : {n : Nat} → Nat | _ => 0` matches on `n`). This elaborator has no `@fun`
+    /// yet, so such a declaration gets the implicit lambda first and is refused where the pin
+    /// accepts it.
+    fn let_equations_as_value(
+        &mut self,
+        mut syntax: Syntax,
+    ) -> Result<Syntax, NatDefinitionElabError> {
+        let Syntax::Node { info, args, .. } = &mut syntax else {
+            unreachable!("checked declaration by equations");
+        };
+        let info = *info;
+        let mut take = |index: usize| std::mem::replace(&mut args[index], null(vec![]));
+        let (name, binders, annotation, alternatives) = (take(0), take(1), take(2), take(3));
+        let arity = self.equation_arity(&alternatives)?;
+        let mut names = Vec::new();
+        let mut discriminants = Vec::new();
+        for index in 0..arity {
+            self.tick()?;
+            let serial = self.next;
+            let _ = self.fresh_name()?;
+            let fresh = Name::num(Name::anonymous(), serial);
+            names.push(identifier(fresh.clone()));
+            if index != 0 {
+                discriminants.push(atom(","));
+            }
+            discriminants.push(Syntax::node(
+                parser_kind(&["Term", "matchDiscr"]),
+                vec![null(vec![]), identifier(fresh)],
+            ));
+        }
+        let body = Syntax::node(
+            parser_kind(&["Term", "match"]),
+            vec![
+                atom("match"),
+                null(vec![]),
+                null(vec![]),
+                null(discriminants),
+                atom("with"),
+                alternatives,
+            ],
+        );
+        let value = Syntax::node(
+            parser_kind(&["Term", "fun"]),
+            vec![
+                atom("fun"),
+                Syntax::node(
+                    parser_kind(&["Term", "basicFun"]),
+                    vec![null(names), null(vec![]), atom("=>"), body],
+                ),
+            ],
+        );
+        Ok(Syntax::Node {
+            info,
+            kind: parser_kind(&["Term", "letIdDecl"]),
+            args: vec![name, binders, annotation, atom(":="), value],
+        })
+    }
+
+    /// `syntax` with every declaration by equations replaced by its `letIdDecl`
+    /// ([`Self::let_equations_as_value`]), or `None` when it has none. The tree is rebuilt with
+    /// an explicit stack, children before their node.
+    fn expand_let_equations(
+        &mut self,
+        syntax: &Syntax,
+    ) -> Result<Option<Syntax>, NatDefinitionElabError> {
+        let mut scan = vec![syntax];
+        let mut found = false;
+        while let Some(node) = scan.pop() {
+            self.tick()?;
+            if let_equations(node) {
+                found = true;
+                break;
+            }
+            if let Syntax::Node { args, .. } = node {
+                scan.extend(args);
+            }
+        }
+        if !found {
+            return Ok(None);
+        }
+        enum Task<'a> {
+            Visit(&'a Syntax),
+            Build(&'a Syntax, usize),
+        }
+        let mut tasks = vec![Task::Visit(syntax)];
+        let mut built = Vec::new();
+        while let Some(task) = tasks.pop() {
+            self.tick()?;
+            match task {
+                Task::Visit(node @ Syntax::Node { args, .. }) => {
+                    tasks.push(Task::Build(node, built.len()));
+                    tasks.extend(args.iter().rev().map(Task::Visit));
+                }
+                Task::Visit(leaf) => built.push(leaf.clone()),
+                Task::Build(Syntax::Node { info, kind, .. }, start) => {
+                    let node = Syntax::Node {
+                        info: *info,
+                        kind: kind.clone(),
+                        args: built.split_off(start),
+                    };
+                    built.push(if let_equations(&node) {
+                        self.let_equations_as_value(node)?
+                    } else {
+                        node
+                    });
+                }
+                Task::Build(..) => unreachable!("only nodes are built"),
+            }
+        }
+        Ok(built.pop())
+    }
+
     /// Pattern lambdas are ordinary lambdas over fresh private names. Domain
     /// inference/checking stays in the existing lambda elaborator. The body's
     /// original alternatives go through the same matrix compiler as match.
@@ -1563,6 +1688,13 @@ impl Context {
         &mut self,
         syntax: &'a Syntax,
     ) -> Result<Cow<'a, Syntax>, NatDefinitionElabError> {
+        // A declaration by equations is its `letIdDecl` first, as the pin expands it before its
+        // `let` elaborates; the scan below reads every `let rec` declaration as one.
+        if let Some(expanded) = self.expand_let_equations(syntax)? {
+            return Ok(Cow::Owned(
+                self.lower_pattern_matrices(&expanded)?.into_owned(),
+            ));
+        }
         let mut scan = vec![syntax];
         let mut needed = false;
         let mut mutation = false;
