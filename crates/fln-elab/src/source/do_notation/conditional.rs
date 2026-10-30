@@ -151,12 +151,10 @@ pub(super) fn split(
             [] => {}
             [binder, colon] => {
                 expect_atom(colon, ":", "condition binder colon")?;
-                // Macro-generated binders are atomic before hygiene scopes
-                // are attached. Validate that shape without erasing the name
-                // which the branch body must use for capture-free lookup.
-                if !matches!(binder, Syntax::Ident { val, .. } if !val.erase_macro_scopes().is_anonymous() && val.erase_macro_scopes().parent().is_anonymous())
-                    && !matches!(binder, Syntax::Atom { val, .. } if val == "_")
-                {
+                // The pin uses a `Term.hole` for `_`; the native parser also
+                // supplies its atom form. Preserve the original syntax and
+                // hygiene scopes for the conditional's branch binders.
+                if super::super::matching::conditional_binding(binder).is_err() {
                     return Err(invalid());
                 }
             }
@@ -661,6 +659,39 @@ mod tests {
         .unwrap();
         assert_eq!(count(&args[0], &Name::from_components(["h"])), 1);
         assert_eq!(count(&args[1], &Name::from_components(["h"])), 1);
+    }
+    #[test]
+    fn anonymous_branch_binders_accept_the_pin_and_native_parser_shapes() {
+        for (binder, accepted) in [
+            (atom("_"), true),
+            (term("hole", vec![atom("_")]), true),
+            (term("hole", vec![]), false),
+            (term("hole", vec![atom("wrong")]), false),
+        ] {
+            let mut input = condition(action("yes"), action("no"));
+            let Syntax::Node { args, .. } = &mut input else {
+                unreachable!()
+            };
+            let binding = null(vec![binder, atom(":")]);
+            args[1] = term("doIfProp", vec![binding.clone(), named("test")]);
+            let result = context().expand_do_conditional(input, None, None);
+            if !accepted {
+                assert!(result.is_err());
+                continue;
+            }
+            let result = result.unwrap();
+            let args = expect_node(
+                &result,
+                &parser_kind(&["Term", "ifThenElse"]),
+                7,
+                "anonymous dependent conditional",
+            )
+            .unwrap();
+            assert_eq!(args[1], binding);
+            assert!(context().match_parts(&result).unwrap().is_conditional());
+            assert_eq!(count(&result, &Name::from_components(["yes"])), 1);
+            assert_eq!(count(&result, &Name::from_components(["no"])), 1);
+        }
     }
     #[test]
     fn deep_conditions_use_a_bounded_heap_walk_and_fresh_requests_recover() {

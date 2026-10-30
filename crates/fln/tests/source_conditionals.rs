@@ -56,7 +56,7 @@ fn conditional_and_match_plans_share_nested_scopes() {
 #[test]
 fn conditionals_are_higher_order_arguments_and_local_values() {
     check(
-        "def apply (f : Nat -> Nat) (n : Nat) : Nat := f n\n def f (b : Bool) : Nat := apply (if b then fun x => x + 1 else fun y => y + 2) 8\n theorem t : f false = 10 := by rfl\n def loc : Nat := by\n let n := if true then 7 else 8\n exact n\n theorem u : loc = 7 := by rfl",
+        "def apply (f : Nat -> Nat) (n : Nat) : Nat := f n\n def f (b : Bool) : Nat := apply (if b then fun x => x + 1 else fun y => y + 2) 8\n theorem t : f false = 10 := by rfl\n def loc : Nat := by\n  let n := if true then 7 else 8\n  exact n\n theorem u : loc = 7 := by rfl",
     );
 }
 #[test]
@@ -154,6 +154,34 @@ fn named_conditionals_capture_refinement_holes_in_separate_scopes() {
           | exact if h : p then h else hp
     "#,
     );
+}
+
+#[test]
+fn anonymous_conditionals_keep_checked_proposition_and_boolean_evidence() {
+    check(
+        r#"
+        def anonymousProp (p : Prop) [Decidable p]
+            (yes : p -> Nat) (no : Not p -> Nat) : Nat :=
+          if _ : p then yes (by assumption) else no (by assumption)
+        theorem positiveAnonymous : anonymousProp True (fun h => 7) (fun h => 9) = 7 := by rfl
+        theorem negativeAnonymous : anonymousProp False (fun h => 7) (fun h => 9) = 9 := by rfl
+        def anonymousBool (b : Bool)
+            (yes : b = true -> Nat) (no : Not (b = true) -> Nat) : Nat :=
+          if _ : b then yes (by assumption) else no (by assumption)
+        theorem trueAnonymous : anonymousBool true (fun h => 11) (fun h => 13) = 11 := by rfl
+        theorem falseAnonymous : anonymousBool false (fun h => 11) (fun h => 13) = 13 := by rfl
+        def anonymousShadow (h : Nat) (p : Prop) [Decidable p] : Nat :=
+          (if _ : p then h else h) + h
+        theorem outerName : anonymousShadow 3 True = 6 := by rfl
+        "#,
+    );
+    for source in [
+        "theorem bad (p : Prop) [Decidable p] : p := if _ : p then by assumption else by assumption",
+        "def bad (p : Prop) [Decidable p] : Nat := if _ : p then h else 0",
+        "theorem bad (p : Prop) [Decidable p] : p := by\n  let ignored : Nat := if _ : p then 1 else 2\n  assumption",
+    ] {
+        reject(source);
+    }
 }
 
 #[test]

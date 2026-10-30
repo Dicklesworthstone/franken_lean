@@ -61,6 +61,23 @@ theorem annotatedValue : annotated (Pair.mk 4 2) = 42 := by rfl
 }
 
 #[test]
+fn anonymous_do_conditions_keep_their_boolean_evidence_in_each_branch() {
+    checked(
+        &engine(),
+        r#"
+def anonymousDo (b : Bool)
+    (yes : b = true -> Id Nat) (no : Not (b = true) -> Id Nat) : Id Nat := do
+  if _ : b then
+    yes (by assumption)
+  else
+    no (by assumption)
+theorem yesAnonymousDo : anonymousDo true (fun h => 7) (fun h => 9) = 7 := by rfl
+theorem noAnonymousDo : anonymousDo false (fun h => 7) (fun h => 9) = 9 := by rfl
+"#,
+    );
+}
+
+#[test]
 fn nested_patterns_wildcards_and_shadowing_preserve_scope() {
     checked(
         &engine(),

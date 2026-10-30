@@ -78,9 +78,36 @@ pub(super) struct MatchParts<'a> {
 }
 #[derive(Clone, Copy)]
 struct ConditionalParts<'a> {
+    /// An explicit evidence binder, including `_`, selects dependent `if`.
+    binds_evidence: bool,
     binding: Option<&'a Name>,
     yes: &'a Syntax,
     no: &'a Syntax,
+}
+
+pub(super) fn conditional_binding(
+    syntax: &Syntax,
+) -> Result<Option<&Name>, NatDefinitionElabError> {
+    match syntax {
+        Syntax::Ident { val, .. }
+            if !val.erase_macro_scopes().is_anonymous()
+                && val.erase_macro_scopes().parent().is_anonymous() =>
+        {
+            Ok(Some(val))
+        }
+        Syntax::Atom { val, .. } if val == "_" => Ok(None),
+        _ if syntax.kind() == Some(&parser_kind(&["Term", "hole"])) => {
+            let parts = expect_node(
+                syntax,
+                &parser_kind(&["Term", "hole"]),
+                1,
+                "anonymous conditional evidence",
+            )?;
+            expect_atom(&parts[0], "_", "anonymous conditional evidence")?;
+            Ok(None)
+        }
+        _ => Err(error(MatchError::InvalidPattern)),
+    }
 }
 impl MatchParts<'_> {
     pub(in crate::source) fn is_conditional(&self) -> bool {
@@ -233,15 +260,7 @@ impl Context {
                     "conditional evidence",
                 )?;
                 expect_atom(&parts[2], ":", "conditional evidence separator")?;
-                let Syntax::Ident { val, .. } = &name[0] else {
-                    return Err(error(MatchError::InvalidPattern));
-                };
-                if val.erase_macro_scopes().is_anonymous()
-                    || !val.erase_macro_scopes().parent().is_anonymous()
-                {
-                    return Err(error(MatchError::InvalidPattern));
-                }
-                (Some(val), &parts[3..])
+                (conditional_binding(&name[0])?, &parts[3..])
             } else {
                 (None, &parts[1..])
             };
@@ -255,6 +274,7 @@ impl Context {
                 generated: true,
                 written: false,
                 conditional: Some(ConditionalParts {
+                    binds_evidence: dependent,
                     binding,
                     yes: &rest[2],
                     no: &rest[4],
@@ -271,17 +291,15 @@ impl Context {
             expect_atom(&parts[0], "if", "conditional keyword")?;
             expect_atom(&parts[3], "then", "conditional then")?;
             expect_atom(&parts[5], "else", "conditional else")?;
-            let binding = match expect_null_args(&parts[1], "conditional evidence")? {
-                [] => None,
-                [Syntax::Ident { val, .. }, colon]
-                    if !val.erase_macro_scopes().is_anonymous()
-                        && val.erase_macro_scopes().parent().is_anonymous() =>
-                {
-                    expect_atom(colon, ":", "conditional evidence separator")?;
-                    Some(val)
-                }
-                _ => return Err(error(MatchError::InvalidPattern)),
-            };
+            let (binds_evidence, binding) =
+                match expect_null_args(&parts[1], "conditional evidence")? {
+                    [] => (false, None),
+                    [binder, colon] => {
+                        expect_atom(colon, ":", "conditional evidence separator")?;
+                        (true, conditional_binding(binder)?)
+                    }
+                    _ => return Err(error(MatchError::InvalidPattern)),
+                };
             return Ok(MatchParts {
                 discriminant: &parts[2],
                 equation: None,
@@ -289,6 +307,7 @@ impl Context {
                 generated: true,
                 written: false,
                 conditional: Some(ConditionalParts {
+                    binds_evidence,
                     binding,
                     yes: &parts[4],
                     no: &parts[6],
@@ -452,7 +471,7 @@ impl Context {
         mut major: Typed,
         expected: Option<Expr>,
     ) -> Result<MatchStart<'a>, NatDefinitionElabError> {
-        if let Some(binding) = parts.conditional.as_ref().map(|c| c.binding.is_some()) {
+        if let Some(binds_evidence) = parts.conditional.as_ref().map(|c| c.binds_evidence) {
             let mut type_ = self.whnf(&major.type_)?;
             let boolean = Expr::const_(Name::from_components(["Bool"]), vec![]);
             // A conditional never refines its condition, as the pin's `ite`/`dite` never do: the
@@ -460,7 +479,7 @@ impl Context {
             // that needs `b` replaced (`if b then Or.inl rfl else Or.inr rfl` against
             // `b = true ∨ b = false`) is refused, as at the pin. `if h : b` is the pin's
             // `dite (b = true)`, its evidence `h : b = true`: the decided proposition below.
-            if type_ == boolean && binding {
+            if type_ == boolean && binds_evidence {
                 major = Typed {
                     value: [
                         boolean.clone(),
