@@ -1,6 +1,9 @@
 //! The explicit `fln ir run` mixed-producer execution door.
 
 use super::*;
+use fln::imported_ir::modules::{
+    LoadedModules, ModuleArtifacts, ModuleLoadError, ModuleLoadLimits,
+};
 use fln::imported_ir::{
     EntryArgument, IrExecutionError, IrExecutionLimits, IrNat, VerifiedPartition,
 };
@@ -12,6 +15,8 @@ pub(super) struct Arguments {
     users: BTreeSet<fln::Name>,
     values: Vec<EntryArgument>,
     paths: Vec<PathBuf>,
+    modules: Vec<fln::Name>,
+    search_paths: Vec<PathBuf>,
     max_bytes: usize,
     json: bool,
     vm: fln::VmExecutionLimits,
@@ -40,6 +45,8 @@ pub(super) fn parse(arguments: Vec<OsString>) -> Result<MultiplexerCommand, Usag
     let mut users = BTreeSet::new();
     let mut values = Vec::new();
     let mut paths = Vec::new();
+    let mut modules = Vec::new();
+    let mut search_paths = Vec::new();
     let mut max_bytes = OLEAN_INSPECT_DEFAULT_MAX_BYTES;
     let mut json = false;
     let mut vm = fln::VmExecutionLimits::user_program();
@@ -78,6 +85,12 @@ pub(super) fn parse(arguments: Vec<OsString>) -> Result<MultiplexerCommand, Usag
             "--user" => {
                 users.insert(parse_name(value()?, "--user")?);
             }
+            "--module" => {
+                let module = parse_name(value()?, "--module")?;
+                module_relative_path(&module).map_err(|error| UsageError(error.to_string()))?;
+                modules.push(module);
+            }
+            "--search-path" => search_paths.push(PathBuf::from(value()?)),
             "--nat" => {
                 let number = text(value()?, "--nat")?.parse::<u64>().map_err(|_| {
                     UsageError("--nat requires an unsigned 64-bit integer".to_owned())
@@ -104,9 +117,19 @@ pub(super) fn parse(arguments: Vec<OsString>) -> Result<MultiplexerCommand, Usag
     let partition = partition.ok_or_else(|| {
         UsageError("ir run requires --partition PATH to the pinned census".to_owned())
     })?;
-    if paths.is_empty() {
+    if paths.is_empty() && modules.is_empty() {
         return Err(UsageError(
-            "ir run requires at least one .ir PATH".to_owned(),
+            "ir run requires .ir PATHs or --module NAME with --search-path DIR".to_owned(),
+        ));
+    }
+    if !paths.is_empty() && (!modules.is_empty() || !search_paths.is_empty()) {
+        return Err(UsageError(
+            "ir run cannot combine explicit .ir PATHs with module search".to_owned(),
+        ));
+    }
+    if !modules.is_empty() && search_paths.is_empty() {
+        return Err(UsageError(
+            "ir run --module requires at least one --search-path DIR".to_owned(),
         ));
     }
     Ok(MultiplexerCommand::IrRun(Arguments {
@@ -115,10 +138,148 @@ pub(super) fn parse(arguments: Vec<OsString>) -> Result<MultiplexerCommand, Usag
         users,
         values,
         paths,
+        modules,
+        search_paths,
         max_bytes,
         json,
         vm,
     }))
+}
+
+/// A structural module component is one portable filename component. Never
+/// split the display form: a quoted import can contain a dot in one component,
+/// and an untrusted import cannot turn a slash or numeric name into a path.
+fn module_relative_path(module: &fln::Name) -> Result<PathBuf, ModuleLoadError> {
+    let invalid = || ModuleLoadError::Resolve {
+        module: module.clone(),
+        detail: "module name contains an unsafe filesystem component".to_owned(),
+    };
+    let mut components = Vec::new();
+    let mut cursor = module.clone();
+    let mut bytes = 0usize;
+    while !cursor.is_anonymous() {
+        if components.len() >= 128 {
+            return Err(ModuleLoadError::Limit("module name components"));
+        }
+        let fln::LeafView::Str(part) = cursor.leaf_view() else {
+            return Err(invalid());
+        };
+        bytes = bytes
+            .checked_add(part.len())
+            .filter(|bytes| *bytes <= 16 * 1024)
+            .ok_or(ModuleLoadError::Limit("module name bytes"))?;
+        let mut segments = Path::new(part).components();
+        if part.is_empty()
+            || part.ends_with(['.', ' '])
+            || part.chars().any(|c| {
+                c.is_control() || matches!(c, '/' | '\\' | ':' | '<' | '>' | '"' | '|' | '?' | '*')
+            })
+            || !matches!(segments.next(), Some(std::path::Component::Normal(_)))
+            || segments.next().is_some()
+        {
+            return Err(invalid());
+        }
+        components.push(part.to_owned());
+        cursor = cursor.parent();
+    }
+    if components.is_empty() {
+        return Err(invalid());
+    }
+    Ok(components.iter().rev().collect())
+}
+
+fn module_file_error(module: &fln::Name, error: BoundedReadFailure) -> ModuleLoadError {
+    match error {
+        BoundedReadFailure::TooLarge { .. } => ModuleLoadError::Limit("artifact bytes"),
+        BoundedReadFailure::Allocation { .. } => ModuleLoadError::Limit("artifact allocation"),
+        BoundedReadFailure::Resource { .. } => ModuleLoadError::Limit("artifact read"),
+        BoundedReadFailure::Input { .. } => ModuleLoadError::Resolve {
+            module: module.clone(),
+            detail: error.to_string(),
+        },
+    }
+}
+
+fn read_module_companion(
+    path: &Path,
+    module: &fln::Name,
+    remaining: usize,
+) -> Result<Option<Vec<u8>>, ModuleLoadError> {
+    let error = |detail| ModuleLoadError::Resolve {
+        module: module.clone(),
+        detail,
+    };
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(failure) if failure.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(failure) => {
+            return Err(error(format!(
+                "cannot inspect {}: {failure}",
+                path.display()
+            )));
+        }
+    };
+    if !metadata.is_file() {
+        return Err(error(format!("{} is not a regular file", path.display())));
+    }
+    // The stream reader remains authoritative if the file changes after this
+    // early size check. Both companions consume one cumulative allowance.
+    if metadata.len() > remaining as u64 {
+        return Err(ModuleLoadError::Limit("artifact bytes"));
+    }
+    let mut file = std::fs::File::open(path)
+        .map_err(|failure| error(format!("cannot open {}: {failure}", path.display())))?;
+    let opened = file
+        .metadata()
+        .map_err(|failure| error(format!("cannot inspect {}: {failure}", path.display())))?;
+    if !opened.is_file() {
+        return Err(error(format!("{} is not a regular file", path.display())));
+    }
+    read_bounded_from(&mut file, remaining, "IR module companion")
+        .map(Some)
+        .map_err(|failure| module_file_error(module, failure))
+}
+
+fn load_modules(arguments: &Arguments) -> Result<LoadedModules, ModuleLoadError> {
+    let limits = ModuleLoadLimits {
+        max_bytes: arguments.max_bytes,
+        ..ModuleLoadLimits::default()
+    };
+    fln::imported_ir::modules::load(&arguments.modules, limits, |module, remaining| {
+        let relative = module_relative_path(module)?;
+        for root in &arguments.search_paths {
+            let base = root.join(&relative);
+            // Append extensions, preserving dots inside quoted components.
+            let companion = |extension: &str| {
+                let mut path = base.as_os_str().to_os_string();
+                path.push(extension);
+                PathBuf::from(path)
+            };
+            let Some(olean) = read_module_companion(&companion(".olean"), module, remaining)?
+            else {
+                continue;
+            };
+            // Select companions from the same search root. An absent .ir is
+            // visible in the report; a later root cannot supply unrelated code
+            // for a public import table selected from this root.
+            let ir = read_module_companion(&companion(".ir"), module, remaining - olean.len())?;
+            return Ok(Some(ModuleArtifacts { olean, ir }));
+        }
+        Ok(None)
+    })
+}
+
+fn module_load_failure(error: ModuleLoadError, json: bool) -> MultiplexerOutput {
+    if error.is_resource() {
+        return failure("resource", &error.to_string(), json, 3);
+    }
+    let (class, code) = match error {
+        ModuleLoadError::MissingModule(_) => ("missing-module", 3),
+        ModuleLoadError::ImportCycle(_) => ("invalid-ir", 1),
+        ModuleLoadError::Decode { .. } => ("codec", 1),
+        _ => ("input", 1),
+    };
+    failure(class, &error.to_string(), json, code)
 }
 
 fn failure(class: &str, detail: &str, json: bool, code: u8) -> MultiplexerOutput {
@@ -176,29 +337,42 @@ fn run_uncaptured(arguments: Arguments) -> MultiplexerOutput {
         Err(error) => return preparation_failure(error, arguments.json),
     };
     let mut modules = Vec::new();
+    let mut loaded_names = Vec::new();
+    let mut missing_ir = Vec::new();
     let mut bytes_read = 0usize;
-    for path in &arguments.paths {
-        let remaining = arguments.max_bytes.saturating_sub(bytes_read);
-        let bytes = match read_bounded(path, remaining, "IR module") {
-            Ok(bytes) => bytes,
-            Err(error) => return failure(error.class(), &error.to_string(), arguments.json, 3),
-        };
-        bytes_read = bytes_read.saturating_add(bytes.len());
-        match fln::decode_ir_artifact(&bytes, remaining) {
-            Ok(module) => modules.push(module),
-            Err(error) => {
-                return failure(
-                    if error.is_resource() {
-                        "resource"
-                    } else {
-                        "codec"
-                    },
-                    &error.to_string(),
-                    arguments.json,
-                    if error.is_resource() { 3 } else { 1 },
-                );
+    if arguments.modules.is_empty() {
+        for path in &arguments.paths {
+            let remaining = arguments.max_bytes.saturating_sub(bytes_read);
+            let bytes = match read_bounded(path, remaining, "IR module") {
+                Ok(bytes) => bytes,
+                Err(error) => return failure(error.class(), &error.to_string(), arguments.json, 3),
+            };
+            bytes_read = bytes_read.saturating_add(bytes.len());
+            match fln::decode_ir_artifact(&bytes, remaining) {
+                Ok(module) => modules.push(module),
+                Err(error) => {
+                    return failure(
+                        if error.is_resource() {
+                            "resource"
+                        } else {
+                            "codec"
+                        },
+                        &error.to_string(),
+                        arguments.json,
+                        if error.is_resource() { 3 } else { 1 },
+                    );
+                }
             }
         }
+    } else {
+        let loaded = match load_modules(&arguments) {
+            Ok(loaded) => loaded,
+            Err(error) => return module_load_failure(error, arguments.json),
+        };
+        bytes_read = loaded.bytes_read();
+        loaded_names = loaded.module_names().to_vec();
+        missing_ir = loaded.missing_ir_modules().to_vec();
+        modules = loaded.into_modules();
     }
     let compiled = match fln::imported_ir::compile(
         &modules,
@@ -281,8 +455,15 @@ fn run_uncaptured(arguments: Arguments) -> MultiplexerOutput {
         ),
     };
     let report = if arguments.json {
+        let names = |names: &[fln::Name]| {
+            names
+                .iter()
+                .map(|name| json_string(&name.to_display_string()))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
         format!(
-            "{{\"schema\":\"fln.ir-run/1\",\"outcome\":{},\"authority\":false,\"engine\":\"golem\",\"entry\":{},\"value\":{},\"detail\":{},\"steps\":{},\"peakStackDepth\":{},\"linkedReferenceFunctions\":[{}],\"nativeExterns\":[{}]}}\n",
+            "{{\"schema\":\"fln.ir-run/1\",\"outcome\":{},\"authority\":false,\"engine\":\"golem\",\"entry\":{},\"value\":{},\"detail\":{},\"steps\":{},\"peakStackDepth\":{},\"linkedReferenceFunctions\":[{}],\"nativeExterns\":[{}],\"loadedModules\":[{}],\"missingIrModules\":[{}],\"artifactBytes\":{}}}\n",
             json_string(outcome),
             json_string(&arguments.entry.to_display_string()),
             value
@@ -299,13 +480,28 @@ fn run_uncaptured(arguments: Arguments) -> MultiplexerOutput {
             peak.map(|n| n.to_string())
                 .unwrap_or_else(|| "null".to_owned()),
             reference,
-            natives
+            natives,
+            names(&loaded_names),
+            names(&missing_ir),
+            bytes_read
         )
     } else {
         let mut text = format!(
             "IR execution: {outcome}\nentry: {}\n",
             arguments.entry.to_display_string()
         );
+        if !loaded_names.is_empty() {
+            text.push_str(&format!(
+                "loaded modules: {} ({bytes_read} artifact bytes)\n",
+                loaded_names.len()
+            ));
+            for module in &missing_ir {
+                text.push_str(&format!(
+                    "module without IR: {}\n",
+                    module.to_display_string()
+                ));
+            }
+        }
         if let Some(value) = value {
             text.push_str(&format!("value: {value}\n"));
         }
@@ -336,6 +532,83 @@ fn run_uncaptured(arguments: Arguments) -> MultiplexerOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn temporary_root() -> PathBuf {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let tick = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "fln-ir-module-cli-{}-{tick}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn write_module(root: &Path, name: &str, imports: &[fln::Name], code: bool) -> usize {
+        let imports: Vec<_> = imports
+            .iter()
+            .cloned()
+            .map(|module| fln::OleanModuleImport {
+                module,
+                import_all: false,
+                is_exported: false,
+                is_meta: false,
+            })
+            .collect();
+        let bytes = fln::encode_olean_module(
+            fln::OleanModuleWriteInput {
+                is_module: false,
+                imports: &imports,
+                constants: &[],
+                extra_const_names: &[],
+            },
+            fln::OleanWriteHeader {
+                version: fln::OLEAN_ACCEPTED_VERSIONS[0],
+                flags: 1,
+                lean_version: fln::OLEAN_PIN_TAG.strip_prefix('v').unwrap(),
+                githash: fln::OLEAN_PIN_COMMIT,
+                base_addr: fln::OLEAN_REGION_ALIGN as u64,
+            },
+            fln::OleanWriteBudget::default(),
+        )
+        .unwrap()
+        .bytes;
+        let path = root.join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path.with_extension("olean"), &bytes).unwrap();
+        let mut size = bytes.len();
+        if code {
+            let ir = include_bytes!("../../fln-olean/fixtures/ir/Init.Data.Nat.Basic.ir");
+            std::fs::write(path.with_extension("ir"), ir).unwrap();
+            size += ir.len();
+        }
+        size
+    }
+
+    fn module_arguments(root: &Path) -> Arguments {
+        let args = [
+            OsString::from("--entry"),
+            OsString::from("Nat.min"),
+            OsString::from("--partition"),
+            OsString::from("p.tsv"),
+            OsString::from("--module"),
+            OsString::from("Root"),
+            OsString::from("--search-path"),
+            root.as_os_str().to_os_string(),
+        ];
+        let MultiplexerCommand::IrRun(arguments) = parse(args.to_vec()).unwrap() else {
+            panic!("module parser");
+        };
+        arguments
+    }
+
+    fn name(text: &str) -> fln::Name {
+        fln::Name::from_components(text.split('.'))
+    }
 
     #[test]
     fn ir_execution_requires_explicit_policy_and_preserves_argument_order() {
@@ -370,5 +643,164 @@ mod tests {
         );
         assert_eq!(parsed.vm.max_steps, 42);
         assert_eq!(parsed.paths, vec![PathBuf::from("input.ir")]);
+    }
+
+    #[test]
+    fn installed_module_options_preserve_roots_and_refuse_ambiguous_modes() {
+        let argv = [
+            "--entry",
+            "Nat.min",
+            "--partition",
+            "p.tsv",
+            "--module",
+            "Root",
+            "--search-path",
+            "first",
+            "--module",
+            "Other",
+            "--search-path",
+            "second",
+        ];
+        let MultiplexerCommand::IrRun(args) = parse(argv.map(OsString::from).to_vec()).unwrap()
+        else {
+            panic!("module parser");
+        };
+        assert_eq!(args.modules, [name("Root"), name("Other")]);
+        assert_eq!(
+            args.search_paths,
+            [PathBuf::from("first"), PathBuf::from("second")]
+        );
+        for tail in [
+            vec!["--module", "Root"],
+            vec!["--search-path", "lib", "input.ir"],
+            vec!["--module", "Root", "--search-path", "lib", "input.ir"],
+            vec!["--module", "../escape", "--search-path", "lib"],
+            vec!["--module", "A\\B", "--search-path", "lib"],
+        ] {
+            let argv: Vec<_> = ["--entry", "Nat.min", "--partition", "p.tsv"]
+                .into_iter()
+                .chain(tail)
+                .map(OsString::from)
+                .collect();
+            assert!(parse(argv).is_err());
+        }
+    }
+
+    #[test]
+    fn filesystem_module_loader_closes_a_diamond_with_one_cumulative_byte_budget() {
+        let root = temporary_root();
+        let total = write_module(&root, "Root", &[name("Left"), name("Right")], false)
+            + write_module(&root, "Left", &[name("Nested.Dependency")], false)
+            + write_module(&root, "Right", &[name("Nested.Dependency")], false)
+            + write_module(&root, "Nested/Dependency", &[], true);
+        let mut args = module_arguments(&root);
+        args.max_bytes = total;
+        let loaded = load_modules(&args).unwrap();
+        assert_eq!(loaded.bytes_read(), total);
+        assert_eq!(
+            loaded.module_names(),
+            [
+                name("Left"),
+                name("Right"),
+                name("Root"),
+                name("Nested.Dependency")
+            ]
+        );
+        assert_eq!(
+            loaded.missing_ir_modules(),
+            [name("Left"), name("Right"), name("Root")]
+        );
+        assert!(
+            loaded
+                .modules()
+                .iter()
+                .flat_map(|module| &module.decls)
+                .any(|decl| decl.name() == &name("Nat.min"))
+        );
+        args.max_bytes = total - 1;
+        let error = load_modules(&args).unwrap_err();
+        assert!(error.is_resource());
+        let output = module_load_failure(error, true);
+        assert_eq!(output.exit_code, 3);
+        assert!(output.stdout.is_empty());
+        assert!(!output.stderr.contains("\"value\":"));
+        args.max_bytes = total;
+        assert_eq!(load_modules(&args).unwrap().bytes_read(), total);
+    }
+
+    #[test]
+    fn module_search_never_mixes_companions_or_skips_a_corrupt_first_match() {
+        let first = temporary_root();
+        let second = temporary_root();
+        write_module(&first, "Root", &[], false);
+        write_module(&second, "Root", &[], true);
+        let mut args = module_arguments(&first);
+        args.search_paths.push(second.clone());
+        let loaded = load_modules(&args).unwrap();
+        assert_eq!(loaded.missing_ir_modules(), [name("Root")]);
+        assert!(loaded.modules()[0].decls.is_empty());
+        std::fs::write(first.join("Root.ir"), b"corrupt IR").unwrap();
+        assert!(matches!(
+            load_modules(&args),
+            Err(ModuleLoadError::Decode {
+                artifact: ".ir code",
+                ..
+            })
+        ));
+        std::fs::write(first.join("Root.olean"), b"corrupt olean").unwrap();
+        assert!(matches!(
+            load_modules(&args),
+            Err(ModuleLoadError::Decode {
+                artifact: ".olean import table",
+                ..
+            })
+        ));
+
+        let empty = temporary_root();
+        let mut later = module_arguments(&empty);
+        later.search_paths.push(second);
+        assert!(
+            load_modules(&later)
+                .unwrap()
+                .missing_ir_modules()
+                .is_empty()
+        );
+        std::fs::create_dir(empty.join("Root.olean")).unwrap();
+        assert!(matches!(
+            load_modules(&later),
+            Err(ModuleLoadError::Resolve { .. })
+        ));
+    }
+
+    #[test]
+    fn imported_names_and_missing_imports_are_checked_before_execution() {
+        let root = temporary_root();
+        write_module(&root, "Root", &[name("Missing")], false);
+        let args = module_arguments(&root);
+        assert!(
+            matches!(load_modules(&args), Err(ModuleLoadError::MissingModule(module)) if module == name("Missing"))
+        );
+        for unsafe_name in [
+            fln::Name::str(fln::Name::anonymous(), "../escape"),
+            fln::Name::str(fln::Name::anonymous(), "A\\B"),
+            fln::Name::str(fln::Name::anonymous(), "/absolute"),
+            fln::Name::str(fln::Name::anonymous(), "bad\nname"),
+            fln::Name::num(fln::Name::anonymous(), 1),
+        ] {
+            write_module(&root, "Root", &[unsafe_name], false);
+            assert!(matches!(
+                load_modules(&args),
+                Err(ModuleLoadError::Resolve { .. })
+            ));
+        }
+        assert_eq!(
+            module_relative_path(&fln::Name::str(name("Nested"), "Part.Name")).unwrap(),
+            PathBuf::from("Nested/Part.Name")
+        );
+        write_module(&root, "Root", &[name("Root")], false);
+        assert!(matches!(
+            load_modules(&args),
+            Err(ModuleLoadError::ImportCycle(_))
+        ));
     }
 }

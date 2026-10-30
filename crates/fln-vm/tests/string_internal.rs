@@ -780,7 +780,13 @@ fn slice_hashes_share_string_hashes_without_copying_or_truncating_the_word() {
         ("aλ😀z", 1, 7, "λ😀", 8_638_642_137_254_647_478u64),
         ("\0abc\0", 0, 5, "\0abc\0", 5_466_980_230_118_552_491),
         ("abc", 1, 1, "", 9_877_294_847_684_254_529),
-        ("abcdefghijk", 0, 11, "abcdefghijk", 16_840_220_840_137_896_361),
+        (
+            "abcdefghijk",
+            0,
+            11,
+            "abcdefghijk",
+            16_840_220_840_137_896_361,
+        ),
     ] {
         let program = replay(vec![
             string(0, source),

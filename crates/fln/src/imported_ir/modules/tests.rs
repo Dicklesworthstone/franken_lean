@@ -29,11 +29,11 @@ fn artifacts(imports: &[&str], with_code: bool) -> ModuleArtifacts {
             extra_const_names: &[],
         },
         crate::OleanWriteHeader {
-            version: 2,
-            flags: 0,
-            lean_version: "4.32.0",
+            version: crate::OLEAN_ACCEPTED_VERSIONS[0],
+            flags: 1,
+            lean_version: crate::OLEAN_PIN_TAG.strip_prefix('v').unwrap(),
             githash: crate::OLEAN_PIN_COMMIT,
-            base_addr: 0x1000,
+            base_addr: crate::OLEAN_REGION_ALIGN as u64,
         },
         crate::OleanWriteBudget::default(),
     )
@@ -293,11 +293,9 @@ fn malformed_companions_are_not_treated_as_missing_code() {
         } else {
             input.ir = Some(b"not IR".to_vec());
         }
-        let result = load(
-            &[name("Broken")],
-            ModuleLoadLimits::default(),
-            |_, _| Ok(Some(input.clone())),
-        );
+        let result = load(&[name("Broken")], ModuleLoadLimits::default(), |_, _| {
+            Ok(Some(input.clone()))
+        });
         assert!(matches!(
             result,
             Err(ModuleLoadError::Decode {
@@ -329,20 +327,16 @@ fn different_module_names_cannot_hide_duplicate_declarations() {
 #[test]
 fn resolver_failures_remain_failures_instead_of_partial_closures() {
     let graph = graph();
-    let result = load(
-        &[name("Root")],
-        ModuleLoadLimits::default(),
-        |module, _| {
-            if module == &name("Dependency") {
-                Err(ModuleLoadError::Resolve {
-                    module: module.clone(),
-                    detail: "unavailable".to_owned(),
-                })
-            } else {
-                Ok(graph.get(module).cloned())
-            }
-        },
-    );
+    let result = load(&[name("Root")], ModuleLoadLimits::default(), |module, _| {
+        if module == &name("Dependency") {
+            Err(ModuleLoadError::Resolve {
+                module: module.clone(),
+                detail: "unavailable".to_owned(),
+            })
+        } else {
+            Ok(graph.get(module).cloned())
+        }
+    });
     assert!(matches!(result, Err(ModuleLoadError::Resolve { .. })));
     replay(&resolve(&graph, &[name("Root")], ModuleLoadLimits::default()).unwrap());
 }
