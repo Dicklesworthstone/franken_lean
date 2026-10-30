@@ -31,6 +31,7 @@ use std::fmt;
 
 mod constructor_updates;
 mod lower;
+mod native_signature;
 mod sha256;
 
 /// A census whose complete bytes match the checked-in pinned publication.
@@ -374,7 +375,7 @@ pub fn compile(
         if let Some(row) = native_row(&name) {
             let arity = match declarations.get(&name) {
                 Some(IrDecl::Extern { params, .. }) => params.len(),
-                _ => row.arity as usize,
+                _ => native_signature::inferred_arity(row)?,
             };
             natives.insert(name, Native::new(row, arity)?);
             continue;
