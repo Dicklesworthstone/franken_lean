@@ -520,13 +520,22 @@ impl Preparation<'_> {
         definition: &DefinitionVal,
     ) -> Result<DefinitionVal, IngressError> {
         self.tick()?;
-        // Only canonical ground specializations have a stable source identity
-        // throughout this preparation. Local signatures and modified copies
-        // still take the full path, even if they reuse a familiar name.
+        // Both admitted ground definitions and canonical specializations have
+        // a stable source identity throughout this preparation. Global
+        // producers and staged callbacks may visit the same admitted body at
+        // many call sites; it needs proof erasure and projection lowering only
+        // once. Local signatures, universe-instantiated copies and modified
+        // bodies still take the full path even if they reuse a familiar name.
         let cacheable = definition.base.level_params.is_empty()
             && closed(&definition.base.type_)
             && closed(&definition.value)
-            && self.specializations.definitions.get(&definition.base.name) == Some(definition);
+            && match self.environment.find(&definition.base.name) {
+                Some(ConstantInfo::Defn(admitted)) => admitted == definition,
+                Some(_) => false,
+                None => {
+                    self.specializations.definitions.get(&definition.base.name) == Some(definition)
+                }
+            };
         if cacheable
             && let Some(entry) = self
                 .specializations

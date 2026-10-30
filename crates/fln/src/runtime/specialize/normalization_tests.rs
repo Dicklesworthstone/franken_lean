@@ -19,6 +19,7 @@ fn engine() -> Engine {
             &[br#"
 def memoKeep (A : Type) (h : 0 = 0) (value : A) : A := value
 def memoPlain (A : Type) (value : A) : A := value
+def memoGround (h : 0 = 0) (value : Nat) : Nat := value
 structure MemoBox (A : Type) where
   value : A
 structure MemoPayload where
@@ -69,6 +70,134 @@ fn with_result(definition: &DefinitionVal, result: Expr) -> DefinitionVal {
             Expr::lam(name, type_, body, info)
         });
     changed
+}
+
+fn admitted(engine: &Engine, label: &str) -> DefinitionVal {
+    let Some(ConstantInfo::Defn(definition)) = engine.environment.find(&name(label)) else {
+        panic!("missing admitted definition {label}")
+    };
+    definition.clone()
+}
+
+#[test]
+fn completed_admitted_normalization_reuses_work_and_preserves_the_source_body() {
+    let engine = engine();
+    let root = engine.logical_root(&KVMap::new());
+    let original = admitted(&engine, "memoGround");
+    let mut preparation = Preparation::new(&engine.environment, IngressLimits::default());
+    let before = preparation.visited;
+    let normalized = preparation
+        .normalize_definition_signature(&original)
+        .unwrap();
+    assert!(preparation.visited > before + 1);
+    assert_ne!(normalized.base.type_, original.base.type_);
+    assert_ne!(normalized.value, original.value);
+
+    // There is no compiler specialization for this ordinary admitted global.
+    // The result must still fit a one-visit remainder at another call site.
+    assert!(
+        preparation
+            .specialized_definition(&original.base.name)
+            .is_none()
+    );
+    let before = preparation.visited;
+    preparation.limits.max_nodes = before + 1;
+    assert_eq!(
+        preparation
+            .normalize_definition_signature(&original)
+            .unwrap(),
+        normalized
+    );
+    assert_eq!(preparation.visited, before + 1);
+    assert!(matches!(
+        preparation.normalize_definition_signature(&original),
+        Err(IngressError::ResourceLimit {
+            resource: IngressResource::Nodes,
+            limit,
+            observed,
+        }) if limit == before + 1 && observed == before + 2
+    ));
+    assert_eq!(admitted(&engine, "memoGround"), original);
+    assert_eq!(engine.logical_root(&KVMap::new()), root);
+}
+
+#[test]
+fn admitted_name_reuse_does_not_cache_modified_or_caller_local_signatures() {
+    let engine = engine();
+    let original = admitted(&engine, "memoGround");
+    let mut preparation = Preparation::new(&engine.environment, IngressLimits::default());
+    let normalized = preparation
+        .normalize_definition_signature(&original)
+        .unwrap();
+    let changed = with_result(&original, nat::literal(42));
+    let local = with_result(&original, Expr::bvar(2).unwrap());
+    let mut polymorphic = original.clone();
+    polymorphic.base.level_params.push(name("u"));
+    for candidate in [&changed, &local, &polymorphic] {
+        let mut fresh = Preparation::new(&engine.environment, IngressLimits::default());
+        let expected = fresh.normalize_definition_signature(candidate);
+        assert_eq!(
+            preparation.normalize_definition_signature(candidate),
+            expected
+        );
+        let entry = &preparation.specializations.normalized_definitions[&original.base.name];
+        assert_eq!(entry.original, original);
+        assert_eq!(entry.normalized, normalized);
+        assert_eq!(preparation.specializations.normalized_definitions.len(), 1);
+        assert!(fresh.specializations.normalized_definitions.is_empty());
+    }
+}
+
+#[test]
+fn admitted_normalization_never_crosses_environment_boundaries() {
+    let first = engine();
+    let source = "def memoGround (h : 0 = 0) (value : Nat) : Nat := 42";
+    let limits = EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024));
+    let second = Engine::with_source_seed(limits)
+        .unwrap()
+        .into_complete()
+        .unwrap()
+        .check_source_files(
+            &[source.as_bytes()],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap()
+        .engine;
+    let first_definition = admitted(&first, "memoGround");
+    let second_definition = admitted(&second, "memoGround");
+    assert_eq!(first_definition.base.type_, second_definition.base.type_);
+    assert_ne!(first_definition.value, second_definition.value);
+    let mut first_preparation = Preparation::new(&first.environment, IngressLimits::default());
+    let mut second_preparation = Preparation::new(&second.environment, IngressLimits::default());
+    let first_normalized = first_preparation
+        .normalize_definition_signature(&first_definition)
+        .unwrap();
+    let second_normalized = second_preparation
+        .normalize_definition_signature(&second_definition)
+        .unwrap();
+    assert_ne!(first_normalized.value, second_normalized.value);
+    // A same-named definition from another environment is not a stable origin
+    // here and must not replace this preparation's completed entry.
+    assert_eq!(
+        first_preparation
+            .normalize_definition_signature(&second_definition)
+            .unwrap(),
+        second_normalized
+    );
+    assert_eq!(
+        first_preparation.specializations.normalized_definitions[&first_definition.base.name]
+            .normalized,
+        first_normalized
+    );
+    assert_eq!(
+        first_preparation
+            .normalize_definition_signature(&first_definition)
+            .unwrap(),
+        first_normalized
+    );
 }
 
 #[test]
