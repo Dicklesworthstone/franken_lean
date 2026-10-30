@@ -21,6 +21,9 @@ use std::sync::Mutex;
 #[path = "stdio_bridge/stderr.rs"]
 mod stderr;
 
+#[path = "stdio_bridge/captured_output.rs"]
+mod captured_output;
+
 static LOCK: Mutex<()> = Mutex::new(());
 
 const fn r(n: u16) -> Register {

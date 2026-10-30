@@ -1086,6 +1086,40 @@ impl Obj {
         stdio_result_transport(&result).ok_or(StdioPutStrError::MalformedResult { bytes_written })
     }
 
+    /// Apply a native putStr callback only to an installed memory capture.
+    ///
+    /// The returned object uses the pin's compiled `IO.Result.ok Unit` ABI,
+    /// through the same builder used by native stream writes. This differs
+    /// from [`Self::try_stdio_put_str`]'s source-adapter transport. A missing
+    /// matching capture refuses before any host write, including when the
+    /// callback contains a different stream Handle.
+    pub fn try_captured_stdio_put_str(
+        &self,
+        text: &Obj,
+        world: &Obj,
+    ) -> Result<Obj, StdioPutStrError> {
+        if !world.is_scalar() || world.unbox() != 0 {
+            return Err(StdioPutStrError::InvalidWorld);
+        }
+        if !canonical_stdio_string(text) {
+            return Err(StdioPutStrError::InvalidString);
+        }
+        if !self.is_stdio_put_str_closure() {
+            return Err(StdioPutStrError::InvalidCallback);
+        }
+        if !stdout_capture::write_if_captured(self, text).map_err(StdioPutStrError::Capture)? {
+            return Err(StdioPutStrError::Capture(
+                stdout_capture::StdoutCaptureError::ScopeUnavailable,
+            ));
+        }
+        // SAFETY: the existing native result builder consumes the immortal
+        // scalar Unit and returns exactly one owned reference. No callback or
+        // host I/O is invoked; the complete write was accepted by the sink.
+        Ok(Obj(unsafe {
+            crate::stdio::io_result_mk_ok(tagged::boxi(0))
+        }))
+    }
+
     /// Fallible `ST.Ref` read.
     ///
     /// Returns `None` when the handle is not a ref or the cell is empty.

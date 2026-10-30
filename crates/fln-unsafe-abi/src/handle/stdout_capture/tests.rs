@@ -10,6 +10,62 @@ fn write(callback: &Obj, text: &str) -> Result<Obj, StdioPutStrError> {
 }
 
 #[test]
+fn captured_native_result_requires_a_sink_and_preserves_borrowed_inputs() {
+    let _lock = crate::tests::lock();
+    let callback = callback();
+    let text = Obj::mk_string("λ\0🙂\n");
+    let world = Obj::mk_nat(0);
+    let references = (callback.header().rc, text.header().rc);
+    assert!(matches!(
+        callback.try_captured_stdio_put_str(&text, &world),
+        Err(StdioPutStrError::Capture(
+            StdoutCaptureError::ScopeUnavailable
+        ))
+    ));
+    let capture = StdoutCapture::begin_isolated(8, true).unwrap();
+    let result = callback.try_captured_stdio_put_str(&text, &world).unwrap();
+    assert!(native_result_is_ok_unit(&result));
+    assert_eq!((callback.header().rc, text.header().rc), references);
+    assert_eq!(capture.finish().bytes, "λ\0🙂\n".as_bytes());
+}
+
+fn native_result_is_ok_unit(value: &Obj) -> bool {
+    // Observe the same one-field result that lean_io_result_mk_ok emits;
+    // the live compiled-IR fixture independently consumes this ABI on Golem.
+    value.header().tag == 0
+        && value.header().other == 1
+        && value
+            .try_ctor_child(0)
+            .is_some_and(|unit| unit.is_scalar() && unit.unbox() == 0)
+}
+
+#[test]
+fn captured_native_result_retains_prefix_and_refuses_invalid_inputs() {
+    let _lock = crate::tests::lock();
+    let callback = callback();
+    let capture = StdoutCapture::begin_isolated(2, true).unwrap();
+    for (text, world) in [
+        (Obj::mk_nat(0), Obj::mk_nat(0)),
+        (Obj::mk_string("bad"), Obj::mk_nat(1)),
+    ] {
+        assert!(callback.try_captured_stdio_put_str(&text, &world).is_err());
+    }
+    callback
+        .try_captured_stdio_put_str(&Obj::mk_string("ok"), &Obj::mk_nat(0))
+        .unwrap();
+    assert!(matches!(
+        callback.try_captured_stdio_put_str(&Obj::mk_string("x"), &Obj::mk_nat(0)),
+        Err(StdioPutStrError::Capture(StdoutCaptureError::Limit {
+            limit: 2,
+            requested: 3
+        }))
+    ));
+    let output = capture.finish();
+    assert_eq!(output.bytes, b"ok");
+    assert!(output.error.is_some());
+}
+
+#[test]
 fn capture_keeps_utf8_nuls_and_thread_sinks_independent() {
     let _lock = crate::tests::lock();
     let threads: Vec<_> = (0..3)

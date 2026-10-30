@@ -167,6 +167,7 @@ impl HeartbeatLimit {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CommandExecutionContext {
     heartbeat_limit: HeartbeatLimit,
+    captured_reference_output: bool,
 }
 
 impl CommandExecutionContext {
@@ -174,7 +175,10 @@ impl CommandExecutionContext {
     pub const UNLIMITED: Self = Self::new(HeartbeatLimit::UNLIMITED);
 
     pub const fn new(heartbeat_limit: HeartbeatLimit) -> Self {
-        Self { heartbeat_limit }
+        Self {
+            heartbeat_limit,
+            captured_reference_output: false,
+        }
     }
 
     /// Capture the pin-defined `maxHeartbeats` option in thousand-unit form.
@@ -191,6 +195,17 @@ impl CommandExecutionContext {
 
     pub const fn heartbeat_limit(self) -> HeartbeatLimit {
         self.heartbeat_limit
+    }
+
+    /// Select the compiled Reference-IR convention for native putStr callbacks.
+    ///
+    /// A matching bounded memory capture must already be installed. Writes
+    /// cannot fall back to the host, and getLine callbacks are refused before
+    /// any read. Other extern effects still require the caller's link policy;
+    /// this option does not authorize filesystem, process, or network access.
+    pub const fn with_captured_reference_output(mut self) -> Self {
+        self.captured_reference_output = true;
+        self
     }
 }
 
@@ -2031,13 +2046,7 @@ pub fn execute_with_context(
     context: CommandExecutionContext,
     cancellation: Option<&dyn CancellationProbe>,
 ) -> Outcome<VmExit> {
-    finish_run(run(
-        program,
-        limits,
-        context.heartbeat_limit(),
-        cancellation,
-        None,
-    ))
+    finish_run(run(program, limits, context, cancellation, None))
 }
 
 /// Execute through bounded inline caches while preserving [`execute`] as the
@@ -2104,7 +2113,7 @@ pub fn execute_cached_with_context(
     finish_run(run(
         program,
         limits,
-        command_context.heartbeat_limit(),
+        command_context,
         cancellation,
         Some(caches),
     ))
@@ -2137,11 +2146,11 @@ fn cache_namespace(
 fn run(
     program: &ValidatedProgram,
     limits: ExecutionLimits,
-    heartbeat_limit: HeartbeatLimit,
+    command_context: CommandExecutionContext,
     cancellation: Option<&dyn CancellationProbe>,
     mut inline_caches: Option<&mut InlineCaches>,
 ) -> Result<VmExit, Stop> {
-    let heartbeat_context = HeartbeatContext::snapshot(heartbeat_limit);
+    let heartbeat_context = HeartbeatContext::snapshot(command_context.heartbeat_limit());
     if limits.max_stack_depth < 1 {
         return Err(stack_exhausted(limits.max_stack_depth, 1, "entry frame"));
     }
@@ -2993,6 +3002,7 @@ fn run(
                         argument_ownership,
                         result_ownership,
                         reading,
+                        command_context,
                     ) {
                         return Ok(VmExit::Refused {
                             refusal,
@@ -3004,7 +3014,8 @@ fn run(
                         args,
                         argument_ownership,
                     )?;
-                    let value = match execute_stdio_apply(&closure, &args, reading) {
+                    let value = match execute_stdio_apply(&closure, &args, reading, command_context)
+                    {
                         Ok(value) => value,
                         Err(refusal) => {
                             return stdio_apply_failure(refusal, steps, peak_stack_depth);
@@ -3208,8 +3219,11 @@ fn run(
                                         &argument_ownership,
                                         result_ownership,
                                         reading,
+                                        command_context,
                                     )
-                                    .and_then(|()| execute_stdio_apply(&value, &args, reading));
+                                    .and_then(|()| {
+                                        execute_stdio_apply(&value, &args, reading, command_context)
+                                    });
                                     let result = match result {
                                         Ok(result) => result,
                                         Err(refusal) => {
@@ -3405,7 +3419,13 @@ fn validate_stdio_apply(
     argument_ownership: &[ArgumentOwnership],
     result_ownership: CallableResultOwnership,
     reading: bool,
+    context: CommandExecutionContext,
 ) -> Result<(), VmRefusal> {
+    if context.captured_reference_output && reading {
+        return Err(VmRefusal::NativeStdoutContract {
+            reason: "captured Reference output does not authorize stream reads",
+        });
+    }
     let expected = if reading { 1 } else { 2 };
     if argument_count != expected {
         return Err(VmRefusal::NativeStdoutContract {
@@ -3421,9 +3441,14 @@ fn validate_stdio_apply(
             reason: "the private stream adapter requires borrowed arguments",
         });
     }
-    if result_ownership != CallableResultOwnership::Owned {
+    let expected_result = if context.captured_reference_output {
+        CallableResultOwnership::Erased
+    } else {
+        CallableResultOwnership::Owned
+    };
+    if result_ownership != expected_result {
         return Err(VmRefusal::NativeStdoutContract {
-            reason: "the private adapter returns an owned transport record",
+            reason: "the callback result ownership differs from the selected stream ABI",
         });
     }
     Ok(())
@@ -3473,7 +3498,12 @@ fn stdio_apply_failure(refusal: VmRefusal, steps: u64, peak: u64) -> Result<VmEx
     })
 }
 
-fn execute_stdio_apply(closure: &Obj, args: &[Obj], reading: bool) -> Result<Obj, VmRefusal> {
+fn execute_stdio_apply(
+    closure: &Obj,
+    args: &[Obj],
+    reading: bool,
+    context: CommandExecutionContext,
+) -> Result<Obj, VmRefusal> {
     if reading {
         let [world] = args else {
             return Err(VmRefusal::NativeStdoutContract {
@@ -3501,26 +3531,29 @@ fn execute_stdio_apply(closure: &Obj, args: &[Obj], reading: bool) -> Result<Obj
             world,
         ));
     }
-    closure
-        .try_stdio_put_str(text, world)
-        .map_err(|error| match error {
-            StdioPutStrError::InvalidCallback => VmRefusal::UnsupportedNativeClosure,
-            StdioPutStrError::Capture(error) => VmRefusal::NativeStdoutCapture { error },
-            StdioPutStrError::InvalidString => VmRefusal::InvalidStringObject,
-            StdioPutStrError::InvalidWorld => {
-                type_mismatch("native stdout putStr", 1, "world scalar 0", world)
-            }
-            StdioPutStrError::UnrepresentableWrite {
-                errno,
-                bytes_written,
-            } => VmRefusal::NativeStdoutWriteError {
-                errno,
-                bytes_written,
-            },
-            StdioPutStrError::MalformedResult { bytes_written } => {
-                VmRefusal::NativeStdoutResult { bytes_written }
-            }
-        })
+    let result = if context.captured_reference_output {
+        closure.try_captured_stdio_put_str(text, world)
+    } else {
+        closure.try_stdio_put_str(text, world)
+    };
+    result.map_err(|error| match error {
+        StdioPutStrError::InvalidCallback => VmRefusal::UnsupportedNativeClosure,
+        StdioPutStrError::Capture(error) => VmRefusal::NativeStdoutCapture { error },
+        StdioPutStrError::InvalidString => VmRefusal::InvalidStringObject,
+        StdioPutStrError::InvalidWorld => {
+            type_mismatch("native stdout putStr", 1, "world scalar 0", world)
+        }
+        StdioPutStrError::UnrepresentableWrite {
+            errno,
+            bytes_written,
+        } => VmRefusal::NativeStdoutWriteError {
+            errno,
+            bytes_written,
+        },
+        StdioPutStrError::MalformedResult { bytes_written } => {
+            VmRefusal::NativeStdoutResult { bytes_written }
+        }
+    })
 }
 
 fn make_golem_closure(
