@@ -175,6 +175,12 @@ pub struct RegisteredMacros {
     candidates: BTreeMap<Name, Vec<RegisteredMacro>>,
 }
 
+struct ExpansionContext<'a> {
+    source: &'a SourceText,
+    context: &'a MacroContext,
+    cancellation: Option<&'a dyn CancellationProbe>,
+}
+
 impl RegisteredMacros {
     /// Prepare a supplied registration subset in actual dependency-first import
     /// order. Dependencies absent from this subset contribute no registrations;
@@ -365,11 +371,13 @@ impl RegisteredMacros {
         };
         report.outcome = self.expand(
             input,
-            source,
-            context,
+            ExpansionContext {
+                source,
+                context,
+                cancellation,
+            },
             state,
             limits,
-            cancellation,
             &mut report,
         );
         report
@@ -385,6 +393,9 @@ impl RegisteredMacros {
     /// Attempts and VM steps are shared across the whole tree. Recursion depth
     /// comes from `context`; `max_visits` additionally bounds repeated results
     /// and macro-free trees. Stops publish neither a partial tree nor state.
+    /// `generation` bounds the sum of converted macro results, including results
+    /// later discarded, so expanding wide sibling trees cannot retain an
+    /// unbounded collection of individually bounded results.
     pub fn expand_tree(
         &self,
         input: &Syntax,
@@ -407,11 +418,13 @@ impl RegisteredMacros {
         };
         let outcome = self.expand_tree_impl(
             input,
-            source,
-            context,
+            ExpansionContext {
+                source,
+                context,
+                cancellation,
+            },
             state,
             limits,
-            cancellation,
             &mut report,
         );
         MacroTreeDispatch {
@@ -424,13 +437,16 @@ impl RegisteredMacros {
     fn expand_tree_impl(
         &self,
         input: &Syntax,
-        source: &SourceText,
-        context: &MacroContext,
+        invocation: ExpansionContext<'_>,
         mut state: MacroState,
         limits: MacroTreeLimits,
-        cancellation: Option<&dyn CancellationProbe>,
         report: &mut MacroDispatch,
     ) -> Outcome<Result<MacroTreeResult, MacroExecutionError>> {
+        let ExpansionContext {
+            source,
+            context,
+            cancellation,
+        } = invocation;
         if cancellation.is_some_and(CancellationProbe::is_cancelled) {
             return Outcome::Inconclusive(Inconclusive::cancelled("before macro tree conversion"));
         }
@@ -448,6 +464,8 @@ impl RegisteredMacros {
         let mut tasks = vec![Task::Visit(input.clone(), context.current_recursion_depth)];
         let mut built = Vec::new();
         let mut visits = 0u64;
+        let mut generated_nodes = 0usize;
+        let mut generated_bytes = 0usize;
         let tactic = Name::from_components(["Lean", "Parser", "Term", "byTactic"]);
         while let Some(task) = tasks.pop() {
             if cancellation.is_some_and(CancellationProbe::is_cancelled) {
@@ -482,11 +500,13 @@ impl RegisteredMacros {
                     current.current_recursion_depth = depth;
                     match self.expand(
                         &syntax,
-                        source,
-                        &current,
+                        ExpansionContext {
+                            source,
+                            context: &current,
+                            cancellation,
+                        },
                         state,
                         limits.dispatch,
-                        cancellation,
                         report,
                     ) {
                         Outcome::Complete(Ok(RegisteredExpansion::Expanded {
@@ -494,6 +514,43 @@ impl RegisteredMacros {
                             state: successor,
                             ..
                         })) => {
+                            let usage = match super::syntax::inject_counted(
+                                &next,
+                                source,
+                                limits.dispatch.execution.syntax,
+                            ) {
+                                Ok((_, usage)) => usage,
+                                Err(error) => {
+                                    return conversion_outcome(error).map_complete(|result| {
+                                        result.map(|_| {
+                                            unreachable!(
+                                                "failed generated conversion cannot produce a tree"
+                                            )
+                                        })
+                                    });
+                                }
+                            };
+                            generated_nodes = generated_nodes.saturating_add(usage.max_nodes);
+                            generated_bytes = generated_bytes.saturating_add(usage.max_bytes);
+                            if generated_nodes > limits.generation.max_nodes {
+                                return stopped(
+                                    "macro tree generated nodes",
+                                    limits.generation.max_nodes as u64,
+                                    generated_nodes as u64,
+                                );
+                            }
+                            if generated_bytes > limits.generation.max_bytes {
+                                return Outcome::Inconclusive(
+                                    Inconclusive::resource(ResourceUsage {
+                                        reason: ResourceReason::Memory {
+                                            limit_bytes: limits.generation.max_bytes as u64,
+                                        },
+                                        allowed: limits.generation.max_bytes as u64,
+                                        observed: generated_bytes as u64,
+                                    })
+                                    .with_progress("macro tree generated bytes"),
+                                );
+                            }
                             state = successor;
                             tasks.push(Task::Visit(next, depth));
                             continue;
@@ -570,13 +627,16 @@ impl RegisteredMacros {
     fn expand(
         &self,
         input: &Syntax,
-        source: &SourceText,
-        context: &MacroContext,
+        invocation: ExpansionContext<'_>,
         mut state: MacroState,
         limits: MacroDispatchLimits,
-        cancellation: Option<&dyn CancellationProbe>,
         report: &mut MacroDispatch,
     ) -> Outcome<Result<RegisteredExpansion, MacroExecutionError>> {
+        let ExpansionContext {
+            source,
+            context,
+            cancellation,
+        } = invocation;
         let kind = match input {
             Syntax::Node { kind, .. } => kind.clone(),
             Syntax::Ident { .. } => Name::from_components(["ident"]),
@@ -707,6 +767,7 @@ pub struct MacroDispatchLimits {
 pub struct MacroTreeLimits {
     pub dispatch: MacroDispatchLimits,
     pub max_visits: u64,
+    pub generation: super::SyntaxLimits,
 }
 
 impl Default for MacroTreeLimits {
@@ -714,6 +775,7 @@ impl Default for MacroTreeLimits {
         Self {
             dispatch: MacroDispatchLimits::default(),
             max_visits: 1_000_000,
+            generation: super::SyntaxLimits::default(),
         }
     }
 }

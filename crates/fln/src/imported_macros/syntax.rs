@@ -305,6 +305,16 @@ fn inject_preresolved(values: &[Preresolved], budget: &mut Budget) -> Result<Obj
 
 /// Inject the full supported tree without borrowing native storage into the VM.
 pub(super) fn inject(tree: &Syntax, source: &SourceText, limits: SyntaxLimits) -> Result<Obj> {
+    inject_counted(tree, source, limits).map(|(value, _)| value)
+}
+
+/// Conversion work excluding the shared source backing, counted by the same
+/// budget that bounds names, strings and pre-resolved lists at the VM boundary.
+pub(super) fn inject_counted(
+    tree: &Syntax,
+    source: &SourceText,
+    limits: SyntaxLimits,
+) -> Result<(Obj, SyntaxLimits)> {
     enum Task<'a> {
         Visit(&'a Syntax),
         Node {
@@ -383,6 +393,15 @@ pub(super) fn inject(tree: &Syntax, source: &SourceText, limits: SyntaxLimits) -
     }
     built
         .pop()
+        .map(|value| {
+            (
+                value,
+                SyntaxLimits {
+                    max_nodes: budget.nodes,
+                    max_bytes: budget.bytes - source.len_bytes(),
+                },
+            )
+        })
         .ok_or(SyntaxConversionError::Malformed("empty syntax traversal"))
 }
 

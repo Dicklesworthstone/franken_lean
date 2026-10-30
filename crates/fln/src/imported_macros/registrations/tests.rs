@@ -549,6 +549,27 @@ fn tree_assembled_siblings_share_the_output_size_limit_and_deep_trees_use_no_hos
         matches!(report.outcome, Outcome::Inconclusive(_)),
         "{report:?}"
     );
+    let mut generated = MacroTreeLimits::default();
+    generated.generation.max_bytes = 120;
+    assert!(matches!(
+        execute(generated).outcome,
+        Outcome::Complete(Ok(MacroTreeResult::Expanded { .. }))
+    ));
+    generated.generation.max_bytes = 119;
+    let stopped = execute(generated);
+    assert_eq!(stopped.attempts.len(), 2);
+    assert!(matches!(stopped.outcome, Outcome::Inconclusive(_)));
+    generated.generation.max_bytes = 120;
+    generated.generation.max_nodes = 3;
+    assert!(matches!(
+        execute(generated).outcome,
+        Outcome::Inconclusive(_)
+    ));
+    generated.generation.max_nodes = 4;
+    assert!(matches!(
+        execute(generated).outcome,
+        Outcome::Complete(Ok(MacroTreeResult::Expanded { .. }))
+    ));
 
     let mut deep = Syntax::Missing;
     for _ in 0..5000 {
