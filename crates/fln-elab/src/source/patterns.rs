@@ -444,6 +444,64 @@ fn expand_pipeline(mut syntax: Syntax, pattern: bool) -> Syntax {
     }
 }
 
+/// The applicative sequencing notations (`Init/Notation.lean:432-440`): `x <*> y` is
+/// `Seq.seq x fun _ : Unit => y`, and `x <* y` and `x *> y` are `SeqLeft.seqLeft` and
+/// `SeqRight.seqRight` alike. The macro names its constants where `Init` declares them, so they
+/// are root-qualified here.
+fn sequence_parts(syntax: &Syntax) -> Option<[&'static str; 2]> {
+    let Syntax::Node { kind, args, .. } = syntax else {
+        return None;
+    };
+    let (spelling, function) = [
+        ("<*>", ["Seq", "seq"]),
+        ("<*", ["SeqLeft", "seqLeft"]),
+        ("*>", ["SeqRight", "seqRight"]),
+    ]
+    .into_iter()
+    .find(|(spelling, _)| kind == &Name::str(Name::anonymous(), format!("term_{spelling}_")))?;
+    (args.len() == 3 && matches!(&args[1], Syntax::Atom { val, .. } if val == spelling))
+        .then_some(function)
+}
+
+fn expand_sequence(mut syntax: Syntax, pattern: bool) -> Syntax {
+    let Some(function) = sequence_parts(&syntax).filter(|_| !pattern) else {
+        return syntax;
+    };
+    let Syntax::Node { info, args, .. } = &mut syntax else {
+        unreachable!("checked notation");
+    };
+    let root = |components: &[&str]| {
+        identifier(Name::from_components(
+            std::iter::once("_root_").chain(components.iter().copied()),
+        ))
+    };
+    let right = std::mem::replace(&mut args[2], null(vec![]));
+    let left = std::mem::replace(&mut args[0], null(vec![]));
+    let thunk = Syntax::node(
+        parser_kind(&["Term", "fun"]),
+        vec![
+            atom("fun"),
+            Syntax::node(
+                parser_kind(&["Term", "basicFun"]),
+                vec![
+                    null(vec![wildcard()]),
+                    null(vec![Syntax::node(
+                        parser_kind(&["Term", "typeSpec"]),
+                        vec![atom(":"), root(&["Unit"])],
+                    )]),
+                    atom("=>"),
+                    right,
+                ],
+            ),
+        ],
+    );
+    Syntax::Node {
+        info: *info,
+        kind: parser_kind(&["Term", "app"]),
+        args: vec![root(&function), null(vec![left, thunk])],
+    }
+}
+
 fn expand_assumption(mut syntax: Syntax, pattern: bool) -> Syntax {
     let rewrite = !pattern
         && matches!(&syntax, Syntax::Node { kind, args, .. }
@@ -1536,7 +1594,8 @@ impl Context {
                 || node.kind() == Some(&parser_kind(&["Term", "structInstFieldEqns"]))
                 || node.kind() == Some(&parser_kind(&["Term", "do"]))
                 || do_notation::is_term_block(node)
-                || pipeline_parts(node).is_some();
+                || pipeline_parts(node).is_some()
+                || sequence_parts(node).is_some();
             if let Syntax::Node { args, .. } = node {
                 if node.kind() == Some(&parser_kind(&["Term", "letrec"])) {
                     let binding = self.let_parts(args, false, true)?;
@@ -1636,6 +1695,7 @@ impl Context {
                     let node = expand_let_pattern(node, pattern);
                     let node = expand_matches(node, pattern);
                     let node = expand_pipeline(node, pattern);
+                    let node = expand_sequence(node, pattern);
                     let mut required = Vec::new();
                     let node = if local_roots.contains(&std::ptr::from_ref(original))
                         && complex(&node, &self.txn.env)

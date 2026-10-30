@@ -149,7 +149,7 @@ impl PinNotation {
     }
 }
 
-/// The `macro_rules` rows of `Init/Notation.lean:303-313,383-388` and
+/// The `macro_rules` rows of `Init/Notation.lean:303-313,383-388,436` and
 /// `Init/Core.lean:880`, for the operator kinds this parser produces.
 /// `<<<`, `>>>`, `∧`, `∨` and `↔` are plain `infix` notations in the pin
 /// (ordinary applications), not expression-tree operators.
@@ -194,6 +194,10 @@ pub(super) fn pin_notation(kind: &Name) -> Option<PinNotation> {
         (
             "term_++_",
             PinNotation::Binary(OperatorKind::Regular, "HAppend.hAppend"),
+        ),
+        (
+            "term_<|>_",
+            PinNotation::Binary(OperatorKind::Lazy, "HOrElse.hOrElse"),
         ),
         ("term-_", PinNotation::Unary("Neg.neg")),
         (
@@ -1231,6 +1235,10 @@ mod tests {
         assert_eq!(
             pin_notation(&kind("term_^_")),
             Some(PinNotation::Binary(OperatorKind::RightAction, "HPow.hPow"))
+        );
+        assert_eq!(
+            pin_notation(&kind("term_<|>_")),
+            Some(PinNotation::Binary(OperatorKind::Lazy, "HOrElse.hOrElse"))
         );
         assert_eq!(
             pin_notation(&kind("term-_")),
