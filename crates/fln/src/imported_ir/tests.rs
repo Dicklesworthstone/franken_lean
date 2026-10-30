@@ -2692,3 +2692,385 @@ fn wide_ir_native_arithmetic_wraps_without_losing_the_high_bit() {
         assert_wide_ir_result(&compiled, 0);
     }
 }
+
+fn assert_float_ir_bits(compiled: &CompiledIr, ty: &IrType, expected: u64) {
+    let bytes = flbc::encode_canonical(compiled.program.program(), flbc::CodecLimits::default())
+        .expect("encode floating scalar program");
+    let replay = flbc::decode_canonical(&bytes, flbc::CodecLimits::default())
+        .expect("decode floating scalar program");
+    for outcome in [
+        compiled.execute(ExecutionLimits::default(), None).outcome,
+        fln_vm::interpreter::execute(&replay, ExecutionLimits::default(), None),
+    ] {
+        let Outcome::Complete(VmExit::Returned(value)) = outcome else {
+            panic!("floating scalar execution did not return: {outcome:?}");
+        };
+        assert!(!value.value.is_scalar());
+        assert_eq!(value.value.header().tag, 0);
+        assert_eq!(value.value.header().other, 0);
+        let bits = if *ty == IrType::Float32 {
+            value.value.try_ctor_scalar_u32(0).map(u64::from)
+        } else {
+            value.value.try_ctor_scalar_u64(0)
+        };
+        assert_eq!(bits, Some(expected));
+    }
+}
+
+fn float_argument(ty: &IrType, bits: u64) -> EntryArgument {
+    if *ty == IrType::Float32 {
+        EntryArgument::Float32Bits(bits as u32)
+    } else {
+        EntryArgument::FloatBits(bits)
+    }
+}
+
+#[test]
+fn pinned_compiler_float_calls_callbacks_and_packed_records_match_reference() {
+    // Binary IR produced from FloatModule.lean by the v4.32.0 Reference at
+    // 8c9756b28d64dab099da31a4c09229a9e6a2ef35. The same pin evaluated these
+    // results. The callbacks exercise compiler-generated _boxed adapters;
+    // the mixed record has source-order stores at byte offsets 8, 12, 0.
+    let module = crate::decode_ir_artifact(
+        include_bytes!("../../../fln-olean/fixtures/ir/FloatModule.ir"),
+        32 * 1024 * 1024,
+    )
+    .expect("pinned compiler float fixture decodes");
+    let users = module
+        .decls
+        .iter()
+        .map(|decl| decl.name().clone())
+        .collect();
+    let modules = [module];
+    let policy = bounded_partition(&[]);
+    for (entry, expected) in [
+        ("float64Answer", "4"),
+        ("float32Answer", "4"),
+        ("floatingRecordAnswer", "9223372038993870855"),
+        ("floatingJoinAnswer", "5"),
+    ] {
+        let compiled = compile(
+            &modules,
+            &name(entry),
+            &[],
+            &policy,
+            &users,
+            IrExecutionLimits::default(),
+        )
+        .unwrap_or_else(|error| panic!("pinned float entry {entry}: {error:?}"));
+        assert_native_owned_result(&compiled, expected);
+        assert!(compiled.reference_functions().len() >= 2);
+    }
+    for (entry, ty, inputs, expected) in [
+        (
+            "float64Add._boxed",
+            IrType::Float,
+            [1.5f64.to_bits(), 2.5f64.to_bits()],
+            4.0f64.to_bits(),
+        ),
+        (
+            "float32Add._boxed",
+            IrType::Float32,
+            [u64::from(1.5f32.to_bits()), u64::from(2.5f32.to_bits())],
+            u64::from(4.0f32.to_bits()),
+        ),
+    ] {
+        let compiled = compile(
+            &modules,
+            &name(entry),
+            &inputs.map(|bits| float_argument(&ty, bits)),
+            &policy,
+            &users,
+            IrExecutionLimits::default(),
+        )
+        .unwrap();
+        assert_float_ir_bits(&compiled, &ty, expected);
+    }
+    for (branch, expected) in [(0, 7.0f64), (1, 5.0f64)] {
+        let compiled = compile(
+            &modules,
+            &name("floatingChoose"),
+            &[
+                nat(branch),
+                EntryArgument::FloatBits(2.5f64.to_bits()),
+                EntryArgument::FloatBits(3.5f64.to_bits()),
+            ],
+            &policy,
+            &users,
+            IrExecutionLimits::default(),
+        )
+        .unwrap();
+        assert_float_ir_bits(&compiled, &IrType::Float, expected.to_bits());
+    }
+}
+
+#[test]
+fn floating_bits_survive_boxes_joins_closures_and_packed_fields_without_nan_normalization() {
+    for (ty, width, patterns) in [
+        (
+            IrType::Float,
+            8,
+            [
+                0,
+                1u64 << 63,
+                1,
+                0x7ff0_0000_0000_0000,
+                0xfff0_0000_0000_0000,
+                0x7ff8_0000_0000_1234,
+                0xfff0_0000_0000_4321,
+            ],
+        ),
+        (
+            IrType::Float32,
+            4,
+            [
+                0,
+                1u64 << 31,
+                1,
+                0x7f80_0000,
+                0xff80_0000,
+                0x7fc0_1234,
+                0xff80_4321,
+            ],
+        ),
+    ] {
+        let callback = function(
+            "Floating.callback",
+            2,
+            vec![
+                wide_ir_binding(3, &ty, IrExpr::Unbox { x: 1 }),
+                binding(
+                    4,
+                    IrExpr::Box {
+                        ty: ty.clone(),
+                        x: 3,
+                    },
+                ),
+                wide_ir_binding(5, &ty, IrExpr::Unbox { x: 4 }),
+            ],
+            IrArg::Var(5),
+        );
+        let entry = wide_ir_entry(
+            body_function(
+                "Floating.boundaries",
+                1,
+                ir_body(
+                    vec![
+                        binding(
+                            2,
+                            IrExpr::Ctor {
+                                info: packed_test_info(0, 0, width),
+                                args: vec![],
+                            },
+                        ),
+                        IrStmt::SSet {
+                            x: 2,
+                            i: 0,
+                            offset: 0,
+                            y: 1,
+                            ty: ty.clone(),
+                        },
+                        wide_ir_binding(
+                            5,
+                            &ty,
+                            IrExpr::SProj {
+                                n: 0,
+                                offset: 0,
+                                x: 2,
+                            },
+                        ),
+                        IrStmt::JDecl {
+                            j: 3,
+                            params: vec![IrParam {
+                                x: 4,
+                                borrow: true,
+                                ty: ty.clone(),
+                            }],
+                            value: ir_body(
+                                vec![
+                                    binding(
+                                        6,
+                                        IrExpr::Box {
+                                            ty: ty.clone(),
+                                            x: 4,
+                                        },
+                                    ),
+                                    binding(
+                                        7,
+                                        IrExpr::Pap {
+                                            function: name("Floating.callback"),
+                                            args: vec![IrArg::Var(6)],
+                                        },
+                                    ),
+                                    number(8, 0),
+                                    binding(
+                                        9,
+                                        IrExpr::Ap {
+                                            x: 7,
+                                            args: vec![IrArg::Var(8)],
+                                        },
+                                    ),
+                                ],
+                                IrTerminal::Ret(IrArg::Var(9)),
+                            ),
+                        },
+                    ],
+                    jump(3, &[5]),
+                ),
+            ),
+            &ty,
+        );
+        for bits in patterns {
+            let compiled = compile_users(
+                vec![callback.clone(), entry.clone()],
+                "Floating.boundaries",
+                &[float_argument(&ty, bits)],
+                IrExecutionLimits::default(),
+            )
+            .expect("floating carriers survive packed storage, joins, and callbacks");
+            assert_float_ir_bits(&compiled, &ty, bits);
+            assert_eq!(compiled.reference_functions().len(), 3);
+        }
+    }
+}
+
+#[test]
+fn floating_unboxing_and_entry_parameters_refuse_non_scalar_carriers() {
+    for ty in [IrType::Float, IrType::Float32] {
+        let decode = function(
+            "Floating.decode",
+            1,
+            vec![wide_ir_binding(2, &ty, IrExpr::Unbox { x: 1 })],
+            IrArg::Var(2),
+        );
+        let identity = wide_ir_entry(function("Floating.identity", 1, vec![], IrArg::Var(1)), &ty);
+        for declaration in [decode, identity] {
+            for argument in [nat(42), EntryArgument::String("not a float".to_owned())] {
+                let entry = declaration.name().to_display_string();
+                let compiled = compile_users(
+                    vec![declaration.clone()],
+                    &entry,
+                    &[argument],
+                    IrExecutionLimits::default(),
+                )
+                .unwrap();
+                assert!(matches!(
+                    compiled.execute(ExecutionLimits::default(), None).outcome,
+                    Outcome::Complete(VmExit::Refused {
+                        refusal: fln_vm::interpreter::VmRefusal::TypeMismatch { .. },
+                        ..
+                    })
+                ));
+            }
+        }
+    }
+}
+
+#[test]
+fn imported_public_float_of_bits_still_canonicalizes_nans() {
+    for (ty, integer, family, input, expected) in [
+        (
+            IrType::Float,
+            IrType::UInt64,
+            "Float",
+            0xfff0_0000_0000_4321,
+            0x7ff8_0000_0000_0000,
+        ),
+        (
+            IrType::Float32,
+            IrType::UInt32,
+            "Float32",
+            0xff80_4321,
+            0x7fc0_0000,
+        ),
+    ] {
+        let compiled = compile_users(
+            vec![function(
+                "Floating.publicOfBits",
+                0,
+                vec![
+                    wide_ir_binding(1, &integer, IrExpr::Lit(IrLit::Num(IrNat::Small(input)))),
+                    wide_ir_binding(
+                        2,
+                        &ty,
+                        IrExpr::Fap {
+                            function: name(&format!("{family}.ofBits")),
+                            args: vec![IrArg::Var(1)],
+                        },
+                    ),
+                ],
+                IrArg::Var(2),
+            )],
+            "Floating.publicOfBits",
+            &[],
+            IrExecutionLimits::default(),
+        )
+        .unwrap();
+        assert_float_ir_bits(&compiled, &ty, expected);
+    }
+}
+
+#[test]
+fn unsupported_floating_literals_constructors_and_cases_never_become_naturals() {
+    use fln_olean::ir::IrAlt;
+    for ty in [IrType::Float, IrType::Float32] {
+        for (expr, form) in [
+            (
+                IrExpr::Lit(IrLit::Num(IrNat::Small(1))),
+                "floating numeric literal",
+            ),
+            (
+                IrExpr::Ctor {
+                    info: packed_test_info(0, 0, 0),
+                    args: vec![],
+                },
+                "floating constructor",
+            ),
+        ] {
+            let result = compile_users(
+                vec![function(
+                    "Floating.invalid",
+                    0,
+                    vec![wide_ir_binding(1, &ty, expr)],
+                    IrArg::Var(1),
+                )],
+                "Floating.invalid",
+                &[],
+                IrExecutionLimits::default(),
+            );
+            assert!(
+                matches!(result, Err(IrExecutionError::Unsupported { form: actual, .. }) if actual == form)
+            );
+        }
+        let result = compile_users(
+            vec![wide_ir_entry(
+                body_function(
+                    "Floating.invalidCase",
+                    1,
+                    ir_body(
+                        vec![],
+                        IrTerminal::Case {
+                            type_name: name("Float"),
+                            x: 1,
+                            x_type: ty.clone(),
+                            alts: vec![IrAlt::Default {
+                                body: ir_body(vec![], IrTerminal::Ret(IrArg::Var(1))),
+                            }],
+                        },
+                    ),
+                ),
+                &ty,
+            )],
+            "Floating.invalidCase",
+            &[float_argument(&ty, 0)],
+            IrExecutionLimits::default(),
+        );
+        assert!(matches!(
+            result,
+            Err(IrExecutionError::Unsupported {
+                form: "floating constructor case",
+                ..
+            })
+        ));
+    }
+}

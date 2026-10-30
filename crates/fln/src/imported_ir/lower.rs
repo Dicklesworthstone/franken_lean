@@ -21,9 +21,16 @@ pub(super) fn compile(
         _ => &[],
     };
     let mut helper_natives = BTreeMap::new();
+    for argument in arguments {
+        if matches!(argument, EntryArgument::FloatBits(_)) {
+            insert_helper(&mut helper_natives, "UInt64.ofNat")?;
+        }
+    }
     for param in entry_parameters {
         if let Some(wide) = wide_scalar(&param.ty) {
             insert_helper(&mut helper_natives, wide.of_nat)?;
+        } else if let Some(float) = floating_scalar(&param.ty) {
+            insert_helper(&mut helper_natives, float.to_bits)?;
         }
     }
     for declaration in declarations.values() {
@@ -38,13 +45,15 @@ pub(super) fn compile(
                     }
                 }
                 for stmt in &body.stmts {
-                    let setter_kind = match stmt {
-                        IrStmt::USet { .. } => Some(flbc::ScalarKind::USize),
-                        IrStmt::SSet { ty, .. } => packed_scalar_kind(ty),
+                    let setter_check = match stmt {
+                        IrStmt::USet { .. } => Some("USize.toNat"),
+                        IrStmt::SSet { ty, .. } => floating_scalar(ty)
+                            .map(|float| float.to_bits)
+                            .or_else(|| packed_scalar_kind(ty).map(packed_scalar_to_nat)),
                         _ => None,
                     };
-                    if let Some(kind) = setter_kind {
-                        insert_helper(&mut helper_natives, packed_scalar_to_nat(kind))?;
+                    if let Some(check) = setter_check {
+                        insert_helper(&mut helper_natives, check)?;
                     }
                     let IrStmt::VDecl { ty, expr, .. } = stmt else {
                         continue;
@@ -54,6 +63,8 @@ pub(super) fn compile(
                             if let Some(wide) = wide_scalar(ty) {
                                 insert_helper(&mut helper_natives, wide.to_nat)?;
                                 insert_helper(&mut helper_natives, wide.of_nat)?;
+                            } else if let Some(float) = floating_scalar(ty) {
+                                insert_helper(&mut helper_natives, float.to_bits)?;
                             } else if let Some(name) = unbox_intrinsic(ty) {
                                 insert_helper(&mut helper_natives, name)?;
                             }
@@ -62,6 +73,8 @@ pub(super) fn compile(
                             if let Some(wide) = wide_scalar(ty) {
                                 insert_helper(&mut helper_natives, wide.to_nat)?;
                                 insert_helper(&mut helper_natives, wide.of_nat)?;
+                            } else if let Some(float) = floating_scalar(ty) {
+                                insert_helper(&mut helper_natives, float.to_bits)?;
                             }
                         }
                         IrExpr::Lit(IrLit::Num(_)) | IrExpr::Ctor { .. } => {
@@ -196,6 +209,11 @@ pub(super) fn compile(
                     &Name::from_components(wide.of_nat.split('.')),
                     vec![value],
                 )
+            } else if let Some(float) = entry_parameters
+                .get(index)
+                .and_then(|param| floating_scalar(&param.ty))
+            {
+                wrapper.validate_float(block, float, value)
             } else {
                 Ok(value)
             }
@@ -310,6 +328,22 @@ fn wide_scalar(ty: &IrType) -> Option<WideScalar> {
     }
 }
 
+struct FloatingScalar {
+    to_bits: &'static str,
+}
+
+fn floating_scalar(ty: &IrType) -> Option<FloatingScalar> {
+    match ty {
+        IrType::Float => Some(FloatingScalar {
+            to_bits: "Float.toBits",
+        }),
+        IrType::Float32 => Some(FloatingScalar {
+            to_bits: "Float32.toBits",
+        }),
+        _ => None,
+    }
+}
+
 fn is_scalar_case(ty: &IrType) -> bool {
     matches!(
         ty,
@@ -326,8 +360,8 @@ fn packed_scalar_kind(ty: &IrType) -> Option<flbc::ScalarKind> {
     match ty {
         IrType::UInt8 => Some(flbc::ScalarKind::UInt8),
         IrType::UInt16 => Some(flbc::ScalarKind::UInt16),
-        IrType::UInt32 => Some(flbc::ScalarKind::UInt32),
-        IrType::UInt64 => Some(flbc::ScalarKind::UInt64),
+        IrType::UInt32 | IrType::Float32 => Some(flbc::ScalarKind::UInt32),
+        IrType::UInt64 | IrType::Float => Some(flbc::ScalarKind::UInt64),
         IrType::USize => Some(flbc::ScalarKind::USize),
         _ => None,
     }
@@ -559,8 +593,68 @@ impl<'a> Builder<'a> {
             EntryArgument::String(value) => {
                 self.boxed(block, ValueType::String, Operation::String(value.clone()))
             }
+            EntryArgument::FloatBits(bits) => {
+                let value = self.nat(block, &IrNat::Small(*bits))?;
+                // UInt64 and Float share the exact 64-bit scalar carrier.
+                // Public Float.ofBits canonicalizes NaNs, so it is not a
+                // representation-preserving box for an imported raw value.
+                self.native_call(
+                    block,
+                    &Name::from_components(["UInt64", "ofNat"]),
+                    vec![value],
+                )
+            }
+            EntryArgument::Float32Bits(bits) => {
+                let value = self.nat(block, &IrNat::Small(u64::from(*bits)))?;
+                self.box_float32_bits(block, value)
+            }
             EntryArgument::Erased => self.boxed(block, ValueType::Unit, Operation::Unit),
         }
+    }
+
+    fn box_float32_bits(&mut self, block: BlockId, value: ValueId) -> Result<ValueId> {
+        // Float32's four-byte scalar carrier differs from tagged UInt32.
+        // Reuse checked packed construction to copy the raw bits without
+        // invoking public Float32.ofBits, which deliberately normalizes NaNs.
+        let kind = flbc::ScalarKind::UInt32;
+        let constructor = self.constructor(&IrCtorInfo {
+            name: Name::anonymous(),
+            cidx: 0,
+            size: 0,
+            usize: 0,
+            ssize: kind.width() as u64,
+        })?;
+        self.tables.packed_operands(1)?;
+        self.boxed(
+            block,
+            ValueType::Constructor,
+            Operation::CtorPacked {
+                constructor,
+                fields: vec![],
+                scalars: vec![flbc::PackedScalar {
+                    offset: 0,
+                    kind,
+                    value,
+                }],
+            },
+        )
+    }
+
+    fn validate_float(
+        &mut self,
+        block: BlockId,
+        float: FloatingScalar,
+        value: ValueId,
+    ) -> Result<ValueId> {
+        // The native boundary checks the boxed scalar carrier. Keep the
+        // original value: public toBits canonicalizes NaNs, while IR box,
+        // unbox and packed fields must preserve every payload bit.
+        self.native_call(
+            block,
+            &Name::from_components(float.to_bits.split('.')),
+            vec![value],
+        )?;
+        Ok(value)
     }
 
     fn argument(&mut self, block: BlockId, arg: &IrArg, locals: &Locals) -> Result<ValueId> {
@@ -702,6 +796,7 @@ impl<'a> Builder<'a> {
         block: BlockId,
         x: u64,
         scalar: flbc::PackedScalar<u64>,
+        float: Option<FloatingScalar>,
         locals: &Locals,
         pending: &mut PendingConstructors,
     ) -> Result<()> {
@@ -747,9 +842,30 @@ impl<'a> Builder<'a> {
         // deferred; the checked original operand remains the packed value.
         self.native_call(
             block,
-            &Name::from_components(packed_scalar_to_nat(kind).split('.')),
+            &Name::from_components(
+                float
+                    .as_ref()
+                    .map_or_else(|| packed_scalar_to_nat(kind), |float| float.to_bits)
+                    .split('.'),
+            ),
             vec![value],
         )?;
+        let value = if float.is_some() {
+            // Read the checked carrier's raw bytes, bypassing public toBits'
+            // NaN normalization. Integer packed operations already preserve
+            // these exact bits and validate their destination bounds.
+            self.emit(
+                block,
+                ValueType::Abi,
+                Operation::ProjectScalar {
+                    value,
+                    offset: 0,
+                    kind,
+                },
+            )?
+        } else {
+            value
+        };
         constructor.scalars.insert(
             offset,
             flbc::PackedScalar {
@@ -771,7 +887,7 @@ impl<'a> Builder<'a> {
         let Some(constructor) = pending.remove(&x) else {
             return Ok(());
         };
-        // The pin packs integer fields without interior padding, but emits
+        // The pin packs scalar fields without interior padding, but emits
         // their stores in source order. Evaluate values in that order, then
         // arrange the disjoint writes by their physical byte positions.
         let mut initialized = constructor.object_bytes;
@@ -953,6 +1069,8 @@ impl<'a> Builder<'a> {
                 let value = self.argument(block, &IrArg::Var(*x), locals)?;
                 if let Some(wide) = wide_scalar(ty) {
                     self.canonicalize_wide(block, wide, value)?
+                } else if let Some(float) = floating_scalar(ty) {
+                    self.validate_float(block, float, value)?
                 } else if matches!(ty, IrType::UInt8 | IrType::UInt16 | IrType::UInt32) {
                     value
                 } else {
@@ -963,6 +1081,8 @@ impl<'a> Builder<'a> {
                 let value = self.argument(block, &IrArg::Var(*x), locals)?;
                 if let Some(wide) = wide_scalar(ty) {
                     self.canonicalize_wide(block, wide, value)?
+                } else if let Some(float) = floating_scalar(ty) {
+                    self.validate_float(block, float, value)?
                 } else {
                     let helper = unbox_intrinsic(ty)
                         .ok_or_else(|| unsupported(self.name, "scalar unboxing representation"))?;
@@ -1060,7 +1180,7 @@ impl<'a> Builder<'a> {
                     .ok_or_else(|| unsupported(self.name, "packed scalar projection type"))?;
                 let value = self.argument(block, &IrArg::Var(*x), locals)?;
                 let offset = self.packed_offset(*n, *offset)?;
-                self.emit(
+                let value = self.emit(
                     block,
                     ValueType::Abi,
                     Operation::ProjectScalar {
@@ -1068,7 +1188,13 @@ impl<'a> Builder<'a> {
                         offset,
                         kind,
                     },
-                )?
+                )?;
+                if *ty == IrType::Float32 {
+                    self.box_float32_bits(block, value)?
+                } else {
+                    // A projected UInt64 already has Float's raw carrier.
+                    value
+                }
             }
         };
         Ok(Local { value, constructor })
@@ -1195,6 +1321,7 @@ impl<'a> Builder<'a> {
                             kind: flbc::ScalarKind::USize,
                             value: *y,
                         },
+                        None,
                         &locals,
                         &mut pending,
                     )?;
@@ -1218,6 +1345,7 @@ impl<'a> Builder<'a> {
                             kind,
                             value: *y,
                         },
+                        floating_scalar(ty),
                         &locals,
                         &mut pending,
                     )?;

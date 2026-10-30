@@ -191,8 +191,8 @@ fn compile_fixture(
 }
 
 fn assert_nat_and_replay(compiled: &CompiledIr, expected: &str) {
-    let bytes = flbc::encode_canonical(compiled.program.program(), flbc::CodecLimits::default())
-        .unwrap();
+    let bytes =
+        flbc::encode_canonical(compiled.program.program(), flbc::CodecLimits::default()).unwrap();
     let replay = flbc::decode_canonical(&bytes, flbc::CodecLimits::default()).unwrap();
     assert_eq!(
         flbc::encode_canonical(&replay, flbc::CodecLimits::default()).unwrap(),

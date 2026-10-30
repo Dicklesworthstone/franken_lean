@@ -56,7 +56,11 @@ fn info(tag: u64, fields: u64) -> IrCtorInfo {
 }
 
 fn param(x: u64, ty: IrType) -> IrParam {
-    IrParam { x, borrow: true, ty }
+    IrParam {
+        x,
+        borrow: true,
+        ty,
+    }
 }
 
 fn function(text: &str, params: &[u64], value: IrBody) -> IrDecl {
@@ -79,8 +83,14 @@ fn cases(x: u64, exclusive: IrBody, shared: IrBody) -> IrTerminal {
         x,
         x_type: IrType::UInt8,
         alts: vec![
-            IrAlt::Ctor { info: info(0, 0), body: exclusive },
-            IrAlt::Ctor { info: info(1, 0), body: shared },
+            IrAlt::Ctor {
+                info: info(0, 0),
+                body: exclusive,
+            },
+            IrAlt::Ctor {
+                info: info(1, 0),
+                body: shared,
+            },
         ],
     }
 }
@@ -105,13 +115,20 @@ fn region() -> IrBody {
                     cases(
                         12,
                         body(
-                            vec![IrStmt::Set { x: 11, i: 0, y: var(14) }],
+                            vec![IrStmt::Set {
+                                x: 11,
+                                i: 0,
+                                y: var(14),
+                            }],
                             jump(20, vec![var(11)]),
                         ),
                         body(
                             vec![bind(
                                 22,
-                                IrExpr::Ctor { info: info(1, 2), args: vec![var(14), var(3)] },
+                                IrExpr::Ctor {
+                                    info: info(1, 2),
+                                    args: vec![var(14), var(3)],
+                                },
                             )],
                             jump(20, vec![var(22)]),
                         ),
@@ -129,14 +146,29 @@ fn region() -> IrBody {
             body(
                 vec![
                     bind(5, IrExpr::Proj { i: 0, x: 1 }),
-                    IrStmt::Dec { x: 5, n: 1, checked: true, persistent: false },
+                    IrStmt::Dec {
+                        x: 5,
+                        n: 1,
+                        checked: true,
+                        persistent: false,
+                    },
                 ],
                 jump(10, vec![var(1), var(4)]),
             ),
             body(
                 vec![
-                    IrStmt::Inc { x: 3, n: 1, checked: true, persistent: false },
-                    IrStmt::Dec { x: 1, n: 1, checked: true, persistent: false },
+                    IrStmt::Inc {
+                        x: 3,
+                        n: 1,
+                        checked: true,
+                        persistent: false,
+                    },
+                    IrStmt::Dec {
+                        x: 1,
+                        n: 1,
+                        checked: true,
+                        persistent: false,
+                    },
                 ],
                 jump(10, vec![IrArg::Erased, var(4)]),
             ),
@@ -154,7 +186,10 @@ fn update(region: IrBody) -> IrDecl {
                 type_name: name("Reset.Node"),
                 x: 1,
                 x_type: IrType::TObject,
-                alts: vec![IrAlt::Ctor { info: info(1, 2), body: region }],
+                alts: vec![IrAlt::Ctor {
+                    info: info(1, 2),
+                    body: region,
+                }],
             },
         ),
     )
@@ -168,7 +203,13 @@ fn entry() -> IrDecl {
             vec![
                 num(1, 19),
                 num(2, 23),
-                bind(3, IrExpr::Ctor { info: info(1, 2), args: vec![var(1), var(2)] }),
+                bind(
+                    3,
+                    IrExpr::Ctor {
+                        info: info(1, 2),
+                        args: vec![var(1), var(2)],
+                    },
+                ),
                 num(4, 42),
                 call(5, "Reset.update", &[3, 4]),
                 bind(6, IrExpr::Proj { i: 0, x: 5 }),
@@ -192,28 +233,52 @@ fn compile_module(
     arguments: &[EntryArgument],
     limits: IrExecutionLimits,
 ) -> Result<CompiledIr> {
-    let users = module.decls.iter().filter_map(|d| match d {
-        IrDecl::Function { name, .. } => Some(name.clone()),
-        _ => None,
-    }).collect();
+    let users = module
+        .decls
+        .iter()
+        .filter_map(|d| match d {
+            IrDecl::Function { name, .. } => Some(name.clone()),
+            _ => None,
+        })
+        .collect();
     let partition = VerifiedPartition {
-        partition: CensusPartition::parse("constant_count\t0\n", GraphArchiveLimits::default()).unwrap(),
+        partition: CensusPartition::parse("constant_count\t0\n", GraphArchiveLimits::default())
+            .unwrap(),
     };
-    compile(std::slice::from_ref(module), &name(entry), arguments, &partition, &users, limits)
+    compile(
+        std::slice::from_ref(module),
+        &name(entry),
+        arguments,
+        &partition,
+        &users,
+        limits,
+    )
 }
 
 fn fixture(region: IrBody) -> IrModule {
-    IrModule { decls: vec![update(region), entry()], ..IrModule::default() }
+    IrModule {
+        decls: vec![update(region), entry()],
+        ..IrModule::default()
+    }
 }
 
 fn compile_region(region: IrBody) -> Result<CompiledIr> {
-    compile_module(&fixture(region), "Reset.main", &[], IrExecutionLimits::default())
+    compile_module(
+        &fixture(region),
+        "Reset.main",
+        &[],
+        IrExecutionLimits::default(),
+    )
 }
 
 fn assert_replay(compiled: &CompiledIr, expected: &str) {
-    let bytes = flbc::encode_canonical(compiled.program.program(), flbc::CodecLimits::default()).unwrap();
+    let bytes =
+        flbc::encode_canonical(compiled.program.program(), flbc::CodecLimits::default()).unwrap();
     let replay = flbc::decode_canonical(&bytes, flbc::CodecLimits::default()).unwrap();
-    assert_eq!(flbc::encode_canonical(&replay, flbc::CodecLimits::default()).unwrap(), bytes);
+    assert_eq!(
+        flbc::encode_canonical(&replay, flbc::CodecLimits::default()).unwrap(),
+        bytes
+    );
     for program in [compiled.program.program(), &replay] {
         let outcome = execute(program, ExecutionLimits::default(), None);
         let Outcome::Complete(VmExit::Returned(value)) = outcome else {
@@ -221,7 +286,12 @@ fn assert_replay(compiled: &CompiledIr, expected: &str) {
         };
         assert_eq!(nat_decimal(&value.value).as_deref(), Some(expected));
     }
-    assert!(compiled.reference_functions().iter().all(|f| f.producer() == "reference"));
+    assert!(
+        compiled
+            .reference_functions()
+            .iter()
+            .all(|f| f.producer() == "reference")
+    );
 }
 
 fn continuation(region: &mut IrBody) -> &mut IrBody {
@@ -248,7 +318,8 @@ fn arm(body: &mut IrBody, index: usize) -> &mut IrBody {
 fn expanded_reset_reuse_preserves_shared_originals_and_strict_common_work() {
     let module = fixture(region());
     let original = module.clone();
-    let compiled = compile_module(&module, "Reset.main", &[], IrExecutionLimits::default()).unwrap();
+    let compiled =
+        compile_module(&module, "Reset.main", &[], IrExecutionLimits::default()).unwrap();
     // Two updates (42+1 and 7+1), retained tail 23, unchanged original head 19.
     assert_replay(&compiled, "93");
     assert_eq!(module, original);
@@ -276,28 +347,49 @@ fn reset_and_reuse_guards_accept_either_boolean_default_and_order() {
 fn reset_prefix_effects_run_once_per_update_including_bytecode_replay() {
     use fln_rt::obj::StdoutCapture;
     let mut region = region();
-    continuation(&mut region).stmts.splice(2..2, [
-        bind(30, IrExpr::Lit(IrLit::Str("between reset and reuse".to_owned()))),
-        bind(31, IrExpr::Pap { function: name("Reset.traceCont"), args: vec![] }),
-        call(32, "dbgTrace", &[30, 31]),
-    ]);
+    continuation(&mut region).stmts.splice(
+        2..2,
+        [
+            bind(
+                30,
+                IrExpr::Lit(IrLit::Str("between reset and reuse".to_owned())),
+            ),
+            bind(
+                31,
+                IrExpr::Pap {
+                    function: name("Reset.traceCont"),
+                    args: vec![],
+                },
+            ),
+            call(32, "dbgTrace", &[30, 31]),
+        ],
+    );
     let mut module = fixture(region);
-    module.decls.push(function("Reset.traceCont", &[1], body(vec![num(2, 0)], IrTerminal::Ret(var(2)))));
+    module.decls.push(function(
+        "Reset.traceCont",
+        &[1],
+        body(vec![num(2, 0)], IrTerminal::Ret(var(2))),
+    ));
     module.decls.push(IrDecl::Extern {
         name: name("dbgTrace"),
         params: vec![param(1, IrType::TObject), param(2, IrType::TObject)],
         result: IrType::TObject,
         entries: vec![],
     });
-    let compiled = compile_module(&module, "Reset.main", &[], IrExecutionLimits::default()).unwrap();
-    let bytes = flbc::encode_canonical(compiled.program.program(), flbc::CodecLimits::default()).unwrap();
+    let compiled =
+        compile_module(&module, "Reset.main", &[], IrExecutionLimits::default()).unwrap();
+    let bytes =
+        flbc::encode_canonical(compiled.program.program(), flbc::CodecLimits::default()).unwrap();
     let replay = flbc::decode_canonical(&bytes, flbc::CodecLimits::default()).unwrap();
     for program in [compiled.program.program(), &replay] {
         let capture = StdoutCapture::begin_evaluation(1024).unwrap();
         let outcome = execute(program, ExecutionLimits::default(), None);
         let captured = capture.finish();
         assert_eq!(captured.error, None);
-        assert_eq!(captured.bytes, b"between reset and reuse\nbetween reset and reuse\n");
+        assert_eq!(
+            captured.bytes,
+            b"between reset and reuse\nbetween reset and reuse\n"
+        );
         let Outcome::Complete(VmExit::Returned(value)) = outcome else {
             panic!("{outcome:?}");
         };
@@ -326,7 +418,13 @@ fn reuse_field_tag_and_continuation_mismatches_never_authorize_sharing() {
         let mut region = region();
         let value = continuation(&mut region);
         match kind {
-            0 => arm(value, 0).stmts[0] = IrStmt::Set { x: 11, i: 1, y: var(14) },
+            0 => {
+                arm(value, 0).stmts[0] = IrStmt::Set {
+                    x: 11,
+                    i: 1,
+                    y: var(14),
+                }
+            }
             1 => arm(value, 0).stmts.push(IrStmt::SetTag { x: 11, cidx: 2 }),
             2 => arm(value, 1).stmts.push(call(40, "Nat.add", &[2, 3])),
             3 => arm(value, 0).terminal = Box::new(IrTerminal::Ret(var(11))),
@@ -338,10 +436,23 @@ fn reuse_field_tag_and_continuation_mismatches_never_authorize_sharing() {
 
 #[test]
 fn reset_parameters_and_receiver_cannot_escape_through_common_code_or_captures() {
-    for (source, nested) in [(11, false), (12, false), (1, false), (11, true), (12, true), (1, true)] {
+    for (source, nested) in [
+        (11, false),
+        (12, false),
+        (1, false),
+        (11, true),
+        (12, true),
+        (1, true),
+    ] {
         let mut region = region();
         let read = if source == 12 {
-            bind(40, IrExpr::Box { ty: IrType::UInt8, x: source })
+            bind(
+                40,
+                IrExpr::Box {
+                    ty: IrType::UInt8,
+                    x: source,
+                },
+            )
         } else {
             bind(40, IrExpr::Proj { i: 0, x: source })
         };
@@ -354,7 +465,10 @@ fn reset_parameters_and_receiver_cannot_escape_through_common_code_or_captures()
         } else {
             value.stmts.insert(2, read);
         }
-        assert!(compile_region(region).is_err(), "read {source}, nested={nested}");
+        assert!(
+            compile_region(region).is_err(),
+            "read {source}, nested={nested}"
+        );
     }
 }
 
@@ -367,7 +481,10 @@ fn original_ir_is_validated_even_in_reset_branches_that_would_be_discarded() {
     };
     *ty = IrType::UInt8;
     let error = compile_region(region).unwrap_err();
-    assert!(matches!(error, IrExecutionError::IrValidation(_)), "{error:?}");
+    assert!(
+        matches!(error, IrExecutionError::IrValidation(_)),
+        "{error:?}"
+    );
 }
 
 #[test]

@@ -4,7 +4,7 @@
 //! The input remains untrusted: selection, IR validation, FIR validation and
 //! FLBC's independent ownership pass all precede execution. The first supported
 //! slice is immutable, pure code: calls, closures, acyclic join points,
-//! constructor cases, fresh packed integer fields and scalar primitives.
+//! constructor cases, fresh packed scalar fields and scalar primitives.
 //! Equivalent object-update alternatives are normalized to fresh construction.
 //! Other mutation, reset/reuse and observable reference counts are refused.
 //! Its RC annotations are replaced by Golem's checked managed ownership, not
@@ -71,6 +71,10 @@ impl VerifiedPartition {
 pub enum EntryArgument {
     Nat(IrNat),
     String(String),
+    /// IEEE-754 binary64 bits, including signed zero and NaN payloads.
+    FloatBits(u64),
+    /// IEEE-754 binary32 bits, including signed zero and NaN payloads.
+    Float32Bits(u32),
     Erased,
 }
 
@@ -327,6 +331,8 @@ pub fn compile(
             let bytes = match argument {
                 EntryArgument::Nat(IrNat::Big(limbs)) => limbs.len().checked_mul(8)?,
                 EntryArgument::String(text) => text.len(),
+                EntryArgument::FloatBits(_) => 8,
+                EntryArgument::Float32Bits(_) => 4,
                 _ => 0,
             };
             sum.checked_add(bytes)
@@ -409,11 +415,19 @@ pub fn compile(
         .collect();
     // Validate and authorize the original closure before eliminating anything:
     // even an unchosen allocation branch cannot hide an invalid declaration.
-    validate_ir_types(std::slice::from_ref(&selected_module), &signatures, limits.ir)
-        .map_err(IrExecutionError::IrValidation)?;
+    validate_ir_types(
+        std::slice::from_ref(&selected_module),
+        &signatures,
+        limits.ir,
+    )
+    .map_err(IrExecutionError::IrValidation)?;
     if constructor_updates::normalize(&mut selected_module, limits)? {
-        validate_ir_types(std::slice::from_ref(&selected_module), &signatures, limits.ir)
-            .map_err(IrExecutionError::IrValidation)?;
+        validate_ir_types(
+            std::slice::from_ref(&selected_module),
+            &signatures,
+            limits.ir,
+        )
+        .map_err(IrExecutionError::IrValidation)?;
     }
     let selected = selected_module
         .decls
@@ -433,6 +447,8 @@ fn check_type(name: &Name, ty: &IrType) -> Result<(), IrExecutionError> {
         | IrType::UInt16
         | IrType::UInt32
         | IrType::UInt64
+        | IrType::Float
+        | IrType::Float32
         | IrType::USize => Ok(()),
         _ => Err(unsupported(name, "packed/unboxed IR representation")),
     }
@@ -457,6 +473,17 @@ fn inspect_body(
             match stmt {
                 IrStmt::VDecl { ty, expr, .. } => {
                     check_type(name, ty)?;
+                    if matches!(ty, IrType::Float | IrType::Float32) {
+                        match expr {
+                            fln_olean::ir::IrExpr::Lit(fln_olean::ir::IrLit::Num(_)) => {
+                                return Err(unsupported(name, "floating numeric literal"));
+                            }
+                            fln_olean::ir::IrExpr::Ctor { .. } => {
+                                return Err(unsupported(name, "floating constructor"));
+                            }
+                            _ => {}
+                        }
+                    }
                     if let fln_olean::ir::IrExpr::Box { ty, .. } = expr {
                         check_type(name, ty)?;
                     }
@@ -484,6 +511,9 @@ fn inspect_body(
         }
         if let IrTerminal::Case { alts, x_type, .. } = body.terminal.as_ref() {
             check_type(name, x_type)?;
+            if matches!(x_type, IrType::Float | IrType::Float32) {
+                return Err(unsupported(name, "floating constructor case"));
+            }
             if alts.len() > limits.ir.max_depth.min(128) {
                 return Err(IrExecutionError::Limit("case alternatives"));
             }

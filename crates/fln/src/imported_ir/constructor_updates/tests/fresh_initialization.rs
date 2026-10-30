@@ -258,7 +258,10 @@ fn fresh_constructor_updates_do_not_cross_reads_calls_closures_or_join_captures(
             &[],
         )
         .unwrap_err();
-        assert!(matches!(error, IrExecutionError::Unsupported { .. }), "{error:?}");
+        assert!(
+            matches!(error, IrExecutionError::Unsupported { .. }),
+            "{error:?}"
+        );
     }
 }
 
@@ -334,8 +337,14 @@ fn fresh_constructor_initialization_checks_bounds_and_rejects_self_cycles() {
         panic!("{outcome:?}");
     };
     assert_eq!(value.value.header().tag, 7);
-    assert_eq!(nat_decimal(&value.value.ctor_child(0)).as_deref(), Some("19"));
-    assert_eq!(nat_decimal(&value.value.ctor_child(1)).as_deref(), Some("23"));
+    assert_eq!(
+        nat_decimal(&value.value.ctor_child(0)).as_deref(),
+        Some("19")
+    );
+    assert_eq!(
+        nat_decimal(&value.value.ctor_child(1)).as_deref(),
+        Some("23")
+    );
 }
 
 #[test]

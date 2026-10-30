@@ -216,17 +216,13 @@ fn alt_body(alt: &IrAlt) -> &IrBody {
     }
 }
 
-fn visit_stmt_reads(
-    stmt: &IrStmt,
-    mut visit: impl FnMut(u64),
-    meter: &mut Meter,
-) -> Result<()> {
+fn visit_stmt_reads(stmt: &IrStmt, mut visit: impl FnMut(u64), meter: &mut Meter) -> Result<()> {
     match stmt {
         IrStmt::VDecl { expr, .. } => {
             let args = match expr {
-                IrExpr::Ctor { args, .. }
-                | IrExpr::Fap { args, .. }
-                | IrExpr::Pap { args, .. } => args.as_slice(),
+                IrExpr::Ctor { args, .. } | IrExpr::Fap { args, .. } | IrExpr::Pap { args, .. } => {
+                    args.as_slice()
+                }
                 IrExpr::Reuse { x, args, .. } | IrExpr::Ap { x, args } => {
                     meter.charge(1)?;
                     visit(*x);
@@ -378,7 +374,10 @@ fn normalize_body(
 }
 
 fn rc_only(stmt: &IrStmt) -> bool {
-    matches!(stmt, IrStmt::Inc { .. } | IrStmt::Dec { .. } | IrStmt::Del { .. })
+    matches!(
+        stmt,
+        IrStmt::Inc { .. } | IrStmt::Dec { .. } | IrStmt::Del { .. }
+    )
 }
 
 /// Return the shared-alternative index only after checking every field, tag,
@@ -487,9 +486,7 @@ fn equivalent_branches(
     let Some(new_shape) = Shape::object_only(info) else {
         return Ok(None);
     };
-    if new_shape.fields != shape.fields
-        || new_shape.tag != tag
-        || args.len() as u64 != shape.fields
+    if new_shape.fields != shape.fields || new_shape.tag != tag || args.len() as u64 != shape.fields
     {
         return Ok(None);
     }
@@ -546,9 +543,7 @@ fn boolean_arms(alts: &[IrAlt]) -> Option<(usize, usize)> {
     let mut fallback = None;
     for (index, alt) in alts.iter().enumerate() {
         match alt {
-            IrAlt::Ctor { info, .. }
-                if info.size == 0 && info.usize == 0 && info.ssize == 0 =>
-            {
+            IrAlt::Ctor { info, .. } if info.size == 0 && info.usize == 0 && info.ssize == 0 => {
                 match info.cidx {
                     0 if exclusive.is_none() => exclusive = Some(index),
                     1 if shared.is_none() => shared = Some(index),
