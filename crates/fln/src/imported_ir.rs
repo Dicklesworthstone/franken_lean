@@ -5,8 +5,8 @@
 //! FLBC's independent ownership pass all precede execution. The first supported
 //! slice is immutable, pure code: calls, closures, acyclic join points,
 //! constructor cases, fresh packed integer fields and scalar primitives.
-//! Mutation after a constructor is read or captured, reset/reuse and
-//! reference-count observations are refused.
+//! Equivalent object-update alternatives are normalized to fresh construction.
+//! Other mutation, reset/reuse and observable reference counts are refused.
 //! Its RC annotations are replaced by Golem's checked managed ownership, not
 //! executed as additional retains/releases on already managed values.
 //!
@@ -29,6 +29,7 @@ use fln_vm::interpreter::{CancellationProbe, ExecutionLimits, VmExit};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
+mod constructor_updates;
 mod lower;
 mod sha256;
 
@@ -398,7 +399,7 @@ pub fn compile(
         }
         selected.insert(name, *declaration);
     }
-    let selected_module = IrModule {
+    let mut selected_module = IrModule {
         decls: selected.values().map(|decl| (*decl).clone()).collect(),
         ..IrModule::default()
     };
@@ -406,8 +407,19 @@ pub fn compile(
         .iter()
         .map(|(name, native)| (name.clone(), native.arguments.len()))
         .collect();
-    validate_ir_types(&[selected_module], &signatures, limits.ir)
+    // Validate and authorize the original closure before eliminating anything:
+    // even an unchosen allocation branch cannot hide an invalid declaration.
+    validate_ir_types(std::slice::from_ref(&selected_module), &signatures, limits.ir)
         .map_err(IrExecutionError::IrValidation)?;
+    if constructor_updates::normalize(&mut selected_module, limits)? {
+        validate_ir_types(std::slice::from_ref(&selected_module), &signatures, limits.ir)
+            .map_err(IrExecutionError::IrValidation)?;
+    }
+    let selected = selected_module
+        .decls
+        .iter()
+        .map(|declaration| (declaration.name().clone(), declaration))
+        .collect();
     lower::compile(&selected, &natives, entry, arguments, limits)
 }
 
@@ -464,7 +476,10 @@ fn inspect_body(
                 // constructor. The IR never acquires a mutable runtime handle.
                 IrStmt::USet { .. } => {}
                 IrStmt::SSet { ty, .. } => check_type(name, ty)?,
-                _ => return Err(unsupported(name, "constructor mutation")),
+                // These reach lowering only if a bounded equivalence check
+                // can replace the entire update region with fresh construction.
+                // Any remaining mutation is still refused by the lowerer.
+                IrStmt::Set { .. } | IrStmt::SetTag { .. } => {}
             }
         }
         if let IrTerminal::Case { alts, x_type, .. } = body.terminal.as_ref() {
