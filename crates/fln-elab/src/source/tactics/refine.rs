@@ -91,7 +91,10 @@ impl Context {
             return Err(error(TacticError::MalformedScript));
         }
         self.txn.lctx = goal.lctx.clone();
-        self.resolve_instances(false)?;
+        // The pin's tactic `elabTerm` ends with `synthesizeSyntheticMVars (postpone := .no)`
+        // (`runTermElab`, vendored `Lean/Elab/Tactic/ElabTerm.lean:29-60`), which applies default
+        // instances, before the term's type meets the goal.
+        self.resolve_instances_with_defaults()?;
         self.flush(false)?;
         self.ensure_tactic_term_type(&term.type_, &goal.target)?;
         let frame = self.refinements.pop().expect("checked refinement depth");
@@ -636,7 +639,8 @@ impl Context {
         }
         let mut frame = self.refinements.pop().expect("checked refinement depth");
         self.txn.lctx = goal.lctx.clone();
-        self.resolve_instances(false)?;
+        // Default instances apply here too (`finish_exact_refinement`).
+        self.resolve_instances_with_defaults()?;
         self.flush(false)?;
         self.ensure_tactic_term_type(&term.type_, &goal.target)?;
         if !frame.placeholders {
