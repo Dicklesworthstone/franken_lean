@@ -232,11 +232,103 @@ fn malformed_call_does_not_determine_a_native_callees_arity() {
     else {
         unreachable!();
     };
-    args.insert(0, IrArg::Erased);
+    // A data-bearing operand cannot impersonate the pin's erased type slot.
+    args.insert(0, var(1));
     assert!(matches!(
         compile_declarations(vec![declaration]),
-        Err(IrExecutionError::IrValidation(_))
+        Err(IrExecutionError::Unsupported { .. })
     ));
+}
+
+#[test]
+fn pinned_array_type_slots_are_erased_without_hiding_bad_data_or_authority() {
+    let declaration = || {
+        entry(
+            vec![
+                num(1, 2),
+                bind(
+                    2,
+                    IrExpr::Fap {
+                        function: name("Array.mkEmpty"),
+                        args: vec![IrArg::Erased, var(1)],
+                    },
+                ),
+                num(3, 42),
+                bind(
+                    4,
+                    IrExpr::Fap {
+                        function: name("Array.push"),
+                        args: vec![IrArg::Erased, var(2), var(3)],
+                    },
+                ),
+                call(5, "Array.size", &[4]),
+            ],
+            5,
+        )
+    };
+    assert_nat(&compile_declarations(vec![declaration()]).unwrap(), "1");
+    for (statement, operand, replacement) in [
+        (1, 0, var(1)),
+        (3, 0, var(1)),
+        (1, 1, var(999)),
+        (3, 1, var(999)),
+        (3, 2, var(999)),
+    ] {
+        let mut mutated = declaration();
+        let IrDecl::Function { body, .. } = &mut mutated else {
+            unreachable!()
+        };
+        let IrStmt::VDecl {
+            expr: IrExpr::Fap { args, .. },
+            ..
+        } = &mut body.stmts[statement]
+        else {
+            unreachable!()
+        };
+        args[operand] = replacement;
+        assert!(compile_declarations(vec![mutated]).is_err());
+    }
+    let first_class = entry(
+        vec![bind(
+            1,
+            IrExpr::Pap {
+                function: name("Array.push"),
+                args: vec![IrArg::Erased],
+            },
+        )],
+        1,
+    );
+    assert!(matches!(
+        compile_declarations(vec![first_class]),
+        Err(IrExecutionError::Unsupported { .. })
+    ));
+    for id in ["extern:Array.mkEmpty", "extern:Array.push"] {
+        let row = fln_vm::extern_table_generated::EXTERN_ROWS
+            .iter()
+            .find(|row| row.id == id)
+            .unwrap();
+        assert!(array_runtime_arity(row).unwrap().is_some());
+        for changed in [
+            GeneratedExternRow {
+                symbol: "foreign_array",
+                ..*row
+            },
+            GeneratedExternRow {
+                arity: row.arity + 1,
+                ..*row
+            },
+            GeneratedExternRow {
+                effect: "state",
+                ..*row
+            },
+            GeneratedExternRow {
+                ownership: "rule(borrowed-args,owned-result)",
+                ..*row
+            },
+        ] {
+            assert!(array_runtime_arity(&changed).is_err());
+        }
+    }
 }
 
 #[test]

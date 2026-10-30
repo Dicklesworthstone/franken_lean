@@ -6,8 +6,131 @@
 //! first observed call site, can supply the runtime arity. Explicit IR extern
 //! declarations are checked against the same authority.
 
-use super::{GeneratedExternRow, IrExecutionError, Name, Ownership, extern_row};
-use fln_olean::ir::{IrParam, IrType};
+use super::{
+    GeneratedExternRow, IrExecutionError, IrExecutionLimits, Name, Native, Ownership, extern_row,
+    unsupported,
+};
+use fln_olean::ir::{IrAlt, IrArg, IrDecl, IrExpr, IrModule, IrParam, IrStmt, IrTerminal, IrType};
+use std::collections::BTreeMap;
+
+/// The pin retains one literal erased element type on these direct array
+/// calls. Remove that slot only for the two reviewed generated rows, before
+/// validating all remaining operands. Never infer a signature from a call.
+pub(super) fn erase_array_arguments(
+    module: &mut IrModule,
+    natives: &BTreeMap<Name, Native>,
+    limits: IrExecutionLimits,
+) -> Result<(), IrExecutionError> {
+    let mut arrays = BTreeMap::new();
+    for (name, native) in natives {
+        let Some(row) = fln_vm::extern_table_generated::EXTERN_ROWS
+            .iter()
+            .find(|row| row.id == native.id)
+        else {
+            continue;
+        };
+        if let Some(runtime) = array_runtime_arity(row)? {
+            arrays.insert(name.clone(), runtime);
+        }
+    }
+    if arrays.is_empty() {
+        return Ok(());
+    }
+    let mut work = 0u64;
+    for declaration in &mut module.decls {
+        let IrDecl::Function { name, body, .. } = declaration else {
+            continue;
+        };
+        let mut pending = vec![(body, 1usize)];
+        while let Some((body, depth)) = pending.pop() {
+            if depth > limits.ir.max_depth.min(128) {
+                return Err(IrExecutionError::Limit("native erased-array depth"));
+            }
+            work = work
+                .checked_add(body.stmts.len() as u64)
+                .and_then(|work| work.checked_add(1))
+                .ok_or(IrExecutionError::Limit("native erased-array adaptation"))?;
+            if work > limits.ir.max_work {
+                return Err(IrExecutionError::Limit("native erased-array adaptation"));
+            }
+            for statement in &mut body.stmts {
+                match statement {
+                    IrStmt::VDecl {
+                        expr: IrExpr::Fap { function, args },
+                        ..
+                    } => {
+                        let Some(&runtime) = arrays.get(function) else {
+                            continue;
+                        };
+                        if args.len() == runtime {
+                            continue;
+                        }
+                        if args.len() != runtime + 1 || args[0] != IrArg::Erased {
+                            return Err(unsupported(name, "unreviewed native array type operand"));
+                        }
+                        args.remove(0);
+                    }
+                    IrStmt::VDecl {
+                        expr: IrExpr::Pap { function, args },
+                        ..
+                    } if arrays.contains_key(function) && args.first() == Some(&IrArg::Erased) => {
+                        return Err(unsupported(
+                            name,
+                            "first-class erased native array primitive",
+                        ));
+                    }
+                    IrStmt::JDecl { value, .. } => pending.push((value, depth + 1)),
+                    _ => {}
+                }
+            }
+            if let IrTerminal::Case { alts, .. } = body.terminal.as_mut() {
+                for alternative in alts {
+                    let (IrAlt::Ctor { body, .. } | IrAlt::Default { body }) = alternative;
+                    pending.push((body, depth + 1));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn array_runtime_arity(row: &GeneratedExternRow) -> Result<Option<usize>, IrExecutionError> {
+    let (name, symbol, runtime, ownership) = match row.id {
+        "extern:Array.mkEmpty" => (
+            "Array.mkEmpty",
+            "lean_mk_empty_array_with_capacity",
+            1,
+            "abi((capacity: borrowed_arg) -> raw_object)",
+        ),
+        "extern:Array.push" => (
+            "Array.push",
+            "lean_array_push",
+            2,
+            "abi((a: owned_arg, v: owned_arg) -> raw_object)",
+        ),
+        _ => return Ok(None),
+    };
+    if row.name != name
+        || row.symbol != symbol
+        || row.module != "Init.Prelude"
+        || row.kind != "defn"
+        || row.levels != 1
+        || row.arity as usize != runtime + 1
+        || row.effect != "pure"
+        || row.safety != "safe"
+        || row.ownership != ownership
+        || row.entry_class != "standard"
+        || row.entry_scope != "all"
+        || row.partition != "toolchain-api"
+        || inferred_arity(row)? != runtime
+    {
+        return Err(IrExecutionError::NativeContract {
+            declaration: Name::from_components(row.name.split('.')),
+            detail: "array primitive differs from its reviewed erased IR bridge".to_owned(),
+        });
+    }
+    Ok(Some(runtime))
+}
 
 /// The pinned IR retains sigma, alpha and the world around these exact five
 /// cell operations. Their native ABI returns the raw value: the surrounding

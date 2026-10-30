@@ -749,6 +749,7 @@ fn compile_with_policy(
     // native state calls. Only those literals are removed; all data uses and
     // all instructions remain for the complete structural/type validation.
     native_effects::erase_state_arguments(&mut selected_module, &natives, limits)?;
+    native_signature::erase_array_arguments(&mut selected_module, &natives, limits)?;
     let signatures = natives
         .iter()
         .map(|(name, native)| (name.clone(), native.ir_arity))
