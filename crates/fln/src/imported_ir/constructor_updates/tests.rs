@@ -475,3 +475,5 @@ fn unknown_input_shapes_do_not_authorize_object_mutation() {
     .unwrap_err();
     assert!(matches!(error, IrExecutionError::Unsupported { .. }));
 }
+
+mod fresh_initialization;

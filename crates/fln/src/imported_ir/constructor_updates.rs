@@ -6,6 +6,7 @@
 //! guess that guard's value. Instead, verify that the two alternatives differ
 //! only in allocation, then retain the fresh-construction alternative.
 //!
+//! Fresh object-field initialization is folded before checking branches.
 //! This deliberately admits only object-field updates with a known incoming
 //! constructor shape. Packed updates, arbitrary mutation, observable sharing
 //! flags, and effectful/different alternatives remain unsupported. No mutable
@@ -17,6 +18,8 @@ use fln_olean::ir::{
     IrAlt, IrArg, IrBody, IrCtorInfo, IrDecl, IrExpr, IrModule, IrStmt, IrTerminal, IrType,
 };
 use std::collections::{BTreeMap, BTreeSet};
+
+mod fresh;
 
 type Result<T> = std::result::Result<T, IrExecutionError>;
 
@@ -87,18 +90,24 @@ pub(super) fn normalize(module: &mut IrModule, limits: IrExecutionLimits) -> Res
     };
     for declaration in &mut module.decls {
         meter.charge(1)?;
-        if let IrDecl::Function { body, .. } = declaration
-            && contains_sharing_guard(body, &mut meter)?
-        {
-            let captures = join_captures(body, &mut meter)?;
-            normalize_body(body, Scope::default(), &captures, &mut meter, 1)?;
+        if let IrDecl::Function { name, body, .. } = declaration {
+            let (stores, sharing) = update_forms(body, &mut meter)?;
+            if stores {
+                fresh::normalize_body(name, body, &mut meter, 1)?;
+            }
+            if sharing {
+                let captures = join_captures(body, &mut meter)?;
+                normalize_body(body, Scope::default(), &captures, &mut meter, 1)?;
+            }
         }
     }
     Ok(meter.changed)
 }
 
 // Ordinary immutable functions need neither scope snapshots nor capture scans.
-fn contains_sharing_guard(body: &IrBody, meter: &mut Meter) -> Result<bool> {
+fn update_forms(body: &IrBody, meter: &mut Meter) -> Result<(bool, bool)> {
+    let mut stores = false;
+    let mut sharing = false;
     let mut pending = vec![(body, 1usize)];
     while let Some((body, depth)) = pending.pop() {
         meter.depth(depth)?;
@@ -108,10 +117,14 @@ fn contains_sharing_guard(body: &IrBody, meter: &mut Meter) -> Result<bool> {
                 IrStmt::VDecl {
                     expr: IrExpr::IsShared { .. },
                     ..
-                } => return Ok(true),
+                } => sharing = true,
+                IrStmt::Set { .. } | IrStmt::SetTag { .. } => stores = true,
                 IrStmt::JDecl { value, .. } => pending.push((value, depth + 1)),
                 _ => {}
             }
+        }
+        if stores && sharing {
+            return Ok((stores, sharing));
         }
         if let IrTerminal::Case { alts, .. } = body.terminal.as_ref() {
             meter.charge(alts.len())?;
@@ -120,7 +133,7 @@ fn contains_sharing_guard(body: &IrBody, meter: &mut Meter) -> Result<bool> {
             }
         }
     }
-    Ok(false)
+    Ok((stores, sharing))
 }
 
 /// A join capturing the updated object could observe an in-place write without
@@ -327,11 +340,8 @@ fn normalize_body(
         let IrTerminal::Case { alts, .. } = body.terminal.as_mut() else {
             unreachable!("a verified update is a case");
         };
-        let IrAlt::Ctor {
-            body: replacement, ..
-        } = alts.swap_remove(index)
-        else {
-            unreachable!("a verified shared alternative is a constructor alternative");
+        let replacement = match alts.swap_remove(index) {
+            IrAlt::Ctor { body, .. } | IrAlt::Default { body } => body,
         };
         body.stmts.pop(); // The flag is used only by the eliminated discriminator.
         body.stmts.extend(replacement.stmts);
@@ -403,9 +413,15 @@ fn equivalent_update(
     }
     let mut exclusive = None;
     let mut shared = None;
+    let mut fallback = None;
     for (index, alt) in alts.iter().enumerate() {
-        let IrAlt::Ctor { info, body } = alt else {
-            return Ok(None);
+        let (info, body) = match alt {
+            IrAlt::Ctor { info, body } => (info, body),
+            IrAlt::Default { body } if fallback.is_none() => {
+                fallback = Some((index, body));
+                continue;
+            }
+            _ => return Ok(None),
         };
         if info.size != 0 || info.usize != 0 || info.ssize != 0 {
             return Ok(None);
@@ -413,6 +429,15 @@ fn equivalent_update(
         match info.cidx {
             0 if exclusive.is_none() => exclusive = Some(body),
             1 if shared.is_none() => shared = Some((index, body)),
+            _ => return Ok(None),
+        }
+    }
+    // `isShared` is a closed Boolean operation, not an arbitrary UInt8
+    // producer. A single default alternative is exactly the missing bit.
+    if let Some((index, body)) = fallback {
+        match (exclusive.is_some(), shared.is_some()) {
+            (true, false) => shared = Some((index, body)),
+            (false, true) => exclusive = Some(body),
             _ => return Ok(None),
         }
     }

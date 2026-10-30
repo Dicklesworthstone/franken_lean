@@ -47,6 +47,11 @@ jobs:
           channel="$(python3 -I -c 'import pathlib,tomllib;print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')"
           rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
           rustc -Vv > target/constructor-runtime/compiler.txt
+      - name: Test imported IR execution and immutable constructor updates
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p fln --lib imported_ir:: -- --nocapture 2>&1 | tee target/constructor-runtime/imported-ir.log
       - name: Test recursors and higher-order execution
         shell: bash
         run: |
