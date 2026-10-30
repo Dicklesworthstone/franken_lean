@@ -304,3 +304,173 @@ fn module_discovery_cannot_replace_the_pinned_execution_partition() {
     assert!(output.stdout.is_empty());
     assert!(String::from_utf8_lossy(&output.stderr).contains("policy-refusal"));
 }
+
+fn live_output_reference() -> Option<PathBuf> {
+    let reference = std::env::var_os("FLN_REFERENCE_LEAN")
+        .map(PathBuf::from)
+        .or_else(|| {
+            let lib = PathBuf::from(std::env::var_os("FLN_REFERENCE_LIB")?);
+            Some(lib.parent()?.parent()?.join("bin/lean"))
+        });
+    assert!(
+        reference.is_some() || std::env::var_os("FLN_REQUIRE_REFERENCE").is_none(),
+        "the pinned Reference is required for installed output capture"
+    );
+    let reference = reference?;
+    let version = Command::new(&reference).arg("--githash").output().unwrap();
+    assert!(version.status.success());
+    assert_eq!(
+        String::from_utf8(version.stdout).unwrap().trim(),
+        fln::OLEAN_PIN_COMMIT
+    );
+    Some(reference)
+}
+
+fn output_command(
+    artifact: &Path,
+    policy: &Path,
+    users: &[String],
+    entry: &str,
+    arguments: &[&str],
+    max_output: Option<usize>,
+) -> std::process::Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_fln"));
+    command
+        .args(["ir", "run", "--json", "--entry", entry, "--partition"])
+        .arg(policy)
+        .args(arguments)
+        .arg(artifact)
+        .stdin(std::process::Stdio::null());
+    for user in users {
+        command.arg("--user").arg(user);
+    }
+    if let Some(max_bytes) = max_output {
+        command.arg("--capture-output").arg(max_bytes.to_string());
+    }
+    command.output().unwrap()
+}
+
+#[test]
+fn installed_capture_runs_pinned_io_preserving_output_raw_return_and_stopped_prefix() {
+    let Some(policy) = partition() else {
+        assert!(
+            std::env::var_os("FLN_REQUIRE_REFERENCE").is_none(),
+            "the pinned execution census is required for installed output capture"
+        );
+        return;
+    };
+    let Some(reference) = live_output_reference() else {
+        eprintln!("SKIP installed captured IR: requires the pinned Reference");
+        return;
+    };
+    let root = module_root();
+    let source = include_str!("../../fln-olean/fixtures/ir/NativeOutputModule.lean");
+    std::fs::write(root.join("NativeOutputModule.lean"), source).unwrap();
+    let generated = Command::new(&reference)
+        .current_dir(&root)
+        .args(["-o", "NativeOutputModule.olean", "NativeOutputModule.lean"])
+        .output()
+        .unwrap();
+    assert!(
+        generated.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&generated.stdout),
+        String::from_utf8_lossy(&generated.stderr),
+    );
+    let artifact = root.join("NativeOutputModule.ir");
+    let module =
+        fln::decode_ir_artifact(&std::fs::read(&artifact).unwrap(), 32 * 1024 * 1024).unwrap();
+    let users: Vec<_> = module
+        .decls
+        .iter()
+        .filter_map(|declaration| match declaration {
+            fln_olean::ir::IrDecl::Function { name, .. } => {
+                let text = name.to_display_string();
+                assert_eq!(fln::Name::from_components(text.split('.')), *name);
+                Some(text)
+            }
+            _ => None,
+        })
+        .collect();
+    let run = |entry, arguments: &[&str], max_output| {
+        output_command(&artifact, &policy, &users, entry, arguments, max_output)
+    };
+    let arguments = ["--string", "α", "--erased"];
+
+    let denied = run("localOutputAction", &arguments, None);
+    assert_eq!(denied.status.code(), Some(3));
+    assert!(denied.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&denied.stderr).contains("effectful native call"));
+
+    std::fs::write(
+        root.join("Oracle.lean"),
+        format!("{source}\n#eval localOutputAction \"α\"\n"),
+    )
+    .unwrap();
+    let oracle = Command::new(&reference)
+        .current_dir(&root)
+        .arg("Oracle.lean")
+        .output()
+        .unwrap();
+    assert!(
+        oracle.status.success(),
+        "{}",
+        String::from_utf8_lossy(&oracle.stderr)
+    );
+    assert_eq!(oracle.stdout, "αtail\0🙂\n42\n".as_bytes());
+
+    let complete = run("localOutputAction", &arguments, Some(12));
+    assert!(
+        complete.status.success(),
+        "{}",
+        String::from_utf8_lossy(&complete.stderr)
+    );
+    assert!(complete.stderr.is_empty());
+    let stdout = String::from_utf8(complete.stdout).unwrap();
+    assert!(!stdout.contains('\0'));
+    assert!(
+        stdout.starts_with('{') && stdout.ends_with("}\n"),
+        "{stdout}"
+    );
+    for expected in [
+        "\"outcome\":\"complete\"",
+        "\"value\":null",
+        "\"valueKind\":\"constructor:0\"",
+        "\"encoding\":\"utf-8\"",
+        "\"data\":\"αtail\\u0000🙂\\n\"",
+        "\"byteLength\":12,\"maxBytes\":12",
+        "\"producer\":\"reference\"",
+        "\"authority\":false",
+    ] {
+        assert!(stdout.contains(expected), "{expected}: {stdout}");
+    }
+
+    for (limit, prefix, count) in [(11, "α", 2), (0, "", 0)] {
+        let stopped = run("localOutputAction", &arguments, Some(limit));
+        assert_eq!(stopped.status.code(), Some(3));
+        assert!(stopped.stdout.is_empty());
+        let error = String::from_utf8(stopped.stderr).unwrap();
+        assert!(error.contains("\"outcome\":\"inconclusive\""), "{error}");
+        assert!(error.contains("\"value\":null"), "{error}");
+        assert!(error.contains("\"valueKind\":null"), "{error}");
+        assert!(error.contains(&format!("\"data\":\"{prefix}\"")), "{error}");
+        assert!(
+            error.contains(&format!("\"byteLength\":{count},\"maxBytes\":{limit}")),
+            "{error}"
+        );
+    }
+    assert_eq!(
+        run("localOutputAction", &arguments, Some(12)).stdout,
+        stdout.as_bytes()
+    );
+
+    let read = run("localOutputRead", &["--erased"], Some(12));
+    assert_eq!(read.status.code(), Some(3));
+    assert!(read.stdout.is_empty());
+    let error = String::from_utf8(read.stderr).unwrap();
+    assert!(
+        error.contains("captured Reference output does not authorize stream reads"),
+        "{error}"
+    );
+    assert!(error.contains("\"data\":\"\",\"byteLength\":0"), "{error}");
+}

@@ -5,7 +5,7 @@ use fln::imported_ir::modules::{
     LoadedModules, ModuleArtifacts, ModuleLoadError, ModuleLoadLimits,
 };
 use fln::imported_ir::{
-    EntryArgument, IrExecutionError, IrExecutionLimits, IrNat, VerifiedPartition,
+    EntryArgument, IrCapturedOutput, IrExecutionError, IrExecutionLimits, IrNat, VerifiedPartition,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -18,6 +18,7 @@ pub(super) struct Arguments {
     modules: Vec<fln::Name>,
     search_paths: Vec<PathBuf>,
     max_bytes: usize,
+    capture_output: Option<usize>,
     json: bool,
     vm: fln::VmExecutionLimits,
 }
@@ -48,6 +49,7 @@ pub(super) fn parse(arguments: Vec<OsString>) -> Result<MultiplexerCommand, Usag
     let mut modules = Vec::new();
     let mut search_paths = Vec::new();
     let mut max_bytes = OLEAN_INSPECT_DEFAULT_MAX_BYTES;
+    let mut capture_output = None;
     let mut json = false;
     let mut vm = fln::VmExecutionLimits::user_program();
     let mut options = true;
@@ -100,6 +102,22 @@ pub(super) fn parse(arguments: Vec<OsString>) -> Result<MultiplexerCommand, Usag
             "--string" => values.push(EntryArgument::String(text(value()?, "--string")?)),
             "--erased" => values.push(EntryArgument::Erased),
             "--max-bytes" => max_bytes = parse_byte_limit(&value()?)?,
+            "--capture-output" => {
+                if capture_output.is_some() {
+                    return Err(UsageError(
+                        "--capture-output may be supplied only once".to_owned(),
+                    ));
+                }
+                let bytes = text(value()?, "--capture-output")?
+                    .parse::<usize>()
+                    .map_err(|_| {
+                        UsageError(
+                            "--capture-output requires a non-negative byte allowance fitting this platform"
+                                .to_owned(),
+                        )
+                    })?;
+                capture_output = Some(bytes);
+            }
             "--fln-max-steps" | "--fln-max-frames" => {
                 let number = text(value()?, &flag)?
                     .parse::<u64>()
@@ -141,6 +159,7 @@ pub(super) fn parse(arguments: Vec<OsString>) -> Result<MultiplexerCommand, Usag
         modules,
         search_paths,
         max_bytes,
+        capture_output,
         json,
         vm,
     }))
@@ -318,6 +337,37 @@ fn preparation_failure(error: IrExecutionError, json: bool) -> MultiplexerOutput
     failure(class, &error.to_string(), json, code)
 }
 
+/// Preserve the complete accepted byte sequence, including NULs and newlines.
+/// Canonical native String writes are UTF-8; a future binary diagnostic must
+/// still be inspectable without replacement characters or raw JSON controls.
+fn captured_output_data(output: &IrCapturedOutput) -> (&'static str, String) {
+    match std::str::from_utf8(&output.bytes) {
+        Ok(text) => ("utf-8", json_string(text)),
+        Err(_) => {
+            let mut data = String::from("[");
+            for (index, byte) in output.bytes.iter().enumerate() {
+                if index != 0 {
+                    data.push(',');
+                }
+                data.push_str(&byte.to_string());
+            }
+            data.push(']');
+            ("bytes", data)
+        }
+    }
+}
+
+fn captured_output_json(output: &IrCapturedOutput) -> String {
+    let (encoding, data) = captured_output_data(output);
+    format!(
+        "{{\"encoding\":{},\"data\":{},\"byteLength\":{},\"maxBytes\":{}}}",
+        json_string(encoding),
+        data,
+        output.bytes.len(),
+        output.max_bytes
+    )
+}
+
 pub(super) fn run(arguments: Arguments) -> MultiplexerOutput {
     stdout_capture::json(arguments.json, "fln.ir-run/1", || run_uncaptured(arguments))
 }
@@ -374,14 +424,26 @@ fn run_uncaptured(arguments: Arguments) -> MultiplexerOutput {
         missing_ir = loaded.missing_ir_modules().to_vec();
         modules = loaded.into_modules();
     }
-    let compiled = match fln::imported_ir::compile(
-        &modules,
-        &arguments.entry,
-        &arguments.values,
-        &policy,
-        &arguments.users,
-        IrExecutionLimits::default(),
-    ) {
+    let compiled = match arguments.capture_output {
+        Some(max_bytes) => fln::imported_ir::compile_with_captured_output(
+            &modules,
+            &arguments.entry,
+            &arguments.values,
+            &policy,
+            &arguments.users,
+            IrExecutionLimits::default(),
+            max_bytes,
+        ),
+        None => fln::imported_ir::compile(
+            &modules,
+            &arguments.entry,
+            &arguments.values,
+            &policy,
+            &arguments.users,
+            IrExecutionLimits::default(),
+        ),
+    };
+    let compiled = match compiled {
         Ok(compiled) => compiled,
         Err(error) => return preparation_failure(error, arguments.json),
     };
@@ -404,22 +466,35 @@ fn run_uncaptured(arguments: Arguments) -> MultiplexerOutput {
         .map(|row| json_string(row))
         .collect::<Vec<_>>()
         .join(",");
+    let mut value_kind = None;
     let (outcome, value, detail, code, steps, peak) = match &execution.outcome {
         fln::Outcome::Complete(exit @ fln::VmExit::Returned(done)) => {
-            let value = match closed_cli_value(exit) {
-                Ok(value) => value,
-                Err(error) => {
+            if execution.captured_output.is_some() {
+                // This is the physical return kind, not an inferred source
+                // type or an interpretation of an IO.Result constructor tag.
+                value_kind = Some(vm_value_kind_name(fln::vm_value_kind(&done.value)));
+            }
+            match closed_cli_value(exit) {
+                Ok(value) => (
+                    "complete",
+                    value,
+                    None,
+                    0,
+                    Some(done.usage.steps),
+                    Some(done.usage.peak_stack_depth),
+                ),
+                Err(error) if execution.captured_output.is_none() => {
                     return failure("value-projection", &error.to_string(), arguments.json, 3);
                 }
-            };
-            (
-                "complete",
-                value,
-                None,
-                0,
-                Some(done.usage.steps),
-                Some(done.usage.peak_stack_depth),
-            )
+                Err(error) => (
+                    "inconclusive",
+                    None,
+                    Some(format!("value projection: {error}")),
+                    3,
+                    Some(done.usage.steps),
+                    Some(done.usage.peak_stack_depth),
+                ),
+            }
         }
         fln::Outcome::Complete(fln::VmExit::Panicked { message, usage }) => (
             "program-panic",
@@ -462,8 +537,21 @@ fn run_uncaptured(arguments: Arguments) -> MultiplexerOutput {
                 .collect::<Vec<_>>()
                 .join(",")
         };
+        let output_fields = execution
+            .captured_output
+            .as_ref()
+            .map_or_else(String::new, |output| {
+                format!(
+                    ",\"valueKind\":{},\"capturedOutput\":{}",
+                    value_kind
+                        .as_deref()
+                        .map(json_string)
+                        .unwrap_or_else(|| "null".to_owned()),
+                    captured_output_json(output),
+                )
+            });
         format!(
-            "{{\"schema\":\"fln.ir-run/1\",\"outcome\":{},\"authority\":false,\"engine\":\"golem\",\"entry\":{},\"value\":{},\"detail\":{},\"steps\":{},\"peakStackDepth\":{},\"linkedReferenceFunctions\":[{}],\"nativeExterns\":[{}],\"loadedModules\":[{}],\"missingIrModules\":[{}],\"artifactBytes\":{}}}\n",
+            "{{\"schema\":\"fln.ir-run/1\",\"outcome\":{},\"authority\":false,\"engine\":\"golem\",\"entry\":{},\"value\":{},\"detail\":{},\"steps\":{},\"peakStackDepth\":{},\"linkedReferenceFunctions\":[{}],\"nativeExterns\":[{}],\"loadedModules\":[{}],\"missingIrModules\":[{}],\"artifactBytes\":{}{}}}\n",
             json_string(outcome),
             json_string(&arguments.entry.to_display_string()),
             value
@@ -483,7 +571,8 @@ fn run_uncaptured(arguments: Arguments) -> MultiplexerOutput {
             natives,
             names(&loaded_names),
             names(&missing_ir),
-            bytes_read
+            bytes_read,
+            output_fields
         )
     } else {
         let mut text = format!(
@@ -504,6 +593,17 @@ fn run_uncaptured(arguments: Arguments) -> MultiplexerOutput {
         }
         if let Some(value) = value {
             text.push_str(&format!("value: {value}\n"));
+        }
+        if let Some(kind) = value_kind {
+            text.push_str(&format!("value kind: {kind}\n"));
+        }
+        if let Some(output) = &execution.captured_output {
+            let (encoding, data) = captured_output_data(output);
+            text.push_str(&format!(
+                "captured output ({} / {} bytes, {encoding}): {data}\n",
+                output.bytes.len(),
+                output.max_bytes
+            ));
         }
         if let Some(detail) = detail {
             text.push_str(&format!("detail: {detail}\n"));
@@ -643,6 +743,67 @@ mod tests {
         );
         assert_eq!(parsed.vm.max_steps, 42);
         assert_eq!(parsed.paths, vec![PathBuf::from("input.ir")]);
+        assert_eq!(parsed.capture_output, None);
+    }
+
+    #[test]
+    fn output_capture_requires_an_explicit_unique_byte_allowance_including_zero() {
+        for bytes in [0usize, 12, usize::MAX] {
+            let argv = [
+                "--entry",
+                "User.main",
+                "--partition",
+                "p.tsv",
+                "input.ir",
+                "--capture-output",
+                &bytes.to_string(),
+            ];
+            let MultiplexerCommand::IrRun(args) = parse(argv.map(OsString::from).to_vec()).unwrap()
+            else {
+                panic!("IR run parser");
+            };
+            assert_eq!(args.capture_output, Some(bytes));
+        }
+        for tail in [
+            vec!["--capture-output"],
+            vec!["--capture-output", "-1"],
+            vec!["--capture-output", "NaN"],
+            vec!["--capture-output", "18446744073709551616"],
+            vec!["--capture-output", "0", "--capture-output", "1"],
+        ] {
+            let args = ["--entry", "User.main", "--partition", "p.tsv", "input.ir"]
+                .into_iter()
+                .chain(tail)
+                .map(OsString::from)
+                .collect();
+            let error = parse(args).unwrap_err();
+            assert!(error.to_string().contains("--capture-output"));
+        }
+    }
+
+    #[test]
+    fn captured_output_serializes_exact_bytes_without_control_or_binary_loss() {
+        assert_eq!(
+            captured_output_json(&IrCapturedOutput {
+                bytes: "\0\"\\\nλ🙂".as_bytes().to_vec(),
+                max_bytes: 16,
+            }),
+            "{\"encoding\":\"utf-8\",\"data\":\"\\u0000\\\"\\\\\\nλ🙂\",\"byteLength\":10,\"maxBytes\":16}",
+        );
+        assert_eq!(
+            captured_output_json(&IrCapturedOutput {
+                bytes: vec![0xff, 0, 0x80],
+                max_bytes: 3,
+            }),
+            "{\"encoding\":\"bytes\",\"data\":[255,0,128],\"byteLength\":3,\"maxBytes\":3}",
+        );
+        assert_eq!(
+            captured_output_json(&IrCapturedOutput {
+                bytes: Vec::new(),
+                max_bytes: 0
+            }),
+            "{\"encoding\":\"utf-8\",\"data\":\"\",\"byteLength\":0,\"maxBytes\":0}",
+        );
     }
 
     #[test]
