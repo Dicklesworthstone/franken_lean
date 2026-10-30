@@ -2,10 +2,11 @@
 //! on Golem (D-24). Toolchain API bodies are never interpreted.
 //!
 //! The input remains untrusted: selection, IR validation, FIR validation and
-//! FLBC's independent ownership pass all precede execution. The first supported
-//! slice is immutable, pure code: calls, closures, acyclic join points,
-//! constructor cases, fresh packed scalar fields and scalar primitives.
-//! Equivalent object-update alternatives are normalized to fresh construction.
+//! FLBC's independent ownership pass all precede execution. The supported
+//! slice includes calls, closures, acyclic join points, immutable constructors,
+//! packed scalar fields and checked native reference-cell operations.
+//! Reference cells retain State effects; host I/O and runtime-global effects
+//! remain refused. Equivalent object updates use fresh construction.
 //! Other mutation, reset/reuse and observable reference counts are refused.
 //! Its RC annotations are replaced by Golem's checked managed ownership, not
 //! executed as additional retains/releases on already managed values.
@@ -31,6 +32,7 @@ use std::fmt;
 
 mod constructor_updates;
 mod lower;
+mod native_effects;
 mod native_signature;
 mod sha256;
 
@@ -534,14 +536,13 @@ struct Native {
     row: &'static GeneratedExternRow,
     arguments: Vec<flbc::ArgumentOwnership>,
     result: flbc::ResultOwnership,
+    effect: fir::EffectClass,
 }
 
 impl Native {
     fn new(row: &'static GeneratedExternRow, arity: usize) -> Result<Self, IrExecutionError> {
         let name = Name::from_components(row.name.split('.'));
-        if row.effect != "pure" {
-            return Err(unsupported(&name, "effectful native call"));
-        }
+        let effect = native_effects::classify(row)?;
         if matches!(
             row.id,
             "extern:isExclusiveUnsafe" | "extern:dbgTraceIfShared" | "extern:ptrAddrUnsafe"
@@ -586,6 +587,7 @@ impl Native {
             row,
             arguments,
             result,
+            effect,
         })
     }
 }

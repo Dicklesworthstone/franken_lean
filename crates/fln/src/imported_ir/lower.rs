@@ -105,7 +105,7 @@ pub(super) fn compile(
             argument_ownership: native.arguments.clone(),
             result: ValueType::Abi,
             result_ownership: native.result,
-            effect: fir::EffectClass::Pure,
+            effect: native.effect,
         })
         .collect();
     let intrinsic_ids = native_order
