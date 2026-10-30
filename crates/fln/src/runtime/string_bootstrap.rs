@@ -91,6 +91,8 @@ fn native_type(domain: Domain) -> Expr {
         Domain::Word64 => c(NATIVE_WORD64),
         Domain::Bool | Domain::Decision => c("Bool"),
         Domain::StringCallback => function(&[c("String"), c("Nat")], c("String")),
+        Domain::CharacterPredicate => function(&[c("Nat")], c("Bool")),
+        Domain::StringList => Domain::StringList.source_type(),
         Domain::Char
         | Domain::Position
         | Domain::Nat
@@ -531,11 +533,23 @@ impl Preparation<'_> {
                     ValueType::Nat
                 }
                 Domain::Bool => ValueType::Bool,
-                Domain::StringCallback => {
+                Domain::StringCallback | Domain::CharacterPredicate => {
                     let Some(callback @ ValueType::Closure(_)) = self.value_type(type_)? else {
                         return Err(unsupported("String bootstrap native callback type"));
                     };
                     callback
+                }
+                Domain::StringList => {
+                    let list = self.io_checked_shape(type_.clone())?;
+                    if list.constructors.len() != 2
+                        || list.constructors[0].tag != 0
+                        || !list.constructors[0].fields.is_empty()
+                        || list.constructors[1].tag != 1
+                        || list.constructors[1].fields != [c("String"), list.source.clone()]
+                    {
+                        return Err(unsupported("String intercalate checked string list layout"));
+                    }
+                    ValueType::Constructor
                 }
                 Domain::Proof
                 | Domain::Byte
@@ -590,7 +604,11 @@ impl Preparation<'_> {
                 }
                 ValueType::Constructor
             }
-            Domain::StringCallback | Domain::Proof | Domain::Slice => {
+            Domain::StringCallback
+            | Domain::CharacterPredicate
+            | Domain::StringList
+            | Domain::Proof
+            | Domain::Slice => {
                 unreachable!("fixed String bootstrap result")
             }
         };
@@ -979,9 +997,31 @@ impl Preparation<'_> {
                         );
                     }
                 }
+                Domain::CharacterPredicate => {
+                    let callback = self.lift(&argument, 1)?;
+                    let character = self.native_character_from_scalar(b(0)?)?;
+                    let predicate = Expr::lam(
+                        self.string_bootstrap_adapter_name()?,
+                        c("Nat"),
+                        Expr::app(callback, character),
+                        BinderInfo::Default,
+                    );
+                    // A partially applied outer adapter can retain this
+                    // callback after the native call has been exposed. Keep
+                    // its checked interface at the lambda itself, so local
+                    // closure discovery does not depend on a later global
+                    // call-site annotation finding that outer telescope.
+                    argument = Expr::let_e(
+                        self.string_bootstrap_adapter_name()?,
+                        native_type(Domain::CharacterPredicate),
+                        predicate,
+                        b(0)?,
+                        false,
+                    );
+                }
                 // A proof is a logical argument the native row never receives.
                 Domain::Proof => continue,
-                Domain::String | Domain::Nat | Domain::Bool => {}
+                Domain::String | Domain::Nat | Domain::Bool | Domain::StringList => {}
                 Domain::Byte
                 | Domain::CharList
                 | Domain::OptionalChar
@@ -1021,28 +1061,67 @@ impl Preparation<'_> {
             Domain::Substring => self.string_bootstrap_unpack_substring(body)?,
             _ => body,
         };
-        let (binders, type_) = if operation.dependent() {
+        let (binders, mut type_) = if operation.dependent() {
             self.string_bootstrap_telescope(operation)?
         } else {
             let binders: Vec<_> = domains.iter().map(|domain| domain.source_type()).collect();
             let type_ = function(&binders, operation.result().source_type());
             (binders, type_)
         };
-        for binder in binders.into_iter().rev() {
+        // Underapplication must retain the remaining function's checked type.
+        // Applying the fully typed wrapper first can expose an unannotated
+        // residual lambda after its outer let has already been visited. Keep
+        // supplied arguments in strict lets instead: their slots have the
+        // same order as the source telescope, and the remaining lambda gets
+        // its own type anchor before ordinary closure discovery.
+        let prefix_len = if arguments.len() < binders.len() {
+            arguments.len()
+        } else {
+            0
+        };
+        for _ in 0..prefix_len {
+            self.tick()?;
+            let ExprNode::ForallE { body, .. } = type_.node() else {
+                return Err(unsupported("String bootstrap partial telescope"));
+            };
+            type_ = body.clone();
+        }
+        for binder in binders[prefix_len..].iter().rev() {
             body = Expr::lam(
                 self.string_bootstrap_adapter_name()?,
-                binder,
+                binder.clone(),
                 body,
                 BinderInfo::Default,
             );
         }
-        let wrapper = Expr::let_e(
+        let mut wrapper = Expr::let_e(
             self.string_bootstrap_adapter_name()?,
             type_,
             body,
             b(0)?,
             false,
         );
+        if prefix_len != 0 {
+            for index in (0..prefix_len).rev() {
+                let argument = if domains[index] == Domain::Proof {
+                    proofs::erased_value()
+                } else {
+                    self.lift(
+                        &arguments[index],
+                        u32::try_from(index)
+                            .map_err(|_| unsupported("String bootstrap partial scope"))?,
+                    )?
+                };
+                wrapper = Expr::let_e(
+                    self.string_bootstrap_adapter_name()?,
+                    binders[index].clone(),
+                    argument,
+                    wrapper,
+                    false,
+                );
+            }
+            return Ok(Some(wrapper));
+        }
         // A supplied proof is never evaluated and never reaches the native row.
         // Pass the inert placeholder instead of the elaborated proof term, so no
         // transform lifts or visits a proof the wrapper discards anyway.

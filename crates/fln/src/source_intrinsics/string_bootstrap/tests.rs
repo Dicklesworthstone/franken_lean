@@ -110,7 +110,26 @@ struct Fixture {
 
 fn fixture() -> Option<&'static Fixture> {
     static FIXTURE: OnceLock<Option<Fixture>> = OnceLock::new();
-    FIXTURE
+    fixture_from_modules(&FIXTURE, &MODULES)
+}
+
+fn predicate_fixture() -> Option<&'static Fixture> {
+    static FIXTURE: OnceLock<Option<Fixture>> = OnceLock::new();
+    fixture_from_modules(
+        &FIXTURE,
+        &[
+            "Init/Prelude",
+            "Init/Data/String/Bootstrap",
+            "Init/Data/Char/Basic",
+        ],
+    )
+}
+
+fn fixture_from_modules(
+    cache: &'static OnceLock<Option<Fixture>>,
+    modules: &[&'static str],
+) -> Option<&'static Fixture> {
+    cache
         .get_or_init(|| {
             let Some(library) = std::env::var_os("FLN_REFERENCE_LIB").map(PathBuf::from) else {
                 assert!(
@@ -125,7 +144,7 @@ fn fixture() -> Option<&'static Fixture> {
             let mut prelude_names = BTreeSet::new();
             let mut prelude_externs = BTreeMap::new();
             let mut owners = BTreeMap::new();
-            for module in MODULES {
+            for &module in modules {
                 let path = library.join(module).with_extension("olean");
                 let parts = [
                     std::fs::read(&path).unwrap(),
@@ -331,6 +350,69 @@ const CHECKED_TEXT_ANSWERS: [u64; 28] = [
     1,
 ];
 
+const CALLBACKS: [Operation; 5] = [
+    Operation::Any,
+    Operation::NextWhile,
+    Operation::SubstringAll,
+    Operation::SubstringTakeWhile,
+    Operation::Intercalate,
+];
+
+const CALLBACK_SOURCE: &str = r#"
+def callbackMiddle : Substring.Raw := Substring.Raw.mk "aλ😀z" (String.Pos.Raw.mk 1) (String.Pos.Raw.mk 7)
+#eval if String.Internal.any "aλ😀\x00z" (fun c => Nat.beq c.toNat 128512) then 1 else 0
+#eval if String.Internal.any "aλ😀" (fun c => Nat.beq c.toNat 120) then 1 else 0
+#eval if String.Internal.any "" (fun _ => true) then 1 else 0
+#eval let needle : Nat := 955; if String.Internal.any "aλ😀" (fun c => Nat.beq c.toNat needle) then 1 else 0
+#eval let any := String.Internal.any "aλ😀"; if any (fun c => Nat.beq c.toNat 955) then 1 else 0
+#eval (String.Internal.nextWhile "aλ😀z" (fun c => Bool.not (Nat.beq c.toNat 122)) (String.Pos.Raw.mk 0)).byteIdx
+#eval (String.Internal.nextWhile "aλ😀z" (fun c => Nat.beq c.toNat 65) (String.Pos.Raw.mk 2)).byteIdx
+#eval (String.Internal.nextWhile "aλ😀z" (fun _ => true) (String.Pos.Raw.mk 99)).byteIdx
+#eval let seek := String.Internal.nextWhile "aλ😀z" (fun c => Bool.not (Nat.beq c.toNat 122)); (seek (String.Pos.Raw.mk 3)).byteIdx
+#eval if Substring.Raw.Internal.all callbackMiddle (fun c => Bool.not (Nat.beq c.toNat 122)) then 1 else 0
+#eval if Substring.Raw.Internal.all callbackMiddle (fun c => Bool.not (Nat.beq c.toNat 128512)) then 1 else 0
+#eval if Substring.Raw.Internal.all (Substring.Raw.mk "aλ😀z" (String.Pos.Raw.mk 1) (String.Pos.Raw.mk 1)) (fun _ => false) then 1 else 0
+#eval (Substring.Raw.Internal.takeWhile callbackMiddle (fun c => Bool.not (Nat.beq c.toNat 128512))).stopPos.byteIdx
+#eval (Substring.Raw.Internal.takeWhile (Substring.Raw.mk "aλ😀z" (String.Pos.Raw.mk 9) (String.Pos.Raw.mk 12)) (fun c => Nat.beq c.toNat 65)).stopPos.byteIdx
+#eval (Substring.Raw.Internal.takeWhile (Substring.Raw.mk "aλ😀z" (String.Pos.Raw.mk 18446744073709551616) (String.Pos.Raw.mk 18446744073709551619)) (fun c => Nat.beq c.toNat 65)).stopPos.byteIdx - 18446744073709551616
+#eval String.Internal.intercalate "λ" ["a", "", "😀\x00", "z"]
+#eval String.Internal.intercalate "" ["", "a", ""]
+#eval String.Internal.intercalate "x" []
+#eval let join := String.Internal.intercalate "x"; join ["λ", "😀"]
+#eval if String.Internal.any "aλ" (fun c => String.Internal.any (String.push "" c) (fun d => Nat.beq d.toNat 955)) then 1 else 0
+#eval String.Internal.intercalate "," [Substring.Raw.Internal.toString (Substring.Raw.Internal.takeWhile callbackMiddle (fun c => Bool.not (Nat.beq c.toNat 128512))), String.push "" '😀']
+#eval if String.Internal.any "x" (fun _ => true) then 1 else 0
+#eval if String.Internal.any "x" (fun _ => false) then 1 else 0
+"#;
+
+// Exact stdout lines from the pinned executable; the same source runs through
+// ordinary checker admission, native callback frames and canonical replay.
+const CALLBACK_ANSWERS: [&str; 23] = [
+    "1",
+    "0",
+    "0",
+    "1",
+    "1",
+    "7",
+    "3",
+    "99",
+    "7",
+    "1",
+    "0",
+    "1",
+    "3",
+    "12",
+    "3",
+    "\"aλλ😀\\x00λz\"",
+    "\"a\"",
+    "\"\"",
+    "\"λx😀\"",
+    "1",
+    "\"λ,😀\"",
+    "1",
+    "0",
+];
+
 /// The ownership the generated census row requires of an FLBC call.
 fn generated_ownership(row: &str, arguments: usize) -> (Vec<ArgumentOwnership>, ResultOwnership) {
     use fln_vm::extern_row::{
@@ -362,10 +444,17 @@ fn generated_ownership(row: &str, arguments: usize) -> (Vec<ArgumentOwnership>, 
 }
 
 fn with_fixture(test: impl FnOnce(&Fixture) + Send + 'static) {
+    with_fixture_from(fixture, test);
+}
+
+fn with_fixture_from(
+    load: fn() -> Option<&'static Fixture>,
+    test: impl FnOnce(&Fixture) + Send + 'static,
+) {
     std::thread::Builder::new()
         .stack_size(STACK)
         .spawn(move || {
-            if let Some(fixture) = fixture() {
+            if let Some(fixture) = load() {
                 test(fixture);
             }
         })
@@ -676,7 +765,8 @@ fn actual_string_inventories_close_the_pin_and_share_only_successful_checks() {
         let counts = [
             325, 325, 325, 326, 325, 323, 323, 324, 351, 3413, 3413, 2318, 369, 3416, 3416, 4040,
             3653, 3396, 3413, 3415, 3415, 3416, 3935, 3413, 370, 341, 3396, 349, 17, 18, 328, 328,
-            353, 328, 328, 328, 354, 328, 336, 3667, 3697, 1509, 1034, 3413, 3413, 3413, 3413,
+            353, 328, 328, 328, 354, 328, 336, 3667, 3697, 1509, 1034, 3413, 3413, 3413, 3413, 324,
+            325, 328, 328, 324,
         ];
         assert_eq!(counts.len(), Operation::ALL.len());
         let mut defining = BTreeSet::new();
@@ -822,6 +912,158 @@ fn hashes_slices_and_checked_positions_execute_checked_source_and_replay() {
 }
 
 #[test]
+fn partially_applied_predicates_keep_checked_callbacks_and_replay() {
+    // The failure was in the adapter's residual callback, not the later
+    // Slice/Pos libraries. Keep a small real-pin reproduction while retaining
+    // the full contract check and both ordinary source checkers.
+    with_fixture_from(predicate_fixture, |fixture| {
+        for operation in [Operation::Any, Operation::NextWhile] {
+            assert_eq!(
+                actual_dependencies(&fixture.environment, operation),
+                inventory(operation).into_keys().collect()
+            );
+            assert!(matches(&fixture.environment, operation).unwrap());
+        }
+        let engine = Engine::from_environment(fixture.environment.clone());
+        let options = KVMap::new();
+        let root = engine.logical_root(&options);
+        let source = r#"
+#eval let any := String.Internal.any "aλ😀"; if any (fun c => Nat.beq c.toNat 955) then 1 else 0
+#eval let needle : Nat := 955; let seek := String.Internal.nextWhile "λλz" (fun c => Nat.beq c.toNat needle); (seek (String.Pos.Raw.mk 0)).byteIdx
+"#;
+        let complete = engine
+            .execute_source_commands_with_checks(
+                source.as_bytes(),
+                &options,
+                EngineExecutionLimits::new(Budget::for_stack_bytes(STACK)),
+            )
+            .unwrap_or_else(|error| panic!("partially applied String predicate: {error:?}"))
+            .into_complete()
+            .unwrap();
+        let indices = &complete.batch.source_evaluation_indices;
+        assert_eq!(indices.len(), 2);
+        for (&index, (operation, expected)) in indices
+            .iter()
+            .zip([(Operation::Any, 1), (Operation::NextWhile, 4)])
+        {
+            let execution = &complete.batch.executions[index];
+            assert_eq!(
+                execution.checker.ground,
+                CheckerAdmissionGround::UnsafeQuarantine
+            );
+            assert_eq!(
+                closed_vm_value(&execution.exit).unwrap(),
+                Some(ClosedVmValue::Scalar(expected))
+            );
+            let program =
+                flbc::decode_canonical(&execution.flbc_artifact, Default::default()).unwrap();
+            assert_eq!(
+                flbc::encode_canonical(&program, Default::default()).unwrap(),
+                execution.flbc_artifact
+            );
+            let expected_row = format!("extern:{}", operation.label());
+            assert!(
+                program
+                    .functions()
+                    .iter()
+                    .flat_map(|function| &function.code)
+                    .any(
+                        |instruction| matches!(instruction, Instruction::Intrinsic { row, .. }
+                        if row == &expected_row)
+                    )
+            );
+            let replay =
+                execute_flbc_artifact(&execution.flbc_artifact, &options, Default::default())
+                    .unwrap()
+                    .into_complete()
+                    .unwrap();
+            assert_eq!(
+                closed_vm_value(&replay).unwrap(),
+                Some(ClosedVmValue::Scalar(expected))
+            );
+        }
+        assert_eq!(engine.logical_root(&options), root);
+    });
+}
+
+#[test]
+fn predicates_and_intercalate_execute_checked_source_callbacks_and_replay() {
+    with_fixture(|fixture| {
+        let engine = Engine::from_environment(fixture.environment.clone());
+        let options = KVMap::new();
+        let root = engine.logical_root(&options);
+        let limits = EngineExecutionLimits::new(Budget::for_stack_bytes(STACK));
+        let complete = engine
+            .execute_source_commands_with_checks(CALLBACK_SOURCE.as_bytes(), &options, limits)
+            .unwrap_or_else(|error| panic!("String predicate/list adapters: {error:?}"))
+            .into_complete()
+            .unwrap();
+        let indices = &complete.batch.source_evaluation_indices;
+        assert_eq!(indices.len(), CALLBACK_ANSWERS.len());
+        let mut selected = BTreeSet::new();
+        for (&index, expected) in indices.iter().zip(CALLBACK_ANSWERS) {
+            let expected = if let Some(text) = expected.strip_prefix('"') {
+                ClosedVmValue::String(text.strip_suffix('"').unwrap().replace("\\x00", "\0"))
+            } else {
+                ClosedVmValue::Scalar(expected.parse().unwrap())
+            };
+            let execution = &complete.batch.executions[index];
+            assert_eq!(
+                execution.checker.ground,
+                CheckerAdmissionGround::UnsafeQuarantine
+            );
+            assert_eq!(
+                closed_vm_value(&execution.exit).unwrap().as_ref(),
+                Some(&expected),
+                "callback evaluation {index}"
+            );
+            let program =
+                flbc::decode_canonical(&execution.flbc_artifact, Default::default()).unwrap();
+            assert_eq!(
+                flbc::encode_canonical(&program, Default::default()).unwrap(),
+                execution.flbc_artifact
+            );
+            for instruction in program
+                .functions()
+                .iter()
+                .flat_map(|function| &function.code)
+            {
+                if let Instruction::Intrinsic {
+                    row,
+                    argument_ownership,
+                    result_ownership,
+                    ..
+                } = instruction
+                    && CALLBACKS
+                        .iter()
+                        .any(|operation| *row == format!("extern:{}", operation.label()))
+                {
+                    assert_eq!(
+                        (argument_ownership.clone(), *result_ownership),
+                        generated_ownership(row, argument_ownership.len())
+                    );
+                    selected.insert(row.clone());
+                }
+            }
+            let replay =
+                execute_flbc_artifact(&execution.flbc_artifact, &options, Default::default())
+                    .unwrap()
+                    .into_complete()
+                    .unwrap();
+            assert_eq!(closed_vm_value(&replay).unwrap().as_ref(), Some(&expected));
+        }
+        assert_eq!(
+            selected,
+            CALLBACKS
+                .map(|operation| format!("extern:{}", operation.label()))
+                .into_iter()
+                .collect()
+        );
+        assert_eq!(engine.logical_root(&options), root);
+    });
+}
+
+#[test]
 fn checked_text_answers_match_the_actual_pinned_executable() {
     let Some(library) = std::env::var_os("FLN_REFERENCE_LIB").map(PathBuf::from) else {
         assert!(std::env::var_os("FLN_REQUIRE_REFERENCE").is_none());
@@ -860,7 +1102,7 @@ fn checked_text_answers_match_the_actual_pinned_executable() {
         &path,
         format!(
             "import Init.Data.String.Slice\nimport Init.Data.String.Pattern.Basic\n\
-             set_option linter.deprecated false\n{CHECKED_TEXT_SOURCE}"
+             set_option linter.deprecated false\n{CHECKED_TEXT_SOURCE}\n{CALLBACK_SOURCE}"
         ),
     )
     .unwrap();
@@ -874,6 +1116,11 @@ fn checked_text_answers_match_the_actual_pinned_executable() {
     let expected: String = CHECKED_TEXT_ANSWERS
         .into_iter()
         .map(|answer| format!("{answer}\n"))
+        .chain(
+            CALLBACK_ANSWERS
+                .into_iter()
+                .map(|answer| format!("{answer}\n")),
+        )
         .collect();
     assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);
 }
@@ -1158,6 +1405,7 @@ axiom proof {p : Prop} : p
                     !BOOTSTRAP.contains(operation)
                         && !SUBSTRING.contains(operation)
                         && !CHECKED_TEXT.contains(operation)
+                        && !CALLBACKS.contains(operation)
                 })
                 .map(|operation| format!("extern:{}", operation.label()))
                 .chain(["extern:String.Internal.foldl".to_owned()])

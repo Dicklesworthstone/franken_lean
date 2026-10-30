@@ -20,7 +20,7 @@
 use super::*;
 
 const DEPENDENCIES: &str = include_str!("string_bootstrap/dependencies.txt");
-const DEPENDENCY_COUNT: usize = 4166;
+const DEPENDENCY_COUNT: usize = 4171;
 
 /// Successful dependency checks shared only within one immutable Preparation.
 /// Membership and each selected root's extern still belong to its operation.
@@ -84,6 +84,11 @@ pub(crate) enum Operation {
     GetOption,
     RawGetBang,
     GetBang,
+    Any,
+    NextWhile,
+    SubstringAll,
+    SubstringTakeWhile,
+    Intercalate,
 }
 
 /// One bit per operation in the inventory's membership column.
@@ -101,6 +106,8 @@ pub(crate) enum Domain {
     Nat,
     Bool,
     StringCallback,
+    CharacterPredicate,
+    StringList,
     /// `String.Pos s`, the checked `Pos.Raw` record over the earlier String.
     /// As a result it is rebuilt over the same String.
     StringPosition,
@@ -133,6 +140,9 @@ impl Domain {
             Self::Bool => c("Bool"),
             Self::Byte => c("UInt8"),
             Self::CharList => Expr::app(Expr::const_(name("List"), vec![Level::zero()]), c("Char")),
+            Self::StringList => {
+                Expr::app(Expr::const_(name("List"), vec![Level::zero()]), c("String"))
+            }
             Self::OptionalChar => {
                 Expr::app(Expr::const_(name("Option"), vec![Level::zero()]), c("Char"))
             }
@@ -149,6 +159,9 @@ impl Domain {
                 ),
                 BinderInfo::Default,
             ),
+            Self::CharacterPredicate => {
+                Expr::forall_e(Name::anonymous(), c("Char"), c("Bool"), BinderInfo::Default)
+            }
             Self::StringPosition | Self::Proof => {
                 unreachable!("dependent String domains use the checked telescope")
             }
@@ -157,7 +170,7 @@ impl Domain {
 }
 
 impl Operation {
-    pub(crate) const ALL: [Self; 47] = [
+    pub(crate) const ALL: [Self; 52] = [
         Self::ByteSize,
         Self::PosOf,
         Self::OffsetOfPos,
@@ -205,6 +218,11 @@ impl Operation {
         Self::GetOption,
         Self::RawGetBang,
         Self::GetBang,
+        Self::Any,
+        Self::NextWhile,
+        Self::SubstringAll,
+        Self::SubstringTakeWhile,
+        Self::Intercalate,
     ];
 
     pub(crate) fn index(self) -> usize {
@@ -264,6 +282,11 @@ impl Operation {
             Self::GetOption => "String.get?",
             Self::RawGetBang => "String.Pos.Raw.get!",
             Self::GetBang => "String.get!",
+            Self::Any => "String.Internal.any",
+            Self::NextWhile => "String.Internal.nextWhile",
+            Self::SubstringAll => "Substring.Raw.Internal.all",
+            Self::SubstringTakeWhile => "Substring.Raw.Internal.takeWhile",
+            Self::Intercalate => "String.Internal.intercalate",
         }
     }
 
@@ -303,6 +326,11 @@ impl Operation {
             | Self::SubstringIsEmpty
             | Self::SubstringGet
             | Self::SubstringPrev
+            | Self::Any
+            | Self::NextWhile
+            | Self::SubstringAll
+            | Self::SubstringTakeWhile
+            | Self::Intercalate
             | Self::InternalGetUtf8Byte => ("opaque", "Init.Data.String.Bootstrap"),
             Self::RawGet
             | Self::DecodeChar
@@ -330,7 +358,8 @@ impl Operation {
     /// that the native row does not receive.
     pub(crate) fn domains(self) -> &'static [Domain] {
         use Domain::{
-            Char, Nat, Position, Proof, Slice, String, StringCallback, StringPosition, Substring,
+            Char, CharacterPredicate, Nat, Position, Proof, Slice, String, StringCallback,
+            StringList, StringPosition, Substring,
         };
         match self {
             Self::ByteSize
@@ -346,6 +375,10 @@ impl Operation {
             Self::Extract | Self::RawExtract => &[String, Position, Position],
             Self::Pushn => &[String, Char, Nat],
             Self::Foldl => &[StringCallback, String, String],
+            Self::Any => &[String, CharacterPredicate],
+            Self::NextWhile => &[String, CharacterPredicate, Position],
+            Self::SubstringAll | Self::SubstringTakeWhile => &[Substring, CharacterPredicate],
+            Self::Intercalate => &[String, StringList],
             Self::RawSet | Self::Set => &[String, Position, Char],
             Self::DecodeChar | Self::InternalGetUtf8Byte => &[String, Nat, Proof],
             Self::GetUtf8Byte
@@ -388,7 +421,9 @@ impl Operation {
     /// erases to the checked `Bool` placeholder: `Char`, `UInt8`, `String.Pos`.
     #[cfg(test)]
     pub(crate) fn uses_character(self) -> bool {
-        matches!(self, Self::PosOf | Self::Pushn | Self::Foldl) || self >= Self::InternalGet
+        self != Self::Intercalate
+            && (matches!(self, Self::PosOf | Self::Pushn | Self::Foldl)
+                || self >= Self::InternalGet)
     }
 
     pub(crate) fn result(self) -> Domain {
@@ -400,7 +435,8 @@ impl Operation {
             | Self::NextFast
             | Self::PosMin
             | Self::PosSub
-            | Self::SubstringPrev => Domain::Position,
+            | Self::SubstringPrev
+            | Self::NextWhile => Domain::Position,
             Self::PosNext => Domain::StringPosition,
             Self::Extract
             | Self::Pushn
@@ -410,8 +446,13 @@ impl Operation {
             | Self::PosSet
             | Self::PosExtract
             | Self::Set
-            | Self::SubstringToString => Domain::String,
-            Self::IsEmpty | Self::SubstringBeq | Self::SubstringIsEmpty => Domain::Bool,
+            | Self::SubstringToString
+            | Self::Intercalate => Domain::String,
+            Self::IsEmpty
+            | Self::SubstringBeq
+            | Self::SubstringIsEmpty
+            | Self::Any
+            | Self::SubstringAll => Domain::Bool,
             Self::InternalGet
             | Self::RawGet
             | Self::DecodeChar
@@ -424,7 +465,9 @@ impl Operation {
             Self::RawGetBang | Self::GetBang => Domain::Char,
             Self::GetUtf8Byte | Self::GetUtf8ByteAlias | Self::InternalGetUtf8Byte => Domain::Byte,
             Self::ToList | Self::Data => Domain::CharList,
-            Self::SubstringDrop | Self::SubstringExtract => Domain::Substring,
+            Self::SubstringDrop | Self::SubstringExtract | Self::SubstringTakeWhile => {
+                Domain::Substring
+            }
             Self::Hash | Self::SliceHash => Domain::Word64,
             Self::SliceLt => Domain::Decision,
             Self::Memcmp | Self::IsValid => Domain::Bool,
