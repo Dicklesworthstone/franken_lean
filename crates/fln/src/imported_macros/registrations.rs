@@ -1,8 +1,9 @@
 //! Registered imported macros over caller-supplied native Syntax.
 //!
 //! Registration order comes from the caller's checked import replay, never a
-//! sorted module inventory. This bounded embedding door does not install parser
-//! descriptions, activate scoped namespaces, or execute module initializers.
+//! sorted module inventory. Scoped registrations remain inactive until an
+//! explicit activation produces an immutable successor. This bounded embedding
+//! door does not install parser descriptions or execute module initializers.
 use super::{
     CompiledMacro, MacroContext, MacroExecutionError, MacroLimits, MacroResult, MacroState,
     StateBudget, compile, conversion_outcome, inject_state,
@@ -75,11 +76,6 @@ pub enum MacroRegistrationError {
         declaration: Name,
         reason: &'static str,
     },
-    Scoped {
-        module: Name,
-        declaration: Name,
-        namespace: Name,
-    },
     Compile {
         module: Name,
         declaration: Name,
@@ -133,17 +129,6 @@ impl fmt::Display for MacroRegistrationError {
                 declaration.to_display_string(),
                 module.to_display_string()
             ),
-            Self::Scoped {
-                module,
-                declaration,
-                namespace,
-            } => write!(
-                f,
-                "macro {} in {} requires unsupported scope activation {}",
-                declaration.to_display_string(),
-                module.to_display_string(),
-                namespace.to_display_string()
-            ),
             Self::Compile {
                 module,
                 declaration,
@@ -160,18 +145,33 @@ impl fmt::Display for MacroRegistrationError {
 
 impl std::error::Error for MacroRegistrationError {}
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct RegisteredMacro {
     module: Name,
     declaration: Name,
     compiled: Arc<CompiledMacro>,
 }
 
-/// Prepared global registrations. Every candidate has passed both exact owner
-/// validation and the ordinary census-authorized imported-IR compiler.
-#[derive(Debug)]
+type CandidateTable = BTreeMap<Name, Arc<[RegisteredMacro]>>;
+
+/// Prepared global and scoped registrations. Every candidate, including inactive
+/// scoped candidates, has passed exact owner validation and the ordinary
+/// census-authorized imported-IR compiler. Clones share code and candidate chains.
+#[derive(Debug, Clone)]
 pub struct RegisteredMacros {
-    candidates: BTreeMap<Name, Vec<RegisteredMacro>>,
+    candidates: Arc<CandidateTable>,
+    scoped: Arc<BTreeMap<Name, CandidateTable>>,
+    active_scopes: BTreeSet<Name>,
+}
+
+fn dispatch_order(table: BTreeMap<Name, Vec<RegisteredMacro>>) -> CandidateTable {
+    table
+        .into_iter()
+        .map(|(kind, mut entries)| {
+            entries.reverse();
+            (kind, Arc::from(entries))
+        })
+        .collect()
 }
 
 struct ExpansionContext<'a> {
@@ -188,7 +188,8 @@ impl RegisteredMacros {
     ///
     /// Entries within a module retain the pin's stored order, with later
     /// registrations tried first. Unknown extension families remain uninterpreted.
-    /// Scoped entries are a typed refusal until an explicit activation API exists.
+    /// Scoped entries are checked and compiled too, but remain inactive until
+    /// [`Self::activate_scoped`] is called with their exact namespace.
     pub fn prepare(
         ordered_modules: &[MacroRegistrationModule<'_>],
         admitted: &Environment,
@@ -234,6 +235,7 @@ impl RegisteredMacros {
         }
         let mut decoder = macros::Decoder::new(limits.metadata);
         let mut candidates: BTreeMap<Name, Vec<RegisteredMacro>> = BTreeMap::new();
+        let mut scoped: BTreeMap<Name, BTreeMap<Name, Vec<RegisteredMacro>>> = BTreeMap::new();
         let mut compiled: BTreeMap<Name, (Name, Arc<CompiledMacro>)> = BTreeMap::new();
         for input in ordered_modules {
             let module = &input.checked.name;
@@ -254,13 +256,6 @@ impl RegisteredMacros {
                 }
             }
             for row in rows {
-                if let Some(namespace) = row.scope {
-                    return Err(MacroRegistrationError::Scoped {
-                        module: module.clone(),
-                        declaration: row.declaration,
-                        namespace,
-                    });
-                }
                 let error = |reason| MacroRegistrationError::Owner {
                     module: module.clone(),
                     declaration: row.declaration.clone(),
@@ -314,7 +309,11 @@ impl RegisteredMacros {
                         );
                         callable
                     };
-                let chain = candidates.entry(row.key).or_default();
+                let table = match row.scope {
+                    Some(namespace) => scoped.entry(namespace).or_default(),
+                    None => &mut candidates,
+                };
+                let chain = table.entry(row.key).or_default();
                 chain
                     .try_reserve(1)
                     .map_err(|_| MacroRegistrationError::Limit("candidate allocation"))?;
@@ -325,10 +324,58 @@ impl RegisteredMacros {
                 });
             }
         }
-        for chain in candidates.values_mut() {
-            chain.reverse();
+        Ok(Self {
+            candidates: Arc::new(dispatch_order(candidates)),
+            scoped: Arc::new(
+                scoped
+                    .into_iter()
+                    .map(|(namespace, entries)| (namespace, dispatch_order(entries)))
+                    .collect(),
+            ),
+            active_scopes: BTreeSet::new(),
+        })
+    }
+
+    /// Activate exactly one namespace in an immutable successor, following
+    /// `ScopedEnvExtension.activateScoped` at the pin. Later activations take
+    /// precedence over earlier ones; each namespace retains its reverse import
+    /// and entry order. Reopening an active namespace does not reorder it.
+    ///
+    /// Retain the original registry to leave a lexical scope or roll back an
+    /// alternative. Neither a successful activation nor an allocation refusal
+    /// changes it. Unknown namespaces are no-ops: this prepared registry cannot
+    /// acquire additional registrations after activation.
+    pub fn activate_scoped(&self, namespace: &Name) -> Result<Self, MacroRegistrationError> {
+        if self.active_scopes.contains(namespace) {
+            return Ok(self.clone());
         }
-        Ok(Self { candidates })
+        let Some(entries) = self.scoped.get(namespace) else {
+            return Ok(self.clone());
+        };
+        let mut candidates = self.candidates.as_ref().clone();
+        for (kind, additions) in entries {
+            let previous = self.candidates.get(kind);
+            let count = additions
+                .len()
+                .checked_add(previous.map_or(0, |chain| chain.len()))
+                .ok_or(MacroRegistrationError::Limit("scoped candidates"))?;
+            let mut chain = Vec::new();
+            chain
+                .try_reserve_exact(count)
+                .map_err(|_| MacroRegistrationError::Limit("scoped candidate allocation"))?;
+            chain.extend(additions.iter().cloned());
+            if let Some(previous) = previous {
+                chain.extend(previous.iter().cloned());
+            }
+            candidates.insert(kind.clone(), Arc::from(chain));
+        }
+        let mut active_scopes = self.active_scopes.clone();
+        active_scopes.insert(namespace.clone());
+        Ok(Self {
+            candidates: Arc::new(candidates),
+            scoped: Arc::clone(&self.scoped),
+            active_scopes,
+        })
     }
 
     /// Registered declarations in the exact order this syntax kind will try.
@@ -336,7 +383,7 @@ impl RegisteredMacros {
         self.candidates
             .get(kind)
             .into_iter()
-            .flatten()
+            .flat_map(|chain| chain.iter())
             .map(|entry| &entry.declaration)
     }
 
@@ -657,7 +704,12 @@ impl RegisteredMacros {
                 Name::str(Name::anonymous(), val)
             }
         };
-        for candidate in self.candidates.get(&kind).into_iter().flatten() {
+        for candidate in self
+            .candidates
+            .get(&kind)
+            .into_iter()
+            .flat_map(|chain| chain.iter())
+        {
             if cancellation.is_some_and(CancellationProbe::is_cancelled) {
                 return Outcome::Inconclusive(Inconclusive::cancelled(
                     "registered macro before candidate",

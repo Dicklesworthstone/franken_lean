@@ -28,3 +28,34 @@ macro_rules (kind := registeredChoice)
 macro (name := registeredScope) "registeredScope%" a:term "," b:term : term => do
   let ctx ← read
   if ctx.currMacroScope == 17 then pure a else pure b
+
+-- Imported scoped registrations remain dormant until their exact namespace is
+-- activated. Later activation wins, while reopening is idempotent.
+syntax (name := registeredScopedChoice) "registeredScopedChoice%" term "," term "," term : term
+
+macro_rules (kind := registeredScopedChoice)
+  | `(registeredScopedChoice% $a, $_b, $_c) => pure a
+
+namespace RegistryFirst
+scoped macro_rules (kind := registeredScopedChoice)
+  | `(registeredScopedChoice% $_a, $b, $_c) => pure b
+
+scoped macro_rules (kind := registeredScopedChoice)
+  | `(registeredScopedChoice% $_a, $_b, $c) => pure c
+end RegistryFirst
+
+namespace RegistrySecond
+scoped macro_rules (kind := registeredScopedChoice)
+  | `(registeredScopedChoice% $_a, $b, $_c) => pure b
+end RegistrySecond
+
+#eval registeredScopedChoice% 10, 20, 30
+section
+open scoped RegistryFirst
+#eval registeredScopedChoice% 10, 20, 30
+open scoped RegistrySecond
+#eval registeredScopedChoice% 10, 20, 30
+open scoped RegistryFirst
+#eval registeredScopedChoice% 10, 20, 30
+end
+#eval registeredScopedChoice% 10, 20, 30

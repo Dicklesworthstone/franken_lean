@@ -58,8 +58,8 @@ fn live_metadata_drives_ordered_macro_dispatch_state_diagnostics_and_authority()
         String::from_utf8_lossy(&result.stderr)
     );
     assert_eq!(
-        result.stdout, b"10\n20\n",
-        "the pin's source caller exercises both competing expansions"
+        result.stdout, b"10\n20\n10\n30\n20\n20\n10\n",
+        "the pin's source caller exercises competing expansions and scoped activation"
     );
     assert!(result.stderr.is_empty());
 
@@ -125,6 +125,97 @@ fn live_metadata_drives_ordered_macro_dispatch_state_diagnostics_and_authority()
         MacroRegistryLimits::default(),
     )
     .unwrap_or_else(|error| panic!("{error}; {dir:?}"));
+
+    let scoped_kind = name("registeredScopedChoice");
+    let scoped_rows = macros::decode(&extensions, DecodeLimits::default()).unwrap();
+    let scoped_rows: Vec<_> = scoped_rows
+        .iter()
+        .filter(|row| row.key == scoped_kind)
+        .collect();
+    assert_eq!(
+        scoped_rows.len(),
+        4,
+        "four actual global/scoped registrations"
+    );
+    assert_eq!(
+        scoped_rows
+            .iter()
+            .map(|row| row.scope.clone())
+            .collect::<Vec<_>>(),
+        [
+            None,
+            Some(name("RegistryFirst")),
+            Some(name("RegistryFirst")),
+            Some(name("RegistrySecond")),
+        ]
+    );
+    let first = registry.activate_scoped(&name("RegistryFirst")).unwrap();
+    let both = first.activate_scoped(&name("RegistrySecond")).unwrap();
+    let reopened = both.activate_scoped(&name("RegistryFirst")).unwrap();
+    let reverse = registry
+        .activate_scoped(&name("RegistrySecond"))
+        .unwrap()
+        .activate_scoped(&name("RegistryFirst"))
+        .unwrap();
+    let scoped_input = Syntax::node(
+        scoped_kind.clone(),
+        vec![
+            Syntax::atom(SourceInfo::None, "registeredScopedChoice%"),
+            Syntax::atom(SourceInfo::None, "left"),
+            Syntax::atom(SourceInfo::None, ","),
+            Syntax::atom(SourceInfo::None, "middle"),
+            Syntax::atom(SourceInfo::None, ","),
+            Syntax::atom(SourceInfo::None, "right"),
+        ],
+    );
+    let scoped_source = SourceText::from_utf8(b"").unwrap();
+    for (registry, expected, row) in [
+        (&registry, "left", 0),
+        (&first, "right", 2),
+        (&both, "middle", 3),
+        (&reopened, "middle", 3),
+        (&reverse, "right", 2),
+        (&registry, "left", 0),
+    ] {
+        let report = registry.expand_root(
+            &scoped_input,
+            &scoped_source,
+            &context(),
+            MacroState::default(),
+            MacroDispatchLimits::default(),
+            None,
+        );
+        assert!(
+            matches!(&report.outcome,
+                Outcome::Complete(Ok(RegisteredExpansion::Expanded {
+                    syntax, declaration, state, ..
+                })) if syntax == &Syntax::atom(SourceInfo::None, expected)
+                    && declaration == &scoped_rows[row].declaration
+                    && state.macro_scope == 1),
+            "{report:?}; {dir:?}"
+        );
+        assert_eq!(report.attempts.len(), 1);
+        assert!(report.completed_vm_usage.steps > 0);
+    }
+    assert_eq!(
+        registry
+            .declarations(&scoped_kind)
+            .cloned()
+            .collect::<Vec<_>>(),
+        [scoped_rows[0].declaration.clone()]
+    );
+    assert_eq!(
+        reopened
+            .declarations(&scoped_kind)
+            .cloned()
+            .collect::<Vec<_>>(),
+        [
+            scoped_rows[3].declaration.clone(),
+            scoped_rows[2].declaration.clone(),
+            scoped_rows[1].declaration.clone(),
+            scoped_rows[0].declaration.clone(),
+        ]
+    );
 
     let scope_input = Syntax::node(
         name("registeredScope"),
@@ -246,6 +337,23 @@ run_cmd do
   if reprStr actual == reprStr input then throwError "wrong-expansion control survived"
   let rootFirst ← liftMacroM (expandMacros (choice (choice (branch "ten") (branch "twenty")) (branch "winner")))
   if reprStr rootFirst != reprStr (branch "winner") then throwError "root-before-children mismatch"
+  let scopedInput := Syntax.node .none `registeredScopedChoice #[
+    .atom .none "registeredScopedChoice%", .atom .none "left", .atom .none ",",
+    .atom .none "middle", .atom .none ",", .atom .none "right"]
+  let originalEnv ← getEnv
+  let firstEnv := macroAttribute.ext.activateScoped originalEnv `RegistryFirst
+  let bothEnv := macroAttribute.ext.activateScoped firstEnv `RegistrySecond
+  let reopenedEnv := macroAttribute.ext.activateScoped bothEnv `RegistryFirst
+  let reverseEnv := macroAttribute.ext.activateScoped
+    (macroAttribute.ext.activateScoped originalEnv `RegistrySecond) `RegistryFirst
+  for (environment, text) in [
+      (originalEnv, "left"), (firstEnv, "right"), (bothEnv, "middle"),
+      (reopenedEnv, "middle"), (reverseEnv, "right"), (originalEnv, "left")] do
+    setEnv environment
+    let expanded ← liftMacroM (expandMacros scopedInput)
+    if reprStr expanded != reprStr (Syntax.atom .none text) then
+      throwError "scoped expansion mismatch: {repr expanded}"
+  setEnv originalEnv
   let env ← getEnv
   let scopeInput := Syntax.node .none `registeredScope #[
     .atom .none "registeredScope%", .atom .none "first", .atom .none ",", .atom .none "second"]

@@ -892,11 +892,13 @@ fn scoped_foreign_changed_and_missing_owners_refuse_before_execution() {
         function("User.rule", Behavior::Identity),
         function("Other.rule", Behavior::Identity),
     ]);
-    for (rows, scoped) in [
-        (journal(&[("choice", "User.rule", Some("Scope"))]), true),
-        (journal(&[("choice", "Other.rule", None)]), false),
-        (journal(&[("choice", "Missing.rule", None)]), false),
+    for (declaration, scope) in [
+        ("Other.rule", None),
+        ("Missing.rule", None),
+        ("Other.rule", Some("Scope")),
+        ("Missing.rule", Some("Scope")),
     ] {
+        let rows = journal(&[("choice", declaration, scope)]);
         let result = RegisteredMacros::prepare(
             &[MacroRegistrationModule {
                 checked: &module,
@@ -908,11 +910,7 @@ fn scoped_foreign_changed_and_missing_owners_refuse_before_execution() {
             &users(&code),
             MacroRegistryLimits::default(),
         );
-        if scoped {
-            assert!(matches!(result, Err(MacroRegistrationError::Scoped { .. })));
-        } else {
-            assert!(matches!(result, Err(MacroRegistrationError::Owner { .. })));
-        }
+        assert!(matches!(result, Err(MacroRegistrationError::Owner { .. })));
     }
     let mut altered = owner("User.rule");
     if let ConstantInfo::Defn(info) = &mut altered {
@@ -1105,4 +1103,329 @@ fn scope_overflow_stops_before_vm_and_all_unsupported_keeps_state() {
     );
     assert!(matches!(stopped.outcome, Outcome::Inconclusive(_)));
     assert!(stopped.attempts.is_empty());
+}
+
+fn selecting_function(text: &str, index: u64) -> IrDecl {
+    let mut declaration = function(text, Behavior::Identity);
+    let IrDecl::Function { body, .. } = &mut declaration else {
+        unreachable!()
+    };
+    body.stmts = vec![
+        bind(3, IrExpr::Lit(IrLit::Num(IrNat::Small(index)))),
+        bind(
+            4,
+            IrExpr::Fap {
+                function: name("Lean.Syntax.getArg"),
+                args: vec![IrArg::Var(0), IrArg::Var(3)],
+            },
+        ),
+        bind(5, ctor(layout::RESULT_OK, "EStateM.Result.ok", &[4, 2])),
+    ];
+    *body.terminal = IrTerminal::Ret(IrArg::Var(5));
+    declaration
+}
+
+#[test]
+fn scoped_activation_preserves_import_order_precedence_and_parent_snapshots() {
+    let z = checked(
+        "Z",
+        &[
+            owner("Z.base"),
+            owner("Z.firstOld"),
+            owner("Z.firstNew"),
+            owner("Z.second"),
+        ],
+        &[],
+    );
+    let a = checked("A", &[owner("A.first"), owner("A.base")], &["Z"]);
+    let z_rows = journal(&[
+        ("choice", "Z.base", None),
+        ("choice", "Z.firstOld", Some("First")),
+        ("choice", "Z.firstNew", Some("First")),
+        ("choice", "Z.second", Some("Second")),
+    ]);
+    let a_rows = journal(&[
+        ("choice", "A.first", Some("First")),
+        ("choice", "A.base", None),
+    ]);
+    let code = code(vec![
+        selecting_function("Z.base", 0),
+        selecting_function("Z.firstOld", 0),
+        selecting_function("Z.firstNew", 1),
+        selecting_function("Z.second", 1),
+        selecting_function("A.first", 2),
+        selecting_function("A.base", 0),
+    ]);
+    let registry = prepare(
+        &[
+            MacroRegistrationModule {
+                checked: &z,
+                extensions: &z_rows,
+            },
+            MacroRegistrationModule {
+                checked: &a,
+                extensions: &a_rows,
+            },
+        ],
+        &code,
+    );
+    let first = registry.activate_scoped(&name("First")).unwrap();
+    let both = first.activate_scoped(&name("Second")).unwrap();
+    let reopened = both.activate_scoped(&name("First")).unwrap();
+    let reversed = registry
+        .activate_scoped(&name("Second"))
+        .unwrap()
+        .activate_scoped(&name("First"))
+        .unwrap();
+    let declarations = |registry: &RegisteredMacros| {
+        registry
+            .declarations(&name("choice"))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(declarations(&registry), [name("A.base"), name("Z.base")]);
+    assert_eq!(
+        declarations(&first),
+        [
+            name("A.first"),
+            name("Z.firstNew"),
+            name("Z.firstOld"),
+            name("A.base"),
+            name("Z.base"),
+        ]
+    );
+    assert_eq!(
+        declarations(&both),
+        [
+            name("Z.second"),
+            name("A.first"),
+            name("Z.firstNew"),
+            name("Z.firstOld"),
+            name("A.base"),
+            name("Z.base"),
+        ]
+    );
+    assert_eq!(declarations(&reopened), declarations(&both));
+    let input = Syntax::node(
+        name("choice"),
+        ["left", "middle", "right"]
+            .map(|text| Syntax::atom(SourceInfo::None, text))
+            .to_vec(),
+    );
+    let source = SourceText::from_utf8(b"").unwrap();
+    for (registry, selected, text) in [
+        (&registry, "A.base", "left"),
+        (&first, "A.first", "right"),
+        (&both, "Z.second", "middle"),
+        (&reopened, "Z.second", "middle"),
+        (&reversed, "A.first", "right"),
+        // Returning from a lexical scope uses the unchanged parent snapshot.
+        (&registry, "A.base", "left"),
+    ] {
+        let report = registry.expand_root(
+            &input,
+            &source,
+            &context(),
+            MacroState::default(),
+            MacroDispatchLimits::default(),
+            None,
+        );
+        assert!(
+            matches!(&report.outcome,
+                Outcome::Complete(Ok(RegisteredExpansion::Expanded {
+                    declaration, syntax, state, ..
+                })) if declaration == &name(selected)
+                    && syntax == &Syntax::atom(SourceInfo::None, text)
+                    && state.macro_scope == 1),
+            "{report:?}"
+        );
+        assert_eq!(report.attempts.len(), 1);
+        assert!(report.completed_vm_usage.steps > 0);
+    }
+}
+
+#[test]
+fn scoped_activation_requires_the_exact_structural_namespace() {
+    let module = checked("User", &[owner("User.rule")], &[]);
+    let rows = journal(&[("choice", "User.rule", Some("Scope.Inner"))]);
+    let registry = prepare(
+        &[MacroRegistrationModule {
+            checked: &module,
+            extensions: &rows,
+        }],
+        &code(vec![function("User.rule", Behavior::Identity)]),
+    );
+    for candidate in [
+        registry.clone(),
+        registry.activate_scoped(&name("Scope")).unwrap(),
+        registry
+            .activate_scoped(&Name::str(Name::anonymous(), "Scope.Inner"))
+            .unwrap(),
+        registry.activate_scoped(&name("Scope.InnerExtra")).unwrap(),
+    ] {
+        let report = run(&candidate, MacroDispatchLimits::default());
+        assert!(matches!(
+            report.outcome,
+            Outcome::Complete(Ok(RegisteredExpansion::Unsupported {
+                state: MacroState {
+                    macro_scope: 17,
+                    ..
+                }
+            }))
+        ));
+        assert!(report.attempts.is_empty());
+    }
+    let active = registry.activate_scoped(&name("Scope.Inner")).unwrap();
+    let report = run(&active, MacroDispatchLimits::default());
+    assert!(matches!(
+        report.outcome,
+        Outcome::Complete(Ok(RegisteredExpansion::Expanded { .. }))
+    ));
+    assert_eq!(report.attempts.len(), 1);
+    assert!(registry.declarations(&name("choice")).next().is_none());
+}
+
+#[test]
+fn inactive_scoped_candidates_still_require_owners_authority_and_shared_limits() {
+    let module = checked("User", &[owner("User.base"), owner("User.scoped")], &[]);
+    let rows = journal(&[
+        ("choice", "User.base", None),
+        ("choice", "User.scoped", Some("Scope")),
+    ]);
+    let code = code(vec![
+        function("User.base", Behavior::Identity),
+        function("User.scoped", Behavior::Identity),
+    ]);
+    let modules = [MacroRegistrationModule {
+        checked: &module,
+        extensions: &rows,
+    }];
+    let admitted = environment(&[&module]);
+    let partition = VerifiedPartition::user_fixture();
+    assert!(matches!(
+        RegisteredMacros::prepare(
+            &modules,
+            &admitted,
+            &code,
+            &partition,
+            &users(&code),
+            MacroRegistryLimits {
+                max_macros: 1,
+                ..MacroRegistryLimits::default()
+            }
+        ),
+        Err(MacroRegistrationError::Limit("compiled macros"))
+    ));
+    assert!(matches!(
+        RegisteredMacros::prepare(
+            &modules,
+            &admitted,
+            &code,
+            &partition,
+            &BTreeSet::from([name("User.base")]),
+            MacroRegistryLimits::default()
+        ),
+        Err(MacroRegistrationError::Compile { declaration, .. })
+            if declaration == name("User.scoped")
+    ));
+    let incomplete = environment(&[&checked("User", &[owner("User.base")], &[])]);
+    assert!(matches!(
+        RegisteredMacros::prepare(
+            &modules,
+            &incomplete,
+            &code,
+            &partition,
+            &users(&code),
+            MacroRegistryLimits::default()
+        ),
+        Err(MacroRegistrationError::Owner { declaration, .. })
+            if declaration == name("User.scoped")
+    ));
+    // Recovery uses the original, unchanged inputs and validates both candidates.
+    let recovered = RegisteredMacros::prepare(
+        &modules,
+        &admitted,
+        &code,
+        &partition,
+        &users(&code),
+        MacroRegistryLimits::default(),
+    )
+    .unwrap()
+    .activate_scoped(&name("Scope"))
+    .unwrap();
+    assert!(matches!(
+        run(&recovered, MacroDispatchLimits::default()).outcome,
+        Outcome::Complete(Ok(RegisteredExpansion::Expanded { declaration, .. }))
+            if declaration == name("User.scoped")
+    ));
+}
+
+#[test]
+fn scoped_fallbacks_share_steps_and_attempts_and_reactivation_is_idempotent() {
+    let module = checked("User", &[owner("User.base"), owner("User.skip")], &[]);
+    let rows = journal(&[
+        ("choice", "User.base", None),
+        ("choice", "User.skip", Some("Scope")),
+    ]);
+    let code = code(vec![
+        function("User.base", Behavior::Identity),
+        function("User.skip", Behavior::AdvanceUnsupported),
+    ]);
+    let base = prepare(
+        &[MacroRegistrationModule {
+            checked: &module,
+            extensions: &rows,
+        }],
+        &code,
+    );
+    let active = base.activate_scoped(&name("Scope")).unwrap();
+    let reopened = active.activate_scoped(&name("Scope")).unwrap();
+    let report = run(&reopened, MacroDispatchLimits::default());
+    assert!(matches!(
+        &report.outcome,
+        Outcome::Complete(Ok(RegisteredExpansion::Expanded {
+            declaration,
+            state: MacroState {
+                macro_scope: 41,
+                ..
+            },
+            ..
+        })) if declaration == &name("User.base")
+    ));
+    assert_eq!(
+        report
+            .attempts
+            .iter()
+            .map(|attempt| attempt.declaration.clone())
+            .collect::<Vec<_>>(),
+        [name("User.skip"), name("User.base")]
+    );
+    let mut exact = MacroDispatchLimits::default();
+    exact.execution.vm.max_steps = report.completed_vm_usage.steps;
+    assert!(matches!(
+        run(&active, exact).outcome,
+        Outcome::Complete(Ok(RegisteredExpansion::Expanded { .. }))
+    ));
+    exact.execution.vm.max_steps -= 1;
+    assert!(matches!(
+        run(&active, exact).outcome,
+        Outcome::Inconclusive(_)
+    ));
+    assert!(matches!(
+        run(
+            &active,
+            MacroDispatchLimits {
+                max_attempts: 1,
+                ..MacroDispatchLimits::default()
+            }
+        )
+        .outcome,
+        Outcome::Inconclusive(_)
+    ));
+    let parent = run(&base, MacroDispatchLimits::default());
+    assert_eq!(parent.attempts.len(), 1);
+    assert!(matches!(
+        parent.outcome,
+        Outcome::Complete(Ok(RegisteredExpansion::Expanded { .. }))
+    ));
 }
