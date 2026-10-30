@@ -39,9 +39,11 @@ impl Context {
     pub(super) fn simp_rule_may_unfold(&self, rule: &SimpRule<'_>) -> bool {
         match rule {
             SimpRule::Explicit(_) => true,
-            SimpRule::Local(_) | SimpRule::Arith | SimpRule::Decide | SimpRule::Simprocs(_) => {
-                false
-            }
+            SimpRule::Local(_)
+            | SimpRule::Arith
+            | SimpRule::Decide
+            | SimpRule::Conditional { .. }
+            | SimpRule::Simprocs(_) => false,
             SimpRule::Global(rule) => {
                 rule.proof.is_none()
                     && match self.txn.env.find(&rule.declaration) {
@@ -63,9 +65,11 @@ impl Context {
             SimpRule::Explicit(rule) => {
                 self.simp_unfold_selection_for_term(rule.syntax, rule.reverse)
             }
-            SimpRule::Local(_) | SimpRule::Arith | SimpRule::Decide | SimpRule::Simprocs(_) => {
-                Ok(None)
-            }
+            SimpRule::Local(_)
+            | SimpRule::Arith
+            | SimpRule::Decide
+            | SimpRule::Conditional { .. }
+            | SimpRule::Simprocs(_) => Ok(None),
             SimpRule::Global(rule) => {
                 self.tick()?;
                 if rule.proof.is_some() {

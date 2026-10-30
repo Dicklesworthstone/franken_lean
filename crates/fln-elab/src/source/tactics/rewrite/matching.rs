@@ -684,11 +684,15 @@ impl Context {
         // variable to itself (`eq_self`'s `?a = ?a`, `iff_self`'s `?p ↔ ?p`) is a reflexivity
         // test, so its occurrence's two sides must also agree at reducible transparency.
         let reflexive = inside_out && reflexive_pattern(&pattern);
-        let mut pending = vec![(target, false)];
+        // A function prefix remains a theorem candidate, but its arguments
+        // are visited under the complete application's congruence policy.
+        // Distinguish that root-only visit from a later ordinary occurrence
+        // of the same shared Expr.
+        let mut pending = vec![(target, false, false)];
         let mut visited = HashSet::new();
         // The post-order ordinal of the node being tried: the same for every rule at one target.
         let mut position = 0usize;
-        while let Some((term, exit)) = pending.pop() {
+        while let Some((term, exit, prefix_only)) = pending.pop() {
             self.tick()?;
             if exit {
                 position += 1;
@@ -698,18 +702,45 @@ impl Context {
                 }
             }
             if !exit {
-                if !visited.insert(term.allocation_identity()) {
+                if !visited.insert((term.allocation_identity(), prefix_only)) {
                     continue;
                 }
                 if inside_out && !root_only {
-                    pending.push((term, true));
-                    pending.extend(
-                        children(term)
-                            .into_iter()
-                            .rev()
-                            .flatten()
-                            .map(|child| (child, false)),
-                    );
+                    pending.push((term, true, prefix_only));
+                    if !prefix_only {
+                        if matches!(term.node(), ExprNode::App { .. }) {
+                            let mut head = term;
+                            let mut spine = Vec::new();
+                            while let ExprNode::App { f, a } = head.node() {
+                                spine.push((head, a));
+                                head = f;
+                            }
+                            let visit = self
+                                .simp_application_argument_kinds(head, spine.len())
+                                .unwrap_or_else(|| vec![true; spine.len()]);
+                            // Preserve head/argument/prefix post-order while
+                            // never entering fixed, instance or proof arguments.
+                            // In particular, a fact p must not rewrite p inside
+                            // a dependent branch's proof of p.
+                            for (index, (prefix, argument)) in spine.iter().enumerate() {
+                                if index != 0 {
+                                    pending.push((prefix, false, true));
+                                }
+                                if visit[spine.len() - 1 - index] {
+                                    pending.push((argument, false, false));
+                                }
+                            }
+                            pending.push((head, false, false));
+                        } else {
+                            pending.extend(
+                                children(term)
+                                    .into_iter()
+                                    .rev()
+                                    .flatten()
+                                    .map(|child| (child, false, false)),
+                            );
+                        }
+                    }
                     continue;
                 }
                 if !root_only {
@@ -718,7 +749,7 @@ impl Context {
                             .into_iter()
                             .rev()
                             .flatten()
-                            .map(|child| (child, false)),
+                            .map(|child| (child, false, false)),
                     );
                 }
             }

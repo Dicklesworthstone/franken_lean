@@ -405,8 +405,8 @@ fn discarded_reset_arms_cannot_hide_calls_bad_projections_or_changed_operands() 
             0 => arm(&mut region, 0).stmts.push(call(40, "Nat.add", &[2, 3])),
             1 => arm(&mut region, 0).stmts[0] = bind(5, IrExpr::Proj { i: 2, x: 1 }),
             2 => arm(&mut region, 0).stmts[0] = bind(5, IrExpr::Proj { i: 0, x: 2 }),
-            3 => arm(&mut region, 1).terminal = Box::new(jump(10, vec![var(1), var(4)])),
-            _ => arm(&mut region, 0).terminal = Box::new(jump(10, vec![var(1), IrArg::Erased])),
+            3 => *arm(&mut region, 1).terminal = jump(10, vec![var(1), var(4)]),
+            _ => *arm(&mut region, 0).terminal = jump(10, vec![var(1), IrArg::Erased]),
         }
         assert!(compile_region(region).is_err(), "reset mismatch {kind}");
     }
@@ -427,8 +427,8 @@ fn reuse_field_tag_and_continuation_mismatches_never_authorize_sharing() {
             }
             1 => arm(value, 0).stmts.push(IrStmt::SetTag { x: 11, cidx: 2 }),
             2 => arm(value, 1).stmts.push(call(40, "Nat.add", &[2, 3])),
-            3 => arm(value, 0).terminal = Box::new(IrTerminal::Ret(var(11))),
-            _ => arm(value, 1).terminal = Box::new(jump(20, vec![var(3)])),
+            3 => *arm(value, 0).terminal = IrTerminal::Ret(var(11)),
+            _ => *arm(value, 1).terminal = jump(20, vec![var(3)]),
         }
         assert!(compile_region(region).is_err(), "reuse mismatch {kind}");
     }

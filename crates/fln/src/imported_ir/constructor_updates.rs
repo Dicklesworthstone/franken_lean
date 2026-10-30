@@ -505,7 +505,8 @@ fn equivalent_branches(
                 let Some((slot, value)) = packed::store(stmt, fresh, *shape) else {
                     return Ok(None);
                 };
-                if value == *receiver || value == *flag || !scalar_initializers.insert(slot, value) {
+                if value == *receiver || value == *flag || !scalar_initializers.insert(slot, value)
+                {
                     return Ok(None);
                 }
             }

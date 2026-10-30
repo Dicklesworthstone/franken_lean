@@ -200,3 +200,110 @@ fn simp_configuration_is_read_as_the_pin_reads_it() {
         );
     }
 }
+
+#[test]
+fn default_conditional_presteps_preserve_the_selected_branch_and_scope() {
+    let Some(lib) = pinned_lib() else {
+        return;
+    };
+    let root = workspace();
+    let program = r#"
+set_option simprocs true in
+example (p : Prop) [Decidable p] (h : p) (a b : Nat) :
+    (if p then a else b) = a := by simp [h, -ite_true]
+example (p : Prop) [Decidable p] (h : p) (a b : Nat) :
+    (if p then a else b) = a := by simp [h]
+example (p : Prop) [Decidable p] (h : ¬ p) (a b : Nat) :
+    (if p then a else b) = b := by simp [h]
+example (p : Prop) [Decidable p] (h : p) (f : p → Nat) (g : ¬ p → Nat) :
+    dite p f g = f h := by simp [h]
+example (p : Prop) [Decidable p] (h : ¬ p) (f : p → Nat) (g : ¬ p → Nat) :
+    dite p f g = g h := by simp [h]
+example (p : Prop) [Decidable p] (h : p) (b : Nat) :
+    (fun n : Nat => if p then n else b) = (fun n : Nat => n) := by simp [h]
+example (p : Prop) [Decidable p] (h : p) (a b c : Nat)
+    (hx : (if p then a else b) = c) : a = c := by
+  simp [h] at hx
+  exact hx
+example (p : Prop) [Decidable p] (h : p) (a b : Nat) :
+    (if p then a else b) = a := by
+  conv => lhs; simp [h]
+example (p : Prop) [Decidable p] (h : p) (a b c : Nat) (ha : a = c) :
+    (if p then a else b) = c := by simpa [h] using ha
+example (p : Prop) [Decidable p] (h : p) (f g : Nat → Nat) (n : Nat) :
+    (if p then f else g) n = f n := by simp [h]
+example (p : Prop) [Decidable p] (h : p) (f g : Nat → Nat) :
+    (fun n => (if p then f else g) n) = f := by simp [h]
+-- A selected fact must not rewrite the proposition inside proof arguments.
+example (p : Prop) (h1 h2 : p) (f : p → Nat) :
+    f (of_eq_true (propext (iff_true_intro h1))) = f h2 := by simp [h1]
+example (p : Prop) (h : ¬ p) (g : ¬ p → Nat) :
+    g (of_eq_false (propext (Iff.intro h
+      (fun hf : False => False.rec (motive := fun _ => p) hf)))) = g h := by simp [h]
+-- Skipping proof arguments must retain function and partial-application rules.
+example (f g : Nat → Nat) (h : f = g) (x : Nat) :
+    f x = g x := by simp only [h]
+example (f : Nat → Nat → Nat) (g : Nat → Nat) (a b : Nat)
+    (h : f a = g) : f a b = g b := by simp only [h]
+example (f : Nat → Nat → Nat) (g : Nat → Nat) (a b : Nat)
+    (k : Nat → (Nat → Nat) → Nat) (h : f a = g) :
+    k (f a b) (f a) = k (g b) g := by simp only [h]
+-- A later proof dependency does not freeze the earlier data argument.
+example (f : (n : Nat) → n = n → Nat) (a b : Nat) (h : a = b) :
+    f a rfl = f b rfl := by simp only [h]
+"#;
+    let (code, stderr, pinned) = check(&lib, &root, "conditional_scopes", program);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(
+        pinned.unwrap_or(0),
+        0,
+        "the pinned lean rejects the controls"
+    );
+    for (name, program) in [
+        (
+            "simprocs_option_disables_conditional_presteps",
+            "set_option simprocs false in\nexample (p : Prop) [Decidable p] (h : p) (a b : Nat) :\n    (if p then a else b) = a := by simp [h, -ite_true]\n",
+        ),
+        (
+            "only_has_no_default_conditional_presteps",
+            "example (p : Prop) [Decidable p] (h : p) (a b : Nat) :\n    (if p then a else b) = a := by simp only [h]\n",
+        ),
+        (
+            "a_symbolic_condition_does_not_choose_a_branch",
+            "example (p : Prop) [Decidable p] (a b : Nat) :\n    (if p then a else b) = a := by simp\n",
+        ),
+        (
+            "a_proven_condition_does_not_choose_the_wrong_branch",
+            "example (p : Prop) [Decidable p] (h : p) (a b : Nat) :\n    (if p then a else b) = b := by simp [h]\n",
+        ),
+        (
+            "proof_irrelevance_does_not_bypass_erased_eq_self",
+            "example (p : Prop) (h1 h2 : p) (f : p → Nat) :\n    f h1 = f h2 := by simp [-eq_self]\n",
+        ),
+    ] {
+        let (code, stderr, pinned) = check(&lib, &root, name, program);
+        assert_ne!(code, 0, "{name}: accepted {program}");
+        assert!(
+            stderr.contains("made no progress") || stderr.contains("unsolved goals"),
+            "{name}: not the tactic's own refusal\n{stderr}"
+        );
+        assert_ne!(pinned.unwrap_or(1), 0, "{name}: the pinned lean accepts it");
+    }
+}
+
+#[test]
+fn conditional_simp_does_not_expand_both_recursive_branches() {
+    let Some(lib) = pinned_lib() else {
+        return;
+    };
+    let root = workspace();
+    // All four unchanged pin probes: ite/dite, true/false. At depth 32,
+    // rewriting both branches before the condition exceeds the work limit.
+    let program = format!(
+        "import Init.Data.Nat.Basic\n{}",
+        include_str!("../../../vendor/lean4-src/tests/elab/simpIfPre.lean")
+    );
+    let (code, stderr, pinned) = check(&lib, &root, "conditional_recursion", &program);
+    assert_eq!(code, 0, "{stderr}");
+    assert_eq!(pinned.unwrap_or(0), 0, "the pinned lean rejects simpIfPre");
+}

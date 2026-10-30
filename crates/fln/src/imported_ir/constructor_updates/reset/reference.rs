@@ -33,7 +33,10 @@ fn live_pinned_recursive_updates_match_reference_and_canonical_replay() {
     let pin = lock
         .lines()
         .find(|line| line.starts_with("reference "))
-        .and_then(|line| line.split_whitespace().find_map(|s| s.strip_prefix("commit=")))
+        .and_then(|line| {
+            line.split_whitespace()
+                .find_map(|s| s.strip_prefix("commit="))
+        })
         .expect("SUITE.lock Reference commit");
     let version = Command::new(&reference).arg("--githash").output().unwrap();
     assert!(version.status.success());
@@ -84,12 +87,20 @@ fn live_pinned_recursive_updates_match_reference_and_canonical_replay() {
                     if let IrStmt::JDecl { params, value, .. } = stmt
                         && let [parameter] = params.as_slice()
                     {
-                        let scalar_prefix = value.stmts.iter().take_while(|stmt| match stmt {
-                            IrStmt::Set { x, .. } | IrStmt::SetTag { x, .. }
-                            | IrStmt::USet { x, .. } | IrStmt::SSet { x, .. } => *x == parameter.x,
-                            _ => false,
-                        }).any(|stmt| matches!(stmt, IrStmt::USet { .. } | IrStmt::SSet { .. }));
-                        if scalar_prefix { packed_continuations += 1; }
+                        let scalar_prefix = value
+                            .stmts
+                            .iter()
+                            .take_while(|stmt| match stmt {
+                                IrStmt::Set { x, .. }
+                                | IrStmt::SetTag { x, .. }
+                                | IrStmt::USet { x, .. }
+                                | IrStmt::SSet { x, .. } => *x == parameter.x,
+                                _ => false,
+                            })
+                            .any(|stmt| matches!(stmt, IrStmt::USet { .. } | IrStmt::SSet { .. }));
+                        if scalar_prefix {
+                            packed_continuations += 1;
+                        }
                     }
                 }
                 if matches!(body.stmts.as_slice(), [.., IrStmt::JDecl { params, .. },
@@ -101,9 +112,15 @@ fn live_pinned_recursive_updates_match_reference_and_canonical_replay() {
             }
         }
     }
-    assert!(expanded > 0, "the pin emitted no expanded reset region; inspect {dir:?}");
+    assert!(
+        expanded > 0,
+        "the pin emitted no expanded reset region; inspect {dir:?}"
+    );
 
-    assert!(packed_continuations > 0, "the pin emitted no common packed initialization; inspect {dir:?}");
+    assert!(
+        packed_continuations > 0,
+        "the pin emitted no common packed initialization; inspect {dir:?}"
+    );
 
     let cases = [
         ("resetAnswer", 0),
@@ -129,19 +146,36 @@ fn live_pinned_recursive_updates_match_reference_and_canonical_replay() {
         .unwrap();
     std::fs::write(dir.join("oracle.stdout"), &oracle.stdout).unwrap();
     std::fs::write(dir.join("oracle.stderr"), &oracle.stderr).unwrap();
-    assert!(oracle.status.success(), "Reference oracle failed: {}{}",
-        String::from_utf8_lossy(&oracle.stdout), String::from_utf8_lossy(&oracle.stderr));
+    assert!(
+        oracle.status.success(),
+        "Reference oracle failed: {}{}",
+        String::from_utf8_lossy(&oracle.stdout),
+        String::from_utf8_lossy(&oracle.stderr)
+    );
     let output = String::from_utf8(oracle.stdout).unwrap();
     let expected: Vec<_> = output.lines().collect();
-    assert_eq!(expected.len(), cases.len(), "unexpected oracle output: {output}");
-    assert!(expected.iter().all(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())));
+    assert_eq!(
+        expected.len(),
+        cases.len(),
+        "unexpected oracle output: {output}"
+    );
+    assert!(
+        expected
+            .iter()
+            .all(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+    );
 
-    let users = module.decls.iter().filter_map(|decl| match decl {
-        IrDecl::Function { name, .. } => Some(name.clone()),
-        _ => None,
-    }).collect();
+    let users = module
+        .decls
+        .iter()
+        .filter_map(|decl| match decl {
+            IrDecl::Function { name, .. } => Some(name.clone()),
+            _ => None,
+        })
+        .collect();
     let partition = VerifiedPartition {
-        partition: CensusPartition::parse("constant_count\t0\n", GraphArchiveLimits::default()).unwrap(),
+        partition: CensusPartition::parse("constant_count\t0\n", GraphArchiveLimits::default())
+            .unwrap(),
     };
     for ((entry, value), expected) in cases.into_iter().zip(expected) {
         let compiled = compile(
@@ -151,17 +185,29 @@ fn live_pinned_recursive_updates_match_reference_and_canonical_replay() {
             &partition,
             &users,
             IrExecutionLimits::default(),
-        ).unwrap_or_else(|error| panic!("{entry} {value}: {error:?}; artifacts {dir:?}"));
-        let encoded = flbc::encode_canonical(compiled.program.program(), flbc::CodecLimits::default()).unwrap();
+        )
+        .unwrap_or_else(|error| panic!("{entry} {value}: {error:?}; artifacts {dir:?}"));
+        let encoded =
+            flbc::encode_canonical(compiled.program.program(), flbc::CodecLimits::default())
+                .unwrap();
         let replay = flbc::decode_canonical(&encoded, flbc::CodecLimits::default()).unwrap();
         for program in [compiled.program.program(), &replay] {
             let outcome = execute(program, ExecutionLimits::default(), None);
             let Outcome::Complete(VmExit::Returned(result)) = outcome else {
                 panic!("{entry} {value}: {outcome:?}");
             };
-            assert_eq!(nat_decimal(&result.value).as_deref(), Some(expected), "{entry} {value}");
+            assert_eq!(
+                nat_decimal(&result.value).as_deref(),
+                Some(expected),
+                "{entry} {value}"
+            );
         }
-        assert!(compiled.reference_functions().iter().all(|f| f.producer() == "reference"));
+        assert!(
+            compiled
+                .reference_functions()
+                .iter()
+                .all(|f| f.producer() == "reference")
+        );
         eprintln!("live Reference and Golem: {entry} {value} = {expected}");
     }
 }

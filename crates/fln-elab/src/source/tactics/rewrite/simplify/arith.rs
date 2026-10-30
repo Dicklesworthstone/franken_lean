@@ -822,23 +822,11 @@ impl Context {
                     head = f;
                 }
                 args.reverse();
-                let type_ = match head.node() {
-                    ExprNode::Const { name, .. } => self
-                        .txn
-                        .env
-                        .find(name)
-                        .map(|info| info.constant_val().type_.clone()),
-                    ExprNode::FVar { id } => {
-                        self.txn.lctx.find(id).map(|local| local.type_.clone())
-                    }
-                    _ => None,
-                };
-                let Some(type_) = type_ else {
+                let Some(visit) = self.simp_application_argument_kinds(head, args.len()) else {
                     let mut all = vec![head];
                     all.extend(args);
                     return all;
                 };
-                let visit = self.simp_arith_argument_kinds(&type_, args.len());
                 args.into_iter()
                     .zip(visit)
                     .filter_map(|(arg, visit)| visit.then_some(arg))
@@ -858,6 +846,26 @@ impl Context {
             ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => vec![expr],
             _ => Vec::new(),
         }
+    }
+
+    /// Argument policy for the complete application, shared with theorem
+    /// matching. Computing it again at a function prefix would mistake later
+    /// proof/instance dependencies for dependencies in the final result.
+    pub(in crate::source::tactics::rewrite) fn simp_application_argument_kinds(
+        &self,
+        head: &Expr,
+        count: usize,
+    ) -> Option<Vec<bool>> {
+        let type_ = match head.node() {
+            ExprNode::Const { name, .. } => self
+                .txn
+                .env
+                .find(name)
+                .map(|info| info.constant_val().type_.clone()),
+            ExprNode::FVar { id } => self.txn.lctx.find(id).map(|local| local.type_.clone()),
+            _ => None,
+        }?;
+        Some(self.simp_arith_argument_kinds(&type_, count))
     }
 
     /// For each of `count` arguments of a function of type `type_`, whether simp rewrites it

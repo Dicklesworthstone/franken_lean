@@ -129,6 +129,13 @@ use Policy::*;
 /// The table, in one place. `maxRecDepth`'s default is `defaultMaxRecDepth`, 512
 /// (`Init/Prelude.lean`).
 pub const ROWS: &[Row] = &[
+    // Read by the default conditional pre-simprocs in tactics/rewrite/simplify.rs.
+    row(
+        "simprocs",
+        Bool(true),
+        "Lean/Meta/Tactic/Simp/Simproc.lean:337",
+        Honored,
+    ),
     // Simp may re-synthesize occurrence-assigned theorem dictionaries.
     row(
         "tactic.skipAssignedInstances",
@@ -998,6 +1005,8 @@ mod tests {
             .filter(|row| matches!(row.policy, Honored | HonoredAtLeast { .. } | HonoredOff))
             .map(|row| row.name)
             .collect();
+        // `simprocs`: rewrite/simplify.rs; source_simp_config selects and disables
+        // conditional pre-steps with the ordinary ite_true theorem erased.
         // `tactic.skipAssignedInstances`: matching/instance_args.rs;
         // source_simp_instance_matching exercises both values.
         // `stderrAsMessages`: presented `#eval` stream capture (`fln`, lib.rs);
@@ -1030,6 +1039,7 @@ mod tests {
         assert_eq!(
             honored,
             [
+                "simprocs",
                 "tactic.skipAssignedInstances",
                 "autoLift",
                 "stderrAsMessages",

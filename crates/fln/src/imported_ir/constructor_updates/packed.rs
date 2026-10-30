@@ -59,9 +59,11 @@ pub(super) fn projection(ty: &IrType, expr: &IrExpr) -> Option<(u64, Slot)> {
     let kind = Kind::from_type(ty)?;
     let (receiver, offset) = match expr {
         IrExpr::UProj { i, x } if kind == Kind::USize => (*x, offset(*i, 0)?),
-        IrExpr::SProj { n, offset: bytes, x } if kind != Kind::USize => {
-            (*x, offset(*n, *bytes)?)
-        }
+        IrExpr::SProj {
+            n,
+            offset: bytes,
+            x,
+        } if kind != Kind::USize => (*x, offset(*n, *bytes)?),
         _ => return None,
     };
     Some((receiver, Slot { offset, kind }))
@@ -73,17 +75,34 @@ pub(super) fn store(stmt: &IrStmt, receiver: u64, shape: Shape) -> Option<(Slot,
     let end = word_end.checked_add(shape.bytes)?;
     let (slot, value, lower, upper) = match stmt {
         IrStmt::USet { x, i, y } if *x == receiver => (
-            Slot { offset: offset(*i, 0)?, kind: Kind::USize },
+            Slot {
+                offset: offset(*i, 0)?,
+                kind: Kind::USize,
+            },
             *y,
             object_end,
             word_end,
         ),
-        IrStmt::SSet { x, i, offset: bytes, y, ty } if *x == receiver => {
+        IrStmt::SSet {
+            x,
+            i,
+            offset: bytes,
+            y,
+            ty,
+        } if *x == receiver => {
             let kind = Kind::from_type(ty)?;
             if kind == Kind::USize {
                 return None;
             }
-            (Slot { offset: offset(*i, *bytes)?, kind }, *y, word_end, end)
+            (
+                Slot {
+                    offset: offset(*i, *bytes)?,
+                    kind,
+                },
+                *y,
+                word_end,
+                end,
+            )
         }
         _ => return None,
     };
@@ -99,9 +118,19 @@ impl Writes {
         let Some(end) = slot.offset.checked_add(slot.kind.width()) else {
             return false;
         };
-        if self.0.range(..slot.offset).next_back().is_some_and(|(_, (prior, _))| {
-            prior.offset.saturating_add(prior.kind.width()) > slot.offset
-        }) || self.0.range(slot.offset..).next().is_some_and(|(next, _)| *next < end) {
+        if self
+            .0
+            .range(..slot.offset)
+            .next_back()
+            .is_some_and(|(_, (prior, _))| {
+                prior.offset.saturating_add(prior.kind.width()) > slot.offset
+            })
+            || self
+                .0
+                .range(slot.offset..)
+                .next()
+                .is_some_and(|(next, _)| *next < end)
+        {
             return false;
         }
         self.0.insert(slot.offset, (slot, value));

@@ -48,7 +48,11 @@ impl Context {
         // procedure's definitional rewrite comes as an unfolding, so one reaching here has a proof.
         if matches!(
             rule,
-            SimpRule::Local(_) | SimpRule::Arith | SimpRule::Decide | SimpRule::Simprocs(_)
+            SimpRule::Local(_)
+                | SimpRule::Arith
+                | SimpRule::Decide
+                | SimpRule::Conditional { .. }
+                | SimpRule::Simprocs(_)
         ) {
             return Ok(false);
         }
@@ -271,15 +275,27 @@ impl Context {
                         .cloned()
                         .collect();
                     let target = self.instantiate(&local.type_)?;
-                    let index = self.simp_target_index(&target)?;
-                    let transition = self.simp_first_rewrite(
-                        &active,
-                        permute,
-                        |this, rule| {
-                            Ok(this.simp_rule_admitted(rule, index.as_ref(), SimpKeySide::Rewrite))
-                        },
-                        |this, rule| this.simp_hypothesis_step(&local, rule, &active),
-                    )?;
+                    let pre = self.simp_pre_rewrite(&active, |this, rule| {
+                        this.simp_hypothesis_step(&local, rule, &active)
+                    })?;
+                    let transition = if pre.is_some() {
+                        pre
+                    } else {
+                        let index = self.simp_target_index(&target)?;
+                        self.simp_first_rewrite(
+                            &active,
+                            permute,
+                            |this, rule| {
+                                Ok(!matches!(rule, SimpRule::Conditional { .. })
+                                    && this.simp_rule_admitted(
+                                        rule,
+                                        index.as_ref(),
+                                        SimpKeySide::Rewrite,
+                                    ))
+                            },
+                            |this, rule| this.simp_hypothesis_step(&local, rule, &active),
+                        )?
+                    };
                     if let Some((chosen, (replacement, unfolded))) = transition {
                         let rule = &active[chosen];
                         if steps >= MAX_SIMPLIFICATION_STEPS {

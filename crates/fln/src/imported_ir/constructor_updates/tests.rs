@@ -287,14 +287,14 @@ fn tail_join_continuations_receive_the_same_fresh_value_without_capturing_the_re
             value: body(vec![], IrTerminal::Ret(var(11))),
         },
     );
-    branch(&mut region, 0).terminal = Box::new(IrTerminal::Jmp {
+    *branch(&mut region, 0).terminal = IrTerminal::Jmp {
         j: 10,
         args: vec![var(1)],
-    });
-    branch(&mut region, 1).terminal = Box::new(IrTerminal::Jmp {
+    };
+    *branch(&mut region, 1).terminal = IrTerminal::Jmp {
         j: 10,
         args: vec![var(5)],
-    });
+    };
     let compiled = compile_fixture(region, false, IrExecutionLimits::default()).unwrap();
     assert_nat_and_replay(&compiled, "91");
 }
@@ -325,7 +325,7 @@ fn branch_mismatches_and_observable_sharing_are_never_specialized() {
             3 => branch(&mut region, 0)
                 .stmts
                 .insert(0, call(6, "Nat.add", &[2, 3])),
-            4 => branch(&mut region, 0).terminal = Box::new(IrTerminal::Ret(var(4))),
+            4 => *branch(&mut region, 0).terminal = IrTerminal::Ret(var(4)),
             5 => {
                 branch(&mut region, 0).stmts[0] = IrStmt::Set {
                     x: 1,
@@ -387,14 +387,14 @@ fn join_capture_of_the_original_object_prevents_branch_elimination() {
             ),
         },
     );
-    branch(&mut region, 0).terminal = Box::new(IrTerminal::Jmp {
+    *branch(&mut region, 0).terminal = IrTerminal::Jmp {
         j: 10,
         args: vec![var(1)],
-    });
-    branch(&mut region, 1).terminal = Box::new(IrTerminal::Jmp {
+    };
+    *branch(&mut region, 1).terminal = IrTerminal::Jmp {
         j: 10,
         args: vec![var(5)],
-    });
+    };
     assert!(matches!(
         compile_fixture(region, true, IrExecutionLimits::default()),
         Err(IrExecutionError::Unsupported { .. })

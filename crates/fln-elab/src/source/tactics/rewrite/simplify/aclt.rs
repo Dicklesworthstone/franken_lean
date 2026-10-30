@@ -145,6 +145,8 @@ fn beta(function: &Expr, args: &[Expr]) -> Option<Expr> {
 /// runs after the rules in that order (`Rewrite.lean:542-546`), last.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub(super) enum SimpReach {
+    /// A conditional's default pre-simproc runs before visiting its branches.
+    Conditional,
     /// `simpUsingDecide`, which runs before a node's other rewrites (`decide.rs`).
     Decide,
     Unfold,
@@ -302,6 +304,7 @@ impl Context {
             let statement = match rule {
                 SimpRule::Arith
                 | SimpRule::Decide
+                | SimpRule::Conditional { .. }
                 | SimpRule::Simprocs(_)
                 | SimpRule::Global(_) => continue,
                 SimpRule::Explicit(explicit) if explicit.global.is_some() => continue,
@@ -367,7 +370,7 @@ impl Context {
                 self.restore_simp_trial(original);
                 continue;
             };
-            if !permute {
+            if !permute || place.reach == SimpReach::Conditional {
                 return Ok(Some((index, found)));
             }
             let earlier = match &chosen {

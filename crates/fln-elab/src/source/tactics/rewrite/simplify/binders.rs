@@ -33,6 +33,17 @@ impl Context {
     ) -> Result<Option<(Typed, Expr, bool, SimpPlace)>, NatDefinitionElabError> {
         // A rewrite at a node is already chosen: one beneath a binder or by `+arith` comes later.
         let limited = self.simp_reach_limit.is_some();
+        if let SimpRule::Conditional { depth } = rule {
+            let place = SimpPlace::of(SimpReach::Conditional);
+            if let Some((evidence, occurrence)) =
+                self.simp_conditional_evidence(target, premises, *depth)?
+            {
+                return Ok(Some((evidence, occurrence, false, place)));
+            }
+            return Ok(self
+                .simp_binder_rule(target, rule, premises)?
+                .map(|evidence| (evidence, target.clone(), false, place)));
+        }
         if matches!(rule, SimpRule::Decide) {
             // The walk reaches every closed proposition, under binders too: one mentioning a
             // bound variable is never decided (`simpUsingDecide` skips free variables).
@@ -179,6 +190,16 @@ impl Context {
         if matches!(rule, SimpRule::Decide) {
             return Ok(None);
         }
+        if let SimpRule::Conditional { depth } = rule {
+            let Some((evidence, occurrence)) =
+                self.simp_conditional_evidence(body, premises, *depth)?
+            else {
+                return Ok(None);
+            };
+            return self
+                .simp_occurrence_equality(body, &occurrence, evidence, false)
+                .map(Some);
+        }
         if matches!(rule, SimpRule::Arith) {
             let Some((evidence, occurrence)) = self.simp_arith_evidence(body)? else {
                 return Ok(None);
@@ -266,6 +287,11 @@ impl Context {
         premises: &[SimpRule<'_>],
     ) -> Result<Option<Typed>, NatDefinitionElabError> {
         let mut frames = Vec::<BinderFrame>::new();
+        let conditional = if matches!(rule, SimpRule::Conditional { .. }) {
+            Some(self.conditional_selections(premises)?)
+        } else {
+            None
+        };
         let outer = self.txn.lctx.clone();
         let mut pending = vec![Scan {
             root: target.clone(),
@@ -284,6 +310,15 @@ impl Context {
             retained.push(scan.term.clone());
             if scan.term.has_loose_bvars() {
                 continue;
+            }
+            if let Some(selections) = &conditional {
+                self.txn.lctx = match scan.parent {
+                    Some(index) => frames[index].inner.clone(),
+                    None => outer.clone(),
+                };
+                if self.simp_conditional_head_exposed(&scan.term, selections)? {
+                    continue;
+                }
             }
             if let ExprNode::Lam {
                 binder_type,
@@ -368,7 +403,11 @@ impl Context {
             if matches!(scan.term.node(), ExprNode::LetE { .. }) {
                 continue;
             }
-            for child in children(&scan.term).into_iter().rev().flatten() {
+            // This search only discovers binders. Known constant/local heads
+            // have none; computed heads are included by the fallback. Retain
+            // the application's argument policy for every rule, so a proof's
+            // internal motive is not mistaken for a term to rewrite.
+            for child in self.simp_visited_children(&scan.term).into_iter().rev() {
                 self.tick()?;
                 pending.push(Scan {
                     root: scan.root.clone(),

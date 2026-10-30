@@ -6,6 +6,7 @@
 mod aclt;
 mod arith;
 mod binders;
+mod conditional;
 mod config;
 mod decide;
 mod dsimp;
@@ -42,10 +43,15 @@ pub(in crate::source) enum SimpRule<'a> {
     /// `simpArith` runs after `rewritePost` (`Rewrite.lean:542-546`). It rewrites; it never
     /// closes a goal by itself.
     Arith,
-    /// `+decide`'s decision of closed propositions (`decide.rs`), always the first rule: the
+    /// `+decide`'s decision of closed propositions (`decide.rs`), a pre-step: the
     /// pin's `simpUsingDecide` ends `preDefault` (`Rewrite.lean:536-540`), which runs at a node
     /// before its post rewrites.
     Decide,
+    /// The default `reduceIte`/`reduceDIte` pre-simprocs. The depth travels with
+    /// recursive condition simplification, never in shared or ambient state.
+    Conditional {
+        depth: usize,
+    },
     /// The default `Nat` simplification procedures the call runs (`simproc.rs`), after every
     /// theorem and before `+arith`'s normalization: the pin's `userPostSimprocs` follows
     /// `rewritePost` and precedes `simpArith` (`Rewrite.lean:542-546`).
@@ -56,7 +62,11 @@ impl SimpRule<'_> {
         match self {
             Self::Explicit(rule) => rule.reverse,
             Self::Global(rule) => rule.reverse,
-            Self::Local(_) | Self::Arith | Self::Decide | Self::Simprocs(_) => false,
+            Self::Local(_)
+            | Self::Arith
+            | Self::Decide
+            | Self::Conditional { .. }
+            | Self::Simprocs(_) => false,
         }
     }
 }
@@ -410,7 +420,10 @@ impl Context {
     ) -> bool {
         if matches!(
             rule,
-            SimpRule::Arith | SimpRule::Decide | SimpRule::Simprocs(_)
+            SimpRule::Arith
+                | SimpRule::Decide
+                | SimpRule::Conditional { .. }
+                | SimpRule::Simprocs(_)
         ) {
             return matches!(side, SimpKeySide::Rewrite);
         }
@@ -783,9 +796,10 @@ impl Context {
             }
             // Arithmetic normalization, decision and the procedures have no single proof term
             // to select.
-            SimpRule::Arith | SimpRule::Decide | SimpRule::Simprocs(_) => {
-                Err(error(TacticError::MalformedScript))
-            }
+            SimpRule::Arith
+            | SimpRule::Decide
+            | SimpRule::Conditional { .. }
+            | SimpRule::Simprocs(_) => Err(error(TacticError::MalformedScript)),
         }
     }
 
@@ -902,6 +916,26 @@ impl Context {
         let mut rules = self.simp_rule_selection(dsimp, only, arguments)?;
         if config.decide {
             rules.insert(0, SimpRule::Decide);
+        }
+        // `mkSimpContext` starts `simp only` with an empty simproc set. The
+        // conditional pre-step is therefore a default-simp operation, even
+        // when an explicit fact in `simp only [h]` proves the condition.
+        if !dsimp
+            && expect_null_args(only, "optional explicit simp set")?.is_empty()
+            && self
+                .txn
+                .options
+                .get_bool(&Name::from_components(["simprocs"]), true)
+            && self
+                .txn
+                .env
+                .contains(&Name::from_components(["ite_cond_eq_true"]))
+            && self
+                .txn
+                .env
+                .contains(&Name::from_components(["dite_cond_eq_true"]))
+        {
+            rules.insert(0, SimpRule::Conditional { depth: 0 });
         }
         // `arith` is honoured as the pin's `updateArith` does: off while the environment lacks
         // `Nat.Linear.ExprCnstr.eq_of_toNormPoly_eq`.
@@ -1139,7 +1173,13 @@ impl Context {
         mut rules: Vec<SimpRule<'a>>,
         procedures: NatSimprocs,
     ) -> Vec<SimpRule<'a>> {
-        if !procedures.is_empty() && self.simp_procedures_supported() {
+        if !procedures.is_empty()
+            && self.simp_procedures_supported()
+            && self
+                .txn
+                .options
+                .get_bool(&Name::from_components(["simprocs"]), true)
+        {
             rules.push(SimpRule::Simprocs(procedures));
         }
         rules
@@ -1438,26 +1478,48 @@ impl Context {
         expr: &Expr,
     ) -> Result<(Expr, Option<Expr>), NatDefinitionElabError> {
         let rules = self.simp_rules(args)?;
+        self.simp_expression_with_rules(&rules, expr)
+    }
+
+    /// The same proof-producing expression simplifier, with an already frozen
+    /// rule set. A conditional's pre-simproc uses it for its condition before
+    /// any rule is tried in either branch.
+    fn simp_expression_with_rules(
+        &mut self,
+        rules: &[SimpRule<'_>],
+        expr: &Expr,
+    ) -> Result<(Expr, Option<Expr>), NatDefinitionElabError> {
         let original = self.instantiate(expr)?;
         let mut current = original.clone();
         let mut proof: Option<Expr> = None;
         let mut history = vec![current.clone()];
         let mut steps = 0usize;
-        let permute = self.simp_rules_permute(&rules)?;
+        let permute = self.simp_rules_permute(rules)?;
         loop {
             self.tick()?;
-            let next = if let Some(normalized) = self.simp_normalize(&current)? {
+            let pre = self.simp_pre_rewrite(rules, |this, rule| {
+                let Some((evidence, occurrence, reverse, place)) =
+                    this.simp_rule_evidence(&current, rule, rules)?
+                else {
+                    return Ok(None);
+                };
+                let (next, step) =
+                    this.conv_congr_arg_step(&current, evidence, &occurrence, reverse, false)?;
+                Ok(Some(((next, Some(step)), place)))
+            })?;
+            let next = if let Some((_, next)) = pre {
+                Some(next)
+            } else if let Some(normalized) = self.simp_normalize(&current)? {
                 Some((normalized, None))
             } else {
                 let index = self.simp_target_index(&current)?;
                 self.simp_first_rewrite(
-                    &rules,
+                    rules,
                     permute,
                     |this, rule| {
-                        Ok(
-                            this.simp_rule_admitted(rule, index.as_ref(), SimpKeySide::Rewrite)
-                                && !this.simp_definition_absent(rule, index.as_ref()),
-                        )
+                        Ok(!matches!(rule, SimpRule::Conditional { .. })
+                            && this.simp_rule_admitted(rule, index.as_ref(), SimpKeySide::Rewrite)
+                            && !this.simp_definition_absent(rule, index.as_ref()))
                     },
                     |this, rule| {
                         if !this.simp_rule_may_rewrite(rule, &current)? {
@@ -1470,7 +1532,7 @@ impl Context {
                             }
                             UnfoldResult::NotDefinition => {
                                 let Some((evidence, occurrence, reverse, place)) =
-                                    this.simp_rule_evidence(&current, rule, &rules)?
+                                    this.simp_rule_evidence(&current, rule, rules)?
                                 else {
                                     return Ok(None);
                                 };
@@ -1574,6 +1636,25 @@ impl Context {
             self.txn.lctx = goal.lctx.clone();
             let mut advanced = false;
             let target = self.instantiate(&goal.target)?;
+            let pre =
+                self.simp_pre_rewrite(rules, |this, rule| this.simp_step(&goal, rule, rules))?;
+            if let Some((_, (next_goal, value))) = pre {
+                if steps >= MAX_SIMPLIFICATION_STEPS {
+                    return Err(failure(SourceInferenceError::ResourceLimit));
+                }
+                let next_target = self.instantiate(&next_goal.target)?;
+                for previous in &history {
+                    self.tick()?;
+                    if self.rewrite_same(previous, &next_target)? {
+                        return Err(error(TacticError::SimplificationCycle));
+                    }
+                }
+                history.push(next_target);
+                proof.work.push(Work::Close(goal, value));
+                goal = next_goal;
+                steps += 1;
+                continue;
+            }
             if let Some(normalized) = self.simp_normalize(&target)? {
                 if steps >= MAX_SIMPLIFICATION_STEPS {
                     return Err(failure(SourceInferenceError::ResourceLimit));
@@ -1596,10 +1677,9 @@ impl Context {
                 rules,
                 permute,
                 |this, rule| {
-                    Ok(
-                        this.simp_rule_admitted(rule, index.as_ref(), SimpKeySide::Rewrite)
-                            && !this.simp_definition_absent(rule, index.as_ref()),
-                    )
+                    Ok(!matches!(rule, SimpRule::Conditional { .. })
+                        && this.simp_rule_admitted(rule, index.as_ref(), SimpKeySide::Rewrite)
+                        && !this.simp_definition_absent(rule, index.as_ref()))
                 },
                 |this, rule| this.simp_step(&goal, rule, rules),
             )?;
