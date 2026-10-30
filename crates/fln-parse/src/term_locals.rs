@@ -186,8 +186,9 @@ pub(super) fn layout_boundary(
         .is_some_and(|keyword| column(view, tokens, at) <= column(view, tokens, keyword))
 }
 
-/// Bound a tactic-valued assertion before handing it to the independent proof
-/// planner. Its own nested declarations and branches remain in the same slice.
+/// Bound a tactic-valued assertion or do binding before handing it to the
+/// independent proof planner. Its nested declarations and branches remain in
+/// the same slice; the enclosing continuation is parsed by its own term frame.
 pub(super) fn proof_limit(
     view: &SourceView,
     tokens: &[LexedToken],
@@ -195,7 +196,11 @@ pub(super) fn proof_limit(
     by: usize,
     end: usize,
 ) -> usize {
-    let Some(keyword) = pending_value(frames) else {
+    let (keyword, do_binding) = if let Some(keyword) = pending_value(frames) {
+        (keyword, false)
+    } else if let Some(keyword) = term_do::proof_value_keyword(frames) {
+        (keyword, true)
+    } else {
         return end;
     };
     if by + 1 >= end {
@@ -204,6 +209,12 @@ pub(super) fn proof_limit(
     let mut baseline = column(view, tokens, keyword);
     let first = by + 1;
     if newline(view, tokens, first) && column(view, tokens, first) <= baseline {
+        if do_binding {
+            // At the pin this is an empty proof followed by a do statement,
+            // not a tactic at a relaxed indentation. Elaboration diagnoses
+            // the missing proof without treating that statement as evidence.
+            return first;
+        }
         // An inline declaration can place `have ... := by` far to the right.
         // Its first indented tactic establishes the proof's actual baseline.
         baseline = column(view, tokens, first).saturating_sub(1);

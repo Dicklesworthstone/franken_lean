@@ -78,6 +78,45 @@ theorem noAnonymousDo : anonymousDo false (fun h => 7) (fun h => 9) = 9 := by rf
 }
 
 #[test]
+fn do_binding_proofs_use_branch_evidence_and_preserve_the_continuation() {
+    checked(
+        &engine(),
+        r#"
+def anonymousProofDo (b : Bool) : Id Nat := do
+  if _ : b then
+    let evidence : b = true := by assumption
+    return 7
+  else
+    let evidence : Not (b = true) := by assumption
+    return 9
+theorem yesAnonymousProofDo : anonymousProofDo true = 7 := by rfl
+theorem noAnonymousProofDo : anonymousProofDo false = 9 := by rfl
+def monadicProofValue : Id Nat := do
+  let n : Nat ← by exact 7
+  return n
+theorem monadicProofResult : monadicProofValue = 7 := by rfl
+"#,
+    );
+}
+
+#[test]
+fn same_column_do_actions_do_not_fill_empty_binding_proofs() {
+    let base = engine();
+    let root = base.logical_root(&KVMap::new());
+    let source = "def bad : Id Nat := do\n  let h : True := by\n  trivial\n  return 7";
+    assert!(
+        base.check_source_files(&[source.as_bytes()], &KVMap::new(), limits())
+            .is_err(),
+        "a same-column do action must not become proof evidence"
+    );
+    assert_eq!(base.logical_root(&KVMap::new()), root);
+    checked(
+        &base,
+        "def good : Id Nat := do\n  let h : True := by\n    trivial\n  return 7\ntheorem goodResult : good = 7 := by rfl",
+    );
+}
+
+#[test]
 fn nested_patterns_wildcards_and_shadowing_preserve_scope() {
     checked(
         &engine(),

@@ -1339,6 +1339,28 @@ fn term_element(
     ))
 }
 
+/// The binding whose unparenthesized proof value is being read. Groups and
+/// annotations keep their own boundaries; only completed prefix bodies may
+/// expose the surrounding binding.
+pub(super) fn proof_value_keyword(frames: &[BoundedTermFrame]) -> Option<usize> {
+    for frame in frames.iter().rev() {
+        if frame.negation.is_some() {
+            continue;
+        }
+        match frame.prefix.as_ref()? {
+            term_locals::Prefix::Do(p) => {
+                return match p.statement {
+                    Statement::Binding { keyword, .. } if p.phase == Phase::Value => Some(keyword),
+                    _ => None,
+                };
+            }
+            prefix if prefix.body() => {}
+            _ => return None,
+        }
+    }
+    None
+}
+
 /// Only body prefixes may close before the next do statement. Parentheses,
 /// annotations and records retain their own layout and delimiters. Explicit
 /// braces, unlike indentation, cannot be closed by an offside token.
