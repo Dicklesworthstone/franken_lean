@@ -5,7 +5,8 @@
 //! `ModuleData` whose extension entries hold one `Lean.IR.Decl` per compiled
 //! declaration (`exportIREntries`, vendored `src/Lean/Compiler/IR/CompilerM.lean`).
 //! The container is the ordinary compacted region the `.olean` reader already
-//! opens; this module interprets the `Lean.IR.declMapExt` entries.
+//! opens; this module interprets the `Lean.IR.declMapExt` entries and the
+//! ordered regular-initializer journal saved beside them.
 //!
 //! Constructor tags and field slots come from the generated [`crate::ir_format`]
 //! (`scripts/extract/gen_ir_contract.py`), never from a hand-written table.
@@ -309,8 +310,12 @@ impl IrDecl {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct IrModule {
     pub decls: Vec<IrDecl>,
+    /// The regular-initializer journal, in the pin's stored execution order.
+    /// A named initializer supplies a global value; an anonymous parameter
+    /// denotes a standalone action. These are data, never execution authority.
+    pub initializers: Vec<crate::initializers::InitEntry>,
     /// Extension blocks of the `.ir` file this decoder does not interpret
-    /// (the initializer and package tables), by name, with entries present.
+    /// (including the package table), by name, with entries present.
     pub uninterpreted: Vec<Name>,
 }
 
@@ -318,6 +323,7 @@ pub struct IrModule {
 pub struct IrDecodeLimits {
     pub max_bytes: usize,
     pub max_objects: u64,
+    /// Code declarations and regular-initializer entries, counted together.
     pub max_decls: usize,
     /// Decoded IR nodes (types, expressions, instructions, arguments) in total.
     pub max_nodes: u64,
@@ -984,41 +990,72 @@ impl Reader {
             _ => Err(shape("unknown Decl constructor")),
         }
     }
+
+    fn initializer(&mut self, obj: &Obj) -> R<crate::initializers::InitEntry> {
+        self.node()?;
+        crate::initializers::project_entry(&mut self.conversion, obj).map_err(|error| {
+            use crate::source_extensions::DecodeError;
+            match error {
+                DecodeError::Limit { resource } => limit(resource),
+                DecodeError::Shape { detail } => shape(detail),
+                DecodeError::Region(error) => IrDecodeError::Region(error),
+                DecodeError::Conversion(error) => IrDecodeError::Conversion(error),
+            }
+        })
+    }
 }
 
-/// Decode the IR declarations from the extension blocks of one `.ir` file.
+/// Decode the IR declarations and regular initialization journal of one `.ir` file.
 ///
 /// `blocks` is what [`crate::region::MappedOlean::extension_payloads`] returns
 /// for that file. A file with no declaration block, or an empty one, decodes to
-/// an empty module. Any other block is named in `uninterpreted`, never read.
+/// an empty declaration table. The initializer journal retains its stored order
+/// and is decoded under the same cumulative payload, object, entry and node
+/// budgets. Repeated blocks or initialized declaration names are malformed;
+/// failure never returns a usable prefix. Other nonempty blocks are named in
+/// `uninterpreted`, never read or executed.
 pub fn decode_ir(blocks: &[OpaqueExtensionBlock], limits: IrDecodeLimits) -> R<IrModule> {
     let wanted = Name::from_components(format::DECL_MAP_EXTENSION.split('.'));
+    let initializer = Name::from_components(crate::initializers::REGULAR_INIT_EXTENSION.split('.'));
     let mut reader = Reader {
         conversion: Conversion::new(),
         nodes_left: limits.max_nodes,
         max_depth: limits.max_depth,
     };
     let mut out = IrModule::default();
-    let mut seen = false;
+    let mut seen = BTreeSet::new();
+    let mut initialized = BTreeSet::new();
     let mut bytes_left = limits.max_bytes;
     let mut objects_left = limits.max_objects;
+    let mut entries_left = limits.max_decls;
     for block in blocks {
-        if block.name != wanted {
+        if !seen.insert(&block.name) {
+            return Err(shape(if block.name == wanted {
+                "duplicate IR declaration block"
+            } else if block.name == initializer {
+                "duplicate IR initializer block"
+            } else {
+                "duplicate IR extension block"
+            }));
+        }
+        if block.name != wanted && block.name != initializer {
             if !block.entries.is_empty() {
                 out.uninterpreted.push(block.name.clone());
             }
             continue;
         }
-        if seen {
-            return Err(shape("duplicate IR declaration block"));
+        entries_left = entries_left
+            .checked_sub(block.entries.len())
+            .ok_or_else(|| limit("IR declarations"))?;
+        if block.name == wanted {
+            out.decls
+                .try_reserve_exact(block.entries.len())
+                .map_err(|_| limit("declaration allocation"))?;
+        } else {
+            out.initializers
+                .try_reserve_exact(block.entries.len())
+                .map_err(|_| limit("initializer allocation"))?;
         }
-        seen = true;
-        if block.entries.len() > limits.max_decls {
-            return Err(limit("IR declarations"));
-        }
-        out.decls
-            .try_reserve_exact(block.entries.len())
-            .map_err(|_| limit("declaration allocation"))?;
         for payload in &block.entries {
             bytes_left = bytes_left
                 .checked_sub(payload.len())
@@ -1028,7 +1065,15 @@ pub fn decode_ir(blocks: &[OpaqueExtensionBlock], limits: IrDecodeLimits) -> R<I
                 .checked_sub(report.objects)
                 .ok_or_else(|| limit("objects"))?;
             let obj = materialize(payload, 0).map_err(IrDecodeError::Region)?;
-            out.decls.push(reader.decl(&obj)?);
+            if block.name == wanted {
+                out.decls.push(reader.decl(&obj)?);
+            } else {
+                let entry = reader.initializer(&obj)?;
+                if !initialized.insert(entry.declaration.clone()) {
+                    return Err(shape("duplicate IR initialized declaration"));
+                }
+                out.initializers.push(entry);
+            }
         }
     }
     Ok(out)

@@ -91,7 +91,7 @@ fn external(name: &str) -> IrDecl {
 fn module(decls: Vec<IrDecl>) -> IrModule {
     IrModule {
         decls,
-        uninterpreted: Vec::new(),
+        ..IrModule::default()
     }
 }
 

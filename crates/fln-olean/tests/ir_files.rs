@@ -310,7 +310,7 @@ fn dot_ids_do_not_merge_distinct_names_with_the_same_display_text() {
                 sorry_dep: None,
             })
             .collect(),
-        uninterpreted: vec![],
+        ..IrModule::default()
     };
     let checked = build_validated_ir_call_graph(
         &[("unused-path", &module)],

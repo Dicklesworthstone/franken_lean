@@ -43,7 +43,7 @@ fn bind(x: u64, expr: IrExpr) -> IrStmt {
 fn module(decls: Vec<IrDecl>) -> IrModule {
     IrModule {
         decls,
-        uninterpreted: vec![],
+        ..IrModule::default()
     }
 }
 

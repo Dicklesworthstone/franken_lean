@@ -350,7 +350,7 @@ mod tests {
     fn module(decls: Vec<IrDecl>) -> IrModule {
         IrModule {
             decls,
-            uninterpreted: vec![],
+            ..IrModule::default()
         }
     }
     fn partition() -> CensusPartition {

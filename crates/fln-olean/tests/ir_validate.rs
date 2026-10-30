@@ -64,7 +64,7 @@ fn bind(x: u64, expr: IrExpr) -> IrStmt {
 fn module(decls: Vec<IrDecl>) -> IrModule {
     IrModule {
         decls,
-        uninterpreted: vec![],
+        ..IrModule::default()
     }
 }
 fn run(decls: Vec<IrDecl>) -> Result<IrValidationSummary, IrValidationError> {
@@ -974,6 +974,7 @@ fn borrow_flags_and_uninterpreted_extensions_are_not_mutated_or_promoted() {
     let modules = [IrModule {
         decls: vec![declaration],
         uninterpreted: vec![name("opaque.extension")],
+        ..IrModule::default()
     }];
     let original = modules.clone();
     let report = validate_ir(&modules, &BTreeMap::new(), IrValidationLimits::default()).unwrap();

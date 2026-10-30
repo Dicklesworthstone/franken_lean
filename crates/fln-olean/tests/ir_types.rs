@@ -41,7 +41,7 @@ fn function(params: Vec<IrParam>, body: IrBody) -> IrDecl {
 fn module(decls: Vec<IrDecl>) -> IrModule {
     IrModule {
         decls,
-        uninterpreted: vec![],
+        ..IrModule::default()
     }
 }
 fn sample(source: IrType, result: IrType, expr: IrExpr) -> IrModule {

@@ -24,6 +24,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use fln_core::name::{LeafView, Name};
+use fln_olean::initializers::{InitEntry, REGULAR_INIT_EXTENSION};
 use fln_olean::ir::{
     IrAlt, IrArg, IrBody, IrCtorInfo, IrDecl, IrDecodeError, IrDecodeLimits, IrExpr, IrExternEntry,
     IrLit, IrModule, IrNat, IrParam, IrStmt, IrTerminal, IrType, decode_ir,
@@ -31,7 +32,7 @@ use fln_olean::ir::{
 use fln_olean::region::{OleanView, OpaqueExtensionBlock, WalkBudget};
 use fln_rt::convert::inject_name;
 use fln_rt::obj::Obj;
-use fln_rt::region::compact;
+use fln_rt::region::{audit, compact};
 
 /// Cumulative allowance for the captured entries of one file. An entry is
 /// captured as a standalone region, so a graph shared between declarations is
@@ -668,7 +669,248 @@ fn an_olean_that_carries_its_own_ir_decodes_to_what_the_pin_prints() {
     );
 }
 
+#[test]
+fn live_pinned_ir_retains_named_and_standalone_initializers_in_source_order() {
+    let reference = reference_lib().and_then(|lib| reference_lean(&lib));
+    let Some(lean) = reference else {
+        assert!(
+            std::env::var_os("FLN_REQUIRE_REFERENCE").is_none(),
+            "the pinned Reference is required for the live IR initializer fixture"
+        );
+        eprintln!("SKIP: live IR initializer decoding requires the pinned Reference");
+        return;
+    };
+    let pin = include_str!("../../../SUITE.lock")
+        .lines()
+        .find(|line| line.starts_with("reference "))
+        .and_then(|line| {
+            line.split_whitespace()
+                .find_map(|part| part.strip_prefix("commit="))
+        })
+        .unwrap();
+    let version = Command::new(&lean).arg("--githash").output().unwrap();
+    assert!(version.status.success());
+    assert_eq!(String::from_utf8(version.stdout).unwrap().trim(), pin);
+
+    let root = std::env::var_os("FLN_IR_REFERENCE_ARTIFACTS")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = root.join(format!("initializer-ir-{}-{unique}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("InitializerModule.lean"),
+        include_str!("../fixtures/ir/InitializerModule.lean"),
+    )
+    .unwrap();
+    let generated = Command::new(&lean)
+        .current_dir(&dir)
+        .args(["-o", "InitializerModule.olean", "InitializerModule.lean"])
+        .output()
+        .unwrap();
+    std::fs::write(dir.join("compile.stdout"), &generated.stdout).unwrap();
+    std::fs::write(dir.join("compile.stderr"), &generated.stderr).unwrap();
+    assert!(
+        generated.status.success(),
+        "Reference compilation failed in {dir:?}: {}{}",
+        String::from_utf8_lossy(&generated.stdout),
+        String::from_utf8_lossy(&generated.stderr)
+    );
+    let (blocks, _) = open(&std::fs::read(dir.join("InitializerModule.ir")).unwrap()).unwrap();
+    let module = decode_ir(&blocks, IrDecodeLimits::default()).unwrap();
+    assert_eq!(
+        module.initializers,
+        vec![
+            InitEntry {
+                declaration: n("zValue"),
+                initializer: Some(n("initializeZ")),
+            },
+            InitEntry {
+                declaration: n("advanceZ"),
+                initializer: None,
+            },
+            InitEntry {
+                declaration: n("aValue"),
+                initializer: Some(n("initializeA")),
+            },
+        ],
+        "actual compiler journal differs from the fixture's source order: {dir:?}"
+    );
+    assert!(!module.uninterpreted.contains(&n(REGULAR_INIT_EXTENSION)));
+    for entry in &module.initializers {
+        assert!(
+            module
+                .decls
+                .iter()
+                .any(|decl| decl.name() == &entry.declaration)
+        );
+        if let Some(initializer) = &entry.initializer {
+            assert!(module.decls.iter().any(|decl| decl.name() == initializer));
+        }
+    }
+    // The named globals' bodies are placeholders. Retaining this metadata is
+    // necessary to distinguish them from ordinarily executable constants.
+    for global in ["zValue", "aValue"] {
+        assert!(module.decls.iter().any(|decl| matches!(
+            decl,
+            IrDecl::Function { name, params, body, .. }
+                if name == &n(global)
+                    && params.is_empty()
+                    && body.stmts.is_empty()
+                    && matches!(body.terminal.as_ref(), IrTerminal::Unreachable)
+        )));
+    }
+}
+
 // ---- hand-built objects: shapes no real file contains ----
+
+fn initializer_pair(declaration: &Name, initializer: &Name) -> Obj {
+    Obj::mk_ctor(
+        0,
+        vec![inject_name(declaration), inject_name(initializer)],
+        &[],
+    )
+}
+
+fn initializer_block(entries: &[Obj]) -> OpaqueExtensionBlock {
+    OpaqueExtensionBlock {
+        name: n(REGULAR_INIT_EXTENSION),
+        entries: entries
+            .iter()
+            .map(|entry| compact(entry, 0).unwrap())
+            .collect(),
+    }
+}
+
+#[test]
+fn initializer_journals_preserve_order_structural_names_and_unknown_extensions() {
+    let dotted = Name::from_components(["z.value"]);
+    let qualified = n("z.value");
+    let journal = initializer_block(&[
+        initializer_pair(&dotted, &n("initializeZ")),
+        initializer_pair(&n("action"), &Name::anonymous()),
+        initializer_pair(&qualified, &n("initializeA")),
+    ]);
+    let foreign = OpaqueExtensionBlock {
+        // A single string containing dots must not select the initializer decoder.
+        name: Name::from_components([REGULAR_INIT_EXTENSION]),
+        entries: vec![vec![]],
+    };
+    let module = decode_ir(&[journal, foreign.clone()], IrDecodeLimits::default()).unwrap();
+    assert_eq!(
+        module.initializers,
+        [
+            InitEntry {
+                declaration: dotted,
+                initializer: Some(n("initializeZ"))
+            },
+            InitEntry {
+                declaration: n("action"),
+                initializer: None
+            },
+            InitEntry {
+                declaration: qualified,
+                initializer: Some(n("initializeA"))
+            },
+        ]
+    );
+    assert_eq!(module.uninterpreted, [foreign.name]);
+    assert!(module.decls.is_empty());
+}
+
+#[test]
+fn initializer_suffixes_and_duplicate_names_or_blocks_never_return_a_prefix() {
+    let valid = initializer_pair(&n("value"), &n("initializeValue"));
+    for invalid in [
+        Obj::mk_nat(0),
+        Obj::mk_ctor(
+            1,
+            vec![inject_name(&n("other")), inject_name(&n("init"))],
+            &[],
+        ),
+        Obj::mk_ctor(0, vec![inject_name(&n("other"))], &[]),
+        initializer_pair(&Name::anonymous(), &n("init")),
+        initializer_pair(&n("value"), &n("otherInitializer")),
+        Obj::mk_ctor(
+            0,
+            vec![inject_name(&n("other")), Obj::mk_string("not a Name")],
+            &[],
+        ),
+    ] {
+        let block = initializer_block(&[valid.clone_ref(), invalid]);
+        assert!(decode_ir(&[block], IrDecodeLimits::default()).is_err());
+    }
+    let block = initializer_block(&[valid]);
+    assert!(matches!(
+        decode_ir(&[block.clone(), block.clone()], IrDecodeLimits::default()),
+        Err(IrDecodeError::Shape {
+            detail: "duplicate IR initializer block"
+        })
+    ));
+    let mut corrupt = block;
+    corrupt.entries.push(vec![]);
+    assert!(decode_ir(&[corrupt], IrDecodeLimits::default()).is_err());
+}
+
+#[test]
+fn initializer_and_code_records_share_all_decode_budgets() {
+    let declaration = block_of(&function(ret_erased())).pop().unwrap();
+    let initializer = initializer_block(&[initializer_pair(&n("value"), &n("initializeValue"))]);
+    let code_bytes = declaration.entries[0].len();
+    let init_bytes = initializer.entries[0].len();
+    let code_objects = audit(&declaration.entries[0], 0).unwrap().objects;
+    let init_objects = audit(&initializer.entries[0], 0).unwrap().objects;
+    for limits in [
+        IrDecodeLimits {
+            max_bytes: code_bytes.max(init_bytes),
+            ..Default::default()
+        },
+        IrDecodeLimits {
+            max_objects: code_objects.max(init_objects),
+            ..Default::default()
+        },
+        IrDecodeLimits {
+            max_decls: 1,
+            ..Default::default()
+        },
+        IrDecodeLimits {
+            max_nodes: 3,
+            ..Default::default()
+        },
+    ] {
+        assert!(decode_ir(std::slice::from_ref(&declaration), limits).is_ok());
+        assert!(decode_ir(std::slice::from_ref(&initializer), limits).is_ok());
+        for blocks in [
+            [declaration.clone(), initializer.clone()],
+            [initializer.clone(), declaration.clone()],
+        ] {
+            assert!(decode_ir(&blocks, limits).unwrap_err().is_resource());
+        }
+    }
+    let exact = IrDecodeLimits {
+        max_bytes: code_bytes + init_bytes,
+        max_objects: code_objects + init_objects,
+        max_decls: 2,
+        max_nodes: 4,
+        ..Default::default()
+    };
+    let module = decode_ir(&[declaration, initializer], exact).unwrap();
+    assert_eq!((module.decls.len(), module.initializers.len()), (1, 1));
+    let zero = IrDecodeLimits {
+        max_bytes: 0,
+        max_objects: 0,
+        max_decls: 0,
+        max_nodes: 0,
+        ..exact
+    };
+    assert_eq!(
+        decode_ir(&[initializer_block(&[])], zero).unwrap(),
+        IrModule::default()
+    );
+}
 
 fn block_of(decl: &Obj) -> Vec<OpaqueExtensionBlock> {
     vec![OpaqueExtensionBlock {
