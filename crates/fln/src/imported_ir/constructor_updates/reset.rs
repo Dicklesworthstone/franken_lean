@@ -44,7 +44,7 @@ pub(super) fn normalize(
     let terminal = std::mem::replace(&mut body.terminal, Box::new(IrTerminal::Unreachable));
     let mut matching = IrBody { stmts, terminal };
     apply(&mut matching, choice, meter)?;
-    body.terminal = Box::new(IrTerminal::Case {
+    *body.terminal = IrTerminal::Case {
         // This name is diagnostic metadata. The runtime witness comes from
         // the complete CtorInfo layout, lowered to CtorLayoutTest.
         type_name: info.name.clone(),
@@ -62,7 +62,7 @@ pub(super) fn normalize(
                 },
             },
         ],
-    });
+    };
     Ok(true)
 }
 

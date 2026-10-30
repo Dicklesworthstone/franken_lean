@@ -113,7 +113,7 @@ fn named_global_requires_capability_and_returns_its_initialized_value() {
         .collect();
     assert!(matches!(
         compile(
-            &[module.clone()],
+            std::slice::from_ref(&module),
             &name("g"),
             &[],
             &partition(),
@@ -247,7 +247,7 @@ fn journal_entries_and_dependency_walks_use_preparation_budgets() {
         .iter()
         .map(|decl| (decl.name().clone(), decl))
         .collect();
-    let index = index(&[module.clone()], IrExecutionLimits::default()).unwrap();
+    let index = index(std::slice::from_ref(&module), IrExecutionLimits::default()).unwrap();
     let mut limits = IrExecutionLimits::default();
     limits.ir.max_work = 0;
     assert!(matches!(

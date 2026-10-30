@@ -308,7 +308,7 @@ fn void_world_parameters_require_erased_entry_values_and_cannot_be_observed() {
     let IrDecl::Function { body, .. } = &mut observed.decls[0] else {
         unreachable!()
     };
-    body.terminal = Box::new(IrTerminal::Ret(IrArg::Var(9)));
+    *body.terminal = IrTerminal::Ret(IrArg::Var(9));
     assert!(matches!(
         prepare(&observed, EntryArgument::Erased),
         Err(IrExecutionError::Unsupported {

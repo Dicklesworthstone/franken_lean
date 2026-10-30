@@ -83,7 +83,7 @@ pub enum MacroRegistrationError {
     Compile {
         module: Name,
         declaration: Name,
-        error: MacroExecutionError,
+        error: Box<MacroExecutionError>,
     },
 }
 
@@ -92,10 +92,9 @@ impl MacroRegistrationError {
         match self {
             Self::Limit(_) => true,
             Self::Decode { error, .. } => error.is_resource(),
-            Self::Compile {
-                error: MacroExecutionError::Compile(error),
-                ..
-            } => error.is_resource(),
+            Self::Compile { error, .. } => {
+                matches!(error.as_ref(), MacroExecutionError::Compile(error) if error.is_resource())
+            }
             _ => false,
         }
     }
@@ -305,7 +304,7 @@ impl RegisteredMacros {
                                 MacroRegistrationError::Compile {
                                     module: module.clone(),
                                     declaration: row.declaration.clone(),
-                                    error,
+                                    error: Box::new(error),
                                 }
                             })?,
                         );

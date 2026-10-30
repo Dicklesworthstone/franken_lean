@@ -49,19 +49,10 @@ pub struct MacroState {
     pub expanded_macro_declarations: Vec<Name>,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct MacroLimits {
     pub syntax: SyntaxLimits,
     pub vm: ExecutionLimits,
-}
-
-impl Default for MacroLimits {
-    fn default() -> Self {
-        Self {
-            syntax: SyntaxLimits::default(),
-            vm: ExecutionLimits::default(),
-        }
-    }
 }
 
 /// Exceptions remain distinct: unsupported syntax may try another registered

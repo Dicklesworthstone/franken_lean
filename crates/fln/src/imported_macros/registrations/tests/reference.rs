@@ -379,9 +379,9 @@ run_cmd do
             MacroRegistryLimits::default()
         ),
         Err(MacroRegistrationError::Compile {
-            error: MacroExecutionError::Compile(IrExecutionError::Unclassified(_)),
+            ref error,
             ..
-        })
+        }) if matches!(error.as_ref(), MacroExecutionError::Compile(IrExecutionError::Unclassified(_)))
     ));
     assert!(matches!(
         RegisteredMacros::prepare(

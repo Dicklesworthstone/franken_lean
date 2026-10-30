@@ -279,7 +279,7 @@ fn peeling_registry() -> RegisteredMacros {
         ),
         bind(5, ctor(layout::RESULT_OK, "EStateM.Result.ok", &[4, 2])),
     ];
-    body.terminal = Box::new(IrTerminal::Ret(IrArg::Var(5)));
+    *body.terminal = IrTerminal::Ret(IrArg::Var(5));
     prepare(
         &[MacroRegistrationModule {
             checked: &module,
@@ -507,7 +507,7 @@ fn tree_assembled_siblings_share_the_output_size_limit_and_deep_trees_use_no_hos
         bind(5, ctor(layout::SYNTAX_ATOM, "Lean.Syntax.atom", &[3, 4])),
         bind(6, ctor(layout::RESULT_OK, "EStateM.Result.ok", &[5, 2])),
     ];
-    body.terminal = Box::new(IrTerminal::Ret(IrArg::Var(6)));
+    *body.terminal = IrTerminal::Ret(IrArg::Var(6));
     let registry = prepare(
         &[MacroRegistrationModule {
             checked: &module,
@@ -977,12 +977,12 @@ fn metadata_never_grants_user_or_native_execution_authority() {
             matches!(
                 result,
                 Err(MacroRegistrationError::Compile {
-                    error: MacroExecutionError::Compile(
+                    ref error,
+                    ..
+                }) if matches!(error.as_ref(), MacroExecutionError::Compile(
                         IrExecutionError::Unclassified(_)
                             | IrExecutionError::UserOverridesCensus(_)
-                    ),
-                    ..
-                })
+                    ))
             ),
             "{result:?}"
         );
