@@ -16,8 +16,8 @@
 use super::{
     BigNat, Inconclusive, IntrinsicFailure, IntrinsicResult, Obj, ResourceReason, ResourceUsage,
     Stop, ValueKind, VmRefusal, ensure_nat_bits, expect_arity, extract_utf8, finish_nat_result,
-    nat_as_usize, nat_from_big_nat, scalar_code_point, string_value, type_mismatch, value_kind,
-    with_nat_view, with_nat_views,
+    nat_as_usize, nat_from_big_nat, scalar_code_point, string_value, type_mismatch, uint64_result,
+    value_kind, with_nat_view, with_nat_views,
 };
 
 // Bound this count-driven allocation before reserving or repeating. This is
@@ -52,6 +52,13 @@ pub(super) enum Intrinsic {
     SubstringIsEmpty,
     SubstringGet,
     SubstringPrev,
+    Hash,
+    SliceHash,
+    SliceLt,
+    Memcmp,
+    IsValid,
+    GetOption,
+    GetBang,
 }
 
 #[derive(Debug)]
@@ -93,6 +100,13 @@ impl Intrinsic {
             "extern:Substring.Raw.Internal.isEmpty" => Self::SubstringIsEmpty,
             "extern:Substring.Raw.Internal.get" => Self::SubstringGet,
             "extern:Substring.Raw.Internal.prev" => Self::SubstringPrev,
+            "extern:String.hash" => Self::Hash,
+            "extern:String.Slice.hash" => Self::SliceHash,
+            "extern:String.Slice.instDecidableLt" => Self::SliceLt,
+            "extern:String.Slice.Pattern.Internal.memcmpStr" => Self::Memcmp,
+            "extern:String.Pos.Raw.isValid" => Self::IsValid,
+            "extern:String.Pos.Raw.get?" | "extern:String.get?" => Self::GetOption,
+            "extern:String.Pos.Raw.get!" | "extern:String.get!" => Self::GetBang,
             _ => return None,
         })
     }
@@ -119,7 +133,20 @@ impl Intrinsic {
             Self::SubstringIsEmpty => "Substring.Raw.Internal.isEmpty",
             Self::SubstringGet => "Substring.Raw.Internal.get",
             Self::SubstringPrev => "Substring.Raw.Internal.prev",
+            Self::Hash => "String.hash",
+            Self::SliceHash => "String.Slice.hash",
+            Self::SliceLt => "String.Slice.instDecidableLt",
+            Self::Memcmp => "String.Slice.Pattern.Internal.memcmpStr",
+            Self::IsValid => "String.Pos.Raw.isValid",
+            Self::GetOption => "String.Pos.Raw.get?",
+            Self::GetBang => "String.Pos.Raw.get!",
         }
+    }
+
+    /// These two census rows return an unboxed UInt64. FLBC stores that
+    /// complete word in its reviewed zero-field scalar box, as UInt64 ops do.
+    pub(super) fn has_wide_result(self) -> bool {
+        matches!(self, Self::Hash | Self::SliceHash)
     }
 
     pub(super) fn invoke(
@@ -132,9 +159,12 @@ impl Intrinsic {
             row,
             args,
             match self {
+                Self::Memcmp => 5,
                 Self::Pushn | Self::Utf8Set | Self::SubstringExtract => 3,
                 Self::Data
                 | Self::Front
+                | Self::Hash
+                | Self::SliceHash
                 | Self::SubstringToString
                 | Self::SubstringFront
                 | Self::SubstringIsEmpty => 1,
@@ -143,6 +173,17 @@ impl Intrinsic {
         )?;
         let operation = self.operation();
         match self {
+            Self::Hash => {
+                let buffer = string_buffer(&args[0], operation, 0)?;
+                return Ok(uint64_result(fln_core::lean_hash::murmur_hash_64a(
+                    &buffer[..buffer.len() - 1],
+                    11,
+                )));
+            }
+            Self::SliceHash | Self::SliceLt => {
+                return self.invoke_slice(args);
+            }
+            Self::Memcmp => return memcmp(args),
             Self::Data => return data(&args[0], operation),
             Self::Front => {
                 let buffer = string_buffer(&args[0], operation, 0)?;
@@ -181,7 +222,10 @@ impl Intrinsic {
             | Self::Utf8GetFast
             | Self::GetByteFast
             | Self::Utf8NextFast
-            | Self::Utf8Set => return self.invoke_positioned(operation, args),
+            | Self::Utf8Set
+            | Self::IsValid
+            | Self::GetOption
+            | Self::GetBang => return self.invoke_positioned(operation, args),
             Self::PosOf | Self::OffsetOfPos | Self::Pushn => {}
         }
         let text = string_value(&args[0], operation, 0)?;
@@ -235,7 +279,14 @@ impl Intrinsic {
             | Self::SubstringBeq
             | Self::SubstringIsEmpty
             | Self::SubstringGet
-            | Self::SubstringPrev => unreachable!("specialized rows return above"),
+            | Self::SubstringPrev
+            | Self::Hash
+            | Self::SliceHash
+            | Self::SliceLt
+            | Self::Memcmp
+            | Self::IsValid
+            | Self::GetOption
+            | Self::GetBang => unreachable!("specialized rows return above"),
         };
         // The generated census specifies borrowed operands and an owned result
         // for all three rows, even when a small Nat uses an immediate object.
@@ -256,6 +307,46 @@ impl Intrinsic {
         let position = nat_as_usize(&args[1], operation, 1)?;
         let scalar = |value: u32| IntrinsicResult::scalar(Obj::mk_nat(value as usize));
         match self {
+            Self::IsValid => {
+                let valid = args[1].is_scalar()
+                    && position.is_some_and(|index| {
+                        index == size
+                            || (index < size && utf8_first_byte_size(buffer[index]).is_some())
+                    });
+                Ok(IntrinsicResult::owned(Obj::mk_nat(usize::from(valid))))
+            }
+            Self::GetOption | Self::GetBang => {
+                let code = position
+                    .filter(|index| args[1].is_scalar() && *index < size)
+                    .and_then(|index| utf8_get_core(&buffer[..size], index));
+                if self == Self::GetOption {
+                    // Golem's constructor instructions retain fieldless
+                    // constructors as objects; use the same representation
+                    // as a compiled Option.none, never a scalar Nat sentinel.
+                    let value = match code {
+                        Some(code) => Obj::mk_ctor(1, vec![Obj::mk_nat(code as usize)], &[]),
+                        None => Obj::mk_ctor(0, Vec::new(), &[]),
+                    };
+                    return Ok(IntrinsicResult::owned(value));
+                }
+                let code = match code {
+                    Some(code) => code,
+                    None => {
+                        // This is the language's recoverable panic, not a
+                        // Rust panic or a fabricated successful lookup.
+                        fln_rt::diagnostics::report_panic(
+                            b"Error: invalid `String.Pos` at `String.get!`",
+                        );
+                        if let Some(error) = fln_rt::obj::StdoutCapture::current_error() {
+                            return Err(VmRefusal::NativeStdoutCapture { error }.into());
+                        }
+                        CHAR_DEFAULT_VALUE
+                    }
+                };
+                // The census's reviewed rule declares an owned result for
+                // get!, unlike the raw-value get/get' rows above.
+                Ok(IntrinsicResult::owned(Obj::mk_nat(code as usize)))
+            }
             Self::Utf8Get => {
                 // A non-scalar Nat, the end, and an interior byte are all `'A'`.
                 let code = position
@@ -456,6 +547,95 @@ impl Intrinsic {
         };
         Ok(IntrinsicResult::owned(result))
     }
+
+    fn invoke_slice(self, args: &[Obj]) -> Result<IntrinsicResult, IntrinsicFailure> {
+        let operation = self.operation();
+        let left = Slice::read(&args[0], operation, 0)?;
+        let buffer = string_buffer(&left.string, operation, 0)?;
+        let bytes = &buffer[left.start..left.end];
+        if self == Self::SliceHash {
+            return Ok(uint64_result(fln_core::lean_hash::murmur_hash_64a(
+                bytes, 11,
+            )));
+        }
+        let right = Slice::read(&args[1], operation, 1)?;
+        let other = string_buffer(&right.string, operation, 1)?;
+        // UTF-8 byte order is the pin's memcmp order; equal prefixes are
+        // ordered by their lengths. No substring allocation is necessary.
+        Ok(IntrinsicResult::scalar(Obj::mk_nat(usize::from(
+            bytes < &other[right.start..right.end],
+        ))))
+    }
+}
+
+struct Slice {
+    string: Obj,
+    start: usize,
+    end: usize,
+}
+
+impl Slice {
+    fn read(value: &Obj, operation: &'static str, argument: usize) -> Result<Self, VmRefusal> {
+        let malformed =
+            || type_mismatch(operation, argument, "String.Slice with valid bounds", value);
+        if value_kind(value) != ValueKind::Ctor(0) || value.header().other != 3 {
+            return Err(malformed());
+        }
+        let string = value.try_ctor_child(0).ok_or_else(malformed)?;
+        let start = value.try_ctor_child(1).ok_or_else(malformed)?;
+        let end = value.try_ctor_child(2).ok_or_else(malformed)?;
+        let start = checked_position(&start, operation, argument)?;
+        let end = checked_position(&end, operation, argument)?;
+        let buffer = string_buffer(&string, operation, argument)?;
+        let size = buffer.len() - 1;
+        let boundary = |index| {
+            index == size || (index < size && utf8_first_byte_size(buffer[index]).is_some())
+        };
+        if start > end || !boundary(start) || !boundary(end) {
+            return Err(malformed());
+        }
+        Ok(Self { string, start, end })
+    }
+}
+
+/// Slice and memcmp proof arguments guarantee machine-sized offsets at the
+/// pin. Validate that premise before using an object as a host array index.
+fn checked_position(
+    value: &Obj,
+    operation: &'static str,
+    argument: usize,
+) -> Result<usize, VmRefusal> {
+    let position = nat_as_usize(value, operation, argument)?;
+    match position {
+        Some(position) if value.is_scalar() => Ok(position),
+        _ => Err(VmRefusal::NatOverflow { operation }),
+    }
+}
+
+fn memcmp(args: &[Obj]) -> Result<IntrinsicResult, IntrinsicFailure> {
+    const OPERATION: &str = "String.Slice.Pattern.Internal.memcmpStr";
+    let left = string_buffer(&args[0], OPERATION, 0)?;
+    let right = string_buffer(&args[1], OPERATION, 1)?;
+    let start = checked_position(&args[2], OPERATION, 2)?;
+    let other_start = checked_position(&args[3], OPERATION, 3)?;
+    let size = checked_position(&args[4], OPERATION, 4)?;
+    let window = |bytes: &[u8], begin: usize| -> Result<std::ops::Range<usize>, VmRefusal> {
+        let end = begin
+            .checked_add(size)
+            .ok_or(VmRefusal::ArrayIndexOutOfBounds {
+                index: usize::MAX,
+                size: bytes.len() - 1,
+            })?;
+        if begin > bytes.len() - 1 || end > bytes.len() - 1 {
+            return Err(VmRefusal::ArrayIndexOutOfBounds {
+                index: end,
+                size: bytes.len() - 1,
+            });
+        }
+        Ok(begin..end)
+    };
+    let equal = left[window(left, start)?] == right[window(right, other_start)?];
+    Ok(IntrinsicResult::scalar(Obj::mk_nat(usize::from(equal))))
 }
 
 struct Substring {

@@ -9,6 +9,10 @@ use fln_comp::flbc::{
 use fln_core::diag::ResourceReason;
 use fln_core::outcome::{Authority, InconclusiveCause, Outcome};
 use fln_rt::obj::{Obj, shadow};
+use fln_vm::extern_row::{
+    ArgumentOwnership as ContractArgument, Ownership, ResultOwnership as ContractResult,
+};
+use fln_vm::extern_table_generated::EXTERN_ROWS;
 use fln_vm::interpreter::{ExecutionLimits, ValueKind, VmExit, VmRefusal, execute};
 use std::cell::Cell;
 use std::sync::{Mutex, MutexGuard};
@@ -46,12 +50,29 @@ fn string(dst: u16, value: &str) -> I {
 }
 
 fn call(dst: u16, row: &str, args: &[u16]) -> I {
+    let generated = EXTERN_ROWS.iter().find(|entry| entry.id == row).unwrap();
+    let ownership = Ownership::parse(generated.ownership).unwrap();
     I::Intrinsic {
         dst: r(dst),
         row: row.to_owned(),
         args: args.iter().copied().map(r).collect(),
-        argument_ownership: vec![A::Borrowed; args.len()],
-        result_ownership: R::Owned,
+        argument_ownership: ownership
+            .argument_ownership(args.len())
+            .unwrap()
+            .into_iter()
+            .map(|value| match value {
+                ContractArgument::Borrowed => A::Borrowed,
+                ContractArgument::Owned => A::Owned,
+                ContractArgument::Scalar => A::Scalar,
+                ContractArgument::Unique => A::Unique,
+            })
+            .collect(),
+        result_ownership: match ownership.result_ownership().unwrap() {
+            ContractResult::Owned => R::Owned,
+            ContractResult::Borrowed => R::Borrowed,
+            ContractResult::Scalar => R::Scalar,
+            ContractResult::RawObject => R::RawObject,
+        },
     }
 }
 
@@ -648,4 +669,243 @@ fn malformed_substring_records_are_refused_and_nat_limits_remain_nonanswers() {
     ));
     assert_eq!(raw_positions(&returned(&program)).1, "7");
     assert_clean_shadow();
+}
+
+#[test]
+fn checked_string_positions_distinguish_character_boundaries_from_the_end() {
+    let _guard = lock();
+    shadow::enable();
+    for (position, valid, character) in [
+        (0, true, Some('a')),
+        (1, true, Some('λ')),
+        (2, false, None),
+        (3, true, Some('😀')),
+        (4, false, None),
+        (5, false, None),
+        (6, false, None),
+        (7, true, Some('\0')),
+        (8, true, None),
+        (9, false, None),
+        (1 << 63, false, None),
+    ] {
+        assert_eq!(
+            invoke("extern:String.Pos.Raw.isValid", "aλ😀\0", &[position]).unbox(),
+            usize::from(valid),
+        );
+        for row in ["extern:String.Pos.Raw.get?", "extern:String.get?"] {
+            let option = invoke(row, "aλ😀\0", &[position]);
+            match character {
+                Some(character) => {
+                    assert_eq!(option.header().tag, 1);
+                    assert_eq!(option.header().other, 1);
+                    assert_eq!(
+                        option.try_ctor_child(0).unwrap().unbox(),
+                        character as usize
+                    );
+                }
+                None => {
+                    assert_eq!(option.header().tag, 0);
+                    assert_eq!(option.header().other, 0);
+                }
+            }
+        }
+    }
+    assert_eq!(invoke("extern:String.Pos.Raw.isValid", "", &[0]).unbox(), 1);
+    assert_eq!(
+        invoke("extern:String.Pos.Raw.get?", "", &[0]).header().tag,
+        0
+    );
+    for row in ["extern:String.Pos.Raw.get!", "extern:String.get!"] {
+        assert_eq!(invoke(row, "aλ😀", &[1]).unbox(), 'λ' as usize);
+    }
+    assert_clean_shadow();
+}
+
+#[test]
+fn string_get_bang_reports_the_pinned_recoverable_panic_and_respects_capture_limits() {
+    const TEST: &str =
+        "string_get_bang_reports_the_pinned_recoverable_panic_and_respects_capture_limits";
+    const CHILD: &str = "FLN_STRING_GET_BANG_TEST";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+            .env(CHILD, "1")
+            .env("LEAN_BACKTRACE", "0")
+            .env_remove("LEAN_ABORT_ON_PANIC")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(output.stderr.is_empty());
+        return;
+    }
+    let _guard = lock();
+    const MESSAGE: &[u8] = b"Error: invalid `String.Pos` at `String.get!`\n";
+    for row in ["extern:String.Pos.Raw.get!", "extern:String.get!"] {
+        for position in [2, 3, 1 << 63] {
+            let capture = fln_rt::obj::StdoutCapture::begin_isolated(MESSAGE.len(), true).unwrap();
+            assert_eq!(invoke(row, "aλ", &[position]).unbox(), 'A' as usize);
+            let output = capture.finish();
+            assert_eq!(output.error, None);
+            assert_eq!(output.bytes, MESSAGE);
+        }
+        let program = fixture(row, string(0, "aλ"), vec![nat(1, 2)]);
+        let capture = fln_rt::obj::StdoutCapture::begin_isolated(MESSAGE.len() - 1, true).unwrap();
+        assert!(matches!(
+            execute(&program, ExecutionLimits::default(), None),
+            Outcome::Inconclusive(_)
+        ));
+        let output = capture.finish();
+        assert!(output.bytes.is_empty());
+        assert_eq!(
+            output.error,
+            Some(fln_rt::obj::StdoutCaptureError::Limit {
+                limit: MESSAGE.len() - 1,
+                requested: MESSAGE.len(),
+            })
+        );
+    }
+}
+
+#[test]
+fn slice_hashes_share_string_hashes_without_copying_or_truncating_the_word() {
+    let _guard = lock();
+    shadow::enable();
+    // Measured with the exact pinned executable, not computed by the port.
+    for (source, begin, end, slice, expected) in [
+        ("aλ😀z", 1, 7, "λ😀", 8_638_642_137_254_647_478u64),
+        ("\0abc\0", 0, 5, "\0abc\0", 5_466_980_230_118_552_491),
+        ("abc", 1, 1, "", 9_877_294_847_684_254_529),
+        ("abcdefghijk", 0, 11, "abcdefghijk", 16_840_220_840_137_896_361),
+    ] {
+        let program = replay(vec![
+            string(0, source),
+            nat(1, begin),
+            nat(2, end),
+            I::Ctor {
+                dst: r(3),
+                tag: 0,
+                fields: vec![r(0), r(1), r(2)],
+                scalar_bytes: vec![],
+            },
+            call(4, "extern:String.Slice.hash", &[3]),
+            string(5, slice),
+            call(6, "extern:String.hash", &[5]),
+            call(7, "extern:UInt64.decEq", &[4, 6]),
+            call(8, "extern:UInt64.toNat", &[4]),
+            I::Array {
+                dst: r(9),
+                items: vec![r(7), r(8)],
+            },
+            I::Return { src: r(9) },
+        ]);
+        let result = returned(&program);
+        assert_eq!(result.array_child(0).unbox(), 1);
+        assert_eq!(
+            fln_vm::interpreter::nat_decimal(&result.array_child(1)).unwrap(),
+            expected.to_string()
+        );
+    }
+    // The first hash has its high bit set. Returning a tagged Nat here would
+    // discard that bit; UInt64.toNat must recover all 64 bits after replay.
+    let hash = invoke("extern:String.hash", "", &[]);
+    assert_eq!(
+        hash.try_ctor_scalar_u64(0).unwrap(),
+        9_877_294_847_684_254_529
+    );
+    assert!(hash.try_ctor_scalar_u64(0).unwrap() > (usize::MAX >> 1) as u64);
+    drop(hash);
+    assert_clean_shadow();
+}
+
+#[test]
+fn slice_comparison_uses_lexicographic_bytes_and_memcmp_honors_raw_byte_windows() {
+    let _guard = lock();
+    for (left, right, expected) in [
+        ("λ", "😀", true),
+        ("a", "ab", true),
+        ("ab", "a", false),
+        ("", "", false),
+        ("a\0b", "a\0c", true),
+    ] {
+        let program = replay(vec![
+            string(0, left),
+            nat(1, 0),
+            nat(2, left.len() as u64),
+            I::Ctor {
+                dst: r(3),
+                tag: 0,
+                fields: vec![r(0), r(1), r(2)],
+                scalar_bytes: vec![],
+            },
+            string(4, right),
+            nat(5, right.len() as u64),
+            I::Ctor {
+                dst: r(6),
+                tag: 0,
+                fields: vec![r(4), r(1), r(5)],
+                scalar_bytes: vec![],
+            },
+            call(7, "extern:String.Slice.instDecidableLt", &[3, 6]),
+            I::Return { src: r(7) },
+        ]);
+        assert_eq!(returned(&program).unbox(), usize::from(expected));
+    }
+    for (left, right, begin, other, length, expected) in [
+        ("aλ😀z", "λ😀", 1, 0, 6, true),
+        ("aλ😀z", "λX", 1, 0, 3, false),
+        ("λ", "λ", 1, 1, 1, true),
+        ("abc", "", 3, 0, 0, true),
+        ("a\0b", "a\0c", 1, 1, 1, true),
+    ] {
+        let program = replay(vec![
+            string(0, left),
+            string(1, right),
+            nat(2, begin),
+            nat(3, other),
+            nat(4, length),
+            call(
+                5,
+                "extern:String.Slice.Pattern.Internal.memcmpStr",
+                &[0, 1, 2, 3, 4],
+            ),
+            I::Return { src: r(5) },
+        ]);
+        assert_eq!(returned(&program).unbox(), usize::from(expected));
+    }
+}
+
+#[test]
+fn malformed_slice_bounds_and_missing_memcmp_proofs_never_read_outside_buffers() {
+    let _guard = lock();
+    for (begin, end) in [(2, 7), (3, 4), (7, 1), (0, 9), (1 << 63, 1 << 63)] {
+        let program = substring_program("extern:String.Slice.hash", begin, end, vec![]);
+        assert!(matches!(
+            execute(&program, ExecutionLimits::default(), None),
+            Outcome::Complete(VmExit::Refused { .. })
+        ));
+    }
+    for (begin, end, length) in [(0, 0, 4), (4, 0, 0), (0, 4, 0), (2, 2, 2), (1 << 63, 0, 0)] {
+        let program = replay(vec![
+            string(0, "abc"),
+            string(1, "abc"),
+            nat(2, begin),
+            nat(3, end),
+            nat(4, length),
+            call(
+                5,
+                "extern:String.Slice.Pattern.Internal.memcmpStr",
+                &[0, 1, 2, 3, 4],
+            ),
+            I::Return { src: r(5) },
+        ]);
+        assert!(matches!(
+            execute(&program, ExecutionLimits::default(), None),
+            Outcome::Complete(VmExit::Refused { .. })
+        ));
+    }
 }

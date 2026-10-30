@@ -4169,9 +4169,11 @@ fn finish_intrinsic_result(
     if expected != ResultOwnership::Scalar {
         return Ok(value);
     }
+    let boxed_integer = floats::boxed_integer_result(row)
+        || strings::Intrinsic::for_row(row).is_some_and(strings::Intrinsic::has_wide_result);
     let scalar_kind_matches = if let Some(intrinsic) = floats::Intrinsic::for_row(row) {
         intrinsic.result_kind_matches(&value)
-    } else if floats::boxed_integer_result(row) {
+    } else if boxed_integer {
         floats::wide_argument(&value, "wide scalar result", 0).is_ok()
     } else {
         value.is_scalar()
@@ -4179,9 +4181,7 @@ fn finish_intrinsic_result(
     if !scalar_kind_matches {
         return Err(VmRefusal::IntrinsicResultKind {
             row: row.to_string(),
-            expected: if floats::Intrinsic::for_row(row).is_some()
-                || floats::boxed_integer_result(row)
-            {
+            expected: if floats::Intrinsic::for_row(row).is_some() || boxed_integer {
                 "the row's boxed or immediate scalar representation"
             } else {
                 "tagged scalar"
