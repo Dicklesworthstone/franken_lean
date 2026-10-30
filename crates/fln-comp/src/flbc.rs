@@ -3352,7 +3352,7 @@ fn validate_function(program: &Program, function: &Function) -> Result<(), Valid
                 argument_ownership,
                 ..
             } => {
-                if !valid_extern_row(row) {
+                if !valid_intrinsic_row(row) {
                     return Err(ValidationError::InvalidExternRow {
                         function: function.id,
                         pc,
@@ -3548,10 +3548,11 @@ fn check_target(function: &Function, pc: Pc, target: Pc) -> Result<(), Validatio
     Ok(())
 }
 
-fn valid_extern_row(row: &str) -> bool {
-    row.strip_prefix("extern:").is_some_and(|name| {
-        !name.is_empty() && !name.bytes().any(|byte| byte.is_ascii_whitespace())
-    })
+fn valid_intrinsic_row(row: &str) -> bool {
+    crate::fir::valid_mirror_row(row)
+        || row.strip_prefix("extern:").is_some_and(|name| {
+            !name.is_empty() && !name.bytes().any(|byte| byte.is_ascii_whitespace())
+        })
 }
 
 #[derive(Clone, Copy)]

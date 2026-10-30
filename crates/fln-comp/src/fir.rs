@@ -2676,7 +2676,7 @@ fn validate_intrinsics(intrinsics: &[IntrinsicDecl]) -> Result<(), ValidationErr
                 seen: intrinsic.id,
             });
         }
-        if !valid_extern_row(&intrinsic.row) {
+        if !valid_extern_row(&intrinsic.row) && !valid_mirror_row(&intrinsic.row) {
             return Err(ValidationError::InvalidIntrinsicRow {
                 intrinsic: intrinsic.id,
                 row_bytes: intrinsic.row.len(),
@@ -3603,8 +3603,19 @@ fn value_type(
 /// This checks only FIR syntax. Binding the id to the generated extern contract
 /// remains a source-ingress obligation.
 pub fn valid_extern_row(row: &str) -> bool {
+    valid_native_row_name(row, "extern:")
+}
+
+/// Native definitions have their own namespace, separate from extern census
+/// rows. This validates the envelope only; Golem binds the exact Mirror id and
+/// its generated argument/result ownership before executing an implementation.
+pub(crate) fn valid_mirror_row(row: &str) -> bool {
+    valid_native_row_name(row, "mirror:")
+}
+
+fn valid_native_row_name(row: &str, prefix: &str) -> bool {
     row.len() <= 4_096
-        && row.strip_prefix("extern:").is_some_and(|name| {
+        && row.strip_prefix(prefix).is_some_and(|name| {
             !name.is_empty()
                 && !name
                     .chars()
@@ -4661,6 +4672,90 @@ mod tests {
                 ],
             }],
         )
+    }
+
+    #[test]
+    fn native_mirror_rows_lower_and_replay_without_becoming_extern_rows() {
+        let row = "mirror:Lean.Name.mkStr1";
+        assert!(!valid_extern_row(row));
+        assert!(valid_mirror_row(row));
+        let program = Program::new(
+            f(0),
+            Vec::new(),
+            Vec::new(),
+            vec![IntrinsicDecl {
+                id: i(0),
+                row: row.to_owned(),
+                arguments: vec![ValueType::String],
+                argument_ownership: vec![flbc::ArgumentOwnership::Owned],
+                result: ValueType::Abi,
+                result_ownership: flbc::ResultOwnership::RawObject,
+                effect: EffectClass::Pure,
+            }],
+            vec![Function {
+                id: f(0),
+                parameters: Vec::new(),
+                parameter_ownership: Vec::new(),
+                result: ValueType::Abi,
+                result_ownership: flbc::CallableResultOwnership::Erased,
+                blocks: vec![Block {
+                    id: b(0),
+                    bindings: vec![
+                        Binding {
+                            id: v(0),
+                            ty: ValueType::String,
+                            operation: Operation::String("one.component".to_owned()),
+                        },
+                        Binding {
+                            id: v(1),
+                            ty: ValueType::Abi,
+                            operation: Operation::Intrinsic {
+                                intrinsic: i(0),
+                                args: vec![v(0)],
+                            },
+                        },
+                    ],
+                    terminator: Terminator::Return { value: v(1) },
+                }],
+            }],
+        );
+        let validated = validate(program.clone(), ValidationLimits::default()).unwrap();
+        let lowered = lower_to_flbc(&validated).unwrap();
+        let bytes = flbc::encode_canonical(&lowered, flbc::CodecLimits::default()).unwrap();
+        let replay = flbc::decode_canonical(&bytes, flbc::CodecLimits::default()).unwrap();
+        assert_eq!(
+            flbc::encode_canonical(&replay, flbc::CodecLimits::default()).unwrap(),
+            bytes
+        );
+        assert!(matches!(
+            &replay.functions()[0].code[1],
+            flbc::Instruction::Intrinsic { row: actual, .. } if actual == row
+        ));
+        for invalid in [
+            "mirror:".to_owned(),
+            "mirror:Lean Name".to_owned(),
+            "mirror:Lean.\0Name".to_owned(),
+            "mirror:Lean.\u{2003}Name".to_owned(),
+            "native:Lean.Name.mkStr1".to_owned(),
+            format!("mirror:{}", "x".repeat(4_090)),
+        ] {
+            let mut bad_fir = program.clone();
+            bad_fir.intrinsics[0].row = invalid.clone();
+            assert!(matches!(
+                validate(bad_fir, ValidationLimits::default()),
+                Err(ValidationError::InvalidIntrinsicRow { .. })
+            ));
+            let mut bad_flbc = flbc::Program::new(replay.entry(), replay.functions().to_vec());
+            let flbc::Instruction::Intrinsic { row, .. } = &mut bad_flbc.functions[0].code[1]
+            else {
+                panic!("retained Mirror intrinsic");
+            };
+            *row = invalid;
+            assert!(matches!(
+                flbc::validate(bad_flbc),
+                Err(flbc::ValidationError::InvalidExternRow { .. })
+            ));
+        }
     }
 
     fn boxing_program() -> Program {
