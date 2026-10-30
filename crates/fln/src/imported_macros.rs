@@ -30,8 +30,9 @@ pub use syntax::{SyntaxConversionError, SyntaxLimits};
 
 /// The read-only shape of the pin's Macro.Context.
 ///
-/// The first execution slice requires the compiled entry's context argument to
-/// be unused. Contextual name lookup, fresh-name generation and the five
+/// User code may read the quotation name, scope, depth, depth limit and source
+/// reference supplied by the native context. Its opaque MethodsRef cannot be
+/// inspected or passed out of the entry. Contextual name lookup and the five
 /// Macro.Methods remain unavailable; state-counter updates are supported.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MacroContext {
@@ -139,11 +140,11 @@ pub fn compile(
             IrExecutionError::MissingDeclaration(entry.clone()),
         ));
     };
-    // The initial MethodsRef token must be unobservable. Merely refusing
-    // getMethods calls would miss a direct untrusted-IR projection or an
-    // unsafe cast in user code. Validate the original, already checked body
-    // before executing anything; passing context to another function also
-    // counts as observing it in this deliberately bounded first slice.
+    // The initial MethodsRef token must be unobservable. Ordinary fields are
+    // real native values, so reading them is permitted. Confine the context
+    // carrier itself: a projection of the opaque slot, mutation, reinterpretation
+    // or passing it to another function could expose the placeholder token.
+    // Validate the original, already checked body before executing anything.
     if observes_context(body, params[1].x) {
         return Err(MacroExecutionError::Compile(
             IrExecutionError::Unsupported {
@@ -180,8 +181,12 @@ fn observes_context(body: &IrBody, context: u64) -> bool {
         IrExpr::Ap { x, args } | IrExpr::Reuse { x, args, .. } => {
             *x == context || args.iter().any(argument)
         }
+        IrExpr::Proj { i, x } => {
+            *x == context
+                && (*i == layout::MACRO_CONTEXT_METHODS_FIELD
+                    || *i >= layout::MACRO_CONTEXT.object_fields as u64)
+        }
         IrExpr::Reset { x, .. }
-        | IrExpr::Proj { x, .. }
         | IrExpr::UProj { x, .. }
         | IrExpr::SProj { x, .. }
         | IrExpr::Box { x, .. }

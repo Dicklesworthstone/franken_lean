@@ -100,6 +100,24 @@ def generate(lean):
         ])
     for constant, tag in scalars.items():
         lines.append(f"pub const {constant}: usize = {tag};")
+    # The confinement boundary must not hand-copy the opaque field's offset.
+    # Require the exact getter emitted by the pin, not an arbitrary projection
+    # elsewhere in the trace or a fallback to a remembered source field order.
+    getter = re.search(
+        r"(?m)^    def FrankenLean\.MacroLayout\.contextMethods \((x_\d+) : @& obj\) : tobj :=\n"
+        r"(.*?)(?=^    def |^\[|\Z)", trace, re.S,
+    )
+    if getter is None:
+        raise ValueError("missing Macro.Context methods getter")
+    projection = re.fullmatch(
+        rf"\s*let (x_\d+) : tobj := proj\[(\d+)\] {re.escape(getter[1])};\s*inc \1;\s*ret \1\s*", getter[2],
+    )
+    if projection is None:
+        raise ValueError("Macro.Context methods getter is not one object projection")
+    field = int(projection[2])
+    if field >= layouts[CONSTRUCTORS["MACRO_CONTEXT"]][1]:
+        raise ValueError("Macro.Context methods field is outside the extracted layout")
+    lines.extend(["", f"pub const MACRO_CONTEXT_METHODS_FIELD: u64 = {field};"])
     for constant, function in FUNCTIONS.items():
         signature = re.search(
             rf"(?m)^    def FrankenLean\.MacroLayout\.{function} (.*?) : (\w+) :=$", trace,

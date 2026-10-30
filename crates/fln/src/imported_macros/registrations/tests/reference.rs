@@ -126,6 +126,43 @@ fn live_metadata_drives_ordered_macro_dispatch_state_diagnostics_and_authority()
     )
     .unwrap_or_else(|error| panic!("{error}; {dir:?}"));
 
+    let scope_input = Syntax::node(
+        name("registeredScope"),
+        vec![
+            Syntax::atom(SourceInfo::None, "registeredScope%"),
+            Syntax::atom(SourceInfo::None, "first"),
+            Syntax::atom(SourceInfo::None, ","),
+            Syntax::atom(SourceInfo::None, "second"),
+        ],
+    );
+    let scope_context = MacroContext {
+        current_macro_scope: 999,
+        ..context()
+    };
+    let mut scope_state = MacroState {
+        macro_scope: 17,
+        ..MacroState::default()
+    };
+    for (text, next_scope) in [("first", 18), ("second", 19)] {
+        let report = registry.expand_root(
+            &scope_input,
+            &SourceText::from_utf8(b"").unwrap(),
+            &scope_context,
+            scope_state,
+            MacroDispatchLimits::default(),
+            None,
+        );
+        let Outcome::Complete(Ok(RegisteredExpansion::Expanded { syntax, state, .. })) =
+            report.outcome
+        else {
+            panic!("{report:?}; {dir:?}")
+        };
+        assert_eq!(syntax, Syntax::atom(SourceInfo::None, text));
+        assert_eq!(state.macro_scope, next_scope);
+        assert_eq!(report.attempts.len(), 1);
+        scope_state = state;
+    }
+
     // This is the same unchanged imported macro code as above, now used through
     // the recursive consumer. The outer macro selects a still-unexpanded child;
     // only then does that result select its own branch. A sibling checks that
@@ -209,6 +246,21 @@ run_cmd do
   if reprStr actual == reprStr input then throwError "wrong-expansion control survived"
   let rootFirst ← liftMacroM (expandMacros (choice (choice (branch "ten") (branch "twenty")) (branch "winner")))
   if reprStr rootFirst != reprStr (branch "winner") then throwError "root-before-children mismatch"
+  let env ← getEnv
+  let scopeInput := Syntax.node .none `registeredScope #[
+    .atom .none "registeredScope%", .atom .none "first", .atom .none ",", .atom .none "second"]
+  let scopeContext : Macro.Context := ⟨default, `Main, 999, 0, 512, scopeInput⟩
+  let firstState : Macro.State := { (default : Macro.State) with macroScope := 17 }
+  match Lean.Elab.expandMacroImpl? env scopeInput scopeContext firstState with
+  | .ok (some (_, .ok first)) state =>
+    if reprStr first != reprStr (Syntax.atom .none "first") || state.macroScope != 18 then
+      throwError "first scope mismatch"
+    match Lean.Elab.expandMacroImpl? env scopeInput scopeContext state with
+    | .ok (some (_, .ok second)) state =>
+      if reprStr second != reprStr (Syntax.atom .none "second") || state.macroScope != 19 then
+        throwError "fresh scope was reused"
+    | _ => throwError "second scoped dispatch failed"
+  | _ => throwError "first scoped dispatch failed"
   logInfo "recursive tree identical; unchanged-tree control differs"
 "#;
     std::fs::write(dir.join("RecursiveOracle.lean"), oracle).unwrap();

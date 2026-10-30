@@ -243,12 +243,129 @@ fn live_pinned_macro_runs_native_syntax_methods_and_matches_complete_subtrees() 
         .is_err()
     );
 
+    let context_entry = module
+        .decls
+        .iter()
+        .find_map(|declaration| match declaration {
+            IrDecl::Function { name, .. }
+                if name
+                    .to_display_string()
+                    .ends_with("_macroRules_contextChoose_1") =>
+            {
+                Some(name.clone())
+            }
+            _ => None,
+        })
+        .expect("the actual context macro has an entry");
+    let context_macro = prepare(&context_entry);
+    let context_input = Syntax::node(
+        name("contextChoose"),
+        vec![
+            Syntax::atom(SourceInfo::None, "contextTerm%"),
+            branch.clone(),
+            Syntax::atom(SourceInfo::None, ","),
+            leaf(),
+        ],
+    );
+    for (scope, expected) in [(17, branch.clone()), (18, leaf()), (17, branch.clone())] {
+        let current = MacroContext {
+            current_macro_scope: scope,
+            ..context()
+        };
+        let report = context_macro.execute(
+            &context_input,
+            &source(),
+            &current,
+            &MacroState::default(),
+            MacroLimits::default(),
+            None,
+        );
+        assert!(
+            matches!(report.outcome, Outcome::Complete(Ok(MacroResult::Expanded { syntax, state }))
+            if syntax == expected && state == MacroState::default()),
+            "scope {scope}"
+        );
+    }
+    let fields_macro = prepare(&name("contextFields"));
+    for (quotation, depth, maximum) in [("Main", 0, 512), ("Other", 3, 512), ("Main", 512, 512)] {
+        let current = MacroContext {
+            quotation_context: name(quotation),
+            current_recursion_depth: depth,
+            max_recursion_depth: maximum,
+            ..context()
+        };
+        let expected = if depth == maximum {
+            leaf()
+        } else {
+            Syntax::node(name(quotation), vec![leaf(), leaf()])
+        };
+        let report = fields_macro.execute(
+            &leaf(),
+            &source(),
+            &current,
+            &MacroState::default(),
+            MacroLimits::default(),
+            None,
+        );
+        assert!(
+            matches!(report.outcome, Outcome::Complete(Ok(MacroResult::Expanded { syntax, state }))
+            if syntax == expected && state == MacroState::default()),
+            "{quotation}, {depth}/{maximum}"
+        );
+    }
+    let mut exhausted = MacroLimits::default();
+    exhausted.vm.max_steps = 0;
+    assert!(matches!(
+        fields_macro
+            .execute(
+                &leaf(),
+                &source(),
+                &context(),
+                &MacroState::default(),
+                exhausted,
+                None
+            )
+            .outcome,
+        Outcome::Inconclusive(_)
+    ));
+    assert!(matches!(
+        fields_macro
+            .execute(
+                &leaf(),
+                &source(),
+                &context(),
+                &MacroState::default(),
+                MacroLimits::default(),
+                Some(&|| true)
+            )
+            .outcome,
+        Outcome::Inconclusive(_)
+    ));
+    assert!(matches!(
+        fields_macro
+            .execute(
+                &leaf(),
+                &source(),
+                &context(),
+                &MacroState::default(),
+                MacroLimits::default(),
+                None
+            )
+            .outcome,
+        Outcome::Complete(Ok(MacroResult::Expanded { .. }))
+    ));
+
     let oracle_entry = choose
         .to_display_string()
         .replace("NativeMacroModule", "Oracle");
     let oracle_source = format!(
         "{fixture}\n{}",
-        ORACLE.replace("MACRO_ENTRY", &oracle_entry)
+        ORACLE.replace("MACRO_ENTRY", &oracle_entry).replace(
+            "CONTEXT_ENTRY",
+            &context_entry
+                .to_display_string()
+                .replace("NativeMacroModule", "Oracle")
+        )
     );
     std::fs::write(dir.join("Oracle.lean"), oracle_source).unwrap();
     let oracle = Command::new(&reference)
@@ -264,7 +381,10 @@ fn live_pinned_macro_runs_native_syntax_methods_and_matches_complete_subtrees() 
         String::from_utf8_lossy(&oracle.stdout),
         String::from_utf8_lossy(&oracle.stderr)
     );
-    assert_eq!(oracle.stdout, b"[true, true, true, true, true]\n");
+    assert_eq!(
+        oracle.stdout,
+        b"[true, true, true, true, true, true, true, true, true, true]\n"
+    );
     assert!(oracle.stderr.is_empty());
 
     // A real executable wrong-expansion control: change getArg's selected
@@ -353,6 +473,11 @@ def sampleInput (first : Lean.Syntax) : Lean.Syntax :=
   .node .none `userChoose #[.atom .none "chooseTerm%", first, .atom .none ",", sampleLeaf]
 def sampleContext : Lean.Macro.Context :=
   ⟨default, `Main, 17, 0, 512, sampleLeaf⟩
+def contextInput : Lean.Syntax :=
+  .node .none `contextChoose #[.atom .none "contextTerm%", .node .none `branch #[sampleLeaf], .atom .none ",", sampleLeaf]
+def contextNodeExact (expected : Lean.Name) : Lean.Syntax → Bool
+  | .node .none kind args => kind == expected && args.size == 2 && leafExact args[0]! && leafExact args[1]!
+  | _ => false
 #eval show List Bool from
   let first := match MACRO_ENTRY (sampleInput (.atom .none "plain")) sampleContext default with
     | .ok out state => leafExact out && state.macroScope == 0 && state.traceMsgs.isEmpty
@@ -369,5 +494,20 @@ def sampleContext : Lean.Macro.Context :=
   let diagnostic := match errorMacro sampleLeaf sampleContext default with
     | .error (.error ref msg) state => leafExact ref && msg == "λ\x00error" && state.macroScope == 0 && state.traceMsgs.isEmpty
     | _ => false
-  [first, second, unsupported, scopedOk, diagnostic]
+  let scopeFirst := match CONTEXT_ENTRY contextInput sampleContext default with
+    | .ok out state => branchExact out && state.macroScope == 0 && state.traceMsgs.isEmpty
+    | _ => false
+  let scopeSecond := match CONTEXT_ENTRY contextInput { sampleContext with currMacroScope := 18 } default with
+    | .ok out state => leafExact out && state.macroScope == 0 && state.traceMsgs.isEmpty
+    | _ => false
+  let fields := match contextFields sampleLeaf sampleContext default with
+    | .ok out state => contextNodeExact `Main out && state.macroScope == 0 && state.traceMsgs.isEmpty
+    | _ => false
+  let other := match contextFields sampleLeaf { sampleContext with quotContext := `Other, currRecDepth := 3 } default with
+    | .ok out state => contextNodeExact `Other out && state.macroScope == 0 && state.traceMsgs.isEmpty
+    | _ => false
+  let depth := match contextFields sampleLeaf { sampleContext with currRecDepth := 512 } default with
+    | .ok out state => leafExact out && state.macroScope == 0 && state.traceMsgs.isEmpty
+    | _ => false
+  [first, second, unsupported, scopedOk, diagnostic, scopeFirst, scopeSecond, fields, other, depth]
 "#;

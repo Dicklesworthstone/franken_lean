@@ -37,6 +37,9 @@ def macroContext (methods : Lean.Macro.MethodsRef) (quotContext : Lean.Name)
     (scope depth maxDepth : Nat) (ref : Lean.Syntax) : Lean.Macro.Context :=
   ⟨methods, quotContext, scope, depth, maxDepth, ref⟩
 
+@[noinline] def contextMethods (value : @& Lean.Macro.Context) : Lean.Macro.MethodsRef :=
+  value.methods
+
 -- The constructor is private. The public inline operation exposes its exact
 -- compiled layout without reaching through that source-level visibility.
 def macroState : Lean.MacroM Nat := Lean.Macro.withFreshMacroScope (pure 5)

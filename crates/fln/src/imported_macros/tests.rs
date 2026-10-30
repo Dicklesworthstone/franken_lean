@@ -444,3 +444,172 @@ fn macro_selection_never_executes_toolchain_bodies_or_ambient_effects() {
         Err(MacroExecutionError::Signature { arity: 4 })
     ));
 }
+
+#[test]
+fn ordinary_context_fields_are_readable_but_the_carrier_and_methods_are_confined() {
+    for field in 0..layout::MACRO_CONTEXT.object_fields as u64 {
+        let code = module(
+            vec![
+                bind(3, IrExpr::Proj { i: field, x: 1 }),
+                bind(4, ctor(layout::RESULT_OK, "EStateM.Result.ok", &[0, 2])),
+            ],
+            4,
+        );
+        let compiled = compile(
+            &[code],
+            &name("User.macro"),
+            &VerifiedPartition::user_fixture(),
+            &BTreeSet::from([name("User.macro")]),
+            IrExecutionLimits::default(),
+        );
+        if field == layout::MACRO_CONTEXT_METHODS_FIELD {
+            assert!(matches!(
+                compiled,
+                Err(MacroExecutionError::Compile(
+                    IrExecutionError::Unsupported {
+                        form: "Macro.Context observation requires native Macro.Methods support",
+                        ..
+                    }
+                ))
+            ));
+        } else {
+            let result = compiled.unwrap().execute(
+                &leaf(),
+                &source(),
+                &context(),
+                &MacroState::default(),
+                MacroLimits::default(),
+                None,
+            );
+            assert!(
+                matches!(result.outcome, Outcome::Complete(Ok(MacroResult::Expanded { syntax, state }))
+                if syntax == leaf() && state == MacroState::default())
+            );
+        }
+    }
+
+    // All ways of observing/escaping the carrier itself stay closed. This also
+    // checks nested blocks, not merely the entry's top-level statement list.
+    let forbidden = [
+        IrExpr::Proj {
+            i: layout::MACRO_CONTEXT.object_fields as u64,
+            x: 1,
+        },
+        IrExpr::Proj { i: u64::MAX, x: 1 },
+        IrExpr::UProj { i: 1, x: 1 },
+        IrExpr::SProj {
+            n: 0,
+            offset: 0,
+            x: 1,
+        },
+        IrExpr::IsShared { x: 1 },
+        IrExpr::Unbox { x: 1 },
+        IrExpr::Box {
+            ty: IrType::TObject,
+            x: 1,
+        },
+        IrExpr::Reset { n: 0, x: 1 },
+        IrExpr::Fap {
+            function: name("User.helper"),
+            args: vec![IrArg::Var(1)],
+        },
+        IrExpr::Pap {
+            function: name("User.helper"),
+            args: vec![IrArg::Var(1)],
+        },
+        IrExpr::Ap { x: 1, args: vec![] },
+        ctor(layout::RESULT_OK, "EStateM.Result.ok", &[1, 2]),
+    ];
+    for expression in forbidden {
+        let body = IrBody {
+            stmts: vec![bind(3, expression)],
+            terminal: Box::new(IrTerminal::Ret(IrArg::Var(0))),
+        };
+        assert!(observes_context(&body, 1), "{body:?}");
+        let nested = IrBody {
+            stmts: vec![IrStmt::JDecl {
+                j: 10,
+                params: vec![],
+                value: body,
+            }],
+            terminal: Box::new(IrTerminal::Ret(IrArg::Var(0))),
+        };
+        assert!(observes_context(&nested, 1));
+    }
+    for statement in [
+        IrStmt::Set {
+            x: 1,
+            i: 0,
+            y: IrArg::Var(0),
+        },
+        IrStmt::USet { x: 1, i: 0, y: 0 },
+        IrStmt::SSet {
+            x: 1,
+            i: 0,
+            offset: 0,
+            y: 0,
+            ty: IrType::UInt8,
+        },
+        IrStmt::SetTag { x: 1, cidx: 0 },
+    ] {
+        assert!(observes_context(
+            &IrBody {
+                stmts: vec![statement],
+                terminal: Box::new(IrTerminal::Ret(IrArg::Var(0))),
+            },
+            1
+        ));
+    }
+}
+
+#[test]
+fn passing_context_to_a_user_helper_cannot_launder_the_opaque_token() {
+    let mut code = module(
+        vec![
+            bind(
+                3,
+                IrExpr::Fap {
+                    function: name("User.helper"),
+                    args: vec![IrArg::Var(1)],
+                },
+            ),
+            bind(4, ctor(layout::RESULT_OK, "EStateM.Result.ok", &[3, 2])),
+        ],
+        4,
+    );
+    code.decls.push(IrDecl::Function {
+        name: name("User.helper"),
+        params: vec![IrParam {
+            x: 0,
+            borrow: false,
+            ty: IrType::TObject,
+        }],
+        result: IrType::TObject,
+        body: IrBody {
+            stmts: vec![bind(
+                1,
+                IrExpr::Proj {
+                    i: layout::MACRO_CONTEXT_METHODS_FIELD,
+                    x: 0,
+                },
+            )],
+            terminal: Box::new(IrTerminal::Ret(IrArg::Var(1))),
+        },
+        sorry_dep: None,
+    });
+    assert!(matches!(
+        compile(
+            &[code],
+            &name("User.macro"),
+            &VerifiedPartition::user_fixture(),
+            &BTreeSet::from([name("User.macro"), name("User.helper")]),
+            IrExecutionLimits::default(),
+        ),
+        Err(MacroExecutionError::Compile(
+            IrExecutionError::Unsupported {
+                form: "Macro.Context observation requires native Macro.Methods support",
+                ..
+            }
+        ))
+    ));
+}

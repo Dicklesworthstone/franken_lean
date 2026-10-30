@@ -24,3 +24,7 @@ macro_rules (kind := registeredChoice)
 
 #eval registeredChoice% 10, 20
 #eval registeredChoice% (10 + 1), 20
+
+macro (name := registeredScope) "registeredScope%" a:term "," b:term : term => do
+  let ctx ← read
+  if ctx.currMacroScope == 17 then pure a else pure b
