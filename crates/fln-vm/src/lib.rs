@@ -17,5 +17,6 @@ pub mod extern_row;
 pub mod extern_table_generated;
 pub mod interpreter;
 pub mod load;
+pub mod macro_native;
 pub mod parity;
 pub mod scientific;

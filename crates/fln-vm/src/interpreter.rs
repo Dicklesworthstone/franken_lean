@@ -62,6 +62,7 @@ mod array_construction;
 mod arrays;
 mod diagnostics;
 mod floats;
+mod macro_native;
 mod packed_constructors;
 mod string_fold;
 mod strings;
@@ -581,6 +582,7 @@ struct IntrinsicPlan {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum IntrinsicImplementation {
+    MacroNative(macro_native::Intrinsic),
     PanicCore,
     DbgTrace,
     Float(floats::Intrinsic),
@@ -916,6 +918,9 @@ enum IntrinsicImplementation {
 
 impl IntrinsicImplementation {
     fn for_row(row: &str) -> Self {
+        if let Some(intrinsic) = macro_native::Intrinsic::for_row(row) {
+            return Self::MacroNative(intrinsic);
+        }
         match row {
             "extern:panicCore" => Self::PanicCore,
             "extern:dbgTrace" => Self::DbgTrace,
@@ -1436,6 +1441,10 @@ pub enum ValueKind {
 /// value or requested host row did not satisfy the operation contract.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum VmRefusal {
+    CallableEntry {
+        function: FunctionId,
+        reason: &'static str,
+    },
     UnknownIntrinsic {
         row: String,
     },
@@ -1567,6 +1576,9 @@ pub enum VmRefusal {
 impl fmt::Display for VmRefusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::CallableEntry { function, reason } => {
+                write!(f, "callable entry {}: {reason}", function.get())
+            }
             Self::UnknownIntrinsic { row } => write!(f, "unknown intrinsic row {row:?}"),
             Self::UnsupportedIntrinsic { row } => {
                 write!(f, "intrinsic row {row:?} has no prototype implementation")
@@ -1923,6 +1935,11 @@ struct IntrinsicResult {
 }
 
 enum IntrinsicFailure {
+    MirrorResource {
+        resource: &'static str,
+        allowed: u64,
+        observed: u64,
+    },
     Refused(VmRefusal),
     NatMagnitudeLimit {
         allowed: u64,
@@ -2047,7 +2064,30 @@ pub fn execute_with_context(
     context: CommandExecutionContext,
     cancellation: Option<&dyn CancellationProbe>,
 ) -> Outcome<VmExit> {
-    finish_run(run(program, limits, context, cancellation, None))
+    finish_run(run(program, limits, context, cancellation, None, None))
+}
+
+/// Invoke an already validated function with owned input handles.
+///
+/// The bytecode's ordinary entry and canonical identity are unchanged. The
+/// requested function must exist and receive exactly its declared arity.
+/// Unique inputs are refused because this boundary carries no uniqueness
+/// proof. No command-scoped host effect capability is installed.
+pub fn execute_function(
+    program: &ValidatedProgram,
+    function: FunctionId,
+    arguments: Vec<Obj>,
+    limits: ExecutionLimits,
+    cancellation: Option<&dyn CancellationProbe>,
+) -> Outcome<VmExit> {
+    finish_run(run(
+        program,
+        limits,
+        CommandExecutionContext::UNLIMITED,
+        cancellation,
+        None,
+        Some((function, arguments)),
+    ))
 }
 
 /// Execute through bounded inline caches while preserving [`execute`] as the
@@ -2117,6 +2157,7 @@ pub fn execute_cached_with_context(
         command_context,
         cancellation,
         Some(caches),
+        None,
     ))
 }
 
@@ -2137,7 +2178,15 @@ fn cache_namespace(
     Some(CacheNamespace {
         program_root: hash(Domain::CacheKey, &canonical),
         schema_version: program.schema_version(),
-        extern_contract_root: hash(Domain::CacheKey, EXTERN_ROW_CONTRACT_ROOT.as_bytes()),
+        extern_contract_root: hash(
+            Domain::CacheKey,
+            format!(
+                "{}\n{}",
+                EXTERN_ROW_CONTRACT_ROOT,
+                crate::macro_native::CONTRACT
+            )
+            .as_bytes(),
+        ),
         environment_root: context.environment_root(),
         build_profile: context.build_profile(),
         mode: context.mode(),
@@ -2150,21 +2199,48 @@ fn run(
     command_context: CommandExecutionContext,
     cancellation: Option<&dyn CancellationProbe>,
     mut inline_caches: Option<&mut InlineCaches>,
+    invocation: Option<(FunctionId, Vec<Obj>)>,
 ) -> Result<VmExit, Stop> {
     let heartbeat_context = HeartbeatContext::snapshot(command_context.heartbeat_limit());
     if limits.max_stack_depth < 1 {
         return Err(stack_exhausted(limits.max_stack_depth, 1, "entry frame"));
     }
-    let entry = program.function(program.entry()).ok_or_else(|| {
-        Stop::InternalFault(InternalFault::new(
-            "FLBC-VALIDATED-TARGET",
-            "validated entry function disappeared",
-        ))
-    })?;
+    let (entry_id, arguments) = invocation.unwrap_or_else(|| (program.entry(), Vec::new()));
+    let refuse_entry = |reason| VmExit::Refused {
+        refusal: VmRefusal::CallableEntry {
+            function: entry_id,
+            reason,
+        },
+        usage: usage(0, 0),
+    };
+    let Some(entry) = program.function(entry_id) else {
+        return Ok(refuse_entry(
+            "function is absent from the validated program",
+        ));
+    };
+    if arguments.len() != usize::from(entry.arity) {
+        return Ok(refuse_entry(
+            "argument count differs from the function signature",
+        ));
+    }
+    for (argument, ownership) in arguments.iter().zip(&entry.parameter_ownership) {
+        if *ownership == ArgumentOwnership::Unique {
+            return Ok(refuse_entry(
+                "unique arguments require an internal ownership witness",
+            ));
+        }
+        if *ownership == ArgumentOwnership::Scalar && !argument.is_scalar() {
+            return Ok(refuse_entry("scalar parameter received a heap object"));
+        }
+    }
+    let mut entry_registers = empty_registers(entry.register_count);
+    for (slot, argument) in entry_registers.iter_mut().zip(arguments) {
+        *slot = Some(argument);
+    }
     let mut stack = vec![Frame {
         function: entry.id,
         pc: 0,
-        registers: empty_registers(entry.register_count),
+        registers: entry_registers,
         return_to: None,
         pending_tail_return: None,
     }];
@@ -2884,6 +2960,28 @@ fn run(
                                 allowed,
                                 observed,
                                 &location.to_string(),
+                            ));
+                        }
+                        Err(IntrinsicFailure::MirrorResource {
+                            resource,
+                            allowed,
+                            observed,
+                        }) => {
+                            return Err(Stop::Inconclusive(
+                                Inconclusive::resource(ResourceUsage {
+                                    reason: if resource.ends_with("bytes") {
+                                        ResourceReason::Memory {
+                                            limit_bytes: allowed,
+                                        }
+                                    } else {
+                                        ResourceReason::StructuralBudget {
+                                            unit: fln_core::diag::StructuralUnit::ProducedNodes,
+                                        }
+                                    },
+                                    allowed,
+                                    observed,
+                                })
+                                .with_progress(format!("native Mirror {resource}")),
                             ));
                         }
                         Err(IntrinsicFailure::FileReadResource(error)) => {
@@ -4171,6 +4269,42 @@ fn resolve_intrinsic_plan(
     declared_arguments: &[ArgumentOwnership],
     declared_result: ResultOwnership,
 ) -> Result<IntrinsicPlan, VmRefusal> {
+    if let Some(mirror) = crate::macro_native::row_for_id(row) {
+        if mirror.borrowed.len() != declared_arguments.len() {
+            return Err(VmRefusal::IntrinsicArity {
+                row: row.to_owned(),
+                expected: mirror.borrowed.len(),
+                actual: declared_arguments.len(),
+            });
+        }
+        for (argument, (expected, actual)) in mirror
+            .argument_ownership()
+            .into_iter()
+            .zip(declared_arguments.iter().copied())
+            .enumerate()
+        {
+            if expected != actual {
+                return Err(VmRefusal::IntrinsicOwnershipMismatch {
+                    row: row.to_owned(),
+                    argument,
+                    expected,
+                    actual,
+                });
+            }
+        }
+        let expected = mirror.result_ownership();
+        if expected != declared_result {
+            return Err(VmRefusal::IntrinsicResultOwnershipMismatch {
+                row: row.to_owned(),
+                expected,
+                actual: declared_result,
+            });
+        }
+        return Ok(IntrinsicPlan {
+            row: mirror.id,
+            implementation: IntrinsicImplementation::for_row(mirror.id),
+        });
+    }
     let generated = EXTERN_ROWS
         .iter()
         .find(|generated| generated.id == row)
@@ -4628,6 +4762,7 @@ fn dispatch_intrinsic(
             .saturating_mul(8),
     );
     match implementation {
+        IntrinsicImplementation::MacroNative(intrinsic) => intrinsic.invoke(row, args),
         IntrinsicImplementation::PanicCore => diagnostics::panic(row, args),
         IntrinsicImplementation::ArrayConstruction(intrinsic) => intrinsic.invoke(row, args),
         IntrinsicImplementation::ArrayExtra(_)
@@ -7704,6 +7839,7 @@ fn closure_intrinsic_application(
         | IntrinsicImplementation::ArrayExtra(_)
         | IntrinsicImplementation::Float(_)
         | IntrinsicImplementation::StringInternal(_)
+        | IntrinsicImplementation::MacroNative(_)
         | IntrinsicImplementation::PanicCore
         | IntrinsicImplementation::Unsupported => Err(VmRefusal::UnsupportedIntrinsic {
             row: row.to_string(),

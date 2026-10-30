@@ -25,6 +25,7 @@ pub mod convert;
 pub mod native_heap;
 pub mod region;
 mod region_contract;
+pub mod syntax_abi_generated;
 
 /// The safe CompatHeap object surface (see the crate docs).
 pub mod obj {
