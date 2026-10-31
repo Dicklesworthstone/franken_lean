@@ -30,12 +30,24 @@ end SourceScoped
 #check (Nat + Bool)
 #eval (7 + 11)
 
+public def pinDeclaredValue : Nat := (7 + 11)
+public theorem pinDeclaredValue_eq : pinDeclaredValue = 11 := by rfl
+#eval pinDeclaredValue
+
 section
 open scoped SourceScoped
 #check (Nat + Bool)
 #eval (7 + 11)
+public def pinScopedDeclaredValue : Nat := (7 + 11)
+#eval pinScopedDeclaredValue
 end
 
 #check (Nat + Bool)
 #eval (7 + 11)
+#eval pinDeclaredValue
+
+public def pinDeclaredHelper (n : Nat) : Nat :=
+  let helper (_left : Nat) : Nat := _left + 11
+  helper n
+#eval pinDeclaredHelper 7
 

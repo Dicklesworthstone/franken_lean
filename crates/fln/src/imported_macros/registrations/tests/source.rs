@@ -4,8 +4,8 @@
 //! neither fixture substitutes for production artifact admission.
 use super::*;
 use crate::imported_macros::source::{
-    SourceMacroCheck, SourceMacroError, SourceMacroEvaluation, SourceMacroEvaluationResult,
-    SourceMacroInvocation,
+    SourceMacroAdmission, SourceMacroCheck, SourceMacroError, SourceMacroEvaluation,
+    SourceMacroEvaluationResult, SourceMacroInvocation,
 };
 use crate::{Engine, EngineAdmissionLimits};
 use std::sync::Arc;
@@ -119,6 +119,316 @@ fn evaluate(
 
 fn execution_limits() -> crate::EngineExecutionLimits {
     crate::EngineExecutionLimits::new(crate::Budget::for_stack_bytes(2 * 1024 * 1024))
+}
+
+fn admit(
+    engine: &Engine,
+    registry: &RegisteredMacros,
+    source: &[u8],
+    limits: MacroTreeLimits,
+    admission_limits: EngineAdmissionLimits,
+    cancellation: Option<&dyn CancellationProbe>,
+) -> SourceMacroAdmission {
+    engine.admit_source_declaration_with_imported_macros(
+        source,
+        &KVMap::new(),
+        admission_limits,
+        SourceMacroInvocation {
+            registry,
+            context: &context(),
+            state: MacroState {
+                macro_scope: 17,
+                ..MacroState::default()
+            },
+            lookup: None,
+            limits,
+            cancellation,
+        },
+    )
+}
+
+fn admitted(
+    report: &SourceMacroAdmission,
+) -> &crate::imported_macros::source::SourceMacroAdmissionResult {
+    let Outcome::Complete(Ok(result)) = &report.outcome else {
+        panic!("{report:?}")
+    };
+    assert_eq!(
+        result.admission.checker.ground,
+        crate::CheckerAdmissionGround::BodyCheckedAgainstDeclaredType
+    );
+    assert!(report.state.is_some());
+    result
+}
+
+fn assert_declared_value(engine: &Engine, declaration: &str, expected: u64) {
+    let source = format!("#eval {declaration}");
+    let batch = engine
+        .execute_source_commands_with_checks(source.as_bytes(), &KVMap::new(), execution_limits())
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let fln_vm::interpreter::VmExit::Returned(result) = &batch.batch.executions[0].exit else {
+        panic!("{batch:?}")
+    };
+    assert!(result.value.is_scalar());
+    assert_eq!(result.value.unbox() as u64, expected);
+}
+
+#[test]
+fn imported_macros_admit_named_values_and_proofs_through_the_ordinary_authority() {
+    let (engine, registry, _) = fixture();
+    let before = engine.logical_root(&KVMap::new());
+    let source = "-- λ🦀\r\ndef macroChosen : Nat := (7 + 11)\r\n".as_bytes();
+    let report = admit(
+        &engine,
+        &registry,
+        source,
+        MacroTreeLimits::default(),
+        admission(),
+        None,
+    );
+    let result = admitted(&report);
+    assert_eq!(result.parsed.reconstruct_original(), source);
+    assert_eq!(result.admission.base_logical_root, before);
+    assert_ne!(result.admission.result_logical_root, before);
+    assert_eq!(report.attempts.len(), 2);
+    assert_eq!(report.state.as_ref().unwrap().macro_scope, 19);
+    assert_declared_value(&result.admission.engine, "macroChosen", 11);
+    assert!(!engine.environment().contains(&name("macroChosen")));
+
+    let proof_source = b"@[simp] theorem macroChosen_eq : macroChosen = 11 := by rfl";
+    let proof = admit(
+        &result.admission.engine,
+        &registry,
+        proof_source,
+        MacroTreeLimits::default(),
+        admission(),
+        None,
+    );
+    let proof = admitted(&proof);
+    assert!(matches!(
+        proof.admission.declaration,
+        crate::Declaration::Thm(_)
+    ));
+    let simple = proof
+        .admission
+        .engine
+        .admit_source_declaration(
+            b"theorem usingMacroChosen : macroChosen = 11 := by simp",
+            &KVMap::new(),
+            admission(),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert!(
+        matches!(simple.declaration, crate::Declaration::Thm(_)),
+        "the macro path must install the theorem's simp attribute"
+    );
+    let false_proof = admit(
+        &result.admission.engine,
+        &registry,
+        b"theorem falseMacroChosen : macroChosen = 18 := by rfl",
+        MacroTreeLimits::default(),
+        admission(),
+        None,
+    );
+    assert!(matches!(
+        false_proof.outcome,
+        Outcome::Complete(Err(SourceMacroError::Frontend(_)))
+    ));
+    assert!(false_proof.state.is_none());
+    assert!(
+        !result
+            .admission
+            .engine
+            .environment()
+            .contains(&name("falseMacroChosen"))
+    );
+
+    let scoped = registry.activate_scoped(&name("SourceScoped")).unwrap();
+    let left = admit(
+        &engine,
+        &scoped,
+        b"def scopedMacroChosen : Nat := 7 + 11",
+        MacroTreeLimits::default(),
+        admission(),
+        None,
+    );
+    assert_declared_value(&admitted(&left).admission.engine, "scopedMacroChosen", 7);
+    let replay = admit(
+        &engine,
+        &registry,
+        source,
+        MacroTreeLimits::default(),
+        admission(),
+        None,
+    );
+    assert_eq!(
+        admitted(&replay).admission.result_logical_root,
+        result.admission.result_logical_root
+    );
+    assert_eq!(engine.logical_root(&KVMap::new()), before);
+}
+
+#[test]
+fn macro_admission_keeps_local_helper_receipts_and_drops_failed_successors() {
+    let (engine, registry, _) = fixture();
+    let before = engine.logical_root(&KVMap::new());
+    let report = admit(
+        &engine,
+        &registry,
+        b"def macroHelper (n : Nat) : Nat := let helper (x : Nat) : Nat := x + 11; helper n",
+        MacroTreeLimits::default(),
+        admission(),
+        None,
+    );
+    let result = admitted(&report);
+    assert!(
+        result.admission.admissions.len() >= 2,
+        "the local helper must retain a separate admission receipt"
+    );
+    assert!(
+        result
+            .admission
+            .admissions
+            .iter()
+            .all(|receipt| receipt.checker.ground
+                == crate::CheckerAdmissionGround::BodyCheckedAgainstDeclaredType)
+    );
+    assert_declared_value(&result.admission.engine, "macroHelper 7", 11);
+    for source in [
+        b"def badMacro : Bool := 7 + 11".as_slice(),
+        b"def badMacro : Nat := 7 - 11",
+        b"def badMacro : Nat := let unused (x : Nat) : Bool := x; 7 + 11",
+        b"#eval 7 + 11",
+        b"#check Nat",
+        b"def badMacro := 7\ndef alsoBad := 11",
+        b"\xef\xbb\xbfdef badMacro := 7 + 11",
+    ] {
+        let failed = admit(
+            &engine,
+            &registry,
+            source,
+            MacroTreeLimits::default(),
+            admission(),
+            None,
+        );
+        assert!(
+            matches!(failed.outcome, Outcome::Complete(Err(_))),
+            "{failed:?}"
+        );
+        assert!(failed.state.is_none());
+        assert!(!engine.environment().contains(&name("badMacro")));
+    }
+    struct Cancelled;
+    impl CancellationProbe for Cancelled {
+        fn is_cancelled(&self) -> bool {
+            true
+        }
+    }
+    let mut no_macro_work = MacroTreeLimits::default();
+    no_macro_work.dispatch.execution.vm.max_steps = 0;
+    for (limits, cancellation) in [
+        (no_macro_work, None),
+        (
+            MacroTreeLimits::default(),
+            Some(&Cancelled as &dyn CancellationProbe),
+        ),
+    ] {
+        let failed = admit(
+            &engine,
+            &registry,
+            b"def limitedMacro : Nat := 7 + 11",
+            limits,
+            admission(),
+            cancellation,
+        );
+        assert!(
+            matches!(failed.outcome, Outcome::Inconclusive(_)),
+            "{failed:?}"
+        );
+        assert!(failed.state.is_none());
+    }
+    let term = fln_checker::term::TermBudget::new(0, 0).with_max_arena_nodes(0);
+    let whnf = fln_checker::whnf::WhnfBudget::new(0, 0, term);
+    let inference = fln_checker::infer::InferenceBudget::new(0, 0, term, term).with_whnf(whnf);
+    let mut constrained = admission();
+    constrained.checker.admission =
+        crate::CheckerAdmissionBudget::new(inference, whnf, inference.defeq);
+    let stopped = admit(
+        &engine,
+        &registry,
+        b"def limitedMacro : Nat := 7 + 11",
+        MacroTreeLimits::default(),
+        constrained,
+        None,
+    );
+    assert!(
+        matches!(&stopped.outcome, Outcome::Complete(Err(SourceMacroError::Frontend(error))) if matches!(error.as_ref(), crate::EngineExecutionError::CouncilNoAnswer { summary } if summary.contains("fln-checker"))),
+        "{stopped:?}"
+    );
+    assert!(stopped.state.is_none());
+    assert!(!engine.environment().contains(&name("limitedMacro")));
+    assert_eq!(engine.logical_root(&KVMap::new()), before);
+}
+
+#[test]
+fn macro_admission_validates_import_binding_and_keeps_the_declaration_boundary() {
+    let (engine, registry, _) = fixture();
+    let mut ambient = engine.clone();
+    ambient.imported_modules = Arc::new(BTreeSet::new());
+    let failed = admit(
+        &ambient,
+        &registry,
+        b"def ambientMacro : Nat := 7 + 11",
+        MacroTreeLimits::default(),
+        admission(),
+        None,
+    );
+    assert!(matches!(
+        failed.outcome,
+        Outcome::Complete(Err(SourceMacroError::Binding(_)))
+    ));
+    assert!(failed.attempts.is_empty());
+    assert!(failed.state.is_none());
+
+    let module = checked("CommandBoundary", &[owner("CommandBoundary.unwrap")], &[]);
+    let rows = journal(&[(
+        "Lean.Parser.Command.declaration",
+        "CommandBoundary.unwrap",
+        None,
+    )]);
+    let code = code(vec![selecting_function("CommandBoundary.unwrap", 0)]);
+    let registry = prepare(
+        &[MacroRegistrationModule {
+            checked: &module,
+            extensions: &rows,
+        }],
+        &code,
+    );
+    let engine = bound_engine(&module);
+    let before = engine.logical_root(&KVMap::new());
+    let failed = admit(
+        &engine,
+        &registry,
+        b"def escapedMacro : Nat := 11",
+        MacroTreeLimits::default(),
+        admission(),
+        None,
+    );
+    assert!(
+        matches!(
+            failed.outcome,
+            Outcome::Complete(Err(SourceMacroError::DeclarationRequired))
+        ),
+        "{failed:?}"
+    );
+    assert_eq!(failed.attempts.len(), 1);
+    assert!(failed.state.is_none());
+    assert!(!engine.environment().contains(&name("escapedMacro")));
+    assert_eq!(engine.logical_root(&KVMap::new()), before);
 }
 
 fn evaluated_nat(report: &SourceMacroEvaluation, expected: u64) -> &SourceMacroEvaluationResult {
