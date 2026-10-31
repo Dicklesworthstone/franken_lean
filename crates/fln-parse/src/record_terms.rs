@@ -37,6 +37,7 @@ fn frame(record: RecordFrame) -> BoundedTermFrame {
         application: Vec::new(),
         operands: Vec::new(),
         operators: Vec::new(),
+        command_position: false,
         argument_floor: None,
     }
 }
@@ -87,7 +88,7 @@ fn push_field(
         record.field = Some(Field::Definition);
         frames.push(frame(record));
         // The value's arguments start right of the first field (`checkColGt`).
-        let mut value = term_binders::frame(prefix);
+        let mut value = term_binders::frame(frames, prefix);
         value.argument_floor = Some(floor);
         frames.push(value);
     }

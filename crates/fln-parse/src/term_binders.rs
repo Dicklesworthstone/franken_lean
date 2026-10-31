@@ -79,7 +79,10 @@ fn binder_name(
     }
 }
 
-pub(super) fn frame(prefix: impl Into<term_locals::Prefix>) -> BoundedTermFrame {
+pub(super) fn frame(
+    parents: &[BoundedTermFrame],
+    prefix: impl Into<term_locals::Prefix>,
+) -> BoundedTermFrame {
     BoundedTermFrame {
         record: None,
         ascription: None,
@@ -89,6 +92,7 @@ pub(super) fn frame(prefix: impl Into<term_locals::Prefix>) -> BoundedTermFrame 
         application: Vec::new(),
         operands: Vec::new(),
         operators: Vec::new(),
+        command_position: parents.last().is_none_or(|frame| frame.command_position),
         argument_floor: None,
     }
 }

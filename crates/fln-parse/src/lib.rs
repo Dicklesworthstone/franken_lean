@@ -299,6 +299,9 @@ struct BoundedTermFrame {
     application: Vec<(Syntax, usize)>,
     operands: Vec<(Syntax, usize)>,
     operators: Vec<BoundedInfixToken>,
+    /// Whether the enclosing command's saved position is still active. Brackets clear it,
+    /// including for prefix frames nested inside them; closing the bracket restores its parent.
+    command_position: bool,
     /// The column an application argument in this frame starts right of, when a construct saved
     /// one for this frame (`checkColGt` against its `withPosition`): a structure instance's
     /// first field, for a field's value. A bracket opens its own frame without one
@@ -2241,7 +2244,7 @@ fn push_bounded_operand(
     // token is no argument at the pin: the term ends before it, and what follows is no command
     // (`def g : Nat := f` with `2` at column 0 on the next line). Later positions a construct saves
     // lie right of the command's, so this checks the weakest of them.
-    if frame.open.is_none() {
+    if frame.command_position {
         for (_, at) in application.iter().skip(1) {
             if !right_of_command_start(view, tokens, *at) {
                 return Err(NatDefinitionParseError::OutsideSeedGrammar {
@@ -3153,9 +3156,10 @@ fn split_range_argument(tokens: &[LexedToken], frames: &mut Vec<BoundedTermFrame
     let frame = frames.last_mut().expect("the root term frame remains live");
     let last = frame.application.pop().expect("an argument");
     let head = std::mem::take(&mut frame.application);
-    frames.push(term_binders::frame(term_locals::Prefix::RangeArgument(
-        head,
-    )));
+    frames.push(term_binders::frame(
+        frames,
+        term_locals::Prefix::RangeArgument(head),
+    ));
     frames
         .last_mut()
         .expect("the range frame")
@@ -3286,14 +3290,16 @@ fn initial_bounded_frames(
         application: Vec::new(),
         operands: Vec::new(),
         operators: Vec::new(),
+        command_position: true,
         argument_floor: None,
     }];
     let mut cursor = range.start;
     if sequence {
         let prefix = term_do::Prefix::branch(view, tokens, &mut cursor, range.end)?;
-        frames.push(term_binders::frame(term_locals::Prefix::Do(Box::new(
-            prefix,
-        ))));
+        frames.push(term_binders::frame(
+            &frames,
+            term_locals::Prefix::Do(Box::new(prefix)),
+        ));
     }
     Ok((frames, cursor))
 }
@@ -3685,7 +3691,7 @@ fn bounded_term_layout(
         } else {
             let (prefix, next) =
                 prefix.finish_header(leaves, view, tokens, index, value, range.end)?;
-            frames.push(term_binders::frame(prefix));
+            frames.push(term_binders::frame(frames, prefix));
             cursor = next;
         }
         return Ok(Some(cursor));
@@ -3706,7 +3712,7 @@ fn bounded_term_layout(
         let prefix = frame.prefix.take().expect("waiting assertion prefix");
         let value = finish_bounded_frame(view, tokens, frame, grammar, index)?;
         let (prefix, next) = prefix.finish_header(leaves, view, tokens, index, value, range.end)?;
-        frames.push(term_binders::frame(prefix));
+        frames.push(term_binders::frame(frames, prefix));
         cursor = next;
         return Ok(Some(cursor));
     }
@@ -3760,7 +3766,7 @@ fn bounded_term_layout(
             let domain = finish_bounded_frame(view, tokens, frame, grammar, index)?;
             let (prefix, end) =
                 prefix.finish_header(leaves, view, tokens, index, domain, range.end)?;
-            frames.push(term_binders::frame(prefix));
+            frames.push(term_binders::frame(frames, prefix));
             cursor = end;
             return Ok(Some(cursor));
         }
@@ -3771,7 +3777,7 @@ fn bounded_term_layout(
     {
         let prefix =
             term_binders::Prefix::start(leaves, view, tokens, index, &mut cursor, range.end)?;
-        frames.push(term_binders::frame(prefix));
+        frames.push(term_binders::frame(frames, prefix));
         return Ok(Some(cursor));
     }
     if grammar == DefinitionGrammar::Scalar
@@ -3859,7 +3865,7 @@ fn bounded_term_token(
         && let Some(prefix) =
             bounded_term_prefix(leaves, view, tokens, frames, index, &mut cursor, range.end)?
     {
-        frames.push(term_binders::frame(prefix));
+        frames.push(term_binders::frame(frames, prefix));
         return Ok(cursor);
     }
     let kind = tokens.get(index).map(|token| &token.kind);
@@ -3943,7 +3949,10 @@ fn bounded_term_compound_token(
         Some(TokenKind::Symbol(symbol))
             if grammar == DefinitionGrammar::Scalar && (symbol == "←" || symbol == "<-") =>
         {
-            frames.push(term_binders::frame(term_locals::Prefix::Nested(index)));
+            frames.push(term_binders::frame(
+                frames,
+                term_locals::Prefix::Nested(index),
+            ));
         }
         // `return e` outside `do`: the do parser reads its own statements first. A do element's
         // bare `return` is its keyword leaf, and a bare one here is complete.
@@ -3951,7 +3960,10 @@ fn bounded_term_compound_token(
             if grammar == DefinitionGrammar::Scalar && symbol == "return" =>
         {
             if !push_bare_return(leaves, view, tokens, frames, index, range.end) {
-                frames.push(term_binders::frame(term_locals::Prefix::Return(index)));
+                frames.push(term_binders::frame(
+                    frames,
+                    term_locals::Prefix::Return(index),
+                ));
             }
         }
         Some(TokenKind::Symbol(symbol))
@@ -3979,9 +3991,10 @@ fn bounded_term_compound_token(
                 "*...<" => "term*...<_",
                 _ => "term*...=_",
             };
-            frames.push(term_binders::frame(term_locals::Prefix::StarRange(
-                index, label,
-            )));
+            frames.push(term_binders::frame(
+                frames,
+                term_locals::Prefix::StarRange(index, label),
+            ));
         }
         Some(TokenKind::Symbol(symbol))
             if grammar == DefinitionGrammar::Scalar && symbol == "*...*" =>
@@ -4031,7 +4044,10 @@ fn bounded_term_compound_token(
         Some(TokenKind::Symbol(symbol))
             if grammar == DefinitionGrammar::Scalar && symbol == "panic!" =>
         {
-            frames.push(term_binders::frame(term_locals::Prefix::Panic(index)));
+            frames.push(term_binders::frame(
+                frames,
+                term_locals::Prefix::Panic(index),
+            ));
         }
         Some(TokenKind::Symbol(symbol))
             if grammar == DefinitionGrammar::Scalar && symbol == "unreachable!" =>
@@ -4178,6 +4194,7 @@ fn bounded_term_compound_token(
                 application: Vec::new(),
                 operands: Vec::new(),
                 operators: Vec::new(),
+                command_position: frames.last().is_none_or(|frame| frame.command_position),
                 argument_floor: None,
             });
         }
@@ -4263,7 +4280,7 @@ fn bounded_term_compound_token(
         {
             let prefix =
                 term_binders::Prefix::start(leaves, view, tokens, index, &mut cursor, range.end)?;
-            frames.push(term_binders::frame(prefix));
+            frames.push(term_binders::frame(frames, prefix));
         }
         Some(TokenKind::Symbol(symbol))
             if grammar == DefinitionGrammar::Scalar && (symbol == "." || symbol == "·") =>
@@ -4339,6 +4356,7 @@ fn bounded_term_compound_token(
                     application: Vec::new(),
                     operands: Vec::new(),
                     operators: Vec::new(),
+                    command_position: false,
                     argument_floor: None,
                 });
             } else {
@@ -4382,6 +4400,7 @@ fn bounded_term_compound_token(
                 application: Vec::new(),
                 operands: Vec::new(),
                 operators: Vec::new(),
+                command_position: false,
                 argument_floor: None,
             });
         }

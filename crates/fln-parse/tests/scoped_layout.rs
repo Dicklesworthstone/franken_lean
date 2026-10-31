@@ -2,6 +2,54 @@
 #![forbid(unsafe_code)]
 use fln_parse::{command_scope, parse_source_command};
 
+const BRACKET_PREFIX_CASES: [(&str, &str, bool); 5] = [
+    ("outside", "def x : Nat := Nat.add 40\n2\n#eval x\n", false),
+    (
+        "closed-parenthesis",
+        "def use (f : Nat -> Nat) (g : Nat -> Nat) : Nat := g (f 40)\ndef x : Nat := use (fun n => Nat.add n\n2)\n(fun n => n)\n#eval x\n",
+        false,
+    ),
+    (
+        "parenthesized",
+        "def x : Nat := (Nat.add 40\n2)\n#eval x\n",
+        true,
+    ),
+    (
+        "lambda",
+        "def use (f : Nat -> Nat) : Nat := f 40\ndef x : Nat := use (fun n =>\nNat.add n\n2)\n#eval x\n",
+        true,
+    ),
+    (
+        "ascribed-lambda",
+        "def use (f : Nat -> Nat) : Nat := f 40\ndef x : Nat := use ((fun n =>\nNat.add n\n2) : Nat -> Nat)\n#eval x\n",
+        true,
+    ),
+];
+
+#[test]
+fn bracket_position_resets_survive_prefixes_and_end_at_the_closing_bracket() {
+    for (label, source, expected) in BRACKET_PREFIX_CASES {
+        for source in [source.to_owned(), source.replace('\n', "\r\n")] {
+            let native = command_scope::partition(source.as_bytes()).is_ok_and(|commands| {
+                commands
+                    .into_iter()
+                    .all(|(_, bytes)| match command_scope::parse(bytes) {
+                        Ok(Some(_)) => true,
+                        Ok(None) => match parse_source_command(bytes) {
+                            Ok(parsed) => {
+                                assert_eq!(parsed.reconstruct_original(), bytes);
+                                true
+                            }
+                            Err(_) => false,
+                        },
+                        Err(_) => false,
+                    })
+            });
+            assert_eq!(native, expected, "{label}: {source}");
+        }
+    }
+}
+
 #[test]
 fn variable_binders_must_start_right_of_the_command() {
     for source in [
@@ -155,6 +203,9 @@ fn scoped_layout_verdicts_agree_with_the_actual_pinned_compiler() {
     ));
     std::fs::create_dir(&root).unwrap();
     let mut cases = Vec::new();
+    for (label, source, expected) in BRACKET_PREFIX_CASES {
+        cases.push((format!("application-{label}"), source.to_owned(), expected));
+    }
     for (indent, valid) in [("", false), ("  ", true)] {
         cases.push((
             format!("variable-{valid}"),

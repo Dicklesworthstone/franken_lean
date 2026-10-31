@@ -88,6 +88,7 @@ fn frame(open: usize) -> BoundedTermFrame {
         application: Vec::new(),
         operands: Vec::new(),
         operators: Vec::new(),
+        command_position: false,
         argument_floor: None,
     }
 }
