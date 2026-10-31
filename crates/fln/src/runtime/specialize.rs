@@ -842,7 +842,8 @@ impl Preparation<'_> {
         Ok(value)
     }
     /// Expose a concrete dictionary field and eliminate its type lambdas. For
-    /// runtime lambdas, retain strict evaluation and sharing with a let binder.
+    /// runtime lambdas, discard unused beta arguments and share used values
+    /// with a let binder. A computed callee retains its initializer prefix.
     pub(super) fn static_apply(
         &mut self,
         head: &Expr,
@@ -918,6 +919,14 @@ impl Preparation<'_> {
             let Some(argument) = args.get(consumed) else {
                 break;
             };
+            // The pin eliminates an unused argument of a literal lambda
+            // before runtime preparation, including diagnostic computations.
+            // Do not visit the discarded argument or duplicate a used one.
+            if !body.has_loose_bvar(0) {
+                head = self.substitution(body, argument)?;
+                consumed += 1;
+                continue;
+            }
             // Constructing a syntactic lambda executes none of its body. It
             // can be substituted capture-avoidantly without duplicating or
             // dropping an action. This also exposes mutual-match minor

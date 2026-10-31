@@ -299,6 +299,16 @@ fn recursive_local_closures_discard_unused_values_and_share_used_values() {
                 "used\n",
                 10,
             ),
+            (
+                r#"#eval (fun (_x : Nat) => 42) (dbg_trace "unused argument"; 5)"#,
+                "",
+                42,
+            ),
+            (
+                r#"#eval (fun (x : Nat) => x + x) (dbg_trace "shared argument"; 5)"#,
+                "shared argument\n",
+                10,
+            ),
         ] {
             check(
                 engine,
