@@ -286,6 +286,33 @@ fn checked_thunks_share_forces_keep_allocations_distinct_and_delay_only_the_body
 }
 
 #[test]
+fn recursive_local_closures_discard_unused_values_and_share_used_values() {
+    fixture(|engine, compiler| {
+        for (source, trace, value) in [
+            (
+                r#"#eval let rec x : Nat := dbg_trace "unused"; 5; 42"#,
+                "",
+                42,
+            ),
+            (
+                r#"#eval let rec x : Nat := dbg_trace "used"; 5; x + x"#,
+                "used\n",
+                10,
+            ),
+        ] {
+            check(
+                engine,
+                compiler,
+                source,
+                trace,
+                ClosedVmValue::Scalar(value),
+                &value.to_string(),
+            );
+        }
+    });
+}
+
+#[test]
 fn public_fields_patterns_and_first_class_operations_keep_cached_getters() {
     fixture(|engine, compiler| {
         for (source, trace) in [

@@ -2118,6 +2118,22 @@ impl Context {
                 count
             }
         }
+        #[derive(Clone, Copy)]
+        enum LetKind {
+            Let,
+            Have,
+            LetI,
+            HaveI,
+            LetRec,
+        }
+        impl LetKind {
+            fn opaque(self) -> bool {
+                matches!(self, Self::Have | Self::HaveI | Self::LetRec)
+            }
+            fn inline(self) -> bool {
+                matches!(self, Self::LetI | Self::HaveI)
+            }
+        }
         enum Task<'a> {
             RestoreOptions(KVMap),
             DoJoinValue(Name, &'a Syntax, Option<Expr>),
@@ -2183,11 +2199,9 @@ impl Context {
             LocalFunctionAnnotation(local_functions::Build<'a>),
             LocalFunctionStart(local_functions::Build<'a>, Option<usize>),
             LocalFunctionValue(local_functions::Build<'a>, usize),
-            // The last two flags: opaque (`have`), and inline (`letI`/`haveI`, whose
-            // value replaces the bound variable instead of becoming a `let`).
-            LetAnnotation(Name, &'a Syntax, &'a Syntax, Option<Expr>, bool, bool),
-            LetValue(Name, Option<Expr>, &'a Syntax, Option<Expr>, bool, bool),
-            LetBody(LocalContext, FVarId, Name, Typed, bool, bool),
+            LetAnnotation(Name, &'a Syntax, &'a Syntax, Option<Expr>, LetKind),
+            LetValue(Name, Option<Expr>, &'a Syntax, Option<Expr>, LetKind),
+            LetBody(LocalContext, FVarId, Name, Typed, LetKind),
             RewriteTerm(
                 tactics::ProofState<'a>,
                 tactics::ProofGoal,
@@ -2804,8 +2818,7 @@ impl Context {
                                         id,
                                         name.clone(),
                                         value,
-                                        false,
-                                        false,
+                                        LetKind::Let,
                                     ));
                                     tasks.push(Task::Visit(body, expected, finish));
                                     continue;
@@ -2951,8 +2964,7 @@ impl Context {
                                         witness,
                                         continuation,
                                         expected,
-                                        true,
-                                        false,
+                                        LetKind::Have,
                                     ));
                                     tasks.push(Task::Visit(
                                         annotation,
@@ -3102,9 +3114,19 @@ impl Context {
                                         body,
                                         ..
                                     } = binding;
+                                    let binding_kind = match (opaque, inline) {
+                                        (false, false) => LetKind::Let,
+                                        (true, false) => LetKind::Have,
+                                        (false, true) => LetKind::LetI,
+                                        (true, true) => LetKind::HaveI,
+                                    };
                                     if let Some(annotation) = annotation {
                                         tasks.push(Task::LetAnnotation(
-                                            name, value, body, expected, opaque, inline,
+                                            name,
+                                            value,
+                                            body,
+                                            expected,
+                                            binding_kind,
                                         ));
                                         tasks.push(Task::Visit(
                                             annotation,
@@ -3113,7 +3135,11 @@ impl Context {
                                         ));
                                     } else {
                                         tasks.push(Task::LetValue(
-                                            name, None, body, expected, opaque, inline,
+                                            name,
+                                            None,
+                                            body,
+                                            expected,
+                                            binding_kind,
                                         ));
                                         tasks.push(Task::Visit(value, None, true));
                                     }
@@ -4521,17 +4547,24 @@ impl Context {
                             // it becomes the auxiliary `f.g` only once `f` is complete
                             // (`elabLetRec`, Lean/Elab/LetRec.lean:140-147: `withAuxLocalDecls`,
                             // then `registerLetRecsToLift`). Inside `f` it cannot unfold, as a
-                            // `have` cannot; the admitted term still binds the value.
+                            // `have` cannot. Its closure is an applied lambda, as in the
+                            // pin's `mkAppN (mkLambdaFVars fvars body) mvars`.
+                            let binding_kind = if build.binding.recursive {
+                                LetKind::LetRec
+                            } else if build.binding.opaque {
+                                LetKind::Have
+                            } else {
+                                LetKind::Let
+                            };
                             tasks.push(Task::LetValue(
                                 build.binding.name,
                                 None,
                                 build.binding.body,
                                 build.expected,
-                                build.binding.opaque || build.binding.recursive,
-                                false,
+                                binding_kind,
                             ));
                         }
-                        Task::LetAnnotation(name, value, body, expected, opaque, inline) => {
+                        Task::LetAnnotation(name, value, body, expected, binding_kind) => {
                             let annotation = values.pop().expect("let annotation visit");
                             self.sort_level(&annotation)?;
                             tasks.push(Task::LetValue(
@@ -4539,8 +4572,7 @@ impl Context {
                                 Some(annotation.value.clone()),
                                 body,
                                 expected,
-                                opaque,
-                                inline,
+                                binding_kind,
                             ));
                             tasks.push(Task::Visit(value, Some(annotation.value), true));
                         }
@@ -4563,7 +4595,7 @@ impl Context {
                                 value.type_.clone(),
                                 BinderInfo::Default,
                             );
-                            tasks.push(Task::LetBody(saved, id, name, value, false, false));
+                            tasks.push(Task::LetBody(saved, id, name, value, LetKind::Let));
                             tasks.push(Task::Visit(body, Some(result_type), true));
                         }
                         Task::DoBindJoinStart(name, continuation, body, result_type, annotated) => {
@@ -4615,7 +4647,7 @@ impl Context {
                         Task::DoBindJoinValue(saved, id, name, body) => {
                             let continuation = values.pop().expect("nested do continuation visit");
                             values.push(body);
-                            tasks.push(Task::LetBody(saved, id, name, continuation, false, false));
+                            tasks.push(Task::LetBody(saved, id, name, continuation, LetKind::Let));
                         }
                         Task::DoNestedAnnotation(body, expected, finish) => {
                             let annotation =
@@ -4623,14 +4655,14 @@ impl Context {
                             self.sort_level(&annotation)?;
                             tasks.push(Task::Visit(body, expected, finish));
                         }
-                        Task::LetValue(name, annotation, body, expected, opaque, inline) => {
+                        Task::LetValue(name, annotation, body, expected, binding_kind) => {
                             let mut value = values.pop().expect("let value visit");
                             if let Some(annotation) = annotation {
                                 value.type_ = annotation;
                             }
                             let saved = self.txn.lctx.clone();
                             let id = FVarId(self.fresh_name()?);
-                            if opaque {
+                            if binding_kind.opaque() {
                                 // A `have` witness is checked, but cannot unfold in
                                 // the continuation's elaboration context.
                                 self.txn.lctx.add_param(
@@ -4664,11 +4696,11 @@ impl Context {
                                     self.check_pattern_typing(&discriminants, &alternatives)?;
                                 }
                             }
-                            tasks.push(Task::LetBody(saved, id, name, value, opaque, inline));
+                            tasks.push(Task::LetBody(saved, id, name, value, binding_kind));
                             tasks.push(Task::Visit(body, expected, true));
                         }
-                        Task::LetBody(saved, id, name, value, opaque, inline) => {
-                            if opaque {
+                        Task::LetBody(saved, id, name, value, binding_kind) => {
+                            if binding_kind.opaque() {
                                 // Do not postpone equations over the assertion past the
                                 // context that gives it its opaque interpretation. The
                                 // others stay pending, as at the pin: a numeral's type may
@@ -4692,11 +4724,27 @@ impl Context {
                                 .abstract_fvar(&id, 0)
                                 .map_err(|_| failure(SourceInferenceError::Scope))?;
                             let type_ = self.substitute(&abstract_type, &value.value)?;
-                            let value = if inline {
+                            let value = if binding_kind.inline() {
                                 // `letI`/`haveI`: the value replaces the variable.
                                 self.substitute(&abstract_body, &value.value)?
+                            } else if matches!(binding_kind, LetKind::LetRec) {
+                                Expr::app(
+                                    Expr::lam(
+                                        name,
+                                        value.type_,
+                                        abstract_body,
+                                        BinderInfo::Default,
+                                    ),
+                                    value.value,
+                                )
                             } else {
-                                Expr::let_e(name, value.type_, value.value, abstract_body, opaque)
+                                Expr::let_e(
+                                    name,
+                                    value.type_,
+                                    value.value,
+                                    abstract_body,
+                                    binding_kind.opaque(),
+                                )
                             };
                             values.push(Typed { value, type_ });
                             self.txn.lctx = saved;
