@@ -781,6 +781,22 @@ impl ParsedSourceCommand {
         None
     }
 
+    /// Retain the original source metadata for an externally expanded named
+    /// declaration. The canonical declaration wrapper must survive; this does
+    /// not turn a query or a scope command into a declaration. Elaboration and
+    /// admission still validate the entire replacement tree.
+    pub fn with_expanded_declaration(mut self, syntax: Syntax) -> Option<Self> {
+        if self.kind == SourceCommandKind::Definition
+            && self.syntax.kind() == Some(&parser_kind(&["Command", "declaration"]))
+            && matches!(&syntax, Syntax::Node { kind, args, .. }
+                if *kind == parser_kind(&["Command", "declaration"]) && args.len() == 2)
+        {
+            self.syntax = syntax;
+            return Some(self);
+        }
+        None
+    }
+
     /// This command with the entered grammar's notations expanded, as
     /// [`ParsedDefinition::expanded`]; its query term's text stays the source's.
     pub fn expanded(mut self) -> Result<ParsedSourceCommand, NatDefinitionParseError> {

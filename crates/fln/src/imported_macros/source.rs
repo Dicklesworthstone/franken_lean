@@ -1,4 +1,4 @@
-//! Checked imported node macros on standalone source `#check` and raw `#eval` paths.
+//! Imported node macros on source declarations, standalone `#check` and raw `#eval`.
 //!
 //! This is an explicit embedding door for syntax the current parser already
 //! understands. It installs no artifact parser descriptions. The prepared
@@ -21,7 +21,7 @@ use super::registrations::{
 use super::{MacroContext, MacroExecutionError, MacroState};
 use crate::{
     DefinitionExecution, Engine, EngineAdmissionLimits, EngineExecutionError,
-    EngineExecutionLimits, SourceCheck,
+    EngineExecutionLimits, SourceCheck, SourceDeclarationAdmission,
 };
 use fln_core::diag::ResourceReason;
 use fln_core::name::Name;
@@ -66,6 +66,7 @@ pub enum SourceMacroError {
         kind: Name,
     },
     EvaluationRequired,
+    DeclarationRequired,
 }
 
 impl std::fmt::Display for SourceMacroError {
@@ -97,6 +98,9 @@ impl std::fmt::Display for SourceMacroError {
             ),
             Self::EvaluationRequired => {
                 write!(f, "source macro evaluation requires one ordinary #eval")
+            }
+            Self::DeclarationRequired => {
+                write!(f, "source macro admission requires one named declaration")
             }
         }
     }
@@ -136,6 +140,26 @@ pub struct SourceMacroEvaluation {
     pub completed_vm_usage: ExecutionUsage,
 }
 
+/// Original source metadata and the ordinary declaration-admission receipts.
+/// The successor includes attributes and separately checked local helpers, as
+/// on `Engine::admit_source_declaration`. Inspect its actual checker ground:
+/// safe definitions are body-checked, while unsafe declarations are quarantined.
+#[derive(Debug)]
+pub struct SourceMacroAdmissionResult {
+    pub parsed: ParsedSourceCommand,
+    pub admission: SourceDeclarationAdmission,
+}
+
+/// A named declaration produced by imported macros, or a typed stop. A failed
+/// expansion/admission exposes neither an Engine successor nor macro state.
+#[derive(Debug)]
+pub struct SourceMacroAdmission {
+    pub outcome: Outcome<Result<SourceMacroAdmissionResult, SourceMacroError>>,
+    pub state: Option<MacroState>,
+    pub attempts: Vec<MacroAttempt>,
+    pub completed_vm_usage: ExecutionUsage,
+}
+
 struct Progress {
     state: Option<MacroState>,
     attempts: Vec<MacroAttempt>,
@@ -143,6 +167,63 @@ struct Progress {
 }
 
 impl Engine {
+    /// Expand an explicitly supplied imported node-macro table over one named
+    /// declaration, then use the ordinary Engine's complete source-admission
+    /// path. This publishes a usable immutable successor only after all
+    /// declaration attributes and local helpers complete. No source text is
+    /// rendered or reparsed, no parser descriptions are installed, and no VM
+    /// evaluation of the admitted definition is requested.
+    ///
+    /// As on the query adapter, active atomic or tactic registrations that
+    /// require elaborator dispatch remain explicit refusals. The entire
+    /// declaration tree is visited, including its signature and body. Command
+    /// wrapper changes into queries or scope commands are refused.
+    pub fn admit_source_declaration_with_imported_macros(
+        &self,
+        source: &[u8],
+        options: &KVMap,
+        limits: EngineAdmissionLimits,
+        invocation: SourceMacroInvocation<'_>,
+    ) -> SourceMacroAdmission {
+        let mut progress = Progress {
+            state: None,
+            attempts: Vec::new(),
+            usage: ExecutionUsage {
+                steps: 0,
+                system_polls: 0,
+                peak_stack_depth: 0,
+            },
+        };
+        let outcome = match expand(
+            self,
+            source,
+            SourceCommandKind::Definition,
+            invocation,
+            &mut progress,
+        ) {
+            Outcome::Complete(Ok((parsed, state))) => {
+                match self.admit_source_syntax(source, parsed.syntax(), options, limits) {
+                    Ok(Outcome::Complete(admission)) => {
+                        progress.state = Some(state);
+                        Outcome::Complete(Ok(SourceMacroAdmissionResult { parsed, admission }))
+                    }
+                    Ok(Outcome::Inconclusive(reason)) => Outcome::Inconclusive(reason),
+                    Ok(Outcome::InternalFault(fault)) => Outcome::InternalFault(fault),
+                    Err(error) => frontend(error),
+                }
+            }
+            Outcome::Complete(Err(error)) => Outcome::Complete(Err(error)),
+            Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
+            Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
+        };
+        SourceMacroAdmission {
+            outcome,
+            state: progress.state,
+            attempts: progress.attempts,
+            completed_vm_usage: progress.usage,
+        }
+    }
+
     /// Parse one ordinary `#check`, execute an explicitly supplied checked
     /// imported node-macro table, and dual-check the expanded term.
     ///
@@ -305,10 +386,10 @@ fn expand(
             ));
         }
     };
-    let command = if expected == SourceCommandKind::Check {
-        "check"
-    } else {
-        "eval"
+    let command = match expected {
+        SourceCommandKind::Check => "check",
+        SourceCommandKind::Definition => "declaration",
+        _ => "eval",
     };
     let Syntax::Node { kind, args, .. } = parsed.syntax() else {
         return wrong_command(expected);
@@ -319,7 +400,11 @@ fn expand(
     {
         return wrong_command(expected);
     }
-    let input = &args[1];
+    let input = if expected == SourceCommandKind::Definition {
+        parsed.syntax()
+    } else {
+        &args[1]
+    };
     let scope = engine.base_source_scope();
     // Production source checks should not require the embedding caller to
     // reconstruct the Macro.Methods environment capability that the Engine
@@ -391,7 +476,12 @@ fn expand(
             Ok(None) => {}
             Err(reason) => return Outcome::Inconclusive(reason),
         }
-        let Some(parsed) = parsed.with_expanded_query_term(syntax) else {
+        let rewritten = if expected == SourceCommandKind::Definition {
+            parsed.with_expanded_declaration(syntax)
+        } else {
+            parsed.with_expanded_query_term(syntax)
+        };
+        let Some(parsed) = rewritten else {
             return wrong_command(expected);
         };
         (parsed, state)
@@ -453,6 +543,8 @@ fn evaluate(
 fn wrong_command<T>(expected: SourceCommandKind) -> Outcome<Result<T, SourceMacroError>> {
     if expected == SourceCommandKind::Check {
         frontend(EngineExecutionError::StandaloneCheckRequired)
+    } else if expected == SourceCommandKind::Definition {
+        Outcome::Complete(Err(SourceMacroError::DeclarationRequired))
     } else {
         Outcome::Complete(Err(SourceMacroError::EvaluationRequired))
     }

@@ -2285,11 +2285,24 @@ impl Engine {
             .and_then(fln_parse::ParsedDefinition::expanded)
             .map_err(DefinitionFrontendError::Parse)
             .map_err(EngineExecutionError::Frontend)?;
+        self.admit_source_syntax(source, parsed.syntax(), options, limits)
+    }
+
+    /// The shared admission path for parsed source and imported macro output.
+    /// Syntax stays untrusted: elaboration, both admission seats, declaration
+    /// attributes and separately checked local helpers are unchanged.
+    fn admit_source_syntax(
+        &self,
+        source: &[u8],
+        syntax: &fln_syntax::tree::Syntax,
+        options: &KVMap,
+        limits: EngineAdmissionLimits,
+    ) -> Result<Outcome<SourceDeclarationAdmission>, EngineExecutionError> {
         let mut scope = self.base_source_scope();
         scope.source_site = Some(source_check::source_site(source)?);
         let elaborated = match source_records::elaboration_outcome(
             fln_elab::elaborate_definition_with_effects_in_scope_with_budget(
-                parsed.syntax(),
+                syntax,
                 self.environment(),
                 limits.kernel,
                 &scope,
@@ -2299,35 +2312,35 @@ impl Engine {
             Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
         };
-        let default_priorities = fln_elab::source::default_instance_registration(parsed.syntax())
+        let default_priorities = fln_elab::source::default_instance_registration(syntax)
             .map_err(DefinitionFrontendError::Elaborate)
             .map_err(EngineExecutionError::Frontend)?;
-        let registration = fln_elab::source::instance_registration(parsed.syntax())
+        let registration = fln_elab::source::instance_registration(syntax)
             .map_err(DefinitionFrontendError::Elaborate)
             .map_err(EngineExecutionError::Frontend)?;
-        let instance_namespace = fln_elab::source::instance_registration_is_scoped(parsed.syntax())
+        let instance_namespace = fln_elab::source::instance_registration_is_scoped(syntax)
             .map_err(DefinitionFrontendError::Elaborate)
             .map_err(EngineExecutionError::Frontend)?
             .then(|| self.base_source_scope().namespace);
-        let local = fln_elab::source::instance_registration_is_local(parsed.syntax())
+        let local = fln_elab::source::instance_registration_is_local(syntax)
             .map_err(DefinitionFrontendError::Elaborate)
             .map_err(EngineExecutionError::Frontend)?;
-        let simp = fln_elab::source::scope::simp::registration(parsed.syntax())
+        let simp = fln_elab::source::scope::simp::registration(syntax)
             .map_err(DefinitionFrontendError::Elaborate)
             .map_err(EngineExecutionError::Frontend)?;
-        let reducibility = fln_elab::source::scope::simp::reducibility(parsed.syntax())
+        let reducibility = fln_elab::source::scope::simp::reducibility(syntax)
             .map_err(DefinitionFrontendError::Elaborate)
             .map_err(EngineExecutionError::Frontend)?;
-        let macro_inline = fln_elab::source::scope::simp::macro_inline(parsed.syntax())
+        let macro_inline = fln_elab::source::scope::simp::macro_inline(syntax)
             .map_err(DefinitionFrontendError::Elaborate)
             .map_err(EngineExecutionError::Frontend)?;
-        let executable = fln_elab::source::scope::executable::registrations(parsed.syntax())
+        let executable = fln_elab::source::scope::executable::registrations(syntax)
             .map_err(DefinitionFrontendError::Elaborate)
             .map_err(EngineExecutionError::Frontend)?;
-        let noncomputable = fln_elab::source::noncomputable_registration(parsed.syntax())
+        let noncomputable = fln_elab::source::noncomputable_registration(syntax)
             .map_err(DefinitionFrontendError::Elaborate)
             .map_err(EngineExecutionError::Frontend)?;
-        let protected = fln_elab::source::protected_registration(parsed.syntax())
+        let protected = fln_elab::source::protected_registration(syntax)
             .map_err(DefinitionFrontendError::Elaborate)
             .map_err(EngineExecutionError::Frontend)?
             .map(|name| fln_elab::source::scope::SourceScope::default().declaration_name(&name))
@@ -2350,7 +2363,7 @@ impl Engine {
                     elaborated.equation_info.as_ref(),
                     options,
                 )?;
-                if fln_elab::source::scope::simp::defeq::direct_rfl(parsed.syntax()) {
+                if fln_elab::source::scope::simp::defeq::direct_rfl(syntax) {
                     let name = match &admitted.declaration {
                         Declaration::Thm(theorem) => Some(&theorem.base.name),
                         Declaration::Defn(definition) => Some(&definition.base.name),
@@ -2466,7 +2479,7 @@ impl Engine {
                     source_records::declared_name(&admitted.declaration).cloned()
                     && let Some(environment) = source_records::tag_deprecated(
                         &admitted.engine,
-                        parsed.syntax(),
+                        syntax,
                         &declared,
                         &self.base_source_scope(),
                         limits.kernel,
@@ -2486,7 +2499,7 @@ impl Engine {
                     Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
                 };
                 let scope = scope
-                    .for_declaration(parsed.syntax())
+                    .for_declaration(syntax)
                     .map_err(DefinitionFrontendError::Elaborate)
                     .map_err(EngineExecutionError::Frontend)?;
                 return self.finish_source_simp_admission(admitted, simp, &scope, options, limits);
