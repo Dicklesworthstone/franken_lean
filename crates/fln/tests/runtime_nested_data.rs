@@ -329,7 +329,7 @@ def choose : NestedTree -> Nat
 #[test]
 fn heterogeneous_nested_containers_keep_their_constructor_fields() {
     with_fixture(|engine, _, compiler| {
-        let source = r#"
+        let definitions = r#"
 inductive Packet where
   | data (value : Nat)
   | group (children : Array Packet) (selected : Option Packet)
@@ -342,10 +342,26 @@ def inspect : Packet -> Nat
     | .some child => match child with
       | .data value => value
       | .group _ _ => 7
-#eval inspect (Packet.group (Array.mk (List.cons (Packet.data 12) List.nil)) (Option.some (Packet.data 42)))
 "#;
-        reference(compiler, source, "42");
-        run(engine, source, 42);
+        for (value, expected) in [
+            (
+                "Packet.group (Array.mk (List.cons (Packet.data 12) List.nil)) (Option.some (Packet.data 42))",
+                42,
+            ),
+            (
+                "Packet.group (Array.mk (List.cons (Packet.data 12) List.nil)) Option.none",
+                1,
+            ),
+            ("Packet.group (Array.mk List.nil) Option.none", 0),
+            (
+                "Packet.group (Array.mk List.nil) (Option.some (Packet.group (Array.mk List.nil) Option.none))",
+                7,
+            ),
+        ] {
+            let source = format!("{definitions}#eval inspect ({value})\n");
+            reference(compiler, &source, &expected.to_string());
+            run(engine, &source, expected);
+        }
     });
 }
 

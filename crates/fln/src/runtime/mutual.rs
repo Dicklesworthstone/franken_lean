@@ -22,7 +22,11 @@ pub(super) struct Member {
 }
 
 pub(super) struct Group {
-    shapes: Vec<records::Shape>,
+    // A native auxiliary (for example Array) has no constructor-object
+    // layout. An ordinary case needs only the selected layout; a fold needs
+    // every member and must refuse a missing one.
+    shapes: Vec<Option<records::Shape>>,
+    families: Vec<Expr>,
     selected: usize,
     indices: Vec<Vec<Expr>>,
     minor_offset: usize,
@@ -135,7 +139,8 @@ impl Preparation<'_> {
             .and_then(|n| n.checked_add(1))
             .ok_or_else(|| unsupported("mutual recursor arity"))?;
         Ok(Some(Group {
-            shapes,
+            families: shapes.iter().map(|shape| shape.source.clone()).collect(),
+            shapes: shapes.into_iter().map(Some).collect(),
             selected,
             indices,
             minor_offset,
@@ -174,12 +179,9 @@ impl Preparation<'_> {
         group: &Group,
         args: &[Expr],
     ) -> Result<Option<variants::Case>, IngressError> {
-        let shape = &group.shapes[group.selected];
-        let families: Vec<_> = group
-            .shapes
-            .iter()
-            .map(|shape| shape.source.clone())
-            .collect();
+        let Some(shape) = &group.shapes[group.selected] else {
+            return Ok(None);
+        };
         let Some(motive) = self.indexed_motive(
             &args[rec.num_params as usize + group.selected],
             &group.indices[group.selected],
@@ -215,7 +217,7 @@ impl Preparation<'_> {
                     field,
                     Expr::proj(shape.projection(ctor), field as u64, major.clone()),
                 )?;
-                if self.recursive_field(type_, &families)?.is_some() {
+                if self.recursive_field(type_, &group.families)?.is_some() {
                     reserve(&mut hypotheses, self.limits.max_context_depth)?;
                     hypotheses.push(FVarId(Name::num(case_name.clone(), field as u64)));
                 }

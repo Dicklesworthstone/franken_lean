@@ -42,6 +42,8 @@ impl Preparation<'_> {
         let mut telescope =
             self.universe_instance(&rec.base.type_, &rec.base.level_params, levels)?;
         let mut shapes = Vec::new();
+        let mut families = Vec::new();
+        let mut constructor_counts = Vec::new();
         let mut seen = HashSet::new();
         for (position, argument) in args[..major].iter().enumerate() {
             self.tick()?;
@@ -83,14 +85,26 @@ impl Preparation<'_> {
                 {
                     return Ok(None);
                 }
-                if self.value_type(&source)? != Some(ValueType::Constructor) {
-                    return Ok(None);
-                }
-                let Some(shape) = self.record_shape(&source)? else {
-                    return Ok(None);
+                let constructor_count = info.ctors.len();
+                let shape = match self.value_type(&source)? {
+                    Some(ValueType::Constructor) => {
+                        let Some(shape) = self.record_shape(&source)? else {
+                            return Ok(None);
+                        };
+                        Some(shape)
+                    }
+                    // Preserve the checked native representation. This member
+                    // may supply an unused IH to an ordinary case, but cannot
+                    // be projected or folded as a constructor object.
+                    Some(_) => None,
+                    None => return Ok(None),
                 };
                 reserve(&mut shapes, self.limits.max_context_depth)?;
                 shapes.push(shape);
+                reserve(&mut families, self.limits.max_context_depth)?;
+                families.push(source);
+                reserve(&mut constructor_counts, self.limits.max_context_depth)?;
+                constructor_counts.push(constructor_count);
             }
             telescope = self.substitution(body, argument)?;
         }
@@ -102,24 +116,26 @@ impl Preparation<'_> {
         // List (List Tree) and List Tree share constructor names. The actual
         // major TYPE selects the member, never a recursor spelling or a first
         // matching constructor name which would conflate those instantiations.
-        let Some(selected) = shapes.iter().position(|shape| shape.source == source) else {
+        let Some(selected) = families.iter().position(|family| *family == source) else {
             return Ok(None);
         };
         let mut total = 0usize;
         let mut minor_offset = 0usize;
         let mut indices = Vec::new();
-        for (index, shape) in shapes.iter().enumerate() {
+        for (index, count) in constructor_counts.into_iter().enumerate() {
             self.tick()?;
             if index == selected {
                 minor_offset = total;
             }
             total = total
-                .checked_add(shape.constructors.len())
+                .checked_add(count)
                 .ok_or_else(|| unsupported("nested constructor count"))?;
             reserve(&mut indices, self.limits.max_context_depth)?;
             indices.push(Vec::new());
         }
-        let shape = &shapes[selected];
+        let Some(shape) = &shapes[selected] else {
+            return Ok(None);
+        };
         if total != rec.num_minors as usize || rec.rules.len() != shape.constructors.len() {
             return Ok(None);
         }
@@ -133,6 +149,7 @@ impl Preparation<'_> {
         }
         Ok(Some(Group {
             shapes,
+            families,
             selected,
             indices,
             minor_offset,

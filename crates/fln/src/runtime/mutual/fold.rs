@@ -119,8 +119,16 @@ impl Preparation<'_> {
         group: &Group,
         args: &[Expr],
     ) -> Result<Option<Fold>, IngressError> {
+        let Some(shapes) = group
+            .shapes
+            .iter()
+            .map(Option::as_ref)
+            .collect::<Option<Vec<_>>>()
+        else {
+            return Ok(None);
+        };
         let mut motives = Vec::new();
-        for (index, shape) in group.shapes.iter().enumerate() {
+        for (index, shape) in shapes.iter().enumerate() {
             self.tick()?;
             let Some(motive) = self.mutual_motive(
                 &args[rec.num_params as usize + index],
@@ -143,13 +151,9 @@ impl Preparation<'_> {
             u64::from(id),
         );
         let mut members = Vec::new();
-        let families: Vec<_> = group
-            .shapes
-            .iter()
-            .map(|shape| shape.source.clone())
-            .collect();
+        let families = &group.families;
         let mut minor_index = rec.num_params as usize + motives.len();
-        for (index, (shape, motive)) in group.shapes.iter().zip(&motives).enumerate() {
+        for (index, (shape, motive)) in shapes.iter().zip(&motives).enumerate() {
             self.tick()?;
             let name = Name::num(group_name.clone(), index as u64);
             let case_name = Name::num(case_prefix.clone(), index as u64);
@@ -196,7 +200,7 @@ impl Preparation<'_> {
                         return Err(unsupported("mutual constructor field telescope"));
                     };
                     logical_fields = self.substitution(next_field, &field)?;
-                    if let Some(recursive) = self.recursive_field(field_type, &families)? {
+                    if let Some(recursive) = self.recursive_field(field_type, families)? {
                         let target = recursive.target;
                         let marker = FVarId(Name::num(
                             Name::num(case_name.clone(), constructor_index as u64),
@@ -209,7 +213,7 @@ impl Preparation<'_> {
                         let indices = self.indexed_recursive_field_arguments(
                             &recursive,
                             logical_type,
-                            &group.shapes[target].source,
+                            &families[target],
                             group.indices[target].len(),
                         )?;
                         // A function-valued child supplies a function-valued
