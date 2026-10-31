@@ -7,6 +7,7 @@ use fln_olean::ir::{
 use fln_syntax::source::{BytePos, ByteSpan, SourceInfo};
 use fln_syntax::tree::Preresolved;
 
+#[cfg(test)]
 mod lookup_reference;
 mod reference;
 

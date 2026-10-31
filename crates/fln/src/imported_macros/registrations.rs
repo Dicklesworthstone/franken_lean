@@ -1031,5 +1031,4 @@ fn stopped<T>(what: &'static str, allowed: u64, observed: u64) -> Outcome<T> {
 }
 
 #[cfg(test)]
-#[path = "registrations/tests.rs"]
 mod tests;

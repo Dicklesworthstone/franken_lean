@@ -16,13 +16,13 @@ use fln_rt::region::compact;
 use fln_rt::syntax_abi_generated as layout;
 use fln_syntax::source::SourceInfo;
 
-#[path = "tests/reference.rs"]
+#[cfg(test)]
 mod reference;
 
-#[path = "tests/source.rs"]
+#[cfg(test)]
 mod source;
 
-#[path = "tests/lookup.rs"]
+#[cfg(test)]
 mod lookup;
 
 fn name(text: &str) -> Name {

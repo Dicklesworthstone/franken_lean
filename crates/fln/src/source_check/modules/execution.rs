@@ -202,6 +202,7 @@ impl imported::SourceOleanImport {
             contexts::ImportContexts::capture(&engine, &engine, &checked, BTreeMap::new());
         Self {
             contexts,
+            macro_journals: Vec::new(),
             engine,
             checked,
             result_logical_root: root,

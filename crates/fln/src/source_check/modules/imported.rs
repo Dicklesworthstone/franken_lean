@@ -190,6 +190,10 @@ pub struct SourceMetadataReport {
 #[derive(Debug)]
 pub struct SourceOleanImport {
     pub(super) contexts: super::contexts::ImportContexts,
+    /// Macro rows from the same final journals used by admission, in import
+    /// replay order. Keep these private: callers need not reconstruct or pair
+    /// artifact payloads with the public checking records.
+    pub(super) macro_journals: Vec<(Name, Vec<OpaqueExtensionBlock>)>,
     /// The metadata-enabled successor. Both checker projections and import
     /// identities are retained; metadata itself grants no declaration authority.
     pub engine: Engine,
@@ -199,6 +203,66 @@ pub struct SourceOleanImport {
     pub result_logical_root: LogicalRoot,
     /// Actual dependency-first metadata replay order.
     pub modules: Vec<SourceMetadataReport>,
+}
+
+impl SourceOleanImport {
+    /// Compile this import closure's complete macro table from its captured
+    /// journals and checked owners. The caller supplies companion IR and the
+    /// verified census partition; no artifacts are reopened or decoded again.
+    /// Every registered macro, including inactive scoped entries, must compile
+    /// successfully. Unsupported entries are errors, never silently omitted.
+    ///
+    /// Preparation does not activate macros on ordinary source entry points.
+    /// Use the resulting registry with the imported-macro source operations;
+    /// scoped registrations still require explicit namespace activation.
+    pub fn prepare_imported_macros(
+        &self,
+        code: &[fln_olean::ir::IrModule],
+        partition: &crate::imported_ir::VerifiedPartition,
+        user_declarations: &BTreeSet<Name>,
+        limits: crate::imported_macros::registrations::MacroRegistryLimits,
+    ) -> std::result::Result<
+        crate::imported_macros::registrations::RegisteredMacros,
+        crate::imported_macros::registrations::MacroRegistrationError,
+    > {
+        use crate::imported_macros::registrations::{
+            MacroRegistrationError, MacroRegistrationModule, RegisteredMacros,
+        };
+        if self.macro_journals.len() > limits.max_modules {
+            return Err(MacroRegistrationError::Limit("modules"));
+        }
+        let mut checked = BTreeMap::new();
+        for module in &self.checked.modules {
+            if checked.insert(&module.name, module).is_some() {
+                return Err(MacroRegistrationError::DuplicateModule(module.name.clone()));
+            }
+        }
+        let modules =
+            self.macro_journals
+                .iter()
+                .map(|(name, extensions)| {
+                    let checked = checked.get(name).copied().ok_or_else(|| {
+                        MacroRegistrationError::Owner {
+                            module: name.clone(),
+                            declaration: Name::anonymous(),
+                            reason: "captured macro journal lost its checked module",
+                        }
+                    })?;
+                    Ok(MacroRegistrationModule {
+                        checked,
+                        extensions,
+                    })
+                })
+                .collect::<std::result::Result<Vec<_>, MacroRegistrationError>>()?;
+        RegisteredMacros::prepare(
+            &modules,
+            self.contexts.complete.environment(),
+            code,
+            partition,
+            user_declarations,
+            limits,
+        )
+    }
 }
 
 #[derive(Debug)]
@@ -501,6 +565,7 @@ impl Engine {
 struct PreparedMetadata {
     reports: Vec<SourceMetadataReport>,
     decoded: metadata::SourceExtensions,
+    macro_journals: Vec<(Name, Vec<OpaqueExtensionBlock>)>,
 }
 
 struct MetadataModule {
@@ -579,6 +644,8 @@ fn prepare_source_metadata(
         })
         .collect();
     let mut reports = Vec::new();
+    let mut macro_journals = Vec::new();
+    let macro_extension = Name::from_components(metadata::macros::MACRO_EXTENSION.split('.'));
     let mut capture_left = limits.max_capture_bytes;
     let mut entries_left = limits.metadata.max_entries;
     let mut defeq_tags = ReflexivityTags::default();
@@ -625,6 +692,7 @@ fn prepare_source_metadata(
             uninterpreted: Vec::new(),
         };
         let mut seen = BTreeSet::new();
+        let mut macro_blocks = Vec::new();
         for block in captured {
             if !seen.insert(block.name.clone()) {
                 return Err(SourceOleanImportError::Metadata {
@@ -699,10 +767,16 @@ fn prepare_source_metadata(
                 // Move payloads, not copies. The remaining allowances include
                 // every tag already decoded across the module boundaries.
                 blocks[kind].entries.extend(entries);
-            } else if !block.entries.is_empty() {
-                report.uninterpreted.push(block.name);
+            } else {
+                if !block.entries.is_empty() {
+                    report.uninterpreted.push(block.name.clone());
+                }
+                if block.name == macro_extension {
+                    macro_blocks.push(block);
+                }
             }
         }
+        macro_journals.push((module.name.clone(), macro_blocks));
         reports.push(report);
     }
     cancelled!("source-olean/before-metadata-decode");
@@ -712,7 +786,11 @@ fn prepare_source_metadata(
     decoded.defeq = defeq_tags.declarations;
     decoded.backward_defeq = backward_defeq_tags.declarations;
     cancelled!("source-olean/after-metadata-preflight");
-    Ok(Outcome::Complete(PreparedMetadata { reports, decoded }))
+    Ok(Outcome::Complete(PreparedMetadata {
+        reports,
+        decoded,
+        macro_journals,
+    }))
 }
 
 impl Engine {
@@ -746,6 +824,7 @@ impl Engine {
         let PreparedMetadata {
             mut reports,
             decoded,
+            macro_journals,
         } = prepared;
         if reports.len() != order.len()
             || reports
@@ -1444,6 +1523,7 @@ impl Engine {
         let contexts = super::contexts::ImportContexts::capture(self, &engine, &checked, journals);
         cancelled!("source-olean/after-context-capture");
         Ok(Outcome::Complete(SourceOleanImport {
+            macro_journals,
             engine,
             checked,
             result_logical_root,
