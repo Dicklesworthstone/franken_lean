@@ -367,7 +367,7 @@ fn source_refuses_imported_tactics_left_for_the_tactic_evaluator() {
 }
 
 #[test]
-fn source_lookup_capability_changes_expansion_using_the_admitted_snapshot() {
+fn source_lookup_capability_defaults_to_the_engine_snapshot_and_allows_explicit_override() {
     use crate::imported_macros::lookup::EnvironmentMacroLookup;
 
     let module = checked(
@@ -396,32 +396,10 @@ fn source_lookup_capability_changes_expansion_using_the_admitted_snapshot() {
     let engine = bound_engine(&module);
     let before = engine.logical_root(&KVMap::new());
     let source = b"#check Nat + (Nat + Bool)";
-    let absent = run(&engine, &registry, source, MacroTreeLimits::default(), None);
-    assert!(matches!(
-        absent.outcome,
-        Outcome::Complete(Err(SourceMacroError::Execution(_)))
-    ));
-    assert!(absent.state.is_none());
 
-    let module_name = name("SourceQuery");
-    let namespace = Name::anonymous();
-    let old_lookup = EnvironmentMacroLookup::new(engine.environment(), &module_name, &namespace);
-    let invoke = |engine: &Engine, lookup: &dyn fln_vm::macro_native::MacroLookup| {
-        engine.check_source_command_with_imported_macros(
-            source,
-            &KVMap::new(),
-            admission(),
-            SourceMacroInvocation {
-                registry: &registry,
-                context: &context(),
-                state: MacroState::default(),
-                lookup: Some(lookup),
-                limits: MacroTreeLimits::default(),
-                cancellation: None,
-            },
-        )
-    };
-    let missing = invoke(&engine, &old_lookup);
+    // No embedding-supplied capability is necessary on the production source
+    // path. The Engine binds its own immutable environment snapshot.
+    let missing = run(&engine, &registry, source, MacroTreeLimits::default(), None);
     checked_constant(&missing, "Bool");
     assert_eq!(missing.attempts.len(), 4);
     assert!(missing.attempts.iter().any(|attempt| {
@@ -438,11 +416,47 @@ fn source_lookup_capability_changes_expansion_using_the_admitted_snapshot() {
         .unwrap()
         .engine;
     let after = successor.logical_root(&KVMap::new());
-    let new_lookup = EnvironmentMacroLookup::new(successor.environment(), &module_name, &namespace);
-    let available = invoke(&successor, &new_lookup);
+    let available = run(
+        &successor,
+        &registry,
+        source,
+        MacroTreeLimits::default(),
+        None,
+    );
     checked_constant(&available, "Nat");
     assert_eq!(available.attempts.len(), 2);
-    checked_constant(&invoke(&engine, &old_lookup), "Bool");
+
+    // An explicit provider remains an invocation-local override. Supplying the
+    // predecessor snapshot to the successor must not be silently replaced by
+    // ambient authority from the newer Engine.
+    let module_name = name("SourceQuery");
+    let namespace = Name::anonymous();
+    let stale_lookup = EnvironmentMacroLookup::new(engine.environment(), &module_name, &namespace);
+    let stale = successor.check_source_command_with_imported_macros(
+        source,
+        &KVMap::new(),
+        admission(),
+        SourceMacroInvocation {
+            registry: &registry,
+            context: &context(),
+            state: MacroState::default(),
+            lookup: Some(&stale_lookup),
+            limits: MacroTreeLimits::default(),
+            cancellation: None,
+        },
+    );
+    checked_constant(&stale, "Bool");
+
+    checked_constant(
+        &run(
+            &engine,
+            &registry,
+            source,
+            MacroTreeLimits::default(),
+            None,
+        ),
+        "Bool",
+    );
     assert_eq!(engine.logical_root(&KVMap::new()), before);
     assert_eq!(successor.logical_root(&KVMap::new()), after);
 }
