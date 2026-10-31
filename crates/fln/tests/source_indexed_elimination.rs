@@ -28,25 +28,66 @@ fn check(source: &str) -> fln::SourceFileCheck {
         .into_complete()
         .unwrap()
 }
+fn rejects_proof(source: &str) {
+    let base = engine();
+    let options = KVMap::new();
+    let root = base.logical_root(&options);
+    let error = base
+        .check_source_files(
+            &[source.as_bytes()],
+            &options,
+            SourceCheckLimits::new(limits()),
+        )
+        .expect_err(source);
+    assert_eq!(error.disposition(), ("elaboration", false, 1), "{error:?}");
+    assert!(
+        matches!(&error, fln::SourceCheckError::Command { command: 3, .. }),
+        "the proof must be reached after its definition: {error:?}"
+    );
+    assert_eq!(base.logical_root(&options), root);
+}
 const VEC: &str = "inductive Vec (A : Type) : Nat -> Type where | nil : Vec A 0 | cons (n : Nat) (head : A) (tail : Vec A n) : Vec A (Nat.succ n)\n";
 const LENGTH: &str = "def length {A : Type} (n : Nat) (xs : Vec A n) : Nat := by\n  induction xs with\n  | nil => exact 0\n  | cons k x tail ih => exact Nat.succ ih\n";
 const COPY: &str = "def copy {A : Type} (n : Nat) (xs : Vec A n) : Vec A n := by\n  induction xs with\n  | nil => exact Vec.nil\n  | cons k x tail ih => exact Vec.cons k x ih\n";
+// The minimal seed has no imported congrArg lemma. Check its source proof here.
+const CONGRUENCE: &str = "theorem sourceCongrArg {A B : Type} (f : A -> B) {x y : A} (h : x = y) : f x = f y := by\n  cases h\n  rfl\n";
 
 #[test]
 fn indexed_induction_computes_length_and_proves_it_equals_the_index() {
-    check(&format!(
-        "{VEC}{LENGTH}\
-        theorem length_ok {{A : Type}} (n : Nat) (xs : Vec A n) : length n xs = n := by\n  induction xs with\n  | nil => rfl\n  | cons k x tail ih => simp only [length, ih]\n\
+    let source = |proof: &str| {
+        format!(
+            "{VEC}{LENGTH}{CONGRUENCE}\
+        theorem length_ok {{A : Type}} (n : Nat) (xs : Vec A n) : length n xs = n := by\n  induction xs with\n  | nil => rfl\n  | cons k x tail ih => {proof}\n\
         theorem sample : length 2 (Vec.cons 1 7 (Vec.cons 0 9 Vec.nil)) = 2 := by rfl"
+        )
+    };
+    // The pin leaves a recursor application after unfolding length. Its
+    // original `simp only [length, ih]` script does not rewrite that with ih.
+    // Preserve that refusal; apply congruence and normalize the actual proof.
+    rejects_proof(&source("simp only [length, ih]"));
+    check(&source(
+        "simpa only [length] using sourceCongrArg Nat.succ ih",
+    ));
+    rejects_proof(&source(
+        "simpa only [length] using sourceCongrArg (fun m : Nat => Nat.succ (Nat.succ m)) ih",
     ));
 }
 
 #[test]
 fn indexed_induction_can_return_data_at_the_refined_index() {
-    check(&format!(
-        "{VEC}{COPY}\
-        theorem copy_ok {{A : Type}} (n : Nat) (xs : Vec A n) : copy n xs = xs := by\n  induction xs with\n  | nil => rfl\n  | cons k x tail ih => simp only [copy, ih]\n\
+    let source = |proof: &str| {
+        format!(
+            "{VEC}{COPY}{CONGRUENCE}\
+        theorem copy_ok {{A : Type}} (n : Nat) (xs : Vec A n) : copy n xs = xs := by\n  induction xs with\n  | nil => rfl\n  | cons k x tail ih => {proof}\n\
         theorem sample : copy 1 (Vec.cons 0 7 Vec.nil) = Vec.cons 0 7 Vec.nil := by rfl"
+        )
+    };
+    rejects_proof(&source("simp only [copy, ih]"));
+    check(&source(
+        "simpa only [copy] using sourceCongrArg (Vec.cons k x) ih",
+    ));
+    rejects_proof(&source(
+        "simpa only [copy] using sourceCongrArg (Vec.cons k x) (Eq.refl tail)",
     ));
 }
 
