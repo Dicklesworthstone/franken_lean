@@ -19,6 +19,12 @@ use fln_syntax::source::SourceInfo;
 #[path = "tests/reference.rs"]
 mod reference;
 
+#[path = "tests/source.rs"]
+mod source;
+
+#[path = "tests/lookup.rs"]
+mod lookup;
+
 fn name(text: &str) -> Name {
     Name::from_components(text.split('.'))
 }

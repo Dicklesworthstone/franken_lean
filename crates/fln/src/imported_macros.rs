@@ -27,6 +27,7 @@ use std::collections::{BTreeSet, HashSet};
 mod confinement;
 pub mod lookup;
 pub mod registrations;
+pub mod source;
 mod syntax;
 pub use syntax::{SyntaxConversionError, SyntaxLimits};
 

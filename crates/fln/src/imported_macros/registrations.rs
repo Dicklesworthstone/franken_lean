@@ -5,8 +5,8 @@
 //! explicit activation produces an immutable successor. This bounded embedding
 //! door does not install parser descriptions or execute module initializers.
 use super::{
-    CompiledMacro, MacroContext, MacroExecutionError, MacroLimits, MacroResult, MacroState,
-    StateBudget, compile, conversion_outcome, inject_state,
+    CompiledMacro, MacroContext, MacroExecutionError, MacroInvocation, MacroLimits, MacroResult,
+    MacroState, StateBudget, compile, conversion_outcome, inject_state,
 };
 use crate::imported_ir::{IrExecutionLimits, ReferenceFunction, VerifiedPartition};
 use crate::{CheckedOleanModule, Environment};
@@ -21,6 +21,7 @@ use fln_olean::source_extensions::{DecodeError, DecodeLimits, macros};
 use fln_syntax::source::SourceText;
 use fln_syntax::tree::Syntax;
 use fln_vm::interpreter::{CancellationProbe, ExecutionUsage};
+use fln_vm::macro_native::MacroLookup;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Arc;
@@ -162,6 +163,9 @@ pub struct RegisteredMacros {
     candidates: Arc<CandidateTable>,
     scoped: Arc<BTreeMap<Name, CandidateTable>>,
     active_scopes: BTreeSet<Name>,
+    /// Exact checked owners retained for binding an embedding registry to a
+    /// later source-checking engine. Scope activation shares this provenance.
+    owners: Arc<BTreeMap<Name, (Name, ConstantInfo)>>,
 }
 
 fn dispatch_order(table: BTreeMap<Name, Vec<RegisteredMacro>>) -> CandidateTable {
@@ -174,9 +178,21 @@ fn dispatch_order(table: BTreeMap<Name, Vec<RegisteredMacro>>) -> CandidateTable
         .collect()
 }
 
+/// Owned invocation state and borrowed inputs for one registered expansion.
+///
+/// Lookup authority is supplied for this invocation only. Registries and their
+/// scoped successors retain no provider; legacy entry points supply `None`.
+pub struct MacroDispatchInvocation<'a> {
+    pub source: &'a SourceText,
+    pub context: &'a MacroContext,
+    pub state: MacroState,
+    pub lookup: Option<&'a dyn MacroLookup>,
+}
+
 struct ExpansionContext<'a> {
     source: &'a SourceText,
     context: &'a MacroContext,
+    lookup: Option<&'a dyn MacroLookup>,
     cancellation: Option<&'a dyn CancellationProbe>,
 }
 
@@ -236,7 +252,8 @@ impl RegisteredMacros {
         let mut decoder = macros::Decoder::new(limits.metadata);
         let mut candidates: BTreeMap<Name, Vec<RegisteredMacro>> = BTreeMap::new();
         let mut scoped: BTreeMap<Name, BTreeMap<Name, Vec<RegisteredMacro>>> = BTreeMap::new();
-        let mut compiled: BTreeMap<Name, (Name, Arc<CompiledMacro>)> = BTreeMap::new();
+        let mut compiled: BTreeMap<Name, (Name, ConstantInfo, Arc<CompiledMacro>)> =
+            BTreeMap::new();
         for input in ordered_modules {
             let module = &input.checked.name;
             let rows = decoder.decode(input.extensions).map_err(|error| {
@@ -278,7 +295,7 @@ impl RegisteredMacros {
                     ));
                 }
                 let callable =
-                    if let Some((previous_module, callable)) = compiled.get(&row.declaration) {
+                    if let Some((previous_module, _, callable)) = compiled.get(&row.declaration) {
                         if previous_module != module {
                             return Err(error("registration has multiple checked module owners"));
                         }
@@ -305,7 +322,7 @@ impl RegisteredMacros {
                         );
                         compiled.insert(
                             row.declaration.clone(),
-                            (module.clone(), Arc::clone(&callable)),
+                            (module.clone(), (**owner).clone(), Arc::clone(&callable)),
                         );
                         callable
                     };
@@ -333,7 +350,39 @@ impl RegisteredMacros {
                     .collect(),
             ),
             active_scopes: BTreeSet::new(),
+            owners: Arc::new(
+                compiled
+                    .into_iter()
+                    .map(|(declaration, (module, owner, _))| (declaration, (module, owner)))
+                    .collect(),
+            ),
         })
+    }
+
+    /// A prepared registry is not transferable authority. An Engine source
+    /// invocation must still have imported each owner module and retain its
+    /// exact checked declaration, including inactive scoped registrations.
+    pub(crate) fn validate_source_engine(
+        &self,
+        engine: &crate::Engine,
+    ) -> Result<(), MacroRegistrationError> {
+        for (declaration, (module, owner)) in self.owners.iter() {
+            let reason = if !engine.imported_modules().contains(module) {
+                Some("macro module is not an admitted import of the source engine")
+            } else if engine.environment().find(declaration) != Some(owner) {
+                Some("source engine declaration differs from the checked macro owner")
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
+                return Err(MacroRegistrationError::Owner {
+                    module: module.clone(),
+                    declaration: declaration.clone(),
+                    reason,
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Activate exactly one namespace in an immutable successor, following
@@ -375,6 +424,7 @@ impl RegisteredMacros {
             candidates: Arc::new(candidates),
             scoped: Arc::clone(&self.scoped),
             active_scopes,
+            owners: Arc::clone(&self.owners),
         })
     }
 
@@ -404,6 +454,35 @@ impl RegisteredMacros {
         limits: MacroDispatchLimits,
         cancellation: Option<&dyn CancellationProbe>,
     ) -> MacroDispatch {
+        self.expand_root_with_context(
+            input,
+            MacroDispatchInvocation {
+                source,
+                context,
+                state,
+                lookup: None,
+            },
+            limits,
+            cancellation,
+        )
+    }
+
+    /// Expand one root with optional invocation-local native lookup authority.
+    /// The same provider is available to every candidate in the chain; state
+    /// and the cumulative work allowance follow the ordinary dispatch rules.
+    pub fn expand_root_with_context(
+        &self,
+        input: &Syntax,
+        invocation: MacroDispatchInvocation<'_>,
+        limits: MacroDispatchLimits,
+        cancellation: Option<&dyn CancellationProbe>,
+    ) -> MacroDispatch {
+        let MacroDispatchInvocation {
+            source,
+            context,
+            state,
+            lookup,
+        } = invocation;
         let mut report = MacroDispatch {
             outcome: Outcome::Complete(Ok(RegisteredExpansion::Unsupported {
                 state: MacroState::default(),
@@ -420,6 +499,7 @@ impl RegisteredMacros {
             ExpansionContext {
                 source,
                 context,
+                lookup,
                 cancellation,
             },
             state,
@@ -451,6 +531,35 @@ impl RegisteredMacros {
         limits: MacroTreeLimits,
         cancellation: Option<&dyn CancellationProbe>,
     ) -> MacroTreeDispatch {
+        self.expand_tree_with_context(
+            input,
+            MacroDispatchInvocation {
+                source,
+                context,
+                state,
+                lookup: None,
+            },
+            limits,
+            cancellation,
+        )
+    }
+
+    /// Expand a complete tree using one explicit native lookup snapshot.
+    /// Authority follows every candidate and revisited result without being
+    /// installed in the registry or copied into a Syntax or Macro.Context value.
+    pub fn expand_tree_with_context(
+        &self,
+        input: &Syntax,
+        invocation: MacroDispatchInvocation<'_>,
+        limits: MacroTreeLimits,
+        cancellation: Option<&dyn CancellationProbe>,
+    ) -> MacroTreeDispatch {
+        let MacroDispatchInvocation {
+            source,
+            context,
+            state,
+            lookup,
+        } = invocation;
         let mut report = MacroDispatch {
             outcome: Outcome::Complete(Ok(RegisteredExpansion::Unsupported {
                 state: MacroState::default(),
@@ -467,6 +576,7 @@ impl RegisteredMacros {
             ExpansionContext {
                 source,
                 context,
+                lookup,
                 cancellation,
             },
             state,
@@ -491,6 +601,7 @@ impl RegisteredMacros {
         let ExpansionContext {
             source,
             context,
+            lookup,
             cancellation,
         } = invocation;
         if cancellation.is_some_and(CancellationProbe::is_cancelled) {
@@ -549,6 +660,7 @@ impl RegisteredMacros {
                         ExpansionContext {
                             source,
                             context: &current,
+                            lookup,
                             cancellation,
                         },
                         state,
@@ -681,6 +793,7 @@ impl RegisteredMacros {
         let ExpansionContext {
             source,
             context,
+            lookup,
             cancellation,
         } = invocation;
         let kind = match input {
@@ -736,11 +849,14 @@ impl RegisteredMacros {
             current.current_macro_scope = fresh_scope;
             let mut execution = limits.execution;
             execution.vm.max_steps -= report.completed_vm_usage.steps;
-            let result = candidate.compiled.execute(
+            let result = candidate.compiled.execute_with_context(
                 input,
-                source,
-                &current,
-                &state,
+                MacroInvocation {
+                    source,
+                    context: &current,
+                    state: &state,
+                    lookup,
+                },
                 execution,
                 cancellation,
             );
