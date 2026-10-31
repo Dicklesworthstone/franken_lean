@@ -1415,7 +1415,15 @@ impl Context {
                     continue;
                 }
                 let mut value = self.instantiate(&expansion.value)?;
-                let actual = self.instantiate(&frames[index].target)?;
+                // Judge the selected dictionary's type, as the tabled lane
+                // does. The request can retain an unused deferred argument
+                // even though the answer is fully known. Reconciliation below
+                // still checks it against that original request. If bounded
+                // reconstruction has no answer, retain the existing target path.
+                let actual = self
+                    .known_type(&value)?
+                    .unwrap_or_else(|| frames[index].target.clone());
+                let actual = self.instantiate(&actual)?;
                 if value.has_expr_mvar()
                     || actual.has_expr_mvar()
                     || ((value.has_level_mvar() || actual.has_level_mvar())

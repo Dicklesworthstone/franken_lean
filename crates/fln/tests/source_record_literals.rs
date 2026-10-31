@@ -831,6 +831,14 @@ fn type_positions_preserve_parenthesized_local_scope_without_leaking_dictionarie
          def unused : (have A : Type := Nat; Nat) := 8\n\
          theorem unused_ok : unused = 8 := by rfl",
     );
+    // A real instance for that folded projection must remain eligible. The
+    // bare numeral fails only while its actual carrier has no such provider.
+    check(
+        &nested.engine,
+        "instance dictionaryNumeral : OfNat (let d : Factory := { carrier := Nat, produce := 7 }; Factory.carrier) 8 where\n\
+           ofNat := (8 : Nat)\n\
+         theorem selectedCarrier : nested 8 = (8 : Nat) := by rfl",
+    );
     assert!(
         base.check_source_files(
             &["def nested (x : (let d : Factory := { carrier := Nat, produce := 7 }; Factory.carrier)) : Nat := x\ntheorem computes : nested 8 = 8 := by rfl".as_bytes()],

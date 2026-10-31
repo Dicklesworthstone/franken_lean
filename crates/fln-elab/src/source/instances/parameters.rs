@@ -246,11 +246,7 @@ impl Context {
                 // under `withNewMCtxDepth (allowLevelAssignments := true)`, so `Inhabited PUnit.{?u}`
                 // is answered by `instInhabitedPUnit.{?u}`.
                 ParameterMode::Input => {
-                    // An unused let value or beta argument can hold an opaque
-                    // deferred local function without leaving the carrier unknown.
-                    // Reduce only to decide readiness, at the usual instance
-                    // transparency. Keep the original input for matching and keys.
-                    if argument.has_expr_mvar() && self.instance_type(&argument)?.has_expr_mvar() {
+                    if argument.has_expr_mvar() {
                         return Ok(None);
                     }
                     argument.clone()
