@@ -35,8 +35,11 @@
 //! - Any other definition may or may not be reducible, so both outcomes are
 //!   queried: its folded key, and the keys of its delta-beta unfolding.
 //! - A recursor, matcher, smart-unfolded definition, `Quot.lift` or `Quot.ind`,
-//!   a projection, `let`, unapplied lambda, let-bound or unknown free variable,
+//!   a projection, unapplied lambda, let-bound or unknown free variable,
 //!   and every metavariable is a star, which matches any path.
+//! - Both `let` and `have` zeta-reduce. The resulting head still obeys the
+//!   reducibility rules above: substituting a class dictionary does not make
+//!   its semireducible carrier projection unfold at reducible transparency.
 //!
 //! What the second rule assumes: a definition stays not reducible after an
 //! instance stored it folded. A later `attribute [reducible]` breaks that. In
@@ -646,6 +649,14 @@ impl Query<'_> {
                     out.push((Key::Arrow, vec![binder_type.clone()]));
                 }
                 ExprNode::Sort { .. } if args.is_empty() => out.push((Key::Other, Vec::new())),
+                ExprNode::LetE { value, body, .. } => {
+                    if unfolds >= MAX_UNFOLDS {
+                        return star();
+                    }
+                    let reduced = body.subst_loose(0, std::slice::from_ref(value)).ok()?;
+                    let applied = args.iter().rev().cloned().fold(reduced, Expr::app);
+                    pending.push((applied, unfolds + 1));
+                }
                 // `whnfCore` beta-reduces an applied lambda.
                 ExprNode::Lam { .. } if !args.is_empty() => {
                     if unfolds >= MAX_UNFOLDS {

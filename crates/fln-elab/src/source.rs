@@ -6731,6 +6731,18 @@ fn definition_elaboration(
         instance_type.unwrap_or(term.type_)
     };
     let level_params = context.declaration_levels(&[type_.clone(), term.value.clone()])?;
+    // `PreDefinition.letToHaveType`: later elaboration observes the published
+    // type, including the opacity of lets whose bodies check without unfolding
+    // their local values. Keep the final kernel admission as the authority.
+    let type_ = if context
+        .txn
+        .options
+        .get_bool(&Name::from_components(["cleanup", "letToHave"]), true)
+    {
+        context.let_to_have(&type_, &level_params)?
+    } else {
+        type_
+    };
     let mut base = ConstantVal {
         name: name.clone(),
         level_params,

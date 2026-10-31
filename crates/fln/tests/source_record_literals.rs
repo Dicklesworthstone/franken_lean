@@ -799,10 +799,37 @@ fn type_positions_preserve_parenthesized_local_scope_without_leaking_dictionarie
     // also refuses `def recursiveType (x : (let rec ty …; ty 2)) : Nat := x` ("Type
     // mismatch": a `let rec` stays opaque until its definition is complete).
     // `source_local_recursion` exercises that distinct delayed-closure boundary.
-    check(
+    let nested = check(
         &base,
         "def nested (x : (let d : Factory := { carrier := Nat, produce := 7 }; Factory.carrier)) : Nat := x\n\
          theorem computes : nested (8 : Nat) = 8 := by rfl",
+    );
+    let signature = &nested
+        .engine
+        .environment()
+        .find(&Name::from_components(["nested"]))
+        .unwrap()
+        .constant_val()
+        .type_;
+    let fln::ExprNode::ForallE { binder_type, .. } = signature.node() else {
+        panic!("nested must retain its parameter");
+    };
+    assert!(
+        matches!(
+            binder_type.node(),
+            fln::ExprNode::LetE { non_dep: true, .. }
+        ),
+        "published Factory type must preserve the pin's opaque have: {binder_type:?}"
+    );
+    // Concrete type aliases still compute, and an unused have is discarded.
+    // An opaque used Factory dictionary must not make all let-headed inputs
+    // fail, or make a later explicit numeral change an earlier inference.
+    check(
+        &base,
+        "def alias : (let A : Type := Nat; A) := 8\n\
+         theorem alias_ok : alias = 8 := by rfl\n\
+         def unused : (have A : Type := Nat; Nat) := 8\n\
+         theorem unused_ok : unused = 8 := by rfl",
     );
     assert!(
         base.check_source_files(

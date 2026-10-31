@@ -520,115 +520,180 @@ impl Context {
     /// `letToHave`: a `let` whose body type-checks with its variable opaque becomes a `have`
     /// (vendored `Lean/Meta/LetToHave.lean`). The pin decides it by tracking whether checking
     /// the body unfolds the variable; here the kernel checks the body with the variable a
-    /// plain local, against the type this elaborator reconstructs. When either answer is
-    /// missing the `let` stays dependent.
-    fn let_to_have(
+    /// plain local, against the type this elaborator reconstructs. An unknown type keeps
+    /// the `let` dependent; a stopped kernel query remains a typed nonanswer.
+    pub(super) fn let_to_have(
         &mut self,
         expr: &Expr,
         level_params: &[Name],
     ) -> Result<Expr, NatDefinitionElabError> {
-        self.tick()?;
         if !contains_dependent_let(expr) {
             return Ok(expr.clone());
         }
-        Ok(match expr.node() {
-            ExprNode::App { f, a } => Expr::app(
-                self.let_to_have(f, level_params)?,
-                self.let_to_have(a, level_params)?,
-            ),
-            ExprNode::MData { data, expr } => {
-                Expr::mdata(data.clone(), self.let_to_have(expr, level_params)?)
-            }
-            ExprNode::Proj {
-                struct_name,
-                idx,
-                expr,
-            } => Expr::proj(
-                struct_name.clone(),
-                *idx,
-                self.let_to_have(expr, level_params)?,
-            ),
-            ExprNode::Lam {
-                binder_name,
-                binder_type,
-                body,
-                binder_info,
-            }
-            | ExprNode::ForallE {
-                binder_name,
-                binder_type,
-                body,
-                binder_info,
-            } => {
-                let lambda = matches!(expr.node(), ExprNode::Lam { .. });
-                let binder_type = self.let_to_have(binder_type, level_params)?;
-                let id = FVarId(self.fresh_name()?);
-                let saved = self.txn.lctx.len();
-                self.txn.lctx.add_param(
-                    id.clone(),
-                    binder_name.clone(),
-                    binder_type.clone(),
-                    *binder_info,
-                );
-                let opened = self.substitute(body, &Expr::fvar(id.clone()))?;
-                let body = self.let_to_have(&opened, level_params);
-                self.txn.lctx.truncate(saved);
-                let body = body?
-                    .abstract_fvar(&id, 0)
-                    .map_err(|_| failure(SourceInferenceError::Scope))?;
-                if lambda {
-                    Expr::lam(binder_name.clone(), binder_type, body, *binder_info)
-                } else {
-                    Expr::forall_e(binder_name.clone(), binder_type, body, *binder_info)
+        // Declaration types are arbitrary source input. Keep traversal and scope
+        // restoration on the heap rather than adding a Rust frame per binder.
+        enum Task {
+            Visit(Expr),
+            App,
+            MData(KVMap),
+            Proj(Name, u64),
+            OpenBinder(Name, Expr, BinderInfo, bool),
+            CloseBinder(FVarId, usize, Name, Expr, BinderInfo, bool),
+            OpenLet(Name, Expr, bool),
+            CloseLet(FVarId, usize, Name, Expr, Expr, bool),
+        }
+        let saved = self.txn.lctx.len();
+        let result = (|| {
+            let mut tasks = vec![Task::Visit(expr.clone())];
+            let mut values = Vec::new();
+            let pop = |values: &mut Vec<Expr>| {
+                values
+                    .pop()
+                    .ok_or_else(|| failure(SourceInferenceError::Scope))
+            };
+            while let Some(task) = tasks.pop() {
+                self.tick()?;
+                match task {
+                    Task::Visit(expr) => match expr.node() {
+                        ExprNode::App { f, a } => {
+                            tasks.push(Task::App);
+                            tasks.push(Task::Visit(a.clone()));
+                            tasks.push(Task::Visit(f.clone()));
+                        }
+                        ExprNode::MData { data, expr } => {
+                            tasks.push(Task::MData(data.clone()));
+                            tasks.push(Task::Visit(expr.clone()));
+                        }
+                        ExprNode::Proj {
+                            struct_name,
+                            idx,
+                            expr,
+                        } => {
+                            tasks.push(Task::Proj(struct_name.clone(), *idx));
+                            tasks.push(Task::Visit(expr.clone()));
+                        }
+                        ExprNode::Lam {
+                            binder_name,
+                            binder_type,
+                            body,
+                            binder_info,
+                        }
+                        | ExprNode::ForallE {
+                            binder_name,
+                            binder_type,
+                            body,
+                            binder_info,
+                        } => {
+                            tasks.push(Task::OpenBinder(
+                                binder_name.clone(),
+                                body.clone(),
+                                *binder_info,
+                                matches!(expr.node(), ExprNode::Lam { .. }),
+                            ));
+                            tasks.push(Task::Visit(binder_type.clone()));
+                        }
+                        ExprNode::LetE {
+                            decl_name,
+                            type_,
+                            value,
+                            body,
+                            non_dep,
+                        } => {
+                            tasks.push(Task::OpenLet(decl_name.clone(), body.clone(), *non_dep));
+                            tasks.push(Task::Visit(value.clone()));
+                            tasks.push(Task::Visit(type_.clone()));
+                        }
+                        _ => values.push(expr),
+                    },
+                    Task::App => {
+                        let a = pop(&mut values)?;
+                        let f = pop(&mut values)?;
+                        values.push(Expr::app(f, a));
+                    }
+                    Task::MData(data) => {
+                        let expr = pop(&mut values)?;
+                        values.push(Expr::mdata(data, expr));
+                    }
+                    Task::Proj(name, idx) => {
+                        let expr = pop(&mut values)?;
+                        values.push(Expr::proj(name, idx, expr));
+                    }
+                    Task::OpenBinder(name, body, info, lambda) => {
+                        let type_ = pop(&mut values)?;
+                        let id = FVarId(self.fresh_name()?);
+                        let saved = self.txn.lctx.len();
+                        self.txn
+                            .lctx
+                            .add_param(id.clone(), name.clone(), type_.clone(), info);
+                        let opened = self.substitute(&body, &Expr::fvar(id.clone()))?;
+                        tasks.push(Task::CloseBinder(id, saved, name, type_, info, lambda));
+                        tasks.push(Task::Visit(opened));
+                    }
+                    Task::CloseBinder(id, saved, name, type_, info, lambda) => {
+                        let body = pop(&mut values)?;
+                        self.txn.lctx.truncate(saved);
+                        let body = body
+                            .abstract_fvar(&id, 0)
+                            .map_err(|_| failure(SourceInferenceError::Scope))?;
+                        values.push(if lambda {
+                            Expr::lam(name, type_, body, info)
+                        } else {
+                            Expr::forall_e(name, type_, body, info)
+                        });
+                    }
+                    Task::OpenLet(name, body, non_dep) => {
+                        let value = pop(&mut values)?;
+                        let type_ = pop(&mut values)?;
+                        let id = FVarId(self.fresh_name()?);
+                        let saved = self.txn.lctx.len();
+                        let opened = self.substitute(&body, &Expr::fvar(id.clone()))?;
+                        let non_dep = non_dep || {
+                            self.txn.lctx.add_param(
+                                id.clone(),
+                                name.clone(),
+                                type_.clone(),
+                                BinderInfo::Default,
+                            );
+                            let answer = self.body_checks_opaque(&opened, level_params);
+                            self.txn.lctx.truncate(saved);
+                            answer?
+                        };
+                        if non_dep {
+                            self.txn.lctx.add_param(
+                                id.clone(),
+                                name.clone(),
+                                type_.clone(),
+                                BinderInfo::Default,
+                            );
+                        } else {
+                            self.txn.lctx.add_let(
+                                id.clone(),
+                                name.clone(),
+                                type_.clone(),
+                                value.clone(),
+                            );
+                        }
+                        tasks.push(Task::CloseLet(id, saved, name, type_, value, non_dep));
+                        tasks.push(Task::Visit(opened));
+                    }
+                    Task::CloseLet(id, saved, name, type_, value, non_dep) => {
+                        let body = pop(&mut values)?;
+                        self.txn.lctx.truncate(saved);
+                        let body = body
+                            .abstract_fvar(&id, 0)
+                            .map_err(|_| failure(SourceInferenceError::Scope))?;
+                        values.push(Expr::let_e(name, type_, value, body, non_dep));
+                    }
                 }
             }
-            ExprNode::LetE {
-                decl_name,
-                type_,
-                value,
-                body,
-                non_dep,
-            } => {
-                let type_ = self.let_to_have(type_, level_params)?;
-                let value = self.let_to_have(value, level_params)?;
-                let id = FVarId(self.fresh_name()?);
-                let saved = self.txn.lctx.len();
-                let opened = self.substitute(body, &Expr::fvar(id.clone()))?;
-                let non_dep = *non_dep || {
-                    self.txn.lctx.add_param(
-                        id.clone(),
-                        decl_name.clone(),
-                        type_.clone(),
-                        BinderInfo::Default,
-                    );
-                    let nondependent = self.body_checks_opaque(&opened, level_params);
-                    self.txn.lctx.truncate(saved);
-                    nondependent?
-                };
-                if non_dep {
-                    self.txn.lctx.add_param(
-                        id.clone(),
-                        decl_name.clone(),
-                        type_.clone(),
-                        BinderInfo::Default,
-                    );
-                } else {
-                    self.txn.lctx.add_let(
-                        id.clone(),
-                        decl_name.clone(),
-                        type_.clone(),
-                        value.clone(),
-                    );
-                }
-                let body = self.let_to_have(&opened, level_params);
-                self.txn.lctx.truncate(saved);
-                let body = body?
-                    .abstract_fvar(&id, 0)
-                    .map_err(|_| failure(SourceInferenceError::Scope))?;
-                Expr::let_e(decl_name.clone(), type_, value, body, non_dep)
+            let result = pop(&mut values)?;
+            if !values.is_empty() {
+                return Err(failure(SourceInferenceError::Scope));
             }
-            _ => expr.clone(),
-        })
+            Ok(result)
+        })();
+        self.txn.lctx.truncate(saved);
+        result
     }
 
     /// Whether `body` type-checks in the current local context, every local opaque but the
@@ -687,20 +752,48 @@ impl Context {
             return Ok(false);
         }
         let opaque = std::collections::BTreeSet::new();
-        Ok(matches!(
-            fln_kernel::check_type_with_unfolding(
-                &self.txn.env,
-                level_params,
-                &value,
-                &expected,
-                self.kernel,
-                fln_kernel::DefEqUnfolding {
-                    opaque_definitions: &opaque,
-                    unfold_theorems: false,
-                },
-            ),
-            Outcome::Complete(Verdict::Accepted { .. })
-        ))
+        let remaining = if self.txn.budget.max_heartbeats == 0 {
+            u64::MAX
+        } else {
+            self.txn
+                .budget
+                .max_heartbeats
+                .saturating_sub(self.txn.budget.heartbeats_consumed)
+        };
+        let outcome = fln_kernel::check_type_with_unfolding(
+            &self.txn.env,
+            level_params,
+            &value,
+            &expected,
+            self.kernel
+                .narrowed(self.kernel.steps.min(remaining), self.kernel.depth),
+            fln_kernel::DefEqUnfolding {
+                opaque_definitions: &opaque,
+                unfold_theorems: false,
+            },
+        );
+        let consumed = match &outcome {
+            Outcome::Complete(Verdict::Accepted { consumption })
+            | Outcome::Complete(Verdict::Rejected { consumption, .. }) => consumption.steps_used,
+            Outcome::Inconclusive(problem) => match &problem.cause {
+                fln_core::outcome::InconclusiveCause::ResourceExhausted { usage }
+                    if matches!(usage.reason, fln_core::diag::ResourceReason::ExecutionSteps) =>
+                {
+                    usage.observed
+                }
+                _ => 0,
+            },
+            _ => 0,
+        };
+        self.txn.budget.heartbeats_consumed =
+            self.txn.budget.heartbeats_consumed.saturating_add(consumed);
+        match outcome {
+            Outcome::Complete(Verdict::Accepted { .. }) => Ok(true),
+            Outcome::Complete(Verdict::Rejected { .. }) => Ok(false),
+            outcome => Err(failure(SourceInferenceError::TypeObligation(Box::new(
+                outcome,
+            )))),
+        }
     }
 
     fn theorem(
