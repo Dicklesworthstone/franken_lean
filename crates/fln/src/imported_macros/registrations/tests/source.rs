@@ -125,17 +125,20 @@ fn evaluated_nat(report: &SourceMacroEvaluation, expected: u64) -> &SourceMacroE
     let Outcome::Complete(Ok(result)) = &report.outcome else {
         panic!("{report:?}")
     };
+    assert_eq!(result.execution.checker.schema, "fln.checker-admission/1");
+    // Like ordinary #eval, the pin compiles an unsafe auxiliary. Its checker
+    // receipt must record quarantine, never a proof of a safe logical body.
     assert_eq!(
         result.execution.checker.ground,
         crate::CheckerAdmissionGround::UnsafeQuarantine
     );
-    let crate::Declaration::Defn(evaluation) = &result.execution.declaration else {
-        panic!("#eval must retain its generated declaration")
-    };
-    assert_eq!(evaluation.safety, DefinitionSafety::Unsafe);
     assert!(
         matches!(result.execution.runtime_type.node(), ExprNode::Const { name: result, .. } if result == &name("Nat"))
     );
+    assert!(matches!(
+        &result.execution.declaration,
+        crate::Declaration::Defn(declaration) if declaration.safety == DefinitionSafety::Unsafe
+    ));
     let fln_vm::interpreter::VmExit::Returned(returned) = &result.execution.exit else {
         panic!("{report:?}")
     };
@@ -154,7 +157,7 @@ fn evaluated_nat(report: &SourceMacroEvaluation, expected: u64) -> &SourceMacroE
 fn imported_source_macros_change_checked_vm_values_and_scoped_replays() {
     let (engine, registry, _) = fixture();
     let before = engine.logical_root(&KVMap::new());
-    let source = b"\xef\xbb\xbf#eval (7 + 11)\r\n";
+    let source = "-- λ🦀\r\n#eval (7 + 11)\r\n".as_bytes();
     let ordinary = engine
         .execute_source_commands_with_checks(source, &KVMap::new(), execution_limits())
         .unwrap()
@@ -241,31 +244,27 @@ fn source_macro_evaluation_stops_preserve_state_and_recover() {
         assert!(report.state.is_none());
         assert!(!report.attempts.is_empty());
     }
-    // The source seed deliberately has no sorryAx or Lean.Name. Admit the
-    // pin's actual axiom telescope through both checkers, then exercise the
-    // dependency guard with an explicit application, without a labeled-sorry
-    // fixture or a fabricated checker/import marker for the axiom.
-    let with_sorry = engine
-        .admit_source_declaration(
-            b"@[extern \"lean_sorry\"] axiom sorryAx.{u} (a : Sort u) (synthetic : Bool) : a",
-            &KVMap::new(),
-            admission(),
-        )
-        .unwrap()
-        .into_complete()
-        .unwrap()
-        .engine;
     let sorry = evaluate(
-        &with_sorry,
+        &engine,
         &registry,
-        b"#eval 0 + sorryAx Nat false",
+        b"#eval 0 + (sorry : Nat)",
         MacroTreeLimits::default(),
         execution_limits(),
         None,
     );
+    // The small seed deliberately omits sorryAx. It refuses labeled `sorry`
+    // during elaboration, before the later evaluation dependency guard.
+    assert!(!engine.environment().contains(&name("sorryAx")));
+    let Outcome::Complete(Err(SourceMacroError::Frontend(error))) = &sorry.outcome else {
+        panic!("{sorry:?}");
+    };
     assert!(
-        matches!(&sorry.outcome, Outcome::Complete(Err(SourceMacroError::Frontend(error))) if matches!(**error, crate::EngineExecutionError::EvaluationDependsOnSorry)),
-        "an expanded #eval must retain the ordinary sorry refusal: {sorry:?}"
+        matches!(error.as_ref(), crate::EngineExecutionError::Frontend(
+            crate::DefinitionFrontendError::Elaborate(fln_elab::NatDefinitionElabError::Inference(
+                fln_elab::source::SourceInferenceError::UnknownConstant(missing)
+            ))
+        ) if missing == &name("sorryAx")),
+        "{sorry:?}"
     );
     assert!(sorry.state.is_none());
     for source in [
@@ -336,6 +335,67 @@ fn source_macro_evaluation_stops_preserve_state_and_recover() {
     assert_eq!(engine.logical_root(&KVMap::new()), before);
 }
 
+#[test]
+fn expanded_evaluations_refuse_actual_sorry_dependencies_before_execution() {
+    let (engine, registry, _) = fixture();
+    // Admit the pin's actual polymorphic axiom telescope from source through
+    // both checkers. Explicit application exercises the dependency guard
+    // without requiring Lean.Name constructors to label the `sorry` syntax.
+    let admitted = engine
+        .admit_source_declaration(
+            b"axiom sorryAx.{u} (a : Sort u) (synthetic : Bool) : a",
+            &KVMap::new(),
+            admission(),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap()
+        .engine;
+    // The pin also marks sorryAx as extern lean_sorry. Without that metadata
+    // ordinary source elaboration correctly rejects the bare axiom as
+    // noncomputable before reaching the evaluation dependency check.
+    let environment = fln_elab::externs::register(
+        admitted.environment(),
+        &name("sorryAx"),
+        vec![fln_elab::externs::ExternEntry::Standard {
+            backend: name("all"),
+            symbol: "lean_sorry".to_owned(),
+        }],
+    )
+    .unwrap();
+    let mut engine = Engine::from_environment(environment);
+    engine.imported_modules = Arc::clone(&admitted.imported_modules);
+    let before = engine.logical_root(&KVMap::new());
+    let ordinary = engine
+        .execute_source_commands_with_checks(
+            b"#eval sorryAx Nat false",
+            &KVMap::new(),
+            execution_limits(),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(&ordinary, crate::EngineExecutionError::BatchCommand { error, .. }
+            if matches!(error.as_ref(), crate::EngineExecutionError::EvaluationDependsOnSorry)),
+        "{ordinary:?}"
+    );
+    let report = evaluate(
+        &engine,
+        &registry,
+        b"#eval 0 + (sorryAx Nat false)",
+        MacroTreeLimits::default(),
+        execution_limits(),
+        None,
+    );
+    assert!(
+        matches!(&report.outcome, Outcome::Complete(Err(SourceMacroError::Frontend(error)))
+            if matches!(error.as_ref(), crate::EngineExecutionError::EvaluationDependsOnSorry)),
+        "{report:?}"
+    );
+    assert_eq!(report.attempts.len(), 2);
+    assert!(report.state.is_none());
+    assert_eq!(engine.logical_root(&KVMap::new()), before);
+}
+
 fn checked_constant<'a>(report: &'a SourceMacroCheck, expected: &str) -> &'a crate::SourceCheck {
     let Outcome::Complete(Ok(checked)) = &report.outcome else {
         panic!("{report:?}")
@@ -363,7 +423,7 @@ fn imported_ir_changes_a_real_source_query_and_preserves_original_coordinates() 
     let (engine, registry, _) = fixture();
     let options = KVMap::new();
     let before = engine.logical_root(&options);
-    let source = b"\xef\xbb\xbf#check (Nat + Bool)\r\n";
+    let source = "-- λ🦀\r\n#check (Nat + Bool)\r\n".as_bytes();
     assert!(
         engine
             .check_source_command(source, &options, admission())
@@ -412,6 +472,33 @@ fn imported_ir_changes_a_real_source_query_and_preserves_original_coordinates() 
         ),
         "Bool",
     );
+    assert_eq!(engine.logical_root(&options), before);
+}
+
+#[test]
+fn source_bom_refusal_precedes_imported_macro_execution() {
+    let (engine, registry, _) = fixture();
+    let options = KVMap::new();
+    let before = engine.logical_root(&options);
+    // The pinned Reference rejects U+FEFF as an unexpected token at byte zero;
+    // SourceView preserves it rather than treating it as whitespace. Keep that
+    // lexical refusal even when imported macros could change the later term.
+    let source = b"\xef\xbb\xbf#check (Nat + Bool)\r\n";
+    let report = run(&engine, &registry, source, MacroTreeLimits::default(), None);
+    let Outcome::Complete(Err(SourceMacroError::Frontend(error))) = &report.outcome else {
+        panic!("{report:?}");
+    };
+    let crate::EngineExecutionError::Frontend(crate::DefinitionFrontendError::Parse(
+        fln_parse::NatDefinitionParseError::Lexical { diagnostics },
+    )) = error.as_ref()
+    else {
+        panic!("{error:?}");
+    };
+    assert_eq!(diagnostics.len(), 1);
+    assert_eq!(diagnostics[0].at, fln_parse::BytePos(0));
+    assert!(report.attempts.is_empty());
+    assert!(report.state.is_none());
+    assert_eq!(report.completed_vm_usage.steps, 0);
     assert_eq!(engine.logical_root(&options), before);
 }
 

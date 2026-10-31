@@ -50,7 +50,7 @@ mod where_decls;
 use build::{BuildError, Leaves};
 use fln_core::name::Name;
 use fln_syntax::literal::LiteralKind;
-use fln_syntax::run::{Event, lex_run, lex_run_from};
+use fln_syntax::run::{Event, lex_run};
 pub use fln_syntax::source::BytePos;
 use fln_syntax::source::{ByteSpan, SourceError, SourceInfo, SourceText};
 use fln_syntax::token::{LexedToken, TokenKind};
@@ -891,21 +891,11 @@ fn null_node(args: Vec<Syntax>) -> Syntax {
 /// activated scopes.
 fn lex_source(view: &SourceView) -> Result<fln_syntax::run::LexRun, NatDefinitionParseError> {
     let text = view.normalized();
-    extensions::with_token_table(|table| {
-        // Like the import header, a command entered at byte zero skips only
-        // a leading BOM. Keep it in the view and the first leaf's trivia so
-        // coordinates and lossless reconstruction still cover the original.
-        let run = if text.has_bom() {
-            lex_run_from(text, table, BytePos(fln_syntax::source::BOM.len()))
-        } else {
-            lex_run(text, table)
-        };
-        extensions::interpolate(text, table, run)
-    })
-    .map_err(|at| NatDefinitionParseError::OutsideSeedGrammar {
-        at: view.to_original(at),
-        expected: NatDefinitionExpectation::ScalarValue,
-    })
+    extensions::with_token_table(|table| extensions::interpolate(text, table, lex_run(text, table)))
+        .map_err(|at| NatDefinitionParseError::OutsideSeedGrammar {
+            at: view.to_original(at),
+            expected: NatDefinitionExpectation::ScalarValue,
+        })
 }
 
 /// Whether a bracketed binder at `index` may start a dependent arrow
@@ -6752,17 +6742,18 @@ mod nat_definition_tests {
             Some(b"-- leading trivia\n#eval let x : Nat := 40; Nat.add x 2\n".as_slice())
         );
 
-        let bom = b"\xef\xbb\xbf#eval 11\r\n";
-        let parsed = parse_source_command(bom).expect("only a leading BOM is trivia");
-        assert_eq!(parsed.reconstruct_original(), bom);
-        assert_eq!(
-            parsed.reconstruct_normalized().as_deref(),
-            Some(b"\xef\xbb\xbf#eval 11\n".as_slice())
-        );
-        assert_eq!(parsed.query_term_normalized(), Some("11"));
-        assert!(
-            matches!(parse_source_command(b"#eval \xef\xbb\xbf11"), Err(NatDefinitionParseError::Lexical { diagnostics }) if diagnostics.iter().any(|diagnostic| diagnostic.at == BytePos(6)))
-        );
+        // The pin rejects a BOM as a token, including at the beginning of a
+        // real source file. CRLF normalization must not hide its byte offset.
+        for source in [
+            "\u{feff}#eval 11\r\n",
+            "\u{feff}#check Nat\r\n",
+            "-- α 🦀\r\n#eval \u{feff}11\r\n",
+            "-- α 🦀\r\n#check \u{feff}Nat\r\n",
+        ] {
+            let error = parse_source_command(source.as_bytes()).expect_err("a BOM is not trivia");
+            assert_eq!(error.primary_offset(), source.find('\u{feff}').map(BytePos));
+            assert!(matches!(error, NatDefinitionParseError::Lexical { .. }));
+        }
 
         let refusal = parse_source_command(b"#eval 1 2")
             .expect_err("a literal-headed application remains outside the bounded grammar");
@@ -6773,6 +6764,112 @@ mod nat_definition_tests {
                 expected: NatDefinitionExpectation::EndOfCommand,
             }
         ));
+    }
+
+    #[test]
+    fn source_command_bom_rejection_matches_pinned_reference_files() {
+        let Some(reference) = std::env::var_os("FLN_REFERENCE_LEAN") else {
+            assert_ne!(
+                std::env::var("FLN_REQUIRE_REFERENCE").as_deref(),
+                Ok("1"),
+                "FLN_REFERENCE_LEAN is required for the source-file oracle"
+            );
+            eprintln!("SKIP live source-file oracle: FLN_REFERENCE_LEAN is not configured");
+            return;
+        };
+        let pin = include_str!("../../../SUITE.lock")
+            .lines()
+            .find(|line| line.starts_with("reference leanprover/lean4 "))
+            .unwrap()
+            .split_whitespace()
+            .find_map(|field| field.strip_prefix("commit="))
+            .unwrap();
+        let directory = std::env::temp_dir().join(format!(
+            "fln-source-bom-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        eprintln!("source-file oracle retained at {}", directory.display());
+        let identity = std::process::Command::new(&reference)
+            .arg("--githash")
+            .output()
+            .unwrap();
+        std::fs::write(directory.join("identity.stdout"), &identity.stdout).unwrap();
+        std::fs::write(directory.join("identity.stderr"), &identity.stderr).unwrap();
+        assert!(identity.status.success());
+        assert_eq!(String::from_utf8(identity.stdout).unwrap().trim(), pin);
+
+        for (query, command, kind) in [
+            ("check", "#check Nat", SourceCommandKind::Check),
+            ("eval", "#eval 11", SourceCommandKind::Evaluation),
+        ] {
+            for imported in [false, true] {
+                for (label, prefix, accepted) in [
+                    ("plain", "", true),
+                    ("unicode", "-- α 🦀\r\n", true),
+                    ("bom", "\u{feff}", false),
+                ] {
+                    let header = if imported { "import Init\r\n" } else { "" };
+                    let source = format!("{prefix}{header}{command}\r\n");
+                    let file = directory.join(format!("{query}_{imported}_{label}.lean"));
+                    std::fs::write(&file, source.as_bytes()).unwrap();
+                    let native = partition_source_module(source.as_bytes()).and_then(|module| {
+                        module
+                            .commands
+                            .iter()
+                            .map(|(offset, command)| {
+                                parse_source_command(command)
+                                    .map(|parsed| parsed.kind())
+                                    .map_err(|error| error.with_original_offset(*offset))
+                            })
+                            .collect::<Result<Vec<_>, _>>()
+                    });
+                    let mut oracle = std::process::Command::new(&reference);
+                    oracle.current_dir(&directory).arg(&file);
+                    if let Some(library) = std::env::var_os("FLN_REFERENCE_LIB") {
+                        oracle.env("LEAN_PATH", library);
+                    }
+                    let output = oracle.output().unwrap();
+                    std::fs::write(file.with_extension("stdout"), &output.stdout).unwrap();
+                    std::fs::write(file.with_extension("stderr"), &output.stderr).unwrap();
+                    std::fs::write(file.with_extension("status"), output.status.to_string())
+                        .unwrap();
+                    let diagnostics = format!(
+                        "{}{}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                    assert_eq!(output.status.success(), accepted, "{file:?}: {diagnostics}");
+                    assert_eq!(
+                        native.is_ok(),
+                        output.status.success(),
+                        "{file:?}: {native:?}"
+                    );
+                    if accepted {
+                        assert_eq!(native.unwrap(), vec![kind]);
+                    } else {
+                        assert_eq!(native.unwrap_err().primary_offset(), Some(BytePos(0)));
+                        assert_eq!(output.status.code(), Some(1));
+                        assert!(
+                            diagnostics.contains(":1:0: error: expected token"),
+                            "{diagnostics}"
+                        );
+                        // The Reference may recover and print the query result.
+                        // Its nonzero status still means this file was rejected.
+                        if query == "eval" {
+                            assert!(
+                                diagnostics.lines().any(|line| line == "11"),
+                                "{diagnostics}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]

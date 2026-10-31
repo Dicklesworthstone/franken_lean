@@ -377,18 +377,28 @@ fn macro_selection_never_executes_toolchain_bodies_or_ambient_effects() {
             }
         ))
     ));
+    // Namespace reads now have a native lookup row. Global-name resolution
+    // still requires an unsupported method and must not run a toolchain body.
     let unknown = module(
         vec![
+            bind(3, IrExpr::Lit(IrLit::Str("User".into()))),
             bind(
-                3,
+                4,
                 IrExpr::Fap {
-                    function: name("Lean.Macro.resolveGlobalName"),
-                    args: vec![IrArg::Var(0), IrArg::Var(1), IrArg::Var(2)],
+                    function: name("Lean.Name.mkStr1"),
+                    args: vec![IrArg::Var(3)],
                 },
             ),
-            bind(4, ctor(layout::RESULT_OK, "EStateM.Result.ok", &[0, 2])),
+            bind(
+                5,
+                IrExpr::Fap {
+                    function: name("Lean.Macro.resolveGlobalName"),
+                    args: vec![IrArg::Var(4), IrArg::Var(1), IrArg::Var(2)],
+                },
+            ),
+            bind(6, ctor(layout::RESULT_OK, "EStateM.Result.ok", &[0, 2])),
         ],
-        4,
+        6,
     );
     assert!(matches!(
         compile(
@@ -399,8 +409,8 @@ fn macro_selection_never_executes_toolchain_bodies_or_ambient_effects() {
             IrExecutionLimits::default()
         ),
         Err(MacroExecutionError::Compile(
-            IrExecutionError::Unclassified(_)
-        ))
+            IrExecutionError::Unclassified(declaration)
+        )) if declaration == name("Lean.Macro.resolveGlobalName")
     ));
     let refs = module(
         vec![
