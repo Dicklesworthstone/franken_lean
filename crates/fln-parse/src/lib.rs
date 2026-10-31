@@ -1289,7 +1289,9 @@ fn local_line_break(
     // A lambda/branch arrow or block introducer still owes its first body
     // token. Its inline column cannot turn that token into the enclosing
     // let's continuation (`let rec f := fun x =>\n  match x with …`).
-    if ["=>", "↦", "by", "do", "then", "else", ":="]
+    // A nested prefix's explicit separator likewise still owes its body.
+    // The enclosing separator would already have ended this scan.
+    if ["=>", "↦", "by", "do", "then", "else", ":=", ";"]
         .iter()
         .any(|word| term_locals::word(tokens, at - 1, word))
     {
@@ -1352,7 +1354,7 @@ fn find_let_separator(
     from: usize,
 ) -> Option<(usize, Option<usize>, usize)> {
     let mut delimiters = Vec::new();
-    let mut nested_lets = Vec::new();
+    let mut nested_prefixes = Vec::new();
     // After a `do`, `by` or `decreasing_by` in the value, every `;` is that block's: only a line
     // ends the value.
     let mut block = false;
@@ -1375,11 +1377,11 @@ fn find_let_separator(
             {
                 block = false;
             }
-            while nested_lets
+            while nested_prefixes
                 .last()
                 .is_some_and(|&nested| local_line_break(view, tokens, nested, nested, index))
             {
-                nested_lets.pop();
+                nested_prefixes.pop();
             }
         }
         if delimiters.is_empty()
@@ -1387,9 +1389,13 @@ fn find_let_separator(
                 || term_locals::word(tokens, index, "have")
                 || term_locals::word(tokens, index, "letI")
                 || term_locals::word(tokens, index, "haveI")
-                || term_locals::word(tokens, index, "suffices"))
+                || term_locals::word(tokens, index, "suffices")
+                || term_locals::word(tokens, index, "dbg_trace")
+                || term_locals::word(tokens, index, "assert!"))
         {
-            nested_lets.push(index);
+            // These prefixes each own a separator before their continuation.
+            // It cannot terminate the surrounding local initializer.
+            nested_prefixes.push(index);
             continue;
         }
         if let TokenKind::Symbol(symbol) = &token.kind {
@@ -1404,12 +1410,12 @@ fn find_let_separator(
                         return None;
                     }
                 }
-                "let" if delimiters.is_empty() => nested_lets.push(index),
+                "let" if delimiters.is_empty() => nested_prefixes.push(index),
                 ";" if delimiters.is_empty() && !block => {
-                    if nested_lets.is_empty() {
+                    if nested_prefixes.is_empty() {
                         return Some((index, Some(index), index + 1));
                     }
-                    nested_lets.pop();
+                    nested_prefixes.pop();
                 }
                 _ => {}
             }
@@ -6625,6 +6631,31 @@ mod nat_definition_tests {
             "def traced : Nat := dbg_trace \"message\" 42",
             "def traced : Nat := dbg_trace \"message\";",
             "def traced : Nat := dbg_trace \"missing {42\"; 42",
+        ] {
+            assert!(parse_definition(source.as_bytes()).is_err(), "{source}");
+        }
+    }
+
+    #[test]
+    fn local_initializers_keep_debug_and_assertion_separators() {
+        for source in [
+            "def traced : Nat := let rec x : Nat := dbg_trace \"unused\"; 5; 42",
+            "def traced : Nat := let rec x : Nat := dbg_trace \"used\"; 5; x + x",
+            "def traced : Nat := let x : Nat := dbg_trace \"outer\"; dbg_trace \"inner\"; 5; x",
+            "def checked : Nat := let rec x : Nat := assert! true; 5; x",
+        ] {
+            for source in [
+                source.to_owned(),
+                source.replace("; ", ";\n  "),
+                source.replace("; ", ";\r\n  "),
+            ] {
+                let parsed = parse_definition(source.as_bytes()).expect(&source);
+                assert_eq!(parsed.reconstruct_original(), source.as_bytes());
+            }
+        }
+        for source in [
+            "def bad : Nat := let rec x : Nat := dbg_trace \"missing body\"; 42",
+            "def bad : Nat := let rec x : Nat := assert! true; 42",
         ] {
             assert!(parse_definition(source.as_bytes()).is_err(), "{source}");
         }
