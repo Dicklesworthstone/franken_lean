@@ -50,7 +50,7 @@ mod where_decls;
 use build::{BuildError, Leaves};
 use fln_core::name::Name;
 use fln_syntax::literal::LiteralKind;
-use fln_syntax::run::{Event, lex_run};
+use fln_syntax::run::{Event, lex_run, lex_run_from};
 pub use fln_syntax::source::BytePos;
 use fln_syntax::source::{ByteSpan, SourceError, SourceInfo, SourceText};
 use fln_syntax::token::{LexedToken, TokenKind};
@@ -891,11 +891,21 @@ fn null_node(args: Vec<Syntax>) -> Syntax {
 /// activated scopes.
 fn lex_source(view: &SourceView) -> Result<fln_syntax::run::LexRun, NatDefinitionParseError> {
     let text = view.normalized();
-    extensions::with_token_table(|table| extensions::interpolate(text, table, lex_run(text, table)))
-        .map_err(|at| NatDefinitionParseError::OutsideSeedGrammar {
-            at: view.to_original(at),
-            expected: NatDefinitionExpectation::ScalarValue,
-        })
+    extensions::with_token_table(|table| {
+        // Like the import header, a command entered at byte zero skips only
+        // a leading BOM. Keep it in the view and the first leaf's trivia so
+        // coordinates and lossless reconstruction still cover the original.
+        let run = if text.has_bom() {
+            lex_run_from(text, table, BytePos(fln_syntax::source::BOM.len()))
+        } else {
+            lex_run(text, table)
+        };
+        extensions::interpolate(text, table, run)
+    })
+    .map_err(|at| NatDefinitionParseError::OutsideSeedGrammar {
+        at: view.to_original(at),
+        expected: NatDefinitionExpectation::ScalarValue,
+    })
 }
 
 /// Whether a bracketed binder at `index` may start a dependent arrow
@@ -6740,6 +6750,18 @@ mod nat_definition_tests {
         assert_eq!(
             parsed.reconstruct_normalized().as_deref(),
             Some(b"-- leading trivia\n#eval let x : Nat := 40; Nat.add x 2\n".as_slice())
+        );
+
+        let bom = b"\xef\xbb\xbf#eval 11\r\n";
+        let parsed = parse_source_command(bom).expect("only a leading BOM is trivia");
+        assert_eq!(parsed.reconstruct_original(), bom);
+        assert_eq!(
+            parsed.reconstruct_normalized().as_deref(),
+            Some(b"\xef\xbb\xbf#eval 11\n".as_slice())
+        );
+        assert_eq!(parsed.query_term_normalized(), Some("11"));
+        assert!(
+            matches!(parse_source_command(b"#eval \xef\xbb\xbf11"), Err(NatDefinitionParseError::Lexical { diagnostics }) if diagnostics.iter().any(|diagnostic| diagnostic.at == BytePos(6)))
         );
 
         let refusal = parse_source_command(b"#eval 1 2")
