@@ -444,12 +444,15 @@ impl Context {
         receiver: &Typed,
         fields: &[(Name, Expr)],
     ) -> Result<Option<Typed>, NatDefinitionElabError> {
-        let Some(ConstantInfo::Defn(definition)) = self.txn.env.find(helper).cloned() else {
-            return if self.txn.env.contains(helper) {
-                Err(malformed())
-            } else {
-                Ok(None)
-            };
+        let Some(info) = self.txn.env.find(helper).cloned() else {
+            return Ok(None);
+        };
+        let (base, body) = match info {
+            ConstantInfo::Defn(definition) if definition.safety == DefinitionSafety::Safe => {
+                (definition.base, definition.value)
+            }
+            ConstantInfo::Thm(theorem) => (theorem.base, theorem.value),
+            _ => return Err(malformed()),
         };
         let target = self.whnf(&receiver.type_)?;
         let (head, parameters) = operators::spine(&target);
@@ -459,8 +462,7 @@ impl Context {
         let Some(ConstantInfo::Induct(family)) = self.txn.env.find(name).cloned() else {
             return Err(malformed());
         };
-        if definition.safety != DefinitionSafety::Safe
-            || definition.base.level_params != family.base.level_params
+        if base.level_params != family.base.level_params
             || parameters.len() != family.num_params as usize
         {
             return Err(malformed());
@@ -478,16 +480,8 @@ impl Context {
         let native =
             (0..ctor.num_fields).find(|index| defaults.helper(name, *index) == Some(helper));
         let mut value = Typed {
-            value: self.instantiate_params(
-                &definition.value,
-                &definition.base.level_params,
-                levels,
-            )?,
-            type_: self.instantiate_params(
-                &definition.base.type_,
-                &definition.base.level_params,
-                levels,
-            )?,
+            value: self.instantiate_params(&body, &base.level_params, levels)?,
+            type_: self.instantiate_params(&base.type_, &base.level_params, levels)?,
         };
         for parameter in parameters {
             self.apply_imported_record_body(&mut value, &parameter)?;
@@ -1264,7 +1258,10 @@ impl Context {
             {
                 return Err(malformed());
             }
-            let value = self.whnf(&projected.value)?;
+            // Preserve the written receiver. Reducing a projection here expands
+            // source lets, duplicating shared thunks and delayed state actions.
+            // Conversion may reduce its type; executable value preparation may not.
+            let value = projected.value;
             let type_ = self.known_type(&value)?.ok_or_else(malformed)?;
             self.constrain(&type_, &projected.type_)?;
             receiver = Typed { value, type_ };

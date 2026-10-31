@@ -635,8 +635,8 @@ struct Context {
     equations: Vec<SourceEquation>,
     stalled_flush: Option<StalledFlush>,
     instance_goals: Vec<MVarId>,
-    // Instance goals a `fun` or `∀` closed over before they were solved (`instances.rs`).
-    bound_instances: Vec<instances::BoundInstance>,
+    // Inference/instance goals closed over before they were solved (`instances.rs`).
+    bound_metavars: Vec<instances::BoundMetavar>,
     // Nesting of pending instance synthesis started by unification, the pin's
     // `synthPendingDepth`. Bounded by `MAX_SYNTH_PENDING_DEPTH`.
     synth_pending_depth: u8,
@@ -830,7 +830,7 @@ impl Context {
             equations: Vec::new(),
             stalled_flush: None,
             instance_goals: Vec::new(),
-            bound_instances: Vec::new(),
+            bound_metavars: Vec::new(),
             synth_pending_depth: 0,
             overload_depth: 0,
             level_params: Vec::new(),
@@ -950,8 +950,8 @@ impl Context {
 
     fn instantiate(&mut self, value: &Expr) -> Result<Expr, NatDefinitionElabError> {
         self.tick()?;
-        if !self.bound_instances.is_empty() {
-            self.settle_bound_instances()?;
+        if !self.bound_metavars.is_empty() {
+            self.settle_bound_metavars()?;
         }
         self.txn
             .instantiate_expr(value)
@@ -1688,8 +1688,8 @@ impl Context {
         }
         // The unifier instantiates the equations itself, so a goal solved under a closed binder
         // is put back into place before it reads them.
-        if !self.bound_instances.is_empty() {
-            self.settle_bound_instances()?;
+        if !self.bound_metavars.is_empty() {
+            self.settle_bound_metavars()?;
         }
         loop {
             if self.equations.is_empty() {
@@ -2396,7 +2396,21 @@ impl Context {
                             }
                             if let Some(hole) = &checkpoint.hole {
                                 let value = values.pop().expect("resumed argument visit");
-                                self.constrain(hole, &value.value)?;
+                                self.constrain_type(&value.type_, &checkpoint.expected)?;
+                                let ExprNode::MVar { id } = hole.node() else {
+                                    return Err(failure(SourceInferenceError::Scope));
+                                };
+                                self.txn
+                                    .assign_mvar(
+                                        id.clone(),
+                                        value.value,
+                                        AssignmentJustification::SyntheticHole,
+                                    )
+                                    .map_err(|error| {
+                                        failure(SourceInferenceError::Unification(Box::new(
+                                            UnificationError::Metavariable(error),
+                                        )))
+                                    })?;
                             }
                             checkpoint.finish_options(self);
                             attempts.pop();

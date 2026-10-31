@@ -128,8 +128,9 @@ pub(super) enum FieldReceiver<'a> {
 
 /// A projection whose receiver's carrier will be determined by later source
 /// constraints. Both the value and its result type explicitly apply their
-/// captured parameters. Lexical lets are expanded before abstraction, so an
-/// unrelated let cannot add a cyclic type dependency to the pending value.
+/// captured parameters. The type hole excludes lexical lets, so an unrelated
+/// let cannot add a cyclic type dependency. The value hole also captures let
+/// slots, preserving their strict initialization and shared runtime objects.
 /// Closing a lambda cannot hide a free variable in a later assignment.
 #[derive(Clone)]
 pub(super) struct PostponedField {
@@ -177,17 +178,18 @@ impl Context {
         at: Option<&Syntax>,
     ) -> Result<FieldResolution, NatDefinitionElabError> {
         let mut locals = Vec::new();
+        let mut type_locals = Vec::new();
         for mut local in self.txn.lctx.decls().to_vec() {
             self.tick()?;
-            if local.is_let() {
-                continue;
-            }
             let type_ = self.instantiate(&local.type_)?;
             local.type_ = self.zeta_locals(&type_)?;
+            if !local.is_let() {
+                type_locals.push(local.clone());
+            }
             locals.push(local);
         }
         let sort = self.type_expected()?;
-        let type_type = self.forall_captured(&locals, sort)?;
+        let type_type = self.forall_captured(&type_locals, sort)?;
         let type_name = self.fresh_name()?;
         let type_id = MVarId(type_name.clone());
         self.txn.mvars.declare(
@@ -200,7 +202,7 @@ impl Context {
             None,
         );
         let mut expected = Expr::mvar(type_id);
-        for local in &locals {
+        for local in &type_locals {
             self.tick()?;
             expected = Expr::app(expected, Expr::fvar(local.id.clone()));
         }
@@ -268,8 +270,7 @@ impl Context {
                 let type_ = self.instantiate(&term.type_)?;
                 term.type_ = self.zeta_locals(&type_)?;
                 let term = self.finish_optional_term(term, Some(&record.expected))?;
-                let value = self.instantiate(&term.value)?;
-                let mut value = self.zeta_locals(&value)?;
+                let mut value = self.instantiate(&term.value)?;
                 for local in record.locals.iter().rev() {
                     self.tick()?;
                     let domain = self.instantiate(&local.type_)?;

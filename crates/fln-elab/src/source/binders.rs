@@ -620,7 +620,7 @@ impl Context {
     ) -> Result<Typed, NatDefinitionElabError> {
         body.value = self.instantiate(&body.value)?;
         body.type_ = self.instantiate(&body.type_)?;
-        self.capture_bound_instances(&state.locals, &state.saved, &mut body)?;
+        self.capture_bound_metavars(&state.locals, &state.saved, &mut body)?;
         if self.capture_bound_coercions(&state.locals, &state.saved, &body)? {
             body.value = self.instantiate(&body.value)?;
             body.type_ = self.instantiate(&body.type_)?;

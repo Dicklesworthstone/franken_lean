@@ -265,7 +265,25 @@ impl<'a> Checkpoint<'a> {
         }
         let hole = match &self.hole {
             Some(hole) => hole.clone(),
-            None => context.hole(expected.clone())?,
+            None => {
+                // This term is owned by the postponed elaborator, not ordinary
+                // inference. In particular, a failed replay logs a declaration
+                // error; `exact` must not abort on an unassigned natural hole
+                // and let `first` erase that error by selecting another branch.
+                // The pin uses the same kind in `postponeElabTermCore`.
+                let name = context.fresh_name()?;
+                let id = MVarId(name.clone());
+                context.txn.mvars.declare(
+                    id.clone(),
+                    name,
+                    expected.clone(),
+                    context.txn.lctx.clone(),
+                    MetavarKind::SyntheticOpaque,
+                    0,
+                    None,
+                );
+                Expr::mvar(id)
+            }
         };
         queue.arguments.push(Argument {
             syntax: self.syntax,

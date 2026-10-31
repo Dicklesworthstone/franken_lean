@@ -22,10 +22,10 @@ const DEFAULT_MAX_RESULT_SIZE: u64 = 128;
 /// `synthPendingImp`, synthesis is refused only once the depth exceeds it.
 pub(super) const MAX_SYNTH_PENDING_DEPTH: u8 = 1;
 
-/// An instance goal a `fun` or `∀` closed over before it was solved: `abstracted` stands in the
-/// closed term for the goal over `locals` ([`Context::capture_bound_instances`]).
+/// A metavariable a `fun` or `∀` closed over before it was solved: `abstracted` stands in the
+/// closed term for the goal over `locals` ([`Context::capture_bound_metavars`]).
 #[derive(Clone, Debug)]
-pub(super) struct BoundInstance {
+pub(super) struct BoundMetavar {
     abstracted: MVarId,
     goal: MVarId,
     locals: Vec<LocalDecl>,
@@ -330,31 +330,57 @@ impl Context {
         self.whnf_with_transparency(type_, UnificationTransparency::Abbreviations, false)
     }
 
-    /// Before a `fun` or `∀` closes over `locals`, take its unsolved instance goals whose context
-    /// holds one of them out of `body`: each becomes `?n x₁ … xₖ` over the locals it may use,
+    /// Before a `fun` or `∀` closes over `locals`, take unsolved inference and instance goals
+    /// whose context holds one of them out of `body`: each becomes `?n x₁ … xₖ` over its locals,
     /// with `?n` outside the binders, in `outer`. A goal solved after the binders close may then
     /// mention them without escaping its scope. The pin's `mkLambdaFVars` does this through
     /// `elimMVarDeps`, delaying `?n`'s assignment until the goal is solved
-    /// (`MetavarContext.elimMVar`); [`Context::settle_bound_instances`] assigns it then.
-    pub(super) fn capture_bound_instances(
+    /// (`MetavarContext.elimMVar`); [`Context::settle_bound_metavars`] assigns it then.
+    /// Ordinary assignable holes redirect to a natural function hole immediately, including
+    /// in saved equations and other metavariable types. Opaque instance goals retain delayed
+    /// assignments. Dedicated postponed coercion holes retain their separate capture path.
+    pub(super) fn capture_bound_metavars(
         &mut self,
         locals: &[LocalDecl],
         outer: &LocalContext,
         body: &mut Typed,
     ) -> Result<(), NatDefinitionElabError> {
-        if locals.is_empty()
-            || self.instance_goals.is_empty()
-            || !(body.value.has_expr_mvar() || body.type_.has_expr_mvar())
-        {
+        if locals.is_empty() || !(body.value.has_expr_mvar() || body.type_.has_expr_mvar()) {
             return Ok(());
         }
         let mut present = self.txn.mvars.collect_mvars(&body.value);
         present.extend(self.txn.mvars.collect_mvars(&body.type_));
+        let mut goals = self.instance_goals.clone();
+        // A delayed capture can itself cross another enclosing binder before
+        // its original goal is solved. Close that placeholder over this scope too.
+        for bound in &self.bound_metavars {
+            if !goals.contains(&bound.abstracted) {
+                goals.push(bound.abstracted.clone());
+            }
+        }
+        let mut inferred: Vec<_> = present
+            .iter()
+            .filter(|id| {
+                !goals.contains(id)
+                    && self
+                        .txn
+                        .mvars
+                        .get_decl(id)
+                        .is_some_and(|declaration| declaration.kind == MetavarKind::Natural)
+            })
+            .cloned()
+            .collect();
+        // Fresh source identities give inference holes a stable order;
+        // never let the dependency set's randomized iteration choose fresh names.
+        inferred.sort_by(|left, right| left.0.cmp(&right.0));
+        // Redirect ordinary dependencies before forming opaque goals' closed types.
+        // Keep the existing relative order of the instance goals.
+        inferred.extend(goals);
         let mut replacements = crate::mvar::MetavarStore::new();
         let mut captured_any = false;
-        for goal in self.instance_goals.clone() {
+        for goal in inferred {
             self.tick()?;
-            if !present.contains(&goal) {
+            if !present.contains(&goal) || self.txn.mvars.is_assigned(&goal) {
                 continue;
             }
             let declaration = self
@@ -380,7 +406,11 @@ impl Context {
                 name,
                 type_,
                 outer.clone(),
-                MetavarKind::SyntheticOpaque,
+                if declaration.kind == MetavarKind::Natural {
+                    MetavarKind::Natural
+                } else {
+                    MetavarKind::SyntheticOpaque
+                },
                 0,
                 None,
             );
@@ -389,6 +419,30 @@ impl Context {
                 .fold(Expr::mvar(abstracted.clone()), |head, local| {
                     Expr::app(head, Expr::fvar(local.id.clone()))
                 });
+            if declaration.kind == MetavarKind::Natural {
+                let scope_args = declaration
+                    .scope_args
+                    .unwrap_or(0)
+                    .checked_add(captured.len())
+                    .ok_or_else(|| failure(SourceInferenceError::ResourceLimit))?;
+                self.txn
+                    .mvars
+                    .set_scope_args(&abstracted, scope_args)
+                    .map_err(|error| {
+                        failure(SourceInferenceError::Unification(Box::new(
+                            UnificationError::Metavariable(error),
+                        )))
+                    })?;
+                self.txn
+                    .assign_mvar(goal, application, AssignmentJustification::SyntheticHole)
+                    .map_err(|error| {
+                        failure(SourceInferenceError::Unification(Box::new(
+                            UnificationError::Metavariable(error),
+                        )))
+                    })?;
+                captured_any = true;
+                continue;
+            }
             replacements.declare(
                 goal.clone(),
                 goal.0.clone(),
@@ -409,7 +463,7 @@ impl Context {
                         UnificationError::Metavariable(error),
                     )))
                 })?;
-            self.bound_instances.push(BoundInstance {
+            self.bound_metavars.push(BoundMetavar {
                 abstracted,
                 goal,
                 locals: captured,
@@ -419,6 +473,8 @@ impl Context {
         if captured_any {
             body.value = replacements.instantiate(&body.value);
             body.type_ = replacements.instantiate(&body.type_);
+            body.value = self.instantiate(&body.value)?;
+            body.type_ = self.instantiate(&body.type_)?;
         }
         Ok(())
     }
@@ -447,10 +503,10 @@ impl Context {
     /// Assign each captured goal's `?n := fun x₁ … xₖ => v` once the goal is solved by `v` and
     /// `v` holds no unsolved hole that could still mention the locals (the pin instantiates a
     /// delayed assignment only then, `instantiateMVars`' `delayed` case).
-    pub(super) fn settle_bound_instances(&mut self) -> Result<(), NatDefinitionElabError> {
+    pub(super) fn settle_bound_metavars(&mut self) -> Result<(), NatDefinitionElabError> {
         loop {
             let mut settled = None;
-            for (index, bound) in self.bound_instances.iter().enumerate() {
+            for (index, bound) in self.bound_metavars.iter().enumerate() {
                 if !self.txn.mvars.is_assigned(&bound.goal) {
                     continue;
                 }
@@ -474,7 +530,7 @@ impl Context {
             let Some((index, mut value)) = settled else {
                 return Ok(());
             };
-            let bound = self.bound_instances.remove(index);
+            let bound = self.bound_metavars.remove(index);
             for local in bound.locals.iter().rev() {
                 self.tick()?;
                 let domain = self
@@ -615,8 +671,8 @@ impl Context {
                             trial.equations.push(equation);
                         }
                         *self = trial;
-                        if !self.bound_instances.is_empty() {
-                            self.settle_bound_instances()?;
+                        if !self.bound_metavars.is_empty() {
+                            self.settle_bound_metavars()?;
                         }
                     }
                     Ok(SearchResult::Stuck) => {}
