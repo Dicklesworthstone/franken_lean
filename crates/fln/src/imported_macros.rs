@@ -15,7 +15,7 @@ use crate::imported_ir::{
 use fln_core::diag::{ResourceReason, StructuralUnit};
 use fln_core::name::{LeafView, Name};
 use fln_core::outcome::{Inconclusive, Outcome, ResourceUsage};
-use fln_olean::ir::{IrArg, IrBody, IrDecl, IrExpr, IrModule, IrStmt, IrTerminal};
+use fln_olean::ir::IrModule;
 use fln_rt::convert::{Conversion, inject_name};
 use fln_rt::obj::Obj;
 use fln_rt::syntax_abi_generated as layout;
@@ -24,6 +24,7 @@ use fln_syntax::tree::Syntax;
 use fln_vm::interpreter::{CancellationProbe, ExecutionLimits, ExecutionUsage, VmExit, VmRefusal};
 use std::collections::{BTreeSet, HashSet};
 
+mod confinement;
 pub mod registrations;
 mod syntax;
 pub use syntax::{SyntaxConversionError, SyntaxLimits};
@@ -32,8 +33,9 @@ pub use syntax::{SyntaxConversionError, SyntaxLimits};
 ///
 /// User code may read the quotation name, scope, depth, depth limit and source
 /// reference supplied by the native context. Its opaque MethodsRef cannot be
-/// inspected or passed out of the entry. Contextual name lookup and the five
-/// Macro.Methods remain unavailable; state-counter updates are supported.
+/// inspected, mutated or allowed to escape verified calls. Contextual name
+/// lookup and the five Macro.Methods remain unavailable; state-counter updates
+/// are supported.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MacroContext {
     pub quotation_context: Name,
@@ -131,28 +133,15 @@ pub fn compile(
             arity: callable.arity(),
         });
     }
-    let Some(IrDecl::Function { params, body, .. }) = modules
-        .iter()
-        .flat_map(|module| &module.decls)
-        .find(|declaration| declaration.name() == entry)
-    else {
-        return Err(MacroExecutionError::Compile(
-            IrExecutionError::MissingDeclaration(entry.clone()),
-        ));
-    };
-    // The initial MethodsRef token must be unobservable. Ordinary fields are
-    // real native values, so reading them is permitted. Confine the context
-    // carrier itself: a projection of the opaque slot, mutation, reinterpretation
-    // or passing it to another function could expose the placeholder token.
-    // Validate the original, already checked body before executing anything.
-    if observes_context(body, params[1].x) {
-        return Err(MacroExecutionError::Compile(
-            IrExecutionError::Unsupported {
-                declaration: entry.clone(),
-                form: "Macro.Context observation requires native Macro.Methods support",
-            },
-        ));
-    }
+    // Follow context carriers through already selected Reference helpers,
+    // joins and statically known closures, without exposing the opaque slot.
+    confinement::check(
+        modules,
+        entry,
+        callable.reference_functions(),
+        limits.ir.max_work,
+    )
+    .map_err(MacroExecutionError::Compile)?;
     // MacroM has no ambient IO or mutable reference capabilities. Even the
     // explicit ST allowance of the general library executor is unavailable.
     for id in callable.native_externs() {
@@ -170,46 +159,6 @@ pub fn compile(
         }
     }
     Ok(CompiledMacro { callable })
-}
-
-fn observes_context(body: &IrBody, context: u64) -> bool {
-    let argument = |value: &IrArg| *value == IrArg::Var(context);
-    let expression = |value: &IrExpr| match value {
-        IrExpr::Ctor { args, .. } | IrExpr::Fap { args, .. } | IrExpr::Pap { args, .. } => {
-            args.iter().any(argument)
-        }
-        IrExpr::Ap { x, args } | IrExpr::Reuse { x, args, .. } => {
-            *x == context || args.iter().any(argument)
-        }
-        IrExpr::Proj { i, x } => {
-            *x == context
-                && (*i == layout::MACRO_CONTEXT_METHODS_FIELD
-                    || *i >= layout::MACRO_CONTEXT.object_fields as u64)
-        }
-        IrExpr::Reset { x, .. }
-        | IrExpr::UProj { x, .. }
-        | IrExpr::SProj { x, .. }
-        | IrExpr::Box { x, .. }
-        | IrExpr::Unbox { x }
-        | IrExpr::IsShared { x } => *x == context,
-        IrExpr::Lit(_) => false,
-    };
-    body.bodies().into_iter().any(|body| {
-        body.stmts.iter().any(|statement| match statement {
-            IrStmt::VDecl { expr, .. } => expression(expr),
-            IrStmt::Set { x, y, .. } => *x == context || argument(y),
-            IrStmt::USet { x, y, .. } | IrStmt::SSet { x, y, .. } => *x == context || *y == context,
-            IrStmt::SetTag { x, .. } => *x == context,
-            IrStmt::JDecl { .. } | IrStmt::Inc { .. } | IrStmt::Dec { .. } | IrStmt::Del { .. } => {
-                false
-            }
-        }) || match body.terminal.as_ref() {
-            IrTerminal::Case { x, .. } => *x == context,
-            IrTerminal::Ret(value) => argument(value),
-            IrTerminal::Jmp { args, .. } => args.iter().any(argument),
-            IrTerminal::Unreachable => false,
-        }
-    })
 }
 
 impl CompiledMacro {

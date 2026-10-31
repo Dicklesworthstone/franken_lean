@@ -488,8 +488,39 @@ fn ordinary_context_fields_are_readable_but_the_carrier_and_methods_are_confined
         }
     }
 
-    // All ways of observing/escaping the carrier itself stay closed. This also
-    // checks nested blocks, not merely the entry's top-level statement list.
+    // Introspection, mutation, storage and calls to unselected helpers stay
+    // closed. Check the new confinement pass directly because several of
+    // these deliberately adversarial operations also fail earlier validation.
+    // Nested blocks must be checked alongside top-level statements.
+    let assert_confined = |body: IrBody| {
+        let mut code = module(vec![], 0);
+        let IrDecl::Function {
+            body: entry_body, ..
+        } = &mut code.decls[0]
+        else {
+            unreachable!()
+        };
+        *entry_body = body;
+        let selected = [ReferenceFunction {
+            name: name("User.macro"),
+            function: flbc::FunctionId::new(0),
+        }];
+        assert!(
+            matches!(
+                confinement::check(
+                    std::slice::from_ref(&code),
+                    &name("User.macro"),
+                    &selected,
+                    IrExecutionLimits::default().ir.max_work,
+                ),
+                Err(IrExecutionError::Unsupported {
+                    form: "Macro.Context observation requires native Macro.Methods support",
+                    ..
+                })
+            ),
+            "{code:?}"
+        );
+    };
     let forbidden = [
         IrExpr::Proj {
             i: layout::MACRO_CONTEXT.object_fields as u64,
@@ -525,7 +556,7 @@ fn ordinary_context_fields_are_readable_but_the_carrier_and_methods_are_confined
             stmts: vec![bind(3, expression)],
             terminal: Box::new(IrTerminal::Ret(IrArg::Var(0))),
         };
-        assert!(observes_context(&body, 1), "{body:?}");
+        assert_confined(body.clone());
         let nested = IrBody {
             stmts: vec![IrStmt::JDecl {
                 j: 10,
@@ -534,7 +565,7 @@ fn ordinary_context_fields_are_readable_but_the_carrier_and_methods_are_confined
             }],
             terminal: Box::new(IrTerminal::Ret(IrArg::Var(0))),
         };
-        assert!(observes_context(&nested, 1));
+        assert_confined(nested);
     }
     for statement in [
         IrStmt::Set {
@@ -552,13 +583,10 @@ fn ordinary_context_fields_are_readable_but_the_carrier_and_methods_are_confined
         },
         IrStmt::SetTag { x: 1, cidx: 0 },
     ] {
-        assert!(observes_context(
-            &IrBody {
-                stmts: vec![statement],
-                terminal: Box::new(IrTerminal::Ret(IrArg::Var(0))),
-            },
-            1
-        ));
+        assert_confined(IrBody {
+            stmts: vec![statement],
+            terminal: Box::new(IrTerminal::Ret(IrArg::Var(0))),
+        });
     }
 }
 
