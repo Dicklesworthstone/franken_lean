@@ -12,6 +12,7 @@
 //! node with an active registration is therefore refused explicitly, as is a
 //! registered macro left behind the tactic-evaluator boundary.
 
+use super::lookup::EnvironmentMacroLookup;
 use super::registrations::{
     MacroAttempt, MacroDispatchInvocation, MacroRegistrationError, MacroTreeLimits,
     MacroTreeResult, RegisteredMacros,
@@ -33,8 +34,10 @@ pub struct SourceMacroInvocation<'a> {
     pub registry: &'a RegisteredMacros,
     pub context: &'a MacroContext,
     pub state: MacroState,
-    /// Optional native read-only lookup capability for this invocation. It is
-    /// passed unchanged to every fallback, nested expansion and sibling.
+    /// Optional native read-only lookup override for this invocation. When it
+    /// is absent, the Engine binds its own immutable environment, source module,
+    /// and current namespace. An override is passed unchanged to every fallback,
+    /// nested expansion and sibling and is never retained by the registry.
     pub lookup: Option<&'a dyn MacroLookup>,
     pub limits: MacroTreeLimits,
     pub cancellation: Option<&'a dyn CancellationProbe>,
@@ -121,9 +124,12 @@ impl Engine {
     ///
     /// Every registry owner, including inactive scoped entries, must still be
     /// the exact declaration of an admitted import in this engine. Additional
-    /// source declarations do not invalidate that binding. Macro diagnostics,
-    /// execution refusals, cancellation and resource stops never return a
-    /// successful `SourceCheck` or a partially advanced macro state.
+    /// source declarations do not invalidate that binding. Unless the caller
+    /// supplies an explicit lookup override, native MacroM environment queries
+    /// are answered from this Engine's immutable environment and base source
+    /// scope for the duration of the call. Macro diagnostics, execution
+    /// refusals, cancellation and resource stops never return a successful
+    /// `SourceCheck` or a partially advanced macro state.
     pub fn check_source_command_with_imported_macros(
         &self,
         source: &[u8],
@@ -206,6 +212,20 @@ fn check(
     }
     let input = &args[1];
     let scope = engine.base_source_scope();
+    // Production source checks should not require the embedding caller to
+    // reconstruct the Macro.Methods environment capability that the Engine
+    // already owns. Bind a fresh borrowed provider to this immutable snapshot.
+    // Standalone source has no module identity; the anonymous module cannot
+    // accidentally select a foreign private declaration.
+    let anonymous_module = Name::anonymous();
+    let main_module = scope
+        .source_module
+        .as_ref()
+        .or(scope.private_module.as_ref())
+        .unwrap_or(&anonymous_module);
+    let engine_lookup =
+        EnvironmentMacroLookup::new(engine.environment(), main_module, &scope.namespace);
+    let lookup = lookup.or(Some(&engine_lookup as &dyn MacroLookup));
     let resolve = crate::source_check::grammar::resolver(engine.environment(), &scope);
     let existing_global = parsed.query_is_identifier()
         && matches!(input, Syntax::Ident { val, .. }
