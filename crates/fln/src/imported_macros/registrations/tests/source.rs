@@ -215,17 +215,31 @@ fn source_macro_evaluation_stops_preserve_state_and_recover() {
         assert!(report.state.is_none());
         assert!(!report.attempts.is_empty());
     }
+    // The source seed deliberately has no sorryAx or Lean.Name. Admit the
+    // pin's actual axiom telescope through both checkers, then exercise the
+    // dependency guard with an explicit application, without a labeled-sorry
+    // fixture or a fabricated checker/import marker for the axiom.
+    let with_sorry = engine
+        .admit_source_declaration(
+            b"axiom sorryAx.{u} (a : Sort u) (synthetic : Bool) : a",
+            &KVMap::new(),
+            admission(),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap()
+        .engine;
     let sorry = evaluate(
-        &engine,
+        &with_sorry,
         &registry,
-        b"#eval 0 + (sorry : Nat)",
+        b"#eval 0 + sorryAx Nat false",
         MacroTreeLimits::default(),
         execution_limits(),
         None,
     );
     assert!(
-        matches!(sorry.outcome, Outcome::Complete(Err(SourceMacroError::Frontend(error))) if matches!(*error, crate::EngineExecutionError::EvaluationDependsOnSorry)),
-        "an expanded #eval must retain the ordinary sorry refusal"
+        matches!(&sorry.outcome, Outcome::Complete(Err(SourceMacroError::Frontend(error))) if matches!(**error, crate::EngineExecutionError::EvaluationDependsOnSorry)),
+        "an expanded #eval must retain the ordinary sorry refusal: {sorry:?}"
     );
     assert!(sorry.state.is_none());
     for source in [
@@ -451,8 +465,10 @@ fn source_diagnostics_and_budgets_publish_neither_checks_nor_partial_state() {
     short_steps.dispatch.execution.vm.max_steps -= 1;
     let mut short_attempts = MacroTreeLimits::default();
     short_attempts.dispatch.max_attempts = 1;
-    let mut short_visits = MacroTreeLimits::default();
-    short_visits.max_visits = 0;
+    let short_visits = MacroTreeLimits {
+        max_visits: 0,
+        ..MacroTreeLimits::default()
+    };
     let mut short_source = MacroTreeLimits::default();
     short_source.dispatch.execution.syntax.max_bytes = 1;
     for limits in [short_steps, short_attempts, short_visits, short_source] {

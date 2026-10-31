@@ -382,8 +382,8 @@ fn macro_selection_never_executes_toolchain_bodies_or_ambient_effects() {
             bind(
                 3,
                 IrExpr::Fap {
-                    function: name("Lean.Macro.getCurrNamespace"),
-                    args: vec![IrArg::Var(1), IrArg::Var(2)],
+                    function: name("Lean.Macro.resolveGlobalName"),
+                    args: vec![IrArg::Var(0), IrArg::Var(1), IrArg::Var(2)],
                 },
             ),
             bind(4, ctor(layout::RESULT_OK, "EStateM.Result.ok", &[0, 2])),
