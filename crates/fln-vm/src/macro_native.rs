@@ -9,6 +9,15 @@ use fln_comp::flbc::{ArgumentOwnership, ResultOwnership};
 use fln_core::name::Name;
 use fln_rt::syntax_abi_generated as generated;
 
+/// Read-only host lookups explicitly supplied for one macro invocation.
+///
+/// The VM never reconstructs this authority from an opaque MethodsRef value.
+/// Callers bind it to their native environment and current source namespace.
+pub trait MacroLookup {
+    fn current_namespace(&self) -> &Name;
+    fn has_decl(&self, declaration: &Name) -> bool;
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct MirrorRow {
     pub id: &'static str,
@@ -113,6 +122,20 @@ pub const ROWS: &[MirrorRow] = &[
         borrowed: generated::SYNTAX_GET_ID_BORROWED,
         parameters: generated::SYNTAX_GET_ID_PARAMETERS,
         result_type: generated::SYNTAX_GET_ID_RESULT,
+    },
+    MirrorRow {
+        id: "mirror:Lean.Macro.getCurrNamespace",
+        name: "Lean.Macro.getCurrNamespace",
+        borrowed: generated::MACRO_GET_CURR_NAMESPACE_BORROWED,
+        parameters: generated::MACRO_GET_CURR_NAMESPACE_PARAMETERS,
+        result_type: generated::MACRO_GET_CURR_NAMESPACE_RESULT,
+    },
+    MirrorRow {
+        id: "mirror:Lean.Macro.hasDecl",
+        name: "Lean.Macro.hasDecl",
+        borrowed: generated::MACRO_HAS_DECL_BORROWED,
+        parameters: generated::MACRO_HAS_DECL_PARAMETERS,
+        result_type: generated::MACRO_HAS_DECL_RESULT,
     },
 ];
 

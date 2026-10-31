@@ -2,7 +2,8 @@
 //! safe object observers; Reference toolchain bodies are never dispatched.
 
 use super::{IntrinsicFailure, IntrinsicResult, Obj, VmRefusal, expect_arity, nat_as_usize};
-use fln_core::name::Name;
+use crate::macro_native::MacroLookup;
+use fln_core::name::{LeafView, Name};
 use fln_rt::convert::{Conversion, ConvertError, inject_name};
 use fln_rt::syntax_abi_generated as layout;
 
@@ -21,6 +22,8 @@ pub(super) enum Intrinsic {
     IsMissing,
     IsIdent,
     GetId,
+    GetCurrNamespace,
+    HasDecl,
 }
 
 impl Intrinsic {
@@ -36,6 +39,8 @@ impl Intrinsic {
             "mirror:Lean.Syntax.isMissing" => Self::IsMissing,
             "mirror:Lean.Syntax.isIdent" => Self::IsIdent,
             "mirror:Lean.Syntax.getId" => Self::GetId,
+            "mirror:Lean.Macro.getCurrNamespace" => Self::GetCurrNamespace,
+            "mirror:Lean.Macro.hasDecl" => Self::HasDecl,
             _ => return None,
         })
     }
@@ -45,13 +50,22 @@ impl Intrinsic {
         row: &str,
         args: &[Obj],
     ) -> Result<IntrinsicResult, IntrinsicFailure> {
+        self.invoke_with_lookup(row, args, None)
+    }
+
+    pub(super) fn invoke_with_lookup(
+        self,
+        row: &str,
+        args: &[Obj],
+        lookup: Option<&dyn MacroLookup>,
+    ) -> Result<IntrinsicResult, IntrinsicFailure> {
         expect_arity(
             row,
             args,
-            if matches!(self, Self::IsOfKind | Self::GetArg | Self::SetKind) {
-                2
-            } else {
-                1
+            match self {
+                Self::IsOfKind | Self::GetArg | Self::SetKind | Self::GetCurrNamespace => 2,
+                Self::HasDecl => 3,
+                _ => 1,
             },
         )?;
         match self {
@@ -174,6 +188,31 @@ impl Intrinsic {
                 };
                 Ok(IntrinsicResult::raw_object(id))
             }
+            Self::GetCurrNamespace | Self::HasDecl => {
+                let context_index = usize::from(self == Self::HasDecl);
+                check_layout(&args[context_index], layout::MACRO_CONTEXT)?;
+                let state = &args[context_index + 1];
+                check_layout(state, layout::MACRO_STATE)?;
+                let operation = if self == Self::HasDecl {
+                    "Lean.Macro.hasDecl"
+                } else {
+                    "Lean.Macro.getCurrNamespace"
+                };
+                let lookup = lookup.ok_or(VmRefusal::MacroLookupUnavailable { operation })?;
+                let value = if self == Self::HasDecl {
+                    let declaration = name(&args[0])?;
+                    Obj::mk_nat(usize::from(lookup.has_decl(&declaration)))
+                } else {
+                    bounded_native_name(lookup.current_namespace())?
+                };
+                // Both methods are MacroM actions. Preserve the complete state
+                // handle and return the exact generated EStateM.ok carrier.
+                Ok(IntrinsicResult::raw_object(Obj::mk_ctor(
+                    layout::RESULT_OK.tag,
+                    vec![value, state.clone_ref()],
+                    &[],
+                )))
+            }
         }
     }
 }
@@ -183,6 +222,37 @@ enum SyntaxKind {
     Node,
     Atom,
     Ident,
+}
+
+fn check_layout(value: &Obj, expected: layout::CtorLayout) -> Result<(), VmRefusal> {
+    if value.is_scalar() || value.obj_tag() != usize::from(expected.tag) {
+        return Err(VmRefusal::InvalidCtorObject);
+    }
+    let word = std::mem::size_of::<usize>();
+    let bytes =
+        (word + expected.object_fields * word + expected.scalar_bytes).div_ceil(word) * word;
+    if usize::from(value.header().other) != expected.object_fields || value.byte_size() != bytes {
+        return Err(VmRefusal::InvalidCtorObject);
+    }
+    Ok(())
+}
+
+fn bounded_native_name(value: &Name) -> Result<Obj, IntrinsicFailure> {
+    let mut cursor = value.clone();
+    let mut nodes = 0u64;
+    let mut bytes = 0u64;
+    loop {
+        nodes = nodes.saturating_add(1);
+        if let LeafView::Str(text) = cursor.leaf_view() {
+            bytes = bytes.saturating_add(text.len() as u64);
+        }
+        limit("name nodes", MAX_NAME_NODES, nodes)?;
+        limit("name bytes", MAX_NAME_BYTES, bytes)?;
+        if cursor.is_anonymous() {
+            return Ok(inject_name(value));
+        }
+        cursor = cursor.parent();
+    }
 }
 
 fn syntax_kind(value: &Obj) -> Result<SyntaxKind, VmRefusal> {

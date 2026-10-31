@@ -50,6 +50,8 @@ FUNCTIONS = {
     "SYNTAX_IS_MISSING": "syntaxIsMissing",
     "SYNTAX_IS_IDENT": "syntaxIsIdent",
     "SYNTAX_GET_ID": "syntaxGetId",
+    "MACRO_GET_CURR_NAMESPACE": "macroGetCurrNamespace",
+    "MACRO_HAS_DECL": "macroHasDecl",
 }
 
 

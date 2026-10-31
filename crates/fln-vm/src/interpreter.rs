@@ -1443,6 +1443,10 @@ pub enum ValueKind {
 /// value or requested host row did not satisfy the operation contract.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum VmRefusal {
+    /// A native MacroM lookup was invoked without an explicit host capability.
+    MacroLookupUnavailable {
+        operation: &'static str,
+    },
     CallableEntry {
         function: FunctionId,
         reason: &'static str,
@@ -1602,6 +1606,12 @@ impl fmt::Display for VmRefusal {
             Self::UnknownIntrinsic { row } => write!(f, "unknown intrinsic row {row:?}"),
             Self::UnsupportedIntrinsic { row } => {
                 write!(f, "intrinsic row {row:?} has no prototype implementation")
+            }
+            Self::MacroLookupUnavailable { operation } => {
+                write!(
+                    f,
+                    "{operation} requires an explicit macro lookup capability"
+                )
             }
             Self::IntrinsicArity {
                 row,
@@ -2084,7 +2094,15 @@ pub fn execute_with_context(
     context: CommandExecutionContext,
     cancellation: Option<&dyn CancellationProbe>,
 ) -> Outcome<VmExit> {
-    finish_run(run(program, limits, context, cancellation, None, None))
+    finish_run(run(
+        program,
+        limits,
+        context,
+        cancellation,
+        None,
+        None,
+        None,
+    ))
 }
 
 /// Invoke an already validated function with owned input handles.
@@ -2130,6 +2148,30 @@ pub fn execute_function_with_context(
         cancellation,
         None,
         Some((function, arguments)),
+        None,
+    ))
+}
+
+/// Invoke a macro callable with an explicit, invocation-local lookup capability.
+///
+/// Lookup authority is borrowed only for this run. It is not available to
+/// ordinary or cached execution, output callbacks, or an opaque MethodsRef.
+pub fn execute_function_with_macro_lookup(
+    program: &ValidatedProgram,
+    function: FunctionId,
+    arguments: Vec<Obj>,
+    limits: ExecutionLimits,
+    lookup: &dyn crate::macro_native::MacroLookup,
+    cancellation: Option<&dyn CancellationProbe>,
+) -> Outcome<VmExit> {
+    finish_run(run(
+        program,
+        limits,
+        CommandExecutionContext::UNLIMITED,
+        cancellation,
+        None,
+        Some((function, arguments)),
+        Some(lookup),
     ))
 }
 
@@ -2201,6 +2243,7 @@ pub fn execute_cached_with_context(
         cancellation,
         Some(caches),
         None,
+        None,
     ))
 }
 
@@ -2243,6 +2286,7 @@ fn run(
     cancellation: Option<&dyn CancellationProbe>,
     mut inline_caches: Option<&mut InlineCaches>,
     invocation: Option<(FunctionId, Vec<Obj>)>,
+    macro_lookup: Option<&dyn crate::macro_native::MacroLookup>,
 ) -> Result<VmExit, Stop> {
     let heartbeat_context = HeartbeatContext::snapshot(command_context.heartbeat_limit());
     if limits.max_stack_depth < 1 {
@@ -2993,12 +3037,18 @@ fn run(
                         }
                     }
                 } else {
-                    match invoke_intrinsic(
-                        plan.implementation,
-                        plan.row,
-                        values,
-                        limits.max_nat_magnitude_bytes,
-                    ) {
+                    let invoked = match plan.implementation {
+                        IntrinsicImplementation::MacroNative(intrinsic) => {
+                            intrinsic.invoke_with_lookup(plan.row, &values, macro_lookup)
+                        }
+                        implementation => invoke_intrinsic(
+                            implementation,
+                            plan.row,
+                            values,
+                            limits.max_nat_magnitude_bytes,
+                        ),
+                    };
+                    match invoked {
                         Ok(result) => {
                             let value =
                                 match finish_intrinsic_result(plan.row, result_ownership, result) {

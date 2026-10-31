@@ -232,16 +232,22 @@ fn live_pinned_macro_runs_native_syntax_methods_and_matches_complete_subtrees() 
     assert!(
         matches!(diagnostic.outcome, Outcome::Complete(Ok(MacroResult::Error { reference, message, state })) if reference == leaf() && message == "λ\0error" && state == MacroState::default())
     );
-    assert!(
-        compile(
-            std::slice::from_ref(&module),
-            &name("namespaceMacro"),
-            &VerifiedPartition::user_fixture(),
-            &users,
-            IrExecutionLimits::default()
-        )
-        .is_err()
+    let namespace = prepare(&name("namespaceMacro")).execute(
+        &leaf(),
+        &source(),
+        &context(),
+        &MacroState::default(),
+        MacroLimits::default(),
+        None,
     );
+    assert!(matches!(
+        namespace.outcome,
+        Outcome::Complete(Err(MacroExecutionError::Runtime(
+            VmRefusal::MacroLookupUnavailable {
+                operation: "Lean.Macro.getCurrNamespace"
+            }
+        )))
+    ));
 
     let context_entry = module
         .decls

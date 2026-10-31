@@ -5,6 +5,8 @@ use super::super::{
 use super::*;
 use fln_comp::flbc;
 
+mod lookup;
+
 fn atom(text: &str) -> Obj {
     Obj::mk_ctor(
         layout::SYNTAX_ATOM.tag,
@@ -37,6 +39,8 @@ fn invoke(intrinsic: Intrinsic, args: &[Obj]) -> Obj {
         Intrinsic::IsMissing => "mirror:Lean.Syntax.isMissing",
         Intrinsic::IsIdent => "mirror:Lean.Syntax.isIdent",
         Intrinsic::GetId => "mirror:Lean.Syntax.getId",
+        Intrinsic::GetCurrNamespace => "mirror:Lean.Macro.getCurrNamespace",
+        Intrinsic::HasDecl => "mirror:Lean.Macro.hasDecl",
     };
     match intrinsic.invoke(id, args) {
         Ok(value) => value.into_object(),

@@ -291,6 +291,12 @@ impl CompiledCallableIr {
         self.arity
     }
 
+    /// The validated callable entry, including its initializer wrapper when
+    /// one was requested. It differs from the zero-argument bootstrap entry.
+    pub const fn entry_function(&self) -> flbc::FunctionId {
+        self.entry
+    }
+
     pub fn program(&self) -> &flbc::ValidatedProgram {
         self.compiled.program.program()
     }

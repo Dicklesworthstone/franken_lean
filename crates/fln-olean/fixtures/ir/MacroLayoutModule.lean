@@ -84,4 +84,14 @@ def prod (name : Lean.Name) (value : String) : Lean.Name × String := (name, val
 
 @[noinline] def syntaxGetId (value : Lean.Syntax) : Lean.Name := value.getId
 
+@[noinline] def macroGetCurrNamespace (context : @& Lean.Macro.Context)
+    (state : Lean.Macro.State) :
+    EStateM.Result Lean.Macro.Exception Lean.Macro.State Lean.Name :=
+  Lean.Macro.getCurrNamespace context state
+
+@[noinline] def macroHasDecl (name : Lean.Name) (context : @& Lean.Macro.Context)
+    (state : Lean.Macro.State) :
+    EStateM.Result Lean.Macro.Exception Lean.Macro.State Bool :=
+  Lean.Macro.hasDecl name context state
+
 end FrankenLean.MacroLayout

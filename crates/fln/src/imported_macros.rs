@@ -4,9 +4,9 @@
 //! functions, including their branches and exceptions. It supplies immutable
 //! Syntax, context and state objects and returns the complete resulting state.
 //! It does not enable expansion-less parser registrations, interpret Lean's
-//! toolchain implementation, or pretend that the five environment-dependent
-//! Macro.Methods have been implemented. A macro demanding those methods is
-//! refused by the ordinary native-call selection boundary.
+//! toolchain implementation, or supply ambient environment authority. Native
+//! namespace and declaration lookups require an explicit invocation capability;
+//! the remaining Macro.Methods are refused at native-call selection.
 
 use crate::imported_ir::{
     self, CompiledCallableIr, IrExecutionError, IrExecutionLimits, ReferenceFunction,
@@ -25,6 +25,7 @@ use fln_vm::interpreter::{CancellationProbe, ExecutionLimits, ExecutionUsage, Vm
 use std::collections::{BTreeSet, HashSet};
 
 mod confinement;
+pub mod lookup;
 pub mod registrations;
 mod syntax;
 pub use syntax::{SyntaxConversionError, SyntaxLimits};
@@ -33,9 +34,9 @@ pub use syntax::{SyntaxConversionError, SyntaxLimits};
 ///
 /// User code may read the quotation name, scope, depth, depth limit and source
 /// reference supplied by the native context. Its opaque MethodsRef cannot be
-/// inspected, mutated or allowed to escape verified calls. Contextual name
-/// lookup and the five Macro.Methods remain unavailable; state-counter updates
-/// are supported.
+/// inspected, mutated or allowed to escape verified calls. Namespace and
+/// declaration lookups use the explicit capability in [`MacroInvocation`];
+/// the other three Macro.Methods remain unavailable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MacroContext {
     pub quotation_context: Name,
@@ -50,6 +51,17 @@ pub struct MacroState {
     pub macro_scope: u64,
     pub trace_messages: Vec<(Name, String)>,
     pub expanded_macro_declarations: Vec<Name>,
+}
+
+/// Borrowed inputs and optional lookup authority for one macro invocation.
+///
+/// The capability is not encoded in Macro.Context or retained in compiled code.
+/// Passing `None` preserves the authority of [`CompiledMacro::execute`].
+pub struct MacroInvocation<'a> {
+    pub source: &'a SourceText,
+    pub context: &'a MacroContext,
+    pub state: &'a MacroState,
+    pub lookup: Option<&'a dyn fln_vm::macro_native::MacroLookup>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -177,15 +189,43 @@ impl CompiledMacro {
         limits: MacroLimits,
         cancellation: Option<&dyn CancellationProbe>,
     ) -> MacroExecution {
+        self.execute_with_context(
+            input,
+            MacroInvocation {
+                source,
+                context,
+                state,
+                lookup: None,
+            },
+            limits,
+            cancellation,
+        )
+    }
+
+    /// Run against an explicitly selected environment lookup snapshot.
+    /// Syntax and the complete successor state still pass bounded projection
+    /// before either is exposed to the caller.
+    pub fn execute_with_context(
+        &self,
+        input: &Syntax,
+        invocation: MacroInvocation<'_>,
+        limits: MacroLimits,
+        cancellation: Option<&dyn CancellationProbe>,
+    ) -> MacroExecution {
+        let MacroInvocation {
+            source,
+            context,
+            state,
+            lookup,
+        } = invocation;
         let prepared = (|| {
             let syntax = syntax::inject(input, source, limits.syntax)?;
             let mut budget = StateBudget::new(limits.syntax);
             let context = make_ctor(
                 layout::MACRO_CONTEXT,
                 vec![
-                    // Opaque MethodsRef: no native method can inspect this token.
-                    // Selecting getMethods/any environment method is a compile
-                    // refusal until its explicit capability is implemented.
+                    // Opaque MethodsRef: native lookups use the separate host
+                    // capability and never derive authority from this token.
                     Obj::mk_nat(0),
                     budget.inject_name(&context.quotation_context)?,
                     nat(context.current_macro_scope),
@@ -201,8 +241,22 @@ impl CompiledMacro {
         let outcome = match prepared {
             Err(error) => conversion_outcome(error),
             Ok(arguments) => {
-                let report = self.callable.execute(arguments, limits.vm, cancellation);
-                match report.outcome {
+                let outcome = match lookup {
+                    Some(lookup) => fln_vm::interpreter::execute_function_with_macro_lookup(
+                        self.callable.program(),
+                        self.callable.entry_function(),
+                        arguments,
+                        limits.vm,
+                        lookup,
+                        cancellation,
+                    ),
+                    None => {
+                        self.callable
+                            .execute(arguments, limits.vm, cancellation)
+                            .outcome
+                    }
+                };
+                match outcome {
                     Outcome::Complete(VmExit::Returned(result)) => {
                         vm_usage = Some(result.usage);
                         match project_result(&result.value, source, limits.syntax) {
