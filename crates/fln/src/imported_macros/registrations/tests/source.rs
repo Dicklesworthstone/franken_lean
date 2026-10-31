@@ -224,7 +224,7 @@ fn imported_macros_admit_named_values_and_proofs_through_the_ordinary_authority(
         .unwrap();
     assert!(
         matches!(simple.declaration, crate::Declaration::Thm(_)),
-        "the macro path must install the theorem's simp attribute"
+        "later ordinary source must use the admitted value"
     );
     let false_proof = admit(
         &result.admission.engine,
@@ -273,13 +273,73 @@ fn imported_macros_admit_named_values_and_proofs_through_the_ordinary_authority(
 }
 
 #[test]
+fn macro_admission_installs_simp_attributes_after_expanding_the_signature() {
+    let (engine, registry, _) = fixture();
+    let predicate = engine
+        .admit_source_declaration(
+            b"axiom MacroPredicate : Nat -> Prop",
+            &KVMap::new(),
+            admission(),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let premise = predicate
+        .engine
+        .admit_source_declaration(
+            b"axiom macroPremise : MacroPredicate 11",
+            &KVMap::new(),
+            admission(),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let source = b"theorem useMacroProperty : MacroPredicate 11 := by simp";
+    assert!(
+        premise
+            .engine
+            .admit_source_declaration(source, &KVMap::new(), admission())
+            .is_err(),
+        "an opaque proposition has no simp proof before its lemma is registered"
+    );
+    let report = admit(
+        &premise.engine,
+        &registry,
+        b"@[simp] theorem macroProperty : MacroPredicate (7 + 11) := macroPremise",
+        MacroTreeLimits::default(),
+        admission(),
+        None,
+    );
+    let registered = admitted(&report);
+    assert_eq!(report.attempts.len(), 2);
+    let used = registered
+        .admission
+        .engine
+        .admit_source_declaration(source, &KVMap::new(), admission())
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!(
+        used.checker.ground,
+        crate::CheckerAdmissionGround::BodyCheckedAgainstDeclaredType
+    );
+    assert!(matches!(used.declaration, crate::Declaration::Thm(_)));
+    assert!(
+        !premise
+            .engine
+            .environment()
+            .contains(&name("macroProperty"))
+    );
+}
+
+#[test]
 fn macro_admission_keeps_local_helper_receipts_and_drops_failed_successors() {
     let (engine, registry, _) = fixture();
     let before = engine.logical_root(&KVMap::new());
     let report = admit(
         &engine,
         &registry,
-        b"def macroHelper (n : Nat) : Nat := let helper (x : Nat) : Nat := x + 11; helper n",
+        b"def macroHelper (n : Nat) : Nat := let rec helper (x : Nat) : Nat := x + 11; helper n",
         MacroTreeLimits::default(),
         admission(),
         None,
@@ -298,6 +358,13 @@ fn macro_admission_keeps_local_helper_receipts_and_drops_failed_successors() {
                 == crate::CheckerAdmissionGround::BodyCheckedAgainstDeclaredType)
     );
     assert_declared_value(&result.admission.engine, "macroHelper 7", 11);
+    assert!(
+        result
+            .admission
+            .engine
+            .environment()
+            .contains(&name("macroHelper.helper"))
+    );
     for source in [
         b"def badMacro : Bool := 7 + 11".as_slice(),
         b"def badMacro : Nat := 7 - 11",

@@ -249,7 +249,7 @@ fn live_imported_ir_changes_source_checks_with_the_pins_order_and_scoped_behavio
         "nativeScopedDeclaredValue",
         7,
     );
-    let helper = admit(&engine, &registry, b"def nativeDeclaredHelper (n : Nat) : Nat := let helper (x : Nat) : Nat := x + 11; helper n", MacroTreeLimits::default(), admission(), None);
+    let helper = admit(&engine, &registry, b"def nativeDeclaredHelper (n : Nat) : Nat := let rec helper (x : Nat) : Nat := x + 11; helper n", MacroTreeLimits::default(), admission(), None);
     let helper = admitted(&helper);
     assert!(helper.admission.admissions.len() >= 2);
     assert_declared_value(&helper.admission.engine, "nativeDeclaredHelper 7", 11);

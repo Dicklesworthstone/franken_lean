@@ -47,7 +47,7 @@ end
 #eval pinDeclaredValue
 
 public def pinDeclaredHelper (n : Nat) : Nat :=
-  let helper (_left : Nat) : Nat := _left + 11
+  let rec helper (_left : Nat) : Nat := _left + 11
   helper n
 #eval pinDeclaredHelper 7
 
