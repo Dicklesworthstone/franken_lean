@@ -115,8 +115,10 @@ pub struct SourceMacroCheck {
     pub completed_vm_usage: ExecutionUsage,
 }
 
-/// Expanded source and the ordinary Engine execution, including both checker
-/// observations, canonical FLBC and Golem's typed exit. The input Engine is
+/// Expanded source and the ordinary Engine execution, including its admission
+/// observations, canonical FLBC and Golem's typed exit. As with ordinary #eval,
+/// the generated unsafe declaration is quarantined: this is not a body-checked
+/// proof or a safe logical declaration. The input Engine is
 /// immutable; only this result retains the generated declaration's successor.
 #[derive(Debug)]
 pub struct SourceMacroEvaluationResult {
@@ -211,6 +213,8 @@ impl Engine {
     /// it does not select a Repr printer or capture IO streams. Normal Engine
     /// execution limits apply to evaluation; the invocation's cancellation
     /// probe applies to expansion and is checked again before evaluation.
+    /// Like the pin and the ordinary Engine evaluator, the generated definition
+    /// is unsafe; its checker ground is `UnsafeQuarantine`, not body checking.
     pub fn evaluate_source_command_with_imported_macros(
         &self,
         source: &[u8],

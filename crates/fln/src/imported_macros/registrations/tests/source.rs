@@ -127,7 +127,14 @@ fn evaluated_nat(report: &SourceMacroEvaluation, expected: u64) -> &SourceMacroE
     };
     assert_eq!(
         result.execution.checker.ground,
-        crate::CheckerAdmissionGround::BodyCheckedAgainstDeclaredType
+        crate::CheckerAdmissionGround::UnsafeQuarantine
+    );
+    let crate::Declaration::Defn(evaluation) = &result.execution.declaration else {
+        panic!("#eval must retain its generated declaration")
+    };
+    assert_eq!(evaluation.safety, DefinitionSafety::Unsafe);
+    assert!(
+        matches!(result.execution.runtime_type.node(), ExprNode::Const { name: result, .. } if result == &name("Nat"))
     );
     let fln_vm::interpreter::VmExit::Returned(returned) = &result.execution.exit else {
         panic!("{report:?}")
@@ -169,6 +176,25 @@ fn imported_source_macros_change_checked_vm_values_and_scoped_replays() {
     };
     let report = run(&registry, source);
     let result = evaluated_nat(&report, 11);
+    let crate::Declaration::Defn(evaluation) = &result.execution.declaration else {
+        unreachable!()
+    };
+    let mut laundering = evaluation.clone();
+    laundering.base.name = name("SourceLibrary.safeEvaluationLeak");
+    laundering.value = Expr::const_(evaluation.base.name.clone(), Vec::new());
+    laundering.safety = DefinitionSafety::Safe;
+    let refused = result.execution.engine.admit_declaration(
+        crate::Declaration::Defn(laundering),
+        &KVMap::new(),
+        admission(),
+    );
+    assert!(
+        matches!(
+            refused,
+            Err(crate::EngineAdmissionError::KernelRejected { .. })
+        ),
+        "an evaluated unsafe declaration must not enter a safe body: {refused:?}"
+    );
     assert_eq!(result.parsed.reconstruct_original(), source);
     assert_eq!(result.parsed.query_term_normalized(), Some("(7 + 11)"));
     assert_eq!(report.attempts.len(), 2);
@@ -221,7 +247,7 @@ fn source_macro_evaluation_stops_preserve_state_and_recover() {
     // fixture or a fabricated checker/import marker for the axiom.
     let with_sorry = engine
         .admit_source_declaration(
-            b"axiom sorryAx.{u} (a : Sort u) (synthetic : Bool) : a",
+            b"@[extern \"lean_sorry\"] axiom sorryAx.{u} (a : Sort u) (synthetic : Bool) : a",
             &KVMap::new(),
             admission(),
         )
