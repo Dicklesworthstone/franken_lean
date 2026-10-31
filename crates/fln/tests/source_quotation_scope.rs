@@ -63,12 +63,20 @@ fn substituted_notation_arguments_cannot_be_captured_by_template_binders() {
 #[test]
 fn template_dotted_names_read_fields_of_template_locals() {
     accepted(
-        "macro \"foo!\" x:term : term => `(let xs := $x; xs.succ + xs)\n\
+        "def xs.succ : Nat := 999\n\
+         macro \"foo!\" x:term : term => `(let xs := $x; xs.succ + xs)\n\
          def f1 (x : Nat) : Nat := foo! x+1\n\
          theorem ex1 (x : Nat) : f1 x = Nat.succ (x+1) + (x + 1) := rfl\n\
          def f2 (xs : Nat) : Nat := foo! xs\n\
          theorem ex2 (xs : Nat) : f2 xs = Nat.succ xs + xs := rfl\n",
         2,
+    );
+    assert!(
+        check(
+            "macro \"bad!\" x:term : term => `(let xs := $x; xs.noSuchField)\n\
+             def invalid : Nat := bad! (7 : Nat)"
+        )
+        .is_err()
     );
 }
 

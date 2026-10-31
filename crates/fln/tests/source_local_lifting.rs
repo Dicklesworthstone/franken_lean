@@ -202,6 +202,37 @@ fn theorems_type_positions_and_namespaces_keep_helper_identity() {
 }
 
 #[test]
+fn unused_deferred_type_values_do_not_block_known_instance_inputs() {
+    let base = check(
+        &engine(),
+        "def typed : (let rec A : Type := Nat; Nat) := 5\n\
+         def parameter (n : Nat) : (let rec A : Type := Nat; Nat) := n + 1\n\
+         theorem typedValue : typed = 5 := by rfl\n\
+         theorem parameterValue : parameter 3 = 4 := by rfl",
+    );
+    helper(&base, &["typed", "A"]);
+    helper(&base, &["parameter", "A"]);
+    run(&base, "#eval typed", "5");
+    run(&base, "#eval parameter 3", "4");
+    let root = base.logical_root(&KVMap::new());
+    for source in [
+        "def unknown : (let A : Type := _; A) := 5",
+        "def bad (x : (let rec ty (n : Nat) : Type := match n with | 0 => Nat | Nat.succ k => ty k; ty 2)) : Nat := x",
+        "def bad : (let rec A : Type := Nat; Bool) := 5",
+    ] {
+        let error = base
+            .check_source_files(
+                &[source.as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(EngineAdmissionLimits::new(budget())),
+            )
+            .expect_err("a real type dependency or wrong instance must remain refused");
+        assert_eq!(error.disposition(), ("elaboration", false, 1), "{error:?}");
+        assert_eq!(base.logical_root(&KVMap::new()), root);
+    }
+}
+
+#[test]
 fn single_source_admission_retains_every_real_checker_transition() {
     let base = engine();
     let root = base.logical_root(&KVMap::new());

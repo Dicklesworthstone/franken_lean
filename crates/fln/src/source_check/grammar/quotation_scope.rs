@@ -691,15 +691,20 @@ pub(super) fn preresolve(
                     built.push(ident.clone());
                     continue;
                 }
-                if locals.iter().rev().any(|local| name_has_prefix(val, local))
-                    || rule
-                        .variables
-                        .iter()
-                        .any(|(_, variable)| name_has_prefix(val, variable))
+                if locals.iter().rev().any(|local| name_has_prefix(val, local)) {
+                    // Expansion scopes the receiver and its dotted use together.
+                    // Keep this lexical name for the elaborator's hygienic field
+                    // lookup instead of anchoring a same-spelled global here.
+                    built.push(ident.clone());
+                    continue;
+                }
+                if rule
+                    .variables
+                    .iter()
+                    .any(|(_, variable)| name_has_prefix(val, variable))
                 {
-                    // A dotted use needs lexical field handling, not a global
-                    // with the same qualified spelling. Exact bound names were
-                    // retained above; their field paths are not represented yet.
+                    // A template argument requires substitution of the receiver
+                    // syntax, which an unsplit dotted identifier cannot express.
                     return Err(EngineExecutionError::NotImplemented {
                         feature: "quotation field access through a bound name",
                     });
@@ -859,15 +864,16 @@ mod tests {
             })
         ));
         assert!(preresolve(&rule("notation \"bound\" => fun x : Nat => x"), &resolve).is_ok());
-        assert!(matches!(
-            preresolve(
-                &rule("notation \"boundField\" => fun x : Nat => x.val"),
-                &resolve
+        assert_eq!(
+            names(
+                &preresolve(
+                    &rule("notation \"boundField\" => fun x : Nat => x.succ"),
+                    &resolve
+                )
+                .unwrap()
             ),
-            Err(EngineExecutionError::NotImplemented {
-                feature: "quotation field access through a bound name"
-            })
-        ));
+            ["x", "_root_.Declared.Nat", "x.succ"]
+        );
     }
 
     #[test]
