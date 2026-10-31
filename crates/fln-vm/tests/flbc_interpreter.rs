@@ -8968,7 +8968,10 @@ fn generated_array_read_family_preserves_values_ownership_and_hostile_refusals()
     assert_eq!(string_contents(&source.array_child(0)), "zero");
     assert_eq!(string_contents(&source.array_child(1)), "one");
     assert_eq!(string_contents(&completed.value.array_child(1)), "one");
-    assert_eq!(completed.value.array_child(2).unbox(), 2);
+    assert_eq!(
+        completed.value.array_child(2).try_ctor_scalar_u64(0),
+        Some(2)
+    );
     assert_eq!(string_contents(&completed.value.array_child(3)), "one");
     drop(source);
     drop(completed);

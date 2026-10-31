@@ -7,14 +7,18 @@
 //! array. Both directions retain payloads before releasing their input.
 
 use super::{
-    IntrinsicFailure, IntrinsicResult, Obj, VmRefusal, array_value, expect_arity, with_nat_view,
+    IntrinsicFailure, IntrinsicResult, Obj, VmRefusal, array_value, expect_arity, nat_as_usize,
+    with_nat_view,
 };
+
+const MAX_REPLICATE_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum Intrinsic {
     FromList,
     ToList,
     Empty,
+    Replicate,
 }
 
 impl Intrinsic {
@@ -23,6 +27,7 @@ impl Intrinsic {
             "extern:Array.mk" => Self::FromList,
             "extern:Array.toList" => Self::ToList,
             "extern:Array.emptyWithCapacity" | "extern:Array.mkEmpty" => Self::Empty,
+            "extern:Array.replicate" => Self::Replicate,
             _ => return None,
         })
     }
@@ -32,8 +37,27 @@ impl Intrinsic {
         row: &str,
         args: &[Obj],
     ) -> Result<IntrinsicResult, IntrinsicFailure> {
-        expect_arity(row, args, 1)?;
+        expect_arity(row, args, if self == Self::Replicate { 2 } else { 1 })?;
         let result = match self {
+            Self::Replicate => {
+                let count = nat_as_usize(&args[0], "Array.replicate", 0)?;
+                let requested =
+                    count.and_then(|count| count.checked_mul(std::mem::size_of::<Obj>()));
+                let limit = || IntrinsicFailure::ArrayResource {
+                    allowed: MAX_REPLICATE_BYTES as u64,
+                    observed: requested.map_or(u64::MAX, |bytes| bytes as u64),
+                };
+                let Some((count, bytes)) = count.zip(requested) else {
+                    return Err(limit());
+                };
+                if bytes > MAX_REPLICATE_BYTES {
+                    return Err(limit());
+                }
+                let mut items = Vec::new();
+                items.try_reserve_exact(count).map_err(|_| limit())?;
+                items.resize_with(count, || args[1].clone_ref());
+                Obj::mk_array(items)
+            }
             Self::FromList => {
                 let mut cursor = args[0].clone_ref();
                 let mut items = Vec::new();

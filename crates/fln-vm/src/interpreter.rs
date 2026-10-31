@@ -861,16 +861,20 @@ enum IntrinsicImplementation {
     ByteArrayDecEq,
     ByteArrayEmptyWithCapacity,
     ByteArrayGet,
+    ByteArrayGetBang,
     ByteArrayHash,
     ByteArrayMk,
     ByteArrayPush,
     ByteArraySet,
+    ByteArraySetBang,
     ByteArraySize,
+    ByteArrayUSize,
     ByteArrayUGet,
     ByteArrayUset,
     ByteArrayValidateUtf8,
     ArraySize,
     ArrayGetInternal,
+    ArrayGetDefault,
     ArrayUGet,
     ArrayGetBorrowed,
     ArrayUSize,
@@ -1234,16 +1238,24 @@ impl IntrinsicImplementation {
             "extern:ByteArray.decEq" => Self::ByteArrayDecEq,
             "extern:ByteArray.emptyWithCapacity" => Self::ByteArrayEmptyWithCapacity,
             "extern:ByteArray.get" => Self::ByteArrayGet,
+            "extern:ByteArray.get!" => Self::ByteArrayGetBang,
             "extern:ByteArray.hash" => Self::ByteArrayHash,
             "extern:ByteArray.mk" => Self::ByteArrayMk,
             "extern:ByteArray.push" => Self::ByteArrayPush,
             "extern:ByteArray.set" => Self::ByteArraySet,
+            "extern:ByteArray.set!" => Self::ByteArraySetBang,
             "extern:ByteArray.size" => Self::ByteArraySize,
+            "extern:ByteArray.usize" => Self::ByteArrayUSize,
             "extern:ByteArray.uget" => Self::ByteArrayUGet,
             "extern:ByteArray.uset" => Self::ByteArrayUset,
             "extern:ByteArray.validateUTF8" => Self::ByteArrayValidateUtf8,
             "extern:Array.size" => Self::ArraySize,
-            "extern:Array.getInternal" => Self::ArrayGetInternal,
+            "extern:Array.getInternal" | "extern:Array.getInternalBorrowed" => {
+                Self::ArrayGetInternal
+            }
+            "extern:Array.get!Internal" | "extern:Array.get!InternalBorrowed" => {
+                Self::ArrayGetDefault
+            }
             "extern:Array.uget" => Self::ArrayUGet,
             "extern:Array.ugetBorrowed" => Self::ArrayGetBorrowed,
             "extern:Array.usize" => Self::ArrayUSize,
@@ -1965,6 +1977,10 @@ struct IntrinsicResult {
 }
 
 enum IntrinsicFailure {
+    ArrayResource {
+        allowed: u64,
+        observed: u64,
+    },
     MirrorResource {
         resource: &'static str,
         allowed: u64,
@@ -3079,6 +3095,18 @@ fn run(
                                 allowed,
                                 observed,
                                 &location.to_string(),
+                            ));
+                        }
+                        Err(IntrinsicFailure::ArrayResource { allowed, observed }) => {
+                            return Err(Stop::Inconclusive(
+                                Inconclusive::resource(ResourceUsage {
+                                    reason: ResourceReason::Memory {
+                                        limit_bytes: allowed,
+                                    },
+                                    allowed,
+                                    observed,
+                                })
+                                .with_progress("native Array.replicate output bytes"),
                             ));
                         }
                         Err(IntrinsicFailure::MirrorResource {
@@ -4511,7 +4539,11 @@ fn finish_intrinsic_result(
         return Ok(value);
     }
     let boxed_integer = floats::boxed_integer_result(row)
-        || strings::Intrinsic::for_row(row).is_some_and(strings::Intrinsic::has_wide_result);
+        || strings::Intrinsic::for_row(row).is_some_and(strings::Intrinsic::has_wide_result)
+        || matches!(
+            row,
+            "extern:ByteArray.hash" | "extern:ByteArray.usize" | "extern:Array.usize"
+        );
     let scalar_kind_matches = if let Some(intrinsic) = floats::Intrinsic::for_row(row) {
         intrinsic.result_kind_matches(&value)
     } else if boxed_integer {
@@ -6981,16 +7013,36 @@ fn dispatch_intrinsic(
             let index = array_index(&args[1], "Array.getInternal", size)?;
             Ok(IntrinsicResult::owned(args[0].array_child(index)))
         }
+        IntrinsicImplementation::ArrayGetDefault => {
+            expect_arity(row, args, 3)?;
+            let (size, _) = array_value(&args[1], "Array.get!Internal", 1)?;
+            let index = nat_as_usize(&args[2], "Array.get!Internal", 2)?;
+            let value = if let Some(index) = index.filter(|index| *index < size) {
+                args[1].array_child(index)
+            } else {
+                arrays::report_bounds_panic()?;
+                args[0].clone_ref()
+            };
+            // Both generated ABIs return raw_object. Retain the selected
+            // value before the borrowed inputs leave the caller's frame.
+            Ok(IntrinsicResult::raw_object(value))
+        }
         IntrinsicImplementation::ArrayUGet => {
             expect_arity(row, args, 2)?;
             let (size, _) = array_value(&args[0], "Array.uget", 0)?;
-            let index = array_index(&args[1], "Array.uget", size)?;
+            let index = usize_argument(&args[1], "Array.uget", 1)?;
+            if index >= size {
+                return Err(VmRefusal::ArrayIndexOutOfBounds { index, size }.into());
+            }
             Ok(IntrinsicResult::raw_object(args[0].array_child(index)))
         }
         IntrinsicImplementation::ArrayGetBorrowed => {
             expect_arity(row, args, 2)?;
             let (size, _) = array_value(&args[0], "Array.ugetBorrowed", 0)?;
-            let index = array_index(&args[1], "Array.ugetBorrowed", size)?;
+            let index = usize_argument(&args[1], "Array.ugetBorrowed", 1)?;
+            if index >= size {
+                return Err(VmRefusal::ArrayIndexOutOfBounds { index, size }.into());
+            }
             Ok(IntrinsicResult::borrowed_promoted(
                 args[0].array_child(index),
             ))
@@ -6998,7 +7050,7 @@ fn dispatch_intrinsic(
         IntrinsicImplementation::ArrayUSize => {
             expect_arity(row, args, 1)?;
             let (size, _) = array_value(&args[0], "Array.usize", 0)?;
-            Ok(IntrinsicResult::scalar(Obj::mk_nat(size)))
+            Ok(usize_result(size))
         }
         IntrinsicImplementation::NatDecEq
         | IntrinsicImplementation::NatDecLe
@@ -7035,12 +7087,7 @@ fn dispatch_intrinsic(
         IntrinsicImplementation::ByteArrayUGet => {
             expect_arity(row, args, 2)?;
             let bytes = byte_array_bytes(&args[0], "ByteArray.uget", 0)?;
-            let index = nat_as_usize(&args[1], "ByteArray.uget", 1)?.ok_or(
-                VmRefusal::ArrayIndexOutOfBounds {
-                    index: usize::MAX,
-                    size: bytes.len(),
-                },
-            )?;
+            let index = usize_argument(&args[1], "ByteArray.uget", 1)?;
             if index >= bytes.len() {
                 return Err(VmRefusal::ArrayIndexOutOfBounds {
                     index,
@@ -7052,28 +7099,39 @@ fn dispatch_intrinsic(
                 bytes[index],
             ))))
         }
-        IntrinsicImplementation::ByteArrayGet => {
+        IntrinsicImplementation::ByteArrayUSize => {
+            expect_arity(row, args, 1)?;
+            let bytes = byte_array_bytes(&args[0], "ByteArray.usize", 0)?;
+            Ok(usize_result(bytes.len()))
+        }
+        IntrinsicImplementation::ByteArrayGet | IntrinsicImplementation::ByteArrayGetBang => {
             expect_arity(row, args, 2)?;
             let bytes = byte_array_bytes(&args[0], "ByteArray.get", 0)?;
-            // The pin answers 0 for any out-of-bounds index — including a
-            // non-scalar Nat, which cannot name a valid byte here.
             let byte = match nat_as_usize(&args[1], "ByteArray.get", 1)? {
                 Some(index) if index < bytes.len() => bytes[index],
+                index if implementation == IntrinsicImplementation::ByteArrayGet => {
+                    return Err(VmRefusal::ArrayIndexOutOfBounds {
+                        index: index.unwrap_or(usize::MAX),
+                        size: bytes.len(),
+                    }
+                    .into());
+                }
                 _ => 0,
             };
             Ok(IntrinsicResult::scalar(Obj::mk_nat(usize::from(byte))))
         }
-        IntrinsicImplementation::ByteArraySet => {
+        IntrinsicImplementation::ByteArraySet | IntrinsicImplementation::ByteArraySetBang => {
             expect_arity(row, args, 3)?;
             let bytes = byte_array_bytes(&args[0], "ByteArray.set", 0)?;
-            let index = nat_as_usize(&args[1], "ByteArray.set", 1)?.ok_or(
-                VmRefusal::ArrayIndexOutOfBounds {
-                    index: usize::MAX,
-                    size: bytes.len(),
-                },
-            )?;
+            let index = nat_as_usize(&args[1], "ByteArray.set", 1)?.unwrap_or(usize::MAX);
             let value = byte_argument(&args[2], "ByteArray.set", 2)?;
-            // The pin returns the array UNCHANGED for an out-of-range set.
+            if implementation == IntrinsicImplementation::ByteArraySet && index >= bytes.len() {
+                return Err(VmRefusal::ArrayIndexOutOfBounds {
+                    index,
+                    size: bytes.len(),
+                }
+                .into());
+            }
             if index < bytes.len() {
                 let mut updated = bytes;
                 updated[index] = value;
@@ -7085,12 +7143,7 @@ fn dispatch_intrinsic(
         IntrinsicImplementation::ByteArrayUset => {
             expect_arity(row, args, 3)?;
             let bytes = byte_array_bytes(&args[0], "ByteArray.uset", 0)?;
-            let index = nat_as_usize(&args[1], "ByteArray.uset", 1)?.ok_or(
-                VmRefusal::ArrayIndexOutOfBounds {
-                    index: usize::MAX,
-                    size: bytes.len(),
-                },
-            )?;
+            let index = usize_argument(&args[1], "ByteArray.uset", 1)?;
             if index >= bytes.len() {
                 return Err(VmRefusal::ArrayIndexOutOfBounds {
                     index,
@@ -7138,18 +7191,10 @@ fn dispatch_intrinsic(
         IntrinsicImplementation::ByteArrayHash => {
             expect_arity(row, args, 1)?;
             let bytes = byte_array_bytes(&args[0], "ByteArray.hash", 0)?;
-            // `hash_str(size, ptr, seed=11)` at the pin is MurmurHash64A. The
-            // census declares a scalar result, so hashes beyond the tagged
-            // ceiling are a typed non-answer until mpz-carrying result
-            // contracts exist for this row.
-            let hash_value = fln_core::lean_hash::murmur_hash_64a(&bytes, 11);
-            if hash_value > (usize::MAX >> 1) as u64 {
-                return Err(VmRefusal::NatOverflow {
-                    operation: "ByteArray.hash",
-                }
-                .into());
-            }
-            Ok(IntrinsicResult::scalar(Obj::mk_nat(hash_value as usize)))
+            // The UInt64 result retains all 64 bits, including the high bit.
+            Ok(uint64_result(fln_core::lean_hash::murmur_hash_64a(
+                &bytes, 11,
+            )))
         }
         IntrinsicImplementation::ByteArrayCopySlice => {
             expect_arity(row, args, 6)?;
@@ -7911,11 +7956,14 @@ fn closure_intrinsic_application(
         | IntrinsicImplementation::ByteArrayDecEq
         | IntrinsicImplementation::ByteArrayEmptyWithCapacity
         | IntrinsicImplementation::ByteArrayGet
+        | IntrinsicImplementation::ByteArrayGetBang
         | IntrinsicImplementation::ByteArrayHash
         | IntrinsicImplementation::ByteArrayMk
         | IntrinsicImplementation::ByteArrayPush
         | IntrinsicImplementation::ByteArraySet
+        | IntrinsicImplementation::ByteArraySetBang
         | IntrinsicImplementation::ByteArraySize
+        | IntrinsicImplementation::ByteArrayUSize
         | IntrinsicImplementation::ByteArrayUGet
         | IntrinsicImplementation::ByteArrayUset
         | IntrinsicImplementation::ByteArrayValidateUtf8
@@ -7926,6 +7974,7 @@ fn closure_intrinsic_application(
         | IntrinsicImplementation::StringTrim
         | IntrinsicImplementation::ArraySize
         | IntrinsicImplementation::ArrayGetInternal
+        | IntrinsicImplementation::ArrayGetDefault
         | IntrinsicImplementation::ArrayUGet
         | IntrinsicImplementation::ArrayGetBorrowed
         | IntrinsicImplementation::ArrayUSize
@@ -9498,11 +9547,14 @@ mod tests {
             "extern:ByteArray.decEq",
             "extern:ByteArray.emptyWithCapacity",
             "extern:ByteArray.get",
+            "extern:ByteArray.get!",
             "extern:ByteArray.hash",
             "extern:ByteArray.mk",
             "extern:ByteArray.push",
             "extern:ByteArray.set",
+            "extern:ByteArray.set!",
             "extern:ByteArray.size",
+            "extern:ByteArray.usize",
             "extern:ByteArray.uget",
             "extern:ByteArray.uset",
             "extern:ByteArray.validateUTF8",
@@ -9541,22 +9593,26 @@ mod tests {
             owned_usize(invoke("extern:ByteArray.size", &[array.clone_ref()])),
             3
         );
-        // get answers 0 out of bounds; uget refuses typed.
+        // get! answers 0 out of bounds; proof-bearing reads refuse typed.
         assert_eq!(
             owned_usize(invoke("extern:ByteArray.get", &[array.clone_ref(), n(1)])),
             105
         );
         assert_eq!(
-            owned_usize(invoke("extern:ByteArray.get", &[array.clone_ref(), n(9)])),
+            owned_usize(invoke("extern:ByteArray.get!", &[array.clone_ref(), n(9)])),
             0
         );
+        assert!(matches!(
+            invoke("extern:ByteArray.get", &[array.clone_ref(), n(9)]),
+            Err(VmRefusal::ArrayIndexOutOfBounds { index: 9, size: 3 })
+        ));
         assert!(matches!(
             invoke("extern:ByteArray.uget", &[array.clone_ref(), n(9)]),
             Err(VmRefusal::ArrayIndexOutOfBounds { index: 9, size: 3 })
         ));
         assert_eq!(
             owned_usize(invoke(
-                "extern:ByteArray.get",
+                "extern:ByteArray.get!",
                 &[array, Obj::mk_mpz(&[u64::from(u32::MAX) + 1], false)]
             )),
             0
@@ -9566,7 +9622,7 @@ mod tests {
     #[test]
     fn byte_array_set_uset_push_copy_slice_port_the_pin() {
         let array = ba(&[104, 105]);
-        // set in range replaces; set out of range returns the array unchanged.
+        // set in range replaces; set! out of range leaves the array unchanged.
         assert_eq!(
             ba_bytes(invoke(
                 "extern:ByteArray.set",
@@ -9576,11 +9632,15 @@ mod tests {
         );
         assert_eq!(
             ba_bytes(invoke(
-                "extern:ByteArray.set",
+                "extern:ByteArray.set!",
                 &[array.clone_ref(), n(9), n(98)]
             )),
             [104, 105]
         );
+        assert!(matches!(
+            invoke("extern:ByteArray.set", &[array.clone_ref(), n(9), n(98)]),
+            Err(VmRefusal::ArrayIndexOutOfBounds { index: 9, size: 2 })
+        ));
         assert_eq!(
             ba_bytes(invoke(
                 "extern:ByteArray.uset",
@@ -9632,27 +9692,15 @@ mod tests {
             0
         );
 
-        // Most 64-bit hashes exceed the tagged-Nat ceiling and are typed
-        // non-answers under this row's scalar contract; find an input whose
-        // hash fits, then pin the exact value.
-        let mut fitted = None;
+        let mut saw_high_bit = false;
         for seed_byte in 0u8..=255 {
-            let candidate_input = [seed_byte];
-            let candidate = fln_core::lean_hash::murmur_hash_64a(&candidate_input, 11);
-            if candidate <= (usize::MAX >> 1) as u64 {
-                fitted = Some((candidate_input, candidate));
-                break;
-            }
+            let input = [seed_byte];
+            let expected = fln_core::lean_hash::murmur_hash_64a(&input, 11);
+            let hash = invoke("extern:ByteArray.hash", &[ba(&input)]).expect("UInt64 hash");
+            assert_eq!(hash.try_ctor_scalar_u64(0), Some(expected));
+            saw_high_bit |= expected > (usize::MAX >> 1) as u64;
         }
-        let (input_bytes, expected) = fitted.expect("some byte hashes below the ceiling");
-        let hash =
-            invoke("extern:ByteArray.hash", &[ba(&input_bytes)]).expect("the fitting hash answers");
-        assert_eq!(
-            nat_as_usize(&hash, "test projection", 0)
-                .expect("well-typed")
-                .expect("machine word"),
-            expected as usize
-        );
+        assert!(saw_high_bit);
 
         assert_eq!(
             owned_usize(invoke(

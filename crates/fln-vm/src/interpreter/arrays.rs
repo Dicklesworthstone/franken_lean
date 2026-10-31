@@ -4,13 +4,14 @@
 //! output slots; proof-erased bounds violations are typed VM refusals.
 use super::{
     IntrinsicFailure, IntrinsicResult, Obj, VmRefusal, array_value, expect_arity, nat_as_usize,
-    uint64_argument,
+    usize_argument,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum Intrinsic {
     Pop,
     Set,
+    SetBang,
     Uset,
     Swap,
     SwapIfInBounds,
@@ -21,6 +22,7 @@ impl Intrinsic {
         Some(match row {
             "extern:Array.pop" => Self::Pop,
             "extern:Array.set" => Self::Set,
+            "extern:Array.set!" => Self::SetBang,
             "extern:Array.uset" => Self::Uset,
             "extern:Array.swap" => Self::Swap,
             "extern:Array.swapIfInBounds" => Self::SwapIfInBounds,
@@ -37,6 +39,7 @@ impl Intrinsic {
         let operation = match self {
             Self::Pop => "Array.pop",
             Self::Set => "Array.set",
+            Self::SetBang => "Array.set!",
             Self::Uset => "Array.uset",
             Self::Swap => "Array.swap",
             Self::SwapIfInBounds => "Array.swapIfInBounds",
@@ -56,12 +59,18 @@ impl Intrinsic {
         // Nat indices retain their arbitrary precision: an mpz is never
         // truncated to its low word and accidentally treated as in bounds.
         let first = if self == Self::Uset {
-            uint64_argument(&args[1], operation, 1)? as usize
+            usize_argument(&args[1], operation, 1)?
         } else {
             nat_as_usize(&args[1], operation, 1)?.unwrap_or(usize::MAX)
         };
         match self {
-            Self::Set | Self::Uset => {
+            Self::Set | Self::SetBang | Self::Uset => {
+                if self == Self::SetBang && first >= size {
+                    report_bounds_panic()?;
+                    return Ok(IntrinsicResult::raw_object(
+                        args.into_iter().next().expect("checked set arity"),
+                    ));
+                }
                 check_index(first, size)?;
                 let mut args = args.into_iter();
                 let array = args.next().expect("checked set arity");
@@ -92,6 +101,14 @@ impl Intrinsic {
             Self::Pop => unreachable!("pop returned before index processing"),
         }
     }
+}
+
+pub(super) fn report_bounds_panic() -> Result<(), VmRefusal> {
+    fln_rt::diagnostics::report_panic(b"Error: index out of bounds");
+    if let Some(error) = fln_rt::obj::StdoutCapture::current_error() {
+        return Err(VmRefusal::NativeStdoutCapture { error });
+    }
+    Ok(())
 }
 
 fn check_index(index: usize, size: usize) -> Result<(), VmRefusal> {
