@@ -760,15 +760,19 @@ impl ParsedSourceCommand {
         &self.syntax
     }
 
-    /// Replace only the term of an ordinary `#check` after an external macro
+    /// Replace only the term of an ordinary `#check` or `#eval` after an external macro
     /// expander has produced native Syntax. The command wrapper, source view,
     /// query span and identifier-as-written flag remain the parser's originals.
     /// No source text is rendered or reparsed, so hygiene and source coordinates
     /// survive the boundary. Other commands return `None`.
-    pub fn with_expanded_check_term(mut self, term: Syntax) -> Option<Self> {
-        if self.kind == SourceCommandKind::Check
-            && let Syntax::Node { kind, args, .. } = &mut self.syntax
-            && *kind == parser_kind(&["Command", "check"])
+    pub fn with_expanded_query_term(mut self, term: Syntax) -> Option<Self> {
+        let command = match self.kind {
+            SourceCommandKind::Check => "check",
+            SourceCommandKind::Evaluation => "eval",
+            _ => return None,
+        };
+        if let Syntax::Node { kind, args, .. } = &mut self.syntax
+            && *kind == parser_kind(&["Command", command])
             && args.len() == 2
         {
             args[1] = term;

@@ -28,11 +28,14 @@ public meta def sourceChooseLeft : Macro := fun stx _ state =>
 end SourceScoped
 
 #check (Nat + Bool)
+#eval (7 + 11)
 
 section
 open scoped SourceScoped
 #check (Nat + Bool)
+#eval (7 + 11)
 end
 
 #check (Nat + Bool)
+#eval (7 + 11)
 

@@ -55,7 +55,10 @@ fn live_imported_ir_changes_source_checks_with_the_pins_order_and_scoped_behavio
         String::from_utf8_lossy(&result.stdout),
         String::from_utf8_lossy(&result.stderr)
     );
-    assert_eq!(result.stdout, b"Bool : Type\nNat : Type\nBool : Type\n");
+    assert_eq!(
+        result.stdout,
+        b"Bool : Type\n11\nNat : Type\n7\nBool : Type\n11\n"
+    );
     assert!(result.stderr.is_empty());
 
     let public = std::fs::read(dir.join("NativeSourceMacroModule.olean")).unwrap();
@@ -165,5 +168,26 @@ fn live_imported_ir_changes_source_checks_with_the_pins_order_and_scoped_behavio
             if message == "source macro diagnostic"
     ));
     assert!(diagnostic.state.is_none());
+    let mut artifacts = Vec::new();
+    for (active, expected) in [(&registry, 11), (&scoped, 7), (&registry, 11)] {
+        let report = evaluate(
+            &engine,
+            active,
+            b"#eval (7 + 11)",
+            MacroTreeLimits::default(),
+            execution_limits(),
+            None,
+        );
+        let result = evaluated_nat(&report, expected);
+        artifacts.push(result.execution.flbc_artifact.clone());
+        assert!(report.attempts.iter().all(|attempt| {
+            attempt
+                .reference_functions
+                .iter()
+                .any(|function| function.name == attempt.declaration)
+        }));
+    }
+    assert_eq!(artifacts[0], artifacts[2]);
+    assert_ne!(artifacts[0], artifacts[1]);
     assert_eq!(engine.logical_root(&KVMap::new()), before);
 }

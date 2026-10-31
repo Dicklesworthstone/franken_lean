@@ -1,10 +1,11 @@
-//! Checked imported node macros on the standalone source `#check` path.
+//! Checked imported node macros on standalone source `#check` and raw `#eval` paths.
 //!
 //! This is an explicit embedding door for syntax the current parser already
 //! understands. It installs no artifact parser descriptions. The prepared
 //! registry owns the expansion pass: no template expansion runs before it or
 //! replays its results. The resulting native Syntax enters the same elaborator
-//! and dual-check admission as `Engine::check_source_command`.
+//! and dual-check admission as `Engine::check_source_command`; raw evaluations
+//! then use the ordinary compiler, codec and Golem execution path.
 //!
 //! Recursive expansion follows `Lean.expandMacros`, including its tactic
 //! boundary. Atomic macro dispatch belongs to term elaboration, which this
@@ -18,11 +19,15 @@ use super::registrations::{
     MacroTreeResult, RegisteredMacros,
 };
 use super::{MacroContext, MacroExecutionError, MacroState};
-use crate::{Engine, EngineAdmissionLimits, EngineExecutionError, SourceCheck};
+use crate::{
+    DefinitionExecution, Engine, EngineAdmissionLimits, EngineExecutionError,
+    EngineExecutionLimits, SourceCheck,
+};
 use fln_core::diag::ResourceReason;
 use fln_core::name::Name;
 use fln_core::options::KVMap;
 use fln_core::outcome::{Inconclusive, Outcome, ResourceUsage};
+use fln_parse::{ParsedSourceCommand, SourceCommandKind};
 use fln_syntax::tree::Syntax;
 use fln_vm::interpreter::{CancellationProbe, ExecutionUsage};
 use fln_vm::macro_native::MacroLookup;
@@ -51,7 +56,7 @@ pub enum SourceMacroError {
     Diagnostic {
         module: Name,
         declaration: Name,
-        reference: Syntax,
+        reference: Box<Syntax>,
         message: String,
     },
     AtomicExpansion {
@@ -60,6 +65,7 @@ pub enum SourceMacroError {
     TacticExpansion {
         kind: Name,
     },
+    EvaluationRequired,
 }
 
 impl std::fmt::Display for SourceMacroError {
@@ -89,6 +95,9 @@ impl std::fmt::Display for SourceMacroError {
                 "source macro adapter requires tactic evaluator dispatch for kind {}",
                 kind.to_display_string()
             ),
+            Self::EvaluationRequired => {
+                write!(f, "source macro evaluation requires one ordinary #eval")
+            }
         }
     }
 }
@@ -101,6 +110,25 @@ impl std::error::Error for SourceMacroError {}
 #[derive(Debug)]
 pub struct SourceMacroCheck {
     pub outcome: Outcome<Result<SourceCheck, SourceMacroError>>,
+    pub state: Option<MacroState>,
+    pub attempts: Vec<MacroAttempt>,
+    pub completed_vm_usage: ExecutionUsage,
+}
+
+/// Expanded source and the ordinary Engine execution, including both checker
+/// observations, canonical FLBC and Golem's typed exit. The input Engine is
+/// immutable; only this result retains the generated declaration's successor.
+#[derive(Debug)]
+pub struct SourceMacroEvaluationResult {
+    pub parsed: ParsedSourceCommand,
+    pub execution: DefinitionExecution,
+}
+
+/// Raw evaluation with an explicit imported macro table. A completed execution
+/// may carry a non-returning VM exit; only a normal return publishes macro state.
+#[derive(Debug)]
+pub struct SourceMacroEvaluation {
+    pub outcome: Outcome<Result<SourceMacroEvaluationResult, SourceMacroError>>,
     pub state: Option<MacroState>,
     pub attempts: Vec<MacroAttempt>,
     pub completed_vm_usage: ExecutionUsage,
@@ -146,8 +174,83 @@ impl Engine {
                 peak_stack_depth: 0,
             },
         };
-        let outcome = check(self, source, options, admission, invocation, &mut progress);
+        let outcome = match expand(
+            self,
+            source,
+            SourceCommandKind::Check,
+            invocation,
+            &mut progress,
+        ) {
+            Outcome::Complete(Ok((parsed, state))) => {
+                match self.check_parsed_source_command(parsed, options, admission, 0) {
+                    Ok(Outcome::Complete(checked)) => {
+                        progress.state = Some(state);
+                        Outcome::Complete(Ok(checked))
+                    }
+                    Ok(Outcome::Inconclusive(reason)) => Outcome::Inconclusive(reason),
+                    Ok(Outcome::InternalFault(fault)) => Outcome::InternalFault(fault),
+                    Err(error) => frontend(error),
+                }
+            }
+            Outcome::Complete(Err(error)) => Outcome::Complete(Err(error)),
+            Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
+            Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
+        };
         SourceMacroCheck {
+            outcome,
+            state: progress.state,
+            attempts: progress.attempts,
+            completed_vm_usage: progress.usage,
+        }
+    }
+
+    /// Expand an ordinary standalone `#eval` with the same checked imported
+    /// table as the source-check door, then use the Engine's raw evaluation
+    /// elaborator, dual-check admission, compiler, canonical codec and Golem.
+    /// No printed expansion is reparsed. This is the raw embedding surface:
+    /// it does not select a Repr printer or capture IO streams. Normal Engine
+    /// execution limits apply to evaluation; the invocation's cancellation
+    /// probe applies to expansion and is checked again before evaluation.
+    pub fn evaluate_source_command_with_imported_macros(
+        &self,
+        source: &[u8],
+        options: &KVMap,
+        limits: EngineExecutionLimits,
+        invocation: SourceMacroInvocation<'_>,
+    ) -> SourceMacroEvaluation {
+        let mut progress = Progress {
+            state: None,
+            attempts: Vec::new(),
+            usage: ExecutionUsage {
+                steps: 0,
+                system_polls: 0,
+                peak_stack_depth: 0,
+            },
+        };
+        let outcome = match expand(
+            self,
+            source,
+            SourceCommandKind::Evaluation,
+            invocation,
+            &mut progress,
+        ) {
+            Outcome::Complete(Ok((parsed, state))) => evaluate(self, parsed, options, limits)
+                .map_complete(|result| {
+                    if result.as_ref().is_ok_and(|result| {
+                        matches!(
+                            result.execution.exit,
+                            fln_vm::interpreter::VmExit::Returned(_)
+                        )
+                    }) {
+                        progress.state = Some(state);
+                    }
+                    result
+                }),
+            Outcome::Complete(Err(error)) => Outcome::Complete(Err(error)),
+            Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
+            Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
+        };
+        SourceMacroEvaluation {
             outcome,
             state: progress.state,
             attempts: progress.attempts,
@@ -156,14 +259,13 @@ impl Engine {
     }
 }
 
-fn check(
+fn expand(
     engine: &Engine,
     source: &[u8],
-    options: &KVMap,
-    admission: EngineAdmissionLimits,
+    expected: SourceCommandKind,
     invocation: SourceMacroInvocation<'_>,
     progress: &mut Progress,
-) -> Outcome<Result<SourceCheck, SourceMacroError>> {
+) -> Outcome<Result<(ParsedSourceCommand, MacroState), SourceMacroError>> {
     let SourceMacroInvocation {
         registry,
         context,
@@ -173,9 +275,7 @@ fn check(
         cancellation,
     } = invocation;
     if cancellation.is_some_and(CancellationProbe::is_cancelled) {
-        return Outcome::Inconclusive(Inconclusive::cancelled(
-            "before imported source macro check",
-        ));
+        return Outcome::Inconclusive(Inconclusive::cancelled("before imported source macros"));
     }
     if let Err(error) = registry.validate_source_engine(engine) {
         return Outcome::Complete(Err(SourceMacroError::Binding(Box::new(error))));
@@ -201,14 +301,19 @@ fn check(
             ));
         }
     };
-    let Syntax::Node { kind, args, .. } = parsed.syntax() else {
-        return frontend(EngineExecutionError::StandaloneCheckRequired);
+    let command = if expected == SourceCommandKind::Check {
+        "check"
+    } else {
+        "eval"
     };
-    if *kind != Name::from_components(["Lean", "Parser", "Command", "check"])
+    let Syntax::Node { kind, args, .. } = parsed.syntax() else {
+        return wrong_command(expected);
+    };
+    if *kind != Name::from_components(["Lean", "Parser", "Command", command])
         || args.len() != 2
-        || parsed.kind() != fln_parse::SourceCommandKind::Check
+        || parsed.kind() != expected
     {
-        return frontend(EngineExecutionError::StandaloneCheckRequired);
+        return wrong_command(expected);
     }
     let input = &args[1];
     let scope = engine.base_source_scope();
@@ -227,7 +332,8 @@ fn check(
         EnvironmentMacroLookup::new(engine.environment(), main_module, &scope.namespace);
     let lookup = lookup.or(Some(&engine_lookup as &dyn MacroLookup));
     let resolve = crate::source_check::grammar::resolver(engine.environment(), &scope);
-    let existing_global = parsed.query_is_identifier()
+    let existing_global = expected == SourceCommandKind::Check
+        && parsed.query_is_identifier()
         && matches!(input, Syntax::Ident { val, .. }
             if matches!(resolve(val),
                 crate::source_check::grammar::Resolution::Global(_)
@@ -262,7 +368,7 @@ fn check(
                 return Outcome::Complete(Err(SourceMacroError::Diagnostic {
                     module,
                     declaration,
-                    reference,
+                    reference: Box::new(reference),
                     message,
                 }));
             }
@@ -281,28 +387,74 @@ fn check(
             Ok(None) => {}
             Err(reason) => return Outcome::Inconclusive(reason),
         }
-        let Some(parsed) = parsed.with_expanded_check_term(syntax) else {
-            return frontend(EngineExecutionError::StandaloneCheckRequired);
+        let Some(parsed) = parsed.with_expanded_query_term(syntax) else {
+            return wrong_command(expected);
         };
         (parsed, state)
     };
     if cancellation.is_some_and(CancellationProbe::is_cancelled) {
         return Outcome::Inconclusive(Inconclusive::cancelled(
-            "after imported source macros, before source checking",
+            "after imported source macros, before source elaboration",
         ));
     }
-    match engine.check_parsed_source_command(parsed, options, admission, 0) {
-        Ok(Outcome::Complete(checked)) => {
-            progress.state = Some(state);
-            Outcome::Complete(Ok(checked))
+    Outcome::Complete(Ok((parsed, state)))
+}
+
+fn evaluate(
+    engine: &Engine,
+    parsed: ParsedSourceCommand,
+    options: &KVMap,
+    limits: EngineExecutionLimits,
+) -> Outcome<Result<SourceMacroEvaluationResult, SourceMacroError>> {
+    let run = || -> Result<Outcome<DefinitionExecution>, EngineExecutionError> {
+        let mut scope = engine.base_source_scope();
+        scope.source_site = Some(crate::source_check::source_site(
+            &parsed.reconstruct_original(),
+        )?);
+        let name = crate::fresh_generated_command_name(engine.environment(), 0)?;
+        let (declaration, _) = match crate::source_evaluation::elaborate(
+            engine,
+            parsed.syntax(),
+            name,
+            &scope,
+            options,
+            limits,
+            crate::EvaluationPresentation::Raw,
+        )? {
+            Outcome::Complete(result) => result,
+            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+        };
+        if crate::source_execution::evaluation_depends_on_sorry(
+            engine,
+            std::iter::once(&declaration),
+        )? {
+            return Err(EngineExecutionError::EvaluationDependsOnSorry);
         }
-        Ok(Outcome::Inconclusive(reason)) => Outcome::Inconclusive(reason),
-        Ok(Outcome::InternalFault(fault)) => Outcome::InternalFault(fault),
+        engine.execute_definition_entry(
+            declaration,
+            options,
+            limits,
+            crate::source_evaluation::Entry::Evaluation,
+        )
+    };
+    match run() {
+        Ok(outcome) => {
+            outcome.map_complete(|execution| Ok(SourceMacroEvaluationResult { parsed, execution }))
+        }
         Err(error) => frontend(error),
     }
 }
 
-fn frontend(error: EngineExecutionError) -> Outcome<Result<SourceCheck, SourceMacroError>> {
+fn wrong_command<T>(expected: SourceCommandKind) -> Outcome<Result<T, SourceMacroError>> {
+    if expected == SourceCommandKind::Check {
+        frontend(EngineExecutionError::StandaloneCheckRequired)
+    } else {
+        Outcome::Complete(Err(SourceMacroError::EvaluationRequired))
+    }
+}
+
+fn frontend<T>(error: EngineExecutionError) -> Outcome<Result<T, SourceMacroError>> {
     Outcome::Complete(Err(SourceMacroError::Frontend(Box::new(error))))
 }
 

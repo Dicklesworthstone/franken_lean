@@ -3,7 +3,10 @@
 //! registration tests. The live cell additionally compiles actual Lean macros;
 //! neither fixture substitutes for production artifact admission.
 use super::*;
-use crate::imported_macros::source::{SourceMacroCheck, SourceMacroError, SourceMacroInvocation};
+use crate::imported_macros::source::{
+    SourceMacroCheck, SourceMacroError, SourceMacroEvaluation, SourceMacroEvaluationResult,
+    SourceMacroInvocation,
+};
 use crate::{Engine, EngineAdmissionLimits};
 use std::sync::Arc;
 
@@ -86,6 +89,211 @@ fn run(
             cancellation,
         },
     )
+}
+
+fn evaluate(
+    engine: &Engine,
+    registry: &RegisteredMacros,
+    source: &[u8],
+    limits: MacroTreeLimits,
+    execution: crate::EngineExecutionLimits,
+    cancellation: Option<&dyn CancellationProbe>,
+) -> SourceMacroEvaluation {
+    engine.evaluate_source_command_with_imported_macros(
+        source,
+        &KVMap::new(),
+        execution,
+        SourceMacroInvocation {
+            registry,
+            context: &context(),
+            state: MacroState {
+                macro_scope: 17,
+                ..MacroState::default()
+            },
+            lookup: None,
+            limits,
+            cancellation,
+        },
+    )
+}
+
+fn execution_limits() -> crate::EngineExecutionLimits {
+    crate::EngineExecutionLimits::new(crate::Budget::for_stack_bytes(2 * 1024 * 1024))
+}
+
+fn evaluated_nat(report: &SourceMacroEvaluation, expected: u64) -> &SourceMacroEvaluationResult {
+    let Outcome::Complete(Ok(result)) = &report.outcome else {
+        panic!("{report:?}")
+    };
+    assert_eq!(
+        result.execution.checker.ground,
+        crate::CheckerAdmissionGround::BodyCheckedAgainstDeclaredType
+    );
+    let fln_vm::interpreter::VmExit::Returned(returned) = &result.execution.exit else {
+        panic!("{report:?}")
+    };
+    assert!(returned.value.is_scalar());
+    assert_eq!(returned.value.unbox() as u64, expected);
+    assert!(!result.execution.flbc_artifact.is_empty());
+    assert_ne!(
+        result.execution.base_logical_root,
+        result.execution.result_logical_root
+    );
+    assert!(report.state.is_some());
+    result
+}
+
+#[test]
+fn imported_source_macros_change_checked_vm_values_and_scoped_replays() {
+    let (engine, registry, _) = fixture();
+    let before = engine.logical_root(&KVMap::new());
+    let source = b"\xef\xbb\xbf#eval (7 + 11)\r\n";
+    let ordinary = engine
+        .execute_source_commands_with_checks(source, &KVMap::new(), execution_limits())
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let fln_vm::interpreter::VmExit::Returned(returned) = &ordinary.batch.executions[0].exit else {
+        panic!("{ordinary:?}")
+    };
+    assert_eq!(returned.value.unbox(), 18);
+    let run = |registry, source| {
+        evaluate(
+            &engine,
+            registry,
+            source,
+            MacroTreeLimits::default(),
+            execution_limits(),
+            None,
+        )
+    };
+    let report = run(&registry, source);
+    let result = evaluated_nat(&report, 11);
+    assert_eq!(result.parsed.reconstruct_original(), source);
+    assert_eq!(result.parsed.query_term_normalized(), Some("(7 + 11)"));
+    assert_eq!(report.attempts.len(), 2);
+    assert_eq!(report.state.as_ref().unwrap().macro_scope, 19);
+    let replay = run(&registry, source);
+    assert_eq!(
+        evaluated_nat(&replay, 11).execution.flbc_artifact,
+        result.execution.flbc_artifact
+    );
+    let scoped = registry.activate_scoped(&name("SourceScoped")).unwrap();
+    let scoped_report = run(&scoped, source);
+    evaluated_nat(&scoped_report, 7);
+    assert_eq!(scoped_report.attempts.len(), 1);
+    evaluated_nat(&run(&registry, source), 11);
+    evaluated_nat(&run(&registry, b"#eval 7 + (11 + 13)"), 13);
+    let plain = run(&registry, b"#eval 9");
+    evaluated_nat(&plain, 9);
+    assert!(plain.attempts.is_empty());
+    assert_eq!(plain.state.as_ref().unwrap().macro_scope, 17);
+    assert_eq!(engine.logical_root(&KVMap::new()), before);
+}
+
+#[test]
+fn source_macro_evaluation_stops_preserve_state_and_recover() {
+    let (engine, registry, _) = fixture();
+    let before = engine.logical_root(&KVMap::new());
+    for source in [
+        b"#eval 7 - 11".as_slice(),
+        b"#eval 7 + Missing",
+        b"#eval Nat + Bool",
+    ] {
+        let report = evaluate(
+            &engine,
+            &registry,
+            source,
+            MacroTreeLimits::default(),
+            execution_limits(),
+            None,
+        );
+        assert!(
+            matches!(report.outcome, Outcome::Complete(Err(_))),
+            "{report:?}"
+        );
+        assert!(report.state.is_none());
+        assert!(!report.attempts.is_empty());
+    }
+    let sorry = evaluate(
+        &engine,
+        &registry,
+        b"#eval 0 + (sorry : Nat)",
+        MacroTreeLimits::default(),
+        execution_limits(),
+        None,
+    );
+    assert!(
+        matches!(sorry.outcome, Outcome::Complete(Err(SourceMacroError::Frontend(error))) if matches!(*error, crate::EngineExecutionError::EvaluationDependsOnSorry)),
+        "an expanded #eval must retain the ordinary sorry refusal"
+    );
+    assert!(sorry.state.is_none());
+    for source in [
+        b"#check 7".as_slice(),
+        b"#guard true",
+        b"def x := 7",
+        b"#eval 7\n#eval 11",
+    ] {
+        let report = evaluate(
+            &engine,
+            &registry,
+            source,
+            MacroTreeLimits::default(),
+            execution_limits(),
+            None,
+        );
+        assert!(
+            matches!(report.outcome, Outcome::Complete(Err(_))),
+            "{report:?}"
+        );
+        assert!(report.state.is_none());
+        assert!(report.attempts.is_empty());
+    }
+    let mut macro_limits = MacroTreeLimits::default();
+    macro_limits.dispatch.execution.vm.max_steps = 0;
+    let mut vm_limits = execution_limits();
+    vm_limits.vm.max_steps = 0;
+    struct Cancelled;
+    impl CancellationProbe for Cancelled {
+        fn is_cancelled(&self) -> bool {
+            true
+        }
+    }
+    for (macros, execution, cancellation) in [
+        (macro_limits, execution_limits(), None),
+        (MacroTreeLimits::default(), vm_limits, None),
+        (
+            MacroTreeLimits::default(),
+            execution_limits(),
+            Some(&Cancelled as &dyn CancellationProbe),
+        ),
+    ] {
+        let report = evaluate(
+            &engine,
+            &registry,
+            b"#eval 7 + 11",
+            macros,
+            execution,
+            cancellation,
+        );
+        assert!(
+            matches!(report.outcome, Outcome::Inconclusive(_)),
+            "{report:?}"
+        );
+        assert!(report.state.is_none());
+    }
+    evaluated_nat(
+        &evaluate(
+            &engine,
+            &registry,
+            b"#eval 7 + 11",
+            MacroTreeLimits::default(),
+            execution_limits(),
+            None,
+        ),
+        11,
+    );
+    assert_eq!(engine.logical_root(&KVMap::new()), before);
 }
 
 fn checked_constant<'a>(report: &'a SourceMacroCheck, expected: &str) -> &'a crate::SourceCheck {
@@ -309,6 +517,22 @@ fn source_shortcut_preserves_global_queries_and_refuses_unhandled_atomic_macros(
     );
     assert!(global.attempts.is_empty());
     assert_eq!(global.state.unwrap().macro_scope, 17);
+    let evaluation = evaluate(
+        &engine,
+        &registry,
+        b"#eval true",
+        MacroTreeLimits::default(),
+        execution_limits(),
+        None,
+    );
+    assert!(matches!(
+        evaluation.outcome,
+        Outcome::Complete(Err(SourceMacroError::AtomicExpansion { .. }))
+    ));
+    assert!(
+        evaluation.state.is_none(),
+        "#eval must not take the #check existing-global shortcut"
+    );
     let unknown = run(
         &engine,
         &registry,
@@ -448,13 +672,7 @@ fn source_lookup_capability_defaults_to_the_engine_snapshot_and_allows_explicit_
     checked_constant(&stale, "Bool");
 
     checked_constant(
-        &run(
-            &engine,
-            &registry,
-            source,
-            MacroTreeLimits::default(),
-            None,
-        ),
+        &run(&engine, &registry, source, MacroTreeLimits::default(), None),
         "Bool",
     );
     assert_eq!(engine.logical_root(&KVMap::new()), before);
