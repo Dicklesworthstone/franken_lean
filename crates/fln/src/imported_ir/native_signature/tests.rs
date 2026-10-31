@@ -10,6 +10,12 @@ use fln_olean::ir_archive::CensusPartition;
 use fln_vm::interpreter::{ExecutionLimits, VmExit, execute, nat_decimal};
 use std::collections::BTreeSet;
 
+#[path = "tests/arrays_reference.rs"]
+mod arrays_reference;
+
+#[path = "tests/array_proofs.rs"]
+mod array_proofs;
+
 fn name(text: &str) -> Name {
     Name::from_components(text.split('.'))
 }
@@ -314,6 +320,11 @@ fn pinned_array_type_slots_are_erased_without_hiding_bad_data_or_authority() {
         "extern:Array.mkEmpty",
         "extern:Array.push",
         "extern:Array.size",
+        "extern:Array.replicate",
+        "extern:Array.set!",
+        "extern:Array.get!Internal",
+        "extern:Array.get!InternalBorrowed",
+        "extern:Array.usize",
         "extern:Void.mk",
     ] {
         let row = fln_vm::extern_table_generated::EXTERN_ROWS
@@ -340,6 +351,70 @@ fn pinned_array_type_slots_are_erased_without_hiding_bad_data_or_authority() {
             },
         ] {
             assert!(erased_type_runtime_arity(&changed).is_err());
+        }
+    }
+}
+
+#[test]
+fn replicated_arrays_keep_their_erased_type_and_default_value_slots_distinct() {
+    for getter in ["Array.get!Internal", "Array.get!InternalBorrowed"] {
+        let declaration = || {
+            entry(
+                vec![
+                    num(1, 3),
+                    num(2, 19),
+                    bind(
+                        3,
+                        IrExpr::Fap {
+                            function: name("Array.replicate"),
+                            args: vec![IrArg::Erased, var(1), var(2)],
+                        },
+                    ),
+                    num(4, 1),
+                    num(5, 42),
+                    bind(
+                        6,
+                        IrExpr::Fap {
+                            function: name("Array.set!"),
+                            args: vec![IrArg::Erased, var(3), var(4), var(5)],
+                        },
+                    ),
+                    num(7, 0),
+                    bind(
+                        8,
+                        IrExpr::Fap {
+                            function: name(getter),
+                            args: vec![IrArg::Erased, var(7), var(6), var(4)],
+                        },
+                    ),
+                ],
+                8,
+            )
+        };
+        let compiled = compile_declarations(vec![declaration()]).unwrap();
+        assert_nat(&compiled, "42");
+        for target in ["Array.replicate", "Array.set!", getter] {
+            assert!(
+                compiled
+                    .native_externs()
+                    .iter()
+                    .any(|row| row == &format!("extern:{target}"))
+            );
+        }
+        for statement in [2, 5, 7] {
+            let mut mutated = declaration();
+            let IrDecl::Function { body, .. } = &mut mutated else {
+                unreachable!()
+            };
+            let IrStmt::VDecl {
+                expr: IrExpr::Fap { args, .. },
+                ..
+            } = &mut body.stmts[statement]
+            else {
+                unreachable!()
+            };
+            args[0] = var(1);
+            assert!(compile_declarations(vec![mutated]).is_err());
         }
     }
 }

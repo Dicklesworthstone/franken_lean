@@ -13,8 +13,17 @@ use super::{
 use fln_olean::ir::{IrAlt, IrArg, IrDecl, IrExpr, IrModule, IrParam, IrStmt, IrTerminal, IrType};
 use std::collections::BTreeMap;
 
-/// The pin retains one literal erased type on these direct native
-/// calls. Remove that slot only for the reviewed generated rows, before
+mod array_proofs;
+
+#[derive(Clone, Copy)]
+struct ErasedOperands {
+    runtime: usize,
+    type_prefix: bool,
+    proof_suffix: bool,
+}
+
+/// The pin retains literal erased types and bounds proofs on reviewed direct
+/// calls. Remove those slots only for the exact generated rows, before
 /// validating all remaining operands. Never infer a signature from a call.
 pub(super) fn erase_type_arguments(
     module: &mut IrModule,
@@ -29,8 +38,17 @@ pub(super) fn erase_type_arguments(
         else {
             continue;
         };
-        if let Some(runtime) = erased_type_runtime_arity(row)? {
-            bridges.insert(name.clone(), runtime);
+        let bridge = if let Some(runtime) = erased_type_runtime_arity(row)? {
+            Some(ErasedOperands {
+                runtime,
+                type_prefix: true,
+                proof_suffix: false,
+            })
+        } else {
+            array_proofs::erased_operands(row)?
+        };
+        if let Some(bridge) = bridge {
+            bridges.insert(name.clone(), bridge);
         }
     }
     if bridges.is_empty() {
@@ -59,25 +77,37 @@ pub(super) fn erase_type_arguments(
                         expr: IrExpr::Fap { function, args },
                         ..
                     } => {
-                        let Some(&runtime) = bridges.get(function) else {
+                        let Some(&bridge) = bridges.get(function) else {
                             continue;
                         };
-                        if args.len() == runtime {
+                        if args.len() == bridge.runtime {
                             continue;
                         }
-                        if args.len() != runtime + 1 || args[0] != IrArg::Erased {
-                            return Err(unsupported(name, "unreviewed native erased type operand"));
+                        let erased =
+                            usize::from(bridge.type_prefix) + usize::from(bridge.proof_suffix);
+                        if args.len() != bridge.runtime + erased
+                            || (bridge.type_prefix && args.first() != Some(&IrArg::Erased))
+                            || (bridge.proof_suffix && args.last() != Some(&IrArg::Erased))
+                        {
+                            return Err(unsupported(name, "unreviewed native erased operand"));
                         }
-                        args.remove(0);
+                        if bridge.proof_suffix {
+                            args.pop();
+                        }
+                        if bridge.type_prefix {
+                            args.remove(0);
+                        }
                     }
                     IrStmt::VDecl {
                         expr: IrExpr::Pap { function, args },
                         ..
-                    } if bridges.contains_key(function) && args.first() == Some(&IrArg::Erased) => {
-                        return Err(unsupported(
-                            name,
-                            "first-class erased native type primitive",
-                        ));
+                    } if bridges.get(function).is_some_and(|bridge| {
+                        (bridge.type_prefix && args.first() == Some(&IrArg::Erased))
+                            || (bridge.proof_suffix
+                                && (args.len() > bridge.runtime || args.contains(&IrArg::Erased)))
+                    }) =>
+                    {
+                        return Err(unsupported(name, "first-class erased native primitive"));
                     }
                     IrStmt::JDecl { value, .. } => pending.push((value, depth + 1)),
                     _ => {}
@@ -95,7 +125,7 @@ pub(super) fn erase_type_arguments(
 }
 
 fn erased_type_runtime_arity(row: &GeneratedExternRow) -> Result<Option<usize>, IrExecutionError> {
-    let (name, symbol, module, kind, levels, runtime, ownership) = match row.id {
+    let (name, symbol, module, kind, levels, runtime, ownership, safety) = match row.id {
         "extern:Array.mkEmpty" => (
             "Array.mkEmpty",
             "lean_mk_empty_array_with_capacity",
@@ -104,6 +134,7 @@ fn erased_type_runtime_arity(row: &GeneratedExternRow) -> Result<Option<usize>, 
             1,
             1,
             "abi((capacity: borrowed_arg) -> raw_object)",
+            "safe",
         ),
         "extern:Array.push" => (
             "Array.push",
@@ -113,6 +144,7 @@ fn erased_type_runtime_arity(row: &GeneratedExternRow) -> Result<Option<usize>, 
             1,
             2,
             "abi((a: owned_arg, v: owned_arg) -> raw_object)",
+            "safe",
         ),
         "extern:Array.size" => (
             "Array.size",
@@ -122,6 +154,57 @@ fn erased_type_runtime_arity(row: &GeneratedExternRow) -> Result<Option<usize>, 
             1,
             1,
             "abi((a: borrowed_arg) -> raw_object)",
+            "safe",
+        ),
+        "extern:Array.replicate" => (
+            "Array.replicate",
+            "lean_mk_array",
+            "Init.Data.Array.Basic",
+            "defn",
+            1,
+            2,
+            "abi((n: owned_arg, v: owned_arg) -> raw_object)",
+            "safe",
+        ),
+        "extern:Array.set!" => (
+            "Array.set!",
+            "lean_array_set",
+            "Init.Data.Array.Set",
+            "defn",
+            1,
+            3,
+            "abi((a: owned_arg, i: borrowed_arg, v: owned_arg) -> raw_object)",
+            "safe",
+        ),
+        "extern:Array.get!Internal" => (
+            "Array.get!Internal",
+            "lean_array_get",
+            "Init.Prelude",
+            "defn",
+            1,
+            3,
+            "abi((def_val: borrowed_arg, a: borrowed_arg, i: borrowed_arg) -> raw_object)",
+            "safe",
+        ),
+        "extern:Array.get!InternalBorrowed" => (
+            "Array.get!InternalBorrowed",
+            "lean_array_get_borrowed",
+            "Init.Prelude",
+            "opaque",
+            1,
+            3,
+            "abi((def_val: borrowed_arg, a: borrowed_arg, i: borrowed_arg) -> raw_object)",
+            "unsafe",
+        ),
+        "extern:Array.usize" => (
+            "Array.usize",
+            "lean_array_size",
+            "Init.Data.Array.Basic",
+            "defn",
+            1,
+            1,
+            "abi((o: borrowed_arg) -> value)",
+            "safe",
         ),
         "extern:Void.mk" => (
             "Void.mk",
@@ -131,6 +214,7 @@ fn erased_type_runtime_arity(row: &GeneratedExternRow) -> Result<Option<usize>, 
             0,
             1,
             "abi((a: owned_arg) -> owned_res)",
+            "safe",
         ),
         _ => return Ok(None),
     };
@@ -141,7 +225,7 @@ fn erased_type_runtime_arity(row: &GeneratedExternRow) -> Result<Option<usize>, 
         || row.levels != levels
         || row.arity as usize != runtime + 1
         || row.effect != "pure"
-        || row.safety != "safe"
+        || row.safety != safety
         || row.ownership != ownership
         || row.entry_class != "standard"
         || row.entry_scope != "all"
