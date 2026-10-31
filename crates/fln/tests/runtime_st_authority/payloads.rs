@@ -251,14 +251,16 @@ pub(super) fn check_payloads(engine: &Engine) {
     // a proved representation. An unused callback with an unknown domain is
     // no more executable than an unknown payload itself. A preceding Nat
     // allocation must not let either bypass discovery through the row cache.
-    for (payload, initial) in [
-        ("MissingCellPayload", "missingCellPayload"),
-        ("MissingCellPayload -> Nat", "fun _ => 0"),
+    // The value probe depends on an axiom: its logical declaration must be
+    // noncomputable, as at the pin. Raw execution still has to refuse its carrier.
+    for (computability, payload, initial) in [
+        ("noncomputable ", "MissingCellPayload", "missingCellPayload"),
+        ("", "MissingCellPayload -> Nat", "fun _ => 0"),
     ] {
         let unsupported = format!(
             "axiom MissingCellPayload : Type\n\
              axiom missingCellPayload : MissingCellPayload\n\
-             def unsupportedCell : Nat := runST (fun sigma =>\n\
+             {computability}def unsupportedCell : Nat := runST (fun sigma =>\n\
                ST.bind (ST.Prim.mkRef (σ := sigma) (α := Nat) 0) (fun _ =>\n\
                  ST.bind (ST.Prim.mkRef (σ := sigma) (α := {payload}) ({initial}))\n\
                    (fun _ => ST.pure 0)))\n"
@@ -301,7 +303,7 @@ fn decoded_ground_payloads_share_canonical_rows_without_import_admission() {
     std::thread::Builder::new()
         .stack_size(STACK)
         .spawn(move || {
-            check_payloads(&decoded_st_fixture(&library));
+            check_payloads(&decoded_st_fixture(&library, true));
         })
         .unwrap()
         .join()

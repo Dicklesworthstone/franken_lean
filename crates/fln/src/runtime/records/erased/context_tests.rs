@@ -71,7 +71,7 @@ fn nodes_error<T>(result: Result<T, IngressError>, limit: usize) {
 
 #[test]
 fn native_arrays_share_only_compatible_hidden_element_interfaces() {
-    crate::runtime::array_iteration::tests::with_fixture(|environment| {
+    crate::runtime::array_iteration::with_fixture(|environment| {
         let mut preparation = Preparation::new(environment, IngressLimits::default());
         assert!(preparation.native_arrays_enabled().unwrap());
         let boxed = preparation.enable_boxed_type().unwrap();

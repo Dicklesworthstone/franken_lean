@@ -416,4 +416,7 @@ impl Preparation<'_> {
 }
 
 #[cfg(test)]
-pub(super) mod tests;
+pub(super) use tests::{replace, with_fixture, without};
+
+#[cfg(test)]
+mod tests;

@@ -410,12 +410,12 @@ const MODIFY_PROGRAM: &str = r#"
 /// Debugging fixture only: these imported declarations have NOT passed the
 /// module council. The authoritative integration test below never calls this
 /// helper and still reads and admits the complete artifact closure itself.
-fn decoded_st_fixture(library: &Path) -> Engine {
+fn decoded_st_fixture(library: &Path, dependency_externs: bool) -> Engine {
     let root = name("Init.System.ST");
     let artifacts = artifacts(library, &root);
     let module_count = artifacts.len();
     let mut constants = BTreeMap::<Name, ConstantInfo>::new();
-    let mut root_externs = None;
+    let mut externs = BTreeMap::new();
     for (module, (public, server, private)) in &artifacts {
         let decoded = fln::decode_olean_module_artifacts(
             public,
@@ -424,30 +424,38 @@ fn decoded_st_fixture(library: &Path) -> Engine {
             OleanDecodeLimits::new(BYTES),
         )
         .unwrap();
-        if module == &root {
-            let view = if decoded.module.is_module {
-                fln_olean::region::OleanView::parse_with_dependencies(
-                    private.as_deref().expect("module private part"),
-                    &[
-                        public.as_slice(),
-                        server.as_deref().expect("module server part"),
-                    ],
-                )
-            } else {
-                fln_olean::region::OleanView::parse(public)
-            }
+        let view = if decoded.module.is_module {
+            fln_olean::region::OleanView::parse_with_dependencies(
+                private.as_deref().expect("module private part"),
+                &[
+                    public.as_slice(),
+                    server.as_deref().expect("module server part"),
+                ],
+            )
+        } else {
+            fln_olean::region::OleanView::parse(public)
+        }
+        .unwrap();
+        let blocks = view
+            .extension_payloads(OleanWalkBudget::default(), BYTES)
             .unwrap();
-            let blocks = view
-                .extension_payloads(OleanWalkBudget::default(), BYTES)
-                .unwrap();
-            root_externs = Some(
-                fln_olean::source_extensions::decode(
-                    &blocks,
-                    fln_olean::source_extensions::DecodeLimits::default(),
-                )
-                .unwrap()
-                .externs,
-            );
+        for attribute in fln_olean::source_extensions::decode(
+            &blocks,
+            fln_olean::source_extensions::DecodeLimits::default(),
+        )
+        .unwrap()
+        .externs
+        {
+            if !dependency_externs && module != &root {
+                continue;
+            }
+            if let Some(previous) = externs.insert(attribute.declaration, attribute.entries.clone())
+            {
+                assert_eq!(
+                    previous, attribute.entries,
+                    "conflicting raw-fixture externs"
+                );
+            }
         }
         for info in decoded.constants {
             let replace = if let Some(previous) = constants.get(info.name()) {
@@ -495,11 +503,14 @@ fn decoded_st_fixture(library: &Path) -> Engine {
     for info in constants.into_values() {
         environment = environment.add_decl(info).unwrap();
     }
-    // The explicit Prim/ST.bind programs need the ST module's real extern
-    // data; no MonadLift/instance registration is synthesized for this probe.
-    for attribute in root_externs.expect("actual ST module metadata") {
-        let entries = attribute
-            .entries
+    // Keep actual dependency externs too: large Nat arithmetic must not fall
+    // back to its recursive logical body because this fixture dropped metadata.
+    // No MonadLift/instance registration is synthesized for this raw probe.
+    if dependency_externs {
+        assert!(externs.contains_key(&name("Nat.sub")));
+    }
+    for (declaration, entries) in externs {
+        let entries = entries
             .into_iter()
             .map(|entry| {
                 use fln_elab::externs::ExternEntry as Native;
@@ -512,8 +523,7 @@ fn decoded_st_fixture(library: &Path) -> Engine {
                 }
             })
             .collect();
-        environment =
-            fln_elab::externs::register(&environment, &attribute.declaration, entries).unwrap();
+        environment = fln_elab::externs::register(&environment, &declaration, entries).unwrap();
     }
     let table = fln_elab::externs::ExternTable::read(&environment).unwrap();
     for (target, symbol) in EXTERNS {
@@ -536,12 +546,36 @@ fn decoded_st_fixture_debugs_native_actions_without_import_admission() {
     std::thread::Builder::new()
         .stack_size(STACK)
         .spawn(move || {
-            let engine = decoded_st_fixture(&library);
+            let engine = decoded_st_fixture(&library, true);
             let options = KVMap::new();
             let root = engine.logical_root(&options);
             let source = PROGRAM
                 .strip_prefix("\nprelude\nimport Init.System.ST\n")
                 .expect("remove only the module header for the raw-fixture probe");
+            // Reproduce the incomplete fixture with the same original budgets.
+            // This is a resource stop, never an accepted or rejected program.
+            let missing = decoded_st_fixture(&library, false);
+            let missing_root = missing.logical_root(&options);
+            let original_limits = EngineExecutionLimits::new(Budget::for_stack_bytes(STACK));
+            let fln::Outcome::Inconclusive(stopped) = missing
+                .execute_source_commands_with_checks(source.as_bytes(), &options, original_limits)
+                .unwrap()
+            else {
+                panic!("missing dependency externs must retain their typed resource stop");
+            };
+            let fln_core::outcome::InconclusiveCause::ResourceExhausted { usage } = stopped.cause
+            else {
+                panic!("missing dependency externs stopped for another reason");
+            };
+            assert_eq!(usage.allowed, original_limits.vm.max_stack_depth);
+            assert_eq!(
+                usage.reason,
+                fln_core::diag::ResourceReason::RecursionDepth {
+                    limit: original_limits.vm.max_stack_depth
+                }
+            );
+            assert_eq!(usage.observed, usage.allowed + 1);
+            assert_eq!(missing.logical_root(&options), missing_root);
             let completed = engine
                 .execute_source_commands_with_checks(
                     source.as_bytes(),

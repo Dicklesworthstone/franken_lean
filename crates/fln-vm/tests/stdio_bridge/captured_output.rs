@@ -1,4 +1,6 @@
 //! The captured Reference convention is checked again at every native apply.
+#![forbid(unsafe_code)]
+
 use super::*;
 use fln_rt::obj::StdoutCapture;
 use fln_vm::interpreter::{

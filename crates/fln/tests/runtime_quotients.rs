@@ -77,6 +77,22 @@ def unbox (q : Quot (fun (a b : Box) => a.value = b.value)) : Nat :=
 }
 
 #[test]
+fn late_relation_inference_closes_holes_over_grouped_and_nested_lambdas() {
+    for proof in [
+        "fun (a b : Nat) (h : True) => rfl",
+        "fun (a : Nat) => fun (b : Nat) => fun (h : True) => rfl",
+        "fun a => fun b => fun h => rfl",
+    ] {
+        let source = format!(
+            "def constantQ (q : Quot (fun (a b : Nat) => True)) : Nat :=\n\
+               Quot.lift (fun (n : Nat) => 42) ({proof}) q\n\
+             #eval constantQ (Quot.mk (fun (a b : Nat) => True) 7)"
+        );
+        execute(&source, "42");
+    }
+}
+
+#[test]
 fn ignored_representatives_still_run_once_and_resource_stops_do_not_publish() {
     let source = r#"
 def count (n : Nat) : Nat := match n with | .zero => 0 | .succ k => count k + 1

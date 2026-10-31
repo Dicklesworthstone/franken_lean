@@ -2,7 +2,7 @@
 //! supplies native representation contracts. Execution and FLBC replay live in
 //! source_imported_arrays; these tests exercise the substitution boundary.
 use super::*;
-use crate::runtime::array_iteration::tests::{replace, with_fixture, without};
+use crate::runtime::array_iteration::{replace, with_fixture, without};
 use fln_elab::externs::{self, ExternEntry};
 use fln_elab::implemented_by;
 

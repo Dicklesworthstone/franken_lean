@@ -42,9 +42,14 @@ fn inventory() -> BTreeMap<Name, &'static str> {
     rows
 }
 
-/// Reachability is recomputed from decoded constants, including erased proof
-/// bodies, recursor rules, and complete constructor/mutual membership.
-fn dependencies(lookup: impl Fn(&Name) -> Option<ConstantInfo>, roots: &[&str]) -> BTreeSet<Name> {
+/// Logical reachability includes erased proofs and complete mutual membership.
+/// Execution additionally needs actual unsafe companions; their presence is
+/// part of the native Array contract even when no logical body refers to them.
+fn dependencies(
+    lookup: impl Fn(&Name) -> Option<ConstantInfo>,
+    roots: &[&str],
+    execution: bool,
+) -> BTreeSet<Name> {
     let mut pending: Vec<_> = roots.iter().map(|root| name(root)).collect();
     let mut found = BTreeSet::new();
     while let Some(label) = pending.pop() {
@@ -53,6 +58,15 @@ fn dependencies(lookup: impl Fn(&Name) -> Option<ConstantInfo>, roots: &[&str]) 
         }
         let info = lookup(&label)
             .unwrap_or_else(|| panic!("missing actual dependency {}", label.to_display_string()));
+        if execution
+            && (matches!(&info, ConstantInfo::Defn(value) if value.safety == fln_env::constants::DefinitionSafety::Safe)
+                || matches!(&info, ConstantInfo::Opaque(value) if !value.is_unsafe))
+        {
+            let companion = Name::str(label.clone(), "_unsafe_rec");
+            if lookup(&companion).is_some() {
+                pending.push(companion);
+            }
+        }
         let mut expressions = vec![&info.constant_val().type_];
         match &info {
             ConstantInfo::Defn(value) => {
@@ -199,6 +213,10 @@ fn fixture() -> Option<&'static Fixture> {
                     // This actual recursor is not a backwards dependency of
                     // the logical byte/string constructor contract.
                     "True.rec",
+                    // Native Array storage checks the complete family, including
+                    // its eliminator, beyond this String constructor's logical
+                    // dependency cone. Keep the original contract guard intact.
+                    "Array.rec",
                     // Complete imported Nat/List recursion recognition also
                     // checks these actual family recursors. Their logical
                     // callers do not otherwise reference the recursor rows.
@@ -218,7 +236,7 @@ fn fixture() -> Option<&'static Fixture> {
                     "Nat.pow._unsafe_rec",
                 ])
                 .collect();
-            let needed = dependencies(|label| constants.get(label).cloned(), &roots);
+            let needed = dependencies(|label| constants.get(label).cloned(), &roots, true);
             let mut environment = Environment::new();
             for label in &needed {
                 environment = environment
@@ -380,7 +398,11 @@ fn actual_string_bytes_inventory_binds_the_full_layout_proof_and_packing_closure
         let rows = inventory();
         assert_eq!(rows.len(), 318);
         assert_eq!(
-            dependencies(|label| fixture.environment.find(label).cloned(), &HELPERS),
+            dependencies(
+                |label| fixture.environment.find(label).cloned(),
+                &HELPERS,
+                false
+            ),
             rows.keys().cloned().collect()
         );
         for (label, digest) in rows {
@@ -478,6 +500,25 @@ def fromChars (cs : List Char) : String :=
         );
 
         let options = KVMap::new();
+        // Removing a required execution root must still produce the original
+        // strict Array refusal before execution.
+        let incomplete = Engine::from_environment(rebuild(fixture, Some(&name("Array.rec")), None));
+        let incomplete_root = incomplete.logical_root(&options);
+        let refused = incomplete.execute_source_commands_with_checks(
+            b"def fromCharsWithoutArrayModel (cs : List Char) : String := String.ofByteArray (List.utf8Encode cs) (ByteArray.IsValidUTF8.intro cs rfl)",
+            &options,
+            EngineExecutionLimits::new(Budget::for_stack_bytes(STACK)),
+        );
+        let Err(EngineExecutionError::BatchCommand { error, .. }) = refused else {
+            panic!("the incomplete Array model must still refuse execution")
+        };
+        assert!(matches!(
+            *error,
+            EngineExecutionError::Ingress(IngressError::UnsupportedNode {
+                kind: "native Array differs from its complete pinned logical and execution contract"
+            })
+        ));
+        assert_eq!(incomplete.logical_root(&options), incomplete_root);
         let limits = EngineAdmissionLimits::for_stack_bytes(STACK);
         let engine = Engine::from_environment(fixture.environment.clone());
         let before = engine.logical_root(&options);
