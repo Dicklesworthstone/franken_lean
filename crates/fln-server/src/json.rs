@@ -330,11 +330,15 @@ fn rpc_goal(value: RawField<'_>) -> bool {
 /// The native goals/diagnostics use text leaves. The native highlighter also
 /// emits append nodes and highlighted tags. Walk on the heap under a node bound.
 fn rpc_tagged_text(value: RawField<'_>) -> bool {
+    // Highlighting splits input leaves, so its output can contain more nodes
+    // than the highlighter's input-node ceiling. The shortest TaggedText node
+    // is {"text":""}; derive the walk ceiling from the actual wire budget.
+    let max_nodes = 1024 * 1024 / r#"{"text":""}"#.len();
     let mut work = vec![value];
     let mut visited = 0usize;
     while let Some(node) = work.pop() {
         visited += 1;
-        if visited > 4096 {
+        if visited > max_nodes {
             return false;
         }
         match (
@@ -348,10 +352,10 @@ fn rpc_tagged_text(value: RawField<'_>) -> bool {
                 }
             }
             (RawField::Missing, RawField::Value(append), RawField::Missing) => {
-                let Some(children) = array_elements(append, 4096 - visited) else {
+                let Some(children) = array_elements(append, max_nodes - visited) else {
                     return false;
                 };
-                if work.len() + children.len() > 4096 - visited {
+                if work.len() + children.len() > max_nodes - visited {
                     return false;
                 }
                 work.extend(children.into_iter().map(RawField::Value));

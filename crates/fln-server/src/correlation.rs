@@ -1225,7 +1225,7 @@ mod tests {
             r#"{{"append":[{}]}}"#,
             vec![r#"{"text":"x"}"#; 4096].join(",")
         );
-        assert!(!RpcProcedure::Highlight.result(&nodes));
+        assert!(RpcProcedure::Highlight.result(&nodes));
         let invalid_range = r#"[{"range":{"start":{"line":1,"character":0},"end":{"line":0,"character":0}},"message":{"text":"x"}}]"#;
         assert!(!RpcProcedure::Diagnostics.result(invalid_range));
         assert!(RpcProcedure::Goals.result("null"));
