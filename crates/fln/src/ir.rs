@@ -35,6 +35,7 @@ pub enum CompileError {
     Allocation,
     Invariant { what: &'static str },
     Lowering(fir::LoweringError),
+    Validation(fln_olean::ir_types::IrTypeValidationError),
 }
 
 impl std::fmt::Display for CompileError {
@@ -45,6 +46,7 @@ impl std::fmt::Display for CompileError {
             Self::Allocation => f.write_str("IR compilation allocation refused"),
             Self::Invariant { what } => write!(f, "IR compiler invariant: {what}"),
             Self::Lowering(error) => error.fmt(f),
+            Self::Validation(error) => error.fmt(f),
         }
     }
 }
@@ -236,6 +238,44 @@ impl Function<'_> {
         }
         Ok(out)
     }
+    fn call(
+        &mut self,
+        function: Name,
+        args: &[flbc::Register],
+        ownership: &[flbc::ArgumentOwnership],
+    ) -> Result<Value> {
+        // Golem keeps each borrowed operand alive for the whole call. The
+        // same register may also supply a consuming operand, whose callee
+        // can drop it before reading the borrow. Preserve that lifetime even
+        // when this caller no longer owns a separate reference afterwards.
+        self.meter.charge(args.len())?;
+        let mut borrowed = Vec::new();
+        borrowed
+            .try_reserve_exact(args.len())
+            .map_err(|_| CompileError::Allocation)?;
+        for (r, policy) in args.iter().zip(ownership) {
+            if !policy.consumes() {
+                let value = self.get(*r)?;
+                self.retain(value)?;
+                borrowed.push(Value {
+                    owned: true,
+                    ..value
+                });
+            }
+        }
+        let args = self.args(args, ownership, false)?;
+        let constant = args.is_empty();
+        let result = self.bind(IrType::TObject, IrExpr::Fap { function, args })?;
+        // A nullary FAP loads a borrowed value from the interpreter's
+        // constant cache. FLBC calls return an owned value instead.
+        if constant {
+            self.retain(result)?;
+        }
+        for value in borrowed {
+            self.drop_value(value)?;
+        }
+        Ok(result)
+    }
     fn finish(mut self, value: Value) -> Result<IrBody> {
         if !value.owned {
             self.retain(value)?;
@@ -268,11 +308,11 @@ fn compile_function(
     for (i, policy) in function.parameter_ownership.iter().enumerate() {
         let borrow = !policy.consumes();
         registers[i] = Some(Value {
-            index: i as u64,
+            index: i as u64 + 1,
             owned: !borrow,
         });
         params.push(IrParam {
-            x: i as u64,
+            x: i as u64 + 1,
             borrow,
             ty: IrType::TObject,
         });
@@ -284,7 +324,7 @@ fn compile_function(
     let mut out = Function {
         names,
         registers,
-        next: u64::from(function.arity),
+        next: u64::from(function.arity) + 1,
         stmts: Vec::new(),
         meter,
     };
@@ -294,7 +334,7 @@ fn compile_function(
         match instruction {
             I::Nat { dst, value } => {
                 let v = out.bind(
-                    IrType::Tagged,
+                    IrType::TObject,
                     IrExpr::Lit(IrLit::Num(IrNat::Small(*value))),
                 )?;
                 out.set(*dst, v)?;
@@ -302,7 +342,7 @@ fn compile_function(
             I::NatBig { dst, limbs_le } => {
                 out.meter.charge(limbs_le.len())?;
                 let v = out.bind(
-                    IrType::Tagged,
+                    IrType::TObject,
                     IrExpr::Lit(IrLit::Num(IrNat::Big(limbs_le.clone()))),
                 )?;
                 out.set(*dst, v)?;
@@ -336,8 +376,7 @@ fn compile_function(
                 ..
             } => {
                 let function = out.name(*function)?;
-                let args = out.args(args, argument_ownership, false)?;
-                let v = out.bind(IrType::TObject, IrExpr::Fap { function, args })?;
+                let v = out.call(function, args, argument_ownership)?;
                 out.set(*dst, v)?;
             }
             I::Closure {
@@ -346,7 +385,9 @@ fn compile_function(
                 captures,
                 capture_ownership,
             } => {
-                let function = out.name(*function)?;
+                // Applying a closure consumes all arguments, including its
+                // captures. The boxed entry releases the base's borrows.
+                let function = Name::str(out.name(*function)?, "_boxed");
                 let args = out.args(captures, capture_ownership, true)?;
                 let v = out.bind(IrType::Object, IrExpr::Pap { function, args })?;
                 out.set(*dst, v)?;
@@ -377,8 +418,7 @@ fn compile_function(
                 ..
             } => {
                 let function = out.name(*function)?;
-                let args = out.args(args, argument_ownership, false)?;
-                let v = out.bind(IrType::TObject, IrExpr::Fap { function, args })?;
+                let v = out.call(function, args, argument_ownership)?;
                 return Ok(IrDecl::Function {
                     name,
                     params,
@@ -437,7 +477,7 @@ fn boxed_wrapper(declaration: &IrDecl, meter: &mut Budget) -> Result<IrDecl> {
     };
     meter.charge(params.len().saturating_mul(3).saturating_add(1))?;
     let mut stmts = vec![IrStmt::VDecl {
-        x: params.len() as u64,
+        x: params.len() as u64 + 1,
         ty: IrType::TObject,
         expr: IrExpr::Fap {
             function: name.clone(),
@@ -466,7 +506,7 @@ fn boxed_wrapper(declaration: &IrDecl, meter: &mut Budget) -> Result<IrDecl> {
         result: IrType::TObject,
         body: IrBody {
             stmts,
-            terminal: Box::new(IrTerminal::Ret(IrArg::Var(params.len() as u64))),
+            terminal: Box::new(IrTerminal::Ret(IrArg::Var(params.len() as u64 + 1))),
         },
         sorry_dep: None,
     })
@@ -496,7 +536,10 @@ pub fn compile(
             &mut meter,
         )?;
         if function.blocks.len() != 1
-            || !matches!(function.blocks[0].terminator, fir::Terminator::Return(_))
+            || !matches!(
+                function.blocks[0].terminator,
+                fir::Terminator::Return { .. }
+            )
         {
             return Err(unsupported("control-flow graph"));
         }
@@ -572,10 +615,21 @@ pub fn compile(
         declarations.push(declaration);
     }
     declarations.sort_by(|a, b| a.name().quick_cmp(b.name()));
-    Ok(IrModule {
+    let module = IrModule {
         decls: declarations,
         ..IrModule::default()
-    })
+    };
+    fln_olean::ir_types::validate_ir_types(
+        std::slice::from_ref(&module),
+        &std::collections::BTreeMap::new(),
+        fln_olean::ir_validate::IrValidationLimits {
+            max_declarations: module.decls.len(),
+            max_work: meter.0,
+            ..fln_olean::ir_validate::IrValidationLimits::default()
+        },
+    )
+    .map_err(CompileError::Validation)?;
+    Ok(module)
 }
 
 /// A compiled, council-admitted definition. The base engine is unchanged;
