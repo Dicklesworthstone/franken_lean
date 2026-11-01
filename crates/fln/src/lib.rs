@@ -66,6 +66,7 @@ pub use fln_comp::flbc::{CodecError, CodecLimits, ValidatedProgram};
 use fln_comp::ingress::{
     FunctionBinding, IngressResource, IntrinsicBinding, LambdaBinding, LambdaRecursion,
 };
+pub mod ir;
 mod runtime;
 pub use fln_comp::ingress::{IngressError, IngressLimits, ScalarConstructorBinding};
 pub use fln_core::diag::{
@@ -6082,6 +6083,72 @@ impl Engine {
         limits: EngineExecutionLimits,
         entry: source_evaluation::Entry,
     ) -> Result<Outcome<DefinitionExecution>, EngineExecutionError> {
+        let prepared = match self.prepare_definition_entry_with_helpers(
+            declaration,
+            helpers,
+            options,
+            limits,
+            entry,
+        )? {
+            Outcome::Complete(prepared) => prepared,
+            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+        };
+        let PreparedDefinition {
+            admission,
+            runtime_type,
+            io_result_types,
+            fir,
+        } = prepared;
+        // Optimization may change cost, never whether the program lowers.
+        let lowered = fln_comp::fir::optimize(&fir, limits.ingress.fir)
+            .ok()
+            .and_then(|optimized| fln_comp::fir::lower_to_flbc(&optimized).ok())
+            .map_or_else(|| fln_comp::fir::lower_to_flbc(&fir), Ok)
+            .map_err(EngineExecutionError::Lowering)?;
+        let lowered = fln_comp::flbc::insert_ownership(&lowered, limits.ownership)
+            .map_err(LoweringError::OwnershipInsertion)
+            .map_err(EngineExecutionError::Lowering)?
+            .into_program();
+        let flbc_artifact = fln_comp::flbc::encode_canonical(&lowered, limits.flbc_codec)
+            .map_err(EngineExecutionError::Codec)?;
+        let executable = fln_comp::flbc::decode_canonical(&flbc_artifact, limits.flbc_codec)
+            .map_err(EngineExecutionError::Codec)?;
+        let cache_context = ExecutionCacheContext::new(
+            ContentRoot::new(admission.base_logical_root.0.0),
+            source_run_build_profile().0,
+            self.mode,
+        );
+        let exit = match execute_golem_cached(&executable, options, limits.vm, cache_context) {
+            Outcome::Complete(exit) => exit,
+            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+        };
+        Ok(Outcome::Complete(DefinitionExecution {
+            engine: admission.engine,
+            declaration: admission.declaration,
+            runtime_type,
+            io_result_types,
+            evaluation_presentation: None,
+            evaluation_output: None,
+            io_stdout: None,
+            base_logical_root: admission.base_logical_root,
+            result_logical_root: admission.result_logical_root,
+            flbc_artifact,
+            exit,
+            checker: admission.checker,
+            local_functions: admission.admissions.into_iter().skip(1).collect(),
+        }))
+    }
+
+    fn prepare_definition_entry_with_helpers(
+        &self,
+        declaration: Declaration,
+        helpers: &[Declaration],
+        options: &KVMap,
+        limits: EngineExecutionLimits,
+        entry: source_evaluation::Entry,
+    ) -> Result<Outcome<PreparedDefinition>, EngineExecutionError> {
         let (expression, declared_type) = match &declaration {
             Declaration::Defn(definition) => {
                 (definition.value.clone(), definition.base.type_.clone())
@@ -6217,54 +6284,20 @@ impl Engine {
             limits.ingress,
         )
         .map_err(EngineExecutionError::Ingress)?;
-        // Run the program with matchers absorbed and known closures called
-        // directly, as the pin's compiler builds it. If the simplified program
-        // is refused by either validator, lower the one ingress produced, so
-        // the simplification can change how fast a program runs, never whether.
-        let lowered = fln_comp::fir::optimize(ingress.fir(), limits.ingress.fir)
-            .ok()
-            .and_then(|optimized| fln_comp::fir::lower_to_flbc(&optimized).ok())
-            .map_or_else(|| fln_comp::fir::lower_to_flbc(ingress.fir()), Ok)
-            .map_err(EngineExecutionError::Lowering)?;
-        // Ingress keeps aliases for reusable source locals, and the FIR
-        // optimizer may transfer array parameters through internal calls.
-        // Retire each alias only after the independent ownership validator
-        // proves its final use; otherwise every update observes a shared
-        // reference even when the source no longer uses the original value.
-        let lowered = fln_comp::flbc::insert_ownership(&lowered, limits.ownership)
-            .map_err(LoweringError::OwnershipInsertion)
-            .map_err(EngineExecutionError::Lowering)?
-            .into_program();
-        let flbc_artifact = fln_comp::flbc::encode_canonical(&lowered, limits.flbc_codec)
-            .map_err(EngineExecutionError::Codec)?;
-        let executable = fln_comp::flbc::decode_canonical(&flbc_artifact, limits.flbc_codec)
-            .map_err(EngineExecutionError::Codec)?;
-        let cache_context = ExecutionCacheContext::new(
-            ContentRoot::new(admission.base_logical_root.0.0),
-            source_run_build_profile().0,
-            self.mode,
-        );
-        let exit = match execute_golem_cached(&executable, options, limits.vm, cache_context) {
-            Outcome::Complete(exit) => exit,
-            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
-            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
-        };
-        Ok(Outcome::Complete(DefinitionExecution {
-            engine: admission.engine,
-            declaration: admission.declaration,
+        Ok(Outcome::Complete(PreparedDefinition {
+            admission,
             runtime_type,
             io_result_types,
-            evaluation_presentation: None,
-            evaluation_output: None,
-            io_stdout: None,
-            base_logical_root: admission.base_logical_root,
-            result_logical_root: admission.result_logical_root,
-            flbc_artifact,
-            exit,
-            checker: admission.checker,
-            local_functions: admission.admissions.into_iter().skip(1).collect(),
+            fir: ingress.into_fir(),
         }))
     }
+}
+
+struct PreparedDefinition {
+    admission: SourceDeclarationAdmission,
+    runtime_type: Expr,
+    io_result_types: Option<source_evaluation::IoResultTypes>,
+    fir: fln_comp::fir::ValidatedProgram,
 }
 
 /// Execute a validated FLBC program on the Golem VM with the given option map
