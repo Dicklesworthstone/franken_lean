@@ -7,8 +7,9 @@
 //! of kernel admission or faithful byte identity. Module publication must bind
 //! the entry and additional names to its own checked declaration/ABI contract.
 //! `compile_source_definition` additionally exports closed Nat/String function
-//! signatures under their source names, with owned object arguments. Erased,
-//! dependent, polymorphic and scalar source conventions remain unsupported.
+//! signatures under their source names, with owned object arguments.
+//! Type-dependent runtime carriers and scalar source conventions remain
+//! unsupported. Type/proof slots retain their original source positions.
 
 use fln_comp::{fir, flbc};
 use fln_core::name::Name;
@@ -475,16 +476,31 @@ fn compile_function(
 }
 
 fn boxed_wrapper(declaration: &IrDecl, meter: &mut Budget) -> Result<IrDecl> {
-    let IrDecl::Function { name, params, .. } = declaration else {
+    let IrDecl::Function {
+        name,
+        params,
+        result,
+        ..
+    } = declaration
+    else {
         return Err(invariant("native function"));
     };
     meter.charge(params.len().saturating_mul(3).saturating_add(1))?;
     let mut stmts = vec![IrStmt::VDecl {
         x: params.len() as u64 + 1,
-        ty: IrType::TObject,
+        ty: result.clone(),
         expr: IrExpr::Fap {
             function: name.clone(),
-            args: params.iter().map(|p| IrArg::Var(p.x)).collect(),
+            args: params
+                .iter()
+                .map(|p| {
+                    if p.ty == IrType::Erased {
+                        IrArg::Erased
+                    } else {
+                        IrArg::Var(p.x)
+                    }
+                })
+                .collect(),
         },
     }];
     for p in params {
@@ -503,10 +519,15 @@ fn boxed_wrapper(declaration: &IrDecl, meter: &mut Budget) -> Result<IrDecl> {
             .iter()
             .map(|p| IrParam {
                 borrow: false,
+                ty: if p.ty == IrType::Erased {
+                    IrType::TObject
+                } else {
+                    p.ty.clone()
+                },
                 ..p.clone()
             })
             .collect(),
-        result: IrType::TObject,
+        result: result.clone(),
         body: IrBody {
             stmts,
             terminal: Box::new(IrTerminal::Ret(IrArg::Var(params.len() as u64 + 1))),
@@ -653,6 +674,123 @@ struct SourceSignature {
     name: Name,
     params: Vec<IrParam>,
     result: IrType,
+    reduced: Option<Vec<ReducedArgument>>,
+}
+
+enum ReducedArgument {
+    Parameter(u64),
+    Literal(IrLit, IrType),
+    Erased,
+}
+
+// Reduction metadata can inline the full entry and call `f._redArg` instead.
+// Analyze an explicit lambda telescope, with closed let initializers. Calls
+// through source parameters stay opaque; named/local/beta-redex calls refuse
+// because further simplification could change the reduction mask. This is a
+// bounded source subset, not an approximation silently used for general code.
+fn source_parameter_uses(
+    value: &fln_core::expr::Expr,
+    arity: usize,
+    meter: &mut Budget,
+) -> Result<Vec<bool>> {
+    use fln_core::expr::ExprNode;
+    let mut levels = Vec::new();
+    let mut pending = Vec::new();
+    let mut depth = 0_u64;
+    let mut body = value;
+    while levels.len() < arity {
+        meter.charge(1)?;
+        match body.node() {
+            ExprNode::Lam { body: next, .. } => {
+                levels
+                    .try_reserve(1)
+                    .map_err(|_| CompileError::Allocation)?;
+                levels.push(depth);
+                depth = depth.checked_add(1).ok_or(CompileError::Limit)?;
+                body = next;
+            }
+            ExprNode::LetE {
+                value, body: next, ..
+            } => {
+                pending
+                    .try_reserve(1)
+                    .map_err(|_| CompileError::Allocation)?;
+                pending.push((value, depth, true));
+                depth = depth.checked_add(1).ok_or(CompileError::Limit)?;
+                body = next;
+            }
+            ExprNode::MData { expr, .. } => body = expr,
+            _ => return Err(unsupported("source export lambda telescope")),
+        }
+    }
+    pending
+        .try_reserve(1)
+        .map_err(|_| CompileError::Allocation)?;
+    pending.push((body, depth, false));
+    let mut used = Vec::new();
+    used.try_reserve_exact(arity)
+        .map_err(|_| CompileError::Allocation)?;
+    used.resize(arity, false);
+    while let Some((expr, depth, initializer)) = pending.pop() {
+        meter.charge(1)?;
+        pending
+            .try_reserve(2)
+            .map_err(|_| CompileError::Allocation)?;
+        match expr.node() {
+            ExprNode::BVar { idx } => {
+                let level = depth
+                    .checked_sub(u64::from(*idx) + 1)
+                    .ok_or_else(|| unsupported("open source export"))?;
+                if let Ok(index) = levels.binary_search(&level) {
+                    if initializer && arity > 1 {
+                        return Err(unsupported("parameter-dependent source initializer"));
+                    }
+                    used[index] = true;
+                }
+            }
+            ExprNode::App { f, a } => {
+                if !initializer && arity > 1 {
+                    let mut head = f;
+                    loop {
+                        meter.charge(1)?;
+                        match head.node() {
+                            ExprNode::App { f, .. } => head = f,
+                            ExprNode::MData { expr, .. } => head = expr,
+                            _ => break,
+                        }
+                    }
+                    let ExprNode::BVar { idx } = head.node() else {
+                        return Err(unsupported("specializable source call"));
+                    };
+                    let level = depth
+                        .checked_sub(u64::from(*idx) + 1)
+                        .ok_or_else(|| unsupported("open source call"))?;
+                    if levels.binary_search(&level).is_err() {
+                        return Err(unsupported("local source call"));
+                    }
+                }
+                pending.push((f, depth, initializer));
+                pending.push((a, depth, initializer));
+            }
+            ExprNode::Lam { body, .. } => pending.push((
+                body,
+                depth.checked_add(1).ok_or(CompileError::Limit)?,
+                initializer,
+            )),
+            ExprNode::LetE { value, body, .. } => {
+                pending.push((value, depth, true));
+                pending.push((
+                    body,
+                    depth.checked_add(1).ok_or(CompileError::Limit)?,
+                    initializer,
+                ));
+            }
+            ExprNode::MData { expr, .. } => pending.push((expr, depth, initializer)),
+            ExprNode::Const { .. } | ExprNode::Lit { .. } => {}
+            _ => return Err(unsupported("source reduction expression")),
+        }
+    }
+    Ok(used)
 }
 
 // Walk source types before erasure. In particular, a proof/type argument must
@@ -695,13 +833,12 @@ fn source_carrier(ty: &fln_core::expr::Expr, meter: &mut Budget) -> Result<IrTyp
 
 fn source_signature(
     definition: &fln_env::constants::DefinitionVal,
+    erasures: &[bool],
     meter: &mut Budget,
 ) -> Result<SourceSignature> {
     use fln_core::expr::ExprNode;
-    if !definition.base.level_params.is_empty() {
-        return Err(unsupported("universe-polymorphic source export"));
-    }
     let mut params = Vec::new();
+    let mut function_parameters = Vec::new();
     let mut ty = &definition.base.type_;
     let result = loop {
         meter.charge(1)?;
@@ -709,7 +846,24 @@ fn source_signature(
             ExprNode::ForallE {
                 binder_type, body, ..
             } => {
-                let carrier = source_carrier(binder_type, meter)?;
+                let erased = erasures
+                    .get(params.len())
+                    .copied()
+                    .ok_or_else(|| invariant("source erasure telescope"))?;
+                let carrier = if erased {
+                    IrType::Erased
+                } else {
+                    source_carrier(binder_type, meter)?
+                };
+                let mut parameter = binder_type;
+                while let ExprNode::MData { expr, .. } = parameter.node() {
+                    meter.charge(1)?;
+                    parameter = expr;
+                }
+                function_parameters
+                    .try_reserve(1)
+                    .map_err(|_| CompileError::Allocation)?;
+                function_parameters.push(matches!(parameter.node(), ExprNode::ForallE { .. }));
                 params
                     .try_reserve(1)
                     .map_err(|_| CompileError::Allocation)?;
@@ -724,10 +878,54 @@ fn source_signature(
             _ => break source_carrier(ty, meter)?,
         }
     };
+    if params.len() != erasures.len() {
+        return Err(invariant("source erasure arity"));
+    }
+    let reduced = if !params.is_empty() {
+        let mut used = source_parameter_uses(&definition.value, params.len(), meter)?;
+        for (used, erased) in used.iter_mut().zip(erasures) {
+            *used &= !erased;
+        }
+        let count = used.iter().filter(|used| **used).count();
+        // The pin deliberately keeps a completely unused telescope: reducing
+        // it to a constant could evaluate an otherwise unreachable body.
+        if count > 0 && count < params.len() {
+            let mut args = Vec::new();
+            args.try_reserve_exact(params.len())
+                .map_err(|_| CompileError::Allocation)?;
+            let mut next = 1;
+            for (index, param) in params.iter().enumerate() {
+                if used[index] {
+                    args.push(ReducedArgument::Parameter(next));
+                    next += 1;
+                } else if param.ty == IrType::Erased {
+                    args.push(ReducedArgument::Erased);
+                } else if function_parameters[index] {
+                    return Err(unsupported("unused higher-order source parameter"));
+                } else if param.ty == IrType::TObject {
+                    args.push(ReducedArgument::Literal(
+                        IrLit::Num(IrNat::Small(0)),
+                        IrType::TObject,
+                    ));
+                } else {
+                    args.push(ReducedArgument::Literal(
+                        IrLit::Str(String::new()),
+                        IrType::Object,
+                    ));
+                }
+            }
+            Some(args)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     Ok(SourceSignature {
         name: definition.base.name.clone(),
         params,
         result,
+        reduced,
     })
 }
 
@@ -735,7 +933,7 @@ fn export_source(
     signature: SourceSignature,
     value_entry: &Name,
     meter: &mut Budget,
-) -> Result<IrDecl> {
+) -> Result<Vec<IrDecl>> {
     meter.charge(signature.params.len().saturating_mul(2).saturating_add(8))?;
     let closure = signature.params.len() as u64 + 1;
     let result = closure.checked_add(1).ok_or(CompileError::Limit)?;
@@ -764,21 +962,99 @@ fn export_source(
             ty: signature.result.clone(),
             expr: IrExpr::Ap {
                 x: closure,
-                args: signature.params.iter().map(|p| IrArg::Var(p.x)).collect(),
+                args: signature
+                    .params
+                    .iter()
+                    .map(|p| {
+                        if p.ty == IrType::Erased {
+                            IrArg::Erased
+                        } else {
+                            IrArg::Var(p.x)
+                        }
+                    })
+                    .collect(),
             },
         });
         result
     };
-    Ok(IrDecl::Function {
-        name: signature.name,
-        params: signature.params,
-        result: signature.result,
+    let public = IrDecl::Function {
+        name: signature.name.clone(),
+        params: signature.params.clone(),
+        result: signature.result.clone(),
         body: IrBody {
             stmts,
             terminal: Box::new(IrTerminal::Ret(IrArg::Var(returned))),
         },
         sorry_dep: None,
-    })
+    };
+    let mut declarations = Vec::new();
+    declarations
+        .try_reserve_exact(4)
+        .map_err(|_| CompileError::Allocation)?;
+    if !signature.params.is_empty() {
+        declarations.push(boxed_wrapper(&public, meter)?);
+    }
+    declarations.push(public);
+    if let Some(reduced) = signature.reduced {
+        meter.charge(reduced.len().saturating_mul(3).saturating_add(4))?;
+        let mut params = Vec::new();
+        params
+            .try_reserve_exact(reduced.len())
+            .map_err(|_| CompileError::Allocation)?;
+        for (original, arg) in signature.params.iter().zip(&reduced) {
+            if let ReducedArgument::Parameter(x) = arg {
+                params.push(IrParam {
+                    x: *x,
+                    ..original.clone()
+                });
+            }
+        }
+        let mut next = params.len() as u64 + 1;
+        let mut stmts = Vec::new();
+        let mut args = Vec::new();
+        stmts
+            .try_reserve_exact(reduced.len() + 1)
+            .map_err(|_| CompileError::Allocation)?;
+        args.try_reserve_exact(reduced.len())
+            .map_err(|_| CompileError::Allocation)?;
+        for arg in reduced {
+            args.push(match arg {
+                ReducedArgument::Parameter(x) => IrArg::Var(x),
+                ReducedArgument::Erased => IrArg::Erased,
+                ReducedArgument::Literal(literal, ty) => {
+                    let x = next;
+                    next = next.checked_add(1).ok_or(CompileError::Limit)?;
+                    stmts.push(IrStmt::VDecl {
+                        x,
+                        ty,
+                        expr: IrExpr::Lit(literal),
+                    });
+                    IrArg::Var(x)
+                }
+            });
+        }
+        stmts.push(IrStmt::VDecl {
+            x: next,
+            ty: signature.result.clone(),
+            expr: IrExpr::Fap {
+                function: signature.name.clone(),
+                args,
+            },
+        });
+        let adapter = IrDecl::Function {
+            name: Name::str(signature.name, "_redArg"),
+            params,
+            result: signature.result,
+            body: IrBody {
+                stmts,
+                terminal: Box::new(IrTerminal::Ret(IrArg::Var(next))),
+            },
+            sorry_dep: None,
+        };
+        declarations.push(boxed_wrapper(&adapter, meter)?);
+        declarations.push(adapter);
+    }
+    Ok(declarations)
 }
 
 /// A compiled, council-admitted definition. The base engine is unchanged;
@@ -830,8 +1106,13 @@ pub fn compile_definition(
 }
 
 /// Export a checked definition under its source name and source argument count.
-/// Supported types are closed arrows over Nat/String (including higher-order
-/// arguments), using owned object parameters. No erased argument is dropped.
+/// Runtime types are closed arrows over Nat/String (including higher-order
+/// arguments), using owned object parameters. Source type/proof slots are
+/// classified in their original telescope and retained as erased parameters.
+/// A runtime carrier depending on a source type parameter remains unsupported.
+/// Source arrows require an explicit lambda telescope; multiple arguments also
+/// require closed let initializers and calls through source parameters. Ambiguous reductions and
+/// unused higher-order arguments refuse instead of guessing a `_redArg` ABI.
 /// The source signature is projected from the same declaration submitted
 /// unchanged to both checkers; success requires their admission and complete
 /// IR validation. This does not establish faithful bytes or general source ABI.
@@ -856,9 +1137,23 @@ fn compile_definition_impl(
 ) -> std::result::Result<fln_core::outcome::Outcome<DefinitionCompilation>, DefinitionCompileError>
 {
     let mut meter = Budget(limits.max_work);
+    meter.charge(1).map_err(DefinitionCompileError::Ir)?;
     let signature = match (&declaration, entry) {
         (crate::Declaration::Defn(definition), None) => {
-            Some(source_signature(definition, &mut meter).map_err(DefinitionCompileError::Ir)?)
+            let mut ingress = engine_limits.ingress;
+            ingress.max_nodes = ingress
+                .max_nodes
+                .min(usize::try_from(meter.0).unwrap_or(usize::MAX));
+            let (erasures, work) = crate::runtime::Preparation::new(engine.environment(), ingress)
+                .source_parameter_erasures(&definition.base.type_)
+                .map_err(|error| {
+                    DefinitionCompileError::Engine(crate::EngineExecutionError::Ingress(error))
+                })?;
+            meter.charge(work).map_err(DefinitionCompileError::Ir)?;
+            Some(
+                source_signature(definition, &erasures, &mut meter)
+                    .map_err(DefinitionCompileError::Ir)?,
+            )
         }
         _ => None,
     };
@@ -868,7 +1163,11 @@ fn compile_definition_impl(
             &[],
             options,
             engine_limits,
-            crate::source_evaluation::Entry::Value,
+            if signature.is_some() {
+                crate::source_evaluation::Entry::SourceValue
+            } else {
+                crate::source_evaluation::Entry::Value
+            },
         )
         .map_err(DefinitionCompileError::Engine)?;
     use fln_core::outcome::Outcome;
@@ -888,7 +1187,7 @@ fn compile_definition_impl(
             let mut module = compile_module(&prepared.fir, &value_entry, limits, &mut meter)
                 .map_err(DefinitionCompileError::Ir)?;
             if let Some(signature) = signature {
-                module.decls.push(
+                module.decls.extend(
                     export_source(signature, &value_entry, &mut meter)
                         .map_err(DefinitionCompileError::Ir)?,
                 );

@@ -58,7 +58,7 @@ fn export_cases() -> [(
     &'static str,
     &'static str,
     usize,
-); 10] {
+); 23] {
     [
         ("Nat", "42", "compiled", "Nat", "42", 0),
         (
@@ -126,7 +126,120 @@ fn export_cases() -> [(
             "\"partial capture\"",
             2,
         ),
+        (
+            "String -> Nat -> Nat",
+            "fun _ x => x",
+            "compiled \"unused\" 42",
+            "Nat",
+            "42",
+            2,
+        ),
+        (
+            "Nat -> Nat -> Nat -> Nat",
+            "fun _ x _ => x",
+            "compiled 7 184467440737095516160 9",
+            "Nat",
+            "184467440737095516160",
+            3,
+        ),
+        (
+            "Nat -> String -> String",
+            "fun _ x => x",
+            "compiled 7 \"retained string\"",
+            "String",
+            "\"retained string\"",
+            2,
+        ),
+        (
+            "∀ (x : Nat), x = x -> Nat",
+            "fun x _ => x",
+            "compiled 42 rfl",
+            "Nat",
+            "42",
+            2,
+        ),
+        (
+            "(0 = 0) -> String",
+            "fun _ => \"erased proof\"",
+            "compiled rfl",
+            "String",
+            "\"erased proof\"",
+            1,
+        ),
+        (
+            "Type -> Nat -> Nat",
+            "fun _ x => x",
+            "compiled String 184467440737095516160",
+            "Nat",
+            "184467440737095516160",
+            2,
+        ),
+        (
+            "Prop -> Nat -> Nat",
+            "fun _ x => x",
+            "compiled (0 = 0) 42",
+            "Nat",
+            "42",
+            2,
+        ),
+        (
+            "Type -> Nat",
+            "fun _ => 42",
+            "compiled String",
+            "Nat",
+            "42",
+            1,
+        ),
+        (
+            "(0 = 0) -> Nat",
+            "fun _ => 42",
+            "compiled rfl",
+            "Nat",
+            "42",
+            1,
+        ),
+        (
+            "Type -> String -> String",
+            "fun _ x => x",
+            "compiled Nat \"erased type string\"",
+            "String",
+            "\"erased type string\"",
+            2,
+        ),
+        (
+            "Type -> Nat -> String",
+            "fun _ => let saved := \"type-slot capture\"; fun _ => saved",
+            "let f := compiled String; f 7",
+            "String",
+            "\"type-slot capture\"",
+            2,
+        ),
+        (
+            "Nat -> Type -> Nat",
+            "fun x _ => x",
+            "compiled 184467440737095516160 String",
+            "Nat",
+            "184467440737095516160",
+            2,
+        ),
+        (
+            "Type -> (Nat -> String) -> Nat -> String",
+            "fun _ f x => f x",
+            "compiled Nat (fun _ => \"typed callback\") 7",
+            "String",
+            "\"typed callback\"",
+            3,
+        ),
     ]
+}
+
+fn erased_positions(index: usize) -> &'static [usize] {
+    match index {
+        13 | 21 => &[1],
+        14..=20 => &[0],
+        22 => &[0],
+        _ => &[],
+    }
 }
 
 fn checked_definition(base: &Engine, source: &str) -> (fln::Declaration, Engine) {
@@ -151,7 +264,9 @@ fn source_exports_keep_source_arguments_and_compile_without_execution() {
     let base = base();
     let options = KVMap::new();
     let original = base.logical_root(&options);
-    for (ty, expression, application, result_type, expected, arity) in export_cases() {
+    for (index, (ty, expression, application, result_type, expected, arity)) in
+        export_cases().into_iter().enumerate()
+    {
         let source = format!("def compiled : {ty} := {expression}");
         let (declaration, checked) = checked_definition(&base, &source);
         let mut no_execution = limits();
@@ -182,6 +297,30 @@ fn source_exports_keep_source_arguments_and_compile_without_execution() {
         };
         assert_eq!(params.len(), arity, "{source}");
         assert!(params.iter().all(|p| !p.borrow));
+        assert_eq!(
+            params
+                .iter()
+                .enumerate()
+                .filter_map(|(i, p)| (p.ty == IrType::Erased).then_some(i))
+                .collect::<Vec<_>>(),
+            erased_positions(index),
+            "erased source slots retain their exact positions: {source}",
+        );
+        if !erased_positions(index).is_empty() {
+            let boxed = compiled
+                .module
+                .decls
+                .iter()
+                .find(|d| d.name() == &name("compiled._boxed"))
+                .unwrap();
+            let IrDecl::Function { params: boxed, .. } = boxed else {
+                panic!("source boxed entry")
+            };
+            assert_eq!(boxed.len(), arity);
+            for &position in erased_positions(index) {
+                assert_eq!(boxed[position].ty, IrType::TObject);
+            }
+        }
         let source = format!("def result : {result_type} := {application}");
         let executed = checked
             .execute_source_definitions(&[source.as_bytes()], &options, limits())
@@ -218,11 +357,36 @@ fn source_exports_keep_source_arguments_and_compile_without_execution() {
         ));
         assert_eq!(base.logical_root(&options), original);
     }
+    // Retain the exact formerly unsupported input as a positive, including its
+    // dependent proof domain, rather than merely dropping it from the negatives.
+    let source = "def compiled (x : Nat) (_h : x = x) : Nat := x";
+    let (declaration, checked) = checked_definition(&base, source);
+    let compiled = ir::compile_source_definition(
+        &base,
+        declaration,
+        &options,
+        limits(),
+        CompileLimits::default(),
+    )
+    .unwrap()
+    .into_complete()
+    .unwrap();
+    assert_eq!(
+        compiled.admission.result_logical_root,
+        checked.logical_root(&options)
+    );
+    assert_eq!(base.logical_root(&options), original);
     for source in [
-        "def compiled (x : Nat) (_h : x = x) : Nat := x",
         "def compiled {A : Type} (x : A) : A := x",
         "universe u\ndef compiled {A : Type u} (x : A) : A := x",
+        "def compiled {A : Type} (x : A) : Nat := 42",
+        "def compiled (P : Prop) : P -> P := fun x => x",
+        "def compiled : Nat -> Type := fun _ => Nat",
         "def compiled : Bool -> Bool := fun x => x",
+        "def compiled : (Nat -> Nat) -> Nat -> Nat := invoke",
+        "def compiled (x y : Nat) : Nat := keep x",
+        "def compiled (x y : Nat) : Nat := let saved := x; saved",
+        "def compiled (f : Nat -> Nat) (x : Nat) : Nat := x",
     ] {
         let (declaration, _) = checked_definition(&base, source);
         assert!(
@@ -457,7 +621,7 @@ fn cached_closure_program() -> fln_comp::fir::ValidatedProgram {
 fn replace_result(params: &[fln_olean::ir::IrParam], body: &mut IrBody, ty: &str) {
     let mut stmts: Vec<_> = params
         .iter()
-        .filter(|p| !p.borrow)
+        .filter(|p| !p.borrow && p.ty != IrType::Erased)
         .map(|p| IrStmt::Dec {
             x: p.x,
             n: 1,
@@ -648,6 +812,99 @@ fn consume(lean: &Path, dir: &Path) -> std::process::Output {
         .arg("Consumer.lean")
         .output()
         .unwrap()
+}
+
+struct RuntimeProbe<'a> {
+    ty: &'a str,
+    application: &'a str,
+    entry: &'a str,
+    check_meta: bool,
+    higher_universe: bool,
+    heap_call: Option<&'a str>,
+}
+
+fn consume_ir(
+    lean: &Path,
+    dir: &Path,
+    label: &str,
+    probe: &RuntimeProbe<'_>,
+) -> std::process::Output {
+    // Import only Lean statically. Loading the target and retrieving its value
+    // at runtime prevents compiler inlining of logical companion bodies from
+    // making an IR-body mutation invisible. Types come from the checked source
+    // signature; generated reduced entries use independently specified cases.
+    // The pin's public evalConst fixes its value universe at Type 0. A source
+    // type such as Type -> Nat -> Nat is in Type 1. Lift only the lookup
+    // function's erased universe, preserving all runtime arguments, its meta
+    // check, and the EXACT original source type passed to the lookup. This is
+    // an unsafe Reference-oracle adapter, never production Rust or a cast of
+    // the target value to a different source telescope. The pin-original IR
+    // positive below must pass through this same adapter before native IR.
+    let (adapter, evaluation) = if probe.higher_universe {
+        (
+            "universe u\nprivate unsafe def evalConstAt :\n    (α : Type u) -> Lean.Environment -> Lean.Options -> Lean.Name -> Bool -> Except String α :=\n  unsafeCast (@Lean.Environment.evalConst)\n",
+            format!(
+                "evalConstAt ({}) env {{}} `{} {}",
+                probe.ty, probe.entry, probe.check_meta,
+            ),
+        )
+    } else {
+        (
+            "",
+            format!(
+                "env.evalConst ({}) {{}} `{} (checkMeta := {})",
+                probe.ty, probe.entry, probe.check_meta,
+            ),
+        )
+    };
+    let mut source = format!(
+        "import Lean\n{adapter}unsafe def main : IO Unit := do\n  Lean.enableInitializersExecution\n  let env ← Lean.importModules #[{{ module := `NativeIrCase, isMeta := true }}] {{}} (loadExts := true)\n  match {evaluation} with\n  | .error message => throw (IO.userError message)\n  | .ok compiled => do\n    IO.println (reprStr ({}))\n    IO.println (reprStr ({}))\n",
+        probe.application, probe.application,
+    );
+    if let Some(call) = probe.heap_call {
+        source.push_str(&format!("    let saved ← IO.FS.readFile \"heap-input.txt\"\n    let got := {call}\n    IO.println (reprStr (got, saved))\n"));
+    }
+    let filename = format!("Runtime-{label}.lean");
+    std::fs::write(dir.join(&filename), source).unwrap();
+    Command::new(lean)
+        .current_dir(dir)
+        .env("LEAN_PATH", dir)
+        .args(["--run", &filename])
+        .output()
+        .unwrap()
+}
+
+fn assert_probe(output: std::process::Output, dir: &Path, label: &str, expected: &str) {
+    std::fs::write(dir.join(format!("{label}.stdout")), &output.stdout).unwrap();
+    std::fs::write(dir.join(format!("{label}.stderr")), &output.stderr).unwrap();
+    assert!(
+        output.status.success(),
+        "{label}: {:?}: {} {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().trim(),
+        expected,
+        "{label}"
+    );
+}
+
+fn reduced_case(index: usize) -> Option<(&'static str, &'static str)> {
+    match index {
+        7 | 11 => Some(("Nat -> Nat", "compiled 184467440737095516160")),
+        10 => Some(("Nat -> Nat", "compiled 42")),
+        12 => Some(("String -> String", "compiled \"retained string\"")),
+        19 => Some(("String -> String", "compiled \"erased type string\"")),
+        13 | 16 => Some(("Nat -> Nat", "compiled 42")),
+        15 | 21 => Some(("Nat -> Nat", "compiled 184467440737095516160")),
+        22 => Some((
+            "(Nat -> String) -> Nat -> String",
+            "compiled (fun _ => \"typed callback\") 7",
+        )),
+        _ => None,
+    }
 }
 
 #[test]
@@ -960,15 +1217,23 @@ fn the_pin_calls_native_source_exports_directly_and_as_functions() {
         std::fs::write(dir.join("original.ir"), &original).unwrap();
         let bytes = encode(&compiled.module, &original);
         std::fs::write(dir.join("NativeIrCase.ir"), &bytes).unwrap();
+        std::fs::write(dir.join("native.ir"), &bytes).unwrap();
         let mut consumer = format!(
             "module\nmeta import NativeIrCase\n#eval ({application})\n#eval ({application})\n"
         );
         let mut expected_output = format!("{expected}\n{expected}");
-        if index == 4 {
+        if index == 4 || index == 12 || index == 19 {
             // Effectful input prevents closed-term lifting from making the
             // alias a persistent literal. The caller keeps it across the call.
             std::fs::write(dir.join("heap-input.txt"), "fresh heap string").unwrap();
-            consumer.push_str("#eval do\n  let saved ← IO.FS.readFile \"heap-input.txt\"\n  let got := compiled saved\n  pure (got, saved)\n");
+            let call = if index == 4 {
+                "compiled saved"
+            } else if index == 12 {
+                "compiled 7 saved"
+            } else {
+                "compiled Nat saved"
+            };
+            consumer.push_str(&format!("#eval do\n  let saved ← IO.FS.readFile \"heap-input.txt\"\n  let got := {call}\n  pure (got, saved)\n"));
             expected_output.push_str("\n(\"fresh heap string\", \"fresh heap string\")");
         }
         std::fs::write(dir.join("Consumer.lean"), consumer).unwrap();
@@ -986,6 +1251,69 @@ fn the_pin_calls_native_source_exports_directly_and_as_functions() {
             String::from_utf8(result.stdout).unwrap().trim(),
             expected_output
         );
+
+        let full_probe = RuntimeProbe {
+            ty,
+            application,
+            entry: "compiled",
+            check_meta: true,
+            higher_universe: matches!(index, 15 | 17 | 19 | 20 | 21 | 22),
+            heap_call: match index {
+                4 => Some("compiled saved"),
+                12 => Some("compiled 7 saved"),
+                19 => Some("compiled Nat saved"),
+                _ => None,
+            },
+        };
+        let reduced_probe = reduced_case(index).map(|(ty, application)| RuntimeProbe {
+            ty,
+            application,
+            entry: "compiled._redArg",
+            check_meta: false,
+            higher_universe: false,
+            heap_call: (index == 12 || index == 19).then_some("compiled saved"),
+        });
+        assert_eq!(
+            compiled
+                .module
+                .decls
+                .iter()
+                .any(|d| d.name() == &name("compiled._redArg")),
+            reduced_probe.is_some(),
+            "the independently specified reduced-entry cases must actually exist",
+        );
+        // Check this evaluator against the pin's own IR with the same logical
+        // companions and independently supplied types before judging our IR.
+        std::fs::write(dir.join("NativeIrCase.ir"), &original).unwrap();
+        assert_probe(
+            consume_ir(&lean, &dir, "full", &full_probe),
+            &dir,
+            "runtime-reference",
+            &expected_output,
+        );
+        if let Some(probe) = &reduced_probe {
+            assert_probe(
+                consume_ir(&lean, &dir, "reduced", probe),
+                &dir,
+                "runtime-reduced-reference",
+                &expected_output,
+            );
+        }
+        std::fs::write(dir.join("NativeIrCase.ir"), &bytes).unwrap();
+        assert_probe(
+            consume_ir(&lean, &dir, "full", &full_probe),
+            &dir,
+            "runtime-native",
+            &expected_output,
+        );
+        if let Some(probe) = &reduced_probe {
+            assert_probe(
+                consume_ir(&lean, &dir, "reduced", probe),
+                &dir,
+                "runtime-reduced-native",
+                &expected_output,
+            );
+        }
 
         // Alter only the source export, retaining every internal value body.
         let mut mutant = compiled.module.clone();
@@ -1011,7 +1339,9 @@ fn the_pin_calls_native_source_exports_directly_and_as_functions() {
                 .filter(|d| d.name() != &name("compiled"))
                 .collect::<Vec<_>>(),
         );
-        std::fs::write(dir.join("NativeIrCase.ir"), encode(&mutant, &original)).unwrap();
+        let mutant_bytes = encode(&mutant, &original);
+        std::fs::write(dir.join("export-mutant.ir"), &mutant_bytes).unwrap();
+        std::fs::write(dir.join("NativeIrCase.ir"), mutant_bytes).unwrap();
         let result = consume(&lean, &dir);
         std::fs::write(dir.join("export-mutant.stdout"), &result.stdout).unwrap();
         std::fs::write(dir.join("export-mutant.stderr"), &result.stderr).unwrap();
@@ -1028,13 +1358,26 @@ fn the_pin_calls_native_source_exports_directly_and_as_functions() {
             "\"changed IR\""
         };
         let mut changed_output = format!("{changed}\n{changed}");
-        if index == 4 {
+        if index == 4 || index == 12 || index == 19 {
             changed_output.push_str("\n(\"changed IR\", \"fresh heap string\")");
         }
-        assert_eq!(
-            String::from_utf8(result.stdout).unwrap().trim(),
-            changed_output
+        // Ordinary compilation may inline the logical companion's original
+        // body. Retain its diagnostic output, but use direct interpreter calls
+        // to require observation of this valid, deliberately changed IR.
+        assert_probe(
+            consume_ir(&lean, &dir, "full", &full_probe),
+            &dir,
+            "runtime-export-mutant",
+            &changed_output,
         );
+        if let Some(probe) = &reduced_probe {
+            assert_probe(
+                consume_ir(&lean, &dir, "reduced", probe),
+                &dir,
+                "runtime-reduced-mutant",
+                &changed_output,
+            );
+        }
         std::fs::write(dir.join("NativeIrCase.ir"), bytes).unwrap();
         assert_eq!(base.logical_root(&options), original_root);
     }

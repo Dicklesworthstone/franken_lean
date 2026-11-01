@@ -6239,7 +6239,7 @@ impl Engine {
             .with_executable_opaques(&self.executable_opaques)
             .with_runtime_initializers(&self.runtime_initializers);
         let evaluated = match entry {
-            source_evaluation::Entry::Value => None,
+            source_evaluation::Entry::Value | source_evaluation::Entry::SourceValue => None,
             source_evaluation::Entry::Evaluation => preparation
                 .evaluation_entry(&expression, &declared_type)
                 .map_err(EngineExecutionError::Ingress)?,
@@ -6248,6 +6248,26 @@ impl Engine {
             Some((expression, type_, types)) => (expression, type_, Some(types)),
             None => (expression, declared_type, None),
         };
+        // This view belongs only to the source IR compiler. Ordinary value/IO
+        // preparation retains static motive and record-type metadata. Proofs
+        // are classified in the original admitted contexts before this view
+        // changes any type-valued source parameter to an inert runtime slot.
+        let source_view = if matches!(entry, source_evaluation::Entry::SourceValue) {
+            preparation
+                .source_value_view(&expression, &declared_type)
+                .map_err(EngineExecutionError::Ingress)?
+        } else {
+            None
+        };
+        let source_declaration = source_view.as_ref().map(|(value, type_)| {
+            let mut declaration = admission.declaration.clone();
+            if let Declaration::Defn(definition) = &mut declaration {
+                definition.base.type_ = type_.clone();
+                definition.value = value.clone();
+            }
+            declaration
+        });
+        let (expression, declared_type) = source_view.unwrap_or((expression, declared_type));
         let runtime_type = preparation
             .normalize_type(&declared_type)
             .map_err(EngineExecutionError::Ingress)?;
@@ -6262,8 +6282,14 @@ impl Engine {
             &mut preparation,
         )
         .map_err(EngineExecutionError::Ingress)?;
-        let local_lambda = executable_lambda(&admission.declaration, &expression, &mut preparation)
-            .map_err(EngineExecutionError::Ingress)?;
+        let local_lambda = executable_lambda(
+            source_declaration
+                .as_ref()
+                .unwrap_or(&admission.declaration),
+            &expression,
+            &mut preparation,
+        )
+        .map_err(EngineExecutionError::Ingress)?;
         if let Some(lambda) = local_lambda {
             preparation.lambdas.push(lambda);
         }

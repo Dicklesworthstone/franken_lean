@@ -41,6 +41,8 @@ pub enum EvaluationResultPresentation {
 #[derive(Clone, Copy)]
 pub(super) enum Entry {
     Value,
+    /// Compile a checked source function with explicit erased ABI slots.
+    SourceValue,
     Evaluation,
 }
 

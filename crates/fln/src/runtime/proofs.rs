@@ -30,6 +30,167 @@ enum Frame {
 }
 
 impl Preparation<'_> {
+    /// Classify source ABI slots in their original, checked telescope. This
+    /// shares the runtime's contextual proof/type queries; it does not infer
+    /// exported arity from the erased executable expression.
+    pub(crate) fn source_parameter_erasures(
+        &mut self,
+        input: &Expr,
+    ) -> Result<(Vec<bool>, usize), IngressError> {
+        let before = self.visited;
+        let mut context = Vec::new();
+        let mut erased = Vec::new();
+        let mut type_ = input;
+        loop {
+            self.tick()?;
+            match type_.node() {
+                ExprNode::MData { expr, .. } => type_ = expr,
+                ExprNode::ForallE {
+                    binder_type, body, ..
+                } => {
+                    let slot = self.type_parameter(binder_type)?
+                        || self.proposition_type(binder_type, &context)?;
+                    reserve(&mut erased, self.limits.max_context_depth)?;
+                    erased.push(slot);
+                    self.push_proof_local(&mut context, binder_type.clone())?;
+                    type_ = body;
+                }
+                _ => return Ok((erased, self.visited - before)),
+            }
+        }
+    }
+
+    /// A private executable view for the source IR entry, after admission.
+    /// Erase proofs in their ORIGINAL contexts first, then replace only the
+    /// source telescope's static type slots. Ordinary runtime normalization,
+    /// nested motives, record metadata and Type-valued results retain their
+    /// existing semantics. No projected declaration is admitted or published.
+    pub(crate) fn source_value_view(
+        &mut self,
+        value: &Expr,
+        type_: &Expr,
+    ) -> Result<Option<(Expr, Expr)>, IngressError> {
+        let mut slots = Vec::new();
+        let mut current = type_;
+        loop {
+            self.tick()?;
+            match current.node() {
+                ExprNode::MData { expr, .. } => current = expr,
+                ExprNode::ForallE {
+                    binder_type, body, ..
+                } => {
+                    reserve(&mut slots, self.limits.max_context_depth)?;
+                    slots.push(self.type_parameter(binder_type)?);
+                    current = body;
+                }
+                _ => break,
+            }
+        }
+        if !slots.iter().any(|slot| *slot) {
+            return Ok(None);
+        }
+        if !self.proof_erasure_available() {
+            return Err(unsupported("source type-slot scalar binding"));
+        }
+        let value = self.erase_proofs(value, Some(type_.clone()))?;
+        let type_ = self.erase_runtime_type(type_)?;
+        let value = self.source_slot_view(&value, &slots, false)?;
+        let type_ = self.source_slot_view(&type_, &slots, true)?;
+        Ok(Some((value, type_)))
+    }
+
+    fn source_slot_view(
+        &mut self,
+        input: &Expr,
+        slots: &[bool],
+        type_plane: bool,
+    ) -> Result<Expr, IngressError> {
+        enum Prefix {
+            Binder(Name, Expr, BinderInfo),
+            Let(Name, Expr, Expr, bool),
+            Metadata(KVMap),
+        }
+        let mut prefix = Vec::new();
+        let mut current = input.clone();
+        let mut position = 0;
+        while position < slots.len() {
+            self.tick()?;
+            reserve(&mut prefix, self.limits.max_nodes)?;
+            match current.node() {
+                ExprNode::ForallE {
+                    binder_name,
+                    binder_type,
+                    body,
+                    binder_info,
+                } if type_plane => {
+                    prefix.push(Prefix::Binder(
+                        binder_name.clone(),
+                        if slots[position] {
+                            erased_type()
+                        } else {
+                            binder_type.clone()
+                        },
+                        *binder_info,
+                    ));
+                    position += 1;
+                    current = body.clone();
+                }
+                ExprNode::Lam {
+                    binder_name,
+                    binder_type,
+                    body,
+                    binder_info,
+                } if !type_plane => {
+                    prefix.push(Prefix::Binder(
+                        binder_name.clone(),
+                        if slots[position] {
+                            erased_type()
+                        } else {
+                            binder_type.clone()
+                        },
+                        *binder_info,
+                    ));
+                    position += 1;
+                    current = body.clone();
+                }
+                ExprNode::LetE {
+                    decl_name,
+                    type_,
+                    value,
+                    body,
+                    non_dep,
+                } if !type_plane => {
+                    prefix.push(Prefix::Let(
+                        decl_name.clone(),
+                        type_.clone(),
+                        value.clone(),
+                        *non_dep,
+                    ));
+                    current = body.clone();
+                }
+                ExprNode::MData { data, expr } => {
+                    prefix.push(Prefix::Metadata(data.clone()));
+                    current = expr.clone();
+                }
+                _ => return Err(unsupported("source type-slot telescope")),
+            }
+        }
+        for frame in prefix.into_iter().rev() {
+            self.tick()?;
+            current = match frame {
+                Prefix::Binder(name, domain, info) if type_plane => {
+                    Expr::forall_e(name, domain, current, info)
+                }
+                Prefix::Binder(name, domain, info) => Expr::lam(name, domain, current, info),
+                Prefix::Let(name, type_, value, non_dep) => {
+                    Expr::let_e(name, type_, value, current, non_dep)
+                }
+                Prefix::Metadata(data) => Expr::mdata(data, current),
+            };
+        }
+        Ok(current)
+    }
+
     fn proof_erasure_available(&self) -> bool {
         source_scalar_constructor_binding(self.environment, &name("Bool.false")).is_some()
     }
