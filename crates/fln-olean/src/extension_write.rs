@@ -63,7 +63,7 @@ fn extent(fixed: u64, count: usize, width: u64) -> Result<u64> {
         .ok_or_else(|| contract("extension object extent overflows"))
 }
 
-struct Builder {
+pub(crate) struct Builder {
     budget: WriteBudget,
     objects: u64,
     bytes: u64,
@@ -75,7 +75,7 @@ struct Builder {
 }
 
 impl Builder {
-    fn new(budget: WriteBudget) -> Self {
+    pub(crate) fn new(budget: WriteBudget) -> Self {
         Self {
             budget,
             objects: 0,
@@ -86,7 +86,7 @@ impl Builder {
         }
     }
 
-    fn charge(&mut self, bytes: u64) -> Result<()> {
+    pub(crate) fn charge(&mut self, bytes: u64) -> Result<()> {
         let objects = self
             .objects
             .checked_add(1)
@@ -204,7 +204,7 @@ impl Builder {
         Ok(())
     }
 
-    fn string(&mut self, text: &str) -> Result<Obj> {
+    pub(crate) fn string(&mut self, text: &str) -> Result<Obj> {
         if let Some(object) = self.strings.get(text) {
             return Ok(object.clone_ref());
         }
@@ -214,7 +214,7 @@ impl Builder {
         Ok(object)
     }
 
-    fn name(&mut self, name: &Name) -> Result<Obj> {
+    pub(crate) fn name(&mut self, name: &Name) -> Result<Obj> {
         let mut chain = Vec::new();
         let mut cursor = name.clone();
         let mut parent = loop {
@@ -255,7 +255,7 @@ impl Builder {
         Ok(parent)
     }
 
-    fn array(&mut self, children: Vec<Obj>) -> Result<Obj> {
+    pub(crate) fn array(&mut self, children: Vec<Obj>) -> Result<Obj> {
         self.charge(extent(24, children.len(), 8)?)?;
         Ok(Obj::mk_array(children))
     }

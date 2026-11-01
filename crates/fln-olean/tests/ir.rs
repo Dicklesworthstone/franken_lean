@@ -410,6 +410,311 @@ fn the_generated_layout_is_what_the_vendored_declarations_render_to() {
 }
 
 #[test]
+fn the_pin_reads_and_executes_fresh_native_ir_and_detects_changed_or_corrupt_output() {
+    use fln_olean::ModuleExtensionInput;
+    use fln_olean::ir::write::{IrWriteInput, IrWriteLimits, encode_ir};
+    use fln_olean::write::{ModuleWriteInput, OleanWriteHeader};
+
+    let Some(lean) = reference_lib().and_then(|lib| reference_lean(&lib)) else {
+        assert!(
+            std::env::var_os("FLN_REQUIRE_REFERENCE").is_none(),
+            "the pin is required for fresh IR consumer coverage"
+        );
+        eprintln!("SKIP: fresh IR consumer requires the pinned Reference");
+        return;
+    };
+    let pin = include_str!("../../../SUITE.lock")
+        .lines()
+        .find(|line| line.starts_with("reference "))
+        .and_then(|line| {
+            line.split_whitespace()
+                .find_map(|field| field.strip_prefix("commit="))
+        })
+        .unwrap();
+    let identity = Command::new(&lean).arg("--githash").output().unwrap();
+    assert!(identity.status.success());
+    assert_eq!(String::from_utf8(identity.stdout).unwrap().trim(), pin);
+    let root = std::env::var_os("FLN_IR_REFERENCE_ARTIFACTS")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = root.join(format!("fresh-native-ir-{}-{unique}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let source = "module\n@[noinline] public def freshNat (x : Nat) : Nat := x\n@[noinline] public def freshText (x : String) : String := x\npublic opaque freshAnswer : Nat := 42\n";
+    std::fs::write(dir.join("FreshIrProbe.lean"), source).unwrap();
+    let generated = Command::new(&lean)
+        .current_dir(&dir)
+        .args(["-o", "FreshIrProbe.olean", "FreshIrProbe.lean"])
+        .output()
+        .unwrap();
+    std::fs::write(dir.join("compile.stdout"), &generated.stdout).unwrap();
+    std::fs::write(dir.join("compile.stderr"), &generated.stderr).unwrap();
+    assert!(
+        generated.status.success(),
+        "fixture generation failed: {}",
+        String::from_utf8_lossy(&generated.stderr)
+    );
+
+    // The Reference supplies only the fixture's logical companions, import
+    // header and opaque package metadata. No compiled body is decoded or reused
+    // in the fresh IR below. This tests the writer/consumer, NOT source codegen.
+    let original = std::fs::read(dir.join("FreshIrProbe.ir")).unwrap();
+    std::fs::write(dir.join("original.ir"), &original).unwrap();
+    let view = OleanView::parse(&original).unwrap();
+    let module = view.module_data(WalkBudget::default()).unwrap();
+    let extra_names = view.extra_const_names(WalkBudget::default()).unwrap();
+    let (blocks, _) = open(&original).unwrap();
+    let additional: Vec<_> = blocks
+        .iter()
+        .filter(|block| {
+            block.name != n("Lean.IR.declMapExt") && block.name != n(REGULAR_INIT_EXTENSION)
+        })
+        .map(|block| {
+            (
+                block.name.clone(),
+                block
+                    .entries
+                    .iter()
+                    .map(|bytes| fln_rt::region::materialize(bytes, 0).unwrap())
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect();
+    let additional: Vec<_> = additional
+        .iter()
+        .map(|(name, entries)| ModuleExtensionInput { name, entries })
+        .collect();
+    let parameter = |ty, borrow| IrParam { x: 1, borrow, ty };
+    let ret = |x| IrBody {
+        stmts: vec![],
+        terminal: Box::new(IrTerminal::Ret(IrArg::Var(x))),
+    };
+    let identity = |label: &str, ty: IrType, checked| IrDecl::Function {
+        name: n(label),
+        params: vec![parameter(ty.clone(), true)],
+        result: ty,
+        body: IrBody {
+            stmts: vec![IrStmt::Inc {
+                x: 1,
+                n: 1,
+                checked,
+                persistent: false,
+            }],
+            ..ret(1)
+        },
+        sorry_dep: None,
+    };
+    let wrapper = |label: &str, ty: IrType, checked| IrDecl::Function {
+        name: n(&format!("{label}._boxed")),
+        params: vec![parameter(ty.clone(), false)],
+        result: ty.clone(),
+        body: IrBody {
+            stmts: vec![
+                IrStmt::VDecl {
+                    x: 2,
+                    ty,
+                    expr: IrExpr::Fap {
+                        function: n(label),
+                        args: vec![IrArg::Var(1)],
+                    },
+                },
+                IrStmt::Dec {
+                    x: 1,
+                    n: 1,
+                    checked,
+                    persistent: false,
+                },
+            ],
+            ..ret(2)
+        },
+        sorry_dep: None,
+    };
+    let answer = |value| IrDecl::Function {
+        name: n("freshAnswer"),
+        params: vec![],
+        result: IrType::TObject,
+        body: IrBody {
+            stmts: vec![IrStmt::VDecl {
+                x: 1,
+                ty: IrType::Tagged,
+                expr: IrExpr::Lit(IrLit::Num(IrNat::Small(value))),
+            }],
+            ..ret(1)
+        },
+        sorry_dep: None,
+    };
+    let emit = |value, change_identities| {
+        let mut declarations = vec![
+            identity("freshNat", IrType::TObject, true),
+            identity("freshText", IrType::Object, false),
+            wrapper("freshNat", IrType::TObject, true),
+            wrapper("freshText", IrType::Object, false),
+            answer(value),
+        ];
+        if change_identities {
+            for declaration in &mut declarations {
+                if let IrDecl::Function { name, body, .. } = declaration {
+                    let literal = if *name == n("freshNat") {
+                        Some((IrType::Tagged, IrLit::Num(IrNat::Small(99))))
+                    } else if *name == n("freshText") {
+                        Some((IrType::Object, IrLit::Str("changed IR".into())))
+                    } else {
+                        None
+                    };
+                    if let Some((ty, literal)) = literal {
+                        *body = IrBody {
+                            stmts: vec![IrStmt::VDecl {
+                                x: 2,
+                                ty,
+                                expr: IrExpr::Lit(literal),
+                            }],
+                            ..ret(2)
+                        };
+                    }
+                }
+            }
+        }
+        let encoded = encode_ir(
+            IrWriteInput {
+                module: ModuleWriteInput {
+                    is_module: module.is_module,
+                    imports: &module.imports,
+                    constants: &[],
+                    extra_const_names: &extra_names,
+                },
+                declarations: &declarations,
+                initializers: &[],
+                additional_extensions: &additional,
+            },
+            OleanWriteHeader {
+                version: view.header.version,
+                flags: view.header.flags,
+                lean_version: &view.header.lean_version,
+                githash: &view.header.githash,
+                base_addr: view.header.base_addr,
+            },
+            IrWriteLimits::default(),
+        )
+        .unwrap();
+        declarations.sort_by(|a, b| a.name().quick_cmp(b.name()));
+        (encoded.bytes, declarations)
+    };
+    let (bytes, declarations) = emit(42, false);
+    std::fs::write(dir.join("FreshIrProbe.ir"), &bytes).unwrap();
+    let printed = Command::new(&lean)
+        .arg("--run")
+        .arg(fln_core::checked_workspace_root!().join("scripts/tribunal/ir_dump.lean"))
+        .arg(dir.join("FreshIrProbe.ir"))
+        .output()
+        .unwrap();
+    std::fs::write(dir.join("fresh.irdump"), &printed.stdout).unwrap();
+    assert!(
+        printed.status.success(),
+        "Reference IR reader: {}",
+        String::from_utf8_lossy(&printed.stderr)
+    );
+    let printed = String::from_utf8(printed.stdout).unwrap();
+    assert_eq!(
+        printed
+            .lines()
+            .filter(|line| !line.starts_with('#'))
+            .collect::<Vec<_>>(),
+        declarations.iter().map(spell_decl).collect::<Vec<_>>()
+    );
+
+    // Keep the original logical consumer, which can unfold the imported
+    // identity. IR evaluation needs the module system's compile-time import
+    // phase: Environment.ImportedModule.interpData? selects a different data
+    // source for a legacy runtime-only import. The body-mutation controls below
+    // must demonstrate that this consumer actually uses the emitted companion.
+    std::fs::write(
+        dir.join("ProofConsumer.lean"),
+        "import FreshIrProbe\nexample : freshNat 7 = 7 := rfl\n",
+    )
+    .unwrap();
+    let proof = Command::new(&lean)
+        .current_dir(&dir)
+        .env("LEAN_PATH", &dir)
+        .arg("ProofConsumer.lean")
+        .output()
+        .unwrap();
+    assert!(
+        proof.status.success(),
+        "logical consumer: {}{}",
+        String::from_utf8_lossy(&proof.stdout),
+        String::from_utf8_lossy(&proof.stderr)
+    );
+    std::fs::write(dir.join("Consumer.lean"),
+        "module\nmeta import FreshIrProbe\n#eval freshNat freshAnswer\n#eval freshText \"native IR\"\n").unwrap();
+    let consume = || {
+        Command::new(&lean)
+            .current_dir(&dir)
+            .env("LEAN_PATH", &dir)
+            .arg("Consumer.lean")
+            .output()
+            .unwrap()
+    };
+    let good = consume();
+    std::fs::write(dir.join("consumer.stdout"), &good.stdout).unwrap();
+    std::fs::write(dir.join("consumer.stderr"), &good.stderr).unwrap();
+    assert!(
+        good.status.success(),
+        "Reference consumer in {}: {}{}",
+        dir.display(),
+        String::from_utf8_lossy(&good.stdout),
+        String::from_utf8_lossy(&good.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(good.stdout)
+            .unwrap()
+            .lines()
+            .collect::<Vec<_>>(),
+        ["42", "\"native IR\""]
+    );
+
+    // A valid body mutation must reach evaluation; a test that accidentally
+    // consumes native code or the original IR would keep printing 42 here.
+    let (changed, _) = emit(43, false);
+    std::fs::write(dir.join("FreshIrProbe.ir"), &changed).unwrap();
+    let changed = consume();
+    std::fs::write(dir.join("changed.stdout"), &changed.stdout).unwrap();
+    assert!(changed.status.success());
+    assert_eq!(
+        String::from_utf8(changed.stdout)
+            .unwrap()
+            .lines()
+            .collect::<Vec<_>>(),
+        ["43", "\"native IR\""]
+    );
+    let (changed, _) = emit(42, true);
+    std::fs::write(dir.join("FreshIrProbe.ir"), &changed).unwrap();
+    let changed = consume();
+    std::fs::write(dir.join("changed-identities.stdout"), &changed.stdout).unwrap();
+    assert!(changed.status.success());
+    assert_eq!(
+        String::from_utf8(changed.stdout)
+            .unwrap()
+            .lines()
+            .collect::<Vec<_>>(),
+        ["99", "\"changed IR\""]
+    );
+    let mut corrupt = bytes.clone();
+    corrupt[0] ^= 0xff;
+    std::fs::write(dir.join("FreshIrProbe.ir"), &corrupt).unwrap();
+    let refused = consume();
+    std::fs::write(dir.join("corrupt.stdout"), &refused.stdout).unwrap();
+    std::fs::write(dir.join("corrupt.stderr"), &refused.stderr).unwrap();
+    assert!(
+        !refused.status.success(),
+        "corrupt IR must not be replaced by another execution path"
+    );
+    std::fs::write(dir.join("FreshIrProbe.ir"), &bytes).unwrap();
+}
+
+#[test]
 fn two_real_ir_files_decode_to_exactly_what_the_pin_prints() {
     for (module_path, bytes, pin_printout) in FIXTURES {
         let (blocks, listed) = open(bytes).expect("committed fixture opens");
