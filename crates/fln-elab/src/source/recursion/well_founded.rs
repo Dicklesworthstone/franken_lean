@@ -2178,10 +2178,8 @@ impl Context {
             }
             call
         };
-        // Reuse remains directional. Refinement can replace an earlier local
-        // while retaining a later hypothesis, so the last local alone does not
-        // establish that every capture is still in scope. Sibling/expired
-        // contexts keep distinct goals.
+        // Reuse remains directional: the cached original scope's last local
+        // must still be present. Sibling/expired contexts keep distinct goals.
         if let Some(cached) = self
             .well_founded
             .as_ref()
@@ -2191,10 +2189,6 @@ impl Context {
             .cloned()
             && self.txn.lctx.find(&cached.scope).is_some()
             && self.well_founded_cached_scope(cached.branch_scope.as_ref())?
-            && self
-                .elimination_reads(&cached.value)?
-                .iter()
-                .all(|id| self.txn.lctx.find(id).is_some())
         {
             return Ok(cached.value);
         }

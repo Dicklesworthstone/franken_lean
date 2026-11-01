@@ -3825,10 +3825,28 @@ impl Context {
                             }
                             tactics::ProofAction::MatchTerm { syntax, goal } => {
                                 self.txn.lctx = goal.lctx.clone();
-                                self.check_application_typing(syntax, &goal.target)?;
-                                let expected = Some(goal.target.clone());
+                                let mut expected = self.instantiate(&goal.target)?;
+                                let mut head = &expected;
+                                while let ExprNode::App { f, .. } = head.node() {
+                                    self.tick()?;
+                                    head = f;
+                                }
+                                if matches!(head.node(), ExprNode::MVar { .. }) {
+                                    // The pin gives an unresolved match result a fresh
+                                    // branch-local type proxy (`elabMatchAltView`). Relate
+                                    // it before visiting the body so numeric elaboration
+                                    // does not compare sibling scopes directly. Preserve
+                                    // the original sort and the final branch comparison.
+                                    let sort = self.known_type(&expected)?.ok_or_else(|| {
+                                        failure(SourceInferenceError::ExpectedType)
+                                    })?;
+                                    let proxy = self.hole(sort)?;
+                                    self.constrain(&proxy, &expected)?;
+                                    expected = proxy;
+                                }
+                                self.check_application_typing(syntax, &expected)?;
                                 tasks.push(Task::MatchTerm(proof, goal));
-                                tasks.push(Task::Visit(syntax, expected, true));
+                                tasks.push(Task::Visit(syntax, Some(expected), true));
                             }
                             tactics::ProofAction::Term {
                                 syntax,
