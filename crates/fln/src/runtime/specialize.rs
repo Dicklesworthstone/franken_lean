@@ -1,9 +1,10 @@
 //! Post-admission monomorphization of type arguments and concrete dictionaries.
 //!
 //! Derived names never enter the logical environment. Dictionary selection is
-//! permitted only for closed constructor values with inert fields, and runtime
-//! beta reduction introduces strict lets: it never duplicates or drops an
-//! action. Both the original theorem checking and FIR validation remain intact.
+//! permitted only for closed constructor values with inert fields. Runtime
+//! beta reduction shares used arguments through strict lets and discards unused
+//! literal-lambda arguments as at the pin. Theorem checking and FIR validation
+//! remain intact.
 mod arguments;
 mod heads;
 mod imported_lists;

@@ -151,7 +151,7 @@ impl Preparation<'_> {
         let mut type_ = args[parameters + selected].clone();
         for arg in &args[arity - 1 - rec.num_indices as usize..arity] {
             self.tick()?;
-            type_ = self.minor_apply(type_, arg.clone())?;
+            type_ = self.minor_apply(type_, arg.clone(), nat::MinorApplication::Strict)?;
         }
         let type_ = self.erase_runtime_type(&type_)?;
         if rec.all.len() == 1

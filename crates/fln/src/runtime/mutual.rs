@@ -22,9 +22,8 @@ pub(super) struct Member {
 }
 
 pub(super) struct Group {
-    // A native auxiliary (for example Array) has no constructor-object
-    // layout. An ordinary case needs only the selected layout; a fold needs
-    // every member and must refuse a missing one.
+    // A native auxiliary has no constructor-object layout. An ordinary
+    // case needs the selected layout; a fold needs every member's layout.
     shapes: Vec<Option<records::Shape>>,
     families: Vec<Expr>,
     selected: usize,
@@ -202,6 +201,16 @@ impl Preparation<'_> {
             return Err(unsupported("runtime mutual case name collision"));
         }
         let major = Expr::bvar(0).map_err(|_| unsupported("mutual major scope"))?;
+        // Only the synthetic IH probes of unindexed nested cases expose
+        // literal aliases. Real fields, indices and fold arguments retain
+        // their prepared stages and once-only computations.
+        let application = if rec.num_motives as usize > rec.all.len()
+            && group.indices.iter().all(Vec::is_empty)
+        {
+            nat::MinorApplication::UnindexedCase
+        } else {
+            nat::MinorApplication::Strict
+        };
         let mut branches = Vec::new();
         let mut constructors = Vec::new();
         for (index, ctor) in shape.constructors.iter().enumerate() {
@@ -224,7 +233,7 @@ impl Preparation<'_> {
             }
             for marker in hypotheses {
                 self.tick()?;
-                body = self.minor_apply(body, Expr::fvar(marker))?;
+                body = self.minor_apply(body, Expr::fvar(marker), application)?;
             }
             // A retained marker means this is a fold, not a plain case split.
             // It must use the recursive lowering, never a made-up IH value.

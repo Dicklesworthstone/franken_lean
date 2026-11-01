@@ -69,7 +69,7 @@ fn literal_beta_gaps_match_preparation_without_discarding_strict_operands() {
     let environment = Environment::new();
     let mut preparation = Preparation::new(&environment, IngressLimits::default());
     let unused = lam(lam(b(0)));
-    for argument in [b(0), nat::literal(7)] {
+    for argument in [b(0), nat::literal(7), Expr::app(constant("spend"), b(0))] {
         let input = alias(Expr::app(unused.clone(), argument));
         assert_eq!(
             preparation.administrative_callable_gap(&input).unwrap(),
@@ -77,7 +77,15 @@ fn literal_beta_gaps_match_preparation_without_discarding_strict_operands() {
         );
     }
     for input in [
-        alias(Expr::app(unused, Expr::app(constant("spend"), b(0)))),
+        alias(Expr::app(
+            local(
+                "paid",
+                constant("Nat"),
+                Expr::app(constant("spend"), b(0)),
+                lam(lam(Expr::app(Expr::app(constant("Nat.add"), b(0)), b(2)))),
+            ),
+            nat::literal(7),
+        )),
         alias(Expr::app(lam(lam(b(1))), b(0))),
         alias(Expr::app(constant("computeCallback"), b(0))),
     ] {
@@ -86,7 +94,7 @@ fn literal_beta_gaps_match_preparation_without_discarding_strict_operands() {
                 .administrative_callable_gap(&input)
                 .unwrap()
                 .is_none(),
-            "a computed operand, used slot, or named factory retains its stage: {input:?}"
+            "a computed callee, used slot, or named factory retains its stage: {input:?}"
         );
     }
 }

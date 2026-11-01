@@ -309,6 +309,21 @@ fn recursive_local_closures_discard_unused_values_and_share_used_values() {
                 "shared argument\n",
                 10,
             ),
+            (
+                r#"#eval ((fun (_x : Nat) => fun n : Nat => n) (dbg_trace "unused callback argument"; 5)) 42"#,
+                "",
+                42,
+            ),
+            (
+                r#"#eval ((fun (x : Nat) => fun n : Nat => n + x + x) (dbg_trace "shared callback argument"; 5)) 32"#,
+                "shared callback argument\n",
+                42,
+            ),
+            (
+                r#"#eval ((let paid : Nat := dbg_trace "callee prefix"; 5; fun (_x : Nat) => fun n : Nat => n + paid) (dbg_trace "unused callback operand"; 5)) 37"#,
+                "callee prefix\n",
+                42,
+            ),
         ] {
             check(
                 engine,

@@ -233,10 +233,18 @@ impl Preparation<'_> {
                     }
                 }
                 for (marker, _, _) in &hypotheses {
-                    body = self.minor_apply(body, Expr::fvar(marker.clone()))?;
+                    body = self.minor_apply(
+                        body,
+                        Expr::fvar(marker.clone()),
+                        nat::MinorApplication::Strict,
+                    )?;
                 }
                 for argument in (0..extra).rev() {
-                    body = self.minor_apply(body, variable(argument + 1)?)?;
+                    body = self.minor_apply(
+                        body,
+                        variable(argument + 1)?,
+                        nat::MinorApplication::Strict,
+                    )?;
                 }
                 // A sibling may have a different result or accumulator
                 // telescope. Use its interface, and share only the IHs that

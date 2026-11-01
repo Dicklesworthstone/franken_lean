@@ -93,9 +93,8 @@ impl Preparation<'_> {
                         };
                         Some(shape)
                     }
-                    // Preserve the checked native representation. This member
-                    // may supply an unused IH to an ordinary case, but cannot
-                    // be projected or folded as a constructor object.
+                    // Retain the checked native representation; it cannot be
+                    // projected or folded as a constructor object.
                     Some(_) => None,
                     None => return Ok(None),
                 };

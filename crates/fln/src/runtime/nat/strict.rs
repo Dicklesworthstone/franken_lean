@@ -16,7 +16,7 @@ fn local(label: &str, value: Expr, body: Expr) -> Expr {
 fn prepare(function: Expr, argument: Expr) -> Expr {
     let environment = Environment::new();
     Preparation::new(&environment, IngressLimits::default())
-        .minor_apply(function, argument)
+        .minor_apply(function, argument, MinorApplication::Strict)
         .unwrap()
 }
 
@@ -91,7 +91,11 @@ fn deep_let_spines_are_heap_backed_and_refuse_exhausted_budgets() {
                 ..IngressLimits::default()
             };
             assert!(matches!(
-                Preparation::new(&environment, small).minor_apply(function.clone(), literal(42)),
+                Preparation::new(&environment, small).minor_apply(
+                    function.clone(),
+                    literal(42),
+                    MinorApplication::Strict
+                ),
                 Err(IngressError::ResourceLimit { .. })
             ));
             let no_work = IngressLimits {
@@ -99,7 +103,11 @@ fn deep_let_spines_are_heap_backed_and_refuse_exhausted_budgets() {
                 ..IngressLimits::default()
             };
             assert!(matches!(
-                Preparation::new(&environment, no_work).minor_apply(function.clone(), literal(42)),
+                Preparation::new(&environment, no_work).minor_apply(
+                    function.clone(),
+                    literal(42),
+                    MinorApplication::Strict
+                ),
                 Err(IngressError::ResourceLimit { .. })
             ));
             let mut result = prepare(function, literal(42));

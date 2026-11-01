@@ -21,6 +21,12 @@ struct Motive {
     result_type: Expr,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum MinorApplication {
+    Strict,
+    UnindexedCase,
+}
+
 pub(super) fn literal(value: u64) -> Expr {
     Expr::lit(Literal::Nat(NatLit::from_u64(value)))
 }
@@ -206,8 +212,10 @@ impl Preparation<'_> {
     pub(super) fn minor_apply(
         &mut self,
         mut function: Expr,
-        mut argument: Expr,
+        argument: Expr,
+        application: MinorApplication,
     ) -> Result<Expr, IngressError> {
+        let mut argument = Some(argument);
         let mut bindings = Vec::new();
         let mut result = loop {
             self.tick()?;
@@ -220,18 +228,58 @@ impl Preparation<'_> {
                     body,
                     non_dep,
                 } => {
+                    // A checked annotation can bind a literal callback and
+                    // apply it in the body. Expose that value before carrying
+                    // a synthetic IH through the alias's application spine.
+                    // Computed initializers keep the strict binding below.
+                    if application == MinorApplication::UnindexedCase
+                        && let Some(literal) = self.inert_callable(value)?
+                    {
+                        let literal = self.annotate_callable_tail(&literal, type_)?;
+                        function = self.substitution(body, &literal)?;
+                        continue;
+                    }
                     // (let x := v; f) a = let x := v; f (lift a).
                     // Substituting v instead can discard an initializer, run it
                     // repeatedly, or move it after the application argument.
                     reserve(&mut bindings, self.limits.max_context_depth)?;
                     bindings.push((decl_name.clone(), type_.clone(), value.clone(), *non_dep));
-                    argument = self.lift(&argument, 1)?;
+                    if let Some(pending) = &mut argument {
+                        *pending = self.lift(pending, 1)?;
+                    }
                     function = body.clone();
                 }
-                ExprNode::Lam { body, .. } => break self.substitution(body, &argument)?,
-                _ => break Expr::app(function, argument),
+                ExprNode::Lam { body, .. } => {
+                    let Some(pending) = argument.take() else {
+                        break function;
+                    };
+                    // Substitution can expose the literal helper only after
+                    // the final IH is supplied. Finish its head reduction
+                    // before deciding whether a symbolic IH remains live.
+                    function = self.substitution(body, &pending)?;
+                }
+                ExprNode::App { .. } => {
+                    // A selected minor can still be a literal helper applied
+                    // to its callback. Reuse beta preparation while preserving
+                    // strict producer prefixes and callable type anchors.
+                    let (head, args) = self.spine(&function)?;
+                    if !matches!(head.node(), ExprNode::Lam { .. } | ExprNode::LetE { .. }) {
+                        break function;
+                    }
+                    let Some(reduced) = self.static_apply(&head, &args)? else {
+                        break function;
+                    };
+                    if reduced == function {
+                        break function;
+                    }
+                    function = self.inert_callable(&reduced)?.unwrap_or(reduced);
+                }
+                _ => break function,
             }
         };
+        if let Some(pending) = argument {
+            result = Expr::app(result, pending);
+        }
         for (name, type_, value, nondep) in bindings.into_iter().rev() {
             self.tick()?;
             result = Expr::let_e(name, type_, value, result, nondep);
@@ -277,12 +325,16 @@ impl Preparation<'_> {
         let major = variable(extra)?;
         let predecessor = self.nat_predecessor(major.clone())?;
         let hypothesis = Expr::app(variable(extra + 1)?, Expr::fvar(predecessor_marker.clone()));
-        step = self.minor_apply(step, Expr::fvar(predecessor_marker.clone()))?;
-        step = self.minor_apply(step, Expr::fvar(marker.clone()))?;
+        step = self.minor_apply(
+            step,
+            Expr::fvar(predecessor_marker.clone()),
+            MinorApplication::Strict,
+        )?;
+        step = self.minor_apply(step, Expr::fvar(marker.clone()), MinorApplication::Strict)?;
         for index in (0..extra).rev() {
             let argument = variable(index)?;
-            zero = self.minor_apply(zero, argument.clone())?;
-            step = self.minor_apply(step, argument)?;
+            zero = self.minor_apply(zero, argument.clone(), MinorApplication::Strict)?;
+            step = self.minor_apply(step, argument, MinorApplication::Strict)?;
         }
         let body = step
             .lift_loose(0, 1)
@@ -514,6 +566,200 @@ mod tests {
         .unwrap()
         .into_complete()
         .unwrap()
+    }
+
+    #[test]
+    fn applied_literal_minors_discard_only_unused_hypotheses_and_keep_strict_prefixes() {
+        let engine = seeded_engine();
+        let natural = scalar(ValueType::Nat).unwrap();
+        let function_type = Expr::forall_e(
+            Name::anonymous(),
+            natural.clone(),
+            natural.clone(),
+            BinderInfo::Default,
+        );
+        let identity = Expr::lam(
+            name("minor"),
+            function_type,
+            variable(0).unwrap(),
+            BinderInfo::Default,
+        );
+        let marker = Expr::fvar(FVarId(name("symbolicIH")));
+        for used in [false, true] {
+            let minor = Expr::lam(
+                name("ih"),
+                natural.clone(),
+                if used {
+                    variable(0).unwrap()
+                } else {
+                    literal(42)
+                },
+                BinderInfo::Default,
+            );
+            let applied = Expr::app(identity.clone(), minor);
+            let expected = if used { marker.clone() } else { literal(42) };
+            let mut preparation = Preparation::new(engine.environment(), IngressLimits::default());
+            assert_eq!(
+                preparation
+                    .minor_apply(applied.clone(), marker.clone(), MinorApplication::Strict)
+                    .unwrap(),
+                expected
+            );
+            let initializer = call("observableInitializer", []);
+            let strict = Expr::let_e(
+                name("prefix"),
+                natural.clone(),
+                initializer.clone(),
+                applied,
+                false,
+            );
+            let reduced = preparation
+                .minor_apply(strict, marker.clone(), MinorApplication::Strict)
+                .unwrap();
+            assert_eq!(
+                reduced,
+                Expr::let_e(
+                    name("prefix"),
+                    natural.clone(),
+                    initializer,
+                    expected,
+                    false,
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn final_minor_arguments_expose_literal_helpers_without_erasing_live_hypotheses() {
+        let engine = seeded_engine();
+        let natural = scalar(ValueType::Nat).unwrap();
+        let marker = Expr::fvar(FVarId(name("symbolicIH")));
+        for used in [false, true] {
+            let helper = Expr::lam(
+                name("value"),
+                natural.clone(),
+                if used {
+                    variable(0).unwrap()
+                } else {
+                    literal(42)
+                },
+                BinderInfo::Default,
+            );
+            let minor = Expr::lam(
+                name("ih"),
+                natural.clone(),
+                Expr::app(helper, variable(0).unwrap()),
+                BinderInfo::Default,
+            );
+            for strict in [false, true] {
+                let initializer = call("observableInitializer", []);
+                let input = if strict {
+                    Expr::let_e(
+                        name("prefix"),
+                        natural.clone(),
+                        initializer.clone(),
+                        minor.clone(),
+                        false,
+                    )
+                } else {
+                    minor.clone()
+                };
+                let mut preparation =
+                    Preparation::new(engine.environment(), IngressLimits::default());
+                let result = preparation
+                    .minor_apply(input, marker.clone(), MinorApplication::Strict)
+                    .unwrap();
+                let value = if strict {
+                    let ExprNode::LetE { value, body, .. } = result.node() else {
+                        panic!("the computed prefix remains strict")
+                    };
+                    assert_eq!(*value, initializer);
+                    body
+                } else {
+                    &result
+                };
+                assert_eq!(value.has_fvar(), used, "{value:?}");
+                if !used {
+                    assert_eq!(*value, literal(42));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn typed_minor_aliases_discard_only_unused_hypotheses_and_preserve_strict_prefixes() {
+        let engine = seeded_engine();
+        let natural = scalar(ValueType::Nat).unwrap();
+        let function_type = Expr::forall_e(
+            Name::anonymous(),
+            natural.clone(),
+            natural.clone(),
+            BinderInfo::Default,
+        );
+        let marker = Expr::fvar(FVarId(name("symbolicIH")));
+        for used in [false, true] {
+            let minor = Expr::lam(
+                name("ih"),
+                natural.clone(),
+                if used {
+                    variable(0).unwrap()
+                } else {
+                    literal(42)
+                },
+                BinderInfo::Default,
+            );
+            let alias = Expr::let_e(
+                name("minor"),
+                function_type.clone(),
+                minor,
+                variable(0).unwrap(),
+                false,
+            );
+            let expected = if used { marker.clone() } else { literal(42) };
+            let mut preparation = Preparation::new(engine.environment(), IngressLimits::default());
+            let staged = preparation
+                .minor_apply(alias.clone(), marker.clone(), MinorApplication::Strict)
+                .unwrap();
+            assert!(staged.has_fvar(), "strict lowering keeps the alias stage");
+            assert_eq!(
+                preparation
+                    .minor_apply(
+                        alias.clone(),
+                        marker.clone(),
+                        MinorApplication::UnindexedCase
+                    )
+                    .unwrap(),
+                expected
+            );
+            let initializer = call("observableInitializer", []);
+            let strict = Expr::let_e(
+                name("prefix"),
+                natural.clone(),
+                initializer.clone(),
+                alias,
+                false,
+            );
+            let staged = preparation
+                .minor_apply(strict.clone(), marker.clone(), MinorApplication::Strict)
+                .unwrap();
+            let ExprNode::LetE { value, body, .. } = staged.node() else {
+                panic!("strict lowering retains the producer prefix")
+            };
+            assert_eq!(*value, initializer);
+            assert!(body.has_fvar(), "strict lowering keeps the alias stage");
+            assert_eq!(
+                preparation
+                    .minor_apply(strict, marker.clone(), MinorApplication::UnindexedCase)
+                    .unwrap(),
+                Expr::let_e(
+                    name("prefix"),
+                    natural.clone(),
+                    initializer,
+                    expected,
+                    false,
+                )
+            );
+        }
     }
 
     #[test]

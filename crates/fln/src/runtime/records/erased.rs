@@ -113,7 +113,7 @@ impl Preparation<'_> {
             Some(false) => field,
             None => return Err(unsupported("constructor minor field metadata")),
         };
-        self.minor_apply(minor, argument)
+        self.minor_apply(minor, argument, nat::MinorApplication::Strict)
     }
 
     pub(in crate::runtime) fn enable_boxed_type(&mut self) -> Result<Expr, IngressError> {
