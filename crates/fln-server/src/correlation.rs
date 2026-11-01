@@ -39,6 +39,10 @@ pub struct CorrelationStats {
     pub no_information_query_results: u64,
     pub semantic_query_results: u64,
     pub semantic_query_errors: u64,
+    pub rpc_connect_results: u64,
+    pub rpc_call_results: u64,
+    pub rpc_errors: u64,
+    /// RequestFailed RPC responses, including semantic-provider refusals.
     pub rpc_unsupported_errors: u64,
     pub unknown_method_not_found_errors: u64,
     pub cancellation_target_id_bytes: u64,
@@ -57,6 +61,8 @@ enum RequestContract {
     Hover,
     Completion,
     Definition,
+    RpcConnect,
+    RpcCall(crate::json::RpcProcedure),
     UnsupportedRpc,
     UnknownMethod,
 }
@@ -72,7 +78,8 @@ impl RequestContract {
             "textDocument/completion" => Self::Completion,
             "textDocument/definition" => Self::Definition,
             "$/lean/plainTermGoal" => Self::PlainTermGoal,
-            "$/lean/rpc/connect" | "$/lean/rpc/call" => Self::UnsupportedRpc,
+            "$/lean/rpc/connect" => Self::RpcConnect,
+            "$/lean/rpc/call" => Self::UnsupportedRpc,
             _ => Self::UnknownMethod,
         }
     }
@@ -87,6 +94,8 @@ impl RequestContract {
             Self::Hover => "hover",
             Self::Completion => "completion",
             Self::Definition => "definition",
+            Self::RpcConnect => "rpc-connect",
+            Self::RpcCall(_) => "rpc-call",
             Self::UnsupportedRpc => "unsupported-rpc",
             Self::UnknownMethod => "unknown-method",
         }
@@ -137,6 +146,9 @@ enum MethodResponseClass {
     NoInformationQueryResult,
     SemanticQueryResult,
     SemanticQueryError,
+    RpcConnectResult,
+    RpcCallResult,
+    RpcError,
     RpcUnsupportedError,
     UnknownMethodNotFoundError,
 }
@@ -151,6 +163,9 @@ struct MethodResponseStats {
     no_information_query_results: u64,
     semantic_query_results: u64,
     semantic_query_errors: u64,
+    rpc_connect_results: u64,
+    rpc_call_results: u64,
+    rpc_errors: u64,
     rpc_unsupported_errors: u64,
     unknown_method_not_found_errors: u64,
 }
@@ -192,6 +207,13 @@ impl MethodResponseStats {
             MethodResponseClass::SemanticQueryError => {
                 Self::bump(&mut self.semantic_query_errors, "semantic-query error")
             }
+            MethodResponseClass::RpcConnectResult => {
+                Self::bump(&mut self.rpc_connect_results, "RPC connect result")
+            }
+            MethodResponseClass::RpcCallResult => {
+                Self::bump(&mut self.rpc_call_results, "RPC call result")
+            }
+            MethodResponseClass::RpcError => Self::bump(&mut self.rpc_errors, "RPC error"),
             MethodResponseClass::RpcUnsupportedError => Self::bump(
                 &mut self.rpc_unsupported_errors,
                 "unsupported-RPC RequestFailed",
@@ -208,7 +230,9 @@ impl MethodResponseStats {
             .checked_add(self.shutdown_results)?
             .checked_add(self.diagnostic_wait_results)?
             .checked_add(self.no_information_query_results)?
-            .checked_add(self.semantic_query_results)
+            .checked_add(self.semantic_query_results)?
+            .checked_add(self.rpc_connect_results)?
+            .checked_add(self.rpc_call_results)
     }
 
     fn error_total(self) -> Option<u64> {
@@ -216,7 +240,8 @@ impl MethodResponseStats {
             .checked_add(self.diagnostic_wait_failed_errors)?
             .checked_add(self.rpc_unsupported_errors)?
             .checked_add(self.unknown_method_not_found_errors)?
-            .checked_add(self.semantic_query_errors)
+            .checked_add(self.semantic_query_errors)?
+            .checked_add(self.rpc_errors)
     }
 
     fn total(self) -> Option<u64> {
@@ -304,6 +329,37 @@ fn client_request_ids_with_limits(
             )
         },
     )?;
+    // The transcript visitor deliberately retains no params. Read the already
+    // validated wire again, storing only the bounded procedure enum beside its
+    // canonical request ID. Unknown/ambiguous names remain refusal-only.
+    let mut input = Cursor::new(bytes);
+    while let Some(body) = crate::transport::read_message(&mut input)
+        .map_err(|error| format!("client RPC-contract transport failure: {error}"))?
+    {
+        let text = std::str::from_utf8(&body)
+            .map_err(|_| "client RPC-contract body is not UTF-8".to_owned())?;
+        let envelope = parse_envelope(text)
+            .map_err(|_| "client RPC-contract envelope is invalid".to_owned())?;
+        if !matches!(envelope.method, DecodedField::Valid(ref method) if method == "$/lean/rpc/call")
+        {
+            continue;
+        }
+        let RequestIdField::Valid(id) = envelope.id else {
+            continue;
+        };
+        let DecodedField::Valid(method) =
+            crate::json::object_string_member(envelope.params, "method")
+        else {
+            continue;
+        };
+        if let Some(procedure) = crate::json::RpcProcedure::for_name(&method) {
+            let request = requests
+                .frames
+                .get_mut(&id.as_json())
+                .ok_or_else(|| "client RPC call lost its indexed ID".to_owned())?;
+            request.request_contract = Some(RequestContract::RpcCall(procedure));
+        }
+    }
     Ok(requests)
 }
 
@@ -597,16 +653,49 @@ fn classify_method_response(
             format!("error code {code}"),
             "InvalidParams, RequestFailed, or RequestCancelled",
         ),
-        (RequestContract::UnsupportedRpc, ResponseShape::Error(REQUEST_FAILED_CODE)) => {
-            Ok(MethodResponseClass::RpcUnsupportedError)
+        (RequestContract::RpcConnect, ResponseShape::Result(value))
+            if crate::json::rpc_connect_result(value) =>
+        {
+            Ok(MethodResponseClass::RpcConnectResult)
+        }
+        (RequestContract::RpcCall(procedure), ResponseShape::Result(value))
+            if procedure.result(value) =>
+        {
+            Ok(MethodResponseClass::RpcCallResult)
+        }
+        (RequestContract::RpcConnect, ResponseShape::Result(value)) => mismatch(
+            result_kind(value).to_owned(),
+            "an RPC sessionId encoded as a UInt64 string",
+        ),
+        (RequestContract::RpcCall(_), ResponseShape::Result(value)) => mismatch(
+            result_kind(value).to_owned(),
+            "the requested native RPC procedure's typed result",
+        ),
+        (
+            RequestContract::RpcConnect
+            | RequestContract::RpcCall(_)
+            | RequestContract::UnsupportedRpc,
+            ResponseShape::Error(REQUEST_FAILED_CODE),
+        ) => Ok(MethodResponseClass::RpcUnsupportedError),
+        (RequestContract::RpcConnect, ResponseShape::Error(-32602 | -32800))
+        | (RequestContract::RpcCall(_), ResponseShape::Error(-32602 | -32800 | -32900))
+        | (
+            RequestContract::UnsupportedRpc,
+            ResponseShape::Error(-32601 | -32602 | -32800 | -32900),
+        ) => Ok(MethodResponseClass::RpcError),
+        (RequestContract::RpcConnect | RequestContract::RpcCall(_), ResponseShape::Error(code)) => {
+            mismatch(
+                format!("error code {code}"),
+                "a typed RPC parameter, session, cancellation or provider error",
+            )
         }
         (RequestContract::UnsupportedRpc, ResponseShape::Result(value)) => mismatch(
             result_kind(value).to_string(),
-            "RequestFailed because Lean RPC sessions are not implemented",
+            "a typed error for an unknown or malformed RPC procedure",
         ),
         (RequestContract::UnsupportedRpc, ResponseShape::Error(code)) => mismatch(
             format!("error code {code}"),
-            "RequestFailed because Lean RPC sessions are not implemented",
+            "a typed error for an unknown or malformed RPC procedure",
         ),
         (RequestContract::UnknownMethod, ResponseShape::Error(METHOD_NOT_FOUND_CODE)) => {
             Ok(MethodResponseClass::UnknownMethodNotFoundError)
@@ -859,6 +948,9 @@ pub fn correlate_transcripts(
         no_information_query_results: method_responses.no_information_query_results,
         semantic_query_results: method_responses.semantic_query_results,
         semantic_query_errors: method_responses.semantic_query_errors,
+        rpc_connect_results: method_responses.rpc_connect_results,
+        rpc_call_results: method_responses.rpc_call_results,
+        rpc_errors: method_responses.rpc_errors,
         rpc_unsupported_errors: method_responses.rpc_unsupported_errors,
         unknown_method_not_found_errors: method_responses.unknown_method_not_found_errors,
         cancellation_target_id_bytes: cancellations.id_bytes,
@@ -889,6 +981,7 @@ pub fn render_correlation(stats: CorrelationStats) -> String {
             "\"diagnosticWaitFailedErrors\":{},",
             "\"noInformationQueryResults\":{},",
             "\"semanticQueryResults\":{},\"semanticQueryErrors\":{},",
+            "\"rpcConnectResults\":{},\"rpcCallResults\":{},\"rpcErrors\":{},",
             "\"rpcUnsupportedErrors\":{},",
             "\"unknownMethodNotFoundErrors\":{},",
             "\"clientWireBytes\":{},\"serverWireBytes\":{},",
@@ -926,6 +1019,9 @@ pub fn render_correlation(stats: CorrelationStats) -> String {
         stats.no_information_query_results,
         stats.semantic_query_results,
         stats.semantic_query_errors,
+        stats.rpc_connect_results,
+        stats.rpc_call_results,
+        stats.rpc_errors,
         stats.rpc_unsupported_errors,
         stats.unknown_method_not_found_errors,
         stats.client.lifecycle.transcript.wire_bytes,
@@ -963,6 +1059,177 @@ mod tests {
         let mut framed = Vec::new();
         crate::transport::write_message(&mut framed, body.as_bytes()).unwrap();
         framed
+    }
+
+    // Wire fixtures exercise correlation only; native elaboration is checked by
+    // the real serve-lsp conversation separately.
+    fn rpc_pair(procedure: &str, response: &str) -> (Vec<u8>, Vec<u8>) {
+        let call = format!(
+            r#"{{"jsonrpc":"2.0","id":"call","method":"$/lean/rpc/call","params":{{"textDocument":{{"uri":"file:///A"}},"position":{{"line":0,"character":0}},"sessionId":"17","method":{},"params":{{"textDocument":{{"uri":"file:///A"}},"position":{{"line":0,"character":0}},"query":"P","msg":{{"text":"P"}}}}}}}}"#,
+            crate::json_string(procedure)
+        );
+        let client = framed(&[
+            r#"{"jsonrpc":"2.0","id":"init","method":"initialize","params":{}}"#,
+            r#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
+            r#"{"jsonrpc":"2.0","method":"textDocument/didOpen","params":{"textDocument":{"uri":"file:///A","version":1,"text":"x"}}}"#,
+            r#"{"jsonrpc":"2.0","id":"connect","method":"$/lean/rpc/connect","params":{"uri":"file:///A"}}"#,
+            &call,
+            r#"{"jsonrpc":"2.0","method":"$/lean/rpc/keepAlive","params":{"uri":"file:///A","sessionId":"17"}}"#,
+            r#"{"jsonrpc":"2.0","method":"$/lean/rpc/release","params":{"uri":"file:///A","sessionId":"17","refs":[]}}"#,
+            r#"{"jsonrpc":"2.0","method":"textDocument/didClose","params":{"textDocument":{"uri":"file:///A"}}}"#,
+            r#"{"jsonrpc":"2.0","id":"shutdown","method":"shutdown","params":null}"#,
+            r#"{"jsonrpc":"2.0","method":"exit","params":null}"#,
+        ]);
+        let server = framed(&[
+            r#"{"jsonrpc":"2.0","id":"init","result":{}}"#,
+            r#"{"jsonrpc":"2.0","id":"connect","result":{"sessionId":"17"}}"#,
+            response,
+            r#"{"jsonrpc":"2.0","id":"shutdown","result":null}"#,
+        ]);
+        (client, server)
+    }
+
+    #[test]
+    fn successful_rpc_conversations_are_correlated_by_procedure() {
+        for (procedure, value) in [
+            (
+                "Lean.Widget.getInteractiveGoals",
+                r#"{"goals":[{"hyps":[],"type":{"text":"P"},"ctx":{"p":"0"},"goalPrefix":"⊢ ","mvarId":"m"}]}"#,
+            ),
+            (
+                "Lean.Widget.getInteractiveTermGoal",
+                r#"{"hyps":[],"type":{"text":"P"},"ctx":{"__rpcref":"0"},"term":{"__rpcref":"1"},"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}}}"#,
+            ),
+            (
+                "Lean.Widget.getInteractiveDiagnostics",
+                r#"[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":1}},"severity":1,"message":{"text":"unknown identifier"}}]"#,
+            ),
+            ("Lean.Widget.highlightMatches", r#"{"text":"P"}"#),
+        ] {
+            let response = format!(r#"{{"jsonrpc":"2.0","id":"call","result":{value}}}"#);
+            let (client, server) = rpc_pair(procedure, &response);
+            let stats = correlate_transcripts(&client, &server).unwrap();
+            assert_eq!(stats.matched_responses, 4, "{procedure}");
+            assert_eq!(stats.method_contract_responses, 4);
+            assert_eq!(stats.server.result_responses, 4);
+            assert_eq!(stats.server.error_responses, 0);
+            assert_eq!(stats.rpc_connect_results, 1);
+            assert_eq!(stats.rpc_call_results, 1);
+        }
+    }
+
+    #[test]
+    fn rpc_result_shapes_and_decoded_procedure_names_cannot_be_interchanged() {
+        let procedure = "Lean.Widget.getInteractiveGoals";
+        for value in [
+            "{}",
+            "[]",
+            "1",
+            r#"{"goals":null}"#,
+            r#"{"goals":[],"go\u0061ls":[]}"#,
+            r#"{"goals":[{"hyps":[],"type":{"text":"P"},"ctx":{"p":0},"goalPrefix":"⊢ ","mvarId":"m"}]}"#,
+            r#"{"goals":[{"hyps":[],"type":{"text":"P"},"ctx":{"p":"0","__rpcref":"1"},"goalPrefix":"⊢ ","mvarId":"m"}]}"#,
+        ] {
+            let response = format!(r#"{{"jsonrpc":"2.0","id":"call","result":{value}}}"#);
+            let (client, server) = rpc_pair(procedure, &response);
+            assert!(correlate_transcripts(&client, &server).is_err(), "{value}");
+        }
+        let reply = r#"{"jsonrpc":"2.0","id":"call","result":{"goals":[]}}"#;
+        let (client, server) = rpc_pair(procedure, reply);
+        let client = String::from_utf8(client).unwrap();
+        // Frame bodies grow when escaped spellings are used, so reframe rather
+        // than altering bytes underneath an old Content-Length.
+        let mut reframed = Vec::new();
+        let mut input = Cursor::new(client.as_bytes());
+        while let Some(body) = crate::transport::read_message(&mut input).unwrap() {
+            let text = String::from_utf8(body)
+                .unwrap()
+                .replace("getInteractiveGoals", "getInteractiveGo\\u0061ls");
+            reframed.extend(frame(&text));
+        }
+        assert!(correlate_transcripts(&reframed, &server).is_ok());
+        for name in [
+            "Lean.Widget.getInteractiveDiagnostics",
+            "Lean.Widget.getInteractiveTermGoal",
+            "Lean.Widget.unknown",
+        ] {
+            let (client, server) = rpc_pair(name, reply);
+            assert!(correlate_transcripts(&client, &server).is_err(), "{name}");
+        }
+    }
+
+    #[test]
+    fn rpc_session_ids_are_lossless_and_typed_errors_are_never_empty_successes() {
+        for value in [
+            r#"{"sessionId":17}"#,
+            r#"{"sessionId":"18446744073709551616"}"#,
+            r#"{"sessionId":"-1"}"#,
+            r#"{"sessionId":"1","session\u0049d":"2"}"#,
+            "null",
+            "{}",
+        ] {
+            assert!(!crate::json::rpc_connect_result(value), "{value}");
+        }
+        assert!(crate::json::rpc_connect_result(
+            r#"{"sessionId":"18446744073709551615"}"#
+        ));
+        for code in [-32602, -32800, -32803, -32900] {
+            let reply = format!(
+                r#"{{"jsonrpc":"2.0","id":"call","error":{{"code":{code},"message":"refused"}}}}"#
+            );
+            let (client, server) = rpc_pair("Lean.Widget.getInteractiveGoals", &reply);
+            let stats = correlate_transcripts(&client, &server).unwrap();
+            assert_eq!(stats.rpc_call_results, 0);
+            assert_eq!(stats.server.error_responses, 1);
+            assert_eq!(stats.rpc_errors + stats.rpc_unsupported_errors, 1);
+        }
+        let reply = r#"{"jsonrpc":"2.0","id":"call","error":{"code":-32601,"message":"unknown"}}"#;
+        let (client, server) = rpc_pair("Lean.Widget.unknown", reply);
+        assert_eq!(
+            correlate_transcripts(&client, &server).unwrap().rpc_errors,
+            1
+        );
+        let (client, server) = rpc_pair("Lean.Widget.getInteractiveGoals", reply);
+        assert!(correlate_transcripts(&client, &server).is_err());
+        for name in [
+            "Lean.Widget.getInteractiveDiagnostics",
+            "Lean.Widget.highlightMatches",
+            "Lean.Widget.unknown",
+        ] {
+            let (client, server) = rpc_pair(name, r#"{"jsonrpc":"2.0","id":"call","result":null}"#);
+            assert!(correlate_transcripts(&client, &server).is_err(), "{name}");
+        }
+    }
+
+    #[test]
+    fn native_rpc_presentations_preserve_bounds_and_reject_conflicting_tags() {
+        use crate::json::RpcProcedure;
+        assert!(
+            RpcProcedure::Highlight
+                .result(r#"{"append":[{"text":"ab"},{"tag":["highlighted",{"text":"cd"}]}]}"#)
+        );
+        for value in [
+            r#"{"text":"x","append":[]}"#,
+            r#"{"tag":["unknown",{"text":"x"}]}"#,
+            r#"{"tag":["highlighted",null]}"#,
+            r#"{"text":1}"#,
+            r#"{"text":"x","te\u0078t":"y"}"#,
+        ] {
+            assert!(!RpcProcedure::Highlight.result(value), "{value}");
+        }
+        assert!(
+            !RpcProcedure::Highlight
+                .result(&format!(r#"{{"text":"{}"}}"#, "x".repeat(1024 * 1024)))
+        );
+        let nodes = format!(
+            r#"{{"append":[{}]}}"#,
+            vec![r#"{"text":"x"}"#; 4096].join(",")
+        );
+        assert!(!RpcProcedure::Highlight.result(&nodes));
+        let invalid_range = r#"[{"range":{"start":{"line":1,"character":0},"end":{"line":0,"character":0}},"message":{"text":"x"}}]"#;
+        assert!(!RpcProcedure::Diagnostics.result(invalid_range));
+        assert!(RpcProcedure::Goals.result("null"));
+        assert!(RpcProcedure::TermGoal.result("null"));
     }
 
     fn framed(bodies: &[&str]) -> Vec<u8> {
