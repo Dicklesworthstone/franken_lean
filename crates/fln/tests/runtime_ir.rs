@@ -50,6 +50,217 @@ fn cases() -> [(&'static str, &'static str, &'static str); 5] {
     ]
 }
 
+// Source type, body, downstream application, result type/value, source arity.
+fn export_cases() -> [(
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    &'static str,
+    usize,
+); 10] {
+    [
+        ("Nat", "42", "compiled", "Nat", "42", 0),
+        (
+            "String",
+            "\"source export\"",
+            "compiled",
+            "String",
+            "\"source export\"",
+            0,
+        ),
+        ("Nat -> Nat", "fun x => x", "compiled 42", "Nat", "42", 1),
+        (
+            "Nat -> Nat",
+            "fun x => x",
+            "compiled 184467440737095516160",
+            "Nat",
+            "184467440737095516160",
+            1,
+        ),
+        (
+            "String -> String",
+            "fun x => x",
+            "compiled \"caller string\"",
+            "String",
+            "\"caller string\"",
+            1,
+        ),
+        (
+            "(Nat -> String) -> Nat -> String",
+            "fun f x => f x",
+            "compiled (fun _ => \"caller callback\") 7",
+            "String",
+            "\"caller callback\"",
+            2,
+        ),
+        (
+            "Nat -> String",
+            "let saved := \"source capture\"; fun _ => saved",
+            "compiled 7",
+            "String",
+            "\"source capture\"",
+            1,
+        ),
+        (
+            "Nat -> Nat -> Nat",
+            "fun x _ => x",
+            "compiled 184467440737095516160 5",
+            "Nat",
+            "184467440737095516160",
+            2,
+        ),
+        (
+            "Nat -> Nat",
+            "fun x => x",
+            "(fun (f : Nat -> Nat) => f 42) compiled",
+            "Nat",
+            "42",
+            1,
+        ),
+        (
+            "Nat -> Nat -> String",
+            "fun _ => let saved := \"partial capture\"; fun _ => saved",
+            "let f := compiled 7; f 9",
+            "String",
+            "\"partial capture\"",
+            2,
+        ),
+    ]
+}
+
+fn checked_definition(base: &Engine, source: &str) -> (fln::Declaration, Engine) {
+    let checked = base
+        .check_source_files(
+            &[source.as_bytes()],
+            &KVMap::new(),
+            fln::SourceCheckLimits::new(EngineAdmissionLimits::new(limits().kernel)),
+        )
+        .unwrap_or_else(|e| panic!("{source}: {e:?}"))
+        .into_complete()
+        .unwrap();
+    let environment = checked.engine.environment();
+    let fln::ConstantInfo::Defn(definition) = environment.find(&name("compiled")).unwrap() else {
+        panic!("source definition")
+    };
+    (fln::Declaration::Defn(definition.clone()), checked.engine)
+}
+
+#[test]
+fn source_exports_keep_source_arguments_and_compile_without_execution() {
+    let base = base();
+    let options = KVMap::new();
+    let original = base.logical_root(&options);
+    for (ty, expression, application, result_type, expected, arity) in export_cases() {
+        let source = format!("def compiled : {ty} := {expression}");
+        let (declaration, checked) = checked_definition(&base, &source);
+        let mut no_execution = limits();
+        no_execution.vm.max_steps = 0;
+        let compiled = ir::compile_source_definition(
+            &base,
+            declaration.clone(),
+            &options,
+            no_execution,
+            CompileLimits::default(),
+        )
+        .unwrap_or_else(|e| panic!("{source}: {e:?}"))
+        .into_complete()
+        .unwrap();
+        assert_eq!(compiled.entry, name("compiled"));
+        assert_eq!(
+            compiled.admission.result_logical_root,
+            checked.logical_root(&options)
+        );
+        let public = compiled
+            .module
+            .decls
+            .iter()
+            .find(|d| d.name() == &name("compiled"))
+            .unwrap();
+        let IrDecl::Function { params, .. } = public else {
+            panic!("source function entry")
+        };
+        assert_eq!(params.len(), arity, "{source}");
+        assert!(params.iter().all(|p| !p.borrow));
+        let source = format!("def result : {result_type} := {application}");
+        let executed = checked
+            .execute_source_definitions(&[source.as_bytes()], &options, limits())
+            .unwrap_or_else(|e| panic!("{source}: {e:?}"))
+            .into_complete()
+            .unwrap();
+        let VmExit::Returned(value) = &executed.executions[0].exit else {
+            panic!("native source application")
+        };
+        if result_type == "Nat" {
+            assert_eq!(
+                fln_vm::interpreter::nat_decimal(&value.value).as_deref(),
+                Some(expected)
+            );
+        } else {
+            let string = value.value.try_string_view().unwrap();
+            assert_eq!(
+                &string.3[..string.0 - 1],
+                expected.trim_matches('"').as_bytes()
+            );
+        }
+        assert!(matches!(
+            ir::compile_source_definition(
+                &base,
+                declaration,
+                &options,
+                no_execution,
+                CompileLimits {
+                    max_work: 0,
+                    ..CompileLimits::default()
+                },
+            ),
+            Err(ir::DefinitionCompileError::Ir(ir::CompileError::Limit))
+        ));
+        assert_eq!(base.logical_root(&options), original);
+    }
+    for source in [
+        "def compiled (x : Nat) (_h : x = x) : Nat := x",
+        "def compiled {A : Type} (x : A) : A := x",
+        "universe u\ndef compiled {A : Type u} (x : A) : A := x",
+        "def compiled : Bool -> Bool := fun x => x",
+    ] {
+        let (declaration, _) = checked_definition(&base, source);
+        assert!(
+            matches!(
+                ir::compile_source_definition(
+                    &base,
+                    declaration,
+                    &options,
+                    limits(),
+                    CompileLimits::default(),
+                ),
+                Err(ir::DefinitionCompileError::Ir(
+                    ir::CompileError::Unsupported { .. }
+                ))
+            ),
+            "{source}"
+        );
+        assert_eq!(base.logical_root(&options), original);
+    }
+    let (fln::Declaration::Defn(mut wrong), _) =
+        checked_definition(&base, "def compiled : Nat := 42")
+    else {
+        panic!("ordinary definition")
+    };
+    wrong.value = fln_core::expr::Expr::lit(fln_core::expr::Literal::Str("not a Nat".into()));
+    assert!(matches!(
+        ir::compile_source_definition(
+            &base,
+            fln::Declaration::Defn(wrong),
+            &options,
+            limits(),
+            CompileLimits::default(),
+        ),
+        Err(ir::DefinitionCompileError::Engine(_))
+    ));
+    assert_eq!(base.logical_root(&options), original);
+}
+
 // Valid FIR permits a borrowed argument to alias a consumed argument. Unlike
 // source parameters (normally borrowed), this exercises that mixed contract
 // directly, with a freshly allocated closure whose last owner is transferred.
@@ -667,5 +878,164 @@ fn the_pin_executes_native_compiler_output_and_observes_changed_bodies() {
             assert_eq!(String::from_utf8(changed.stdout).unwrap().trim(), wanted);
         }
         std::fs::write(dir.join("NativeIrCase.ir"), bytes).unwrap();
+    }
+}
+
+#[test]
+fn the_pin_calls_native_source_exports_directly_and_as_functions() {
+    let Some(lean) = reference() else {
+        assert!(
+            std::env::var_os("FLN_REQUIRE_REFERENCE").is_none(),
+            "pinned Reference is required"
+        );
+        eprintln!("SKIP: source export consumer requires the pin");
+        return;
+    };
+    let pin = include_str!("../../../SUITE.lock")
+        .lines()
+        .find(|s| s.starts_with("reference "))
+        .unwrap()
+        .split_whitespace()
+        .find_map(|s| s.strip_prefix("commit="))
+        .unwrap();
+    let identity = Command::new(&lean).arg("--githash").output().unwrap();
+    assert!(identity.status.success());
+    assert_eq!(String::from_utf8(identity.stdout).unwrap().trim(), pin);
+    let base = base();
+    let options = KVMap::new();
+    let original_root = base.logical_root(&options);
+    let root = std::env::var_os("FLN_IR_REFERENCE_ARTIFACTS")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    for (index, (ty, expression, application, result_type, expected, _)) in
+        export_cases().into_iter().enumerate()
+    {
+        let source = format!("def compiled : {ty} := {expression}");
+        let (declaration, checked) = checked_definition(&base, &source);
+        let mut no_execution = limits();
+        no_execution.vm.max_steps = 0;
+        let compiled = ir::compile_source_definition(
+            &base,
+            declaration,
+            &options,
+            no_execution,
+            CompileLimits::default(),
+        )
+        .unwrap_or_else(|e| panic!("{source}: {e:?}"))
+        .into_complete()
+        .unwrap();
+        assert_eq!(
+            compiled.admission.result_logical_root,
+            checked.logical_root(&options)
+        );
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = root.join(format!(
+            "native-source-export-{}-{unique}-{index}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Only logical companions and envelope metadata come from the oracle.
+        // Its IR declarations are replaced, never supplied to this compiler.
+        std::fs::write(
+            dir.join("NativeIrCase.lean"),
+            format!("module\npublic opaque compiled : {ty} := {expression}\n"),
+        )
+        .unwrap();
+        let generated = Command::new(&lean)
+            .current_dir(&dir)
+            .args(["-o", "NativeIrCase.olean", "NativeIrCase.lean"])
+            .output()
+            .unwrap();
+        std::fs::write(dir.join("compile.stdout"), &generated.stdout).unwrap();
+        std::fs::write(dir.join("compile.stderr"), &generated.stderr).unwrap();
+        assert!(
+            generated.status.success(),
+            "{source}: {}",
+            String::from_utf8_lossy(&generated.stderr)
+        );
+        let original = std::fs::read(dir.join("NativeIrCase.ir")).unwrap();
+        std::fs::write(dir.join("original.ir"), &original).unwrap();
+        let bytes = encode(&compiled.module, &original);
+        std::fs::write(dir.join("NativeIrCase.ir"), &bytes).unwrap();
+        let mut consumer = format!(
+            "module\nmeta import NativeIrCase\n#eval ({application})\n#eval ({application})\n"
+        );
+        let mut expected_output = format!("{expected}\n{expected}");
+        if index == 4 {
+            // Effectful input prevents closed-term lifting from making the
+            // alias a persistent literal. The caller keeps it across the call.
+            std::fs::write(dir.join("heap-input.txt"), "fresh heap string").unwrap();
+            consumer.push_str("#eval do\n  let saved ← IO.FS.readFile \"heap-input.txt\"\n  let got := compiled saved\n  pure (got, saved)\n");
+            expected_output.push_str("\n(\"fresh heap string\", \"fresh heap string\")");
+        }
+        std::fs::write(dir.join("Consumer.lean"), consumer).unwrap();
+        let result = consume(&lean, &dir);
+        std::fs::write(dir.join("native.stdout"), &result.stdout).unwrap();
+        std::fs::write(dir.join("native.stderr"), &result.stderr).unwrap();
+        assert!(
+            result.status.success(),
+            "{source}: {:?}: {} {}",
+            result.status,
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(
+            String::from_utf8(result.stdout).unwrap().trim(),
+            expected_output
+        );
+
+        // Alter only the source export, retaining every internal value body.
+        let mut mutant = compiled.module.clone();
+        let public = mutant
+            .decls
+            .iter_mut()
+            .find(|d| d.name() == &name("compiled"))
+            .unwrap();
+        let IrDecl::Function { params, body, .. } = public else {
+            panic!("source function entry")
+        };
+        replace_result(params, body, result_type);
+        assert_eq!(
+            mutant
+                .decls
+                .iter()
+                .filter(|d| d.name() != &name("compiled"))
+                .collect::<Vec<_>>(),
+            compiled
+                .module
+                .decls
+                .iter()
+                .filter(|d| d.name() != &name("compiled"))
+                .collect::<Vec<_>>(),
+        );
+        std::fs::write(dir.join("NativeIrCase.ir"), encode(&mutant, &original)).unwrap();
+        let result = consume(&lean, &dir);
+        std::fs::write(dir.join("export-mutant.stdout"), &result.stdout).unwrap();
+        std::fs::write(dir.join("export-mutant.stderr"), &result.stderr).unwrap();
+        assert!(
+            result.status.success(),
+            "{source}: {:?}: {} {}",
+            result.status,
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let changed = if result_type == "Nat" {
+            "99"
+        } else {
+            "\"changed IR\""
+        };
+        let mut changed_output = format!("{changed}\n{changed}");
+        if index == 4 {
+            changed_output.push_str("\n(\"changed IR\", \"fresh heap string\")");
+        }
+        assert_eq!(
+            String::from_utf8(result.stdout).unwrap().trim(),
+            changed_output
+        );
+        std::fs::write(dir.join("NativeIrCase.ir"), bytes).unwrap();
+        assert_eq!(base.logical_root(&options), original_root);
     }
 }

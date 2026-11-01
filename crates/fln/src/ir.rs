@@ -6,6 +6,9 @@
 //! This is not the source declaration's unboxed/exported ABI, nor a certificate
 //! of kernel admission or faithful byte identity. Module publication must bind
 //! the entry and additional names to its own checked declaration/ABI contract.
+//! `compile_source_definition` additionally exports closed Nat/String function
+//! signatures under their source names, with owned object arguments. Erased,
+//! dependent, polymorphic and scalar source conventions remain unsupported.
 
 use fln_comp::{fir, flbc};
 use fln_core::name::Name;
@@ -523,17 +526,28 @@ pub fn compile(
     entry: &Name,
     limits: CompileLimits,
 ) -> Result<IrModule> {
+    let mut meter = Budget(limits.max_work);
+    let module = compile_module(program, entry, limits, &mut meter)?;
+    validate_module(&module, &meter)?;
+    Ok(module)
+}
+
+fn compile_module(
+    program: &fir::ValidatedProgram,
+    entry: &Name,
+    limits: CompileLimits,
+    meter: &mut Budget,
+) -> Result<IrModule> {
     if entry.is_anonymous() {
         return Err(unsupported("anonymous entry name"));
     }
-    let mut meter = Budget(limits.max_work);
     for function in program.functions() {
         signature(
             &function.parameters,
             &function.parameter_ownership,
             function.result,
             function.result_ownership,
-            &mut meter,
+            meter,
         )?;
         if function.blocks.len() != 1
             || !matches!(
@@ -587,7 +601,7 @@ pub fn compile(
             &closure.parameter_ownership,
             closure.result,
             closure.result_ownership,
-            &mut meter,
+            meter,
         )?;
     }
     let lowered = fir::lower_to_flbc_with_ownership(program, limits.ownership)
@@ -606,21 +620,24 @@ pub fn compile(
     }
     let mut declarations = Vec::new();
     for function in lowered.program().functions() {
-        let declaration = compile_function(function, &names, &mut meter)?;
+        let declaration = compile_function(function, &names, meter)?;
         // A boxed application always owns its operands. The wrapper releases
         // those whose base function borrows them, just as the pin's wrappers do.
         if !function.parameter_ownership.is_empty() {
-            declarations.push(boxed_wrapper(&declaration, &mut meter)?);
+            declarations.push(boxed_wrapper(&declaration, meter)?);
         }
         declarations.push(declaration);
     }
     declarations.sort_by(|a, b| a.name().quick_cmp(b.name()));
-    let module = IrModule {
+    Ok(IrModule {
         decls: declarations,
         ..IrModule::default()
-    };
+    })
+}
+
+fn validate_module(module: &IrModule, meter: &Budget) -> Result<()> {
     fln_olean::ir_types::validate_ir_types(
-        std::slice::from_ref(&module),
+        std::slice::from_ref(module),
         &std::collections::BTreeMap::new(),
         fln_olean::ir_validate::IrValidationLimits {
             max_declarations: module.decls.len(),
@@ -629,7 +646,139 @@ pub fn compile(
         },
     )
     .map_err(CompileError::Validation)?;
-    Ok(module)
+    Ok(())
+}
+
+struct SourceSignature {
+    name: Name,
+    params: Vec<IrParam>,
+    result: IrType,
+}
+
+// Walk source types before erasure. In particular, a proof/type argument must
+// not disappear and silently change the exported source calling convention.
+fn source_carrier(ty: &fln_core::expr::Expr, meter: &mut Budget) -> Result<IrType> {
+    use fln_core::expr::ExprNode;
+    let nat = Name::from_components(["Nat"]);
+    let string = Name::from_components(["String"]);
+    let mut pending = vec![ty];
+    let mut result = None;
+    while let Some(ty) = pending.pop() {
+        meter.charge(1)?;
+        let carrier = match ty.node() {
+            ExprNode::Const { name, levels } if levels.is_empty() && name == &nat => {
+                IrType::TObject
+            }
+            ExprNode::Const { name, levels } if levels.is_empty() && name == &string => {
+                IrType::Object
+            }
+            ExprNode::ForallE {
+                binder_type, body, ..
+            } => {
+                pending
+                    .try_reserve(2)
+                    .map_err(|_| CompileError::Allocation)?;
+                pending.push(body);
+                pending.push(binder_type);
+                IrType::Object
+            }
+            ExprNode::MData { expr, .. } => {
+                pending.push(expr);
+                continue;
+            }
+            _ => return Err(unsupported("source export carrier")),
+        };
+        result.get_or_insert(carrier);
+    }
+    result.ok_or_else(|| invariant("source carrier"))
+}
+
+fn source_signature(
+    definition: &fln_env::constants::DefinitionVal,
+    meter: &mut Budget,
+) -> Result<SourceSignature> {
+    use fln_core::expr::ExprNode;
+    if !definition.base.level_params.is_empty() {
+        return Err(unsupported("universe-polymorphic source export"));
+    }
+    let mut params = Vec::new();
+    let mut ty = &definition.base.type_;
+    let result = loop {
+        meter.charge(1)?;
+        match ty.node() {
+            ExprNode::ForallE {
+                binder_type, body, ..
+            } => {
+                let carrier = source_carrier(binder_type, meter)?;
+                params
+                    .try_reserve(1)
+                    .map_err(|_| CompileError::Allocation)?;
+                params.push(IrParam {
+                    x: params.len() as u64 + 1,
+                    borrow: false,
+                    ty: carrier,
+                });
+                ty = body;
+            }
+            ExprNode::MData { expr, .. } => ty = expr,
+            _ => break source_carrier(ty, meter)?,
+        }
+    };
+    Ok(SourceSignature {
+        name: definition.base.name.clone(),
+        params,
+        result,
+    })
+}
+
+fn export_source(
+    signature: SourceSignature,
+    value_entry: &Name,
+    meter: &mut Budget,
+) -> Result<IrDecl> {
+    meter.charge(signature.params.len().saturating_mul(2).saturating_add(8))?;
+    let closure = signature.params.len() as u64 + 1;
+    let result = closure.checked_add(1).ok_or(CompileError::Limit)?;
+    let mut stmts = vec![
+        IrStmt::VDecl {
+            x: closure,
+            ty: IrType::TObject,
+            expr: IrExpr::Fap {
+                function: value_entry.clone(),
+                args: vec![],
+            },
+        },
+        // The value producer is nullary: its constant-cache result is borrowed.
+        IrStmt::Inc {
+            x: closure,
+            n: 1,
+            checked: true,
+            persistent: false,
+        },
+    ];
+    let returned = if signature.params.is_empty() {
+        closure
+    } else {
+        stmts.push(IrStmt::VDecl {
+            x: result,
+            ty: signature.result.clone(),
+            expr: IrExpr::Ap {
+                x: closure,
+                args: signature.params.iter().map(|p| IrArg::Var(p.x)).collect(),
+            },
+        });
+        result
+    };
+    Ok(IrDecl::Function {
+        name: signature.name,
+        params: signature.params,
+        result: signature.result,
+        body: IrBody {
+            stmts,
+            terminal: Box::new(IrTerminal::Ret(IrArg::Var(returned))),
+        },
+        sorry_dep: None,
+    })
 }
 
 /// A compiled, council-admitted definition. The base engine is unchanged;
@@ -670,6 +819,49 @@ pub fn compile_definition(
     limits: CompileLimits,
 ) -> std::result::Result<fln_core::outcome::Outcome<DefinitionCompilation>, DefinitionCompileError>
 {
+    compile_definition_impl(
+        engine,
+        declaration,
+        Some(entry),
+        options,
+        engine_limits,
+        limits,
+    )
+}
+
+/// Export a checked definition under its source name and source argument count.
+/// Supported types are closed arrows over Nat/String (including higher-order
+/// arguments), using owned object parameters. No erased argument is dropped.
+/// The source signature is projected from the same declaration submitted
+/// unchanged to both checkers; success requires their admission and complete
+/// IR validation. This does not establish faithful bytes or general source ABI.
+pub fn compile_source_definition(
+    engine: &crate::Engine,
+    declaration: crate::Declaration,
+    options: &fln_core::options::KVMap,
+    engine_limits: crate::EngineExecutionLimits,
+    limits: CompileLimits,
+) -> std::result::Result<fln_core::outcome::Outcome<DefinitionCompilation>, DefinitionCompileError>
+{
+    compile_definition_impl(engine, declaration, None, options, engine_limits, limits)
+}
+
+fn compile_definition_impl(
+    engine: &crate::Engine,
+    declaration: crate::Declaration,
+    entry: Option<&Name>,
+    options: &fln_core::options::KVMap,
+    engine_limits: crate::EngineExecutionLimits,
+    limits: CompileLimits,
+) -> std::result::Result<fln_core::outcome::Outcome<DefinitionCompilation>, DefinitionCompileError>
+{
+    let mut meter = Budget(limits.max_work);
+    let signature = match (&declaration, entry) {
+        (crate::Declaration::Defn(definition), None) => {
+            Some(source_signature(definition, &mut meter).map_err(DefinitionCompileError::Ir)?)
+        }
+        _ => None,
+    };
     let prepared = engine
         .prepare_definition_entry_with_helpers(
             declaration,
@@ -684,12 +876,29 @@ pub fn compile_definition(
         Outcome::Inconclusive(reason) => Ok(Outcome::Inconclusive(reason)),
         Outcome::InternalFault(fault) => Ok(Outcome::InternalFault(fault)),
         Outcome::Complete(prepared) => {
-            let module =
-                compile(&prepared.fir, entry, limits).map_err(DefinitionCompileError::Ir)?;
+            let exported = signature.as_ref().map(|s| s.name.clone());
+            let entry = entry.cloned().or(exported).ok_or_else(|| {
+                DefinitionCompileError::Ir(invariant("admitted source definition"))
+            })?;
+            let value_entry = if signature.is_some() {
+                Name::str(entry.clone(), "_fln_value")
+            } else {
+                entry.clone()
+            };
+            let mut module = compile_module(&prepared.fir, &value_entry, limits, &mut meter)
+                .map_err(DefinitionCompileError::Ir)?;
+            if let Some(signature) = signature {
+                module.decls.push(
+                    export_source(signature, &value_entry, &mut meter)
+                        .map_err(DefinitionCompileError::Ir)?,
+                );
+                module.decls.sort_by(|a, b| a.name().quick_cmp(b.name()));
+            }
+            validate_module(&module, &meter).map_err(DefinitionCompileError::Ir)?;
             Ok(Outcome::Complete(DefinitionCompilation {
                 admission: prepared.admission,
                 runtime_type: prepared.runtime_type,
-                entry: entry.clone(),
+                entry,
                 module,
             }))
         }
