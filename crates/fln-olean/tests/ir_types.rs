@@ -837,6 +837,15 @@ fn real_boxed_nat_wrapper_passes_and_a_wrong_box_annotation_is_refused() {
         .clone();
     let mut modules = [module(vec![wrapper])];
     validate_ir_types(&modules, &signatures, IrValidationLimits::default()).unwrap();
+    validate_ir_types(
+        &modules,
+        &signatures,
+        IrValidationLimits {
+            one_based_variables: true,
+            ..IrValidationLimits::default()
+        },
+    )
+    .unwrap();
     let IrDecl::Function { body, .. } = &mut modules[0].decls[0] else {
         unreachable!()
     };
@@ -860,4 +869,122 @@ fn real_boxed_nat_wrapper_passes_and_a_wrong_box_annotation_is_refused() {
             ..
         })
     ));
+}
+
+#[test]
+fn one_based_export_requirement_refuses_zero_in_every_variable_binding_scope() {
+    let zero_local = || bind(0, IrType::TObject, IrExpr::Lit(IrLit::Num(IrNat::Small(7))));
+    let inputs = [
+        function(
+            vec![param(0, IrType::TObject)],
+            body(vec![], IrTerminal::Ret(IrArg::Var(0))),
+        ),
+        function(
+            vec![],
+            body(vec![zero_local()], IrTerminal::Ret(IrArg::Var(0))),
+        ),
+        function(
+            vec![param(1, IrType::TObject)],
+            body(
+                vec![IrStmt::JDecl {
+                    j: 2,
+                    params: vec![param(0, IrType::TObject)],
+                    value: body(vec![], IrTerminal::Ret(IrArg::Var(0))),
+                }],
+                IrTerminal::Jmp {
+                    j: 2,
+                    args: vec![IrArg::Var(1)],
+                },
+            ),
+        ),
+        function(
+            vec![param(1, IrType::TObject)],
+            body(
+                vec![],
+                IrTerminal::Case {
+                    type_name: name("Choice"),
+                    x: 1,
+                    x_type: IrType::TObject,
+                    alts: vec![IrAlt::Default {
+                        body: body(vec![zero_local()], IrTerminal::Ret(IrArg::Var(0))),
+                    }],
+                },
+            ),
+        ),
+        IrDecl::Extern {
+            name: name("Main"),
+            params: vec![param(0, IrType::TObject)],
+            result: IrType::TObject,
+            entries: vec![fln_olean::ir::IrExternEntry::Opaque],
+        },
+        function(
+            vec![param(0, IrType::Erased)],
+            body(vec![], IrTerminal::Ret(IrArg::Erased)),
+        ),
+    ];
+    for declaration in inputs {
+        let modules = [module(vec![declaration])];
+        let original = modules.clone();
+        // Structural parity remains distinct from the interpreter's index
+        // representation. None of the existing zero-based tests is rewritten.
+        validate_ir_types(&modules, &BTreeMap::new(), IrValidationLimits::default()).unwrap();
+        let error = validate_ir_types(
+            &modules,
+            &BTreeMap::new(),
+            IrValidationLimits {
+                one_based_variables: true,
+                ..IrValidationLimits::default()
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            Error::Structural(fln_olean::ir_validate::IrValidationError {
+                declaration: Some(ref declaration),
+                kind: IrValidationErrorKind::ZeroVariableIndex,
+            }) if declaration == &name("Main")
+        ));
+        assert_eq!(modules, original);
+    }
+}
+
+#[test]
+fn one_based_variables_preserve_zero_join_ids_and_the_exact_work_boundary() {
+    let modules = [module(vec![function(
+        vec![param(1, IrType::TObject)],
+        body(
+            vec![IrStmt::JDecl {
+                j: 0,
+                params: vec![param(2, IrType::TObject)],
+                value: body(vec![], IrTerminal::Ret(IrArg::Var(2))),
+            }],
+            IrTerminal::Jmp {
+                j: 0,
+                args: vec![IrArg::Var(1)],
+            },
+        ),
+    )])];
+    let original = modules.clone();
+    let baseline =
+        validate_ir_types(&modules, &BTreeMap::new(), IrValidationLimits::default()).unwrap();
+    let exact = IrValidationLimits {
+        one_based_variables: true,
+        max_work: baseline.work,
+        ..IrValidationLimits::default()
+    };
+    assert_eq!(
+        validate_ir_types(&modules, &BTreeMap::new(), exact).unwrap(),
+        baseline,
+    );
+    let error = validate_ir_types(
+        &modules,
+        &BTreeMap::new(),
+        IrValidationLimits {
+            max_work: baseline.work - 1,
+            ..exact
+        },
+    )
+    .unwrap_err();
+    assert!(error.is_resource());
+    assert_eq!(modules, original);
 }

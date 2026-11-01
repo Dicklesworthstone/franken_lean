@@ -663,6 +663,7 @@ fn validate_module(module: &IrModule, meter: &Budget) -> Result<()> {
         fln_olean::ir_validate::IrValidationLimits {
             max_declarations: module.decls.len(),
             max_work: meter.0,
+            one_based_variables: true,
             ..fln_olean::ir_validate::IrValidationLimits::default()
         },
     )
@@ -1080,6 +1081,7 @@ impl std::fmt::Display for DefinitionCompileError {
         }
     }
 }
+
 impl std::error::Error for DefinitionCompileError {}
 
 /// Admit and compile without executing the definition. This shares the exact
@@ -1201,5 +1203,47 @@ fn compile_definition_impl(
                 module,
             }))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn export_validation_refuses_zero_variables_and_accepts_the_one_based_control() {
+        let mut module = IrModule {
+            decls: vec![IrDecl::Function {
+                name: Name::str(Name::anonymous(), "exported"),
+                params: vec![IrParam {
+                    x: 0,
+                    borrow: false,
+                    ty: IrType::TObject,
+                }],
+                result: IrType::TObject,
+                body: IrBody {
+                    stmts: vec![],
+                    terminal: Box::new(IrTerminal::Ret(IrArg::Var(0))),
+                },
+                sorry_dep: None,
+            }],
+            ..IrModule::default()
+        };
+        let failure = validate_module(&module, &Budget(1_000)).unwrap_err();
+        assert!(matches!(
+            failure,
+            CompileError::Validation(fln_olean::ir_types::IrTypeValidationError::Structural(
+                fln_olean::ir_validate::IrValidationError {
+                    kind: fln_olean::ir_validate::IrValidationErrorKind::ZeroVariableIndex,
+                    ..
+                }
+            ))
+        ));
+        let IrDecl::Function { params, body, .. } = &mut module.decls[0] else {
+            unreachable!()
+        };
+        params[0].x = 1;
+        *body.terminal = IrTerminal::Ret(IrArg::Var(1));
+        validate_module(&module, &Budget(1_000)).unwrap();
     }
 }

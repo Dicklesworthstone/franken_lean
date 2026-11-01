@@ -110,6 +110,7 @@ impl Default for IrExecutionLimits {
                 max_declarations: 1 << 20,
                 max_work: 8_000_000,
                 max_depth: 128,
+                one_based_variables: false,
             },
             fir: fir::ValidationLimits::default(),
             ownership: flbc::OwnershipLimits::default(),

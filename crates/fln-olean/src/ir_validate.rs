@@ -30,6 +30,11 @@ pub struct IrValidationLimits {
     pub max_work: u64,
     /// Body nesting including the function body (depth one).
     pub max_depth: usize,
+    /// Require variable IDs to start at one, as the pin's interpreter does.
+    /// The pin's data-only IR checker permits zero, so this is opt-in for
+    /// exporters. Join-point IDs are unaffected. This necessary representation
+    /// condition grants no ownership, allocation or execution authority.
+    pub one_based_variables: bool,
 }
 
 impl Default for IrValidationLimits {
@@ -38,6 +43,7 @@ impl Default for IrValidationLimits {
             max_declarations: 1 << 20,
             max_work: 64_000_000,
             max_depth: 512,
+            one_based_variables: false,
         }
     }
 }
@@ -83,6 +89,7 @@ pub enum IrValidationErrorKind {
     DuplicateIndex {
         index: IrIndex,
     },
+    ZeroVariableIndex,
     UnknownVariable {
         index: IrIndex,
     },
@@ -349,6 +356,9 @@ impl Checker<'_> {
 
     fn bind_variable(&mut self, index: IrIndex) -> Result<(), IrValidationError> {
         self.mark(index)?;
+        if self.budget.limits.one_based_variables && index == 0 {
+            return Err(self.fail(IrValidationErrorKind::ZeroVariableIndex));
+        }
         self.variables.insert(index);
         self.bindings.push(Binding::Variable(index));
         Ok(())
