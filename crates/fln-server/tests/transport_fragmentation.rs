@@ -7,6 +7,7 @@ struct Fragmented<'a> {
     bytes: &'a [u8],
     offset: usize,
     width: usize,
+    failure: Option<(usize, io::ErrorKind)>,
 }
 
 impl<'a> Fragmented<'a> {
@@ -16,6 +17,14 @@ impl<'a> Fragmented<'a> {
             bytes,
             offset: 0,
             width,
+            failure: None,
+        }
+    }
+
+    fn failing_once(bytes: &'a [u8], at: usize, kind: io::ErrorKind) -> Self {
+        Self {
+            failure: Some((at, kind)),
+            ..Self::new(bytes, 1)
         }
     }
 }
@@ -32,6 +41,12 @@ impl Read for Fragmented<'_> {
 
 impl BufRead for Fragmented<'_> {
     fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        if let Some((at, kind)) = self.failure
+            && at == self.offset
+        {
+            self.failure = None;
+            return Err(io::Error::new(kind, "injected transport read failure"));
+        }
         let end = cmp::min(self.bytes.len(), self.offset.saturating_add(self.width));
         Ok(&self.bytes[self.offset..end])
     }
@@ -108,4 +123,38 @@ fn every_fragment_width_reports_a_truncated_body() {
         );
     }
     framed.clear();
+}
+
+#[test]
+fn interruptions_at_each_frame_boundary_preserve_the_frame_and_clean_eof() {
+    let body = br#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#;
+    let framed = frame(body);
+    for at in 0..=framed.len() {
+        let mut input = Fragmented::failing_once(&framed, at, io::ErrorKind::Interrupted);
+        assert_eq!(
+            fln_server::transport::read_message(&mut input)
+                .unwrap_or_else(|error| panic!("interrupted at byte {at}: {error}"))
+                .as_deref(),
+            Some(body.as_slice())
+        );
+        assert!(
+            fln_server::transport::read_message(&mut input)
+                .unwrap_or_else(|error| panic!("interrupted at EOF byte {at}: {error}"))
+                .is_none()
+        );
+        assert!(input.failure.is_none(), "byte {at} was not reached");
+    }
+}
+
+#[test]
+fn non_interrupt_errors_keep_their_original_kind_and_message() {
+    let framed = frame(b"{}");
+    let body_start = framed.len() - 2;
+    for at in [0, 5, body_start + 1] {
+        let mut input = Fragmented::failing_once(&framed, at, io::ErrorKind::PermissionDenied);
+        let error = fln_server::transport::read_message(&mut input).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(error.to_string(), "injected transport read failure");
+        assert_eq!(input.offset, at, "failure must not consume any later bytes");
+    }
 }

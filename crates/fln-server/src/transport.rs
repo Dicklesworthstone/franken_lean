@@ -58,7 +58,11 @@ fn read_header_line(
     let mut line = Vec::new();
     loop {
         let (consumed, terminated) = {
-            let available = input.fill_buf()?;
+            let available = match input.fill_buf() {
+                Ok(available) => available,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            };
             if available.is_empty() {
                 if line.is_empty() {
                     return Ok(None);
@@ -316,7 +320,7 @@ pub fn read_message(input: &mut dyn BufRead) -> io::Result<Option<Vec<u8>>> {
 
 /// Write one Content-Length-framed LSP message with caller-selected ceilings.
 ///
-/// Oversized messages are refused before any framing bytes are written.
+/// Any exceeded body or header ceiling is refused before framing bytes are written.
 pub fn write_message_with_limits(
     output: &mut dyn Write,
     body: &[u8],
@@ -329,7 +333,17 @@ pub fn write_message_with_limits(
             limits.max_message_bytes
         )));
     }
-    write!(output, "Content-Length: {}\r\n\r\n", body.len())?;
+    let header = format!("Content-Length: {}\r\n\r\n", body.len());
+    if header.len() > limits.max_header_bytes {
+        return Err(invalid_data(format!(
+            "LSP header block exceeds {} bytes",
+            limits.max_header_bytes
+        )));
+    }
+    if limits.max_header_fields == 0 {
+        return Err(invalid_data("LSP header block exceeds 0 fields"));
+    }
+    output.write_all(header.as_bytes())?;
     output.write_all(body)?;
     output.flush()
 }
@@ -512,6 +526,50 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert!(error.to_string().contains("transport ceiling"));
         assert!(output.is_empty());
+    }
+
+    #[test]
+    fn writer_obeys_header_byte_limits_before_writing() {
+        for body in [b"".as_slice(), b"{}".as_slice()] {
+            let header_bytes = format!("Content-Length: {}\r\n\r\n", body.len()).len();
+            let mut output = Vec::new();
+            let error = write_message_with_limits(
+                &mut output,
+                body,
+                TransportLimits::new(body.len(), header_bytes - 1, 1),
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(output.is_empty());
+
+            let limits = TransportLimits::new(body.len(), header_bytes, 1);
+            write_message_with_limits(&mut output, body, limits).unwrap();
+            assert_eq!(
+                read_message_with_limits(&mut BufReader::new(output.as_slice()), limits)
+                    .unwrap()
+                    .as_deref(),
+                Some(body)
+            );
+        }
+    }
+
+    #[test]
+    fn writer_obeys_header_field_limits_before_writing() {
+        let body = b"{}";
+        let mut output = Vec::new();
+        let limits = TransportLimits::new(body.len(), 64, 0);
+        let error = write_message_with_limits(&mut output, body, limits).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(output.is_empty());
+
+        let limits = TransportLimits::new(body.len(), 64, 1);
+        write_message_with_limits(&mut output, body, limits).unwrap();
+        assert_eq!(
+            read_message_with_limits(&mut BufReader::new(output.as_slice()), limits)
+                .unwrap()
+                .as_deref(),
+            Some(body.as_slice())
+        );
     }
 
     #[test]
