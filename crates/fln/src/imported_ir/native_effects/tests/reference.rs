@@ -84,7 +84,12 @@ fn live_pinned_local_state_matches_reference_and_canonical_replay() {
     .unwrap();
     let partition_path = std::env::var_os("FLN_REFERENCE_PARTITION")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("contracts/builtin_partition.tsv"));
+        .unwrap_or_else(|| {
+            PathBuf::from(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../contracts/builtin_partition.tsv"
+            ))
+        });
     let partition = VerifiedPartition::from_pinned_tsv(
         &std::fs::read_to_string(&partition_path).unwrap_or_else(|error| {
             panic!("pinned partition {}: {error}", partition_path.display())

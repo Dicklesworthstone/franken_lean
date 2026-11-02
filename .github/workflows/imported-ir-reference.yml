@@ -28,6 +28,7 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: '0'
       CARGO_PROFILE_TEST_DEBUG: '0'
       FLN_REQUIRE_REFERENCE: '1'
+      FLN_REFERENCE_PARTITION: ${{ github.workspace }}/contracts/builtin_partition.tsv
       FLN_IR_REFERENCE_ARTIFACTS: ${{ github.workspace }}/target/imported-ir-reference/live
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -56,7 +57,7 @@ jobs:
             4e717523217af592fa2d7b9c479410a31816c065d66ccbf0c2149337cfec0f5c \
             "$archive" | sha256sum --check
           tar -xzf "$archive" -C "$tool_root"
-          export ELAN_HOME="$RUNNER_TEMP/ir-elan"
+          export ELAN_HOME="$HOME/.elan"
           "$tool_root/elan-init" -y --no-modify-path --default-toolchain none
           export PATH="$ELAN_HOME/bin:$PATH"
           mapfile -t reference_rows < <(grep -E '^reference ' SUITE.lock)
@@ -70,6 +71,9 @@ jobs:
           test "$("$toolchain_root/bin/lean" --githash)" = "$pin_commit"
           printf 'FLN_REFERENCE_LIB=%s/lib/lean\nFLN_REFERENCE_LEAN=%s/bin/lean\n' \
             "$toolchain_root" "$toolchain_root" >> "$GITHUB_ENV"
+      - name: Materialize and verify the pinned execution partition
+        shell: bash
+        run: scripts/extract/census_materialize.sh
       - name: Execute imported IR and native macros, lint, and check formatting
         shell: bash
         run: |
