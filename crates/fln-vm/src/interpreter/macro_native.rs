@@ -2,7 +2,7 @@
 //! safe object observers; Reference toolchain bodies are never dispatched.
 
 use super::{IntrinsicFailure, IntrinsicResult, Obj, VmRefusal, expect_arity, nat_as_usize};
-use crate::macro_native::MacroLookup;
+use crate::macro_native::{MacroLookup, MacroLookupError};
 use fln_core::name::{LeafView, Name};
 use fln_rt::convert::{Conversion, ConvertError, inject_name};
 use fln_rt::syntax_abi_generated as layout;
@@ -24,6 +24,8 @@ pub(super) enum Intrinsic {
     GetId,
     GetCurrNamespace,
     HasDecl,
+    ResolveNamespace,
+    ResolveGlobalName,
 }
 
 impl Intrinsic {
@@ -41,6 +43,8 @@ impl Intrinsic {
             "mirror:Lean.Syntax.getId" => Self::GetId,
             "mirror:Lean.Macro.getCurrNamespace" => Self::GetCurrNamespace,
             "mirror:Lean.Macro.hasDecl" => Self::HasDecl,
+            "mirror:Lean.Macro.resolveNamespace" => Self::ResolveNamespace,
+            "mirror:Lean.Macro.resolveGlobalName" => Self::ResolveGlobalName,
             _ => return None,
         })
     }
@@ -64,7 +68,7 @@ impl Intrinsic {
             args,
             match self {
                 Self::IsOfKind | Self::GetArg | Self::SetKind | Self::GetCurrNamespace => 2,
-                Self::HasDecl => 3,
+                Self::HasDecl | Self::ResolveNamespace | Self::ResolveGlobalName => 3,
                 _ => 1,
             },
         )?;
@@ -188,13 +192,20 @@ impl Intrinsic {
                 };
                 Ok(IntrinsicResult::raw_object(id))
             }
-            Self::GetCurrNamespace | Self::HasDecl => {
-                let context_index = usize::from(self == Self::HasDecl);
+            Self::GetCurrNamespace
+            | Self::HasDecl
+            | Self::ResolveNamespace
+            | Self::ResolveGlobalName => {
+                let context_index = usize::from(self != Self::GetCurrNamespace);
                 check_layout(&args[context_index], layout::MACRO_CONTEXT)?;
                 let state = &args[context_index + 1];
                 check_layout(state, layout::MACRO_STATE)?;
                 let operation = if self == Self::HasDecl {
                     "Lean.Macro.hasDecl"
+                } else if self == Self::ResolveNamespace {
+                    "Lean.Macro.resolveNamespace"
+                } else if self == Self::ResolveGlobalName {
+                    "Lean.Macro.resolveGlobalName"
                 } else {
                     "Lean.Macro.getCurrNamespace"
                 };
@@ -202,10 +213,22 @@ impl Intrinsic {
                 let value = if self == Self::HasDecl {
                     let declaration = name(&args[0])?;
                     Obj::mk_nat(usize::from(lookup.has_decl(&declaration)))
+                } else if self == Self::ResolveNamespace {
+                    let requested = name(&args[0])?;
+                    let names = lookup
+                        .resolve_namespace(&requested)
+                        .map_err(|error| lookup_error(operation, error))?;
+                    namespace_candidates(&names)?
+                } else if self == Self::ResolveGlobalName {
+                    let requested = name(&args[0])?;
+                    let names = lookup
+                        .resolve_global_name(&requested)
+                        .map_err(|error| lookup_error(operation, error))?;
+                    global_candidates(&names)?
                 } else {
                     bounded_native_name(lookup.current_namespace())?
                 };
-                // Both methods are MacroM actions. Preserve the complete state
+                // All methods are MacroM actions. Preserve the complete state
                 // handle and return the exact generated EStateM.ok carrier.
                 Ok(IntrinsicResult::raw_object(Obj::mk_ctor(
                     layout::RESULT_OK.tag,
@@ -215,6 +238,105 @@ impl Intrinsic {
             }
         }
     }
+}
+
+fn lookup_error(operation: &'static str, error: MacroLookupError) -> IntrinsicFailure {
+    match error {
+        MacroLookupError::Unavailable => VmRefusal::MacroLookupUnavailable { operation }.into(),
+        MacroLookupError::Invalid(detail) => {
+            VmRefusal::MacroLookupInvalid { operation, detail }.into()
+        }
+        MacroLookupError::Exhausted(resource) => IntrinsicFailure::MacroLookupExhausted {
+            operation,
+            resource,
+        },
+        MacroLookupError::Limit {
+            resource,
+            limit,
+            observed,
+        } => IntrinsicFailure::MirrorResource {
+            resource,
+            allowed: limit,
+            observed,
+        },
+    }
+}
+
+/// Bound the whole overload list before allocating any ABI objects. Individual
+/// name limits alone permit unbounded lists of small names or projections.
+#[derive(Default)]
+struct LookupBudget {
+    nodes: u64,
+    bytes: u64,
+}
+
+impl LookupBudget {
+    fn nodes(&mut self, count: u64) -> Result<(), IntrinsicFailure> {
+        self.nodes = self.nodes.saturating_add(count);
+        limit("macro lookup nodes", MAX_NAME_NODES, self.nodes)
+    }
+
+    fn text(&mut self, text: &str) -> Result<(), IntrinsicFailure> {
+        self.bytes = self.bytes.saturating_add(text.len() as u64);
+        limit("macro lookup bytes", MAX_NAME_BYTES, self.bytes)
+    }
+
+    fn name(&mut self, name: &Name) -> Result<(), IntrinsicFailure> {
+        let mut cursor = name.clone();
+        loop {
+            self.nodes(1)?;
+            if cursor.component_overflowed() {
+                return Err(VmRefusal::InvalidCtorObject.into());
+            }
+            if let LeafView::Str(text) = cursor.leaf_view() {
+                self.text(text)?;
+            }
+            if cursor.is_anonymous() {
+                return Ok(());
+            }
+            cursor = cursor.parent();
+        }
+    }
+}
+
+fn cons(head: Obj, tail: Obj) -> Obj {
+    Obj::mk_ctor(layout::LIST_CONS.tag, vec![head, tail], &[])
+}
+
+fn namespace_candidates(names: &[Name]) -> Result<Obj, IntrinsicFailure> {
+    let mut budget = LookupBudget::default();
+    budget.nodes(names.len() as u64)?;
+    for name in names {
+        budget.name(name)?;
+    }
+    // Namespace resolution deliberately preserves duplicates and host order.
+    let mut result = Obj::mk_nat(layout::LIST_NIL_TAG);
+    for name in names.iter().rev() {
+        result = cons(inject_name(name), result);
+    }
+    Ok(result)
+}
+
+fn global_candidates(names: &[(Name, Vec<String>)]) -> Result<Obj, IntrinsicFailure> {
+    let mut budget = LookupBudget::default();
+    budget.nodes((names.len() as u64).saturating_mul(2))?;
+    for (name, projections) in names {
+        budget.name(name)?;
+        budget.nodes((projections.len() as u64).saturating_mul(2))?;
+        for projection in projections {
+            budget.text(projection)?;
+        }
+    }
+    let mut result = Obj::mk_nat(layout::LIST_NIL_TAG);
+    for (name, projections) in names.iter().rev() {
+        let mut fields = Obj::mk_nat(layout::LIST_NIL_TAG);
+        for projection in projections.iter().rev() {
+            fields = cons(Obj::mk_string(projection), fields);
+        }
+        let candidate = Obj::mk_ctor(layout::PROD.tag, vec![inject_name(name), fields], &[]);
+        result = cons(candidate, result);
+    }
+    Ok(result)
 }
 
 enum SyntaxKind {

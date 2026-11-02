@@ -52,6 +52,8 @@ FUNCTIONS = {
     "SYNTAX_GET_ID": "syntaxGetId",
     "MACRO_GET_CURR_NAMESPACE": "macroGetCurrNamespace",
     "MACRO_HAS_DECL": "macroHasDecl",
+    "MACRO_RESOLVE_NAMESPACE": "macroResolveNamespace",
+    "MACRO_RESOLVE_GLOBAL_NAME": "macroResolveGlobalName",
 }
 
 

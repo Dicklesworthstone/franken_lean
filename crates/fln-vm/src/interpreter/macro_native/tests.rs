@@ -41,6 +41,8 @@ fn invoke(intrinsic: Intrinsic, args: &[Obj]) -> Obj {
         Intrinsic::GetId => "mirror:Lean.Syntax.getId",
         Intrinsic::GetCurrNamespace => "mirror:Lean.Macro.getCurrNamespace",
         Intrinsic::HasDecl => "mirror:Lean.Macro.hasDecl",
+        Intrinsic::ResolveNamespace => "mirror:Lean.Macro.resolveNamespace",
+        Intrinsic::ResolveGlobalName => "mirror:Lean.Macro.resolveGlobalName",
     };
     match intrinsic.invoke(id, args) {
         Ok(value) => value.into_object(),

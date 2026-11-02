@@ -1459,6 +1459,11 @@ pub enum VmRefusal {
     MacroLookupUnavailable {
         operation: &'static str,
     },
+    /// A supplied MacroM capability refused malformed or unsupported metadata.
+    MacroLookupInvalid {
+        operation: &'static str,
+        detail: &'static str,
+    },
     CallableEntry {
         function: FunctionId,
         reason: &'static str,
@@ -1633,6 +1638,9 @@ impl fmt::Display for VmRefusal {
                 f,
                 "intrinsic row {row:?} received {actual} values, expected {expected}"
             ),
+            Self::MacroLookupInvalid { operation, detail } => {
+                write!(f, "{operation} cannot resolve names: {detail}")
+            }
             Self::IntrinsicOwnershipContract { row, reason } => write!(
                 f,
                 "intrinsic row {row:?} has a non-executable ownership contract: {reason}"
@@ -1985,6 +1993,10 @@ enum IntrinsicFailure {
         resource: &'static str,
         allowed: u64,
         observed: u64,
+    },
+    MacroLookupExhausted {
+        operation: &'static str,
+        resource: &'static str,
     },
     Refused(VmRefusal),
     NatMagnitudeLimit {
@@ -3133,6 +3145,17 @@ fn run(
                         }
                         Err(IntrinsicFailure::FileReadResource(error)) => {
                             return Err(file_read_exhausted(error, &location.to_string()));
+                        }
+                        Err(IntrinsicFailure::MacroLookupExhausted {
+                            operation,
+                            resource,
+                        }) => {
+                            return Err(Stop::Inconclusive(
+                                Inconclusive::dependency_unavailable(format!(
+                                    "native macro lookup exhausted {resource}"
+                                ))
+                                .with_progress(operation),
+                            ));
                         }
                         Err(IntrinsicFailure::StringResource(error)) => {
                             return Err(strings::resource_exhausted(error, &location.to_string()));

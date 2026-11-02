@@ -99,7 +99,8 @@ jobs:
             git ls-files 'crates/fln/src/imported_ir/constructor_updates/*.rs' \
               'crates/fln/src/imported_ir/constructor_updates/**/*.rs' \
               'crates/fln/src/imported_macros/*.rs' \
-              'crates/fln/src/imported_macros/**/*.rs')
+              'crates/fln/src/imported_macros/**/*.rs' \
+              'crates/fln-vm/src/interpreter/macro_native/**/*.rs')
           rustfmt --edition 2024 --config skip_children=true --check "${files[@]}" \
             2>&1 | tee target/imported-ir-reference/format.log || status=1
           # Developer artifacts are formatted copies, never changes to tested
