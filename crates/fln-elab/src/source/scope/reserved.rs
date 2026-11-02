@@ -71,7 +71,7 @@ pub(in crate::source) fn structurally_recursive(env: &Environment, name: &Name) 
 /// `isReservedName` over the ported predicates. The caller asks for each form of the name, as
 /// `checkNotAlreadyDeclared` does; a module's private equation names are found through the
 /// private form, so exposure needs no separate case.
-pub(super) fn is_reserved(env: &Environment, name: &Name) -> bool {
+pub fn is_reserved(env: &Environment, name: &Name) -> bool {
     let LeafView::Str(suffix) = name.leaf_view() else {
         return false;
     };

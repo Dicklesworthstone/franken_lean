@@ -4,6 +4,7 @@ use super::*;
 pub mod executable;
 pub mod options;
 mod reserved;
+pub use reserved::is_reserved as is_reserved_name;
 pub(in crate::source) use reserved::structurally_recursive;
 pub mod simp;
 pub mod variables;

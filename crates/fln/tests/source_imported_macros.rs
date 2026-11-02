@@ -242,6 +242,12 @@ fn actual_artifacts(reference: PathBuf, library: PathBuf, partition: PathBuf) {
     );
     assert!(
         checked.attempts[0]
+            .native_functions
+            .iter()
+            .any(|row| row == "mirror:Lean.Macro.resolveGlobalName")
+    );
+    assert!(
+        checked.attempts[0]
             .reference_functions
             .iter()
             .any(|function| {
@@ -255,6 +261,7 @@ fn actual_artifacts(reference: PathBuf, library: PathBuf, partition: PathBuf) {
         &empty_environment,
         &anonymous,
         &anonymous,
+        &[],
         &[],
     );
     let missing_namespace = engine.check_source_command_with_imported_macros(

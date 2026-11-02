@@ -422,6 +422,7 @@ fn expand(
         main_module,
         &scope.namespace,
         &scope.opened,
+        &scope.explicit_opens,
     );
     let lookup = lookup.or(Some(&engine_lookup as &dyn MacroLookup));
     let resolve = crate::source_check::grammar::resolver(engine.environment(), &scope);

@@ -13,7 +13,11 @@ end AdmittedLookup
 @[macro Lean.Parser.Term.typeAscription]
 public meta def admittedChooseTerm : Macro := fun stx context state =>
   match Lean.Macro.resolveNamespace `AdmittedLookup context state with
-  | .ok (.cons _ _) next => .ok (stx.getArg 1) next
+  | .ok (.cons _ _) next =>
+    match Lean.Macro.resolveGlobalName `Nat context next with
+    | .ok (.cons _ _) after => .ok (stx.getArg 1) after
+    | .ok .nil after => .error .unsupportedSyntax after
+    | .error error after => .error error after
   | .ok .nil next => .error .unsupportedSyntax next
   | .error error next => .error error next
 

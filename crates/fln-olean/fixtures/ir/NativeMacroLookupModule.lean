@@ -21,3 +21,11 @@ public section
   | [] => pure (.atom .none "absent")
   | [first] => pure (.node .none first #[stx])
   | first :: second :: _ => pure (.node .none first #[.node .none second #[stx]])
+
+@[noinline] def lookupResolveGlobalMacro (stx : Lean.Syntax) : Lean.MacroM Lean.Syntax := do
+  let candidates ← Lean.Macro.resolveGlobalName stx.getId
+  match candidates with
+  | [] => pure (.atom .none "absent")
+  | [(target, [])] => pure (.node .none target #[stx])
+  | [(target, field :: _)] => pure (.node .none target #[.atom .none field])
+  | (first, _) :: (second, _) :: _ => pure (.node .none first #[.node .none second #[stx]])

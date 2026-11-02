@@ -113,6 +113,7 @@ fn live_native_macro_lookup_uses_explicit_isolated_environments_and_preserves_st
     let namespace_macro = prepare("lookupNamespaceMacro");
     let has_decl_macro = prepare("lookupHasDeclMacro");
     let resolve_namespace_macro = prepare("lookupResolveNamespaceMacro");
+    let resolve_global_macro = prepare("lookupResolveGlobalMacro");
     let only_a = name("Provided.onlyA");
     let only_b = name("Provided.onlyB");
     let environment_a = fln_elab::namespaces::register_module(
@@ -128,8 +129,9 @@ fn live_native_macro_lookup_uses_explicit_isolated_environments_and_preserves_st
     let namespace_a = name("Live.SpaceA");
     let namespace_b = name("Live.SpaceB");
     let opened_a = [name("Other")];
-    let lookup_a = EnvironmentMacroLookup::new(&environment_a, &module_a, &namespace_a, &opened_a);
-    let lookup_b = EnvironmentMacroLookup::new(&environment_b, &module_b, &namespace_b, &[]);
+    let lookup_a =
+        EnvironmentMacroLookup::new(&environment_a, &module_a, &namespace_a, &opened_a, &[]);
+    let lookup_b = EnvironmentMacroLookup::new(&environment_b, &module_b, &namespace_b, &[], &[]);
     let source = SourceText::from_utf8(b"value").unwrap();
     let context = MacroContext {
         quotation_context: name("Quotation.Origin"),
@@ -247,10 +249,35 @@ fn live_native_macro_lookup_uses_explicit_isolated_environments_and_preserves_st
         Syntax::atom(SourceInfo::None, "absent"),
         "mirror:Lean.Macro.resolveNamespace",
     );
+    for lookup in [&lookup_a, &lookup_b, &lookup_a] {
+        let expected = if std::ptr::eq(lookup, &lookup_a) {
+            Syntax::node(name("Provided.onlyA"), vec![input_a.clone()])
+        } else {
+            Syntax::atom(SourceInfo::None, "absent")
+        };
+        check(
+            &resolve_global_macro,
+            &input_a,
+            lookup,
+            expected,
+            "mirror:Lean.Macro.resolveGlobalName",
+        );
+    }
+    check(
+        &resolve_global_macro,
+        &identifier(name("Provided.onlyA.field")),
+        &lookup_a,
+        Syntax::node(
+            name("Provided.onlyA"),
+            vec![Syntax::atom(SourceInfo::None, "field")],
+        ),
+        "mirror:Lean.Macro.resolveGlobalName",
+    );
     for (compiled, operation) in [
         (&namespace_macro, "Lean.Macro.getCurrNamespace"),
         (&has_decl_macro, "Lean.Macro.hasDecl"),
         (&resolve_namespace_macro, "Lean.Macro.resolveNamespace"),
+        (&resolve_global_macro, "Lean.Macro.resolveGlobalName"),
     ] {
         let unavailable = compiled.execute(
             &input_a,
@@ -323,7 +350,8 @@ fn live_native_macro_lookup_uses_explicit_isolated_environments_and_preserves_st
         name("Current.Inner"),
         name("First"),
     ];
-    let lookup = EnvironmentMacroLookup::new(&namespace_environment, &module_a, &current, &opened);
+    let lookup =
+        EnvironmentMacroLookup::new(&namespace_environment, &module_a, &current, &opened, &[]);
     let expected = ["Child", "_root_.Child", "Missing"]
         .map(|query| {
             lookup
