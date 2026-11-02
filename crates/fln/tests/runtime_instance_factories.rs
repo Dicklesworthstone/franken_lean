@@ -106,6 +106,96 @@ def fromFunctionBox (n delta : Nat) : Nat :=
 }
 
 #[test]
+fn constant_methods_and_parent_instances_keep_bound_factory_arguments() {
+    execute(
+        r#"
+structure IndexedBox (A : Type) (n : Nat) where
+  value : A
+class GetAt (C A : Type) (valid : C -> Nat -> Prop) where
+  get : (xs : C) -> (i : Nat) -> valid xs i -> A
+def boxGet {A : Type} {n : Nat} (xs : IndexedBox A n) (_ : Nat) (_ : n = n) : A := xs.value
+instance makeGetAt (n : Nat) {A : Type} : GetAt (IndexedBox A n) A (fun _ _ => n = n) :=
+  { get := boxGet (A := A) (n := n) }
+def fromBox (n : Nat) (xs : IndexedBox Nat n) : Nat :=
+  @GetAt.get (IndexedBox Nat n) Nat (fun _ _ => n = n) (makeGetAt n (A := Nat)) xs 0 rfl
+#eval fromBox 7 { value := 42 }
+"#,
+        "42",
+    );
+    execute(
+        r#"
+structure IndexedBox (A : Type) (n : Nat) where
+  value : A
+class GetAt (C A : Type) (valid : C -> Nat -> Prop) where
+  get : (xs : C) -> (i : Nat) -> valid xs i -> A
+class BothAt (C A : Type) (valid : C -> Nat -> Prop) extends GetAt C A valid where
+  other : Nat
+instance makeBothAt (n : Nat) {A : Type} : BothAt (IndexedBox A n) A (fun _ _ => n = n) :=
+  { get := fun xs _ _ => xs.value, other := 0 }
+def fromBox (n : Nat) (xs : IndexedBox Nat n) : Nat :=
+  @GetAt.get (IndexedBox Nat n) Nat (fun _ _ => n = n)
+    (@BothAt.toGetAt (IndexedBox Nat n) Nat (fun _ _ => n = n) (makeBothAt n (A := Nat))) xs 0 rfl
+#eval fromBox 7 { value := 42 }
+"#,
+        "42",
+    );
+    execute(
+        r#"
+structure IndexedBox (A : Type) (n : Nat) where
+  value : A
+class GetAt (C A : Type) (valid : C -> Nat -> Prop) where
+  get : (xs : C) -> (i : Nat) -> valid xs i -> A
+def addBox (delta n : Nat) (xs : IndexedBox Nat n) (_ : Nat) (_ : n = n) : Nat := xs.value + delta
+instance makeGetAt (n delta : Nat) : GetAt (IndexedBox Nat n) Nat (fun _ _ => n = n) :=
+  { get := addBox delta n }
+def fromBox (n delta x : Nat) : Nat :=
+  @GetAt.get (IndexedBox Nat n) Nat (fun _ _ => n = n) (makeGetAt n delta) { value := x } 0 rfl
+#eval fromBox 7 1 20 + fromBox 8 2 20
+"#,
+        "43",
+    );
+}
+
+#[test]
+fn inherited_methods_cannot_discard_a_computed_sibling() {
+    let base = engine();
+    let options = KVMap::new();
+    let root = base.logical_root(&options);
+    let source = r#"
+structure IndexedBox (A : Type) (n : Nat) where
+  value : A
+class GetAt (C A : Type) (valid : C -> Nat -> Prop) where
+  get : (xs : C) -> (i : Nat) -> valid xs i -> A
+class BothAt (C A : Type) (valid : C -> Nat -> Prop) extends GetAt C A valid where
+  other : Nat
+def count (n : Nat) : Nat := match n with | .zero => 0 | .succ k => count k + 1
+instance makeBothAt (n : Nat) {A : Type} : BothAt (IndexedBox A n) A (fun _ _ => n = n) :=
+  { get := fun xs _ _ => xs.value, other := count n }
+def fromBox (n : Nat) (xs : IndexedBox Nat n) : Nat :=
+  @GetAt.get (IndexedBox Nat n) Nat (fun _ _ => n = n)
+    (@BothAt.toGetAt (IndexedBox Nat n) Nat (fun _ _ => n = n) (makeBothAt n (A := Nat))) xs 0 rfl
+#eval fromBox 30 { value := 42 }
+"#;
+    let error = base
+        .execute_source_definitions(&[source.as_bytes()], &options, limits())
+        .expect_err("an inherited method cannot erase its outer dictionary's strict work");
+    let mut cause = &error;
+    while let fln::EngineExecutionError::BatchCommand { error, .. } = cause {
+        cause = error;
+    }
+    assert!(
+        matches!(
+            cause,
+            fln::EngineExecutionError::Ingress(
+                fln_comp::ingress::IngressError::UnsupportedCallableSignature { name }
+            ) if name.to_display_string().starts_with("_fln_runtime_specialization.")
+        ),
+        "{error:?}"
+    );
+    assert_eq!(base.logical_root(&options), root);
+}
+
+#[test]
 fn dependent_computed_dictionary_fields_are_not_discarded_as_inert_metadata() {
     let base = engine();
     let options = KVMap::new();

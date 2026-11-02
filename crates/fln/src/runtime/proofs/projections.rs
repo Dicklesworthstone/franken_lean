@@ -115,40 +115,16 @@ impl Preparation<'_> {
         Ok(Some(body))
     }
 
-    /// An already-bound local and a lambda are values even when their syntax
-    /// mentions the caller's telescope. Applications that could perform work
-    /// still need the existing closed, inert factory check.
+    /// Use the same administrative evaluator for parameters and dictionary
+    /// fields. Bound locals remain values; a computed unused operand refuses.
     fn inert_projection_argument(&mut self, expression: &Expr) -> Result<bool, IngressError> {
-        self.tick()?;
-        let (head, arguments) = self.spine(expression)?;
-        if arguments.is_empty()
-            && matches!(
-                head.node(),
-                ExprNode::BVar { .. }
-                    | ExprNode::Lam { .. }
-                    | ExprNode::ForallE { .. }
-                    | ExprNode::Sort { .. }
-                    | ExprNode::Lit { .. }
-            )
-        {
-            return Ok(true);
-        }
-        if let ExprNode::Const { name, levels } = head.node()
-            && let Some(ConstantInfo::Induct(family)) = self.environment.find(name)
-            && !family.is_unsafe
-            && family.base.level_params.len() == levels.len()
-        {
-            // A checked type value does not execute its indices, including
-            // an index referring to the surrounding runtime telescope.
-            return Ok(true);
-        }
-        Ok(self.instance_factory_value(expression)?.is_some())
+        Ok(self.scoped_instance_factory_value(expression)?.is_some())
     }
 
     /// Select a method only through administrative factory reductions. Every
-    /// discarded argument and constructor operand must be inert. Strict lets,
-    /// computed fields, native allocations and external implementations stay
-    /// on their ordinary execution paths; no receiver computation runs here.
+    /// discarded argument and constructor operand must be inert. Computed
+    /// initializers, native allocations and external implementations stay on
+    /// their ordinary execution paths; no receiver computation runs here.
     fn known_instance_method(
         &mut self,
         family: &Name,
@@ -162,76 +138,26 @@ impl Preparation<'_> {
         {
             return Ok(None);
         }
-        let mut value = receiver.clone();
-        loop {
-            self.tick()?;
-            let (head, arguments) = self.spine(&value)?;
-            match head.node() {
-                ExprNode::Const { name, levels } => {
-                    self.check_noncomputable_head(&head)?;
-                    if self.has_implementation(name)? || self.has_extern_attribute(name)? {
-                        return Ok(None);
-                    }
-                    if let Some(ConstantInfo::Ctor(constructor)) = self.environment.find(name) {
-                        if constructor.is_unsafe
-                            || constructor.induct != *family
-                            || constructor.base.level_params.len() != levels.len()
-                            || arguments.len()
-                                != constructor.num_params as usize + constructor.num_fields as usize
-                        {
-                            return Ok(None);
-                        }
-                        let position = usize::try_from(index)
-                            .ok()
-                            .filter(|&i| i < constructor.num_fields as usize)
-                            .and_then(|i| i.checked_add(constructor.num_params as usize));
-                        let Some(method) = position.and_then(|i| arguments.get(i)).cloned() else {
-                            return Ok(None);
-                        };
-                        let (method_head, method_arguments) = self.spine(&method)?;
-                        if !method_arguments.is_empty()
-                            || !matches!(method_head.node(), ExprNode::Lam { .. })
-                        {
-                            return Ok(None);
-                        }
-                        for argument in &arguments {
-                            if !self.inert_projection_argument(argument)? {
-                                return Ok(None);
-                            }
-                        }
-                        return Ok(Some(method));
-                    }
-                    let definition = match self.environment.find(name) {
-                        Some(ConstantInfo::Defn(definition)) => Some(definition.clone()),
-                        _ => self.specialized_definition(name),
-                    };
-                    let Some(definition) = definition.filter(|definition| {
-                        definition.safety == fln_env::constants::DefinitionSafety::Safe
-                            && definition.base.level_params.len() == levels.len()
-                    }) else {
-                        return Ok(None);
-                    };
-                    value = arguments.into_iter().fold(
-                        self.universe_instance(
-                            &definition.value,
-                            &definition.base.level_params,
-                            levels,
-                        )?,
-                        Expr::app,
-                    );
-                }
-                ExprNode::Lam { body, .. } if !arguments.is_empty() => {
-                    if !self.inert_projection_argument(&arguments[0])? {
-                        return Ok(None);
-                    }
-                    value = arguments[1..]
-                        .iter()
-                        .cloned()
-                        .fold(self.substitution(body, &arguments[0])?, Expr::app);
-                }
-                _ => return Ok(None),
-            }
+        let Some(value) = self.scoped_instance_factory_value(receiver)? else {
+            return Ok(None);
+        };
+        let Some(method) = self.instance_factory_field(family, index, &value)? else {
+            return Ok(None);
+        };
+        let (head, arguments) = self.spine(&method)?;
+        if !arguments.is_empty() {
+            return Ok(None);
         }
+        let callable = if matches!(head.node(), ExprNode::Lam { .. }) {
+            true
+        } else if self.inert_native_function(&head)?
+            && let Some(type_) = self.callable_type(&head)?
+        {
+            matches!(self.type_head(&type_)?.node(), ExprNode::ForallE { .. })
+        } else {
+            false
+        };
+        Ok(callable.then_some(method))
     }
 
     pub(in crate::runtime) fn original_projection_type(

@@ -81,6 +81,77 @@ fn applied_factories_produce_inert_constructor_values_without_changing_inputs() 
 }
 
 #[test]
+fn scoped_factory_values_preserve_locals_without_reusing_another_callers_cache() {
+    let environment = environment();
+    let mut preparation = Preparation::new(&environment, IngressLimits::default());
+    for index in [0, 1, 0] {
+        let input = call("factory", [b(index)]);
+        assert!(
+            preparation
+                .instance_factory_value(&input)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            preparation.scoped_instance_factory_value(&input).unwrap(),
+            Some(call("Dictionary.mk", [b(index), b(index)]))
+        );
+    }
+    assert!(preparation.specializations.factory_values.is_empty());
+}
+
+#[test]
+fn executable_factory_selection_rechecks_noncomputable_metadata_cache_entries() {
+    let seed = crate::Engine::with_source_seed(crate::EngineAdmissionLimits::new(
+        crate::Budget::for_stack_bytes(2 * 1024 * 1024),
+    ))
+    .unwrap()
+    .into_complete()
+    .unwrap();
+    let environment = definition(
+        seed.environment().clone(),
+        "hidden",
+        pi(c("Nat"), c("Nat"), BinderInfo::Default),
+        lam(c("Nat"), b(0)),
+    );
+    let environment = fln_elab::noncomputable::register(&environment, &name("hidden")).unwrap();
+    let environment = definition(
+        environment,
+        "logicalType",
+        Expr::sort(Level::one()),
+        c("Nat"),
+    );
+    let environment =
+        fln_elab::noncomputable::register(&environment, &name("logicalType")).unwrap();
+    let mut preparation = Preparation::new(&environment, IngressLimits::default());
+    let input = c("hidden");
+    assert!(
+        preparation
+            .instance_factory_value(&input)
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        preparation
+            .specializations
+            .factory_values
+            .contains_key(&input)
+    );
+    assert!(matches!(
+        preparation.scoped_instance_factory_value(&input),
+        Err(IngressError::UnsupportedNode {
+            kind: "noncomputable runtime dependency"
+        })
+    ));
+    assert_eq!(
+        preparation
+            .scoped_instance_factory_value(&c("logicalType"))
+            .unwrap(),
+        Some(c("Nat"))
+    );
+}
+
+#[test]
 fn inert_let_values_and_constructor_function_aliases_are_supported() {
     let environment = definition(
         environment(),

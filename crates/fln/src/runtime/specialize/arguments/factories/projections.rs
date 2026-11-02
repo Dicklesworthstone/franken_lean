@@ -2,7 +2,7 @@
 use super::*;
 
 impl Preparation<'_> {
-    pub(super) fn instance_factory_field(
+    pub(in crate::runtime) fn instance_factory_field(
         &mut self,
         family: &Name,
         index: u64,

@@ -5,10 +5,7 @@
 use super::*;
 
 impl Preparation<'_> {
-    pub(super) fn check_noncomputable_head(&mut self, head: &Expr) -> Result<(), IngressError> {
-        let ExprNode::Const { name, .. } = head.node() else {
-            return Ok(());
-        };
+    pub(super) fn is_noncomputable_name(&mut self, name: &Name) -> Result<bool, IngressError> {
         if self.noncomputable.is_none() {
             // Bound the metadata work before decoding. Failed or partial reads
             // never populate the cache, which belongs to this immutable environment.
@@ -42,11 +39,17 @@ impl Preparation<'_> {
                 })?;
             self.noncomputable = Some(names);
         }
-        if !self
+        Ok(self
             .noncomputable
             .as_ref()
-            .is_some_and(|names| names.contains(name))
-        {
+            .is_some_and(|names| names.contains(name)))
+    }
+
+    pub(super) fn check_noncomputable_head(&mut self, head: &Expr) -> Result<(), IngressError> {
+        let ExprNode::Const { name, .. } = head.node() else {
+            return Ok(());
+        };
+        if !self.is_noncomputable_name(name)? {
             return Ok(());
         }
         // The pin's checkComputable permits extern declarations. The ordinary

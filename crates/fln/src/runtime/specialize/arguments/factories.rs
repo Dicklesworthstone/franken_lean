@@ -3,7 +3,9 @@
 //! Lambda bodies remain code until applied. Every supplied argument, local
 //! initializer and constructor operand must independently be inert, even when
 //! the result would discard it. Intrinsics, recursors, executable axioms, unsafe
-//! bodies and open values never become compile-time dictionary evidence.
+//! bodies never become compile-time dictionary evidence. Ordinary specialization
+//! accepts closed inputs only; method projection additionally permits already-bound
+//! locals as inert values, without caching expressions in that caller's scope.
 use super::*;
 use std::collections::VecDeque;
 
@@ -32,11 +34,29 @@ impl Preparation<'_> {
         &mut self,
         input: &Expr,
     ) -> Result<Option<Expr>, IngressError> {
+        self.instance_factory_value_in_scope(input, false)
+    }
+
+    pub(in crate::runtime) fn scoped_instance_factory_value(
+        &mut self,
+        input: &Expr,
+    ) -> Result<Option<Expr>, IngressError> {
+        self.instance_factory_value_in_scope(input, true)
+    }
+
+    fn instance_factory_value_in_scope(
+        &mut self,
+        input: &Expr,
+        allow_bound_locals: bool,
+    ) -> Result<Option<Expr>, IngressError> {
         self.tick()?;
-        if !closed(input) {
+        if !allow_bound_locals && !closed(input) {
             return Ok(None);
         }
-        if let Some(value) = self.specializations.factory_values.get(input) {
+        // The scoped path also enforces executable noncomputable/native-carrier
+        // guards. Never inherit an entry from the closed metadata evaluator,
+        // nor record an expression whose de Bruijn indices belong to a caller.
+        if !allow_bound_locals && let Some(value) = self.specializations.factory_values.get(input) {
             return Ok(Some(value.clone()));
         }
         let mut tasks = vec![Task::Value(input.clone())];
@@ -128,6 +148,14 @@ impl Preparation<'_> {
                                 if !constructor.is_unsafe
                                     && levels.len() == constructor.base.level_params.len() =>
                             {
+                                if allow_bound_locals
+                                    && (self.st_ref_record_forbidden(&constructor.induct)?
+                                        || self.array_record_forbidden(&constructor.induct)?
+                                        || self.thunk_record_forbidden(&constructor.induct)?
+                                        || self.task_record_forbidden(&constructor.induct)?)
+                                {
+                                    return Ok(None);
+                                }
                                 let arity = (constructor.num_params as usize)
                                     .checked_add(constructor.num_fields as usize)
                                     .ok_or_else(|| unsupported("instance constructor arity"))?;
@@ -164,6 +192,7 @@ impl Preparation<'_> {
                         | ExprNode::ForallE { .. }
                         | ExprNode::Sort { .. }
                         | ExprNode::Lit { .. } => values.push(head),
+                        ExprNode::BVar { .. } if allow_bound_locals => values.push(head),
                         ExprNode::Const { name, levels } => {
                             // The native-function fast path above preserves a
                             // verified callable. Any other explicit extern
@@ -178,6 +207,13 @@ impl Preparation<'_> {
                                 || definition.base.level_params.len() != levels.len()
                             {
                                 return Ok(None);
+                            }
+                            if allow_bound_locals
+                                && self.is_noncomputable_name(name)?
+                                && !self.type_parameter(&definition.base.type_)?
+                                && !self.proposition_type(&definition.base.type_, &[])?
+                            {
+                                self.check_noncomputable_head(&head)?;
                             }
                             let body = self.universe_instance(
                                 &definition.value,
@@ -293,7 +329,7 @@ impl Preparation<'_> {
         let value = values
             .pop()
             .ok_or_else(|| unsupported("instance factory result"))?;
-        if closed(&value) {
+        if !allow_bound_locals && closed(&value) {
             self.tick()?;
             let entries = &mut self.specializations.factory_values;
             let additional = usize::from(!entries.contains_key(input));
