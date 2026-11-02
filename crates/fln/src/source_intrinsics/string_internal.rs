@@ -1,6 +1,6 @@
 //! Pinned opaque string primitives are ABI contracts, not reducible models.
 //!
-//! Init.Data.String.Bootstrap at the SUITE.lock pin declares these two safe
+//! Init.Data.String.Bootstrap at the SUITE.lock pin declares these safe
 //! opaques with Inhabited fallback bodies. The Reference uses their extern
 //! entries, never those fallback values. Require the entire opaque and its
 //! scalar/class/dictionary contract before selecting the existing generated
@@ -109,6 +109,7 @@ fn opaque(label: &str) -> OpaqueVal {
     let (arguments, result, instance) = match label {
         "String.Internal.append" => (2, constant("String"), constant("String.instInhabited")),
         "String.Internal.length" => (1, constant("Nat"), constant("instInhabitedNat")),
+        "String.Internal.isPrefixOf" => (2, constant("Bool"), constant("instInhabitedBool")),
         _ => unreachable!("fixed imported string primitive"),
     };
     let mut type_ = result;
@@ -126,10 +127,26 @@ fn opaque(label: &str) -> OpaqueVal {
     }
     OpaqueVal {
         base: base(label, vec![], type_.clone()),
-        value: apply(
-            Expr::const_(name("Inhabited.default"), vec![Level::one()]),
-            [type_, dictionary],
-        ),
+        // The pin gives isPrefixOf named parameters, so its fallback is
+        // elaborated under two lambdas. append/length instead declare an
+        // anonymous function type and default that entire function value.
+        value: if label == "String.Internal.isPrefixOf" {
+            lambda(
+                constant("String"),
+                lambda(
+                    constant("String"),
+                    apply(
+                        Expr::const_(name("Inhabited.default"), vec![Level::one()]),
+                        [constant("Bool"), constant("instInhabitedBool")],
+                    ),
+                ),
+            )
+        } else {
+            apply(
+                Expr::const_(name("Inhabited.default"), vec![Level::one()]),
+                [type_, dictionary],
+            )
+        },
         is_unsafe: false,
         all: vec![name(label)],
     }
@@ -227,6 +244,36 @@ fn support() -> Vec<Declaration> {
     ]
 }
 
+fn boolean_support() -> [Declaration; 3] {
+    [
+        fln_elab::seed::bool_seed_declaration(),
+        Declaration::Defn(DefinitionVal {
+            base: base("instInhabitedBool.default", vec![], constant("Bool")),
+            value: constant("Bool.false"),
+            hints: ReducibilityHints::Regular(1),
+            safety: DefinitionSafety::Safe,
+            all: vec![name("instInhabitedBool.default")],
+        }),
+        Declaration::Defn(DefinitionVal {
+            base: base(
+                "instInhabitedBool",
+                vec![],
+                Expr::app(
+                    Expr::const_(name("Inhabited"), vec![Level::one()]),
+                    constant("Bool"),
+                ),
+            ),
+            value: apply(
+                Expr::const_(name("Inhabited.mk"), vec![Level::one()]),
+                [constant("Bool"), constant("instInhabitedBool.default")],
+            ),
+            hints: ReducibilityHints::Regular(2),
+            safety: DefinitionSafety::Safe,
+            all: vec![name("instInhabitedBool")],
+        }),
+    ]
+}
+
 pub(crate) fn imported_string_internal_matches(
     environment: &Environment,
     requested: &Name,
@@ -238,6 +285,8 @@ pub(crate) fn imported_string_internal_matches(
         "String.Internal.append"
     } else if requested == &name("String.Internal.length") {
         "String.Internal.length"
+    } else if requested == &name("String.Internal.isPrefixOf") {
+        "String.Internal.isPrefixOf"
     } else {
         return Ok(false);
     };
@@ -259,6 +308,13 @@ pub(crate) fn imported_string_internal_matches(
     for expected in support() {
         if !comparison.declaration(environment, expected)? {
             return Err(unsupported());
+        }
+    }
+    if label == "String.Internal.isPrefixOf" {
+        for expected in boolean_support() {
+            if !comparison.declaration(environment, expected)? {
+                return Err(unsupported());
+            }
         }
     }
     Ok(true)

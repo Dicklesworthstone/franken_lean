@@ -223,6 +223,7 @@ fn admitted_bootstrap_strings_execute_unicode_and_refuse_changed_opaque_contract
         for (declaration, symbol) in [
             ("String.Internal.append", "lean_string_append"),
             ("String.Internal.length", "lean_string_length"),
+            ("String.Internal.isPrefixOf", "lean_string_isprefixof"),
             ("String.utf8ByteSize", "lean_string_utf8_byte_size"),
             ("String.Internal.posOf", "lean_string_posof"),
             ("String.Internal.offsetOfPos", "lean_string_offsetofpos"),
@@ -289,6 +290,13 @@ import Init.Data.String.Bootstrap
 #eval (Substring.Raw.Internal.get (Substring.Raw.mk "aλ😀z" (String.Pos.Raw.mk 1) (String.Pos.Raw.mk 3)) (String.Pos.Raw.mk 6)).toNat
 #eval (Substring.Raw.Internal.prev (Substring.Raw.mk "aλ😀z" (String.Pos.Raw.mk 1) (String.Pos.Raw.mk 7)) (String.Pos.Raw.mk 6)).byteIdx
 #eval let ss := Substring.Raw.mk "aλ😀z" (String.Pos.Raw.mk 1) (String.Pos.Raw.mk 7); let drop := Substring.Raw.Internal.drop ss; (drop 1).str
+#eval if String.Internal.isPrefixOf "" "" then 42 else 0
+#eval if String.Internal.isPrefixOf "λ" "λ😀" then 42 else 0
+#eval if String.Internal.isPrefixOf "λ😀" "λ" then 42 else 0
+#eval if String.Internal.isPrefixOf "\x00λ" "\x00λz" then 42 else 0
+#eval if String.Internal.isPrefixOf "λ" "μ" then 42 else 0
+#eval let starts := String.Internal.isPrefixOf "λ"; if starts "λ😀" then 42 else 0
+#eval let invoke (f : String -> Bool) : Nat := if f "λx" then 42 else 0; invoke (String.Internal.isPrefixOf "λ")
 "#;
         let entry = name("Main");
         let modules = [SourceModuleInput { name: &entry, source: source.as_bytes() }];
@@ -324,6 +332,13 @@ import Init.Data.String.Bootstrap
             Some(ClosedVmValue::Scalar(122)),
             Some(ClosedVmValue::Scalar(2)),
             Some(ClosedVmValue::String("aλ😀z".to_owned())),
+            Some(ClosedVmValue::Scalar(42)),
+            Some(ClosedVmValue::Scalar(42)),
+            Some(ClosedVmValue::Scalar(0)),
+            Some(ClosedVmValue::Scalar(42)),
+            Some(ClosedVmValue::Scalar(0)),
+            Some(ClosedVmValue::Scalar(42)),
+            Some(ClosedVmValue::Scalar(42)),
         ]);
         assert_eq!("é😀a".len(), 7, "the native length result counts codepoints, not bytes");
         // Replay the actual bytes emitted after both imported-module and
@@ -344,7 +359,7 @@ import Init.Data.String.Bootstrap
             let replay = fln::execute_flbc_artifact(&execution.flbc_artifact, &options, Default::default()).unwrap().into_complete().unwrap();
             assert_eq!(fln::closed_vm_value(&replay).unwrap(), fln::closed_vm_value(&execution.exit).unwrap());
         }
-        for operation in ["utf8ByteSize", "Internal.posOf", "Internal.offsetOfPos", "Internal.extract", "Internal.next", "Internal.pushn", "Internal.foldl", "Internal.isEmpty", "Internal.front", "Pos.Raw.Internal.min", "Pos.Raw.Internal.sub"] {
+        for operation in ["utf8ByteSize", "Internal.posOf", "Internal.offsetOfPos", "Internal.extract", "Internal.next", "Internal.pushn", "Internal.foldl", "Internal.isEmpty", "Internal.isPrefixOf", "Internal.front", "Pos.Raw.Internal.min", "Pos.Raw.Internal.sub"] {
             assert!(string_rows.contains(&format!("extern:String.{operation}")), "the admitted source must select {operation}'s actual native row");
         }
         for operation in ["toString", "drop", "front", "extract", "beq", "isEmpty", "get", "prev"] {
@@ -359,6 +374,31 @@ import Init.Data.String.Bootstrap
         let retry = run();
         assert_eq!(executions.iter().map(|execution| &execution.flbc_artifact).collect::<Vec<_>>(), retry.modules[0].commands.batch.executions.iter().map(|execution| &execution.flbc_artifact).collect::<Vec<_>>());
         assert_eq!(imported.engine.logical_root(&options), original_root);
+
+        let changed_prefix = replace_checked(&imported.engine, "String.Internal.isPrefixOf", |info| {
+            let ConstantInfo::Opaque(mut value) = info else { unreachable!() };
+            value.value = Expr::lam(Name::anonymous(), Expr::const_(name("String"), vec![]), Expr::lam(Name::anonymous(), Expr::const_(name("String"), vec![]), Expr::const_(name("Bool.false"), vec![]), BinderInfo::Default), BinderInfo::Default);
+            Declaration::Opaque(value)
+        });
+        let changed_bool = replace_checked(&imported.engine, "instInhabitedBool", |info| {
+            let ConstantInfo::Defn(mut value) = info else { unreachable!() };
+            let ExprNode::App { f, .. } = value.value.node() else { panic!("actual Bool inhabitant constructor") };
+            value.value = Expr::app(f.clone(), Expr::const_(name("Bool.true"), vec![]));
+            Declaration::Defn(value)
+        });
+        let changed_default = replace_checked(&imported.engine, "instInhabitedBool.default", |info| {
+            let ConstantInfo::Defn(mut value) = info else { unreachable!() };
+            value.value = Expr::const_(name("Bool.true"), vec![]);
+            Declaration::Defn(value)
+        });
+        for engine in [changed_prefix, changed_bool, changed_default] {
+            let root = engine.logical_root(&options);
+            let failure = engine.execute_source_commands_with_checks(b"#eval if String.Internal.isPrefixOf \"a\" \"abc\" then 42 else 0", &options, limits.execution).expect_err("an altered prefix opaque or Boolean default cannot acquire its native row");
+            let mut cause = &failure;
+            while let fln::EngineExecutionError::BatchCommand { error, .. } = cause { cause = error; }
+            assert!(matches!(cause, fln::EngineExecutionError::Ingress(fln::IngressError::UnsupportedNode { kind: "imported string extern does not match its complete opaque contract" })), "{failure:?}");
+            assert_eq!(engine.logical_root(&options), root);
+        }
 
         let changed_body = replace_checked(&imported.engine, "String.Internal.length", |info| {
             let ConstantInfo::Opaque(mut value) = info else { unreachable!() };

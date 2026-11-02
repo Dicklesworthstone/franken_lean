@@ -2,7 +2,7 @@ use super::*;
 
 fn model() -> Vec<ConstantInfo> {
     let mut values = scalar_records();
-    for declaration in support() {
+    for declaration in support().into_iter().chain(boolean_support()) {
         match declaration {
             Declaration::Defn(value) => values.push(ConstantInfo::Defn(value)),
             Declaration::Inductive(block) => {
@@ -14,8 +14,12 @@ fn model() -> Vec<ConstantInfo> {
         }
     }
     values.extend(
-        ["String.Internal.append", "String.Internal.length"]
-            .map(|label| ConstantInfo::Opaque(opaque(label))),
+        [
+            "String.Internal.append",
+            "String.Internal.length",
+            "String.Internal.isPrefixOf",
+        ]
+        .map(|label| ConstantInfo::Opaque(opaque(label))),
     );
     values
 }
@@ -41,17 +45,25 @@ fn canonical_entry(label: &str) -> fln_elab::externs::ExternEntry {
 }
 
 fn environment(change: impl Fn(&mut ConstantInfo)) -> Environment {
-    ["String.Internal.append", "String.Internal.length"]
-        .into_iter()
-        .fold(bare_environment(change), |env, label| {
-            fln_elab::externs::register(&env, &name(label), vec![canonical_entry(label)]).unwrap()
-        })
+    [
+        "String.Internal.append",
+        "String.Internal.length",
+        "String.Internal.isPrefixOf",
+    ]
+    .into_iter()
+    .fold(bare_environment(change), |env, label| {
+        fln_elab::externs::register(&env, &name(label), vec![canonical_entry(label)]).unwrap()
+    })
 }
 
 #[test]
 fn complete_opaque_contract_selects_existing_pure_rows_and_meters_every_comparison() {
     let env = environment(|_| {});
-    for label in ["String.Internal.append", "String.Internal.length"] {
+    for label in [
+        "String.Internal.append",
+        "String.Internal.length",
+        "String.Internal.isPrefixOf",
+    ] {
         let mut work = 0;
         assert!(
             imported_string_internal_matches(
@@ -69,6 +81,10 @@ fn complete_opaque_contract_selects_existing_pure_rows_and_meters_every_comparis
                 .unwrap()
                 .unwrap();
         assert_eq!(binding.row, format!("extern:{label}"));
+        if label == "String.Internal.isPrefixOf" {
+            assert_eq!(binding.arguments, [ValueType::String, ValueType::String]);
+            assert_eq!(binding.result, ValueType::Bool);
+        }
         assert_eq!(binding.effect, fln_comp::fir::EffectClass::Pure);
         assert_eq!(
             binding.result_ownership,
@@ -92,7 +108,11 @@ fn complete_opaque_contract_selects_existing_pure_rows_and_meters_every_comparis
 
 #[test]
 fn changed_opaque_metadata_values_and_support_never_acquire_native_authority() {
-    for target in ["String.Internal.append", "String.Internal.length"] {
+    for target in [
+        "String.Internal.append",
+        "String.Internal.length",
+        "String.Internal.isPrefixOf",
+    ] {
         for mutation in 0..9 {
             let env = environment(|info| {
                 if info.name() == &name(target) {
@@ -174,6 +194,52 @@ fn changed_opaque_metadata_values_and_support_never_acquire_native_authority() {
 }
 
 #[test]
+fn prefix_results_require_the_complete_bool_family_and_default() {
+    for mutation in 0..4 {
+        let env = environment(|info| {
+            if mutation == 0 && info.name() == &name("Bool") {
+                let ConstantInfo::Induct(value) = info else {
+                    unreachable!()
+                };
+                value.num_params = 1;
+            } else if mutation == 1 && info.name() == &name("Bool.false") {
+                let ConstantInfo::Ctor(value) = info else {
+                    unreachable!()
+                };
+                value.cidx = 1;
+            } else if mutation == 2 && info.name() == &name("instInhabitedBool") {
+                let ConstantInfo::Defn(value) = info else {
+                    unreachable!()
+                };
+                value.value = apply(
+                    Expr::const_(name("Inhabited.mk"), vec![Level::one()]),
+                    [constant("Bool"), constant("Bool.true")],
+                );
+            } else if mutation == 3 && info.name() == &name("instInhabitedBool.default") {
+                let ConstantInfo::Defn(value) = info else {
+                    unreachable!()
+                };
+                value.value = constant("Bool.true");
+            }
+        });
+        assert!(
+            matches!(
+                executable_intrinsic_binding(
+                    &env,
+                    &name("String.Internal.isPrefixOf"),
+                    &mut 0,
+                    IngressLimits::default(),
+                ),
+                Err(IngressError::UnsupportedNode {
+                    kind: "imported string extern does not match its complete opaque contract"
+                })
+            ),
+            "Boolean support mutation {mutation}"
+        );
+    }
+}
+
+#[test]
 fn exact_bootstrap_opaque_and_prelude_dependencies_match_the_pin() {
     let Some(library) = std::env::var_os("FLN_REFERENCE_LIB").map(std::path::PathBuf::from) else {
         assert!(
@@ -232,7 +298,11 @@ fn exact_bootstrap_opaque_and_prelude_dependencies_match_the_pin() {
 #[test]
 fn opaque_models_need_exact_extern_entries_not_just_matching_constants() {
     use fln_elab::externs::{self, ExternEntry};
-    for label in ["String.Internal.append", "String.Internal.length"] {
+    for label in [
+        "String.Internal.append",
+        "String.Internal.length",
+        "String.Internal.isPrefixOf",
+    ] {
         let bare = bare_environment(|_| {});
         assert!(
             !imported_string_internal_matches(

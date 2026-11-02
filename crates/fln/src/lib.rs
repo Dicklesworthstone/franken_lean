@@ -6769,7 +6769,7 @@ fn generated_source_intrinsic_binding(name: &Name) -> Option<IntrinsicBinding> {
             ValueType::Nat,
             Some("String.length"),
         ),
-        "String.decEq" => (
+        "String.decEq" | "String.Internal.isPrefixOf" => (
             vec![ValueType::String, ValueType::String],
             ValueType::Bool,
             None,
