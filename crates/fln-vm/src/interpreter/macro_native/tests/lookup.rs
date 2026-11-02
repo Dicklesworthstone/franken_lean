@@ -1,4 +1,5 @@
 use super::*;
+use crate::macro_native::ResolvedGlobals;
 use std::cell::Cell;
 
 struct Lookup {
@@ -265,4 +266,262 @@ fn vm_lookup_capability_is_isolated_per_invocation_and_obeys_stops() {
         ));
     }
     assert_eq!(first.calls.get(), calls);
+}
+
+struct ResolutionLookup {
+    namespace: Name,
+    requested: Name,
+    namespaces: Vec<Name>,
+    globals: ResolvedGlobals,
+    failure: Option<MacroLookupError>,
+    calls: Cell<usize>,
+}
+
+impl MacroLookup for ResolutionLookup {
+    fn current_namespace(&self) -> &Name {
+        &self.namespace
+    }
+
+    fn has_decl(&self, _: &Name) -> bool {
+        false
+    }
+
+    fn resolve_namespace(&self, requested: &Name) -> Result<Vec<Name>, MacroLookupError> {
+        assert_eq!(requested, &self.requested);
+        self.calls.set(self.calls.get() + 1);
+        match &self.failure {
+            Some(error) => Err(error.clone()),
+            None => Ok(self.namespaces.clone()),
+        }
+    }
+
+    fn resolve_global_name(&self, requested: &Name) -> Result<ResolvedGlobals, MacroLookupError> {
+        assert_eq!(requested, &self.requested);
+        self.calls.set(self.calls.get() + 1);
+        match &self.failure {
+            Some(error) => Err(error.clone()),
+            None => Ok(self.globals.clone()),
+        }
+    }
+}
+
+fn resolution_lookup() -> ResolutionLookup {
+    let first = Name::from_components(["First", "candidate"]);
+    let second = Name::from_components(["Second", "candidate"]);
+    ResolutionLookup {
+        namespace: Name::from_components(["Current"]),
+        requested: Name::from_components(["candidate", "field"]),
+        namespaces: vec![first.clone(), second.clone(), first.clone()],
+        globals: vec![
+            (second, vec!["field".into(), "λ".into()]),
+            (first, Vec::new()),
+        ],
+        failure: None,
+        calls: Cell::new(0),
+    }
+}
+
+fn list_values(value: &Obj) -> Vec<Obj> {
+    let mut cursor = value.clone_ref();
+    let mut result = Vec::new();
+    while !cursor.is_scalar() {
+        check_layout(&cursor, layout::LIST_CONS).unwrap();
+        result.push(child(&cursor, 0).unwrap());
+        cursor = child(&cursor, 1).unwrap();
+    }
+    assert_eq!(cursor.unbox(), layout::LIST_NIL_TAG);
+    result
+}
+
+#[test]
+fn native_resolution_preserves_overload_projection_order_and_complete_state() {
+    let lookup = resolution_lookup();
+    for (intrinsic, row) in [
+        (
+            Intrinsic::ResolveNamespace,
+            "mirror:Lean.Macro.resolveNamespace",
+        ),
+        (
+            Intrinsic::ResolveGlobalName,
+            "mirror:Lean.Macro.resolveGlobalName",
+        ),
+    ] {
+        let state = state();
+        let value = intrinsic
+            .invoke_with_lookup(
+                row,
+                &[inject_name(&lookup.requested), context(), state.clone_ref()],
+                Some(&lookup),
+            )
+            .unwrap_or_else(|_| panic!("{row} refused an authorized query"))
+            .into_object();
+        let candidates = list_values(&result_payload(&value, &state));
+        if intrinsic == Intrinsic::ResolveNamespace {
+            let names: Vec<_> = candidates
+                .iter()
+                .map(|value| Conversion::new().project_name(value).unwrap())
+                .collect();
+            assert_eq!(names, lookup.namespaces);
+        } else {
+            let names: ResolvedGlobals = candidates
+                .iter()
+                .map(|value| {
+                    check_layout(value, layout::PROD).unwrap();
+                    let declaration = Conversion::new()
+                        .project_name(&child(value, 0).unwrap())
+                        .unwrap();
+                    let projections = list_values(&child(value, 1).unwrap())
+                        .iter()
+                        .map(|value| string(value).unwrap().to_owned())
+                        .collect();
+                    (declaration, projections)
+                })
+                .collect();
+            assert_eq!(names, lookup.globals);
+        }
+    }
+    assert_eq!(lookup.calls.get(), 2);
+}
+
+#[test]
+fn resolution_refusals_and_resource_stops_are_not_empty_answers() {
+    for row in [
+        "mirror:Lean.Macro.resolveNamespace",
+        "mirror:Lean.Macro.resolveGlobalName",
+    ] {
+        let program = callable_program(row);
+        for failure in [
+            Some(MacroLookupError::Unavailable),
+            Some(MacroLookupError::Invalid("corrupt namespace journal")),
+            Some(MacroLookupError::Exhausted("alias metadata")),
+            Some(MacroLookupError::Limit {
+                resource: "namespace journal bytes",
+                limit: 10,
+                observed: 11,
+            }),
+            None,
+        ] {
+            let mut lookup = resolution_lookup();
+            lookup.failure = failure.clone();
+            lookup.namespaces.clear();
+            lookup.globals.clear();
+            let state = state();
+            let outcome = crate::interpreter::execute_function_with_macro_lookup(
+                &program,
+                flbc::FunctionId::new(1),
+                vec![inject_name(&lookup.requested), context(), state.clone_ref()],
+                ExecutionLimits::default(),
+                &lookup,
+                None,
+            );
+            match failure {
+                Some(MacroLookupError::Unavailable) => assert!(matches!(
+                    outcome,
+                    Outcome::Complete(VmExit::Refused {
+                        refusal: VmRefusal::MacroLookupUnavailable { .. },
+                        ..
+                    })
+                )),
+                Some(MacroLookupError::Invalid(_)) => assert!(matches!(
+                    outcome,
+                    Outcome::Complete(VmExit::Refused {
+                        refusal: VmRefusal::MacroLookupInvalid { .. },
+                        ..
+                    })
+                )),
+                Some(MacroLookupError::Limit { .. }) => {
+                    let Outcome::Inconclusive(stop) = outcome else {
+                        panic!("resource stop became an answer: {outcome:?}")
+                    };
+                    assert!(matches!(
+                        stop.cause,
+                        fln_core::outcome::InconclusiveCause::ResourceExhausted { .. }
+                    ));
+                }
+                Some(MacroLookupError::Exhausted(_)) => {
+                    let Outcome::Inconclusive(stop) = outcome else {
+                        panic!("dependency exhaustion became an answer: {outcome:?}")
+                    };
+                    assert!(matches!(
+                        stop.cause,
+                        fln_core::outcome::InconclusiveCause::DependencyUnavailable { .. }
+                    ));
+                }
+                None => {
+                    let Outcome::Complete(VmExit::Returned(result)) = outcome else {
+                        panic!("unresolved lookup did not return {row}: {outcome:?}")
+                    };
+                    let value = result_payload(&result.value, &state);
+                    assert!(value.is_scalar());
+                    assert_eq!(value.unbox(), layout::LIST_NIL_TAG);
+                }
+            }
+            assert_eq!(lookup.calls.get(), 1);
+        }
+    }
+}
+
+#[test]
+fn resolution_validates_arguments_and_does_not_invent_missing_authority() {
+    let provider = resolution_lookup();
+    let minimal = lookup("Minimal");
+    for (intrinsic, row) in [
+        (
+            Intrinsic::ResolveNamespace,
+            "mirror:Lean.Macro.resolveNamespace",
+        ),
+        (
+            Intrinsic::ResolveGlobalName,
+            "mirror:Lean.Macro.resolveGlobalName",
+        ),
+    ] {
+        assert!(matches!(
+            intrinsic.invoke_with_lookup(
+                row,
+                &[inject_name(&provider.requested), context(), state()],
+                Some(&minimal)
+            ),
+            Err(IntrinsicFailure::Refused(
+                VmRefusal::MacroLookupUnavailable { .. }
+            ))
+        ));
+        for arguments in [
+            vec![Obj::mk_string("not a Name"), context(), state()],
+            vec![inject_name(&provider.requested), Obj::mk_nat(0), state()],
+            vec![inject_name(&provider.requested), context(), Obj::mk_nat(0)],
+        ] {
+            assert!(matches!(
+                intrinsic.invoke_with_lookup(row, &arguments, Some(&provider)),
+                Err(IntrinsicFailure::Refused(_))
+            ));
+        }
+    }
+    assert_eq!(provider.calls.get(), 0);
+    assert_eq!(minimal.calls.get(), 0);
+}
+
+#[test]
+fn resolution_bounds_whole_lists_before_encoding_abi_values() {
+    let names = vec![Name::anonymous(); MAX_NAME_NODES as usize + 1];
+    assert!(matches!(
+        namespace_candidates(&names),
+        Err(IntrinsicFailure::MirrorResource {
+            resource: "macro lookup nodes",
+            ..
+        })
+    ));
+    let text = "x".repeat(MAX_NAME_BYTES as usize / 2 + 1);
+    let names = vec![(Name::anonymous(), vec![text.clone(), text])];
+    assert!(matches!(
+        global_candidates(&names),
+        Err(IntrinsicFailure::MirrorResource {
+            resource: "macro lookup bytes",
+            ..
+        })
+    ));
+    let overflowed = Name::num_overflowing(Name::anonymous(), 0);
+    assert!(matches!(
+        namespace_candidates(&[overflowed]),
+        Err(IntrinsicFailure::Refused(VmRefusal::InvalidCtorObject))
+    ));
 }

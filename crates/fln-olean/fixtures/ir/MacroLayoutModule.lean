@@ -94,4 +94,14 @@ def prod (name : Lean.Name) (value : String) : Lean.Name × String := (name, val
     EStateM.Result Lean.Macro.Exception Lean.Macro.State Bool :=
   Lean.Macro.hasDecl name context state
 
+@[noinline] def macroResolveNamespace (name : Lean.Name) (context : @& Lean.Macro.Context)
+    (state : Lean.Macro.State) :
+    EStateM.Result Lean.Macro.Exception Lean.Macro.State (List Lean.Name) :=
+  Lean.Macro.resolveNamespace name context state
+
+@[noinline] def macroResolveGlobalName (name : Lean.Name) (context : @& Lean.Macro.Context)
+    (state : Lean.Macro.State) :
+    EStateM.Result Lean.Macro.Exception Lean.Macro.State (List (Lean.Name × List String)) :=
+  Lean.Macro.resolveGlobalName name context state
+
 end FrankenLean.MacroLayout

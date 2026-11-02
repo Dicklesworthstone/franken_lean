@@ -16,7 +16,60 @@ use fln_rt::syntax_abi_generated as generated;
 pub trait MacroLookup {
     fn current_namespace(&self) -> &Name;
     fn has_decl(&self, declaration: &Name) -> bool;
+
+    /// Namespace candidates in the pin's lookup order, including repetitions.
+    /// A provider that cannot answer must refuse, never return an empty answer.
+    fn resolve_namespace(&self, _name: &Name) -> Result<Vec<Name>, MacroLookupError> {
+        Err(MacroLookupError::Unavailable)
+    }
+
+    /// Global candidates with their projection suffixes, in lookup order.
+    /// Resolving a reserved name does not execute its declaration action.
+    fn resolve_global_name(&self, _name: &Name) -> Result<ResolvedGlobals, MacroLookupError> {
+        Err(MacroLookupError::Unavailable)
+    }
 }
+
+/// Ordered overload candidates and their projection suffixes.
+pub type ResolvedGlobals = Vec<(Name, Vec<String>)>;
+
+/// A name query's host-side stop, kept distinct from a successful empty result.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MacroLookupError {
+    Unavailable,
+    Invalid(&'static str),
+    /// A dependency exhausted its resources without numerical usage details.
+    Exhausted(&'static str),
+    Limit {
+        resource: &'static str,
+        limit: u64,
+        observed: u64,
+    },
+}
+
+impl std::fmt::Display for MacroLookupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unavailable => f.write_str("macro lookup capability is unavailable"),
+            Self::Invalid(detail) => write!(f, "invalid macro lookup: {detail}"),
+            Self::Exhausted(resource) => {
+                write!(f, "native macro lookup exhausted {resource}")
+            }
+            Self::Limit {
+                resource,
+                limit,
+                observed,
+            } => {
+                write!(
+                    f,
+                    "macro lookup {resource} limit {limit}, observed {observed}"
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for MacroLookupError {}
 
 #[derive(Clone, Copy, Debug)]
 pub struct MirrorRow {
@@ -136,6 +189,20 @@ pub const ROWS: &[MirrorRow] = &[
         borrowed: generated::MACRO_HAS_DECL_BORROWED,
         parameters: generated::MACRO_HAS_DECL_PARAMETERS,
         result_type: generated::MACRO_HAS_DECL_RESULT,
+    },
+    MirrorRow {
+        id: "mirror:Lean.Macro.resolveNamespace",
+        name: "Lean.Macro.resolveNamespace",
+        borrowed: generated::MACRO_RESOLVE_NAMESPACE_BORROWED,
+        parameters: generated::MACRO_RESOLVE_NAMESPACE_PARAMETERS,
+        result_type: generated::MACRO_RESOLVE_NAMESPACE_RESULT,
+    },
+    MirrorRow {
+        id: "mirror:Lean.Macro.resolveGlobalName",
+        name: "Lean.Macro.resolveGlobalName",
+        borrowed: generated::MACRO_RESOLVE_GLOBAL_NAME_BORROWED,
+        parameters: generated::MACRO_RESOLVE_GLOBAL_NAME_PARAMETERS,
+        result_type: generated::MACRO_RESOLVE_GLOBAL_NAME_RESULT,
     },
 ];
 

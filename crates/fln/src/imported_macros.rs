@@ -5,8 +5,8 @@
 //! Syntax, context and state objects and returns the complete resulting state.
 //! It does not enable expansion-less parser registrations, interpret Lean's
 //! toolchain implementation, or supply ambient environment authority. Native
-//! namespace and declaration lookups require an explicit invocation capability;
-//! the remaining Macro.Methods are refused at native-call selection.
+//! namespace, declaration membership and name resolution require an explicit
+//! invocation capability; the recursive `expandMacro?` callback remains refused.
 
 use crate::imported_ir::{
     self, CompiledCallableIr, IrExecutionError, IrExecutionLimits, ReferenceFunction,
@@ -35,9 +35,9 @@ pub use syntax::{SyntaxConversionError, SyntaxLimits};
 ///
 /// User code may read the quotation name, scope, depth, depth limit and source
 /// reference supplied by the native context. Its opaque MethodsRef cannot be
-/// inspected, mutated or allowed to escape verified calls. Namespace and
-/// declaration lookups use the explicit capability in [`MacroInvocation`];
-/// the other three Macro.Methods remain unavailable.
+/// inspected, mutated or allowed to escape verified calls. Namespace queries,
+/// declaration membership and name resolution use the explicit capability in
+/// [`MacroInvocation`]; the recursive `expandMacro?` callback remains unavailable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MacroContext {
     pub quotation_context: Name,

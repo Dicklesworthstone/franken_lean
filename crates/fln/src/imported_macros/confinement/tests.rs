@@ -457,6 +457,14 @@ fn native_context_method_policy_is_exact_and_position_specific() {
             "Lean.Macro.hasDecl",
             vec![Value::Plain, Value::Context, Value::Plain],
         ),
+        (
+            "Lean.Macro.resolveNamespace",
+            vec![Value::Plain, Value::Context, Value::Plain],
+        ),
+        (
+            "Lean.Macro.resolveGlobalName",
+            vec![Value::Plain, Value::Context, Value::Plain],
+        ),
     ] {
         analyzer
             .native_arguments(&owner, &name(function), &arguments)
@@ -497,6 +505,38 @@ fn native_context_method_policy_is_exact_and_position_specific() {
                 .is_err(),
             "accepted {function} {arguments:?}"
         );
+    }
+    for method in ["resolveNamespace", "resolveGlobalName"] {
+        let function = Name::from_components(["Lean", "Macro", method]);
+        for arguments in [
+            [Value::Context, Value::Plain, Value::Plain],
+            [Value::Plain, Value::Plain, Value::Context],
+            [Value::Context, Value::Context, Value::Plain],
+            [Value::Plain, Value::Mixed, Value::Plain],
+        ] {
+            assert!(
+                analyzer
+                    .native_arguments(&owner, &function, &arguments)
+                    .is_err(),
+                "accepted {method} with misplaced or mixed context"
+            );
+        }
+        for impostor in [
+            Name::str(Name::anonymous(), format!("Lean.Macro.{method}")),
+            Name::str(function, "_redArg"),
+            Name::from_components(["User", method]),
+        ] {
+            assert!(
+                analyzer
+                    .native_arguments(
+                        &owner,
+                        &impostor,
+                        &[Value::Plain, Value::Context, Value::Plain],
+                    )
+                    .is_err(),
+                "accepted a name-resolution method impostor"
+            );
+        }
     }
 }
 

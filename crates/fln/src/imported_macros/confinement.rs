@@ -101,7 +101,10 @@ fn refusal(declaration: &Name) -> IrExecutionError {
 /// Their arities still come from the mechanically extracted Mirror contract.
 fn accepted_native_context_argument(function: &Name, index: usize) -> bool {
     (index == 0 && *function == Name::from_components(["Lean", "Macro", "getCurrNamespace"]))
-        || (index == 1 && *function == Name::from_components(["Lean", "Macro", "hasDecl"]))
+        || (index == 1
+            && ["hasDecl", "resolveNamespace", "resolveGlobalName"]
+                .into_iter()
+                .any(|method| *function == Name::from_components(["Lean", "Macro", method])))
 }
 
 impl Analyzer<'_> {
