@@ -1161,7 +1161,8 @@ fn source_lookup_capability_defaults_to_the_engine_snapshot_and_allows_explicit_
     // ambient authority from the newer Engine.
     let module_name = name("SourceQuery");
     let namespace = Name::anonymous();
-    let stale_lookup = EnvironmentMacroLookup::new(engine.environment(), &module_name, &namespace);
+    let stale_lookup =
+        EnvironmentMacroLookup::new(engine.environment(), &module_name, &namespace, &[]);
     let stale = successor.check_source_command_with_imported_macros(
         source,
         &KVMap::new(),

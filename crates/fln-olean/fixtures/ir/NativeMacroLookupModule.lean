@@ -14,3 +14,10 @@ public section
     pure (.atom .none "present")
   else
     pure (.atom .none "absent")
+
+@[noinline] def lookupResolveNamespaceMacro (stx : Lean.Syntax) : Lean.MacroM Lean.Syntax := do
+  let candidates ← Lean.Macro.resolveNamespace stx.getId
+  match candidates with
+  | [] => pure (.atom .none "absent")
+  | [first] => pure (.node .none first #[stx])
+  | first :: second :: _ => pure (.node .none first #[.node .none second #[stx]])

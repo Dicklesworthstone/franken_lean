@@ -417,8 +417,12 @@ fn expand(
         .as_ref()
         .or(scope.private_module.as_ref())
         .unwrap_or(&anonymous_module);
-    let engine_lookup =
-        EnvironmentMacroLookup::new(engine.environment(), main_module, &scope.namespace);
+    let engine_lookup = EnvironmentMacroLookup::new(
+        engine.environment(),
+        main_module,
+        &scope.namespace,
+        &scope.opened,
+    );
     let lookup = lookup.or(Some(&engine_lookup as &dyn MacroLookup));
     let resolve = crate::source_check::grammar::resolver(engine.environment(), &scope);
     let existing_global = expected == SourceCommandKind::Check

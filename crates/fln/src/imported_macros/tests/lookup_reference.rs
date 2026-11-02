@@ -112,16 +112,24 @@ fn live_native_macro_lookup_uses_explicit_isolated_environments_and_preserves_st
     };
     let namespace_macro = prepare("lookupNamespaceMacro");
     let has_decl_macro = prepare("lookupHasDeclMacro");
+    let resolve_namespace_macro = prepare("lookupResolveNamespaceMacro");
     let only_a = name("Provided.onlyA");
     let only_b = name("Provided.onlyB");
-    let environment_a = environment(&only_a);
-    let environment_b = environment(&only_b);
+    let environment_a = fln_elab::namespaces::register_module(
+        &environment(&only_a),
+        &[name("Live.SpaceA.LookupChild"), name("Other.LookupChild")],
+    )
+    .unwrap();
+    let environment_b =
+        fln_elab::namespaces::register_module(&environment(&only_b), &[name("LookupChild")])
+            .unwrap();
     let module_a = name("ModuleA");
     let module_b = name("ModuleB");
     let namespace_a = name("Live.SpaceA");
     let namespace_b = name("Live.SpaceB");
-    let lookup_a = EnvironmentMacroLookup::new(&environment_a, &module_a, &namespace_a);
-    let lookup_b = EnvironmentMacroLookup::new(&environment_b, &module_b, &namespace_b);
+    let opened_a = [name("Other")];
+    let lookup_a = EnvironmentMacroLookup::new(&environment_a, &module_a, &namespace_a, &opened_a);
+    let lookup_b = EnvironmentMacroLookup::new(&environment_b, &module_b, &namespace_b, &[]);
     let source = SourceText::from_utf8(b"value").unwrap();
     let context = MacroContext {
         quotation_context: name("Quotation.Origin"),
@@ -203,9 +211,46 @@ fn live_native_macro_lookup_uses_explicit_isolated_environments_and_preserves_st
         Syntax::atom(SourceInfo::None, "absent"),
         "mirror:Lean.Macro.hasDecl",
     );
+    let child = identifier(name("LookupChild"));
+    for (lookup, expected) in [
+        (
+            &lookup_a,
+            Syntax::node(
+                name("Live.SpaceA.LookupChild"),
+                vec![Syntax::node(name("Other.LookupChild"), vec![child.clone()])],
+            ),
+        ),
+        (
+            &lookup_b,
+            Syntax::node(name("LookupChild"), vec![child.clone()]),
+        ),
+        (
+            &lookup_a,
+            Syntax::node(
+                name("Live.SpaceA.LookupChild"),
+                vec![Syntax::node(name("Other.LookupChild"), vec![child.clone()])],
+            ),
+        ),
+    ] {
+        check(
+            &resolve_namespace_macro,
+            &child,
+            lookup,
+            expected,
+            "mirror:Lean.Macro.resolveNamespace",
+        );
+    }
+    check(
+        &resolve_namespace_macro,
+        &input_a,
+        &lookup_a,
+        Syntax::atom(SourceInfo::None, "absent"),
+        "mirror:Lean.Macro.resolveNamespace",
+    );
     for (compiled, operation) in [
         (&namespace_macro, "Lean.Macro.getCurrNamespace"),
         (&has_decl_macro, "Lean.Macro.hasDecl"),
+        (&resolve_namespace_macro, "Lean.Macro.resolveNamespace"),
     ] {
         let unavailable = compiled.execute(
             &input_a,
@@ -257,7 +302,65 @@ fn live_native_macro_lookup_uses_explicit_isolated_environments_and_preserves_st
         b"[true, true, true, true, true, true, true, true, true]\n"
     );
     assert!(oracle.stderr.is_empty());
+
+    // Unlike the finite membership callbacks above, this oracle invokes the
+    // pin's actual namespace resolver over its actual namespace extension.
+    let namespace_environment = fln_elab::namespaces::register_module(
+        &Environment::new(),
+        &[
+            name("Current.Child"),
+            name("Current.Inner.Child"),
+            name("First.Child"),
+            name("Second.Child"),
+            name("Child"),
+        ],
+    )
+    .unwrap();
+    let current = name("Current.Inner.Deep");
+    let opened = [
+        name("First"),
+        name("Second"),
+        name("Current.Inner"),
+        name("First"),
+    ];
+    let lookup = EnvironmentMacroLookup::new(&namespace_environment, &module_a, &current, &opened);
+    let expected = ["Child", "_root_.Child", "Missing"]
+        .map(|query| {
+            lookup
+                .resolve_namespace(&name(query))
+                .unwrap()
+                .iter()
+                .map(Name::to_display_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .join(";")
+        + "\n";
+    std::fs::write(dir.join("NamespaceOracle.lean"), NAMESPACE_ORACLE).unwrap();
+    let oracle = Command::new(&reference)
+        .current_dir(&dir)
+        .arg("NamespaceOracle.lean")
+        .output()
+        .unwrap();
+    std::fs::write(dir.join("namespace-oracle.stdout"), &oracle.stdout).unwrap();
+    std::fs::write(dir.join("namespace-oracle.stderr"), &oracle.stderr).unwrap();
+    assert!(oracle.status.success(), "{oracle:?}; {dir:?}");
+    assert_eq!(oracle.stdout, expected.as_bytes(), "{dir:?}");
+    assert!(oracle.stderr.is_empty());
 }
+
+const NAMESPACE_ORACLE: &str = r#"
+import Lean
+open Lean Elab Command in
+run_elab do
+  let env ← getEnv
+  let env := [ `Current.Child, `Current.Inner.Child, `First.Child, `Second.Child, `Child ].foldl
+    (fun env ns => env.registerNamespace ns) env
+  let opens := [OpenDecl.simple `First [], .simple `Current.Inner [], .simple `Second [], .simple `First []]
+  let rows := [ `Child, `_root_.Child, `Missing ].map fun query =>
+    (ResolveName.resolveNamespace env `Current.Inner.Deep opens query).map (·.toString)
+  logInfo m!"{String.intercalate ";" (rows.map (String.intercalate ","))}"
+"#;
 
 const ORACLE: &str = r#"
 def lookupInput (name : Lean.Name) : Lean.Syntax :=

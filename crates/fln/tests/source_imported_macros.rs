@@ -236,12 +236,47 @@ fn actual_artifacts(reference: PathBuf, library: PathBuf, partition: PathBuf) {
     assert!(checked.attempts[0].vm_usage.as_ref().unwrap().steps > 0);
     assert!(
         checked.attempts[0]
+            .native_functions
+            .iter()
+            .any(|row| row == "mirror:Lean.Macro.resolveNamespace")
+    );
+    assert!(
+        checked.attempts[0]
             .reference_functions
             .iter()
             .any(|function| {
                 function.name == name("admittedChooseTerm") && function.producer() == "reference"
             })
     );
+
+    let empty_environment = Environment::new();
+    let anonymous = Name::anonymous();
+    let empty_lookup = fln::imported_macros::lookup::EnvironmentMacroLookup::new(
+        &empty_environment,
+        &anonymous,
+        &anonymous,
+        &[],
+    );
+    let missing_namespace = engine.check_source_command_with_imported_macros(
+        b"#check (Nat : Bool)",
+        &options,
+        admission,
+        SourceMacroInvocation {
+            lookup: Some(&empty_lookup),
+            ..invocation()
+        },
+    );
+    assert!(
+        matches!(missing_namespace.outcome, Outcome::Complete(Err(_))),
+        "{missing_namespace:?}"
+    );
+    assert!(missing_namespace.attempts.iter().any(|attempt| {
+        attempt
+            .native_functions
+            .iter()
+            .any(|row| row == "mirror:Lean.Macro.resolveNamespace")
+    }));
+    assert_eq!(engine.logical_root(&options), base_root);
 
     let report = engine.admit_source_declaration_with_imported_macros(
         b"def nativeAdmittedMacroValue : Nat := (11 : Bool)",
