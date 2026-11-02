@@ -113,33 +113,10 @@ fn live_native_macro_lookup_uses_explicit_isolated_environments_and_preserves_st
     let namespace_macro = prepare("lookupNamespaceMacro");
     let has_decl_macro = prepare("lookupHasDeclMacro");
     let resolve_namespace_macro = prepare("lookupResolveNamespaceMacro");
-    // The unchanged direct action reaches a distinct IR prerequisite: nested
-    // reset/reuse across several joins. Keep the actual typed frontier visible;
-    // a refusal here is not counted as a macro execution or lookup success.
-    let direct_global = compile(
-        std::slice::from_ref(&module),
-        &name("lookupResolveGlobalMacro"),
-        &VerifiedPartition::user_fixture(),
-        &users,
-        IrExecutionLimits::default(),
-    );
-    let direct_status = direct_global
-        .as_ref()
-        .map(|_| "compiled")
-        .map_err(ToString::to_string);
-    assert!(
-        matches!(
-            direct_global,
-            Err(MacroExecutionError::Compile(
-                IrExecutionError::Unsupported {
-                    form: "mutable IR statement",
-                    ..
-                }
-            ))
-        ),
-        "{direct_status:?}; {dir:?}"
-    );
-    let resolve_global_macro = prepare("lookupResolveGlobalSeparatedMacro");
+    // Exercise both the unchanged direct action (nested reset/reuse in the
+    // default pin IR) and the separately factored pure construction helper.
+    let resolve_global_macro = prepare("lookupResolveGlobalMacro");
+    let separated_global_macro = prepare("lookupResolveGlobalSeparatedMacro");
     let only_a = name("Provided.onlyA");
     let only_b = name("Provided.onlyB");
     let environment_a = fln_elab::namespaces::register_module(
@@ -275,35 +252,38 @@ fn live_native_macro_lookup_uses_explicit_isolated_environments_and_preserves_st
         Syntax::atom(SourceInfo::None, "absent"),
         "mirror:Lean.Macro.resolveNamespace",
     );
-    for lookup in [&lookup_a, &lookup_b, &lookup_a] {
-        let expected = if std::ptr::eq(lookup, &lookup_a) {
-            Syntax::node(name("Provided.onlyA"), vec![input_a.clone()])
-        } else {
-            Syntax::atom(SourceInfo::None, "absent")
-        };
+    for compiled in [&resolve_global_macro, &separated_global_macro] {
+        for lookup in [&lookup_a, &lookup_b, &lookup_a] {
+            let expected = if std::ptr::eq(lookup, &lookup_a) {
+                Syntax::node(name("Provided.onlyA"), vec![input_a.clone()])
+            } else {
+                Syntax::atom(SourceInfo::None, "absent")
+            };
+            check(
+                compiled,
+                &input_a,
+                lookup,
+                expected,
+                "mirror:Lean.Macro.resolveGlobalName",
+            );
+        }
         check(
-            &resolve_global_macro,
-            &input_a,
-            lookup,
-            expected,
+            compiled,
+            &identifier(name("Provided.onlyA.field")),
+            &lookup_a,
+            Syntax::node(
+                name("Provided.onlyA"),
+                vec![Syntax::atom(SourceInfo::None, "field")],
+            ),
             "mirror:Lean.Macro.resolveGlobalName",
         );
     }
-    check(
-        &resolve_global_macro,
-        &identifier(name("Provided.onlyA.field")),
-        &lookup_a,
-        Syntax::node(
-            name("Provided.onlyA"),
-            vec![Syntax::atom(SourceInfo::None, "field")],
-        ),
-        "mirror:Lean.Macro.resolveGlobalName",
-    );
     for (compiled, operation) in [
         (&namespace_macro, "Lean.Macro.getCurrNamespace"),
         (&has_decl_macro, "Lean.Macro.hasDecl"),
         (&resolve_namespace_macro, "Lean.Macro.resolveNamespace"),
         (&resolve_global_macro, "Lean.Macro.resolveGlobalName"),
+        (&separated_global_macro, "Lean.Macro.resolveGlobalName"),
     ] {
         let unavailable = compiled.execute(
             &input_a,

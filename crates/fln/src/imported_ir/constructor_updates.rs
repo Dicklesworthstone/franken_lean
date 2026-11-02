@@ -121,8 +121,21 @@ pub(super) fn normalize(module: &mut IrModule, limits: IrExecutionLimits) -> Res
                 fresh::normalize_body(name, body, &mut meter, 1)?;
             }
             if sharing {
-                let captures = join_captures(body, &mut meter)?;
-                normalize_body(body, Scope::default(), &captures, &mut meter, 1)?;
+                // Removing an outer reset can expose an inner receiver that
+                // was conservatively captured by the outer lexical join.
+                // Recompute captures after each changing pass; all passes
+                // share the same work budget, including unsuccessful scans.
+                let mut changed = meter.changed;
+                loop {
+                    meter.changed = false;
+                    let captures = join_captures(body, &mut meter)?;
+                    normalize_body(body, Scope::default(), &captures, &mut meter, 1)?;
+                    if !meter.changed {
+                        break;
+                    }
+                    changed = true;
+                }
+                meter.changed = changed;
             }
         }
     }

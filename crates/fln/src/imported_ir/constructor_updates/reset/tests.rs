@@ -365,74 +365,184 @@ fn expanded_reset_reuse_preserves_shared_originals_and_strict_common_work() {
     }
 }
 
+// The reuse discriminator is captured by a later join, rather than being
+// the reset continuation's own terminal. This is the default pin shape for
+// nested constructor reuse in ordinary MacroM code.
+fn deferred_region() -> IrBody {
+    let mut region = region();
+    let value = continuation(&mut region);
+    let terminal = std::mem::replace(&mut value.terminal, Box::new(jump(60, vec![])));
+    value.stmts.push(IrStmt::JDecl {
+        j: 60,
+        params: vec![],
+        value: IrBody {
+            stmts: vec![],
+            terminal,
+        },
+    });
+    region
+}
+
+#[test]
+fn deferred_reuse_preserves_shared_originals_common_work_and_canonical_replay() {
+    for module in [
+        fixture(deferred_region()),
+        unshaped_fixture(deferred_region()),
+    ] {
+        let original = module.clone();
+        let first =
+            compile_module(&module, "Reset.main", &[], IrExecutionLimits::default()).unwrap();
+        let second =
+            compile_module(&module, "Reset.main", &[], IrExecutionLimits::default()).unwrap();
+        assert_replay(&first, "93");
+        assert_eq!(module, original);
+        assert_eq!(
+            flbc::encode_canonical(first.program.program(), flbc::CodecLimits::default()).unwrap(),
+            flbc::encode_canonical(second.program.program(), flbc::CodecLimits::default()).unwrap(),
+        );
+        let mut limits = IrExecutionLimits::default();
+        limits.ir.max_work = 1;
+        assert!(
+            compile_module(&module, "Reset.main", &[], limits)
+                .unwrap_err()
+                .is_resource()
+        );
+        assert_eq!(module, original);
+    }
+}
+
+#[test]
+fn deferred_reuse_refuses_escaped_tokens_bits_and_inequivalent_mutation() {
+    for kind in 0..8 {
+        let mut region = deferred_region();
+        let value = continuation(&mut region);
+        if kind == 7 {
+            // The first guard passes its result to this continuation. A
+            // second reuse would mutate that same escaped object on the hot
+            // path, even though both guards separately match fresh allocation.
+            let IrStmt::JDecl { value: after, .. } = &mut value.stmts[2] else {
+                panic!("result continuation");
+            };
+            *after.terminal = cases(
+                12,
+                body(
+                    vec![IrStmt::Set {
+                        x: 11,
+                        i: 0,
+                        y: var(21),
+                    }],
+                    IrTerminal::Ret(var(11)),
+                ),
+                body(
+                    vec![bind(
+                        41,
+                        IrExpr::Ctor {
+                            info: info(1, 2),
+                            args: vec![var(21), var(3)],
+                        },
+                    )],
+                    IrTerminal::Ret(var(41)),
+                ),
+            );
+        } else {
+            let IrStmt::JDecl { value: nested, .. } = &mut value.stmts[3] else {
+                panic!("deferred reuse join");
+            };
+            match kind {
+                0 => nested.stmts.push(bind(40, IrExpr::Proj { i: 0, x: 11 })),
+                1 => nested.stmts.push(bind(
+                    40,
+                    IrExpr::Box {
+                        ty: IrType::UInt8,
+                        x: 12,
+                    },
+                )),
+                2 => nested.stmts.push(call(40, "Nat.add", &[11, 2])),
+                3 => *arm(nested, 0).terminal = jump(20, vec![var(3)]),
+                4 => arm(nested, 0).stmts.push(IrStmt::SetTag { x: 11, cidx: 2 }),
+                5 => arm(nested, 1).stmts.push(call(40, "Nat.add", &[2, 3])),
+                _ => nested.stmts.push(IrStmt::JDecl {
+                    j: 50,
+                    params: vec![],
+                    value: body(vec![], IrTerminal::Ret(var(11))),
+                }),
+            }
+        }
+        refused_with_or_without_incoming_shape(region, &format!("deferred mismatch {kind}"));
+    }
+}
+
 #[test]
 fn inferred_record_shape_is_checked_for_raw_calls_and_canonical_replay() {
-    let compiled = callable(&unshaped_fixture(region()));
-    let bytes = flbc::encode_canonical(compiled.program(), flbc::CodecLimits::default()).unwrap();
-    let replay = flbc::decode_canonical(&bytes, flbc::CodecLimits::default()).unwrap();
-    let entry = compiled
-        .reference_functions()
-        .iter()
-        .find(|function| function.name == name("Reset.update"))
-        .unwrap()
-        .function;
-    for program in [compiled.program(), &replay] {
-        assert!(
-            program
-                .functions()
-                .iter()
-                .flat_map(|f| &f.code)
-                .any(|instruction| matches!(
-                    instruction,
-                    flbc::Instruction::CtorLayoutTest {
-                        expected_tag: 1,
-                        expected_fields: 2,
-                        expected_scalar_bytes: 0,
-                        ..
-                    }
-                ))
-        );
-        let original = Obj::mk_ctor(1, vec![Obj::mk_nat(19), Obj::mk_nat(23)], &[]);
-        let outcome = execute_function(
-            program,
-            entry,
-            vec![original.clone_ref(), Obj::mk_nat(42)],
-            ExecutionLimits::default(),
-            None,
-        );
-        let Outcome::Complete(VmExit::Returned(result)) = outcome else {
-            panic!("{outcome:?}")
-        };
-        assert_eq!(
-            nat_decimal(&result.value.ctor_child(0)).as_deref(),
-            Some("43")
-        );
-        assert_eq!(
-            nat_decimal(&result.value.ctor_child(1)).as_deref(),
-            Some("23")
-        );
-        assert_eq!(nat_decimal(&original.ctor_child(0)).as_deref(), Some("19"));
-        for malformed in [
-            Obj::mk_ctor(2, vec![Obj::mk_nat(19), Obj::mk_nat(23)], &[]),
-            Obj::mk_ctor(
-                1,
-                vec![Obj::mk_nat(19), Obj::mk_nat(23), Obj::mk_nat(0)],
-                &[],
-            ),
-            Obj::mk_ctor(1, vec![Obj::mk_nat(19), Obj::mk_nat(23)], &[0]),
-            Obj::mk_ctor(1, vec![Obj::mk_nat(19), Obj::mk_nat(23)], &[0; 16]),
-        ] {
+    for region in [region(), deferred_region()] {
+        let compiled = callable(&unshaped_fixture(region));
+        let bytes =
+            flbc::encode_canonical(compiled.program(), flbc::CodecLimits::default()).unwrap();
+        let replay = flbc::decode_canonical(&bytes, flbc::CodecLimits::default()).unwrap();
+        let entry = compiled
+            .reference_functions()
+            .iter()
+            .find(|function| function.name == name("Reset.update"))
+            .unwrap()
+            .function;
+        for program in [compiled.program(), &replay] {
+            assert!(
+                program
+                    .functions()
+                    .iter()
+                    .flat_map(|f| &f.code)
+                    .any(|instruction| matches!(
+                        instruction,
+                        flbc::Instruction::CtorLayoutTest {
+                            expected_tag: 1,
+                            expected_fields: 2,
+                            expected_scalar_bytes: 0,
+                            ..
+                        }
+                    ))
+            );
+            let original = Obj::mk_ctor(1, vec![Obj::mk_nat(19), Obj::mk_nat(23)], &[]);
             let outcome = execute_function(
                 program,
                 entry,
-                vec![malformed, Obj::mk_nat(42)],
+                vec![original.clone_ref(), Obj::mk_nat(42)],
                 ExecutionLimits::default(),
                 None,
             );
-            assert!(
-                matches!(outcome, Outcome::Complete(VmExit::Panicked { .. })),
-                "{outcome:?}"
+            let Outcome::Complete(VmExit::Returned(result)) = outcome else {
+                panic!("{outcome:?}")
+            };
+            assert_eq!(
+                nat_decimal(&result.value.ctor_child(0)).as_deref(),
+                Some("43")
             );
+            assert_eq!(
+                nat_decimal(&result.value.ctor_child(1)).as_deref(),
+                Some("23")
+            );
+            assert_eq!(nat_decimal(&original.ctor_child(0)).as_deref(), Some("19"));
+            for malformed in [
+                Obj::mk_ctor(2, vec![Obj::mk_nat(19), Obj::mk_nat(23)], &[]),
+                Obj::mk_ctor(
+                    1,
+                    vec![Obj::mk_nat(19), Obj::mk_nat(23), Obj::mk_nat(0)],
+                    &[],
+                ),
+                Obj::mk_ctor(1, vec![Obj::mk_nat(19), Obj::mk_nat(23)], &[0]),
+                Obj::mk_ctor(1, vec![Obj::mk_nat(19), Obj::mk_nat(23)], &[0; 16]),
+            ] {
+                let outcome = execute_function(
+                    program,
+                    entry,
+                    vec![malformed, Obj::mk_nat(42)],
+                    ExecutionLimits::default(),
+                    None,
+                );
+                assert!(
+                    matches!(outcome, Outcome::Complete(VmExit::Panicked { .. })),
+                    "{outcome:?}"
+                );
+            }
         }
     }
 }
@@ -615,54 +725,56 @@ fn reset_and_reuse_guards_accept_either_boolean_default_and_order() {
 #[test]
 fn reset_prefix_effects_run_once_per_update_including_bytecode_replay() {
     use fln_rt::obj::StdoutCapture;
-    let mut region = region();
-    continuation(&mut region).stmts.splice(
-        2..2,
-        [
-            bind(
-                30,
-                IrExpr::Lit(IrLit::Str("between reset and reuse".to_owned())),
-            ),
-            bind(
-                31,
-                IrExpr::Pap {
-                    function: name("Reset.traceCont"),
-                    args: vec![],
-                },
-            ),
-            call(32, "dbgTrace", &[30, 31]),
-        ],
-    );
-    let mut module = fixture(region);
-    module.decls.push(function(
-        "Reset.traceCont",
-        &[1],
-        body(vec![num(2, 0)], IrTerminal::Ret(var(2))),
-    ));
-    module.decls.push(IrDecl::Extern {
-        name: name("dbgTrace"),
-        params: vec![param(1, IrType::TObject), param(2, IrType::TObject)],
-        result: IrType::TObject,
-        entries: vec![],
-    });
-    let compiled =
-        compile_module(&module, "Reset.main", &[], IrExecutionLimits::default()).unwrap();
-    let bytes =
-        flbc::encode_canonical(compiled.program.program(), flbc::CodecLimits::default()).unwrap();
-    let replay = flbc::decode_canonical(&bytes, flbc::CodecLimits::default()).unwrap();
-    for program in [compiled.program.program(), &replay] {
-        let capture = StdoutCapture::begin_evaluation(1024).unwrap();
-        let outcome = execute(program, ExecutionLimits::default(), None);
-        let captured = capture.finish();
-        assert_eq!(captured.error, None);
-        assert_eq!(
-            captured.bytes,
-            b"between reset and reuse\nbetween reset and reuse\n"
+    for mut region in [region(), deferred_region()] {
+        continuation(&mut region).stmts.splice(
+            2..2,
+            [
+                bind(
+                    30,
+                    IrExpr::Lit(IrLit::Str("between reset and reuse".to_owned())),
+                ),
+                bind(
+                    31,
+                    IrExpr::Pap {
+                        function: name("Reset.traceCont"),
+                        args: vec![],
+                    },
+                ),
+                call(32, "dbgTrace", &[30, 31]),
+            ],
         );
-        let Outcome::Complete(VmExit::Returned(value)) = outcome else {
-            panic!("{outcome:?}");
-        };
-        assert_eq!(nat_decimal(&value.value).as_deref(), Some("93"));
+        let mut module = fixture(region);
+        module.decls.push(function(
+            "Reset.traceCont",
+            &[1],
+            body(vec![num(2, 0)], IrTerminal::Ret(var(2))),
+        ));
+        module.decls.push(IrDecl::Extern {
+            name: name("dbgTrace"),
+            params: vec![param(1, IrType::TObject), param(2, IrType::TObject)],
+            result: IrType::TObject,
+            entries: vec![],
+        });
+        let compiled =
+            compile_module(&module, "Reset.main", &[], IrExecutionLimits::default()).unwrap();
+        let bytes =
+            flbc::encode_canonical(compiled.program.program(), flbc::CodecLimits::default())
+                .unwrap();
+        let replay = flbc::decode_canonical(&bytes, flbc::CodecLimits::default()).unwrap();
+        for program in [compiled.program.program(), &replay] {
+            let capture = StdoutCapture::begin_evaluation(1024).unwrap();
+            let outcome = execute(program, ExecutionLimits::default(), None);
+            let captured = capture.finish();
+            assert_eq!(captured.error, None);
+            assert_eq!(
+                captured.bytes,
+                b"between reset and reuse\nbetween reset and reuse\n"
+            );
+            let Outcome::Complete(VmExit::Returned(value)) = outcome else {
+                panic!("{outcome:?}");
+            };
+            assert_eq!(nat_decimal(&value.value).as_deref(), Some("93"));
+        }
     }
 }
 
