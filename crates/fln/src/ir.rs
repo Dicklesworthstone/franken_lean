@@ -6,10 +6,11 @@
 //! This is not the source declaration's unboxed/exported ABI, nor a certificate
 //! of kernel admission or faithful byte identity. Module publication must bind
 //! the entry and additional names to its own checked declaration/ABI contract.
-//! `compile_source_definition` additionally exports closed Nat/String function
-//! signatures under their source names, with owned object arguments.
-//! Type-dependent runtime carriers and scalar source conventions remain
-//! unsupported. Type/proof slots retain their original source positions.
+//! `compile_source_definition` additionally exports closed Nat/String/Bool
+//! function signatures under their source names, with owned object arguments
+//! and the pin's UInt8 Boolean convention. Type-dependent runtime carriers and
+//! other scalar conventions remain unsupported. Type/proof slots retain their
+//! original source positions.
 
 use fln_comp::{fir, flbc};
 use fln_core::name::Name;
@@ -486,23 +487,35 @@ fn boxed_wrapper(declaration: &IrDecl, meter: &mut Budget) -> Result<IrDecl> {
         return Err(invariant("native function"));
     };
     meter.charge(params.len().saturating_mul(3).saturating_add(1))?;
-    let mut stmts = vec![IrStmt::VDecl {
-        x: params.len() as u64 + 1,
+    let mut next = params.len() as u64 + 1;
+    let mut stmts = Vec::new();
+    let mut args = Vec::new();
+    for p in params {
+        args.push(if p.ty == IrType::Erased {
+            IrArg::Erased
+        } else if p.ty == IrType::UInt8 {
+            let x = next;
+            next = next.checked_add(1).ok_or(CompileError::Limit)?;
+            stmts.push(IrStmt::VDecl {
+                x,
+                ty: IrType::UInt8,
+                expr: IrExpr::Unbox { x: p.x },
+            });
+            IrArg::Var(x)
+        } else {
+            IrArg::Var(p.x)
+        });
+    }
+    let called = next;
+    next = next.checked_add(1).ok_or(CompileError::Limit)?;
+    stmts.push(IrStmt::VDecl {
+        x: called,
         ty: result.clone(),
         expr: IrExpr::Fap {
             function: name.clone(),
-            args: params
-                .iter()
-                .map(|p| {
-                    if p.ty == IrType::Erased {
-                        IrArg::Erased
-                    } else {
-                        IrArg::Var(p.x)
-                    }
-                })
-                .collect(),
+            args,
         },
-    }];
+    });
     for p in params {
         if p.borrow {
             stmts.push(IrStmt::Dec {
@@ -513,6 +526,20 @@ fn boxed_wrapper(declaration: &IrDecl, meter: &mut Budget) -> Result<IrDecl> {
             });
         }
     }
+    let returned = if *result == IrType::UInt8 {
+        meter.charge(1)?;
+        stmts.push(IrStmt::VDecl {
+            x: next,
+            ty: IrType::Tagged,
+            expr: IrExpr::Box {
+                ty: IrType::UInt8,
+                x: called,
+            },
+        });
+        next
+    } else {
+        called
+    };
     Ok(IrDecl::Function {
         name: Name::str(name.clone(), "_boxed"),
         params: params
@@ -521,16 +548,22 @@ fn boxed_wrapper(declaration: &IrDecl, meter: &mut Budget) -> Result<IrDecl> {
                 borrow: false,
                 ty: if p.ty == IrType::Erased {
                     IrType::TObject
+                } else if p.ty == IrType::UInt8 {
+                    IrType::Tagged
                 } else {
                     p.ty.clone()
                 },
                 ..p.clone()
             })
             .collect(),
-        result: result.clone(),
+        result: if *result == IrType::UInt8 {
+            IrType::Tagged
+        } else {
+            result.clone()
+        },
         body: IrBody {
             stmts,
-            terminal: Box::new(IrTerminal::Ret(IrArg::Var(params.len() as u64 + 1))),
+            terminal: Box::new(IrTerminal::Ret(IrArg::Var(returned))),
         },
         sorry_dep: None,
     })
@@ -800,6 +833,7 @@ fn source_carrier(ty: &fln_core::expr::Expr, meter: &mut Budget) -> Result<IrTyp
     use fln_core::expr::ExprNode;
     let nat = Name::from_components(["Nat"]);
     let string = Name::from_components(["String"]);
+    let boolean = Name::from_components(["Bool"]);
     let mut pending = vec![ty];
     let mut result = None;
     while let Some(ty) = pending.pop() {
@@ -810,6 +844,9 @@ fn source_carrier(ty: &fln_core::expr::Expr, meter: &mut Budget) -> Result<IrTyp
             }
             ExprNode::Const { name, levels } if levels.is_empty() && name == &string => {
                 IrType::Object
+            }
+            ExprNode::Const { name, levels } if levels.is_empty() && name == &boolean => {
+                IrType::UInt8
             }
             ExprNode::ForallE {
                 binder_type, body, ..
@@ -908,6 +945,11 @@ fn source_signature(
                         IrLit::Num(IrNat::Small(0)),
                         IrType::TObject,
                     ));
+                } else if param.ty == IrType::UInt8 {
+                    args.push(ReducedArgument::Literal(
+                        IrLit::Num(IrNat::Small(0)),
+                        IrType::UInt8,
+                    ));
                 } else {
                     args.push(ReducedArgument::Literal(
                         IrLit::Str(String::new()),
@@ -937,7 +979,7 @@ fn export_source(
 ) -> Result<Vec<IrDecl>> {
     meter.charge(signature.params.len().saturating_mul(2).saturating_add(8))?;
     let closure = signature.params.len() as u64 + 1;
-    let result = closure.checked_add(1).ok_or(CompileError::Limit)?;
+    let mut next = closure.checked_add(1).ok_or(CompileError::Limit)?;
     let mut stmts = vec![
         IrStmt::VDecl {
             x: closure,
@@ -958,25 +1000,52 @@ fn export_source(
     let returned = if signature.params.is_empty() {
         closure
     } else {
+        // Closure application takes boxed operands, while the source-facing
+        // Boolean entry takes UInt8. Keep that boundary explicit in both
+        // directions; the internal FIR program remains entirely boxed.
+        let mut args = Vec::new();
+        for p in &signature.params {
+            args.push(if p.ty == IrType::Erased {
+                IrArg::Erased
+            } else if p.ty == IrType::UInt8 {
+                let x = next;
+                next = next.checked_add(1).ok_or(CompileError::Limit)?;
+                stmts.push(IrStmt::VDecl {
+                    x,
+                    ty: IrType::Tagged,
+                    expr: IrExpr::Box {
+                        ty: IrType::UInt8,
+                        x: p.x,
+                    },
+                });
+                IrArg::Var(x)
+            } else {
+                IrArg::Var(p.x)
+            });
+        }
+        let result = next;
+        next = next.checked_add(1).ok_or(CompileError::Limit)?;
         stmts.push(IrStmt::VDecl {
             x: result,
-            ty: signature.result.clone(),
-            expr: IrExpr::Ap {
-                x: closure,
-                args: signature
-                    .params
-                    .iter()
-                    .map(|p| {
-                        if p.ty == IrType::Erased {
-                            IrArg::Erased
-                        } else {
-                            IrArg::Var(p.x)
-                        }
-                    })
-                    .collect(),
+            ty: if signature.result == IrType::UInt8 {
+                IrType::TObject
+            } else {
+                signature.result.clone()
             },
+            expr: IrExpr::Ap { x: closure, args },
         });
         result
+    };
+    let returned = if signature.result == IrType::UInt8 {
+        meter.charge(1)?;
+        stmts.push(IrStmt::VDecl {
+            x: next,
+            ty: IrType::UInt8,
+            expr: IrExpr::Unbox { x: returned },
+        });
+        next
+    } else {
+        returned
     };
     let public = IrDecl::Function {
         name: signature.name.clone(),

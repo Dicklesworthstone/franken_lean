@@ -58,7 +58,7 @@ fn export_cases() -> [(
     &'static str,
     &'static str,
     usize,
-); 23] {
+); 36] {
     [
         ("Nat", "42", "compiled", "Nat", "42", 0),
         (
@@ -230,6 +230,96 @@ fn export_cases() -> [(
             "\"typed callback\"",
             3,
         ),
+        ("Bool", "true", "compiled", "Bool", "true", 0),
+        ("Bool", "false", "compiled", "Bool", "false", 0),
+        (
+            "Bool -> Bool",
+            "fun x => x",
+            "compiled true",
+            "Bool",
+            "true",
+            1,
+        ),
+        (
+            "Bool -> Bool",
+            "fun x => x",
+            "compiled false",
+            "Bool",
+            "false",
+            1,
+        ),
+        (
+            "Bool -> Bool",
+            "fun x => x",
+            "(fun (f : Bool -> Bool) => f false) compiled",
+            "Bool",
+            "false",
+            1,
+        ),
+        (
+            "Bool -> Nat -> Nat",
+            "fun _ x => x",
+            "compiled false 42",
+            "Nat",
+            "42",
+            2,
+        ),
+        (
+            "Nat -> Bool -> Bool",
+            "fun _ x => x",
+            "compiled 7 true",
+            "Bool",
+            "true",
+            2,
+        ),
+        (
+            "(Bool -> Bool) -> Bool -> Bool",
+            "fun f x => f x",
+            "compiled (fun _ => false) true",
+            "Bool",
+            "false",
+            2,
+        ),
+        (
+            "Type -> Bool -> Bool",
+            "fun _ x => x",
+            "compiled Nat true",
+            "Bool",
+            "true",
+            2,
+        ),
+        (
+            "Bool -> String -> String",
+            "fun _ x => x",
+            "compiled true \"retained Boolean string\"",
+            "String",
+            "\"retained Boolean string\"",
+            2,
+        ),
+        (
+            "Bool -> Bool",
+            "fun _ => true",
+            "compiled false",
+            "Bool",
+            "true",
+            1,
+        ),
+        (
+            "Bool -> Bool -> Bool",
+            "fun x _ => x",
+            "compiled true false",
+            "Bool",
+            "true",
+            2,
+        ),
+        (
+            "(Bool -> Bool) -> Bool -> Bool",
+            "fun f x => f x",
+            "compiled (fun x => x) true",
+            "Bool",
+            "true",
+            2,
+        ),
     ]
 }
 
@@ -237,7 +327,16 @@ fn erased_positions(index: usize) -> &'static [usize] {
     match index {
         13 | 21 => &[1],
         14..=20 => &[0],
-        22 => &[0],
+        22 | 31 => &[0],
+        _ => &[],
+    }
+}
+
+fn boolean_positions(index: usize) -> &'static [usize] {
+    match index {
+        25..=28 | 32 | 33 => &[0],
+        29..=31 | 35 => &[1],
+        34 => &[0, 1],
         _ => &[],
     }
 }
@@ -292,11 +391,29 @@ fn source_exports_keep_source_arguments_and_compile_without_execution() {
             .iter()
             .find(|d| d.name() == &name("compiled"))
             .unwrap();
-        let IrDecl::Function { params, .. } = public else {
+        let IrDecl::Function { params, result, .. } = public else {
             panic!("source function entry")
         };
         assert_eq!(params.len(), arity, "{source}");
         assert!(params.iter().all(|p| !p.borrow));
+        assert_eq!(
+            params
+                .iter()
+                .enumerate()
+                .filter_map(|(i, p)| (p.ty == IrType::UInt8).then_some(i))
+                .collect::<Vec<_>>(),
+            boolean_positions(index),
+            "the independently specified Boolean source slots are UInt8: {source}",
+        );
+        assert_eq!(
+            *result,
+            match result_type {
+                "Bool" => IrType::UInt8,
+                "Nat" => IrType::TObject,
+                _ => IrType::Object,
+            },
+            "source result carrier: {source}",
+        );
         assert_eq!(
             params
                 .iter()
@@ -306,19 +423,30 @@ fn source_exports_keep_source_arguments_and_compile_without_execution() {
             erased_positions(index),
             "erased source slots retain their exact positions: {source}",
         );
-        if !erased_positions(index).is_empty() {
+        if !erased_positions(index).is_empty() || !boolean_positions(index).is_empty() {
             let boxed = compiled
                 .module
                 .decls
                 .iter()
                 .find(|d| d.name() == &name("compiled._boxed"))
                 .unwrap();
-            let IrDecl::Function { params: boxed, .. } = boxed else {
+            let IrDecl::Function {
+                params: boxed,
+                result: boxed_result,
+                ..
+            } = boxed
+            else {
                 panic!("source boxed entry")
             };
             assert_eq!(boxed.len(), arity);
             for &position in erased_positions(index) {
                 assert_eq!(boxed[position].ty, IrType::TObject);
+            }
+            for &position in boolean_positions(index) {
+                assert_eq!(boxed[position].ty, IrType::Tagged);
+            }
+            if result_type == "Bool" {
+                assert_eq!(*boxed_result, IrType::Tagged);
             }
         }
         let source = format!("def result : {result_type} := {application}");
@@ -335,6 +463,9 @@ fn source_exports_keep_source_arguments_and_compile_without_execution() {
                 fln_vm::interpreter::nat_decimal(&value.value).as_deref(),
                 Some(expected)
             );
+        } else if result_type == "Bool" {
+            assert!(value.value.is_scalar());
+            assert_eq!(value.value.unbox(), usize::from(expected == "true"));
         } else {
             let string = value.value.try_string_view().unwrap();
             assert_eq!(
@@ -382,7 +513,6 @@ fn source_exports_keep_source_arguments_and_compile_without_execution() {
         "def compiled {A : Type} (x : A) : Nat := 42",
         "def compiled (P : Prop) : P -> P := fun x => x",
         "def compiled : Nat -> Type := fun _ => Nat",
-        "def compiled : Bool -> Bool := fun x => x",
         "def compiled : (Nat -> Nat) -> Nat -> Nat := invoke",
         "def compiled (x y : Nat) : Nat := keep x",
         "def compiled (x y : Nat) : Nat := let saved := x; saved",
@@ -621,7 +751,7 @@ fn cached_closure_program() -> fln_comp::fir::ValidatedProgram {
 fn replace_result(params: &[fln_olean::ir::IrParam], body: &mut IrBody, ty: &str) {
     let mut stmts: Vec<_> = params
         .iter()
-        .filter(|p| !p.borrow && p.ty != IrType::Erased)
+        .filter(|p| !p.borrow && p.ty != IrType::Erased && p.ty != IrType::UInt8)
         .map(|p| IrStmt::Dec {
             x: p.x,
             n: 1,
@@ -646,6 +776,34 @@ fn replace_result(params: &[fln_olean::ir::IrParam], body: &mut IrBody, ty: &str
     *body = IrBody {
         stmts,
         terminal: Box::new(IrTerminal::Ret(IrArg::Var(result))),
+    };
+}
+
+fn replace_boolean_result(
+    params: &[fln_olean::ir::IrParam],
+    body: &mut IrBody,
+    carrier: IrType,
+    value: bool,
+) {
+    let mut stmts: Vec<_> = params
+        .iter()
+        .filter(|p| !p.borrow && matches!(p.ty, IrType::Object | IrType::TObject | IrType::Tagged))
+        .map(|p| IrStmt::Dec {
+            x: p.x,
+            n: 1,
+            checked: true,
+            persistent: false,
+        })
+        .collect();
+    let x = params.iter().map(|p| p.x).max().unwrap_or(0) + 1;
+    stmts.push(IrStmt::VDecl {
+        x,
+        ty: carrier,
+        expr: IrExpr::Lit(IrLit::Num(IrNat::Small(u64::from(value)))),
+    });
+    *body = IrBody {
+        stmts,
+        terminal: Box::new(IrTerminal::Ret(IrArg::Var(x))),
     };
 }
 
@@ -903,6 +1061,9 @@ fn reduced_case(index: usize) -> Option<(&'static str, &'static str)> {
             "(Nat -> String) -> Nat -> String",
             "compiled (fun _ => \"typed callback\") 7",
         )),
+        28 => Some(("Nat -> Nat", "compiled 42")),
+        29 | 31 | 34 => Some(("Bool -> Bool", "compiled true")),
+        32 => Some(("String -> String", "compiled \"retained Boolean string\"")),
         _ => None,
     }
 }
@@ -1222,7 +1383,7 @@ fn the_pin_calls_native_source_exports_directly_and_as_functions() {
             "module\nmeta import NativeIrCase\n#eval ({application})\n#eval ({application})\n"
         );
         let mut expected_output = format!("{expected}\n{expected}");
-        if index == 4 || index == 12 || index == 19 {
+        if index == 4 || index == 12 || index == 19 || index == 32 {
             // Effectful input prevents closed-term lifting from making the
             // alias a persistent literal. The caller keeps it across the call.
             std::fs::write(dir.join("heap-input.txt"), "fresh heap string").unwrap();
@@ -1230,6 +1391,8 @@ fn the_pin_calls_native_source_exports_directly_and_as_functions() {
                 "compiled saved"
             } else if index == 12 {
                 "compiled 7 saved"
+            } else if index == 32 {
+                "compiled false saved"
             } else {
                 "compiled Nat saved"
             };
@@ -1257,11 +1420,12 @@ fn the_pin_calls_native_source_exports_directly_and_as_functions() {
             application,
             entry: "compiled",
             check_meta: true,
-            higher_universe: matches!(index, 15 | 17 | 19 | 20 | 21 | 22),
+            higher_universe: matches!(index, 15 | 17 | 19 | 20 | 21 | 22 | 31),
             heap_call: match index {
                 4 => Some("compiled saved"),
                 12 => Some("compiled 7 saved"),
                 19 => Some("compiled Nat saved"),
+                32 => Some("compiled false saved"),
                 _ => None,
             },
         };
@@ -1271,7 +1435,7 @@ fn the_pin_calls_native_source_exports_directly_and_as_functions() {
             entry: "compiled._redArg",
             check_meta: false,
             higher_universe: false,
-            heap_call: (index == 12 || index == 19).then_some("compiled saved"),
+            heap_call: (index == 12 || index == 19 || index == 32).then_some("compiled saved"),
         });
         assert_eq!(
             compiled
@@ -1325,7 +1489,11 @@ fn the_pin_calls_native_source_exports_directly_and_as_functions() {
         let IrDecl::Function { params, body, .. } = public else {
             panic!("source function entry")
         };
-        replace_result(params, body, result_type);
+        if result_type == "Bool" {
+            replace_boolean_result(params, body, IrType::UInt8, expected == "false");
+        } else {
+            replace_result(params, body, result_type);
+        }
         assert_eq!(
             mutant
                 .decls
@@ -1354,11 +1522,13 @@ fn the_pin_calls_native_source_exports_directly_and_as_functions() {
         );
         let changed = if result_type == "Nat" {
             "99"
+        } else if result_type == "Bool" {
+            if expected == "true" { "false" } else { "true" }
         } else {
             "\"changed IR\""
         };
         let mut changed_output = format!("{changed}\n{changed}");
-        if index == 4 || index == 12 || index == 19 {
+        if index == 4 || index == 12 || index == 19 || index == 32 {
             changed_output.push_str("\n(\"changed IR\", \"fresh heap string\")");
         }
         // Ordinary compilation may inline the logical companion's original
@@ -1375,6 +1545,43 @@ fn the_pin_calls_native_source_exports_directly_and_as_functions() {
                 consume_ir(&lean, &dir, "reduced", probe),
                 &dir,
                 "runtime-reduced-mutant",
+                &changed_output,
+            );
+        }
+        if result_type == "Bool" && !boolean_positions(index).is_empty() {
+            // Preserve the public entry and change only its boxed adapter.
+            // Runtime lookup must execute that adapter, not merely an unused
+            // wrapper included in the output module.
+            let mut mutant = compiled.module.clone();
+            let boxed = mutant
+                .decls
+                .iter_mut()
+                .find(|d| d.name() == &name("compiled._boxed"))
+                .unwrap();
+            let IrDecl::Function { params, body, .. } = boxed else {
+                panic!("source boxed function")
+            };
+            replace_boolean_result(params, body, IrType::Tagged, expected == "false");
+            assert_eq!(
+                mutant
+                    .decls
+                    .iter()
+                    .filter(|d| d.name() != &name("compiled._boxed"))
+                    .collect::<Vec<_>>(),
+                compiled
+                    .module
+                    .decls
+                    .iter()
+                    .filter(|d| d.name() != &name("compiled._boxed"))
+                    .collect::<Vec<_>>(),
+            );
+            let bytes = encode(&mutant, &original);
+            std::fs::write(dir.join("boxed-export-mutant.ir"), &bytes).unwrap();
+            std::fs::write(dir.join("NativeIrCase.ir"), &bytes).unwrap();
+            assert_probe(
+                consume_ir(&lean, &dir, "full", &full_probe),
+                &dir,
+                "runtime-boxed-export-mutant",
                 &changed_output,
             );
         }
