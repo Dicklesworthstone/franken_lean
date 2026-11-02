@@ -6566,7 +6566,7 @@ fn executable_dependencies(
                     continue;
                 };
                 let Some(signature) = preparation.signature(&definition, true)? else {
-                    continue;
+                    return Err(IngressError::UnsupportedCallableSignature { name });
                 };
                 signature
             }

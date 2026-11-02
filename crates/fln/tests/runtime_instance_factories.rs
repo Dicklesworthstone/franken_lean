@@ -34,6 +34,16 @@ class Echo (K : Type) where
 instance echoFor (K : Type) : Echo K := { echo := fun a => a }
 "#;
 
+const INDEXED: &str = r#"
+structure IndexedBox (A : Type) (n : Nat) where
+  value : A
+class GetAt (C A : Type) (valid : C -> Nat -> Prop) where
+  get : (xs : C) -> (i : Nat) -> valid xs i -> A
+instance makeGetAt (n : Nat) {A : Type} :
+    GetAt (IndexedBox A n) A (fun _ _ => n = n) :=
+  { get := fun xs _ _ => xs.value }
+"#;
+
 #[test]
 fn inferred_parameterized_dictionaries_can_contain_polymorphic_methods() {
     execute(&format!("{ECHO}#eval Echo.echo (K := Nat) 42"), "42");
@@ -45,6 +55,129 @@ fn inferred_parameterized_dictionaries_can_contain_polymorphic_methods() {
         &format!("{ECHO}#eval String.length (Echo.echo (K := Nat) \"abcdef\")"),
         "6",
     );
+}
+
+#[test]
+fn value_indexed_factories_expose_methods_before_runtime_catalog_selection() {
+    execute(
+        r#"
+class EchoAt (n : Nat) where
+  echo : Nat -> Nat
+instance echoAt (n : Nat) : EchoAt n := { echo := fun x => x }
+def useEchoAt (n x : Nat) : Nat := EchoAt.echo (n := n) x
+#eval useEchoAt 7 42
+"#,
+        "42",
+    );
+    execute(
+        &format!(
+            r#"{INDEXED}
+def fromIndexedBox (n : Nat) (xs : IndexedBox Nat n) : Nat :=
+  @GetAt.get (IndexedBox Nat n) Nat (fun _ _ => n = n)
+    (makeGetAt n (A := Nat)) xs 0 rfl
+#eval fromIndexedBox 7 {{ value := 42 }}
+"#,
+        ),
+        "42",
+    );
+    execute(
+        &format!(
+            r#"{INDEXED}
+def fromStringBox (n : Nat) (suffix : String) : Nat :=
+  String.length (@GetAt.get (IndexedBox String n) String (fun _ _ => n = n)
+    (makeGetAt n (A := String)) {{ value := "λ" ++ suffix }} 0 rfl)
+#eval fromStringBox 7 "ab"
+"#,
+        ),
+        "3",
+    );
+    execute(
+        &format!(
+            r#"{INDEXED}
+def fromFunctionBox (n delta : Nat) : Nat :=
+  let f := @GetAt.get (IndexedBox (Nat -> Nat) n) (Nat -> Nat) (fun _ _ => n = n)
+    (makeGetAt n (A := Nat -> Nat)) {{ value := fun x => x + delta }} 0 rfl
+  f 40
+#eval fromFunctionBox 7 2
+"#,
+        ),
+        "42",
+    );
+}
+
+#[test]
+fn dependent_computed_dictionary_fields_are_not_discarded_as_inert_metadata() {
+    let base = engine();
+    let options = KVMap::new();
+    let root = base.logical_root(&options);
+    let source = r#"
+structure IndexedBox (A : Type) (n : Nat) where
+  value : A
+class GetAt (C A : Type) (valid : C -> Nat -> Prop) where
+  get : (xs : C) -> (i : Nat) -> valid xs i -> A
+  unused : Nat
+def count (n : Nat) : Nat := match n with | .zero => 0 | .succ k => count k + 1
+instance makeGetAt (n : Nat) {A : Type} :
+    GetAt (IndexedBox A n) A (fun _ _ => n = n) :=
+  { get := fun xs _ _ => xs.value, unused := count n }
+def fromIndexedBox (n : Nat) (xs : IndexedBox Nat n) : Nat :=
+  @GetAt.get (IndexedBox Nat n) Nat (fun _ _ => n = n)
+    (makeGetAt n (A := Nat)) xs 0 rfl
+#eval fromIndexedBox 30 { value := 42 }
+"#;
+    let error = base
+        .execute_source_definitions(&[source.as_bytes()], &options, limits())
+        .expect_err("an unsupported strict dictionary must not become a fabricated inert method");
+    let mut cause = &error;
+    while let fln::EngineExecutionError::BatchCommand { error, .. } = cause {
+        cause = error;
+    }
+    assert!(
+        matches!(
+            cause,
+            fln::EngineExecutionError::Ingress(
+                fln_comp::ingress::IngressError::UnsupportedCallableSignature { name }
+            ) if name.to_display_string().starts_with("_fln_runtime_specialization.")
+        ),
+        "{error:?}"
+    );
+    assert!(
+        error
+            .to_string()
+            .contains("supported ground runtime signature")
+    );
+    assert_eq!(base.logical_root(&options), root);
+}
+
+#[test]
+fn class_method_projection_preserves_a_computed_datatype_parameter() {
+    let definitions = r#"
+class EchoAt (n : Nat) where
+  echo : Nat -> Nat
+instance echoAt (n : Nat) : EchoAt n := { echo := fun x => x }
+def count (n : Nat) : Nat := match n with | .zero => 0 | .succ k => count k + 1
+"#;
+    let idle = execute(
+        &format!("{definitions}#eval @EchoAt.echo 30 (echoAt 30) 42"),
+        "42",
+    );
+    let program = format!("{definitions}#eval @EchoAt.echo (count 30) (echoAt 30) 42");
+    let busy = execute(&program, "42");
+    assert!(
+        busy > idle + 30,
+        "computed projection parameter vanished: {idle} vs {busy}"
+    );
+    let base = engine();
+    let options = KVMap::new();
+    let root = base.logical_root(&options);
+    let mut bounded = limits();
+    bounded.vm.max_steps = idle;
+    assert!(matches!(
+        base.execute_source_definitions(&[program.as_bytes()], &options, bounded)
+            .unwrap(),
+        fln::Outcome::Inconclusive(_)
+    ));
+    assert_eq!(base.logical_root(&options), root);
 }
 
 #[test]

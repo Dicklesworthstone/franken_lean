@@ -151,6 +151,11 @@ pub enum IngressError {
         name: Name,
         name_hash: u64,
     },
+    /// Catalog discovery found the definition, but its parameter/result
+    /// types do not have a supported ground runtime calling convention.
+    UnsupportedCallableSignature {
+        name: Name,
+    },
     CheckSystemUniverseArity {
         name_hash: u64,
         expected: usize,
@@ -493,6 +498,11 @@ impl fmt::Display for IngressError {
             Self::UnknownConstant { name, name_hash } => write!(
                 formatter,
                 "core Expr constant `{}` (observable name hash {name_hash}) is not in the runtime catalogs",
+                name.to_display_string()
+            ),
+            Self::UnsupportedCallableSignature { name } => write!(
+                formatter,
+                "definition `{}` has no supported ground runtime signature for its parameter/result types",
                 name.to_display_string()
             ),
             Self::CheckSystemUniverseArity {

@@ -251,8 +251,8 @@ fn a_computed_generic_callback_is_not_relabelled_as_a_flat_runtime_closure() {
     assert!(
         matches!(
             &error,
-            EngineExecutionError::Ingress(IngressError::UnknownConstant { name, .. })
-                if name == &Name::from_components(["usePoly"])
+            EngineExecutionError::Ingress(IngressError::UnsupportedCallableSignature { name })
+                if name == &Name::from_components(["choosePoly"])
         ),
         "an unsupported dynamic generic value must refuse without rewrite exhaustion: {error:?}"
     );
