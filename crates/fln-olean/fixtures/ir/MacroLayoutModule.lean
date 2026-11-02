@@ -40,6 +40,12 @@ def macroContext (methods : Lean.Macro.MethodsRef) (quotContext : Lean.Name)
 @[noinline] def contextMethods (value : @& Lean.Macro.Context) : Lean.Macro.MethodsRef :=
   value.methods
 
+@[noinline] def contextQuotation (value : @& Lean.Macro.Context) : Lean.Name :=
+  value.quotContext
+
+@[noinline] def contextScope (value : @& Lean.Macro.Context) : Nat :=
+  value.currMacroScope
+
 -- The constructor is private. The public inline operation exposes its exact
 -- compiled layout without reaching through that source-level visibility.
 def macroState : Lean.MacroM Nat := Lean.Macro.withFreshMacroScope (pure 5)
@@ -62,6 +68,14 @@ def listNil (_ : Unit) : List Lean.Syntax := []
 def prod (name : Lean.Name) (value : String) : Lean.Name × String := (name, value)
 
 @[noinline] def nameMkStr1 (value : String) : Lean.Name := Lean.Name.mkStr1 value
+
+@[noinline] def addMacroScope (context value : Lean.Name) (scope : Nat) : Lean.Name :=
+  Lean.addMacroScope context value scope
+
+@[noinline] def macroAddMacroScope (value : Lean.Name) (context : @& Lean.Macro.Context)
+    (state : Lean.Macro.State) :
+    EStateM.Result Lean.Macro.Exception Lean.Macro.State Lean.Name :=
+  Lean.Macro.addMacroScope value context state
 
 @[noinline] def syntaxIsOfKind (value : Lean.Syntax) (kind : @& Lean.Name) : Bool :=
   value.isOfKind kind

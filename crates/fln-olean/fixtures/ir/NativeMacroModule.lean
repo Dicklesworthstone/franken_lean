@@ -46,3 +46,15 @@ macro (name := contextChoose) "contextTerm%" a:term "," b:term : term => do
 
 @[noinline] def replaceSyntaxKindMacro (stx : Lean.Syntax) : Lean.MacroM Lean.Syntax :=
   pure (stx.setKind (Lean.Name.mkStr1 "renamed"))
+
+-- Attach hygiene to an existing identifier without changing its source bytes,
+-- source information or pre-resolution data.
+@[noinline] def attachScopeMacro (stx : Lean.Syntax) : Lean.MacroM Lean.Syntax := do
+  match stx with
+  | .ident info raw value preresolved =>
+    let value ← Lean.Macro.addMacroScope value
+    pure (.ident info raw value preresolved)
+  | _ => pure stx
+
+@[noinline] def freshIdentifierMacro (stx : Lean.Syntax) : Lean.MacroM Lean.Syntax :=
+  Lean.Macro.withFreshMacroScope (attachScopeMacro stx)

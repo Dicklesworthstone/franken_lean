@@ -12,7 +12,10 @@ mod initialization;
 type Result<T> = std::result::Result<T, IrExecutionError>;
 
 pub(super) fn compile(
-    declarations: &BTreeMap<Name, &IrDecl>,
+    normalized: (
+        &BTreeMap<Name, &IrDecl>,
+        &constructor_updates::Normalization,
+    ),
     supplied_natives: &BTreeMap<Name, Native>,
     entry: &Name,
     arguments: &[EntryArgument],
@@ -20,6 +23,7 @@ pub(super) fn compile(
     initialization: Option<&globals::InitializationPlan>,
     callable: bool,
 ) -> Result<CompiledIr> {
+    let (declarations, normalization) = normalized;
     let callable_wrapper = callable && initialization.is_some();
     let entry_parameters: &[IrParam] = match declarations.get(entry) {
         Some(IrDecl::Function { params, .. }) => params,
@@ -219,6 +223,14 @@ pub(super) fn compile(
             result_ownership: flbc::CallableResultOwnership::Erased,
         })
         .collect();
+    let guard_count = normalization
+        .tag_independent_guards
+        .values()
+        .try_fold(0usize, |count, guards| count.checked_add(guards.len()))
+        .ok_or(IrExecutionError::Limit("lowering scope work"))?;
+    if guard_count as u64 > limits.ir.max_work {
+        return Err(IrExecutionError::Limit("lowering scope work"));
+    }
     let mut tables = Tables {
         targets,
         intrinsic_ids,
@@ -231,11 +243,12 @@ pub(super) fn compile(
         next_function: function_count,
         helper_functions: Vec::new(),
         helper_provenance: Vec::new(),
-        scope_work: 0,
+        scope_work: guard_count as u64,
         capture_operands: 0,
         packed_operands: 0,
         packed_scalar_bytes: 0,
         global_slots,
+        tag_independent_guards: normalization.tag_independent_guards.clone(),
     };
     let mut wrapper = Builder::new(
         entry,
@@ -511,6 +524,7 @@ struct Tables {
     packed_operands: usize,
     packed_scalar_bytes: usize,
     global_slots: BTreeMap<Name, usize>,
+    tag_independent_guards: BTreeMap<Name, BTreeSet<u64>>,
 }
 
 impl Tables {
@@ -1572,12 +1586,37 @@ impl<'a> Builder<'a> {
             IrAlt::Default { body } => Some(body),
             _ => None,
         });
+        let shape_only = self
+            .tables
+            .tag_independent_guards
+            .get(self.name)
+            .is_some_and(|parameters| parameters.contains(&x));
+        if shape_only
+            && (scalar
+                || arms.len() != 1
+                || !matches!(default, Some(body) if body.stmts.is_empty() && matches!(body.terminal.as_ref(), IrTerminal::Unreachable))
+                || arms[0].0.size == 0
+                || arms[0].0.usize != 0
+                || arms[0].0.ssize != 0)
+        {
+            return Err(unsupported(
+                self.name,
+                "invalid derived constructor layout guard",
+            ));
+        }
         if !scalar {
             // Check object cases before scalar nullary constructors. No
             // reference-count test or guessed object-to-number conversion.
             arms.sort_by_key(|(info, _)| fieldless_constructor(info));
         }
-        self.case_arm(block, x, value, &arms, default, (locals, joins, ty))
+        self.case_arm(
+            block,
+            x,
+            value,
+            &arms,
+            default,
+            (locals, joins, ty, shape_only),
+        )
     }
 
     fn case_arm(
@@ -1587,9 +1626,9 @@ impl<'a> Builder<'a> {
         value: ValueId,
         arms: &[(&IrCtorInfo, &IrBody)],
         default: Option<&IrBody>,
-        scope: (Locals, Joins, &IrType),
+        scope: (Locals, Joins, &IrType, bool),
     ) -> Result<()> {
-        let (locals, joins, ty) = scope;
+        let (locals, joins, ty, shape_only) = scope;
         let scalar = is_scalar_case(ty);
         let Some(((info, body), rest)) = arms.split_first() else {
             if let Some(body) = default {
@@ -1602,49 +1641,63 @@ impl<'a> Builder<'a> {
         };
         let fieldless = fieldless_constructor(info);
         let heap_tag = info.cidx <= u64::from(fln_rt::abi::TAG_MAX_CTOR_TAG);
-        let constructor = if fieldless && (scalar || !heap_tag) {
+        let constructor = if shape_only || fieldless && (scalar || !heap_tag) {
             None
         } else {
             Some(self.constructor(info)?)
         };
-        let condition = match constructor {
-            // Case metadata is a complete Reference constructor layout.
-            // Check it before granting the matching arm a layout witness;
-            // tag/field count alone would accept hidden scalar payloads.
-            Some(constructor) => self.emit(
+        let condition = if shape_only {
+            let fields = u16::try_from(info.size)
+                .map_err(|_| IrExecutionError::Limit("constructor fields"))?;
+            self.emit(
                 block,
                 ValueType::Bool,
-                Operation::CtorLayoutTest { constructor, value },
-            )?,
-            None if !scalar => self.emit(
-                block,
-                ValueType::Bool,
-                Operation::ScalarTagTest {
+                Operation::CtorShapeTest {
                     value,
-                    tag: info.cidx,
+                    expected_fields: fields,
+                    expected_scalar_bytes: 0,
                 },
-            )?,
-            None => {
-                let (tag, equal) = if let Some(wide) = wide_scalar(ty) {
-                    let equal = wide.equal;
-                    let tag = self.wide_literal(block, wide, &IrNat::Small(info.cidx))?;
-                    (tag, equal)
-                } else {
-                    (self.nat(block, &IrNat::Small(info.cidx))?, "Nat.beq")
-                };
-                let equal = self.native_call(
-                    block,
-                    &Name::from_components(equal.split('.')),
-                    vec![value, tag],
-                )?;
-                self.emit(
+            )?
+        } else {
+            match constructor {
+                // Case metadata is a complete Reference constructor layout.
+                // Check it before granting the matching arm a layout witness;
+                // tag/field count alone would accept hidden scalar payloads.
+                Some(constructor) => self.emit(
                     block,
                     ValueType::Bool,
-                    Operation::Unbox {
-                        value: equal,
-                        ty: ValueType::Bool,
+                    Operation::CtorLayoutTest { constructor, value },
+                )?,
+                None if !scalar => self.emit(
+                    block,
+                    ValueType::Bool,
+                    Operation::ScalarTagTest {
+                        value,
+                        tag: info.cidx,
                     },
-                )?
+                )?,
+                None => {
+                    let (tag, equal) = if let Some(wide) = wide_scalar(ty) {
+                        let equal = wide.equal;
+                        let tag = self.wide_literal(block, wide, &IrNat::Small(info.cidx))?;
+                        (tag, equal)
+                    } else {
+                        (self.nat(block, &IrNat::Small(info.cidx))?, "Nat.beq")
+                    };
+                    let equal = self.native_call(
+                        block,
+                        &Name::from_components(equal.split('.')),
+                        vec![value, tag],
+                    )?;
+                    self.emit(
+                        block,
+                        ValueType::Bool,
+                        Operation::Unbox {
+                            value: equal,
+                            ty: ValueType::Bool,
+                        },
+                    )?
+                }
             }
         };
         self.tables
@@ -1667,7 +1720,14 @@ impl<'a> Builder<'a> {
                 },
             )?;
             let scalar_miss = self.block()?;
-            self.case_arm(scalar_miss, x, value, rest, default, (locals, joins, ty))?;
+            self.case_arm(
+                scalar_miss,
+                x,
+                value,
+                rest,
+                default,
+                (locals, joins, ty, shape_only),
+            )?;
             self.finish_block(
                 zero,
                 Terminator::BranchZero {
@@ -1677,7 +1737,14 @@ impl<'a> Builder<'a> {
                 },
             );
         } else {
-            self.case_arm(zero, x, value, rest, default, (locals, joins, ty))?;
+            self.case_arm(
+                zero,
+                x,
+                value,
+                rest,
+                default,
+                (locals, joins, ty, shape_only),
+            )?;
         }
         self.finish_block(
             block,

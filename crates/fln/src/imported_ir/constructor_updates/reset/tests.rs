@@ -631,6 +631,160 @@ fn inferred_guard_preserves_the_original_strict_effect_checkpoint() {
     }
 }
 
+fn retag_region(deferred: bool) -> IrBody {
+    let mut region = if deferred {
+        deferred_region()
+    } else {
+        region()
+    };
+    let value = continuation(&mut region);
+    let value = if deferred {
+        let IrStmt::JDecl { value, .. } = &mut value.stmts[3] else {
+            panic!("deferred reuse join");
+        };
+        value
+    } else {
+        value
+    };
+    arm(value, 0)
+        .stmts
+        .insert(0, IrStmt::SetTag { x: 11, cidx: 1 });
+    region
+}
+
+#[test]
+fn inferred_retagging_checks_extent_without_assuming_the_output_tag_was_the_input_tag() {
+    for deferred in [false, true] {
+        let compiled = callable(&unshaped_fixture(retag_region(deferred)));
+        let bytes =
+            flbc::encode_canonical(compiled.program(), flbc::CodecLimits::default()).unwrap();
+        let replay = flbc::decode_canonical(&bytes, flbc::CodecLimits::default()).unwrap();
+        let entry = compiled
+            .reference_functions()
+            .iter()
+            .find(|function| function.name == name("Reset.update"))
+            .unwrap()
+            .function;
+        for program in [compiled.program(), &replay] {
+            assert!(
+                program
+                    .functions()
+                    .iter()
+                    .flat_map(|f| &f.code)
+                    .any(|instruction| matches!(
+                        instruction,
+                        flbc::Instruction::CtorShapeTest {
+                            expected_fields: 2,
+                            expected_scalar_bytes: 0,
+                            ..
+                        }
+                    ))
+            );
+            for tag in [0, 1, 2, fln_rt::abi::TAG_MAX_CTOR_TAG] {
+                let original = Obj::mk_ctor(tag, vec![Obj::mk_nat(19), Obj::mk_nat(23)], &[]);
+                let outcome = execute_function(
+                    program,
+                    entry,
+                    vec![original.clone_ref(), Obj::mk_nat(42)],
+                    ExecutionLimits::default(),
+                    None,
+                );
+                let Outcome::Complete(VmExit::Returned(result)) = outcome else {
+                    panic!("{outcome:?}");
+                };
+                assert_eq!(result.value.header().tag, 1);
+                assert_eq!(
+                    nat_decimal(&result.value.ctor_child(0)).as_deref(),
+                    Some("43")
+                );
+                assert_eq!(
+                    nat_decimal(&result.value.ctor_child(1)).as_deref(),
+                    Some("23")
+                );
+                assert_eq!(original.header().tag, tag);
+                assert_eq!(nat_decimal(&original.ctor_child(0)).as_deref(), Some("19"));
+            }
+            for malformed in [
+                Obj::mk_nat(0),
+                Obj::mk_string("not a constructor"),
+                Obj::mk_ctor(
+                    0,
+                    vec![Obj::mk_nat(19), Obj::mk_nat(23), Obj::mk_nat(0)],
+                    &[],
+                ),
+                Obj::mk_ctor(0, vec![Obj::mk_nat(19), Obj::mk_nat(23)], &[0]),
+            ] {
+                let outcome = execute_function(
+                    program,
+                    entry,
+                    vec![malformed, Obj::mk_nat(42)],
+                    ExecutionLimits::default(),
+                    None,
+                );
+                assert!(
+                    matches!(
+                        outcome,
+                        Outcome::Complete(VmExit::Panicked { .. } | VmExit::Refused { .. })
+                    ),
+                    "{outcome:?}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn an_inferred_shape_guard_does_not_change_a_source_case_on_the_same_receiver() {
+    let mut module = unshaped_fixture(retag_region(true));
+    let IrDecl::Function { body: update, .. } = &mut module.decls[0] else {
+        unreachable!()
+    };
+    let region = std::mem::replace(update, body(vec![], IrTerminal::Unreachable));
+    *update.terminal = IrTerminal::Case {
+        type_name: name("Reset.Node"),
+        x: 1,
+        x_type: IrType::TObject,
+        alts: vec![
+            IrAlt::Ctor {
+                info: info(0, 2),
+                body: body(vec![num(90, 9)], IrTerminal::Ret(var(90))),
+            },
+            IrAlt::Default { body: region },
+        ],
+    };
+    let compiled = callable(&module);
+    let entry = compiled
+        .reference_functions()
+        .iter()
+        .find(|function| function.name == name("Reset.update"))
+        .unwrap()
+        .function;
+    for tag in [0, 2] {
+        let outcome = execute_function(
+            compiled.program(),
+            entry,
+            vec![
+                Obj::mk_ctor(tag, vec![Obj::mk_nat(19), Obj::mk_nat(23)], &[]),
+                Obj::mk_nat(42),
+            ],
+            ExecutionLimits::default(),
+            None,
+        );
+        let Outcome::Complete(VmExit::Returned(result)) = outcome else {
+            panic!("{outcome:?}");
+        };
+        if tag == 0 {
+            assert_eq!(nat_decimal(&result.value).as_deref(), Some("9"));
+        } else {
+            assert_eq!(result.value.header().tag, 1);
+            assert_eq!(
+                nat_decimal(&result.value.ctor_child(0)).as_deref(),
+                Some("43")
+            );
+        }
+    }
+}
+
 #[test]
 fn an_unknown_packed_layout_is_not_inferred_from_allocation_padding() {
     let mut region = region();

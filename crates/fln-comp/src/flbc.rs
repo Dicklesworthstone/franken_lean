@@ -34,15 +34,16 @@ use std::fmt;
 /// version 17 adds object-field projection checked against the runtime layout;
 /// version 18 adds immutable packed integer construction and checked projection;
 /// version 19 adds total, borrowed discrimination of tagged scalar constructors;
-/// version 20 checks complete constructor allocation layouts.
-pub const FLBC_SCHEMA_VERSION: u16 = 20;
+/// version 20 checks complete constructor allocation layouts;
+/// version 21 adds a tag-independent complete constructor-shape test.
+pub const FLBC_SCHEMA_VERSION: u16 = 21;
 
 /// Canonical binary envelope version for persisted FLBC artifacts.
 ///
 /// This is independent of [`FLBC_SCHEMA_VERSION`]: the envelope freezes byte
 /// framing and opcode numbers, while the embedded schema version freezes the
 /// program model accepted by [`validate`].
-pub const FLBC_WIRE_VERSION: u16 = 15;
+pub const FLBC_WIRE_VERSION: u16 = 16;
 
 /// Canonical witness schema for the bounded ownership pass.
 ///
@@ -94,6 +95,7 @@ const OP_CTOR_PACKED: u8 = 23;
 const OP_CTOR_SCALAR: u8 = 24;
 const OP_SCALAR_TAG_TEST: u8 = 25;
 const OP_CTOR_LAYOUT_TEST: u8 = 26;
+const OP_CTOR_SHAPE_TEST: u8 = 27;
 
 /// Explicit allocation and work ceilings for canonical FLBC artifacts.
 ///
@@ -610,6 +612,15 @@ pub enum Instruction {
         expected_fields: u16,
         expected_scalar_bytes: u16,
     },
+    /// Total borrowed constructor-layout test independent of the tag. Checks
+    /// exact object slots and the aligned allocation size without reading a
+    /// payload or granting a tag witness. Every nonconstructor is a nonmatch.
+    CtorShapeTest {
+        dst: Register,
+        src: Register,
+        expected_fields: u16,
+        expected_scalar_bytes: u16,
+    },
     /// Return scalar 1 only when the borrowed operand is a tagged scalar with
     /// this exact tag. Heap objects, including mpz numbers and fieldless heap
     /// constructors, return 0 without reading their payload or invoking Nat.
@@ -743,6 +754,7 @@ impl Instruction {
             | Self::CtorScalar { src, .. }
             | Self::CtorTest { src, .. }
             | Self::CtorLayoutTest { src, .. }
+            | Self::CtorShapeTest { src, .. }
             | Self::ScalarTagTest { src, .. }
             | Self::CheckSystemValue { module_name: src } => {
                 vec![*src]
@@ -786,6 +798,7 @@ impl Instruction {
             | Self::CtorScalar { dst, .. }
             | Self::CtorTest { dst, .. }
             | Self::CtorLayoutTest { dst, .. }
+            | Self::CtorShapeTest { dst, .. }
             | Self::ScalarTagTest { dst, .. }
             | Self::Array { dst, .. }
             | Self::Intrinsic { dst, .. }
@@ -2502,6 +2515,18 @@ fn encode_instruction(encoder: &mut Encoder, instruction: &Instruction) -> Resul
             encoder.u16(*expected_fields)?;
             encoder.u16(*expected_scalar_bytes)
         }
+        Instruction::CtorShapeTest {
+            dst,
+            src,
+            expected_fields,
+            expected_scalar_bytes,
+        } => {
+            encoder.u8(OP_CTOR_SHAPE_TEST)?;
+            encoder.register(*dst)?;
+            encoder.register(*src)?;
+            encoder.u16(*expected_fields)?;
+            encoder.u16(*expected_scalar_bytes)
+        }
         Instruction::ScalarTagTest {
             dst,
             src,
@@ -2696,6 +2721,12 @@ fn decode_instruction(decoder: &mut Decoder<'_>) -> Result<Instruction, CodecErr
             dst: decoder.register()?,
             src: decoder.register()?,
             expected_tag: decoder.u8()?,
+            expected_fields: decoder.u16()?,
+            expected_scalar_bytes: decoder.u16()?,
+        }),
+        OP_CTOR_SHAPE_TEST => Ok(Instruction::CtorShapeTest {
+            dst: decoder.register()?,
+            src: decoder.register()?,
             expected_fields: decoder.u16()?,
             expected_scalar_bytes: decoder.u16()?,
         }),
@@ -3557,6 +3588,26 @@ fn validate_function(program: &Program, function: &Function) -> Result<(), Valid
                     });
                 }
             }
+            Instruction::CtorShapeTest {
+                expected_fields,
+                expected_scalar_bytes,
+                ..
+            } => {
+                if usize::from(*expected_fields) >= abi::MAX_CTOR_FIELDS {
+                    return Err(ValidationError::CtorFieldShapeOutOfRange {
+                        function: function.id,
+                        pc,
+                        expected_fields: *expected_fields,
+                    });
+                }
+                if usize::from(*expected_scalar_bytes) >= abi::MAX_CTOR_SCALARS_SIZE {
+                    return Err(ValidationError::TooManyCtorScalarBytes {
+                        function: function.id,
+                        pc,
+                        count: usize::from(*expected_scalar_bytes),
+                    });
+                }
+            }
             Instruction::String { .. }
             | Instruction::ScalarTagTest { .. }
             | Instruction::Copy { .. }
@@ -4034,6 +4085,7 @@ fn ownership_reads<E>(
         | Instruction::CtorScalar { src, .. }
         | Instruction::CtorTest { src, .. }
         | Instruction::CtorLayoutTest { src, .. }
+        | Instruction::CtorShapeTest { src, .. }
         | Instruction::ScalarTagTest { src, .. }
         | Instruction::CheckSystemValue { module_name: src } => visit(*src)?,
         Instruction::Ctor { fields, .. } => {
@@ -4277,6 +4329,7 @@ fn ownership_operand_count(instruction: &Instruction) -> usize {
         | Instruction::CtorScalar { .. }
         | Instruction::CtorTest { .. }
         | Instruction::CtorLayoutTest { .. }
+        | Instruction::CtorShapeTest { .. }
         | Instruction::ScalarTagTest { .. }
         | Instruction::CheckSystemValue { .. }
         | Instruction::JumpIfZero { .. }
@@ -4365,6 +4418,7 @@ fn ownership_payload_bytes(instruction: &Instruction) -> usize {
         | Instruction::CtorScalar { .. }
         | Instruction::CtorTest { .. }
         | Instruction::CtorLayoutTest { .. }
+        | Instruction::CtorShapeTest { .. }
         | Instruction::ScalarTagTest { .. }
         | Instruction::Array { .. }
         | Instruction::Call { .. }
@@ -4623,6 +4677,17 @@ fn ownership_clone_instruction(instruction: &Instruction) -> Result<Instruction,
             dst: *dst,
             src: *src,
             expected_tag: *expected_tag,
+            expected_fields: *expected_fields,
+            expected_scalar_bytes: *expected_scalar_bytes,
+        },
+        Instruction::CtorShapeTest {
+            dst,
+            src,
+            expected_fields,
+            expected_scalar_bytes,
+        } => Instruction::CtorShapeTest {
+            dst: *dst,
+            src: *src,
             expected_fields: *expected_fields,
             expected_scalar_bytes: *expected_scalar_bytes,
         },
@@ -7531,6 +7596,12 @@ mod codec_tests {
                             dst: r(14),
                             src: r(11),
                             expected_tag: 2,
+                            expected_fields: 1,
+                            expected_scalar_bytes: 8,
+                        },
+                        Instruction::CtorShapeTest {
+                            dst: r(14),
+                            src: r(11),
                             expected_fields: 1,
                             expected_scalar_bytes: 8,
                         },

@@ -352,7 +352,10 @@ mod tests {
             insert_helper(&mut natives, name).unwrap();
         }
         super::super::compile(
-            &declarations,
+            (
+                &declarations,
+                &constructor_updates::Normalization::default(),
+            ),
             &natives,
             &name(entry),
             &[],
@@ -414,7 +417,10 @@ mod tests {
             (plan(&[("Global.value", "Global.init")]), "49"),
         ] {
             let compiled = super::super::compile(
-                &declarations,
+                (
+                    &declarations,
+                    &constructor_updates::Normalization::default(),
+                ),
                 &natives,
                 &name("Global.entry"),
                 &[],

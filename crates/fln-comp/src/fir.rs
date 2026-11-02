@@ -38,8 +38,9 @@ pub use optimize::optimize;
 /// version 19 projects object fields whose constructor layout is known at runtime;
 /// version 20 supports immutable packed integer construction and projection;
 /// version 21 adds exact tagged-scalar tests over borrowed ABI values;
-/// version 22 checks complete constructor allocation layouts over ABI values.
-pub const FIR_SCHEMA_VERSION: u16 = 22;
+/// version 22 checks complete constructor allocation layouts over ABI values;
+/// version 23 adds tag-independent complete constructor-shape tests.
+pub const FIR_SCHEMA_VERSION: u16 = 23;
 
 /// Explicit ceilings for FIR validation work.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -446,6 +447,14 @@ pub enum Operation {
         constructor: ConstructorId,
         value: ValueId,
     },
+    /// Total borrowed discrimination of an erased constructor's object slots
+    /// and aligned allocation size, independent of its tag. This produces no
+    /// constructor or tag witness for projections or subsequent matches.
+    CtorShapeTest {
+        value: ValueId,
+        expected_fields: u16,
+        expected_scalar_bytes: u16,
+    },
     /// Total tagged-scalar discrimination. Heap values are a nonmatch, without
     /// a numeric conversion, allocation, or assumption about their layout.
     ScalarTagTest {
@@ -547,6 +556,7 @@ impl Operation {
             | Self::ProjectScalar { value, .. }
             | Self::CtorTest { value, .. }
             | Self::CtorLayoutTest { value, .. }
+            | Self::CtorShapeTest { value, .. }
             | Self::ScalarTagTest { value, .. }
             | Self::CheckSystemValue { module_name: value } => OperationReads {
                 first: Some(*value),
@@ -1277,6 +1287,12 @@ pub enum ValidationError {
         function: FunctionId,
         block: BlockId,
         actual: ValueType,
+    },
+    ConstructorShapeTestLayoutOutOfRange {
+        function: FunctionId,
+        block: BlockId,
+        expected_fields: u16,
+        expected_scalar_bytes: u16,
     },
     ScalarTagTestOperandType {
         function: FunctionId,
@@ -2068,6 +2084,17 @@ impl fmt::Display for ValidationError {
             } => write!(
                 formatter,
                 "function {} block {} constructor layout test expects Abi, got {actual:?}",
+                function.get(),
+                block.get()
+            ),
+            Self::ConstructorShapeTestLayoutOutOfRange {
+                function,
+                block,
+                expected_fields,
+                expected_scalar_bytes,
+            } => write!(
+                formatter,
+                "function f{} block b{} constructor shape test exceeds the ABI layout limits: {expected_fields} object slots, {expected_scalar_bytes} scalar bytes",
                 function.get(),
                 block.get()
             ),
@@ -3028,6 +3055,31 @@ fn infer_operation_type(
                     function: function.id,
                     block: block.id,
                     actual,
+                });
+            }
+            Ok(ValueType::Bool)
+        }
+        Operation::CtorShapeTest {
+            value,
+            expected_fields,
+            expected_scalar_bytes,
+        } => {
+            let actual = value_type(function, block, value_types, *value)?;
+            if actual != ValueType::Abi {
+                return Err(ValidationError::ConstructorLayoutTestOperandType {
+                    function: function.id,
+                    block: block.id,
+                    actual,
+                });
+            }
+            if usize::from(*expected_fields) >= abi::MAX_CTOR_FIELDS
+                || usize::from(*expected_scalar_bytes) >= abi::MAX_CTOR_SCALARS_SIZE
+            {
+                return Err(ValidationError::ConstructorShapeTestLayoutOutOfRange {
+                    function: function.id,
+                    block: block.id,
+                    expected_fields: *expected_fields,
+                    expected_scalar_bytes: *expected_scalar_bytes,
                 });
             }
             Ok(ValueType::Bool)
@@ -4133,6 +4185,16 @@ fn lower_single_binding(
                     })?,
             })
         }
+        Operation::CtorShapeTest {
+            value,
+            expected_fields,
+            expected_scalar_bytes,
+        } => Ok(flbc::Instruction::CtorShapeTest {
+            dst,
+            src: lower_register(*value)?,
+            expected_fields: *expected_fields,
+            expected_scalar_bytes: *expected_scalar_bytes,
+        }),
         Operation::ScalarTagTest { value, tag } => Ok(flbc::Instruction::ScalarTagTest {
             dst,
             src: lower_register(*value)?,
@@ -4469,6 +4531,15 @@ fn write_operation(output: &mut impl fmt::Write, operation: &Operation) -> fmt::
                 value.get()
             )
         }
+        Operation::CtorShapeTest {
+            value,
+            expected_fields,
+            expected_scalar_bytes,
+        } => write!(
+            output,
+            "ctor-shape-test v{} fields={expected_fields} scalar-bytes={expected_scalar_bytes}",
+            value.get()
+        ),
         Operation::ScalarTagTest { value, tag } => {
             write!(output, "scalar-tag-test v{} tag={tag}", value.get())
         }

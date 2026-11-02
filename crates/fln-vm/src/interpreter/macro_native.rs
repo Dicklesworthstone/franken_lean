@@ -13,6 +13,8 @@ const MAX_NAME_BYTES: u64 = 16 * 1024 * 1024;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum Intrinsic {
     MkStr1,
+    AddMacroScope,
+    MacroAddMacroScope,
     IsOfKind,
     GetArg,
     GetNumArgs,
@@ -32,6 +34,8 @@ impl Intrinsic {
     pub(super) fn for_row(row: &str) -> Option<Self> {
         Some(match row {
             "mirror:Lean.Name.mkStr1" => Self::MkStr1,
+            "mirror:Lean.addMacroScope" => Self::AddMacroScope,
+            "mirror:Lean.Macro.addMacroScope" => Self::MacroAddMacroScope,
             "mirror:Lean.Syntax.isOfKind" => Self::IsOfKind,
             "mirror:Lean.Syntax.getArg" => Self::GetArg,
             "mirror:Lean.Syntax.getNumArgs" => Self::GetNumArgs,
@@ -68,7 +72,11 @@ impl Intrinsic {
             args,
             match self {
                 Self::IsOfKind | Self::GetArg | Self::SetKind | Self::GetCurrNamespace => 2,
-                Self::HasDecl | Self::ResolveNamespace | Self::ResolveGlobalName => 3,
+                Self::AddMacroScope
+                | Self::MacroAddMacroScope
+                | Self::HasDecl
+                | Self::ResolveNamespace
+                | Self::ResolveGlobalName => 3,
                 _ => 1,
             },
         )?;
@@ -80,6 +88,25 @@ impl Intrinsic {
                     Name::anonymous(),
                     text,
                 ))))
+            }
+            Self::AddMacroScope => Ok(IntrinsicResult::raw_object(attach_scope(
+                &args[0], &args[1], &args[2],
+            )?)),
+            Self::MacroAddMacroScope => {
+                check_layout(&args[1], layout::MACRO_CONTEXT)?;
+                check_layout(&args[2], layout::MACRO_STATE)?;
+                // Pure quotation data only: never inspect MethodsRef or derive
+                // a host capability from the opaque context field.
+                let value = attach_scope(
+                    &child(&args[1], layout::MACRO_CONTEXT_QUOTATION_FIELD)?,
+                    &args[0],
+                    &child(&args[1], layout::MACRO_CONTEXT_SCOPE_FIELD)?,
+                )?;
+                Ok(IntrinsicResult::raw_object(Obj::mk_ctor(
+                    layout::RESULT_OK.tag,
+                    vec![value, args[2].clone_ref()],
+                    &[],
+                )))
             }
             Self::IsOfKind => {
                 let kind = match syntax_kind(&args[0])? {
@@ -240,6 +267,26 @@ impl Intrinsic {
     }
 }
 
+fn attach_scope(context: &Obj, value: &Obj, scope: &Obj) -> Result<Obj, IntrinsicFailure> {
+    let context = name(context)?;
+    let value = name(value)?;
+    let (bits, scope) = super::with_nat_view(scope, "Lean.addMacroScope", 2, |view| {
+        (view.bit_length(), view.to_u64())
+    })?;
+    limit("macro scope bits", 64, bits)?;
+    let scope = scope.ok_or(VmRefusal::InvalidCtorObject)?;
+    // Bound the whole result before copying components or allocating ABI Names.
+    // Two individually valid inputs can exceed the combined allowance.
+    let mut budget = NameBudget::new("macro scope nodes", "macro scope bytes");
+    budget.name(&context)?;
+    budget.name(&value)?;
+    budget.nodes(3)?; // separator, marker and the new numeric scope
+    budget.text("_@_hyg")?;
+    let result = fln_core::name::hygiene::add_macro_scope(&context, &value, scope)
+        .map_err(|_| VmRefusal::InvalidCtorObject)?;
+    Ok(inject_name(&result))
+}
+
 fn lookup_error(operation: &'static str, error: MacroLookupError) -> IntrinsicFailure {
     match error {
         MacroLookupError::Unavailable => VmRefusal::MacroLookupUnavailable { operation }.into(),
@@ -264,21 +311,31 @@ fn lookup_error(operation: &'static str, error: MacroLookupError) -> IntrinsicFa
 
 /// Bound the whole overload list before allocating any ABI objects. Individual
 /// name limits alone permit unbounded lists of small names or projections.
-#[derive(Default)]
-struct LookupBudget {
+struct NameBudget {
     nodes: u64,
     bytes: u64,
+    node_resource: &'static str,
+    byte_resource: &'static str,
 }
 
-impl LookupBudget {
+impl NameBudget {
+    fn new(node_resource: &'static str, byte_resource: &'static str) -> Self {
+        Self {
+            nodes: 0,
+            bytes: 0,
+            node_resource,
+            byte_resource,
+        }
+    }
+
     fn nodes(&mut self, count: u64) -> Result<(), IntrinsicFailure> {
         self.nodes = self.nodes.saturating_add(count);
-        limit("macro lookup nodes", MAX_NAME_NODES, self.nodes)
+        limit(self.node_resource, MAX_NAME_NODES, self.nodes)
     }
 
     fn text(&mut self, text: &str) -> Result<(), IntrinsicFailure> {
         self.bytes = self.bytes.saturating_add(text.len() as u64);
-        limit("macro lookup bytes", MAX_NAME_BYTES, self.bytes)
+        limit(self.byte_resource, MAX_NAME_BYTES, self.bytes)
     }
 
     fn name(&mut self, name: &Name) -> Result<(), IntrinsicFailure> {
@@ -304,7 +361,7 @@ fn cons(head: Obj, tail: Obj) -> Obj {
 }
 
 fn namespace_candidates(names: &[Name]) -> Result<Obj, IntrinsicFailure> {
-    let mut budget = LookupBudget::default();
+    let mut budget = NameBudget::new("macro lookup nodes", "macro lookup bytes");
     budget.nodes(names.len() as u64)?;
     for name in names {
         budget.name(name)?;
@@ -318,7 +375,7 @@ fn namespace_candidates(names: &[Name]) -> Result<Obj, IntrinsicFailure> {
 }
 
 fn global_candidates(names: &[(Name, Vec<String>)]) -> Result<Obj, IntrinsicFailure> {
-    let mut budget = LookupBudget::default();
+    let mut budget = NameBudget::new("macro lookup nodes", "macro lookup bytes");
     budget.nodes((names.len() as u64).saturating_mul(2))?;
     for (name, projections) in names {
         budget.name(name)?;

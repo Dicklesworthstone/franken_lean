@@ -204,10 +204,13 @@ fn actual_artifacts(reference: PathBuf, library: PathBuf, partition: PathBuf) {
         admission,
         invocation(),
     );
-    assert!(matches!(
-        refused.outcome,
-        Outcome::Complete(Err(SourceMacroError::Frontend(_)))
-    ));
+    assert!(
+        matches!(
+            refused.outcome,
+            Outcome::Complete(Err(SourceMacroError::Frontend(_)))
+        ),
+        "{refused:?}"
+    );
     assert_eq!(refused.attempts.len(), 1);
     assert!(refused.state.is_none());
     assert!(!engine.environment().contains(&name("badMacroValue")));
@@ -230,6 +233,36 @@ fn actual_artifacts(reference: PathBuf, library: PathBuf, partition: PathBuf) {
     assert!(
         matches!(query.value.node(), ExprNode::Const { name: value, .. } if *value == name("Nat"))
     );
+    // The real admitted macro returns a scoped identifier, and the ordinary
+    // elaborator resolves its captured global declaration without losing the
+    // original source spelling or position.
+    let mut pending = vec![result.parsed.syntax()];
+    let mut scoped_identifiers = 0;
+    while let Some(syntax) = pending.pop() {
+        match syntax {
+            fln_syntax::tree::Syntax::Node { args, .. } => pending.extend(args),
+            fln_syntax::tree::Syntax::Ident {
+                info,
+                raw_val,
+                val,
+                preresolved,
+            } if val.has_macro_scopes() => {
+                let scopes = fln_syntax::hygiene::extract_macro_scopes(val).unwrap();
+                assert_eq!(scopes.name, name("Nat"));
+                assert_eq!(scopes.context, context.quotation_context);
+                assert_eq!(scopes.scopes, [0]);
+                assert_eq!((raw_val.start().0, raw_val.end().0), (8, 11));
+                assert!(
+                    matches!(info, fln_syntax::source::SourceInfo::Original { pos, end_pos, .. } if pos.0 == 8 && end_pos.0 == 11)
+                );
+                assert!(preresolved.iter().any(|entry| matches!(entry,
+                    fln_syntax::tree::Preresolved::Decl { name: target, fields } if *target == name("Nat") && fields.is_empty())));
+                scoped_identifiers += 1;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(scoped_identifiers, 1);
     assert_eq!(checked.attempts.len(), 1);
     assert_eq!(checked.attempts[0].module, module_name);
     assert_eq!(checked.attempts[0].declaration, name("admittedChooseTerm"));
@@ -245,6 +278,12 @@ fn actual_artifacts(reference: PathBuf, library: PathBuf, partition: PathBuf) {
             .native_functions
             .iter()
             .any(|row| row == "mirror:Lean.Macro.resolveGlobalName")
+    );
+    assert!(
+        checked.attempts[0]
+            .native_functions
+            .iter()
+            .any(|row| row == "mirror:Lean.Macro.addMacroScope")
     );
     assert!(
         checked.attempts[0]

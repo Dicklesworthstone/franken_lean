@@ -114,6 +114,20 @@ pub const ROWS: &[MirrorRow] = &[
         result_type: generated::NAME_MK_STR1_RESULT,
     },
     MirrorRow {
+        id: "mirror:Lean.addMacroScope",
+        name: "Lean.addMacroScope",
+        borrowed: generated::ADD_MACRO_SCOPE_BORROWED,
+        parameters: generated::ADD_MACRO_SCOPE_PARAMETERS,
+        result_type: generated::ADD_MACRO_SCOPE_RESULT,
+    },
+    MirrorRow {
+        id: "mirror:Lean.Macro.addMacroScope",
+        name: "Lean.Macro.addMacroScope",
+        borrowed: generated::MACRO_ADD_MACRO_SCOPE_BORROWED,
+        parameters: generated::MACRO_ADD_MACRO_SCOPE_PARAMETERS,
+        result_type: generated::MACRO_ADD_MACRO_SCOPE_RESULT,
+    },
+    MirrorRow {
         id: "mirror:Lean.Syntax.getArg",
         name: "Lean.Syntax.getArg",
         borrowed: generated::SYNTAX_GET_ARG_BORROWED,

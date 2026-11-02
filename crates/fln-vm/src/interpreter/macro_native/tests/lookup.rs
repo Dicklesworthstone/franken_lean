@@ -154,7 +154,7 @@ fn malformed_macro_carriers_do_not_invoke_host_lookups() {
     assert_eq!(lookup.calls.get(), 0);
 }
 
-fn callable_program(row_id: &str) -> flbc::ValidatedProgram {
+pub(super) fn callable_program(row_id: &str) -> flbc::ValidatedProgram {
     let row = crate::macro_native::row_for_id(row_id).unwrap();
     let arity = u16::try_from(row.parameters.len()).unwrap();
     let register = flbc::Register::new;

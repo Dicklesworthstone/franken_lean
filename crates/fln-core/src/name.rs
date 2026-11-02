@@ -657,6 +657,212 @@ impl Name {
     }
 }
 
+/// Pure macro-scope identities shared by syntax expansion and native VM rows.
+/// Keeping these Name operations here avoids coupling the VM to parser/source
+/// machinery. The syntax hygiene facade reexports this same implementation.
+pub mod hygiene {
+    use super::{LeafView, Name};
+
+    const MACRO_SCOPES_MARKER: &str = "_hyg";
+    const MACRO_SCOPES_SEPARATOR: &str = "_@";
+
+    /// The Reference's `MacroScope := Nat`, bounded by the Native Name substrate.
+    pub type MacroScope = u64;
+
+    /// Scope zero is reserved by the Reference; the first frontend scope is one.
+    pub const FIRST_FRONTEND_MACRO_SCOPE: MacroScope = 1;
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum NameComponent {
+        Str(String),
+        Num { value: u64, overflowed: bool },
+    }
+
+    fn name_components(name: &Name) -> Vec<NameComponent> {
+        let mut components = Vec::new();
+        let mut cursor = name.clone();
+        while !cursor.is_anonymous() {
+            let component = match cursor.leaf_view() {
+                LeafView::Anonymous => break,
+                LeafView::Str(value) => NameComponent::Str(value.to_string()),
+                LeafView::Num(value) => NameComponent::Num {
+                    value,
+                    overflowed: cursor.component_overflowed(),
+                },
+            };
+            components.push(component);
+            cursor = cursor.parent();
+        }
+        components.reverse();
+        components
+    }
+
+    fn name_from_components(components: &[NameComponent]) -> Name {
+        let mut name = Name::anonymous();
+        for component in components {
+            name = match component {
+                NameComponent::Str(value) => Name::str(name, value),
+                NameComponent::Num {
+                    value,
+                    overflowed: false,
+                } => Name::num(name, *value),
+                NameComponent::Num {
+                    value,
+                    overflowed: true,
+                } => Name::num_overflowing(name, *value),
+            };
+        }
+        name
+    }
+
+    /// A parsed hygienic name, exactly matching the pinned Reference's four fields.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct MacroScopesView {
+        /// The original name before any macro scope was attached.
+        pub name: Name,
+        /// Imported context/scope components accumulated across context changes.
+        pub imported: Name,
+        /// The globally unique current quotation context.
+        pub context: Name,
+        /// Current-context scopes in root-to-leaf order.
+        pub scopes: Vec<MacroScope>,
+    }
+
+    impl MacroScopesView {
+        /// The Reference's `MacroScopesView.review`.
+        pub fn review(&self) -> Name {
+            if self.scopes.is_empty() {
+                return self.name.clone();
+            }
+            let separator = Name::str(self.name.clone(), MACRO_SCOPES_SEPARATOR);
+            let imported = separator.append_core(&self.imported);
+            let context = imported.append_core(&self.context);
+            let mut reviewed = Name::str(context, MACRO_SCOPES_MARKER);
+            for scope in &self.scopes {
+                reviewed = Name::num(reviewed, *scope);
+            }
+            reviewed
+        }
+    }
+
+    /// A malformed hygienic-name decoration.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum HygieneError {
+        /// A `_hyg` decoration without any following scope.
+        EmptyScopeStack { name: Name },
+        /// The `_@` separator required by the hygienic-name grammar was absent.
+        MissingSeparator { name: Name },
+        /// The substrate cannot retain the original unbounded numeric component.
+        OverflowingScope { name: Name },
+    }
+
+    /// Total, stack-safe `Name.extractMacroScopes`.
+    pub fn extract_macro_scopes(name: &Name) -> Result<MacroScopesView, HygieneError> {
+        if !name.has_macro_scopes() {
+            return Ok(MacroScopesView {
+                name: name.clone(),
+                imported: Name::anonymous(),
+                context: Name::anonymous(),
+                scopes: Vec::new(),
+            });
+        }
+
+        let components = name_components(name);
+        let mut marker_end = components.len();
+        while marker_end > 0 && matches!(components[marker_end - 1], NameComponent::Num { .. }) {
+            marker_end -= 1;
+        }
+        let marker_index = marker_end
+            .checked_sub(1)
+            .ok_or_else(|| HygieneError::MissingSeparator { name: name.clone() })?;
+        if !matches!(&components[marker_index], NameComponent::Str(value) if value == MACRO_SCOPES_MARKER)
+        {
+            return Err(HygieneError::MissingSeparator { name: name.clone() });
+        }
+
+        let mut scopes = Vec::with_capacity(components.len() - marker_end);
+        for component in &components[marker_end..] {
+            let NameComponent::Num { value, overflowed } = component else {
+                return Err(HygieneError::MissingSeparator { name: name.clone() });
+            };
+            if *overflowed {
+                return Err(HygieneError::OverflowingScope { name: name.clone() });
+            }
+            scopes.push(*value);
+        }
+        if scopes.is_empty() {
+            return Err(HygieneError::EmptyScopeStack { name: name.clone() });
+        }
+
+        // `extractMainModule` walks backward from `_hyg`. The first numeric
+        // component separates the current context from accumulated imported
+        // context/scope components; without one, the first `_@` does.
+        let mut cursor = marker_index;
+        let mut imported_end = None;
+        let separator_index = 'find_separator: loop {
+            if cursor == 0 {
+                return Err(HygieneError::MissingSeparator { name: name.clone() });
+            }
+            let index = cursor - 1;
+            match &components[index] {
+                NameComponent::Str(value) if value == MACRO_SCOPES_SEPARATOR => break index,
+                NameComponent::Num { .. } => {
+                    imported_end = Some(index + 1);
+                    let mut imported_cursor = index;
+                    loop {
+                        if imported_cursor == 0 {
+                            return Err(HygieneError::MissingSeparator { name: name.clone() });
+                        }
+                        let imported_index = imported_cursor - 1;
+                        if matches!(&components[imported_index], NameComponent::Str(value) if value == MACRO_SCOPES_SEPARATOR)
+                        {
+                            break 'find_separator imported_index;
+                        }
+                        imported_cursor -= 1;
+                    }
+                }
+                NameComponent::Str(_) => cursor -= 1,
+            }
+        };
+
+        let context_start = imported_end.unwrap_or(separator_index + 1);
+        Ok(MacroScopesView {
+            name: name_from_components(&components[..separator_index]),
+            imported: imported_end.map_or_else(Name::anonymous, |end| {
+                name_from_components(&components[separator_index + 1..end])
+            }),
+            context: name_from_components(&components[context_start..marker_index]),
+            scopes,
+        })
+    }
+
+    /// Total, stack-safe `Name.addMacroScope`.
+    pub fn add_macro_scope(
+        context: &Name,
+        name: &Name,
+        scope: MacroScope,
+    ) -> Result<Name, HygieneError> {
+        if !name.has_macro_scopes() {
+            let separator = Name::str(name.clone(), MACRO_SCOPES_SEPARATOR);
+            let context = separator.append_core(context);
+            return Ok(Name::num(Name::str(context, MACRO_SCOPES_MARKER), scope));
+        }
+        let mut view = extract_macro_scopes(name)?;
+        if view.context == *context {
+            return Ok(Name::num(name.clone(), scope));
+        }
+        let mut imported = view.imported.append_core(&view.context);
+        for prior_scope in &view.scopes {
+            imported = Name::num(imported, *prior_scope);
+        }
+        view.imported = imported;
+        view.context = context.clone();
+        view.scopes.clear();
+        view.scopes.push(scope);
+        Ok(view.review())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

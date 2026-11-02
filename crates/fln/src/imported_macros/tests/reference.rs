@@ -472,6 +472,104 @@ fn live_pinned_macro_runs_native_syntax_methods_and_matches_complete_subtrees() 
         Outcome::Complete(Ok(MacroResult::Expanded { .. }))
     ));
 
+    let attach = prepare(&name("attachScopeMacro"));
+    let fresh = prepare(&name("freshIdentifierMacro"));
+    let mut plain = leaf();
+    let Syntax::Ident { val, .. } = &mut plain else {
+        panic!("identifier fixture");
+    };
+    *val = name("α");
+    let initial_state = MacroState {
+        macro_scope: 10,
+        trace_messages: vec![(name("Trace"), "opaque\0λ".into())],
+        expanded_macro_declarations: vec![name("Previous.macro")],
+    };
+    let scoped_name = |scope| Name::num(name("α._@.Main._hyg"), scope);
+    let run_scope = |compiled: &CompiledMacro,
+                     input: &Syntax,
+                     context: &MacroContext,
+                     state: &MacroState,
+                     expected_name: Name,
+                     expected_counter| {
+        let report = compiled.execute(
+            input,
+            &source(),
+            context,
+            state,
+            MacroLimits::default(),
+            None,
+        );
+        assert!(
+            report
+                .native_functions
+                .iter()
+                .any(|row| row == "mirror:Lean.Macro.addMacroScope"),
+            "the actual MacroM must select its native scope row: {report:?}"
+        );
+        assert!(report.reference_functions.iter().all(|function| {
+            function.producer() == "reference"
+                && !function.name.to_display_string().starts_with("Lean.")
+        }));
+        let mut expected = input.clone();
+        let Syntax::Ident { val, .. } = &mut expected else {
+            panic!("scope input must be an identifier");
+        };
+        *val = expected_name;
+        let mut expected_state = state.clone();
+        expected_state.macro_scope = expected_counter;
+        let Outcome::Complete(Ok(MacroResult::Expanded { syntax, state })) = report.outcome else {
+            panic!("scope attachment did not complete");
+        };
+        assert_eq!(
+            syntax, expected,
+            "complete source/name/preresolution payload"
+        );
+        assert_eq!(state, expected_state, "complete caller state");
+        (syntax, state)
+    };
+    run_scope(
+        &attach,
+        &plain,
+        &context(),
+        &initial_state,
+        scoped_name(17),
+        10,
+    );
+    let (first, first_state) = run_scope(
+        &fresh,
+        &plain,
+        &context(),
+        &initial_state,
+        scoped_name(10),
+        11,
+    );
+    let (second, second_state) = run_scope(
+        &fresh,
+        &first,
+        &context(),
+        &first_state,
+        Name::num(scoped_name(10), 11),
+        12,
+    );
+    let other_context = MacroContext {
+        quotation_context: name("Other.Module"),
+        current_macro_scope: 99,
+        ..context()
+    };
+    let imported = Name::num(Name::num(name("α._@.Main"), 10), 11);
+    let changed_name = Name::num(
+        Name::str(imported.append_core(&name("Other.Module")), "_hyg"),
+        99,
+    );
+    run_scope(
+        &attach,
+        &second,
+        &other_context,
+        &second_state,
+        changed_name,
+        12,
+    );
+
     let oracle_entry = choose
         .to_display_string()
         .replace("NativeMacroModule", "Oracle");
@@ -500,7 +598,7 @@ fn live_pinned_macro_runs_native_syntax_methods_and_matches_complete_subtrees() 
     );
     assert_eq!(
         oracle.stdout,
-        b"[true, true, true, true, true, true, true, true, true, true]\n[true, true, true, true, true, true, true, true, true, true, true, true, true, true, true]\n"
+        b"[true, true, true, true, true, true, true, true, true, true]\n[true, true, true, true, true, true, true, true, true, true, true, true, true, true, true]\n[true, true, true, true, true]\n"
     );
     assert!(oracle.stderr.is_empty());
 
@@ -663,4 +761,50 @@ def inspectResult (macroFn : Lean.Syntax → Lean.MacroM Lean.Syntax)
    inspectResult inspectSyntaxMacro identAtom (emptyNodeExact `ident),
    inspectResult idSyntaxMacro identAtom (emptyNodeExact .anonymous),
    inspectResult replaceSyntaxKindMacro identAtom (fun | .atom .none s => s == "ident" | _ => false)]
+def scopeInput (value : Lean.Name) : Lean.Syntax :=
+  match sampleLeaf with
+  | .ident info raw _ pre => .ident info raw value pre
+  | _ => .missing
+def scopeExact (expected : Lean.Name) : Lean.Syntax → Bool
+  | .ident info raw value pre => value == expected &&
+      leafExact (.ident info raw (Lean.Name.num `Main._hyg 17) pre)
+  | _ => false
+def scopeBump : Nat → Lean.MacroM Unit
+  | 0 => pure ()
+  | n + 1 => Lean.Macro.withFreshMacroScope (scopeBump n)
+def scopeState : Lean.Macro.State :=
+  match (do scopeBump 10; Lean.Macro.trace `Trace "opaque\x00λ") sampleContext default with
+  | .ok _ state => state
+  | .error _ state => state
+def scopeStateExact (counter : Nat) (state : Lean.Macro.State) : Bool :=
+  state.macroScope == counter && state.traceMsgs == [(`Trace, "opaque\x00λ")]
+def scopeBase : Lean.Name :=
+  .str (.str (.str .anonymous "α") "_@") "Main"
+def scopeName (counter : Nat) : Lean.Name := .num (.str scopeBase "_hyg") counter
+#eval show List Bool from
+  let plain := scopeInput `α
+  let attached := match attachScopeMacro plain sampleContext scopeState with
+    | .ok output state => scopeExact (scopeName 17) output && scopeStateExact 10 state
+    | _ => false
+  let first := freshIdentifierMacro plain sampleContext scopeState
+  let firstOk := match first with
+    | .ok output state => scopeExact (scopeName 10) output && scopeStateExact 11 state
+    | _ => false
+  let second := match first with
+    | .ok output state => freshIdentifierMacro output sampleContext state
+    | .error error state => .error error state
+  let secondOk := match second with
+    | .ok output state => scopeExact (.num (scopeName 10) 11) output && scopeStateExact 12 state
+    | _ => false
+  let changed := match second with
+    | .ok input state =>
+      let expected := Lean.Name.num (.str (.str (.str (.num (.num scopeBase 10) 11) "Other") "Module") "_hyg") 99
+      match attachScopeMacro input { sampleContext with quotContext := `Other.Module, currMacroScope := 99 } state with
+      | .ok output state => scopeExact expected output && scopeStateExact 12 state
+      | _ => false
+    | _ => false
+  let atom := match attachScopeMacro (.atom .none "unchanged") sampleContext scopeState with
+    | .ok (.atom .none "unchanged") state => scopeStateExact 10 state
+    | _ => false
+  [attached, firstOk, secondOk, changed, atom]
 "#;

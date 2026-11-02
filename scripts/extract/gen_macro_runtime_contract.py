@@ -41,6 +41,8 @@ SCALARS = {
 }
 FUNCTIONS = {
     "NAME_MK_STR1": "nameMkStr1",
+    "ADD_MACRO_SCOPE": "addMacroScope",
+    "MACRO_ADD_MACRO_SCOPE": "macroAddMacroScope",
     "SYNTAX_IS_OF_KIND": "syntaxIsOfKind",
     "SYNTAX_GET_ARG": "syntaxGetArg",
     "SYNTAX_GET_NUM_ARGS": "syntaxGetNumArgs",
@@ -114,21 +116,26 @@ def generate(lean):
     # The confinement boundary must not hand-copy the opaque field's offset.
     # Require the exact getter emitted by the pin, not an arbitrary projection
     # elsewhere in the trace or a fallback to a remembered source field order.
-    getter = re.search(
-        r"(?m)^    def FrankenLean\.MacroLayout\.contextMethods \((x_\d+) : @& obj\) : tobj :=\n"
-        r"(.*?)(?=^    def |^\[|\Z)", trace, re.S,
-    )
-    if getter is None:
-        raise ValueError("missing Macro.Context methods getter")
-    projection = re.fullmatch(
-        rf"\s*let (x_\d+) : tobj := proj\[(\d+)\] {re.escape(getter[1])};\s*inc \1;\s*ret \1\s*", getter[2],
-    )
-    if projection is None:
-        raise ValueError("Macro.Context methods getter is not one object projection")
-    field = int(projection[2])
-    if field >= layouts[CONSTRUCTORS["MACRO_CONTEXT"]][1]:
-        raise ValueError("Macro.Context methods field is outside the extracted layout")
-    lines.extend(["", f"pub const MACRO_CONTEXT_METHODS_FIELD: u64 = {field};"])
+    for function, constant, rust_type in [
+        ("contextMethods", "MACRO_CONTEXT_METHODS_FIELD", "u64"),
+        ("contextQuotation", "MACRO_CONTEXT_QUOTATION_FIELD", "usize"),
+        ("contextScope", "MACRO_CONTEXT_SCOPE_FIELD", "usize"),
+    ]:
+        getter = re.search(
+            rf"(?m)^    def FrankenLean\.MacroLayout\.{function} \((x_\d+) : @& obj\) : tobj :=\n"
+            r"(.*?)(?=^    def |^\[|\Z)", trace, re.S,
+        )
+        if getter is None:
+            raise ValueError(f"missing Macro.Context getter: {function}")
+        projection = re.fullmatch(
+            rf"\s*let (x_\d+) : tobj := proj\[(\d+)\] {re.escape(getter[1])};\s*inc \1;\s*ret \1\s*", getter[2],
+        )
+        if projection is None:
+            raise ValueError(f"Macro.Context getter is not one object projection: {function}")
+        field = int(projection[2])
+        if field >= layouts[CONSTRUCTORS["MACRO_CONTEXT"]][1]:
+            raise ValueError(f"Macro.Context getter is outside the extracted layout: {function}")
+        lines.extend(["", f"pub const {constant}: {rust_type} = {field};"])
     for constant, function in FUNCTIONS.items():
         signature = re.search(
             rf"(?m)^    def FrankenLean\.MacroLayout\.{function} (.*?) : (\w+) :=$", trace,

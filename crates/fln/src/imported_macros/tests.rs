@@ -380,6 +380,43 @@ fn macro_selection_never_executes_toolchain_bodies_or_ambient_effects() {
     ));
     // Name resolution has native lookup rows. Recursive macro expansion still
     // requires an unsupported method and must not run a toolchain body.
+    for (function, args) in [
+        ("Lean.Macro.addMacroScope", [1, 0, 2]),
+        ("Lean.Macro.addMacroScope", [0, 1, 1]),
+        ("Lean.addMacroScope", [1, 0, 2]),
+    ] {
+        let observer = module(
+            vec![
+                bind(
+                    5,
+                    IrExpr::Fap {
+                        function: name(function),
+                        args: args.into_iter().map(IrArg::Var).collect(),
+                    },
+                ),
+                bind(6, ctor(layout::RESULT_OK, "EStateM.Result.ok", &[0, 2])),
+            ],
+            6,
+        );
+        assert!(
+            matches!(
+                compile(
+                    &[observer],
+                    &name("User.macro"),
+                    &VerifiedPartition::user_fixture(),
+                    &BTreeSet::from([name("User.macro")]),
+                    IrExecutionLimits::default()
+                ),
+                Err(MacroExecutionError::Compile(
+                    IrExecutionError::Unsupported {
+                        form: "Macro.Context observation requires native Macro.Methods support",
+                        ..
+                    }
+                ))
+            ),
+            "context escaped through {function}"
+        );
+    }
     let unknown = module(
         vec![
             bind(

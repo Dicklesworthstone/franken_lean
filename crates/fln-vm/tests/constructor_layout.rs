@@ -328,3 +328,305 @@ fn invalid_layouts_and_untyped_operands_are_refused_before_execution() {
         Err(fir::ValidationError::MissingConstructor { .. })
     ));
 }
+
+fn shape_program(input: flbc::Instruction) -> flbc::Program {
+    let mut source = program(input);
+    source.functions[0].code[2] = flbc::Instruction::CtorShapeTest {
+        dst: r(2),
+        src: r(1),
+        expected_fields: 1,
+        expected_scalar_bytes: 0,
+    };
+    source
+}
+
+#[test]
+fn shape_guard_accepts_different_tags_but_refuses_payload_and_carrier_mismatches() {
+    use flbc::Instruction as I;
+    let constructors = [0, 1, 7, fln_rt::abi::TAG_MAX_CTOR_TAG].map(|tag| {
+        (
+            I::Ctor {
+                dst: r(1),
+                tag,
+                fields: vec![r(0)],
+                scalar_bytes: vec![],
+            },
+            "1",
+        )
+    });
+    let mismatches = [
+        (
+            I::Ctor {
+                dst: r(1),
+                tag: 7,
+                fields: vec![],
+                scalar_bytes: vec![],
+            },
+            "0",
+        ),
+        (
+            I::Ctor {
+                dst: r(1),
+                tag: 7,
+                fields: vec![r(0), r(0)],
+                scalar_bytes: vec![],
+            },
+            "0",
+        ),
+        (
+            I::Ctor {
+                dst: r(1),
+                tag: 7,
+                fields: vec![r(0)],
+                scalar_bytes: vec![0],
+            },
+            "0",
+        ),
+        (
+            I::Ctor {
+                dst: r(1),
+                tag: 7,
+                fields: vec![r(0)],
+                scalar_bytes: vec![0; 16],
+            },
+            "0",
+        ),
+        (
+            I::Nat {
+                dst: r(1),
+                value: 7,
+            },
+            "0",
+        ),
+        (
+            I::NatBig {
+                dst: r(1),
+                limbs_le: vec![u64::MAX],
+            },
+            "0",
+        ),
+        (
+            I::String {
+                dst: r(1),
+                value: "other heap kind".into(),
+            },
+            "0",
+        ),
+        (
+            I::Array {
+                dst: r(1),
+                items: vec![r(0)],
+            },
+            "0",
+        ),
+        (
+            I::Closure {
+                dst: r(1),
+                function: flbc::FunctionId::new(1),
+                captures: vec![r(0)],
+                capture_ownership: vec![flbc::ArgumentOwnership::Owned],
+            },
+            "0",
+        ),
+    ];
+    for (input, expected) in constructors.into_iter().chain(mismatches) {
+        let is_closure = matches!(input, I::Closure { .. });
+        let mut source = shape_program(input);
+        if is_closure {
+            source.functions.push(flbc::Function {
+                id: flbc::FunctionId::new(1),
+                arity: 2,
+                parameter_ownership: vec![flbc::ArgumentOwnership::Owned; 2],
+                result_ownership: flbc::CallableResultOwnership::Owned,
+                register_count: 2,
+                code: vec![I::Return { src: r(0) }],
+            });
+        }
+        for replay in replays(source) {
+            assert_eq!(nat_decimal(&returned(&replay)).as_deref(), Some(expected));
+        }
+    }
+    let word = std::mem::size_of::<usize>();
+    for (actual_bytes, expected_bytes, expected) in [
+        (word, word, "1"),
+        (word + 1, word, "0"),
+        // A shape includes aligned allocation size, not the number of bytes
+        // distinguishable inside the allocator's final padding word.
+        (1, word, "1"),
+    ] {
+        let mut source = shape_program(I::Ctor {
+            dst: r(1),
+            tag: 1,
+            fields: vec![r(0)],
+            scalar_bytes: vec![0; actual_bytes],
+        });
+        source.functions[0].code[2] = I::CtorShapeTest {
+            dst: r(2),
+            src: r(1),
+            expected_fields: 1,
+            expected_scalar_bytes: u16::try_from(expected_bytes).unwrap(),
+        };
+        for replay in replays(source) {
+            assert_eq!(nat_decimal(&returned(&replay)).as_deref(), Some(expected));
+        }
+    }
+}
+
+#[test]
+fn shape_guard_checks_before_overwriting_its_input_and_preserves_aliases() {
+    use flbc::Instruction as I;
+    let mut source = shape_program(I::Ctor {
+        dst: r(1),
+        tag: 1,
+        fields: vec![r(0)],
+        scalar_bytes: vec![],
+    });
+    source.functions[0].register_count = 4;
+    source.functions[0].result_ownership = flbc::CallableResultOwnership::Owned;
+    source.functions[0].code.insert(
+        2,
+        I::Copy {
+            dst: r(3),
+            src: r(1),
+        },
+    );
+    source.functions[0].code[3] = I::CtorShapeTest {
+        dst: r(1),
+        src: r(1),
+        expected_fields: 1,
+        expected_scalar_bytes: 0,
+    };
+    source.functions[0].code[4] = I::Ctor {
+        dst: r(2),
+        tag: 0,
+        fields: vec![r(1), r(3)],
+        scalar_bytes: vec![],
+    };
+    source.functions[0].code.push(I::Return { src: r(2) });
+    for replay in replays(source) {
+        let result = returned(&replay);
+        assert_eq!(
+            nat_decimal(&result.try_ctor_child(0).unwrap()).as_deref(),
+            Some("1")
+        );
+        let kept = result.try_ctor_child(1).unwrap();
+        assert_eq!(kept.header().tag, 1);
+        assert!(
+            kept.try_ctor_child(0)
+                .unwrap()
+                .try_borrow_string_view()
+                .is_some()
+        );
+    }
+}
+
+#[test]
+fn shape_guard_survives_fir_optimization_lowering_and_canonical_replay() {
+    for tag in [0, 1, 7, fln_rt::abi::TAG_MAX_CTOR_TAG] {
+        let mut source = fir_program();
+        source.constructors[0].tag = tag;
+        source.functions[0].blocks[0].bindings[4].operation = fir::Operation::CtorShapeTest {
+            value: fir::ValueId::new(3),
+            expected_fields: 1,
+            expected_scalar_bytes: 0,
+        };
+        let checked = fir::validate(source, fir::ValidationLimits::default()).unwrap();
+        assert!(
+            checked
+                .canonical_text()
+                .contains("ctor-shape-test v3 fields=1 scalar-bytes=0")
+        );
+        for checked in [
+            checked.clone(),
+            fir::optimize(&checked, fir::ValidationLimits::default()).unwrap(),
+        ] {
+            let lowered =
+                fir::lower_to_flbc_with_ownership(&checked, flbc::OwnershipLimits::default())
+                    .unwrap();
+            assert!(
+                lowered.program().functions()[0]
+                    .code
+                    .iter()
+                    .any(|instruction| matches!(
+                        instruction,
+                        flbc::Instruction::CtorShapeTest {
+                            expected_fields: 1,
+                            expected_scalar_bytes: 0,
+                            ..
+                        }
+                    ))
+            );
+            let bytes =
+                flbc::encode_canonical(lowered.program(), flbc::CodecLimits::default()).unwrap();
+            let replay = flbc::decode_canonical(&bytes, flbc::CodecLimits::default()).unwrap();
+            assert_eq!(nat_decimal(&returned(&replay)).as_deref(), Some("1"));
+        }
+    }
+}
+
+#[test]
+fn malformed_shape_tests_are_refused_by_fir_and_bytecode_decoding() {
+    use flbc::Instruction as I;
+    for (fields, scalars) in [(u16::MAX, 0), (1, u16::MAX)] {
+        let mut invalid = fir_program();
+        invalid.functions[0].blocks[0].bindings[4].operation = fir::Operation::CtorShapeTest {
+            value: fir::ValueId::new(3),
+            expected_fields: fields,
+            expected_scalar_bytes: scalars,
+        };
+        assert!(matches!(
+            fir::validate(invalid, fir::ValidationLimits::default()),
+            Err(fir::ValidationError::ConstructorShapeTestLayoutOutOfRange { .. })
+        ));
+    }
+    let mut invalid = fir_program();
+    invalid.functions[0].blocks[0].bindings[4].operation = fir::Operation::CtorShapeTest {
+        value: fir::ValueId::new(2),
+        expected_fields: 1,
+        expected_scalar_bytes: 0,
+    };
+    assert!(matches!(
+        fir::validate(invalid, fir::ValidationLimits::default()),
+        Err(fir::ValidationError::ConstructorLayoutTestOperandType { .. })
+    ));
+
+    let checked = flbc::validate(shape_program(I::Nat {
+        dst: r(1),
+        value: 7,
+    }))
+    .unwrap();
+    let bytes = flbc::encode_canonical(&checked, flbc::CodecLimits::default()).unwrap();
+    // The new opcode's wire payload is two registers, object slots and scalar
+    // bytes, each u16. Match its unique complete encoding before corrupting it.
+    let encoding: [u8; 9] = [27, 2, 0, 1, 0, 1, 0, 0, 0];
+    let matches: Vec<_> = bytes
+        .windows(encoding.len())
+        .enumerate()
+        .filter_map(|(offset, window)| (window == encoding).then_some(offset))
+        .collect();
+    assert_eq!(matches.len(), 1);
+    for (field_offset, scalar) in [(5, false), (7, true)] {
+        let mut malformed = bytes.clone();
+        malformed[matches[0] + field_offset..matches[0] + field_offset + 2]
+            .copy_from_slice(&u16::MAX.to_le_bytes());
+        let error = flbc::decode_canonical(&malformed, flbc::CodecLimits::default()).unwrap_err();
+        assert!(
+            if scalar {
+                matches!(
+                    error,
+                    flbc::CodecError::Validation(
+                        flbc::ValidationError::TooManyCtorScalarBytes { .. }
+                    )
+                )
+            } else {
+                matches!(
+                    error,
+                    flbc::CodecError::Validation(
+                        flbc::ValidationError::CtorFieldShapeOutOfRange { .. }
+                    )
+                )
+            },
+            "{error:?}"
+        );
+    }
+}

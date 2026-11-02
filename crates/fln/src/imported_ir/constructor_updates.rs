@@ -30,7 +30,9 @@ type Result<T> = std::result::Result<T, IrExecutionError>;
 
 #[derive(Clone, Copy)]
 struct Shape {
-    tag: u64,
+    // An unknown input tag must be overwritten on every consuming path before
+    // equivalence to a fresh allocation can be established.
+    tag: Option<u64>,
     fields: u64,
     words: u64,
     bytes: u64,
@@ -39,7 +41,7 @@ struct Shape {
 impl Shape {
     fn from_info(info: &IrCtorInfo) -> Option<Self> {
         (info.size > 0 || info.usize > 0 || info.ssize > 0).then_some(Self {
-            tag: info.cidx,
+            tag: Some(info.cidx),
             fields: info.size,
             words: info.usize,
             bytes: info.ssize,
@@ -67,9 +69,33 @@ struct Meter {
     max_work: u64,
     max_depth: usize,
     changed: bool,
+    next_index: Option<u64>,
+    tag_independent_guards: BTreeSet<u64>,
+}
+
+/// Guard provenance is part of the normalized module's meaning. It is never
+/// serialized as Reference IR: only the immediately following FIR lowering
+/// consumes these fresh, declaration-local join parameters.
+#[derive(Debug, Default)]
+pub(super) struct Normalization {
+    pub changed: bool,
+    pub tag_independent_guards: BTreeMap<fln_core::name::Name, BTreeSet<u64>>,
 }
 
 impl Meter {
+    fn fresh_index(&mut self) -> Result<u64> {
+        self.charge(1)?;
+        let index = self
+            .next_index
+            .ok_or(IrExecutionError::Limit("constructor guard indices"))?;
+        self.next_index = Some(
+            index
+                .checked_add(1)
+                .ok_or(IrExecutionError::Limit("constructor guard indices"))?,
+        );
+        Ok(index)
+    }
+
     fn charge(&mut self, count: usize) -> Result<()> {
         self.work = self
             .work
@@ -106,21 +132,46 @@ impl Meter {
 
 /// Called only after the complete selected input has passed IR validation.
 /// Work, including scope snapshots and join-capture scans, has its own bound.
-pub(super) fn normalize(module: &mut IrModule, limits: IrExecutionLimits) -> Result<bool> {
+pub(super) fn normalize(module: &mut IrModule, limits: IrExecutionLimits) -> Result<Normalization> {
     let mut meter = Meter {
         work: 0,
         max_work: limits.ir.max_work,
         max_depth: limits.ir.max_depth.min(128),
         changed: false,
+        next_index: None,
+        tag_independent_guards: BTreeSet::new(),
     };
+    let mut normalization = Normalization::default();
     for declaration in &mut module.decls {
         meter.charge(1)?;
-        if let IrDecl::Function { name, body, .. } = declaration {
+        if let IrDecl::Function {
+            name, params, body, ..
+        } = declaration
+        {
             let (stores, sharing) = update_forms(body, &mut meter)?;
             if stores {
                 fresh::normalize_body(name, body, &mut meter, 1)?;
             }
             if sharing {
+                meter.charge(params.len())?;
+                let mut maximum = params.iter().map(|param| param.x).max().unwrap_or(0);
+                for nested in body.bodies() {
+                    meter.charge(nested.stmts.len().saturating_add(1))?;
+                    for stmt in &nested.stmts {
+                        match stmt {
+                            IrStmt::VDecl { x, .. } => maximum = maximum.max(*x),
+                            IrStmt::JDecl { j, params, .. } => {
+                                maximum = maximum.max(*j);
+                                meter.charge(params.len())?;
+                                for param in params {
+                                    maximum = maximum.max(param.x);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                meter.next_index = maximum.checked_add(1);
                 // Removing an outer reset can expose an inner receiver that
                 // was conservatively captured by the outer lexical join.
                 // Recompute captures after each changing pass; all passes
@@ -137,9 +188,16 @@ pub(super) fn normalize(module: &mut IrModule, limits: IrExecutionLimits) -> Res
                 }
                 meter.changed = changed;
             }
+            if !meter.tag_independent_guards.is_empty() {
+                normalization.tag_independent_guards.insert(
+                    name.clone(),
+                    std::mem::take(&mut meter.tag_independent_guards),
+                );
+            }
         }
     }
-    Ok(meter.changed)
+    normalization.changed = meter.changed;
+    Ok(normalization)
 }
 
 // Ordinary immutable functions need neither scope snapshots nor capture scans.
@@ -489,7 +547,7 @@ fn equivalent_branches(
                 }
             }
             IrStmt::SetTag { x, cidx } if x == receiver && !changed_tag => {
-                tag = *cidx;
+                tag = Some(*cidx);
                 changed_tag = true;
             }
             _ if rc_only(stmt) => {

@@ -46,13 +46,24 @@ pub(super) fn normalize(
     // Prove the entire reset/reuse region under that conditional layout, then
     // establish it with an executable guard before moving any common work.
     let mut guarded_scope = meter.scope(scope)?;
-    guarded_scope.shapes.insert(
-        receiver,
-        Shape::object_only(&info).expect("candidate is an object-only heap constructor"),
-    );
-    let Some(choice) = equivalent(body, &guarded_scope, captures, meter)? else {
-        return Ok(false);
-    };
+    let mut candidate =
+        Shape::object_only(&info).expect("candidate is an object-only heap constructor");
+    // The cold allocation fixes the OUTPUT tag. First leave the input tag
+    // unknown: equivalence then requires every consuming hot path to replace
+    // it. If that cannot be proved, retain the original tag-sensitive guard.
+    candidate.tag = None;
+    guarded_scope.shapes.insert(receiver, candidate);
+    let (choice, tag_independent) =
+        if let Some(choice) = equivalent(body, &guarded_scope, captures, meter)? {
+            (choice, true)
+        } else {
+            candidate.tag = Some(info.cidx);
+            guarded_scope.shapes.insert(receiver, candidate);
+            let Some(choice) = equivalent(body, &guarded_scope, captures, meter)? else {
+                return Ok(false);
+            };
+            (choice, false)
+        };
     meter.depth(depth + 1)?;
     meter.charge(3)?;
     // Keep every original strict prefix statement before the guard. Only the
@@ -62,11 +73,18 @@ pub(super) fn normalize(
     let terminal = std::mem::replace(&mut body.terminal, Box::new(IrTerminal::Unreachable));
     let mut matching = IrBody { stmts, terminal };
     apply(&mut matching, choice, meter)?;
-    *body.terminal = IrTerminal::Case {
+    let guard_parameter = if tag_independent {
+        meter.depth(depth + 2)?;
+        meter.charge(5)?;
+        meter.fresh_index()?
+    } else {
+        receiver
+    };
+    let guard = IrTerminal::Case {
         // This name is diagnostic metadata. The runtime witness comes from
         // the complete CtorInfo layout, lowered to CtorLayoutTest.
         type_name: info.name.clone(),
-        x: receiver,
+        x: guard_parameter,
         x_type: IrType::TObject,
         alts: vec![
             IrAlt::Ctor {
@@ -81,6 +99,32 @@ pub(super) fn normalize(
             },
         ],
     };
+    if tag_independent {
+        // A fresh lexical parameter binds the guard's provenance to this one
+        // generated case; no source case on the original receiver can acquire
+        // the tag-independent interpretation. The proof above excludes uses
+        // of that receiver in the moved continuation.
+        let join = meter.fresh_index()?;
+        body.stmts.push(IrStmt::JDecl {
+            j: join,
+            params: vec![fln_olean::ir::IrParam {
+                x: guard_parameter,
+                borrow: true,
+                ty: IrType::TObject,
+            }],
+            value: IrBody {
+                stmts: Vec::new(),
+                terminal: Box::new(guard),
+            },
+        });
+        *body.terminal = IrTerminal::Jmp {
+            j: join,
+            args: vec![IrArg::Var(receiver)],
+        };
+        meter.tag_independent_guards.insert(guard_parameter);
+    } else {
+        *body.terminal = guard;
+    }
     Ok(true)
 }
 

@@ -552,3 +552,110 @@ fn only_selected_reference_declarations_can_receive_context() {
     }];
     assert!(check(&[module], &name("User.macro"), &selected, 10_000).is_err());
 }
+
+fn relay_context() -> Vec<IrStmt> {
+    let mut statements: Vec<_> = (0..layout::MACRO_CONTEXT.object_fields)
+        .map(|field| {
+            bind(
+                3 + field as u64,
+                IrExpr::Proj {
+                    i: field as u64,
+                    x: 1,
+                },
+            )
+        })
+        .collect();
+    statements.push(bind(
+        10,
+        IrExpr::Ctor {
+            info: IrCtorInfo {
+                name: name("Lean.Macro.Context.mk"),
+                cidx: u64::from(layout::MACRO_CONTEXT.tag),
+                size: layout::MACRO_CONTEXT.object_fields as u64,
+                usize: 0,
+                ssize: layout::MACRO_CONTEXT.scalar_bytes as u64,
+            },
+            args: (0..layout::MACRO_CONTEXT.object_fields)
+                .map(|field| IrArg::Var(3 + field as u64))
+                .collect(),
+        },
+    ));
+    statements
+}
+
+#[test]
+fn opaque_methods_can_only_relay_into_the_exact_context_constructor() {
+    let mut statements = relay_context();
+    statements.push(bind(11, call("User.helper", &[10, 2])));
+    assert_executes(&module(vec![entry(statements, 11), helper()]));
+
+    // Every dimension of the exception matters, including structural Name
+    // components and the location of the opaque field in the constructor.
+    for mutation in 0..7 {
+        let mut statements = relay_context();
+        let IrStmt::VDecl {
+            expr: IrExpr::Ctor { info, args },
+            ..
+        } = statements.last_mut().unwrap()
+        else {
+            unreachable!()
+        };
+        match mutation {
+            0 => info.name = Name::from_components(["Lean.Macro.Context.mk"]),
+            1 => info.cidx += 1,
+            2 => info.size += 1,
+            3 => info.usize += 1,
+            4 => info.ssize += 1,
+            5 => {
+                args.swap(0, 1);
+            }
+            6 => args.push(IrArg::Erased),
+            _ => unreachable!(),
+        }
+        statements.push(bind(11, ok(0, 2)));
+        assert!(
+            checked(&module(vec![entry(statements, 11)]), 10_000).is_err(),
+            "accepted context constructor mutation {mutation}"
+        );
+    }
+}
+
+#[test]
+fn a_relay_does_not_authorize_another_methods_use_or_an_unused_projection() {
+    let methods = 3 + layout::MACRO_CONTEXT_METHODS_FIELD;
+    for expression in [
+        IrExpr::Proj { i: 0, x: methods },
+        IrExpr::IsShared { x: methods },
+        call("Nat.decEq", &[methods, methods]),
+        call("User.ignore", &[methods, 2]),
+        partial("User.ignore", &[methods]),
+        ok(methods, 2),
+        // This second projection has its own identity even though it reads
+        // the same context. Relaying the first cannot excuse an unused read.
+        IrExpr::Proj {
+            i: layout::MACRO_CONTEXT_METHODS_FIELD,
+            x: 1,
+        },
+    ] {
+        let mut statements = relay_context();
+        statements.push(bind(11, expression.clone()));
+        statements.push(bind(12, ok(0, 2)));
+        let fixture = module(vec![
+            entry(statements, 12),
+            function(
+                "User.ignore",
+                &[20, 21],
+                vec![],
+                IrTerminal::Ret(IrArg::Var(21)),
+            ),
+        ]);
+        assert!(
+            checked(&fixture, 10_000).is_err(),
+            "accepted {expression:?}"
+        );
+    }
+    let mut statements = relay_context();
+    statements.push(bind(11, ok(10, 2)));
+    assert!(checked(&module(vec![entry(statements, 11)]), 10_000).is_err());
+    assert!(checked(&module(vec![entry(relay_context(), methods)]), 10_000).is_err());
+}

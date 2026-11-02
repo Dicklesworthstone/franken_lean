@@ -426,7 +426,11 @@ fn update_normalization_is_bounded_and_a_refusal_does_not_mutate_the_inputs() {
     let error = normalize(&mut copy, limits).unwrap_err();
     assert!(error.is_resource());
     assert_eq!(copy, input);
-    assert!(normalize(&mut copy, IrExecutionLimits::default()).unwrap());
+    assert!(
+        normalize(&mut copy, IrExecutionLimits::default())
+            .unwrap()
+            .changed
+    );
     for declaration in &copy.decls {
         if let IrDecl::Function { body, .. } = declaration {
             for body in body.bodies() {
@@ -443,7 +447,11 @@ fn update_normalization_is_bounded_and_a_refusal_does_not_mutate_the_inputs() {
         }
     }
     let first = copy.clone();
-    assert!(!normalize(&mut copy, IrExecutionLimits::default()).unwrap());
+    assert!(
+        !normalize(&mut copy, IrExecutionLimits::default())
+            .unwrap()
+            .changed
+    );
     assert_eq!(copy, first, "normalization is deterministic and idempotent");
     assert_nat_and_replay(
         &compile_fixture(update_region(), false, IrExecutionLimits::default()).unwrap(),

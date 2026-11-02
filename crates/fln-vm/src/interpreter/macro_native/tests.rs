@@ -30,6 +30,8 @@ fn node(kind: Name, children: Vec<Obj>) -> Obj {
 fn invoke(intrinsic: Intrinsic, args: &[Obj]) -> Obj {
     let id = match intrinsic {
         Intrinsic::MkStr1 => "mirror:Lean.Name.mkStr1",
+        Intrinsic::AddMacroScope => "mirror:Lean.addMacroScope",
+        Intrinsic::MacroAddMacroScope => "mirror:Lean.Macro.addMacroScope",
         Intrinsic::IsOfKind => "mirror:Lean.Syntax.isOfKind",
         Intrinsic::GetArg => "mirror:Lean.Syntax.getArg",
         Intrinsic::GetNumArgs => "mirror:Lean.Syntax.getNumArgs",
@@ -98,6 +100,190 @@ fn native_kinds_include_missing_ident_and_atom_pseudo_kinds() {
         Conversion::new().project_name(&single).unwrap(),
         Name::from_components(["A", "B"])
     );
+}
+
+#[test]
+fn native_scope_attachment_shares_the_hygiene_engine_and_preserves_state() {
+    let context = inject_name(&Name::from_components(["Main"]));
+    let original = inject_name(&Name::from_components(["α"]));
+    let scoped = invoke(
+        Intrinsic::AddMacroScope,
+        &[context.clone_ref(), original.clone_ref(), Obj::mk_nat(17)],
+    );
+    assert_eq!(
+        Conversion::new().project_name(&scoped).unwrap(),
+        Name::num(Name::from_components(["α", "_@", "Main", "_hyg"]), 17)
+    );
+    assert_eq!(
+        Conversion::new().project_name(&original).unwrap(),
+        Name::from_components(["α"])
+    );
+    let repeated = invoke(
+        Intrinsic::AddMacroScope,
+        &[context.clone_ref(), scoped.clone_ref(), Obj::mk_nat(18)],
+    );
+    assert_eq!(
+        Conversion::new().project_name(&repeated).unwrap(),
+        Name::num(
+            Name::num(Name::from_components(["α", "_@", "Main", "_hyg"]), 17),
+            18
+        )
+    );
+    let other = inject_name(&Name::from_components(["Other", "Module"]));
+    let changed = invoke(
+        Intrinsic::AddMacroScope,
+        &[other, repeated, Obj::mk_nat(99)],
+    );
+    let imported = Name::num(
+        Name::num(Name::from_components(["α", "_@", "Main"]), 17),
+        18,
+    );
+    let expected = Name::num(
+        Name::str(
+            imported.append_core(&Name::from_components(["Other", "Module"])),
+            "_hyg",
+        ),
+        99,
+    );
+    assert_eq!(Conversion::new().project_name(&changed).unwrap(), expected);
+
+    for scope in [0, u64::MAX] {
+        let value = invoke(
+            Intrinsic::AddMacroScope,
+            &[
+                context.clone_ref(),
+                original.clone_ref(),
+                Obj::mk_mpz(&[scope], false),
+            ],
+        );
+        assert_eq!(
+            Conversion::new().project_name(&value).unwrap(),
+            Name::num(Name::from_components(["α", "_@", "Main", "_hyg"]), scope)
+        );
+    }
+    let state = Obj::mk_ctor(
+        layout::MACRO_STATE.tag,
+        vec![
+            Obj::mk_nat(10),
+            Obj::mk_nat(layout::LIST_NIL_TAG),
+            Obj::mk_nat(layout::LIST_NIL_TAG),
+        ],
+        &[],
+    );
+    let ctx = Obj::mk_ctor(
+        layout::MACRO_CONTEXT.tag,
+        vec![
+            Obj::mk_string("opaque methods must not be observed"),
+            context,
+            Obj::mk_nat(17),
+            Obj::mk_nat(0),
+            Obj::mk_nat(1000),
+            Obj::mk_nat(layout::SYNTAX_MISSING_TAG),
+        ],
+        &[],
+    );
+    let program = lookup::callable_program("mirror:Lean.Macro.addMacroScope");
+    let bytes = flbc::encode_canonical(&program, flbc::CodecLimits::default()).unwrap();
+    let replay = flbc::decode_canonical(&bytes, flbc::CodecLimits::default()).unwrap();
+    for program in [&program, &replay] {
+        let outcome = execute_function(
+            program,
+            flbc::FunctionId::new(1),
+            vec![original.clone_ref(), ctx.clone_ref(), state.clone_ref()],
+            ExecutionLimits::default(),
+            None,
+        );
+        let Outcome::Complete(VmExit::Returned(result)) = outcome else {
+            panic!("{outcome:?}")
+        };
+        check_layout(&result.value, layout::RESULT_OK).unwrap();
+        assert_eq!(
+            child(&result.value, 1).unwrap().identity_token(),
+            state.identity_token()
+        );
+        assert_eq!(
+            Conversion::new()
+                .project_name(&child(&result.value, 0).unwrap())
+                .unwrap(),
+            Conversion::new().project_name(&scoped).unwrap()
+        );
+    }
+}
+
+#[test]
+fn native_scope_attachment_refuses_malformed_data_and_preserves_resource_stops() {
+    let row = "mirror:Lean.addMacroScope";
+    let context = inject_name(&Name::from_components(["Main"]));
+    let plain = inject_name(&Name::from_components(["α"]));
+    for malformed in [
+        Name::from_components(["x", "_hyg"]),
+        Name::num(Name::from_components(["x", "Ctx", "_hyg"]), 5),
+    ] {
+        assert!(matches!(
+            Intrinsic::AddMacroScope.invoke(
+                row,
+                &[context.clone_ref(), inject_name(&malformed), Obj::mk_nat(1)]
+            ),
+            Err(IntrinsicFailure::Refused(VmRefusal::InvalidCtorObject))
+        ));
+    }
+    assert!(matches!(
+        Intrinsic::AddMacroScope.invoke(
+            row,
+            &[
+                context.clone_ref(),
+                plain.clone_ref(),
+                Obj::mk_mpz(&[1], true)
+            ]
+        ),
+        Err(IntrinsicFailure::Refused(VmRefusal::TypeMismatch { .. }))
+    ));
+    assert!(matches!(
+        Intrinsic::AddMacroScope.invoke(row, &[context.clone_ref(), plain.clone_ref()]),
+        Err(IntrinsicFailure::Refused(VmRefusal::IntrinsicArity { .. }))
+    ));
+    let program = lookup::callable_program(row);
+    for (scope, limits, cancellation) in [
+        (
+            Obj::mk_mpz(&[0, 1], false),
+            ExecutionLimits::default(),
+            None,
+        ),
+        (
+            Obj::mk_nat(1),
+            ExecutionLimits {
+                max_steps: 0,
+                ..ExecutionLimits::default()
+            },
+            None,
+        ),
+    ] {
+        assert!(matches!(
+            execute_function(
+                &program,
+                flbc::FunctionId::new(1),
+                vec![context.clone_ref(), plain.clone_ref(), scope],
+                limits,
+                cancellation
+            ),
+            Outcome::Inconclusive(_)
+        ));
+    }
+    let oversized_context = inject_name(&Name::str(
+        Name::anonymous(),
+        "c".repeat((MAX_NAME_BYTES / 2) as usize),
+    ));
+    let oversized_value = inject_name(&Name::str(
+        Name::anonymous(),
+        "v".repeat((MAX_NAME_BYTES / 2) as usize),
+    ));
+    assert!(matches!(
+        Intrinsic::AddMacroScope.invoke(row, &[oversized_context, oversized_value, Obj::mk_nat(1)]),
+        Err(IntrinsicFailure::MirrorResource {
+            resource: "macro scope bytes",
+            ..
+        })
+    ));
 }
 
 #[test]

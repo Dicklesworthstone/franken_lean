@@ -918,7 +918,7 @@ fn compile_with_policy(
     let erased_worlds =
         native_effects::erase_world_arguments(&mut selected_module, &natives, limits)?;
     let updated_constructors = constructor_updates::normalize(&mut selected_module, limits)?;
-    if erased_worlds || updated_constructors {
+    if erased_worlds || updated_constructors.changed {
         let signatures = natives
             .iter()
             .map(|(name, native)| (name.clone(), native.arguments.len()))
@@ -936,7 +936,7 @@ fn compile_with_policy(
         .map(|declaration| (declaration.name().clone(), declaration))
         .collect();
     let mut compiled = lower::compile(
-        &selected,
+        (&selected, &updated_constructors),
         &natives,
         entry,
         arguments,

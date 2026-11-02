@@ -7,8 +7,10 @@
 //! retain their target and captures, without recursive host data structures.
 //! A carrier may only be projected at a public context field, forwarded to
 //! checked code, or consumed by an explicitly supported native context method.
-//! It may never be stored, returned, reinterpreted, mutated or handed to an
-//! unresolved closure. All visits share the caller's IR work ceiling.
+//! The opaque methods field may only be relayed directly into the extracted
+//! context constructor, which remains a carrier. An unused methods projection
+//! still refuses. Neither value may be returned, reinterpreted, mutated or
+//! handed to an unresolved closure. All visits share the caller's IR ceiling.
 
 use super::{IrExecutionError, Name, ReferenceFunction, layout};
 use fln_olean::ir::{IrArg, IrBody, IrDecl, IrExpr, IrModule, IrParam, IrStmt, IrTerminal};
@@ -20,6 +22,8 @@ const OBSERVATION: &str = "Macro.Context observation requires native Macro.Metho
 enum Value {
     Plain,
     Context,
+    /// An opaque projection, identified by its declaration-local result index.
+    Methods(u64),
     Closure(usize),
     /// A join merged incompatible values, at least one containing context.
     Mixed,
@@ -40,6 +44,12 @@ struct Analyzer<'a> {
     pending: Vec<(Name, Vec<Value>)>,
     seen: BTreeSet<(Name, Vec<Value>)>,
     remaining: u64,
+}
+
+#[derive(Default)]
+struct MethodsRelays {
+    projected: BTreeSet<u64>,
+    relayed: BTreeSet<u64>,
 }
 
 pub(super) fn check(
@@ -102,9 +112,14 @@ fn refusal(declaration: &Name) -> IrExecutionError {
 fn accepted_native_context_argument(function: &Name, index: usize) -> bool {
     (index == 0 && *function == Name::from_components(["Lean", "Macro", "getCurrNamespace"]))
         || (index == 1
-            && ["hasDecl", "resolveNamespace", "resolveGlobalName"]
-                .into_iter()
-                .any(|method| *function == Name::from_components(["Lean", "Macro", method])))
+            && [
+                "hasDecl",
+                "resolveNamespace",
+                "resolveGlobalName",
+                "addMacroScope",
+            ]
+            .into_iter()
+            .any(|method| *function == Name::from_components(["Lean", "Macro", method])))
 }
 
 impl Analyzer<'_> {
@@ -119,7 +134,7 @@ impl Analyzer<'_> {
     fn confined(&self, value: Value) -> bool {
         match value {
             Value::Plain => false,
-            Value::Context | Value::Mixed => true,
+            Value::Context | Value::Methods(_) | Value::Mixed => true,
             Value::Closure(index) => self.closures[index].confined,
         }
     }
@@ -175,6 +190,12 @@ impl Analyzer<'_> {
         function: &Name,
         arguments: Vec<Value>,
     ) -> Result<Value, IrExecutionError> {
+        if arguments
+            .iter()
+            .any(|value| matches!(value, Value::Methods(_)))
+        {
+            return Err(refusal(owner));
+        }
         if !arguments.iter().any(|&value| self.confined(value)) {
             return Ok(Value::Plain);
         }
@@ -197,6 +218,12 @@ impl Analyzer<'_> {
         function: &Name,
         arguments: Vec<Value>,
     ) -> Result<Value, IrExecutionError> {
+        if arguments
+            .iter()
+            .any(|value| matches!(value, Value::Methods(_)))
+        {
+            return Err(refusal(owner));
+        }
         let Some(arity) = self.arity(function) else {
             self.reject_confined(owner, arguments)?;
             return Ok(Value::Plain);
@@ -264,7 +291,9 @@ impl Analyzer<'_> {
         &mut self,
         owner: &Name,
         variables: &BTreeMap<u64, Value>,
+        destination: u64,
         expression: &IrExpr,
+        methods: &mut MethodsRelays,
     ) -> Result<Option<Value>, IrExecutionError> {
         match expression {
             IrExpr::Lit(_) => Ok(Some(Value::Plain)),
@@ -291,6 +320,10 @@ impl Analyzer<'_> {
                 let Some(&value) = variables.get(x) else {
                     return Ok(None);
                 };
+                if value == Value::Context && *i == layout::MACRO_CONTEXT_METHODS_FIELD {
+                    methods.projected.insert(destination);
+                    return Ok(Some(Value::Methods(destination)));
+                }
                 if value == Value::Context
                     && *i != layout::MACRO_CONTEXT_METHODS_FIELD
                     && *i < layout::MACRO_CONTEXT.object_fields as u64
@@ -304,6 +337,28 @@ impl Analyzer<'_> {
                 let Some(arguments) = self.arguments(variables, args)? else {
                     return Ok(None);
                 };
+                if let IrExpr::Ctor { info, .. } = expression
+                    && info.name == Name::from_components(["Lean", "Macro", "Context", "mk"])
+                    && info.cidx == u64::from(layout::MACRO_CONTEXT.tag)
+                    && info.size == layout::MACRO_CONTEXT.object_fields as u64
+                    && info.usize == 0
+                    && info.ssize == layout::MACRO_CONTEXT.scalar_bytes as u64
+                    && arguments.len() == layout::MACRO_CONTEXT.object_fields
+                    && arguments.iter().enumerate().all(|(index, value)| {
+                        if index as u64 == layout::MACRO_CONTEXT_METHODS_FIELD {
+                            matches!(value, Value::Methods(_))
+                        } else {
+                            *value == Value::Plain
+                        }
+                    })
+                {
+                    for value in arguments {
+                        if let Value::Methods(origin) = value {
+                            methods.relayed.insert(origin);
+                        }
+                    }
+                    return Ok(Some(Value::Context));
+                }
                 self.reject_confined(owner, arguments)?;
                 if let IrExpr::Reuse { x, .. } = expression {
                     let Some(&value) = variables.get(x) else {
@@ -353,6 +408,7 @@ impl Analyzer<'_> {
         self.charge(params.len())?;
         let mut variables: BTreeMap<_, _> =
             params.iter().map(|param| param.x).zip(arguments).collect();
+        let mut methods = MethodsRelays::default();
         let bodies = root.bodies();
         self.charge(bodies.len())?;
         let mut joins = BTreeMap::new();
@@ -372,7 +428,9 @@ impl Analyzer<'_> {
                     self.charge(1)?;
                     match statement {
                         IrStmt::VDecl { x, expr, .. } => {
-                            if let Some(value) = self.expression(owner, &variables, expr)? {
+                            if let Some(value) =
+                                self.expression(owner, &variables, *x, expr, &mut methods)?
+                            {
                                 changed |= self.merge(&mut variables, *x, value);
                             }
                         }
@@ -415,6 +473,12 @@ impl Analyzer<'_> {
                     }
                     IrTerminal::Jmp { j, args } => {
                         if let Some(arguments) = self.arguments(&variables, args)? {
+                            if arguments
+                                .iter()
+                                .any(|value| matches!(value, Value::Methods(_)))
+                            {
+                                return Err(refusal(owner));
+                            }
                             let params = joins.get(j).ok_or_else(|| refusal(owner))?;
                             if params.len() != arguments.len() {
                                 return Err(refusal(owner));
@@ -429,6 +493,10 @@ impl Analyzer<'_> {
                 }
             }
             if !changed {
+                self.charge(methods.projected.len())?;
+                if !methods.projected.is_subset(&methods.relayed) {
+                    return Err(refusal(owner));
+                }
                 return Ok(());
             }
         }
