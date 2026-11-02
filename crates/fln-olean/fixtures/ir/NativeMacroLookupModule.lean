@@ -29,3 +29,18 @@ public section
   | [(target, [])] => pure (.node .none target #[stx])
   | [(target, field :: _)] => pure (.node .none target #[.atom .none field])
   | (first, _) :: (second, _) :: _ => pure (.node .none first #[.node .none second #[stx]])
+
+-- Keep the direct action above as the nested-reset compiler frontier. This
+-- equivalent action separates pure result construction from the MacroM state
+-- carrier and observes the same first suffix field as the direct action.
+@[noinline] def lookupGlobalSyntax (stx : Lean.Syntax)
+    (candidates : List (Lean.Name × List String)) : Lean.Syntax :=
+  match candidates with
+  | [] => .atom .none "absent"
+  | [(target, [])] => .node .none target #[stx]
+  | [(target, field :: _)] => .node .none target #[.atom .none field]
+  | (first, _) :: (second, _) :: _ => .node .none first #[.node .none second #[stx]]
+
+@[noinline] def lookupResolveGlobalSeparatedMacro (stx : Lean.Syntax) : Lean.MacroM Lean.Syntax := do
+  let candidates ← Lean.Macro.resolveGlobalName stx.getId
+  pure (lookupGlobalSyntax stx candidates)

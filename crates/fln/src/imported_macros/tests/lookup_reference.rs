@@ -113,7 +113,33 @@ fn live_native_macro_lookup_uses_explicit_isolated_environments_and_preserves_st
     let namespace_macro = prepare("lookupNamespaceMacro");
     let has_decl_macro = prepare("lookupHasDeclMacro");
     let resolve_namespace_macro = prepare("lookupResolveNamespaceMacro");
-    let resolve_global_macro = prepare("lookupResolveGlobalMacro");
+    // The unchanged direct action reaches a distinct IR prerequisite: nested
+    // reset/reuse across several joins. Keep the actual typed frontier visible;
+    // a refusal here is not counted as a macro execution or lookup success.
+    let direct_global = compile(
+        std::slice::from_ref(&module),
+        &name("lookupResolveGlobalMacro"),
+        &VerifiedPartition::user_fixture(),
+        &users,
+        IrExecutionLimits::default(),
+    );
+    let direct_status = direct_global
+        .as_ref()
+        .map(|_| "compiled")
+        .map_err(ToString::to_string);
+    assert!(
+        matches!(
+            direct_global,
+            Err(MacroExecutionError::Compile(
+                IrExecutionError::Unsupported {
+                    form: "mutable IR statement",
+                    ..
+                }
+            ))
+        ),
+        "{direct_status:?}; {dir:?}"
+    );
+    let resolve_global_macro = prepare("lookupResolveGlobalSeparatedMacro");
     let only_a = name("Provided.onlyA");
     let only_b = name("Provided.onlyB");
     let environment_a = fln_elab::namespaces::register_module(
@@ -375,7 +401,176 @@ fn live_native_macro_lookup_uses_explicit_isolated_environments_and_preserves_st
     assert!(oracle.status.success(), "{oracle:?}; {dir:?}");
     assert_eq!(oracle.stdout, expected.as_bytes(), "{dir:?}");
     assert!(oracle.stderr.is_empty());
+
+    let main_module = name("GlobalOracle");
+    let global_namespace = name("Current.Inner");
+    let global_opens = [name("First"), name("Second"), name("First")];
+    let explicit = [(1, name("chosen"), name("Target.two"))];
+    let private = Name::num(name("_private.GlobalOracle"), 0).append_core(&name("hidden"));
+    let mut scoped = fln_syntax::hygiene::MacroScopesView {
+        name: name("record"),
+        imported: Name::anonymous(),
+        context: name("Quotation"),
+        scopes: vec![7, 12],
+    };
+    let mut global_environment = [
+        "Current.local",
+        "local",
+        "pooled",
+        "First.pooled",
+        "Second.pooled",
+        "First.exact",
+        "Second.First.exact",
+        "First.record",
+        "First.protected",
+        "Target.one",
+        "Target.two",
+        "Target.two.child",
+        "record",
+    ]
+    .into_iter()
+    .map(name)
+    .chain([private, scoped.review()])
+    .fold(Environment::new(), |env, declaration| {
+        env.add_decl(ConstantInfo::Axiom(AxiomVal {
+            base: ConstantVal {
+                name: declaration,
+                level_params: Vec::new(),
+                type_: Expr::const_(name("Nat"), Vec::new()),
+            },
+            is_unsafe: false,
+        }))
+        .unwrap()
+    });
+    for (alias, target) in [
+        ("Current.local", "Target.one"),
+        ("choice", "Target.one"),
+        ("choice", "Target.two"),
+        ("guarded", "First.protected"),
+    ] {
+        global_environment =
+            fln_elab::aliases::register(&global_environment, &name(alias), &name(target)).unwrap();
+    }
+    global_environment =
+        fln_elab::protected_names::register_module(&global_environment, &[name("First.protected")])
+            .unwrap();
+    let global_lookup = EnvironmentMacroLookup::new(
+        &global_environment,
+        &main_module,
+        &global_namespace,
+        &global_opens,
+        &explicit,
+    );
+    scoped.name = name("record.field.tail");
+    let queries: Vec<_> = [
+        "local",
+        "pooled",
+        "First.exact",
+        "record.field.tail",
+        "_root_.local",
+        "choice",
+        "protected",
+        "guarded",
+        "First.protected",
+        "hidden",
+        "chosen",
+        "chosen.child",
+        "Missing",
+        "Current.local.hcongr_2",
+    ]
+    .into_iter()
+    .map(name)
+    .chain([scoped.review()])
+    .collect();
+    let expected = queries
+        .iter()
+        .map(|query| {
+            let candidates = global_lookup.resolve_global_name(query).unwrap();
+            // Exercise the actual imported user function for the same query, so
+            // native host results also traverse the VM's list/pair/string adapter.
+            let input = identifier(query.clone());
+            let syntax = match candidates.as_slice() {
+                [] => Syntax::atom(SourceInfo::None, "absent"),
+                [(target, fields)] if fields.is_empty() => {
+                    Syntax::node(target.clone(), vec![input.clone()])
+                }
+                [(target, fields)] => Syntax::node(
+                    target.clone(),
+                    vec![Syntax::atom(SourceInfo::None, &fields[0])],
+                ),
+                [(first, _), (second, _), ..] => Syntax::node(
+                    first.clone(),
+                    vec![Syntax::node(second.clone(), vec![input.clone()])],
+                ),
+            };
+            check(
+                &resolve_global_macro,
+                &input,
+                &global_lookup,
+                syntax,
+                "mirror:Lean.Macro.resolveGlobalName",
+            );
+            candidates
+                .iter()
+                .map(|(name, fields)| format!("{}:{}", name.to_display_string(), fields.join(".")))
+                .collect::<Vec<_>>()
+                .join(",")
+        })
+        .collect::<Vec<_>>()
+        .join(";")
+        + "\n";
+    assert!(
+        !global_environment.contains(&name("Current.local.hcongr_2")),
+        "lookup must not realize a reserved declaration"
+    );
+    std::fs::write(dir.join("GlobalOracle.lean"), GLOBAL_ORACLE).unwrap();
+    let oracle = Command::new(&reference)
+        .current_dir(&dir)
+        .arg("GlobalOracle.lean")
+        .output()
+        .unwrap();
+    std::fs::write(dir.join("global-oracle.stdout"), &oracle.stdout).unwrap();
+    std::fs::write(dir.join("global-oracle.stderr"), &oracle.stderr).unwrap();
+    assert!(oracle.status.success(), "{oracle:?}; {dir:?}");
+    assert_eq!(oracle.stdout, expected.as_bytes(), "{dir:?}");
+    assert!(oracle.stderr.is_empty());
 }
+
+const GLOBAL_ORACLE: &str = r#"
+import Lean
+axiom Current.local : Nat
+axiom «local» : Nat
+axiom pooled : Nat
+axiom First.pooled : Nat
+axiom Second.pooled : Nat
+axiom First.exact : Nat
+axiom Second.First.exact : Nat
+axiom First.record : Nat
+axiom First.protected : Nat
+axiom Target.one : Nat
+axiom Target.two : Nat
+axiom Target.two.child : Nat
+axiom record : Nat
+private axiom hidden : Nat
+open Lean Elab Command in
+run_elab do
+  let hygienicName := addMacroScope `Quotation (addMacroScope `Quotation `record 7) 12
+  addDecl (.axiomDecl { name := hygienicName, levelParams := [], type := mkConst `Nat, isUnsafe := false })
+  let env ← getEnv
+  let env := [ (`Current.local, `Target.one), (`choice, `Target.one),
+    (`choice, `Target.two), (`guarded, `First.protected) ].foldl
+    (fun env (alias, target) => addAlias env alias target) env
+  let env := addProtected env `First.protected
+  let opens := [OpenDecl.simple `First [], .simple `Second [], .explicit `chosen `Target.two, .simple `First []]
+  let queries := (["local", "pooled", "First.exact", "record.field.tail", "_root_.local", "choice",
+    "protected", "guarded", "First.protected", "hidden", "chosen", "chosen.child", "Missing",
+    "Current.local.hcongr_2"].map String.toName) ++
+    [addMacroScope `Quotation (addMacroScope `Quotation `record.field.tail 7) 12]
+  let rows := queries.map fun query =>
+    (ResolveName.resolveGlobalName env {} `Current.Inner opens query).map fun (name, fields) =>
+      name.toString ++ ":" ++ String.intercalate "." fields
+  logInfo m!"{String.intercalate ";" (rows.map (String.intercalate ","))}"
+"#;
 
 const NAMESPACE_ORACLE: &str = r#"
 import Lean

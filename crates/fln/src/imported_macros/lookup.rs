@@ -354,7 +354,7 @@ impl MacroLookup for EnvironmentMacroLookup<'_> {
         let tables = self.globals()?;
         let mut view = fln_syntax::hygiene::extract_macro_scopes(requested)
             .map_err(|_| MacroLookupError::Invalid("malformed global macro scopes"))?;
-        let mut fields = Vec::new();
+        let mut fields: Vec<String> = Vec::new();
         while let LeafView::Str(field) = view.name.leaf_view() {
             global_work(&mut work, 1)?;
             let candidates = self.global_candidates(&view.review(), tables, &mut work)?;
@@ -410,6 +410,10 @@ fn replace_global_prefix(
     replacement: &Name,
     work: &mut usize,
 ) -> Result<Option<Name>, MacroLookupError> {
+    // Each attempted replacement may copy the same string suffix again.
+    // Charge its bytes before building names, rather than only counting hops.
+    global_name_work(work, name)?;
+    global_name_work(work, replacement)?;
     let mut suffix = Vec::new();
     let mut cursor = name.clone();
     while &cursor != prefix {
@@ -914,5 +918,143 @@ mod tests {
             [(constant, vec!["field".into(), "tail".into()])]
         );
         assert_eq!(lookup.resolve_global_name(&Name::anonymous()).unwrap(), []);
+    }
+
+    #[test]
+    fn global_explicit_opens_preserve_source_order_and_replace_structural_prefixes() {
+        let module = name("Module");
+        let namespace = Name::anonymous();
+        let opened = [name("First"), name("Second")];
+        let explicit = [(1, name("value"), name("Target"))];
+        let env = environment([
+            name("First.value"),
+            name("Second.value"),
+            name("Target"),
+            name("Target.field"),
+            Name::str(Name::anonymous(), "value.field"),
+        ]);
+        let lookup = EnvironmentMacroLookup::new(&env, &module, &namespace, &opened, &explicit);
+        assert_eq!(
+            lookup.resolve_global_name(&name("value")).unwrap(),
+            [
+                (name("First.value"), vec![]),
+                (name("Target"), vec![]),
+                (name("Second.value"), vec![]),
+            ]
+        );
+        assert_eq!(
+            lookup.resolve_global_name(&name("value.field")).unwrap(),
+            [(name("Target.field"), vec![])]
+        );
+        let quoted = Name::str(Name::anonymous(), "value.field");
+        assert_eq!(
+            lookup.resolve_global_name(&quoted).unwrap(),
+            [(quoted, vec![])]
+        );
+        assert_eq!(
+            lookup
+                .resolve_global_name(&name("value.missing.tail"))
+                .unwrap(),
+            [
+                (name("First.value"), vec!["missing".into(), "tail".into()]),
+                (name("Target"), vec!["missing".into(), "tail".into()]),
+                (name("Second.value"), vec!["missing".into(), "tail".into()]),
+            ]
+        );
+    }
+
+    #[test]
+    fn global_metadata_failures_and_query_exhaustion_are_not_empty_answers() {
+        let module = name("Module");
+        let namespace = Name::anonymous();
+        let base = environment([name("Target")]);
+        let valid = fln_elab::aliases::register(&base, &name("alias"), &name("Target")).unwrap();
+        let before = EnvironmentMacroLookup::new(&valid, &module, &namespace, &[], &[]);
+        assert_eq!(
+            before.resolve_global_name(&name("alias")).unwrap(),
+            [(name("Target"), vec![])]
+        );
+        let alias_journal = name("FrankenLean.sourceAliases.v1");
+        let malformed = valid
+            .push_extension_entry(&alias_journal, b"bad".to_vec())
+            .unwrap();
+        let after = EnvironmentMacroLookup::new(&malformed, &module, &namespace, &[], &[]);
+        for query in ["Target", "Missing"] {
+            assert_eq!(
+                after.resolve_global_name(&name(query)),
+                Err(MacroLookupError::Invalid("malformed global alias metadata"))
+            );
+        }
+        let protected =
+            fln_elab::protected_names::register_module(&base, &[name("Target")]).unwrap();
+        let protected = protected
+            .push_extension_entry(&fln_elab::protected_names::journal_name(), b"bad".to_vec())
+            .unwrap();
+        let lookup = EnvironmentMacroLookup::new(&protected, &module, &namespace, &[], &[]);
+        assert_eq!(
+            lookup.resolve_global_name(&name("Missing")),
+            Err(MacroLookupError::Invalid(
+                "malformed global protected metadata"
+            ))
+        );
+        let oversized = Name::str(Name::anonymous(), "n".repeat(MAX_GLOBAL_WORK + 1));
+        assert_eq!(
+            before.resolve_global_name(&oversized),
+            Err(MacroLookupError::Exhausted("global query"))
+        );
+        assert_eq!(
+            before.resolve_global_name(&Name::num_overflowing(Name::anonymous(), 0)),
+            Err(MacroLookupError::Invalid("overflowed global component"))
+        );
+        assert_eq!(
+            before.resolve_global_name(&Name::str(Name::anonymous(), "_hyg")),
+            Err(MacroLookupError::Invalid("malformed global macro scopes"))
+        );
+        assert_eq!(
+            before.resolve_global_name(&name("alias")).unwrap(),
+            [(name("Target"), vec![])]
+        );
+
+        let long_alias = Name::str(Name::anonymous(), "a".repeat(40_000));
+        let mut large = fln_elab::aliases::register(&base, &long_alias, &name("Target")).unwrap();
+        let payload = large
+            .extension(&alias_journal)
+            .unwrap()
+            .entries()
+            .next()
+            .unwrap()
+            .payload
+            .clone();
+        for _ in 0..27 {
+            large = large
+                .push_extension_entry(&alias_journal, payload.clone())
+                .unwrap();
+        }
+        assert!(!AliasTable::read(&large).unwrap().is_empty());
+        let lookup = EnvironmentMacroLookup::new(&large, &module, &namespace, &[], &[]);
+        assert_eq!(
+            lookup.resolve_global_name(&name("Missing")),
+            Err(MacroLookupError::Exhausted("global metadata"))
+        );
+    }
+
+    #[test]
+    fn global_prefix_replacement_charges_repeated_suffix_copying() {
+        let module = name("Module");
+        let namespace = Name::anonymous();
+        let env = environment([name("Target")]);
+        let explicit = vec![(0, name("alias"), name("Target")); 128];
+        let suffix = "f".repeat(16_384);
+        let query = Name::str(name("alias"), &suffix);
+        let lookup = EnvironmentMacroLookup::new(&env, &module, &namespace, &[], &explicit);
+        assert_eq!(
+            lookup.resolve_global_name(&query),
+            Err(MacroLookupError::Exhausted("global query"))
+        );
+        let lookup = EnvironmentMacroLookup::new(&env, &module, &namespace, &[], &explicit[..1]);
+        assert_eq!(
+            lookup.resolve_global_name(&query).unwrap(),
+            [(name("Target"), vec![suffix])]
+        );
     }
 }
