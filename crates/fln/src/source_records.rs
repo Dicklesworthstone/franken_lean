@@ -243,21 +243,56 @@ impl Engine {
             scope.source_site = Some(source_check::source_site(source)?);
         }
         let parsed = parse_scoped_command(source)?;
+        if !may_name_equation_theorems(source) {
+            return self.admit_parsed_command_in_scope(source, parsed, options, limits, &scope);
+        }
+        self.admit_scoped_command_syntax_with_base(
+            source,
+            parsed,
+            options,
+            limits,
+            &scope,
+            source_base,
+        )
+    }
+
+    /// Admit already expanded syntax in the caller's exact lexical scope.
+    /// Preserve the source buffer only for positions and source-owned metadata;
+    /// do not reparse it or replay native template expansion over the result.
+    ///
+    /// Unlike the ordinary text entry point, this path always discovers equation
+    /// references from the supplied syntax: a macro may introduce a reserved
+    /// equation name that does not occur in the original source bytes.
+    pub(crate) fn admit_scoped_command_syntax_with_base(
+        &self,
+        source: &[u8],
+        parsed: ScopedCommandSyntax,
+        options: &KVMap,
+        limits: EngineAdmissionLimits,
+        scope: &fln_elab::source::scope::SourceScope,
+        source_base: Option<&Environment>,
+    ) -> Result<Outcome<DeclarationBatchAdmission>, EngineExecutionError> {
+        let mut scope = scope.clone();
+        if scope.source_site.is_none() {
+            scope.source_site = Some(source_check::source_site(source)?);
+        }
         // Equation theorems the command names are generated and admitted first; the
         // command's own admissions follow them in one batch.
-        let realized = if may_name_equation_theorems(source) {
-            let syntaxes: Vec<&fln_syntax::tree::Syntax> = match &parsed {
-                ScopedCommandSyntax::Mutual(members) => members.iter().collect(),
-                ScopedCommandSyntax::Example(parsed) => vec![parsed.syntax()],
-                ScopedCommandSyntax::Definition(parsed) => vec![parsed.syntax()],
-            };
-            match self.realize_equation_theorems(&syntaxes, &scope, options, limits, source_base)? {
-                Outcome::Complete(realized) => realized,
-                Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
-                Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
-            }
-        } else {
-            None
+        let syntaxes: Vec<&fln_syntax::tree::Syntax> = match &parsed {
+            ScopedCommandSyntax::Mutual(members) => members.iter().collect(),
+            ScopedCommandSyntax::Example(parsed) => vec![parsed.syntax()],
+            ScopedCommandSyntax::Definition(parsed) => vec![parsed.syntax()],
+        };
+        let realized = match self.realize_equation_theorems(
+            &syntaxes,
+            &scope,
+            options,
+            limits,
+            source_base,
+        )? {
+            Outcome::Complete(realized) => realized,
+            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
         };
         let Some(realized) = realized else {
             return self.admit_parsed_command_in_scope(source, parsed, options, limits, &scope);
@@ -1076,7 +1111,7 @@ impl Engine {
                 );
             }
             return Ok(
-                match self.admit_source_declaration(source, options, limits)? {
+                match self.admit_source_syntax(source, parsed.syntax(), options, limits)? {
                     Outcome::Complete(admitted) => Outcome::Complete(admitted.into_batch()),
                     Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
                     Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
@@ -1549,6 +1584,135 @@ mod tests {
     use fln_elab::constraint::{ConstraintId, unify::UnificationError};
     use fln_elab::source::SourceInferenceError;
     use fln_kernel::verdict::{Consumption, RejectClass, Verdict};
+
+    #[test]
+    fn expanded_syntax_in_the_default_scope_never_reparses_original_source() {
+        let options = KVMap::new();
+        let limits = EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024));
+        let engine = Engine::with_source_seed(limits)
+            .unwrap()
+            .into_complete()
+            .unwrap();
+        let root = engine.logical_root(&options);
+        let original = b"def chosen : Nat := 1";
+        let expanded = parse_scoped_command(b"def chosen : Nat := 2").unwrap();
+        let admitted = engine
+            .admit_scoped_command_syntax_with_base(
+                original,
+                expanded,
+                &options,
+                limits,
+                &fln_elab::source::scope::SourceScope::default(),
+                Some(engine.environment()),
+            )
+            .unwrap()
+            .into_complete()
+            .unwrap();
+        assert_eq!(admitted.base_logical_root, root);
+        admitted
+            .engine
+            .admit_source_command(
+                b"theorem kept_expansion : chosen = 2 := by rfl",
+                &options,
+                limits,
+            )
+            .unwrap()
+            .into_complete()
+            .unwrap();
+        assert_eq!(engine.logical_root(&options), root);
+        assert!(
+            !engine
+                .environment()
+                .contains(&Name::from_components(["chosen"]))
+        );
+    }
+
+    #[test]
+    fn expanded_syntax_realizes_equations_absent_from_source_without_leaking_failed_admissions() {
+        let options = KVMap::new();
+        let limits = EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024));
+        let seed = Engine::with_source_seed(limits)
+            .unwrap()
+            .into_complete()
+            .unwrap();
+        let engine = seed
+            .admit_source_command(b"def N.wrapped (n : Nat) : Nat := n + 1", &options, limits)
+            .unwrap()
+            .into_complete()
+            .unwrap()
+            .engine;
+        let root = engine.logical_root(&options);
+        let equation = Name::from_components(["N", "wrapped", "eq_1"]);
+        let theorem = Name::from_components(["N", "result"]);
+        let mut scope = engine.base_source_scope();
+        scope.namespace = Name::from_components(["N"]);
+        assert!(!engine.environment().contains(&equation));
+
+        // This isolates the already-expanded admission seam. The original
+        // source carries no equation request; the supplied replacement tree
+        // does. Neither re-reading the original proof nor applying its text
+        // prefilter is allowed to discard the replacement's dependency.
+        let original = b"theorem result (n : Nat) : wrapped n = n + 1 := by rfl";
+        assert!(!may_name_equation_theorems(original));
+        let expanded =
+            parse_scoped_command(b"theorem result (n : Nat) : wrapped n = n + 1 := wrapped.eq_1 n")
+                .unwrap();
+        let admitted = engine
+            .admit_scoped_command_syntax_with_base(
+                original,
+                expanded,
+                &options,
+                limits,
+                &scope,
+                Some(seed.environment()),
+            )
+            .unwrap()
+            .into_complete()
+            .unwrap();
+        assert_eq!(admitted.base_logical_root, root);
+        assert_eq!(
+            admitted.result_logical_root,
+            admitted.engine.logical_root(&options)
+        );
+        assert_eq!(
+            admitted
+                .admissions
+                .iter()
+                .filter_map(|row| declared_name(&row.declaration))
+                .collect::<Vec<_>>(),
+            vec![&equation, &theorem],
+            "the expanded dependency has its own preceding council admission"
+        );
+        assert!(admitted.engine.environment().contains(&equation));
+        assert!(admitted.engine.environment().contains(&theorem));
+        assert_eq!(engine.logical_root(&options), root);
+        assert!(!engine.environment().contains(&equation));
+        assert!(!engine.environment().contains(&theorem));
+
+        // The same dependency can be checked privately before the expanded
+        // theorem fails. Neither the auxiliary nor a successor may escape.
+        let original = b"theorem bad (n : Nat) : wrapped n = n := by rfl";
+        assert!(!may_name_equation_theorems(original));
+        let expanded =
+            parse_scoped_command(b"theorem bad (n : Nat) : wrapped n = n := wrapped.eq_1 n")
+                .unwrap();
+        let failure = engine.admit_scoped_command_syntax_with_base(
+            original,
+            expanded,
+            &options,
+            limits,
+            &scope,
+            Some(seed.environment()),
+        );
+        assert!(matches!(failure, Err(EngineExecutionError::Frontend(_))));
+        assert_eq!(engine.logical_root(&options), root);
+        assert!(!engine.environment().contains(&equation));
+        assert!(
+            !engine
+                .environment()
+                .contains(&Name::from_components(["N", "bad"]))
+        );
+    }
 
     #[test]
     fn kernel_carriers_preserve_nonanswers_and_never_turn_verdict_errors_into_values() {

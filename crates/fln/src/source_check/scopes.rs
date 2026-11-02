@@ -1,6 +1,7 @@
 //! Section lifetimes affect source resolution, not the checked environment. Ending
 //! a section restores lookup/universe state but never removes its declarations.
 use super::*;
+use crate::imported_macros::registrations::{MacroRegistrationError, RegisteredMacros};
 use fln_elab::instances::scoped::ActiveScopes;
 use fln_elab::source::scope::{SourceScope, components};
 use fln_parse::command_scope::ScopeCommand;
@@ -13,6 +14,7 @@ struct Frame {
     label: Option<String>,
     saved: SourceScope,
     public_instances: ActiveScopes,
+    imported_macros: Option<RegisteredMacros>,
 }
 #[derive(Default)]
 pub(crate) struct Scopes {
@@ -20,6 +22,10 @@ pub(crate) struct Scopes {
     // Public and private journals have different rows and insertion positions.
     // Each namespace activation must retain the boundary in its own world.
     public_instances: ActiveScopes,
+    // Imported macro activations have the same lexical lifetime as opened
+    // namespaces. The registry retains its checked owners independently of the
+    // ordinary source name-resolution state.
+    imported_macros: Option<RegisteredMacros>,
     stack: Vec<Frame>,
     namespaces: BTreeSet<Name>,
 }
@@ -27,6 +33,7 @@ pub(crate) struct Scopes {
 pub(crate) enum TransitionError {
     Scope(String),
     Registry(fln_elab::instances::InstanceRegistryError),
+    Macro(MacroRegistrationError),
 }
 
 impl TransitionError {
@@ -35,6 +42,7 @@ impl TransitionError {
         match self {
             Self::Scope(message) => message,
             Self::Registry(error) => format!("{error:?}"),
+            Self::Macro(error) => error.to_string(),
         }
     }
     pub fn into_source(self, file: usize, command: usize, offset: usize) -> SourceCheckError {
@@ -55,6 +63,14 @@ impl TransitionError {
                             fln_elab::source::SourceInferenceError::InstanceRegistry(error),
                         ),
                     ),
+                )),
+            },
+            Self::Macro(error) => SourceCheckError::ImportedMacro {
+                file,
+                command,
+                offset,
+                error: Box::new(crate::imported_macros::source::SourceMacroError::Binding(
+                    Box::new(error),
                 )),
             },
         }
@@ -99,6 +115,13 @@ impl Scopes {
                             .activate(public_env, &self.current.namespace)
                             .map_err(TransitionError::Registry)?;
                     }
+                    if let Some(registry) = &self.imported_macros {
+                        self.imported_macros = Some(
+                            registry
+                                .activate_scoped(&self.current.namespace)
+                                .map_err(TransitionError::Macro)?,
+                        );
+                    }
                 }
             }
             ScopeCommand::Open(names) => {
@@ -136,6 +159,7 @@ impl Scopes {
         self.observe_namespaces(env)
             .map_err(TransitionError::Registry)?;
         let mut public_instances = self.public_instances.clone();
+        let mut imported_macros = self.imported_macros.clone();
         let registry =
             fln_elab::instances::InstanceRegistry::read(env).map_err(TransitionError::Registry)?;
         for namespace in registry.instance_namespaces() {
@@ -158,6 +182,13 @@ impl Scopes {
                         .activate(public_env, &namespace)
                         .map_err(TransitionError::Registry)?;
                 }
+                if let Some(registry) = &imported_macros {
+                    imported_macros = Some(
+                        registry
+                            .activate_scoped(&namespace)
+                            .map_err(TransitionError::Macro)?,
+                    );
+                }
                 if !scoped_only {
                     Self::add_open(&mut next, namespace).map_err(TransitionError::Scope)?;
                 }
@@ -165,7 +196,31 @@ impl Scopes {
         }
         self.current = next;
         self.public_instances = public_instances;
+        self.imported_macros = imported_macros;
         Ok(())
+    }
+
+    /// Install the imported world's original registry at a file boundary.
+    /// Scoped-only namespaces may have no ordinary declaration bearing their
+    /// name, so retain those exact anchors for normal namespace resolution.
+    pub(crate) fn set_imported_macros(&mut self, registry: RegisteredMacros) {
+        for namespace in registry.scoped_namespaces() {
+            self.observe_namespace(namespace);
+        }
+        self.imported_macros = Some(registry);
+    }
+
+    pub(crate) fn imported_macros(&self) -> Option<&RegisteredMacros> {
+        self.imported_macros.as_ref()
+    }
+
+    /// Imported empty namespaces are lookup anchors, not checked declarations.
+    pub(crate) fn observe_namespace(&mut self, namespace: &Name) {
+        let mut parent = namespace.clone();
+        while !parent.is_anonymous() {
+            self.namespaces.insert(parent.clone());
+            parent = parent.parent();
+        }
     }
 
     /// The same lexical state with activation chronology from the public
@@ -589,6 +644,7 @@ impl Scopes {
                         label: Some(part.clone()),
                         saved: self.current.clone(),
                         public_instances: self.public_instances.clone(),
+                        imported_macros: self.imported_macros.clone(),
                     });
                     if namespace {
                         self.current.namespace = Name::str(self.current.namespace.clone(), part);
@@ -601,6 +657,7 @@ impl Scopes {
                     label: None,
                     saved: self.current.clone(),
                     public_instances: self.public_instances.clone(),
+                    imported_macros: self.imported_macros.clone(),
                 });
             }
             ScopeCommand::SectionWithModifiers {
@@ -626,6 +683,7 @@ impl Scopes {
                         label,
                         saved: self.current.clone(),
                         public_instances: self.public_instances.clone(),
+                        imported_macros: self.imported_macros.clone(),
                     });
                     self.current.public_declarations |= public;
                     self.current.expose_definitions |= expose;
@@ -654,6 +712,7 @@ impl Scopes {
                     let frame = self.stack.pop().expect("validated end depth");
                     self.current = frame.saved;
                     self.public_instances = frame.public_instances;
+                    self.imported_macros = frame.imported_macros;
                 }
             }
             ScopeCommand::Open(names) => {

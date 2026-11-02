@@ -278,6 +278,13 @@ impl SourceGrammar {
         with_grammar(&self.file.grammar(), parse)
     }
 
+    /// Imported executable macros own their expansion pass. Source-template
+    /// journals require a separate mixed-dispatch implementation before they
+    /// can participate in that pass without replaying an expansion.
+    pub(crate) fn has_templates(&self) -> bool {
+        self.file.rules().next().is_some()
+    }
+
     /// The notations active here, as a printer applies them
     /// ([`fln_parse::extensions::FileGrammar::notations`]).
     pub(crate) fn notations(&self) -> fln_parse::extensions::Notations {

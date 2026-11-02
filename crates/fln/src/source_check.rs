@@ -67,6 +67,12 @@ pub enum SourceCheckError {
         offset: usize,
         error: Box<EngineExecutionError>,
     },
+    ImportedMacro {
+        file: usize,
+        command: usize,
+        offset: usize,
+        error: Box<crate::imported_macros::source::SourceMacroError>,
+    },
 }
 impl std::fmt::Display for SourceCheckError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -90,6 +96,14 @@ impl std::fmt::Display for SourceCheckError {
                 offset,
                 error,
             } => write!(f, "file {file}, command {command}, byte {offset}: {error}"),
+            Self::ImportedMacro {
+                file,
+                command,
+                offset,
+                error,
+            } => {
+                write!(f, "file {file}, command {command}, byte {offset}: {error}")
+            }
         }
     }
 }
@@ -97,7 +111,8 @@ impl std::error::Error for SourceCheckError {}
 
 impl SourceCheckError {
     /// Reuse the same command effects in the execution stream without turning
-    /// a resource stop into a source rejection or discarding a typed cause.
+    /// a resource stop into a source rejection. Imported-macro errors retain
+    /// their classification here and their full typed cause in the file report.
     pub(crate) fn into_execution_error(self) -> EngineExecutionError {
         match self {
             Self::Scope { message, .. } => EngineExecutionError::ScopeTransition { message },
@@ -106,6 +121,10 @@ impl SourceCheckError {
                 EngineExecutionError::SourceScopeLimit { resource, limit }
             }
             Self::Command { error, .. } => *error,
+            Self::ImportedMacro { error, .. } => EngineExecutionError::ImportedMacro {
+                disposition: error.disposition(),
+                message: error.to_string(),
+            },
         }
     }
 
@@ -116,6 +135,7 @@ impl SourceCheckError {
             Self::EmptyInput | Self::Scope { .. } => ("input", false, 1),
             Self::Limit { .. } => ("resource", false, 3),
             Self::Command { error, .. } => classify(error),
+            Self::ImportedMacro { error, .. } => error.disposition(),
         }
     }
 }
@@ -125,6 +145,7 @@ pub(crate) fn classify(error: &EngineExecutionError) -> (&'static str, bool, u8)
     use fln_elab::{NatDefinitionElabError, source::SourceInferenceError};
     match error {
         EngineExecutionError::BatchCommand { error, .. } => classify(error),
+        EngineExecutionError::ImportedMacro { disposition, .. } => *disposition,
         EngineExecutionError::KernelRejected { .. } => ("kernel-rejection", true, 1),
         EngineExecutionError::CouncilHalted { .. }
         | EngineExecutionError::CouncilNoAnswer { .. } => ("inconclusive", false, 3),
@@ -756,13 +777,15 @@ impl Engine {
         options: &KVMap,
         limits: SourceCheckLimits,
     ) -> Result<Outcome<SourceFileCheck>, SourceCheckError> {
-        self.check_source_files_recording(sources, options, limits, None, None, None, None, None)
+        self.check_source_files_recording(
+            sources, options, limits, None, None, None, None, None, None,
+        )
     }
 
     // Module imports record only the candidates that survived ordinary admission.
     // The optional recorder is private and never returned on a failed batch.
     #[allow(clippy::too_many_arguments)]
-    fn check_source_files_recording(
+    pub(crate) fn check_source_files_recording(
         &self,
         sources: &[&[u8]],
         options: &KVMap,
@@ -772,7 +795,11 @@ impl Engine {
         source_module: Option<&Name>,
         mut public: Option<&mut modules::visibility::PublicWorld<'_>>,
         original_source: Option<(&[u8], fln_parse::BytePos)>,
+        mut macros: Option<&mut crate::imported_macros::source::FileSession<'_>>,
     ) -> Result<Outcome<SourceFileCheck>, SourceCheckError> {
+        if let Some(reason) = macros.as_deref().and_then(|session| session.cancelled()) {
+            return Ok(Outcome::Inconclusive(reason));
+        }
         if sources.is_empty() {
             return Err(SourceCheckError::EmptyInput);
         }
@@ -808,6 +835,9 @@ impl Engine {
             let mut scopes = scopes::Scopes::new(&engine);
             scopes.current.private_module = private_module.cloned();
             scopes.current.source_module = source_module.cloned();
+            if let Some(session) = macros.as_deref() {
+                scopes.set_imported_macros(session.registry());
+            }
             // The syntax this file declares extends the grammar of what follows it.
             let mut grammar = grammar::SourceGrammar::for_engine(
                 &engine,
@@ -815,6 +845,16 @@ impl Engine {
                 private_module.is_some(),
             )
             .map_err(|error| command_error(file, count, fln_parse::BytePos(0), error))?;
+            if macros.is_some() && grammar.has_templates() {
+                return Err(SourceCheckError::ImportedMacro {
+                    file,
+                    command: count,
+                    offset: 0,
+                    error: Box::new(
+                        crate::imported_macros::source::SourceMacroError::TemplateGrammar,
+                    ),
+                });
+            }
             grammar.extend_scopes(&mut scopes);
             let commands = grammar.enter(|| partition_commands(source, file, count))?;
             if commands.len() > limits.max_commands.saturating_sub(count) {
@@ -829,6 +869,9 @@ impl Engine {
             let mut queue: std::collections::VecDeque<SourceStep<'_>> =
                 commands.into_iter().map(SourceStep::Command).collect();
             while let Some(step) = queue.pop_front() {
+                if let Some(reason) = macros.as_deref().and_then(|session| session.cancelled()) {
+                    return Ok(Outcome::Inconclusive(reason));
+                }
                 let (start, command) = match step {
                     SourceStep::Command(command) => command,
                     SourceStep::Scope(start, transition) => {
@@ -910,6 +953,22 @@ impl Engine {
                         }
                         Err(control) => control,
                     };
+                    if macros.is_some()
+                        && matches!(
+                            control,
+                            fln_parse::command_scope::ScopeCommand::Variable(_)
+                                | fln_parse::command_scope::ScopeCommand::Executable(_)
+                        )
+                    {
+                        return Err(SourceCheckError::ImportedMacro {
+                            file,
+                            command: count,
+                            offset: start.0,
+                            error: Box::new(
+                                crate::imported_macros::source::SourceMacroError::ScopeSyntax,
+                            ),
+                        });
+                    }
                     grammar.observe(&control);
                     match apply_module_control_command(
                         &mut engine,
@@ -947,6 +1006,16 @@ impl Engine {
                     )
                     .map_err(|error| command_error(file, count, start, error))?
                 {
+                    if macros.is_some() {
+                        return Err(SourceCheckError::ImportedMacro {
+                            file,
+                            command: count,
+                            offset: start.0,
+                            error: Box::new(
+                                crate::imported_macros::source::SourceMacroError::TemplateGrammar,
+                            ),
+                        });
+                    }
                     grammar.extend_scopes(&mut scopes);
                     count += 1;
                     continue;
@@ -960,7 +1029,43 @@ impl Engine {
                     scopes.current.clone()
                 };
                 let exported = scope.exports_declaration() && public.is_some();
-                let (next, admitted) = if exported {
+                let (next, admitted) = if let Some(session) = macros.as_deref_mut() {
+                    let parsed = match grammar.enter(|| {
+                        session.expand_command(
+                            &engine,
+                            scopes.imported_macros().expect("imported macro file scope"),
+                            command,
+                            &scope,
+                        )
+                    }) {
+                        Outcome::Complete(Ok(parsed)) => parsed,
+                        Outcome::Complete(Err(error)) => {
+                            return Err(SourceCheckError::ImportedMacro {
+                                file,
+                                command: count,
+                                offset: start.0,
+                                error: Box::new(error),
+                            });
+                        }
+                        Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                        Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                    };
+                    match engine
+                        .admit_scoped_command_syntax_with_base(
+                            command,
+                            parsed,
+                            options,
+                            limits.admission,
+                            &scope,
+                            Some(&file_base),
+                        )
+                        .map_err(|error| command_error(file, count, start, error))?
+                    {
+                        Outcome::Complete(admitted) => (admitted.engine.clone(), admitted),
+                        Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                        Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                    }
+                } else if exported {
                     match grammar
                         .enter(|| {
                             public
@@ -1052,6 +1157,9 @@ impl Engine {
                 })?;
             }
             final_scope = scopes.current;
+        }
+        if let Some(reason) = macros.as_deref().and_then(|session| session.cancelled()) {
+            return Ok(Outcome::Inconclusive(reason));
         }
         Ok(Outcome::Complete(SourceFileCheck {
             result_logical_root: engine.logical_root(options),

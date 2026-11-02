@@ -8521,6 +8521,13 @@ pub enum EngineExecutionError {
         index: usize,
     },
     Frontend(NatDefinitionFrontendError),
+    /// Source-check adapters retain the full typed macro error. Execution
+    /// adapters preserve its classification and diagnostic in this cloneable
+    /// error envelope instead of turning a capability/resource stop into rejection.
+    ImportedMacro {
+        message: String,
+        disposition: (&'static str, bool, u8),
+    },
     KernelRejected {
         class: RejectClass,
         message: String,
@@ -8694,6 +8701,7 @@ impl fmt::Display for EngineExecutionError {
                 module.to_display_string(),
             ),
             Self::Frontend(error) => write!(formatter, "frontend refused source: {error}"),
+            Self::ImportedMacro { message, .. } => write!(formatter, "{message}"),
             Self::KernelRejected { class, message } => {
                 write!(
                     formatter,

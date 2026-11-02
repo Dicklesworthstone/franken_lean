@@ -800,6 +800,33 @@ impl ParsedSourceCommand {
         None
     }
 
+    /// Replace an anonymous example's complete syntax while retaining its
+    /// source view. An expander cannot turn a scratch-only example into a
+    /// named declaration or another command through this boundary.
+    pub fn with_expanded_example(mut self, syntax: Syntax) -> Option<Self> {
+        if self.kind == SourceCommandKind::Example
+            && matches!(&syntax, Syntax::Node { kind, args, .. }
+                if *kind == parser_kind(&["Command", "declaration"])
+                    && args.len() == 2
+                    && matches!(&args[1], Syntax::Node { kind, args, .. }
+                        if *kind == parser_kind(&["Command", "example"]) && args.len() == 3))
+        {
+            self.syntax = syntax;
+            return Some(self);
+        }
+        None
+    }
+
+    /// Transfer a named declaration to the declaration-admission parser view
+    /// without reparsing text or expanding its syntax again.
+    pub fn into_definition(self) -> Option<ParsedDefinition> {
+        (self.kind == SourceCommandKind::Definition).then_some(ParsedDefinition {
+            source_view: self.source_view,
+            syntax: self.syntax,
+            epilogue: self.epilogue,
+        })
+    }
+
     /// This command with the entered grammar's notations expanded, as
     /// [`ParsedDefinition::expanded`]; its query term's text stays the source's.
     pub fn expanded(mut self) -> Result<ParsedSourceCommand, NatDefinitionParseError> {

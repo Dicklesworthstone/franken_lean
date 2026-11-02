@@ -348,6 +348,21 @@ fn tree_expands_roots_before_children_revisits_results_and_threads_sibling_state
         vec![name("User.peel"); 3]
     );
     assert_eq!(report.attempts.len(), 3);
+    // The first result is the intermediate `peel(x)` (five conversion nodes,
+    // five copied bytes), followed by two `x` atoms (two nodes, one byte each).
+    // Counting only the final container would lose the discarded middle tree.
+    assert_eq!(
+        report.usage,
+        MacroTreeUsage {
+            visits: 6,
+            generated_nodes: 9,
+            generated_bytes: 7,
+        }
+    );
+    assert!(
+        report.usage.generated_nodes > 7,
+        "the final tree has seven conversion nodes"
+    );
     assert!(report.attempts.iter().all(|attempt| {
         attempt
             .native_functions
@@ -380,6 +395,14 @@ fn tree_expands_roots_before_children_revisits_results_and_threads_sibling_state
     let stopped = execute(short);
     assert!(matches!(stopped.outcome, Outcome::Inconclusive(_)));
     assert_eq!(stopped.attempts.len(), 2);
+    assert_eq!(
+        stopped.usage,
+        MacroTreeUsage {
+            visits: 5,
+            generated_nodes: 7,
+            generated_bytes: 6,
+        }
+    );
     assert!(
         matches!(execute(MacroTreeLimits::default()).outcome, Outcome::Complete(Ok(MacroTreeResult::Expanded { syntax, .. })) if syntax == expected)
     );
@@ -401,6 +424,13 @@ fn tree_skips_tactic_blocks_and_leaves_and_checks_macro_free_depth_and_visits() 
         matches!(report.outcome, Outcome::Complete(Ok(MacroTreeResult::Expanded { syntax, .. })) if syntax == tactic)
     );
     assert!(report.attempts.is_empty());
+    assert_eq!(
+        report.usage,
+        MacroTreeUsage {
+            visits: 1,
+            ..MacroTreeUsage::default()
+        }
+    );
     let tree = Syntax::node(
         name("outer"),
         vec![Syntax::node(name("inner"), vec![Syntax::Missing])],
@@ -417,12 +447,20 @@ fn tree_skips_tactic_blocks_and_leaves_and_checks_macro_free_depth_and_visits() 
         max_visits: 2,
         ..MacroTreeLimits::default()
     };
-    assert!(matches!(
-        execute(&tree, &context(), short).outcome,
-        Outcome::Inconclusive(_)
-    ));
+    let stopped = execute(&tree, &context(), short);
+    assert!(matches!(stopped.outcome, Outcome::Inconclusive(_)));
+    assert_eq!(stopped.usage.visits, 2);
+    let completed = execute(&tree, &context(), MacroTreeLimits::default());
     assert!(
-        matches!(execute(&tree, &context(), MacroTreeLimits::default()).outcome, Outcome::Complete(Ok(MacroTreeResult::Expanded { syntax, .. })) if syntax == tree)
+        matches!(completed.outcome, Outcome::Complete(Ok(MacroTreeResult::Expanded { syntax, .. })) if syntax == tree)
+    );
+    assert!(completed.attempts.is_empty());
+    assert_eq!(
+        completed.usage,
+        MacroTreeUsage {
+            visits: 3,
+            ..MacroTreeUsage::default()
+        }
     );
 }
 
@@ -493,6 +531,7 @@ fn tree_self_expansion_diagnostics_malformed_output_and_cancellation_do_not_retu
         );
         assert!(matches!(cancelled.outcome, Outcome::Inconclusive(_)));
         assert!(cancelled.attempts.is_empty());
+        assert_eq!(cancelled.usage, MacroTreeUsage::default());
     }
 }
 
@@ -555,6 +594,15 @@ fn tree_assembled_siblings_share_the_output_size_limit_and_deep_trees_use_no_hos
         matches!(report.outcome, Outcome::Inconclusive(_)),
         "{report:?}"
     );
+    assert_eq!(
+        report.usage,
+        MacroTreeUsage {
+            visits: 5,
+            generated_nodes: 4,
+            generated_bytes: 120,
+        },
+        "a final output conversion stop retains all preceding expansion work"
+    );
     let mut generated = MacroTreeLimits::default();
     generated.generation.max_bytes = 120;
     assert!(matches!(
@@ -565,6 +613,15 @@ fn tree_assembled_siblings_share_the_output_size_limit_and_deep_trees_use_no_hos
     let stopped = execute(generated);
     assert_eq!(stopped.attempts.len(), 2);
     assert!(matches!(stopped.outcome, Outcome::Inconclusive(_)));
+    assert_eq!(
+        stopped.usage,
+        MacroTreeUsage {
+            visits: 4,
+            generated_nodes: 4,
+            generated_bytes: 120,
+        },
+        "the generation limit stops before revisiting the second result"
+    );
     generated.generation.max_bytes = 120;
     generated.generation.max_nodes = 3;
     assert!(matches!(
@@ -597,6 +654,13 @@ fn tree_assembled_siblings_share_the_output_size_limit_and_deep_trees_use_no_hos
         matches!(report.outcome, Outcome::Complete(Ok(MacroTreeResult::Expanded { syntax, .. })) if syntax == deep)
     );
     assert!(report.attempts.is_empty());
+    assert_eq!(
+        report.usage,
+        MacroTreeUsage {
+            visits: 5001,
+            ..MacroTreeUsage::default()
+        }
+    );
 }
 
 fn context() -> MacroContext {

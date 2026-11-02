@@ -10,6 +10,8 @@ use crate::imported_macros::source::{
 use crate::{Engine, EngineAdmissionLimits};
 use std::sync::Arc;
 
+mod batches;
+
 fn admission() -> EngineAdmissionLimits {
     EngineAdmissionLimits::new(crate::Budget::for_stack_bytes(2 * 1024 * 1024))
 }
@@ -269,6 +271,112 @@ fn imported_macros_admit_named_values_and_proofs_through_the_ordinary_authority(
         admitted(&replay).admission.result_logical_root,
         result.admission.result_logical_root
     );
+    assert_eq!(engine.logical_root(&KVMap::new()), before);
+}
+
+#[test]
+fn imported_macros_check_anonymous_examples_across_binders_signatures_and_bodies() {
+    let (engine, registry, _) = fixture();
+    let options = KVMap::new();
+    let before = engine.logical_root(&options);
+    let declarations = engine.environment().len();
+    for source in [
+        "-- λ🦀\r\nexample : (7 + 11) = 11 := by rfl\r\n",
+        "example (h : (7 + 11) = 11) : 11 = 11 := h",
+        "example : 11 = 11 := Eq.refl (7 + 11)",
+    ] {
+        let report = run(
+            &engine,
+            &registry,
+            source.as_bytes(),
+            MacroTreeLimits::default(),
+            None,
+        );
+        let Outcome::Complete(Ok(checked)) = &report.outcome else {
+            panic!("{source}: {report:?}")
+        };
+        assert_eq!(checked.parsed.kind(), fln_parse::SourceCommandKind::Example);
+        assert_eq!(checked.parsed.reconstruct_original(), source.as_bytes());
+        assert_eq!(checked.environment_root, before);
+        assert_eq!(
+            checked.checker.ground,
+            crate::CheckerAdmissionGround::BodyCheckedAgainstDeclaredType
+        );
+        let crate::Declaration::Defn(scratch) = &checked.declaration else {
+            panic!("an example must be checked as a scratch definition")
+        };
+        assert!(!engine.environment().contains(&scratch.base.name));
+        assert_eq!(report.attempts.len(), 2);
+        assert_eq!(report.attempts[0].declaration, name("SourceLibrary.skip"));
+        assert_eq!(report.attempts[1].declaration, name("SourceLibrary.right"));
+        assert_eq!(report.state.as_ref().unwrap().macro_scope, 19);
+        assert_eq!(engine.environment().len(), declarations);
+        assert_eq!(engine.logical_root(&options), before);
+    }
+}
+
+#[test]
+fn imported_macro_examples_reject_false_proofs_and_preserve_state_on_stops() {
+    let (engine, registry, _) = fixture();
+    let before = engine.logical_root(&KVMap::new());
+    let false_proof = run(
+        &engine,
+        &registry,
+        b"example : (7 + 11) = 18 := by rfl",
+        MacroTreeLimits::default(),
+        None,
+    );
+    assert!(
+        matches!(
+            false_proof.outcome,
+            Outcome::Complete(Err(SourceMacroError::Frontend(_)))
+        ),
+        "{false_proof:?}"
+    );
+    assert_eq!(false_proof.attempts.len(), 2);
+    assert!(false_proof.state.is_none());
+
+    struct Cancelled;
+    impl CancellationProbe for Cancelled {
+        fn is_cancelled(&self) -> bool {
+            true
+        }
+    }
+    let mut no_steps = MacroTreeLimits::default();
+    no_steps.dispatch.execution.vm.max_steps = 0;
+    for (limits, cancellation) in [
+        (no_steps, None),
+        (
+            MacroTreeLimits::default(),
+            Some(&Cancelled as &dyn CancellationProbe),
+        ),
+    ] {
+        let stopped = run(
+            &engine,
+            &registry,
+            b"example : (7 + 11) = 11 := by rfl",
+            limits,
+            cancellation,
+        );
+        assert!(
+            matches!(stopped.outcome, Outcome::Inconclusive(_)),
+            "{stopped:?}"
+        );
+        assert!(stopped.state.is_none());
+        assert_eq!(engine.logical_root(&KVMap::new()), before);
+    }
+    let recovered = run(
+        &engine,
+        &registry,
+        b"example : (7 + 11) = 11 := by rfl",
+        MacroTreeLimits::default(),
+        None,
+    );
+    assert!(
+        matches!(recovered.outcome, Outcome::Complete(Ok(_))),
+        "{recovered:?}"
+    );
+    assert_eq!(recovered.state.as_ref().unwrap().macro_scope, 19);
     assert_eq!(engine.logical_root(&KVMap::new()), before);
 }
 

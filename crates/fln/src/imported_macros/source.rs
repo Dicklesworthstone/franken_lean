@@ -1,4 +1,4 @@
-//! Imported node macros on source declarations, standalone `#check` and raw `#eval`.
+//! Imported node macros on source declarations, anonymous examples, `#check` and raw `#eval`.
 //!
 //! This is an explicit embedding door for syntax the current parser already
 //! understands. It installs no artifact parser descriptions. The prepared
@@ -16,9 +16,10 @@
 use super::lookup::EnvironmentMacroLookup;
 use super::registrations::{
     MacroAttempt, MacroDispatchInvocation, MacroRegistrationError, MacroTreeLimits,
-    MacroTreeResult, RegisteredMacros,
+    MacroTreeResult, MacroTreeUsage, RegisteredMacros,
 };
 use super::{MacroContext, MacroExecutionError, MacroState};
+use crate::source_check::{SourceCheckError, SourceCheckLimits, SourceFileCheck};
 use crate::{
     DefinitionExecution, Engine, EngineAdmissionLimits, EngineExecutionError,
     EngineExecutionLimits, SourceCheck, SourceDeclarationAdmission,
@@ -67,6 +68,9 @@ pub enum SourceMacroError {
     },
     EvaluationRequired,
     DeclarationRequired,
+    ExampleRequired,
+    TemplateGrammar,
+    ScopeSyntax,
 }
 
 impl std::fmt::Display for SourceMacroError {
@@ -102,11 +106,39 @@ impl std::fmt::Display for SourceMacroError {
             Self::DeclarationRequired => {
                 write!(f, "source macro admission requires one named declaration")
             }
+            Self::ExampleRequired => {
+                write!(f, "source macro checking requires an anonymous example")
+            }
+            Self::TemplateGrammar => write!(
+                f,
+                "imported macro file checking requires a grammar without source-declared templates"
+            ),
+            Self::ScopeSyntax => write!(
+                f,
+                "imported macro file checking requires macro expansion for syntax-bearing scope controls"
+            ),
         }
     }
 }
 
 impl std::error::Error for SourceMacroError {}
+
+impl SourceMacroError {
+    pub(crate) fn disposition(&self) -> (&'static str, bool, u8) {
+        match self {
+            Self::Frontend(error) => crate::source_check::classify(error),
+            Self::Binding(error) if error.is_resource() => ("resource", false, 3),
+            Self::Execution(error)
+                if matches!(error.as_ref(),
+                MacroExecutionError::Compile(error) if error.is_resource()) =>
+            {
+                ("resource", false, 3)
+            }
+            Self::Diagnostic { .. } => ("macro", false, 1),
+            _ => ("capability", false, 5),
+        }
+    }
+}
 
 /// A complete source check or a typed stop, together with the macro work that
 /// actually ran. No successor environment is published. State is returned only
@@ -160,13 +192,246 @@ pub struct SourceMacroAdmission {
     pub completed_vm_usage: ExecutionUsage,
 }
 
+/// An admission-only file batch and its actual macro work. A failed command
+/// exposes neither the successful prefix's Engine nor a successor MacroState.
+#[derive(Debug)]
+pub struct SourceMacroFileCheck {
+    pub outcome: Outcome<Result<SourceFileCheck, SourceCheckError>>,
+    pub state: Option<MacroState>,
+    pub attempts: Vec<MacroAttempt>,
+    pub completed_vm_usage: ExecutionUsage,
+    pub tree_usage: MacroTreeUsage,
+}
+
 struct Progress {
     state: Option<MacroState>,
     attempts: Vec<MacroAttempt>,
     usage: ExecutionUsage,
+    tree_usage: MacroTreeUsage,
+}
+
+/// One private transaction across all files. Lexical registry activation lives
+/// in the ordinary scope stack; state and work allowances survive scope exits
+/// and file boundaries and are returned only with a complete checked batch.
+pub(crate) struct FileSession<'a> {
+    registry: &'a RegisteredMacros,
+    context: &'a MacroContext,
+    state: MacroState,
+    lookup: Option<&'a dyn MacroLookup>,
+    limits: MacroTreeLimits,
+    cancellation: Option<&'a dyn CancellationProbe>,
+    progress: Progress,
+}
+
+impl<'a> FileSession<'a> {
+    fn new(invocation: SourceMacroInvocation<'a>) -> Self {
+        Self {
+            registry: invocation.registry,
+            context: invocation.context,
+            state: invocation.state,
+            lookup: invocation.lookup,
+            limits: invocation.limits,
+            cancellation: invocation.cancellation,
+            progress: Progress {
+                state: None,
+                attempts: Vec::new(),
+                usage: ExecutionUsage {
+                    steps: 0,
+                    system_polls: 0,
+                    peak_stack_depth: 0,
+                },
+                tree_usage: MacroTreeUsage::default(),
+            },
+        }
+    }
+
+    pub(crate) fn registry(&self) -> RegisteredMacros {
+        self.registry.clone()
+    }
+
+    pub(crate) fn cancelled(&self) -> Option<Inconclusive> {
+        self.cancellation
+            .is_some_and(CancellationProbe::is_cancelled)
+            .then(|| Inconclusive::cancelled("imported macro source batch"))
+    }
+
+    pub(crate) fn expand_command(
+        &mut self,
+        engine: &Engine,
+        registry: &RegisteredMacros,
+        source: &[u8],
+        scope: &fln_elab::source::scope::SourceScope,
+    ) -> Outcome<Result<crate::source_records::ScopedCommandSyntax, SourceMacroError>> {
+        let mut remaining = self.limits;
+        remaining.dispatch.max_attempts = remaining
+            .dispatch
+            .max_attempts
+            .saturating_sub(self.progress.attempts.len() as u64);
+        remaining.dispatch.execution.vm.max_steps = remaining
+            .dispatch
+            .execution
+            .vm
+            .max_steps
+            .saturating_sub(self.progress.usage.steps);
+        remaining.max_visits = remaining
+            .max_visits
+            .saturating_sub(self.progress.tree_usage.visits);
+        remaining.generation.max_nodes = remaining
+            .generation
+            .max_nodes
+            .saturating_sub(self.progress.tree_usage.generated_nodes);
+        remaining.generation.max_bytes = remaining
+            .generation
+            .max_bytes
+            .saturating_sub(self.progress.tree_usage.generated_bytes);
+        let mut progress = Progress {
+            state: None,
+            attempts: Vec::new(),
+            usage: ExecutionUsage {
+                steps: 0,
+                system_polls: 0,
+                peak_stack_depth: 0,
+            },
+            tree_usage: MacroTreeUsage::default(),
+        };
+        let expanded = expand_in_scope(
+            engine,
+            source,
+            None,
+            scope,
+            SourceMacroInvocation {
+                registry,
+                context: self.context,
+                state: std::mem::take(&mut self.state),
+                lookup: self.lookup,
+                limits: remaining,
+                cancellation: self.cancellation,
+            },
+            &mut progress,
+        );
+        if let Err(reason) = self.record(progress) {
+            return Outcome::Inconclusive(reason);
+        }
+        expanded.map_complete(|result| {
+            result.and_then(|(parsed, state)| {
+                let parsed = if parsed.kind() == SourceCommandKind::Example {
+                    crate::source_records::ScopedCommandSyntax::Example(parsed)
+                } else {
+                    crate::source_records::ScopedCommandSyntax::Definition(
+                        parsed
+                            .into_definition()
+                            .ok_or(SourceMacroError::DeclarationRequired)?,
+                    )
+                };
+                self.state = state;
+                Ok(parsed)
+            })
+        })
+    }
+
+    fn record(&mut self, mut progress: Progress) -> Result<(), Inconclusive> {
+        let overflow =
+            || Inconclusive::dependency_unavailable("imported macro batch usage overflow");
+        self.progress.usage.steps = self
+            .progress
+            .usage
+            .steps
+            .checked_add(progress.usage.steps)
+            .ok_or_else(overflow)?;
+        self.progress.usage.system_polls = self
+            .progress
+            .usage
+            .system_polls
+            .checked_add(progress.usage.system_polls)
+            .ok_or_else(overflow)?;
+        self.progress.usage.peak_stack_depth = self
+            .progress
+            .usage
+            .peak_stack_depth
+            .max(progress.usage.peak_stack_depth);
+        self.progress.tree_usage.visits = self
+            .progress
+            .tree_usage
+            .visits
+            .checked_add(progress.tree_usage.visits)
+            .ok_or_else(overflow)?;
+        self.progress.tree_usage.generated_nodes = self
+            .progress
+            .tree_usage
+            .generated_nodes
+            .checked_add(progress.tree_usage.generated_nodes)
+            .ok_or_else(overflow)?;
+        self.progress.tree_usage.generated_bytes = self
+            .progress
+            .tree_usage
+            .generated_bytes
+            .checked_add(progress.tree_usage.generated_bytes)
+            .ok_or_else(overflow)?;
+        self.progress
+            .attempts
+            .try_reserve(progress.attempts.len())
+            .map_err(|_| {
+                Inconclusive::dependency_unavailable("imported macro batch attempt allocation")
+            })?;
+        self.progress.attempts.append(&mut progress.attempts);
+        Ok(())
+    }
 }
 
 impl Engine {
+    /// Check declaration files with an explicitly prepared imported-macro
+    /// registry. The ordinary file driver owns namespaces, sections, opens,
+    /// attributes, declaration admission and anonymous-example checking.
+    /// Scoped registrations follow those exact lexical lifetimes; later macros
+    /// observe earlier admitted declarations through the native lookup provider.
+    ///
+    /// Attempts, VM steps, syntax visits and generated syntax share one budget
+    /// across the complete batch. Each file restores the initial registry's
+    /// activation, while MacroState continues in command order. No failed prefix
+    /// is published. Source-declared templates, syntax-bearing scope controls,
+    /// mutual blocks, artifact parser installation and module-system visibility
+    /// remain separate capabilities.
+    pub fn check_source_files_with_imported_macros(
+        &self,
+        sources: &[&[u8]],
+        options: &KVMap,
+        limits: SourceCheckLimits,
+        invocation: SourceMacroInvocation<'_>,
+    ) -> SourceMacroFileCheck {
+        let mut session = FileSession::new(invocation);
+        let outcome = if let Err(error) = session.registry.validate_source_engine(self) {
+            Outcome::Complete(Err(SourceCheckError::ImportedMacro {
+                file: 0,
+                command: 0,
+                offset: 0,
+                error: Box::new(SourceMacroError::Binding(Box::new(error))),
+            }))
+        } else {
+            match self.check_source_files_recording(
+                sources,
+                options,
+                limits,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(&mut session),
+            ) {
+                Ok(outcome) => outcome.map_complete(Ok),
+                Err(error) => Outcome::Complete(Err(error)),
+            }
+        };
+        let state = matches!(&outcome, Outcome::Complete(Ok(_))).then_some(session.state);
+        SourceMacroFileCheck {
+            outcome,
+            state,
+            attempts: session.progress.attempts,
+            completed_vm_usage: session.progress.usage,
+            tree_usage: session.progress.tree_usage,
+        }
+    }
+
     /// Expand an explicitly supplied imported node-macro table over one named
     /// declaration, then use the ordinary Engine's complete source-admission
     /// path. This publishes a usable immutable successor only after all
@@ -193,6 +458,7 @@ impl Engine {
                 system_polls: 0,
                 peak_stack_depth: 0,
             },
+            tree_usage: MacroTreeUsage::default(),
         };
         let outcome = match expand(
             self,
@@ -224,8 +490,10 @@ impl Engine {
         }
     }
 
-    /// Parse one ordinary `#check`, execute an explicitly supplied checked
-    /// imported node-macro table, and dual-check the expanded term.
+    /// Parse one ordinary `#check` or anonymous `example`, execute an explicitly
+    /// supplied checked imported node-macro table, and dual-check the expansion.
+    /// Examples expand their binders, signature and body, then discard the
+    /// scratch checker successor just as ordinary source examples do.
     ///
     /// The source grammar is the same as `check_source_command`; this method
     /// does not enable additional parser registrations or compile source macros.
@@ -256,6 +524,7 @@ impl Engine {
                 system_polls: 0,
                 peak_stack_depth: 0,
             },
+            tree_usage: MacroTreeUsage::default(),
         };
         let outcome = match expand(
             self,
@@ -311,6 +580,7 @@ impl Engine {
                 system_polls: 0,
                 peak_stack_depth: 0,
             },
+            tree_usage: MacroTreeUsage::default(),
         };
         let outcome = match expand(
             self,
@@ -351,6 +621,24 @@ fn expand(
     invocation: SourceMacroInvocation<'_>,
     progress: &mut Progress,
 ) -> Outcome<Result<(ParsedSourceCommand, MacroState), SourceMacroError>> {
+    expand_in_scope(
+        engine,
+        source,
+        Some(expected),
+        &engine.base_source_scope(),
+        invocation,
+        progress,
+    )
+}
+
+fn expand_in_scope(
+    engine: &Engine,
+    source: &[u8],
+    expected: Option<SourceCommandKind>,
+    scope: &fln_elab::source::scope::SourceScope,
+    invocation: SourceMacroInvocation<'_>,
+    progress: &mut Progress,
+) -> Outcome<Result<(ParsedSourceCommand, MacroState), SourceMacroError>> {
     let SourceMacroInvocation {
         registry,
         context,
@@ -386,9 +674,27 @@ fn expand(
             ));
         }
     };
+    let expected = match expected {
+        Some(SourceCommandKind::Check) if parsed.kind() == SourceCommandKind::Example => {
+            SourceCommandKind::Example
+        }
+        Some(expected) => expected,
+        None if matches!(
+            parsed.kind(),
+            SourceCommandKind::Definition | SourceCommandKind::Example
+        ) =>
+        {
+            parsed.kind()
+        }
+        None => return wrong_command(SourceCommandKind::Definition),
+    };
+    let declaration = matches!(
+        expected,
+        SourceCommandKind::Definition | SourceCommandKind::Example
+    );
     let command = match expected {
         SourceCommandKind::Check => "check",
-        SourceCommandKind::Definition => "declaration",
+        SourceCommandKind::Definition | SourceCommandKind::Example => "declaration",
         _ => "eval",
     };
     let Syntax::Node { kind, args, .. } = parsed.syntax() else {
@@ -400,12 +706,11 @@ fn expand(
     {
         return wrong_command(expected);
     }
-    let input = if expected == SourceCommandKind::Definition {
+    let input = if declaration {
         parsed.syntax()
     } else {
         &args[1]
     };
-    let scope = engine.base_source_scope();
     // Production source checks should not require the embedding caller to
     // reconstruct the Macro.Methods environment capability that the Engine
     // already owns. Bind a fresh borrowed provider to this immutable snapshot.
@@ -425,7 +730,7 @@ fn expand(
         &scope.explicit_opens,
     );
     let lookup = lookup.or(Some(&engine_lookup as &dyn MacroLookup));
-    let resolve = crate::source_check::grammar::resolver(engine.environment(), &scope);
+    let resolve = crate::source_check::grammar::resolver(engine.environment(), scope);
     let existing_global = expected == SourceCommandKind::Check
         && parsed.query_is_identifier()
         && matches!(input, Syntax::Ident { val, .. }
@@ -450,6 +755,7 @@ fn expand(
         );
         progress.attempts = expanded.attempts;
         progress.usage = expanded.completed_vm_usage;
+        progress.tree_usage = expanded.usage;
         let (syntax, state) = match expanded.outcome {
             Outcome::Complete(Ok(MacroTreeResult::Expanded { syntax, state })) => (syntax, state),
             Outcome::Complete(Ok(MacroTreeResult::Error {
@@ -481,10 +787,10 @@ fn expand(
             Ok(None) => {}
             Err(reason) => return Outcome::Inconclusive(reason),
         }
-        let rewritten = if expected == SourceCommandKind::Definition {
-            parsed.with_expanded_declaration(syntax)
-        } else {
-            parsed.with_expanded_query_term(syntax)
+        let rewritten = match expected {
+            SourceCommandKind::Definition => parsed.with_expanded_declaration(syntax),
+            SourceCommandKind::Example => parsed.with_expanded_example(syntax),
+            _ => parsed.with_expanded_query_term(syntax),
         };
         let Some(parsed) = rewritten else {
             return wrong_command(expected);
@@ -550,6 +856,8 @@ fn wrong_command<T>(expected: SourceCommandKind) -> Outcome<Result<T, SourceMacr
         frontend(EngineExecutionError::StandaloneCheckRequired)
     } else if expected == SourceCommandKind::Definition {
         Outcome::Complete(Err(SourceMacroError::DeclarationRequired))
+    } else if expected == SourceCommandKind::Example {
+        Outcome::Complete(Err(SourceMacroError::ExampleRequired))
     } else {
         Outcome::Complete(Err(SourceMacroError::EvaluationRequired))
     }

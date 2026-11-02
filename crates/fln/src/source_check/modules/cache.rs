@@ -744,6 +744,7 @@ pub(super) fn run_collecting(
                         Some(module.name),
                         public.as_mut(),
                         Some((module.source, header.body_start)),
+                        None,
                     )
                 }
                 .map_err(|mut error| {
