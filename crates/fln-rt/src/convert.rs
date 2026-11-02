@@ -53,7 +53,7 @@ use fln_core::options::{DataValue, KVMap, SyntaxHandle};
 use fln_unsafe_abi::handle::Obj;
 
 use crate::abi;
-use crate::native_heap::{NativeHandle, NativeHeap};
+use crate::native_heap::{HeapError, NativeHandle, NativeHeap};
 
 /// The converter's declaration, as data (see the module docs).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,6 +105,8 @@ pub enum ConvertError {
     UnsupportedConstructor { family: &'static str, tag: u8 },
     /// A level or expression depth overflowed the native bound.
     NativeOverflow { family: &'static str },
+    /// A native heap operation failed; the original cause is preserved.
+    NativeHeap(HeapError),
     /// Conversion work was exhausted, not a malformed input verdict.
     NodeBudgetExhausted {
         family: &'static str,
@@ -135,6 +137,7 @@ impl std::fmt::Display for ConvertError {
             Self::NativeOverflow { family } => {
                 write!(f, "{family} overflowed the native bound")
             }
+            Self::NativeHeap(error) => write!(f, "native conversion heap: {error}"),
             Self::NodeBudgetExhausted {
                 family,
                 visited,
@@ -147,7 +150,14 @@ impl std::fmt::Display for ConvertError {
     }
 }
 
-impl std::error::Error for ConvertError {}
+impl std::error::Error for ConvertError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::NativeHeap(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 
 // Compat tags, upstream's own assignments (lean.h: the object constructors
 // for Name / LeanLevel / LeanLiteral / LeanExpr / List).
@@ -482,7 +492,9 @@ impl Conversion {
     ) -> Result<NativeHandle<Expr>, ConvertError> {
         self.projected += 1;
         let before = heap.live();
-        let handle = heap.intern(self.expr(root)?, Expr::hash);
+        let handle = heap
+            .intern(self.expr(root)?, Expr::hash)
+            .map_err(ConvertError::NativeHeap)?;
         if heap.live() == before {
             self.dedup_hits += 1;
         }
@@ -523,8 +535,9 @@ impl Conversion {
                     });
                 }
             };
-            let mut pending = false;
-            let ancestors = stack.len();
+            // Keep only the active ancestor path on the stack. Queued
+            // siblings can legally be reached through another child.
+            let mut pending = None;
             for &i in child_slots {
                 let child = ctor_field(&current, i, "expr")?;
                 if child.is_scalar() {
@@ -537,16 +550,18 @@ impl Conversion {
                 if done.contains_key(&child_key) {
                     continue;
                 }
-                if stack[..ancestors]
+                if stack
                     .iter()
                     .any(|frame| frame.identity_token() == child_key)
                 {
                     return Err(malformed("expr", "expr graph is cyclic"));
                 }
-                stack.push(child);
-                pending = true;
+                pending = Some(child);
             }
-            if pending {
+            // Validate every immediate child before descending, retaining
+            // the original last-child-first traversal order.
+            if let Some(child) = pending {
+                stack.push(child);
                 continue;
             }
             self.enter("expr")?;
@@ -749,10 +764,8 @@ impl Conversion {
                     });
                 }
             };
-            let mut pending = false;
-            // Only ancestors are a cycle. A sibling already pushed this
-            // visit (max of a shared child) is the same work item twice.
-            let ancestors = stack.len();
+            // Pending siblings are not ancestors: max u (succ u) is a DAG.
+            let mut pending = None;
             for &i in child_slots {
                 let child = ctor_field(&current, i, "level")?;
                 let child_key = child.identity_token();
@@ -766,16 +779,16 @@ impl Conversion {
                 if done.contains_key(&child_key) {
                     continue;
                 }
-                if stack[..ancestors]
+                if stack
                     .iter()
                     .any(|frame| frame.identity_token() == child_key)
                 {
                     return Err(malformed("level", "level graph is cyclic"));
                 }
-                stack.push(child);
-                pending = true;
+                pending = Some(child);
             }
-            if pending {
+            if let Some(child) = pending {
+                stack.push(child);
                 continue;
             }
             self.enter("level")?;
@@ -1052,9 +1065,7 @@ impl Conversion {
 /// Inject a native Expr back into fresh Compat objects (the injection
 /// declaration: the result owns its own references; the heap is untouched).
 pub fn inject_expr(heap: &NativeHeap, handle: NativeHandle<Expr>) -> Result<Obj, ConvertError> {
-    let expr = heap
-        .get(handle)
-        .map_err(|_| malformed("expr", "the native handle does not resolve"))?;
+    let expr = heap.get(handle).map_err(ConvertError::NativeHeap)?;
     inject_expr_value(expr)
 }
 

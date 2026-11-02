@@ -170,22 +170,22 @@ fn persistent_allocations_are_immutable_and_never_freed() {
 fn interning_dedups_structurally_and_a_freed_slot_leaves_the_index() {
     let mut heap = NativeHeap::new();
     let key = |s: &String| s.clone();
-    let first = heap.intern("shared".to_string(), key);
-    let second = heap.intern("shared".to_string(), key);
+    let first = heap.intern("shared".to_string(), key).unwrap();
+    let second = heap.intern("shared".to_string(), key).unwrap();
     assert_eq!(
         first, second,
         "the same value interns to the same live handle"
     );
     assert_eq!(heap.live(), 1, "dedup is real, not nominal");
 
-    let third = heap.intern("different".to_string(), key);
+    let third = heap.intern("different".to_string(), key).unwrap();
     assert_ne!(first, third);
     assert_eq!(heap.live(), 2);
 
     // Free the interned handle: the index must not resolve a future re-used slot
     // to a different value.
     heap.free(first).unwrap();
-    let fourth = heap.intern("shared".to_string(), key);
+    let fourth = heap.intern("shared".to_string(), key).unwrap();
     assert_eq!(heap.get(fourth).unwrap(), "shared");
     assert_eq!(heap.live(), 2, "one freed, one re-interned fresh");
 }
@@ -193,30 +193,36 @@ fn interning_dedups_structurally_and_a_freed_slot_leaves_the_index() {
 #[test]
 fn colliding_values_and_types_keep_their_own_live_interned_handles() {
     let mut heap = NativeHeap::new();
-    let first = heap.intern(7_u64, |_| 0_u8);
-    let second = heap.intern(11_u64, |_| 0_u8);
-    let other_type = heap.intern("seven".to_owned(), |_| 0_u8);
+    let first = heap.intern(7_u64, |_| 0_u8).unwrap();
+    let second = heap.intern(11_u64, |_| 0_u8).unwrap();
+    let other_type = heap.intern("seven".to_owned(), |_| 0_u8).unwrap();
     assert_ne!(first, second);
     for _ in 0..3 {
-        assert_eq!(heap.intern(7_u64, |_| 0_u8), first);
-        assert_eq!(heap.intern(11_u64, |_| 0_u8), second);
-        assert_eq!(heap.intern("seven".to_owned(), |_| 0_u8), other_type);
+        assert_eq!(heap.intern(7_u64, |_| 0_u8).unwrap(), first);
+        assert_eq!(heap.intern(11_u64, |_| 0_u8).unwrap(), second);
+        assert_eq!(
+            heap.intern("seven".to_owned(), |_| 0_u8).unwrap(),
+            other_type
+        );
     }
     assert_eq!(heap.live(), 3);
     heap.free(first).unwrap();
-    assert_eq!(heap.intern(11_u64, |_| 0_u8), second);
-    assert_eq!(heap.intern("seven".to_owned(), |_| 0_u8), other_type);
-    let replacement = heap.intern(7_u64, |_| 0_u8);
+    assert_eq!(heap.intern(11_u64, |_| 0_u8).unwrap(), second);
+    assert_eq!(
+        heap.intern("seven".to_owned(), |_| 0_u8).unwrap(),
+        other_type
+    );
+    let replacement = heap.intern(7_u64, |_| 0_u8).unwrap();
     assert_ne!(replacement, first);
     assert_eq!(heap.get(first), Err(HeapError::StaleHandle));
-    assert_eq!(heap.intern(7_u64, |_| 0_u8), replacement);
+    assert_eq!(heap.intern(7_u64, |_| 0_u8).unwrap(), replacement);
     assert_eq!(heap.live(), 3);
 }
 
 #[test]
 fn retyped_free_is_failure_atomic_for_allocations_and_interned_values() {
     let mut heap = NativeHeap::new();
-    for handle in [heap.alloc(19_u64), heap.intern(23_u64, |_| 0_u8)] {
+    for handle in [heap.alloc(19_u64), heap.intern(23_u64, |_| 0_u8).unwrap()] {
         let value = *heap.get(handle).unwrap();
         let live = heap.live();
         assert_eq!(
@@ -226,7 +232,7 @@ fn retyped_free_is_failure_atomic_for_allocations_and_interned_values() {
         assert_eq!(heap.get(handle), Ok(&value));
         assert_eq!(heap.live(), live);
     }
-    let canonical = heap.intern(23_u64, |_| 0_u8);
+    let canonical = heap.intern(23_u64, |_| 0_u8).unwrap();
     assert_eq!(heap.live(), 2);
     assert_eq!(heap.get(canonical), Ok(&23));
 }
@@ -234,29 +240,43 @@ fn retyped_free_is_failure_atomic_for_allocations_and_interned_values() {
 #[test]
 fn mutable_access_detaches_only_the_validated_interned_allocation() {
     let mut heap = NativeHeap::new();
-    let first = heap.intern(7_u64, |_| 0_u8);
-    let second = heap.intern(11_u64, |_| 0_u8);
+    let first = heap.intern(7_u64, |_| 0_u8).unwrap();
+    let second = heap.intern(11_u64, |_| 0_u8).unwrap();
     assert_eq!(
         heap.get_mut(first.retype::<String>()),
         Err(HeapError::TypeMismatch)
     );
     assert_eq!(
-        heap.intern(7_u64, |_| 0_u8),
+        heap.intern(7_u64, |_| 0_u8).unwrap(),
         first,
         "refusal must not detach"
     );
     *heap.get_mut(first).unwrap() = 11;
     assert_eq!(
-        heap.intern(11_u64, |_| 0_u8),
+        heap.intern(11_u64, |_| 0_u8).unwrap(),
         second,
         "mutation must not replace the canonical peer"
     );
-    let fresh = heap.intern(7_u64, |_| 0_u8);
+    let fresh = heap.intern(7_u64, |_| 0_u8).unwrap();
     assert_ne!(fresh, first);
     assert_eq!(heap.get(first), Ok(&11));
     heap.free(first).unwrap();
-    assert_eq!(heap.intern(7_u64, |_| 0_u8), fresh);
-    assert_eq!(heap.intern(11_u64, |_| 0_u8), second);
+    assert_eq!(heap.intern(7_u64, |_| 0_u8).unwrap(), fresh);
+    assert_eq!(heap.intern(11_u64, |_| 0_u8).unwrap(), second);
+}
+
+#[test]
+fn interning_on_a_closed_heap_is_typed_and_does_not_evaluate_the_key() {
+    let mut heap = NativeHeap::new();
+    heap.close();
+    assert_eq!(
+        heap.intern(42_u64, |_| -> u8 {
+            panic!("closed heap evaluated an interning key")
+        }),
+        Err(HeapError::Closed)
+    );
+    assert_eq!(heap.live(), 0);
+    assert!(heap.is_closed());
 }
 
 // ---------------------------------------------------------------------------

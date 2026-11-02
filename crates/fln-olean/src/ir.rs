@@ -367,6 +367,9 @@ impl IrDecodeError {
             Self::Limit { .. }
                 | Self::Conversion(ConvertError::NodeBudgetExhausted { .. })
                 | Self::Conversion(ConvertError::NativeOverflow { .. })
+                | Self::Conversion(ConvertError::NativeHeap(
+                    fln_rt::native_heap::HeapError::SlotCapacity
+                ))
         )
     }
 }

@@ -20,7 +20,7 @@ use fln_core::level::{LMVarId, Level};
 use fln_core::name::Name;
 use fln_core::options::{DataValue, KVMap, SyntaxHandle};
 use fln_rt::convert::{Conversion, ConvertError, INJECT_DECL, PROJECT_DECL, inject_expr};
-use fln_rt::native_heap::NativeHeap;
+use fln_rt::native_heap::{HeapError, NativeHeap};
 use fln_unsafe_abi::handle::Obj;
 
 fn name_component_count(name: &Name) -> usize {
@@ -64,6 +64,60 @@ fn a_conversion_dropped_without_projecting_allocates_nothing() {
         0,
         "laziness: no inspection, no projection, no allocation"
     );
+}
+
+#[test]
+fn projection_into_a_closed_heap_returns_a_typed_error_and_remains_reusable() {
+    let input = Obj::mk_ctor(0, vec![Obj::mk_nat(0)], &[]);
+    let mut closed = NativeHeap::new();
+    closed.close();
+    let mut conversion = Conversion::new();
+    let error = conversion
+        .project_expr(&mut closed, &input)
+        .expect_err("a closed destination must refuse projection");
+    assert_eq!(
+        std::error::Error::source(&error).and_then(|source| source.downcast_ref::<HeapError>()),
+        Some(&HeapError::Closed)
+    );
+    assert!(closed.is_closed());
+    assert_eq!(closed.live(), 0);
+    let mut fresh = NativeHeap::new();
+    let recovered = conversion.project_expr(&mut fresh, &input).unwrap();
+    assert_eq!(fresh.get(recovered).unwrap(), &Expr::bvar(0).unwrap());
+    assert_eq!(fresh.live(), 1);
+}
+
+#[test]
+fn injection_preserves_foreign_stale_and_closed_native_handle_causes() {
+    let mut heap = NativeHeap::new();
+    let handle = heap.alloc(Expr::bvar(0).unwrap());
+    let other = NativeHeap::new();
+    let foreign = inject_expr(&other, handle)
+        .err()
+        .expect("a foreign handle must refuse");
+    assert_eq!(
+        std::error::Error::source(&foreign).and_then(|source| source.downcast_ref::<HeapError>()),
+        Some(&HeapError::WrongHeap)
+    );
+    assert_eq!(heap.live(), 1);
+    heap.free(handle).unwrap();
+    let stale = inject_expr(&heap, handle)
+        .err()
+        .expect("a stale handle must refuse");
+    assert_eq!(
+        std::error::Error::source(&stale).and_then(|source| source.downcast_ref::<HeapError>()),
+        Some(&HeapError::StaleHandle)
+    );
+    let current = heap.alloc(Expr::bvar(1).unwrap());
+    heap.close();
+    let closed = inject_expr(&heap, current)
+        .err()
+        .expect("a closed heap must refuse");
+    assert_eq!(
+        std::error::Error::source(&closed).and_then(|source| source.downcast_ref::<HeapError>()),
+        Some(&HeapError::Closed)
+    );
+    assert_eq!(heap.live(), 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -1059,6 +1113,73 @@ fn project_reuses_a_shared_expr_child() {
         panic!("expected an app");
     };
     assert_eq!(f.hash(), a.hash());
+}
+
+#[test]
+fn project_does_not_mistake_a_queued_sibling_for_an_expr_ancestor() {
+    for nested_on_right in [false, true] {
+        let shared = Expr::bvar(0).unwrap();
+        let nested = Expr::app(shared.clone(), Expr::bvar(1).unwrap());
+        let expected = if nested_on_right {
+            Expr::app(shared, nested)
+        } else {
+            Expr::app(nested, shared)
+        };
+        let mut heap = NativeHeap::new();
+        let original = heap.alloc(expected.clone());
+        let input = inject_expr(&heap, original).unwrap();
+        let (shared, nested) = if nested_on_right {
+            (input.ctor_child(0), input.ctor_child(1))
+        } else {
+            (input.ctor_child(1), input.ctor_child(0))
+        };
+        assert_eq!(
+            shared.identity_token(),
+            nested.ctor_child(0).identity_token()
+        );
+        let restored = Conversion::new()
+            .project_expr(&mut heap, &input)
+            .expect("a shared sibling reached through a descendant is not a cycle");
+        assert_eq!(heap.get(restored).unwrap(), &expected);
+    }
+}
+
+#[test]
+fn project_does_not_mistake_a_queued_sibling_for_a_level_ancestor() {
+    for imax in [false, true] {
+        for nested_on_right in [false, true] {
+            let shared = Level::zero().succ().unwrap();
+            let nested = shared.clone().succ().unwrap();
+            let (left, right) = if nested_on_right {
+                (shared, nested)
+            } else {
+                (nested, shared)
+            };
+            let level = if imax {
+                Level::imax(left, right).unwrap()
+            } else {
+                Level::max(left, right).unwrap()
+            };
+            let expected = Expr::sort(level);
+            let mut heap = NativeHeap::new();
+            let original = heap.alloc(expected.clone());
+            let input = inject_expr(&heap, original).unwrap();
+            let level = input.ctor_child(0);
+            let (shared, nested) = if nested_on_right {
+                (level.ctor_child(0), level.ctor_child(1))
+            } else {
+                (level.ctor_child(1), level.ctor_child(0))
+            };
+            assert_eq!(
+                shared.identity_token(),
+                nested.ctor_child(0).identity_token()
+            );
+            let restored = Conversion::new()
+                .project_expr(&mut heap, &input)
+                .expect("a shared sibling reached through a successor is not a cycle");
+            assert_eq!(heap.get(restored).unwrap(), &expected);
+        }
+    }
 }
 
 #[test]

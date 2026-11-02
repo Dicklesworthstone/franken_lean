@@ -71,6 +71,8 @@ pub enum HeapError {
     TypeMismatch,
     /// A persistent allocation was offered to `get_mut` or `free`.
     PersistentMutation,
+    /// No additional slot can be represented by a handle's index.
+    SlotCapacity,
 }
 
 impl fmt::Display for HeapError {
@@ -87,6 +89,7 @@ impl fmt::Display for HeapError {
             Self::PersistentMutation => {
                 write!(f, "a persistent allocation is immutable and never freed")
             }
+            Self::SlotCapacity => write!(f, "the heap slot index space is exhausted"),
         }
     }
 }
@@ -280,9 +283,12 @@ impl NativeHeap {
         self.closed
     }
 
-    fn alloc_slot(&mut self, value: Box<dyn Any + Send + Sync>, persistent: bool) -> (u32, u32) {
-        self.live += 1;
-        if let Some(head) = self.free_head {
+    fn alloc_slot(
+        &mut self,
+        value: Box<dyn Any + Send + Sync>,
+        persistent: bool,
+    ) -> Result<(u32, u32), HeapError> {
+        let allocation = if let Some(head) = self.free_head {
             let (next_free, generation) = match &self.slots[head as usize] {
                 Slot::Vacant {
                     next_free,
@@ -299,7 +305,9 @@ impl NativeHeap {
             };
             (head, generation)
         } else {
-            let index = self.slots.len() as u32;
+            // A truncated index would issue a handle for an earlier live
+            // allocation. Fail before changing the heap's allocation state.
+            let index = u32::try_from(self.slots.len()).map_err(|_| HeapError::SlotCapacity)?;
             self.slots.push(Slot::Occupied {
                 value,
                 generation: 1,
@@ -307,16 +315,22 @@ impl NativeHeap {
                 intern_key: None,
             });
             (index, 1)
-        }
+        };
+        self.live += 1;
+        Ok(allocation)
     }
 
     /// Allocate a value. The returned handle is the only way back to it.
+    /// Closed heaps and exhausted slot indices are caller invariant failures
+    /// here; untrusted conversion uses the fallible [`Self::intern`] API.
     pub fn alloc<T: Send + Sync + 'static>(&mut self, value: T) -> NativeHandle<T> {
         assert!(
             !self.closed,
             "alloc on a closed heap is a caller bug — the converters' region discipline, not a runtime state to model"
         );
-        let (index, generation) = self.alloc_slot(Box::new(value), false);
+        let (index, generation) = self
+            .alloc_slot(Box::new(value), false)
+            .expect("NativeHeap slot index space exhausted");
         self.handle(index, generation)
     }
 
@@ -329,7 +343,9 @@ impl NativeHeap {
             !self.closed,
             "alloc_persistent on a closed heap is a caller bug"
         );
-        let (index, generation) = self.alloc_slot(Box::new(value), true);
+        let (index, generation) = self
+            .alloc_slot(Box::new(value), true)
+            .expect("NativeHeap slot index space exhausted");
         self.handle(index, generation)
     }
 
@@ -337,7 +353,13 @@ impl NativeHeap {
     /// the heap returns its handle instead of a new allocation (R10's dedup
     /// — the dual-heap memory law). `key` extracts the interning key; the
     /// full value is compared on a hit, so a collision cannot fuse.
-    pub fn intern<T, K>(&mut self, value: T, key: impl Fn(&T) -> K) -> NativeHandle<T>
+    /// Closed heaps and an exhausted slot index return typed errors without
+    /// changing the allocation or interning state.
+    pub fn intern<T, K>(
+        &mut self,
+        value: T,
+        key: impl Fn(&T) -> K,
+    ) -> Result<NativeHandle<T>, HeapError>
     where
         T: Eq + Send + Sync + 'static,
         K: Hash + Eq + 'static,
@@ -348,17 +370,20 @@ impl NativeHeap {
     /// Intern with a caller-chosen equality. The key hash only selects a
     /// collision bucket; `eq` must compare full value identity, not just a
     /// hash. Prefer `intern` for types that implement `Eq`, including `Expr`.
+    /// A closed heap refuses before evaluating either caller callback.
     pub fn intern_by<T, K>(
         &mut self,
         value: T,
         key: impl Fn(&T) -> K,
         eq: impl Fn(&T, &T) -> bool,
-    ) -> NativeHandle<T>
+    ) -> Result<NativeHandle<T>, HeapError>
     where
         T: Send + Sync + 'static,
         K: Hash + Eq + 'static,
     {
-        assert!(!self.closed, "intern on a closed heap is a caller bug");
+        if self.closed {
+            return Err(HeapError::Closed);
+        }
         let key_value = key(&value);
         let key_hash = {
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -376,11 +401,11 @@ impl NativeHeap {
                     && let Some(stored) = stored.downcast_ref::<T>()
                     && eq(stored, &value)
                 {
-                    return self.handle(entry.slot, *generation);
+                    return Ok(self.handle(entry.slot, *generation));
                 }
             }
         }
-        let (index, generation) = self.alloc_slot(Box::new(value), false);
+        let (index, generation) = self.alloc_slot(Box::new(value), false)?;
         if let Slot::Occupied { intern_key, .. } = &mut self.slots[index as usize] {
             *intern_key = Some(map_key);
         }
@@ -388,7 +413,7 @@ impl NativeHeap {
             .entry(map_key)
             .or_default()
             .push(InternEntry { slot: index });
-        self.handle(index, generation)
+        Ok(self.handle(index, generation))
     }
 
     /// Resolve a handle for reading. Every refusal is typed.
