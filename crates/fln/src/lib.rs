@@ -12490,7 +12490,7 @@ mod tests {
     /// v4.32.0 stdlib's `Init/Prelude` exported, server and private parts
     /// (fln-cli's `olean_verify_rebuild_chain_fixture_is_the_pinned_init_prelude`
     /// holds that against the installed pin), read from the invoking tree.
-    fn pinned_prelude_chain() -> [Vec<u8>; 3] {
+    pub(crate) fn pinned_prelude_chain() -> [Vec<u8>; 3] {
         let manifest_dir = std::env::var_os("CARGO_MANIFEST_DIR")
             .map(std::path::PathBuf::from)
             .expect("cargo identifies the invoking crate directory");

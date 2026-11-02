@@ -1044,10 +1044,11 @@ impl Context {
         if self.txn.lctx.find_by_user_name(val).is_some() {
             return Ok(None);
         }
-        let Ok(Some(resolved)) = self.resolve_source_candidates(val)? else {
+        let (resolved, explicit_target) = self.resolve_unambiguous_identifier_name(ident)?;
+        let Some(resolved) = resolved else {
             return Ok(None);
         };
-        if self.txn.lctx.find_by_user_name(&resolved).is_some()
+        if (!explicit_target && self.txn.lctx.find_by_user_name(&resolved).is_some())
             || self.defining.as_ref() == Some(&resolved)
             || self.recursion.as_ref().is_some_and(|r| r.name == resolved)
         {
@@ -1103,8 +1104,12 @@ pub fn requests(
     while let Some(syntax) = pending.pop() {
         context.tick()?;
         match syntax {
-            Syntax::Ident { val, .. } if equation_like_leaf(val) => {
-                if let Ok(Some(resolved)) = context.resolve_source_candidates(val)?
+            Syntax::Ident { val, preresolved, .. }
+                if equation_like_leaf(val)
+                    || preresolved.iter().any(|entry| matches!(entry,
+                        fln_syntax::tree::Preresolved::Decl { name, .. } if equation_like_leaf(name))) =>
+            {
+                if let (Some(resolved), _) = context.resolve_unambiguous_identifier_name(syntax)?
                     && !env.contains(&resolved)
                     && target(env, &resolved).is_some()
                 {
@@ -1122,8 +1127,8 @@ pub fn requests(
                         }
                         _ => term,
                     };
-                    if let Syntax::Ident { val, .. } = ident
-                        && let Ok(Some(resolved)) = context.resolve_source_candidates(val)?
+                    if let Syntax::Ident { .. } = ident
+                        && let (Some(resolved), _) = context.resolve_unambiguous_identifier_name(ident)?
                         && safe_definition(env, &resolved).is_some()
                         && !is_matcher_name(&resolved)
                         && !equations_generated(env, &resolved)

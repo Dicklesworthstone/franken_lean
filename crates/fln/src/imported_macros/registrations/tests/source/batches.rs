@@ -16,6 +16,12 @@ use std::cell::Cell;
 /// supplied compiler IR is untrusted, as it is for ordinary imported user code;
 /// its behavior is not inferred from these kernel bodies.
 fn artifact_fixture() -> (Engine, RegisteredMacros) {
+    artifact_fixture_with_extra_rows(&[])
+}
+
+fn artifact_fixture_with_extra_rows(
+    extra_rows: &[(&str, &str, Option<&str>)],
+) -> (Engine, RegisteredMacros) {
     let seed = Engine::with_source_seed(admission())
         .unwrap()
         .into_complete()
@@ -47,6 +53,7 @@ fn artifact_fixture() -> (Engine, RegisteredMacros) {
         "SourceLibrary.diagnostic",
         "SourceLibrary.hasDecl",
         "SourceLibrary.preresolved",
+        "SourceLibrary.attributeProbe",
     ];
     let mut constants = vec![definition(
         "Lean.Macro",
@@ -67,8 +74,14 @@ fn artifact_fixture() -> (Engine, RegisteredMacros) {
         ("term_-_", "SourceLibrary.diagnostic", None),
         ("term_*_", "SourceLibrary.hasDecl", None),
         ("term_/_", "SourceLibrary.preresolved", None),
+        (
+            "Lean.Parser.Command.attribute",
+            "SourceLibrary.attributeProbe",
+            None,
+        ),
     ]
     .into_iter()
+    .chain(extra_rows.iter().copied())
     .map(|(key, declaration, scope)| {
         let pair = Obj::mk_ctor(
             0,
@@ -136,6 +149,7 @@ fn artifact_fixture() -> (Engine, RegisteredMacros) {
         function("SourceLibrary.diagnostic", Behavior::Diagnostic),
         super::super::lookup::has_decl_selector("SourceLibrary.hasDecl"),
         preresolved_function(),
+        function("SourceLibrary.attributeProbe", Behavior::Unsupported),
     ]);
     let registry = imported
         .prepare_imported_macros(
@@ -444,11 +458,11 @@ fn imported_macro_batches_share_attempt_step_visit_and_generation_budgets() {
 fn imported_macro_batches_discard_successful_prefixes_on_false_proofs_and_diagnostics() {
     let (engine, registry) = artifact_fixture();
     let before = engine.logical_root(&KVMap::new());
-    let prefix = b"def prefix : Nat := 7 + 11".as_slice();
+    let prefix = b"def checkedPrefix : Nat := 7 + 11".as_slice();
     let false_proof = batch(
         &engine,
         &registry,
-        &[prefix, b"example : prefix = 18 := by rfl"],
+        &[prefix, b"example : checkedPrefix = 18 := by rfl"],
         MacroTreeLimits::default(),
         None,
     );
@@ -479,13 +493,13 @@ fn imported_macro_batches_discard_successful_prefixes_on_false_proofs_and_diagno
     assert_eq!(diagnostic.attempts.len(), 3);
     assert!(diagnostic.state.is_none());
     assert_eq!(engine.logical_root(&KVMap::new()), before);
-    assert!(!engine.environment().contains(&name("prefix")));
+    assert!(!engine.environment().contains(&name("checkedPrefix")));
     let good = batch(
         &engine,
         &registry,
         &[
             prefix,
-            b"example : prefix = 11 := by rfl\ntheorem proof : prefix = 11 := by rfl",
+            b"example : checkedPrefix = 11 := by rfl\ntheorem proof : checkedPrefix = 11 := by rfl",
         ],
         MacroTreeLimits::default(),
         None,
@@ -497,7 +511,7 @@ fn imported_macro_batches_discard_successful_prefixes_on_false_proofs_and_diagno
         checked.engine.environment().len(),
         engine.environment().len() + 2
     );
-    assert_declared_value(&checked.engine, "prefix", 11);
+    assert_declared_value(&checked.engine, "checkedPrefix", 11);
     assert!(checked.engine.environment().contains(&name("proof")));
 }
 
@@ -505,7 +519,7 @@ fn imported_macro_batches_discard_successful_prefixes_on_false_proofs_and_diagno
 fn imported_macro_batches_refuse_source_templates_without_replaying_native_expansion() {
     let (engine, registry) = artifact_fixture();
     let before = engine.logical_root(&KVMap::new());
-    let source = b"def prefix : Nat := 7 + 11\n\
+    let source = b"def checkedPrefix : Nat := 7 + 11\n\
         syntax \"localValue\" : term\n\
         macro_rules | `(localValue) => `(11)\n\
         def templated : Nat := localValue";
@@ -523,21 +537,197 @@ fn imported_macro_batches_refuse_source_templates_without_replaying_native_expan
     assert_eq!(refused.attempts.len(), 2);
     assert!(refused.state.is_none());
     assert_eq!(engine.logical_root(&KVMap::new()), before);
-    assert!(!engine.environment().contains(&name("prefix")));
+    assert!(!engine.environment().contains(&name("checkedPrefix")));
 }
 
 #[test]
-fn imported_macro_batches_refuse_unexpanded_syntax_bearing_scope_controls() {
+fn imported_macro_batches_expand_variable_types_and_restore_variable_in_scopes() {
     let (engine, registry) = artifact_fixture();
     let before = engine.logical_root(&KVMap::new());
-    for (tail, command) in [
-        ("variable (h : (7 + 11) = 11)", 1),
+    let source = "-- λ🦀\r\nsection Outer\r\n\
+        variable (x : Nat + Bool)\r\n\
+        def fromBool : Bool := x\r\n\
+        section\r\nopen scoped SourceScoped\r\n\
+        variable (y : Nat + Bool)\r\n\
+        def fromNat : Nat := y\r\n\
+        def originalBool : Bool := x\r\nend\r\nend Outer\r\n\
+        variable (z : Nat + Bool) in\r\ndef oneCommand : Bool := z\r\n\
+        def afterIn : Nat := 7 + 11\r\n";
+    let report = batch(
+        &engine,
+        &registry,
+        &[source.as_bytes()],
+        MacroTreeLimits::default(),
+        None,
+    );
+    let checked = succeeded(&report);
+    for (expression, value) in [
+        ("fromBool true", 1),
+        ("fromNat 7", 7),
+        ("originalBool false", 0),
+        ("oneCommand true", 1),
+        ("afterIn", 11),
+    ] {
+        assert_declared_value(&checked.engine, expression, value);
+    }
+    assert!(checked.scope.variables.is_empty());
+    assert_eq!(report.attempts.len(), 7);
+    assert_eq!(report.state.as_ref().unwrap().macro_scope, 24);
+    assert_eq!(engine.logical_root(&KVMap::new()), before);
+
+    let escaped = batch(
+        &engine,
+        &registry,
+        &[b"variable (z : Nat + Bool) in\ndef oneCommand : Bool := z\ndef escaped : Bool := z"],
+        MacroTreeLimits::default(),
+        None,
+    );
+    assert!(
+        matches!(escaped.outcome, Outcome::Complete(Err(_))),
+        "{escaped:?}"
+    );
+    assert_eq!(escaped.attempts.len(), 2);
+    assert!(escaped.state.is_none());
+    assert!(!engine.environment().contains(&name("oneCommand")));
+    assert_eq!(engine.logical_root(&KVMap::new()), before);
+}
+
+#[test]
+fn imported_macro_batches_dispatch_the_complete_variable_command_and_preserve_its_shape() {
+    let kind = "Lean.Parser.Command.variable";
+    let source = b"variable (x : Nat + Bool)\ndef wouldPass : Bool := x";
+    let (engine, registry) =
+        artifact_fixture_with_extra_rows(&[(kind, "SourceLibrary.diagnostic", None)]);
+    let before = engine.logical_root(&KVMap::new());
+    let diagnosed = batch(
+        &engine,
+        &registry,
+        &[source],
+        MacroTreeLimits::default(),
+        None,
+    );
+    assert!(
+        matches!(&diagnosed.outcome, Outcome::Complete(Err(SourceCheckError::ImportedMacro { error, .. }))
+            if matches!(error.as_ref(), SourceMacroError::Diagnostic { reference, message, .. }
+                if reference.kind() == Some(&name(kind)) && message == "λ\0diagnostic")),
+        "{diagnosed:?}"
+    );
+    assert_eq!(diagnosed.attempts.len(), 1);
+    assert_eq!(
+        diagnosed.attempts[0].declaration,
+        name("SourceLibrary.diagnostic")
+    );
+    assert!(diagnosed.state.is_none());
+    assert!(!engine.environment().contains(&name("wouldPass")));
+    assert_eq!(engine.logical_root(&KVMap::new()), before);
+
+    let (engine, registry) =
+        artifact_fixture_with_extra_rows(&[(kind, "SourceLibrary.skip", None)]);
+    let declined = batch(
+        &engine,
+        &registry,
+        &[source],
+        MacroTreeLimits::default(),
+        None,
+    );
+    assert_declared_value(&succeeded(&declined).engine, "wouldPass true", 1);
+    assert_eq!(declined.attempts.len(), 3);
+    assert_eq!(declined.state.as_ref().unwrap().macro_scope, 20);
+
+    // Selecting argument 2 of a two-argument variable command returns missing
+    // syntax. It must not be interpreted as an empty or successful telescope.
+    let (engine, registry) =
+        artifact_fixture_with_extra_rows(&[(kind, "SourceLibrary.right", None)]);
+    let malformed = batch(
+        &engine,
+        &registry,
+        &[source],
+        MacroTreeLimits::default(),
+        None,
+    );
+    assert!(
+        matches!(&malformed.outcome, Outcome::Complete(Err(SourceCheckError::ImportedMacro { error, .. }))
+            if matches!(error.as_ref(), SourceMacroError::ScopeControl { kind: actual } if actual == &name(kind))),
+        "{malformed:?}"
+    );
+    assert_eq!(malformed.attempts.len(), 1);
+    assert!(malformed.state.is_none());
+    assert!(!engine.environment().contains(&name("wouldPass")));
+}
+
+#[test]
+fn imported_macro_batches_refuse_active_native_scope_roots_instead_of_ignoring_them() {
+    for (kind, source) in [
         (
-            "def replacement : Nat := 11\nattribute [implemented_by replacement] prefix",
-            2,
+            "Lean.Parser.Command.namespace",
+            "namespace Client\ndef wouldPass : Nat := 7 + 11\nend Client",
+        ),
+        (
+            "Lean.Parser.Command.open",
+            "open scoped SourceScoped\ndef wouldPass : Nat := 7 + 11",
+        ),
+        (
+            "Lean.Parser.Command.open",
+            "open scoped SourceScoped in\ndef wouldPass : Nat := 7 + 11",
+        ),
+        (
+            "Lean.Parser.Command.openScoped",
+            "open scoped SourceScoped\ndef wouldPass : Nat := 7 + 11",
+        ),
+        (
+            "Lean.Parser.Command.openScoped",
+            "open scoped SourceScoped in\ndef wouldPass : Nat := 7 + 11",
+        ),
+        (
+            "Lean.Parser.Command.openSimple",
+            "open SourceScoped\ndef wouldPass : Nat := 7 + 11",
+        ),
+        (
+            "Lean.Parser.Command.openOnly",
+            "open Nat (succ)\ndef wouldPass : Nat := 7 + 11",
+        ),
+        (
+            "Lean.Parser.Command.in",
+            "open scoped SourceScoped in\ndef wouldPass : Nat := 7 + 11",
+        ),
+        (
+            "Lean.Parser.Command.in",
+            "variable (x : Nat + Bool) in\ndef wouldPass : Bool := x",
+        ),
+        (
+            "Lean.Parser.Command.set_option",
+            "set_option maxRecDepth 1024\ndef wouldPass : Nat := 7 + 11",
+        ),
+        (
+            "Lean.Parser.Command.set_option",
+            "set_option maxRecDepth 1024 in\ndef wouldPass : Nat := 7 + 11",
+        ),
+        (
+            "num",
+            "set_option maxRecDepth 1024\ndef wouldPass : Nat := 7 + 11",
+        ),
+        (
+            "num",
+            "set_option maxRecDepth 1024 in\ndef wouldPass : Nat := 7 + 11",
+        ),
+        // This string option is a parser fixture, not an admitted option row.
+        // Its active syntax macro must be refused before native option policy.
+        (
+            "str",
+            "set_option o \"text\"\ndef wouldPass : Nat := 7 + 11",
+        ),
+        (
+            "str",
+            "set_option o \"text\" in\ndef wouldPass : Nat := 7 + 11",
+        ),
+        (
+            "false",
+            "set_option autoLift false in\ndef wouldPass : Nat := 7 + 11",
         ),
     ] {
-        let source = format!("def prefix : Nat := 7 + 11\n{tail}\n");
+        let (engine, registry) =
+            artifact_fixture_with_extra_rows(&[(kind, "SourceLibrary.diagnostic", None)]);
+        let before = engine.logical_root(&KVMap::new());
         let refused = batch(
             &engine,
             &registry,
@@ -546,19 +736,216 @@ fn imported_macro_batches_refuse_unexpanded_syntax_bearing_scope_controls() {
             None,
         );
         let Outcome::Complete(Err(error)) = &refused.outcome else {
-            panic!("{refused:?}")
+            panic!("{kind}: {refused:?}")
         };
         assert!(
-            matches!(error, SourceCheckError::ImportedMacro { file: 0, command: position, error, .. }
-                if *position == command && matches!(error.as_ref(), SourceMacroError::ScopeSyntax)),
-            "{refused:?}"
+            matches!(error, SourceCheckError::ImportedMacro { error, .. }
+                if matches!(error.as_ref(), SourceMacroError::ScopeControl { kind: actual } if actual == &name(kind))),
+            "{kind}: {refused:?}"
         );
         assert_eq!(error.disposition(), ("capability", false, 5));
-        assert_eq!(refused.attempts.len(), 2);
+        assert!(refused.attempts.is_empty());
         assert!(refused.state.is_none());
         assert_eq!(engine.logical_root(&KVMap::new()), before);
-        assert!(!engine.environment().contains(&name("prefix")));
-        assert!(!engine.environment().contains(&name("replacement")));
+        assert!(!engine.environment().contains(&name("wouldPass")));
+        assert!(!engine.environment().contains(&name("Client.wouldPass")));
+    }
+}
+
+#[test]
+fn imported_macro_batches_expand_executable_attributes_before_validating_their_effects() {
+    let (engine, registry) = artifact_fixture();
+    let before = engine.logical_root(&KVMap::new());
+    let source = b"axiom original : Bool + Nat\n\
+        def replacement : Nat := 23\n\
+        attribute [implemented_by replacement] original";
+    let report = batch(
+        &engine,
+        &registry,
+        &[source],
+        MacroTreeLimits::default(),
+        None,
+    );
+    let checked = succeeded(&report);
+    // The root macro runs, declines replacement, and leaves a real attribute
+    // command to validate. Its work/state cannot disappear at the control seam.
+    assert_eq!(report.attempts.len(), 3);
+    assert_eq!(
+        report.attempts[2].declaration,
+        name("SourceLibrary.attributeProbe")
+    );
+    assert_eq!(report.state.as_ref().unwrap().macro_scope, 20);
+    assert_eq!(
+        fln_elab::implemented_by::ImplementedByTable::read(checked.engine.environment())
+            .unwrap()
+            .get(&name("original")),
+        Some(&name("replacement")),
+    );
+    assert_declared_value(&checked.engine, "original", 23);
+    assert_eq!(engine.logical_root(&KVMap::new()), before);
+
+    let invalid = batch(
+        &engine,
+        &registry,
+        &[b"axiom original : Bool + Nat\ndef replacement : Bool := true\nattribute [implemented_by replacement] original"],
+        MacroTreeLimits::default(),
+        None,
+    );
+    assert!(
+        matches!(invalid.outcome, Outcome::Complete(Err(_))),
+        "{invalid:?}"
+    );
+    assert_eq!(invalid.attempts.len(), 3);
+    assert!(invalid.state.is_none());
+    assert!(!engine.environment().contains(&name("original")));
+    assert_eq!(engine.logical_root(&KVMap::new()), before);
+}
+
+#[test]
+fn imported_macro_batches_expand_mutual_signatures_and_bodies_before_atomic_admission() {
+    let (engine, registry) = artifact_fixture();
+    let before = engine.logical_root(&KVMap::new());
+    let source = "-- λ🦀\n\
+        namespace Group\nmutual\n  def first : Bool + Nat := 3 + second\n  def second : Bool + Nat := 7 + 11\n\
+        end\nexample : first = 11 := by rfl\nend Group\n"
+        .replace('\n', "\r\n");
+    let report = batch(
+        &engine,
+        &registry,
+        &[source.as_bytes()],
+        MacroTreeLimits::default(),
+        None,
+    );
+    let checked = succeeded(&report);
+    assert_declared_value(&checked.engine, "Group.first", 11);
+    assert_declared_value(&checked.engine, "Group.second", 11);
+    assert_eq!(report.attempts.len(), 8);
+    assert_eq!(report.state.as_ref().unwrap().macro_scope, 25);
+    assert_eq!(engine.logical_root(&KVMap::new()), before);
+
+    let invalid = batch(
+        &engine,
+        &registry,
+        &[br"def checkedPrefix : Nat := 5
+mutual
+  def first : Bool + Nat := 3 + second
+  def second : Bool + Nat := 7 + true
+end"],
+        MacroTreeLimits::default(),
+        None,
+    );
+    assert!(
+        matches!(invalid.outcome, Outcome::Complete(Err(_))),
+        "{invalid:?}"
+    );
+    assert_eq!(invalid.attempts.len(), 8);
+    assert!(invalid.state.is_none());
+    for declaration in ["checkedPrefix", "first", "second"] {
+        assert!(!engine.environment().contains(&name(declaration)));
+    }
+    assert_eq!(engine.logical_root(&KVMap::new()), before);
+}
+
+#[test]
+fn imported_macro_batches_expand_mutually_inductive_constructor_types() {
+    let (engine, registry) = artifact_fixture();
+    let before = engine.logical_root(&KVMap::new());
+    let source = br"mutual
+  inductive MacroTree where
+    | leaf (value : Bool + Nat)
+    | node (children : MacroForest)
+  inductive MacroForest where
+    | nil
+    | cons (tag : Bool + Nat) (head : MacroTree) (tail : MacroForest)
+end
+def unpack (tree : MacroTree) : Nat := match tree with
+  | MacroTree.leaf n => n
+  | MacroTree.node _ => 0
+example : unpack (MacroTree.leaf 11) = 11 := by rfl
+";
+    let report = batch(
+        &engine,
+        &registry,
+        &[source],
+        MacroTreeLimits::default(),
+        None,
+    );
+    let checked = succeeded(&report);
+    for declaration in ["MacroTree", "MacroForest"] {
+        assert!(
+            matches!(checked.engine.environment().find(&name(declaration)),
+            Some(ConstantInfo::Induct(info)) if info.all.len() == 2)
+        );
+        assert!(
+            matches!(checked.engine.environment().find(&name(&format!("{declaration}.rec"))),
+            Some(ConstantInfo::Rec(info)) if info.num_motives == 2)
+        );
+    }
+    assert_declared_value(&checked.engine, "unpack (MacroTree.leaf 11)", 11);
+    assert_eq!(report.attempts.len(), 4);
+    assert_eq!(report.state.as_ref().unwrap().macro_scope, 21);
+    assert_eq!(engine.logical_root(&KVMap::new()), before);
+}
+
+#[test]
+fn imported_macro_controls_and_mutual_members_share_one_budget() {
+    let (engine, registry) = artifact_fixture();
+    let before = engine.logical_root(&KVMap::new());
+    let source = br"variable (x : Bool + Nat)
+axiom checkedPrefix : Bool + Nat
+def replacement : Nat := 13
+attribute [implemented_by replacement] checkedPrefix
+mutual
+  def first : Bool + Nat := 3 + second
+  def second : Bool + Nat := 7 + 11
+end";
+    let report = batch(
+        &engine,
+        &registry,
+        &[source],
+        MacroTreeLimits::default(),
+        None,
+    );
+    let checked = succeeded(&report);
+    assert_eq!(report.attempts.len(), 13);
+    assert_eq!(report.state.as_ref().unwrap().macro_scope, 30);
+    assert_declared_value(&checked.engine, "first", 11);
+    assert_declared_value(&checked.engine, "checkedPrefix", 13);
+    let mut exact = MacroTreeLimits::default();
+    exact.dispatch.max_attempts = report.attempts.len() as u64;
+    exact.dispatch.execution.vm.max_steps = report.completed_vm_usage.steps;
+    exact.max_visits = report.tree_usage.visits;
+    exact.generation.max_nodes = report.tree_usage.generated_nodes;
+    exact.generation.max_bytes = report.tree_usage.generated_bytes;
+    let replay = batch(&engine, &registry, &[source], exact, None);
+    assert_eq!(
+        succeeded(&replay).result_logical_root,
+        checked.result_logical_root
+    );
+    for resource in ["attempts", "steps", "visits", "nodes", "bytes"] {
+        let mut limits = exact;
+        match resource {
+            "attempts" => limits.dispatch.max_attempts -= 1,
+            "steps" => limits.dispatch.execution.vm.max_steps -= 1,
+            "visits" => limits.max_visits -= 1,
+            "nodes" => limits.generation.max_nodes -= 1,
+            "bytes" => limits.generation.max_bytes -= 1,
+            _ => unreachable!(),
+        }
+        let stopped = batch(&engine, &registry, &[source], limits, None);
+        assert!(
+            matches!(stopped.outcome, Outcome::Inconclusive(_)),
+            "{resource}: {stopped:?}"
+        );
+        assert!(
+            stopped.attempts.len() >= 5,
+            "{resource}: controls and prefix completed"
+        );
+        assert!(stopped.state.is_none());
+        assert_eq!(engine.logical_root(&KVMap::new()), before);
+        for declaration in ["checkedPrefix", "replacement", "first", "second"] {
+            assert!(!engine.environment().contains(&name(declaration)));
+        }
     }
 }
 
@@ -577,7 +964,7 @@ fn imported_macro_batches_cancel_after_a_checked_prefix_without_returning_its_st
     }
     let (engine, registry) = artifact_fixture();
     let before = engine.logical_root(&KVMap::new());
-    let prefix = b"def prefix : Nat := 7 + 11".as_slice();
+    let prefix = b"def checkedPrefix : Nat := 7 + 11".as_slice();
     let counter = Polls {
         count: Cell::new(0),
         stop_at: usize::MAX,
@@ -609,7 +996,7 @@ fn imported_macro_batches_cancel_after_a_checked_prefix_without_returning_its_st
     assert!(stopped.completed_vm_usage.steps >= first.completed_vm_usage.steps);
     assert!(stopped.state.is_none());
     assert_eq!(engine.logical_root(&KVMap::new()), before);
-    assert!(!engine.environment().contains(&name("prefix")));
+    assert!(!engine.environment().contains(&name("checkedPrefix")));
     let recovered = batch(
         &engine,
         &registry,

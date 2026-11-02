@@ -92,6 +92,12 @@ pub enum SourceInferenceError {
     Deriving(deriving::DerivingError),
     EvaluationPrinting(evaluation::PrintingError),
     UnknownConstant(Name),
+    /// Explicit quotation metadata cannot be replaced by lookup of its spelling.
+    /// Unsupported metadata is a capability boundary, never an alternate resolution.
+    PreresolvedReference {
+        name: Name,
+        feature: &'static str,
+    },
     /// An auto-bound implicit's type mentions a binder written after it (the pin's
     /// `addAutoBoundImplicits`, Lean/Elab/Term/TermElabM.lean:2044-2058).
     AutoBoundDependsOnExplicit {
@@ -327,6 +333,11 @@ impl std::fmt::Display for SourceInferenceError {
             Self::UnknownConstant(name) => {
                 write!(f, "Unknown identifier `{}`", name.to_display_string())
             }
+            Self::PreresolvedReference { name, feature } => write!(
+                f,
+                "pre-resolved identifier `{}` requires {feature}",
+                name.to_display_string()
+            ),
             Self::UnknownMemberConstant(name) => {
                 write!(f, "Unknown constant `{}`", name.to_display_string())
             }
@@ -1218,12 +1229,20 @@ impl Context {
             // A template's name (macro-scoped) is a global once its scopes are erased, unless a
             // prefix of it, with its scopes, names a local the template bound.
             let hygienic = name.has_macro_scopes();
-            if hygienic && let Some(term) = self.hygienic_record_field(name, expected, syntax)? {
+            let preresolved = matches!(syntax, Syntax::Ident { preresolved, .. }
+                if preresolved.iter().any(|entry| matches!(entry, fln_syntax::tree::Preresolved::Decl { .. })));
+            if (hygienic || preresolved)
+                && !scope::is_root_qualified(name)
+                && let Some(term) = self.hygienic_record_field(name, expected, syntax)?
+            {
                 return Ok(term);
             }
-            let resolved = self
-                .resolve_source_name(name)?
-                .unwrap_or_else(|| name.erase_macro_scopes());
+            let (resolved, explicit_target) = if column.is_some() && !preresolved {
+                (self.resolve_source_name(name)?, false)
+            } else {
+                self.resolve_identifier_name(syntax)?
+            };
+            let resolved = resolved.unwrap_or_else(|| name.erase_macro_scopes());
             // The fallback to the name as written must not reach a seed constant the pin
             // does not have: resolution already refused it (`source_unreachable`), and the
             // direct lookup below would otherwise find it anyway.
@@ -1234,6 +1253,7 @@ impl Context {
             }
             if !scope::is_root_qualified(name)
                 && !hygienic
+                && !explicit_target
                 && let Some(local) = self.txn.lctx.find_by_user_name(&resolved)
             {
                 return Ok(Typed {
@@ -2030,6 +2050,7 @@ impl Context {
     ) -> Result<Typed, NatDefinitionElabError> {
         // An application whose argument the pin postpones and then refuses (`pattern_typing`,
         // R1 of franken_lean-z8j.1.6.3).
+        self.check_preresolved_syntax(syntax)?;
         if let Some(expected) = &expected {
             self.check_application_typing(syntax, expected)?;
         }
@@ -6109,6 +6130,7 @@ fn definition_elaboration(
     context: &mut Context,
     generated_name: Option<Name>,
 ) -> Result<Declaration, NatDefinitionElabError> {
+    context.check_preresolved_syntax(syntax)?;
     let expanded = context.expand_match_alternatives(syntax)?;
     let syntax = expanded.as_ref();
     let declaration = expect_node(
@@ -7291,12 +7313,13 @@ impl Context {
         if self.txn.lctx.find_by_user_name(name).is_some() {
             return Ok(None);
         }
-        let Ok(Some(resolved)) = self.resolve_source_candidates(name)? else {
+        let (resolved, explicit_target) = self.resolve_unambiguous_identifier_name(syntax)?;
+        let Some(resolved) = resolved else {
             return Ok(None);
         };
         if crate::seed::protected::source_unreachable(&resolved)
             || !self.txn.env.contains(&resolved)
-            || self.txn.lctx.find_by_user_name(&resolved).is_some()
+            || (!explicit_target && self.txn.lctx.find_by_user_name(&resolved).is_some())
         {
             return Ok(None);
         }

@@ -389,22 +389,17 @@ mod tests {
         static PIN: OnceLock<Engine> = OnceLock::new();
         PIN.get_or_init(|| {
             let module = name("Init.Prelude");
+            let [exported, server, private] = crate::tests::pinned_prelude_chain();
             Engine::builder()
                 .build_empty()
                 .import_olean_modules_for_source(
                     &[OleanModuleInput {
                         name: &module,
-                        // File-relative, as fln-olean's source_extensions test includes the
-                        // same fixture: compile-time bytes need no compile-time tree root.
-                        artifact: include_bytes!(
-                            "../../../../fln-conformance/fixtures/tag_attributes/prelude.olean"
-                        ),
-                        server_artifact: Some(include_bytes!(
-                            "../../../../fln-conformance/fixtures/tag_attributes/prelude.olean.server"
-                        )),
-                        private_artifact: Some(include_bytes!(
-                            "../../../../fln-conformance/fixtures/tag_attributes/prelude.olean.private"
-                        )),
+                        // The mandatory fixture is read from the invoking tree,
+                        // exactly as the other pinned Prelude tests read it.
+                        artifact: &exported,
+                        server_artifact: Some(&server),
+                        private_artifact: Some(&private),
                     }],
                     std::slice::from_ref(&module),
                     &KVMap::new(),

@@ -1387,7 +1387,7 @@ impl Model<'_> {
             return Ok(None);
         }
         let [
-            Syntax::Ident { val, .. },
+            head @ Syntax::Ident { val, .. },
             Syntax::Node {
                 args: arguments, ..
             },
@@ -1399,7 +1399,7 @@ impl Model<'_> {
             return Ok(None);
         }
         // An ambiguous or unknown head is the elaborator's to report, in the pin's words.
-        let Ok(Some(name)) = self.cx.resolve_source_name(val) else {
+        let (Some(name), _) = self.cx.resolve_unambiguous_identifier_name(head)? else {
             return Ok(None);
         };
         let Some(constant) = self.cx.txn.env.find(&name).cloned() else {
@@ -1553,9 +1553,9 @@ impl Model<'_> {
                 && let Syntax::Node {
                     args: annotation, ..
                 } = &args[3]
-                && let [Syntax::Ident { val, .. }] = annotation.as_slice()
+                && let [head @ Syntax::Ident { val, .. }] = annotation.as_slice()
                 && self.cx.txn.lctx.find_by_user_name(val).is_none()
-                && let Ok(Some(name)) = self.cx.resolve_source_name(val)
+                && let (Some(name), _) = self.cx.resolve_unambiguous_identifier_name(head)?
                 && let Some(info) = self.inductive(&name)
                 && info.num_params == 0
                 && info.num_indices == 0
@@ -1578,6 +1578,10 @@ impl Model<'_> {
         }
         let display = val.to_display_string();
         if display == "true" || display == "false" {
+            let (_, explicit_target) = self.cx.resolve_identifier_name(syntax)?;
+            if explicit_target {
+                return Ok(Argument::Other);
+            }
             let bool_ = Name::from_components(["Bool"]);
             return Ok(Argument::Typed(
                 Expr::const_(bool_.append_core(val), vec![]),

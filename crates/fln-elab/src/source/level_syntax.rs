@@ -292,7 +292,8 @@ impl Context {
             return Err(error(LevelSyntaxError::LocalUniverseArguments));
         }
         let name = &self
-            .resolve_source_name(name)?
+            .resolve_identifier_name(head)?
+            .0
             .unwrap_or_else(|| name.clone());
         let levels = expect_null_args(levels, "explicit universe list")?;
         if levels.is_empty() || levels.len() % 2 == 0 {

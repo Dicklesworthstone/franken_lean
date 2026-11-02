@@ -1386,6 +1386,23 @@ pub(crate) enum ScopedCommandSyntax {
 pub(crate) fn parse_scoped_command(
     source: &[u8],
 ) -> Result<ScopedCommandSyntax, EngineExecutionError> {
+    parse_scoped_command_with_expansion(source, true)
+}
+
+/// Parse the same command forms without running native notation templates.
+/// An external expander owns the supplied syntax from this boundary onward.
+/// Mutual members retain offsets in the normalized view of the whole group;
+/// definitions and examples also retain their original source metadata.
+pub(crate) fn parse_scoped_command_without_expansion(
+    source: &[u8],
+) -> Result<ScopedCommandSyntax, EngineExecutionError> {
+    parse_scoped_command_with_expansion(source, false)
+}
+
+fn parse_scoped_command_with_expansion(
+    source: &[u8],
+    expand_templates: bool,
+) -> Result<ScopedCommandSyntax, EngineExecutionError> {
     if let Some(members) = fln_parse::command_scope::mutual::parse(source)
         .map_err(DefinitionFrontendError::Parse)
         .map_err(EngineExecutionError::Frontend)?
@@ -1395,12 +1412,24 @@ pub(crate) fn parse_scoped_command(
     // Under an entered grammar (`source_check::grammar`), the file's notations are expanded
     // before the elaborator reads the tree.
     let parsed = fln_parse::parse_definition(source)
-        .and_then(fln_parse::ParsedDefinition::expanded)
+        .and_then(|parsed| {
+            if expand_templates {
+                parsed.expanded()
+            } else {
+                Ok(parsed)
+            }
+        })
         .map_err(DefinitionFrontendError::Parse)
         .map_err(EngineExecutionError::Frontend)?;
     if fln_elab::source::scope::is_example(parsed.syntax()) {
         let parsed = fln_parse::parse_source_command(source)
-            .and_then(fln_parse::ParsedSourceCommand::expanded)
+            .and_then(|parsed| {
+                if expand_templates {
+                    parsed.expanded()
+                } else {
+                    Ok(parsed)
+                }
+            })
             .map_err(DefinitionFrontendError::Parse)
             .map_err(EngineExecutionError::Frontend)?;
         return Ok(ScopedCommandSyntax::Example(parsed));
@@ -1584,6 +1613,106 @@ mod tests {
     use fln_elab::constraint::{ConstraintId, unify::UnificationError};
     use fln_elab::source::SourceInferenceError;
     use fln_kernel::verdict::{Consumption, RejectClass, Verdict};
+
+    #[test]
+    fn raw_command_parser_preserves_templates_for_the_external_expander() {
+        use crate::source_check::grammar::{Resolution, SourceGrammar};
+        use fln_syntax::tree::Syntax;
+
+        let has_atom = |syntax: &Syntax, expected: &str| {
+            let mut pending = vec![syntax];
+            while let Some(syntax) = pending.pop() {
+                match syntax {
+                    Syntax::Node { args, .. } => pending.extend(args),
+                    Syntax::Atom { val, .. } if val == expected => return true,
+                    _ => {}
+                }
+            }
+            false
+        };
+        let mut grammar = SourceGrammar::implicit_init();
+        assert!(
+            grammar
+                .declare(b"notation \"picked!\" => 7", |_| Resolution::Nothing)
+                .unwrap()
+        );
+        for source in [
+            "-- λ🦀\r\ndef chosen : Nat := picked!\r\n",
+            "-- λ🦀\r\nexample : Nat := picked!\r\n",
+        ] {
+            let raw = grammar
+                .enter(|| parse_scoped_command_without_expansion(source.as_bytes()))
+                .unwrap();
+            let ordinary = grammar
+                .enter(|| parse_scoped_command(source.as_bytes()))
+                .unwrap();
+            let (raw_syntax, ordinary_syntax) = match (&raw, &ordinary) {
+                (
+                    ScopedCommandSyntax::Definition(raw),
+                    ScopedCommandSyntax::Definition(ordinary),
+                ) => {
+                    assert_eq!(raw.reconstruct_original(), source.as_bytes());
+                    assert_eq!(raw.source_view(), ordinary.source_view());
+                    assert_eq!(raw.epilogue(), ordinary.epilogue());
+                    (raw.syntax(), ordinary.syntax())
+                }
+                (ScopedCommandSyntax::Example(raw), ScopedCommandSyntax::Example(ordinary)) => {
+                    assert_eq!(raw.reconstruct_original(), source.as_bytes());
+                    assert_eq!(raw.source_view(), ordinary.source_view());
+                    assert_eq!(raw.epilogue(), ordinary.epilogue());
+                    (raw.syntax(), ordinary.syntax())
+                }
+                _ => panic!("raw parsing must preserve the ordinary command classification"),
+            };
+            assert!(has_atom(raw_syntax, "picked!"));
+            assert!(!has_atom(ordinary_syntax, "picked!"));
+            assert!(has_atom(ordinary_syntax, "7"));
+            assert_ne!(raw_syntax, ordinary_syntax);
+        }
+    }
+
+    #[test]
+    fn raw_mutual_members_share_the_whole_groups_normalized_source_coordinates() {
+        use fln_syntax::source::{SourceInfo, SourceText};
+        use fln_syntax::tree::Syntax;
+        use fln_syntax::view::SourceView;
+
+        let source =
+            "-- λ🦀\r\nmutual\r\n  def first : Nat := 7\r\n  def second : Nat := first\r\nend\r\n";
+        let ScopedCommandSyntax::Mutual(raw) =
+            parse_scoped_command_without_expansion(source.as_bytes()).unwrap()
+        else {
+            panic!("raw parsing must retain the complete mutual group");
+        };
+        let ScopedCommandSyntax::Mutual(ordinary) =
+            parse_scoped_command(source.as_bytes()).unwrap()
+        else {
+            panic!("ordinary parsing must retain the complete mutual group");
+        };
+        assert_eq!(raw, ordinary);
+        assert_eq!(raw.len(), 2);
+        let view = SourceView::of(&SourceText::from_utf8(source.as_bytes()).unwrap());
+        let mut pending = vec![&raw[1]];
+        let mut named_member = false;
+        while let Some(syntax) = pending.pop() {
+            match syntax {
+                Syntax::Node { args, .. } => pending.extend(args),
+                Syntax::Ident {
+                    info, raw_val, val, ..
+                } if *val == Name::from_components(["second"]) => {
+                    let SourceInfo::Original { pos, .. } = info else {
+                        panic!("a parsed member name retains its original position");
+                    };
+                    assert_eq!(view.normalized().span_str(*raw_val), Some("second"));
+                    assert_eq!(pos.0, view.normalized().as_str().find("second").unwrap());
+                    assert_eq!(view.to_original(*pos).0, source.find("second").unwrap());
+                    named_member = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(named_member);
+    }
 
     #[test]
     fn expanded_syntax_in_the_default_scope_never_reparses_original_source() {

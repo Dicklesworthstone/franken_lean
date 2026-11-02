@@ -537,9 +537,11 @@ fn tree_self_expansion_diagnostics_malformed_output_and_cancellation_do_not_retu
 
 #[test]
 fn tree_assembled_siblings_share_the_output_size_limit_and_deep_trees_use_no_host_recursion() {
-    let module = checked("User", &[owner("User.grow")], &[]);
-    let rows = journal(&[("grow", "User.grow", None)]);
-    let mut grow = function("User.grow", Behavior::Identity);
+    // Keep state-name conversion below the 100-byte ceiling, so the negative
+    // control reaches the assembled output rather than stopping on MacroState.
+    let module = checked("User", &[owner("g")], &[]);
+    let rows = journal(&[("grow", "g", None)]);
+    let mut grow = function("g", Behavior::Identity);
     let IrDecl::Function { body, .. } = &mut grow else {
         unreachable!()
     };

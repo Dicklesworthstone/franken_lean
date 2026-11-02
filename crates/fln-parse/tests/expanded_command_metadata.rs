@@ -3,7 +3,7 @@
 #![forbid(unsafe_code)]
 
 use fln_core::name::Name;
-use fln_parse::{SourceCommandKind, parse_source_command};
+use fln_parse::{SourceCommandKind, parse_definition, parse_source_command};
 use fln_syntax::source::SourceInfo;
 use fln_syntax::tree::{Preresolved, Syntax};
 
@@ -148,6 +148,77 @@ fn declaration_transfer_retains_expanded_syntax_and_original_source_metadata() {
             parse_source_command(source)
                 .unwrap()
                 .into_definition()
+                .is_none()
+        );
+    }
+}
+
+#[test]
+fn expanded_definition_retains_source_metadata_without_replaying_its_tree() {
+    let source = "-- λ🦀\r\nprivate def chosen : Nat := value\r\n";
+    let parsed = parse_definition(source.as_bytes()).unwrap();
+    let source_view = parsed.source_view().clone();
+    let epilogue = parsed.epilogue();
+    let mut syntax = parsed.syntax().clone();
+    replace_identifier_metadata(&mut syntax, "value");
+    assert_ne!(&syntax, parsed.syntax());
+
+    let definition = parsed.with_expanded_syntax(syntax.clone()).unwrap();
+    assert_eq!(definition.syntax(), &syntax);
+    assert_eq!(definition.source_view(), &source_view);
+    assert_eq!(definition.epilogue(), epilogue);
+    assert_eq!(definition.reconstruct_original(), source.as_bytes());
+}
+
+#[test]
+fn named_declaration_replacements_cannot_enter_anonymous_or_query_paths() {
+    let definition = parse_definition(b"def chosen : Nat := 7").unwrap();
+    let command = parse_source_command(b"def chosen : Nat := 7").unwrap();
+    for source in [b"example : Nat := 7".as_slice(), b"#check Nat", b"#eval 7"] {
+        let replacement = parse_source_command(source).unwrap().syntax().clone();
+        assert!(
+            definition
+                .clone()
+                .with_expanded_syntax(replacement.clone())
+                .is_none(),
+            "named definition replacement must preserve the declaration boundary"
+        );
+        assert!(
+            command
+                .clone()
+                .with_expanded_declaration(replacement)
+                .is_none(),
+            "named command replacement must preserve the declaration boundary"
+        );
+    }
+    assert!(
+        parse_definition(b"example : Nat := 7")
+            .unwrap()
+            .with_expanded_syntax(definition.syntax().clone())
+            .is_none(),
+        "an example parsed through the broad definition parser stays anonymous"
+    );
+
+    for add_child in [false, true] {
+        let mut malformed = definition.syntax().clone();
+        let Syntax::Node { args, .. } = &mut malformed else {
+            panic!("canonical declaration");
+        };
+        if add_child {
+            args.push(Syntax::Missing);
+        } else {
+            args.pop();
+        }
+        assert!(
+            definition
+                .clone()
+                .with_expanded_syntax(malformed.clone())
+                .is_none()
+        );
+        assert!(
+            command
+                .clone()
+                .with_expanded_declaration(malformed)
                 .is_none()
         );
     }

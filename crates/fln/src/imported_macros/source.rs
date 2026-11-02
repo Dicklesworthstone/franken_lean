@@ -29,7 +29,9 @@ use fln_core::name::Name;
 use fln_core::options::KVMap;
 use fln_core::outcome::{Inconclusive, Outcome, ResourceUsage};
 use fln_parse::{ParsedSourceCommand, SourceCommandKind};
+use fln_syntax::source::SourceText;
 use fln_syntax::tree::Syntax;
+use fln_syntax::view::SourceView;
 use fln_vm::interpreter::{CancellationProbe, ExecutionUsage};
 use fln_vm::macro_native::MacroLookup;
 
@@ -70,7 +72,9 @@ pub enum SourceMacroError {
     DeclarationRequired,
     ExampleRequired,
     TemplateGrammar,
-    ScopeSyntax,
+    ScopeControl {
+        kind: Name,
+    },
 }
 
 impl std::fmt::Display for SourceMacroError {
@@ -113,9 +117,10 @@ impl std::fmt::Display for SourceMacroError {
                 f,
                 "imported macro file checking requires a grammar without source-declared templates"
             ),
-            Self::ScopeSyntax => write!(
+            Self::ScopeControl { kind } => write!(
                 f,
-                "imported macro file checking requires macro expansion for syntax-bearing scope controls"
+                "source macro adapter cannot apply an expanded scope control of kind {}",
+                kind.to_display_string()
             ),
         }
     }
@@ -255,6 +260,84 @@ impl<'a> FileSession<'a> {
             .then(|| Inconclusive::cancelled("imported macro source batch"))
     }
 
+    /// Native scope transitions do not interpret arbitrary expanded command
+    /// trees. Refuse an active registration instead of silently bypassing it,
+    /// including transitions introduced by an `in` wrapper.
+    pub(crate) fn check_native_control(
+        &self,
+        registry: &RegisteredMacros,
+        control: &fln_parse::command_scope::ScopeCommand,
+    ) -> Result<(), SourceMacroError> {
+        use fln_parse::command_scope::ScopeCommand;
+        let command = match control {
+            ScopeCommand::Variable(_) | ScopeCommand::Executable(_) | ScopeCommand::Trivia => {
+                return Ok(());
+            }
+            ScopeCommand::Namespace(_) => "namespace",
+            ScopeCommand::Section(_) | ScopeCommand::SectionWithModifiers { .. } => "section",
+            ScopeCommand::End(_) => "end",
+            ScopeCommand::Open(_)
+            | ScopeCommand::OpenScoped(_)
+            | ScopeCommand::OpenExplicit { .. } => "open",
+            ScopeCommand::Universe(_) => "universe",
+            ScopeCommand::Include(_) => "include",
+            ScopeCommand::Omit(_) => "omit",
+            ScopeCommand::Simp(_) | ScopeCommand::Instance(_) | ScopeCommand::Reducibility(_) => {
+                "attribute"
+            }
+            ScopeCommand::OpenIn { .. }
+            | ScopeCommand::SetOptionIn { .. }
+            | ScopeCommand::In { .. } => "in",
+            ScopeCommand::SetOption { .. } => "set_option",
+            ScopeCommand::Export { .. } => "export",
+            ScopeCommand::Exit => "exit",
+            ScopeCommand::GuardMsgs { .. } => return Ok(()), // Already refused by this front door.
+        };
+        let kind = Name::from_components(["Lean", "Parser", "Command", command]);
+        if registry.declarations(&kind).next().is_some() {
+            return Err(SourceMacroError::ScopeControl { kind });
+        }
+        // `open` is a wrapper around its actual open declaration. Native
+        // lowering must not silently discard a macro on that child either.
+        // Inspect only the head of an `in` wrapper, never its pending body.
+        let nested: &[&str] = match control {
+            ScopeCommand::Open(_) => &["openSimple"],
+            ScopeCommand::OpenScoped(_) => &["openScoped"],
+            ScopeCommand::OpenExplicit { .. } => &["openOnly"],
+            ScopeCommand::OpenIn { scoped: true, .. } => &["open", "openScoped"],
+            ScopeCommand::OpenIn { scoped: false, .. } => &["open", "openSimple"],
+            ScopeCommand::SetOptionIn { .. } => &["set_option"],
+            _ => &[],
+        };
+        for command in nested {
+            let kind = Name::from_components(["Lean", "Parser", "Command", command]);
+            if registry.declarations(&kind).next().is_some() {
+                return Err(SourceMacroError::ScopeControl { kind });
+            }
+        }
+        // The parser's optionValue alternative emits a bare literal node or
+        // boolean atom, without an optionValue wrapper.
+        let value_kind = match control {
+            ScopeCommand::SetOption { value, .. } | ScopeCommand::SetOptionIn { value, .. } => {
+                match value {
+                    fln_core::options::DataValue::OfNat(_) => Some("num"),
+                    fln_core::options::DataValue::OfString(_) => Some("str"),
+                    fln_core::options::DataValue::OfBool(true) => Some("true"),
+                    fln_core::options::DataValue::OfBool(false) => Some("false"),
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        if let Some(value_kind) = value_kind {
+            let kind = Name::from_components([value_kind]);
+            if registry.declarations(&kind).next().is_some() {
+                return Err(SourceMacroError::ScopeControl { kind });
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn expand_command(
         &mut self,
         engine: &Engine,
@@ -262,6 +345,157 @@ impl<'a> FileSession<'a> {
         source: &[u8],
         scope: &fln_elab::source::scope::SourceScope,
     ) -> Outcome<Result<crate::source_records::ScopedCommandSyntax, SourceMacroError>> {
+        use crate::source_records::ScopedCommandSyntax;
+        match source_preflight(engine, registry, source, self.limits, self.cancellation) {
+            Outcome::Complete(Ok(())) => {}
+            Outcome::Complete(Err(error)) => return Outcome::Complete(Err(error)),
+            Outcome::Inconclusive(reason) => return Outcome::Inconclusive(reason),
+            Outcome::InternalFault(fault) => return Outcome::InternalFault(fault),
+        }
+        let parsed = match crate::source_records::parse_scoped_command_without_expansion(source) {
+            Ok(parsed) => parsed,
+            Err(error) => return frontend(error),
+        };
+        match parsed {
+            ScopedCommandSyntax::Mutual(mut members) => {
+                let view = match source_view(source) {
+                    Ok(view) => view,
+                    Err(error) => return Outcome::Complete(Err(error)),
+                };
+                // Mutual members see the group's original predecessor, while
+                // macro state and budgets advance in their source order. The
+                // whole group is admitted only after all expansions succeed.
+                for member in &mut members {
+                    match self.expand_syntax(engine, registry, view.normalized(), member, scope) {
+                        Outcome::Complete(Ok(syntax)) => {
+                            if !matches!(&syntax, Syntax::Node { kind, args, .. }
+                                if *kind == Name::from_components(["Lean", "Parser", "Command", "declaration"])
+                                    && args.len() == 2)
+                                || fln_elab::source::scope::is_example(&syntax)
+                            {
+                                return wrong_command(SourceCommandKind::Definition);
+                            }
+                            *member = syntax;
+                        }
+                        Outcome::Complete(Err(error)) => return Outcome::Complete(Err(error)),
+                        Outcome::Inconclusive(reason) => return Outcome::Inconclusive(reason),
+                        Outcome::InternalFault(fault) => return Outcome::InternalFault(fault),
+                    }
+                }
+                Outcome::Complete(Ok(ScopedCommandSyntax::Mutual(members)))
+            }
+            ScopedCommandSyntax::Example(parsed) => self
+                .expand_syntax(
+                    engine,
+                    registry,
+                    parsed.source_view().normalized(),
+                    parsed.syntax(),
+                    scope,
+                )
+                .map_complete(|result| {
+                    result.and_then(|syntax| {
+                        parsed
+                            .with_expanded_example(syntax)
+                            .map(ScopedCommandSyntax::Example)
+                            .ok_or(SourceMacroError::ExampleRequired)
+                    })
+                }),
+            ScopedCommandSyntax::Definition(parsed) => self
+                .expand_syntax(
+                    engine,
+                    registry,
+                    parsed.source_view().normalized(),
+                    parsed.syntax(),
+                    scope,
+                )
+                .map_complete(|result| {
+                    result.and_then(|syntax| {
+                        parsed
+                            .with_expanded_syntax(syntax)
+                            .map(ScopedCommandSyntax::Definition)
+                            .ok_or(SourceMacroError::DeclarationRequired)
+                    })
+                }),
+        }
+    }
+
+    /// Expand the parser's existing binder/attribute tree, using its original
+    /// normalized backing source. Native namespace and option controls retain
+    /// their ordinary scope semantics; they do not enter command-macro dispatch.
+    pub(crate) fn expand_control(
+        &mut self,
+        engine: &Engine,
+        registry: &RegisteredMacros,
+        source: &[u8],
+        control: fln_parse::command_scope::ScopeCommand,
+        scope: &fln_elab::source::scope::SourceScope,
+    ) -> Outcome<Result<fln_parse::command_scope::ScopeCommand, SourceMacroError>> {
+        use fln_parse::command_scope::ScopeCommand;
+        let (syntax, variable) = match control {
+            ScopeCommand::Variable(syntax) => (syntax, true),
+            ScopeCommand::Executable(syntax) => (syntax, false),
+            other => return Outcome::Complete(Ok(other)),
+        };
+        match source_preflight(engine, registry, source, self.limits, self.cancellation) {
+            Outcome::Complete(Ok(())) => {}
+            Outcome::Complete(Err(error)) => return Outcome::Complete(Err(error)),
+            Outcome::Inconclusive(reason) => return Outcome::Inconclusive(reason),
+            Outcome::InternalFault(fault) => return Outcome::InternalFault(fault),
+        }
+        let view = match source_view(source) {
+            Ok(view) => view,
+            Err(error) => return Outcome::Complete(Err(error)),
+        };
+        // Variables were parsed into a binder-only control payload. Recover
+        // the original canonical command tree before expansion so a registered
+        // Command.variable macro participates, just as an attribute root does.
+        let variable_kind = Name::from_components(["Lean", "Parser", "Command", "variable"]);
+        let syntax = if variable {
+            match fln_parse::command_scope::trees::tree(source) {
+                Ok(Some(syntax)) => syntax,
+                Ok(None) => {
+                    return Outcome::Complete(Err(SourceMacroError::ScopeControl {
+                        kind: variable_kind,
+                    }));
+                }
+                Err(error) => {
+                    return frontend(EngineExecutionError::Frontend(
+                        crate::DefinitionFrontendError::Parse(error),
+                    ));
+                }
+            }
+        } else {
+            syntax
+        };
+        self.expand_syntax(engine, registry, view.normalized(), &syntax, scope)
+            .map_complete(|result| {
+                result.and_then(|mut syntax| {
+                    if variable {
+                        if let Syntax::Node { kind, args, .. } = &mut syntax
+                            && *kind == variable_kind
+                            && args.len() == 2
+                            && let Some(binders) = args.pop()
+                        {
+                            return Ok(ScopeCommand::Variable(binders));
+                        }
+                        Err(SourceMacroError::ScopeControl {
+                            kind: variable_kind,
+                        })
+                    } else {
+                        Ok(ScopeCommand::Executable(syntax))
+                    }
+                })
+            })
+    }
+
+    fn expand_syntax(
+        &mut self,
+        engine: &Engine,
+        registry: &RegisteredMacros,
+        source: &SourceText,
+        syntax: &Syntax,
+        scope: &fln_elab::source::scope::SourceScope,
+    ) -> Outcome<Result<Syntax, SourceMacroError>> {
         let mut remaining = self.limits;
         remaining.dispatch.max_attempts = remaining
             .dispatch
@@ -294,10 +528,10 @@ impl<'a> FileSession<'a> {
             },
             tree_usage: MacroTreeUsage::default(),
         };
-        let expanded = expand_in_scope(
+        let expanded = expand_syntax_in_scope(
             engine,
             source,
-            None,
+            syntax,
             scope,
             SourceMacroInvocation {
                 registry,
@@ -313,18 +547,9 @@ impl<'a> FileSession<'a> {
             return Outcome::Inconclusive(reason);
         }
         expanded.map_complete(|result| {
-            result.and_then(|(parsed, state)| {
-                let parsed = if parsed.kind() == SourceCommandKind::Example {
-                    crate::source_records::ScopedCommandSyntax::Example(parsed)
-                } else {
-                    crate::source_records::ScopedCommandSyntax::Definition(
-                        parsed
-                            .into_definition()
-                            .ok_or(SourceMacroError::DeclarationRequired)?,
-                    )
-                };
+            result.map(|(syntax, state)| {
                 self.state = state;
-                Ok(parsed)
+                syntax
             })
         })
     }
@@ -388,9 +613,11 @@ impl Engine {
     /// Attempts, VM steps, syntax visits and generated syntax share one budget
     /// across the complete batch. Each file restores the initial registry's
     /// activation, while MacroState continues in command order. No failed prefix
-    /// is published. Source-declared templates, syntax-bearing scope controls,
-    /// mutual blocks, artifact parser installation and module-system visibility
-    /// remain separate capabilities.
+    /// is published. Variable binders, executable attributes and mutual members
+    /// use the same expansion pass. Native scope controls retain their ordinary
+    /// semantics without command-root macro dispatch. Source-declared templates,
+    /// artifact parser installation and module-system visibility remain separate
+    /// capabilities.
     pub fn check_source_files_with_imported_macros(
         &self,
         sources: &[&[u8]],
@@ -639,32 +866,17 @@ fn expand_in_scope(
     invocation: SourceMacroInvocation<'_>,
     progress: &mut Progress,
 ) -> Outcome<Result<(ParsedSourceCommand, MacroState), SourceMacroError>> {
-    let SourceMacroInvocation {
-        registry,
-        context,
-        state,
-        lookup,
-        limits,
-        cancellation,
-    } = invocation;
-    if cancellation.is_some_and(CancellationProbe::is_cancelled) {
-        return Outcome::Inconclusive(Inconclusive::cancelled("before imported source macros"));
-    }
-    if let Err(error) = registry.validate_source_engine(engine) {
-        return Outcome::Complete(Err(SourceMacroError::Binding(Box::new(error))));
-    }
-    let allowed = limits.dispatch.execution.syntax.max_bytes;
-    if source.len() > allowed {
-        return Outcome::Inconclusive(
-            Inconclusive::resource(ResourceUsage {
-                reason: ResourceReason::Memory {
-                    limit_bytes: allowed as u64,
-                },
-                allowed: allowed as u64,
-                observed: source.len() as u64,
-            })
-            .with_progress("imported source macro bytes"),
-        );
+    match source_preflight(
+        engine,
+        invocation.registry,
+        source,
+        invocation.limits,
+        invocation.cancellation,
+    ) {
+        Outcome::Complete(Ok(())) => {}
+        Outcome::Complete(Err(error)) => return Outcome::Complete(Err(error)),
+        Outcome::Inconclusive(reason) => return Outcome::Inconclusive(reason),
+        Outcome::InternalFault(fault) => return Outcome::InternalFault(fault),
     }
     let parsed = match fln_parse::parse_source_command(source) {
         Ok(parsed) => parsed,
@@ -711,11 +923,115 @@ fn expand_in_scope(
     } else {
         &args[1]
     };
-    // Production source checks should not require the embedding caller to
-    // reconstruct the Macro.Methods environment capability that the Engine
-    // already owns. Bind a fresh borrowed provider to this immutable snapshot.
-    // Standalone source has no module identity; the anonymous module cannot
-    // accidentally select a foreign private declaration.
+    let resolve = crate::source_check::grammar::resolver(engine.environment(), scope);
+    let existing_global = expected == SourceCommandKind::Check
+        && parsed.query_is_identifier()
+        && matches!(input, Syntax::Ident { val, .. }
+            if matches!(resolve(val),
+                crate::source_check::grammar::Resolution::Global(_)
+                | crate::source_check::grammar::Resolution::Constructor(_)));
+    let (parsed, state) = if existing_global {
+        if invocation
+            .cancellation
+            .is_some_and(CancellationProbe::is_cancelled)
+        {
+            return Outcome::Inconclusive(Inconclusive::cancelled(
+                "after imported source macros, before source elaboration",
+            ));
+        }
+        (parsed, invocation.state)
+    } else {
+        // Parse once, then expand the term before any parser template could
+        // erase the node the imported table is meant to see.
+        let expanded = expand_syntax_in_scope(
+            engine,
+            parsed.source_view().normalized(),
+            input,
+            scope,
+            invocation,
+            progress,
+        );
+        let (syntax, state) = match expanded {
+            Outcome::Complete(Ok(result)) => result,
+            Outcome::Complete(Err(error)) => return Outcome::Complete(Err(error)),
+            Outcome::Inconclusive(reason) => return Outcome::Inconclusive(reason),
+            Outcome::InternalFault(fault) => return Outcome::InternalFault(fault),
+        };
+        let rewritten = match expected {
+            SourceCommandKind::Definition => parsed.with_expanded_declaration(syntax),
+            SourceCommandKind::Example => parsed.with_expanded_example(syntax),
+            _ => parsed.with_expanded_query_term(syntax),
+        };
+        let Some(parsed) = rewritten else {
+            return wrong_command(expected);
+        };
+        (parsed, state)
+    };
+    Outcome::Complete(Ok((parsed, state)))
+}
+
+fn source_view(source: &[u8]) -> Result<SourceView, SourceMacroError> {
+    SourceText::from_utf8(source)
+        .map(|text| SourceView::of(&text))
+        .map_err(|error| {
+            SourceMacroError::Frontend(Box::new(EngineExecutionError::Frontend(
+                crate::DefinitionFrontendError::Parse(fln_parse::DefinitionParseError::Source(
+                    error,
+                )),
+            )))
+        })
+}
+
+fn source_preflight(
+    engine: &Engine,
+    registry: &RegisteredMacros,
+    source: &[u8],
+    limits: MacroTreeLimits,
+    cancellation: Option<&dyn CancellationProbe>,
+) -> Outcome<Result<(), SourceMacroError>> {
+    if cancellation.is_some_and(CancellationProbe::is_cancelled) {
+        return Outcome::Inconclusive(Inconclusive::cancelled("before imported source macros"));
+    }
+    if let Err(error) = registry.validate_source_engine(engine) {
+        return Outcome::Complete(Err(SourceMacroError::Binding(Box::new(error))));
+    }
+    let allowed = limits.dispatch.execution.syntax.max_bytes;
+    if source.len() > allowed {
+        return Outcome::Inconclusive(
+            Inconclusive::resource(ResourceUsage {
+                reason: ResourceReason::Memory {
+                    limit_bytes: allowed as u64,
+                },
+                allowed: allowed as u64,
+                observed: source.len() as u64,
+            })
+            .with_progress("imported source macro bytes"),
+        );
+    }
+    Outcome::Complete(Ok(()))
+}
+
+/// The one executable expansion pass for queries, declarations, mutual members
+/// and syntax-bearing controls. The caller has validated the source binding and
+/// byte ceiling before parsing; this pass neither prints nor reparses Syntax.
+fn expand_syntax_in_scope(
+    engine: &Engine,
+    source: &SourceText,
+    input: &Syntax,
+    scope: &fln_elab::source::scope::SourceScope,
+    invocation: SourceMacroInvocation<'_>,
+    progress: &mut Progress,
+) -> Outcome<Result<(Syntax, MacroState), SourceMacroError>> {
+    let SourceMacroInvocation {
+        registry,
+        context,
+        state,
+        lookup,
+        limits,
+        cancellation,
+    } = invocation;
+    // Bind native Macro.Methods to this exact immutable predecessor and scope.
+    // An anonymous module cannot select a foreign private declaration.
     let anonymous_module = Name::anonymous();
     let main_module = scope
         .source_module
@@ -730,79 +1046,55 @@ fn expand_in_scope(
         &scope.explicit_opens,
     );
     let lookup = lookup.or(Some(&engine_lookup as &dyn MacroLookup));
-    let resolve = crate::source_check::grammar::resolver(engine.environment(), scope);
-    let existing_global = expected == SourceCommandKind::Check
-        && parsed.query_is_identifier()
-        && matches!(input, Syntax::Ident { val, .. }
-            if matches!(resolve(val),
-                crate::source_check::grammar::Resolution::Global(_)
-                | crate::source_check::grammar::Resolution::Constructor(_)));
-    let (parsed, state) = if existing_global {
-        (parsed, state)
-    } else {
-        // Parse once, then expand the term before any parser template could
-        // erase the node the imported table is meant to see.
-        let expanded = registry.expand_tree_with_context(
-            input,
-            MacroDispatchInvocation {
-                source: parsed.source_view().normalized(),
-                context,
-                state,
-                lookup,
-            },
-            limits,
-            cancellation,
-        );
-        progress.attempts = expanded.attempts;
-        progress.usage = expanded.completed_vm_usage;
-        progress.tree_usage = expanded.usage;
-        let (syntax, state) = match expanded.outcome {
-            Outcome::Complete(Ok(MacroTreeResult::Expanded { syntax, state })) => (syntax, state),
-            Outcome::Complete(Ok(MacroTreeResult::Error {
+    let expanded = registry.expand_tree_with_context(
+        input,
+        MacroDispatchInvocation {
+            source,
+            context,
+            state,
+            lookup,
+        },
+        limits,
+        cancellation,
+    );
+    progress.attempts = expanded.attempts;
+    progress.usage = expanded.completed_vm_usage;
+    progress.tree_usage = expanded.usage;
+    let (syntax, state) = match expanded.outcome {
+        Outcome::Complete(Ok(MacroTreeResult::Expanded { syntax, state })) => (syntax, state),
+        Outcome::Complete(Ok(MacroTreeResult::Error {
+            module,
+            declaration,
+            reference,
+            message,
+            ..
+        })) => {
+            return Outcome::Complete(Err(SourceMacroError::Diagnostic {
                 module,
                 declaration,
-                reference,
+                reference: Box::new(reference),
                 message,
-                ..
-            })) => {
-                return Outcome::Complete(Err(SourceMacroError::Diagnostic {
-                    module,
-                    declaration,
-                    reference: Box::new(reference),
-                    message,
-                }));
-            }
-            Outcome::Complete(Err(error)) => {
-                return Outcome::Complete(Err(SourceMacroError::Execution(Box::new(error))));
-            }
-            Outcome::Inconclusive(reason) => return Outcome::Inconclusive(reason),
-            Outcome::InternalFault(fault) => return Outcome::InternalFault(fault),
-        };
-        // expandMacros deliberately leaves atomic syntax alone. Silently
-        // ignoring an active atomic registration would claim a different
-        // source meaning, so retain an explicit boundary until term elaboration
-        // itself can invoke the imported table.
-        match deferred_candidate(registry, &syntax) {
-            Ok(Some(error)) => return Outcome::Complete(Err(error)),
-            Ok(None) => {}
-            Err(reason) => return Outcome::Inconclusive(reason),
+            }));
         }
-        let rewritten = match expected {
-            SourceCommandKind::Definition => parsed.with_expanded_declaration(syntax),
-            SourceCommandKind::Example => parsed.with_expanded_example(syntax),
-            _ => parsed.with_expanded_query_term(syntax),
-        };
-        let Some(parsed) = rewritten else {
-            return wrong_command(expected);
-        };
-        (parsed, state)
+        Outcome::Complete(Err(error)) => {
+            return Outcome::Complete(Err(SourceMacroError::Execution(Box::new(error))));
+        }
+        Outcome::Inconclusive(reason) => return Outcome::Inconclusive(reason),
+        Outcome::InternalFault(fault) => return Outcome::InternalFault(fault),
     };
+    // Atomic and tactic dispatch belongs to their elaborators. Do not silently
+    // ignore a registration that this recursive expansion pass leaves behind.
+    match deferred_candidate(registry, &syntax) {
+        Ok(Some(error)) => return Outcome::Complete(Err(error)),
+        Ok(None) => {}
+        Err(reason) => return Outcome::Inconclusive(reason),
+    }
     if cancellation.is_some_and(CancellationProbe::is_cancelled) {
         return Outcome::Inconclusive(Inconclusive::cancelled(
             "after imported source macros, before source elaboration",
         ));
     }
-    Outcome::Complete(Ok((parsed, state)))
+    Outcome::Complete(Ok((syntax, state)))
 }
 
 fn evaluate(

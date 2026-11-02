@@ -552,6 +552,58 @@ fn strip_name_prefix(name: &Name, prefix: &Name) -> Option<Name> {
 }
 
 impl Context {
+    /// Some specialized pattern/tactic paths still consume only identifier names.
+    /// They may consume the native parser's already anchored exact spelling, but
+    /// must not discard other declaration metadata.
+    pub(super) fn check_preresolved_syntax(
+        &mut self,
+        syntax: &Syntax,
+    ) -> Result<(), NatDefinitionElabError> {
+        use fln_syntax::tree::Preresolved;
+        let mut pending = vec![(syntax, false)];
+        while let Some((syntax, specialized)) = pending.pop() {
+            self.tick()?;
+            match syntax {
+                Syntax::Node { kind, args, .. } => {
+                    let specialized = specialized
+                        || kind.parent() == parser_kind(&["Tactic"])
+                        || kind == &parser_kind(&["Term", "match"])
+                        || kind == &parser_kind(&["Term", "matchAlt"])
+                        || kind == &parser_kind(&["Command", "declValEqns"]);
+                    pending.extend(args.iter().map(|arg| (arg, specialized)));
+                }
+                Syntax::Ident {
+                    val, preresolved, ..
+                } => {
+                    let mut declaration = None;
+                    let mut multiple = false;
+                    for entry in preresolved {
+                        self.tick()?;
+                        if let Preresolved::Decl { name, fields } = entry {
+                            multiple |= declaration.is_some();
+                            declaration = Some((name, fields));
+                        }
+                    }
+                    let Some((name, fields)) = declaration else {
+                        continue;
+                    };
+                    let anchored = !multiple
+                        && fields.is_empty()
+                        && val.erase_macro_scopes()
+                            == Name::from_components(["_root_"]).append_core(name);
+                    if !anchored && specialized {
+                        return Err(failure(SourceInferenceError::PreresolvedReference {
+                            name: val.clone(),
+                            feature: "pre-resolved identifiers in pattern or tactic syntax",
+                        }));
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn scoped(env: &Environment, kernel: Budget, scope: &SourceScope) -> Self {
         let mut context = Self::new(env, kernel);
         context.source_scope = scope.clone();
@@ -570,6 +622,99 @@ impl Context {
     ) -> Result<Option<Name>, NatDefinitionElabError> {
         self.resolve_source_candidates(name)?
             .map_err(|candidates| error(ScopeError::Ambiguous(name.clone(), candidates)))
+    }
+
+    /// The pin's `Term.resolveName` (Term/TermElabM.lean:2143–2165): local
+    /// spelling wins, then explicit `.decl` metadata replaces global lookup.
+    /// Namespace metadata is ignored. The boolean marks an exact global target
+    /// so a later lookup cannot capture it with a same-named use-site local.
+    pub(super) fn resolve_identifier_name(
+        &mut self,
+        syntax: &Syntax,
+    ) -> Result<(Option<Name>, bool), NatDefinitionElabError> {
+        use fln_syntax::tree::Preresolved;
+        let Syntax::Ident {
+            val, preresolved, ..
+        } = syntax
+        else {
+            return Err(failure(SourceInferenceError::Scope));
+        };
+        let ordinary = self.resolve_source_candidates(val)?;
+        let mut declaration = None;
+        let mut multiple = false;
+        for entry in preresolved {
+            self.tick()?;
+            if let Preresolved::Decl { name, fields } = entry {
+                multiple |= declaration.is_some();
+                declaration = Some((name, fields));
+            }
+        }
+        let Some((target, fields)) = declaration else {
+            return ordinary
+                .map(|name| (name, false))
+                .map_err(|candidates| error(ScopeError::Ambiguous(val.clone(), candidates)));
+        };
+        if let Ok(Some(name)) = &ordinary
+            && !is_root_qualified(val)
+            && ((!val.has_macro_scopes() && self.txn.lctx.find_by_user_name(name).is_some())
+                || self.defining.as_ref() == Some(name)
+                || self
+                    .recursion
+                    .as_ref()
+                    .is_some_and(|state| &state.name == name)
+                || self
+                    .well_founded
+                    .as_ref()
+                    .is_some_and(|state| state.target(name).is_some())
+                || self
+                    .partial
+                    .as_ref()
+                    .and_then(|state| state.group.as_ref())
+                    .is_some_and(|group| group.names.contains(name)))
+        {
+            return Ok((Some(name.clone()), false));
+        }
+        let unsupported = |feature| {
+            failure(SourceInferenceError::PreresolvedReference {
+                name: val.clone(),
+                feature,
+            })
+        };
+        if multiple {
+            return Err(unsupported("overloaded pre-resolved declarations"));
+        }
+        if !fields.is_empty() {
+            return Err(unsupported("pre-resolved field projections"));
+        }
+        if self
+            .source_scope
+            .variables
+            .locals()
+            .find_by_user_name(target)
+            .is_some()
+        {
+            return Err(unsupported("captured section-variable identities"));
+        }
+        if !self.txn.env.contains(target)
+            && super::equation_theorems::target(&self.txn.env, target).is_none()
+        {
+            return Err(unsupported("an available exact declaration target"));
+        }
+        Ok((Some(target.clone()), true))
+    }
+
+    /// Probe a single global candidate before falling back to full term elaboration.
+    /// Ordinary overload ambiguity remains the term elaborator's to decide.
+    pub(super) fn resolve_unambiguous_identifier_name(
+        &mut self,
+        syntax: &Syntax,
+    ) -> Result<(Option<Name>, bool), NatDefinitionElabError> {
+        match self.resolve_identifier_name(syntax) {
+            Err(NatDefinitionElabError::Inference(SourceInferenceError::NameScope(
+                ScopeError::Ambiguous(..),
+            ))) => Ok((None, false)),
+            result => result,
+        }
     }
 
     /// [`Self::resolve_source_name`], with the candidates of an ambiguous name handed

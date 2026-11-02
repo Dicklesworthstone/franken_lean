@@ -609,17 +609,12 @@ fn retained_simp_suffixes_preserve_source_order_and_redundant_events() {
 #[test]
 fn pinned_prelude_defaults_reach_source_simp_and_keep_negative_controls() {
     let root = n("Init.Prelude");
+    let [exported, server, private] = crate::tests::pinned_prelude_chain();
     let input = OleanModuleInput {
         name: &root,
-        artifact: include_bytes!(
-            "../../../../../../fln-conformance/fixtures/tag_attributes/prelude.olean"
-        ),
-        server_artifact: Some(include_bytes!(
-            "../../../../../../fln-conformance/fixtures/tag_attributes/prelude.olean.server"
-        )),
-        private_artifact: Some(include_bytes!(
-            "../../../../../../fln-conformance/fixtures/tag_attributes/prelude.olean.private"
-        )),
+        artifact: &exported,
+        server_artifact: Some(&server),
+        private_artifact: Some(&private),
     };
     on_import_stack(|| {
         let receipt = Engine::from_environment(Environment::new())

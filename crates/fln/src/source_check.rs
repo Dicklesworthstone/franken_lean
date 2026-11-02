@@ -180,7 +180,8 @@ pub(crate) fn classify(error: &EngineExecutionError) -> (&'static str, bool, u8)
             ) => ("internal-fault", false, 4),
             SourceInferenceError::NativeEvaluation(_) => ("capability", false, 5),
             SourceInferenceError::EvaluationPrinting(_)
-            | SourceInferenceError::EquationTheorem(_) => ("capability", false, 5),
+            | SourceInferenceError::EquationTheorem(_)
+            | SourceInferenceError::PreresolvedReference { .. } => ("capability", false, 5),
             SourceInferenceError::SimpSet(
                 fln_elab::source::scope::simp::SimpSetError::Malformed,
             )
@@ -875,6 +876,19 @@ impl Engine {
                 let (start, command) = match step {
                     SourceStep::Command(command) => command,
                     SourceStep::Scope(start, transition) => {
+                        if let Some(session) = macros.as_deref() {
+                            session
+                                .check_native_control(
+                                    scopes.imported_macros().expect("imported macro file scope"),
+                                    &transition,
+                                )
+                                .map_err(|error| SourceCheckError::ImportedMacro {
+                                    file,
+                                    command: count,
+                                    offset: start.0,
+                                    error: Box::new(error),
+                                })?;
+                        }
                         grammar.observe(&transition);
                         scopes
                             .check_limits(&transition)
@@ -899,6 +913,19 @@ impl Engine {
                 if let Some(control) = control {
                     if matches!(control, fln_parse::command_scope::ScopeCommand::Trivia) {
                         continue;
+                    }
+                    if let Some(session) = macros.as_deref() {
+                        session
+                            .check_native_control(
+                                scopes.imported_macros().expect("imported macro file scope"),
+                                &control,
+                            )
+                            .map_err(|error| SourceCheckError::ImportedMacro {
+                                file,
+                                command: count,
+                                offset: start.0,
+                                error: Box::new(error),
+                            })?;
                     }
                     if let fln_parse::command_scope::ScopeCommand::In { head, body } = control {
                         for step in in_command_steps(start, command, head, body)
@@ -953,22 +980,33 @@ impl Engine {
                         }
                         Err(control) => control,
                     };
-                    if macros.is_some()
-                        && matches!(
+                    let control = if let Some(session) = macros.as_deref_mut() {
+                        match session.expand_control(
+                            &engine,
+                            scopes.imported_macros().expect("imported macro file scope"),
+                            command,
                             control,
-                            fln_parse::command_scope::ScopeCommand::Variable(_)
-                                | fln_parse::command_scope::ScopeCommand::Executable(_)
-                        )
-                    {
-                        return Err(SourceCheckError::ImportedMacro {
-                            file,
-                            command: count,
-                            offset: start.0,
-                            error: Box::new(
-                                crate::imported_macros::source::SourceMacroError::ScopeSyntax,
-                            ),
-                        });
-                    }
+                            &scopes.current,
+                        ) {
+                            Outcome::Complete(Ok(control)) => control,
+                            Outcome::Complete(Err(error)) => {
+                                return Err(SourceCheckError::ImportedMacro {
+                                    file,
+                                    command: count,
+                                    offset: start.0,
+                                    error: Box::new(error),
+                                });
+                            }
+                            Outcome::Inconclusive(reason) => {
+                                return Ok(Outcome::Inconclusive(reason));
+                            }
+                            Outcome::InternalFault(fault) => {
+                                return Ok(Outcome::InternalFault(fault));
+                            }
+                        }
+                    } else {
+                        control
+                    };
                     grammar.observe(&control);
                     match apply_module_control_command(
                         &mut engine,

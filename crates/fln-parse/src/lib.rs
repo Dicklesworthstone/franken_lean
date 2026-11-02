@@ -690,6 +690,18 @@ impl ParsedDefinition {
         &self.syntax
     }
 
+    /// Replace a named declaration's syntax after external expansion, retaining
+    /// the original source view and epilogue. The canonical declaration wrapper
+    /// must survive, and neither the original nor replacement may be an example.
+    /// The elaborator still validates the complete replacement declaration.
+    pub fn with_expanded_syntax(mut self, syntax: Syntax) -> Option<Self> {
+        if is_named_declaration_syntax(&self.syntax) && is_named_declaration_syntax(&syntax) {
+            self.syntax = syntax;
+            return Some(self);
+        }
+        None
+    }
+
     /// This definition with the entered grammar's notations expanded
     /// ([`extensions::expand_active`]): the tree the elaborator reads. Unchanged with no grammar
     /// entered. An expanded tree's leaves include its templates', so
@@ -754,6 +766,14 @@ pub struct ParsedSourceCommand {
     query_identifier: bool,
 }
 
+fn is_named_declaration_syntax(syntax: &Syntax) -> bool {
+    matches!(syntax, Syntax::Node { kind, args, .. }
+        if *kind == parser_kind(&["Command", "declaration"])
+            && args.len() == 2
+            && args[1].kind().is_some_and(|body|
+                *body != parser_kind(&["Command", "example"])))
+}
+
 impl ParsedSourceCommand {
     pub const fn kind(&self) -> SourceCommandKind {
         self.kind
@@ -790,9 +810,8 @@ impl ParsedSourceCommand {
     /// admission still validate the entire replacement tree.
     pub fn with_expanded_declaration(mut self, syntax: Syntax) -> Option<Self> {
         if self.kind == SourceCommandKind::Definition
-            && self.syntax.kind() == Some(&parser_kind(&["Command", "declaration"]))
-            && matches!(&syntax, Syntax::Node { kind, args, .. }
-                if *kind == parser_kind(&["Command", "declaration"]) && args.len() == 2)
+            && is_named_declaration_syntax(&self.syntax)
+            && is_named_declaration_syntax(&syntax)
         {
             self.syntax = syntax;
             return Some(self);
@@ -820,11 +839,12 @@ impl ParsedSourceCommand {
     /// Transfer a named declaration to the declaration-admission parser view
     /// without reparsing text or expanding its syntax again.
     pub fn into_definition(self) -> Option<ParsedDefinition> {
-        (self.kind == SourceCommandKind::Definition).then_some(ParsedDefinition {
-            source_view: self.source_view,
-            syntax: self.syntax,
-            epilogue: self.epilogue,
-        })
+        (self.kind == SourceCommandKind::Definition && is_named_declaration_syntax(&self.syntax))
+            .then_some(ParsedDefinition {
+                source_view: self.source_view,
+                syntax: self.syntax,
+                epilogue: self.epilogue,
+            })
     }
 
     /// This command with the entered grammar's notations expanded, as
