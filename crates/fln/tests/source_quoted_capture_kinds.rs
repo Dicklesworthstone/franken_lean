@@ -55,7 +55,7 @@ fn quotation_field_captures_do_not_fall_back_to_a_shadowed_namespace() {
         (
             "quotation binder",
             "notation \"fieldFn!\" => fun box : Box => box.val\ntheorem escaped : fieldFn! ({ val := 2 } : Box) = 1 := rfl\n",
-            "quotation field access through a bound name",
+            "Unification",
         ),
         (
             "notation parameter",
@@ -75,6 +75,13 @@ fn quotation_field_captures_do_not_fall_back_to_a_shadowed_namespace() {
             assert!(error.contains(feature), "{label}: {error}");
         }
     }
+    // A quotation binder and its dotted use now share a hygienic identity.
+    // The same function proves the actual field value, while the original
+    // wrong equality above must still fail elaboration despite `box.val = 1`.
+    let source = format!(
+        "{head}notation \"fieldFn!\" => fun box : Box => box.val\ntheorem selected : fieldFn! ({{ val := 2 }} : Box) = 2 := rfl\n"
+    );
+    assert_eq!(check(&source).unwrap(), 1);
     for (body, expected) in [("_root_.box.val", 1), ("boxcar.val", 3), ("«box.val»", 4)] {
         let source = format!(
             "{head}namespace boxcar\ndef val : Nat := 3\nend boxcar\ndef «box.val» : Nat := 4\nsection\nvariable (box : Box)\nnotation \"globalField!\" => {body}\nend\ntheorem globalMeaning : globalField! = {expected} := rfl\n"
