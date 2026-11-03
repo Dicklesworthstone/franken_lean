@@ -58,6 +58,76 @@ fn defaulted_callback_results_resume_chained_field_constraints() {
 }
 
 #[test]
+fn delayed_projection_receiver_types_can_depend_on_outer_parameters() {
+    check(
+        r#"structure Pair (A B : Type) where
+  first : A
+  second : B
+def dependentReceiver (A : Type) (pair : Pair A Bool) : Bool :=
+  let getSecond (x : _) := x.second
+  getSecond pair
+theorem dependentReceiver_correct (A : Type) (pair : Pair A Bool) :
+  dependentReceiver A pair = pair.second := Eq.refl pair.second
+def dependentResult (A : Type) (pair : Pair A Bool) : A :=
+  let getFirst (x : _) := x.first
+  getFirst pair
+theorem dependentResult_correct (A : Type) (pair : Pair A Bool) :
+  dependentResult A pair = pair.first := Eq.refl pair.first
+def dependentReceiverViaLet (A : Type) (pair : Pair A Bool) : A :=
+  let Carrier := A
+  let saved := pair
+  let getFirst (_tag : Carrier) (x : _) := x.first
+  getFirst pair.first saved
+theorem dependentReceiverViaLet_correct (A : Type) (pair : Pair A Bool) :
+  dependentReceiverViaLet A pair = pair.first := Eq.refl pair.first"#,
+    );
+}
+
+#[test]
+fn delayed_projection_holes_cannot_capture_later_function_parameters() {
+    let options = KVMap::new();
+    let base = engine()
+        .check_source_files(
+            &[b"structure Pair (A B : Type) where\n  first : A\n  second : B"],
+            &options,
+            limits(),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap()
+        .engine;
+    let root = base.logical_root(&options);
+    for source in [
+        "def sentinelPrefix : Nat := 7\n\
+         def bad : (A : Type) -> Pair A Bool -> A :=\n\
+           let getFirst (x : _) := x.first\n\
+           fun A pair => getFirst pair",
+        "def sentinelPrefix : Nat := 7\n\
+         def bad (A : Type) : A :=\n\
+           let getFirst (x : _) := x.first\n\
+           getFirst (Pair.mk 7 true)",
+    ] {
+        let error = base
+            .check_source_files(&[source.as_bytes()], &options, limits())
+            .expect_err("an inferred receiver cannot capture a later binder or change its carrier");
+        assert_eq!(error.disposition().0, "elaboration", "{source}\n{error}");
+        assert_eq!(base.logical_root(&options), root);
+        for name in ["sentinelPrefix", "bad"] {
+            assert!(!base.environment().contains(&Name::from_components([name])));
+        }
+    }
+    let repaired = b"def repaired (A : Type) (pair : Pair A Bool) : A :=\n\
+                       let getFirst (x : _) := x.first\n\
+                       getFirst pair\n\
+                     theorem repaired_correct (A : Type) (pair : Pair A Bool) :\n\
+                       repaired A pair = pair.first := Eq.refl pair.first";
+    assert!(matches!(
+        base.check_source_files(&[repaired], &options, limits()),
+        Ok(Outcome::Complete(_))
+    ));
+}
+
+#[test]
 fn proof_methods_use_the_receivers_actual_dependent_type() {
     check(
         "theorem reverse.{u} {A B : Sort u} {a : A} {b : B} (h : HEq a b) : HEq b a := h.symm\n\

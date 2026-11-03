@@ -177,9 +177,28 @@ impl Context {
         path: &Name,
         at: Option<&Syntax>,
     ) -> Result<FieldResolution, NatDefinitionElabError> {
+        let mut captured = self.txn.lctx.decls().to_vec();
+        let outer = LocalContext::new();
+        // The closed holes below also abstract the types of their parameters.
+        // An unresolved receiver type can still capture earlier parameters in
+        // its own metavariable context. Eliminate those hidden dependencies
+        // before abstraction, or solving that type later would introduce free
+        // locals beneath the already closed telescope. Process domains in
+        // lexical order so each later domain sees the earlier redirections.
+        for index in 0..captured.len() {
+            self.tick()?;
+            let local = &captured[index];
+            let type_ = self.instantiate(&local.type_)?;
+            let mut term = Typed {
+                value: Expr::fvar(local.id.clone()),
+                type_: self.zeta_locals(&type_)?,
+            };
+            self.capture_bound_metavars(&captured, &outer, &mut term)?;
+            captured[index].type_ = term.type_;
+        }
         let mut locals = Vec::new();
         let mut type_locals = Vec::new();
-        for mut local in self.txn.lctx.decls().to_vec() {
+        for mut local in captured {
             self.tick()?;
             let type_ = self.instantiate(&local.type_)?;
             local.type_ = self.zeta_locals(&type_)?;
@@ -201,6 +220,20 @@ impl Context {
             0,
             None,
         );
+        // This hole abstracts its entire lexical scope, just like the holes
+        // closed by `capture_bound_metavars`. Applying the local helper can
+        // replace its receiver with an earlier captured argument, so the spine
+        // need not remain a list of distinct locals. Preserve the scope-argument
+        // count so ordinary constant approximation can solve an independent
+        // result type without treating that repeated argument as injective.
+        self.txn
+            .mvars
+            .set_scope_args(&type_id, type_locals.len())
+            .map_err(|error| {
+                failure(SourceInferenceError::Unification(Box::new(
+                    UnificationError::Metavariable(error),
+                )))
+            })?;
         let mut expected = Expr::mvar(type_id);
         for local in &type_locals {
             self.tick()?;
