@@ -513,6 +513,13 @@ impl<'a> Preparation<'a> {
             };
             self.lower_projections(&erased)?
         };
+        // Finish proof erasure before entering the traversal's host frame.
+        // Its dispatch temporaries are large in unoptimized builds; retaining
+        // them during native-model validation can exhaust a small host stack.
+        self.expression_worklist(input)
+    }
+
+    fn expression_worklist(&mut self, input: Expr) -> Result<Expr, IngressError> {
         let mut tasks = vec![Task::Visit(input.clone())];
         let mut values = Vec::<Expr>::new();
         let limit = self.limits.max_nodes.saturating_mul(3).saturating_add(1);
