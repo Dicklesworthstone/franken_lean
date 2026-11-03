@@ -5,6 +5,7 @@
 use super::*;
 use fln_comp::flbc::{self, ArgumentOwnership, Instruction, ResultOwnership};
 use fln_elab::externs::{self, ExternEntry};
+use fln_elab::instances::imported::{ClassParameters, ImportActivation};
 use fln_olean::source_extensions as metadata;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::PathBuf;
@@ -143,6 +144,8 @@ fn fixture_from_modules(
             let mut actual_externs = BTreeMap::new();
             let mut prelude_names = BTreeSet::new();
             let mut prelude_externs = BTreeMap::new();
+            let mut classes = BTreeMap::new();
+            let mut prelude_classes = BTreeMap::new();
             let mut owners = BTreeMap::new();
             for &module in modules {
                 let path = library.join(module).with_extension("olean");
@@ -171,12 +174,26 @@ fn fixture_from_modules(
                     .extension_payloads(OleanWalkBudget::default(), STACK)
                     .unwrap()
                     .into_iter()
-                    .filter(|block| block.name == name(metadata::EXTERN_EXTENSION))
+                    .filter(|block| {
+                        block.name == name(metadata::EXTERN_EXTENSION)
+                            || block.name == name(metadata::CLASS_EXTENSION)
+                    })
                     .collect();
-                for row in metadata::decode(&blocks, metadata::DecodeLimits::default())
-                    .unwrap()
-                    .externs
-                {
+                let decoded_metadata =
+                    metadata::decode(&blocks, metadata::DecodeLimits::default()).unwrap();
+                for row in decoded_metadata.classes {
+                    let parameters = ClassParameters {
+                        out_params: row.out_params,
+                        out_level_params: row.out_level_params,
+                    };
+                    if module == "Init/Prelude" {
+                        prelude_classes.insert(row.name.clone(), parameters.clone());
+                    }
+                    if let Some(previous) = classes.insert(row.name, parameters.clone()) {
+                        assert_eq!(previous, parameters);
+                    }
+                }
+                for row in decoded_metadata.externs {
                     let entries = row
                         .entries
                         .into_iter()
@@ -221,6 +238,17 @@ fn fixture_from_modules(
             for info in constants.into_values() {
                 environment = environment.add_decl(info).unwrap();
             }
+            // Raw ConstantInfo decoding does not activate class metadata. The
+            // ordinary elaborator requires the pin's class registrations when
+            // it checks implicit instance binders (including canonical ite).
+            // Preserve the actual output-parameter policy rather than guessing
+            // class names from declaration shapes or installing seed metadata.
+            assert!(!classes.is_empty() && !prelude_classes.is_empty());
+            let mut activation = ImportActivation::new(environment);
+            for (class, parameters) in &classes {
+                activation = activation.register_class(class, parameters).unwrap();
+            }
+            let mut environment = activation.finish().unwrap();
             for (label, entries) in &actual_externs {
                 environment = externs::register(&environment, label, entries.clone()).unwrap();
             }
@@ -230,6 +258,11 @@ fn fixture_from_modules(
                     .with_entry(environment.entry(&label).unwrap())
                     .unwrap();
             }
+            let mut activation = ImportActivation::new(prelude);
+            for (class, parameters) in prelude_classes {
+                activation = activation.register_class(&class, &parameters).unwrap();
+            }
+            let mut prelude = activation.finish().unwrap();
             for (label, entries) in prelude_externs {
                 prelude = externs::register(&prelude, &label, entries).unwrap();
             }
@@ -743,6 +776,22 @@ fn rebuild(fixture: &Fixture, omit: Option<&Name>, omit_extern: Option<&Name>) -
             environment = environment
                 .with_entry(fixture.environment.entry(label).unwrap())
                 .unwrap();
+        }
+    }
+    // A negative changes only its selected declaration or extern. Keep all
+    // other journal bytes, including the genuine class context, unchanged.
+    // An omitted class deliberately leaves invalid metadata for the consumer
+    // to refuse, rather than silently changing two inputs in that control.
+    for (journal, state) in fixture.environment.extensions() {
+        if journal != &externs::journal_name() {
+            environment = environment
+                .register_extension(state.descriptor.clone())
+                .unwrap();
+            for entry in state.entries() {
+                environment = environment
+                    .push_extension_entry(journal, entry.payload.to_vec())
+                    .unwrap();
+            }
         }
     }
     for (label, entries) in &fixture.externs {
