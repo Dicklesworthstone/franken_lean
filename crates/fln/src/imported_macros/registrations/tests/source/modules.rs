@@ -943,6 +943,67 @@ fn runtime_vm_limits_withhold_macro_program_states_and_retain_macro_work() {
     assert!(stopped.states.is_none());
 }
 
+#[test]
+fn later_module_parse_refusal_precedes_earlier_module_runtime_work() {
+    use crate::source_check::modules::execution::SourceProgramExecutionError;
+    let (imported, code) = batches::artifact_import_fixture();
+    let before = imported.engine.logical_root(&KVMap::new());
+    let compilation = MacroCompilationInputs::new(
+        code.clone(),
+        VerifiedPartition::user_fixture(),
+        users(&code),
+    );
+    let mut execution = execution_limits();
+    execution.vm.max_steps = 0;
+    let prefix = "prelude\nimport SourceLibrary\n#eval 7 + 11\n";
+    let valid = [
+        ("Main", "prelude\nimport Lib\ndef checked : Nat := 1\n"),
+        ("Lib", prefix),
+    ];
+    let control = execute_deferred_program(
+        &imported,
+        compilation.clone(),
+        &valid,
+        MacroRegistryLimits::default(),
+        execution,
+        None,
+    );
+    assert!(
+        matches!(control.outcome, Outcome::Inconclusive(_)),
+        "{control:?}"
+    );
+    assert!(
+        !control.attempts.is_empty(),
+        "the valid graph must reach the earlier module: {control:?}"
+    );
+    assert!(control.states.is_none());
+    let malformed = [
+        ("Main", "prelude\nimport Lib\ndef broken : Nat := (\n"),
+        ("Lib", prefix),
+    ];
+    let stopped = execute_deferred_program(
+        &imported,
+        compilation,
+        &malformed,
+        MacroRegistryLimits::default(),
+        execution,
+        None,
+    );
+    let Outcome::Complete(Err(SourceProgramExecutionError::Source(error))) = &stopped.outcome
+    else {
+        panic!("later syntax must be refused before any earlier evaluation: {stopped:?}")
+    };
+    assert!(
+        matches!(error, SourceModuleCheckError::Source { module, .. } if *module == name("Main")),
+        "{error:?}"
+    );
+    assert_eq!(error.disposition(), ("input", false, 1));
+    assert!(stopped.attempts.is_empty(), "{stopped:?}");
+    assert_eq!(stopped.completed_vm_usage.steps, 0);
+    assert!(stopped.states.is_none());
+    assert_eq!(imported.engine.logical_root(&KVMap::new()), before);
+}
+
 fn check_deferred(
     imported: &SourceOleanImport,
     compilation: MacroCompilationInputs,

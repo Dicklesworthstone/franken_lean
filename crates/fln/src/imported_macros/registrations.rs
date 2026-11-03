@@ -23,7 +23,6 @@ use fln_syntax::tree::Syntax;
 use fln_vm::interpreter::{CancellationProbe, ExecutionUsage};
 use fln_vm::macro_native::MacroLookup;
 
-mod parsers;
 mod recursive;
 use recursive::{ExpansionWork, RegistryExpansion, add_tree_usage, add_vm_usage};
 use std::collections::{BTreeMap, BTreeSet};
@@ -258,9 +257,6 @@ pub struct RegisteredMacros {
     /// Exact checked owners retained for binding an embedding registry to a
     /// later source-checking engine. Scope activation shares this provenance.
     owners: Arc<BTreeMap<Name, (Name, ConstantInfo)>>,
-    /// Present only on registries prepared by a complete source-import receipt.
-    /// Standalone embedding registries retain their existing syntax-only door.
-    parsers: parsers::Modules,
 }
 
 fn dispatch_order(table: BTreeMap<Name, Vec<RegisteredMacro>>) -> CandidateTable {
@@ -496,43 +492,7 @@ impl RegisteredMacros {
                     .map(|(declaration, (module, owner, _))| (declaration, (module, owner)))
                     .collect(),
             ),
-            parsers: Arc::from([]),
         })
-    }
-
-    pub(crate) fn with_source_parsers(
-        mut self,
-        modules: &[MacroRegistrationModule<'_>],
-        admitted: &Environment,
-        limits: MacroRegistryLimits,
-    ) -> Result<Self, MacroRegistrationError> {
-        let (parsers, owners) = parsers::prepare(modules, admitted, limits)?;
-        let retained = Arc::make_mut(&mut self.owners);
-        for (declaration, owner) in owners {
-            if retained
-                .get(&declaration)
-                .is_some_and(|previous| previous != &owner)
-            {
-                return Err(MacroRegistrationError::Owner {
-                    module: owner.0,
-                    declaration,
-                    reason: "parser and macro registration owners differ",
-                });
-            }
-            retained.insert(declaration, owner);
-        }
-        self.parsers = parsers;
-        Ok(self)
-    }
-
-    pub(crate) fn install_source_parsers(
-        &self,
-        grammar: &mut crate::source_check::grammar::SourceGrammar,
-    ) -> Result<(), crate::EngineExecutionError> {
-        for (_, module) in self.parsers.iter() {
-            grammar.import_artifact(module)?;
-        }
-        Ok(())
     }
 
     /// Select a checked source module's actual external import world. A graph's
@@ -636,17 +596,6 @@ impl RegisteredMacros {
                     .map(|(declaration, owner)| (declaration.clone(), owner.clone()))
                     .collect(),
             ),
-            parsers: Arc::from(
-                ordered_modules
-                    .iter()
-                    .filter_map(|name| {
-                        self.parsers
-                            .iter()
-                            .find(|(module, _)| module == name)
-                            .cloned()
-                    })
-                    .collect::<Vec<_>>(),
-            ),
         })
     }
 
@@ -657,15 +606,6 @@ impl RegisteredMacros {
         &self,
         engine: &crate::Engine,
     ) -> Result<(), MacroRegistrationError> {
-        for (module, grammar) in self.parsers.iter() {
-            if !grammar.is_empty() && !engine.imported_modules().contains(module) {
-                return Err(MacroRegistrationError::Owner {
-                    module: module.clone(),
-                    declaration: Name::anonymous(),
-                    reason: "parser journal module is not an admitted import of the source engine",
-                });
-            }
-        }
         for (declaration, (module, owner)) in self.owners.iter() {
             let reason = if !engine.imported_modules().contains(module) {
                 Some("macro module is not an admitted import of the source engine")
@@ -727,7 +667,6 @@ impl RegisteredMacros {
             active_scopes,
             modules: Arc::clone(&self.modules),
             owners: Arc::clone(&self.owners),
-            parsers: Arc::clone(&self.parsers),
         })
     }
 

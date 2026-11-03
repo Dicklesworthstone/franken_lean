@@ -21,6 +21,11 @@ use fln_rt::obj::Obj;
 use fln_rt::region::compact;
 use std::sync::OnceLock;
 
+// Keep the former macro-local reader's file as tests of the authoritative
+// parser registry; production has one reconstruction and ownership path.
+#[path = "../imported_macros/registrations/parsers.rs"]
+mod macro_bindings;
+
 fn c(symbol: &str) -> Expr {
     Expr::const_(name(symbol), vec![])
 }
