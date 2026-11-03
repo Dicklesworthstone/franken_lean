@@ -492,11 +492,20 @@ impl Preparation<'_> {
                             };
                             let recursor = match head.node() {
                                 ExprNode::Const { name, .. } => match self.environment.find(name) {
-                                    Some(ConstantInfo::Rec(rec)) => Some((
-                                        rec.num_params as usize,
-                                        rec.num_motives as usize,
-                                        rec.num_indices as usize,
-                                    )),
+                                    Some(ConstantInfo::Rec(rec)) => {
+                                        let arity = (rec.num_params as usize)
+                                            .checked_add(rec.num_motives as usize)
+                                            .and_then(|n| n.checked_add(rec.num_minors as usize))
+                                            .and_then(|n| n.checked_add(rec.num_indices as usize))
+                                            .and_then(|n| n.checked_add(1))
+                                            .ok_or_else(|| unsupported("recursor arity"))?;
+                                        Some((
+                                            rec.num_params as usize,
+                                            rec.num_motives as usize,
+                                            rec.num_indices as usize,
+                                            arity,
+                                        ))
+                                    }
                                     _ => None,
                                 },
                                 _ => None,
@@ -504,6 +513,8 @@ impl Preparation<'_> {
                             let mut type_ = self.projection_receiver_type(&head, &context)?;
                             let mut arguments = Vec::new();
                             let local_callbacks = matches!(head.node(), ExprNode::BVar { .. });
+                            let recursor_callbacks =
+                                recursor.is_some_and(|(_, _, _, arity)| args.len() > arity);
                             let mut callback_types = Vec::new();
                             for (index, arg) in args.iter().enumerate() {
                                 self.tick()?;
@@ -530,16 +541,19 @@ impl Preparation<'_> {
                                     None => None,
                                 };
                                 let static_type = static_sort.is_some();
-                                if local_callbacks {
-                                    // The checked local telescope is available here,
-                                    // before proof erasure removes its dependent domains.
-                                    // Keep the runtime type of callback operands ending
-                                    // in a literal lambda, including leading strict lets:
-                                    // later global-call annotation cannot recover a BVar's
-                                    // type without this original local context.
+                                if local_callbacks || recursor_callbacks {
+                                    // Retain the checked domains before proof erasure.
+                                    // Later global-call annotation cannot recover a
+                                    // local callee's telescope or a recursor's returned
+                                    // function telescope. The recursor's own minors
+                                    // keep their family-specific lowering; only trailing
+                                    // operands need these ordinary callback anchors.
+                                    let callback_operand = local_callbacks
+                                        || recursor.is_some_and(|(_, _, _, arity)| index >= arity);
                                     let callback_type = match &domain {
                                         Some(domain)
-                                            if !static_type
+                                            if callback_operand
+                                                && !static_type
                                                 && self.has_literal_callable_tail(arg)? =>
                                         {
                                             Some(self.erase_type_in(domain, &context)?)
@@ -563,7 +577,7 @@ impl Preparation<'_> {
                                     // Type-valued motives still use their original
                                     // context to erase returned proof dependencies.
                                     Frame::Keep(
-                                        if let Some((params, motives, indices)) = recursor
+                                        if let Some((params, motives, indices, _)) = recursor
                                             && (params..params.saturating_add(motives))
                                                 .contains(&index)
                                             && self.refined_index_motive(arg, indices)?.is_some()

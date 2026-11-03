@@ -81,6 +81,56 @@ fn partial_and_polymorphic_proof_calls_retain_runtime_arguments() {
     );
     run("#eval (fun (n : Nat) (h : n = n) => n) 42 (by rfl)", "42");
 }
+
+#[test]
+fn recursor_trailing_literal_callbacks_keep_checked_types_and_captures() {
+    // These operands follow the complete recursor telescope. They are runtime callbacks,
+    // whereas the recursor's motive and minors have their own checked lowering contracts.
+    run(
+        "def through (offset n : Nat) : Nat :=\n  Nat.rec (motive := fun _ => (Nat -> Nat) -> Nat)\n    (fun f => f 40) (fun _ prev f => f (prev f)) n (fun x => x + offset)\n#eval through 1 1",
+        "42",
+    );
+    run(
+        "def throughOwned (suffix : String) (n : Nat) : Nat :=\n  Nat.rec (motive := fun _ => (Nat -> String) -> Nat)\n    (fun f => String.length (f 0))\n    (fun _ prev f => prev f + String.length (f 0)) n (fun _ => suffix)\n#eval throughOwned \"λ😀\" 2",
+        "6",
+    );
+}
+
+#[test]
+fn recursor_trailing_callbacks_erase_dependent_proof_arguments() {
+    run(
+        "def throughProof (offset n : Nat) : Nat :=\n  Nat.rec (motive := fun _ => ((x : Nat) -> x = x -> Nat) -> Nat)\n    (fun f => f 40 (by rfl))\n    (fun _ prev f => f (prev f) (by rfl)) n (fun x _ => x + offset)\n#eval throughProof 1 1",
+        "42",
+    );
+}
+
+#[test]
+fn recursor_trailing_callback_initializers_stay_strict_and_shared() {
+    let prefix = r#"def work (n : Nat) : Nat := match n with
+  | .zero => 0
+  | .succ k => work k + 1
+def throughStrict (cost n : Nat) : Nat :=
+  Nat.rec (motive := fun _ => (Nat -> Nat) -> Nat)
+    (fun f => f 0) (fun _ prev f => prev f + f 0) n
+    (let paid := work cost; fun _ => paid)
+"#;
+    let once_cheap = run(&format!("{prefix}#eval throughStrict 0 0"), "0");
+    let once_paid = run(&format!("{prefix}#eval throughStrict 40 0"), "40");
+    let repeated_cheap = run(&format!("{prefix}#eval throughStrict 0 3"), "0");
+    let repeated_paid = run(&format!("{prefix}#eval throughStrict 40 3"), "160");
+    let once_work = once_paid
+        .checked_sub(once_cheap)
+        .expect("callback initialization must perform its runtime work");
+    let repeated_work = repeated_paid
+        .checked_sub(repeated_cheap)
+        .expect("repeated callbacks must retain their initialization");
+    assert!(once_work > 0, "strict callback initialization was erased");
+    assert_eq!(
+        once_work, repeated_work,
+        "the callback's strict initializer must run once, outside its returned lambda"
+    );
+}
+
 #[test]
 fn rejected_proofs_and_resource_stops_do_not_publish() {
     let base = Engine::with_source_seed(EngineAdmissionLimits::new(limits().kernel))
