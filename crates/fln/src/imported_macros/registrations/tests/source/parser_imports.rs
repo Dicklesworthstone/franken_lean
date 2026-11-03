@@ -10,6 +10,8 @@ use fln_core::expr::BinderInfo;
 // Share the codec's mechanically extracted wire contract across artifact tests.
 use crate::imported_parsers::test_wire as wire;
 
+mod commands;
+
 #[derive(Clone, Copy, Debug)]
 enum Fault {
     None,

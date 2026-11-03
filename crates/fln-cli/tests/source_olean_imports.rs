@@ -1210,6 +1210,138 @@ end ImportedBoxScope
 }
 
 #[test]
+fn installed_imported_command_syntax_admits_and_executes_real_artifact_expansions() {
+    let selected = ["AdmittedSourceMacro"];
+    let provider = format!(
+        "{}\n{}",
+        include_str!("../../fln-olean/fixtures/ir/AdmittedSourceMacro.lean"),
+        r#"
+public section
+
+syntax (name := admittedDeclare) "declare%" "[" command "]" : command
+
+@[macro admittedDeclare]
+meta def admittedDeclareCommand : Macro := fun stx _ state =>
+  .ok (stx.getArg 2) state
+
+namespace ImportedCommandScope
+
+scoped syntax (name := admittedScopedDeclare) "scopedDeclare%" "[" command "]" : command
+
+@[scoped macro admittedScopedDeclare]
+meta def admittedScopedDeclareCommand : Macro := fun stx _ state =>
+  .ok (stx.getArg 2) state
+
+end ImportedCommandScope
+"#
+    );
+    let Some(project) = ImportedMacroProject::prepare_with_source(&provider) else {
+        return;
+    };
+    assert!(
+        !project
+            .root
+            .join("client/AdmittedSourceMacro.lean")
+            .exists()
+    );
+    // The pinned compiler constructs the command descriptors and their macro
+    // companions. The macro selects the parser's real command child; neither
+    // the fixture nor the native runner manufactures a declaration layout.
+    let declarations = concat!(
+        "prelude\nimport AdmittedSourceMacro\n",
+        "declare% [declare% [def importedCommandValue : Nat := (31 : Bool)]]\n",
+        "declare% [theorem importedCommandValue_eq : Eq importedCommandValue 31 := Eq.refl importedCommandValue]\n",
+        "section\nopen scoped ImportedCommandScope\n",
+        "scopedDeclare% [def scopedCommandValue : Nat := (37 : Bool)]\n",
+        "end\n",
+    );
+    let client = format!("{declarations}#check importedCommandValue\n#check scopedCommandValue\n");
+    let oracle = project.oracle(&client);
+    assert!(oracle.status.success(), "{oracle:?}; {:?}", project.root);
+    assert_eq!(
+        oracle.stdout,
+        b"importedCommandValue : Nat\nscopedCommandValue : Nat\n"
+    );
+    assert!(oracle.stderr.is_empty(), "{oracle:?}");
+
+    let accepted = project.check_with_syntax(declarations, &selected);
+    assert!(accepted.contains("\"theorems\":1"), "{accepted}");
+    for declaration in [
+        "admittedDeclareCommand",
+        "ImportedCommandScope.admittedScopedDeclareCommand",
+    ] {
+        assert!(
+            accepted.contains(&format!("\"name\":\"{declaration}\"")),
+            "{accepted}"
+        );
+    }
+
+    let lean = project.native_with_syntax("lean", &client, Some(&project.partition), &selected);
+    assert!(lean.status.success(), "{lean:?}; {:?}", project.root);
+    assert_eq!(lean.stdout, oracle.stdout);
+    assert!(lean.stderr.is_empty(), "{lean:?}");
+    let run = project.native_with_syntax(
+        "run",
+        &format!("{client}#eval importedCommandValue\n#eval scopedCommandValue\n"),
+        Some(&project.partition),
+        &selected,
+    );
+    assert!(run.status.success(), "{run:?}; {:?}", project.root);
+    assert!(run.stderr.is_empty(), "{run:?}");
+    let report = String::from_utf8(run.stdout).unwrap();
+    assert!(report.contains("\"outcome\":\"complete\""), "{report}");
+    for value in [31, 37] {
+        assert!(
+            report.contains(&format!("\"kind\":\"nat\",\"value\":{value}")),
+            "{report}"
+        );
+    }
+    assert_imported_macro_provenance(&report);
+    assert!(
+        report.contains("\"name\":\"admittedDeclareCommand\""),
+        "{report}"
+    );
+
+    let false_proof = concat!(
+        "declare% [theorem wrongCommandProof : Eq importedCommandValue 99 := ",
+        "Eq.refl importedCommandValue]\n",
+    );
+    let invalid = format!("{declarations}{false_proof}");
+    let oracle = project.oracle(&invalid);
+    assert!(!oracle.status.success(), "{oracle:?}");
+    ImportedMacroProject::refused(project.native_with_syntax(
+        "check-source",
+        &invalid,
+        Some(&project.partition),
+        &selected,
+    ));
+    // Runtime queries before the bad generated theorem remain buffered. No
+    // successful prefix may escape when its ordinary admission rejects it.
+    ImportedMacroProject::refused(project.native_with_syntax(
+        "run",
+        &format!("{client}#eval importedCommandValue\n{false_proof}"),
+        Some(&project.partition),
+        &selected,
+    ));
+
+    let inactive =
+        format!("{declarations}scopedDeclare% [def escapedCommandScope : Nat := (41 : Bool)]\n");
+    let oracle = project.oracle(&inactive);
+    assert!(!oracle.status.success(), "{oracle:?}");
+    ImportedMacroProject::refused(project.native_with_syntax(
+        "check-source",
+        &inactive,
+        Some(&project.partition),
+        &selected,
+    ));
+    // Registering macro bodies alone does not activate their artifact grammar.
+    for verb in ["check-source", "run", "lean"] {
+        ImportedMacroProject::refused(project.native(verb, declarations, Some(&project.partition)));
+    }
+    assert_eq!(project.check_with_syntax(declarations, &selected), accepted);
+}
+
+#[test]
 fn installed_imported_macros_drive_checked_source_and_runtime_commands() {
     let Some(project) = ImportedMacroProject::prepare() else {
         return;

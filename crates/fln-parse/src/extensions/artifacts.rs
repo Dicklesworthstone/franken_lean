@@ -63,6 +63,18 @@ pub(super) struct ArtifactGrammar {
 }
 
 impl ArtifactGrammar {
+    pub(super) fn scoped_command_heads(&self) -> BTreeSet<String> {
+        let command = Name::from_components(["command"]);
+        self.scoped
+            .values()
+            .flatten()
+            .filter(|declaration| {
+                declaration.leading && declaration.category.as_ref() == Some(&command)
+            })
+            .flat_map(|declaration| heads(&declaration.descr, 0))
+            .collect()
+    }
+
     pub(super) fn activate(
         &self,
         namespace: &Name,
@@ -676,13 +688,16 @@ fn descriptor(
         Descr::Cat(category, precedence) => {
             let builtin = simple(category);
             if *precedence > MAX_PREC
-                || !(matches!(builtin.as_deref(), Some("term" | "tactic"))
+                || !(matches!(builtin.as_deref(), Some("term" | "tactic" | "command"))
                     || categories.contains(category))
             {
                 return Err("artifact parser references an unavailable category or precedence");
             }
             if builtin.as_deref() == Some("term") && !matches!(*precedence, 0 | 1023 | 1024) {
                 return Err("artifact term operands require zero, argument or maximum precedence");
+            }
+            if builtin.as_deref() == Some("command") && *precedence != 0 {
+                return Err("artifact command operands require zero precedence");
             }
             Ok(false)
         }

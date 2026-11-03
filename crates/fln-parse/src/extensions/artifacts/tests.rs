@@ -195,6 +195,89 @@ fn standalone_scoped_tokens_and_kinds_activate_and_restore_without_parsers() {
 }
 
 #[test]
+fn scoped_command_heads_partition_without_activating_their_parser() {
+    let mut file = grammar();
+    file.import_artifact(&ImportedSyntaxModule {
+        entries: vec![
+            token("scopedDeclare!", Some("Commands")),
+            ImportedSyntaxEntry::Kind {
+                scope: None,
+                kind: name("Library.scopedCommand"),
+            },
+            parser(
+                "Library.scopedCommand",
+                "command",
+                Some("Commands"),
+                Descr::Node {
+                    kind: name("Library.scopedCommand"),
+                    prec: LEAD_PREC,
+                    body: Box::new(symbol("scopedDeclare!")),
+                },
+            ),
+            token("commandWord", Some("Commands")),
+            parser(
+                "Library.wordCommand",
+                "command",
+                Some("Commands"),
+                Descr::Node {
+                    kind: name("Library.wordCommand"),
+                    prec: LEAD_PREC,
+                    body: Box::new(symbol("commandWord")),
+                },
+            ),
+        ],
+    })
+    .unwrap();
+    let source = b"section\r\nopen scoped Commands\r\nscopedDeclare!\r\nend\r\ndef after := 1\r\n";
+    let commands =
+        with_grammar(&file.grammar(), || crate::command_scope::partition(source)).unwrap();
+    assert_eq!(commands.len(), 5);
+    assert_eq!(commands[1].1, b"open scoped Commands\r\n");
+    assert_eq!(commands[2].1, b"scopedDeclare!\r\n");
+    assert_eq!(
+        commands[2].0.0,
+        b"section\r\nopen scoped Commands\r\n".len()
+    );
+    assert_eq!(
+        commands
+            .iter()
+            .flat_map(|(_, bytes)| bytes.iter().copied())
+            .collect::<Vec<_>>(),
+        source
+    );
+    assert!(!file.grammar().table().contains("scopedDeclare!"));
+    assert!(parse(&file, "scopedDeclare!").is_err());
+    assert!(parse(&grammar(), "scopedDeclare!").is_err());
+    file.apply(&ScopeCommand::Section(None));
+    file.apply(&ScopeCommand::OpenScoped(vec![name("Commands")]));
+    assert!(parse(&file, "scopedDeclare!").is_ok());
+    file.apply(&ScopeCommand::End(None));
+    assert!(parse(&file, "scopedDeclare!").is_err());
+    assert!(!file.grammar().table().contains("scopedDeclare!"));
+    let source = b"def text : String := \"scopedDeclare!\"\n-- scopedDeclare!\ndef next := 1";
+    let commands =
+        with_grammar(&file.grammar(), || crate::command_scope::partition(source)).unwrap();
+    assert_eq!(
+        commands.len(),
+        2,
+        "strings and comments contain no commands"
+    );
+    let source = b"def commandWord : Nat := 1\ndef value : Nat :=\n  commandWord";
+    let commands =
+        with_grammar(&file.grammar(), || crate::command_scope::partition(source)).unwrap();
+    assert_eq!(
+        commands.len(),
+        2,
+        "inactive heads remain ordinary identifiers"
+    );
+    assert!(!file.grammar().table().contains("commandWord"));
+    for (_, command) in commands {
+        with_grammar(&file.grammar(), || crate::parse_source_command(command)).unwrap();
+    }
+    assert!(file.export_native().unwrap().is_empty());
+}
+
+#[test]
 fn a_kind_row_cannot_enable_a_census_parser_alternative() {
     let mut file = grammar();
     file.import_artifact(&ImportedSyntaxModule {

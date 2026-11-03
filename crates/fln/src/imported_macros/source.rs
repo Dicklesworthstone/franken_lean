@@ -1,9 +1,11 @@
-//! Imported node macros on source declarations, anonymous examples, `#check` and raw `#eval`.
+//! Imported node macros on source declarations, custom commands, anonymous examples,
+//! `#check` and raw `#eval`.
 //!
-//! This is an explicit embedding door for syntax the current parser already
-//! understands. It installs no artifact parser descriptions. The prepared
-//! registry owns the expansion pass: no template expansion runs before it or
-//! replays its results. The resulting native Syntax enters the same elaborator
+//! Standalone calls use the native parser. Module sessions also consume the
+//! receipt-bound parser product installed by the source driver; custom commands
+//! must expand to one named declaration. The prepared registry owns the
+//! expansion pass: no template expansion runs before it or replays its results.
+//! The resulting native Syntax enters the same elaborator
 //! and dual-check admission as `Engine::check_source_command`; raw evaluations
 //! then use the ordinary compiler, codec and Golem execution path.
 //!
@@ -463,6 +465,11 @@ impl<'a> FileSession<'a> {
                 ));
             }
         };
+        if self.is_imported_command(registry, &parsed) {
+            return self
+                .expand_imported_command(engine, registry, parsed, scope)
+                .map_complete(|result| result.map(Box::new).map(ProgramCommandSyntax::Single));
+        }
         let expected = parsed.kind();
         let declaration = matches!(
             expected,
@@ -542,7 +549,27 @@ impl<'a> FileSession<'a> {
         }
         let parsed = match crate::source_records::parse_scoped_command_without_expansion(source) {
             Ok(parsed) => parsed,
-            Err(error) => return frontend(error),
+            Err(error) => {
+                // Custom command roots are not declarations until their
+                // imported macro has produced one. Read the entered grammar's
+                // original syntax, without templates or reparsed expansion.
+                let Ok(parsed) = fln_parse::parse_source_command(source) else {
+                    return frontend(error);
+                };
+                if !self.is_imported_command(registry, &parsed) {
+                    return frontend(error);
+                }
+                return self
+                    .expand_imported_command(engine, registry, parsed, scope)
+                    .map_complete(|result| {
+                        result.and_then(|parsed| {
+                            parsed
+                                .into_definition()
+                                .map(ScopedCommandSyntax::Definition)
+                                .ok_or(SourceMacroError::DeclarationRequired)
+                        })
+                    });
+            }
         };
         match parsed {
             ScopedCommandSyntax::Mutual(mut members) => {
@@ -605,6 +632,62 @@ impl<'a> FileSession<'a> {
                     })
                 }),
         }
+    }
+
+    /// A parsed custom command needs both its receipt-bound command parser
+    /// and a currently active macro candidate. Token/kind rows alone and
+    /// registrations in other categories do not authorize this path. The
+    /// entered grammar has already applied lexical parser-scope activation.
+    fn is_imported_command(
+        &self,
+        registry: &RegisteredMacros,
+        parsed: &ParsedSourceCommand,
+    ) -> bool {
+        use fln_parse::extensions::{Descr, ImportedSyntaxEntry};
+        if parsed.kind() != SourceCommandKind::Definition {
+            return false;
+        }
+        let Some(kind) = parsed.syntax().kind() else {
+            return false;
+        };
+        if *kind == Name::from_components(["Lean", "Parser", "Command", "declaration"])
+            || registry.declarations(kind).next().is_none()
+        {
+            return false;
+        }
+        let command = Name::from_components(["command"]);
+        self.parsers.entries.iter().any(|entry| {
+            matches!(entry, ImportedSyntaxEntry::Parser(parser)
+                if parser.category.as_ref() == Some(&command)
+                    && parser.leading
+                    && matches!(&parser.descr, Descr::Node { kind: root, .. } if root == kind))
+        })
+    }
+
+    /// The caller has checked both registrations and the source preflight.
+    /// Expand the complete original tree once, then require one ordinary named
+    /// declaration. The usual elaborator and council still own its admission.
+    fn expand_imported_command(
+        &mut self,
+        engine: &Engine,
+        registry: &RegisteredMacros,
+        parsed: ParsedSourceCommand,
+        scope: &fln_elab::source::scope::SourceScope,
+    ) -> Outcome<Result<ParsedSourceCommand, SourceMacroError>> {
+        self.expand_syntax(
+            engine,
+            registry,
+            parsed.source_view().normalized(),
+            parsed.syntax(),
+            scope,
+        )
+        .map_complete(|result| {
+            result.and_then(|syntax| {
+                parsed
+                    .with_expanded_command_declaration(syntax)
+                    .ok_or(SourceMacroError::DeclarationRequired)
+            })
+        })
     }
 
     /// Expand the parser's existing binder/attribute tree, using its original

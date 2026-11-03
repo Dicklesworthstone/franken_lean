@@ -77,6 +77,7 @@ mod artifacts;
 mod atoms;
 mod categories;
 pub(crate) use categories::{category_for_quotation, parse_category_quotation};
+mod commands;
 mod local_rules;
 mod macro_rules;
 mod modules;
@@ -751,6 +752,11 @@ impl ExtensionInfix {
 #[derive(Debug)]
 pub struct ActiveGrammar {
     table: TokenTable,
+    /// Scoped artifact command heads are recognized only while slicing a file,
+    /// before scope directives run. This never installs a parser or token into
+    /// the active command grammar.
+    partition_table: Option<TokenTable>,
+    partition_commands: BTreeSet<String>,
     /// Categories introduced by native source, never guessed from a node kind.
     source_categories: BTreeSet<Name>,
     /// Categories whose quotation parser is supplied by the native source
@@ -1005,6 +1011,8 @@ impl ActiveGrammar {
         ActiveGrammar {
             category_decls,
             table: TokenTable::from_tokens(tokens),
+            partition_table: None,
+            partition_commands: BTreeSet::new(),
             source_categories: BTreeSet::new(),
             source_quotation_categories: BTreeSet::new(),
             decls,
@@ -1585,12 +1593,23 @@ impl FileGrammar {
                 Trail::Decl(index) => own(*index, &mut tokens, &mut decls),
             }
         }
+        // All of these heads came from fully validated artifact descriptions,
+        // within the same descriptor and token ceilings. Recognizing their
+        // boundaries cannot activate the scoped parser or its macro registry.
+        let partition_commands = self.artifact.scoped_command_heads();
+        let partition_table = (!partition_commands.is_subset(&tokens)).then(|| {
+            let mut partition_tokens = tokens.clone();
+            partition_tokens.extend(partition_commands.iter().cloned());
+            TokenTable::from_tokens(partition_tokens)
+        });
         let artifact_quotations: BTreeSet<_> = decls
             .iter()
             .filter_map(|declaration| self.artifact.quotations.get(&declaration.decl))
             .cloned()
             .collect();
         let mut grammar = ActiveGrammar::new(tokens, decls);
+        grammar.partition_table = partition_table;
+        grammar.partition_commands = partition_commands;
         // These descriptors register the native quotation route. They must
         // never fall back to generic descriptor execution: that route does
         // not enter quotation depth and could choose a category after a
@@ -3398,6 +3417,16 @@ pub(crate) fn with_token_table<R>(lex: impl FnOnce(&TokenTable) -> R) -> R {
     }
 }
 
+/// File slicing may see a scoped artifact command before its opening directive
+/// is applied. Its head is recognized here without exposing it to ordinary
+/// lexing, parser dispatch or macro activation.
+pub(crate) fn with_partition_token_table<R>(lex: impl FnOnce(&TokenTable) -> R) -> R {
+    match active() {
+        Some(grammar) => lex(grammar.partition_table.as_ref().unwrap_or(&grammar.table)),
+        None => lex(production_table()),
+    }
+}
+
 /// `interpolatedStrFn` (`Lean/Parser/Basic.lean`) for the active grammar: the string after an
 /// interpolation head (`s!`) is not one string literal but chunks (`"a{`, `}b{`, `}"`, each a
 /// string-literal token here) around terms lexed with the table, each term ending at the `}` that
@@ -3762,10 +3791,13 @@ pub(crate) fn attribute_syntax(head: &str) -> Option<bool> {
         .then_some(false)
 }
 
-/// Whether `symbol` begins a `command` declaration of the active grammar (`norm_cast_add_elim`):
-/// a line it starts starts a command.
-pub(crate) fn is_command_keyword(symbol: &str) -> bool {
-    active().is_some_and(|grammar| grammar.commands.contains_key(symbol))
+/// Whether `symbol` can start a command slice. Scoped artifact command heads
+/// participate before activation; only actual command parsing may decide
+/// whether their parser is active at that source position.
+pub(crate) fn is_partition_command_keyword(symbol: &str) -> bool {
+    active().is_some_and(|grammar| {
+        grammar.commands.contains_key(symbol) || grammar.partition_commands.contains(symbol)
+    })
 }
 
 /// The command in `range` read by the active `command` declaration its first token names (`seal`,
@@ -3776,31 +3808,36 @@ pub(crate) fn command(
     tokens: &[LexedToken],
     range: Range<usize>,
 ) -> Option<Syntax> {
-    let grammar = active()?;
-    let head = token_text(tokens.get(range.start)?)?;
-    let run = Run {
-        leaves,
-        view,
-        tokens,
-    };
-    let mut parsed = None;
-    for &index in grammar.commands.get(head.as_str())? {
-        if let Some((items, end)) = run.parse(
-            &grammar.decls[index].descr,
-            range.start,
-            range.end,
-            &Follow::End,
-            0,
-        ) && end == range.end
-            && let [syntax] = items.as_slice()
-        {
-            if parsed.is_some() {
+    categories::bounded(|| {
+        let grammar = active()?;
+        let head = token_text(tokens.get(range.start)?)?;
+        let run = Run {
+            leaves,
+            view,
+            tokens,
+        };
+        let mut parsed = None;
+        for &index in grammar.commands.get(head.as_str())? {
+            if !categories::tick() {
                 return None;
             }
-            parsed = Some(syntax.clone());
+            if let Some((items, end)) = run.parse(
+                &grammar.decls[index].descr,
+                range.start,
+                range.end,
+                &Follow::End,
+                0,
+            ) && end == range.end
+                && let [syntax] = items.as_slice()
+            {
+                if parsed.is_some() {
+                    return None;
+                }
+                parsed = Some(syntax.clone());
+            }
         }
-    }
-    parsed
+        parsed
+    })
 }
 
 /// The attribute in `range` read by the active `attr` declaration its first token names: `None`
@@ -4198,6 +4235,7 @@ impl Run<'_> {
                     Some("tactic") => {
                         crate::proofs::tactic(self.leaves, self.view, self.tokens, at..stop).ok()?
                     }
+                    Some("command") if *prec == 0 => self.command_operand(at, stop)?,
                     _ => return None,
                 };
                 Some((vec![syntax], stop))
