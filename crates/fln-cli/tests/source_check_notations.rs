@@ -262,23 +262,30 @@ fn a_section_capture_never_resolves_to_an_unrelated_global() {
     let cases = [
         (
             "prelude\nimport Init.Core\ndef x : Nat := 1\nsection\nvariable (x : Nat)\nnotation \"capturedValue!\" => x\nend\n#check capturedValue!\n",
+            5,
             "quotation capture of a section variable",
             "Unknown constant",
         ),
         (
             "prelude\nimport Init.Core\nstructure Box where\n  val : Nat\nnamespace box\ndef val : Nat := 1\nend box\nsection\nvariable (box : Box)\nnotation \"capturedBox!\" => box.val\nend\n#check capturedBox!\n",
+            5,
             "quotation capture of a section variable",
             "Unknown constant",
         ),
         (
             "prelude\nimport Init.Core\nstructure Box where\n  val : Nat\nnamespace box\ndef val : Nat := 1\nend box\nnotation \"fieldFn!\" => fun box : Box => box.val\ntheorem escaped : fieldFn! ({ val := 2 } : Box) = 1 := rfl\n",
-            "quotation field access through a bound name",
+            1,
+            "elaboration",
             "Not a definitional equality",
         ),
     ];
-    for (source, feature, pin_message) in cases {
+    for (source, native_code, feature, pin_message) in cases {
         let (code, stdout, stderr) = ours(&lib, &root, source);
-        assert_eq!(code, Some(5), "stdout: {stdout}\nstderr: {stderr}");
+        assert_eq!(
+            code,
+            Some(native_code),
+            "stdout: {stdout}\nstderr: {stderr}"
+        );
         assert!(stdout.is_empty(), "{stdout}");
         assert!(stderr.contains(feature), "{stderr}");
         let (code, output) = pinned(&lib, &root.join("Notations.lean"))
@@ -290,6 +297,17 @@ fn a_section_capture_never_resolves_to_an_unrelated_global() {
             source
         );
     }
+    // The bound dotted use selects the argument's field, including when the
+    // namespace contains a different same-spelled value.
+    let source = "prelude\nimport Init.Core\nstructure Box where\n  val : Nat\nnamespace box\ndef val : Nat := 1\nend box\nnotation \"fieldFn!\" => fun box : Box => box.val\ntheorem selected : fieldFn! ({ val := 2 } : Box) = 2 := rfl\n";
+    let (code, stdout, stderr) = ours(&lib, &root, source);
+    assert_eq!(code, Some(0), "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stdout.is_empty(), "{stdout}");
+    assert!(stderr.is_empty(), "{stderr}");
+    let (code, output) = pinned(&lib, &root.join("Notations.lean"))
+        .expect("the pinned Reference binary is required for the capture comparison");
+    assert_eq!(code, 0, "{output}");
+    assert!(output.is_empty(), "{output}");
 }
 
 #[test]
