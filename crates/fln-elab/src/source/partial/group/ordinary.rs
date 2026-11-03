@@ -464,70 +464,100 @@ fn mutual_structural(
     {
         return Err(refusal("fresh distinct ordinary mutual names"));
     }
-    let mut planner = Context::scoped(environment, kernel, scope);
-    planner.txn.budget = meter.txn.budget.clone();
-    let planned = planner.mutual_structural_plan(names.clone(), types, arities, fixed, levels);
-    meter.txn.budget = planner.txn.budget;
-    let plan = std::sync::Arc::new(planned?);
-    let mut wrappers = Vec::new();
-    let mut pieces = Vec::new();
-    for (position, &index) in component.iter().enumerate() {
-        let mut context = Context::scoped(environment, kernel, scope);
-        context.txn.budget = meter.txn.budget.clone();
-        context.partial = Some(State {
-            kind: Kind::Unsafe,
-            group: Some(parts.group.clone()),
-            ordinary: true,
-            ..State::default()
-        });
-        context.mutual_structural_member = Some(recursion::StructuralMember::new(
-            plan.clone(),
-            position,
-            captures.clone(),
-        ));
-        let elaborated = definition_in_context(&parts.members[index], &mut context);
-        meter.txn.budget = context.txn.budget.clone();
-        let Declaration::Mutual(mut definitions) = elaborated? else {
-            return Err(refusal("one ordinary body per mutual header"));
-        };
-        let (Some(mut wrapper), true) = (definitions.pop(), definitions.is_empty()) else {
-            return Err(refusal("one ordinary body per mutual header"));
-        };
-        if context.noncomputable_definition {
-            return Err(refusal("computable ordinary mutual definition"));
+    // An indexed family's major follows its varying index binders. Try each source
+    // position in order; a candidate must account for every preceding varying binder
+    // as one of that family's independent indices. Each attempt has fresh contexts,
+    // and failed attempts still charge the shared budget.
+    let candidates = arities.iter().copied().min().unwrap_or(0);
+    let mut last = None;
+    for decreasing in fixed..candidates {
+        let attempt = (|| {
+            let mut planner = Context::scoped(environment, kernel, scope);
+            planner.txn.budget = meter.txn.budget.clone();
+            let planned = planner.mutual_structural_plan(
+                names.clone(),
+                types.clone(),
+                arities.clone(),
+                fixed,
+                decreasing,
+                levels.clone(),
+            );
+            meter.txn.budget = planner.txn.budget;
+            let plan = std::sync::Arc::new(planned?);
+            let mut wrappers = Vec::new();
+            let mut pieces = Vec::new();
+            for (position, &index) in component.iter().enumerate() {
+                let mut context = Context::scoped(environment, kernel, scope);
+                context.txn.budget = meter.txn.budget.clone();
+                context.partial = Some(State {
+                    kind: Kind::Unsafe,
+                    group: Some(parts.group.clone()),
+                    ordinary: true,
+                    ..State::default()
+                });
+                context.mutual_structural_member = Some(recursion::StructuralMember::new(
+                    plan.clone(),
+                    position,
+                    captures.clone(),
+                ));
+                let elaborated = definition_in_context(&parts.members[index], &mut context);
+                meter.txn.budget = context.txn.budget.clone();
+                let Declaration::Mutual(mut definitions) = elaborated? else {
+                    return Err(refusal("one ordinary body per mutual header"));
+                };
+                let (Some(mut wrapper), true) = (definitions.pop(), definitions.is_empty()) else {
+                    return Err(refusal("one ordinary body per mutual header"));
+                };
+                if context.noncomputable_definition {
+                    return Err(refusal("computable ordinary mutual definition"));
+                }
+                let piece = context
+                    .mutual_structural_member
+                    .as_ref()
+                    .and_then(recursion::StructuralMember::piece)
+                    .cloned()
+                    .ok_or_else(|| failure(SourceInferenceError::Scope))?;
+                wrapper.safety = DefinitionSafety::Safe;
+                if !matches!(wrapper.hints, ReducibilityHints::Abbrev) {
+                    wrapper.hints = ReducibilityHints::Regular(1);
+                }
+                wrapper.all = names.clone();
+                if wrapper.base.name != names[position] {
+                    return Err(failure(SourceInferenceError::Scope));
+                }
+                wrappers.push(wrapper);
+                pieces.push(piece);
+            }
+            let mut obligations = Vec::new();
+            for &index in component {
+                obligations.push(mutual_typing_obligation(
+                    meter,
+                    &plan,
+                    &parts.bodies[index],
+                )?);
+            }
+            let mut assembler = Context::scoped(environment, kernel, scope);
+            assembler.txn.budget = meter.txn.budget.clone();
+            let assembled = assembler.assemble_mutual_structural(&plan, &pieces, &obligations);
+            meter.txn.budget = assembler.txn.budget;
+            let mutual = assembled?;
+            let implementations = mutual_implementations(meter, parts.bodies, component, &names)?;
+            Ok((mutual, wrappers, implementations))
+        })();
+        match attempt {
+            Ok(compiled) => return Ok(compiled),
+            Err(
+                problem @ NatDefinitionElabError::Inference(SourceInferenceError::Recursion(
+                    recursion::RecursionError::MutualStructuralUnsupported(_)
+                    | recursion::RecursionError::NotDecreasing
+                    | recursion::RecursionError::ChangedParameter
+                    | recursion::RecursionError::PartialApplication,
+                )),
+            ) => last = Some(problem),
+            Err(problem) => return Err(problem),
         }
-        let piece = context
-            .mutual_structural_member
-            .as_ref()
-            .and_then(recursion::StructuralMember::piece)
-            .cloned()
-            .ok_or_else(|| failure(SourceInferenceError::Scope))?;
-        wrapper.safety = DefinitionSafety::Safe;
-        if !matches!(wrapper.hints, ReducibilityHints::Abbrev) {
-            wrapper.hints = ReducibilityHints::Regular(1);
-        }
-        wrapper.all = names.clone();
-        if wrapper.base.name != names[position] {
-            return Err(failure(SourceInferenceError::Scope));
-        }
-        wrappers.push(wrapper);
-        pieces.push(piece);
     }
-    let mut obligations = Vec::new();
-    for &index in component {
-        obligations.push(mutual_typing_obligation(
-            meter,
-            &plan,
-            &parts.bodies[index],
-        )?);
-    }
-    let mut assembler = Context::scoped(environment, kernel, scope);
-    assembler.txn.budget = meter.txn.budget.clone();
-    let assembled = assembler.assemble_mutual_structural(&plan, &pieces, &obligations);
-    meter.txn.budget = assembler.txn.budget;
-    let mutual = assembled?;
-    let implementations = mutual_implementations(meter, parts.bodies, component, &names)?;
-    Ok((mutual, wrappers, implementations))
+    Err(last.unwrap_or_else(|| unsupported("a structural major in every member")))
 }
 
 /// Retain the original source body as a checked initializer under abstract peer functions.

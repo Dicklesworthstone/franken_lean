@@ -18,14 +18,19 @@ pub(in crate::source) struct StructuralPlan {
     pub level_params: Vec<Name>,
     pub arities: Vec<usize>,
     pub fixed: usize,
+    decreasing: usize,
+    /// Source positions of the family's indices, in the family's telescope order.
+    /// They occupy the varying prefix before the major, but need not occur in that order.
+    indices: Vec<usize>,
     family: Name,
     family_parameters: usize,
-    /// These terms are lambda-closed over the common fixed prefix.
+    /// The domain is closed over the source prefix before the major. The recursor is
+    /// closed over only the fixed prefix; its motive abstracts the varying indices.
     domain: Expr,
     recursor: Expr,
     recursor_type: Expr,
-    /// Each component is additionally lambda-closed over the common major. Its value is
-    /// the Pi type of any remaining, varying arguments followed by that member's result.
+    /// Each component is closed over the fixed prefix, family-ordered indices and major.
+    /// Its value is the Pi type of trailing varying arguments followed by the member result.
     components: Vec<Expr>,
 }
 
@@ -195,21 +200,23 @@ impl Context {
         self.match_apply(constructor, right)
     }
 
-    /// Construct a shared motive over a nonindexed, nonmutual inductive family. The
-    /// decreasing argument follows the common fixed prefix; every later argument varies.
-    /// Component result types and arities may differ, including dependent trailing binders.
+    /// Construct a shared motive over one inductive family. Independent local indices may
+    /// occur between the common fixed prefix and the major; the motive abstracts them in
+    /// family order. Component result types and trailing argument telescopes may differ.
     pub(in crate::source) fn mutual_structural_plan(
         &mut self,
         names: Vec<Name>,
         types: Vec<Expr>,
         arities: Vec<usize>,
         fixed: usize,
+        decreasing: usize,
         level_params: Vec<Name>,
     ) -> Result<StructuralPlan, NatDefinitionElabError> {
         if names.is_empty()
             || types.len() != names.len()
             || arities.len() != names.len()
-            || arities.iter().any(|arity| *arity <= fixed)
+            || decreasing < fixed
+            || arities.iter().any(|arity| *arity <= decreasing)
         {
             return Err(unsupported("a decreasing argument in every member"));
         }
@@ -217,7 +224,8 @@ impl Context {
         self.explicit_levels = level_params.len();
         let saved = self.txn.lctx.clone();
         let result = (|| {
-            let (fixed_locals, first) = self.structural_fixed_locals(&types[0], fixed)?;
+            let (prefix_locals, first) = self.structural_fixed_locals(&types[0], decreasing)?;
+            let fixed_locals = &prefix_locals[..fixed];
             let ExprNode::ForallE {
                 binder_type: domain,
                 binder_info,
@@ -242,10 +250,30 @@ impl Context {
                 return Err(unsupported("one inductive family after the fixed prefix"));
             };
             if family.all.len() != 1
-                || family.num_indices != 0
-                || parameters.len() != family.num_params as usize
+                || parameters.len() != family.num_params as usize + family.num_indices as usize
             {
-                return Err(unsupported("a nonindexed, nonmutual inductive family"));
+                return Err(unsupported("one nonmutual inductive family"));
+            }
+            let (parameters, index_values) = parameters.split_at(family.num_params as usize);
+            let indices = match self.elimination_index_locals(index_values) {
+                Err(NatDefinitionElabError::Inference(SourceInferenceError::Match(
+                    matching::MatchError::UnrefinedIndices,
+                ))) => return Err(unsupported("distinct local structural indices")),
+                result => result?,
+            };
+            let mut index_positions = Vec::new();
+            for index in &indices {
+                let Some(position) = prefix_locals.iter().position(|local| local.id == index.id)
+                else {
+                    return Err(unsupported("structural indices preceding the major"));
+                };
+                if position < fixed {
+                    return Err(unsupported("varying structural indices"));
+                }
+                index_positions.push(position);
+            }
+            if indices.len() != decreasing - fixed {
+                return Err(unsupported("only structural indices before the major"));
             }
             let brec = Name::str(family_name.clone(), "brecOn");
             if !self.is_auxiliary_recursor(&brec)? {
@@ -271,16 +299,16 @@ impl Context {
             let mut components = Vec::new();
             for type_ in &types {
                 let mut remainder = type_.clone();
-                for local in &fixed_locals {
+                for local in &prefix_locals {
                     self.tick()?;
                     let ExprNode::ForallE {
                         binder_type, body, ..
                     } = remainder.node()
                     else {
-                        return Err(unsupported("one common fixed prefix"));
+                        return Err(unsupported("one common structural prefix"));
                     };
                     if !self.defeq_guarded(binder_type, &local.type_)? {
-                        return Err(unsupported("fixed parameters of the same type"));
+                        return Err(unsupported("structural prefix parameters of the same type"));
                     }
                     remainder = self.substitute(body, &Expr::fvar(local.id.clone()))?;
                 }
@@ -310,6 +338,7 @@ impl Context {
                 type_: sort,
             })?;
             let motive = self.structural_close(&product, std::slice::from_ref(&major), true)?;
+            let motive = self.structural_close(&motive, &indices, true)?;
             let mut universes = if definition.base.level_params.len() == levels.len() {
                 Vec::new()
             } else {
@@ -330,7 +359,7 @@ impl Context {
                 )?,
             };
             for parameter in parameters {
-                recursor = self.course_apply(recursor, parameter)?;
+                recursor = self.course_apply(recursor, parameter.clone())?;
             }
             recursor = self.course_apply(recursor, motive)?;
             self.flush(true)?;
@@ -338,7 +367,8 @@ impl Context {
             for component in components {
                 let component =
                     self.structural_close(&component, std::slice::from_ref(&major), true)?;
-                closed_components.push(self.structural_close(&component, &fixed_locals, true)?);
+                let component = self.structural_close(&component, &indices, true)?;
+                closed_components.push(self.structural_close(&component, fixed_locals, true)?);
             }
             let plan = StructuralPlan {
                 name: Name::str(names[0].clone(), "_mutual"),
@@ -347,11 +377,13 @@ impl Context {
                 level_params,
                 arities,
                 fixed,
+                decreasing,
+                indices: index_positions,
                 family: family_name.clone(),
                 family_parameters: family.num_params as usize,
-                domain: self.structural_close(&domain, &fixed_locals, true)?,
-                recursor: self.structural_close(&recursor.value, &fixed_locals, true)?,
-                recursor_type: self.structural_close(&recursor.type_, &fixed_locals, true)?,
+                domain: self.structural_close(&domain, &prefix_locals, true)?,
+                recursor: self.structural_close(&recursor.value, fixed_locals, true)?,
+                recursor_type: self.structural_close(&recursor.type_, fixed_locals, true)?,
                 components: closed_components,
             };
             for term in [&plan.domain, &plan.recursor, &plan.recursor_type]
@@ -373,12 +405,17 @@ impl Context {
         &mut self,
         plan: &StructuralPlan,
         fixed: &[Expr],
+        indices: &[Expr],
         major: Expr,
     ) -> Result<(Typed, Expr, Expr), NatDefinitionElabError> {
         let recursor = Typed {
             value: self.structural_open(&plan.recursor, fixed)?,
             type_: self.structural_open(&plan.recursor_type, fixed)?,
         };
+        let mut recursor = recursor;
+        for index in indices {
+            recursor = self.course_apply(recursor, index.clone())?;
+        }
         let recursor = self.course_apply(recursor, major.clone())?;
         let remaining = self.whnf(&recursor.type_)?;
         let ExprNode::ForallE {
@@ -388,7 +425,15 @@ impl Context {
         else {
             return Err(scope());
         };
-        let function = self.whnf(functional)?;
+        let mut function = functional.clone();
+        for index in indices {
+            function = self.whnf(&function)?;
+            let ExprNode::ForallE { body, .. } = function.node() else {
+                return Err(scope());
+            };
+            function = self.substitute(body, index)?;
+        }
+        let function = self.whnf(&function)?;
         let ExprNode::ForallE { body, .. } = function.node() else {
             return Err(scope());
         };
@@ -431,17 +476,15 @@ impl Context {
             .ok_or_else(scope)?;
         parameters.splice(0..0, captures.iter().cloned());
         let expected = expected.ok_or_else(|| error(RecursionError::ResultTypeRequired))?;
-        if parameters.len() != plan.arities[member.index] || parameters.len() <= plan.fixed {
+        if parameters.len() != plan.arities[member.index] || parameters.len() <= plan.decreasing {
             return Err(unsupported("the same body telescope as its planned header"));
         }
         match hint {
             Some(TerminationHint::Structural(hint)) => {
                 if self.structural_hint_parameter(hint, &parameters, header_parameters)?
-                    != plan.fixed
+                    != plan.decreasing
                 {
-                    return Err(unsupported(
-                        "a structural hint selecting the first varying argument",
-                    ));
+                    return Err(unsupported("a structural hint selecting the planned major"));
                 }
             }
             None | Some(TerminationHint::Automatic) => {}
@@ -452,10 +495,19 @@ impl Context {
             .iter()
             .map(|local| Expr::fvar(local.id.clone()))
             .collect();
-        let major = &parameters[plan.fixed];
+        let indices: Vec<_> = plan
+            .indices
+            .iter()
+            .map(|&position| parameters[position].clone())
+            .collect();
+        let index_values: Vec<_> = indices
+            .iter()
+            .map(|local| Expr::fvar(local.id.clone()))
+            .collect();
+        let major = &parameters[plan.decreasing];
         let major_value = Expr::fvar(major.id.clone());
         let (_, _, below_type) =
-            self.structural_recursor_at(&plan, &fixed_values, major_value.clone())?;
+            self.structural_recursor_at(&plan, &fixed_values, &index_values, major_value.clone())?;
         let saved = self.txn.lctx.clone();
         let below_name = self.fresh_name()?;
         let below = self
@@ -516,9 +568,10 @@ impl Context {
             if markers.iter().any(|marker| reads.contains(marker)) {
                 return Err(error(RecursionError::PartialApplication));
             }
-            value = self.structural_close(&value, &parameters[plan.fixed + 1..], true)?;
+            value = self.structural_close(&value, &parameters[plan.decreasing + 1..], true)?;
             value = self.structural_close(&value, std::slice::from_ref(&below), true)?;
             value = self.structural_close(&value, std::slice::from_ref(major), true)?;
+            value = self.structural_close(&value, &indices, true)?;
             value = self.structural_close(&value, &fixed, true)?;
             self.require_resolved_terms(std::slice::from_ref(&value))?;
             if value.has_fvar() || value.has_loose_bvars() || value.has_level_mvar() {
@@ -544,9 +597,12 @@ impl Context {
         let mut wrapper = fixed_values
             .into_iter()
             .fold(Expr::const_(plan.name.clone(), levels), Expr::app);
+        for index in index_values {
+            wrapper = Expr::app(wrapper, index);
+        }
         wrapper = Expr::app(wrapper, major_value);
         wrapper = project(wrapper, member.index, plan.names.len());
-        for parameter in &parameters[plan.fixed + 1..] {
+        for parameter in &parameters[plan.decreasing + 1..] {
             wrapper = Expr::app(wrapper, Expr::fvar(parameter.id.clone()));
         }
         self.close_recursive_lambdas(
@@ -582,7 +638,7 @@ impl Context {
             return Ok(None);
         };
         let plan = member.plan;
-        if arguments.len() <= plan.fixed {
+        if arguments.len() <= plan.decreasing {
             return Ok(None);
         }
         if arguments
@@ -600,10 +656,19 @@ impl Context {
                 return Err(error(RecursionError::ChangedParameter));
             }
         }
-        let requested = &arguments[plan.fixed];
-        let reads = self.elimination_reads(requested)?;
-        if active.markers.iter().any(|marker| reads.contains(marker)) {
-            return Err(error(RecursionError::NotDecreasing));
+        // A dictionary entry is identified by its complete indexed argument, never by
+        // the result type or the major alone. Source and family index orders may differ.
+        let mut requested: Vec<_> = plan
+            .indices
+            .iter()
+            .map(|&position| arguments[position].clone())
+            .collect();
+        requested.push(arguments[plan.decreasing].clone());
+        for argument in &requested {
+            let reads = self.elimination_reads(argument)?;
+            if active.markers.iter().any(|marker| reads.contains(marker)) {
+                return Err(error(RecursionError::NotDecreasing));
+            }
         }
         let below = self
             .txn
@@ -611,14 +676,10 @@ impl Context {
             .find_by_user_name(&active.below)
             .cloned()
             .ok_or_else(|| error(RecursionError::NotDecreasing))?;
-        let entry = self.select_course_entry(
-            &below,
-            &plan.family,
-            plan.family_parameters,
-            std::slice::from_ref(requested),
-        )?;
+        let entry =
+            self.select_course_entry(&below, &plan.family, plan.family_parameters, &requested)?;
         let mut result = project(entry, target, plan.names.len());
-        for argument in arguments.into_iter().skip(plan.fixed + 1) {
+        for argument in arguments.into_iter().skip(plan.decreasing + 1) {
             self.tick()?;
             result = Expr::app(result, argument);
         }
@@ -638,12 +699,26 @@ impl Context {
         self.explicit_levels = plan.level_params.len();
         let saved = self.txn.lctx.clone();
         let result = (|| {
-            let (fixed, _) = self.structural_fixed_locals(&plan.types[0], plan.fixed)?;
+            let (prefix, _) = self.structural_fixed_locals(&plan.types[0], plan.decreasing)?;
+            let fixed = &prefix[..plan.fixed];
             let fixed_values: Vec<_> = fixed
                 .iter()
                 .map(|local| Expr::fvar(local.id.clone()))
                 .collect();
-            let domain = self.structural_open(&plan.domain, &fixed_values)?;
+            let prefix_values: Vec<_> = prefix
+                .iter()
+                .map(|local| Expr::fvar(local.id.clone()))
+                .collect();
+            let indices: Vec<_> = plan
+                .indices
+                .iter()
+                .map(|&position| prefix[position].clone())
+                .collect();
+            let index_values: Vec<_> = indices
+                .iter()
+                .map(|local| Expr::fvar(local.id.clone()))
+                .collect();
+            let domain = self.structural_open(&plan.domain, &prefix_values)?;
             let major_id = FVarId(self.fresh_name()?);
             let major = self
                 .txn
@@ -651,8 +726,12 @@ impl Context {
                 .add_param(major_id, Name::anonymous(), domain, BinderInfo::Default)
                 .clone();
             let major_value = Expr::fvar(major.id.clone());
-            let (recursor, functional_type, below_type) =
-                self.structural_recursor_at(plan, &fixed_values, major_value.clone())?;
+            let (recursor, functional_type, below_type) = self.structural_recursor_at(
+                plan,
+                &fixed_values,
+                &index_values,
+                major_value.clone(),
+            )?;
             let below_id = FVarId(self.fresh_name()?);
             let below = self
                 .txn
@@ -660,14 +739,15 @@ impl Context {
                 .add_param(below_id, Name::anonymous(), below_type, BinderInfo::Default)
                 .clone();
             let mut entries = Vec::new();
+            let mut motive_arguments = index_values;
+            motive_arguments.push(major_value.clone());
+            let mut functional_arguments = motive_arguments.clone();
+            functional_arguments.push(Expr::fvar(below.id.clone()));
             for (piece, component) in pieces.iter().zip(&plan.components) {
                 let piece = self.structural_open(piece, &fixed_values)?;
-                let value = self.structural_open(
-                    &piece,
-                    &[major_value.clone(), Expr::fvar(below.id.clone())],
-                )?;
+                let value = self.structural_open(&piece, &functional_arguments)?;
                 let component = self.structural_open(component, &fixed_values)?;
-                let type_ = self.structural_open(&component, std::slice::from_ref(&major_value))?;
+                let type_ = self.structural_open(&component, &motive_arguments)?;
                 entries.push(Typed { value, type_ });
             }
             let mut product = entries.pop().ok_or_else(scope)?;
@@ -676,6 +756,7 @@ impl Context {
             }
             let functional =
                 self.structural_close(&product.value, &[major.clone(), below], true)?;
+            let functional = self.structural_close(&functional, &indices, true)?;
             let checked = self.match_apply(
                 recursor,
                 Typed {
@@ -687,8 +768,10 @@ impl Context {
                 self.structural_close(&checked.value, std::slice::from_ref(&major), true)?;
             let mut type_ =
                 self.structural_close(&checked.type_, std::slice::from_ref(&major), false)?;
-            value = self.structural_close(&value, &fixed, true)?;
-            type_ = self.structural_close(&type_, &fixed, false)?;
+            value = self.structural_close(&value, &indices, true)?;
+            type_ = self.structural_close(&type_, &indices, false)?;
+            value = self.structural_close(&value, fixed, true)?;
+            type_ = self.structural_close(&type_, fixed, false)?;
             // Original bodies, abstracted over all recursive references, are checked even
             // where normalization of the compiled function would erase an annotation.
             for obligation in obligations.iter().rev() {

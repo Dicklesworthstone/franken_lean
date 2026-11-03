@@ -26,6 +26,240 @@ fn check(source: &str) -> Engine {
         .expect("both checkers complete")
         .engine
 }
+
+fn below_engine() -> (Engine, EngineAdmissionLimits) {
+    // User inductives generate below/brecOn when the seed has the product type
+    // needed by their dictionaries. Reference already provides this declaration.
+    let (base, limits) = engine();
+    let base = base
+        .check_source_files(
+            &[b"structure Prod (A : Type u) (B : Type v) where\n fst : A\n snd : B\n"],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap()
+        .engine;
+    (base, limits)
+}
+
+fn check_below(source: &str) -> Engine {
+    oracle(source, true);
+    let (base, limits) = below_engine();
+    base.check_source_files(
+        &[source.as_bytes()],
+        &KVMap::new(),
+        SourceCheckLimits::new(limits),
+    )
+    .unwrap_or_else(|error| panic!("{source}\n{error:?}"))
+    .into_complete()
+    .expect("both checkers complete")
+    .engine
+}
+
+const MUTUAL_VEC: &str = r#"
+inductive MutualVec (A : Type u) : Nat -> Type u where
+ | nil : MutualVec A 0
+ | cons (n : Nat) : A -> MutualVec A n -> MutualVec A (Nat.succ n)
+"#;
+
+#[test]
+fn mutual_structural_generalizes_implicit_indices_and_dependent_results() {
+    let source = format!(
+        "{MUTUAL_VEC}\n{}",
+        r#"
+mutual
+ def vecLeft.{u} {A : Type u} {n : Nat} (xs : MutualVec A n) : Nat := match xs with
+  | .nil => 0
+  | .cons _ _ tail => vecRight tail + 1
+ def vecRight.{u} {A : Type u} {n : Nat} (xs : MutualVec A n) : Nat := match xs with
+  | .nil => 0
+  | .cons _ _ tail => vecLeft tail + 2
+end
+mutual
+ def vecCopyLeft.{u} {A : Type u} {n : Nat} (xs : MutualVec A n) : MutualVec A n := match xs with
+  | .nil => .nil
+  | .cons k a tail => .cons k a (vecCopyRight tail)
+ def vecCopyRight.{u} {A : Type u} {n : Nat} (xs : MutualVec A n) : MutualVec A n := match xs with
+  | .nil => .nil
+  | .cons k a tail => .cons k a (vecCopyLeft tail)
+end
+example : vecLeft (.cons 2 11 (.cons 1 22 (.cons 0 33 .nil))) = 4 := rfl
+example : vecRight (.cons 2 11 (.cons 1 22 (.cons 0 33 .nil))) = 5 := rfl
+example : vecCopyLeft (.cons 1 11 (.cons 0 22 .nil)) = MutualVec.cons 1 11 (MutualVec.cons 0 22 MutualVec.nil) := rfl
+example : vecCopyRight (.cons 1 11 (.cons 0 22 .nil)) = MutualVec.cons 1 11 (MutualVec.cons 0 22 MutualVec.nil) := rfl
+example (A : Type u) (n : Nat) (a : A) (tail : MutualVec A n) :
+ vecLeft (.cons n a tail) = vecRight tail + 1 := rfl
+example (A : Type u) (n : Nat) (a : A) (tail : MutualVec A n) :
+ vecCopyLeft (.cons n a tail) = MutualVec.cons n a (vecCopyRight tail) := rfl
+"#
+    );
+    let base = check_below(&source);
+    run(
+        &base,
+        "#eval vecLeft (.cons 2 11 (.cons 1 22 (.cons 0 33 .nil)))",
+        "4",
+    );
+    run(
+        &base,
+        "#eval vecRight (.cons 2 11 (.cons 1 22 (.cons 0 33 .nil)))",
+        "5",
+    );
+    run(
+        &base,
+        "#eval vecLeft (vecCopyLeft (.cons 2 11 (.cons 1 22 (.cons 0 33 .nil))))",
+        "4",
+    );
+    run(
+        &base,
+        "#eval vecRight (vecCopyRight (.cons 2 11 (.cons 1 22 (.cons 0 33 .nil))))",
+        "5",
+    );
+}
+
+#[test]
+fn mutual_structural_hint_selects_indexed_major_and_generalizes_accumulator() {
+    let source = format!(
+        "{MUTUAL_VEC}\n{}",
+        r#"
+mutual
+ def accLeft.{u} {A : Type u} (n : Nat) (xs : MutualVec A n) (seed : Nat) : Nat := match xs with
+  | .nil => seed
+  | .cons k _ tail => accRight k tail (seed + 1)
+ termination_by structural xs
+ def accRight.{u} {A : Type u} (n : Nat) (xs : MutualVec A n) (seed : Nat) : Nat := match xs with
+  | .nil => seed
+  | .cons k _ tail => accLeft k tail (seed + 2)
+ termination_by structural xs
+end
+example : accLeft 3 (.cons 2 11 (.cons 1 22 (.cons 0 33 .nil))) 10 = 14 := rfl
+example : accRight 3 (.cons 2 11 (.cons 1 22 (.cons 0 33 .nil))) 10 = 15 := rfl
+example (A : Type u) (n : Nat) (a : A) (tail : MutualVec A n) (seed : Nat) :
+ accLeft (n+1) (.cons n a tail) seed = accRight n tail (seed+1) := rfl
+"#
+    );
+    let base = check_below(&source);
+    run(
+        &base,
+        "#eval accLeft 3 (.cons 2 11 (.cons 1 22 (.cons 0 33 .nil))) 10",
+        "14",
+    );
+    run(
+        &base,
+        "#eval accRight 3 (.cons 2 11 (.cons 1 22 (.cons 0 33 .nil))) 10",
+        "15",
+    );
+}
+
+#[test]
+fn mutual_structural_uses_family_order_for_independently_varying_indices() {
+    let base = check_below(
+        r#"
+inductive MutualGrid : Nat -> Nat -> Type where
+ | empty : MutualGrid 0 0
+ | row (rows cols : Nat) : MutualGrid rows cols -> MutualGrid (rows+1) cols
+ | col (rows cols : Nat) : MutualGrid rows cols -> MutualGrid rows (cols+1)
+mutual
+ def gridLeft (cols rows : Nat) (grid : MutualGrid rows cols) : Nat := match grid with
+  | .empty => 0
+  | .row r c tail => gridRight c r tail + 1
+  | .col r c tail => gridRight c r tail + 1
+ termination_by structural grid
+ def gridRight (cols rows : Nat) (grid : MutualGrid rows cols) : Nat := match grid with
+  | .empty => 0
+  | .row r c tail => gridLeft c r tail + 2
+  | .col r c tail => gridLeft c r tail + 2
+ termination_by structural grid
+end
+example : gridLeft 1 2 (.row 1 1 (.col 1 0 (.row 0 0 .empty))) = 4 := rfl
+example : gridRight 1 2 (.row 1 1 (.col 1 0 (.row 0 0 .empty))) = 5 := rfl
+example (r c : Nat) (tail : MutualGrid r c) :
+ gridLeft c (r+1) (.row r c tail) = gridRight c r tail + 1 := rfl
+example (r c : Nat) (tail : MutualGrid r c) :
+ gridRight (c+1) r (.col r c tail) = gridLeft c r tail + 2 := rfl
+"#,
+    );
+    run(
+        &base,
+        "#eval gridLeft 1 2 (.row 1 1 (.col 1 0 (.row 0 0 .empty)))",
+        "4",
+    );
+    run(
+        &base,
+        "#eval gridRight 1 2 (.row 1 1 (.col 1 0 (.row 0 0 .empty)))",
+        "5",
+    );
+}
+
+#[test]
+fn mutual_structural_indexed_calls_preserve_termination_and_typing_obligations() {
+    let (base, limits) = below_engine();
+    let root = base.logical_root(&KVMap::new());
+    for body in [
+        r#"
+mutual
+ def badLeft.{u} {A : Type u} {n : Nat} (xs : MutualVec A n) : Nat := badRight xs
+ termination_by structural xs
+ def badRight.{u} {A : Type u} {n : Nat} (xs : MutualVec A n) : Nat := badLeft xs
+ termination_by structural xs
+end
+"#,
+        r#"
+mutual
+ def badLeft.{u} {A : Type u} {n : Nat} (xs : MutualVec A n) : Nat := match xs with
+  | .nil => 0
+  | .cons k a tail => let unused := badRight (.cons k a tail); badRight tail
+ termination_by structural xs
+ def badRight.{u} {A : Type u} {n : Nat} (xs : MutualVec A n) : Nat := match xs with
+  | .nil => 0
+  | .cons _ _ tail => badLeft tail
+ termination_by structural xs
+end
+"#,
+        r#"
+mutual
+ def badLeft.{u} {A : Type u} {n : Nat} (xs : MutualVec A n) : Nat := match xs with
+  | .nil => 0
+  | .cons k _ tail => let invalid : Bool := k; badRight tail
+ termination_by structural xs
+ def badRight.{u} {A : Type u} {n : Nat} (xs : MutualVec A n) : Nat := match xs with
+  | .nil => 0
+  | .cons _ _ tail => badLeft tail
+ termination_by structural xs
+end
+"#,
+        r#"
+mutual
+ def badLeft.{u} {A : Type u} (n : Nat) (xs : MutualVec A n) : Nat := match xs with
+  | .nil => 0
+  | .cons k a tail => badRight k (.cons k a tail)
+ termination_by structural xs
+ def badRight.{u} {A : Type u} (n : Nat) (xs : MutualVec A n) : Nat := match xs with
+  | .nil => 0
+  | .cons k _ tail => badLeft k tail
+ termination_by structural xs
+end
+"#,
+    ] {
+        let source = format!("{MUTUAL_VEC}\n{body}");
+        oracle(&source, false);
+        assert!(
+            base.check_source_files(
+                &[source.as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits),
+            )
+            .is_err(),
+            "invalid indexed component must not be admitted: {source}"
+        );
+        assert_eq!(base.logical_root(&KVMap::new()), root);
+        for label in ["MutualVec", "badLeft", "badRight", "badLeft._mutual"] {
+            assert!(!base.environment().contains(&name(label)));
+        }
+    }
+}
+
 #[test]
 fn forward_definitions_reduce_after_dependency_ordered_admission() {
     check(
