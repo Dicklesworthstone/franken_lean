@@ -232,6 +232,9 @@ fn admitted_bootstrap_strings_execute_unicode_and_refuse_changed_opaque_contract
             ("String.Internal.pushn", "lean_string_pushn"),
             ("String.Internal.foldl", "lean_string_foldl"),
             ("String.Internal.isEmpty", "lean_string_isempty"),
+            ("String.Internal.any", "lean_string_any"),
+            ("String.Internal.nextWhile", "lean_string_nextwhile"),
+            ("String.Internal.intercalate", "lean_string_intercalate"),
             ("String.Internal.front", "lean_string_front"),
             ("String.Pos.Raw.Internal.min", "lean_string_pos_min"),
             ("String.Pos.Raw.Internal.sub", "lean_string_pos_sub"),
@@ -243,6 +246,8 @@ fn admitted_bootstrap_strings_execute_unicode_and_refuse_changed_opaque_contract
             ("Substring.Raw.Internal.isEmpty", "lean_substring_isempty"),
             ("Substring.Raw.Internal.get", "lean_substring_get"),
             ("Substring.Raw.Internal.prev", "lean_substring_prev"),
+            ("Substring.Raw.Internal.all", "lean_substring_all"),
+            ("Substring.Raw.Internal.takeWhile", "lean_substring_takewhile"),
         ] {
             assert_eq!(externs.get(&name(declaration)), Some([fln_elab::externs::ExternEntry::Standard { backend: name("all"), symbol: symbol.to_owned() }].as_slice()), "the real artifact supplies execution metadata");
         }
@@ -297,6 +302,14 @@ import Init.Data.String.Bootstrap
 #eval if String.Internal.isPrefixOf "λ" "μ" then 42 else 0
 #eval let starts := String.Internal.isPrefixOf "λ"; if starts "λ😀" then 42 else 0
 #eval let invoke (f : String -> Bool) : Nat := if f "λx" then 42 else 0; invoke (String.Internal.isPrefixOf "λ")
+#eval if String.Internal.any "λ😀" (fun _ => true) then 1 else 0
+#eval if String.Internal.any "" (fun _ => true) then 1 else 0
+#eval let flag := true; let any := String.Internal.any "λ😀"; if any (fun _ => flag) then 1 else 0
+#eval let flag := true; let seek := String.Internal.nextWhile "λ😀" (fun _ => flag); (seek (String.Pos.Raw.mk 0)).byteIdx
+#eval if Substring.Raw.Internal.all (Substring.Raw.mk "λ😀" (String.Pos.Raw.mk 0) (String.Pos.Raw.mk 6)) (fun _ => false) then 1 else 0
+#eval if Substring.Raw.Internal.all (Substring.Raw.mk "λ😀" (String.Pos.Raw.mk 0) (String.Pos.Raw.mk 0)) (fun _ => false) then 1 else 0
+#eval (Substring.Raw.Internal.takeWhile (Substring.Raw.mk "λ😀z" (String.Pos.Raw.mk 0) (String.Pos.Raw.mk 6)) (fun _ => true)).stopPos.byteIdx
+#eval String.Internal.intercalate "λ" ["a", "", "😀\x00", "z"]
 "#;
         let entry = name("Main");
         let modules = [SourceModuleInput { name: &entry, source: source.as_bytes() }];
@@ -339,6 +352,14 @@ import Init.Data.String.Bootstrap
             Some(ClosedVmValue::Scalar(0)),
             Some(ClosedVmValue::Scalar(42)),
             Some(ClosedVmValue::Scalar(42)),
+            Some(ClosedVmValue::Scalar(1)),
+            Some(ClosedVmValue::Scalar(0)),
+            Some(ClosedVmValue::Scalar(1)),
+            Some(ClosedVmValue::Scalar(6)),
+            Some(ClosedVmValue::Scalar(0)),
+            Some(ClosedVmValue::Scalar(1)),
+            Some(ClosedVmValue::Scalar(6)),
+            Some(ClosedVmValue::String("aλλ😀\0λz".to_owned())),
         ]);
         assert_eq!("é😀a".len(), 7, "the native length result counts codepoints, not bytes");
         // Replay the actual bytes emitted after both imported-module and
@@ -359,10 +380,10 @@ import Init.Data.String.Bootstrap
             let replay = fln::execute_flbc_artifact(&execution.flbc_artifact, &options, Default::default()).unwrap().into_complete().unwrap();
             assert_eq!(fln::closed_vm_value(&replay).unwrap(), fln::closed_vm_value(&execution.exit).unwrap());
         }
-        for operation in ["utf8ByteSize", "Internal.posOf", "Internal.offsetOfPos", "Internal.extract", "Internal.next", "Internal.pushn", "Internal.foldl", "Internal.isEmpty", "Internal.isPrefixOf", "Internal.front", "Pos.Raw.Internal.min", "Pos.Raw.Internal.sub"] {
+        for operation in ["utf8ByteSize", "Internal.posOf", "Internal.offsetOfPos", "Internal.extract", "Internal.next", "Internal.pushn", "Internal.foldl", "Internal.isEmpty", "Internal.isPrefixOf", "Internal.front", "Pos.Raw.Internal.min", "Pos.Raw.Internal.sub", "Internal.any", "Internal.nextWhile", "Internal.intercalate"] {
             assert!(string_rows.contains(&format!("extern:String.{operation}")), "the admitted source must select {operation}'s actual native row");
         }
-        for operation in ["toString", "drop", "front", "extract", "beq", "isEmpty", "get", "prev"] {
+        for operation in ["toString", "drop", "front", "extract", "beq", "isEmpty", "get", "prev", "all", "takeWhile"] {
             assert!(string_rows.contains(&format!("extern:Substring.Raw.Internal.{operation}")), "the admitted source must select {operation}'s actual native row");
         }
         let mut tight = limits;

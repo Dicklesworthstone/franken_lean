@@ -126,6 +126,79 @@ fn predicate_fixture() -> Option<&'static Fixture> {
     )
 }
 
+fn activate_class_context(
+    environment: Environment,
+    classes: &BTreeMap<Name, ClassParameters>,
+    instances: &[metadata::InstanceEntry],
+    defaults: &[metadata::DefaultEntry],
+) -> Environment {
+    let mut activation = ImportActivation::new(environment);
+    for (class, parameters) in classes {
+        activation = activation.register_class(class, parameters).unwrap();
+    }
+    for row in instances {
+        let info = activation.environment().find(&row.declaration).unwrap();
+        assert_eq!(
+            row.value,
+            Expr::const_(
+                row.declaration.clone(),
+                info.constant_val()
+                    .level_params
+                    .iter()
+                    .cloned()
+                    .map(Level::param)
+                    .collect(),
+            )
+        );
+        let keys = row
+            .keys
+            .iter()
+            .cloned()
+            .map(|key| {
+                use fln_elab::instances::discr_tree::Key;
+                use metadata::DiscrTreeKey;
+                match key {
+                    DiscrTreeKey::Star => Key::Star,
+                    DiscrTreeKey::Other => Key::Other,
+                    DiscrTreeKey::Lit(value) => Key::Lit(value),
+                    DiscrTreeKey::FVar(name, arity) => {
+                        Key::FVar(fln_core::expr::FVarId(name), arity)
+                    }
+                    DiscrTreeKey::Const(name, arity) => Key::Const(name, arity),
+                    DiscrTreeKey::Arrow => Key::Arrow,
+                    DiscrTreeKey::Proj(name, field, arity) => Key::Proj(name, field, arity),
+                }
+            })
+            .collect();
+        activation = activation
+            .register_instance(
+                &row.declaration,
+                &fln_elab::instances::imported::InstanceParameters {
+                    priority: row.priority,
+                    synth_order: row.synth_order.clone(),
+                    scope: row.scope.clone(),
+                    keys,
+                },
+            )
+            .unwrap();
+    }
+    for row in defaults {
+        let info = activation.environment().find(&row.declaration).unwrap();
+        assert_eq!(
+            fln_elab::instances::instance_telescope(
+                activation.environment(),
+                &info.constant_val().type_
+            )
+            .map(|(_, class)| class),
+            Some(row.class.clone()),
+        );
+        activation = activation
+            .register_default(&row.declaration, row.priority)
+            .unwrap();
+    }
+    activation.finish().unwrap()
+}
+
 fn fixture_from_modules(
     cache: &'static OnceLock<Option<Fixture>>,
     modules: &[&'static str],
@@ -144,8 +217,9 @@ fn fixture_from_modules(
             let mut actual_externs = BTreeMap::new();
             let mut prelude_names = BTreeSet::new();
             let mut prelude_externs = BTreeMap::new();
-            let mut classes = BTreeMap::new();
             let mut prelude_classes = BTreeMap::new();
+            let mut prelude_instances = Vec::new();
+            let mut prelude_defaults = Vec::new();
             let mut owners = BTreeMap::new();
             for &module in modules {
                 let path = library.join(module).with_extension("olean");
@@ -176,20 +250,29 @@ fn fixture_from_modules(
                     .into_iter()
                     .filter(|block| {
                         block.name == name(metadata::EXTERN_EXTENSION)
-                            || block.name == name(metadata::CLASS_EXTENSION)
+                            || (module == "Init/Prelude"
+                                && [
+                                    metadata::CLASS_EXTENSION,
+                                    metadata::INSTANCE_EXTENSION,
+                                    metadata::DEFAULT_EXTENSION,
+                                ]
+                                .iter()
+                                .any(|extension| block.name == name(extension)))
                     })
                     .collect();
                 let decoded_metadata =
                     metadata::decode(&blocks, metadata::DecodeLimits::default()).unwrap();
+                if module == "Init/Prelude" {
+                    prelude_instances.extend(decoded_metadata.instances.iter().cloned());
+                    prelude_defaults.extend(decoded_metadata.defaults.iter().cloned());
+                }
                 for row in decoded_metadata.classes {
                     let parameters = ClassParameters {
                         out_params: row.out_params,
                         out_level_params: row.out_level_params,
                     };
-                    if module == "Init/Prelude" {
-                        prelude_classes.insert(row.name.clone(), parameters.clone());
-                    }
-                    if let Some(previous) = classes.insert(row.name, parameters.clone()) {
+                    assert_eq!(module, "Init/Prelude");
+                    if let Some(previous) = prelude_classes.insert(row.name, parameters.clone()) {
                         assert_eq!(previous, parameters);
                     }
                 }
@@ -238,17 +321,19 @@ fn fixture_from_modules(
             for info in constants.into_values() {
                 environment = environment.add_decl(info).unwrap();
             }
-            // Raw ConstantInfo decoding does not activate class metadata. The
-            // ordinary elaborator requires the pin's class registrations when
-            // it checks implicit instance binders (including canonical ite).
-            // Preserve the actual output-parameter policy rather than guessing
-            // class names from declaration shapes or installing seed metadata.
-            assert!(!classes.is_empty() && !prelude_classes.is_empty());
-            let mut activation = ImportActivation::new(environment);
-            for (class, parameters) in &classes {
-                activation = activation.register_class(class, parameters).unwrap();
-            }
-            let mut environment = activation.finish().unwrap();
+            // The comparison catalogue above supplies exact declaration data,
+            // not those modules' import effects. Its ambient source context is
+            // the real Prelude: retain that complete class/instance/default
+            // journal so canonical ite and ordinary instance binders work.
+            // Actual library admission is tested by the separate integration
+            // target; no seeded classes or chosen instance names belong here.
+            assert!(!prelude_classes.is_empty() && !prelude_instances.is_empty());
+            let mut environment = activate_class_context(
+                environment,
+                &prelude_classes,
+                &prelude_instances,
+                &prelude_defaults,
+            );
             for (label, entries) in &actual_externs {
                 environment = externs::register(&environment, label, entries.clone()).unwrap();
             }
@@ -258,11 +343,12 @@ fn fixture_from_modules(
                     .with_entry(environment.entry(&label).unwrap())
                     .unwrap();
             }
-            let mut activation = ImportActivation::new(prelude);
-            for (class, parameters) in prelude_classes {
-                activation = activation.register_class(&class, &parameters).unwrap();
-            }
-            let mut prelude = activation.finish().unwrap();
+            let mut prelude = activate_class_context(
+                prelude,
+                &prelude_classes,
+                &prelude_instances,
+                &prelude_defaults,
+            );
             for (label, entries) in prelude_externs {
                 prelude = externs::register(&prelude, &label, entries).unwrap();
             }
