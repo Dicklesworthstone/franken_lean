@@ -5,6 +5,13 @@ use fln::{
     Budget, Engine, EngineAdmissionLimits, KVMap, Name, OleanCheckLimits, OleanDecodeLimits,
     OleanModuleInput, Outcome, SourceCheckLimits, olean_module_imports,
 };
+use fln_core::outcome::InconclusiveCause;
+use fln_elab::NatDefinitionElabError;
+use fln_elab::arithmetic::{
+    ArithmeticProvider, LinearConstraint, OmegaCertificate, OmegaInconclusive, OmegaLimits,
+    OmegaOutcome, OmegaResource,
+};
+use fln_elab::source::{SourceInferenceError, scope::SourceScope};
 use std::{collections::BTreeSet, path::Path, process::Command};
 
 const STACK: usize = 128 * 1024 * 1024;
@@ -13,8 +20,11 @@ const ROOTS: &[&str] = &[
     "Init.Grind.Lemmas",
     "Init.Grind.ToInt",
     "Init.Grind.Norm",
+    "Init.Grind.Cases",
+    "Init.Data.Int.OfNat",
+    "Init.Data.Ord.Basic",
 ];
-const HEADER: &str = "prelude\nimport Init.Grind.Tactics\nimport Init.Grind.Lemmas\nimport Init.Grind.ToInt\nimport Init.Grind.Norm\n";
+const HEADER: &str = "prelude\nimport Init.Grind.Tactics\nimport Init.Grind.Lemmas\nimport Init.Grind.ToInt\nimport Init.Grind.Norm\nimport Init.Grind.Cases\nimport Init.Data.Int.OfNat\nimport Init.Data.Ord.Basic\n";
 fn name(text: &str) -> Name {
     Name::from_components(text.split('.'))
 }
@@ -252,6 +262,62 @@ const ACCEPT: &[(&str, &str)] = &[
         "explicit_proof_term",
         "axiom promise : False\nexample : False := by grind only [(promise)]",
     ),
+    (
+        "arithmetic_identity",
+        "example (a : Nat) : a + 0 = a := by grind only []",
+    ),
+    (
+        "arithmetic_nat_chain",
+        "example (i j k : Nat) (h : i + 3 ≤ j) (h' : j + 4 ≤ k) : i + 7 ≤ k := by grind",
+    ),
+    (
+        "arithmetic_integer_rounding",
+        "example (x : Int) (h : 2 * x ≤ 3) (h' : 2 ≤ x) : False := by grind",
+    ),
+    (
+        "arithmetic_negative_integer",
+        "example (x : Int) (h : 2 * x ≤ -1) : x ≤ -1 := by grind",
+    ),
+    (
+        "arithmetic_antisymmetry",
+        "example (x y : Int) (h : x ≤ y) (h' : y ≤ x) : x = y := by grind",
+    ),
+    (
+        "arithmetic_nat_nonnegative",
+        "example (n : Nat) : 0 ≤ n := by grind",
+    ),
+    (
+        "arithmetic_negated_bound",
+        "example (n : Nat) (h : ¬ n ≤ 3) : 4 ≤ n := by grind",
+    ),
+    (
+        "arithmetic_implication_premise",
+        "example (P : Prop) (n : Nat) (h : n ≤ 3) (step : n < 5 → P) : P := by grind",
+    ),
+    (
+        "arithmetic_quantified_consequence",
+        "example (P : Nat → Prop) (a : Nat) (h : ∀ x, P x → x ≤ 3) (ha : P a) : a < 5 := by grind",
+    ),
+    (
+        "arithmetic_propositional_branches",
+        "example (n : Nat) (h : n ≤ 3 ∨ 7 ≤ n) : n ≠ 5 := by grind",
+    ),
+    (
+        "arithmetic_mixed_domains",
+        "example (n : Nat) (z : Int) (h : (n : Int) + 2 ≤ z) (hz : z < 0) : False := by grind",
+    ),
+    (
+        "arithmetic_congruence_arguments",
+        "example (f : Nat → Nat) (n : Nat) : f (n + 1) = f (1 + n) := by grind",
+    ),
+    (
+        "arithmetic_congruence_bounds",
+        "example (f : Int → Nat) (x y : Int) (h : x ≤ y) (h' : y ≤ x) : f x = f y := by grind",
+    ),
+    (
+        "arithmetic_nested_congruence",
+        "example (f g : Nat → Nat) (n : Nat) : f (g (n + 1)) = f (g (1 + n)) := by grind",
+    ),
 ];
 
 const REFUSE: &[(&str, &str)] = &[
@@ -308,6 +374,22 @@ const REFUSE: &[(&str, &str)] = &[
         "explicit_declaration_without_pattern",
         "axiom promise : False\nexample : False := by grind only [promise]",
     ),
+    (
+        "arithmetic_strict_bound_is_not_nonstrict",
+        "example (n : Nat) (h : n ≤ 3) : n < 3 := by grind",
+    ),
+    (
+        "arithmetic_missing_premise",
+        "example (P : Prop) (n : Nat) (h : n ≤ 5) (step : n < 5 → P) : P := by grind",
+    ),
+    (
+        "arithmetic_consistent_integer_bounds",
+        "example (x : Int) (h : 2 * x ≤ 4) (h' : 2 ≤ x) : False := by grind",
+    ),
+    (
+        "arithmetic_congruence_unequal_arguments",
+        "example (f : Nat → Nat) (n : Nat) : f (n + 1) = f (n + 2) := by grind",
+    ),
 ];
 
 const UNSUPPORTED: &[(&str, &str)] = &[
@@ -326,6 +408,89 @@ const UNSUPPORTED: &[(&str, &str)] = &[
 ];
 
 const EXHAUST: &str = "example (P : Nat → Prop) (f : Nat → Nat) (a : Nat) (ha : P a) (step : ∀ x, P x → P (f x)) : False := by grind";
+
+fn cancelled(_: &[LinearConstraint], _: OmegaLimits) -> OmegaOutcome {
+    OmegaOutcome::Inconclusive {
+        reason: OmegaInconclusive::Cancelled,
+        steps_used: 1,
+    }
+}
+
+fn exhausted(_: &[LinearConstraint], _: OmegaLimits) -> OmegaOutcome {
+    OmegaOutcome::Inconclusive {
+        reason: OmegaInconclusive::ResourceLimit {
+            resource: OmegaResource::Rows,
+            limit: 1,
+            observed: 2,
+        },
+        steps_used: 1,
+    }
+}
+
+fn malformed(inputs: &[LinearConstraint], _: OmegaLimits) -> OmegaOutcome {
+    OmegaOutcome::Unsat {
+        certificate: OmegaCertificate {
+            version: 1,
+            inputs: inputs.to_vec(),
+            steps: Vec::new(),
+            conclusion: 0,
+        },
+        steps_used: 1,
+    }
+}
+
+fn assert_arithmetic_provider_boundary(base: &Engine) {
+    // Fault injection at the actual native provider boundary: if grind catches
+    // one of these as an ordinary failed search, `try` would accept via rfl.
+    let parsed = fln_parse::parse_definition(
+        b"theorem boundary (n : Nat) : n + 0 = n := by\n  try grind\n  rfl",
+    )
+    .unwrap();
+    for (provider, cause) in [
+        (
+            cancelled as fn(&[LinearConstraint], OmegaLimits) -> OmegaOutcome,
+            "cancelled",
+        ),
+        (exhausted, "resource"),
+        (malformed, "certificate"),
+    ] {
+        let scope = SourceScope {
+            arithmetic: Some(ArithmeticProvider(provider)),
+            ..SourceScope::default()
+        };
+        let result = fln_elab::elaborate_definition_in_scope_with_budget(
+            parsed.syntax(),
+            base.environment(),
+            limits().admission.kernel,
+            &scope,
+        );
+        match (cause, result) {
+            (
+                "cancelled",
+                Err(NatDefinitionElabError::Inference(
+                    SourceInferenceError::ArithmeticInconclusive(reason),
+                )),
+            ) => assert!(matches!(reason.cause, InconclusiveCause::Cancelled { .. })),
+            (
+                "resource",
+                Err(NatDefinitionElabError::Inference(
+                    SourceInferenceError::ArithmeticInconclusive(reason),
+                )),
+            ) => assert!(matches!(
+                reason.cause,
+                InconclusiveCause::ResourceExhausted { .. }
+            )),
+            (
+                "certificate",
+                Err(NatDefinitionElabError::Inference(SourceInferenceError::Tactic(reason))),
+            ) => assert_eq!(
+                reason.to_string(),
+                "native arithmetic returned an invalid certificate"
+            ),
+            (_, result) => panic!("grind swallowed arithmetic {cause}: {result:?}"),
+        }
+    }
+}
 
 #[test]
 fn ground_and_quantified_grind_proofs_and_refusals_match_the_live_pin() {
@@ -359,7 +524,11 @@ fn ground_and_quantified_grind_proofs_and_refusals_match_the_live_pin() {
                 for (label, source) in cases {
                     let path = directory.join(format!("{label}.lean"));
                     std::fs::write(&path, format!("{HEADER}{source}\n")).unwrap();
-                    let result = Command::new(&compiler).arg(&path).output().unwrap();
+                    let result = Command::new(&compiler)
+                        .arg("-j1")
+                        .arg(&path)
+                        .output()
+                        .unwrap();
                     assert_eq!(
                         result.status.success(),
                         accepted,
@@ -370,6 +539,7 @@ fn ground_and_quantified_grind_proofs_and_refusals_match_the_live_pin() {
                 }
             }
             let engine = base(&library);
+            assert_arithmetic_provider_boundary(&engine);
             let options = KVMap::new();
             let before = engine.logical_root(&options);
             let mut failures = Vec::new();
@@ -474,14 +644,14 @@ fn ground_and_quantified_grind_proofs_and_refusals_match_the_live_pin() {
                 }
                 other => record_failure(&mut failures, "ematch_recovery", format!("{other:?}")),
             }
-            // The pin closes arithmetic beyond this ground fragment. Refusal must
-            // propagate out of try, not turn failure into an acceptance witness.
-            let unsupported = "example (a : Nat) : a + 0 = a := by try grind; rfl";
-            let label = "unsupported arithmetic propagation";
+            // Arithmetic now closes this goal. The subsequent rfl must see the
+            // empty goal list, rather than recovering a swallowed solver stop.
+            let after_arithmetic = "example (a : Nat) : a + 0 = a := by try grind; rfl";
+            let label = "arithmetic success preserves goal accounting";
             eprintln!("grind: native {label}");
-            match engine.check_source_files(&[unsupported.as_bytes()], &options, limits()) {
+            match engine.check_source_files(&[after_arithmetic.as_bytes()], &options, limits()) {
                 Err(error) => {
-                    if !format!("{error:?}").contains("UnsupportedTactic") {
+                    if !format!("{error:?}").contains("NoGoals") {
                         record_failure(&mut failures, label, format!("{error:?}"));
                     }
                 }

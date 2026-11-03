@@ -1,9 +1,10 @@
-//! Native equality, propositional saturation and bounded E-matching for grind.
+//! Native equality, propositional saturation, arithmetic and bounded E-matching for grind.
 //!
 //! Every merge, propagation and case split retains an ordinary proof term.
 //! There is no arithmetic oracle or new axiom. Quantified facts instantiate
-//! their original proofs; arithmetic plugins and custom configurations remain
-//! outside this fragment.
+//! their original proofs; Nat/Int arithmetic replays the native solver's
+//! certificates through the same admitted lemmas as omega. Other theories and
+//! custom configurations remain outside this fragment.
 //! A failure of this fragment is a nonrecoverable capability refusal: it must
 //! never make "try grind; ..." accept a script the pin would already have closed.
 use super::*;
@@ -166,6 +167,9 @@ struct State {
     queued: HashSet<Expr>,
     rules: Vec<Rule>,
     quantifiers: Quantifiers,
+    /// An unsuccessful theory query needs another attempt only after a new
+    /// fact arrives. Branches clone this cache and then add their assumption.
+    arithmetic_attempts: HashMap<Expr, usize>,
 }
 
 impl State {
@@ -568,9 +572,156 @@ impl State {
                     self.enqueue(context, instance)?;
                 }
             }
+            if self.pending.is_empty()
+                && let Some(proof) = self.arithmetic(context, target)?
+            {
+                return Ok(Some(proof));
+            }
             if self.pending.is_empty() {
                 return Ok(None);
             }
+        }
+    }
+
+    fn arithmetic_congruence_candidates(
+        &self,
+        context: &mut Context,
+        propositions: &[Expr],
+    ) -> Result<Vec<Expr>, Error> {
+        // Query only aligned subterms of an already observed equality, such as
+        // the arguments of f (n + 1) = f (1 + n). An all-pairs query over the
+        // term graph would repeatedly run the solver on unrelated expressions.
+        let mut pending: Vec<_> = propositions
+            .iter()
+            .filter_map(equality_target)
+            .map(|(_, _, left, right)| (left, right))
+            .collect();
+        let mut seen = HashSet::new();
+        let mut candidates = Vec::new();
+        while let Some((left, right)) = pending.pop() {
+            context.tick()?;
+            if left == right || !seen.insert((left.clone(), right.clone())) {
+                continue;
+            }
+            if seen.len() > MAX_FACTS {
+                return Err(failure(SourceInferenceError::ResourceLimit));
+            }
+            if let (ExprNode::App { f, a }, ExprNode::App { f: g, a: b }) =
+                (left.node(), right.node())
+            {
+                pending.push((f.clone(), g.clone()));
+                pending.push((a.clone(), b.clone()));
+            }
+            let Some(type_) = context.known_type(&left)? else {
+                continue;
+            };
+            let type_ = normalize(context, &type_)?;
+            if ![constant("Nat"), constant("Int")].contains(&type_) {
+                continue;
+            }
+            let Some(right_type) = context.known_type(&right)? else {
+                continue;
+            };
+            if normalize(context, &right_type)? == type_
+                && !self.graph.equivalent(context, &left, &right)?
+            {
+                candidates.push(equality::equation(Level::one(), type_, left, right));
+            }
+        }
+        Ok(candidates)
+    }
+
+    fn arithmetic(&mut self, context: &mut Context, target: &Expr) -> Result<Option<Expr>, Error> {
+        if context.source_scope.arithmetic.is_none()
+            || !context
+                .txn
+                .env
+                .contains(&name("Lean.Omega.Constraint.addInequality_sat"))
+        {
+            return Ok(None);
+        }
+        let mut facts = VecDeque::new();
+        for fact in &self.facts {
+            context.tick()?;
+            if context.omega_arithmetic_proposition(&fact.type_)? {
+                facts.push_back((fact.type_.clone(), fact.value.clone()));
+            }
+        }
+        // First detect contradictory arithmetic facts; then prove arithmetic
+        // propositions already observed by the equality/propositional engine.
+        // This feeds implication premises and E-matching consequences back into
+        // saturation instead of treating arithmetic as a final-goal-only tactic.
+        let mut candidates = Vec::new();
+        if !facts.is_empty() {
+            candidates.push(constant("False"));
+        }
+        candidates.push(target.clone());
+        candidates.extend(
+            self.graph
+                .nodes
+                .iter()
+                .filter(|node| node.proposition)
+                .map(|node| node.term.clone()),
+        );
+        let mut congruence = Some(candidates.clone());
+        let mut candidates = VecDeque::from(candidates);
+        loop {
+            if candidates.is_empty() {
+                // Direct arithmetic and newly derived propositional facts get
+                // the first chance to close the goal. An unrelated large
+                // equality must not exhaust congruence search before that.
+                if !self.pending.is_empty() {
+                    return Ok(None);
+                }
+                let Some(observed) = congruence.take() else {
+                    return Ok(None);
+                };
+                candidates.extend(self.arithmetic_congruence_candidates(context, &observed)?);
+            }
+            let Some(proposition) = candidates.pop_front() else {
+                return Ok(None);
+            };
+            context.tick()?;
+            if self.arithmetic_attempts.get(&proposition) == Some(&self.facts.len())
+                || self.indices.contains_key(&proposition)
+            {
+                continue;
+            }
+            if proposition != constant("False")
+                && !context.omega_arithmetic_proposition(&proposition)?
+            {
+                continue;
+            }
+            self.arithmetic_attempts
+                .insert(proposition.clone(), self.facts.len());
+            let before = context.clone();
+            let result = context.omega_proof_from_facts(&proposition, facts.clone());
+            // A certificate attempt must not leave decision instances, local
+            // assumptions or assignments behind, even when it succeeds. Its
+            // returned proof binds its private assumptions; work stays charged.
+            restore(context, before);
+            let proof = match result {
+                Ok(proof) => proof,
+                Err(NatDefinitionElabError::Inference(SourceInferenceError::Tactic(
+                    TacticError::ArithmeticNoContradiction | TacticError::ArithmeticUnsupported,
+                ))) => continue,
+                // Invalid certificates, cancellation and exhausted budgets are
+                // never converted to a failed search that `try` could recover.
+                Err(error) => return Err(error),
+            };
+            if proposition == constant("False") {
+                return Ok(Some(false_elim(target.clone(), proof)));
+            }
+            if &proposition == target {
+                return Ok(Some(proof));
+            }
+            self.enqueue(
+                context,
+                Typed {
+                    type_: proposition,
+                    value: proof,
+                },
+            )?;
         }
     }
 

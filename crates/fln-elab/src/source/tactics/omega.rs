@@ -337,12 +337,41 @@ impl Context {
             }
             pending.push_back((local.type_, Expr::fvar(local.id)));
         }
+        let value = self.omega_proof_from_facts(&goal.target, pending)?;
+        self.close_proof_goal(goal, value)
+    }
+
+    /// The arithmetic theory hook consumes only Nat/Int comparisons, including
+    /// their negations. Propositional search and quantified instantiation belong
+    /// to the caller; in particular this does not unfold arbitrary definitions.
+    pub(super) fn omega_arithmetic_proposition(
+        &mut self,
+        proposition: &Expr,
+    ) -> Result<bool, NatDefinitionElabError> {
+        let proposition = self.omega_proposition(proposition)?;
+        if comparison(&proposition).is_some() {
+            return Ok(true);
+        }
+        match negated(&proposition) {
+            Some(inner) => Ok(comparison(&self.omega_proposition(&inner)?).is_some()),
+            None => Ok(false),
+        }
+    }
+
+    /// Produce an ordinary proof from explicitly supplied facts. This is shared
+    /// by omega and grind's arithmetic hook: it cannot close a goal, publish a
+    /// declaration, or turn a solver verdict into admission authority.
+    pub(super) fn omega_proof_from_facts(
+        &mut self,
+        target: &Expr,
+        mut pending: VecDeque<(Expr, Expr)>,
+    ) -> Result<Expr, NatDefinitionElabError> {
         let mut fuel = 256_usize;
-        let value = if is_constant(&goal.target, "False") {
+        let value = if is_constant(target, "False") {
             self.omega_refute(Facts::new(pending), &mut fuel)?
         } else {
-            let (dictionary, classical) = self.omega_decidable(&goal.target)?;
-            let negative = not(goal.target.clone());
+            let (dictionary, classical) = self.omega_decidable(target)?;
+            let negative = not(target.clone());
             let saved = self.txn.lctx.clone();
             let id = FVarId(self.fresh_name()?);
             self.txn.lctx.add_param(
@@ -361,16 +390,16 @@ impl Context {
             if classical {
                 apply(
                     constant("Classical.byContradiction"),
-                    [goal.target.clone(), function],
+                    [target.clone(), function],
                 )
             } else {
                 apply(
                     constant("Decidable.byContradiction"),
-                    [goal.target.clone(), dictionary, function],
+                    [target.clone(), dictionary, function],
                 )
             }
         };
-        self.close_proof_goal(goal, value)
+        Ok(value)
     }
 
     fn omega_scan_subtractions(
