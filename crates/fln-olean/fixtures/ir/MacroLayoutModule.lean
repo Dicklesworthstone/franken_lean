@@ -131,9 +131,9 @@ def optionNone (_ : Unit) : Option Lean.Syntax := none
     EStateM.Result Lean.Macro.Exception Lean.Macro.State (List (Lean.Name × List String)) :=
   Lean.Macro.resolveGlobalName name context state
 
-@[noinline] def macroExpandMacro (syntax : Lean.Syntax) (context : @& Lean.Macro.Context)
+@[noinline] def macroExpandMacro (stx : Lean.Syntax) (context : @& Lean.Macro.Context)
     (state : Lean.Macro.State) :
     EStateM.Result Lean.Macro.Exception Lean.Macro.State (Option Lean.Syntax) :=
-  Lean.Macro.expandMacro? syntax context state
+  Lean.Macro.expandMacro? stx context state
 
 end FrankenLean.MacroLayout

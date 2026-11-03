@@ -507,11 +507,7 @@ fn dormant_macro_provider_source() -> String {
     )
 }
 
-fn compile_macro_provider(
-    reference: &std::path::Path,
-    directory: &std::path::Path,
-    source: &str,
-) {
+fn compile_macro_provider(reference: &std::path::Path, directory: &std::path::Path, source: &str) {
     std::fs::create_dir_all(directory).unwrap();
     std::fs::write(directory.join("AdmittedSourceMacro.lean"), source).unwrap();
     let output = Command::new(reference)
