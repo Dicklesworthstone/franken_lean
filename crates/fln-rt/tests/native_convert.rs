@@ -654,6 +654,203 @@ fn a_short_constructor_is_malformed_not_a_panic() {
     }
 }
 
+fn with_extra_constructor_field(object: &Obj) -> Obj {
+    let header = object.header();
+    let mut fields: Vec<_> = (0..usize::from(header.other))
+        .map(|index| object.ctor_child(index))
+        .collect();
+    fields.push(Obj::mk_nat(0));
+    let mut scalars = Vec::new();
+    for offset in (usize::from(header.other) * 8..usize::from(header.cs_sz) - 8).step_by(8) {
+        scalars.extend_from_slice(&object.ctor_scalar_u64(offset).to_le_bytes());
+    }
+    Obj::mk_ctor(header.tag, fields, &scalars)
+}
+
+fn assert_surplus_fields_refused(input: &Obj, family: &str) {
+    let mut heap = NativeHeap::new();
+    let result = Conversion::new().project_expr(&mut heap, input);
+    assert!(
+        matches!(result, Err(ConvertError::MalformedCompat { family: actual, .. }) if actual == family),
+        "surplus {family} fields must be refused, got {result:?}"
+    );
+    assert_eq!(
+        heap.live(),
+        0,
+        "a malformed graph must publish no native term"
+    );
+}
+
+#[test]
+fn expression_constructors_with_extra_fields_are_malformed() {
+    let zero = Expr::bvar(0).unwrap();
+    let sort = Expr::sort(Level::zero());
+    for expression in [
+        zero.clone(),
+        Expr::fvar(fln_core::expr::FVarId(Name::from_components(["x"]))),
+        Expr::mvar(MVarId(Name::from_components(["m"]))),
+        sort.clone(),
+        Expr::const_(Name::from_components(["f"]), Vec::new()),
+        Expr::app(zero.clone(), zero.clone()),
+        Expr::lam(
+            Name::anonymous(),
+            sort.clone(),
+            zero.clone(),
+            BinderInfo::Default,
+        ),
+        Expr::forall_e(
+            Name::anonymous(),
+            sort.clone(),
+            zero.clone(),
+            BinderInfo::Default,
+        ),
+        Expr::let_e(Name::anonymous(), sort, zero.clone(), zero.clone(), false),
+        Expr::lit(Literal::Nat(NatLit::from_u64(7))),
+        Expr::mdata(KVMap::new(), zero.clone()),
+        Expr::proj(Name::from_components(["S"]), 0, zero),
+    ] {
+        let mut heap = NativeHeap::new();
+        let handle = heap.alloc(expression.clone());
+        let object = inject_expr(&heap, handle).unwrap();
+        let projected = Conversion::new().project_expr(&mut heap, &object).unwrap();
+        assert_eq!(heap.get(projected).unwrap(), &expression);
+        assert_surplus_fields_refused(&with_extra_constructor_field(&object), "expr");
+    }
+}
+
+#[test]
+fn name_constructors_with_extra_fields_are_malformed() {
+    for object in [
+        Obj::mk_ctor(0, Vec::new(), &[]),
+        fln_rt::convert::inject_name(&Name::from_components(["x"])),
+        fln_rt::convert::inject_name(&Name::num(Name::anonymous(), 7)),
+    ] {
+        Conversion::new().project_name(&object).unwrap();
+        let malformed = with_extra_constructor_field(&object);
+        let input = Obj::mk_ctor(4, vec![malformed, Obj::mk_nat(0)], &[]);
+        assert_surplus_fields_refused(&input, "name");
+    }
+}
+
+#[test]
+fn level_constructors_with_extra_fields_are_malformed() {
+    let parameter = Level::param(Name::from_components(["u"]));
+    for level in [
+        Level::zero(),
+        Level::zero().succ().unwrap(),
+        Level::max(parameter.clone(), Level::one()).unwrap(),
+        Level::imax(parameter, Level::one()).unwrap(),
+        Level::param(Name::from_components(["v"])),
+        Level::mvar(LMVarId(Name::from_components(["m"]))),
+    ] {
+        let expression = Expr::sort(level.clone());
+        let mut heap = NativeHeap::new();
+        let handle = heap.alloc(expression.clone());
+        let object = inject_expr(&heap, handle).unwrap();
+        let projected = Conversion::new().project_expr(&mut heap, &object).unwrap();
+        assert_eq!(heap.get(projected).unwrap(), &expression);
+        let encoded = if level.is_zero() {
+            Obj::mk_ctor(0, Vec::new(), &[])
+        } else {
+            object.ctor_child(0)
+        };
+        let input = Obj::mk_ctor(3, vec![with_extra_constructor_field(&encoded)], &[]);
+        assert_surplus_fields_refused(&input, "level");
+    }
+}
+
+#[test]
+fn literal_constructors_with_extra_fields_are_malformed() {
+    for literal in [Literal::Nat(NatLit::from_u64(7)), Literal::Str("λ".into())] {
+        let mut heap = NativeHeap::new();
+        let expression = Expr::lit(literal);
+        let handle = heap.alloc(expression.clone());
+        let object = inject_expr(&heap, handle).unwrap();
+        let projected = Conversion::new().project_expr(&mut heap, &object).unwrap();
+        assert_eq!(heap.get(projected).unwrap(), &expression);
+        let literal = with_extra_constructor_field(&object.ctor_child(0));
+        assert!(matches!(
+            Conversion::new().project_literal(&literal),
+            Err(ConvertError::MalformedCompat {
+                family: "literal",
+                ..
+            })
+        ));
+        assert_surplus_fields_refused(
+            &Obj::mk_ctor(object.header().tag, vec![literal], &[]),
+            "literal",
+        );
+    }
+}
+
+#[test]
+fn data_value_constructors_with_extra_fields_are_malformed() {
+    let key = Name::from_components(["key"]);
+    for value in [
+        DataValue::OfString("λ".into()),
+        DataValue::OfBool(true),
+        DataValue::OfName(Name::from_components(["value"])),
+        DataValue::OfNat(7),
+        DataValue::OfInt(-3),
+        DataValue::OfSyntax(SyntaxHandle(9)),
+    ] {
+        let expression = Expr::mdata(
+            KVMap::from_entries(vec![(key.clone(), value)]),
+            Expr::bvar(0).unwrap(),
+        );
+        let mut heap = NativeHeap::new();
+        let handle = heap.alloc(expression.clone());
+        let object = inject_expr(&heap, handle).unwrap();
+        let projected = Conversion::new().project_expr(&mut heap, &object).unwrap();
+        assert_eq!(heap.get(projected).unwrap(), &expression);
+        let entries = object.ctor_child(0);
+        let pair = entries.ctor_child(0);
+        let value = with_extra_constructor_field(&pair.ctor_child(1));
+        let pair = Obj::mk_ctor(0, vec![pair.ctor_child(0), value], &[]);
+        let entries = Obj::mk_ctor(1, vec![pair, entries.ctor_child(1)], &[]);
+        let input = Obj::mk_ctor(
+            object.header().tag,
+            vec![entries, object.ctor_child(1)],
+            &[],
+        );
+        assert_surplus_fields_refused(&input, "data-value");
+    }
+}
+
+#[test]
+fn list_constructors_with_extra_fields_are_malformed() {
+    let pair = Obj::mk_ctor(
+        0,
+        vec![
+            mk_name(&["key"]),
+            Obj::mk_ctor(3, vec![Obj::mk_nat(7)], &[]),
+        ],
+        &[],
+    );
+    for (family, head) in [("level-list", Obj::mk_nat(0)), ("kvmap", pair)] {
+        for list in [
+            Obj::mk_ctor(0, Vec::new(), &[]),
+            Obj::mk_ctor(1, vec![head.clone_ref(), Obj::mk_nat(0)], &[]),
+        ] {
+            let wrap = |list| {
+                if family == "level-list" {
+                    Obj::mk_ctor(4, vec![mk_name(&["f"]), list], &[])
+                } else {
+                    Obj::mk_ctor(
+                        10,
+                        vec![list, Obj::mk_ctor(0, vec![Obj::mk_nat(0)], &[])],
+                        &[],
+                    )
+                }
+            };
+            Conversion::new()
+                .project_expr(&mut NativeHeap::new(), &wrap(list.clone_ref()))
+                .unwrap();
+            assert_surplus_fields_refused(&wrap(with_extra_constructor_field(&list)), family);
+        }
+    }
+}
+
 #[test]
 fn a_lean_true_two_child_name_num_projects_the_nat_child() {
     let mut heap = NativeHeap::new();

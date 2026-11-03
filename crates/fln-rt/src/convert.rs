@@ -213,6 +213,31 @@ fn lean_box0(obj: &Obj) -> bool {
     obj.is_scalar() && obj.unbox() == 0
 }
 
+/// A projection must account for every object field, including fields that
+/// would otherwise be discarded or hide an inconsistent cached data word.
+fn ctor_fields(obj: &Obj, expected: u8, family: &'static str) -> Result<(), ConvertError> {
+    if obj.is_scalar() {
+        return Err(malformed(
+            family,
+            "a tagged scalar has no constructor fields",
+        ));
+    }
+    let header = obj.header();
+    if header.tag > abi::TAG_MAX_CTOR_TAG {
+        return Err(malformed(family, "not a constructor object"));
+    }
+    if header.other != expected {
+        return Err(malformed(
+            family,
+            format!(
+                "constructor has {} fields, expected {expected}",
+                header.other
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// `ctor_child` asserts arity. Convert's public project path promised a
 /// typed `ConvertError` and never a panic, so a short constructor is a
 /// malformed graph, not an invariant failure.
@@ -337,8 +362,8 @@ fn data_and_u8(data: u64, extra: u8) -> Vec<u8> {
 }
 
 /// Lean-true object-slot count for an Expr constructor. `None` is an
-/// unknown tag. A constructor whose `other` differs is the older
-/// convert-subset packing (inline bvar index, …) and has no Data word.
+/// unknown tag. The supported older inline bvar packing has zero object
+/// slots and no Data word; other arity differences are malformed.
 fn expr_lean_slots(tag: u8) -> Option<u8> {
     Some(match tag {
         TAG_EXPR_BVAR | TAG_EXPR_FVAR | TAG_EXPR_MVAR | TAG_EXPR_SORT | TAG_EXPR_LIT => 1,
@@ -351,6 +376,7 @@ fn expr_lean_slots(tag: u8) -> Option<u8> {
 
 fn level_lean_slots(tag: u8) -> Option<u8> {
     Some(match tag {
+        TAG_LEVEL_ZERO => 0,
         TAG_LEVEL_SUCC | TAG_LEVEL_PARAM | TAG_LEVEL_MVAR => 1,
         TAG_LEVEL_MAX | TAG_LEVEL_IMAX => 2,
         _ => return None,
@@ -535,6 +561,13 @@ impl Conversion {
                     });
                 }
             };
+            let slots = expr_lean_slots(tag).ok_or(ConvertError::UnsupportedConstructor {
+                family: "expr",
+                tag,
+            })?;
+            if tag != TAG_EXPR_BVAR || current.header().other != 0 {
+                ctor_fields(&current, slots, "expr")?;
+            }
             // Keep only the active ancestor path on the stack. Queued
             // siblings can legally be reached through another child.
             let mut pending = None;
@@ -689,8 +722,16 @@ impl Conversion {
                 return Err(malformed("name", "name graph is cyclic"));
             }
             match cursor.obj_tag() as u8 {
-                TAG_NAME_ANONYMOUS => break,
+                TAG_NAME_ANONYMOUS => {
+                    ctor_fields(&cursor, 0, "name")?;
+                    break;
+                }
                 TAG_NAME_STR | TAG_NAME_NUM => {
+                    // Name.num also supports its existing inline-component
+                    // encoding, with one parent pointer instead of two fields.
+                    if cursor.obj_tag() as u8 != TAG_NAME_NUM || cursor.header().other != 1 {
+                        ctor_fields(&cursor, 2, "name")?;
+                    }
                     chain.push(cursor.clone_ref());
                     cursor = ctor_field(&cursor, 0, "name")?;
                 }
@@ -764,6 +805,11 @@ impl Conversion {
                     });
                 }
             };
+            let slots = level_lean_slots(tag).ok_or(ConvertError::UnsupportedConstructor {
+                family: "level",
+                tag,
+            })?;
+            ctor_fields(&current, slots, "level")?;
             // Pending siblings are not ancestors: max u (succ u) is a DAG.
             let mut pending = None;
             for &i in child_slots {
@@ -862,6 +908,9 @@ impl Conversion {
                 "a tagged scalar is not a literal object",
             ));
         }
+        if matches!(obj.obj_tag() as u8, TAG_LIT_NAT | TAG_LIT_STR) {
+            ctor_fields(obj, 1, "literal")?;
+        }
         match obj.obj_tag() as u8 {
             TAG_LIT_NAT => {
                 let payload = ctor_field(obj, 0, "literal")?;
@@ -915,8 +964,12 @@ impl Conversion {
                 return Err(malformed("level-list", "the list ends in a scalar"));
             }
             match cursor.obj_tag() as u8 {
-                TAG_LIST_NIL => return Ok(out),
+                TAG_LIST_NIL => {
+                    ctor_fields(&cursor, 0, "level-list")?;
+                    return Ok(out);
+                }
                 TAG_LIST_CONS => {
+                    ctor_fields(&cursor, 2, "level-list")?;
                     out.push(self.level(&ctor_field(&cursor, 0, "level-list")?)?);
                     cursor = ctor_field(&cursor, 1, "level-list")?;
                 }
@@ -944,8 +997,12 @@ impl Conversion {
                 return Err(malformed("kvmap", "the list ends in a scalar"));
             }
             match cursor.obj_tag() as u8 {
-                TAG_LIST_NIL => return Ok(KVMap::from_entries(entries)),
+                TAG_LIST_NIL => {
+                    ctor_fields(&cursor, 0, "kvmap")?;
+                    return Ok(KVMap::from_entries(entries));
+                }
                 TAG_LIST_CONS => {
+                    ctor_fields(&cursor, 2, "kvmap")?;
                     let pair = ctor_field(&cursor, 0, "kvmap")?;
                     if pair.is_scalar() || pair.obj_tag() as u8 != 0 || pair.header().other != 2 {
                         return Err(malformed("kvmap", "expected a Name × DataValue pair"));
@@ -971,6 +1028,12 @@ impl Conversion {
                 "data-value",
                 "a tagged scalar is not a DataValue object",
             ));
+        }
+        if matches!(
+            obj.obj_tag() as u8,
+            TAG_DV_STRING | TAG_DV_NAME | TAG_DV_NAT | TAG_DV_INT | TAG_DV_SYNTAX
+        ) {
+            ctor_fields(obj, 1, "data-value")?;
         }
         match obj.obj_tag() as u8 {
             TAG_DV_STRING => {
