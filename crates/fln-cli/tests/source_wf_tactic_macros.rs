@@ -138,6 +138,97 @@ fn wf_tactic_macros_run_as_the_pin_does() {
     }
 }
 
+/// `ite_eq_dite` in `Init/WF.lean` makes an unnamed conditional's fact available
+/// to termination proofs. It runs after source elaboration at the pin, so the
+/// same fact must remain unavailable to a tactic in the original branch, and
+/// source proofs must still match ordinary conditional lemmas against `ite`.
+#[test]
+fn unnamed_conditional_facts_are_scoped_to_termination_proofs() {
+    let Some(lib) = pinned_lib() else {
+        return;
+    };
+    let root = workspace("conditional-facts");
+    let name = "ConditionalFacts.lean";
+    let program = r#"prelude
+import Init.Omega
+import Init.WFComputable
+def downPositive (n : Nat) : Nat :=
+  if 0 < n then downPositive (n - 1) + 1 else 0
+termination_by n
+decreasing_by omega
+def downNegative (n : Nat) : Nat :=
+  if n = 0 then 0 else downNegative (n - 1) + 1
+termination_by n
+decreasing_by omega
+def downNested (n : Nat) : Nat :=
+  if n = 0 then 0 else if n = 1 then 1 else downNested (n - 1) + 1
+termination_by n
+decreasing_by omega
+def downNamed (n : Nat) : Nat :=
+  if h : 0 < n then
+    have h' : 0 < n := by assumption
+    downNamed (n - 1) + 1
+  else 0
+termination_by n
+decreasing_by omega
+def wfSimp (n : Nat) : Nat :=
+  have _h : (if n = 0 then 1 else 1) = 1 := by simp only [ite_self]
+  if h : n = 0 then 0 else wfSimp (n - 1) + 1
+termination_by n
+decreasing_by omega
+def wfRewrite (n : Nat) : Nat :=
+  have _h : ∀ p : Prop, ∀ _ : Decidable p, p → (if p then 1 else 2) = 1 := by
+    intro p inst hp
+    rw [if_pos hp]
+  if h : n = 0 then 0 else wfRewrite (n - 1) + 1
+termination_by n
+decreasing_by omega
+#eval downPositive 4
+#eval downNegative 4
+#eval downNested 4
+#eval downNamed 4
+#eval wfSimp 4
+#eval wfRewrite 4
+"#;
+    std::fs::write(root.join(name), program).unwrap();
+    if let Some((code, stdout)) = pinned(&lib, &root, name) {
+        assert_eq!(
+            (code, stdout.as_str()),
+            (0, "4\n4\n4\n4\n4\n4\n"),
+            "{stdout}"
+        );
+    }
+    let (code, stdout, stderr) = ours(&lib, &root, name);
+    assert_eq!(code, 0, "{stdout}{stderr}");
+    assert_eq!(stdout, "4\n4\n4\n4\n4\n4\n", "{stderr}");
+
+    for (name, tactic) in [
+        ("NoSourceAssumption.lean", "assumption"),
+        ("NoSourceOmega.lean", "omega"),
+    ] {
+        let program = format!(
+            r#"prelude
+import Init.Omega
+import Init.WFComputable
+def bad (n : Nat) : Nat :=
+  if 0 < n then
+    have h : 0 < n := by {tactic}
+    bad (n - 1) + 1
+  else 0
+termination_by n
+decreasing_by omega
+"#
+        );
+        std::fs::write(root.join(name), program).unwrap();
+        if let Some((code, stdout)) = pinned(&lib, &root, name) {
+            assert_eq!(code, 1, "{name}: the pin moved: {stdout}");
+        }
+        let (code, stdout, stderr) = ours(&lib, &root, name);
+        assert_eq!(code, 1, "{name}: {stdout}{stderr}");
+        assert!(stdout.is_empty(), "{name}: {stdout}");
+    }
+}
+
 /// `(file, program, this engine's reason)`: programs the pin rejects.
 const REFUSED: &[(&str, &str, &str)] = &[(
     r#"DecTacRefused.lean"#,

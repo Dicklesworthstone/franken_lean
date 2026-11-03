@@ -4,6 +4,27 @@
 use super::*;
 
 impl Context {
+    /// The pin's `ite_eq_dite` preprocessing exposes an unnamed conditional's
+    /// branch fact only to termination proofs, not to tactics in the original
+    /// source branch. Retain the private local for call lowering while the
+    /// existing compiler-local filter keeps source search and traces honest.
+    pub(in crate::source) fn register_well_founded_conditional_hypothesis(
+        &mut self,
+        name: Name,
+    ) -> Result<(), NatDefinitionElabError> {
+        self.tick()?;
+        if name.is_anonymous() || self.txn.lctx.find_by_user_name(&name).is_none() {
+            return Err(failure(SourceInferenceError::Scope));
+        }
+        let state = self
+            .well_founded
+            .as_mut()
+            .filter(|state| !state.proving)
+            .ok_or_else(|| failure(SourceInferenceError::Scope))?;
+        state.conditional_hypotheses.insert(name);
+        Ok(())
+    }
+
     pub(in crate::source) fn well_founded_branch_depth(&self) -> Option<usize> {
         self.well_founded
             .as_ref()

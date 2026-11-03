@@ -33,6 +33,12 @@ fn canonical_conditionals_delay_both_branches_and_keep_the_selected_result() {
         "#eval dite True (fun _ => 42) (fun _ => spend 10000)",
         "#eval dite False (fun _ => spend 10000) (fun _ => 42)",
         "def choose (b : Bool) : Nat := ite (b = true) 42 (spend 10000)\n#eval choose true",
+        "def choose (b : Bool) : Nat := if b then 42 else spend 10000\n#eval choose true",
+        "def choose (b : Bool) : Nat := if b then spend 10000 else 42\n#eval choose false",
+        "def choose (b : Bool) : Nat := if h : b then 42 else spend 10000\n#eval choose true",
+        "def choose (b : Bool) : Nat := if h : b then spend 10000 else 42\n#eval choose false",
+        "def choose (p : Prop) [Decidable p] : Nat := if p then 42 else spend 10000\n#eval choose True",
+        "def choose (p : Prop) [Decidable p] : Nat := if h : p then spend 10000 else 42\n#eval choose False",
     ] {
         let source = format!("{SPEND}{query}");
         let execution = base
@@ -59,6 +65,10 @@ fn selected_branches_and_ordinary_arguments_still_execute_before_returning() {
     for query in [
         "#eval ite True (spend 10000) 42",
         "#eval ite False 42 (spend 10000)",
+        "def choose (b : Bool) : Nat := if b then spend 10000 else 42\n#eval choose true",
+        "def choose (b : Bool) : Nat := if h : b then 42 else spend 10000\n#eval choose false",
+        "def choose (p : Prop) [Decidable p] : Nat := if p then 42 else spend 10000\n#eval choose False",
+        "#eval if spend 10000 == 0 then 42 else 42",
         "def keep (answer ignored : Nat) : Nat := answer\n#eval keep 42 (spend 10000)",
     ] {
         let source = format!("{SPEND}{query}");
@@ -69,6 +79,43 @@ fn selected_branches_and_ordinary_arguments_still_execute_before_returning() {
         ));
         assert_eq!(base.logical_root(&options), root);
     }
+}
+
+#[test]
+fn dependent_source_conditionals_keep_evidence_and_captured_callbacks() {
+    let base = engine();
+    let options = KVMap::new();
+    let root = base.logical_root(&options);
+    let source = format!(
+        r#"{SPEND}
+def choose (p : Prop) [Decidable p]
+    (yes : p -> Nat -> Nat) (no : Not p -> Nat -> Nat) : Nat -> Nat :=
+  if h : p then yes h else no h
+def run (b : Bool) (saved : Nat) : Nat :=
+  choose (b = true) (fun h n => saved + n) (fun h n => spend 10000) 2
+#eval run true 40
+"#,
+    );
+    let run = || {
+        base.execute_source_definitions(&[source.as_bytes()], &options, limits())
+            .unwrap()
+            .into_complete()
+            .unwrap()
+    };
+    let first = run();
+    let second = run();
+    let VmExit::Returned(value) = &first.executions.last().unwrap().exit else {
+        panic!("selected dependent branch returns its captured callback");
+    };
+    assert_eq!(
+        fln_vm::interpreter::nat_decimal(&value.value).as_deref(),
+        Some("42")
+    );
+    assert_eq!(first.result_logical_root, second.result_logical_root);
+    for (first, second) in first.executions.iter().zip(&second.executions) {
+        assert_eq!(first.flbc_artifact, second.flbc_artifact);
+    }
+    assert_eq!(base.logical_root(&options), root);
 }
 
 #[test]

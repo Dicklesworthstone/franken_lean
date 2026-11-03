@@ -1326,6 +1326,7 @@ impl Context {
                 .map(|parameter| parameter.id.clone())
                 .collect(),
             proof_hidden: HashSet::new(),
+            conditional_hypotheses: HashSet::new(),
             branch_scopes: Vec::new(),
             calls: HashMap::new(),
             goals: Vec::new(),

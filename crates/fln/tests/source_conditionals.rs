@@ -60,6 +60,32 @@ fn conditionals_are_higher_order_arguments_and_local_values() {
         "def apply (f : Nat -> Nat) (n : Nat) : Nat := f n\n def f (b : Bool) : Nat := apply (if b then fun x => x + 1 else fun y => y + 2) 8\n theorem t : f false = 10 := by rfl\n def loc : Nat := by\n  let n := if true then 7 else 8\n  exact n\n theorem u : loc = 7 := by rfl",
     );
 }
+
+#[test]
+fn conditional_arguments_preserve_postponed_outer_notation() {
+    // `.some 40` is postponed until the later `get` argument determines A.
+    // An ordinary conditional introduces no local binder, so completing one
+    // of its branches must not close the surrounding application's scope.
+    for conditional in [
+        "if b then 2 else 3",
+        "if h : b then 2 else 3",
+        "if b then (if b then 2 else 4) else 3",
+    ] {
+        check(&format!(
+            r#"
+def consume {{A : Type}} (value : A) (offset : Nat) (run : A -> Nat) : Nat :=
+  run value + offset
+def get (value : Option Nat) : Nat := match value with
+  | .none => 0
+  | .some n => n
+def result (b : Bool) : Nat := consume (.some 40) ({conditional}) get
+theorem positive : result true = 42 := by rfl
+theorem negative : result false = 43 := by rfl
+"#,
+        ));
+    }
+}
+
 #[test]
 fn branches_can_use_let_telescopes_and_nested_proofs() {
     check(

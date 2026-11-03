@@ -77,6 +77,11 @@ pub(in crate::source) struct State {
     continuation: LocalDecl,
     proof_inaccessible: Vec<FVarId>,
     proof_hidden: HashSet<Name>,
+    /// `ite_eq_dite` supplies these facts to termination proofs, after the
+    /// source body has elaborated at the pin. Our eager call lowering retains
+    /// them in the kernel context but hides them from source proof/instance
+    /// search until `proving` becomes true.
+    conditional_hypotheses: HashSet<Name>,
     branch_scopes: Vec<Name>,
     calls: HashMap<Expr, CachedCall>,
     goals: Vec<Obligation>,
@@ -134,6 +139,7 @@ impl State {
                 .is_some_and(|mutual| mutual.marks(&local.id))
             || local.user_name == self.continuation.user_name
             || self.proof_hidden.contains(&local.user_name)
+            || !self.proving && self.conditional_hypotheses.contains(&local.user_name)
     }
 
     /// The private recursive reference a source name denotes: this definition's
@@ -897,6 +903,7 @@ impl Context {
                 .map(|parameter| parameter.id.clone())
                 .collect(),
             proof_hidden: HashSet::new(),
+            conditional_hypotheses: HashSet::new(),
             branch_scopes: Vec::new(),
             calls: HashMap::new(),
             goals: Vec::new(),
@@ -2254,7 +2261,15 @@ impl Context {
         let mut hidden = Vec::new();
         for local in &locals {
             self.tick()?;
-            if self.is_matrix_hypothesis(local) && !local.user_name.is_anonymous() {
+            if self.is_matrix_hypothesis(local)
+                && !local.user_name.is_anonymous()
+                && !self
+                    .well_founded
+                    .as_ref()
+                    .expect("active well-founded call")
+                    .conditional_hypotheses
+                    .contains(&local.user_name)
+            {
                 hidden.push(local.user_name.clone());
             }
             let mut local = local.clone();
