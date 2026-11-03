@@ -22,6 +22,13 @@ fn scratch(name: &str, bytes: &[u8]) -> PathBuf {
 fn page_size_is_sane() {
     let p = page_size();
     assert!(p.is_power_of_two() && p >= 4096, "page size {p}");
+    #[cfg(target_os = "windows")]
+    {
+        let (native_page, allocation) = crate::windows::page_geometry();
+        assert_eq!(native_page, p);
+        assert!(allocation.is_power_of_two() && allocation >= p);
+        assert!(allocation.is_multiple_of(p));
+    }
 }
 
 #[test]
@@ -71,6 +78,7 @@ fn seal_refuses_mutation_and_double_seal() {
 /// The permission string for the VMA starting exactly at `addr`, from
 /// /proc/self/maps (e.g. "rw-p"). Safe kernel-side observation of what
 /// mprotect actually did — no signal handling required.
+#[cfg(target_os = "linux")]
 fn vma_perms(addr: usize) -> String {
     let maps = std::fs::read_to_string("/proc/self/maps").expect("maps readable");
     let prefix = format!("{addr:x}-");
@@ -94,15 +102,29 @@ fn seal_narrows_kernel_protection_to_read_only() {
     // raw-write drill proves the resulting hardware trap.
     let path = scratch("prot", &[9u8; 100]); // deliberately not page-sized
     let mut m = RegionMapping::map_file_private(&path).expect("map");
+    #[cfg(target_os = "linux")]
     assert!(
         vma_perms(m.addr()).starts_with("rw"),
         "pre-seal mapping must be read-write"
     );
+    #[cfg(target_os = "windows")]
+    assert_eq!(
+        crate::windows::page_protection(m.addr()).expect("query private view"),
+        crate::windows::PAGE_WRITECOPY,
+        "pre-seal view must be copy-on-write in Windows page accounting",
+    );
     m.seal().expect("seal");
+    #[cfg(target_os = "linux")]
     assert_eq!(
         vma_perms(m.addr()),
         "r--p",
         "sealed mapping must be read-only and private in the kernel's own accounting"
+    );
+    #[cfg(target_os = "windows")]
+    assert_eq!(
+        crate::windows::page_protection(m.addr()).expect("query sealed view"),
+        crate::windows::PAGE_READONLY,
+        "VirtualProtect must narrow the actual Windows page permissions",
     );
     // The whole rounded range is one read-only VMA: reads anywhere stay valid.
     assert_eq!(m.as_slice()[99], 9);
@@ -128,7 +150,7 @@ fn at_base_fast_path_and_occupied_fallback() {
         RegionMapping::try_map_file_private_at(&path, taken)
             .expect("try at occupied base")
             .is_none(),
-        "MAP_FIXED_NOREPLACE must refuse an occupied range"
+        "fixed mapping must refuse an occupied range"
     );
     assert_eq!(holder.as_slice()[0], 3, "holder mapping untouched");
     // Misaligned base is a typed error.
@@ -136,6 +158,61 @@ fn at_base_fast_path_and_occupied_fallback() {
         RegionMapping::try_map_file_private_at(&path, taken + 1),
         Err(MapError::MisalignedBase { .. })
     ));
+}
+
+#[test]
+fn partial_page_mapping_preserves_cow_and_seals_the_whole_view() {
+    let page = page_size();
+    let bytes = vec![37; 2 * page + 17];
+    let path = scratch("partial-pages", &bytes);
+    let mut mapping = RegionMapping::map_file_private(&path).expect("private view");
+    let peer = RegionMapping::map_file_private(&path).expect("second private view");
+    for index in [0, page, bytes.len() - 1] {
+        mapping.as_mut_slice().expect("private bytes")[index] = 91;
+        assert_eq!(peer.as_slice()[index], 37);
+    }
+    mapping.seal().expect("seal all pages");
+    for index in [0, page, bytes.len() - 1] {
+        assert_eq!(mapping.as_slice()[index], 91);
+        #[cfg(target_os = "windows")]
+        assert_eq!(
+            crate::windows::page_protection(mapping.addr() + index).expect("query sealed page"),
+            crate::windows::PAGE_READONLY,
+        );
+    }
+    assert!(matches!(mapping.as_mut_slice(), Err(MapError::Sealed)));
+    drop(mapping);
+    assert_eq!(std::fs::read(path).expect("unchanged artifact"), bytes);
+    assert_eq!(peer.as_slice(), bytes);
+}
+
+#[test]
+fn null_fixed_base_is_unavailable_and_does_not_create_a_view() {
+    let path = scratch("null-base", &[17; 23]);
+    assert!(
+        RegionMapping::try_map_file_private_at(&path, 0)
+            .expect("null is an unavailable address")
+            .is_none()
+    );
+    assert_eq!(std::fs::read(path).expect("unchanged artifact"), [17; 23]);
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+fn fixed_view_requires_windows_allocation_granularity() {
+    let (page, allocation) = crate::windows::page_geometry();
+    let path = scratch("allocation-alignment", &[29; 31]);
+    let holder = RegionMapping::map_file_private(&path).expect("holder");
+    assert!(holder.addr().is_multiple_of(allocation));
+    // When Windows has a larger allocation unit than a protection page,
+    // being page-aligned alone must not admit a fixed view.
+    if allocation > page {
+        assert!(matches!(
+            RegionMapping::try_map_file_private_at(&path, holder.addr() + page),
+            Err(MapError::MisalignedBase { .. })
+        ));
+    }
+    assert_eq!(holder.as_slice(), &[29; 31]);
 }
 
 #[test]

@@ -1,22 +1,26 @@
-//! `RegionMapping` — the mmap primitive under Marrow's compacted regions
+//! `RegionMapping` — the file-mapping primitive under Marrow's compacted regions
 //! (bead fln-wgp, plan §6.4): private copy-on-write file mappings, the
 //! at-base fast path, sealing, and page facts.
 //!
 //! Soundness invariant (the covenant argument for the safe slice views):
 //! a `RegionMapping` privately maps a REGULAR file that the region store
 //! treats as an immutable artifact (olean/CAS discipline — the same posture
-//! the Reference's own loader takes). `MAP_PRIVATE` isolates the mapping
-//! from later file writes on every page this process has touched; a store
-//! that truncates a mapped artifact can raise `SIGBUS` — a fault, diagnosed
-//! by the fault drills, never silent corruption. The mapping owns its range
+//! the Reference's own loader takes). Linux `MAP_PRIVATE` and Windows
+//! `FILE_MAP_COPY` keep writes private to this view. The store must not mutate
+//! or truncate a live artifact: such interference can produce an operating
+//! system paging fault. The mapping owns its range
 //! exclusively: slices borrow it under ordinary borrow rules, and `seal`
 //! refuses to run while a mutable borrow could exist (it takes `&mut self`).
 //!
-//! Page facts (`page_size`) come from `/proc/self/auxv` (`AT_PAGESZ`) — safe
-//! file parsing, no libc.
+//! Page facts (`page_size`) come from `/proc/self/auxv` (`AT_PAGESZ`) on Linux
+//! and `GetSystemInfo` on Windows. No libc or additional crate is required.
 
+#[cfg(target_os = "linux")]
 use crate::sys;
+#[cfg(target_os = "windows")]
+use crate::windows;
 use std::fs::File;
+#[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
 use std::path::Path;
 
@@ -27,11 +31,11 @@ pub enum MapError {
     Io(std::io::Error),
     /// Zero-length files have no region payload to map.
     Empty,
-    /// A syscall failed with the given errno.
+    /// A native mapping operation failed with its operating-system error code.
     Sys { call: &'static str, errno: i32 },
     /// A mutable view or reseal was requested after `seal`.
     Sealed,
-    /// The requested fixed base was not page-aligned.
+    /// The fixed base did not meet the operating system's mapping alignment.
     MisalignedBase { addr: usize },
 }
 
@@ -40,10 +44,10 @@ impl std::fmt::Display for MapError {
         match self {
             Self::Io(e) => write!(f, "region file: {e}"),
             Self::Empty => write!(f, "region file is empty"),
-            Self::Sys { call, errno } => write!(f, "{call} failed with errno {errno}"),
+            Self::Sys { call, errno } => write!(f, "{call} failed with OS error {errno}"),
             Self::Sealed => write!(f, "mapping is sealed read-only"),
             Self::MisalignedBase { addr } => {
-                write!(f, "fixed base {addr:#x} is not page-aligned")
+                write!(f, "fixed base {addr:#x} is not mapping-aligned")
             }
         }
     }
@@ -51,26 +55,35 @@ impl std::fmt::Display for MapError {
 
 impl std::error::Error for MapError {}
 
-/// The system page size, from `/proc/self/auxv` (`AT_PAGESZ` = 6). Falls
-/// back to 4096 if the auxv is unreadable (the smallest page size on the
-/// certified matrix — a conservative rounding unit for mprotect/munmap).
+/// The operating system's page size. Linux reads `/proc/self/auxv`
+/// (`AT_PAGESZ` = 6), falling back to 4096 if auxv is unreadable; Windows
+/// queries `GetSystemInfo`. Windows fixed mappings additionally require its
+/// allocation granularity, which can be larger than this protection unit.
 pub fn page_size() -> usize {
-    static PAGE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *PAGE.get_or_init(|| {
-        const AT_PAGESZ: u64 = 6;
-        if let Ok(auxv) = std::fs::read("/proc/self/auxv") {
-            for pair in auxv.as_chunks::<16>().0 {
-                let key = u64::from_le_bytes(pair[0..8].try_into().expect("chunk"));
-                let val = u64::from_le_bytes(pair[8..16].try_into().expect("chunk"));
-                if key == AT_PAGESZ && val.is_power_of_two() {
-                    return usize::try_from(val).expect("page size");
+    #[cfg(target_os = "windows")]
+    {
+        windows::page_geometry().0
+    }
+    #[cfg(target_os = "linux")]
+    {
+        static PAGE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *PAGE.get_or_init(|| {
+            const AT_PAGESZ: u64 = 6;
+            if let Ok(auxv) = std::fs::read("/proc/self/auxv") {
+                for pair in auxv.as_chunks::<16>().0 {
+                    let key = u64::from_le_bytes(pair[0..8].try_into().expect("chunk"));
+                    let val = u64::from_le_bytes(pair[8..16].try_into().expect("chunk"));
+                    if key == AT_PAGESZ && val.is_power_of_two() {
+                        return usize::try_from(val).expect("page size");
+                    }
                 }
             }
-        }
-        4096
-    })
+            4096
+        })
+    }
 }
 
+#[cfg(target_os = "linux")]
 fn round_up_pages(len: usize) -> usize {
     let page = page_size();
     len.div_ceil(page) * page
@@ -92,20 +105,39 @@ impl RegionMapping {
         Self::map_common(path, None)
     }
 
-    /// Try to map `path` privately AT `base` (`MAP_FIXED_NOREPLACE`) — the
-    /// Reference's zero-relocation fast path. `Ok(None)` when the range is
-    /// already occupied; the caller falls back to [`map_file_private`] plus
-    /// a relocation walk (the relocate-or-copy law).
+    /// Try to map `path` privately AT `base` without replacing any existing
+    /// allocation — the Reference's zero-relocation fast path. `Ok(None)`
+    /// means the address is unavailable (including the null address, which
+    /// cannot back a Rust slice). The caller can use [`Self::map_file_private`]
+    /// plus a relocation walk. Windows requires allocation-granularity
+    /// alignment; Linux requires page alignment.
     pub fn try_map_file_private_at(
         path: &Path,
         base: usize,
     ) -> Result<Option<RegionMapping>, MapError> {
-        if !base.is_multiple_of(page_size()) {
+        #[cfg(target_os = "linux")]
+        let alignment = page_size();
+        #[cfg(target_os = "windows")]
+        let alignment = windows::page_geometry().1;
+        if !base.is_multiple_of(alignment) {
             return Err(MapError::MisalignedBase { addr: base });
         }
+        if base == 0 {
+            return Ok(None);
+        }
         match Self::map_common(path, Some(base)) {
+            // Older Linux kernels may ignore MAP_FIXED_NOREPLACE. Never
+            // publish an at-base success for a mapping at another address;
+            // dropping this owned view also releases the unexpected range.
+            Ok(mapping) if mapping.addr() != base => Ok(None),
             Ok(mapping) => Ok(Some(mapping)),
+            #[cfg(target_os = "linux")]
             Err(MapError::Sys { errno, .. }) if errno == sys::EEXIST => Ok(None),
+            #[cfg(target_os = "windows")]
+            Err(MapError::Sys {
+                call: "MapViewOfFileEx",
+                errno,
+            }) if errno == windows::ERROR_INVALID_ADDRESS => Ok(None),
             Err(e) => Err(e),
         }
     }
@@ -120,14 +152,26 @@ impl RegionMapping {
                 "region source is not a regular file",
             )));
         }
-        let len = usize::try_from(meta.len()).map_err(|_| MapError::Empty)?;
+        // Both slice constructors require a range no larger than isize::MAX.
+        // Reject oversized artifacts before requesting any native mapping.
+        let len = usize::try_from(meta.len())
+            .ok()
+            .filter(|len| *len <= isize::MAX as usize)
+            .ok_or_else(|| {
+                MapError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "region file exceeds the maximum slice length",
+                ))
+            })?;
         if len == 0 {
             return Err(MapError::Empty);
         }
+        #[cfg(target_os = "linux")]
         let (addr_hint, flags) = match fixed {
             Some(base) => (base, sys::MAP_PRIVATE | sys::MAP_FIXED_NOREPLACE),
             None => (0, sys::MAP_PRIVATE),
         };
+        #[cfg(target_os = "linux")]
         // SAFETY: len > 0; fixed bases are page-aligned (checked by the
         // caller); the fd is open and readable for the duration of the call
         // (the mapping survives the fd per POSIX). The returned range is
@@ -145,11 +189,23 @@ impl RegionMapping {
             call: "mmap",
             errno,
         })?;
-        Ok(RegionMapping {
+        #[cfg(target_os = "windows")]
+        // SAFETY: the readable regular file stays alive through the call;
+        // len is nonzero and slice-bounded; fixed bases are nonnull and
+        // allocation-aligned. The returned view belongs to this mapping.
+        let addr = unsafe { windows::map_private(&file, len, fixed) }?;
+        let mapping = RegionMapping {
             addr,
             len,
             sealed: false,
-        })
+        };
+        if addr == 0 || addr.checked_add(len).is_none() {
+            return Err(MapError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "native mapping cannot be represented by a Rust slice",
+            )));
+        }
+        Ok(mapping)
     }
 
     /// The mapping's live address (the relocation target base).
@@ -191,7 +247,7 @@ impl RegionMapping {
         Ok(unsafe { std::slice::from_raw_parts_mut(self.addr as *mut u8, self.len) })
     }
 
-    /// Seal the mapping read-only (`mprotect(PROT_READ)`) — region hygiene:
+    /// Seal the mapping read-only in the operating system — region hygiene:
     /// after relocation the region is immutable, and hardened builds trap
     /// any write. Idempotent-refusing: sealing twice is the typed `Sealed`
     /// error so state machines stay explicit.
@@ -201,6 +257,7 @@ impl RegionMapping {
         if self.sealed {
             return Err(MapError::Sealed);
         }
+        #[cfg(target_os = "linux")]
         // SAFETY: the range is an owned mapping; `&mut self` proves no live
         // borrow exists while protections narrow.
         unsafe { sys::sys_mprotect(self.addr, round_up_pages(self.len), sys::PROT_READ) }.map_err(
@@ -209,6 +266,10 @@ impl RegionMapping {
                 errno,
             },
         )?;
+        #[cfg(target_os = "windows")]
+        // SAFETY: the entire range belongs to this view, and `&mut self`
+        // excludes live borrows while Windows narrows its page protection.
+        unsafe { windows::protect_readonly(self.addr, self.len) }?;
         self.sealed = true;
         Ok(())
     }
@@ -218,9 +279,14 @@ impl RegionMapping {
 #[allow(unsafe_code)]
 impl Drop for RegionMapping {
     fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
         // SAFETY: the range is owned and no borrow can outlive Drop; munmap
         // failure here is unreachable for a well-formed mapping and is
         // deliberately ignored (nothing sound can be done in Drop).
         let _ = unsafe { sys::sys_munmap(self.addr, round_up_pages(self.len)) };
+        #[cfg(target_os = "windows")]
+        // SAFETY: addr is the original base of this uniquely owned native
+        // file view, and all borrowed slices ended before Drop.
+        let _ = unsafe { windows::unmap(self.addr) };
     }
 }

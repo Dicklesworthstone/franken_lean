@@ -139,10 +139,10 @@ row FLN-BX-0081 | crates/fln-unsafe-abi/src/handle.rs | fn mk_int | (i64) -> Obj
 row FLN-BX-0053 | crates/fln-unsafe-abi/src/handle.rs | fn identity_token | (&self) -> usize | region compact sharing tests | opaque dedup key; address-derived, never enters artifacts/digests (CGSE)
 row FLN-BX-0054 | crates/fln-unsafe-region/src/lib.rs | mod mapping | module: RegionMapping surface | region suites | exposes only rows below
 row FLN-BX-0055 | crates/fln-unsafe-region/src/mapping.rs | enum MapError | Io/Empty/Sys/Sealed/MisalignedBase | mapping unit suite | typed failure data only
-row FLN-BX-0056 | crates/fln-unsafe-region/src/mapping.rs | fn page_size | () -> usize | auxv parse test | value from /proc/self/auxv
+row FLN-BX-0056 | crates/fln-unsafe-region/src/mapping.rs | fn page_size | () -> usize | page_size_is_sane | scalar OS page geometry from Linux auxv or Windows GetSystemInfo; no admission authority
 row FLN-BX-0057 | crates/fln-unsafe-region/src/mapping.rs | struct RegionMapping | owned private CoW file mapping | mapping unit suite; e2e region lanes | opaque handle; bytes only, no object claim
 row FLN-BX-0058 | crates/fln-unsafe-region/src/mapping.rs | fn map_file_private | (&Path) -> Result<RegionMapping, MapError> | mapping unit suite | mints the owned mapping; typed errors
-row FLN-BX-0059 | crates/fln-unsafe-region/src/mapping.rs | fn try_map_file_private_at | (&Path, usize) -> Result<Option<RegionMapping>, MapError> | at-base fast-path tests | None on occupied range (relocate-or-copy law)
+row FLN-BX-0059 | crates/fln-unsafe-region/src/mapping.rs | fn try_map_file_private_at | (&Path, usize) -> Result<Option<RegionMapping>, MapError> | at-base fast-path and null-base tests; Windows allocation-alignment test | None on unavailable range; never replaces an allocation or reports a different base as success
 row FLN-BX-0060 | crates/fln-unsafe-region/src/mapping.rs | fn addr | (&self) -> usize | relocation tests | value copy (the relocation target base)
 row FLN-BX-0061 | crates/fln-unsafe-region/src/mapping.rs | fn len | (&self) -> usize | mapping unit suite | value copy
 row FLN-BX-0062 | crates/fln-unsafe-region/src/mapping.rs | fn is_empty | (&self) -> bool | mapping unit suite | value query

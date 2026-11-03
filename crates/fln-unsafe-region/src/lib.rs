@@ -8,9 +8,9 @@
 //! `fln-kernel` or `fln-checker` (D3 law a).
 //!
 //! Bead fln-wgp (slice 1): [`mapping::RegionMapping`] — private copy-on-write
-//! file mappings via raw Linux syscalls (the closed universe has no libc;
-//! inline asm per certified architecture), the `MAP_FIXED_NOREPLACE` at-base
-//! fast path, read-only sealing, and auxv-derived page facts. The safe
+//! file mappings via raw Linux syscalls or native Windows file views. Both
+//! backends preserve the non-replacing at-base fast path and kernel-enforced
+//! read-only sealing. Page facts come from the operating system. The safe
 //! relocation engine that drives these mappings lives in `fln-rt::region`.
 
 #![deny(unsafe_code)]
@@ -20,22 +20,25 @@
 // franken_lean-d3-safety-note-unenforced-cdbg.
 #![deny(clippy::undocumented_unsafe_blocks)]
 
-// The mapping primitive is Linux-syscall based; the certified platform matrix
-// is 64-bit little-endian, and slice 1 is Linux-only (macOS/Windows join with
-// their own ledgered primitives when the platform matrix expands).
+// Region images use the certified 64-bit little-endian object layout. Linux
+// and Windows have separate ledgered mapping primitives; other operating
+// systems need an implementation with the same CoW and sealing guarantees.
 #[cfg(not(all(
-    target_os = "linux",
+    any(target_os = "linux", target_os = "windows"),
     target_pointer_width = "64",
     target_endian = "little",
     any(target_arch = "x86_64", target_arch = "aarch64")
 )))]
 compile_error!(
-    "fln-unsafe-region slice 1 requires 64-bit little-endian Linux on \
+    "fln-unsafe-region requires 64-bit little-endian Linux or Windows on \
      x86_64/aarch64; other platforms need their own ledgered mapping primitives"
 );
 
 pub mod mapping;
+#[cfg(target_os = "linux")]
 mod sys;
+#[cfg(target_os = "windows")]
+mod windows;
 
 #[cfg(test)]
 mod tests;

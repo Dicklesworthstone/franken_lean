@@ -6,13 +6,14 @@
 //! * `safe-write` — the safe surface refuses mutation with the typed
 //!   `MapError::Sealed`, never a fault (FL-INV-07 on the API plane);
 //! * `raw-write` — a raw pointer write to the sealed page (the move a buggy
-//!   plugin or JIT stub would make through the ABI membrane) dies by SIGSEGV.
-//!   The parent harness asserts the signal; if the write *survives*, the probe
+//!   plugin or JIT stub would make through the ABI membrane) dies by a native
+//!   protection fault: SIGSEGV on Linux, access violation on Windows.
+//!   The parent harness asserts the fault; if the write *survives*, the probe
 //!   reports the broken hardening and exits 5 so the lane fails loudly.
 //!
 //! Emits NDJSON facts (schema `fln-region-trap/1`) on stdout. Exit codes:
 //! 0 = mode's law held (for `raw-write` the process must instead die by
-//! signal), 2 = usage, 3 = setup failure, 4 = safe surface failed to refuse,
+//! a protection fault), 2 = usage, 3 = setup failure, 4 = safe surface failed to refuse,
 //! 5 = raw write did not trap.
 
 #![deny(unsafe_code)]
@@ -20,9 +21,14 @@
 
 use fln_unsafe_region::mapping::{MapError, RegionMapping};
 
+#[cfg(target_os = "linux")]
+const RAW_WRITE_FAULT: &str = "SIGSEGV terminates this process before the next fact";
+#[cfg(target_os = "windows")]
+const RAW_WRITE_FAULT: &str = "access violation terminates this process before the next fact";
+
 fn fact(kind: &str, body: &str) {
     // Stdout is line-buffered: each fact is flushed by its newline, so the
-    // pre-write facts survive the SIGSEGV that ends the raw-write mode.
+    // pre-write facts survive the protection fault that ends raw-write mode.
     println!("{{\"schema\":\"fln-region-trap/1\",\"{kind}\":{body}}}");
 }
 
@@ -32,14 +38,14 @@ fn fact(kind: &str, body: &str) {
 /// SAFETY: none claimed — this site deliberately breaks the sealed-region
 /// immutability invariant to prove the hardware trap. It runs only inside
 /// the Tribunal's trap lane, in a child process whose expected fate is
-/// SIGSEGV; the store is volatile so it cannot be elided, and nothing after
+/// a native protection fault; the store is volatile so it cannot be elided, and nothing after
 /// it is trusted (a surviving write is reported and the lane fails).
 // UNSAFE-LEDGER: FLN-UL-0063
 #[allow(unsafe_code)]
 fn raw_write(addr: usize) {
     // SAFETY: none claimed, deliberately — this is the invariant violation the drill
     // exists to punish, and the doc comment above states the full justification: the
-    // probe runs only in the trap lane's child process, whose expected fate is SIGSEGV,
+    // probe runs only in the trap lane's child process, whose expected fate is a protection fault,
     // the store is volatile so it cannot be elided, and nothing after it is trusted.
     // The note is repeated here because `clippy::undocumented_unsafe_blocks` reads the
     // comment attached to the BLOCK, not the one attached to the function (bead
@@ -120,7 +126,7 @@ fn main() {
         "raw-write" => {
             fact(
                 "attempting_raw_write",
-                "{\"expected\":\"SIGSEGV terminates this process before the next fact\"}",
+                &format!("{{\"expected\":\"{RAW_WRITE_FAULT}\"}}"),
             );
             raw_write(mapping.addr());
             // Reaching this line means the kernel let the write through:
