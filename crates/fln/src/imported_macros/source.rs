@@ -129,6 +129,13 @@ impl std::fmt::Display for SourceMacroError {
 impl std::error::Error for SourceMacroError {}
 
 impl SourceMacroError {
+    pub(crate) fn into_execution_error(self) -> EngineExecutionError {
+        EngineExecutionError::ImportedMacro {
+            disposition: self.disposition(),
+            message: self.to_string(),
+        }
+    }
+
     pub(crate) fn disposition(&self) -> (&'static str, bool, u8) {
         match self {
             Self::Frontend(error) => crate::source_check::classify(error),
@@ -236,6 +243,49 @@ pub(crate) struct FileSessionReport {
     pub(crate) attempts: Vec<MacroAttempt>,
     pub(crate) completed_vm_usage: ExecutionUsage,
     pub(crate) tree_usage: MacroTreeUsage,
+}
+
+
+/// One expanded command for the ordinary source executor. The parser's
+/// original source view remains attached; execution never prints/reparses an
+/// expansion or invokes a macro a second time for admission.
+pub(crate) enum ProgramCommandSyntax {
+    Single(ParsedSourceCommand),
+    Mutual(Vec<Syntax>),
+}
+
+impl ProgramCommandSyntax {
+    pub(crate) fn syntaxes(&self) -> Vec<&Syntax> {
+        match self {
+            Self::Single(parsed) => vec![parsed.syntax()],
+            Self::Mutual(members) => members.iter().collect(),
+        }
+    }
+
+    pub(crate) fn into_scoped(
+        self,
+    ) -> Result<crate::source_records::ScopedCommandSyntax, EngineExecutionError> {
+        match self {
+            Self::Mutual(members) => {
+                Ok(crate::source_records::ScopedCommandSyntax::Mutual(members))
+            }
+            Self::Single(parsed) => scoped_command(parsed),
+        }
+    }
+}
+
+pub(crate) fn scoped_command(
+    parsed: ParsedSourceCommand,
+) -> Result<crate::source_records::ScopedCommandSyntax, EngineExecutionError> {
+    use crate::source_records::ScopedCommandSyntax;
+    match parsed.kind() {
+        SourceCommandKind::Example => Ok(ScopedCommandSyntax::Example(parsed)),
+        SourceCommandKind::Definition => parsed
+            .into_definition()
+            .map(ScopedCommandSyntax::Definition)
+            .ok_or_else(|| SourceMacroError::DeclarationRequired.into_execution_error()),
+        _ => Err(SourceMacroError::DeclarationRequired.into_execution_error()),
+    }
 }
 
 impl<'a> FileSession<'a> {
@@ -355,6 +405,110 @@ impl<'a> FileSession<'a> {
             }
         }
         Ok(())
+    }
+
+
+    /// Expand the command stream's actual syntax once, before its ordinary
+    /// checker/compiler branches inspect it. Query wrappers stay native; only
+    /// their term enters the same macro expansion used by the embedding API.
+    pub(crate) fn expand_program_command(
+        &mut self,
+        engine: &Engine,
+        registry: &RegisteredMacros,
+        source: &[u8],
+        scope: &fln_elab::source::scope::SourceScope,
+    ) -> Outcome<Result<ProgramCommandSyntax, SourceMacroError>> {
+        match source_preflight(engine, registry, source, self.limits, self.cancellation) {
+            Outcome::Complete(Ok(())) => {}
+            Outcome::Complete(Err(error)) => return Outcome::Complete(Err(error)),
+            Outcome::Inconclusive(reason) => return Outcome::Inconclusive(reason),
+            Outcome::InternalFault(fault) => return Outcome::InternalFault(fault),
+        }
+        match fln_parse::command_scope::mutual::parse(source) {
+            Ok(Some(_)) => {
+                return self
+                    .expand_command(engine, registry, source, scope)
+                    .map_complete(|result| {
+                        result.and_then(|parsed| match parsed {
+                            crate::source_records::ScopedCommandSyntax::Mutual(members) => {
+                                Ok(ProgramCommandSyntax::Mutual(members))
+                            }
+                            _ => Err(SourceMacroError::DeclarationRequired),
+                        })
+                    });
+            }
+            Ok(None) => {}
+            Err(error) => {
+                return frontend(EngineExecutionError::Frontend(
+                    crate::DefinitionFrontendError::Parse(error),
+                ));
+            }
+        }
+        let parsed = match fln_parse::parse_source_command(source) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                return frontend(EngineExecutionError::Frontend(
+                    crate::DefinitionFrontendError::Parse(error),
+                ));
+            }
+        };
+        let expected = parsed.kind();
+        let declaration = matches!(
+            expected,
+            SourceCommandKind::Definition | SourceCommandKind::Example
+        );
+        let command = match expected {
+            SourceCommandKind::Check => "check",
+            SourceCommandKind::Evaluation => "eval",
+            SourceCommandKind::Definition | SourceCommandKind::Example => "declaration",
+        };
+        let Syntax::Node { kind, args, .. } = parsed.syntax() else {
+            return wrong_command(expected);
+        };
+        if *kind != Name::from_components(["Lean", "Parser", "Command", command])
+            || args.len() != 2
+        {
+            return wrong_command(expected);
+        }
+        if !declaration && registry.declarations(kind).next().is_some() {
+            return Outcome::Complete(Err(SourceMacroError::ScopeControl {
+                kind: kind.clone(),
+            }));
+        }
+        let input = if declaration { parsed.syntax() } else { &args[1] };
+        let resolve = crate::source_check::grammar::resolver(engine.environment(), scope);
+        let existing_global = expected == SourceCommandKind::Check
+            && parsed.query_is_identifier()
+            && matches!(input, Syntax::Ident { val, .. }
+                if matches!(resolve(val),
+                    crate::source_check::grammar::Resolution::Global(_)
+                    | crate::source_check::grammar::Resolution::Constructor(_)));
+        if existing_global {
+            return Outcome::Complete(Ok(ProgramCommandSyntax::Single(parsed)));
+        }
+        self.expand_syntax(
+            engine,
+            registry,
+            parsed.source_view().normalized(),
+            input,
+            scope,
+        )
+        .map_complete(|result| {
+            result.and_then(|syntax| {
+                let rewritten = match expected {
+                    SourceCommandKind::Definition => parsed.with_expanded_declaration(syntax),
+                    SourceCommandKind::Example => parsed.with_expanded_example(syntax),
+                    SourceCommandKind::Check | SourceCommandKind::Evaluation => {
+                        parsed.with_expanded_query_term(syntax)
+                    }
+                };
+                rewritten.map(ProgramCommandSyntax::Single).ok_or(match expected {
+                    SourceCommandKind::Definition => SourceMacroError::DeclarationRequired,
+                    SourceCommandKind::Example => SourceMacroError::ExampleRequired,
+                    _ => SourceMacroError::EvaluationRequired,
+                })
+            })
+        })
     }
 
     pub(crate) fn expand_command(

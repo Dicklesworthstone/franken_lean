@@ -2790,6 +2790,7 @@ impl Engine {
             None,
             presentation,
             &[(source, None)],
+            None,
         )
     }
 
@@ -2830,7 +2831,17 @@ impl Engine {
         mut public: Option<&mut source_check::modules::visibility::PublicWorld<'_>>,
         presentation: EvaluationPresentation,
         source_files: &[(&[u8], Option<&Name>)],
+        mut macros: Option<&mut imported_macros::source::FileSession<'_>>,
     ) -> Result<Outcome<SourceCommandBatchExecution>, EngineExecutionError> {
+        use imported_macros::source::ProgramCommandSyntax;
+        if let Some(reason) = macros.as_deref().and_then(|session| session.cancelled()) {
+            return Ok(Outcome::Inconclusive(reason));
+        }
+        if macros.is_some() && !file_starts.is_empty() {
+            return Err(EngineExecutionError::UnexpectedPublication {
+                detail: "an imported macro session belongs to exactly one source module",
+            });
+        }
         if commands.is_empty() {
             return Err(EngineExecutionError::EmptyBatch);
         }
@@ -2928,6 +2939,9 @@ impl Engine {
         let mut scopes = source_check::scopes::Scopes::new(&engine);
         scopes.current.private_module = private_module.cloned();
         scopes.current.source_module = source_module.cloned();
+        if let Some(session) = macros.as_deref() {
+            scopes.set_imported_macros(session.registry());
+        }
         // The syntax a file declares extends the grammar of its commands after it
         // (`source_check::grammar`). The stream was partitioned before any of it was declared.
         let mut grammar = source_check::grammar::SourceGrammar::for_engine(
@@ -2935,6 +2949,11 @@ impl Engine {
             source_module,
             private_module.is_some(),
         )?;
+        if macros.is_some() && grammar.has_templates() {
+            return Err(
+                imported_macros::source::SourceMacroError::TemplateGrammar.into_execution_error(),
+            );
+        }
         grammar.extend_scopes(&mut scopes);
         let mut queue: std::collections::VecDeque<Step<'_>> = commands
             .into_iter()
@@ -2952,7 +2971,17 @@ impl Engine {
         // local false cannot undo an enclosing capture; a local true can add
         // one. Keep that ownership separate from the innermost option map.
         let mut command_stderr_capture: Option<(usize, bool)> = None;
+        let macro_error = |index, at, error: imported_macros::source::SourceMacroError| {
+            EngineExecutionError::BatchCommand {
+                index,
+                error: Box::new(error.into_execution_error()),
+                at: Some(at),
+            }
+        };
         while let Some(step) = queue.pop_front() {
+            if let Some(reason) = macros.as_deref().and_then(|session| session.cancelled()) {
+                return Ok(Outcome::Inconclusive(reason));
+            }
             if let Some((index, offset)) = elaborated_command.take() {
                 deprecations.extend(deprecation_warnings(
                     deprecation_sink.take(),
@@ -2966,6 +2995,14 @@ impl Engine {
             let (command_index, original_offset, command_source) = match step {
                 Step::Command(index, offset, source) => (index, offset, source),
                 Step::Scope(index, transition) => {
+                    if let Some(session) = macros.as_deref() {
+                        session
+                            .check_native_control(
+                                scopes.imported_macros().expect("imported macro file scope"),
+                                &transition,
+                            )
+                            .map_err(|error| macro_error(index, fln_parse::BytePos(0), error))?;
+                    }
                     grammar.observe(&transition);
                     scopes
                         .check_limits(&transition)
@@ -3035,6 +3072,41 @@ impl Engine {
                 })?;
             if let Some(control) = control {
                 use fln_parse::command_scope::ScopeCommand;
+                let control = if let Some(session) = macros.as_deref_mut() {
+                    let registry = scopes.imported_macros().expect("imported macro file scope");
+                    session
+                        .check_native_control(registry, &control)
+                        .map_err(|error| macro_error(command_index, original_offset, error))?;
+                    if matches!(control, ScopeCommand::GuardMsgs { .. }) {
+                        return Err(EngineExecutionError::BatchCommand {
+                            index: command_index,
+                            error: Box::new(EngineExecutionError::NotImplemented {
+                                feature: "imported macro execution under `#guard_msgs`",
+                            }),
+                            at: Some(original_offset),
+                        });
+                    }
+                    match session.expand_control(
+                        &engine,
+                        registry,
+                        command_source,
+                        control,
+                        &scopes.current,
+                    ) {
+                        Outcome::Complete(Ok(control)) => control,
+                        Outcome::Complete(Err(error)) => {
+                            return Err(macro_error(command_index, original_offset, error));
+                        }
+                        Outcome::Inconclusive(reason) => {
+                            return Ok(Outcome::Inconclusive(reason));
+                        }
+                        Outcome::InternalFault(fault) => {
+                            return Ok(Outcome::InternalFault(fault));
+                        }
+                    }
+                } else {
+                    control
+                };
                 match control {
                     ScopeCommand::Trivia => {}
                     // The command ends at its `#exit` token, so the warning sits there.
@@ -3321,6 +3393,13 @@ impl Engine {
                     at: Some(original_offset),
                 })?
             {
+                if macros.is_some() {
+                    return Err(macro_error(
+                        command_index,
+                        original_offset,
+                        imported_macros::source::SourceMacroError::TemplateGrammar,
+                    ));
+                }
                 macro_pattern_warnings.extend(
                     grammar
                         .macro_warnings(&scopes.current.options)
@@ -3336,20 +3415,61 @@ impl Engine {
                 grammar.extend_scopes(&mut scopes);
                 continue;
             }
+            let mut expanded = if let Some(session) = macros.as_deref_mut() {
+                let result = grammar.enter(|| {
+                    session.expand_program_command(
+                        &engine,
+                        scopes.imported_macros().expect("imported macro file scope"),
+                        command_source,
+                        &scopes.current,
+                    )
+                });
+                match result {
+                    Outcome::Complete(Ok(parsed)) => Some(parsed),
+                    Outcome::Complete(Err(error)) => {
+                        return Err(macro_error(command_index, original_offset, error));
+                    }
+                    Outcome::Inconclusive(reason) => {
+                        return Ok(Outcome::Inconclusive(reason));
+                    }
+                    Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                }
+            } else {
+                None
+            };
             let mut scope = if public.is_some() {
-                grammar
-                    .enter(|| scopes.command_scope(command_source))
-                    .map_err(|error| EngineExecutionError::BatchCommand {
-                        index: command_index,
-                        error: Box::new(EngineExecutionError::Frontend(error)),
-                        at: Some(original_offset),
-                    })?
+                let scope = match &expanded {
+                    Some(ProgramCommandSyntax::Mutual(members)) => scopes
+                        .current
+                        .for_mutual_declarations(members)
+                        .map_err(DefinitionFrontendError::Elaborate),
+                    Some(ProgramCommandSyntax::Single(parsed))
+                        if matches!(
+                            parsed.kind(),
+                            SourceCommandKind::Definition | SourceCommandKind::Example
+                        ) => scopes
+                        .current
+                        .for_declaration(parsed.syntax())
+                        .map_err(DefinitionFrontendError::Elaborate),
+                    _ => grammar.enter(|| scopes.command_scope(command_source)),
+                };
+                let mut scope = scope.map_err(|error| EngineExecutionError::BatchCommand {
+                    index: command_index,
+                    error: Box::new(EngineExecutionError::Frontend(error)),
+                    at: Some(original_offset),
+                })?;
+                if expanded.is_some() && scope.exports_declaration() {
+                    scope.instance_scopes = scopes.public_scope().instance_scopes;
+                }
+                scope
             } else {
                 scopes.current.clone()
             };
             // The equation theorems this command names, generated and admitted before it, as
             // the pin's reserved-name action adds them when it resolves the name.
-            if public.is_none() && source_records::may_name_equation_theorems(command_source) {
+            if public.is_none()
+                && (expanded.is_some() || source_records::may_name_equation_theorems(command_source))
+            {
                 let parsed = grammar.enter(|| {
                     fln_parse::parse_source_command(command_source).and_then(|parsed| {
                         grammar.expand_command(
@@ -3365,10 +3485,13 @@ impl Engine {
                         .ok()
                         .flatten(),
                 };
-                let syntaxes: Vec<&fln_syntax::tree::Syntax> = match (&parsed, &members) {
-                    (Ok(parsed), _) => vec![parsed.syntax()],
-                    (Err(_), Some(members)) => members.iter().collect(),
-                    (Err(_), None) => Vec::new(),
+                let syntaxes: Vec<&fln_syntax::tree::Syntax> = match &expanded {
+                    Some(parsed) => parsed.syntaxes(),
+                    None => match (&parsed, &members) {
+                        (Ok(parsed), _) => vec![parsed.syntax()],
+                        (Err(_), Some(members)) => members.iter().collect(),
+                        (Err(_), None) => Vec::new(),
+                    },
                 };
                 if !syntaxes.is_empty() {
                     let realized = grammar
@@ -3470,14 +3593,25 @@ impl Engine {
                 // Queries continue to observe the complete private world.
                 let (next, admission) = match grammar
                     .enter(|| {
-                        public.admit_command(
-                            &engine,
-                            command_source,
-                            options,
-                            limits.admission(),
-                            &scope,
-                            &scopes.current,
-                        )
+                        match expanded.take() {
+                            Some(parsed) => public.admit_command_syntax(
+                                &engine,
+                                command_source,
+                                parsed.into_scoped()?,
+                                options,
+                                limits.admission(),
+                                &scope,
+                                &scopes.current,
+                            ),
+                            None => public.admit_command(
+                                &engine,
+                                command_source,
+                                options,
+                                limits.admission(),
+                                &scope,
+                                &scopes.current,
+                            ),
+                        }
                     })
                     .map_err(|error| EngineExecutionError::BatchCommand {
                         index: command_index,
@@ -3507,28 +3641,40 @@ impl Engine {
                 );
                 continue;
             }
-            if grammar
-                .enter(|| fln_parse::command_scope::mutual::parse(command_source))
-                .map_err(|error| error.with_original_offset(original_offset))
-                .map_err(DefinitionFrontendError::Parse)
-                .map_err(|error| EngineExecutionError::BatchCommand {
-                    index: command_index,
-                    error: Box::new(EngineExecutionError::Frontend(error)),
-                    at: Some(original_offset),
-                })?
-                .is_some()
-            {
+            let mutual = match &expanded {
+                Some(ProgramCommandSyntax::Mutual(_)) => true,
+                Some(ProgramCommandSyntax::Single(_)) => false,
+                None => grammar
+                    .enter(|| fln_parse::command_scope::mutual::parse(command_source))
+                    .map_err(|error| error.with_original_offset(original_offset))
+                    .map_err(DefinitionFrontendError::Parse)
+                    .map_err(|error| EngineExecutionError::BatchCommand {
+                        index: command_index,
+                        error: Box::new(EngineExecutionError::Frontend(error)),
+                        at: Some(original_offset),
+                    })?
+                    .is_some(),
+            };
+            if mutual {
                 // Keep the whole mutual block on the existing two-checker
                 // admission path. Never publish members sequentially or treat
                 // declarations as VM executions merely to advance the stream.
                 let admission = match grammar
-                    .enter(|| {
-                        engine.admit_source_command_in_scope(
+                    .enter(|| match expanded.take() {
+                        Some(parsed) => engine.admit_scoped_command_syntax_with_base(
+                            command_source,
+                            parsed.into_scoped()?,
+                            options,
+                            limits.admission(),
+                            &scope,
+                            Some(&file_base),
+                        ),
+                        None => engine.admit_source_command_in_scope(
                             command_source,
                             options,
                             limits.admission(),
                             &scope,
-                        )
+                        ),
                     })
                     .map_err(|error| EngineExecutionError::BatchCommand {
                         index: command_index,
@@ -3554,22 +3700,30 @@ impl Engine {
                 );
                 continue;
             }
-            let parsed = grammar
-                .enter(|| {
-                    fln_parse::parse_source_command(command_source).and_then(|parsed| {
-                        grammar.expand_command(
-                            parsed,
-                            source_check::grammar::resolver(engine.environment(), &scope),
-                        )
+            let parsed = match expanded.take() {
+                Some(ProgramCommandSyntax::Single(parsed)) => parsed,
+                Some(ProgramCommandSyntax::Mutual(_)) => {
+                    return Err(EngineExecutionError::UnexpectedPublication {
+                        detail: "an expanded mutual command escaped batch admission",
+                    });
+                }
+                None => grammar
+                    .enter(|| {
+                        fln_parse::parse_source_command(command_source).and_then(|parsed| {
+                            grammar.expand_command(
+                                parsed,
+                                source_check::grammar::resolver(engine.environment(), &scope),
+                            )
+                        })
                     })
-                })
-                .map_err(|error| error.with_original_offset(original_offset))
-                .map_err(DefinitionFrontendError::Parse)
-                .map_err(|error| EngineExecutionError::BatchCommand {
-                    index: command_index,
-                    error: Box::new(EngineExecutionError::Frontend(error)),
-                    at: Some(original_offset),
-                })?;
+                    .map_err(|error| error.with_original_offset(original_offset))
+                    .map_err(DefinitionFrontendError::Parse)
+                    .map_err(|error| EngineExecutionError::BatchCommand {
+                        index: command_index,
+                        error: Box::new(EngineExecutionError::Frontend(error)),
+                        at: Some(original_offset),
+                    })?,
+            };
             // An inline `@[simp]` is registered (or, on an example, refused) only by the
             // admission path `check_source_files` uses; the paths below would drop it.
             let has_inline_simp =
@@ -3650,7 +3804,8 @@ impl Engine {
                 });
             }
             if fln_elab::source::is_theorem(parsed.syntax())
-                && source_records::may_name_equation_theorems(command_source)
+                && (macros.is_some()
+                    || source_records::may_name_equation_theorems(command_source))
                 && let Some(public) = public.as_deref_mut()
             {
                 // Generate eligible public equations before the private proof,
@@ -3659,15 +3814,27 @@ impl Engine {
                     fln_elab::source::trace::contains_trace(parsed.syntax()).then_some(&parsed);
                 let result = match grammar
                     .enter(|| {
-                        public.admit_private_command(
-                            &engine,
-                            command_source,
-                            options,
-                            limits.admission(),
-                            &scope,
-                            &file_base,
-                            observed,
-                        )
+                        if macros.is_some() {
+                            public.admit_private_command_syntax(
+                                &engine,
+                                command_source,
+                                imported_macros::source::scoped_command(parsed.clone())?,
+                                options,
+                                limits.admission(),
+                                &scope,
+                                &file_base,
+                            )
+                        } else {
+                            public.admit_private_command(
+                                &engine,
+                                command_source,
+                                options,
+                                limits.admission(),
+                                &scope,
+                                &file_base,
+                                observed,
+                            )
+                        }
                     })
                     .map_err(|error| EngineExecutionError::BatchCommand {
                         index: command_index,
@@ -3878,6 +4045,19 @@ impl Engine {
                                     outcome.map_complete(|observed| {
                                         (observed.admission, observed.traces)
                                     })
+                                })
+                        } else if macros.is_some() {
+                            engine
+                                .admit_scoped_command_syntax_with_base(
+                                    command_source,
+                                    imported_macros::source::scoped_command(parsed.clone())?,
+                                    options,
+                                    limits.admission(),
+                                    &scope,
+                                    Some(&file_base),
+                                )
+                                .map(|outcome| {
+                                    outcome.map_complete(|admission| (admission, Vec::new()))
                                 })
                         } else {
                             engine
@@ -4844,6 +5024,9 @@ impl Engine {
         warnings.sort_by_key(|warning| warning.command_index);
         // The last command, so the order by command stays.
         warnings.extend(exit_warning);
+        if let Some(reason) = macros.as_deref().and_then(|session| session.cancelled()) {
+            return Ok(Outcome::Inconclusive(reason));
+        }
         Ok(Outcome::Complete(SourceCommandBatchExecution {
             scope: scopes.current,
             batch: DefinitionBatchExecution {
@@ -5269,6 +5452,7 @@ impl Engine {
                         .source,
                     Some(entry),
                 )],
+                None,
             )? {
                 Outcome::Complete(completed) => completed,
                 Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
@@ -5796,6 +5980,7 @@ impl Engine {
                     .filter(|index| !parsed[**index].commands.is_empty())
                     .map(|index| (modules[*index].source, Some(modules[*index].name)))
                     .collect::<Vec<_>>(),
+                None,
             )? {
                 Outcome::Complete(completed) => completed,
                 Outcome::Inconclusive(inconclusive) => {
@@ -5925,6 +6110,7 @@ impl Engine {
                 None,
                 EvaluationPresentation::Raw,
                 source_files,
+                None,
             )? {
                 // This door returns no per-command outputs, so nothing could judge a guard:
                 // refuse rather than run the guarded command unjudged.

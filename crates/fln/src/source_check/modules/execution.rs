@@ -61,6 +61,13 @@ impl SourceProgramExecutionError<std::convert::Infallible> {
 }
 
 fn source_error(module: &Name, error: EngineExecutionError) -> SourceModuleCheckError {
+    SourceModuleCheckError::Source {
+        module: module.clone(),
+        error: source_command_error(error),
+    }
+}
+
+fn source_command_error(error: EngineExecutionError) -> SourceCheckError {
     let (command, offset, error) = match error {
         EngineExecutionError::BatchCommand { index, at, error } => {
             (index, at.map_or(0, |at| at.0), error)
@@ -71,14 +78,11 @@ fn source_error(module: &Name, error: EngineExecutionError) -> SourceModuleCheck
             Box::new(error),
         ),
     };
-    SourceModuleCheckError::Source {
-        module: module.clone(),
-        error: SourceCheckError::Command {
-            file: 0,
-            command,
-            offset,
-            error,
-        },
+    SourceCheckError::Command {
+        file: 0,
+        command,
+        offset,
+        error,
     }
 }
 
@@ -259,6 +263,7 @@ impl imported::SourceOleanImport {
             false,
             presentation,
             &mut |_, _| Ok::<(), std::convert::Infallible>(()),
+            None,
         )
         .map_err(SourceProgramExecutionError::into_source_error)
     }
@@ -311,6 +316,7 @@ impl imported::SourceOleanImport {
             true,
             presentation,
             &mut |_, _| Ok::<(), std::convert::Infallible>(()),
+            None,
         )
         .map_err(SourceProgramExecutionError::into_source_error)
     }
@@ -340,11 +346,12 @@ impl imported::SourceOleanImport {
             true,
             presentation,
             validate,
+            None,
         )
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn execute_source_modules_with_implicit_init<E>(
+    pub(super) fn execute_source_modules_with_implicit_init<E>(
         &self,
         modules: &[SourceModuleInput<'_>],
         entry: &Name,
@@ -354,6 +361,7 @@ impl imported::SourceOleanImport {
         implicit_init: bool,
         presentation: EvaluationPresentation,
         validate: &mut impl FnMut(&Name, &SourceCommandBatchExecution) -> Result<(), E>,
+        mut macros: Option<&mut imported_macros::ModuleMacroSession>,
     ) -> Result<Outcome<SourceProgramExecution>, SourceProgramExecutionError<E>> {
         if cancellation.is_some_and(CancellationProbe::is_cancelled) {
             return Ok(Outcome::Inconclusive(Inconclusive::cancelled(
@@ -449,33 +457,69 @@ impl imported::SourceOleanImport {
             });
             let body =
                 grammar.enter(|| commands(module.name, module.source, &plan.headers[index]))?;
-            let completed = if body.is_empty() {
-                let mut completed = engine.empty_source_command_execution(options);
-                completed.scope.private_module = plan.headers[index]
-                    .module_system
-                    .then(|| module.name.clone());
-                completed.scope.source_module = Some(module.name.clone());
-                completed
-            } else {
-                match engine
-                    .execute_source_command_stream(
-                        body,
-                        options,
-                        limits.execution,
-                        true,
-                        &[],
-                        plan.headers[index].module_system.then_some(module.name),
-                        Some(module.name),
-                        public.as_mut(),
-                        presentation,
-                        &[(module.source, Some(module.name))],
-                    )
-                    .map_err(|error| source_error(module.name, error))?
-                {
-                    Outcome::Complete(completed) => completed,
-                    Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
-                    Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+            let execute = |session: Option<
+                &mut crate::imported_macros::source::FileSession<'_>,
+            >| {
+                if body.is_empty() {
+                    if session.is_some() && grammar.has_templates() {
+                        return Err(SourceCheckError::ImportedMacro {
+                            file: 0,
+                            command: 0,
+                            offset: header.body_start.0,
+                            error: Box::new(
+                                crate::imported_macros::source::SourceMacroError::TemplateGrammar,
+                            ),
+                        });
+                    }
+                    let mut completed = engine.empty_source_command_execution(options);
+                    completed.scope.private_module =
+                        header.module_system.then(|| module.name.clone());
+                    completed.scope.source_module = Some(module.name.clone());
+                    Ok(Outcome::Complete(completed))
+                } else {
+                    engine
+                        .execute_source_command_stream(
+                            body,
+                            options,
+                            limits.execution,
+                            true,
+                            &[],
+                            header.module_system.then_some(module.name),
+                            Some(module.name),
+                            public.as_mut(),
+                            presentation,
+                            &[(module.source, Some(module.name))],
+                            session,
+                        )
+                        .map_err(source_command_error)
                 }
+            };
+            let result = if let Some(macros) = macros.as_deref_mut() {
+                let macro_imports: Vec<_> = steps
+                    .iter()
+                    .filter_map(|step| match step {
+                        contexts::Step::External(name) => Some(name.clone()),
+                        contexts::Step::Source(_) => None,
+                    })
+                    .collect();
+                macros.check_module(
+                    module.name,
+                    &macro_imports,
+                    &engine,
+                    cancellation,
+                    |session| execute(Some(session)),
+                )
+            } else {
+                execute(None)
+            }
+            .map_err(|error| SourceModuleCheckError::Source {
+                module: module.name.clone(),
+                error,
+            })?;
+            let completed = match result {
+                Outcome::Complete(completed) => completed,
+                Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
             };
             if cancellation.is_some_and(CancellationProbe::is_cancelled) {
                 return Ok(Outcome::Inconclusive(Inconclusive::cancelled(
