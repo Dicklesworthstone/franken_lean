@@ -94,12 +94,24 @@ impl Preparation<'_> {
             let Some(method) = self.known_instance_method(struct_name, *idx, expr)? else {
                 return Ok(None);
             };
-            return Ok(Some(
-                arguments[parameters + 1..]
-                    .iter()
-                    .cloned()
-                    .fold(method, Expr::app),
-            ));
+            // A factory can expose a polymorphic lambda rather than a named
+            // callable. Instantiate its leading type binders before projection
+            // layout discovery visits the body. Runtime arguments stay applied
+            // exactly once, with their original evaluation order.
+            let mut method = method;
+            for argument in &arguments[parameters + 1..] {
+                self.tick()?;
+                method = if let ExprNode::Lam {
+                    binder_type, body, ..
+                } = method.node()
+                    && self.type_parameter(binder_type)?
+                {
+                    self.substitution(body, argument)?
+                } else {
+                    Expr::app(method, argument.clone())
+                };
+            }
+            return Ok(Some(method));
         }
         for (index, argument) in arguments.iter().enumerate() {
             self.tick()?;
