@@ -90,12 +90,29 @@ impl Engine {
                     Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
                 };
             if noncomputable {
-                admitted.engine.environment = tag_noncomputable(
-                    &admitted.engine,
-                    &admitted.declaration,
-                    &Name::anonymous(),
-                    &fln_elab::source::scope::SourceScope::default(),
-                )?;
+                // Recursive executable companions are admitted as a mutual
+                // declaration, even for a singleton. The whole group has
+                // already passed both checkers; carry the owner's suppressed
+                // compiler failure to every checked member before publishing
+                // any of this batch. A companion must not revive an owner's
+                // genuinely noncomputable runtime dependencies.
+                if let Declaration::Mutual(definitions) = &admitted.declaration {
+                    for definition in definitions {
+                        admitted.engine.environment = tag_noncomputable(
+                            &admitted.engine,
+                            &Declaration::Defn(definition.clone()),
+                            &Name::anonymous(),
+                            &fln_elab::source::scope::SourceScope::default(),
+                        )?;
+                    }
+                } else {
+                    admitted.engine.environment = tag_noncomputable(
+                        &admitted.engine,
+                        &admitted.declaration,
+                        &Name::anonymous(),
+                        &fln_elab::source::scope::SourceScope::default(),
+                    )?;
+                }
                 admitted.result_logical_root = admitted.engine.logical_root(options);
             }
             batch.engine = admitted.engine.clone();

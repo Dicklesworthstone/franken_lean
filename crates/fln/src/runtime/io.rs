@@ -1,8 +1,9 @@
 //! Deferred logical BaseIO adapters for the VM's existing observations.
 //!
-//! These rows return bare ABI Bool values. Only an invoked world action wraps
-//! that payload in its admitted ST.Out constructor. Ordinary definitions keep
-//! their action closures, and no opaque logical default is ever executed.
+//! Native observations return bare Bool values or a checked private transport.
+//! Only invocation of a world action wraps that payload in its admitted ST.Out
+//! constructor. Ordinary definitions keep their action closures, and no opaque
+//! logical default is ever executed.
 
 use super::*;
 use crate::source_intrinsics::io::primitives::{self, Operation};
@@ -18,6 +19,7 @@ use std::collections::BTreeMap;
 pub(super) struct Store {
     next_adapter: u64,
     bindings: BTreeMap<Name, (IntrinsicBinding, Expr)>,
+    environment_layout: Option<Expr>,
 }
 
 fn bool_type() -> Expr {
@@ -71,7 +73,10 @@ impl Preparation<'_> {
         let row = fln_vm::extern_table_generated::EXTERN_ROWS
             .iter()
             .find(|row| {
-                row.name == source && row.kind == "opaque" && row.levels == 0 && row.arity == 0
+                row.name == source
+                    && row.kind == "opaque"
+                    && row.levels == 0
+                    && row.arity as usize == operation.source_arity()
             })
             .ok_or_else(|| unsupported("BaseIO generated primitive row"))?;
         if ContractEffect::parse(row.effect).ok() != Some(ContractEffect::Io) {
@@ -80,7 +85,7 @@ impl Preparation<'_> {
         let ownership = ContractOwnership::parse(row.ownership)
             .map_err(|_| unsupported("BaseIO primitive ownership contract"))?;
         let argument_ownership = ownership
-            .argument_ownership(0)
+            .argument_ownership(operation.source_arity())
             .map_err(|_| unsupported("BaseIO primitive argument ownership"))?
             .into_iter()
             .map(|ownership| match ownership {
@@ -99,20 +104,116 @@ impl Preparation<'_> {
             ContractResult::Scalar => ResultOwnership::Scalar,
             ContractResult::RawObject => ResultOwnership::RawObject,
         };
+        let (arguments, result, type_) = if operation == Operation::GetEnv {
+            let layout = self.io_environment_layout()?;
+            (
+                vec![ValueType::String],
+                ValueType::Constructor,
+                Expr::forall_e(
+                    Name::anonymous(),
+                    apply("String", []),
+                    layout,
+                    BinderInfo::Default,
+                ),
+            )
+        } else {
+            (vec![], ValueType::Bool, bool_type())
+        };
         let binding = IntrinsicBinding {
             name: private.clone(),
             universe_arity: 0,
             row: row.id.to_owned(),
-            arguments: Vec::new(),
+            arguments,
             argument_ownership,
-            result: ValueType::Bool,
+            result,
             result_ownership,
             effect: EffectClass::Io,
         };
-        self.io
-            .bindings
-            .insert(private.clone(), (binding, bool_type()));
+        self.io.bindings.insert(private.clone(), (binding, type_));
         Ok(private)
+    }
+
+    fn io_environment_layout(&mut self) -> Result<Expr, IngressError> {
+        if let Some(layout) = &self.io.environment_layout {
+            return Ok(layout.clone());
+        }
+        let layout = self.io_private_record(
+            "_fln_runtime_environment_result",
+            vec![bool_type(), apply("String", [])],
+        )?;
+        self.io.environment_layout = Some(layout.clone());
+        Ok(layout)
+    }
+
+    fn io_getenv_call(&mut self, arguments: &[Expr]) -> Result<Option<Expr>, IngressError> {
+        if arguments.len() > 2 {
+            return Ok(None);
+        }
+        let Some(world_type) = self.st_evaluation_world()? else {
+            return Ok(None);
+        };
+        let option = self.io_checked_shape(Operation::GetEnv.result_type())?;
+        if option.constructors.len() != 2
+            || option.constructors[0].tag != 0
+            || !option.constructors[0].fields.is_empty()
+            || option.constructors[1].tag != 1
+            || option.constructors[1].fields != [apply("String", [])]
+        {
+            return Err(unsupported("environment checked Option String layout"));
+        }
+        let primitive = self.io_bind_primitive(Operation::GetEnv)?;
+        let transport = self.io_environment_layout()?;
+        let variable =
+            |index| Expr::bvar(index).map_err(|_| unsupported("environment adapter scope"));
+        let field = |index| {
+            Ok::<_, IngressError>(Expr::proj(
+                name("_fln_runtime_environment_result"),
+                index,
+                variable(0)?,
+            ))
+        };
+        let absent = Expr::const_(option.constructors[0].name.clone(), vec![]);
+        let present = Expr::app(
+            Expr::const_(option.constructors[1].name.clone(), vec![]),
+            field(1)?,
+        );
+        let payload = io_result::choose(option.source.clone(), field(0)?, absent, present);
+        let state = apply("IO.RealWorld", []);
+        let result_type = apply("ST.Out", [state.clone(), option.source.clone()]);
+        let returned = apply("ST.Out.mk", [state, option.source, payload, variable(1)?]);
+        let body = Expr::let_e(
+            self.io_adapter_name("_fln_runtime_environment_packet")?,
+            transport,
+            Expr::app(Expr::const_(primitive, vec![]), variable(1)?),
+            returned,
+            false,
+        );
+        let action_type = Expr::forall_e(
+            Name::anonymous(),
+            world_type.clone(),
+            result_type,
+            BinderInfo::Default,
+        );
+        let action = Expr::lam(Name::anonymous(), world_type, body, BinderInfo::Default);
+        let wrapper_type = Expr::forall_e(
+            Name::anonymous(),
+            apply("String", []),
+            action_type,
+            BinderInfo::Default,
+        );
+        let wrapper = Expr::let_e(
+            self.io_adapter_name("_fln_runtime_environment_action")?,
+            wrapper_type,
+            Expr::lam(
+                Name::anonymous(),
+                apply("String", []),
+                action,
+                BinderInfo::Default,
+            ),
+            variable(0)?,
+            false,
+        );
+        Ok(Some(arguments.iter().cloned().fold(wrapper, Expr::app)))
     }
 
     /// Both bare action constants and explicit world applications enter here.
@@ -149,6 +250,9 @@ impl Preparation<'_> {
             )?
         {
             return Ok(None);
+        }
+        if operation == Operation::GetEnv {
+            return self.io_getenv_call(arguments);
         }
         if arguments.len() > 1 {
             return Ok(None);

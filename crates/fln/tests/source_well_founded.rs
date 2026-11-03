@@ -7,6 +7,7 @@ use fln::{
     Budget, ClosedVmValue, Engine, EngineAdmissionLimits, EngineExecutionLimits, KVMap, Name,
     OleanCheckLimits, OleanDecodeLimits, OleanModuleInput, SourceCheckLimits, olean_module_imports,
 };
+use fln_env::constants::{ConstantInfo, DefinitionSafety};
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
@@ -417,6 +418,167 @@ fn native_well_founded_measures_and_checked_decreasing_proofs() {
         .expect("spawn native checking thread")
         .join()
         .expect("native well-founded checks finish");
+}
+
+/// The executable sibling must not bypass termination, safe-declaration rules,
+/// or the noncomputable boundary. The source controls were checked against the
+/// v4.32.0 pin on 2026-11-03, without importing `Init.WFComputable`.
+#[test]
+fn native_well_founded_companions_preserve_safety_and_noncomputability() {
+    let Some(lib) = pinned_lib() else {
+        eprintln!("SKIP: pinned Reference lib/lean absent (set FLN_REQUIRE_REFERENCE=1 to fail)");
+        return;
+    };
+    std::thread::Builder::new()
+        .stack_size(STACK)
+        .spawn(move || {
+            let base = import_closure(&lib);
+            let checked = |engine: &Engine, source: &str| {
+                engine
+                    .check_source_files(
+                        &[source.as_bytes()],
+                        &KVMap::new(),
+                        SourceCheckLimits::new(limits()),
+                    )
+                    .unwrap_or_else(|error| panic!("{source}\n{error:?}"))
+                    .into_complete()
+                    .expect("the checked source finishes")
+                    .engine
+            };
+            let steps = checked(
+                &base,
+                "def boundarySteps (n : Nat) : Nat := if h : 0 < n then boundarySteps 0 else 42\ntermination_by n\ndecreasing_by exact h",
+            );
+            assert!(matches!(steps.environment().find(&n("boundarySteps")),
+                Some(ConstantInfo::Defn(definition)) if definition.safety == DefinitionSafety::Safe));
+            assert!(matches!(steps.environment().find(&n("boundarySteps._unsafe_rec")),
+                Some(ConstantInfo::Defn(definition)) if definition.safety == DefinitionSafety::Partial));
+            let before = steps.logical_root(&KVMap::new());
+            assert!(
+                steps
+                    .check_source_files(
+                        &[b"def boundaryLeak : Nat := boundarySteps._unsafe_rec 0"],
+                        &KVMap::new(),
+                        SourceCheckLimits::new(limits()),
+                    )
+                    .is_err(),
+                "a safe declaration cannot use the Partial executable sibling"
+            );
+            assert_eq!(steps.logical_root(&KVMap::new()), before);
+            assert!(!steps.environment().contains(&n("boundaryLeak")));
+
+            let collision = checked(
+                &base,
+                "def boundaryCollision._unsafe_rec (n : Nat) : Nat := 17",
+            );
+            let existing = collision
+                .environment()
+                .find(&n("boundaryCollision._unsafe_rec"))
+                .unwrap()
+                .clone();
+            for (engine, source, owner) in [
+                (
+                    &base,
+                    "def boundaryBad (n : Nat) : Nat := if h : 0 < n then boundaryBad n else 42\ntermination_by n\ndecreasing_by exact h",
+                    "boundaryBad",
+                ),
+                (
+                    &collision,
+                    "def boundaryCollision (n : Nat) : Nat := if h : 0 < n then boundaryCollision 0 else 42\ntermination_by n\ndecreasing_by exact h",
+                    "boundaryCollision",
+                ),
+            ] {
+                let before = engine.logical_root(&KVMap::new());
+                assert!(
+                    engine
+                        .check_source_files(
+                            &[source.as_bytes()],
+                            &KVMap::new(),
+                            SourceCheckLimits::new(limits()),
+                        )
+                        .is_err(),
+                    "a failed proof or occupied companion name cannot publish {owner}"
+                );
+                assert_eq!(engine.logical_root(&KVMap::new()), before);
+                assert!(!engine.environment().contains(&n(owner)));
+            }
+            assert!(!base.environment().contains(&n("boundaryBad._unsafe_rec")));
+            assert_eq!(
+                collision.environment().find(&n("boundaryCollision._unsafe_rec")),
+                Some(&existing),
+                "an existing declaration is neither replaced nor attached as a companion"
+            );
+
+            let oracle = checked(&base, "axiom boundaryOracle : Nat");
+            let source = "def boundarySuppressed (n : Nat) : Nat := if h : 0 < n then boundarySuppressed 0 else boundaryOracle\ntermination_by n\ndecreasing_by exact h";
+            let error = oracle
+                .check_source_files(
+                    &[source.as_bytes()],
+                    &KVMap::new(),
+                    SourceCheckLimits::new(limits()),
+                )
+                .unwrap_err();
+            assert!(error.to_string().contains("noncomputable"), "{error:?}");
+            let suppressed = checked(
+                &oracle,
+                &format!("noncomputable section\n{source}\nend"),
+            );
+            let tags = fln_elab::noncomputable::read(suppressed.environment()).unwrap();
+            for name in ["boundarySuppressed", "boundarySuppressed._unsafe_rec"] {
+                assert!(suppressed.environment().contains(&n(name)), "{name}");
+                assert!(tags.contains(&n(name)), "untagged failed executable: {name}");
+            }
+            assert!(
+                suppressed
+                    .check_source_files(
+                        &[b"def boundaryAlias : Nat := boundarySuppressed 1"],
+                        &KVMap::new(),
+                        SourceCheckLimits::new(limits()),
+                    )
+                    .is_err()
+            );
+            assert!(
+                suppressed
+                    .execute_source_definitions(
+                        &[b"#eval boundarySuppressed 1"],
+                        &KVMap::new(),
+                        EngineExecutionLimits::new(limits().kernel),
+                    )
+                    .is_err(),
+                "an admitted compiler failure does not become executable through its companion"
+            );
+            let explicit = checked(
+                &oracle,
+                "noncomputable def boundaryExplicit (n : Nat) : Nat := if h : 0 < n then boundaryExplicit 0 else boundaryOracle\ntermination_by n\ndecreasing_by exact h",
+            );
+            assert!(!explicit.environment().contains(&n("boundaryExplicit._unsafe_rec")));
+
+            // Data appearing only inside an erased proof does not make the
+            // executable body depend on the axiom that provided that data.
+            let proof_only = checked(
+                &oracle,
+                "def boundaryProofOnly (n : Nat) : Nat :=\n  let erased : True := (fun (_ : Nat) => True.intro) boundaryOracle\n  if h : 0 < n then boundaryProofOnly 0 else 42\ntermination_by n\ndecreasing_by exact h",
+            );
+            let execution = proof_only
+                .execute_source_definitions(
+                    &[b"#eval boundaryProofOnly 3"],
+                    &KVMap::new(),
+                    EngineExecutionLimits::new(limits().kernel),
+                )
+                .expect("the proof-only dependency erases")
+                .into_complete()
+                .expect("the recursive computation finishes");
+            let [execution] = execution.executions.as_slice() else {
+                panic!("one evaluation")
+            };
+            assert_eq!(
+                fln::closed_vm_value(&execution.exit).unwrap(),
+                Some(ClosedVmValue::Scalar(42))
+            );
+        })
+        .expect("spawn native companion boundary checking thread")
+        .join()
+        .expect("native companion boundary checks finish");
 }
 
 #[test]

@@ -896,6 +896,9 @@ enum IntrinsicImplementation {
     FileHandleWrite,
     FileHandleFlush,
     FilePathReadDir,
+    IoCurrentDir,
+    FileRealPath,
+    IoGetEnv,
     IoGetTaskState,
     IoWait,
     IoWaitAny,
@@ -1277,6 +1280,9 @@ impl IntrinsicImplementation {
             "extern:IO.FS.Handle.write" => Self::FileHandleWrite,
             "extern:IO.FS.Handle.flush" => Self::FileHandleFlush,
             "extern:System.FilePath.readDir" => Self::FilePathReadDir,
+            "extern:IO.currentDir" => Self::IoCurrentDir,
+            "extern:IO.FS.realPath" => Self::FileRealPath,
+            "extern:IO.getEnv" => Self::IoGetEnv,
             "extern:IO.getTaskState" => Self::IoGetTaskState,
             "extern:IO.wait" => Self::IoWait,
             "extern:IO.waitAny" => Self::IoWaitAny,
@@ -7493,6 +7499,24 @@ fn dispatch_intrinsic(
                 .map(IntrinsicResult::owned)
                 .map_err(|error| VmRefusal::NativeFileIo { error }.into())
         }
+        IntrinsicImplementation::IoCurrentDir => {
+            expect_arity(row, args, 0)?;
+            Obj::try_current_dir(&Obj::mk_nat(0))
+                .map(IntrinsicResult::owned)
+                .map_err(|error| VmRefusal::NativeFileIo { error }.into())
+        }
+        IntrinsicImplementation::FileRealPath => {
+            expect_arity(row, args, 1)?;
+            Obj::try_real_path(&args[0], &Obj::mk_nat(0))
+                .map(IntrinsicResult::owned)
+                .map_err(|error| VmRefusal::NativeFileIo { error }.into())
+        }
+        IntrinsicImplementation::IoGetEnv => {
+            expect_arity(row, args, 1)?;
+            Obj::try_get_env(&args[0], &Obj::mk_nat(0))
+                .map(IntrinsicResult::owned)
+                .map_err(|error| VmRefusal::NativeFileIo { error }.into())
+        }
         IntrinsicImplementation::IoGetTaskState => {
             expect_arity(row, args, 1)?;
             expect_value_kind(&args[0], "IO.getTaskState", 0, "Task", ValueKind::Task)?;
@@ -8139,6 +8163,9 @@ fn closure_intrinsic_application(
         | IntrinsicImplementation::FileHandleWrite
         | IntrinsicImplementation::FileHandleFlush
         | IntrinsicImplementation::FilePathReadDir
+        | IntrinsicImplementation::IoCurrentDir
+        | IntrinsicImplementation::FileRealPath
+        | IntrinsicImplementation::IoGetEnv
         | IntrinsicImplementation::IoGetTaskState
         | IntrinsicImplementation::IoWait
         | IntrinsicImplementation::IoWaitAny

@@ -20,6 +20,7 @@ const TRANSPORT: &str = "_fln_runtime_fs_result";
 const READ_TRANSPORT: &str = "_fln_runtime_fs_read_result";
 const BYTES_TRANSPORT: &str = "_fln_runtime_fs_bytes_result";
 const DIRECTORY_TRANSPORT: &str = "_fln_runtime_fs_directory_result";
+const PATH_TRANSPORT: &str = "_fln_runtime_fs_path_result";
 
 #[derive(Default)]
 pub(super) struct Store {
@@ -30,6 +31,7 @@ pub(super) struct Store {
     read_layout: Option<Layout>,
     bytes_layout: Option<Layout>,
     directory_layout: Option<Layout>,
+    path_layout: Option<Layout>,
     word: Option<bytes::WordLayout>,
     word_repr_checked: bool,
     word_platform_checked: bool,
@@ -169,12 +171,16 @@ impl Preparation<'_> {
             Operation::GetLine => &self.fs.read_layout,
             Operation::Read => &self.fs.bytes_layout,
             Operation::ReadDir => &self.fs.directory_layout,
+            Operation::CurrentDir | Operation::RealPath => &self.fs.path_layout,
             _ => &self.fs.layout,
         };
         if let Some(layout) = cached {
             return Ok(layout.clone());
         }
-        let receiver = if operation == Operation::ReadDir {
+        let receiver = if matches!(
+            operation,
+            Operation::ReadDir | Operation::CurrentDir | Operation::RealPath
+        ) {
             c("String")
         } else {
             self.fs_handle()?
@@ -189,6 +195,7 @@ impl Preparation<'_> {
             Operation::GetLine => READ_TRANSPORT,
             Operation::Read => BYTES_TRANSPORT,
             Operation::ReadDir => DIRECTORY_TRANSPORT,
+            Operation::CurrentDir | Operation::RealPath => PATH_TRANSPORT,
             _ => TRANSPORT,
         };
         let transport = self.io_private_record(
@@ -214,6 +221,9 @@ impl Preparation<'_> {
             Operation::GetLine => self.fs.read_layout = Some(layout.clone()),
             Operation::Read => self.fs.bytes_layout = Some(layout.clone()),
             Operation::ReadDir => self.fs.directory_layout = Some(layout.clone()),
+            Operation::CurrentDir | Operation::RealPath => {
+                self.fs.path_layout = Some(layout.clone())
+            }
             _ => self.fs.layout = Some(layout.clone()),
         }
         Ok(layout)
@@ -271,7 +281,10 @@ impl Preparation<'_> {
                     vec![layout.receiver.clone(), bytes.packed],
                 )
             }
-            Operation::ReadDir => (vec![ValueType::String], vec![layout.receiver.clone()]),
+            Operation::ReadDir | Operation::RealPath => {
+                (vec![ValueType::String], vec![layout.receiver.clone()])
+            }
+            Operation::CurrentDir => (vec![], vec![]),
         };
         self.fs.bindings.insert(
             private.clone(),
@@ -335,6 +348,16 @@ impl Preparation<'_> {
             Operation::GetLine => field(layout, 0)?,
             Operation::Read => self.fs_materialize_bytes(field(layout, 0)?)?,
             Operation::ReadDir => self.fs_materialize_directory(field(layout, 0)?)?,
+            Operation::CurrentDir | Operation::RealPath => {
+                let path = self.io_checked_shape(c("System.FilePath"))?;
+                if path.constructors.len() != 1 || path.constructors[0].fields != [c("String")] {
+                    return Err(unsupported("filesystem checked FilePath layout"));
+                }
+                apply(
+                    Expr::const_(path.constructors[0].name.clone(), vec![]),
+                    [field(layout, 0)?],
+                )
+            }
         };
         let success = apply(
             Expr::const_(result.constructors[0].name.clone(), Vec::new()),
@@ -406,6 +429,7 @@ impl Preparation<'_> {
             Operation::GetLine => c("String"),
             Operation::Read => c("ByteArray"),
             Operation::ReadDir => directory::result_type(),
+            Operation::CurrentDir | Operation::RealPath => c("System.FilePath"),
         };
         let result = self.io_checked_shape(apply(
             c("EST.Out"),
@@ -464,7 +488,7 @@ impl Preparation<'_> {
                 vec![layout.receiver.clone(), c("ByteArray")],
                 vec![b(2)?, self.fs_native_write_bytes(b(1)?)?],
             ),
-            Operation::ReadDir => {
+            Operation::ReadDir | Operation::RealPath => {
                 let path = self.io_checked_shape(c("System.FilePath"))?;
                 if path.constructors.len() != 1 || path.constructors[0].fields != [c("String")] {
                     return Err(unsupported("directory checked FilePath layout"));
@@ -474,6 +498,7 @@ impl Preparation<'_> {
                     vec![Expr::proj(path.projection(&path.constructors[0]), 0, b(1)?)],
                 )
             }
+            Operation::CurrentDir => (vec![], vec![]),
         };
         let returned = self.fs_result(operation, &layout, &result)?;
         let mut body = Expr::let_e(

@@ -76,7 +76,7 @@ pub(super) fn handle() -> ConstantInfo {
     })
 }
 
-fn path_layout() -> Vec<ConstantInfo> {
+pub(super) fn path_layout() -> Vec<ConstantInfo> {
     vec![
         inductive("System.FilePath", vec![name("System.FilePath.mk")]),
         constructor(
@@ -206,6 +206,8 @@ pub(super) fn primitive(operation: Operation) -> ConstantInfo {
         ),
         Operation::PutStr => (vec![c("IO.FS.Handle"), c("String")], c("Unit")),
         Operation::Flush => (vec![c("IO.FS.Handle")], c("Unit")),
+        Operation::CurrentDir => (vec![], c("System.FilePath")),
+        Operation::RealPath => (vec![c("System.FilePath")], c("System.FilePath")),
         Operation::GetLine => (vec![c("IO.FS.Handle")], c("String")),
         Operation::Read => (vec![c("IO.FS.Handle"), c("USize")], c("ByteArray")),
         Operation::Write => (vec![c("IO.FS.Handle"), c("ByteArray")], c("Unit")),

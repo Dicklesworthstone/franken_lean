@@ -1,5 +1,6 @@
 //! Checked, lexical section parameters. Their types are checked at the variable
-//! command. The pin keeps the command's syntax and elaborates it again in each
+//! command, with natural inference holes retained for each declaration to solve.
+//! The pin keeps the command's syntax and elaborates it again in each
 //! declaration, so a later `open` or declaration can change what its names mean:
 //! a declaration using a variable whose binder would now elaborate differently is
 //! refused, never checked against the earlier reading.
@@ -8,6 +9,15 @@ use super::*;
 use std::collections::{HashMap, HashSet};
 
 pub const MAX_SECTION_VARIABLES: usize = 4096;
+
+/// A variable command's open inference state is a template, never the mutable
+/// state of a later declaration. In particular, `variable (x : _)` may give `x`
+/// a different type in each declaration, as `runTermElabM` does at the pin.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Inference {
+    mvars: crate::mvar::MetavarStore,
+    universes: crate::universe::UniverseStore,
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SectionVariables {
@@ -19,6 +29,7 @@ pub struct SectionVariables {
     /// Each `variable` command's binders, with the number of section locals after it. The pin
     /// keeps this syntax (`varDecls`) and elaborates it again in every declaration.
     commands: Vec<(Syntax, usize)>,
+    inference: Option<Inference>,
 }
 
 impl SectionVariables {
@@ -82,6 +93,13 @@ impl SectionVariables {
 
     pub(in crate::source) fn levels(&self) -> &[Name] {
         &self.levels
+    }
+
+    pub(in crate::source) fn restore_inference(&self, txn: &mut ElabTxn) {
+        if let Some(inference) = &self.inference {
+            txn.mvars = inference.mvars.clone();
+            txn.universes = inference.universes.clone();
+        }
     }
 }
 
@@ -298,9 +316,10 @@ impl Context {
     }
 }
 
-/// Return a successor only after the entire telescope is elaborated, all holes
-/// are resolved, and its closed type passes the ordinary kernel. This check
-/// publishes no axiom or other declaration, even for unused section variables.
+/// Sanity-check the entire telescope, retaining natural type holes for later
+/// declarations (`elabVariable`, vendored Lean/Elab/BuiltinCommand.lean). A
+/// temporary universally quantified telescope checks those holes without fixing
+/// their source meaning. No axiom or other declaration is published.
 pub fn declare(
     syntax: &Syntax,
     env: &Environment,
@@ -340,24 +359,27 @@ fn elaborate_command(
         return Err(failure(SourceInferenceError::ResourceLimit));
     }
     let mut locals = context.txn.lctx.decls().to_vec();
-    let types: Vec<_> = locals.iter().map(|local| local.type_.clone()).collect();
-    context.generalize_declaration_universes(&types)?;
+    // `withSynthesize` settles synthetic obligations, but an omitted binder
+    // type is a natural hole. It is not an unresolved declaration obligation.
+    context.resolve_instances(true)?;
+    context.flush(true)?;
     for local in &mut locals {
         local.type_ = context.instantiate(&local.type_)?;
-        context.require_resolved(std::slice::from_ref(&local.type_))?;
     }
-    let mut closed = Expr::sort(Level::zero());
-    for local in locals.iter().rev() {
-        context.tick()?;
-        closed = closed
-            .abstract_fvar(&local.id, 0)
-            .map_err(|_| failure(SourceInferenceError::Scope))?;
-        closed = Expr::forall_e(
-            local.user_name.clone(),
-            local.type_.clone(),
-            closed,
-            local.binder_info,
-        );
+    // A later binder may determine that an omitted type is a sort without
+    // determining its universe. That universe must remain just as local to a
+    // declaration: `variable {A}; variable (x : A)` permits `A : Type` in one
+    // declaration and `A : Prop` in another.
+    let open = locals
+        .iter()
+        .any(|local| local.type_.has_expr_mvar() || local.type_.has_level_mvar());
+    if !open {
+        let types: Vec<_> = locals.iter().map(|local| local.type_.clone()).collect();
+        context.generalize_declaration_universes(&types)?;
+        for local in &mut locals {
+            local.type_ = context.instantiate(&local.type_)?;
+            context.require_resolved(std::slice::from_ref(&local.type_))?;
+        }
     }
     let name = loop {
         let name = context.fresh_name()?;
@@ -365,23 +387,8 @@ fn elaborate_command(
             break name;
         }
     };
-    let declaration = Declaration::Axiom(fln_env::constants::AxiomVal {
-        base: ConstantVal {
-            name,
-            level_params: context.declaration_levels(std::slice::from_ref(&closed))?,
-            type_: closed,
-        },
-        is_unsafe: false,
-    });
     if kernel_check {
-        match check(env, &declaration, kernel) {
-            Outcome::Complete(Verdict::Accepted { .. }) => {}
-            outcome => {
-                return Err(failure(SourceInferenceError::TypeObligation(Box::new(
-                    outcome,
-                ))));
-            }
-        }
+        context.check_section_telescope(&locals, name)?;
         // The `variable` command's own elaboration, not a declaration's re-reading of it.
         context.publish_deprecated_uses()?;
     }
@@ -400,10 +407,170 @@ fn elaborate_command(
         included: scope.variables.included.clone(),
         omitted: scope.variables.omitted.clone(),
         commands,
+        inference: open.then(|| Inference {
+            mvars: context.txn.mvars.clone(),
+            universes: context.txn.universes.clone(),
+        }),
     })
 }
 
 impl Context {
+    /// Check an open telescope without choosing values for its holes. The
+    /// temporary parameters precede the locals whose types need them; their own
+    /// dependencies are visited first. All assignments and generalized
+    /// universes belong to the probe, while its work remains charged here.
+    fn check_section_telescope(
+        &mut self,
+        locals: &[LocalDecl],
+        name: Name,
+    ) -> Result<(), NatDefinitionElabError> {
+        let mut probe = self.clone();
+        let result = (|| {
+            let locals = probe.section_probe_locals(locals)?;
+            let types: Vec<_> = locals.iter().map(|local| local.type_.clone()).collect();
+            probe.generalize_declaration_universes(&types)?;
+            let mut closed = Expr::sort(Level::zero());
+            for local in locals.iter().rev() {
+                probe.tick()?;
+                closed = closed
+                    .abstract_fvar(&local.id, 0)
+                    .map_err(|_| failure(SourceInferenceError::Scope))?;
+                closed = Expr::forall_e(
+                    local.user_name.clone(),
+                    probe.instantiate(&local.type_)?,
+                    closed,
+                    local.binder_info,
+                );
+            }
+            probe.require_resolved(std::slice::from_ref(&closed))?;
+            let declaration = Declaration::Axiom(fln_env::constants::AxiomVal {
+                base: ConstantVal {
+                    name,
+                    level_params: probe.declaration_levels(std::slice::from_ref(&closed))?,
+                    type_: closed,
+                },
+                is_unsafe: false,
+            });
+            match check(&probe.txn.env, &declaration, probe.kernel) {
+                Outcome::Complete(Verdict::Accepted { .. }) => Ok(()),
+                outcome => Err(failure(SourceInferenceError::TypeObligation(Box::new(
+                    outcome,
+                )))),
+            }
+        })();
+        self.txn.budget = probe.txn.budget;
+        result
+    }
+
+    fn section_probe_locals(
+        &mut self,
+        locals: &[LocalDecl],
+    ) -> Result<Vec<LocalDecl>, NatDefinitionElabError> {
+        enum Task {
+            Local(LocalDecl),
+            Expression(Expr),
+            Hole(MVarId),
+        }
+        let mut tasks = Vec::new();
+        for local in locals.iter().rev() {
+            tasks.push(Task::Local(local.clone()));
+            tasks.push(Task::Expression(local.type_.clone()));
+        }
+        let mut result = Vec::new();
+        let mut visiting = HashSet::new();
+        while let Some(task) = tasks.pop() {
+            self.tick()?;
+            match task {
+                Task::Local(mut local) => {
+                    local.type_ = self.instantiate(&local.type_)?;
+                    result.push(local);
+                }
+                Task::Hole(id) => {
+                    let declaration = self
+                        .txn
+                        .mvars
+                        .get_decl(&id)
+                        .cloned()
+                        .ok_or_else(|| failure(SourceInferenceError::Scope))?;
+                    let domain = self.instantiate(&declaration.type_)?;
+                    let name = self.fresh_name()?;
+                    let local = LocalDecl {
+                        id: FVarId(name.clone()),
+                        user_name: name,
+                        type_: domain,
+                        value: None,
+                        binder_info: BinderInfo::Default,
+                        index: result.len(),
+                    };
+                    self.txn
+                        .mvars
+                        .assign(
+                            id.clone(),
+                            Expr::fvar(local.id.clone()),
+                            AssignmentJustification::SyntheticHole,
+                        )
+                        .map_err(|_| failure(SourceInferenceError::Scope))?;
+                    visiting.remove(&id);
+                    result.push(local);
+                }
+                Task::Expression(expression) => {
+                    let expression = self.instantiate(&expression)?;
+                    if !expression.has_expr_mvar() {
+                        continue;
+                    }
+                    match expression.node() {
+                        ExprNode::MVar { id } => {
+                            let declaration = self
+                                .txn
+                                .mvars
+                                .get_decl(id)
+                                .ok_or_else(|| failure(SourceInferenceError::Scope))?;
+                            if declaration.kind != MetavarKind::Natural
+                                || declaration.delayed.is_some()
+                                || !visiting.insert(id.clone())
+                            {
+                                return Err(failure(SourceInferenceError::UnresolvedHoles {
+                                    count: 1,
+                                }));
+                            }
+                            tasks.push(Task::Hole(id.clone()));
+                            tasks.push(Task::Expression(declaration.type_.clone()));
+                        }
+                        ExprNode::App { f, a } => {
+                            tasks
+                                .extend([Task::Expression(a.clone()), Task::Expression(f.clone())]);
+                        }
+                        ExprNode::Lam {
+                            binder_type, body, ..
+                        }
+                        | ExprNode::ForallE {
+                            binder_type, body, ..
+                        } => {
+                            tasks.extend([
+                                Task::Expression(body.clone()),
+                                Task::Expression(binder_type.clone()),
+                            ]);
+                        }
+                        ExprNode::LetE {
+                            type_, value, body, ..
+                        } => {
+                            tasks.extend([
+                                Task::Expression(body.clone()),
+                                Task::Expression(value.clone()),
+                                Task::Expression(type_.clone()),
+                            ]);
+                        }
+                        ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => {
+                            tasks.push(Task::Expression(expr.clone()));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        Ok(result)
+    }
+
     /// Metered DAG traversal, including annotation and let domains. This must
     /// inspect instantiated terms so dictionary/unification assignments cannot
     /// hide a dependency from generalization or theorem-header filtering.
@@ -524,8 +691,9 @@ impl Context {
     /// `varDecls`), so after `open Second` an earlier `Carrier` may name `Second.Carrier`, or
     /// be ambiguous. The commands are elaborated again here, in order, and each local compared
     /// with the one first checked; a command that no longer elaborates leaves its locals and
-    /// every later one unconfirmed. Only the first `through` locals are confirmed: a command
-    /// never depends on a later one, so the commands after the one completing them are not read.
+    /// every later one unconfirmed. Replay all commands: a later binder can constrain an earlier
+    /// omitted type even when the declaration captures only that earlier variable. Only the
+    /// first `through` locals are compared.
     fn reinterpreted_section_variables(
         &mut self,
         through: usize,
@@ -533,18 +701,12 @@ impl Context {
         let stored = self.source_scope.variables.clone();
         let mut scope = self.source_scope.clone();
         scope.variables = SectionVariables::default();
-        for (syntax, after) in &stored.commands {
+        for (syntax, _) in &stored.commands {
             self.tick()?;
-            if scope.variables.locals.len() >= through {
-                break;
-            }
             if let Ok(variables) =
                 elaborate_command(syntax, &self.txn.env, self.kernel, &scope, false)
             {
                 scope.variables = variables;
-                if *after >= through {
-                    break;
-                }
                 continue;
             }
             // The pin elaborates binders one group at a time: a later group that no longer

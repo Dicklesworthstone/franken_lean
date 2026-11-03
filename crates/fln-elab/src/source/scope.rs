@@ -612,6 +612,7 @@ impl Context {
         context.source_scope.native = None;
         context.txn.options = scope.options.clone();
         context.txn.lctx = scope.variables.locals().clone();
+        scope.variables.restore_inference(&mut context.txn);
         context.next = scope.variables.next();
         context
     }

@@ -130,6 +130,18 @@ struct CachedCall {
     value: Expr,
 }
 
+/// A compiler body, still parameterized by its typed recursive reference.
+/// It is derived only after the logical fixpoint and all decreasing proofs
+/// have succeeded. Section captures and universe parameters are closed with
+/// the owning declaration, before its separately checked Partial companion
+/// can be published.
+#[derive(Clone)]
+pub(in crate::source) struct Executable {
+    pub name: Name,
+    pub factory: Typed,
+    pub captures: Vec<LocalDecl>,
+}
+
 impl State {
     pub(in crate::source) fn hides(&self, local: &LocalDecl) -> bool {
         local.id == self.marker
@@ -1030,6 +1042,7 @@ impl Context {
             }
             let mut value = self.instantiate(&value)?;
             self.require_resolved_terms(std::slice::from_ref(&value))?;
+            let executable_value = value.clone();
             value = Expr::lam(
                 continuation.user_name.clone(),
                 self.instantiate(&continuation.type_)?,
@@ -1044,7 +1057,22 @@ impl Context {
             let functional =
                 self.uncurry_well_founded_value(&varying_parameters, Typed { value, type_ })?;
             let fixed = self.match_apply(fix, functional)?;
-            self.match_apply(fixed, current).map(Attempt::Complete)
+            let result = self.match_apply(fixed, current)?;
+            // Preserve the logical lowering's fresh-name allocation order.
+            // The compiler factory is a separate effect of that completed body.
+            let executable_type = self.instantiate(&term.type_)?;
+            let executable = self.well_founded_executable_factory(
+                name,
+                parameters,
+                &varying_parameters,
+                &continuation,
+                Typed {
+                    value: executable_value,
+                    type_: executable_type,
+                },
+            )?;
+            self.well_founded_executable = Some(executable);
+            Ok(Attempt::Complete(result))
         })();
         self.well_founded = None;
         self.txn.lctx = saved;
@@ -1068,6 +1096,236 @@ impl Context {
             self.well_founded_definition = true;
         }
         result
+    }
+
+    /// Compile the recursion's body rather than its logical accessibility
+    /// fixpoint, as `addAndCompilePartialRec` does at the pin. The already
+    /// elaborated body uses `rec packed proof`; replace that typed continuation
+    /// with a direct recursive call which ignores only its proof argument.
+    /// Existing packing preserves dependent and interspersed fixed arguments.
+    /// No executable equation for `WellFounded.fix` is needed or fabricated.
+    fn well_founded_executable_factory(
+        &mut self,
+        name: &Name,
+        parameters: &[LocalDecl],
+        varying: &[LocalDecl],
+        continuation: &LocalDecl,
+        body: Typed,
+    ) -> Result<Executable, NatDefinitionElabError> {
+        let state = self
+            .well_founded
+            .as_ref()
+            .ok_or_else(|| failure(SourceInferenceError::Scope))?;
+        let reference = state.reference.clone();
+        let marker = state.marker.clone();
+        let mut recursive = reference.clone();
+        for parameter in parameters {
+            let type_ = self.instantiate(&parameter.type_)?;
+            recursive = self.match_apply(
+                recursive,
+                Typed {
+                    value: Expr::fvar(parameter.id.clone()),
+                    type_,
+                },
+            )?;
+        }
+        let unary = self.uncurry_well_founded_value(varying, recursive)?;
+        let saved = self.txn.lctx.clone();
+        let callback = (|| {
+            let type_ = self.whnf(&continuation.type_)?;
+            let ExprNode::ForallE {
+                binder_name,
+                binder_type,
+                body,
+                binder_info,
+            } = type_.node()
+            else {
+                return Err(failure(SourceInferenceError::ExpectedFunction));
+            };
+            let id = FVarId(self.fresh_name()?);
+            self.txn.lctx.add_param(
+                id.clone(),
+                binder_name.clone(),
+                binder_type.clone(),
+                *binder_info,
+            );
+            let packed = Expr::fvar(id.clone());
+            let at_packed = self.substitute(body, &packed)?;
+            let at_packed = self.whnf(&at_packed)?;
+            let ExprNode::ForallE {
+                binder_name: proof_name,
+                binder_type: proof_type,
+                binder_info: proof_info,
+                ..
+            } = at_packed.node()
+            else {
+                return Err(failure(SourceInferenceError::ExpectedFunction));
+            };
+            let call = self.match_apply(
+                unary,
+                Typed {
+                    value: packed,
+                    type_: binder_type.clone(),
+                },
+            )?;
+            let value = Expr::lam(
+                proof_name.clone(),
+                proof_type.clone(),
+                call.value,
+                *proof_info,
+            );
+            let type_ = Expr::forall_e(
+                proof_name.clone(),
+                proof_type.clone(),
+                call.type_,
+                *proof_info,
+            );
+            Ok(Typed {
+                value: Expr::lam(
+                    binder_name.clone(),
+                    binder_type.clone(),
+                    value
+                        .abstract_fvar(&id, 0)
+                        .map_err(|_| failure(SourceInferenceError::Scope))?,
+                    *binder_info,
+                ),
+                type_: Expr::forall_e(
+                    binder_name.clone(),
+                    binder_type.clone(),
+                    type_
+                        .abstract_fvar(&id, 0)
+                        .map_err(|_| failure(SourceInferenceError::Scope))?,
+                    *binder_info,
+                ),
+            })
+        })();
+        self.txn.lctx = saved;
+        let callback = callback?;
+        self.constrain_type(&callback.type_, &continuation.type_)?;
+        let replace = |expression: &Expr| {
+            expression
+                .abstract_fvar(&continuation.id, 0)
+                .and_then(|body| body.subst_loose(0, std::slice::from_ref(&callback.value)))
+                .map_err(|_| failure(SourceInferenceError::Scope))
+        };
+        let mut factory = Typed {
+            value: replace(&body.value)?,
+            type_: replace(&body.type_)?,
+        };
+        // These are exactly the header and source-written lambda parameters;
+        // a function-valued result is never eta-expanded for compilation.
+        for parameter in parameters.iter().rev() {
+            self.tick()?;
+            let domain = self.instantiate(&parameter.type_)?;
+            factory.value = Expr::lam(
+                parameter.user_name.clone(),
+                domain.clone(),
+                factory
+                    .value
+                    .abstract_fvar(&parameter.id, 0)
+                    .map_err(|_| failure(SourceInferenceError::Scope))?,
+                parameter.binder_info,
+            );
+            factory.type_ = Expr::forall_e(
+                parameter.user_name.clone(),
+                domain,
+                factory
+                    .type_
+                    .abstract_fvar(&parameter.id, 0)
+                    .map_err(|_| failure(SourceInferenceError::Scope))?,
+                parameter.binder_info,
+            );
+        }
+        let domain = self.instantiate(&reference.type_)?;
+        factory = Typed {
+            value: Expr::lam(
+                Name::anonymous(),
+                domain.clone(),
+                factory
+                    .value
+                    .abstract_fvar(&marker, 0)
+                    .map_err(|_| failure(SourceInferenceError::Scope))?,
+                BinderInfo::Default,
+            ),
+            type_: Expr::forall_e(
+                Name::anonymous(),
+                domain,
+                factory
+                    .type_
+                    .abstract_fvar(&marker, 0)
+                    .map_err(|_| failure(SourceInferenceError::Scope))?,
+                BinderInfo::Default,
+            ),
+        };
+        Ok(Executable {
+            name: name.clone(),
+            factory,
+            captures: Vec::new(),
+        })
+    }
+
+    /// Close an executable candidate over the owner's exact public telescope.
+    /// A recursive reference becomes only this candidate's own `_unsafe_rec`
+    /// name; the safe logical definition never mentions a Partial constant.
+    pub(in crate::source) fn close_well_founded_executable(
+        &mut self,
+        definition: &DefinitionVal,
+    ) -> Result<Option<DefinitionVal>, NatDefinitionElabError> {
+        let Some(executable) = self.well_founded_executable.clone() else {
+            return Ok(None);
+        };
+        if executable.name != definition.base.name {
+            return Err(failure(SourceInferenceError::Scope));
+        }
+        let name = Name::str(definition.base.name.clone(), "_unsafe_rec");
+        if self.txn.env.contains(&name) {
+            return Err(NatDefinitionElabError::UnexpectedSyntax {
+                expected: "a fresh well-founded executable companion name",
+            });
+        }
+        let factory = self.finish(executable.factory)?;
+        let ExprNode::Lam { body, .. } = factory.value.node() else {
+            return Err(failure(SourceInferenceError::Scope));
+        };
+        let mut reference = Expr::const_(
+            name.clone(),
+            definition
+                .base
+                .level_params
+                .iter()
+                .cloned()
+                .map(Level::param)
+                .collect(),
+        );
+        for capture in &executable.captures {
+            self.tick()?;
+            reference = Expr::app(reference, Expr::fvar(capture.id.clone()));
+        }
+        let mut value = self.substitute(body, &reference)?;
+        for capture in executable.captures.iter().rev() {
+            self.tick()?;
+            value = Expr::lam(
+                capture.user_name.clone(),
+                self.instantiate(&capture.type_)?,
+                value
+                    .abstract_fvar(&capture.id, 0)
+                    .map_err(|_| failure(SourceInferenceError::Scope))?,
+                capture.binder_info,
+            );
+        }
+        if value.has_fvar() || value.has_loose_bvars() || value.has_expr_mvar() {
+            return Err(failure(SourceInferenceError::Scope));
+        }
+        Ok(Some(DefinitionVal {
+            base: ConstantVal {
+                name: name.clone(),
+                ..definition.base.clone()
+            },
+            value,
+            hints: ReducibilityHints::Opaque,
+            safety: fln_env::constants::DefinitionSafety::Partial,
+            all: vec![name],
+        }))
     }
 
     /// Run the selected decreasing proof: a supplied script once, on every

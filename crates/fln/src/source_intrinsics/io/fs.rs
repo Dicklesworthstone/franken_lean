@@ -26,6 +26,8 @@ pub(crate) enum Operation {
     Write,
     ReadDir,
     Flush,
+    CurrentDir,
+    RealPath,
 }
 
 impl Operation {
@@ -38,6 +40,8 @@ impl Operation {
             Self::Write,
             Self::ReadDir,
             Self::Flush,
+            Self::CurrentDir,
+            Self::RealPath,
         ]
         .into_iter()
         .find(|operation| requested == &operation.source_name())
@@ -52,13 +56,16 @@ impl Operation {
             Self::Write => "IO.FS.Handle.write",
             Self::ReadDir => "System.FilePath.readDir",
             Self::Flush => "IO.FS.Handle.flush",
+            Self::CurrentDir => "IO.currentDir",
+            Self::RealPath => "IO.FS.realPath",
         };
         Name::from_components(label.split('.'))
     }
 
     pub(crate) fn source_arity(self) -> usize {
         match self {
-            Self::GetLine | Self::ReadDir | Self::Flush => 1,
+            Self::CurrentDir => 0,
+            Self::GetLine | Self::ReadDir | Self::Flush | Self::RealPath => 1,
             _ => 2,
         }
     }
@@ -105,7 +112,10 @@ pub(crate) fn primitive_matches(
     )? {
         return Ok(false);
     }
-    if (operation != Operation::ReadDir && !handle_matches(environment, externs, visited, limits)?)
+    if (!matches!(
+        operation,
+        Operation::ReadDir | Operation::CurrentDir | Operation::RealPath
+    ) && !handle_matches(environment, externs, visited, limits)?)
         || !results::contract_matches(environment, externs, visited, limits)?
     {
         return Err(IngressError::UnsupportedNode {
@@ -116,10 +126,16 @@ pub(crate) fn primitive_matches(
     if operation == Operation::Open {
         models.extend(model::open_layout());
     }
-    if operation == Operation::GetLine {
+    if matches!(
+        operation,
+        Operation::GetLine | Operation::CurrentDir | Operation::RealPath
+    ) {
         // This leaf produces native String values. Nominal recognition of
         // String alone cannot authorize a different checked logical layout.
         models.extend(crate::source_intrinsics::string_internal::scalar_records());
+    }
+    if matches!(operation, Operation::CurrentDir | Operation::RealPath) {
+        models.extend(model::path_layout());
     }
     if operation == Operation::Read {
         bytes::contract_matches(environment, externs, visited, limits)?;
@@ -160,6 +176,8 @@ pub(crate) fn assert_pin_models(environment: &Environment) {
             model::primitive(Operation::Write),
             model::primitive(Operation::ReadDir),
             model::primitive(Operation::Flush),
+            model::primitive(Operation::CurrentDir),
+            model::primitive(Operation::RealPath),
         ])
     {
         assert!(

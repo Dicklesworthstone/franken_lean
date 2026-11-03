@@ -728,6 +728,9 @@ struct Context {
     // Set only after a top-level well-founded lowering succeeds. The source
     // declaration result carries this status to post-admission metadata.
     well_founded_definition: bool,
+    // A successful singleton well-founded lowering's executable body. It is
+    // closed and checked separately from the safe logical fixpoint.
+    well_founded_executable: Option<recursion::WellFoundedExecutable>,
     // Set once the definition's body refers to the definition itself, so it is
     // lowered as a recursion: the pin's `recExt` tag (`Lean/Meta/RecExt.lean`).
     recursive_definition: bool,
@@ -882,6 +885,7 @@ impl Context {
             mutual_member: None,
             mutual_structural_member: None,
             well_founded_definition: false,
+            well_founded_executable: None,
             recursive_definition: false,
             course_definitions: Vec::new(),
             partial: None,
@@ -6534,16 +6538,17 @@ fn definition_elaboration(
         // universe metavariables occurring in theorem headers or `Prop`-typed
         // headers (including `example ... : Prop`) to universe parameters before
         // elaborating the body.
-        let mut roots: Vec<_> = context
-            .source_scope
-            .variables
-            .locals()
-            .decls()
-            .iter()
-            .chain(&parameters)
-            .map(|local| local.type_.clone())
-            .collect();
+        let mut roots: Vec<_> = parameters.iter().map(|local| local.type_.clone()).collect();
         roots.extend(expected.iter().cloned());
+        // An unused section variable may still have an inferred type. Only
+        // the variables captured by this header participate in its universe
+        // generalization; their holes must be solved by this declaration.
+        let section = if let Some(selected) = &theorem_section_parameters {
+            selected.clone()
+        } else {
+            context.section_parameters(&roots, false)?
+        };
+        roots.extend(section.iter().map(|local| local.type_.clone()));
         context.generalize_declaration_universes(&roots)?;
     }
     if prop_header || proof_instance {
@@ -6698,6 +6703,11 @@ fn definition_elaboration(
         termination.as_ref(),
         header_parameters,
     )?;
+    // `shouldGenCodeFor` does not emit recursive executable companions for
+    // explicitly noncomputable declarations.
+    if is_noncomputable {
+        context.well_founded_executable = None;
+    }
     // The pin's `isValidMacroInline` (vendored `Lean/Compiler/InlineAttrs.lean:31`): a
     // recursive definition does not take `[macro_inline]`.
     if context.recursive_definition && scope::simp::macro_inline_requested(syntax)? {
@@ -6727,6 +6737,12 @@ fn definition_elaboration(
     } else {
         let mut roots: Vec<_> = parameters.iter().map(|local| local.type_.clone()).collect();
         roots.extend([term.type_.clone(), term.value.clone()]);
+        if let Some(executable) = &context.well_founded_executable {
+            roots.extend([
+                executable.factory.type_.clone(),
+                executable.factory.value.clone(),
+            ]);
+        }
         context.section_parameters(&roots, false)?
     };
     let public_definition_type = context
@@ -6735,6 +6751,9 @@ fn definition_elaboration(
         .map(|header| header.close(context, &section_parameters, &term.type_))
         .transpose()?;
     let partial_captures = section_parameters.clone();
+    if let Some(executable) = &mut context.well_founded_executable {
+        executable.captures = partial_captures.clone();
+    }
     let instance_type = context
         .public_instance_signature
         .clone()
@@ -6746,6 +6765,12 @@ fn definition_elaboration(
         .map(|parameter| parameter.type_.clone())
         .collect();
     universe_roots.extend([term.type_.clone(), term.value.clone()]);
+    if let Some(executable) = &context.well_founded_executable {
+        universe_roots.extend([
+            executable.factory.type_.clone(),
+            executable.factory.value.clone(),
+        ]);
+    }
     universe_roots.extend(context.local_function_lifting.roots());
     context.generalize_declaration_universes(&universe_roots)?;
     let mut term = context.finish(term)?;
@@ -6794,8 +6819,17 @@ fn definition_elaboration(
             // `main` checked. A failed `main` check ends compilation before any other.
             let main_failed = !scope::simp::macro_inline_requested(syntax)?
                 && context.check_main_type(name, &term.type_)?;
-            context.noncomputable_definition =
-                main_failed || context.check_definition_codegen(&term)?;
+            // The pin compiles the recursive pre-definition, not the logical
+            // `WellFounded.fix` term whose accessibility proof is erased.
+            // Keep self as a typed local while checking dependencies; only
+            // the separately admitted companion may contain recursive Consts.
+            let executable = context
+                .well_founded_executable
+                .as_ref()
+                .map(|body| body.factory.clone());
+            let executable = executable.map(|body| context.finish(body)).transpose()?;
+            context.noncomputable_definition = main_failed
+                || context.check_definition_codegen(executable.as_ref().unwrap_or(&term))?;
         } else {
             // The declared body remains fully typed and checked, but the pin
             // compiles the executable replacement instead of that logical body.

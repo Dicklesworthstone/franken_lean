@@ -644,6 +644,150 @@ fn assert_rows(
 }
 
 #[test]
+fn path_observation_contracts_require_exact_opaques_and_foreign_externs_are_refused() {
+    let Some(raw) = raw_pin_environment() else {
+        return;
+    };
+    fs::assert_pin_models(&raw);
+    for operation in [Operation::CurrentDir, Operation::RealPath] {
+        let limits = IngressLimits::default();
+        assert!(!fs::primitive_matches(&raw, operation, &mut None, &mut 0, limits).unwrap());
+        let exact = register_one(&raw, operation, false);
+        let mut work = 0;
+        assert!(fs::primitive_matches(&exact, operation, &mut None, &mut work, limits).unwrap());
+        assert!(work > 0);
+        assert!(matches!(
+            fs::primitive_matches(
+                &exact,
+                operation,
+                &mut None,
+                &mut 0,
+                IngressLimits {
+                    max_nodes: work - 1,
+                    ..limits
+                }
+            ),
+            Err(IngressError::ResourceLimit { .. })
+        ));
+        assert!(
+            fs::primitive_matches(
+                &register_one(&raw, operation, true),
+                operation,
+                &mut None,
+                &mut 0,
+                limits
+            )
+            .is_err()
+        );
+        for target in [
+            operation.source_name(),
+            name("System.FilePath.mk"),
+            name("String.ofByteArray"),
+        ] {
+            let changed = raw
+                .constants()
+                .fold(Environment::new(), |environment, (label, info)| {
+                    let mut info = info.clone();
+                    if label == &target {
+                        match &mut info {
+                            ConstantInfo::Opaque(value) => value.value = c("Bool.false"),
+                            ConstantInfo::Ctor(value) => value.num_fields += 1,
+                            _ => panic!("the pinned path representation target"),
+                        }
+                    }
+                    environment.add_decl(info).unwrap()
+                });
+            assert!(
+                fs::primitive_matches(
+                    &register_one(&changed, operation, false),
+                    operation,
+                    &mut None,
+                    &mut 0,
+                    limits
+                )
+                .is_err(),
+                "{}",
+                target.to_display_string()
+            );
+        }
+    }
+}
+
+fn assert_returned_path(exit: &VmExit, expected: &Path) {
+    let result = returned(exit);
+    assert_constructor(result, 0, 2);
+    assert_eq!(child(result, 1).unbox(), 0);
+    let path = child(result, 0);
+    assert_constructor(&path, 0, 1);
+    assert_text(&child(&path, 0), expected.to_str().unwrap());
+}
+
+#[test]
+fn native_path_actions_execute_aliases_explicit_worlds_and_fresh_replays() {
+    let Some(raw) = raw_pin_environment() else {
+        return;
+    };
+    let environment = register_one(
+        &register_one(&raw, Operation::CurrentDir, false),
+        Operation::RealPath,
+        false,
+    );
+    let engine = Engine::from_environment(environment);
+    let root = engine.logical_root(&KVMap::new());
+    let current = std::env::current_dir().unwrap();
+    for source in [
+        "#eval IO.currentDir",
+        "def savedCurrent : IO System.FilePath := IO.currentDir\n#eval savedCurrent",
+        "#eval (show IO System.FilePath from fun world => IO.currentDir world)",
+    ] {
+        let run = run(&engine, source);
+        let execution = evaluation(&run);
+        assert_returned_path(&execution.exit, &current);
+        assert_rows(execution, &[Operation::CurrentDir]);
+    }
+    let directory = directory("path-actions-λ");
+    std::fs::create_dir(directory.join("child")).unwrap();
+    let source = format!(
+        "def resolvePath := IO.FS.realPath\ndef savedPath : IO System.FilePath := resolvePath (System.FilePath.mk {})\n#eval savedPath",
+        quoted(&directory.join("child/.."))
+    );
+    let batch = run(&engine, &source);
+    for execution in batch.batch.executions.iter().take(2) {
+        assert!(
+            returned(&execution.exit).closure_shell_parts().is_some(),
+            "constructing an action does not resolve its path"
+        );
+    }
+    let execution = evaluation(&batch);
+    assert_returned_path(&execution.exit, &directory.canonicalize().unwrap());
+    assert_rows(execution, &[Operation::RealPath]);
+
+    let later = directory.join("created-after-compilation");
+    let source = format!(
+        "#eval IO.FS.realPath (System.FilePath.mk {})",
+        quoted(&later)
+    );
+    let batch = run(&engine, &source);
+    let execution = evaluation(&batch);
+    assert_error(&execution.exit, 11, 2, Some(later.to_str().unwrap()), "");
+    let program = assert_rows(execution, &[Operation::RealPath]);
+    std::fs::create_dir(&later).unwrap();
+    let replay = execute_golem_with_options(&program, &KVMap::new(), VmExecutionLimits::default())
+        .into_complete()
+        .unwrap();
+    assert_returned_path(&replay, &later.canonicalize().unwrap());
+    let nul = format!("{}\\x00ignored", directory.to_str().unwrap());
+    let source = format!("#eval IO.FS.realPath (System.FilePath.mk \"{nul}\")");
+    let batch = run(&engine, &source);
+    assert_eq!(
+        returned(&evaluation(&batch).exit).header().tag,
+        1,
+        "embedded NUL is a real IO failure, never a truncated success"
+    );
+    assert_eq!(engine.logical_root(&KVMap::new()), root);
+}
+
+#[test]
 fn checked_write_file_sources_defer_effects_and_replay_live_file_writes() {
     let Some(raw) = raw_pin_environment() else {
         return;
