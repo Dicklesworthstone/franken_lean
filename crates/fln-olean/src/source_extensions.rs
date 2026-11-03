@@ -28,6 +28,7 @@ pub use deprecations::DeprecationEntry;
 mod externs;
 pub use externs::{ExternAttribute, ExternEntry};
 pub mod macros;
+pub mod parsers;
 mod simp;
 pub use simp::{SimpEntry, SimpKind, SimpTheorem};
 mod structures;

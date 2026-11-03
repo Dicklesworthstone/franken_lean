@@ -46,6 +46,186 @@ def declaration(text, kind, name):
     return text[found.end():found.end() + end.start()] if end else text[found.end():]
 
 
+def constructor_fields(body, result=None):
+    """Read the closed, first-order constructor declarations used below."""
+    constructors = []
+    for name, signature in re.findall(r"^[ \t]*\|[ \t]*(\w+)[ \t]*([^\n]*)$", body, re.M):
+        fields = []
+        for group in re.findall(r"\(([^()]*)\)", signature):
+            names, ty = group.split(":", 1)
+            ty = ty.split(":=", 1)[0].strip()
+            fields.extend((field, ty) for field in names.split())
+        suffix = re.sub(r"\([^()]*\)", "", signature).strip()
+        if suffix and suffix != f": {result}":
+            raise ValueError(f"unsupported constructor {name} suffix: {suffix}")
+        constructors.append((name, fields))
+    return constructors
+
+
+def parser_contract(text):
+    """Extract parser-journal layout and literal descriptor vocabulary."""
+    extension = text["src/Lean/Parser/Extension.lean"]
+    basic = text["src/Lean/Parser/Basic.lean"]
+    prelude = text["src/Init/Prelude.lean"]
+    namespace = re.search(r"^namespace (Lean)\s*\nnamespace (Parser)\s*$", extension, re.M)
+    registration = re.search(
+        r"builtin_initialize (\w+) : ParserExtension ←\s*registerScopedEnvExtension\s*\{"
+        r"\s*mkInitial\s*:= ParserExtension\.mkInitial"
+        r"\s*addEntry\s*:= ParserExtension\.addEntryImpl"
+        r"\s*toOLeanEntry\s*:= ParserExtension\.Entry\.toOLeanEntry"
+        r"\s*ofOLeanEntry\s*:= ParserExtension\.OLeanEntry\.toEntry\s*\}", extension)
+    if namespace is None or registration is None:
+        raise ValueError("parser extension registration drift")
+    if not re.search(r"abbrev ParserExtension := ScopedEnvExtension OLeanEntry Entry State", extension):
+        raise ValueError("parser extension scope wrapper drift")
+    if not re.search(r"^abbrev Token := String\s*$", text["src/Lean/Parser/Types.lean"], re.M):
+        raise ValueError("parser token representation drift")
+    kind_alias = re.search(r"^abbrev (SyntaxNodeKind) := (Name)\s*$", prelude, re.M)
+    if kind_alias is None:
+        raise ValueError("syntax kind representation drift")
+    lines = ["", f'pub const PARSER_EXTENSION: &str = "{namespace[1]}.{namespace[2]}.{registration[1]}";']
+    constructors = constructor_fields(declaration(extension, "inductive", "OLeanEntry"), "OLeanEntry")
+    expected = {
+        "token": [("val", "Token")],
+        "kind": [("val", "SyntaxNodeKind")],
+        "category": [("catName", "Name"), ("declName", "Name"), ("behavior", "LeadingIdentBehavior")],
+        "parser": [("catName", "Name"), ("declName", "Name"), ("prio", "Nat")],
+    }
+    if dict(constructors) != expected or len(constructors) != len(expected):
+        raise ValueError(f"parser extension constructor drift: {constructors}")
+    for tag, (name, fields) in enumerate(constructors):
+        prefix = f"PARSER_{name.upper()}"
+        lines.append(f"pub const PARSER_ENTRY_{name.upper()}: u8 = {tag};")
+        pointers, scalars = 0, 0
+        for field, ty in fields:
+            field = re.sub(r"([a-z])([A-Z])", r"\1_\2", field).upper()
+            if ty == "LeadingIdentBehavior":
+                lines.append(f"pub const {prefix}_{field}_SCALAR: usize = {scalars};")
+                scalars += 1
+            else:
+                lines.append(f"pub const {prefix}_{field}: usize = {pointers};")
+                pointers += 1
+        lines += [f"pub const {prefix}_POINTERS: usize = {pointers};",
+                  f"pub const {prefix}_SCALAR_BYTES: usize = {scalars};"]
+    behaviors = constructor_fields(declaration(basic, "inductive", "LeadingIdentBehavior"))
+    if behaviors != [("default", []), ("symbol", []), ("both", [])]:
+        raise ValueError(f"leading identifier behavior drift: {behaviors}")
+    for tag, (name, _) in enumerate(behaviors):
+        lines.append(f"pub const PARSER_IDENT_{name.upper()}: u8 = {tag};")
+    scope = declaration(text["src/Lean/ScopedEnvExtension.lean"], "inductive", "Entry")
+    signatures = re.findall(r"^\s*\|\s*(\w+)\s*:\s*([^\n]*)$", scope, re.M)
+    if signatures != [("global", "α → Entry α"), ("scoped", "Name → α → Entry α")]:
+        raise ValueError(f"parser scope payload drift: {signatures}")
+    for name, signature in signatures:
+        fields = signature.split(" → ")[:-1]
+        prefix = f"PARSER_SCOPE_{name.upper()}"
+        lines.append(f"pub const {prefix}_POINTERS: usize = {len(fields)};")
+        for index, ty in enumerate(fields):
+            field = "NAMESPACE" if ty == "Name" else "ENTRY"
+            lines.append(f"pub const {prefix}_{field}: usize = {index};")
+
+    # These are Expr constructor applications, so their arities count every
+    # declared argument, rather than physical pointer/scalar slots.
+    descriptors = constructor_fields(declaration(prelude, "inductive", "ParserDescr"))
+    expected_types = {
+        "const": ["Name"], "unary": ["Name", "ParserDescr"],
+        "binary": ["Name", "ParserDescr", "ParserDescr"],
+        "node": ["SyntaxNodeKind", "Nat", "ParserDescr"],
+        "trailingNode": ["SyntaxNodeKind", "Nat", "Nat", "ParserDescr"],
+        "symbol": ["String"], "nonReservedSymbol": ["String", "Bool"],
+        "cat": ["Name", "Nat"], "parser": ["Name"],
+        "nodeWithAntiquot": ["String", "SyntaxNodeKind", "ParserDescr"],
+        "sepBy": ["ParserDescr", "String", "ParserDescr", "Bool"],
+        "sepBy1": ["ParserDescr", "String", "ParserDescr", "Bool"],
+        "unicodeSymbol": ["String", "String", "Bool"],
+    }
+    actual_types = {name: [ty for _, ty in fields] for name, fields in descriptors}
+    if actual_types != expected_types or len(descriptors) != len(expected_types):
+        raise ValueError(f"ParserDescr constructor drift: {descriptors}")
+    lines.append("pub const PARSER_DESCR_CONSTRUCTORS: &[(&str, usize)] = &[")
+    for name, fields in descriptors:
+        lines.append(f'    ("Lean.ParserDescr.{name}", {len(fields)}),')
+    lines.append("];")
+    qualified = {"Name": "Lean.Name", "SyntaxNodeKind": "Lean.SyntaxNodeKind", "ParserDescr": "Lean.ParserDescr"}
+    lines += ["#[rustfmt::skip]", "pub const PARSER_DESCR_CONSTRUCTOR_FIELDS: &[(&str, &[&str])] = &["]
+    for name, fields in descriptors:
+        types = ", ".join(f'"{qualified.get(ty, ty)}"' for _, ty in fields)
+        lines.append(f'    ("Lean.ParserDescr.{name}", &[{types}]),')
+    lines.append("];")
+    declared = re.findall(r"Expr\.const `([\w.]+) _ =>", declaration(extension, "unsafe def", "mkParserOfConstantUnsafe"))
+    type_constants = {
+        "Lean.Parser.Parser": "PARSER_TYPE",
+        "Lean.Parser.TrailingParser": "TRAILING_PARSER_TYPE",
+        "Lean.ParserDescr": "PARSER_DESCR_TYPE",
+        "Lean.TrailingParserDescr": "TRAILING_PARSER_DESCR_TYPE",
+    }
+    if set(declared) != set(type_constants) or len(declared) != len(type_constants):
+        raise ValueError(f"parser declared type classification drift: {declared}")
+    trailing_alias = re.search(r"^abbrev (TrailingParserDescr) := (ParserDescr)\s*$", prelude, re.M)
+    if trailing_alias is None:
+        raise ValueError("trailing descriptor abbreviation drift")
+    for name in declared:
+        lines.append(f'pub const {type_constants[name]}: &str = "{name}";')
+    lines.append("pub const PARSER_TYPE_ALIASES: &[(&str, &str)] = &[")
+    for alias in [kind_alias, trailing_alias]:
+        lines.append(f'    ("Lean.{alias[1]}", "Lean.{alias[2]}"),')
+    lines.append("];")
+
+    # Validate the literal Name helpers before making their spelling/arity
+    # available to an owner-checked Expr consumer. These are vocabulary, never
+    # permission to execute a same-named ambient declaration.
+    names = constructor_fields(declaration(prelude, "inductive", "Name"), "Name")
+    if names != [("anonymous", []), ("str", [("pre", "Name"), ("str", "String")]),
+                 ("num", [("pre", "Name"), ("i", "Nat")])]:
+        raise ValueError(f"Name literal constructor drift: {names}")
+    lines.append("pub const PARSER_NAME_CONSTRUCTOR_FIELDS: &[(&str, &[&str])] = &[")
+    for name, fields in names:
+        types = ", ".join(f'"{qualified.get(ty, ty)}"' for _, ty in fields)
+        lines.append(f'    ("Lean.Name.{name}", &[{types}]),')
+    lines.append("];")
+    booleans = constructor_fields(declaration(prelude, "inductive", "Bool"), "Bool")
+    if booleans != [("false", []), ("true", [])]:
+        raise ValueError(f"Bool literal constructor drift: {booleans}")
+    lines += ["#[rustfmt::skip]", "pub const PARSER_BOOL_CONSTRUCTOR_FIELDS: &[(&str, &[&str])] = &["]
+    for name, _ in booleans:
+        lines.append(f'    ("Bool.{name}", &[]),')
+    lines.append("];")
+    helpers = [(name, len(fields)) for name, fields in names]
+    for name, parameters, value in [
+        ("mkStr", "(p : Name) (s : String)", "Name.str p s"),
+        ("mkNum", "(p : Name) (v : Nat)", "Name.num p v"),
+        ("mkSimple", "(s : String)", ".str .anonymous s"),
+    ]:
+        pattern = rf"^abbrev {name} {re.escape(parameters)} : Name :=\s*\n\s*{re.escape(value)}\s*$"
+        if not re.search(pattern, prelude, re.M):
+            raise ValueError(f"Name literal helper drift: {name}")
+        helpers.append((name, len(re.findall(r"\(", parameters))))
+    for count in range(1, 9):
+        name = f"mkStr{count}"
+        match = re.search(rf"^@\[expose, reducible\] def {name} \(([^:]+) : String\) : Name :=\s*\n\s*([^\n]+)", prelude, re.M)
+        if match is None:
+            raise ValueError(f"Name literal helper missing: {name}")
+        parameters = match[1].split()
+        if len(parameters) != count:
+            raise ValueError(f"Name literal helper arity drift: {name}")
+        value = ".anonymous"
+        for parameter in parameters:
+            value = f".str {value if value == '.anonymous' else '(' + value + ')'} {parameter}"
+        if match[2].strip() != value:
+            raise ValueError(f"Name literal helper body drift: {name}")
+        helpers.append((name, len(parameters)))
+    lines.append("pub const PARSER_NAME_LITERAL_FORMS: &[(&str, usize)] = &[")
+    for name, arity in helpers:
+        lines.append(f'    ("Lean.Name.{name}", {arity}),')
+    lines.append("];")
+    instance = re.search(r"^instance (instOfNatNat) \(n : Nat\) : OfNat Nat n where\s*\n\s*ofNat := n\s*$", prelude, re.M)
+    if instance is None or not re.search(r"^class OfNat \(α : Type u\) \(_ : Nat\) where\s*\n\s*ofNat : α\s*$", prelude, re.M):
+        raise ValueError("canonical Nat numeral instance drift")
+    lines.append(f'pub const PARSER_NAT_LITERAL_INSTANCE: &str = "{instance[1]}";')
+    lines.append('pub const PARSER_NAT_LITERAL_PROJECTION: &str = "OfNat.ofNat";')
+    return lines
+
+
 def render():
     reference = [line for line in (ROOT / "SUITE.lock").read_text().splitlines() if line.startswith("reference ")]
     if len(reference) != 1:
@@ -61,6 +241,7 @@ def render():
     files.append("src/Lean/Namespace.lean")
     files.append("stage0/stdlib/Lean/Namespace.c")
     files.append("src/Lean/Linter/Deprecated.lean")
+    files.extend(["src/Lean/Parser/Extension.lean", "src/Lean/Parser/Basic.lean", "src/Lean/Parser/Types.lean"])
     sources = {path: (VENDOR / path).read_text(encoding="utf-8") for path in files}
     text = {path: strip_comments(value) for path, value in sources.items()}
     lines = ["//! Generated by scripts/extract/gen_source_extension_contract.py; do not edit.",
@@ -429,6 +610,7 @@ def render():
         lines.append(f"pub const LIST_{tag.upper()}: u8 = {index};")
     lines += ["pub const LIST_CONS_HEAD: usize = 0;", "pub const LIST_CONS_TAIL: usize = 1;",
               "pub const LIST_CONS_POINTERS: usize = 2;"]
+    lines.extend(parser_contract(text))
     return "\n".join(lines) + "\n"
 
 
