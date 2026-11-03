@@ -1036,6 +1036,128 @@ const IMPORTED_MACRO_CLIENT: &str = concat!(
 );
 
 #[test]
+fn installed_imported_syntax_drives_checking_and_runtime_with_scoped_isolation() {
+    let provider = format!(
+        "{}\n{}",
+        include_str!("../../fln-olean/fixtures/ir/AdmittedSourceMacro.lean"),
+        r#"
+public section
+
+syntax (name := admittedBoxTerm) "box%" term "end%" : term
+
+@[macro admittedBoxTerm]
+meta def admittedUnboxTerm : Macro := fun stx _ state =>
+  .ok (stx.getArg 1) state
+
+namespace ImportedBoxScope
+
+scoped syntax (name := admittedScopedBoxTerm) "scopedBox%" term "end%" : term
+
+@[scoped macro admittedScopedBoxTerm]
+meta def admittedUnboxScopedTerm : Macro := fun stx _ state =>
+  .ok (stx.getArg 1) state
+
+end ImportedBoxScope
+"#
+    );
+    let Some(project) = ImportedMacroProject::prepare_with_source(&provider) else {
+        return;
+    };
+    assert!(
+        !project
+            .root
+            .join("client/AdmittedSourceMacro.lean")
+            .exists()
+    );
+    let declarations = concat!(
+        "prelude\nimport AdmittedSourceMacro\n",
+        "def importedBoxValue : Nat := box% (11 : Bool) end%\n",
+        "theorem importedBoxValue_eq : Eq importedBoxValue 11 := Eq.refl importedBoxValue\n",
+        "section\nopen scoped ImportedBoxScope\n",
+        "def scopedBoxValue : Nat := scopedBox% (13 : Bool) end%\n",
+        "theorem scopedBoxValue_eq : Eq scopedBoxValue 13 := Eq.refl scopedBoxValue\n",
+        "end\n",
+    );
+    let client = format!("{declarations}#check box% (Nat : Bool) end%\n#check importedBoxValue\n");
+    let oracle = project.oracle(&client);
+    assert!(oracle.status.success(), "{oracle:?}; {:?}", project.root);
+    assert_eq!(oracle.stdout, b"Nat : Type\nimportedBoxValue : Nat\n");
+    assert!(oracle.stderr.is_empty(), "{oracle:?}");
+    let report = project.check(declarations);
+    assert!(report.contains("\"theorems\":2"), "{report}");
+    assert!(
+        report.contains("\"name\":\"admittedUnboxTerm\""),
+        "{report}"
+    );
+    assert!(
+        report.contains("ImportedBoxScope.admittedUnboxScopedTerm"),
+        "{report}"
+    );
+
+    let lean = project.native("lean", &client, Some(&project.partition));
+    assert!(lean.status.success(), "{lean:?}; {:?}", project.root);
+    assert_eq!(lean.stdout, oracle.stdout);
+    assert!(lean.stderr.is_empty(), "{lean:?}");
+    let run = project.native(
+        "run",
+        &format!("{client}#eval importedBoxValue\n#eval scopedBoxValue\n"),
+        Some(&project.partition),
+    );
+    assert!(run.status.success(), "{run:?}; {:?}", project.root);
+    assert!(run.stderr.is_empty(), "{run:?}");
+    let report = String::from_utf8(run.stdout).unwrap();
+    assert!(report.contains("\"outcome\":\"complete\""), "{report}");
+    for value in [11, 13] {
+        assert!(
+            report.contains(&format!("\"kind\":\"nat\",\"value\":{value}")),
+            "{report}"
+        );
+    }
+    assert_imported_macro_provenance(&report);
+
+    for invalid in [
+        format!("{declarations}theorem bad : Eq importedBoxValue 19 := Eq.refl importedBoxValue\n"),
+        format!("{declarations}def leakedScope : Nat := scopedBox% (17 : Bool) end%\n"),
+    ] {
+        ImportedMacroProject::refused(project.native(
+            "check-source",
+            &invalid,
+            Some(&project.partition),
+        ));
+    }
+    std::fs::write(
+        project.root.join("client/Left.lean"),
+        concat!(
+            "prelude\nimport AdmittedSourceMacro\nopen scoped ImportedBoxScope\n",
+            "def leftValue : Nat := scopedBox% (23 : Bool) end%\n",
+        ),
+    )
+    .unwrap();
+    let right = project.root.join("client/Right.lean");
+    std::fs::write(
+        &right,
+        concat!(
+            "prelude\nimport AdmittedSourceMacro\n",
+            "def rightValue : Nat := scopedBox% (29 : Bool) end%\n",
+        ),
+    )
+    .unwrap();
+    let joined = "prelude\nimport Left\nimport Right\ndef joinedValue : Nat := leftValue\n";
+    ImportedMacroProject::refused(project.native("check-source", joined, Some(&project.partition)));
+    std::fs::write(
+        &right,
+        concat!(
+            "prelude\nimport AdmittedSourceMacro\nopen scoped ImportedBoxScope\n",
+            "def rightValue : Nat := scopedBox% (29 : Bool) end%\n",
+        ),
+    )
+    .unwrap();
+    let joined = project.native("check-source", joined, Some(&project.partition));
+    assert!(joined.status.success(), "{joined:?}; {:?}", project.root);
+    assert!(joined.stderr.is_empty(), "{joined:?}");
+}
+
+#[test]
 fn installed_imported_macros_drive_checked_source_and_runtime_commands() {
     let Some(project) = ImportedMacroProject::prepare() else {
         return;

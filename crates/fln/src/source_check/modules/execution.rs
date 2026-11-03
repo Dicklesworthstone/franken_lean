@@ -380,9 +380,9 @@ impl imported::SourceOleanImport {
                 "source-program/before-plan",
             )));
         }
-        // Artifact parser descriptions are available only after the receipt's
-        // exact per-module projection. Its source is parsed below, inside that
-        // session; the ordinary path retains its early syntax preflight.
+        // Ordinary programs retain their early syntax preflight. Artifact
+        // syntax needs the authoritative import plan before its preflight,
+        // which still finishes for the whole graph before any execution.
         if macros.is_none() {
             preflight::check(modules, limits.modules, implicit_init)?;
         }
@@ -398,6 +398,35 @@ impl imported::SourceOleanImport {
             &mut meter,
             implicit_init,
         )?;
+        if let Some(session) = macros.as_deref() {
+            let indices: BTreeMap<_, _> = modules
+                .iter()
+                .enumerate()
+                .map(|(index, module)| (module.name, index))
+                .collect();
+            preflight::check_with_parsers(
+                modules,
+                limits.modules,
+                implicit_init,
+                |module, grammar| {
+                    let index = *indices.get(module).expect("planned source module");
+                    let steps = self.contexts.order(index, &plan, modules, &mut meter)?;
+                    let imports: Vec<_> = steps
+                        .iter()
+                        .filter_map(|step| match step {
+                            contexts::Step::External(name) => Some(name.clone()),
+                            contexts::Step::Source(_) => None,
+                        })
+                        .collect();
+                    session
+                        .install_parsers_for_preflight(&imports, &self.contexts.complete, grammar)
+                        .map_err(|error| SourceModuleCheckError::Source {
+                            module: module.clone(),
+                            error,
+                        })
+                },
+            )?;
+        }
         let mut exports = BTreeMap::<usize, replay::Export>::new();
         let mut completed_modules = Vec::new();
         let mut parsed_commands = 0usize;

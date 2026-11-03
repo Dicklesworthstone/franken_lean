@@ -7,7 +7,8 @@
 use super::test_wire as wire;
 use super::*;
 use crate::{OleanDecodeLimits, decode_olean_artifact};
-use fln_core::expr::{Literal, NatLit};
+use fln_core::expr::{BinderInfo, Literal, NatLit};
+use fln_core::level::Level;
 use fln_core::options::KVMap;
 use fln_env::constants::{ConstantVal, DefinitionVal, ReducibilityHints};
 use fln_kernel::Declaration;
@@ -293,6 +294,234 @@ fn parser_references_refuse_cycles_and_visible_but_unimported_siblings() {
         Err(ParserRegistrationError::Owner { declaration, reason, .. })
         if declaration == name("Foreign.tail")
             && reason == "description dependency is outside its checked import closure"));
+}
+
+#[test]
+fn nested_data_owner_cannot_borrow_a_sibling_from_the_consumers_wider_world() {
+    let right = checked(
+        "Right",
+        &[definition(
+            "Right.value",
+            "Lean.ParserDescr",
+            app("Lean.ParserDescr.symbol", [text("right")]),
+        )],
+        &[],
+    );
+    let left = checked(
+        "Left",
+        &[definition(
+            "Left.value",
+            "Lean.ParserDescr",
+            c("Right.value"),
+        )],
+        &[],
+    );
+    let consumer = checked(
+        "Consumer",
+        &[definition(
+            "Consumer.rule",
+            "Lean.ParserDescr",
+            node("Consumer.syntax", c("Left.value")),
+        )],
+        &["Left", "Right"],
+    );
+    let rows = journal("Consumer.rule", "Consumer.syntax");
+    let admitted = environment(&[&right, &left, &consumer]);
+    let error = RegisteredParsers::prepare(
+        &[
+            ParserRegistrationModule {
+                checked: &right,
+                extensions: &[],
+            },
+            ParserRegistrationModule {
+                checked: &left,
+                extensions: &[],
+            },
+            ParserRegistrationModule {
+                checked: &consumer,
+                extensions: &rows,
+            },
+        ],
+        &admitted,
+        ParserRegistryLimits::default(),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(error, ParserRegistrationError::Owner { declaration, reason, .. }
+        if declaration == name("Right.value") && reason == "description dependency is outside its checked import closure")
+    );
+}
+
+#[test]
+fn imported_data_function_retains_the_callers_legitimate_argument_world() {
+    let right = checked(
+        "Right",
+        &[definition(
+            "Right.value",
+            "Lean.ParserDescr",
+            app("Lean.ParserDescr.symbol", [text("right")]),
+        )],
+        &[],
+    );
+    let mut helper = definition(
+        "Left.pass",
+        "Lean.ParserDescr",
+        Expr::lam(
+            name("value"),
+            c("Lean.ParserDescr"),
+            Expr::bvar(0).unwrap(),
+            BinderInfo::Default,
+        ),
+    );
+    if let ConstantInfo::Defn(helper) = &mut helper {
+        helper.base.type_ = Expr::forall_e(
+            name("value"),
+            c("Lean.ParserDescr"),
+            c("Lean.ParserDescr"),
+            BinderInfo::Default,
+        );
+    }
+    let left = checked("Left", &[helper], &[]);
+    let consumer = checked(
+        "Consumer",
+        &[definition(
+            "Consumer.rule",
+            "Lean.ParserDescr",
+            node("Consumer.syntax", app("Left.pass", [c("Right.value")])),
+        )],
+        &["Left", "Right"],
+    );
+    let rows = journal("Consumer.rule", "Consumer.syntax");
+    let admitted = environment(&[&right, &left, &consumer]);
+    let registry = RegisteredParsers::prepare(
+        &[
+            ParserRegistrationModule {
+                checked: &right,
+                extensions: &[],
+            },
+            ParserRegistrationModule {
+                checked: &left,
+                extensions: &[],
+            },
+            ParserRegistrationModule {
+                checked: &consumer,
+                extensions: &rows,
+            },
+        ],
+        &admitted,
+        ParserRegistryLimits::default(),
+    )
+    .unwrap();
+    let modules = [name("Right"), name("Left"), name("Consumer")];
+    let product = registry
+        .project_imports(&modules, &projected_engine(admitted, &modules))
+        .unwrap();
+    assert!(
+        matches!(&product.entries[1], ImportedSyntaxEntry::Parser(parser)
+        if matches!(&parser.descr, Descr::Node { body, .. } if **body == Descr::Symbol("right".into())))
+    );
+}
+
+fn category_journal(declaration: &str) -> Vec<OpaqueExtensionBlock> {
+    let mut pointers: Vec<_> = (0..wire::PARSER_CATEGORY_POINTERS)
+        .map(|_| Obj::mk_nat(0))
+        .collect();
+    pointers[wire::PARSER_CATEGORY_CAT_NAME] = inject_name(&name("userCategory"));
+    pointers[wire::PARSER_CATEGORY_DECL_NAME] = inject_name(&name(declaration));
+    let mut scalars = vec![0; wire::PARSER_CATEGORY_SCALAR_BYTES];
+    scalars[wire::PARSER_CATEGORY_BEHAVIOR_SCALAR] = wire::PARSER_IDENT_DEFAULT;
+    let row = Obj::mk_ctor(wire::PARSER_ENTRY_CATEGORY, pointers, &scalars);
+    let mut scope: Vec<_> = (0..wire::PARSER_SCOPE_GLOBAL_POINTERS)
+        .map(|_| Obj::mk_nat(0))
+        .collect();
+    scope[wire::PARSER_SCOPE_GLOBAL_ENTRY] = row;
+    vec![OpaqueExtensionBlock {
+        name: parsers::extension_name(),
+        entries: vec![compact(&Obj::mk_ctor(wire::SCOPE_GLOBAL, scope, &[]), 0).unwrap()],
+    }]
+}
+
+#[test]
+fn category_rows_require_the_checked_category_marker_type() {
+    use fln_elab::inductive::{ConstructorSpec, InductiveSpec, inductive_declaration};
+    use fln_elab::records::RecordBudget;
+    let family = inductive_declaration(
+        &InductiveSpec {
+            name: name("Lean.Parser.Category"),
+            level_params: vec![],
+            parameters: vec![],
+            indices: vec![],
+            constructors: vec![ConstructorSpec {
+                name: name("mk"),
+                fields: vec![],
+                result_indices: vec![],
+            }],
+            result_level: Level::one(),
+        },
+        RecordBudget::default(),
+    )
+    .unwrap();
+    let family = checked("CategoryBase", &flatten(family), &[]);
+    let good = checked(
+        "Good",
+        &[definition(
+            "Good.category",
+            "Lean.Parser.Category",
+            c("Lean.Parser.Category.mk"),
+        )],
+        &["CategoryBase"],
+    );
+    let rows = category_journal("Good.category");
+    let admitted = environment(&[&family, &good]);
+    let registry = RegisteredParsers::prepare(
+        &[
+            ParserRegistrationModule {
+                checked: &family,
+                extensions: &[],
+            },
+            ParserRegistrationModule {
+                checked: &good,
+                extensions: &rows,
+            },
+        ],
+        &admitted,
+        ParserRegistryLimits::default(),
+    )
+    .unwrap();
+    let modules = [name("CategoryBase"), name("Good")];
+    let product = registry
+        .project_imports(&modules, &projected_engine(admitted, &modules))
+        .unwrap();
+    assert!(
+        matches!(&product.entries[0], ImportedSyntaxEntry::Category { declaration, .. } if *declaration == name("Good.category"))
+    );
+    let wrong = checked(
+        "Wrong",
+        &[definition("Wrong.category", "Nat", number(0))],
+        &["CategoryBase"],
+    );
+    let rows = category_journal("Wrong.category");
+    let admitted = environment(&[&family, &wrong]);
+    assert!(matches!(
+        RegisteredParsers::prepare(
+            &[
+                ParserRegistrationModule {
+                    checked: &family,
+                    extensions: &[]
+                },
+                ParserRegistrationModule {
+                    checked: &wrong,
+                    extensions: &rows
+                },
+            ],
+            &admitted,
+            ParserRegistryLimits::default()
+        ),
+        Err(ParserRegistrationError::Owner {
+            reason: "category owner is not a safe monomorphic Lean.Parser.Category definition",
+            ..
+        })
+    ));
 }
 
 #[test]

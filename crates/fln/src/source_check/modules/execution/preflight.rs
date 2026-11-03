@@ -12,6 +12,18 @@ pub(super) fn check(
     limits: SourceModuleCheckLimits,
     implicit_init: bool,
 ) -> Result<(), SourceModuleCheckError> {
+    check_with_parsers(modules, limits, implicit_init, |_, _| Ok(()))
+}
+
+/// Install each module's checked artifact grammar before the syntax-only pass.
+/// The caller supplies the exact external import order; native source grammar
+/// exports still replay through the same bounded pass as ordinary programs.
+pub(super) fn check_with_parsers(
+    modules: &[SourceModuleInput<'_>],
+    limits: SourceModuleCheckLimits,
+    implicit_init: bool,
+    mut install: impl FnMut(&Name, &mut SourceGrammar) -> Result<(), SourceModuleCheckError>,
+) -> Result<(), SourceModuleCheckError> {
     if modules.len() > limits.max_modules {
         return Err(SourceModuleCheckError::Limit {
             resource: "modules",
@@ -99,6 +111,7 @@ pub(super) fn check(
                     }
                 }
             }
+            install(module.name, &mut grammar)?;
             let commands = grammar.enter(|| super::commands(module.name, module.source, header))?;
             for (command, (at, source)) in commands.into_iter().enumerate() {
                 count = count

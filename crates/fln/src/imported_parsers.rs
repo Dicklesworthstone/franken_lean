@@ -300,6 +300,7 @@ impl RegisteredParsers {
                     error,
                 }
             })?;
+            closures.push(closure);
             // Empty journals retain dependency identity without scanning every
             // unrelated declaration or allocating an unnecessary literal world.
             if rows.is_empty() {
@@ -311,14 +312,13 @@ impl RegisteredParsers {
                         bindings: BTreeMap::new(),
                     },
                 );
-                closures.push(closure);
                 continue;
             }
             remaining.max_steps = remaining.max_steps.checked_sub(base.len()).ok_or(
                 ParserRegistrationError::Limit("description preparation steps"),
             )?;
             let mut allowed = base.clone();
-            for &member in &closure {
+            for &member in &closures[index] {
                 for constant in &ordered_modules[member].checked.decoded.constants {
                     charge(&mut remaining)?;
                     if admitted.find(constant.name()) != Some(constant) {
@@ -331,7 +331,13 @@ impl RegisteredParsers {
                     allowed.insert(constant.name().clone());
                 }
             }
-            let mut reader = data::Reader::new(admitted, &allowed, remaining);
+            let mut reader = data::Reader::new(admitted, &allowed, remaining).with_owner_worlds(
+                data::OwnerWorlds {
+                    owners: &owners,
+                    imports: &closures,
+                    base: &base,
+                },
+            );
             let mut syntax = ImportedSyntaxModule::default();
             let mut bindings = BTreeMap::new();
             for row in rows.entries {
@@ -349,6 +355,11 @@ impl RegisteredParsers {
                         behavior,
                     } => {
                         let owner = checked_owner(module, &declaration, index, &owners, admitted)?;
+                        checked_category(module, &declaration, owner)?;
+                        reader
+                            .bind_declaration(&declaration)
+                            .and_then(|()| reader.expected_type("Lean.Parser.Category"))
+                            .map_err(|error| data_error(module, &declaration, error))?;
                         bindings.insert(declaration.clone(), owner.clone());
                         let behavior = match behavior {
                             parsers::LeadingIdentBehavior::Default => {
@@ -375,6 +386,9 @@ impl RegisteredParsers {
                     } => {
                         let owner = checked_owner(module, &declaration, index, &owners, admitted)?;
                         let (leading, body) = description_body(module, &declaration, owner)?;
+                        reader
+                            .bind_declaration(&declaration)
+                            .map_err(|error| data_error(module, &declaration, error))?;
                         // Keep the original type spelling for dispatch, but
                         // independently bind and validate its actual definition.
                         // In particular the trailing abbreviation is an input
@@ -428,7 +442,6 @@ impl RegisteredParsers {
                     bindings,
                 },
             );
-            closures.push(closure);
         }
         Ok(Self {
             modules: Arc::new(modules),
@@ -578,4 +591,25 @@ fn description_body<'a>(
         }
     };
     Ok((leading, &definition.value))
+}
+
+fn checked_category(
+    module: &Name,
+    declaration: &Name,
+    owner: &ConstantInfo,
+) -> Result<(), ParserRegistrationError> {
+    if matches!(owner, ConstantInfo::Defn(definition)
+        if definition.safety == DefinitionSafety::Safe
+            && definition.base.level_params.is_empty()
+            && matches!(definition.base.type_.node(), ExprNode::Const { name: ty, levels }
+                if levels.is_empty() && *ty == name("Lean.Parser.Category")))
+    {
+        Ok(())
+    } else {
+        Err(owner_error(
+            module,
+            declaration,
+            "category owner is not a safe monomorphic Lean.Parser.Category definition",
+        ))
+    }
 }

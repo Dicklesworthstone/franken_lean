@@ -8,6 +8,7 @@ use std::sync::Arc;
 #[derive(Debug)]
 struct ExternalModule {
     imports: Vec<Name>,
+    import_specs: Vec<OleanModuleImport>,
     is_module: bool,
     companion_parts_loaded: bool,
     entries: Vec<EnvironmentEntry>,
@@ -50,12 +51,7 @@ impl ImportContexts {
             !module.unavailable
                 && module.is_module == checked.decoded.module.is_module
                 && module.companion_parts_loaded == checked.decoded.companion_parts_loaded
-                && module.imports.iter().eq(checked
-                    .decoded
-                    .module
-                    .imports
-                    .iter()
-                    .map(|import| &import.module))
+                && module.import_specs == checked.decoded.module.imports
                 && module.entries.len() == checked.decoded.constants.len()
                 && module
                     .entries
@@ -98,6 +94,7 @@ impl ImportContexts {
                             .iter()
                             .map(|i| i.module.clone())
                             .collect(),
+                        import_specs: module.decoded.module.imports.clone(),
                         is_module: module.decoded.module.is_module,
                         companion_parts_loaded: module.decoded.companion_parts_loaded,
                         entries,
@@ -139,6 +136,10 @@ impl ImportContexts {
         for ((name, left), right) in self.modules.iter().zip(other.modules.values()) {
             let module = name.to_display_string();
             assert_eq!(left.imports, right.imports, "{what}: {module}: imports");
+            assert_eq!(
+                left.import_specs, right.import_specs,
+                "{what}: {module}: import specifications"
+            );
             assert_eq!(
                 left.is_module, right.is_module,
                 "{what}: {module}: module system"
@@ -400,5 +401,261 @@ impl imported::SourceOleanImport {
             Outcome::Inconclusive(reason) => Ok(Outcome::Inconclusive(reason)),
             Outcome::InternalFault(fault) => Ok(Outcome::InternalFault(fault)),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::imported_parsers::{ParserRegistrationError, ParserRegistryLimits};
+    use crate::source_check::modules::imported::{SourceOleanImport, SourceOleanImportLimits};
+    use fln_core::expr::{Expr, Literal, NatLit};
+    use fln_env::constants::{
+        ConstantInfo, ConstantVal, DefinitionSafety, DefinitionVal, ReducibilityHints,
+    };
+    use fln_olean::format;
+    use fln_olean::write::{ModuleWriteInput, OleanWriteHeader, WriteBudget, encode_module};
+
+    fn name(text: &str) -> Name {
+        Name::from_components(text.split('.'))
+    }
+
+    fn definition(label: &str, value: Expr) -> ConstantInfo {
+        ConstantInfo::Defn(DefinitionVal {
+            base: ConstantVal {
+                name: name(label),
+                level_params: Vec::new(),
+                type_: Expr::const_(name("Nat"), Vec::new()),
+            },
+            value,
+            hints: ReducibilityHints::Abbrev,
+            safety: DefinitionSafety::Safe,
+            all: vec![name(label)],
+        })
+    }
+
+    fn natural(value: u64) -> Expr {
+        Expr::lit(Literal::Nat(NatLit::from_u64(value)))
+    }
+
+    fn import(module: &str) -> OleanModuleImport {
+        OleanModuleImport {
+            module: name(module),
+            import_all: false,
+            is_exported: false,
+            is_meta: false,
+        }
+    }
+
+    /// Real codec and council admission retain three distinct artifact owners.
+    /// Consumer imports Original; Sibling is a separate root and cannot supply
+    /// parser helpers to Consumer merely because both appear in the receipt.
+    fn receipt() -> SourceOleanImport {
+        let admission = EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024));
+        let seed = Engine::with_source_seed(admission)
+            .unwrap()
+            .into_complete()
+            .unwrap();
+        let specs = [
+            (
+                name("Original"),
+                Vec::new(),
+                vec![
+                    definition("Original.helper", natural(1)),
+                    definition("Original.other", natural(2)),
+                ],
+            ),
+            (
+                name("Consumer"),
+                vec![import("Original")],
+                vec![definition(
+                    "Consumer.owner",
+                    Expr::const_(name("Original.helper"), Vec::new()),
+                )],
+            ),
+            (
+                name("Sibling"),
+                Vec::new(),
+                vec![definition("Sibling.helper", natural(3))],
+            ),
+        ];
+        let bytes: Vec<_> = specs
+            .iter()
+            .map(|(_, imports, constants)| {
+                encode_module(
+                    ModuleWriteInput {
+                        is_module: false,
+                        imports,
+                        constants,
+                        extra_const_names: &[],
+                    },
+                    OleanWriteHeader {
+                        version: format::OLEAN_ACCEPTED_VERSIONS[0],
+                        flags: 1,
+                        lean_version: format::PIN_TAG.strip_prefix('v').unwrap(),
+                        githash: format::PIN_COMMIT,
+                        base_addr: (format::REGION_ALIGN * 2) as u64,
+                    },
+                    WriteBudget::default(),
+                )
+                .unwrap()
+                .bytes
+            })
+            .collect();
+        let inputs: Vec<_> = specs
+            .iter()
+            .zip(&bytes)
+            .map(|((name, _, _), artifact)| OleanModuleInput {
+                name,
+                artifact,
+                server_artifact: None,
+                private_artifact: None,
+            })
+            .collect();
+        seed.import_olean_modules_for_source(
+            &inputs,
+            &[name("Consumer"), name("Sibling")],
+            &KVMap::new(),
+            SourceOleanImportLimits::new(OleanCheckLimits::new(
+                bytes.iter().map(Vec::len).sum(),
+                admission.kernel,
+            )),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap()
+    }
+
+    fn assert_original(receipt: &SourceOleanImport) {
+        let parsers = receipt
+            .prepare_imported_parsers(ParserRegistryLimits::default())
+            .unwrap();
+        let product = parsers
+            .project_imports(
+                &[name("Original"), name("Consumer"), name("Sibling")],
+                &receipt.engine,
+            )
+            .unwrap();
+        assert!(product.is_empty());
+        for module in &receipt.checked.modules {
+            assert!(receipt.contexts.retains_checked_module(module));
+        }
+    }
+
+    fn assert_owner_refusal(receipt: &SourceOleanImport, module: &str) {
+        let error = receipt
+            .prepare_imported_parsers(ParserRegistryLimits::default())
+            .unwrap_err();
+        assert!(!error.is_resource(), "{error:?}");
+        assert!(
+            matches!(&error, ParserRegistrationError::Owner { module: owner, reason, .. }
+                if *owner == name(module)
+                    && *reason == "public checking report differs from retained parser ownership"),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn parser_receipts_bind_original_imports_and_module_parts() {
+        let mut receipt = receipt();
+        assert_original(&receipt);
+        let index = receipt
+            .checked
+            .modules
+            .iter()
+            .position(|module| module.name == name("Consumer"))
+            .unwrap();
+        let original = receipt.checked.modules[index].decoded.clone();
+        let base = receipt.engine.logical_root(&KVMap::new());
+        for mutation in 0..7 {
+            receipt.checked.modules[index].decoded = original.clone();
+            let decoded = &mut receipt.checked.modules[index].decoded;
+            match mutation {
+                0 => decoded.module.imports.push(import("Sibling")),
+                1 => decoded.module.imports[0].module = name("Sibling"),
+                2 => decoded.module.imports[0].import_all = true,
+                3 => decoded.module.imports[0].is_exported = true,
+                4 => decoded.module.imports[0].is_meta = true,
+                5 => decoded.module.is_module = !decoded.module.is_module,
+                6 => decoded.companion_parts_loaded = !decoded.companion_parts_loaded,
+                _ => unreachable!(),
+            }
+            assert_owner_refusal(&receipt, "Consumer");
+            assert_eq!(receipt.engine.logical_root(&KVMap::new()), base);
+        }
+        receipt.checked.modules[index].decoded = original;
+        assert_original(&receipt);
+    }
+
+    #[test]
+    fn parser_receipts_bind_owner_values_and_original_module_assignment() {
+        let mut receipt = receipt();
+        assert_original(&receipt);
+        let index = receipt
+            .checked
+            .modules
+            .iter()
+            .position(|module| module.name == name("Original"))
+            .unwrap();
+        let original = receipt.checked.modules[index].decoded.clone();
+        let sibling = receipt
+            .engine
+            .environment()
+            .find(&name("Sibling.helper"))
+            .unwrap()
+            .clone();
+        for mutation in 0..5 {
+            receipt.checked.modules[index].decoded = original.clone();
+            let constants = &mut receipt.checked.modules[index].decoded.constants;
+            match mutation {
+                0 => constants.push(sibling.clone()),
+                1 => constants[0] = sibling.clone(),
+                2 => constants[0] = definition("Original.helper", natural(99)),
+                3 => constants.swap(0, 1),
+                4 => constants.truncate(1),
+                _ => unreachable!(),
+            }
+            assert_owner_refusal(&receipt, "Original");
+            assert_eq!(
+                receipt.engine.environment().find(sibling.name()),
+                Some(&sibling)
+            );
+        }
+        receipt.checked.modules[index].decoded = original;
+        assert_original(&receipt);
+    }
+
+    #[test]
+    fn parser_receipts_bound_public_reports_before_owner_comparison() {
+        let mut receipt = receipt();
+        let original = receipt.checked.modules[0].decoded.clone();
+        let first = &receipt.checked.modules[0];
+        receipt.checked.modules.push(CheckedOleanModule {
+            name: name("Forged"),
+            decoded: first.decoded.clone(),
+            base_logical_root: first.base_logical_root,
+            result_logical_root: first.result_logical_root,
+            declarations: Vec::new(),
+        });
+        let limits = ParserRegistryLimits {
+            max_modules: 3,
+            ..ParserRegistryLimits::default()
+        };
+        assert!(matches!(
+            receipt.prepare_imported_parsers(limits),
+            Err(ParserRegistrationError::Limit("modules"))
+        ));
+        receipt.checked.modules.pop();
+        receipt.checked.modules[0].decoded.constants[0] = definition("Forged.owner", natural(0));
+        let limits = ParserRegistryLimits {
+            max_declarations: 0,
+            ..ParserRegistryLimits::default()
+        };
+        assert!(matches!(
+            receipt.prepare_imported_parsers(limits),
+            Err(ParserRegistrationError::Limit("owner declarations"))
+        ));
+        receipt.checked.modules[0].decoded = original;
+        assert_original(&receipt);
     }
 }

@@ -15,6 +15,8 @@ enum Fault {
     None,
     MalformedSuffix,
     UnsupportedSuffix,
+    UnsupportedScopedSuffix,
+    TokenBudgetSuffix,
 }
 
 fn constant(label: &str) -> Expr {
@@ -171,7 +173,15 @@ fn fixture(fault: Fault) -> (SourceOleanImport, Vec<IrModule>) {
     match fault {
         Fault::None => {}
         Fault::MalformedSuffix => rows.push(Obj::mk_nat(0)),
-        Fault::UnsupportedSuffix => {
+        Fault::TokenBudgetSuffix => rows.push(scope(
+            Obj::mk_ctor(
+                wire::PARSER_ENTRY_TOKEN,
+                vec![Obj::mk_string(&"k".repeat(4097))],
+                &[],
+            ),
+            None,
+        )),
+        Fault::UnsupportedSuffix | Fault::UnsupportedScopedSuffix => {
             constants.push(definition(
                 "SourceLibrary.unsupportedParser",
                 constant(wire::PARSER_DESCR_TYPE),
@@ -181,7 +191,7 @@ fn fixture(fault: Fault) -> (SourceOleanImport, Vec<IrModule>) {
                 "SourceLibrary.unsupportedKind",
                 "SourceLibrary.unsupportedParser",
                 "unsupportedSyntax!",
-                None,
+                matches!(fault, Fault::UnsupportedScopedSuffix).then_some("Dormant"),
             ));
         }
     }
@@ -197,6 +207,43 @@ fn fixture(fault: Fault) -> (SourceOleanImport, Vec<IrModule>) {
         &constants,
         &rows,
         &[selecting_function("SourceLibrary.chooseMacro", 1)],
+    )
+}
+
+fn execute_graph(
+    imported: &SourceOleanImport,
+    compilation: MacroCompilationInputs,
+    entries: &[(&str, &str)],
+    limits: crate::source_check::modules::execution::SourceProgramLimits,
+    registry_limits: MacroRegistryLimits,
+    cancellation: Option<&dyn fln_vm::interpreter::CancellationProbe>,
+) -> crate::source_check::modules::SourceMacroProgramExecution {
+    let names: Vec<_> = entries.iter().map(|(module, _)| name(module)).collect();
+    let modules: Vec<_> = names
+        .iter()
+        .zip(entries)
+        .map(|(name, (_, source))| crate::SourceModuleInput {
+            name,
+            source: source.as_bytes(),
+        })
+        .collect();
+    imported.execute_source_modules_with_deferred_imported_macros(
+        &modules,
+        &names[0],
+        &KVMap::new(),
+        limits,
+        crate::source_check::modules::SourceModuleDeferredMacroInputs {
+            compilation,
+            registry_limits,
+            context: context(),
+            state: MacroState {
+                macro_scope: 17,
+                ..MacroState::default()
+            },
+            limits: MacroTreeLimits::default(),
+        },
+        cancellation,
+        crate::EvaluationPresentation::Raw,
     )
 }
 
@@ -593,6 +640,99 @@ fn malformed_or_unsupported_later_parser_rows_cannot_publish_a_working_prefix() 
 }
 
 #[test]
+fn inactive_unsupported_parser_rows_are_checked_in_empty_forwarding_modules() {
+    let (imported, code) = fixture(Fault::UnsupportedScopedSuffix);
+    let before = imported.engine.logical_root(&KVMap::new());
+    let source = "prelude\nimport SourceLibrary";
+    let checked = check(
+        &imported,
+        &code,
+        &[("Main", source)],
+        MacroTreeLimits::default(),
+        None,
+    );
+    assert!(
+        matches!(checked.outcome, Outcome::Complete(Err(_))),
+        "{checked:?}"
+    );
+    assert!(checked.attempts.is_empty());
+    assert!(checked.states.is_none());
+
+    let declarations = users(&code);
+    let executed = execute_graph(
+        &imported,
+        MacroCompilationInputs::new(code, VerifiedPartition::user_fixture(), declarations),
+        &[("Main", source)],
+        crate::source_check::modules::execution::SourceProgramLimits::new(execution_limits()),
+        MacroRegistryLimits::default(),
+        None,
+    );
+    assert!(
+        matches!(executed.outcome, Outcome::Complete(Err(_))),
+        "{executed:?}"
+    );
+    assert!(executed.attempts.is_empty());
+    assert_eq!(executed.completed_vm_usage.steps, 0);
+    assert!(executed.states.is_none());
+    assert_eq!(imported.engine.logical_root(&KVMap::new()), before);
+}
+
+#[test]
+fn imported_parser_installation_exhaustion_is_inconclusive_for_empty_source_modules() {
+    let (imported, code) = fixture(Fault::TokenBudgetSuffix);
+    let before = imported.engine.logical_root(&KVMap::new());
+    // The retained metadata and checked descriptions fit their own allowances.
+    // Only the native grammar's independent token-byte allowance is exhausted.
+    imported
+        .prepare_imported_parsers(ParserRegistryLimits::default())
+        .unwrap();
+    let source = "prelude\nimport SourceLibrary";
+    let checked = check(
+        &imported,
+        &code,
+        &[("Main", source)],
+        MacroTreeLimits::default(),
+        None,
+    );
+    assert!(
+        matches!(
+            &checked.outcome,
+            Outcome::Inconclusive(crate::Inconclusive {
+                cause: fln_core::outcome::InconclusiveCause::DependencyUnavailable { what },
+                ..
+            }) if what.text().contains("artifact syntax token past the budget")
+        ),
+        "{checked:?}"
+    );
+    assert!(checked.attempts.is_empty());
+    assert!(checked.states.is_none());
+
+    let declarations = users(&code);
+    let executed = execute_graph(
+        &imported,
+        MacroCompilationInputs::new(code, VerifiedPartition::user_fixture(), declarations),
+        &[("Main", source)],
+        crate::source_check::modules::execution::SourceProgramLimits::new(execution_limits()),
+        MacroRegistryLimits::default(),
+        None,
+    );
+    assert!(
+        matches!(
+            &executed.outcome,
+            Outcome::Inconclusive(crate::Inconclusive {
+                cause: fln_core::outcome::InconclusiveCause::DependencyUnavailable { what },
+                ..
+            }) if what.text().contains("artifact syntax token past the budget")
+        ),
+        "{executed:?}"
+    );
+    assert!(executed.attempts.is_empty());
+    assert_eq!(executed.completed_vm_usage.steps, 0);
+    assert!(executed.states.is_none());
+    assert_eq!(imported.engine.logical_root(&KVMap::new()), before);
+}
+
+#[test]
 fn parser_preparation_exhaustion_is_resource_typed_and_keeps_the_import_receipt_unchanged() {
     let (imported, _) = fixture(Fault::None);
     let before = imported.engine.logical_root(&KVMap::new());
@@ -607,6 +747,188 @@ fn parser_preparation_exhaustion_is_resource_typed_and_keeps_the_import_receipt_
     imported
         .prepare_imported_parsers(ParserRegistryLimits::default())
         .unwrap();
+}
+
+#[test]
+fn imported_parser_preflight_checks_the_whole_graph_before_macro_or_program_execution() {
+    use crate::source_check::modules::SourceModuleCheckError;
+    use crate::source_check::modules::execution::{
+        SourceProgramExecutionError, SourceProgramLimits,
+    };
+
+    let (imported, code) = fixture(Fault::None);
+    let before = imported.engine.logical_root(&KVMap::new());
+    let declarations = users(&code);
+    let compilation =
+        MacroCompilationInputs::new(code, VerifiedPartition::user_fixture(), declarations);
+    let early = "prelude\nimport SourceLibrary\ndef first : Nat := choose! 41\n#eval choose! 42";
+    let complete = execute_graph(
+        &imported,
+        compilation.clone(),
+        &[
+            (
+                "Main",
+                "prelude\nimport Early\ndef chosen : Nat := choose! 43",
+            ),
+            ("Early", early),
+        ],
+        SourceProgramLimits::new(execution_limits()),
+        MacroRegistryLimits::default(),
+        None,
+    );
+    let Outcome::Complete(Ok(program)) = &complete.outcome else {
+        panic!("{complete:?}");
+    };
+    assert_eq!(program.modules.len(), 2);
+    assert_declared_value(&program.modules[1].commands.batch.engine, "chosen", 43);
+    assert_eq!(complete.attempts.len(), 3);
+    assert_eq!(complete.states.as_ref().unwrap().len(), 2);
+
+    let malformed = execute_graph(
+        &imported,
+        compilation.clone(),
+        &[
+            (
+                "Main",
+                "prelude\nimport Early\ndef broken : Nat := choose! (",
+            ),
+            ("Early", early),
+        ],
+        SourceProgramLimits::new(execution_limits()),
+        MacroRegistryLimits::default(),
+        None,
+    );
+    assert!(
+        matches!(
+            &malformed.outcome,
+            Outcome::Complete(Err(SourceProgramExecutionError::Source(
+                SourceModuleCheckError::Source { module, .. }
+            ))) if module == &name("Main")
+        ),
+        "{malformed:?}"
+    );
+    assert!(malformed.attempts.is_empty());
+    assert_eq!(malformed.completed_vm_usage.steps, 0);
+    assert!(malformed.states.is_none());
+
+    let mut limits = SourceProgramLimits::new(execution_limits());
+    limits.modules.source.max_commands = 2;
+    let limited = execute_graph(
+        &imported,
+        compilation,
+        &[
+            (
+                "Main",
+                "prelude\nimport Early\ndef chosen : Nat := choose! 43",
+            ),
+            ("Early", early),
+        ],
+        limits,
+        MacroRegistryLimits::default(),
+        None,
+    );
+    assert!(
+        matches!(
+            &limited.outcome,
+            Outcome::Complete(Err(SourceProgramExecutionError::Source(
+                SourceModuleCheckError::Limit {
+                    resource: "source commands",
+                    limit: 2
+                }
+            )))
+        ),
+        "{limited:?}"
+    );
+    assert!(limited.attempts.is_empty());
+    assert_eq!(limited.completed_vm_usage.steps, 0);
+    assert!(limited.states.is_none());
+    assert_eq!(imported.engine.logical_root(&KVMap::new()), before);
+    assert!(!imported.engine.environment().contains(&name("first")));
+    assert!(!imported.engine.environment().contains(&name("chosen")));
+}
+
+#[test]
+fn imported_parser_resource_stops_and_cancellation_are_inconclusive_in_source_apis() {
+    use crate::source_check::modules::{
+        SourceModuleCheckLimits, SourceModuleDeferredMacroInputs, execution::SourceProgramLimits,
+    };
+
+    struct Cancel;
+    impl fln_vm::interpreter::CancellationProbe for Cancel {
+        fn is_cancelled(&self) -> bool {
+            true
+        }
+    }
+
+    let (imported, code) = fixture(Fault::None);
+    let before = imported.engine.logical_root(&KVMap::new());
+    let declarations = users(&code);
+    let compilation =
+        MacroCompilationInputs::new(code, VerifiedPartition::user_fixture(), declarations);
+    let module = name("Main");
+    let source = "prelude\nimport SourceLibrary\ndef chosen : Nat := choose! 42";
+    for cancelled in [false, true] {
+        let mut registry_limits = MacroRegistryLimits::default();
+        if !cancelled {
+            registry_limits.metadata.max_entries = 0;
+        }
+        let probe = Cancel;
+        let cancellation =
+            cancelled.then_some(&probe as &dyn fln_vm::interpreter::CancellationProbe);
+        let checked = imported.check_source_modules_with_deferred_imported_macros(
+            &[crate::SourceModuleInput {
+                name: &module,
+                source: source.as_bytes(),
+            }],
+            &module,
+            &KVMap::new(),
+            SourceModuleCheckLimits::new(crate::source_check::SourceCheckLimits::new(admission())),
+            SourceModuleDeferredMacroInputs {
+                compilation: compilation.clone(),
+                registry_limits,
+                context: context(),
+                state: MacroState::default(),
+                limits: MacroTreeLimits::default(),
+            },
+            cancellation,
+        );
+        assert!(
+            matches!(checked.outcome, Outcome::Inconclusive(_)),
+            "{checked:?}"
+        );
+        assert!(checked.attempts.is_empty());
+        assert_eq!(checked.completed_vm_usage.steps, 0);
+        assert!(checked.states.is_none());
+
+        let executed = execute_graph(
+            &imported,
+            compilation.clone(),
+            &[("Main", source)],
+            SourceProgramLimits::new(execution_limits()),
+            registry_limits,
+            cancellation,
+        );
+        assert!(
+            matches!(executed.outcome, Outcome::Inconclusive(_)),
+            "{executed:?}"
+        );
+        assert!(executed.attempts.is_empty());
+        assert_eq!(executed.completed_vm_usage.steps, 0);
+        assert!(executed.states.is_none());
+    }
+    let recovered = execute_graph(
+        &imported,
+        compilation,
+        &[("Main", source)],
+        SourceProgramLimits::new(execution_limits()),
+        MacroRegistryLimits::default(),
+        None,
+    );
+    let Outcome::Complete(Ok(program)) = &recovered.outcome else {
+        panic!("{recovered:?}");
+    };
+    assert_declared_value(&program.modules[0].commands.batch.engine, "chosen", 42);
+    assert_eq!(imported.engine.logical_root(&KVMap::new()), before);
 }
 
 #[test]

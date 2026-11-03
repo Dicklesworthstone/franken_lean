@@ -249,9 +249,16 @@ impl SourceGrammar {
         &mut self,
         module: &fln_parse::extensions::ImportedSyntaxModule,
     ) -> Result<(), EngineExecutionError> {
-        self.file
-            .import_artifact(module)
-            .map_err(|feature| EngineExecutionError::NotImplemented { feature })
+        self.file.import_artifact(module).map_err(|feature| {
+            if feature.ends_with("past the budget") {
+                EngineExecutionError::ImportedMacro {
+                    disposition: ("resource", false, 3),
+                    message: format!("imported parser installation: {feature}"),
+                }
+            } else {
+                EngineExecutionError::NotImplemented { feature }
+            }
+        })
     }
 
     pub(crate) fn export_native(

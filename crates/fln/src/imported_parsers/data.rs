@@ -99,12 +99,23 @@ struct Projection {
     arguments: Vec<Value>,
 }
 
+/// Checked declaration origins, distinct from the registration's wider world.
+/// Lexical arguments may come from a caller, but a definition's own constant
+/// references must already belong to that definition's actual imports.
+#[derive(Clone, Copy)]
+pub(super) struct OwnerWorlds<'a> {
+    pub owners: &'a BTreeMap<Name, (usize, &'a ConstantInfo)>,
+    pub imports: &'a [BTreeSet<usize>],
+    pub base: &'a BTreeSet<Name>,
+}
+
 pub(super) struct Reader<'a> {
     environment: &'a Environment,
     allowed: &'a BTreeSet<Name>,
     remaining: DataLimits,
     used: BTreeSet<Name>,
     validated: BTreeMap<Name, ConstructorFields>,
+    owner_worlds: Option<OwnerWorlds<'a>>,
 }
 
 fn name(spelling: &str) -> Name {
@@ -127,7 +138,13 @@ impl<'a> Reader<'a> {
             remaining: limits,
             used: BTreeSet::new(),
             validated: BTreeMap::new(),
+            owner_worlds: None,
         }
+    }
+
+    pub(super) fn with_owner_worlds(mut self, worlds: OwnerWorlds<'a>) -> Self {
+        self.owner_worlds = Some(worlds);
+        self
     }
 
     pub(super) fn remaining_limits(&self) -> DataLimits {
@@ -177,8 +194,76 @@ impl<'a> Reader<'a> {
             .environment
             .find(symbol)
             .ok_or_else(|| DataError::Missing(symbol.clone()))?;
+        if !self.used.contains(symbol) {
+            self.check_dependencies(symbol, declaration)?;
+        }
         self.used.insert(symbol.clone());
         Ok(declaration)
+    }
+
+    pub(super) fn bind_declaration(&mut self, symbol: &Name) -> Result<(), DataError> {
+        self.declaration(symbol).map(|_| ())
+    }
+
+    fn check_dependencies(
+        &mut self,
+        symbol: &Name,
+        declaration: &ConstantInfo,
+    ) -> Result<(), DataError> {
+        let Some(worlds) = self.owner_worlds else {
+            return Ok(());
+        };
+        let Some(&(owner, _)) = worlds.owners.get(symbol) else {
+            // Explicitly supplied admitted-base declarations retain the base
+            // authority of this API; they do not acquire a fabricated owner.
+            return Ok(());
+        };
+        let imports = worlds
+            .imports
+            .get(owner)
+            .ok_or_else(|| DataError::NotPermitted(symbol.clone()))?;
+        let permitted = |reference: &Name| {
+            worlds.base.contains(reference)
+                || worlds
+                    .owners
+                    .get(reference)
+                    .is_some_and(|(module, _)| imports.contains(module))
+        };
+        let mut pending = vec![&declaration.constant_val().type_];
+        if let ConstantInfo::Defn(definition) = declaration {
+            pending.push(&definition.value);
+        }
+        while let Some(expression) = pending.pop() {
+            self.tick()?;
+            match expression.node() {
+                ExprNode::Const { name, .. } => {
+                    if !permitted(name) {
+                        return Err(DataError::NotPermitted(name.clone()));
+                    }
+                }
+                ExprNode::App { f, a } => pending.extend([f, a]),
+                ExprNode::Lam {
+                    binder_type, body, ..
+                }
+                | ExprNode::ForallE {
+                    binder_type, body, ..
+                } => pending.extend([binder_type, body]),
+                ExprNode::LetE {
+                    type_, value, body, ..
+                } => pending.extend([type_, value, body]),
+                ExprNode::MData { expr, .. } => pending.push(expr),
+                ExprNode::Proj {
+                    struct_name, expr, ..
+                } => {
+                    if !permitted(struct_name) {
+                        return Err(DataError::NotPermitted(struct_name.clone()));
+                    }
+                    pending.push(expr);
+                }
+                _ => {}
+            }
+        }
+        Ok(())
     }
 
     fn child(&mut self, parent: &Value, expression: Expr) -> Result<Value, DataError> {

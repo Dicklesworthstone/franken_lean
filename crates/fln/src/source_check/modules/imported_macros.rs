@@ -130,6 +130,36 @@ fn parser_binding_error(error: ParserRegistrationError) -> SourceCheckError {
     }
 }
 
+fn parser_resource(error: &SourceCheckError) -> Option<Inconclusive> {
+    match error {
+        SourceCheckError::ImportedMacro { error, .. } => match error.as_ref() {
+            SourceMacroError::ParserBinding(error) if error.is_resource() => {
+                Some(Inconclusive::dependency_unavailable(format!(
+                    "source-module parser preparation: {error}"
+                )))
+            }
+            _ => None,
+        },
+        SourceCheckError::Command { error, .. } => match error.as_ref() {
+            EngineExecutionError::ImportedMacro {
+                message,
+                disposition: ("resource", false, 3),
+            } if message.starts_with("imported parser installation: ") => {
+                Some(Inconclusive::dependency_unavailable(message.clone()))
+            }
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn module_parser_resource(error: &SourceModuleCheckError) -> Option<Inconclusive> {
+    match error {
+        SourceModuleCheckError::Source { error, .. } => parser_resource(error),
+        _ => None,
+    }
+}
+
 // The module importer and VM expose independent read-only probe traits. Keep
 // both existing APIs intact and forward every poll to the caller's same probe.
 struct ModuleCancellation<'a>(&'a dyn CancellationProbe);
@@ -203,6 +233,30 @@ impl ModuleMacroSession {
         remaining
     }
 
+    /// Preflight uses the immutable artifact context to verify the selected
+    /// bindings without replaying or executing source predecessors. Only this
+    /// module's external import order enters its grammar. Actual execution
+    /// rechecks the same bindings against the module's projected engine.
+    pub(super) fn install_parsers_for_preflight(
+        &self,
+        ordered_imports: &[Name],
+        artifacts: &Engine,
+        grammar: &mut grammar::SourceGrammar,
+    ) -> Result<(), SourceCheckError> {
+        let parsers = self
+            .parsers
+            .project_imports(ordered_imports, artifacts)
+            .map_err(parser_binding_error)?;
+        grammar
+            .import_artifact(&parsers)
+            .map_err(|error| SourceCheckError::Command {
+                file: 0,
+                command: 0,
+                offset: 0,
+                error: Box::new(error),
+            })
+    }
+
     /// The driver supplies the authoritative mixed import order after replay,
     /// and retains ordinary declaration recording and module source positions.
     /// Binding is checked even for an empty forwarding module.
@@ -226,10 +280,16 @@ impl ModuleMacroSession {
         registry
             .validate_source_engine(engine)
             .map_err(binding_error)?;
-        let parsers = self
-            .parsers
-            .project_imports(ordered_imports, engine)
-            .map_err(parser_binding_error)?;
+        let parsers = match self.parsers.project_imports(ordered_imports, engine) {
+            Ok(parsers) => parsers,
+            Err(error) => {
+                let error = parser_binding_error(error);
+                return match parser_resource(&error) {
+                    Some(reason) => Ok(Outcome::Inconclusive(reason)),
+                    None => Err(error),
+                };
+            }
+        };
         let mut context = self.context.clone();
         context.quotation_context = module.clone();
         let cancellation = cancellation.map(MacroCancellation);
@@ -563,6 +623,9 @@ impl imported::SourceOleanImport {
         let mut session = match prepare() {
             Ok(session) => session,
             Err(error) => {
+                if let Some(reason) = parser_resource(&error) {
+                    return SourceMacroProgramExecution::stopped(Outcome::Inconclusive(reason));
+                }
                 return SourceMacroProgramExecution::stopped(Outcome::Complete(Err(
                     SourceModuleCheckError::Source {
                         module: entry.clone(),
@@ -587,7 +650,16 @@ impl imported::SourceOleanImport {
             Some(&mut session),
         ) {
             Ok(outcome) => outcome.map_complete(Ok),
-            Err(error) => Outcome::Complete(Err(error)),
+            Err(error) => {
+                let reason = match &error {
+                    SourceProgramExecutionError::Source(error) => module_parser_resource(error),
+                    SourceProgramExecutionError::Validation { .. } => None,
+                };
+                match reason {
+                    Some(reason) => Outcome::Inconclusive(reason),
+                    None => Outcome::Complete(Err(error)),
+                }
+            }
         };
         session.finish_execution(outcome)
     }
@@ -705,6 +777,9 @@ impl imported::SourceOleanImport {
         let mut session = match prepare() {
             Ok(session) => session,
             Err(error) => {
+                if let Some(reason) = parser_resource(&error) {
+                    return SourceMacroModuleCheck::stopped(Outcome::Inconclusive(reason));
+                }
                 return SourceMacroModuleCheck::stopped(Outcome::Complete(Err(
                     SourceModuleCheckError::Source {
                         module: entry.clone(),
@@ -732,7 +807,10 @@ impl imported::SourceOleanImport {
             },
         ) {
             Ok(outcome) => outcome.map_complete(|run| Ok(run.result.checked)),
-            Err(error) => Outcome::Complete(Err(error)),
+            Err(error) => match module_parser_resource(&error) {
+                Some(reason) => Outcome::Inconclusive(reason),
+                None => Outcome::Complete(Err(error)),
+            },
         };
         session.finish(outcome)
     }

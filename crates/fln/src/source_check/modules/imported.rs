@@ -224,8 +224,19 @@ impl SourceOleanImport {
         use crate::imported_parsers::{
             ParserRegistrationError, ParserRegistrationModule, RegisteredParsers,
         };
-        if self.parser_journals.len() > limits.max_modules {
+        if self.parser_journals.len() > limits.max_modules
+            || self.checked.modules.len() > limits.max_modules
+        {
             return Err(ParserRegistrationError::Limit("modules"));
+        }
+        // Bound caller-editable report sizes before comparing declarations or
+        // allocating an owner map. Private provenance is validated below.
+        let mut declarations = 0usize;
+        for module in &self.checked.modules {
+            declarations = declarations
+                .checked_add(module.decoded.constants.len())
+                .filter(|count| *count <= limits.max_declarations)
+                .ok_or(ParserRegistrationError::Limit("owner declarations"))?;
         }
         let mut checked = BTreeMap::new();
         for module in &self.checked.modules {
