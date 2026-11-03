@@ -59,7 +59,10 @@ fn activate(
                 "instAddNat",
                 "instHAppendOfAppend",
             ],
-            &["Nat.add"],
+            // The actual Prelude rows select native Array storage for the
+            // checked Array Name fields. Raw declarations without these
+            // attributes deliberately retain their logical List layout.
+            &["Nat.add", "Array.mk", "Array.toList", "Array.push"],
         ),
         "Init/Coe" => (
             &["CoeT", "CoeHTCT", "CoeHTC", "CoeOTC", "CoeTC", "Coe"],

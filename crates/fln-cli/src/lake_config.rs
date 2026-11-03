@@ -5,7 +5,7 @@
 //! adapter implements that order for the supported library fields. It never executes Lake's
 //! upstream elaborator, interprets an expression as a Rust string, or invents a FilePath type.
 //! The field declarations and the user's definitions are admitted together against the real
-//! `Init.System.FilePath` import world. Only selected path projections then enter Golem.
+//! `Init.System.FilePath` import world. Only selected field values then enter Golem.
 use super::*;
 use fln_lake::{LakeConfigFormat, LakeTarget};
 use fln_parse::command_scope::{self, ScopeCommand};
@@ -32,15 +32,16 @@ const LAKE_COMMANDS: [&str; 10] = [
 ];
 
 #[derive(Debug, Clone, Copy)]
-enum PathSlot {
+enum ConfigSlot {
     Source,
     Build,
     Library(usize),
+    LibraryRoots(usize),
 }
 
 #[derive(Debug)]
-struct PathField {
-    slot: PathSlot,
+struct ConfigField {
+    slot: ConfigSlot,
     declaration: String,
     label: String,
 }
@@ -50,7 +51,7 @@ struct ParsedConfig {
     config: LakeConfig,
     /// Ordinary source and generated, *typed* field definitions, in source order.
     program: String,
-    fields: Vec<PathField>,
+    fields: Vec<ConfigField>,
 }
 
 pub(super) struct LoadedConfig {
@@ -426,9 +427,10 @@ fn parse(source: &[u8]) -> Result<ParsedConfig, Failure> {
             let declaration_column = tokens.column(0).min(tokens.column(head));
             for (field, expression) in fields(command, &tokens, head + 2, declaration_column)? {
                 let slot = match (library, field.as_str()) {
-                    (None, "srcDir") => PathSlot::Source,
-                    (None, "buildDir") => PathSlot::Build,
-                    (Some(index), "srcDir") => PathSlot::Library(index),
+                    (None, "srcDir") => ConfigSlot::Source,
+                    (None, "buildDir") => ConfigSlot::Build,
+                    (Some(index), "srcDir") => ConfigSlot::Library(index),
+                    (Some(index), "roots") => ConfigSlot::LibraryRoots(index),
                     _ => {
                         return Err(Failure::unsupported(format!(
                             "lakefile.lean: `{keyword}` field `{field}` is not implemented"
@@ -438,10 +440,14 @@ fn parse(source: &[u8]) -> Result<ParsedConfig, Failure> {
                 let generated = fresh_name(original, &mut next);
                 let expression = std::str::from_utf8(expression)
                     .map_err(|_| Failure::input("lakefile.lean: expression is not UTF-8"))?;
+                let type_ = match slot {
+                    ConfigSlot::LibraryRoots(_) => "_root_.Array _root_.Lean.Name",
+                    _ => "_root_.System.FilePath",
+                };
                 parsed.program.push_str(&format!(
-                    "\ndef {generated} : _root_.System.FilePath := (\n{expression}\n)\n"
+                    "\ndef {generated} : {type_} := (\n{expression}\n)\n"
                 ));
-                parsed.fields.push(PathField {
+                parsed.fields.push(ConfigField {
                     slot,
                     declaration: generated,
                     label: format!("{keyword} {declaration}.{field}"),
@@ -531,6 +537,95 @@ fn complete<T>(outcome: Outcome<T>, phase: &str) -> Result<T, Failure> {
     }
 }
 
+/// Read the checked `Array Lean.Name` result without executing `Name.toString` or
+/// flattening distinct names into the same path. Golem derives the ordinary
+/// constructor layout from `Lean.Name` in the admitted Prelude: anonymous, str
+/// (prefix, component), and num (prefix, index). This is a typed value observer,
+/// not an ABI pointer decoder or an alternative declaration-admission path.
+fn module_roots(exit: &fln::VmExit, label: &str) -> Result<Vec<String>, Failure> {
+    let malformed = || {
+        Failure::new(
+            "internal-fault",
+            format!("lakefile.lean: {label} did not return its checked Array Lean.Name"),
+        )
+    };
+    let fln::VmExit::Returned(returned) = exit else {
+        return Err(Failure::new(
+            "execution",
+            format!("lakefile.lean: {label} did not return: {exit:?}"),
+        ));
+    };
+    let (count, _) = returned.value.try_array_view().ok_or_else(malformed)?;
+    if count > MAX_MODULES {
+        return Err(Failure::new(
+            "resource",
+            format!("lakefile.lean: {label} exceeds 256 module roots"),
+        ));
+    }
+    let mut roots = Vec::with_capacity(count);
+    let mut bytes = 0usize;
+    for index in 0..count {
+        // The fallible header view above established this array bound.
+        let mut current = returned.value.array_child(index);
+        let mut components = Vec::new();
+        loop {
+            match fln::vm_value_kind(&current) {
+                fln::VmValueKind::Scalar if current.unbox() == 0 => break,
+                fln::VmValueKind::Ctor(0) if current.try_ctor_child(0).is_none() => break,
+                fln::VmValueKind::Ctor(2) => {
+                    return Err(Failure::unsupported(format!(
+                        "lakefile.lean: {label} has a numeric module-name component"
+                    )));
+                }
+                fln::VmValueKind::Ctor(1) if current.try_ctor_child(2).is_none() => {}
+                _ => return Err(malformed()),
+            }
+            if components.len() == 128 {
+                return Err(Failure::new(
+                    "resource",
+                    format!("lakefile.lean: {label} has a module name exceeding 128 components"),
+                ));
+            }
+            let prefix = current.try_ctor_child(0).ok_or_else(malformed)?;
+            let component = current.try_ctor_child(1).ok_or_else(malformed)?;
+            let (_, _, _, buffer) = component.try_borrow_string_view().ok_or_else(malformed)?;
+            let value = buffer.strip_suffix(&[0]).ok_or_else(malformed)?;
+            bytes = bytes
+                .checked_add(value.len())
+                .and_then(|bytes| bytes.checked_add(1))
+                .filter(|bytes| *bytes <= MAX_CONFIG_BYTES)
+                .ok_or_else(|| {
+                    Failure::new(
+                        "resource",
+                        format!("lakefile.lean: {label} module-root text exceeds 64 KiB"),
+                    )
+                })?;
+            let value = std::str::from_utf8(value).map_err(|_| malformed())?;
+            // In particular, a single quoted component `«A.B»` is not A.B.
+            // Check before joining, so dots and path separators cannot alias.
+            if value.is_empty()
+                || !value
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || c == '_' || c == '\'')
+            {
+                return Err(Failure::unsupported(format!(
+                    "lakefile.lean: {label} requires unsupported quoted or special module-name components"
+                )));
+            }
+            components.push(value.to_owned());
+            current = prefix;
+        }
+        if components.is_empty() {
+            return Err(Failure::unsupported(format!(
+                "lakefile.lean: {label} contains an anonymous module root"
+            )));
+        }
+        components.reverse();
+        roots.push(components.join("."));
+    }
+    Ok(roots)
+}
+
 fn evaluate(
     mut parsed: ParsedConfig,
     engine: fln::Engine,
@@ -565,10 +660,16 @@ fn evaluate(
             }
             next += 1;
         };
-        let source = format!(
-            "def {projection} : _root_.String := _root_.System.FilePath.toString _root_.{}",
-            field.declaration
-        );
+        let source = match field.slot {
+            ConfigSlot::LibraryRoots(_) => format!(
+                "def {projection} : _root_.Array _root_.Lean.Name := _root_.{}",
+                field.declaration
+            ),
+            _ => format!(
+                "def {projection} : _root_.String := _root_.System.FilePath.toString _root_.{}",
+                field.declaration
+            ),
+        };
         let execution = checked
             .engine
             .execute_source_definition(source.as_bytes(), &options, limits)
@@ -581,6 +682,12 @@ fn evaluate(
                 }
             })?;
         let execution = complete(execution, &field.label)?;
+        if let ConfigSlot::LibraryRoots(index) = field.slot {
+            // Replace the default even for #[]; absence and an explicit empty
+            // root set are different Lake configurations.
+            parsed.config.targets[index].roots = module_roots(&execution.exit, &field.label)?;
+            continue;
+        }
         let value = match &execution.exit {
             fln::VmExit::Returned(_) => match fln::closed_vm_value(&execution.exit) {
                 Ok(Some(fln::ClosedVmValue::String(value))) => value,
@@ -604,9 +711,10 @@ fn evaluate(
         let path = PathBuf::from(value);
         relative_directory(&path)?;
         match field.slot {
-            PathSlot::Source => parsed.config.src_dir = path,
-            PathSlot::Build => parsed.config.build_dir = path,
-            PathSlot::Library(index) => parsed.config.targets[index].src_dir = Some(path),
+            ConfigSlot::Source => parsed.config.src_dir = path,
+            ConfigSlot::Build => parsed.config.build_dir = path,
+            ConfigSlot::Library(index) => parsed.config.targets[index].src_dir = Some(path),
+            ConfigSlot::LibraryRoots(_) => unreachable!("root arrays were read above"),
         }
     }
     Ok(parsed.config)

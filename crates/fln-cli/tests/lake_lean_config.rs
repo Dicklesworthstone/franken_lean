@@ -130,6 +130,9 @@ const CONFIG: &str = r#"import Lake
 open System Lake DSL
 def folder (suffix : String) : FilePath := FilePath.mk ("sources/" ++ suffix)
 def products (suffix : String) : FilePath := FilePath.mk ("products/" ++ suffix)
+def rootNames (suffix : String) : Array Lean.Name :=
+  #[Lean.Name.str Lean.Name.anonymous ("De" ++ suffix),
+    Lean.Name.str Lean.Name.anonymous "Support"]
 def countDown : Nat → Nat
   | 0 => 0
   | Nat.succ n => countDown n + 1
@@ -138,8 +141,9 @@ local notation "◆" s => folder s
 package native where
   srcDir := ◆ "first"
   buildDir := products "native"
-@[default_target] lean_lib Demo where
+@[default_target] lean_lib Bundle where
   srcDir := FilePath.mk ("pro" ++ "ofs")
+  roots := rootNames "mo"
 "#;
 
 #[test]
@@ -152,8 +156,12 @@ fn checked_lean_configuration_builds_real_modules_and_refuses_atomically() {
     package.write("lean-toolchain", "leanprover/lean4:v4.32.0\n");
     for (source, declaration) in [("first", "original"), ("second", "changed")] {
         package.write(
+            &format!("sources/{source}/proofs/Support.lean"),
+            "prelude\ndef Support.identity (A : Type) (a : A) : A := a\n",
+        );
+        package.write(
             &format!("sources/{source}/proofs/Demo/Base.lean"),
-            format!("prelude\ndef Demo.{declaration} (A : Type) (a : A) : A := a\n"),
+            format!("prelude\nimport Support\ndef Demo.{declaration} (A : Type) (a : A) : A := Support.identity A a\n"),
         );
         package.write(
             &format!("sources/{source}/proofs/Demo.lean"),
@@ -166,7 +174,7 @@ fn checked_lean_configuration_builds_real_modules_and_refuses_atomically() {
     }
 
     let presence = success(package.lake(&["check-build"]));
-    assert!(presence.contains("\"targets\":[\"Demo\"]"), "{presence}");
+    assert!(presence.contains("\"targets\":[\"Bundle\"]"), "{presence}");
     assert!(
         presence.contains("\"configuration_imports\":[{"),
         "{presence}"
@@ -180,12 +188,13 @@ fn checked_lean_configuration_builds_real_modules_and_refuses_atomically() {
     );
     assert!(!package.root.join("products").exists());
     let built = success(package.lake(&["build", "+Demo:olean"]));
-    assert!(built.contains("\"modules_built\":2"), "{built}");
+    assert!(built.contains("\"modules_built\":3"), "{built}");
     assert!(
         built.contains("\"imports\":[],\"configuration_imports\":[{"),
         "{built}"
     );
     assert_reused_configuration(&built);
+    assert!(inspect(&package.artifact("Support")).contains("Support.identity"));
     assert!(inspect(&package.artifact("Demo.Base")).contains("Demo.original"));
     assert!(inspect(&package.artifact("Demo")).contains("Demo.exported"));
     assert!(!package.artifact("Demo.Unused").exists());
@@ -195,6 +204,14 @@ fn checked_lean_configuration_builds_real_modules_and_refuses_atomically() {
             .join(".lake/build/lib/lean/Demo.olean")
             .exists()
     );
+    // The library's declared name is not an additional implicit root when the
+    // configuration supplies its own computed roots.
+    let missing_root = failure(package.lake(&["build", "+Bundle:olean"]));
+    assert!(
+        missing_root.contains("does not belong to a declared lean_lib root"),
+        "{missing_root}"
+    );
+    assert!(!package.artifact("Bundle").exists());
 
     // The same checked helper, called with different user data, chooses the other
     // source tree. Neither its body nor the field is parsed as a Rust path string.
@@ -224,10 +241,17 @@ fn checked_lean_configuration_builds_real_modules_and_refuses_atomically() {
 
     let base = std::fs::read(package.artifact("Demo.Base")).unwrap();
     let top = std::fs::read(package.artifact("Demo")).unwrap();
+    let support = std::fs::read(package.artifact("Support")).unwrap();
     for (case, invalid) in [
         changed_config.replace("srcDir := ◆ \"second\"", "srcDir := (42 : Nat)"),
         format!("{changed_config}\ndef invalidUnused : Nat := \"wrong\"\n"),
         changed_config.replace("products \"native\"", "FilePath.mk \"../escape\""),
+        changed_config.replace("roots := rootNames \"mo\"", "roots := #[\"Demo\"]"),
+        changed_config.replace("roots := rootNames \"mo\"", "roots := #[]"),
+        changed_config.replace(
+            "roots := rootNames \"mo\"",
+            "roots := #[Lean.Name.str Lean.Name.anonymous \"Demo.Base\"]",
+        ),
         changed_config.replace(
             "srcDir := ◆ \"second\"",
             "srcDir := ◆ \"second\"\n  moreLeanArgs := #[\"--unexpected\"]",
@@ -252,6 +276,7 @@ fn checked_lean_configuration_builds_real_modules_and_refuses_atomically() {
         failure(package.lake(&["build", "+Demo:olean"]));
         assert_eq!(std::fs::read(package.artifact("Demo.Base")).unwrap(), base);
         assert_eq!(std::fs::read(package.artifact("Demo")).unwrap(), top);
+        assert_eq!(std::fs::read(package.artifact("Support")).unwrap(), support);
         assert!(!package.root.join(".lake/build/lib/lean").exists());
     }
 

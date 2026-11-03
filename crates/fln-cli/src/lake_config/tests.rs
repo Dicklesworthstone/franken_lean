@@ -21,6 +21,27 @@ fn native_lake_config_keeps_lean_terms_and_declared_defaults() {
 }
 
 #[test]
+fn native_lake_config_keeps_roots_as_typed_lean_expressions() {
+    let source = b"import Lake\nopen Lake DSL\ndef names : Array Lean.Name := #[`Other]\npackage p\nlean_lib Bundle where\n  roots := names\n  srcDir := \"library\"\nlean_lib Empty where\n  roots := #[]\n";
+    let parsed = parse(source).unwrap_or_else(|error| panic!("{}", error.detail));
+    assert_eq!(parsed.fields.len(), 3);
+    assert!(matches!(parsed.fields[0].slot, ConfigSlot::LibraryRoots(0)));
+    assert!(matches!(parsed.fields[1].slot, ConfigSlot::Library(0)));
+    assert!(matches!(parsed.fields[2].slot, ConfigSlot::LibraryRoots(1)));
+    let program = parsed.program.split_whitespace().collect::<String>();
+    for (index, expression) in [(0, "names"), (2, "#[]")] {
+        assert!(program.contains(&format!(
+            "def{}:_root_.Array_root_.Lean.Name:=({expression})",
+            parsed.fields[index].declaration
+        )));
+    }
+    // Parsing preserves the expressions; checked evaluation replaces these
+    // defaults, including when the resulting array is explicitly empty.
+    assert_eq!(parsed.config.targets[0].roots, ["Bundle"]);
+    assert_eq!(parsed.config.targets[1].roots, ["Empty"]);
+}
+
+#[test]
 fn native_lake_config_uses_prior_local_and_scoped_notation_tokens() {
     let source = "import Lake\nopen System Lake DSL\nnamespace Config\nscoped notation \"◆\" s => System.FilePath.mk s\nend Config\nopen scoped Config\nlocal notation \"◇\" => \"src\"\npackage p where\n  srcDir := ◆ ◇\n@[default_target] lean_lib P\n";
     let parsed = parse(source.as_bytes()).unwrap_or_else(|error| panic!("{}", error.detail));
@@ -51,7 +72,7 @@ fn native_lake_config_refuses_unimplemented_build_semantics() {
         "package p\nrequire dep from git \"https://example.test/dep\"\n",
         "package p\nscript hi := return 0\n",
         "package p where\n  moreLeanArgs := #[\"--foo\"]\nlean_lib P\n",
-        "package p\nlean_lib P where\n  roots := #[`Other]\n",
+        "package p where\n  roots := #[`Other]\nlean_lib P\n",
         "package p\nlean_lib P\nlean_lib P\n",
         "package p\npackage q\nlean_lib P\n",
         "lean_lib P\npackage p\n",
