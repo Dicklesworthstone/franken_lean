@@ -40,8 +40,8 @@ fn imported(built: &SourceModuleBuild) -> SourceOleanImport {
         .map(|a| OleanModuleInput {
             name: &a.name,
             artifact: &a.bytes,
-            server_artifact: None,
-            private_artifact: None,
+            server_artifact: a.companions.as_ref().map(|parts| parts.server.as_slice()),
+            private_artifact: a.companions.as_ref().map(|parts| parts.private.as_slice()),
         })
         .collect();
     Engine::builder()

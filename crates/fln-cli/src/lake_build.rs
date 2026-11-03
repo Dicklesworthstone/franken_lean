@@ -474,6 +474,11 @@ fn compile(
             }
         }
         for artifact in built.artifacts {
+            if artifact.companions.is_some() {
+                return Err(Failure::unsupported(
+                    "module-system .olean publication requires coordinated public/private split artifacts",
+                ));
+            }
             if let Some(previous) = artifacts.get(&artifact.name) {
                 if previous != &artifact.bytes {
                     return Err(Failure::new(

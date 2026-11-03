@@ -19,12 +19,25 @@ fn artifact_discrimination_key(
     }
 }
 
-/// One basic (pre-module-system) `.olean`, containing only its own constants.
+/// One module's checked `.olean` facet, containing only its own constants.
 #[derive(Debug)]
 pub struct SourceModuleArtifact {
     pub name: Name,
     pub bytes: Vec<u8>,
     pub report: OleanModuleWriteReport,
+    /// Module-system companion regions, present together. The public region
+    /// exports interfaces; the private region retains checked implementations.
+    /// These are source artifacts; executable IR is a separate compiler facet.
+    pub companions: Option<SourceModuleCompanions>,
+}
+
+/// The source metadata and implementation companions of one module-system image.
+#[derive(Debug)]
+pub struct SourceModuleCompanions {
+    pub server: Vec<u8>,
+    pub private: Vec<u8>,
+    pub server_report: OleanModuleWriteReport,
+    pub private_report: OleanModuleWriteReport,
 }
 
 /// All products of a successfully checked import closure. No filesystem writes
@@ -87,6 +100,11 @@ impl SourceModuleBuildError {
 }
 
 pub(super) struct PendingArtifact {
+    public: ArtifactData,
+    private: Option<ArtifactData>,
+}
+
+struct ArtifactData {
     name: Name,
     imports: Vec<OleanModuleImport>,
     constants: Vec<ConstantInfo>,
@@ -138,20 +156,14 @@ pub(super) fn validate_import_scope(
     Ok(())
 }
 
-impl PendingArtifact {
-    pub(super) fn capture(
+impl ArtifactData {
+    fn capture(
         name: &Name,
         header: &SourceHeader,
         base: &Environment,
         checked: &Environment,
         meter: &mut Meter,
     ) -> Result<Self, SourceModuleCheckError> {
-        if header.module_system {
-            return Err(SourceModuleCheckError::ImportContext {
-                module: name.clone(),
-                reason: "module-system .olean emission requires public/private split artifacts",
-            });
-        }
         // Default equation policies and realization provenance are local
         // compilation facts: the pin reconstructs their result from the actual
         // checked equation declarations. Nondefault definition-time options
@@ -199,10 +211,24 @@ impl PendingArtifact {
         // name, and retains every explicit import row after it.
         let mut imports = Vec::new();
         for (index, module) in header.imports.iter().enumerate() {
+            let is_exported = if header.module_system && (header.prelude || index != 0) {
+                let explicit = index - usize::from(!header.prelude);
+                let spec = header
+                    .import_specs
+                    .get(explicit)
+                    .filter(|spec| spec.module == *module)
+                    .ok_or_else(|| SourceModuleCheckError::ImportContext {
+                        module: name.clone(),
+                        reason: "module artifact imports differ from their checked header",
+                    })?;
+                spec.public_at.is_some()
+            } else {
+                true
+            };
             imports.push(OleanModuleImport {
                 module: module.clone(),
                 import_all: false,
-                is_exported: true,
+                is_exported,
                 is_meta: false,
             });
             if index == 0 && !header.prelude {
@@ -757,13 +783,15 @@ impl PendingArtifact {
         })
     }
 
-    pub(super) fn encode(
+    fn encode(
         &self,
+        is_module: bool,
+        base_addr: u64,
         budget: OleanWriteBudget,
-    ) -> Result<SourceModuleArtifact, SourceModuleBuildError> {
+    ) -> Result<fln_olean::write::EncodedModule, SourceModuleBuildError> {
         let encoded = encode_module_with_source_metadata(
             OleanModuleWriteInput {
-                is_module: false,
+                is_module,
                 imports: &self.imports,
                 constants: &self.constants,
                 extra_const_names: &[],
@@ -774,7 +802,7 @@ impl PendingArtifact {
                 flags: 1,
                 lean_version: OLEAN_PIN_TAG.strip_prefix('v').unwrap_or(OLEAN_PIN_TAG),
                 githash: OLEAN_PIN_COMMIT,
-                base_addr: (OLEAN_REGION_ALIGN as u64) * 2,
+                base_addr,
             },
             budget,
         )
@@ -782,10 +810,86 @@ impl PendingArtifact {
             module: self.name.clone(),
             error,
         })?;
+        Ok(encoded)
+    }
+}
+
+impl PendingArtifact {
+    pub(super) fn capture(
+        name: &Name,
+        header: &SourceHeader,
+        base: &Environment,
+        checked: &Environment,
+        public: Option<(&Environment, &Environment)>,
+        meter: &mut Meter,
+    ) -> Result<Self, SourceModuleCheckError> {
+        match (header.module_system, public) {
+            (false, None) => Ok(Self {
+                public: ArtifactData::capture(name, header, base, checked, meter)?,
+                private: None,
+            }),
+            (true, Some((public_base, public_checked))) => Ok(Self {
+                public: ArtifactData::capture(name, header, public_base, public_checked, meter)?,
+                private: Some(ArtifactData::capture(name, header, base, checked, meter)?),
+            }),
+            _ => Err(SourceModuleCheckError::ImportContext {
+                module: name.clone(),
+                reason: "module artifact capture has no matching checked public world",
+            }),
+        }
+    }
+
+    pub(super) fn encode(
+        &self,
+        mut budget: OleanWriteBudget,
+    ) -> Result<SourceModuleArtifact, SourceModuleBuildError> {
+        let is_module = self.private.is_some();
+        // Native placement policy for self-contained companion regions. Keep
+        // their compacted addresses above local file offsets and disjoint.
+        // This chooses valid regions; it does not claim the pin's byte layout.
+        let mut base = if is_module {
+            1u64 << 40
+        } else {
+            (OLEAN_REGION_ALIGN as u64) * 2
+        };
+        let public = self.public.encode(is_module, base, budget)?;
+        let companions = if let Some(private) = &self.private {
+            let spend = |budget: &mut OleanWriteBudget,
+                         base: &mut u64,
+                         report: OleanModuleWriteReport|
+             -> Result<(), SourceModuleBuildError> {
+                budget.max_bytes -= report.file_bytes;
+                budget.max_objects -= report.runtime_objects;
+                *base = base
+                    .checked_add(report.file_bytes)
+                    .and_then(|end| end.checked_add(OLEAN_REGION_ALIGN as u64 - 1))
+                    .map(|end| end & !(OLEAN_REGION_ALIGN as u64 - 1))
+                    .ok_or_else(|| SourceModuleBuildError::Encode {
+                        module: self.public.name.clone(),
+                        error: OleanWriteError::Contract {
+                            what: "module companion address space overflows",
+                        },
+                    })?;
+                Ok(())
+            };
+            spend(&mut budget, &mut base, public.report)?;
+            let server = self.public.encode(true, base, budget)?;
+            spend(&mut budget, &mut base, server.report)?;
+            let private = private.encode(true, base, budget)?;
+            Some(SourceModuleCompanions {
+                server: server.bytes,
+                private: private.bytes,
+                server_report: server.report,
+                private_report: private.report,
+            })
+        } else {
+            None
+        };
         Ok(SourceModuleArtifact {
-            name: self.name.clone(),
-            bytes: encoded.bytes,
-            report: encoded.report,
+            name: self.public.name.clone(),
+            bytes: public.bytes,
+            report: public.report,
+            companions,
         })
     }
 }
@@ -799,10 +903,10 @@ impl Engine {
     ///
     /// Both kernel engines must accept the complete graph before any encoded
     /// products are returned. Native extension effects are refused until their
-    /// pinned serialization exists; they are never silently dropped. New
-    /// `module` headers, runtime/native code artifacts and filesystem publication
-    /// are outside this basic `.olean` facet. Writer limits are aggregate across
-    /// the closure, including supporting objects and file headers.
+    /// pinned serialization exists; they are never silently dropped.
+    /// Module-system headers retain their separate public/server/private regions.
+    /// Runtime/native code artifacts and filesystem publication are separate
+    /// facets. Writer limits cover every companion, supporting object and header.
     pub fn compile_source_modules(
         &self,
         modules: &[SourceModuleInput<'_>],
@@ -846,6 +950,12 @@ pub(super) fn finish(
         let artifact = pending.encode(remaining)?;
         remaining.max_bytes -= artifact.report.file_bytes;
         remaining.max_objects -= artifact.report.runtime_objects;
+        if let Some(companions) = &artifact.companions {
+            remaining.max_bytes -=
+                companions.server_report.file_bytes + companions.private_report.file_bytes;
+            remaining.max_objects -= companions.server_report.runtime_objects
+                + companions.private_report.runtime_objects;
+        }
         artifacts.push(artifact);
     }
     Ok(SourceModuleBuild {

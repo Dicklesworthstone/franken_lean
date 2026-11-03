@@ -151,6 +151,10 @@ pub(super) fn reference_import_stdout(
             .with_extension("olean");
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, &artifact.bytes).unwrap();
+        if let Some(parts) = &artifact.companions {
+            std::fs::write(path.with_extension("olean.server"), &parts.server).unwrap();
+            std::fs::write(path.with_extension("olean.private"), &parts.private).unwrap();
+        }
         assert!(
             !path.with_extension("lean").exists(),
             "the oracle must consume our artifact, not rebuild its source"

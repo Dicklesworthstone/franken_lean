@@ -17,7 +17,9 @@ pub mod persisted;
 mod replay;
 pub mod reuse;
 pub(crate) mod visibility;
-pub use artifacts::{SourceModuleArtifact, SourceModuleBuild, SourceModuleBuildError};
+pub use artifacts::{
+    SourceModuleArtifact, SourceModuleBuild, SourceModuleBuildError, SourceModuleCompanions,
+};
 pub use cache::{SourceModuleCacheLimits, SourceModuleSession, SourceModuleSessionCheck};
 pub use fln_parse::command_scope::imports::{SourceHeader, parse_source_header};
 

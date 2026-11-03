@@ -260,6 +260,22 @@ fn private_equation_requests_preserve_public_simp_artifacts() {
              attribute [irreducible] wrap"
         );
         let built = compiled(&[("Main", &source)]);
+        assert!(built.artifacts[0].companions.is_some());
+        let artifact = &built.artifacts[0];
+        let parts = artifact.companions.as_ref().unwrap();
+        let public = fln_olean::region::OleanView::parse(&artifact.bytes).unwrap();
+        let private = fln_olean::region::OleanView::parse_with_dependencies(
+            &parts.private,
+            &[&artifact.bytes, &parts.server],
+        )
+        .unwrap();
+        let declarations = fln_olean::decl::decode_chain_constants_with_origin(
+            &public,
+            &private,
+            fln::OleanWalkBudget::default(),
+        )
+        .unwrap();
+        assert!(declarations.private_only().next().is_some());
         let physical = metadata(&built.artifacts[0].bytes);
         assert_eq!(physical.simps.len(), 3, "{first}");
         let SimpKind::Theorem(theorem) = &physical.simps[0].kind else {
@@ -268,12 +284,148 @@ fn private_equation_requests_preserve_public_simp_artifacts() {
         assert_eq!(theorem.origin, name("wrap.eq_1"));
         assert_eq!(theorem.priority, 1300);
         let receipt = imported(&built);
+        let private_use = "theorem leaked.{u} {A : Sort u} (x : A) : wrap x = x := first x";
+        assert!(
+            receipt
+                .engine
+                .check_source_files(&[private_use.as_bytes()], &KVMap::new(), limits().source,)
+                .is_err()
+        );
         assert!(!receipt.engine.environment().contains(&name("first")));
         assert!(receipt.engine.environment().contains(&name("wrap.eq_1")));
         accepted(
             &receipt.engine,
             "theorem downstream.{u} {A : Sort u} (x : A) : wrap (wrap x) = x := by simp",
         );
+        // This API emits source data, not the IR required by the pin's normal
+        // import path. Read the real regions through its data reader instead.
+        aliases::reference_import_stdout(
+            &built,
+            r#"import Lean
+open Lean
+#eval do
+  let parts ← readModuleDataParts #["Main.olean", "Main.olean.server", "Main.olean.private"]
+  let some (exported, _) := parts[0]? | throw (IO.userError "missing exported region")
+  let some (complete, _) := parts[2]? | throw (IO.userError "missing private region")
+  IO.println s!"{parts.size}/{exported.isModule}/{exported.constNames.contains `wrap.eq_1}/{decide (complete.constNames.size > exported.constNames.size)}"
+"#,
+            true,
+            Some("3/true/true/true\n"),
+        );
+        let exact_budget = OleanWriteBudget {
+            max_bytes: artifact.report.file_bytes
+                + parts.server_report.file_bytes
+                + parts.private_report.file_bytes,
+            max_objects: artifact.report.runtime_objects
+                + parts.server_report.runtime_objects
+                + parts.private_report.runtime_objects,
+        };
+        let initial = Engine::builder().build_empty();
+        for budget in [
+            OleanWriteBudget {
+                max_bytes: exact_budget.max_bytes - 1,
+                ..exact_budget
+            },
+            OleanWriteBudget {
+                max_objects: exact_budget.max_objects - 1,
+                ..exact_budget
+            },
+        ] {
+            assert!(matches!(
+                build(&initial, &[("Main", &source)], budget),
+                Err(SourceModuleBuildError::Encode {
+                    error: fln::OleanWriteError::Budget { .. },
+                    ..
+                })
+            ));
+        }
+        let exact = build(&initial, &[("Main", &source)], exact_budget)
+            .unwrap()
+            .into_complete()
+            .unwrap();
+        assert_eq!(exact.artifacts[0].bytes, artifact.bytes);
+        let exact_parts = exact.artifacts[0].companions.as_ref().unwrap();
+        assert_eq!(exact_parts.server, parts.server);
+        assert_eq!(exact_parts.private, parts.private);
+    }
+}
+
+#[test]
+fn module_families_keep_import_visibility_and_share_the_closure_writer_budget() {
+    let files = [
+        (
+            "Main",
+            "module\nprelude\npublic import Lib\nimport Secret\n@[expose] public def chosen : Token := value\n",
+        ),
+        (
+            "Lib",
+            "module\nprelude\npublic inductive Token where | mk\n@[expose] public def value : Token := Token.mk\n",
+        ),
+        (
+            "Secret",
+            "module\nprelude\npublic inductive Hidden where | mk\n",
+        ),
+    ];
+    let initial = Engine::builder().build_empty();
+    let built = build(&initial, &files, OleanWriteBudget::default())
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let main = built
+        .artifacts
+        .iter()
+        .find(|a| a.name == name("Main"))
+        .unwrap();
+    let module = fln_olean::region::OleanView::parse(&main.bytes)
+        .unwrap()
+        .module_data(fln::OleanWalkBudget::default())
+        .unwrap();
+    assert!(module.is_module);
+    assert_eq!(
+        module
+            .imports
+            .iter()
+            .map(|i| (i.module.clone(), i.is_exported))
+            .collect::<Vec<_>>(),
+        [(name("Lib"), true), (name("Secret"), false)]
+    );
+    let receipt = imported(&built);
+    accepted(&receipt.engine, "def selected : Token := chosen");
+    let mut exact_budget = OleanWriteBudget {
+        max_bytes: 0,
+        max_objects: 0,
+    };
+    for artifact in &built.artifacts {
+        let parts = artifact.companions.as_ref().unwrap();
+        for report in [artifact.report, parts.server_report, parts.private_report] {
+            exact_budget.max_bytes += report.file_bytes;
+            exact_budget.max_objects += report.runtime_objects;
+        }
+    }
+    for budget in [
+        OleanWriteBudget {
+            max_bytes: exact_budget.max_bytes - 1,
+            ..exact_budget
+        },
+        OleanWriteBudget {
+            max_objects: exact_budget.max_objects - 1,
+            ..exact_budget
+        },
+    ] {
+        let error = build(&initial, &files, budget).unwrap_err();
+        assert_eq!(error.disposition(), ("resource", false, 3));
+        assert!(initial.environment().is_empty());
+    }
+    let retry = build(&initial, &files, exact_budget)
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    for (actual, expected) in retry.artifacts.iter().zip(&built.artifacts) {
+        assert_eq!(actual.bytes, expected.bytes);
+        let actual = actual.companions.as_ref().unwrap();
+        let expected = expected.companions.as_ref().unwrap();
+        assert_eq!(actual.server, expected.server);
+        assert_eq!(actual.private, expected.private);
     }
 }
 

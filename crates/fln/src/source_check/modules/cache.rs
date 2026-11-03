@@ -769,6 +769,7 @@ pub(super) fn run_collecting(
                     .as_ref()
                     .map(|world| world.engine().environment().clone());
                 public_scope = public.as_ref().map(|world| world.scope().clone());
+                let public_base = public.as_ref().map(|world| world.file_base().clone());
                 let export = Arc::new(if let Some(public) = public {
                     let export = public.finish()?;
                     replayed_declarations += export.declarations.len();
@@ -789,6 +790,7 @@ pub(super) fn run_collecting(
                         header,
                         imported.environment(),
                         checked.engine.environment(),
+                        public_base.as_ref().zip(public_environment.as_ref()),
                         &mut meter,
                     )?);
                     artifacts.push(Arc::clone(&artifact));

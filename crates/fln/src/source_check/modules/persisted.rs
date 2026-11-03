@@ -636,6 +636,7 @@ pub(super) fn readmit(
         header,
         imported.environment(),
         engine.environment(),
+        None,
         meter,
     ) else {
         return refuse(ModuleRecordRefusal::Artifact);
