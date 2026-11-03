@@ -7,6 +7,75 @@ fn operations() -> [Operation; 2] {
     [Operation::CheckCanceled, Operation::Initializing]
 }
 
+#[test]
+fn environment_observation_requires_complete_option_string_and_native_selection() {
+    let Some(raw) = raw_pin_environment() else {
+        return;
+    };
+    let operation = Operation::GetEnv;
+    assert!(
+        !primitive_matches(&raw, operation, &mut None, &mut 0, IngressLimits::default()).unwrap()
+    );
+    let exact = register(&raw, operation, false);
+    let mut work = 0;
+    assert!(
+        primitive_matches(
+            &exact,
+            operation,
+            &mut None,
+            &mut work,
+            IngressLimits::default()
+        )
+        .unwrap()
+    );
+    assert!(matches!(
+        primitive_matches(
+            &exact,
+            operation,
+            &mut None,
+            &mut 0,
+            IngressLimits {
+                max_nodes: work - 1,
+                ..IngressLimits::default()
+            }
+        ),
+        Err(IngressError::ResourceLimit { .. })
+    ));
+    assert!(
+        primitive_matches(
+            &register(&raw, operation, true),
+            operation,
+            &mut None,
+            &mut 0,
+            IngressLimits::default()
+        )
+        .is_err()
+    );
+    for target in [
+        operation.source_name(),
+        Name::from_components(["Option", "some"]),
+        Name::from_components(["String", "ofByteArray"]),
+    ] {
+        let changed = replace(&raw, &target, |info| match info {
+            ConstantInfo::Opaque(value) => value.value = c("Bool.false"),
+            ConstantInfo::Ctor(value) => value.num_fields += 1,
+            _ => panic!("the pinned environment observation target"),
+        });
+        assert!(
+            primitive_matches(
+                &register(&changed, operation, false),
+                operation,
+                &mut None,
+                &mut 0,
+                IngressLimits::default()
+            )
+            .is_err(),
+            "{}",
+            target.to_display_string()
+        );
+    }
+}
+
 fn raw_pin_environment() -> Option<Environment> {
     let Some(library) = std::env::var_os("FLN_REFERENCE_LIB").map(std::path::PathBuf::from) else {
         assert!(

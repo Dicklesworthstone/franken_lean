@@ -55,9 +55,72 @@ pub enum FileIoError {
     UnrepresentableFlush { errno: i32 },
     MalformedFlushResult,
     MalformedDirectoryResult,
+    MalformedPathResult,
+    MalformedEnvironmentResult,
 }
 
 impl Obj {
+    /// Observe the process working directory at the point the world action is
+    /// executed. The native String or IO.Error is validated into the same
+    /// neutral packet as file reads; it never supplies a logical FilePath.
+    pub fn try_current_dir(world: &Obj) -> Result<Obj, FileIoError> {
+        if !world.is_scalar() || world.unbox() != 0 {
+            return Err(FileIoError::InvalidWorld);
+        }
+        let result = Obj(crate::export::export_lean_io_current_dir());
+        string_result_transport(&result).ok_or(FileIoError::MalformedPathResult)
+    }
+
+    /// Resolve a canonical String path using the native epoch primitive.
+    /// Its C ABI consumes its filename, whereas this safe source door borrows
+    /// it: transfer a retained reference and preserve every caller alias.
+    /// Missing paths and embedded NUL retain the primitive's exact IO errors.
+    pub fn try_real_path(filename: &Obj, world: &Obj) -> Result<Obj, FileIoError> {
+        if !world.is_scalar() || world.unbox() != 0 {
+            return Err(FileIoError::InvalidWorld);
+        }
+        if !canonical_stdio_string(filename) {
+            return Err(FileIoError::InvalidFilename);
+        }
+        let result = Obj(crate::export::export_lean_io_realpath(
+            filename.clone_ref().into_raw(),
+        ));
+        string_result_transport(&result).ok_or(FileIoError::MalformedPathResult)
+    }
+
+    /// Read an environment variable without consuming its borrowed name.
+    /// The owned neutral pair is [present Bool, value String]; absence and a
+    /// present empty value remain distinct. The native Option layout is fully
+    /// checked here and is never treated as a logical Option constructor.
+    pub fn try_get_env(variable: &Obj, world: &Obj) -> Result<Obj, FileIoError> {
+        if !world.is_scalar() || world.unbox() != 0 {
+            return Err(FileIoError::InvalidWorld);
+        }
+        if !canonical_stdio_string(variable) {
+            return Err(FileIoError::InvalidString);
+        }
+        let result = Obj(crate::export::export_lean_io_getenv(variable.0));
+        let value = if result.is_scalar() && result.unbox() == 0 {
+            None
+        } else if native_stdio_ctor_shape(&result, 1, 1, 0) {
+            let value = result
+                .try_ctor_child(0)
+                .filter(canonical_stdio_string)
+                .ok_or(FileIoError::MalformedEnvironmentResult)?;
+            Some(value)
+        } else {
+            return Err(FileIoError::MalformedEnvironmentResult);
+        };
+        Ok(Obj::mk_ctor(
+            0,
+            vec![
+                Obj::mk_nat(usize::from(value.is_some())),
+                value.unwrap_or_else(|| Obj::mk_string("")),
+            ],
+            &[],
+        ))
+    }
+
     /// Whether this object owns exactly a native FILE Handle. No raw pointer
     /// escapes and no external finalizer or callback is invoked.
     pub fn is_file_handle(&self) -> bool {

@@ -183,6 +183,73 @@ fn assert_packet(exit: &VmExit, expected: usize) {
 }
 
 #[test]
+fn environment_queries_rebuild_checked_options_and_keep_actions_deferred() {
+    let Some(raw) = raw_pin_environment() else {
+        return;
+    };
+    let engine = Engine::from_environment(register(&raw, Operation::GetEnv, false));
+    let root = engine.logical_root(&KVMap::new());
+    // This key is impossible to find because NUL is rejected by the pin's
+    // getenv primitive. The valid key observes a real inherited variable.
+    let key = "PATH";
+    let expected = std::env::var(key).ok();
+    for (source, expected) in [
+        (format!("#eval IO.getEnv \"{key}\""), expected.clone()),
+        (
+            format!(
+                "def lookupEnvironment := IO.getEnv\ndef savedEnvironment : BaseIO (Option String) := lookupEnvironment \"{key}\"\n#eval savedEnvironment"
+            ),
+            expected.clone(),
+        ),
+        (
+            format!(
+                "#eval (show BaseIO (Option String) from fun world => IO.getEnv \"{key}\" world)"
+            ),
+            expected,
+        ),
+        ("#eval IO.getEnv \"PATH\\x00suffix\"".to_owned(), None),
+    ] {
+        let batch = run(&engine, &source);
+        let index = *batch.batch.source_evaluation_indices.last().unwrap();
+        let execution = &batch.batch.executions[index];
+        assert_native_row(execution, Operation::GetEnv);
+        let VmExit::Returned(result) = &execution.exit else {
+            panic!("the native environment query must return");
+        };
+        let packet = &result.value;
+        assert_eq!(packet.header().tag, 0);
+        assert_eq!(packet.header().other, 2);
+        assert_eq!(packet.try_ctor_child(1).unwrap().unbox(), 0);
+        let option = packet.try_ctor_child(0).unwrap();
+        assert!(
+            !option.is_scalar(),
+            "the checked Option has a logical constructor layout"
+        );
+        assert_eq!(option.header().tag, u8::from(expected.is_some()));
+        assert_eq!(option.header().other, u8::from(expected.is_some()));
+        if let Some(expected) = expected {
+            assert_eq!(
+                closed_obj_value(&option.try_ctor_child(0).unwrap()).unwrap(),
+                Some(ClosedVmValue::String(expected))
+            );
+        }
+        for (definition_index, definition) in batch.batch.executions.iter().enumerate() {
+            if !batch
+                .batch
+                .source_evaluation_indices
+                .contains(&definition_index)
+            {
+                let VmExit::Returned(value) = &definition.exit else {
+                    panic!("an action definition returns a closure")
+                };
+                assert_eq!(vm_value_kind(&value.value), VmValueKind::Closure);
+            }
+        }
+    }
+    assert_eq!(engine.logical_root(&KVMap::new()), root);
+}
+
+#[test]
 fn native_base_io_observations_run_through_actions_aliases_and_io_lifting() {
     let Some(raw) = raw_pin_environment() else {
         return;

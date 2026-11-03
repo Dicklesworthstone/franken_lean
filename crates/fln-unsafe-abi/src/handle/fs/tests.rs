@@ -58,6 +58,136 @@ fn no_leaks() {
 }
 
 #[test]
+fn path_observations_preserve_native_results_errors_and_filename_ownership() {
+    let _guard = lock();
+    let root = path("path-observations-λ");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::create_dir(root.join("child")).unwrap();
+    shadow::enable();
+    {
+        let world = Obj::mk_nat(0);
+        let current = Obj::try_current_dir(&world).unwrap();
+        assert_eq!(field(&current, 1).unbox(), 1);
+        assert_eq!(
+            text(&field(&current, 0)),
+            std::env::current_dir().unwrap().to_str().unwrap()
+        );
+        let filename = Obj::mk_string(root.join("child/..").to_str().unwrap());
+        let alias = filename.clone_ref();
+        let before = filename.header().rc;
+        let resolved = Obj::try_real_path(&filename, &world).unwrap();
+        assert_eq!(field(&resolved, 1).unbox(), 1);
+        assert_eq!(
+            text(&field(&resolved, 0)),
+            root.canonicalize().unwrap().to_str().unwrap()
+        );
+        assert_eq!(filename.header().rc, before);
+        assert_eq!(text(&filename), text(&alias));
+        let missing = Obj::mk_string(root.join("absent").to_str().unwrap());
+        let failed = Obj::try_real_path(&missing, &world).unwrap();
+        assert_eq!(field(&failed, 1).unbox(), 0);
+        assert_eq!(field(&failed, 4).unbox(), 1);
+        assert_eq!(text(&field(&failed, 5)), text(&missing));
+        assert_eq!(text(&field(&failed, 6)), "");
+        assert_eq!(
+            missing.header().rc,
+            2,
+            "the error retains the borrowed filename"
+        );
+        let nul = Obj::mk_string(&format!("{}\0ignored", root.display()));
+        let failed = Obj::try_real_path(&nul, &world).unwrap();
+        assert_eq!(
+            field(&failed, 1).unbox(),
+            0,
+            "an embedded NUL is never truncated to the existing path"
+        );
+    }
+    no_leaks();
+}
+
+#[test]
+fn process_observations_refuse_invalid_inputs_before_native_calls() {
+    let _guard = lock();
+    for world in [Obj::mk_nat(1), Obj::mk_ctor(0, vec![], &[])] {
+        assert!(matches!(
+            Obj::try_current_dir(&world),
+            Err(FileIoError::InvalidWorld)
+        ));
+        assert!(matches!(
+            Obj::try_real_path(&Obj::mk_string("."), &world),
+            Err(FileIoError::InvalidWorld)
+        ));
+        assert!(matches!(
+            Obj::try_get_env(&Obj::mk_string("PATH"), &world),
+            Err(FileIoError::InvalidWorld)
+        ));
+    }
+    for bad in [
+        Obj::mk_nat(0),
+        Obj::mk_ctor(0, vec![], &[]),
+        Obj::mk_array(vec![]),
+    ] {
+        assert!(matches!(
+            Obj::try_real_path(&bad, &Obj::mk_nat(0)),
+            Err(FileIoError::InvalidFilename)
+        ));
+        assert!(matches!(
+            Obj::try_get_env(&bad, &Obj::mk_nat(0)),
+            Err(FileIoError::InvalidString)
+        ));
+    }
+}
+
+#[test]
+fn environment_observation_distinguishes_missing_empty_unicode_and_embedded_nul() {
+    const CHILD: &str = "FLN_ENV_OBSERVATION_CHILD";
+    const TEXT: &str = "FLN_ENV_OBSERVATION_TEXT";
+    const EMPTY: &str = "FLN_ENV_OBSERVATION_EMPTY";
+    const ABSENT: &str = "FLN_ENV_OBSERVATION_ABSENT";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("handle::fs::tests::environment_observation_distinguishes_missing_empty_unicode_and_embedded_nul")
+            .arg("--nocapture")
+            .env(CHILD, "1")
+            .env(TEXT, "aλ🙂z")
+            .env(EMPTY, "")
+            .env_remove(ABSENT)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let _guard = lock();
+    shadow::enable();
+    {
+        for (variable, present, expected) in [
+            (TEXT.to_owned(), 1, "aλ🙂z"),
+            (EMPTY.to_owned(), 1, ""),
+            (ABSENT.to_owned(), 0, ""),
+            (format!("{TEXT}\0ignored"), 0, ""),
+        ] {
+            let input = Obj::mk_string(&variable);
+            let alias = input.clone_ref();
+            let before = input.header().rc;
+            let result = Obj::try_get_env(&input, &Obj::mk_nat(0)).unwrap();
+            assert_eq!(result.header().tag, 0);
+            assert_eq!(result.header().other, 2);
+            assert_eq!(result.try_ctor_child(0).unwrap().unbox(), present);
+            assert_eq!(text(&result.try_ctor_child(1).unwrap()), expected);
+            assert_eq!(input.header().rc, before);
+            assert_eq!(text(&input), text(&alias));
+        }
+    }
+    no_leaks();
+}
+
+#[test]
 fn file_io_preserves_borrows_aliases_unicode_nuls_and_finalizes_the_last_handle() {
     let _guard = lock();
     let path = path("aliases");
