@@ -5,7 +5,7 @@ use crate::SourceModuleInput;
 use crate::source_check::modules::imported::SourceOleanImport;
 use crate::source_check::modules::{
     SourceMacroModuleCheck, SourceModuleCheck, SourceModuleCheckError, SourceModuleCheckLimits,
-    SourceModuleMacroInputs,
+    SourceModuleDeferredMacroInputs, SourceModuleMacroInputs,
 };
 use crate::source_check::{SourceCheckError, SourceCheckLimits};
 use std::cell::Cell;
@@ -864,4 +864,174 @@ fn runtime_vm_limits_withhold_macro_program_states_and_retain_macro_work() {
     assert_eq!(stopped.attempts.len(), 2);
     assert!(stopped.completed_vm_usage.steps > 0);
     assert!(stopped.states.is_none());
+}
+
+fn check_deferred(
+    imported: &SourceOleanImport,
+    compilation: MacroCompilationInputs,
+    files: &[(&str, &str)],
+    registry_limits: MacroRegistryLimits,
+    cancellation: Option<&dyn CancellationProbe>,
+) -> SourceMacroModuleCheck {
+    let names: Vec<_> = files.iter().map(|(label, _)| name(label)).collect();
+    let inputs: Vec<_> = files
+        .iter()
+        .zip(&names)
+        .map(|((_, source), name)| SourceModuleInput {
+            name,
+            source: source.as_bytes(),
+        })
+        .collect();
+    imported.check_source_modules_with_deferred_imported_macros(
+        &inputs,
+        &name("Main"),
+        &KVMap::new(),
+        SourceModuleCheckLimits::new(SourceCheckLimits::new(admission())),
+        SourceModuleDeferredMacroInputs {
+            compilation,
+            registry_limits,
+            context: context(),
+            state: MacroState {
+                macro_scope: 17,
+                ..MacroState::default()
+            },
+            limits: MacroTreeLimits::default(),
+        },
+        cancellation,
+    )
+}
+
+#[test]
+fn deferred_module_macros_leave_unused_code_uncompiled_and_keep_exact_import_worlds() {
+    let (imported, mut code) = batches::artifact_import_fixture();
+    let before = imported.engine.logical_root(&KVMap::new());
+    // Both the unused global diagnostic and an inactive scoped macro lack IR.
+    // Their complete checked owners remain in the receipt and its journals.
+    for module in &mut code {
+        module.decls.retain(|declaration| {
+            declaration.name() != &name("SourceLibrary.diagnostic")
+                && declaration.name() != &name("SourceLibrary.left")
+        });
+    }
+    assert!(matches!(
+        imported.prepare_imported_macros(
+            &code,
+            &VerifiedPartition::user_fixture(),
+            &users(&code),
+            MacroRegistryLimits::default(),
+        ),
+        Err(MacroRegistrationError::Compile { .. })
+    ));
+    let declarations = users(&code);
+    let compilation =
+        MacroCompilationInputs::new(code, VerifiedPartition::user_fixture(), declarations);
+    let files = [
+        (
+            "Main",
+            "prelude\nimport Lib\nimport Plain\ndef fromMain : Nat := 13 + 17",
+        ),
+        (
+            "Lib",
+            "prelude\nimport SourceLibrary\ndef fromLib : Nat := 7 + 11",
+        ),
+        ("Plain", "prelude\ndef ordinary : Nat := 7 + 11"),
+    ];
+    let report = check_deferred(
+        &imported,
+        compilation.clone(),
+        &files,
+        MacroRegistryLimits::default(),
+        None,
+    );
+    let checked = succeeded(&report);
+    for (declaration, expected) in [("fromLib", 11), ("ordinary", 18), ("fromMain", 17)] {
+        assert_declared_value(&checked.checked.engine, declaration, expected);
+    }
+    let states = report.states.as_ref().unwrap();
+    assert_eq!(states[&name("Lib")].macro_scope, 19);
+    assert_eq!(states[&name("Plain")].macro_scope, 17);
+    assert_eq!(states[&name("Main")].macro_scope, 19);
+    assert_eq!(report.attempts.len(), 4);
+    for source in [
+        "prelude\nimport Lib\ndef blocked : Nat := 7 - 11",
+        "prelude\nimport Lib\nopen scoped SourceScoped\ndef blocked : Nat := 7 + 11",
+    ] {
+        let failed = check_deferred(
+            &imported,
+            compilation.clone(),
+            &[files[1], ("Main", source)],
+            MacroRegistryLimits::default(),
+            None,
+        );
+        assert!(
+            matches!(
+                &failed.outcome,
+                Outcome::Complete(Err(SourceModuleCheckError::Source {
+                    module,
+                    error: SourceCheckError::ImportedMacro { .. },
+                })) if module == &name("Main")
+            ),
+            "{failed:?}"
+        );
+        assert_eq!(failed.attempts.len(), 3);
+        assert!(failed.completed_vm_usage.steps > 0);
+        assert!(failed.states.is_none());
+        assert_eq!(imported.engine.logical_root(&KVMap::new()), before);
+        assert!(!imported.engine.environment().contains(&name("fromLib")));
+        assert!(!imported.engine.environment().contains(&name("blocked")));
+    }
+}
+
+#[test]
+fn deferred_module_compilation_stops_and_cancellation_publish_no_module_states() {
+    struct Cancel;
+    impl CancellationProbe for Cancel {
+        fn is_cancelled(&self) -> bool {
+            true
+        }
+    }
+
+    let (imported, code) = batches::artifact_import_fixture();
+    let before = imported.engine.logical_root(&KVMap::new());
+    let declarations = users(&code);
+    let compilation =
+        MacroCompilationInputs::new(code, VerifiedPartition::user_fixture(), declarations);
+    let files = [
+        ("Main", "prelude\nimport Lib\ndef blocked : Nat := 7 + 11"),
+        (
+            "Lib",
+            "prelude\nimport SourceLibrary\ndef checkedPrefix : Nat := 5",
+        ),
+    ];
+    let mut limits = MacroRegistryLimits::default();
+    limits.compilation.ir.max_work = 0;
+    let stopped = check_deferred(&imported, compilation.clone(), &files, limits, None);
+    assert!(matches!(stopped.outcome, Outcome::Inconclusive(_)));
+    assert_eq!(stopped.attempts.len(), 1);
+    assert_eq!(stopped.completed_vm_usage.steps, 0);
+    assert!(stopped.states.is_none());
+    assert!(!imported.engine.environment().contains(&name("checkedPrefix")));
+    assert!(!imported.engine.environment().contains(&name("blocked")));
+    assert_eq!(imported.engine.logical_root(&KVMap::new()), before);
+
+    let cancelled = check_deferred(
+        &imported,
+        compilation.clone(),
+        &files,
+        MacroRegistryLimits::default(),
+        Some(&Cancel),
+    );
+    assert!(matches!(cancelled.outcome, Outcome::Inconclusive(_)));
+    assert!(cancelled.attempts.is_empty());
+    assert!(cancelled.states.is_none());
+    let recovered = check_deferred(
+        &imported,
+        compilation,
+        &files,
+        MacroRegistryLimits::default(),
+        None,
+    );
+    assert_declared_value(&succeeded(&recovered).checked.engine, "blocked", 11);
+    assert_eq!(recovered.states.as_ref().unwrap().len(), 2);
+    assert_eq!(imported.engine.logical_root(&KVMap::new()), before);
 }

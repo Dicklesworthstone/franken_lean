@@ -77,9 +77,16 @@ search directory cannot supply a replacement for a missing companion. The
 defaults to 64 MiB. `--max-bytes` continues to bound the source closure separately.
 
 Imported registration journals and declaration ownership are validated before
-expansion. User macro code runs on Golem, with toolchain operations provided by
-native implementations; the pinned partition cannot be overridden to run a
-toolchain implementation as user code. The expanded declarations then pass through
+expansion, including inactive scoped registrations. The checking CLI compiles a
+macro's reachable implementation only when that macro is selected, so an unused
+macro with an unsupported operation does not block unrelated declarations.
+Successful compilations are shared across module projections and scoped
+activations; mutable invocation state remains separate. A selected implementation
+that cannot compile stops the check without falling back to an older registration.
+
+User macro code runs on Golem, with toolchain operations provided by native
+implementations; the pinned partition cannot be overridden to run a toolchain
+implementation as user code. The expanded declarations then pass through
 the same kernel and independent-checker admission as ordinary source. Expanding a
 macro does not bypass proof checking.
 
@@ -146,6 +153,14 @@ header parser are exported from `fln::source_check::modules`. A successful
 `SourceModuleCheck` contains the checked entry environment, closure-wide file,
 command and theorem counts, logical roots, module order and replay counts. The
 supplied engine is unchanged on every success, failure and nonanswer.
+
+For an admitted external import receipt,
+`SourceOleanImport::check_source_modules_with_deferred_imported_macros` accepts
+`SourceModuleDeferredMacroInputs`. `MacroCompilationInputs::new` takes ownership
+of decoded IR, the verified partition and the explicit set of permitted user
+declarations without cloning IR bodies. The existing eager preparation APIs
+remain available for callers that require every registered implementation to
+compile before checking starts.
 
 The initial environment is explicit. Without external imports, ordinary checking
 uses the native source seed where appropriate. External `.olean` imports are

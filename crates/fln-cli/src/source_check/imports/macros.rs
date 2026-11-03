@@ -1,11 +1,13 @@
 //! Explicit imported-macro source commands over the same captured artifact closure.
-//! The census remains pinned, every registration must prepare, and no ambient
+//! The census remains pinned, every registration must validate, and no ambient
 //! search root can supply code for an artifact selected from another root.
 use super::*;
 use fln::imported_ir::VerifiedPartition;
-use fln::imported_macros::registrations::{MacroAttempt, MacroRegistryLimits, MacroTreeLimits};
+use fln::imported_macros::registrations::{
+    MacroAttempt, MacroCompilationInputs, MacroRegistryLimits, MacroTreeLimits,
+};
 use fln::imported_macros::{MacroContext, MacroState};
-use fln::source_check::modules::SourceModuleMacroInputs;
+use fln::source_check::modules::{SourceModuleDeferredMacroInputs, SourceModuleMacroInputs};
 use std::collections::BTreeSet;
 
 const DEFAULT_IR_BYTES: usize = 64 * 1024 * 1024;
@@ -137,6 +139,54 @@ pub(in crate::source_check) struct Report {
 }
 
 impl Report {
+    fn from_attempts(
+        ir_bytes: usize,
+        attempts: &[MacroAttempt],
+        vm_steps: u64,
+        syntax_visits: u64,
+    ) -> Result<Self, Failure> {
+        let mut reference = BTreeSet::new();
+        let mut native = BTreeSet::new();
+        for attempt in attempts {
+            reference.extend(
+                attempt
+                    .reference_functions
+                    .iter()
+                    .map(|function| &function.name),
+            );
+            native.extend(attempt.native_functions.iter().map(String::as_str));
+        }
+        let mut linked_json = String::new();
+        push_report(&mut linked_json, ",\"linkedReferenceFunctions\":[")?;
+        for (index, name) in reference.into_iter().enumerate() {
+            if index != 0 {
+                push_report(&mut linked_json, ",")?;
+            }
+            push_report(
+                &mut linked_json,
+                &format!(
+                    "{{\"name\":{},\"producer\":\"reference\"}}",
+                    json_string(&name.to_display_string())
+                ),
+            )?;
+        }
+        push_report(&mut linked_json, "],\"linkedNativeFunctions\":[")?;
+        for (index, name) in native.into_iter().enumerate() {
+            if index != 0 {
+                push_report(&mut linked_json, ",")?;
+            }
+            push_report(&mut linked_json, &json_string(name))?;
+        }
+        push_report(&mut linked_json, "]")?;
+        Ok(Self {
+            attempts: attempts.len(),
+            vm_steps,
+            syntax_visits,
+            ir_bytes,
+            linked_json,
+        })
+    }
+
     pub(in crate::source_check) fn json(&self) -> String {
         format!(
             ",\"importedMacros\":{{\"producer\":\"reference\",\"attempts\":{},\"vmSteps\":{},\"syntaxVisits\":{},\"irBytes\":{}{}}}",
@@ -350,50 +400,11 @@ impl Prepared {
         vm_steps: u64,
         syntax_visits: u64,
     ) -> Result<Report, Failure> {
-        let mut reference = BTreeSet::new();
-        let mut native = BTreeSet::new();
-        for attempt in attempts {
-            reference.extend(
-                attempt
-                    .reference_functions
-                    .iter()
-                    .map(|function| &function.name),
-            );
-            native.extend(attempt.native_functions.iter().map(String::as_str));
-        }
-        let mut linked_json = String::new();
-        push_report(&mut linked_json, ",\"linkedReferenceFunctions\":[")?;
-        for (index, name) in reference.into_iter().enumerate() {
-            if index != 0 {
-                push_report(&mut linked_json, ",")?;
-            }
-            push_report(
-                &mut linked_json,
-                &format!(
-                    "{{\"name\":{},\"producer\":\"reference\"}}",
-                    json_string(&name.to_display_string())
-                ),
-            )?;
-        }
-        push_report(&mut linked_json, "],\"linkedNativeFunctions\":[")?;
-        for (index, name) in native.into_iter().enumerate() {
-            if index != 0 {
-                push_report(&mut linked_json, ",")?;
-            }
-            push_report(&mut linked_json, &json_string(name))?;
-        }
-        push_report(&mut linked_json, "]")?;
-        Ok(Report {
-            attempts: attempts.len(),
-            vm_steps,
-            syntax_visits,
-            ir_bytes: self.bytes,
-            linked_json,
-        })
+        Report::from_attempts(self.bytes, attempts, vm_steps, syntax_visits)
     }
 
     pub(in crate::source_check) fn check(
-        &self,
+        self,
         loaded: &Loaded,
         base: Option<&OleanBase>,
         limits: fln::SourceCheckLimits,
@@ -412,15 +423,27 @@ impl Prepared {
             .zip(sources)
             .map(|(name, source)| SourceModuleInput { name, source })
             .collect::<Vec<_>>();
-        let result = base.receipt.check_source_modules_with_imported_macros(
+        let result = base.receipt.check_source_modules_with_deferred_imported_macros(
             &inputs,
             &names[0],
             &fln::KVMap::new(),
             SourceModuleCheckLimits::new(limits),
-            self.inputs(&users, None),
+            SourceModuleDeferredMacroInputs {
+                compilation: MacroCompilationInputs::new(self.modules, self.partition, users),
+                registry_limits: MacroRegistryLimits::default(),
+                context: MacroContext {
+                    quotation_context: names[0].clone(),
+                    current_macro_scope: 0,
+                    current_recursion_depth: 0,
+                    max_recursion_depth: 1000,
+                },
+                state: MacroState::default(),
+                limits: MacroTreeLimits::default(),
+            },
             None,
         );
-        let report = self.report(
+        let report = Report::from_attempts(
+            self.bytes,
             &result.attempts,
             result.completed_vm_usage.steps,
             result.tree_usage.visits,

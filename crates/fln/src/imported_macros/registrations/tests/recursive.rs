@@ -844,3 +844,78 @@ fn recursive_cycles_and_mid_call_cancellation_are_typed_nonanswers() {
     let recovered = execute(&registry, &input, MacroDispatchLimits::default(), None);
     assert_eq!(expanded(&recovered), expected);
 }
+
+#[test]
+fn deferred_nested_compilation_exhaustion_remains_inconclusive_without_fallback() {
+    let module = checked(
+        "User",
+        &[owner("User.outer"), owner("User.large"), owner("User.fallback")],
+        &[],
+    );
+    let rows = journal(&[
+        ("outer", "User.outer", None),
+        ("choice", "User.fallback", None),
+        ("choice", "User.large", None),
+    ]);
+    let mut large = function("User.large", Behavior::Identity);
+    let IrDecl::Function { body, .. } = &mut large else {
+        unreachable!()
+    };
+    // The outer closure fits; only the runtime-selected child's compilation
+    // exceeds the allowance. The callee is not a direct IR dependency.
+    body.stmts.extend(
+        (4..1200).map(|x| bind(x, IrExpr::Lit(IrLit::Num(IrNat::Small(0))))),
+    );
+    let mut limits = MacroRegistryLimits::default();
+    limits.compilation.ir.max_work = 512;
+    let registry = prepare_deferred(
+        &[MacroRegistrationModule {
+            checked: &module,
+            extensions: &rows,
+        }],
+        code(vec![
+            recursive_function("User.outer", Some(0)),
+            large,
+            function("User.fallback", Behavior::Identity),
+        ]),
+        limits,
+    );
+    let report = execute(
+        &registry,
+        &outer(choice()),
+        MacroDispatchLimits::default(),
+        None,
+    );
+    assert!(
+        matches!(
+            &report.outcome,
+            Outcome::Inconclusive(Inconclusive {
+                cause: InconclusiveCause::DependencyUnavailable { .. },
+                ..
+            })
+        ),
+        "{report:?}"
+    );
+    assert_eq!(attempted(&report), [name("User.outer"), name("User.large")]);
+    assert!(
+        report
+            .attempts
+            .iter()
+            .all(|attempt| attempt.vm_usage.is_none())
+    );
+    assert!(registry.candidates[&name("outer")][0]
+        .compiled
+        .compiled
+        .get()
+        .is_some());
+    assert!(registry.candidates[&name("choice")][0]
+        .compiled
+        .compiled
+        .get()
+        .is_none());
+    assert!(registry.candidates[&name("choice")][1]
+        .compiled
+        .compiled
+        .get()
+        .is_none());
+}

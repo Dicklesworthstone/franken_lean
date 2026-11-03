@@ -320,7 +320,7 @@ pub(super) fn run(
                 Ok(base) => base,
                 Err(error) => return failed(error.class, &error.detail, error.authority, json, error.exit),
             };
-            let checked = if let Some(inputs) = macro_inputs.as_ref() {
+            let checked = if let Some(inputs) = macro_inputs {
                 inputs.check(&loaded, olean_base.as_ref(), limits)
                     .map(|outcome| outcome.map_complete(|(checked, report)| (checked, Some(report))))
             } else {
@@ -387,7 +387,7 @@ pub(super) fn run(
             // The process ends with this answer. Tearing down an imported closure
             // (65,404 declarations for `Init`) node by node took seconds; the
             // operating system reclaims it at exit in one step.
-            std::mem::forget((engine, olean_base, result, loaded, macro_inputs));
+            std::mem::forget((engine, olean_base, result, loaded));
             MultiplexerOutput::success(stdout)
         });
     match worker {

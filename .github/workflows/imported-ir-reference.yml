@@ -105,6 +105,7 @@ jobs:
           files=(crates/fln/src/imported_ir/constructor_updates.rs
             crates/fln/src/lib.rs
             crates/fln/src/source_check/modules.rs
+            crates/fln/src/source_check/modules/imported.rs
             crates/fln/src/source_check/modules/execution.rs
             crates/fln/src/source_check/modules/imported_macros.rs
             crates/fln-cli/src/source_check/imports/execution.rs

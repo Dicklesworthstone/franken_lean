@@ -8,8 +8,8 @@ use super::*;
 use super::execution::{SourceProgramExecution, SourceProgramExecutionError, SourceProgramLimits};
 use crate::imported_ir::VerifiedPartition;
 use crate::imported_macros::registrations::{
-    MacroAttempt, MacroRegistrationError, MacroRegistryLimits, MacroTreeLimits, MacroTreeUsage,
-    RegisteredMacros,
+    MacroAttempt, MacroCompilationInputs, MacroRegistrationError, MacroRegistryLimits,
+    MacroTreeLimits, MacroTreeUsage, RegisteredMacros,
 };
 use crate::imported_macros::source::{
     FileSession, FileSessionReport, SourceMacroError, SourceMacroInvocation,
@@ -37,6 +37,18 @@ pub struct SourceModuleMacroInputs<'a> {
     pub state: MacroState,
     /// Attempts, VM steps, visits and generated syntax accumulate over the
     /// complete source graph, including modules preceding a failed module.
+    pub limits: MacroTreeLimits,
+}
+
+/// Owned compilation inputs for source modules that compile imported macros on
+/// first use. Context, initial state and graph-wide expansion limits have the
+/// same meaning as in `SourceModuleMacroInputs`. No partial registration table
+/// can be supplied: the receipt still provides every captured journal.
+pub struct SourceModuleDeferredMacroInputs {
+    pub compilation: MacroCompilationInputs,
+    pub registry_limits: MacroRegistryLimits,
+    pub context: MacroContext,
+    pub state: MacroState,
     pub limits: MacroTreeLimits,
 }
 
@@ -136,12 +148,17 @@ pub(super) struct ModuleMacroSession {
 }
 
 impl ModuleMacroSession {
-    fn new(registry: RegisteredMacros, input: SourceModuleMacroInputs<'_>) -> Self {
+    fn new(
+        registry: RegisteredMacros,
+        context: MacroContext,
+        state: MacroState,
+        limits: MacroTreeLimits,
+    ) -> Self {
         Self {
             registry,
-            context: input.context,
-            state: input.state,
-            limits: input.limits,
+            context,
+            state,
+            limits,
             states: BTreeMap::new(),
             attempts: Vec::new(),
             completed_vm_usage: empty_usage(),
@@ -416,7 +433,8 @@ impl imported::SourceOleanImport {
                 )));
             }
         };
-        let mut session = ModuleMacroSession::new(registry, input);
+        let mut session =
+            ModuleMacroSession::new(registry, input.context, input.state, input.limits);
         let cancellation = cancellation.map(ModuleCancellation);
         let outcome = match self.execute_source_modules_with_implicit_init(
             modules,
@@ -458,6 +476,73 @@ impl imported::SourceOleanImport {
         input: SourceModuleMacroInputs<'_>,
         cancellation: Option<&dyn CancellationProbe>,
     ) -> SourceMacroModuleCheck {
+        self.check_source_modules_with_macro_preparation(
+            modules,
+            entry,
+            options,
+            limits,
+            || {
+                let registry = self.prepare_imported_macros(
+                    input.code,
+                    input.partition,
+                    input.user_declarations,
+                    input.registry_limits,
+                )?;
+                Ok(ModuleMacroSession::new(
+                    registry,
+                    input.context,
+                    input.state,
+                    input.limits,
+                ))
+            },
+            cancellation,
+        )
+    }
+
+    /// Check the same complete import world while compiling each macro only
+    /// when dispatch reaches it. Unused and inactive candidates need valid
+    /// checked owners but need not have executable closures in this native
+    /// Mirror slice. An invoked unsupported closure stops the check; it never
+    /// disappears from the table or falls back to an older candidate.
+    pub fn check_source_modules_with_deferred_imported_macros(
+        &self,
+        modules: &[SourceModuleInput<'_>],
+        entry: &Name,
+        options: &KVMap,
+        limits: SourceModuleCheckLimits,
+        input: SourceModuleDeferredMacroInputs,
+        cancellation: Option<&dyn CancellationProbe>,
+    ) -> SourceMacroModuleCheck {
+        self.check_source_modules_with_macro_preparation(
+            modules,
+            entry,
+            options,
+            limits,
+            || {
+                let registry = self.prepare_imported_macros_deferred(
+                    input.compilation,
+                    input.registry_limits,
+                )?;
+                Ok(ModuleMacroSession::new(
+                    registry,
+                    input.context,
+                    input.state,
+                    input.limits,
+                ))
+            },
+            cancellation,
+        )
+    }
+
+    fn check_source_modules_with_macro_preparation(
+        &self,
+        modules: &[SourceModuleInput<'_>],
+        entry: &Name,
+        options: &KVMap,
+        limits: SourceModuleCheckLimits,
+        prepare: impl FnOnce() -> Result<ModuleMacroSession, MacroRegistrationError>,
+        cancellation: Option<&dyn CancellationProbe>,
+    ) -> SourceMacroModuleCheck {
         if cancellation.is_some_and(CancellationProbe::is_cancelled) {
             return SourceMacroModuleCheck::stopped(Outcome::Inconclusive(
                 Inconclusive::cancelled("source-module macros/before-preparation"),
@@ -471,13 +556,8 @@ impl imported::SourceOleanImport {
                 },
             )));
         }
-        let registry = match self.prepare_imported_macros(
-            input.code,
-            input.partition,
-            input.user_declarations,
-            input.registry_limits,
-        ) {
-            Ok(registry) => registry,
+        let mut session = match prepare() {
+            Ok(session) => session,
             Err(error) => {
                 return SourceMacroModuleCheck::stopped(Outcome::Complete(Err(
                     SourceModuleCheckError::Source {
@@ -487,7 +567,6 @@ impl imported::SourceOleanImport {
                 )));
             }
         };
-        let mut session = ModuleMacroSession::new(registry, input);
         let cancellation = cancellation.map(ModuleCancellation);
         let outcome = match cache::run_collecting(
             &self.contexts.complete,

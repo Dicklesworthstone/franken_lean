@@ -727,8 +727,47 @@ fn imported_macro_checking_runs_the_real_companion_and_keeps_admission_authority
     assert!(stdout.contains("\"executed\":false"), "{stdout}");
     assert!(stdout.contains("\"attempts\":0,"), "{stdout}");
     assert!(stdout.contains("\"vmSteps\":0,"), "{stdout}");
-}
 
+    // A complete registration table can contain macros whose runtime support
+    // is not needed by this program. Compile bodies only when dispatch selects
+    // them, then preserve the existing typed refusal if the body is demanded.
+    let dormant = root.join("dormant");
+    let dormant_source = format!(
+        "{}\n{}",
+        include_str!("../../fln-olean/fixtures/ir/AdmittedSourceMacro.lean"),
+        concat!(
+            "@[extern \"fln_missing_macro_native\", noinline]\n",
+            "public meta def absentMacroPrimitive (stx : Syntax) : Syntax := stx\n",
+            "@[macro Lean.Parser.Term.hole]\n",
+            "public meta def dormantMacro : Macro := fun stx _ state =>\n",
+            "  .ok (absentMacroPrimitive stx) state\n",
+        )
+    );
+    compile_macro_provider(&reference, &dormant, &dormant_source);
+    let dormant_search = std::env::join_paths([&dormant, &library]).unwrap();
+    let unused = macro_check(&entry, &dormant_search, &partition, &cache, None);
+    assert_eq!(unused.status.code(), Some(0), "{unused:?}");
+    let stdout = String::from_utf8_lossy(&unused.stdout);
+    assert!(stdout.contains("\"executed\":true"), "{stdout}");
+    assert!(stdout.contains("\"theorems\":1"), "{stdout}");
+    let demanded = client.join("Demanded.lean");
+    std::fs::write(
+        &demanded,
+        concat!(
+            "prelude\nimport AdmittedSourceMacro\n",
+            "def checkedPrefix : Nat := (11 : Bool)\n",
+            "def demanded : Nat := _\n",
+        ),
+    )
+    .unwrap();
+    let refused = macro_check(&demanded, &dormant_search, &partition, &cache, None);
+    assert_eq!(refused.status.code(), Some(5), "{refused:?}");
+    assert!(refused.stdout.is_empty(), "{refused:?}");
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(stderr.contains("\"outcome\":\"capability\""), "{stderr}");
+    assert!(stderr.contains("\"authority\":false"), "{stderr}");
+    assert!(stderr.contains("absentMacroPrimitive"), "{stderr}");
+}
 
 /// An actual pinned compiler produces the macro code and its checked owner;
 /// the installed native commands receive only the resulting artifact closure.
