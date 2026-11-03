@@ -2921,7 +2921,7 @@ fn render_olean_human(bytes: usize, decoded: &fln::DecodedOlean, constants: bool
 /// depth-and-width-bounded term sketch per constant so admission halts can be
 /// diagnosed without another tool.
 const CONSTANT_SKETCH_ROWS: usize = 4096;
-const CONSTANT_SKETCH_TERM_CHARS: usize = 700;
+const CONSTANT_SKETCH_TERM_BYTES: usize = 700;
 
 fn constant_kind_label(info: &fln::ConstantInfo) -> &'static str {
     match info {
@@ -2936,26 +2936,31 @@ fn constant_kind_label(info: &fln::ConstantInfo) -> &'static str {
     }
 }
 
-fn sketch_level(level: &fln::Level, out: &mut String) {
+fn sketch_level(level: &fln::Level, budget: &mut usize, out: &mut String) {
+    if *budget == 0 || out.len() > CONSTANT_SKETCH_TERM_BYTES {
+        out.push('…');
+        return;
+    }
+    *budget -= 1;
     match level.view() {
         LevelView::Zero => out.push('0'),
         LevelView::Succ(inner) => {
             out.push_str("succ(");
-            sketch_level(inner, out);
+            sketch_level(inner, budget, out);
             out.push(')');
         }
         LevelView::Max(lhs, rhs) => {
             out.push_str("max(");
-            sketch_level(lhs, out);
+            sketch_level(lhs, budget, out);
             out.push(',');
-            sketch_level(rhs, out);
+            sketch_level(rhs, budget, out);
             out.push(')');
         }
         LevelView::IMax(lhs, rhs) => {
             out.push_str("imax(");
-            sketch_level(lhs, out);
+            sketch_level(lhs, budget, out);
             out.push(',');
-            sketch_level(rhs, out);
+            sketch_level(rhs, budget, out);
             out.push(')');
         }
         LevelView::Param(name) => out.push_str(&name.to_display_string()),
@@ -2964,7 +2969,7 @@ fn sketch_level(level: &fln::Level, out: &mut String) {
 }
 
 fn sketch_expr(expr: &fln::Expr, budget: &mut usize, out: &mut String) {
-    if *budget == 0 || out.len() > CONSTANT_SKETCH_TERM_CHARS {
+    if *budget == 0 || out.len() > CONSTANT_SKETCH_TERM_BYTES {
         out.push('…');
         return;
     }
@@ -2976,7 +2981,7 @@ fn sketch_expr(expr: &fln::Expr, budget: &mut usize, out: &mut String) {
         }
         fln::ExprNode::Sort { level } => {
             out.push_str("Sort{");
-            sketch_level(level, out);
+            sketch_level(level, budget, out);
             out.push('}');
         }
         fln::ExprNode::Const { name, levels } => {
@@ -2987,7 +2992,11 @@ fn sketch_expr(expr: &fln::Expr, budget: &mut usize, out: &mut String) {
                     if index != 0 {
                         out.push(',');
                     }
-                    sketch_level(level, out);
+                    if *budget == 0 || out.len() > CONSTANT_SKETCH_TERM_BYTES {
+                        out.push('…');
+                        break;
+                    }
+                    sketch_level(level, budget, out);
                 }
                 out.push('}');
             }
@@ -3056,8 +3065,12 @@ fn render_constant_sketch(decoded: &fln::DecodedOlean) -> String {
         let mut term = String::new();
         let mut budget = 64usize;
         sketch_expr(&val.type_, &mut budget, &mut term);
-        let truncated = if term.len() > CONSTANT_SKETCH_TERM_CHARS {
-            term.truncate(CONSTANT_SKETCH_TERM_CHARS);
+        let truncated = if term.len() > CONSTANT_SKETCH_TERM_BYTES {
+            let mut end = CONSTANT_SKETCH_TERM_BYTES;
+            while !term.is_char_boundary(end) {
+                end -= 1;
+            }
+            term.truncate(end);
             "…"
         } else {
             ""

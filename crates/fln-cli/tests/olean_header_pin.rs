@@ -80,6 +80,101 @@ fn built(scratch: &Scratch) -> Vec<u8> {
     std::fs::read(scratch.0.join("producer/.lake/build/lib/lean/Ext/A.olean")).unwrap()
 }
 
+fn inspect_constant_type(type_: fln::Expr) -> Output {
+    let scratch = Scratch::new();
+    let constants = [fln::ConstantInfo::Axiom(fln::AxiomVal {
+        base: fln::ConstantVal {
+            name: fln::Name::from_components(["probe"]),
+            level_params: Vec::new(),
+            type_,
+        },
+        is_unsafe: false,
+    })];
+    let bytes = fln::encode_olean_module(
+        fln::OleanModuleWriteInput {
+            is_module: false,
+            imports: &[],
+            constants: &constants,
+            extra_const_names: &[],
+        },
+        fln::OleanWriteHeader {
+            version: fln::OLEAN_ACCEPTED_VERSIONS[0],
+            flags: 1,
+            lean_version: fln::OLEAN_PIN_TAG.strip_prefix('v').unwrap(),
+            githash: fln::OLEAN_PIN_COMMIT,
+            base_addr: fln::OLEAN_REGION_ALIGN as u64,
+        },
+        fln::OleanWriteBudget::default(),
+    )
+    .unwrap()
+    .bytes;
+    let path = scratch.write("probe.olean", &bytes);
+    let output = fln(
+        &scratch,
+        &["olean", "inspect", "--constants", path.to_str().unwrap()],
+        None,
+    );
+    assert_eq!(std::fs::read(path).unwrap(), bytes);
+    output
+}
+
+#[test]
+fn inspecting_constants_preserves_utf8_at_the_sketch_boundary() {
+    for component in [format!("a{}", "é".repeat(351)), "a".repeat(701)] {
+        let output = inspect_constant_type(fln::Expr::const_(
+            fln::Name::from_components([component.as_str()]),
+            Vec::new(),
+        ));
+        assert!(output.status.success(), "{output:?}");
+        assert!(output.stderr.is_empty(), "{output:?}");
+        let text = String::from_utf8(output.stdout).unwrap();
+        let sketch = text.lines().find(|line| line.starts_with("[0]")).unwrap();
+        assert!(sketch.ends_with('…'), "{sketch}");
+        assert!(sketch.contains(&component[..3]), "{sketch}");
+    }
+}
+
+#[test]
+fn inspecting_constants_bounds_deep_universe_sketches() {
+    let mut level = fln::Level::zero();
+    for _ in 0..2048 {
+        level = level.succ().unwrap();
+    }
+    let output = inspect_constant_type(fln::Expr::sort(level));
+    assert!(output.status.success(), "{output:?}");
+    let text = String::from_utf8(output.stdout).unwrap();
+    let sketch = text.lines().find(|line| line.starts_with("[0]")).unwrap();
+    assert!(sketch.contains('…'), "{sketch}");
+    assert!(sketch.matches("succ(").count() <= 64, "{sketch}");
+}
+
+#[test]
+fn inspecting_constants_bounds_shared_universe_sketches() {
+    let mut level = fln::Level::zero();
+    for _ in 0..12 {
+        level = fln::Level::max(level.clone(), level).unwrap();
+    }
+    let output = inspect_constant_type(fln::Expr::sort(level));
+    assert!(output.status.success(), "{output:?}");
+    let text = String::from_utf8(output.stdout).unwrap();
+    let sketch = text.lines().find(|line| line.starts_with("[0]")).unwrap();
+    assert!(sketch.contains('…'), "{sketch}");
+    assert!(sketch.matches("max(").count() <= 64, "{sketch}");
+}
+
+#[test]
+fn inspecting_constants_bounds_many_universe_arguments() {
+    let output = inspect_constant_type(fln::Expr::const_(
+        fln::Name::from_components(["Carrier"]),
+        vec![fln::Level::zero(); 256],
+    ));
+    assert!(output.status.success(), "{output:?}");
+    let text = String::from_utf8(output.stdout).unwrap();
+    let sketch = text.lines().find(|line| line.starts_with("[0]")).unwrap();
+    assert!(sketch.contains('…'), "{sketch}");
+    assert!(sketch.matches(',').count() <= 64, "{sketch}");
+}
+
 /// `(case, field, offset, byte)`: the header field each edit lands in. Offsets are
 /// the generated contract's: flags 6, lean_version 7..40, githash 40..80.
 const FORGERIES: [(&str, &str, usize, u8); 5] = [
