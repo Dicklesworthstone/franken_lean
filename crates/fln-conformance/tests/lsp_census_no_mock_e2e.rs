@@ -158,7 +158,7 @@ impl ServerHarness {
             let Some(compact) = self.next_frame(remaining)? else {
                 return Err(format!("timed out waiting for pinned server response {id}"));
             };
-            if jsonrpc_id_token(&compact).as_deref() == Some(expected_id.as_str()) {
+            if matches_response(&compact, &expected_id) {
                 return Ok(compact);
             }
         }
@@ -274,6 +274,34 @@ fn jsonrpc_id_token(json: &str) -> Option<String> {
                 .bytes()
                 .all(|byte| byte.is_ascii_digit())))
     .then(|| token.to_string())
+}
+
+fn matches_response(json: &str, expected_id: &str) -> bool {
+    // The two request directions have independent IDs. `next_frame` answers
+    // server requests but also returns them to this loop; they are not replies
+    // to our requests even when their IDs coincide. Inspect the top-level
+    // method so a result object containing its own `method` remains a reply.
+    fln_conformance::execution::record_field(json, "method").is_none()
+        && jsonrpc_id_token(json).as_deref() == Some(expected_id)
+}
+
+#[test]
+fn response_correlation_distinguishes_requests_from_replies() {
+    for response in [
+        r#"{"jsonrpc":"2.0","id":10,"result":null}"#,
+        r#"{"jsonrpc":"2.0","id":10,"error":{"code":-32603,"message":"refused"}}"#,
+        r#"{"jsonrpc":"2.0","id":10,"result":{"method":"payload","id":99}}"#,
+    ] {
+        assert!(matches_response(response, "10"), "{response}");
+        assert!(!matches_response(response, "11"), "{response}");
+    }
+    for other in [
+        r#"{"jsonrpc":"2.0","id":10,"method":"workspace/semanticTokens/refresh"}"#,
+        r#"{"jsonrpc":"2.0","method":"client/registerCapability","params":{"id":10}}"#,
+        r#"{"jsonrpc":"2.0","id":"10","result":null}"#,
+    ] {
+        assert!(!matches_response(other, "10"), "{other}");
+    }
 }
 
 impl Drop for ServerHarness {
