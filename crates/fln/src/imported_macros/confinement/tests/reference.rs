@@ -34,10 +34,8 @@ fn live_pinned_macro_context_forwarding_matches_reference_and_refuses_method_esc
         std::process::id()
     ));
     std::fs::create_dir_all(&dir).unwrap();
-    let fixture = include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../fln-olean/fixtures/ir/NativeContextForwardingModule.lean"
-    ));
+    let fixture =
+        include_str!("../../../../../fln-olean/fixtures/ir/NativeContextForwardingModule.lean");
     std::fs::write(dir.join("NativeContextForwardingModule.lean"), fixture).unwrap();
     let generated = Command::new(&reference)
         .current_dir(&dir)

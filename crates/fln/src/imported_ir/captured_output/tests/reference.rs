@@ -19,7 +19,7 @@ fn live_pinned_output_matches_reference_and_consumes_native_io_results() {
         eprintln!("SKIP: live imported output IR requires the pinned Reference");
         return;
     };
-    let pin = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../SUITE.lock"))
+    let pin = include_str!("../../../../../../SUITE.lock")
         .lines()
         .find(|line| line.starts_with("reference "))
         .and_then(|line| {
@@ -40,10 +40,7 @@ fn live_pinned_output_matches_reference_and_consumes_native_io_results() {
         .as_nanos();
     let dir = root.join(format!("output-reference-{}-{unique}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let source = include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../fln-olean/fixtures/ir/NativeOutputModule.lean"
-    ));
+    let source = include_str!("../../../../../fln-olean/fixtures/ir/NativeOutputModule.lean");
     std::fs::write(dir.join("NativeOutputModule.lean"), source).unwrap();
     let generated = Command::new(&reference)
         .current_dir(&dir)

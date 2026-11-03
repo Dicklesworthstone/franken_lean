@@ -251,7 +251,7 @@ fn callable_payload_sources_match_the_live_pinned_reference() {
         eprintln!("SKIP: live callable payload oracle requires the pinned Reference");
         return;
     };
-    let lock = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../SUITE.lock"));
+    let lock = include_str!("../../../../SUITE.lock");
     let pin = lock
         .lines()
         .find(|line| line.starts_with("reference "))

@@ -52,7 +52,7 @@ fn live_pinned_named_globals_share_state_replay_and_recover_after_resource_stops
         eprintln!("SKIP: live initialized-global IR requires the pinned Reference");
         return;
     };
-    let pin = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../SUITE.lock"))
+    let pin = include_str!("../../../../../../SUITE.lock")
         .lines()
         .find(|line| line.starts_with("reference "))
         .and_then(|line| {
@@ -78,10 +78,7 @@ fn live_pinned_named_globals_share_state_replay_and_recover_after_resource_stops
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
         dir.join("InitializedGlobalsModule.lean"),
-        include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../fln-olean/fixtures/ir/InitializedGlobalsModule.lean"
-        )),
+        include_str!("../../../../../fln-olean/fixtures/ir/InitializedGlobalsModule.lean"),
     )
     .unwrap();
     let generated = Command::new(&reference)

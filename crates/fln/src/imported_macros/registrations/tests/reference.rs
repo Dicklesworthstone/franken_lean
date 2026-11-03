@@ -34,10 +34,7 @@ fn live_metadata_drives_ordered_macro_dispatch_state_diagnostics_and_authority()
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
         dir.join("NativeRegisteredMacroModule.lean"),
-        include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../fln-olean/fixtures/ir/NativeRegisteredMacroModule.lean"
-        )),
+        include_str!("../../../../../fln-olean/fixtures/ir/NativeRegisteredMacroModule.lean"),
     )
     .unwrap();
     let result = Command::new(&reference)

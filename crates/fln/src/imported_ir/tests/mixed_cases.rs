@@ -253,10 +253,7 @@ fn live_pin_syntax_option_and_user_sum_defaults_match_reference() {
         .as_nanos();
     let dir = root.join(format!("case-reference-{}-{tick}", std::process::id()));
     std::fs::create_dir(&dir).unwrap();
-    let source = include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../fln-olean/fixtures/ir/CaseModule.lean"
-    ));
+    let source = include_str!("../../../../fln-olean/fixtures/ir/CaseModule.lean");
     std::fs::write(dir.join("CaseModule.lean"), source).unwrap();
     let generated = Command::new(&reference)
         .current_dir(&dir)

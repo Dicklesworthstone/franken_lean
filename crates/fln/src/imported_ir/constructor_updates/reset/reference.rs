@@ -29,7 +29,7 @@ fn live_pinned_recursive_updates_match_reference_and_canonical_replay() {
         eprintln!("SKIP: live imported IR requires FLN_REFERENCE_LEAN or FLN_REFERENCE_LIB");
         return;
     };
-    let lock = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../SUITE.lock"));
+    let lock = include_str!("../../../../../../SUITE.lock");
     let pin = lock
         .lines()
         .find(|line| line.starts_with("reference "))
@@ -55,10 +55,7 @@ fn live_pinned_recursive_updates_match_reference_and_canonical_replay() {
     // Retain source, raw IR, decoded IR and the live oracle output on failure.
     // A unique directory prevents a previous run's artifact being mistaken for
     // a successful compilation. No fixture is regenerated over tracked bytes.
-    let source = include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../fln-olean/fixtures/ir/ResetModule.lean"
-    ));
+    let source = include_str!("../../../../../fln-olean/fixtures/ir/ResetModule.lean");
     std::fs::write(dir.join("ResetModule.lean"), source).unwrap();
     let generated = Command::new(&reference)
         .current_dir(&dir)

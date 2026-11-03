@@ -31,7 +31,7 @@ macro_rules (kind := recursiveNone)
 
 syntax (name := recursiveNever) "recursiveNever%" term : term
 macro_rules (kind := recursiveNever)
-  | _ => throw Lean.Macro.Exception.unsupportedSyntax
+  | _stx => throw Lean.Macro.Exception.unsupportedSyntax
 
 syntax (name := recursiveUnsupported) "recursiveUnsupported%" term : term
 macro_rules (kind := recursiveUnsupported)

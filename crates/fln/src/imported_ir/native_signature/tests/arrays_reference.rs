@@ -21,7 +21,7 @@ fn live_pinned_arrays_match_reference_with_erased_proofs_and_canonical_replay() 
         eprintln!("SKIP: live imported arrays require FLN_REFERENCE_LEAN");
         return;
     };
-    let lock = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../SUITE.lock"));
+    let lock = include_str!("../../../../../../SUITE.lock");
     let pin = lock
         .lines()
         .find(|line| line.starts_with("reference "))
@@ -43,10 +43,7 @@ fn live_pinned_arrays_match_reference_with_erased_proofs_and_canonical_replay() 
         .as_nanos();
     let dir = root.join(format!("array-reference-{}-{unique}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let source = include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../fln-olean/fixtures/ir/NativeArrayModule.lean"
-    ));
+    let source = include_str!("../../../../../fln-olean/fixtures/ir/NativeArrayModule.lean");
     std::fs::write(dir.join("NativeArrayModule.lean"), source).unwrap();
     let generated = Command::new(&reference)
         .current_dir(&dir)

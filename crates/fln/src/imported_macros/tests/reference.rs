@@ -30,10 +30,7 @@ fn live_pinned_macro_runs_native_syntax_methods_and_matches_complete_subtrees() 
         .as_nanos();
     let dir = root.join(format!("macro-reference-{}-{unique}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let fixture = include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../fln-olean/fixtures/ir/NativeMacroModule.lean"
-    ));
+    let fixture = include_str!("../../../../fln-olean/fixtures/ir/NativeMacroModule.lean");
     std::fs::write(dir.join("NativeMacroModule.lean"), fixture).unwrap();
     let generated = Command::new(&reference)
         .current_dir(&dir)

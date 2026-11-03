@@ -21,7 +21,7 @@ fn live_pinned_local_state_matches_reference_and_canonical_replay() {
         eprintln!("SKIP: live imported state IR requires the pinned Reference");
         return;
     };
-    let lock = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../SUITE.lock"));
+    let lock = include_str!("../../../../../../SUITE.lock");
     let pin = lock
         .lines()
         .find(|line| line.starts_with("reference "))
@@ -44,10 +44,7 @@ fn live_pinned_local_state_matches_reference_and_canonical_replay() {
         .as_nanos();
     let dir = root.join(format!("state-reference-{}-{unique}", std::process::id()));
     std::fs::create_dir(&dir).unwrap();
-    let source = include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../fln-olean/fixtures/ir/NativeStateModule.lean"
-    ));
+    let source = include_str!("../../../../../fln-olean/fixtures/ir/NativeStateModule.lean");
     std::fs::write(dir.join("NativeStateModule.lean"), source).unwrap();
     let generated = Command::new(&reference)
         .current_dir(&dir)
@@ -85,10 +82,7 @@ fn live_pinned_local_state_matches_reference_and_canonical_replay() {
     let partition_path = std::env::var_os("FLN_REFERENCE_PARTITION")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
-            PathBuf::from(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/../../contracts/builtin_partition.tsv"
-            ))
+            fln_core::checked_workspace_root!().join("contracts/builtin_partition.tsv")
         });
     let partition = VerifiedPartition::from_pinned_tsv(
         &std::fs::read_to_string(&partition_path).unwrap_or_else(|error| {

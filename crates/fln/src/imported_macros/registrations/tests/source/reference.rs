@@ -30,10 +30,8 @@ fn live_imported_ir_changes_source_checks_with_the_pins_order_and_scoped_behavio
         .as_nanos();
     let dir = root.join(format!("source-macro-{}-{unique}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let source = include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../fln-olean/fixtures/ir/NativeSourceMacroModule.lean"
-    ));
+    let source =
+        include_str!("../../../../../../fln-olean/fixtures/ir/NativeSourceMacroModule.lean");
     std::fs::write(dir.join("NativeSourceMacroModule.lean"), source).unwrap();
     let result = Command::new(&reference)
         .current_dir(&dir)

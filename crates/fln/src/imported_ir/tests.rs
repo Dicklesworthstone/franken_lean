@@ -447,8 +447,7 @@ fn execution_exhaustion_has_no_value_and_preserves_reference_provenance() {
 
 #[test]
 fn pinned_partition_authenticates_real_ir_and_rejects_modified_bytes() {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../contracts/builtin_partition.tsv");
+    let path = fln_core::checked_workspace_root!().join("contracts/builtin_partition.tsv");
     let text = match std::fs::read_to_string(&path) {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {

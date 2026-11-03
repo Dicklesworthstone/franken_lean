@@ -34,10 +34,7 @@ fn live_recursive_macro_method_preserves_scope_fallback_state_and_diagnostics() 
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
         dir.join("NativeRecursiveMacroModule.lean"),
-        include_str!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../fln-olean/fixtures/ir/NativeRecursiveMacroModule.lean"
-        )),
+        include_str!("../../../../../fln-olean/fixtures/ir/NativeRecursiveMacroModule.lean"),
     )
     .unwrap();
     let result = Command::new(&reference)

@@ -245,6 +245,11 @@ impl NeedleDrift {
 /// Checked in **both** directions: an entry that no longer diverges is refused as stale.
 pub const DECLARED_NEEDLE_DIVERGENCE: &[(&str, &str)] = &[
     (
+        "crates/fln-admission/build.rs",
+        "the authority-digest build script reads Cargo's invoking manifest directory at run \
+         time; its var/expect pair names the variable twice but embeds no compile-time root",
+    ),
+    (
         "crates/fln-checker/tests/string_reduce.rs",
         "the KR-314 independence census reads the invoking checker source at run time so a \
          shared target cannot bake another checkout's production reducer into the check \

@@ -59,10 +59,7 @@ fn live_native_macro_lookup_uses_explicit_isolated_environments_and_preserves_st
         .as_nanos();
     let dir = root.join(format!("macro-lookup-{}-{unique}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let fixture = include_str!(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../fln-olean/fixtures/ir/NativeMacroLookupModule.lean"
-    ));
+    let fixture = include_str!("../../../../fln-olean/fixtures/ir/NativeMacroLookupModule.lean");
     std::fs::write(dir.join("NativeMacroLookupModule.lean"), fixture).unwrap();
     let generated = Command::new(&reference)
         .current_dir(&dir)
