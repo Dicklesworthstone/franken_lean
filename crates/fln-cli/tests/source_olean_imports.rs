@@ -987,6 +987,22 @@ fn assert_macro_refusal(output: std::process::Output, exit: i32, class: &str, de
     assert!(error.contains(detail), "{error}");
 }
 
+fn assert_macro_program_refusal(
+    output: std::process::Output,
+    exit: i32,
+    class: &str,
+    authority: bool,
+    detail: &str,
+) {
+    assert_eq!(output.status.code(), Some(exit), "{output:?}");
+    let error = ImportedMacroProject::refused(output);
+    assert!(error.contains("\"schema\":\"fln.source-program/1\""), "{error}");
+    assert!(error.contains("\"outcome\":\"error\""), "{error}");
+    assert!(error.contains(&format!("\"class\":\"{class}\"")), "{error}");
+    assert!(error.contains(&format!("\"authority\":{authority}")), "{error}");
+    assert!(error.contains(detail), "{error}");
+}
+
 // check-source accepts declarations and proofs; runtime personalities also
 // process queries. Keep each test on its documented command surface.
 const IMPORTED_MACRO_DECLARATIONS: &str = concat!(
@@ -1027,7 +1043,8 @@ fn installed_imported_macros_drive_checked_source_and_runtime_commands() {
 
     // fln run exposes its documented raw Nat projection without needing Repr
     // from a larger Init closure. The preceding checked theorem pins its value.
-    let executable = format!("{IMPORTED_MACRO_CLIENT}#eval commandMacroValue\n");
+    let executable =
+        format!("{IMPORTED_MACRO_CLIENT}#eval commandMacroValue\n#eval (13 : Bool)\n");
     let run = project.native("run", &executable, Some(&project.partition));
     assert!(run.status.success(), "{run:?}");
     assert!(run.stderr.is_empty(), "{run:?}");
@@ -1038,6 +1055,8 @@ fn installed_imported_macros_drive_checked_source_and_runtime_commands() {
     );
     assert!(stdout.contains("\"outcome\":\"complete\""), "{stdout}");
     assert!(stdout.contains("\"kind\":\"nat\",\"value\":11"), "{stdout}");
+    assert!(stdout.contains("\"kind\":\"nat\",\"value\":13"), "{stdout}");
+    assert_eq!(stdout.matches("\"event\":\"evaluation\"").count(), 2, "{stdout}");
     assert_eq!(stdout.matches("\"event\":\"check\"").count(), 2, "{stdout}");
     assert_imported_macro_provenance(&stdout);
 
@@ -1057,14 +1076,69 @@ fn installed_imported_macros_drive_checked_source_and_runtime_commands() {
         .env("FLN_MACRO_PARTITION", &project.partition)
         .output()
         .unwrap();
-    assert_macro_refusal(
+    assert_macro_program_refusal(
         output,
         5,
         "capability",
+        false,
         "source-closure sidecars do not yet bind imported macro IR",
     );
     assert!(!flbc.exists(), "a refused sidecar published executable bytes");
     assert!(!sidecar.exists(), "a refused sidecar published a manifest");
+
+    // Raw FLBC retains the final evaluation after its imported macro expanded.
+    // Replaying it needs neither the source frontend nor the macro policy.
+    let product = project.root.join("macro-expanded.flbc");
+    let emit = |source: &str| {
+        Command::new(env!("CARGO_BIN_EXE_fln"))
+            .args(["run", "--json", "--jobs", "1", "--import-posture", "recheck"])
+            .arg("--emit-flbc")
+            .arg(&product)
+            .arg(project.source(source))
+            .current_dir(project.root.join("client"))
+            .env("LEAN_PATH", project.search_path())
+            .env("FLN_MACRO_PARTITION", &project.partition)
+            .output()
+            .unwrap()
+    };
+    let emitted = emit(&executable);
+    assert!(emitted.status.success(), "{emitted:?}");
+    assert!(emitted.stderr.is_empty(), "{emitted:?}");
+    let stdout = String::from_utf8(emitted.stdout).unwrap();
+    assert!(stdout.contains("\"outcome\":\"complete\""), "{stdout}");
+    assert!(stdout.contains("\"kind\":\"nat\",\"value\":13"), "{stdout}");
+    assert!(stdout.contains("\"emittedFlbc\":{\"path\":"), "{stdout}");
+    assert!(stdout.contains("\"emittedSidecar\":null"), "{stdout}");
+    assert_imported_macro_provenance(&stdout);
+    let product_bytes = std::fs::read(&product).unwrap();
+    assert!(!product_bytes.is_empty());
+    let replayed = Command::new(env!("CARGO_BIN_EXE_fln"))
+        .args(["flbc", "run", "--json"])
+        .arg(&product)
+        .current_dir(&project.root)
+        .env_remove("LEAN_PATH")
+        .env_remove("FLN_MACRO_PARTITION")
+        .output()
+        .unwrap();
+    assert!(replayed.status.success(), "{replayed:?}");
+    assert!(replayed.stderr.is_empty(), "{replayed:?}");
+    let stdout = String::from_utf8(replayed.stdout).unwrap();
+    assert!(stdout.contains("\"schema\":\"fln.flbc-run/3\""), "{stdout}");
+    assert!(stdout.contains("\"outcome\":\"complete\""), "{stdout}");
+    assert!(stdout.contains("\"returnValue\":13,"), "{stdout}");
+    assert!(stdout.contains("\"sidecar\":null"), "{stdout}");
+    assert_eq!(std::fs::read(&product).unwrap(), product_bytes);
+
+    let replacement = format!("{IMPORTED_MACRO_CLIENT}#eval (17 : Bool)\n");
+    assert_macro_program_refusal(
+        emit(&replacement),
+        1,
+        "output",
+        true,
+        "already exists; no artifact was published",
+    );
+    assert_eq!(std::fs::read(&product).unwrap(), product_bytes);
+    assert!(!flbc.exists() && !sidecar.exists());
 
     // Opt-in is not permission to accept a bad expansion result or false proof.
     for source in [
@@ -1170,11 +1244,12 @@ fn installed_runtime_compiles_only_dispatched_imported_macros() {
     let error = ImportedMacroProject::refused(refused);
     assert!(error.contains("absentMacroPrimitive"), "{error}");
 
-    let demanded_run = format!("{executable}def demanded : Nat := _\n");
-    assert_macro_refusal(
+    let demanded_run = format!("{executable}#eval _\n");
+    assert_macro_program_refusal(
         project.native("run", &demanded_run, Some(&project.partition)),
         5,
         "capability",
+        false,
         "absentMacroPrimitive",
     );
 
@@ -1191,6 +1266,6 @@ fn installed_runtime_compiles_only_dispatched_imported_macros() {
         .env("FLN_MACRO_PARTITION", &project.partition)
         .output()
         .unwrap();
-    assert_macro_refusal(refused, 5, "capability", "absentMacroPrimitive");
+    assert_macro_program_refusal(refused, 5, "capability", false, "absentMacroPrimitive");
     assert!(!flbc.exists(), "a refused macro published an executable prefix");
 }

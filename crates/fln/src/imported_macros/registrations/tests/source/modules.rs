@@ -1335,3 +1335,148 @@ fn deferred_lean_macro_validation_stops_successors_without_module_states() {
     assert!(stopped.states.is_none());
     assert_eq!(imported.engine.logical_root(&KVMap::new()), before);
 }
+
+#[test]
+fn deferred_program_dispatch_budget_accumulates_across_source_modules() {
+    use crate::source_check::modules::execution::SourceProgramLimits;
+
+    let (imported, code) = batches::artifact_import_fixture();
+    let before = imported.engine.logical_root(&KVMap::new());
+    let declarations = users(&code);
+    let compilation =
+        MacroCompilationInputs::new(code, VerifiedPartition::user_fixture(), declarations);
+    let names = [name("Main"), name("Lib")];
+    let inputs = [
+        SourceModuleInput {
+            name: &names[0],
+            source: b"prelude\nimport Lib\n#eval 13 + 17",
+        },
+        SourceModuleInput {
+            name: &names[1],
+            source: b"prelude\nimport SourceLibrary\ndef fromLib : Nat := 7 + 11",
+        },
+    ];
+    let run = |limits| {
+        imported.execute_source_modules_with_deferred_imported_macros(
+            &inputs,
+            &names[0],
+            &KVMap::new(),
+            SourceProgramLimits::new(execution_limits()),
+            SourceModuleDeferredMacroInputs {
+                compilation: compilation.clone(),
+                registry_limits: MacroRegistryLimits::default(),
+                context: context(),
+                state: MacroState::default(),
+                limits,
+            },
+            None,
+            crate::EvaluationPresentation::Raw,
+        )
+    };
+    let complete = run(MacroTreeLimits::default());
+    assert_eq!(
+        program_values(executed(&complete), "Main"),
+        vec![crate::ClosedVmValue::Scalar(17)]
+    );
+    assert_eq!(complete.attempts.len(), 4);
+
+    let mut limits = MacroTreeLimits::default();
+    limits.dispatch.max_attempts = 3;
+    let stopped = run(limits);
+    assert!(
+        matches!(stopped.outcome, Outcome::Inconclusive(_)),
+        "{stopped:?}"
+    );
+    assert_eq!(stopped.attempts.len(), 3);
+    assert_eq!(
+        stopped.attempts.last().unwrap().declaration,
+        name("SourceLibrary.skip")
+    );
+    assert!(stopped.completed_vm_usage.steps > 0);
+    assert!(stopped.states.is_none());
+    assert_eq!(imported.engine.logical_root(&KVMap::new()), before);
+    assert!(!imported.engine.environment().contains(&name("fromLib")));
+
+    // Previously compiled closures still cost an attempt in each source module.
+    limits.dispatch.max_attempts = 4;
+    let exact = run(limits);
+    assert_eq!(
+        program_values(executed(&exact), "Main"),
+        vec![crate::ClosedVmValue::Scalar(17)]
+    );
+    assert_eq!(exact.states, complete.states);
+    assert_eq!(exact.completed_vm_usage, complete.completed_vm_usage);
+}
+
+#[test]
+fn deferred_lean_programs_keep_implicit_init_edges_and_stop_at_module_validation() {
+    use crate::source_check::modules::execution::{SourceProgramExecutionError, SourceProgramLimits};
+
+    let (imported, code) = batches::artifact_import_fixture();
+    let before = imported.engine.logical_root(&KVMap::new());
+    let declarations = users(&code);
+    let compilation =
+        MacroCompilationInputs::new(code, VerifiedPartition::user_fixture(), declarations);
+    let names = [name("Main"), name("Init"), name("Lib")];
+    let inputs = [
+        SourceModuleInput {
+            name: &names[0],
+            source: b"import Lib\n#eval 13 + 17",
+        },
+        SourceModuleInput {
+            name: &names[1],
+            source: b"prelude",
+        },
+        SourceModuleInput {
+            name: &names[2],
+            source: b"prelude\nimport SourceLibrary\n#eval 7 + 11",
+        },
+    ];
+    let mut visited = Vec::new();
+    let stopped = imported.execute_lean_source_modules_with_deferred_imported_macros_and_validation(
+        &inputs,
+        &names[0],
+        &KVMap::new(),
+        SourceProgramLimits::new(execution_limits()),
+        SourceModuleDeferredMacroInputs {
+            compilation,
+            registry_limits: MacroRegistryLimits::default(),
+            context: context(),
+            state: MacroState::default(),
+            limits: MacroTreeLimits::default(),
+        },
+        None,
+        crate::EvaluationPresentation::Raw,
+        &mut |module, commands| {
+            visited.push(module.clone());
+            if module == &names[2] {
+                assert_eq!(commands.batch.source_evaluation_indices.len(), 1);
+                let index = commands.batch.source_evaluation_indices[0];
+                assert_eq!(
+                    crate::closed_vm_value(&commands.batch.executions[index].exit)
+                        .unwrap()
+                        .unwrap(),
+                    crate::ClosedVmValue::Scalar(11)
+                );
+                Err("reject this module")
+            } else {
+                assert_eq!(module, &names[1]);
+                assert!(commands.batch.executions.is_empty());
+                Ok(())
+            }
+        },
+    );
+    assert!(
+        matches!(
+            &stopped.outcome,
+            Outcome::Complete(Err(SourceProgramExecutionError::Validation { module, error }))
+                if module == &names[2] && *error == "reject this module"
+        ),
+        "{stopped:?}"
+    );
+    assert_eq!(visited, vec![name("Init"), name("Lib")]);
+    assert_eq!(stopped.attempts.len(), 2);
+    assert!(stopped.completed_vm_usage.steps > 0);
+    assert!(stopped.states.is_none());
+    assert_eq!(imported.engine.logical_root(&KVMap::new()), before);
+}
