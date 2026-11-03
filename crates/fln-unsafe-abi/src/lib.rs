@@ -45,6 +45,9 @@
 //! * mpz arithmetic — the fln-bignum shim (Crucible workstream).
 
 #![deny(unsafe_code)]
+// This crate owns the standard C math symbols. LLVM must call those definitions,
+// rather than replace calls with its platform-libm constants or intrinsics.
+#![no_builtins]
 // D3's SAFETY-note half, now enforced here as it already was in the other two boundary
 // crates (bead franken_lean-d3-safety-note-unenforced-cdbg). The 28 sites this crate
 // carried are written; the waiver that stood here is discharged rather than moved.
