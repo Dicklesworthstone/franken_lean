@@ -253,6 +253,11 @@ pub const PARSER_BOOL_CONSTRUCTOR_FIELDS: &[(&str, &[&str])] = &[
     ("Bool.false", &[]),
     ("Bool.true", &[]),
 ];
+#[rustfmt::skip]
+pub const PARSER_NAT_CONSTRUCTOR_FIELDS: &[(&str, &[&str])] = &[
+    ("Nat.zero", &[]),
+    ("Nat.succ", &["Nat"]),
+];
 pub const PARSER_NAME_LITERAL_FORMS: &[(&str, usize)] = &[
     ("Lean.Name.anonymous", 0),
     ("Lean.Name.str", 2),

@@ -54,6 +54,7 @@ pub struct SourceMacroInvocation<'a> {
 #[derive(Debug)]
 pub enum SourceMacroError {
     Binding(Box<MacroRegistrationError>),
+    ParserBinding(Box<crate::imported_parsers::ParserRegistrationError>),
     Execution(Box<MacroExecutionError>),
     Frontend(Box<EngineExecutionError>),
     Diagnostic {
@@ -81,6 +82,7 @@ impl std::fmt::Display for SourceMacroError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Binding(error) => write!(f, "source macro binding: {error}"),
+            Self::ParserBinding(error) => write!(f, "source parser binding: {error}"),
             Self::Execution(error) => write!(f, "source macro execution: {error}"),
             Self::Frontend(error) => write!(f, "{error}"),
             Self::Diagnostic {
@@ -140,6 +142,7 @@ impl SourceMacroError {
         match self {
             Self::Frontend(error) => crate::source_check::classify(error),
             Self::Binding(error) if error.is_resource() => ("resource", false, 3),
+            Self::ParserBinding(error) if error.is_resource() => ("resource", false, 3),
             Self::Execution(error)
                 if matches!(error.as_ref(),
                 MacroExecutionError::Compile(error) if error.is_resource()) =>
@@ -227,6 +230,7 @@ struct Progress {
 /// and file boundaries and are returned only with a complete checked batch.
 pub(crate) struct FileSession<'a> {
     registry: &'a RegisteredMacros,
+    parsers: fln_parse::extensions::ImportedSyntaxModule,
     context: &'a MacroContext,
     state: MacroState,
     lookup: Option<&'a dyn MacroLookup>,
@@ -291,6 +295,7 @@ impl<'a> FileSession<'a> {
     pub(crate) fn new(invocation: SourceMacroInvocation<'a>) -> Self {
         Self {
             registry: invocation.registry,
+            parsers: fln_parse::extensions::ImportedSyntaxModule::default(),
             context: invocation.context,
             state: invocation.state,
             lookup: invocation.lookup,
@@ -320,6 +325,14 @@ impl<'a> FileSession<'a> {
 
     pub(crate) fn registry(&self) -> RegisteredMacros {
         self.registry.clone()
+    }
+
+    pub(crate) fn set_parsers(&mut self, parsers: fln_parse::extensions::ImportedSyntaxModule) {
+        self.parsers = parsers;
+    }
+
+    pub(crate) fn parsers(&self) -> &fln_parse::extensions::ImportedSyntaxModule {
+        &self.parsers
     }
 
     pub(crate) fn cancelled(&self) -> Option<Inconclusive> {

@@ -240,6 +240,20 @@ impl SourceGrammar {
             .map_err(|feature| EngineExecutionError::NotImplemented { feature })
     }
 
+    /// Install the receipt's exact parser projection before parsing this file.
+    /// Artifact entries carry no native templates and are not republished in
+    /// the source grammar journal. Their module/phase visibility is supplied
+    /// by the module driver's checked import world, including module-system
+    /// sources; it is independent of native source-template export semantics.
+    pub(crate) fn import_artifact(
+        &mut self,
+        module: &fln_parse::extensions::ImportedSyntaxModule,
+    ) -> Result<(), EngineExecutionError> {
+        self.file
+            .import_artifact(module)
+            .map_err(|feature| EngineExecutionError::NotImplemented { feature })
+    }
+
     pub(crate) fn export_native(
         &self,
     ) -> Result<fln_parse::extensions::NativeSyntaxModule, EngineExecutionError> {

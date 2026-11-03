@@ -3,6 +3,7 @@
 //! Source exports retain declarations and metadata; evaluation candidates and
 //! scratch queries never become another module's declarations.
 use super::*;
+use crate::imported_macros::source::{FileSession, SourceMacroError};
 use crate::{EngineExecutionLimits, EvaluationPresentation, SourceCommandBatchExecution};
 
 mod preflight;
@@ -92,16 +93,21 @@ fn parse_error(
     at: fln_parse::BytePos,
     error: DefinitionParseError,
 ) -> SourceModuleCheckError {
-    source_error(
-        module,
-        EngineExecutionError::BatchCommand {
-            index: command,
-            at: Some(at),
-            error: Box::new(EngineExecutionError::Frontend(
-                DefinitionFrontendError::Parse(error.with_original_offset(at)),
-            )),
-        },
-    )
+    source_error(module, parse_command_error(command, at, error))
+}
+
+fn parse_command_error(
+    command: usize,
+    at: fln_parse::BytePos,
+    error: DefinitionParseError,
+) -> EngineExecutionError {
+    EngineExecutionError::BatchCommand {
+        index: command,
+        at: Some(at),
+        error: Box::new(EngineExecutionError::Frontend(
+            DefinitionFrontendError::Parse(error.with_original_offset(at)),
+        )),
+    }
 }
 
 fn commands<'a>(
@@ -109,20 +115,25 @@ fn commands<'a>(
     source: &'a [u8],
     header: &SourceHeader,
 ) -> Result<Vec<(fln_parse::BytePos, &'a [u8])>, SourceModuleCheckError> {
-    fln_parse::command_scope::partition(&source[header.body_start.0..])
-        .map(|commands| {
-            commands
-                .into_iter()
-                .filter(|(_, bytes)| {
-                    !matches!(
-                        fln_parse::command_scope::parse(bytes),
-                        Ok(Some(fln_parse::command_scope::ScopeCommand::Trivia))
-                    )
-                })
-                .map(|(at, bytes)| (fln_parse::BytePos(header.body_start.0 + at.0), bytes))
-                .collect()
-        })
-        .map_err(|error| parse_error(module, 0, header.body_start, error))
+    command_bytes(source, header).map_err(|error| parse_error(module, 0, header.body_start, error))
+}
+
+fn command_bytes<'a>(
+    source: &'a [u8],
+    header: &SourceHeader,
+) -> Result<Vec<(fln_parse::BytePos, &'a [u8])>, DefinitionParseError> {
+    fln_parse::command_scope::partition(&source[header.body_start.0..]).map(|commands| {
+        commands
+            .into_iter()
+            .filter(|(_, bytes)| {
+                !matches!(
+                    fln_parse::command_scope::parse(bytes),
+                    Ok(Some(fln_parse::command_scope::ScopeCommand::Trivia))
+                )
+            })
+            .map(|(at, bytes)| (fln_parse::BytePos(header.body_start.0 + at.0), bytes))
+            .collect()
+    })
 }
 
 /// Parse the same mixed command grammar as execution before admitting a costly
@@ -207,6 +218,7 @@ impl imported::SourceOleanImport {
         Self {
             contexts,
             macro_journals: Vec::new(),
+            parser_journals: Vec::new(),
             engine,
             checked,
             result_logical_root: root,
@@ -368,7 +380,12 @@ impl imported::SourceOleanImport {
                 "source-program/before-plan",
             )));
         }
-        preflight::check(modules, limits.modules, implicit_init)?;
+        // Artifact parser descriptions are available only after the receipt's
+        // exact per-module projection. Its source is parsed below, inside that
+        // session; the ordinary path retains its early syntax preflight.
+        if macros.is_none() {
+            preflight::check(modules, limits.modules, implicit_init)?;
+        }
         let mut meter = Meter {
             work: 0,
             bytes: 0,
@@ -383,6 +400,7 @@ impl imported::SourceOleanImport {
         )?;
         let mut exports = BTreeMap::<usize, replay::Export>::new();
         let mut completed_modules = Vec::new();
+        let mut parsed_commands = 0usize;
         for &index in &plan.order {
             if cancellation.is_some_and(CancellationProbe::is_cancelled) {
                 return Ok(Outcome::Inconclusive(Inconclusive::cancelled(
@@ -422,17 +440,23 @@ impl imported::SourceOleanImport {
                 };
             }
             let module = modules[index];
-            // Empty forwarding modules still import a grammar world. Enforce
-            // its phase boundary before bypassing the command stream.
             let header = &plan.headers[index];
-            let grammar = grammar::SourceGrammar::for_engine_with_header(
-                &engine,
-                Some(module.name),
-                header.module_system,
-                header.prelude,
-                &header.imports,
-            )
-            .map_err(|error| source_error(module.name, error))?;
+            // Preserve the ordinary path's grammar/phase check at this point.
+            // Macro sessions obtain their checked parser projection below.
+            let ordinary_grammar = if macros.is_none() {
+                Some(
+                    grammar::SourceGrammar::for_engine_with_header(
+                        &engine,
+                        Some(module.name),
+                        header.module_system,
+                        header.prelude,
+                        &header.imports,
+                    )
+                    .map_err(|error| source_error(module.name, error))?,
+                )
+            } else {
+                None
+            };
             let public_imports = if plan.headers[index].module_system {
                 match visibility::imports(
                     &self.contexts.complete,
@@ -455,44 +479,71 @@ impl imported::SourceOleanImport {
             let mut public = public_imports.map(|engine| {
                 visibility::PublicWorld::new(module.name, engine, &mut meter, cancellation)
             });
-            let body =
-                grammar.enter(|| commands(module.name, module.source, &plan.headers[index]))?;
-            let execute =
-                |session: Option<&mut crate::imported_macros::source::FileSession<'_>>| {
-                    if body.is_empty() {
-                        if session.is_some() && grammar.has_templates() {
-                            return Err(SourceCheckError::ImportedMacro {
+            let execute = |session: Option<&mut FileSession<'_>>| {
+                // Binding and complete-journal validation precede even the
+                // first partition, including an empty forwarding module.
+                let mut grammar = match ordinary_grammar {
+                    Some(grammar) => grammar,
+                    None => grammar::SourceGrammar::for_engine_with_header(
+                        &engine,
+                        Some(module.name),
+                        header.module_system,
+                        header.prelude,
+                        &header.imports,
+                    )
+                    .map_err(source_command_error)?,
+                };
+                if let Some(session) = session.as_deref() {
+                    grammar
+                        .import_artifact(session.parsers())
+                        .map_err(source_command_error)?;
+                    if grammar.has_templates() {
+                        return Err(SourceCheckError::ImportedMacro {
                             file: 0,
                             command: 0,
                             offset: header.body_start.0,
-                            error: Box::new(
-                                crate::imported_macros::source::SourceMacroError::TemplateGrammar,
-                            ),
+                            error: Box::new(SourceMacroError::TemplateGrammar),
                         });
-                        }
-                        let mut completed = engine.empty_source_command_execution(options);
-                        completed.scope.private_module =
-                            header.module_system.then(|| module.name.clone());
-                        completed.scope.source_module = Some(module.name.clone());
-                        Ok(Outcome::Complete(completed))
-                    } else {
-                        engine
-                            .execute_source_command_stream(
-                                body,
-                                options,
-                                limits.execution,
-                                true,
-                                &[],
-                                header.module_system.then_some(module.name),
-                                Some(module.name),
-                                public.as_mut(),
-                                presentation,
-                                &[(module.source, Some(module.name))],
-                                session,
-                            )
-                            .map_err(source_command_error)
                     }
-                };
+                }
+                let body = grammar
+                    .enter(|| command_bytes(module.source, header))
+                    .map_err(|error| {
+                        source_command_error(parse_command_error(0, header.body_start, error))
+                    })?;
+                if session.is_some() {
+                    parsed_commands = parsed_commands
+                        .checked_add(body.len())
+                        .filter(|count| *count <= limits.modules.source.max_commands)
+                        .ok_or(SourceCheckError::Limit {
+                            resource: "source commands",
+                            limit: limits.modules.source.max_commands,
+                        })?;
+                }
+                if body.is_empty() {
+                    let mut completed = engine.empty_source_command_execution(options);
+                    completed.scope.private_module =
+                        header.module_system.then(|| module.name.clone());
+                    completed.scope.source_module = Some(module.name.clone());
+                    Ok(Outcome::Complete(completed))
+                } else {
+                    engine
+                        .execute_source_command_stream(
+                            body,
+                            options,
+                            limits.execution,
+                            true,
+                            &[],
+                            header.module_system.then_some(module.name),
+                            Some(module.name),
+                            public.as_mut(),
+                            presentation,
+                            &[(module.source, Some(module.name))],
+                            session,
+                        )
+                        .map_err(source_command_error)
+                }
+            };
             let result = if let Some(macros) = macros.as_deref_mut() {
                 let macro_imports: Vec<_> = steps
                     .iter()

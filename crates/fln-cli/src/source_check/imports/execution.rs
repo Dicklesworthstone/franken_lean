@@ -298,11 +298,17 @@ fn run_loaded(
                     failure(Failure::input("a prelude or module-system source program requires one entry path"), presentation)
                 });
             }
+            let macro_config = match macros::Config::from_environment() {
+                Ok(config) => config,
+                Err(error) => return Some(failure(error, presentation)),
+            };
             // The established source-only runner resolves an unambiguous root
             // among bounded ancestors. Preserve that route before the import
             // loader (whose explicit module root is the entry's directory).
             // A transitive `prelude` still requires an empty, isolated world.
-            let local = (!ordinary_lean && !headers[0].prelude && !headers[0].module_system)
+            // Imported syntax is parsed only after the captured artifact
+            // grammar is installed by the explicit macro session.
+            let local = (macro_config.is_none() && !ordinary_lean && !headers[0].prelude && !headers[0].module_system)
                 .then(|| discover_source_closure(paths[0].clone(), max_bytes));
             match &local {
                 Some(Ok(discovered))
@@ -339,9 +345,7 @@ fn run_loaded(
             if !explicit_world {
                 return None;
             }
-            let macro_inputs = match macros::Config::from_environment().and_then(|config| {
-                config.as_ref().map(|config| loaded.prepare_macros(config)).transpose()
-            }) {
+            let macro_inputs = match macro_config.as_ref().map(|config| loaded.prepare_macros(config)).transpose() {
                 Ok(prepared) => prepared,
                 Err(error) => return Some(failure(error, presentation)),
             };
@@ -361,13 +365,18 @@ fn run_loaded(
             ));
             limits.execution.vm = vm_limits;
             limits.modules.source.max_bytes = max_bytes;
-            let preflight = if ordinary_lean {
-                preflight_lean_source_program(&inputs, limits.modules)
-            } else {
-                preflight_source_program(&inputs, limits.modules)
-            };
-            if let Err(error) = preflight {
-                return Some(module_failure(error, presentation, &names[0], &sources[0], &display));
+            // The loader has checked headers and bounded the captured closure.
+            // Imported-macro sessions must parse bodies inside the module
+            // driver, after their exact scoped artifact grammar is installed.
+            if macro_inputs.is_none() {
+                let preflight = if ordinary_lean {
+                    preflight_lean_source_program(&inputs, limits.modules)
+                } else {
+                    preflight_source_program(&inputs, limits.modules)
+                };
+                if let Err(error) = preflight {
+                    return Some(module_failure(error, presentation, &names[0], &sources[0], &display));
+                }
             }
             let (_, base) = match loaded.base_engine(
                 || Ok(fln::Engine::from_environment(fln::Environment::new())),

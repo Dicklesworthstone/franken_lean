@@ -41,6 +41,17 @@ pub(super) fn artifact_import_fixture() -> (SourceOleanImport, Vec<IrModule>) {
 pub(super) fn artifact_import_fixture_with_extra_rows(
     extra_rows: &[(&str, &str, Option<&str>)],
 ) -> (SourceOleanImport, Vec<IrModule>) {
+    artifact_import_fixture_with_parser_metadata(extra_rows, &[], &[], &[])
+}
+
+/// Additional syntax data crosses the same public artifact-admission boundary
+/// as the original macro fixtures. Existing callers retain identical inputs.
+pub(super) fn artifact_import_fixture_with_parser_metadata(
+    extra_rows: &[(&str, &str, Option<&str>)],
+    extra_constants: &[ConstantInfo],
+    parser_rows: &[Obj],
+    extra_ir: &[IrDecl],
+) -> (SourceOleanImport, Vec<IrModule>) {
     let seed = Engine::with_source_seed(admission())
         .unwrap()
         .into_complete()
@@ -86,6 +97,7 @@ pub(super) fn artifact_import_fixture_with_extra_rows(
             body.clone(),
         )
     }));
+    constants.extend_from_slice(extra_constants);
     let rows = [
         ("term_+_", "SourceLibrary.right", None),
         ("term_+_", "SourceLibrary.skip", None),
@@ -114,6 +126,17 @@ pub(super) fn artifact_import_fixture_with_extra_rows(
     })
     .collect::<Vec<_>>();
     let extension = name(macros::MACRO_EXTENSION);
+    let parser_extension = fln_olean::source_extensions::parsers::extension_name();
+    let mut extensions = vec![ModuleExtensionInput {
+        name: &extension,
+        entries: &rows,
+    }];
+    if !parser_rows.is_empty() {
+        extensions.push(ModuleExtensionInput {
+            name: &parser_extension,
+            entries: parser_rows,
+        });
+    }
     let bytes = encode_module_with_extensions(
         ModuleWriteInput {
             is_module: false,
@@ -121,10 +144,7 @@ pub(super) fn artifact_import_fixture_with_extra_rows(
             constants: &constants,
             extra_const_names: &[],
         },
-        &[ModuleExtensionInput {
-            name: &extension,
-            entries: &rows,
-        }],
+        &extensions,
         OleanWriteHeader {
             version: format::OLEAN_ACCEPTED_VERSIONS[0],
             flags: 1,
@@ -161,7 +181,7 @@ pub(super) fn artifact_import_fixture_with_extra_rows(
         );
         assert!(!seed.environment().contains(&name(owner)));
     }
-    let code = code(vec![
+    let mut declarations = vec![
         selecting_function("SourceLibrary.right", 2),
         function("SourceLibrary.skip", Behavior::Unsupported),
         selecting_function("SourceLibrary.left", 0),
@@ -169,8 +189,9 @@ pub(super) fn artifact_import_fixture_with_extra_rows(
         super::super::lookup::has_decl_selector("SourceLibrary.hasDecl"),
         preresolved_function(),
         function("SourceLibrary.attributeProbe", Behavior::Unsupported),
-    ]);
-    (imported, code)
+    ];
+    declarations.extend_from_slice(extra_ir);
+    (imported, code(declarations))
 }
 
 /// Preserve the left identifier's spelling and exact backing source, but bind

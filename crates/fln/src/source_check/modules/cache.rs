@@ -748,8 +748,8 @@ pub(super) fn run_collecting(
                     &mut crate::imported_macros::source::FileSession<'_>,
                 >| {
                     if source.is_empty() {
-                        if session.is_some() {
-                            let grammar = grammar::SourceGrammar::for_engine(
+                        if let Some(session) = session {
+                            let mut grammar = grammar::SourceGrammar::for_engine(
                                 &imported,
                                 Some(module.name),
                                 header.module_system,
@@ -762,6 +762,14 @@ pub(super) fn run_collecting(
                                     error: Box::new(error),
                                 }
                             })?;
+                            grammar
+                                .import_artifact(session.parsers())
+                                .map_err(|error| SourceCheckError::Command {
+                                    file: 0,
+                                    command: 0,
+                                    offset: 0,
+                                    error: Box::new(error),
+                                })?;
                             if grammar.has_templates() {
                                 return Err(SourceCheckError::ImportedMacro {
                                     file: 0,

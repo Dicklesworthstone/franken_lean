@@ -15,6 +15,7 @@ use crate::imported_macros::source::{
     FileSession, FileSessionReport, SourceMacroError, SourceMacroInvocation,
 };
 use crate::imported_macros::{MacroContext, MacroState};
+use crate::imported_parsers::{ParserRegistrationError, ParserRegistryLimits, RegisteredParsers};
 use fln_env::modules::CancellationProbe as ModuleCancellationProbe;
 use fln_olean::ir::IrModule;
 use fln_vm::interpreter::{CancellationProbe, ExecutionUsage};
@@ -120,6 +121,15 @@ fn binding_error(error: MacroRegistrationError) -> SourceCheckError {
     }
 }
 
+fn parser_binding_error(error: ParserRegistrationError) -> SourceCheckError {
+    SourceCheckError::ImportedMacro {
+        file: 0,
+        command: 0,
+        offset: 0,
+        error: Box::new(SourceMacroError::ParserBinding(Box::new(error))),
+    }
+}
+
 // The module importer and VM expose independent read-only probe traits. Keep
 // both existing APIs intact and forward every poll to the caller's same probe.
 struct ModuleCancellation<'a>(&'a dyn CancellationProbe);
@@ -138,6 +148,7 @@ impl CancellationProbe for MacroCancellation<'_> {
 
 pub(super) struct ModuleMacroSession {
     registry: RegisteredMacros,
+    parsers: RegisteredParsers,
     context: MacroContext,
     state: MacroState,
     limits: MacroTreeLimits,
@@ -150,12 +161,14 @@ pub(super) struct ModuleMacroSession {
 impl ModuleMacroSession {
     fn new(
         registry: RegisteredMacros,
+        parsers: RegisteredParsers,
         context: MacroContext,
         state: MacroState,
         limits: MacroTreeLimits,
     ) -> Self {
         Self {
             registry,
+            parsers,
             context,
             state,
             limits,
@@ -213,6 +226,10 @@ impl ModuleMacroSession {
         registry
             .validate_source_engine(engine)
             .map_err(binding_error)?;
+        let parsers = self
+            .parsers
+            .project_imports(ordered_imports, engine)
+            .map_err(parser_binding_error)?;
         let mut context = self.context.clone();
         context.quotation_context = module.clone();
         let cancellation = cancellation.map(MacroCancellation);
@@ -226,6 +243,7 @@ impl ModuleMacroSession {
                 .as_ref()
                 .map(|probe| probe as &dyn CancellationProbe),
         });
+        session.set_parsers(parsers);
         let result = check(&mut session);
         let successful = matches!(&result, Ok(Outcome::Complete(_)));
         if let Err(reason) = self.record(module, session.finish(), successful) {
@@ -329,6 +347,19 @@ impl ModuleMacroSession {
 }
 
 impl imported::SourceOleanImport {
+    fn module_parsers(
+        &self,
+        limits: MacroRegistryLimits,
+    ) -> Result<RegisteredParsers, SourceCheckError> {
+        self.prepare_imported_parsers(ParserRegistryLimits {
+            max_modules: limits.max_modules,
+            max_declarations: limits.max_declarations,
+            metadata: limits.metadata,
+            ..ParserRegistryLimits::default()
+        })
+        .map_err(parser_binding_error)
+    }
+
     /// Execute an explicit source graph with the receipt's imported node macros.
     /// Expansion precedes ordinary elaboration, admission, compilation and VM
     /// execution. Every module retains its exact import order and fresh macro
@@ -354,14 +385,18 @@ impl imported::SourceOleanImport {
             options,
             limits,
             || {
-                let registry = self.prepare_imported_macros(
-                    input.code,
-                    input.partition,
-                    input.user_declarations,
-                    input.registry_limits,
-                )?;
+                let parsers = self.module_parsers(input.registry_limits)?;
+                let registry = self
+                    .prepare_imported_macros(
+                        input.code,
+                        input.partition,
+                        input.user_declarations,
+                        input.registry_limits,
+                    )
+                    .map_err(binding_error)?;
                 Ok(ModuleMacroSession::new(
                     registry,
+                    parsers,
                     input.context,
                     input.state,
                     input.limits,
@@ -395,14 +430,18 @@ impl imported::SourceOleanImport {
             options,
             limits,
             || {
-                let registry = self.prepare_imported_macros(
-                    input.code,
-                    input.partition,
-                    input.user_declarations,
-                    input.registry_limits,
-                )?;
+                let parsers = self.module_parsers(input.registry_limits)?;
+                let registry = self
+                    .prepare_imported_macros(
+                        input.code,
+                        input.partition,
+                        input.user_declarations,
+                        input.registry_limits,
+                    )
+                    .map_err(binding_error)?;
                 Ok(ModuleMacroSession::new(
                     registry,
+                    parsers,
                     input.context,
                     input.state,
                     input.limits,
@@ -435,10 +474,13 @@ impl imported::SourceOleanImport {
             options,
             limits,
             || {
+                let parsers = self.module_parsers(input.registry_limits)?;
                 let registry = self
-                    .prepare_imported_macros_deferred(input.compilation, input.registry_limits)?;
+                    .prepare_imported_macros_deferred(input.compilation, input.registry_limits)
+                    .map_err(binding_error)?;
                 Ok(ModuleMacroSession::new(
                     registry,
+                    parsers,
                     input.context,
                     input.state,
                     input.limits,
@@ -472,10 +514,13 @@ impl imported::SourceOleanImport {
             options,
             limits,
             || {
+                let parsers = self.module_parsers(input.registry_limits)?;
                 let registry = self
-                    .prepare_imported_macros_deferred(input.compilation, input.registry_limits)?;
+                    .prepare_imported_macros_deferred(input.compilation, input.registry_limits)
+                    .map_err(binding_error)?;
                 Ok(ModuleMacroSession::new(
                     registry,
+                    parsers,
                     input.context,
                     input.state,
                     input.limits,
@@ -495,7 +540,7 @@ impl imported::SourceOleanImport {
         entry: &Name,
         options: &KVMap,
         limits: SourceProgramLimits,
-        prepare: impl FnOnce() -> Result<ModuleMacroSession, MacroRegistrationError>,
+        prepare: impl FnOnce() -> Result<ModuleMacroSession, SourceCheckError>,
         cancellation: Option<&dyn CancellationProbe>,
         implicit_init: bool,
         presentation: crate::EvaluationPresentation,
@@ -521,7 +566,7 @@ impl imported::SourceOleanImport {
                 return SourceMacroProgramExecution::stopped(Outcome::Complete(Err(
                     SourceModuleCheckError::Source {
                         module: entry.clone(),
-                        error: binding_error(error),
+                        error,
                     }
                     .into(),
                 )));
@@ -553,8 +598,12 @@ impl imported::SourceOleanImport {
     /// admission, preserving original source locations and declaration replay.
     ///
     /// Macro state resets per module; expansion allowances cover the whole
-    /// graph. This explicit adapter uses the current parser's existing syntax
-    /// kinds. Module-system sources retain separate public-signature and
+    /// graph. The receipt's complete parser journals supply supported custom
+    /// syntax before parsing. Closed descriptions use cumulative preparation
+    /// ceilings from `ParserRegistryLimits::default`, with module, declaration
+    /// and metadata ceilings taken from `registry_limits`. Executable parser
+    /// closures and unsupported grammar forms refuse the whole transaction.
+    /// Module-system sources retain separate public-signature and
     /// private-implementation checks, selected from the expanded modifiers.
     /// Source-declared templates and receipts built on previously imported
     /// artifacts are typed refusals.
@@ -574,14 +623,18 @@ impl imported::SourceOleanImport {
             options,
             limits,
             || {
-                let registry = self.prepare_imported_macros(
-                    input.code,
-                    input.partition,
-                    input.user_declarations,
-                    input.registry_limits,
-                )?;
+                let parsers = self.module_parsers(input.registry_limits)?;
+                let registry = self
+                    .prepare_imported_macros(
+                        input.code,
+                        input.partition,
+                        input.user_declarations,
+                        input.registry_limits,
+                    )
+                    .map_err(binding_error)?;
                 Ok(ModuleMacroSession::new(
                     registry,
+                    parsers,
                     input.context,
                     input.state,
                     input.limits,
@@ -611,10 +664,13 @@ impl imported::SourceOleanImport {
             options,
             limits,
             || {
+                let parsers = self.module_parsers(input.registry_limits)?;
                 let registry = self
-                    .prepare_imported_macros_deferred(input.compilation, input.registry_limits)?;
+                    .prepare_imported_macros_deferred(input.compilation, input.registry_limits)
+                    .map_err(binding_error)?;
                 Ok(ModuleMacroSession::new(
                     registry,
+                    parsers,
                     input.context,
                     input.state,
                     input.limits,
@@ -630,7 +686,7 @@ impl imported::SourceOleanImport {
         entry: &Name,
         options: &KVMap,
         limits: SourceModuleCheckLimits,
-        prepare: impl FnOnce() -> Result<ModuleMacroSession, MacroRegistrationError>,
+        prepare: impl FnOnce() -> Result<ModuleMacroSession, SourceCheckError>,
         cancellation: Option<&dyn CancellationProbe>,
     ) -> SourceMacroModuleCheck {
         if cancellation.is_some_and(CancellationProbe::is_cancelled) {
@@ -652,7 +708,7 @@ impl imported::SourceOleanImport {
                 return SourceMacroModuleCheck::stopped(Outcome::Complete(Err(
                     SourceModuleCheckError::Source {
                         module: entry.clone(),
-                        error: binding_error(error),
+                        error,
                     },
                 )));
             }

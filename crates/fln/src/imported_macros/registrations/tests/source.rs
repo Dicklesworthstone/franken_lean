@@ -16,6 +16,8 @@ mod modules;
 
 mod module_visibility;
 
+mod parser_imports;
+
 fn admission() -> EngineAdmissionLimits {
     EngineAdmissionLimits::new(crate::Budget::for_stack_bytes(2 * 1024 * 1024))
 }

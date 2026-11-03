@@ -8,6 +8,8 @@ use std::sync::Arc;
 #[derive(Debug)]
 struct ExternalModule {
     imports: Vec<Name>,
+    is_module: bool,
+    companion_parts_loaded: bool,
     entries: Vec<EnvironmentEntry>,
     unavailable: bool,
     before: Environment,
@@ -38,6 +40,29 @@ fn unavailable(module: &Name, reason: &'static str) -> SourceModuleCheckError {
 impl ImportContexts {
     pub(super) fn has_inherited_imports(&self) -> bool {
         !self.origin.imported_modules().is_empty()
+    }
+
+    /// Public checking reports are observations, not editable provenance.
+    /// Parser preparation must still match the private declarations and import
+    /// graph captured at admission, before consulting any report fields.
+    pub(super) fn retains_checked_module(&self, checked: &CheckedOleanModule) -> bool {
+        self.modules.get(&checked.name).is_some_and(|module| {
+            !module.unavailable
+                && module.is_module == checked.decoded.module.is_module
+                && module.companion_parts_loaded == checked.decoded.companion_parts_loaded
+                && module.imports.iter().eq(checked
+                    .decoded
+                    .module
+                    .imports
+                    .iter()
+                    .map(|import| &import.module))
+                && module.entries.len() == checked.decoded.constants.len()
+                && module
+                    .entries
+                    .iter()
+                    .zip(&checked.decoded.constants)
+                    .all(|(entry, constant)| entry.declaration() == constant)
+        })
     }
 
     pub(super) fn capture(
@@ -73,6 +98,8 @@ impl ImportContexts {
                             .iter()
                             .map(|i| i.module.clone())
                             .collect(),
+                        is_module: module.decoded.module.is_module,
+                        companion_parts_loaded: module.decoded.companion_parts_loaded,
                         entries,
                         unavailable,
                         before,
@@ -112,6 +139,14 @@ impl ImportContexts {
         for ((name, left), right) in self.modules.iter().zip(other.modules.values()) {
             let module = name.to_display_string();
             assert_eq!(left.imports, right.imports, "{what}: {module}: imports");
+            assert_eq!(
+                left.is_module, right.is_module,
+                "{what}: {module}: module system"
+            );
+            assert_eq!(
+                left.companion_parts_loaded, right.companion_parts_loaded,
+                "{what}: {module}: companions"
+            );
             assert!(left.entries == right.entries, "{what}: {module}: entries");
             assert_eq!(
                 left.unavailable, right.unavailable,

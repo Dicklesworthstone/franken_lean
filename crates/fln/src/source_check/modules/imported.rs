@@ -194,6 +194,10 @@ pub struct SourceOleanImport {
     /// replay order. Keep these private: callers need not reconstruct or pair
     /// artifact payloads with the public checking records.
     pub(super) macro_journals: Vec<(Name, Vec<OpaqueExtensionBlock>)>,
+    /// Parser rows from those same complete journals. They remain inert on
+    /// ordinary source paths; the explicit imported-macro adapter prepares and
+    /// installs every supported description before parsing a source module.
+    pub(super) parser_journals: Vec<(Name, Vec<OpaqueExtensionBlock>)>,
     /// The metadata-enabled successor. Both checker projections and import
     /// identities are retained; metadata itself grants no declaration authority.
     pub engine: Engine,
@@ -206,6 +210,58 @@ pub struct SourceOleanImport {
 }
 
 impl SourceOleanImport {
+    /// Reconstruct all retained parser journals from exact admitted owners.
+    /// This reads closed data descriptions and never executes parser closures.
+    /// Grammar capability checking occurs atomically when the projected product
+    /// is installed in a source file's native grammar.
+    pub fn prepare_imported_parsers(
+        &self,
+        limits: crate::imported_parsers::ParserRegistryLimits,
+    ) -> std::result::Result<
+        crate::imported_parsers::RegisteredParsers,
+        crate::imported_parsers::ParserRegistrationError,
+    > {
+        use crate::imported_parsers::{
+            ParserRegistrationError, ParserRegistrationModule, RegisteredParsers,
+        };
+        if self.parser_journals.len() > limits.max_modules {
+            return Err(ParserRegistrationError::Limit("modules"));
+        }
+        let mut checked = BTreeMap::new();
+        for module in &self.checked.modules {
+            if !self.contexts.retains_checked_module(module) {
+                return Err(ParserRegistrationError::Owner {
+                    module: module.name.clone(),
+                    declaration: Name::anonymous(),
+                    reason: "public checking report differs from retained parser ownership",
+                });
+            }
+            if checked.insert(&module.name, module).is_some() {
+                return Err(ParserRegistrationError::DuplicateModule(
+                    module.name.clone(),
+                ));
+            }
+        }
+        let modules =
+            self.parser_journals
+                .iter()
+                .map(|(name, extensions)| {
+                    let checked = checked.get(name).copied().ok_or_else(|| {
+                        ParserRegistrationError::Owner {
+                            module: name.clone(),
+                            declaration: Name::anonymous(),
+                            reason: "captured parser journal lost its checked module",
+                        }
+                    })?;
+                    Ok(ParserRegistrationModule {
+                        checked,
+                        extensions,
+                    })
+                })
+                .collect::<std::result::Result<Vec<_>, ParserRegistrationError>>()?;
+        RegisteredParsers::prepare(&modules, self.contexts.complete.environment(), limits)
+    }
+
     /// Compile this import closure's complete macro table from its captured
     /// journals and checked owners. The caller supplies companion IR and the
     /// verified census partition; no artifacts are reopened or decoded again.
@@ -597,6 +653,7 @@ struct PreparedMetadata {
     reports: Vec<SourceMetadataReport>,
     decoded: metadata::SourceExtensions,
     macro_journals: Vec<(Name, Vec<OpaqueExtensionBlock>)>,
+    parser_journals: Vec<(Name, Vec<OpaqueExtensionBlock>)>,
 }
 
 struct MetadataModule {
@@ -677,6 +734,8 @@ fn prepare_source_metadata(
     let mut reports = Vec::new();
     let mut macro_journals = Vec::new();
     let macro_extension = Name::from_components(metadata::macros::MACRO_EXTENSION.split('.'));
+    let mut parser_journals = Vec::new();
+    let parser_extension = metadata::parsers::extension_name();
     let mut capture_left = limits.max_capture_bytes;
     let mut entries_left = limits.metadata.max_entries;
     let mut defeq_tags = ReflexivityTags::default();
@@ -724,6 +783,7 @@ fn prepare_source_metadata(
         };
         let mut seen = BTreeSet::new();
         let mut macro_blocks = Vec::new();
+        let mut parser_blocks = Vec::new();
         for block in captured {
             if !seen.insert(block.name.clone()) {
                 return Err(SourceOleanImportError::Metadata {
@@ -804,10 +864,13 @@ fn prepare_source_metadata(
                 }
                 if block.name == macro_extension {
                     macro_blocks.push(block);
+                } else if block.name == parser_extension {
+                    parser_blocks.push(block);
                 }
             }
         }
         macro_journals.push((module.name.clone(), macro_blocks));
+        parser_journals.push((module.name.clone(), parser_blocks));
         reports.push(report);
     }
     cancelled!("source-olean/before-metadata-decode");
@@ -821,6 +884,7 @@ fn prepare_source_metadata(
         reports,
         decoded,
         macro_journals,
+        parser_journals,
     }))
 }
 
@@ -856,6 +920,7 @@ impl Engine {
             mut reports,
             decoded,
             macro_journals,
+            parser_journals,
         } = prepared;
         if reports.len() != order.len()
             || reports
@@ -1555,6 +1620,7 @@ impl Engine {
         cancelled!("source-olean/after-context-capture");
         Ok(Outcome::Complete(SourceOleanImport {
             macro_journals,
+            parser_journals,
             engine,
             checked,
             result_logical_root,

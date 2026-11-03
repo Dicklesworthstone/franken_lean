@@ -99,8 +99,9 @@ prefix or successor module state, and resource exhaustion remains inconclusive.
 
 This mode checks declarations and proofs. It does not execute `#eval` or a
 program's `main`, emit artifacts, or enable imported macros in the drop-in `lean`
-personality. It currently uses the parser's supported syntax kinds; source-declared
-templates cannot yet be mixed into the imported-macro session. Hygiene starts
+personality. It uses native syntax and the supported imported parser descriptions
+described below; source-declared templates cannot yet be mixed into the
+imported-macro session. Hygiene starts
 from the adapter's explicit seed, rather than the pin's command-hash seed. An
 unsupported native macro operation or source construct is reported explicitly.
 
@@ -139,12 +140,47 @@ Raw `--emit-flbc` is supported. A source-closure sidecar request is refused
 before execution because that format does not yet bind macro IR and partition
 inputs. Neither output file is created by that refused request.
 
-This remains a bounded macro integration. It expands syntax already recognized
-by the native parser and validates the complete imported registration table;
-unsupported rows are not silently dropped. Imported parser grammars, atomic and
-tactic macro expansion, source templates, and macro execution under `#guard`,
-`#reduce` or `#guard_msgs` are not yet supported. Full stock `Init` macro
-execution is not claimed.
+This remains a bounded macro integration. It expands native syntax and supported
+imported descriptions, and validates the complete imported registration tables;
+unsupported rows are not silently dropped. Executable parser closures, atomic
+and tactic macro expansion, source templates, and macro execution under `#guard`,
+`#reduce` or `#guard_msgs` are not yet supported. Full stock `Init` macro execution
+is not claimed.
+
+## Imported syntax
+
+Both explicit imported-macro modes install supported syntax from the checked
+artifacts before parsing source bodies. A consumer needs no repeated `syntax`
+declaration. For a library exporting supported `choose!` syntax and a macro that
+selects its argument, the consumer can contain only:
+
+```lean
+prelude
+import ChoiceLibrary
+def chosen : Nat := choose! 42
+theorem chosen_ok : chosen = 42 := by rfl
+```
+
+The runtime mode also accepts `#eval choose! 42`. The parsed node reaches the
+imported macro, and its result follows ordinary elaboration, independent checking
+and execution. Source-module forwarding follows the existing public/private
+import rules; `open scoped` activation remains local to the current source scope.
+
+The complete `Lean.Parser.parserExtension` journal retains token, kind, category
+and parser rows in their original order. Parser owners and dependencies must
+belong to the exact checked import closure. Descriptions are reconstructed from
+closed `ParserDescr` or `TrailingParserDescr` data, with generated constructor
+contracts and bounded native reduction of literal helpers. Named description
+references can resolve to checked descriptions; executable `Parser` and
+`TrailingParser` closures are refused.
+
+The current grammar subset includes distinct reserved leading heads, supported
+term infix forms, and leading/trailing custom-category productions. Ambiguous
+heads, unsupported aliases or precedence forms, contextual column checks and
+artifact category quotation parsers are explicit refusals. A malformed or
+unsupported selected journal installs no partial grammar, including in an empty
+forwarding module. Standalone kind or category rows do not create missing parser
+productions, and census entries do not replace missing artifact definitions.
 
 ## Library API and limits
 
@@ -165,6 +201,13 @@ declarations without cloning IR bodies. The corresponding execution methods are
 They retain the ordinary module validator, evaluation presentation and runtime
 resource limits. The existing eager APIs remain available for callers that
 require every registered implementation to compile before processing starts.
+
+`SourceOleanImport::prepare_imported_parsers` exposes the separately bounded,
+immutable parser product through `ParserRegistryLimits`. The integrated macro
+drivers use its default description work, depth and byte ceilings, with module,
+declaration and metadata ceilings taken from the supplied macro registry limits.
+Each source module projects this product to its actual external import order and
+rechecks all retained owner, helper and constructor bindings before installation.
 
 The initial environment is explicit. Without external imports, ordinary checking
 uses the native source seed where appropriate. External `.olean` imports are
