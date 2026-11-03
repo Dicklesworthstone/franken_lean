@@ -273,8 +273,8 @@ pub(super) fn known_reducible(
 
 /// The pin's projection exception is an environment registration, not a name
 /// pattern or a lambda/proj shape. First skip impossible bodies cheaply, then
-/// require the actual validated physical-field identity. The structure exporter
-/// supplies bounded declaration/body validation and charges its complete work.
+/// require the actual validated physical-field identity. The environment index
+/// validates the library within its own bounds; this declaration pays a lookup.
 pub(super) fn registered_projection(
     env: &Environment,
     declaration: &Name,
@@ -292,25 +292,13 @@ pub(super) fn registered_projection(
     if !matches!(body.node(), ExprNode::Proj { .. }) {
         return Ok(false);
     }
-    let structures =
-        crate::records::imported::export::registrations(&Environment::new(), env, meter.remaining)
-            .map_err(|error| match error {
-                crate::records::RecordError::ResourceLimit => SimpSetError::Limit,
-                _ => SimpSetError::Malformed,
-            })?;
-    meter.work(structures.work)?;
-    meter.bytes(structures.bytes_examined)?;
-    for structure in &structures.structures {
-        meter.work(1 + structure.fields.len())?;
-        if structure
-            .fields
-            .iter()
-            .any(|field| &field.projection == declaration)
-        {
-            return Ok(true);
+    meter.work(1)?;
+    crate::records::imported::export::is_registered_projection(env, declaration).map_err(|error| {
+        match error {
+            crate::records::RecordError::ResourceLimit => SimpSetError::Limit,
+            _ => SimpSetError::Malformed,
         }
-    }
-    Ok(false)
+    })
 }
 
 pub(super) fn known_status(
@@ -495,6 +483,121 @@ mod tests {
 
     fn n(text: &str) -> Name {
         Name::from_components(text.split('.'))
+    }
+
+    // These are generated declaration/metadata inputs, not council-admission
+    // evidence. The registry must validate every physical projection itself.
+    fn projection_world(count: usize) -> Environment {
+        use crate::lctx::LocalDecl;
+        use crate::records::imported::{StructureEntry, StructureField};
+        use crate::records::{RecordBudget, RecordSpec, record_declarations};
+        use fln_core::expr::FVarId;
+        use fln_kernel::Declaration;
+
+        let install = |mut env: Environment, declaration| {
+            let constants: Vec<_> = match declaration {
+                Declaration::Inductive(block) => block
+                    .types
+                    .into_iter()
+                    .map(ConstantInfo::Induct)
+                    .chain(block.ctors.into_iter().map(ConstantInfo::Ctor))
+                    .chain(block.recursors.into_iter().map(ConstantInfo::Rec))
+                    .collect(),
+                Declaration::Defn(value) => vec![ConstantInfo::Defn(value)],
+                Declaration::Thm(value) => vec![ConstantInfo::Thm(value)],
+                _ => panic!("unexpected generated record fixture declaration"),
+            };
+            for constant in constants {
+                env = env.add_decl(constant).unwrap();
+            }
+            env
+        };
+        let mut env = install(
+            Environment::new(),
+            crate::seed::nat_inductive_seed_declaration(),
+        );
+        let mut rows = Vec::new();
+        for index in 0..count {
+            let record = if index == 0 {
+                n("Owner")
+            } else {
+                Name::str(
+                    Name::anonymous(),
+                    format!("Noise{index}_{}", "x".repeat(1024)),
+                )
+            };
+            let spec = RecordSpec {
+                name: record.clone(),
+                level_params: vec![],
+                parameters: vec![],
+                fields: vec![LocalDecl {
+                    id: FVarId(n("field")),
+                    user_name: n("value"),
+                    type_: Expr::const_(n("Nat"), vec![]),
+                    value: None,
+                    binder_info: BinderInfo::Default,
+                    index: 0,
+                }],
+                result_level: Level::one(),
+                is_class: false,
+            };
+            for declaration in record_declarations(&spec, RecordBudget::default()).unwrap() {
+                env = install(env, declaration);
+            }
+            rows.push(StructureEntry {
+                name: record.clone(),
+                fields: vec![StructureField {
+                    name: n("value"),
+                    projection: Name::str(record, "value"),
+                    subobject: None,
+                    binder_info: BinderInfo::Default,
+                }],
+                parents: vec![],
+            });
+        }
+        // Each source module registers a bounded batch; the retained activation
+        // avoids imposing one module's validation allowance on the whole world.
+        let mut activation = crate::records::imported::Activation::read(&env).unwrap();
+        for batch in rows.chunks(100) {
+            (activation, env) = activation.register(&env, batch).unwrap();
+        }
+        env
+    }
+
+    #[test]
+    fn projection_query_price_is_independent_of_registry_volume() {
+        let small = projection_world(1);
+        let large = projection_world(600);
+        let measured = crate::records::imported::export::registrations(
+            &Environment::new(),
+            &large,
+            64 * 1024 * 1024,
+        )
+        .unwrap();
+        assert_eq!(measured.structures.len(), 600);
+        assert!(measured.work > 1 << 20, "{}", measured.work);
+        eprintln!(
+            "synthetic projection registry: structures=600 work={} bytes={}",
+            measured.work, measured.bytes_examined
+        );
+        let query = |env| {
+            let mut meter = Meter {
+                remaining: 1 << 20,
+                bytes: 0,
+            };
+            assert_eq!(
+                registered_projection(env, &n("Owner.value"), &mut meter),
+                Ok(true)
+            );
+            ((1 << 20) - meter.remaining, meter.bytes)
+        };
+        let small_price = query(&small);
+        assert_eq!(query(&large), small_price);
+        assert_eq!(
+            query(&large),
+            small_price,
+            "warm queries retain the same charge"
+        );
     }
 
     fn definitions() -> Environment {

@@ -117,6 +117,153 @@ fn name(text: &str) -> Name {
     Name::from_components(text.split('.'))
 }
 
+#[test]
+fn full_init_structure_registry_work_is_measured_from_pinned_artifacts() {
+    use fln_olean::region::{OleanView, WalkBudget};
+    use fln_olean::source_extensions as metadata;
+    use std::collections::BTreeSet;
+
+    let Some(library) = std::env::var_os("FLN_REFERENCE_LIB").map(PathBuf::from) else {
+        assert!(std::env::var_os("FLN_REQUIRE_REFERENCE").is_none());
+        eprintln!("SKIP: full Init registry measurement requires FLN_REFERENCE_LIB");
+        return;
+    };
+    // Actual artifact data and metadata validation only: this measurement does
+    // not admit or execute the Init closure and supplies no council evidence.
+    let mut pending = vec![name("Init")];
+    let mut seen = BTreeSet::new();
+    let mut environment = Environment::new();
+    let mut structures = Vec::new();
+    let mut artifact_bytes = 0usize;
+    while let Some(module) = pending.pop() {
+        if !seen.insert(module.clone()) {
+            continue;
+        }
+        assert!(seen.len() <= 4096, "bounded actual import discovery");
+        let path = library
+            .join(module.to_display_string().replace('.', "/"))
+            .with_extension("olean");
+        let parts = [
+            std::fs::read(&path).unwrap(),
+            std::fs::read(path.with_extension("olean.server")).unwrap(),
+            std::fs::read(path.with_extension("olean.private")).unwrap(),
+        ];
+        let bytes = parts.iter().map(Vec::len).sum::<usize>();
+        artifact_bytes = artifact_bytes.checked_add(bytes).unwrap();
+        assert!(artifact_bytes <= 1 << 30, "bounded artifact-byte input");
+        for part in &parts {
+            fln_olean::pin::check_pinned_header(part).unwrap();
+        }
+        pending
+            .extend(fln::olean_module_imports(&parts[0], OleanDecodeLimits::new(bytes)).unwrap());
+        let view = OleanView::parse_with_dependencies(&parts[2], &[&parts[0], &parts[1]]).unwrap();
+        let blocks: Vec<_> = view
+            .extension_payloads(WalkBudget::default(), BYTES)
+            .unwrap()
+            .into_iter()
+            .filter(|block| block.name == metadata::structure_extension_name())
+            .collect();
+        let rows = metadata::decode(&blocks, metadata::DecodeLimits::default())
+            .unwrap()
+            .structures;
+        if rows.is_empty() {
+            continue;
+        }
+        let families: BTreeSet<_> = rows.iter().map(|row| row.name.clone()).collect();
+        let projections: BTreeSet<_> = rows
+            .iter()
+            .flat_map(|row| {
+                row.fields
+                    .iter()
+                    .map(|field| field.projection.clone())
+                    .chain(row.parents.iter().map(|parent| parent.projection.clone()))
+            })
+            .collect();
+        let decoded = fln::decode_olean_module_artifacts(
+            &parts[0],
+            &parts[1],
+            &parts[2],
+            OleanDecodeLimits::new(bytes),
+        )
+        .unwrap();
+        assert!(decoded.companion_parts_loaded);
+        for constant in decoded.constants {
+            let needed = match &constant {
+                ConstantInfo::Induct(info) => families.contains(&info.base.name),
+                ConstantInfo::Ctor(info) => families.contains(&info.induct),
+                ConstantInfo::Defn(_) | ConstantInfo::Thm(_) => {
+                    projections.contains(constant.name())
+                }
+                _ => false,
+            };
+            if needed {
+                environment = environment.add_decl(constant).unwrap();
+            }
+        }
+        structures.extend(rows.into_iter().map(|row| {
+            StructureEntry {
+                name: row.name,
+                fields: row
+                    .fields
+                    .into_iter()
+                    .map(|field| {
+                        assert!(
+                            field.auto_param.is_none(),
+                            "retain the actual supported structure profile"
+                        );
+                        StructureField {
+                            name: field.name,
+                            projection: field.projection,
+                            subobject: field.subobject,
+                            binder_info: field.binder_info,
+                        }
+                    })
+                    .collect(),
+                parents: row
+                    .parents
+                    .into_iter()
+                    .map(|parent| StructureParent {
+                        name: parent.name,
+                        subobject: parent.subobject,
+                        projection: parent.projection,
+                    })
+                    .collect(),
+            }
+        }));
+    }
+    assert!(seen.len() > 1 && structures.len() > 101);
+    let registered = fln_elab::records::imported::register(&environment, &structures).unwrap();
+    let measured =
+        fln_elab::records::imported::export::registrations(&Environment::new(), &registered, BYTES)
+            .unwrap();
+    assert_eq!(measured.structures, structures);
+    eprintln!(
+        "actual pinned Init structure registry: modules={} structures={} artifact_bytes={} work={} journal_bytes={}",
+        seen.len(),
+        structures.len(),
+        artifact_bytes,
+        measured.work,
+        measured.bytes_examined,
+    );
+    assert_eq!(
+        fln_elab::records::imported::export::registrations(
+            &Environment::new(),
+            &registered,
+            measured.work,
+        )
+        .unwrap(),
+        measured,
+    );
+    assert!(matches!(
+        fln_elab::records::imported::export::registrations(
+            &Environment::new(),
+            &registered,
+            measured.work - 1,
+        ),
+        Err(fln_elab::records::RecordError::ResourceLimit),
+    ));
+}
+
 fn limits() -> SourceCheckLimits {
     SourceCheckLimits::new(EngineAdmissionLimits::new(Budget::for_stack_bytes(STACK)))
 }

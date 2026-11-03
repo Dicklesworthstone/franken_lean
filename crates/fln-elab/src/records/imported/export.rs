@@ -3,7 +3,71 @@
 //! merely because a caller omitted the corresponding structure identity.
 use super::*;
 use crate::records::inheritance;
+use std::cell::RefCell;
 use std::sync::Arc;
+
+// Library validation has its own finite allowance: both journals' byte caps
+// plus the existing structure-validation node allowance. A declaration must
+// not pay for those journals again out of its local elaboration allowance.
+const MAX_PROJECTION_INDEX_WORK: usize = 2 * MAX_BYTES + MAX_NODES;
+
+struct ProjectionIndex {
+    environment: Environment,
+    projections: Arc<BTreeSet<Name>>,
+}
+
+thread_local! {
+    // Retain one immutable world per thread, not an unbounded history. Keeping
+    // the environment alive also prevents declaration-root identity reuse.
+    static LAST_PROJECTIONS: RefCell<Option<ProjectionIndex>> = const { RefCell::new(None) };
+}
+
+fn projection_index(env: &Environment) -> Result<Arc<BTreeSet<Name>>, RecordError> {
+    let hit = LAST_PROJECTIONS.with(|last| {
+        let last = last.borrow();
+        let cached = last.as_ref()?;
+        let same_journals = [extension_name(), inheritance::descriptor().name]
+            .iter()
+            .all(|name| {
+                env.extension(name).map(|state| state.content_digest())
+                    == cached
+                        .environment
+                        .extension(name)
+                        .map(|state| state.content_digest())
+            });
+        (env.has_same_declarations(&cached.environment) && same_journals)
+            .then(|| Arc::clone(&cached.projections))
+    });
+    if let Some(projections) = hit {
+        return Ok(projections);
+    }
+    // Use the complete export validator, including orphan parent rows and
+    // exact projection bodies. A failed validation never populates the cache.
+    let validated = registrations(&Environment::new(), env, MAX_PROJECTION_INDEX_WORK)?;
+    let projections = Arc::new(
+        validated
+            .structures
+            .into_iter()
+            .flat_map(|row| row.fields.into_iter().map(|field| field.projection))
+            .collect(),
+    );
+    LAST_PROJECTIONS.with(|last| {
+        *last.borrow_mut() = Some(ProjectionIndex {
+            environment: env.clone(),
+            projections: Arc::clone(&projections),
+        });
+    });
+    Ok(projections)
+}
+
+/// Query validated physical-field identity without charging a library walk to
+/// each declaration. This index grants no constant-admission authority.
+pub(crate) fn is_registered_projection(
+    env: &Environment,
+    declaration: &Name,
+) -> Result<bool, RecordError> {
+    Ok(projection_index(env)?.contains(declaration))
+}
 
 pub fn journal_name() -> Name {
     extension_name()
