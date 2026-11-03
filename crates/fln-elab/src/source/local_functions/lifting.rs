@@ -175,6 +175,12 @@ impl Context {
         {
             result.push(Declaration::Mutual(vec![companion]));
         }
+        if let Declaration::Defn(definition) = owner
+            && definition.safety == DefinitionSafety::Safe
+            && let Some(companion) = self.close_well_founded_executable(definition)?
+        {
+            result.push(Declaration::Mutual(vec![companion]));
+        }
         Ok(result)
     }
 }

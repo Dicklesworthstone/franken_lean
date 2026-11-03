@@ -6390,10 +6390,10 @@ impl Engine {
             Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
         };
-        // A course-of-values structural definition carries its executable
-        // companion as a helper (`fln_elab::source::recursion::structural_companion`):
-        // the pin compiles the pre-definition, `f._unsafe_rec`, never the
-        // `brecOn` term. Compile that checked companion body instead.
+        // Structural and well-founded definitions carry their executable
+        // companions as helpers. The pin compiles the pre-definition,
+        // `f._unsafe_rec`, rather than the logical recursor or fixpoint.
+        // Compile that separately checked companion body instead.
         let companion = match &admission.declaration {
             Declaration::Defn(definition) if definition.safety == DefinitionSafety::Safe => {
                 let name = Name::str(definition.base.name.clone(), "_unsafe_rec");
@@ -6450,7 +6450,16 @@ impl Engine {
         } else {
             None
         };
-        let source_declaration = source_view.as_ref().map(|(value, type_)| {
+        // Closure signature preparation must inspect the same executable body
+        // as expression preparation. Even without static type slots, a checked
+        // companion can replace a logical fixpoint that has no executable body.
+        // This private view never changes the admitted logical declaration.
+        let source_declaration = (companion.is_some() || source_view.is_some()).then(|| {
+            let (value, type_) = source_view
+                .as_ref()
+                .map_or((&expression, &declared_type), |(value, type_)| {
+                    (value, type_)
+                });
             let mut declaration = admission.declaration.clone();
             if let Declaration::Defn(definition) = &mut declaration {
                 definition.base.type_ = type_.clone();
