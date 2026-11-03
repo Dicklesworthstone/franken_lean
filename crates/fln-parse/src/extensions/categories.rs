@@ -236,7 +236,7 @@ pub(crate) fn category_for_quotation(symbol: &str) -> Option<Name> {
     let suffix = symbol.strip_prefix("`(")?.strip_suffix('|')?;
     let grammar = active()?;
     let mut matches = grammar
-        .source_categories
+        .source_quotation_categories
         .iter()
         .filter(|category| matches!(category.leaf_view(), LeafView::Str(name) if name == suffix));
     let category = matches.next()?.clone();

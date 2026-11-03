@@ -225,6 +225,13 @@ impl FileGrammar {
             .chain(self.declared.iter())
             .map(|decl| decl.decl.clone())
             .chain(self.native_abbreviations.iter().cloned())
+            .chain(self.artifact.owners.iter().cloned())
+            .chain(
+                self.artifact
+                    .namespaces
+                    .iter()
+                    .map(|namespace| Name::str(namespace.clone(), "_artifact_scoped_syntax")),
+            )
             // Scoped rule-only modules have no syntax declaration under their
             // activation namespace. This anchor is for namespace lookup only.
             .chain(
