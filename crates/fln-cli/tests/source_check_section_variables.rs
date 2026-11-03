@@ -392,3 +392,109 @@ fn default_section_variable_binders_cannot_be_reannotated() {
     );
     assert!(diagnostics.contains(expected), "{diagnostics}");
 }
+
+/// `elabVariable` sanity-checks a binder but retains its syntax, and
+/// `runTermElabM` elaborates it afresh for each declaration. Natural type holes
+/// therefore do not become shared assignments across declarations or scopes.
+#[test]
+fn inferred_section_variable_types_match_the_reference_without_leaking() {
+    let Some(lib) = pinned_lib() else { return };
+    let root = workspace();
+    let cases = [
+        (
+            "InferredVariables",
+            true,
+            r#"section
+variable (x : _)
+def asNat : Nat := x
+def asBool : Bool := x
+theorem unusedHole : True := True.intro
+end
+theorem natWorks : asNat 17 = 17 := rfl
+theorem boolWorks : asBool true = true := rfl
+#check @asNat
+#check @asBool
+#check @unusedHole
+section
+variable {A B}
+def polymorphic (f : A → B) (a : A) : B := f a
+def independentlyTyped : Nat := A
+def independentlyBool : Bool := B
+end
+#check @polymorphic
+#check @independentlyTyped
+#check @independentlyBool
+section
+variable {A}
+def earlier : Nat := A
+variable (x : A)
+def asType : Type := A
+def asProp : Prop := A
+def later := x
+section
+variable (y : _)
+def inner : Bool := y
+end
+def restored := x
+end
+theorem beforeWorks : earlier (A := 3) = 3 := rfl
+theorem afterWorks : later (A := Nat) 4 = 4 := rfl
+theorem restoredWorks : restored (A := Bool) true = true := rfl
+#check @earlier
+#check @asType
+#check @asProp
+#check @later
+#check @inner
+#check @restored
+variable {unused}
+"#,
+        ),
+        (
+            "UnresolvedCapture",
+            false,
+            "variable (x : _)\ndef unresolved := x\n",
+        ),
+        (
+            "UnresolvedIncluded",
+            false,
+            "variable (x : _)\ninclude x\ntheorem unresolved : True := True.intro\n",
+        ),
+        (
+            "InvalidOpenTelescope",
+            false,
+            "variable {A}\nvariable (x : Nat) (h : x = true)\n",
+        ),
+        (
+            "InvalidInstanceAfterHole",
+            false,
+            "variable {A}\nvariable [bad : Nat]\n",
+        ),
+    ];
+    for (name, accepted, program) in cases {
+        let entry = root.join(format!("{name}.lean"));
+        std::fs::write(&entry, format!("prelude\nimport Init.Core\n{program}")).unwrap();
+        let Some((code, expected)) = pinned(&lib, &entry) else {
+            eprintln!("SKIP: pinned Reference executable absent");
+            return;
+        };
+        assert_eq!(code == 0, accepted, "{name}: reference: {expected}");
+        let ours = Command::new(env!("CARGO_BIN_EXE_lean"))
+            .arg(&entry)
+            .current_dir(&root)
+            .env("LEAN_PATH", &lib)
+            .env("FLN_IMPORT_REUSE_DIR", root.join("records"))
+            .output()
+            .expect("run the installed lean");
+        assert_eq!(
+            ours.status.code(),
+            Some(if accepted { 0 } else { 1 }),
+            "{name}: stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&ours.stdout),
+            String::from_utf8_lossy(&ours.stderr)
+        );
+        if accepted {
+            assert_eq!(String::from_utf8(ours.stdout).unwrap(), expected, "{name}");
+            assert!(ours.stderr.is_empty(), "{name}: unexpected stderr");
+        }
+    }
+}

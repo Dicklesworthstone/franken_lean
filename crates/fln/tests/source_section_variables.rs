@@ -4,6 +4,7 @@
 
 use fln::{Budget, Engine, EngineAdmissionLimits, KVMap, Name, SourceCheckLimits};
 use fln_core::expr::{BinderInfo, ExprNode};
+use fln_core::level::Level;
 
 fn limits() -> SourceCheckLimits {
     SourceCheckLimits::new(EngineAdmissionLimits::new(Budget::for_stack_bytes(
@@ -138,7 +139,8 @@ fn variable_types_are_checked_even_without_subsequent_declarations() {
         "variable (A : Type) (x : A) (bad : x)",
         "variable (x : Missing)",
         "variable [bad : Nat]",
-        "variable (x : _)",
+        "variable {A}\nvariable (x : 7)",
+        "variable {A}\nvariable (x : A) (bad : x)",
     ] {
         assert!(
             base.check_source_files(&[source.as_bytes()], &KVMap::new(), limits())
@@ -151,6 +153,116 @@ fn variable_types_are_checked_even_without_subsequent_declarations() {
         base.logical_root(&KVMap::new()),
         after.logical_root(&KVMap::new())
     );
+}
+
+#[test]
+fn section_variable_type_holes_are_inferred_independently_per_declaration() {
+    let e = checked(
+        &engine(),
+        r#"section
+variable (x : _)
+def asNat : Nat := x
+def asBool : Bool := x
+theorem unusedHole : True := True.intro
+end
+theorem natWorks : asNat 17 = 17 := rfl
+theorem boolWorks : asBool true = true := rfl
+section
+variable {A B}
+def polymorphic (f : A → B) (a : A) : B := f a
+def independentlyTyped : Nat := A
+def independentlyBool : Bool := B
+end
+theorem applyWorks : polymorphic (fun x : Nat => x + 1) 5 = 6 := rfl
+theorem independentWorks : independentlyTyped (A := 7) = 7 := rfl
+theorem otherWorks : independentlyBool (B := false) = false := rfl"#,
+    );
+    let type_of = |name| {
+        e.environment()
+            .find(&n(name))
+            .unwrap()
+            .constant_val()
+            .type_
+            .clone()
+    };
+    for (name, domain) in [("asNat", "Nat"), ("asBool", "Bool")] {
+        let type_ = type_of(name);
+        let ExprNode::ForallE { binder_type, .. } = type_.node() else {
+            panic!("{name} should capture x");
+        };
+        assert_eq!(
+            binder_type,
+            &fln_core::expr::Expr::const_(n(domain), vec![])
+        );
+    }
+    assert_eq!(
+        binders(&e, "polymorphic")
+            .iter()
+            .map(|(name, _)| name.to_display_string())
+            .collect::<Vec<_>>(),
+        ["A", "B", "f", "a"]
+    );
+    assert!(binders(&e, "unusedHole").is_empty());
+}
+
+#[test]
+fn later_variable_commands_constrain_holes_without_fixing_other_declarations() {
+    let e = checked(
+        &engine(),
+        r#"section
+variable {A}
+def earlier : Nat := A
+variable (x : A)
+def asType : Type := A
+def asProp : Prop := A
+def later := x
+section
+variable (y : _)
+def inner : Bool := y
+end
+def restored := x
+end
+theorem beforeWorks : earlier (A := 3) = 3 := rfl
+theorem afterWorks : later (A := Nat) 4 = 4 := rfl
+theorem restoredWorks : restored (A := Bool) true = true := rfl"#,
+    );
+    assert_eq!(
+        binders(&e, "later"),
+        [
+            (n("A"), BinderInfo::Implicit),
+            (n("x"), BinderInfo::Default)
+        ]
+    );
+    assert_eq!(binders(&e, "later"), binders(&e, "restored"));
+    for (name, universe) in [("asType", Level::one()), ("asProp", Level::zero())] {
+        let type_ = &e.environment().find(&n(name)).unwrap().constant_val().type_;
+        let ExprNode::ForallE { binder_type, .. } = type_.node() else {
+            panic!("{name} should capture A");
+        };
+        assert_eq!(binder_type, &fln_core::expr::Expr::sort(universe));
+    }
+}
+
+#[test]
+fn unresolved_used_variable_types_and_invalid_open_telescopes_are_refused() {
+    let base = engine();
+    let before = base.logical_root(&KVMap::new());
+    for source in [
+        "variable (x : _)\ndef unknown := x",
+        "variable {A}\nvariable (x : Nat) (h : x = true)",
+        "variable {A}\nvariable [bad : Nat]",
+        "variable (x : _)\ninclude x\ntheorem unknown : True := True.intro",
+    ] {
+        assert!(
+            base.check_source_files(&[source.as_bytes()], &KVMap::new(), limits())
+                .is_err(),
+            "{source}"
+        );
+        assert_eq!(before, base.logical_root(&KVMap::new()));
+    }
+    let after = checked(&base, "variable {A B}\nvariable (x : _)");
+    assert_eq!(before, after.logical_root(&KVMap::new()));
+    checked(&base, "theorem recovery : True := True.intro");
 }
 
 #[test]

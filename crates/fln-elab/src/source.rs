@@ -6538,16 +6538,17 @@ fn definition_elaboration(
         // universe metavariables occurring in theorem headers or `Prop`-typed
         // headers (including `example ... : Prop`) to universe parameters before
         // elaborating the body.
-        let mut roots: Vec<_> = context
-            .source_scope
-            .variables
-            .locals()
-            .decls()
-            .iter()
-            .chain(&parameters)
-            .map(|local| local.type_.clone())
-            .collect();
+        let mut roots: Vec<_> = parameters.iter().map(|local| local.type_.clone()).collect();
         roots.extend(expected.iter().cloned());
+        // An unused section variable may still have an inferred type. Only
+        // the variables captured by this header participate in its universe
+        // generalization; their holes must be solved by this declaration.
+        let section = if let Some(selected) = &theorem_section_parameters {
+            selected.clone()
+        } else {
+            context.section_parameters(&roots, false)?
+        };
+        roots.extend(section.iter().map(|local| local.type_.clone()));
         context.generalize_declaration_universes(&roots)?;
     }
     if prop_header || proof_instance {
