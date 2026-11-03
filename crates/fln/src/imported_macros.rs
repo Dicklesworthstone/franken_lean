@@ -6,7 +6,8 @@
 //! It does not enable expansion-less parser registrations, interpret Lean's
 //! toolchain implementation, or supply ambient environment authority. Native
 //! namespace, declaration membership and name resolution require an explicit
-//! invocation capability; the recursive `expandMacro?` callback remains refused.
+//! invocation capability. Registered invocations also bind `expandMacro?` to
+//! their exact active table, with shared work limits and no ambient authority.
 
 use crate::imported_ir::{
     self, CompiledCallableIr, IrExecutionError, IrExecutionLimits, ReferenceFunction,
@@ -17,6 +18,7 @@ use fln_core::name::{LeafView, Name};
 use fln_core::outcome::{Inconclusive, Outcome, ResourceUsage};
 use fln_olean::ir::IrModule;
 use fln_rt::convert::{Conversion, inject_name};
+use fln_rt::macro_expansion_abi_generated as expansion_layout;
 use fln_rt::obj::Obj;
 use fln_rt::syntax_abi_generated as layout;
 use fln_syntax::source::SourceText;
@@ -37,7 +39,7 @@ pub use syntax::{SyntaxConversionError, SyntaxLimits};
 /// reference supplied by the native context. Its opaque MethodsRef cannot be
 /// inspected, mutated or allowed to escape verified calls. Namespace queries,
 /// declaration membership and name resolution use the explicit capability in
-/// [`MacroInvocation`]; the recursive `expandMacro?` callback remains unavailable.
+/// [`MacroInvocation`]; recursive expansion is supplied by the active registry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MacroContext {
     pub quotation_context: Name,
@@ -213,6 +215,20 @@ impl CompiledMacro {
         limits: MacroLimits,
         cancellation: Option<&dyn CancellationProbe>,
     ) -> MacroExecution {
+        self.execute_with_methods(input, invocation, limits, cancellation, None, None)
+    }
+
+    /// Registry-only expansion authority, independent of the environment lookup.
+    /// Nested calls keep the caller's error reference and observable reader depth.
+    pub(crate) fn execute_with_methods(
+        &self,
+        input: &Syntax,
+        invocation: MacroInvocation<'_>,
+        limits: MacroLimits,
+        cancellation: Option<&dyn CancellationProbe>,
+        expansion: Option<&dyn fln_vm::macro_native::MacroExpansion>,
+        reference: Option<&Syntax>,
+    ) -> MacroExecution {
         let MacroInvocation {
             source,
             context,
@@ -221,6 +237,10 @@ impl CompiledMacro {
         } = invocation;
         let prepared = (|| {
             let syntax = syntax::inject(input, source, limits.syntax)?;
+            let reference = match reference {
+                Some(reference) => syntax::inject(reference, source, limits.syntax)?,
+                None => syntax.clone_ref(),
+            };
             let mut budget = StateBudget::new(limits.syntax);
             let context = make_ctor(
                 layout::MACRO_CONTEXT,
@@ -232,7 +252,7 @@ impl CompiledMacro {
                     nat(context.current_macro_scope),
                     nat(context.current_recursion_depth),
                     nat(context.max_recursion_depth),
-                    syntax.clone_ref(),
+                    reference,
                 ],
             );
             let state = inject_state(state, &mut budget)?;
@@ -242,20 +262,19 @@ impl CompiledMacro {
         let outcome = match prepared {
             Err(error) => conversion_outcome(error),
             Ok(arguments) => {
-                let outcome = match lookup {
-                    Some(lookup) => fln_vm::interpreter::execute_function_with_macro_lookup(
+                let outcome = if lookup.is_some() || expansion.is_some() {
+                    fln_vm::interpreter::execute_function_with_macro_methods(
                         self.callable.program(),
                         self.callable.entry_function(),
                         arguments,
                         limits.vm,
-                        lookup,
+                        fln_vm::macro_native::MacroMethods { lookup, expansion },
                         cancellation,
-                    ),
-                    None => {
-                        self.callable
-                            .execute(arguments, limits.vm, cancellation)
-                            .outcome
-                    }
+                    )
+                } else {
+                    self.callable
+                        .execute(arguments, limits.vm, cancellation)
+                        .outcome
                 };
                 match outcome {
                     Outcome::Complete(VmExit::Returned(result)) => {
@@ -469,6 +488,64 @@ impl StateBudget {
             .project_name(name)
             .map_err(SyntaxConversionError::Name)
     }
+
+    /// Share one allowance between all callback projections and injections.
+    /// A failed conversion stops the invocation, so only successful work needs
+    /// to be retained for the next callback.
+    fn callback_syntax<T>(
+        &mut self,
+        convert: impl FnOnce(SyntaxLimits) -> Result<(T, SyntaxLimits), SyntaxConversionError>,
+    ) -> Result<T, SyntaxConversionError> {
+        let remaining = SyntaxLimits {
+            max_nodes: self.limits.max_nodes.saturating_sub(self.nodes),
+            max_bytes: self.limits.max_bytes.saturating_sub(self.bytes),
+        };
+        let (value, usage) = convert(remaining).map_err(|error| match error {
+            SyntaxConversionError::Limit {
+                resource: "nodes",
+                observed,
+                ..
+            } => SyntaxConversionError::Limit {
+                resource: "state nodes",
+                limit: self.limits.max_nodes,
+                observed: self.nodes.saturating_add(observed),
+            },
+            SyntaxConversionError::Limit {
+                resource: "text bytes",
+                observed,
+                ..
+            } => SyntaxConversionError::Limit {
+                resource: "state bytes",
+                limit: self.limits.max_bytes,
+                observed: self.bytes.saturating_add(observed),
+            },
+            other => other,
+        })?;
+        self.charge(usage.max_nodes, usage.max_bytes)?;
+        Ok(value)
+    }
+
+    fn project_callback_syntax(
+        &mut self,
+        value: &Obj,
+        source: &SourceText,
+    ) -> Result<Syntax, SyntaxConversionError> {
+        self.callback_syntax(|remaining| syntax::project_counted(value, source, remaining))
+    }
+
+    fn inject_callback_syntax(
+        &mut self,
+        value: &Syntax,
+        source: &SourceText,
+    ) -> Result<Obj, SyntaxConversionError> {
+        self.callback_syntax(|remaining| {
+            let (value, mut usage) = syntax::inject_counted(value, source, remaining)?;
+            // Generation counters exclude the shared source, but each bridge
+            // injection actually allocates its backing and must pay for it.
+            usage.max_bytes = usage.max_bytes.saturating_add(source.len_bytes());
+            Ok((value, usage))
+        })
+    }
 }
 
 fn list(values: Vec<Obj>) -> Obj {
@@ -578,6 +655,102 @@ fn project_state(
         trace_messages,
         expanded_macro_declarations,
     })
+}
+
+/// Decode the reader and state supplied by user MacroM code at the callback.
+/// These are values, not host authority; MethodsRef is deliberately not read.
+fn project_callback(
+    input: &Obj,
+    context: &Obj,
+    state: &Obj,
+    source: &SourceText,
+    budget: &mut StateBudget,
+) -> Result<(Syntax, MacroContext, Syntax, MacroState), SyntaxConversionError> {
+    check_ctor(context, layout::MACRO_CONTEXT)?;
+    budget.charge(1, 0)?;
+    let quotation_context =
+        budget.project_name(&child(context, layout::MACRO_CONTEXT_QUOTATION_FIELD)?)?;
+    let read_nat = |field| -> Result<u64, SyntaxConversionError> {
+        let value = child(context, field)?;
+        if value.is_scalar() {
+            return Ok(value.unbox() as u64);
+        }
+        let (_, sign, limbs) = value
+            .try_mpz_view()
+            .ok_or(SyntaxConversionError::Malformed(
+                "macro context field is not a Nat",
+            ))?;
+        if sign < 0 || limbs.len() > 1 {
+            return Err(SyntaxConversionError::Malformed(
+                "macro context Nat exceeds the native range",
+            ));
+        }
+        Ok(limbs.first().copied().unwrap_or(0))
+    };
+    let current_macro_scope = read_nat(layout::MACRO_CONTEXT_SCOPE_FIELD)?;
+    let current_recursion_depth = read_nat(expansion_layout::MACRO_CONTEXT_DEPTH_FIELD)?;
+    let max_recursion_depth = read_nat(expansion_layout::MACRO_CONTEXT_MAX_DEPTH_FIELD)?;
+    let reference = budget.project_callback_syntax(
+        &child(context, expansion_layout::MACRO_CONTEXT_REF_FIELD)?,
+        source,
+    )?;
+    Ok((
+        budget.project_callback_syntax(input, source)?,
+        MacroContext {
+            quotation_context,
+            current_macro_scope,
+            current_recursion_depth,
+            max_recursion_depth,
+        },
+        reference,
+        project_state(state, budget)?,
+    ))
+}
+
+/// Build exactly the Option-valued EStateM result of `Macro.expandMacro?`.
+fn inject_callback_result(
+    result: registrations::RegisteredExpansion,
+    source: &SourceText,
+    budget: &mut StateBudget,
+) -> Result<Obj, SyntaxConversionError> {
+    use registrations::RegisteredExpansion;
+    budget.charge(2, 0)?;
+    let (layout, payload, state) = match result {
+        RegisteredExpansion::Expanded { syntax, state, .. } => (
+            layout::RESULT_OK,
+            make_ctor(
+                expansion_layout::OPTION_SOME,
+                vec![budget.inject_callback_syntax(&syntax, source)?],
+            ),
+            state,
+        ),
+        RegisteredExpansion::Unsupported { state } => (
+            layout::RESULT_OK,
+            Obj::mk_nat(expansion_layout::OPTION_NONE_TAG),
+            state,
+        ),
+        RegisteredExpansion::Error {
+            reference,
+            message,
+            state,
+            ..
+        } => {
+            budget.charge(1, message.len())?;
+            (
+                layout::RESULT_ERROR,
+                make_ctor(
+                    layout::EXCEPTION_ERROR,
+                    vec![
+                        budget.inject_callback_syntax(&reference, source)?,
+                        Obj::mk_string(&message),
+                    ],
+                ),
+                state,
+            )
+        }
+    };
+    let state = inject_state(&state, budget)?;
+    Ok(make_ctor(layout, vec![payload, state]))
 }
 
 fn project_result(

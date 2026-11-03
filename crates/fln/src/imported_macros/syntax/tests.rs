@@ -61,6 +61,55 @@ fn syntax_roundtrip_preserves_unicode_trivia_scopes_and_preresolution() {
 }
 
 #[test]
+fn distinct_source_backings_pay_for_each_validation() {
+    let source = SourceText::from_utf8(b"source backing").unwrap();
+    let ident = Syntax::Ident {
+        info: SourceInfo::None,
+        raw_val: range(0, 1),
+        val: Name::anonymous(),
+        preresolved: Vec::new(),
+    };
+    let first = inject(&ident, &source, SyntaxLimits::default()).unwrap();
+    let second = inject(&ident, &source, SyntaxLimits::default()).unwrap();
+    let node = |children| {
+        Obj::mk_ctor(
+            abi::SYNTAX_NODE.tag,
+            vec![
+                Obj::mk_nat(abi::SOURCE_NONE_TAG),
+                inject_name(&Name::anonymous()),
+                Obj::mk_array(children),
+            ],
+            &[],
+        )
+    };
+    let shared = node(vec![first.clone_ref(), first.clone_ref()]);
+    let separate = node(vec![first, second]);
+    let (expected, shared_usage) =
+        project_counted(&shared, &source, SyntaxLimits::default()).unwrap();
+    let (actual, separate_usage) =
+        project_counted(&separate, &source, SyntaxLimits::default()).unwrap();
+    assert_eq!(actual, expected);
+    assert_eq!(separate_usage.max_nodes, shared_usage.max_nodes);
+    assert_eq!(
+        separate_usage.max_bytes,
+        shared_usage.max_bytes + source.len_bytes()
+    );
+    assert_eq!(project(&shared, &source, shared_usage).unwrap(), expected);
+    assert!(matches!(
+        project(&separate, &source, shared_usage),
+        Err(SyntaxConversionError::Limit {
+            resource: "text bytes",
+            limit,
+            observed,
+        }) if limit == shared_usage.max_bytes && observed == separate_usage.max_bytes
+    ));
+    assert_eq!(
+        project(&separate, &source, separate_usage).unwrap(),
+        expected
+    );
+}
+
+#[test]
 fn deep_trees_use_bounded_explicit_stacks() {
     let source = SourceText::from_utf8(b"x").unwrap();
     let mut tree = Syntax::Ident {

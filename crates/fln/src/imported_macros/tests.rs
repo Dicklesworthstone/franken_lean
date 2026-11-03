@@ -378,8 +378,8 @@ fn macro_selection_never_executes_toolchain_bodies_or_ambient_effects() {
             }
         ))
     ));
-    // Name resolution has native lookup rows. Recursive macro expansion still
-    // requires an unsupported method and must not run a toolchain body.
+    // Native methods only receive Context in their exact admitted argument
+    // positions. A recognized method name cannot authorize carrier escape.
     for (function, args) in [
         ("Lean.Macro.addMacroScope", [1, 0, 2]),
         ("Lean.Macro.addMacroScope", [0, 1, 1]),
@@ -417,7 +417,7 @@ fn macro_selection_never_executes_toolchain_bodies_or_ambient_effects() {
             "context escaped through {function}"
         );
     }
-    let unknown = module(
+    let expansion = module(
         vec![
             bind(
                 5,
@@ -430,6 +430,44 @@ fn macro_selection_never_executes_toolchain_bodies_or_ambient_effects() {
         ],
         6,
     );
+    let report = prepared(&expansion).execute(
+        &leaf(),
+        &source(),
+        &context(),
+        &MacroState::default(),
+        MacroLimits::default(),
+        None,
+    );
+    assert_eq!(
+        report
+            .reference_functions
+            .iter()
+            .map(|function| function.name.clone())
+            .collect::<Vec<_>>(),
+        vec![name("User.macro")]
+    );
+    assert_eq!(
+        report.native_functions,
+        vec!["mirror:Lean.Macro.expandMacro?"]
+    );
+    assert!(matches!(
+        report.outcome,
+        Outcome::Complete(Err(MacroExecutionError::Runtime(
+            fln_vm::interpreter::VmRefusal::MacroExpansionUnavailable
+        )))
+    ));
+    let mut unknown = expansion;
+    let IrDecl::Function { body, .. } = &mut unknown.decls[0] else {
+        unreachable!()
+    };
+    let IrStmt::VDecl {
+        expr: IrExpr::Fap { function, .. },
+        ..
+    } = &mut body.stmts[0]
+    else {
+        unreachable!()
+    };
+    *function = name("Lean.Macro.unregisteredMethod");
     assert!(matches!(
         compile(
             &[unknown],
@@ -440,7 +478,7 @@ fn macro_selection_never_executes_toolchain_bodies_or_ambient_effects() {
         ),
         Err(MacroExecutionError::Compile(
             IrExecutionError::Unclassified(declaration)
-        )) if declaration == name("Lean.Macro.expandMacro?")
+        )) if declaration == name("Lean.Macro.unregisteredMethod")
     ));
     let refs = module(
         vec![

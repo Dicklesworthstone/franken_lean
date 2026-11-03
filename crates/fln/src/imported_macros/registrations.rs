@@ -22,6 +22,9 @@ use fln_syntax::source::SourceText;
 use fln_syntax::tree::Syntax;
 use fln_vm::interpreter::{CancellationProbe, ExecutionUsage};
 use fln_vm::macro_native::MacroLookup;
+
+mod recursive;
+use recursive::{ExpansionWork, RegistryExpansion, add_tree_usage, add_vm_usage};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Arc;
@@ -192,6 +195,7 @@ pub struct MacroDispatchInvocation<'a> {
 struct ExpansionContext<'a> {
     source: &'a SourceText,
     context: &'a MacroContext,
+    reference: Option<&'a Syntax>,
     lookup: Option<&'a dyn MacroLookup>,
     cancellation: Option<&'a dyn CancellationProbe>,
 }
@@ -490,28 +494,24 @@ impl RegisteredMacros {
             state,
             lookup,
         } = invocation;
-        let mut report = MacroDispatch {
-            outcome: Outcome::Complete(Ok(RegisteredExpansion::Unsupported {
-                state: MacroState::default(),
-            })),
-            attempts: Vec::new(),
-            completed_vm_usage: ExecutionUsage {
-                steps: 0,
-                system_polls: 0,
-                peak_stack_depth: 0,
-            },
-        };
+        let mut report = MacroDispatch::empty();
+        let mut work = ExpansionWork::new(MacroTreeLimits {
+            dispatch: limits,
+            max_visits: u64::MAX,
+            generation: limits.execution.syntax,
+        });
         report.outcome = self.expand(
             input,
             ExpansionContext {
                 source,
                 context,
+                reference: None,
                 lookup,
                 cancellation,
             },
             state,
-            limits,
             &mut report,
+            &mut work,
         );
         report
     }
@@ -567,36 +567,26 @@ impl RegisteredMacros {
             state,
             lookup,
         } = invocation;
-        let mut report = MacroDispatch {
-            outcome: Outcome::Complete(Ok(RegisteredExpansion::Unsupported {
-                state: MacroState::default(),
-            })),
-            attempts: Vec::new(),
-            completed_vm_usage: ExecutionUsage {
-                steps: 0,
-                system_polls: 0,
-                peak_stack_depth: 0,
-            },
-        };
-        let mut usage = MacroTreeUsage::default();
+        let mut report = MacroDispatch::empty();
+        let mut work = ExpansionWork::new(limits);
         let outcome = self.expand_tree_impl(
             input,
             ExpansionContext {
                 source,
                 context,
+                reference: None,
                 lookup,
                 cancellation,
             },
             state,
-            limits,
             &mut report,
-            &mut usage,
+            &mut work,
         );
         MacroTreeDispatch {
             outcome,
             attempts: report.attempts,
             completed_vm_usage: report.completed_vm_usage,
-            usage,
+            usage: work.usage,
         }
     }
 
@@ -605,16 +595,17 @@ impl RegisteredMacros {
         input: &Syntax,
         invocation: ExpansionContext<'_>,
         mut state: MacroState,
-        limits: MacroTreeLimits,
         report: &mut MacroDispatch,
-        tree_usage: &mut MacroTreeUsage,
+        work: &mut ExpansionWork,
     ) -> Outcome<Result<MacroTreeResult, MacroExecutionError>> {
         let ExpansionContext {
             source,
             context,
+            reference,
             lookup,
             cancellation,
         } = invocation;
+        let limits = work.limits;
         if cancellation.is_some_and(CancellationProbe::is_cancelled) {
             return Outcome::Inconclusive(Inconclusive::cancelled("before macro tree conversion"));
         }
@@ -645,14 +636,14 @@ impl RegisteredMacros {
                     built.push(parent);
                 }
                 Task::Visit(mut syntax, depth) => {
-                    if tree_usage.visits >= limits.max_visits {
+                    if work.usage.visits >= limits.max_visits {
                         return stopped(
                             "macro tree visits",
                             limits.max_visits,
-                            tree_usage.visits.saturating_add(1),
+                            work.usage.visits.saturating_add(1),
                         );
                     }
-                    tree_usage.visits += 1;
+                    work.usage.visits += 1;
                     let Some(kind) = syntax.kind() else {
                         built.push(syntax);
                         continue;
@@ -668,57 +659,19 @@ impl RegisteredMacros {
                         ExpansionContext {
                             source,
                             context: &current,
+                            reference,
                             lookup,
                             cancellation,
                         },
                         state,
-                        limits.dispatch,
                         report,
+                        work,
                     ) {
                         Outcome::Complete(Ok(RegisteredExpansion::Expanded {
                             syntax: next,
                             state: successor,
                             ..
                         })) => {
-                            let usage = match super::syntax::inject_counted(
-                                &next,
-                                source,
-                                limits.dispatch.execution.syntax,
-                            ) {
-                                Ok((_, usage)) => usage,
-                                Err(error) => {
-                                    return conversion_outcome(error).map_complete(|result| {
-                                        result.map(|_| {
-                                            unreachable!(
-                                                "failed generated conversion cannot produce a tree"
-                                            )
-                                        })
-                                    });
-                                }
-                            };
-                            tree_usage.generated_nodes =
-                                tree_usage.generated_nodes.saturating_add(usage.max_nodes);
-                            tree_usage.generated_bytes =
-                                tree_usage.generated_bytes.saturating_add(usage.max_bytes);
-                            if tree_usage.generated_nodes > limits.generation.max_nodes {
-                                return stopped(
-                                    "macro tree generated nodes",
-                                    limits.generation.max_nodes as u64,
-                                    tree_usage.generated_nodes as u64,
-                                );
-                            }
-                            if tree_usage.generated_bytes > limits.generation.max_bytes {
-                                return Outcome::Inconclusive(
-                                    Inconclusive::resource(ResourceUsage {
-                                        reason: ResourceReason::Memory {
-                                            limit_bytes: limits.generation.max_bytes as u64,
-                                        },
-                                        allowed: limits.generation.max_bytes as u64,
-                                        observed: tree_usage.generated_bytes as u64,
-                                    })
-                                    .with_progress("macro tree generated bytes"),
-                                );
-                            }
                             state = successor;
                             tasks.push(Task::Visit(next, depth));
                             continue;
@@ -797,15 +750,17 @@ impl RegisteredMacros {
         input: &Syntax,
         invocation: ExpansionContext<'_>,
         mut state: MacroState,
-        limits: MacroDispatchLimits,
         report: &mut MacroDispatch,
+        work: &mut ExpansionWork,
     ) -> Outcome<Result<RegisteredExpansion, MacroExecutionError>> {
         let ExpansionContext {
             source,
             context,
+            reference,
             lookup,
             cancellation,
         } = invocation;
+        let limits = work.limits.dispatch;
         let kind = match input {
             Syntax::Node { kind, .. } => kind.clone(),
             Syntax::Ident { .. } => Name::from_components(["ident"]),
@@ -859,7 +814,25 @@ impl RegisteredMacros {
             current.current_macro_scope = fresh_scope;
             let mut execution = limits.execution;
             execution.vm.max_steps -= report.completed_vm_usage.steps;
-            let result = candidate.compiled.execute_with_context(
+            // Reserve the outer attempt before re-entry so observations retain
+            // invocation order, even when a nested macro fails or is cancelled.
+            let attempt = report.attempts.len();
+            report.attempts.push(MacroAttempt {
+                module: candidate.module.clone(),
+                declaration: candidate.declaration.clone(),
+                vm_usage: None,
+                reference_functions: Vec::new(),
+                native_functions: Vec::new(),
+            });
+            let callback = RegistryExpansion::new(
+                self,
+                source,
+                lookup,
+                work.remaining(report.attempts.len()),
+                work.callback_depth,
+                work.conversions.clone(),
+            );
+            let result = candidate.compiled.execute_with_methods(
                 input,
                 MacroInvocation {
                     source,
@@ -869,28 +842,40 @@ impl RegisteredMacros {
                 },
                 execution,
                 cancellation,
+                Some(&callback),
+                reference,
             );
+            let nested = callback.into_progress();
+            add_tree_usage(&mut work.usage, nested.tree_usage);
             if let Some(usage) = result.vm_usage {
-                report.completed_vm_usage.steps += usage.steps;
-                report.completed_vm_usage.system_polls += usage.system_polls;
-                report.completed_vm_usage.peak_stack_depth = report
-                    .completed_vm_usage
-                    .peak_stack_depth
-                    .max(usage.peak_stack_depth);
+                // The VM already charged the callbacks to this terminal run.
+                add_vm_usage(&mut report.completed_vm_usage, usage);
+            } else {
+                // A nonterminal outer run has no complete usage record, but
+                // successful nested VM calls remain real completed work.
+                add_vm_usage(&mut report.completed_vm_usage, nested.vm_usage);
             }
-            report.attempts.push(MacroAttempt {
-                module: candidate.module.clone(),
-                declaration: candidate.declaration.clone(),
-                vm_usage: result.vm_usage,
-                reference_functions: result.reference_functions,
-                native_functions: result.native_functions,
-            });
+            report.attempts[attempt].vm_usage = result.vm_usage;
+            report.attempts[attempt].reference_functions = result.reference_functions;
+            report.attempts[attempt].native_functions = result.native_functions;
+            if report.attempts.try_reserve(nested.attempts.len()).is_err() {
+                return Outcome::Inconclusive(Inconclusive::dependency_unavailable(
+                    "host allocation for recursive macro attempt observations",
+                ));
+            }
+            report.attempts.extend(nested.attempts);
             match result.outcome {
                 Outcome::Complete(Ok(MacroResult::Unsupported { state: next })) => state = next,
                 Outcome::Complete(Ok(MacroResult::Expanded {
                     syntax,
                     state: mut next,
                 })) => {
+                    if let Err(error) = work.generated(&syntax, source) {
+                        return conversion_outcome(error).map_complete(|result| {
+                            result
+                                .map(|_| unreachable!("failed generated conversion cannot expand"))
+                        });
+                    }
                     if next.expanded_macro_declarations.try_reserve(1).is_err() {
                         return Outcome::Inconclusive(Inconclusive::dependency_unavailable(
                             "host allocation for expanded macro declarations",
@@ -937,6 +922,9 @@ impl RegisteredMacros {
 #[derive(Debug, Clone, Copy)]
 pub struct MacroDispatchLimits {
     pub max_attempts: u64,
+    /// Per-invocation VM/conversion limits. The syntax allowance additionally
+    /// bounds cumulative callback projection and reinjection work across this
+    /// entire root/tree dispatch, including queries with no matching macro.
     pub execution: MacroLimits,
 }
 
@@ -1028,6 +1016,8 @@ pub enum RegisteredExpansion {
 pub struct MacroAttempt {
     pub module: Name,
     pub declaration: Name,
+    /// Inclusive of completed recursive callbacks made by this invocation.
+    /// Use the dispatch total, not a sum of attempts, for aggregate work.
     pub vm_usage: Option<ExecutionUsage>,
     /// The conservative linked closure, not a claim that every function ran.
     pub reference_functions: Vec<ReferenceFunction>,
@@ -1038,9 +1028,25 @@ pub struct MacroAttempt {
 pub struct MacroDispatch {
     pub outcome: Outcome<Result<RegisteredExpansion, MacroExecutionError>>,
     pub attempts: Vec<MacroAttempt>,
-    /// Sum/max over terminal invocations. An inconclusive invocation reports
-    /// its stop usage in `outcome` and ends dispatch immediately.
+    /// Completed VM work with recursive calls counted once. An inconclusive
+    /// invocation reports its stop usage in `outcome` and ends dispatch.
     pub completed_vm_usage: ExecutionUsage,
+}
+
+impl MacroDispatch {
+    fn empty() -> Self {
+        Self {
+            outcome: Outcome::Complete(Ok(RegisteredExpansion::Unsupported {
+                state: MacroState::default(),
+            })),
+            attempts: Vec::new(),
+            completed_vm_usage: ExecutionUsage {
+                steps: 0,
+                system_polls: 0,
+                peak_stack_depth: 0,
+            },
+        }
+    }
 }
 
 fn stopped<T>(what: &'static str, allowed: u64, observed: u64) -> Outcome<T> {

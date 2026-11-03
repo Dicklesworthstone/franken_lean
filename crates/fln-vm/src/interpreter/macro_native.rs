@@ -28,6 +28,7 @@ pub(super) enum Intrinsic {
     HasDecl,
     ResolveNamespace,
     ResolveGlobalName,
+    ExpandMacro,
 }
 
 impl Intrinsic {
@@ -49,6 +50,7 @@ impl Intrinsic {
             "mirror:Lean.Macro.hasDecl" => Self::HasDecl,
             "mirror:Lean.Macro.resolveNamespace" => Self::ResolveNamespace,
             "mirror:Lean.Macro.resolveGlobalName" => Self::ResolveGlobalName,
+            "mirror:Lean.Macro.expandMacro?" => Self::ExpandMacro,
             _ => return None,
         })
     }
@@ -76,11 +78,15 @@ impl Intrinsic {
                 | Self::MacroAddMacroScope
                 | Self::HasDecl
                 | Self::ResolveNamespace
-                | Self::ResolveGlobalName => 3,
+                | Self::ResolveGlobalName
+                | Self::ExpandMacro => 3,
                 _ => 1,
             },
         )?;
         match self {
+            Self::ExpandMacro => Err(IntrinsicFailure::Refused(
+                VmRefusal::MacroExpansionUnavailable,
+            )),
             Self::MkStr1 => {
                 let text = string(&args[0])?;
                 limit("name bytes", MAX_NAME_BYTES, text.len() as u64)?;

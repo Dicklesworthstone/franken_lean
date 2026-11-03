@@ -5,9 +5,40 @@
 //! the Syntax ABI contract. Keeping a distinct `mirror:` identity avoids
 //! fabricating rows in the generated extern census.
 
+use crate::interpreter::{CancellationProbe, ExecutionLimits, ExecutionUsage, VmRefusal};
 use fln_comp::flbc::{ArgumentOwnership, ResultOwnership};
 use fln_core::name::Name;
+use fln_core::outcome::Outcome;
+use fln_rt::obj::Obj;
 use fln_rt::syntax_abi_generated as generated;
+
+/// Invocation-local authority to expand one root using the active macro table.
+/// The opaque MethodsRef never grants this capability. The arguments and result
+/// use the extracted MacroM ABI; the host must validate them before use.
+pub trait MacroExpansion {
+    fn expand_macro(
+        &self,
+        syntax: &Obj,
+        context: &Obj,
+        state: &Obj,
+        limits: ExecutionLimits,
+        cancellation: Option<&dyn CancellationProbe>,
+    ) -> MacroExpansionResult;
+}
+
+/// A callback's EStateM result and the completed VM work it performed.
+/// Resource stops and internal faults remain outside the Lean exception value.
+pub struct MacroExpansionResult {
+    pub outcome: Outcome<Result<Obj, VmRefusal>>,
+    pub usage: ExecutionUsage,
+}
+
+/// Independent capabilities borrowed for one VM invocation, never cached.
+#[derive(Clone, Copy, Default)]
+pub struct MacroMethods<'a> {
+    pub lookup: Option<&'a dyn MacroLookup>,
+    pub expansion: Option<&'a dyn MacroExpansion>,
+}
 
 /// Read-only host lookups explicitly supplied for one macro invocation.
 ///
@@ -218,6 +249,13 @@ pub const ROWS: &[MirrorRow] = &[
         parameters: generated::MACRO_RESOLVE_GLOBAL_NAME_PARAMETERS,
         result_type: generated::MACRO_RESOLVE_GLOBAL_NAME_RESULT,
     },
+    MirrorRow {
+        id: "mirror:Lean.Macro.expandMacro?",
+        name: "Lean.Macro.expandMacro?",
+        borrowed: fln_rt::macro_expansion_abi_generated::MACRO_EXPAND_MACRO_BORROWED,
+        parameters: fln_rt::macro_expansion_abi_generated::MACRO_EXPAND_MACRO_PARAMETERS,
+        result_type: fln_rt::macro_expansion_abi_generated::MACRO_EXPAND_MACRO_RESULT,
+    },
 ];
 
 pub fn row_for_name(name: &Name) -> Option<&'static MirrorRow> {
@@ -230,4 +268,7 @@ pub fn row_for_id(id: &str) -> Option<&'static MirrorRow> {
 }
 
 /// Included in inline-cache context identity alongside the extern contract.
-pub const CONTRACT: &str = include_str!("../../fln-rt/src/syntax_abi_generated.rs");
+pub const CONTRACT: &str = concat!(
+    include_str!("../../fln-rt/src/syntax_abi_generated.rs"),
+    include_str!("../../fln-rt/src/macro_expansion_abi_generated.rs"),
+);

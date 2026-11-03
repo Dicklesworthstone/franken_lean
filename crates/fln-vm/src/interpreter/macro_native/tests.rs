@@ -45,11 +45,31 @@ fn invoke(intrinsic: Intrinsic, args: &[Obj]) -> Obj {
         Intrinsic::HasDecl => "mirror:Lean.Macro.hasDecl",
         Intrinsic::ResolveNamespace => "mirror:Lean.Macro.resolveNamespace",
         Intrinsic::ResolveGlobalName => "mirror:Lean.Macro.resolveGlobalName",
+        Intrinsic::ExpandMacro => "mirror:Lean.Macro.expandMacro?",
     };
     match intrinsic.invoke(id, args) {
         Ok(value) => value.into_object(),
         Err(_) => panic!("native {id} refused a valid input"),
     }
+}
+
+#[test]
+fn recursive_expansion_requires_an_explicit_host_capability() {
+    let row = "mirror:Lean.Macro.expandMacro?";
+    assert!(matches!(
+        Intrinsic::ExpandMacro.invoke(row, &[Obj::mk_nat(0), Obj::mk_nat(0), Obj::mk_nat(0)]),
+        Err(IntrinsicFailure::Refused(
+            VmRefusal::MacroExpansionUnavailable
+        ))
+    ));
+    assert!(matches!(
+        Intrinsic::ExpandMacro.invoke(row, &[]),
+        Err(IntrinsicFailure::Refused(VmRefusal::IntrinsicArity {
+            expected: 3,
+            actual: 0,
+            ..
+        }))
+    ));
 }
 
 #[test]

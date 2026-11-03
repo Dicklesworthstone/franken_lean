@@ -455,6 +455,11 @@ impl Projection<'_> {
         let backing = child(value, 0)?;
         let identity = backing.identity_token();
         if !self.checked_sources.contains(&identity) {
+            // Budget::new already paid for the first backing. Distinct copies
+            // require another complete comparison even when their bytes match.
+            if !self.checked_sources.is_empty() {
+                self.budget.text(self.source.len_bytes())?;
+            }
             if string(&backing)? != self.source.as_str() {
                 return Err(SyntaxConversionError::Malformed(
                     "foreign substring source buffer",
@@ -582,6 +587,16 @@ impl Projection<'_> {
 
 /// Project a result only when every original source substring retains its bytes.
 pub(super) fn project(value: &Obj, source: &SourceText, limits: SyntaxLimits) -> Result<Syntax> {
+    project_counted(value, source, limits).map(|(value, _)| value)
+}
+
+/// Account for all projection work, including source backing validation. This
+/// allows recursive callbacks to share a conversion allowance across queries.
+pub(super) fn project_counted(
+    value: &Obj,
+    source: &SourceText,
+    limits: SyntaxLimits,
+) -> Result<(Syntax, SyntaxLimits)> {
     enum Task {
         Visit(Obj),
         Node {
@@ -682,9 +697,16 @@ pub(super) fn project(value: &Obj, source: &SourceText, limits: SyntaxLimits) ->
         reserve(&mut built, 1)?;
         built.push(tree);
     }
-    built
+    let syntax = built
         .pop()
-        .ok_or(SyntaxConversionError::Malformed("empty syntax traversal"))
+        .ok_or(SyntaxConversionError::Malformed("empty syntax traversal"))?;
+    Ok((
+        syntax,
+        SyntaxLimits {
+            max_nodes: projection.budget.nodes,
+            max_bytes: projection.budget.bytes,
+        },
+    ))
 }
 
 #[cfg(test)]

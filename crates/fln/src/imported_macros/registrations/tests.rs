@@ -25,6 +25,10 @@ mod source;
 #[cfg(test)]
 mod lookup;
 
+mod recursive;
+
+mod recursive_reference;
+
 fn name(text: &str) -> Name {
     Name::from_components(text.split('.'))
 }

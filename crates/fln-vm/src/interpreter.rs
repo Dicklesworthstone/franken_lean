@@ -1455,6 +1455,12 @@ pub enum ValueKind {
 /// value or requested host row did not satisfy the operation contract.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum VmRefusal {
+    /// Recursive macro expansion requires a separate invocation capability.
+    MacroExpansionUnavailable,
+    /// The native callback could not validate a macro value or linked operation.
+    MacroExpansionInvalid {
+        detail: String,
+    },
     /// A native MacroM lookup was invoked without an explicit host capability.
     MacroLookupUnavailable {
         operation: &'static str,
@@ -1629,6 +1635,12 @@ impl fmt::Display for VmRefusal {
                     f,
                     "{operation} requires an explicit macro lookup capability"
                 )
+            }
+            Self::MacroExpansionUnavailable => {
+                f.write_str("Lean.Macro.expandMacro? requires an explicit expansion capability")
+            }
+            Self::MacroExpansionInvalid { detail } => {
+                write!(f, "native macro expansion: {detail}")
             }
             Self::IntrinsicArity {
                 row,
@@ -2199,7 +2211,32 @@ pub fn execute_function_with_macro_lookup(
         cancellation,
         None,
         Some((function, arguments)),
-        Some(lookup),
+        Some(crate::macro_native::MacroMethods {
+            lookup: Some(lookup),
+            expansion: None,
+        }),
+    ))
+}
+
+/// Invoke a macro with explicit lookup and recursive-expansion capabilities.
+/// Nested VM work is charged to this invocation's remaining instruction and
+/// stack budgets. Neither capability is available through ordinary execution.
+pub fn execute_function_with_macro_methods(
+    program: &ValidatedProgram,
+    function: FunctionId,
+    arguments: Vec<Obj>,
+    limits: ExecutionLimits,
+    methods: crate::macro_native::MacroMethods<'_>,
+    cancellation: Option<&dyn CancellationProbe>,
+) -> Outcome<VmExit> {
+    finish_run(run(
+        program,
+        limits,
+        CommandExecutionContext::UNLIMITED,
+        cancellation,
+        None,
+        Some((function, arguments)),
+        Some(methods),
     ))
 }
 
@@ -2314,7 +2351,7 @@ fn run(
     cancellation: Option<&dyn CancellationProbe>,
     mut inline_caches: Option<&mut InlineCaches>,
     invocation: Option<(FunctionId, Vec<Obj>)>,
-    macro_lookup: Option<&dyn crate::macro_native::MacroLookup>,
+    macro_methods: Option<crate::macro_native::MacroMethods<'_>>,
 ) -> Result<VmExit, Stop> {
     let heartbeat_context = HeartbeatContext::snapshot(command_context.heartbeat_limit());
     if limits.max_stack_depth < 1 {
@@ -3091,9 +3128,67 @@ fn run(
                     }
                 } else {
                     let invoked = match plan.implementation {
-                        IntrinsicImplementation::MacroNative(intrinsic) => {
-                            intrinsic.invoke_with_lookup(plan.row, &values, macro_lookup)
+                        IntrinsicImplementation::MacroNative(
+                            macro_native::Intrinsic::ExpandMacro,
+                        ) if macro_methods.is_some_and(|methods| methods.expansion.is_some()) => {
+                            let [input, context, state] = values.as_slice() else {
+                                return Ok(VmExit::Refused {
+                                    refusal: VmRefusal::IntrinsicArity {
+                                        row: plan.row.to_owned(),
+                                        expected: 3,
+                                        actual: values.len(),
+                                    },
+                                    usage: usage(steps, peak_stack_depth),
+                                });
+                            };
+                            let mut remaining = limits;
+                            remaining.max_steps = limits.max_steps.saturating_sub(steps);
+                            remaining.max_stack_depth =
+                                limits.max_stack_depth.saturating_sub(stack.len() as u64);
+                            let expansion = macro_methods
+                                .and_then(|methods| methods.expansion)
+                                .expect("guarded macro expansion capability");
+                            let nested = expansion.expand_macro(
+                                input,
+                                context,
+                                state,
+                                remaining,
+                                cancellation,
+                            );
+                            if nested.usage.steps > remaining.max_steps
+                                || nested.usage.peak_stack_depth > remaining.max_stack_depth
+                                || nested.usage.system_polls != nested.usage.steps
+                            {
+                                return Err(Stop::InternalFault(InternalFault::new(
+                                    "FLBC-MACRO-CALLBACK-USAGE",
+                                    "macro callback reported work outside its supplied VM budget",
+                                )));
+                            }
+                            steps += nested.usage.steps;
+                            peak_stack_depth = peak_stack_depth.max(
+                                (stack.len() as u64).saturating_add(nested.usage.peak_stack_depth),
+                            );
+                            match nested.outcome {
+                                Outcome::Complete(Ok(value)) => {
+                                    Ok(IntrinsicResult::raw_object(value))
+                                }
+                                Outcome::Complete(Err(refusal)) => {
+                                    Err(IntrinsicFailure::Refused(refusal))
+                                }
+                                Outcome::Inconclusive(reason) => {
+                                    return Err(Stop::Inconclusive(reason));
+                                }
+                                Outcome::InternalFault(fault) => {
+                                    return Err(Stop::InternalFault(fault));
+                                }
+                            }
                         }
+                        IntrinsicImplementation::MacroNative(intrinsic) => intrinsic
+                            .invoke_with_lookup(
+                                plan.row,
+                                &values,
+                                macro_methods.and_then(|methods| methods.lookup),
+                            ),
                         implementation => invoke_intrinsic(
                             implementation,
                             plan.row,

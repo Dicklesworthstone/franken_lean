@@ -46,6 +46,15 @@ def macroContext (methods : Lean.Macro.MethodsRef) (quotContext : Lean.Name)
 @[noinline] def contextScope (value : @& Lean.Macro.Context) : Nat :=
   value.currMacroScope
 
+@[noinline] def contextDepth (value : @& Lean.Macro.Context) : Nat :=
+  value.currRecDepth
+
+@[noinline] def contextMaxDepth (value : @& Lean.Macro.Context) : Nat :=
+  value.maxRecDepth
+
+@[noinline] def contextRef (value : @& Lean.Macro.Context) : Lean.Syntax :=
+  value.ref
+
 -- The constructor is private. The public inline operation exposes its exact
 -- compiled layout without reaching through that source-level visibility.
 def macroState : Lean.MacroM Nat := Lean.Macro.withFreshMacroScope (pure 5)
@@ -66,6 +75,10 @@ def listCons (value : Lean.Syntax) (tail : List Lean.Syntax) : List Lean.Syntax 
 def listNil (_ : Unit) : List Lean.Syntax := []
 
 def prod (name : Lean.Name) (value : String) : Lean.Name × String := (name, value)
+
+def optionSome (value : Lean.Syntax) : Option Lean.Syntax := some value
+
+def optionNone (_ : Unit) : Option Lean.Syntax := none
 
 @[noinline] def nameMkStr1 (value : String) : Lean.Name := Lean.Name.mkStr1 value
 
@@ -117,5 +130,10 @@ def prod (name : Lean.Name) (value : String) : Lean.Name × String := (name, val
     (state : Lean.Macro.State) :
     EStateM.Result Lean.Macro.Exception Lean.Macro.State (List (Lean.Name × List String)) :=
   Lean.Macro.resolveGlobalName name context state
+
+@[noinline] def macroExpandMacro (syntax : Lean.Syntax) (context : @& Lean.Macro.Context)
+    (state : Lean.Macro.State) :
+    EStateM.Result Lean.Macro.Exception Lean.Macro.State (Option Lean.Syntax) :=
+  Lean.Macro.expandMacro? syntax context state
 
 end FrankenLean.MacroLayout

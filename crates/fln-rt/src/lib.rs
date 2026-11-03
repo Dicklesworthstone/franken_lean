@@ -22,6 +22,7 @@
 
 pub mod abi;
 pub mod convert;
+pub mod macro_expansion_abi_generated;
 pub mod native_heap;
 pub mod region;
 mod region_contract;
