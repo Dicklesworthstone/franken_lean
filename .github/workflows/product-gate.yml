@@ -70,6 +70,7 @@ jobs:
         if: ${{ !cancelled() }}
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - name: install and verify the SUITE.lock Reference for source tests
+        id: reference
         if: ${{ !cancelled() }}
         shell: bash
         run: |
@@ -104,9 +105,18 @@ jobs:
           printf 'ELAN_HOME=%s\nFLN_REFERENCE_LIB=%s/lib/lean\nFLN_REFERENCE_LEAN=%s/bin/lean\nFLN_REQUIRE_REFERENCE=1\n' \
             "$ELAN_HOME" "$toolchain_root" "$toolchain_root" >> "$GITHUB_ENV"
           printf '%s\n' "$ELAN_HOME/bin" >> "$GITHUB_PATH"
+      - name: materialize and verify the pinned builtin census
+        if: ${{ !cancelled() && steps.reference.outcome == 'success' }}
+        shell: bash
+        run: |
+          # These shards are generated inputs to ordinary structural tests.
+          # Reproduce them from the verified Reference and check the committed pins.
+          # Its staging directory also supplies real generated output to the
+          # sealed Rust-launch guard's anti-vacuity check.
+          scripts/extract/census_materialize.sh
       - name: test (workspace, no fail-fast)
         if: ${{ !cancelled() }}
-        # Six tests are skipped here BY NAME, and only these; each name is unique
+        # Five tests are skipped here BY NAME, and only these; each name is unique
         # across the workspace, so no filter can drop an unrelated test. They
         # guard the main-tree checkout's own state, not the product, and a CI
         # clone cannot honestly supply what they measure; faking it would be the
@@ -118,9 +128,6 @@ jobs:
         #   main tree, so a clean checkout measures a different population;
         # - real_workspace_policy_report_is_complete_and_read_only: runs the
         #   operator's `br` binary against the live tracker; CI has no `br`;
-        # - every_rust_side_launch_of_a_trusted_script_is_sealed: its
-        #   anti-vacuity floor requires generated output on disk, which a fresh
-        #   checkout never has (AGENTS.md, green-bar table).
         # Measured on this runner (run 36068215033):
         # - the three commit_anchor_reachability tests below classify cited
         #   anchors against refs/original and the pre-filter-branch backup refs,
@@ -133,7 +140,6 @@ jobs:
           cargo test --locked --workspace --no-fail-fast -- \
             --skip the_unresolvable_citation_census_matches_the_measured_population \
             --skip real_workspace_policy_report_is_complete_and_read_only \
-            --skip every_rust_side_launch_of_a_trusted_script_is_sealed \
             --skip the_classifier_separates_a_reachable_anchor_from_a_backup_only_one \
             --skip the_allowance_carries_no_dead_or_zero_rows \
             --skip a_derived_zero_is_refused_as_a_broken_scan \
