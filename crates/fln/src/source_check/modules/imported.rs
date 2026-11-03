@@ -195,9 +195,13 @@ pub struct SourceOleanImport {
     /// artifact payloads with the public checking records.
     pub(super) macro_journals: Vec<(Name, Vec<OpaqueExtensionBlock>)>,
     /// Parser rows from those same complete journals. They remain inert on
-    /// ordinary source paths; the explicit imported-macro adapter prepares and
-    /// installs every supported description before parsing a source module.
+    /// ordinary source paths. The imported-macro adapter installs only modules
+    /// explicitly enabled by `enable_imported_syntax`.
     pub(super) parser_journals: Vec<(Name, Vec<OpaqueExtensionBlock>)>,
+    /// Whole journals selected by the caller, never a filtered set of rows.
+    /// Empty by default so native syntax and imported macros remain usable when
+    /// an unrelated imported library contains an unsupported parser closure.
+    pub(super) parser_selection: BTreeSet<Name>,
     /// The metadata-enabled successor. Both checker projections and import
     /// identities are retained; metadata itself grants no declaration authority.
     pub engine: Engine,
@@ -210,12 +214,107 @@ pub struct SourceOleanImport {
 }
 
 impl SourceOleanImport {
+    /// Enable the complete parser journals of named admitted artifact modules.
+    ///
+    /// Every selected row is decoded, reconstructed from checked declarations
+    /// and validated against the native grammar, including inactive scoped
+    /// rows. Unsupported rows are never omitted from a selected journal.
+    /// Unselected modules retain their checked declarations and import edges,
+    /// so description helpers can still come from their exact dependencies.
+    ///
+    /// The selection starts empty and affects only imported-macro source
+    /// operations. Passing an empty slice clears it. Replacement is atomic:
+    /// failure leaves the previous selection usable. The complete selection
+    /// must fit the native disjoint-head grammar, even for modules not used
+    /// together by a particular file. Each source module subsequently receives
+    /// only the selected journals in its own checked import closure.
+    pub fn enable_imported_syntax(
+        &mut self,
+        modules: &[Name],
+        limits: crate::imported_parsers::ParserRegistryLimits,
+    ) -> std::result::Result<(), crate::imported_parsers::ParserRegistrationError> {
+        use crate::imported_parsers::ParserRegistrationError;
+        if modules.len() > limits.max_modules {
+            return Err(ParserRegistrationError::Limit("selected syntax modules"));
+        }
+        let mut selected = BTreeSet::new();
+        for module in modules {
+            if !selected.insert(module.clone()) {
+                return Err(ParserRegistrationError::DuplicateModule(module.clone()));
+            }
+            if !self.parser_journals.iter().any(|(name, _)| name == module) {
+                return Err(ParserRegistrationError::Owner {
+                    module: module.clone(),
+                    declaration: Name::anonymous(),
+                    reason: "selected parser module is not in the admitted artifact closure",
+                });
+            }
+        }
+        if !selected.is_empty() {
+            let prepared = self.prepare_parser_modules(Some(&selected), limits)?;
+            let order: Vec<_> = self
+                .parser_journals
+                .iter()
+                .map(|(name, _)| name.clone())
+                .collect();
+            let syntax = prepared.project_imports(&order, &self.contexts.complete)?;
+            let mut grammar =
+                fln_parse::extensions::FileGrammar::new(false, &[], Some(Name::anonymous()))
+                    .expect("invariant: the grammar census describes Init")
+                    .own_syntax_only();
+            grammar.retain_imported_expansions(|module| {
+                self.contexts.complete.imported_modules().contains(module)
+            });
+            grammar.import_artifact(&syntax).map_err(|reason| {
+                if matches!(
+                    reason,
+                    "artifact parser description work past the budget"
+                        | "artifact parser description depth past the budget"
+                        | "artifact syntax token past the budget"
+                ) {
+                    ParserRegistrationError::Limit("artifact parser descriptions")
+                } else {
+                    ParserRegistrationError::Description {
+                        module: Name::anonymous(),
+                        declaration: Name::anonymous(),
+                        reason,
+                    }
+                }
+            })?;
+        }
+        self.parser_selection = selected;
+        Ok(())
+    }
+
     /// Reconstruct all retained parser journals from exact admitted owners.
     /// This reads closed data descriptions and never executes parser closures.
     /// Grammar capability checking occurs atomically when the projected product
-    /// is installed in a source file's native grammar.
+    /// is installed in a source file's native grammar. This inspection API does
+    /// not activate syntax; use `enable_imported_syntax` to select whole modules
+    /// for the imported-macro source operations.
     pub fn prepare_imported_parsers(
         &self,
+        limits: crate::imported_parsers::ParserRegistryLimits,
+    ) -> std::result::Result<
+        crate::imported_parsers::RegisteredParsers,
+        crate::imported_parsers::ParserRegistrationError,
+    > {
+        self.prepare_parser_modules(None, limits)
+    }
+
+    pub(super) fn prepare_selected_imported_parsers(
+        &self,
+        limits: crate::imported_parsers::ParserRegistryLimits,
+    ) -> std::result::Result<
+        crate::imported_parsers::RegisteredParsers,
+        crate::imported_parsers::ParserRegistrationError,
+    > {
+        self.prepare_parser_modules(Some(&self.parser_selection), limits)
+    }
+
+    fn prepare_parser_modules(
+        &self,
+        selected: Option<&BTreeSet<Name>>,
         limits: crate::imported_parsers::ParserRegistryLimits,
     ) -> std::result::Result<
         crate::imported_parsers::RegisteredParsers,
@@ -266,7 +365,11 @@ impl SourceOleanImport {
                     })?;
                     Ok(ParserRegistrationModule {
                         checked,
-                        extensions,
+                        extensions: if selected.is_none_or(|selected| selected.contains(name)) {
+                            extensions
+                        } else {
+                            &[]
+                        },
                     })
                 })
                 .collect::<std::result::Result<Vec<_>, ParserRegistrationError>>()?;
@@ -1632,6 +1735,7 @@ impl Engine {
         Ok(Outcome::Complete(SourceOleanImport {
             macro_journals,
             parser_journals,
+            parser_selection: BTreeSet::new(),
             engine,
             checked,
             result_logical_root,

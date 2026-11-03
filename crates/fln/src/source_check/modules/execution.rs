@@ -154,6 +154,18 @@ pub fn preflight_lean_source_program(
     preflight::check(modules, limits, true)
 }
 
+/// Validate module names, headers, byte/import/work limits and source cycles
+/// before importing an artifact grammar. Command parsing is deferred until the
+/// checked per-module parser projection exists; execution retains its aggregate
+/// command bound. `implicit_init` adds ordinary Lean's default import edges.
+pub fn preflight_source_program_headers(
+    modules: &[SourceModuleInput<'_>],
+    limits: SourceModuleCheckLimits,
+    implicit_init: bool,
+) -> Result<(), SourceModuleCheckError> {
+    preflight::check_headers(modules, limits, implicit_init)
+}
+
 fn declarations(
     completed: &SourceCommandBatchExecution,
     meter: &mut Meter,
@@ -219,6 +231,7 @@ impl imported::SourceOleanImport {
             contexts,
             macro_journals: Vec::new(),
             parser_journals: Vec::new(),
+            parser_selection: Default::default(),
             engine,
             checked,
             result_logical_root: root,

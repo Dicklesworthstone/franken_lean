@@ -5,7 +5,7 @@
 use super::*;
 use fln::source_check::modules::execution::{
     SourceProgramExecution, SourceProgramLimits, preflight_lean_source_program,
-    preflight_source_program,
+    preflight_source_program, preflight_source_program_headers,
 };
 
 const SCHEMA: &str = "fln.source-program/1";
@@ -365,20 +365,19 @@ fn run_loaded(
             ));
             limits.execution.vm = vm_limits;
             limits.modules.source.max_bytes = max_bytes;
-            // The loader has checked headers and bounded the captured closure.
-            // Imported-macro sessions must parse bodies inside the module
-            // driver, after their exact scoped artifact grammar is installed.
-            if macro_inputs.is_none() {
-                let preflight = if ordinary_lean {
-                    preflight_lean_source_program(&inputs, limits.modules)
-                } else {
-                    preflight_source_program(&inputs, limits.modules)
-                };
-                if let Err(error) = preflight {
-                    return Some(module_failure(error, presentation, &names[0], &sources[0], &display));
-                }
+            // Preserve graph/header/byte limits before admission. Imported
+            // macro sessions parse bodies after the selected grammar is bound.
+            let preflight = if macro_inputs.is_some() {
+                preflight_source_program_headers(&inputs, limits.modules, ordinary_lean)
+            } else if ordinary_lean {
+                preflight_lean_source_program(&inputs, limits.modules)
+            } else {
+                preflight_source_program(&inputs, limits.modules)
+            };
+            if let Err(error) = preflight {
+                return Some(module_failure(error, presentation, &names[0], &sources[0], &display));
             }
-            let (_, base) = match loaded.base_engine(
+            let (_, mut base) = match loaded.base_engine(
                 || Ok(fln::Engine::from_environment(fln::Environment::new())),
                 jobs,
                 posture,
@@ -386,12 +385,12 @@ fn run_loaded(
                 Ok(base) => base,
                 Err(error) => return Some(failure(error, presentation)),
             };
-            let empty;
-            let receipt = match &base {
-                Some(base) => &base.receipt,
+            let mut empty;
+            let receipt = match &mut base {
+                Some(base) => &mut base.receipt,
                 None => {
                     empty = SourceOleanImport::empty(&fln::KVMap::new());
-                    &empty
+                    &mut empty
                 }
             };
             if macro_inputs.is_some()
@@ -407,6 +406,9 @@ fn run_loaded(
             let evaluation_presentation = evaluation_presentation(presentation);
             let mut macro_report = None;
             let execution = if let Some(prepared) = macro_inputs {
+                if let Err(error) = prepared.enable_syntax(receipt) {
+                    return Some(failure(error, presentation));
+                }
                 let (macro_inputs, ir_bytes) = match prepared.into_inputs(receipt, Some(vm_limits)) {
                     Ok(inputs) => inputs,
                     Err(error) => return Some(failure(error, presentation)),

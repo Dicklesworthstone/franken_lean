@@ -222,6 +222,15 @@ impl RegisteredParsers {
         }
         let mut positions = BTreeMap::new();
         let mut owners = BTreeMap::new();
+        // The default macro-only path selects no parser journals. Retain its
+        // exact module graph without indexing every unrelated declaration in
+        // Init merely to construct an empty grammar.
+        let read_descriptions = ordered_modules.iter().any(|module| {
+            module
+                .extensions
+                .iter()
+                .any(|block| !block.entries.is_empty())
+        });
         let mut remaining = data::DataLimits {
             max_steps: limits.max_steps,
             max_depth: limits.max_depth,
@@ -239,31 +248,35 @@ impl RegisteredParsers {
                     checked.name.clone(),
                 ));
             }
-            for constant in &checked.decoded.constants {
-                charge(&mut remaining)?;
-                if owners.len() >= limits.max_declarations {
-                    return Err(ParserRegistrationError::Limit("owner declarations"));
-                }
-                if owners
-                    .insert(constant.name().clone(), (index, constant))
-                    .is_some()
-                {
-                    return Err(owner_error(
-                        &checked.name,
-                        constant.name(),
-                        "declaration has multiple checked owners",
-                    ));
+            if read_descriptions {
+                for constant in &checked.decoded.constants {
+                    charge(&mut remaining)?;
+                    if owners.len() >= limits.max_declarations {
+                        return Err(ParserRegistrationError::Limit("owner declarations"));
+                    }
+                    if owners
+                        .insert(constant.name().clone(), (index, constant))
+                        .is_some()
+                    {
+                        return Err(owner_error(
+                            &checked.name,
+                            constant.name(),
+                            "declaration has multiple checked owners",
+                        ));
+                    }
                 }
             }
         }
         let mut base = BTreeSet::new();
-        for (declaration, _) in admitted.constants() {
-            charge(&mut remaining)?;
-            if !owners.contains_key(declaration) {
-                if base.len().saturating_add(owners.len()) >= limits.max_declarations {
-                    return Err(ParserRegistrationError::Limit("admitted declarations"));
+        if read_descriptions {
+            for (declaration, _) in admitted.constants() {
+                charge(&mut remaining)?;
+                if !owners.contains_key(declaration) {
+                    if base.len().saturating_add(owners.len()) >= limits.max_declarations {
+                        return Err(ParserRegistrationError::Limit("admitted declarations"));
+                    }
+                    base.insert(declaration.clone());
                 }
-                base.insert(declaration.clone());
             }
         }
         let mut decoder = parsers::Decoder::new(limits.metadata);

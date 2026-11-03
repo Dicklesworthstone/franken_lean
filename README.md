@@ -233,6 +233,13 @@ For source execution, `FLN_MACRO_PARTITION=PARTITION.tsv fln run Main.lean` and
 loader before native checking, compilation and execution. See
 [source-library checking and execution boundaries](docs/NATIVE_SOURCE_MODULES.md#checking-with-imported-macros).
 
+For custom imported notation, add repeatable `--imported-syntax MODULE` options
+to `check-source`, or set `FLN_SYNTAX_MODULES=Module.One,Module.Two` alongside
+`FLN_MACRO_PARTITION` for `fln run` and `lean`. Each selected module's complete
+parser journal is reconstructed from its checked declarations. Grammar and scoped
+activations follow each source module's imports; unsupported parser descriptions
+produce an explicit refusal.
+
 ### Imported IR execution and named globals
 
 `fln ir run` executes an explicitly selected closure of pinned-format compiled

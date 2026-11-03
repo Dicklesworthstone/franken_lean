@@ -99,8 +99,8 @@ prefix or successor module state, and resource exhaustion remains inconclusive.
 
 This mode checks declarations and proofs. It does not execute `#eval` or a
 program's `main`, emit artifacts, or enable imported macros in the drop-in `lean`
-personality. It uses native syntax and the supported imported parser descriptions
-described below; source-declared templates cannot yet be mixed into the
+personality. It uses native syntax and the explicitly selected imported parser
+descriptions described below; source-declared templates cannot yet be mixed into the
 imported-macro session. Hygiene starts
 from the adapter's explicit seed, rather than the pin's command-hash seed. An
 unsupported native macro operation or source construct is reported explicitly.
@@ -123,6 +123,17 @@ preserves ordinary runtime behavior and does not read IR companions. This mode
 requires a checked external artifact import; it does not execute a source file
 containing only local macro declarations.
 
+For custom imported notation, set `FLN_SYNTAX_MODULES` to comma-separated checked
+module names alongside `FLN_MACRO_PARTITION`. The selection enables each named
+module's complete parser journal. Without a selection, imported macros continue
+to use the native grammar. The same variable works with the installed `lean`:
+
+```sh
+FLN_MACRO_PARTITION="$PWD/contracts/builtin_partition.tsv" \
+  FLN_SYNTAX_MODULES=MyLibrary.Notation,MyLibrary.ScopedNotation \
+  LEAN_PATH="/path/to/import/artifacts" fln run --json Main.lean
+```
+
 Expansion feeds the command's actual syntax into elaboration, dual-check
 admission, native compilation and execution. Definitions, examples, mutual
 declarations, public module exports, ordinary `#check` and `#eval` share one
@@ -141,33 +152,46 @@ before execution because that format does not yet bind macro IR and partition
 inputs. Neither output file is created by that refused request.
 
 This remains a bounded macro integration. It expands native syntax and supported
-imported descriptions, and validates the complete imported registration tables;
-unsupported rows are not silently dropped. Executable parser closures, atomic
+selected imported descriptions, and validates complete macro registration tables
+and selected parser journals; unsupported selected rows are not silently dropped.
+Executable parser closures, atomic
 and tactic macro expansion, source templates, and macro execution under `#guard`,
 `#reduce` or `#guard_msgs` are not yet supported. Full stock `Init` macro execution
 is not claimed.
 
 ## Imported syntax
 
-Both explicit imported-macro modes install supported syntax from the checked
-artifacts before parsing source bodies. A consumer needs no repeated `syntax`
-declaration. For a library exporting supported `choose!` syntax and a macro that
-selects its argument, the consumer can contain only:
+Select the checked compiled modules whose custom parser declarations the source
+needs. `--imported-syntax` is repeatable and requires `--imported-macros`:
+
+```sh
+fln check-source --json \
+  --imported-macros contracts/builtin_partition.tsv \
+  --imported-syntax ChoiceLibrary Main.lean
+```
+
+Each name must identify a module in the admitted external import closure. The
+selection installs that module's complete supported syntax before source bodies
+are parsed. A consumer needs no repeated `syntax` declaration. For a library
+exporting `choose% ... endChoose%` syntax and a macro that selects its argument,
+the consumer can contain only:
 
 ```lean
 prelude
 import ChoiceLibrary
-def chosen : Nat := choose! 42
+def chosen : Nat := choose% 42 endChoose%
 theorem chosen_ok : chosen = 42 := by rfl
 ```
 
-The runtime mode also accepts `#eval choose! 42`. The parsed node reaches the
+The runtime mode with `FLN_SYNTAX_MODULES=ChoiceLibrary` also accepts
+`#eval choose% 42 endChoose%`. The parsed node reaches the
 imported macro, and its result follows ordinary elaboration, independent checking
 and execution. Source-module forwarding follows the existing public/private
 import rules; `open scoped` activation remains local to the current source scope.
 
-The complete `Lean.Parser.parserExtension` journal retains token, kind, category
-and parser rows in their original order. Parser owners and dependencies must
+Every selected module's complete `Lean.Parser.parserExtension` journal retains
+token, kind, category and parser rows in their original order. No selected row is
+silently omitted. Parser owners and dependencies must
 belong to the exact checked import closure. Descriptions are reconstructed from
 closed `ParserDescr` or `TrailingParserDescr` data, with generated constructor
 contracts and bounded native reduction of literal helpers. Named description
@@ -181,6 +205,13 @@ artifact category quotation parsers are explicit refusals. A malformed or
 unsupported selected journal installs no partial grammar, including in an empty
 forwarding module. Standalone kind or category rows do not create missing parser
 productions, and census entries do not replace missing artifact definitions.
+
+Source header, graph and byte limits are checked before admission. The module
+driver then parses and counts commands under the selected checked grammar.
+Syntax and `open scoped` activations are projected into each source module's
+actual import context; a sibling's activation cannot leak across that boundary.
+Ordinary source paths and imported-macro mode without a syntax selection retain
+the native grammar.
 
 ## Library API and limits
 
@@ -202,12 +233,18 @@ They retain the ordinary module validator, evaluation presentation and runtime
 resource limits. The existing eager APIs remain available for callers that
 require every registered implementation to compile before processing starts.
 
-`SourceOleanImport::prepare_imported_parsers` exposes the separately bounded,
-immutable parser product through `ParserRegistryLimits`. The integrated macro
-drivers use its default description work, depth and byte ceilings, with module,
-declaration and metadata ceilings taken from the supplied macro registry limits.
-Each source module projects this product to its actual external import order and
-rechecks all retained owner, helper and constructor bindings before installation.
+`SourceOleanImport::enable_imported_syntax(&modules, ParserRegistryLimits::default())`
+atomically selects complete admitted module journals for the integrated macro
+drivers. The initial selection is empty. A failed selection preserves the
+previous selection; an empty list clears it. Limits bound description reduction,
+depth, bytes, declarations and metadata. Each source module projects the selected
+immutable product to its actual external import order and rechecks all retained
+owner, helper and constructor bindings before installation.
+
+`SourceOleanImport::prepare_imported_parsers` remains available for explicit
+inspection of the complete artifact closure, independently of its enabled syntax
+selection. Both APIs reconstruct closed checked data; neither executes parser
+initialization code or accepts a caller-supplied replacement grammar.
 
 The initial environment is explicit. Without external imports, ordinary checking
 uses the native source seed where appropriate. External `.olean` imports are

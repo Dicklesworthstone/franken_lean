@@ -120,6 +120,23 @@ fn parser_rows(kind: &str, declaration: &str, token: &str, namespace: Option<&st
 }
 
 fn fixture(fault: Fault) -> (SourceOleanImport, Vec<IrModule>) {
+    let (mut imported, code) = unselected_fixture(fault);
+    if matches!(fault, Fault::None) {
+        imported
+            .enable_imported_syntax(&[name("SourceLibrary")], ParserRegistryLimits::default())
+            .unwrap();
+    }
+    (imported, code)
+}
+
+fn unselected_fixture(fault: Fault) -> (SourceOleanImport, Vec<IrModule>) {
+    unselected_fixture_with_dependency(fault, false)
+}
+
+fn unselected_fixture_with_dependency(
+    fault: Fault,
+    with_dependency: bool,
+) -> (SourceOleanImport, Vec<IrModule>) {
     let mut constants = Vec::new();
     for declaration in crate::imported_parsers::fixture_declarations() {
         match declaration {
@@ -132,6 +149,26 @@ fn fixture(fault: Fault) -> (SourceOleanImport, Vec<IrModule>) {
             _ => panic!("parser fixture must contain genuine data families and aliases"),
         }
     }
+    let mut dependency_constants = if with_dependency {
+        std::mem::take(&mut constants)
+    } else {
+        Vec::new()
+    };
+    let dependency_rows = if with_dependency {
+        dependency_constants.push(definition(
+            "ParserPrelude.unsupportedParser",
+            constant(wire::PARSER_DESCR_TYPE),
+            descriptor("ParserPrelude.unsupportedKind", "unsupportedSyntax!", true),
+        ));
+        parser_rows(
+            "ParserPrelude.unsupportedKind",
+            "ParserPrelude.unsupportedParser",
+            "unsupportedSyntax!",
+            None,
+        )
+    } else {
+        Vec::new()
+    };
     constants.extend([
         definition(
             "SourceLibrary.chooseParser",
@@ -195,7 +232,7 @@ fn fixture(fault: Fault) -> (SourceOleanImport, Vec<IrModule>) {
             ));
         }
     }
-    batches::artifact_import_fixture_with_parser_metadata(
+    batches::artifact_import_fixture_with_parser_dependency(
         &[
             ("SourceLibrary.choose", "SourceLibrary.chooseMacro", None),
             (
@@ -207,6 +244,7 @@ fn fixture(fault: Fault) -> (SourceOleanImport, Vec<IrModule>) {
         &constants,
         &rows,
         &[selecting_function("SourceLibrary.chooseMacro", 1)],
+        with_dependency.then_some(("ParserPrelude", &dependency_constants, &dependency_rows)),
     )
 }
 
@@ -388,8 +426,12 @@ fn imported_artifact_syntax_executes_evaluations_and_keeps_program_failures_tran
     assert_eq!(imported.engine.logical_root(&KVMap::new()), before);
     assert!(!imported.engine.environment().contains(&name("chosen")));
 
-    let (malformed, code) = fixture(Fault::MalformedSuffix);
+    let (mut malformed, code) = fixture(Fault::MalformedSuffix);
     let before = malformed.engine.logical_root(&KVMap::new());
+    assert!(matches!(
+        malformed.enable_imported_syntax(&[name("SourceLibrary")], ParserRegistryLimits::default()),
+        Err(ParserRegistrationError::Decode { .. })
+    ));
     let stopped = execute(&malformed, &code, source);
     assert!(
         matches!(stopped.outcome, Outcome::Complete(Err(_))),
@@ -607,7 +649,7 @@ fn artifact_parser_follows_transitive_public_imports_and_private_forwarding_boun
 #[test]
 fn malformed_or_unsupported_later_parser_rows_cannot_publish_a_working_prefix() {
     for fault in [Fault::MalformedSuffix, Fault::UnsupportedSuffix] {
-        let (imported, code) = fixture(fault);
+        let (mut imported, code) = fixture(fault);
         let before = imported.engine.logical_root(&KVMap::new());
         if matches!(fault, Fault::MalformedSuffix) {
             assert!(matches!(
@@ -615,6 +657,10 @@ fn malformed_or_unsupported_later_parser_rows_cannot_publish_a_working_prefix() 
                 Err(ParserRegistrationError::Decode { .. })
             ));
         }
+        let error = imported
+            .enable_imported_syntax(&[name("SourceLibrary")], ParserRegistryLimits::default())
+            .unwrap_err();
+        assert!(!error.is_resource(), "{fault:?}: {error}");
         let report = check(
             &imported,
             &code,
@@ -640,9 +686,19 @@ fn malformed_or_unsupported_later_parser_rows_cannot_publish_a_working_prefix() 
 }
 
 #[test]
-fn inactive_unsupported_parser_rows_are_checked_in_empty_forwarding_modules() {
-    let (imported, code) = fixture(Fault::UnsupportedScopedSuffix);
+fn inactive_unsupported_parser_rows_refuse_selection_even_for_empty_forwarding_modules() {
+    let (mut imported, code) = fixture(Fault::UnsupportedScopedSuffix);
     let before = imported.engine.logical_root(&KVMap::new());
+    // Closed data reconstruction succeeds; grammar capability validation must
+    // still examine the complete selected journal, including inactive scopes.
+    imported
+        .prepare_imported_parsers(ParserRegistryLimits::default())
+        .unwrap();
+    let error = imported
+        .enable_imported_syntax(&[name("SourceLibrary")], ParserRegistryLimits::default())
+        .unwrap_err();
+    assert!(matches!(error, ParserRegistrationError::Description { .. }));
+    assert!(!error.is_resource(), "{error}");
     let source = "prelude\nimport SourceLibrary";
     let checked = check(
         &imported,
@@ -652,11 +708,11 @@ fn inactive_unsupported_parser_rows_are_checked_in_empty_forwarding_modules() {
         None,
     );
     assert!(
-        matches!(checked.outcome, Outcome::Complete(Err(_))),
+        matches!(checked.outcome, Outcome::Complete(Ok(_))),
         "{checked:?}"
     );
     assert!(checked.attempts.is_empty());
-    assert!(checked.states.is_none());
+    assert!(checked.states.is_some());
 
     let declarations = users(&code);
     let executed = execute_graph(
@@ -668,24 +724,31 @@ fn inactive_unsupported_parser_rows_are_checked_in_empty_forwarding_modules() {
         None,
     );
     assert!(
-        matches!(executed.outcome, Outcome::Complete(Err(_))),
+        matches!(executed.outcome, Outcome::Complete(Ok(_))),
         "{executed:?}"
     );
     assert!(executed.attempts.is_empty());
     assert_eq!(executed.completed_vm_usage.steps, 0);
-    assert!(executed.states.is_none());
+    assert!(executed.states.is_some());
     assert_eq!(imported.engine.logical_root(&KVMap::new()), before);
 }
 
 #[test]
-fn imported_parser_installation_exhaustion_is_inconclusive_for_empty_source_modules() {
-    let (imported, code) = fixture(Fault::TokenBudgetSuffix);
+fn imported_parser_installation_exhaustion_refuses_selection_before_empty_source_modules() {
+    let (mut imported, code) = fixture(Fault::TokenBudgetSuffix);
     let before = imported.engine.logical_root(&KVMap::new());
     // The retained metadata and checked descriptions fit their own allowances.
     // Only the native grammar's independent token-byte allowance is exhausted.
     imported
         .prepare_imported_parsers(ParserRegistryLimits::default())
         .unwrap();
+    let error = imported
+        .enable_imported_syntax(&[name("SourceLibrary")], ParserRegistryLimits::default())
+        .unwrap_err();
+    assert!(matches!(error, ParserRegistrationError::Limit(_)));
+    assert!(error.is_resource(), "{error}");
+    // Selection failed before source execution. The unchanged empty selection
+    // still permits macro-only forwarding; no parser prefix was installed.
     let source = "prelude\nimport SourceLibrary";
     let checked = check(
         &imported,
@@ -695,17 +758,11 @@ fn imported_parser_installation_exhaustion_is_inconclusive_for_empty_source_modu
         None,
     );
     assert!(
-        matches!(
-            &checked.outcome,
-            Outcome::Inconclusive(crate::Inconclusive {
-                cause: fln_core::outcome::InconclusiveCause::DependencyUnavailable { what },
-                ..
-            }) if what.text().contains("artifact syntax token past the budget")
-        ),
+        matches!(checked.outcome, Outcome::Complete(Ok(_))),
         "{checked:?}"
     );
     assert!(checked.attempts.is_empty());
-    assert!(checked.states.is_none());
+    assert!(checked.states.is_some());
 
     let declarations = users(&code);
     let executed = execute_graph(
@@ -717,18 +774,12 @@ fn imported_parser_installation_exhaustion_is_inconclusive_for_empty_source_modu
         None,
     );
     assert!(
-        matches!(
-            &executed.outcome,
-            Outcome::Inconclusive(crate::Inconclusive {
-                cause: fln_core::outcome::InconclusiveCause::DependencyUnavailable { what },
-                ..
-            }) if what.text().contains("artifact syntax token past the budget")
-        ),
+        matches!(executed.outcome, Outcome::Complete(Ok(_))),
         "{executed:?}"
     );
     assert!(executed.attempts.is_empty());
     assert_eq!(executed.completed_vm_usage.steps, 0);
-    assert!(executed.states.is_none());
+    assert!(executed.states.is_some());
     assert_eq!(imported.engine.logical_root(&KVMap::new()), before);
 }
 
@@ -963,4 +1014,223 @@ fn editing_public_checked_owner_metadata_cannot_replace_retained_parser_authorit
     assert!(report.attempts.is_empty());
     assert!(!imported.engine.environment().contains(&name("prefix")));
     assert_eq!(imported.engine.logical_root(&KVMap::new()), before);
+}
+
+#[test]
+fn imported_parser_selection_is_explicit_atomic_and_reversible() {
+    let (mut imported, code) = unselected_fixture(Fault::None);
+    let before = imported.engine.logical_root(&KVMap::new());
+    let source = "prelude\nimport SourceLibrary\n\
+                  def chosen : Nat := choose! 42\n\
+                  theorem chosen_ok : chosen = 42 := by rfl";
+    let run = |imported: &SourceOleanImport| {
+        check(
+            imported,
+            &code,
+            &[("Main", source)],
+            MacroTreeLimits::default(),
+            None,
+        )
+    };
+    let ordinary_error = |imported: &SourceOleanImport| {
+        let module = name("Main");
+        imported
+            .check_source_modules(
+                &[crate::SourceModuleInput {
+                    name: &module,
+                    source: source.as_bytes(),
+                }],
+                &module,
+                &KVMap::new(),
+                crate::source_check::modules::SourceModuleCheckLimits::new(
+                    crate::source_check::SourceCheckLimits::new(admission()),
+                ),
+                None,
+            )
+            .unwrap_err()
+    };
+    let ordinary_before = format!("{:?}", ordinary_error(&imported));
+    let unselected = run(&imported);
+    assert!(matches!(unselected.outcome, Outcome::Complete(Err(_))));
+    assert!(unselected.attempts.is_empty());
+    assert!(unselected.states.is_none());
+
+    imported
+        .enable_imported_syntax(&[name("SourceLibrary")], ParserRegistryLimits::default())
+        .unwrap();
+    let selected = run(&imported);
+    assert_declared_value(&succeeded(&selected).checked.engine, "chosen", 42);
+    assert_eq!(selected.attempts.len(), 1);
+    assert_eq!(
+        format!("{:?}", ordinary_error(&imported)),
+        ordinary_before,
+        "selection only activates syntax on explicit imported-macro adapters"
+    );
+
+    for (modules, limits, resource) in [
+        (
+            vec![name("SourceLibrary"), name("MissingArtifact")],
+            ParserRegistryLimits::default(),
+            false,
+        ),
+        (
+            vec![name("SourceLibrary"), name("SourceLibrary")],
+            ParserRegistryLimits::default(),
+            false,
+        ),
+        (
+            vec![name("SourceLibrary")],
+            ParserRegistryLimits {
+                max_steps: 0,
+                ..ParserRegistryLimits::default()
+            },
+            true,
+        ),
+    ] {
+        let error = imported
+            .enable_imported_syntax(&modules, limits)
+            .unwrap_err();
+        assert_eq!(error.is_resource(), resource, "{error}");
+        let retained = run(&imported);
+        assert_declared_value(&succeeded(&retained).checked.engine, "chosen", 42);
+        assert_eq!(retained.attempts.len(), 1);
+    }
+
+    imported
+        .enable_imported_syntax(&[], ParserRegistryLimits::default())
+        .unwrap();
+    let cleared = run(&imported);
+    assert!(matches!(cleared.outcome, Outcome::Complete(Err(_))));
+    assert!(cleared.attempts.is_empty());
+    assert!(cleared.states.is_none());
+    assert_eq!(imported.engine.logical_root(&KVMap::new()), before);
+    assert!(!imported.engine.environment().contains(&name("chosen")));
+}
+
+#[test]
+fn unselected_parser_journals_cannot_block_existing_imported_macros() {
+    for fault in [
+        Fault::MalformedSuffix,
+        Fault::UnsupportedSuffix,
+        Fault::TokenBudgetSuffix,
+    ] {
+        let (mut imported, code) = unselected_fixture(fault);
+        let before = imported.engine.logical_root(&KVMap::new());
+        let ordinary = |imported: &SourceOleanImport| {
+            check(
+                imported,
+                &code,
+                &[(
+                    "Main",
+                    "prelude\nimport SourceLibrary\n\
+                     def ordinary : Nat := 11 + 29\n\
+                     theorem ordinary_ok : ordinary = 29 := by rfl",
+                )],
+                MacroTreeLimits::default(),
+                None,
+            )
+        };
+        let before_selection = ordinary(&imported);
+        assert_declared_value(&succeeded(&before_selection).checked.engine, "ordinary", 29);
+        assert!(!before_selection.attempts.is_empty());
+
+        let error = imported
+            .enable_imported_syntax(&[name("SourceLibrary")], ParserRegistryLimits::default())
+            .unwrap_err();
+        assert_eq!(
+            error.is_resource(),
+            matches!(fault, Fault::TokenBudgetSuffix),
+            "{fault:?}: {error}"
+        );
+        if matches!(fault, Fault::TokenBudgetSuffix) {
+            assert!(matches!(error, ParserRegistrationError::Limit(_)));
+        }
+        let after_refusal = ordinary(&imported);
+        assert_declared_value(&succeeded(&after_refusal).checked.engine, "ordinary", 29);
+
+        // A supported prefix in a selected journal must not survive a bad
+        // later row, even when the source would never demand that later parser.
+        let prefix = check(
+            &imported,
+            &code,
+            &[(
+                "Main",
+                "prelude\nimport SourceLibrary\ndef prefix : Nat := choose! 42",
+            )],
+            MacroTreeLimits::default(),
+            None,
+        );
+        assert!(matches!(prefix.outcome, Outcome::Complete(Err(_))));
+        assert!(prefix.attempts.is_empty());
+        assert!(prefix.states.is_none());
+        assert_eq!(imported.engine.logical_root(&KVMap::new()), before);
+        assert!(!imported.engine.environment().contains(&name("ordinary")));
+        assert!(!imported.engine.environment().contains(&name("prefix")));
+    }
+}
+
+#[test]
+fn selecting_user_syntax_retains_checked_helpers_without_selecting_ancestor_parsers() {
+    let (mut imported, code) = unselected_fixture_with_dependency(Fault::None, true);
+    let before = imported.engine.logical_root(&KVMap::new());
+    let ancestor = imported
+        .checked
+        .modules
+        .iter()
+        .find(|module| module.name == name("ParserPrelude"))
+        .unwrap();
+    assert!(
+        ancestor
+            .declarations
+            .iter()
+            .any(|row| row.name == name("Lean.ParserDescr"))
+    );
+    assert!(
+        ancestor
+            .declarations
+            .iter()
+            .any(|row| row.name == name("ParserPrelude.unsupportedParser"))
+    );
+    imported
+        .enable_imported_syntax(&[name("SourceLibrary")], ParserRegistryLimits::default())
+        .unwrap();
+    let run = |imported: &SourceOleanImport| {
+        check(
+            imported,
+            &code,
+            &[
+                (
+                    "Main",
+                    "prelude\nimport Forward\n\
+                     def chosen : Nat := choose! 42\n\
+                     theorem chosen_ok : chosen = 42 := by rfl",
+                ),
+                ("Forward", "prelude\nimport SourceLibrary"),
+            ],
+            MacroTreeLimits::default(),
+            None,
+        )
+    };
+    let selected = run(&imported);
+    assert_declared_value(&succeeded(&selected).checked.engine, "chosen", 42);
+    assert_eq!(selected.attempts.len(), 1);
+    assert_eq!(
+        selected.states.as_ref().unwrap()[&name("Forward")].macro_scope,
+        17,
+        "the empty forwarder validates the same selected dependency product"
+    );
+
+    let error = imported
+        .enable_imported_syntax(
+            &[name("ParserPrelude"), name("SourceLibrary")],
+            ParserRegistryLimits::default(),
+        )
+        .unwrap_err();
+    assert!(matches!(error, ParserRegistrationError::Description { .. }));
+    assert!(!error.is_resource(), "{error}");
+    let retained = run(&imported);
+    assert_declared_value(&succeeded(&retained).checked.engine, "chosen", 42);
+    assert_eq!(retained.attempts.len(), 1);
+    assert_eq!(imported.engine.logical_root(&KVMap::new()), before);
+    assert!(!imported.engine.environment().contains(&name("chosen")));
 }

@@ -22,6 +22,26 @@ pub(super) fn check_with_parsers(
     modules: &[SourceModuleInput<'_>],
     limits: SourceModuleCheckLimits,
     implicit_init: bool,
+    install: impl FnMut(&Name, &mut SourceGrammar) -> Result<(), SourceModuleCheckError>,
+) -> Result<(), SourceModuleCheckError> {
+    check_mode(modules, limits, implicit_init, false, install)
+}
+
+/// Artifact syntax cannot parse until its checked import receipt exists. Keep
+/// all header and graph checks available before that potentially costly import.
+pub(super) fn check_headers(
+    modules: &[SourceModuleInput<'_>],
+    limits: SourceModuleCheckLimits,
+    implicit_init: bool,
+) -> Result<(), SourceModuleCheckError> {
+    check_mode(modules, limits, implicit_init, true, |_, _| Ok(()))
+}
+
+fn check_mode(
+    modules: &[SourceModuleInput<'_>],
+    limits: SourceModuleCheckLimits,
+    implicit_init: bool,
+    defer_commands: bool,
     mut install: impl FnMut(&Name, &mut SourceGrammar) -> Result<(), SourceModuleCheckError>,
 ) -> Result<(), SourceModuleCheckError> {
     if modules.len() > limits.max_modules {
@@ -84,6 +104,12 @@ pub(super) fn check_with_parsers(
                 .collect()
         })
         .collect();
+    if defer_commands {
+        for root in 0..modules.len() {
+            graph::postorder(root, &dependencies, modules, &mut meter)?;
+        }
+        return Ok(());
+    }
     let mut completed = BTreeMap::<usize, NativeSyntaxModule>::new();
     let mut count = 0usize;
     for root in 0..modules.len() {

@@ -411,7 +411,7 @@ impl imported::SourceOleanImport {
         &self,
         limits: MacroRegistryLimits,
     ) -> Result<RegisteredParsers, SourceCheckError> {
-        self.prepare_imported_parsers(ParserRegistryLimits {
+        self.prepare_selected_imported_parsers(ParserRegistryLimits {
             max_modules: limits.max_modules,
             max_declarations: limits.max_declarations,
             metadata: limits.metadata,
@@ -670,8 +670,9 @@ impl imported::SourceOleanImport {
     /// admission, preserving original source locations and declaration replay.
     ///
     /// Macro state resets per module; expansion allowances cover the whole
-    /// graph. The receipt's complete parser journals supply supported custom
-    /// syntax before parsing. Closed descriptions use cumulative preparation
+    /// graph. Parser journals explicitly enabled with `enable_imported_syntax`
+    /// supply custom syntax before parsing. Every selected journal remains
+    /// complete. Closed descriptions use cumulative preparation
     /// ceilings from `ParserRegistryLimits::default`, with module, declaration
     /// and metadata ceilings taken from `registry_limits`. Executable parser
     /// closures and unsupported grammar forms refuse the whole transaction.
