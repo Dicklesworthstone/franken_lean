@@ -542,8 +542,10 @@ fn nested_calls_share_attempt_and_instruction_limits_without_retaining_partial_s
     let input = outer(choice());
     let complete = execute(&registry, &input, MacroDispatchLimits::default(), None);
     let expected = expanded(&complete);
-    let mut exact = MacroDispatchLimits::default();
-    exact.max_attempts = complete.attempts.len() as u64;
+    let mut exact = MacroDispatchLimits {
+        max_attempts: complete.attempts.len() as u64,
+        ..MacroDispatchLimits::default()
+    };
     exact.execution.vm.max_steps = complete.completed_vm_usage.steps;
     let exact_report = execute(&registry, &input, exact, None);
     assert_eq!(expanded(&exact_report), expected);
