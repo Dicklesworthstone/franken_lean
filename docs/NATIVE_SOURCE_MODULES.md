@@ -77,12 +77,13 @@ search directory cannot supply a replacement for a missing companion. The
 defaults to 64 MiB. `--max-bytes` continues to bound the source closure separately.
 
 Imported registration journals and declaration ownership are validated before
-expansion, including inactive scoped registrations. The checking CLI compiles a
-macro's reachable implementation only when that macro is selected, so an unused
-macro with an unsupported operation does not block unrelated declarations.
+expansion, including inactive scoped registrations. The explicit macro modes in
+`check-source`, `fln run` and native `lean` compile a macro's reachable
+implementation only when that macro is selected, so an unused macro with an
+unsupported operation does not block unrelated declarations or execution.
 Successful compilations are shared across module projections and scoped
 activations; mutable invocation state remains separate. A selected implementation
-that cannot compile stops the check without falling back to an older registration.
+that cannot compile stops the command without falling back to an older registration.
 
 User macro code runs on Golem, with toolchain operations provided by native
 implementations; the pinned partition cannot be overridden to run a toolchain
@@ -158,9 +159,12 @@ For an admitted external import receipt,
 `SourceOleanImport::check_source_modules_with_deferred_imported_macros` accepts
 `SourceModuleDeferredMacroInputs`. `MacroCompilationInputs::new` takes ownership
 of decoded IR, the verified partition and the explicit set of permitted user
-declarations without cloning IR bodies. The existing eager preparation APIs
-remain available for callers that require every registered implementation to
-compile before checking starts.
+declarations without cloning IR bodies. The corresponding execution methods are
+`execute_source_modules_with_deferred_imported_macros` and
+`execute_lean_source_modules_with_deferred_imported_macros_and_validation`.
+They retain the ordinary module validator, evaluation presentation and runtime
+resource limits. The existing eager APIs remain available for callers that
+require every registered implementation to compile before processing starts.
 
 The initial environment is explicit. Without external imports, ordinary checking
 uses the native source seed where appropriate. External `.olean` imports are

@@ -7,7 +7,7 @@ use fln::imported_macros::registrations::{
     MacroAttempt, MacroCompilationInputs, MacroRegistryLimits, MacroTreeLimits,
 };
 use fln::imported_macros::{MacroContext, MacroState};
-use fln::source_check::modules::{SourceModuleDeferredMacroInputs, SourceModuleMacroInputs};
+use fln::source_check::modules::SourceModuleDeferredMacroInputs;
 use std::collections::BTreeSet;
 
 const DEFAULT_IR_BYTES: usize = 64 * 1024 * 1024;
@@ -139,7 +139,7 @@ pub(in crate::source_check) struct Report {
 }
 
 impl Report {
-    fn from_attempts(
+    pub(in crate::source_check) fn from_attempts(
         ir_bytes: usize,
         attempts: &[MacroAttempt],
         vm_steps: u64,
@@ -331,10 +331,7 @@ impl Loaded {
 }
 
 impl Prepared {
-    pub(in crate::source_check) fn users(
-        &self,
-        receipt: &SourceOleanImport,
-    ) -> Result<BTreeSet<Name>, Failure> {
+    fn users(&self, receipt: &SourceOleanImport) -> Result<BTreeSet<Name>, Failure> {
         let mut users = BTreeSet::new();
         for (name, code) in self.names.iter().zip(&self.modules) {
             let checked = receipt
@@ -369,38 +366,33 @@ impl Prepared {
         Ok(users)
     }
 
-    pub(in crate::source_check) fn inputs<'a>(
-        &'a self,
-        users: &'a BTreeSet<Name>,
+    /// Move the captured code into the shared deferred registry without cloning
+    /// the imported closure. Keep its byte count available for the final report.
+    pub(in crate::source_check) fn into_inputs(
+        self,
+        receipt: &SourceOleanImport,
         vm: Option<fln::VmExecutionLimits>,
-    ) -> SourceModuleMacroInputs<'a> {
+    ) -> Result<(SourceModuleDeferredMacroInputs, usize), Failure> {
+        let users = self.users(receipt)?;
         let mut limits = MacroTreeLimits::default();
         if let Some(vm) = vm {
             limits.dispatch.execution.vm = vm;
         }
-        SourceModuleMacroInputs {
-            code: &self.modules,
-            partition: &self.partition,
-            user_declarations: users,
-            registry_limits: MacroRegistryLimits::default(),
-            context: MacroContext {
-                quotation_context: Name::anonymous(),
-                current_macro_scope: 0,
-                current_recursion_depth: 0,
-                max_recursion_depth: 1000,
+        Ok((
+            SourceModuleDeferredMacroInputs {
+                compilation: MacroCompilationInputs::new(self.modules, self.partition, users),
+                registry_limits: MacroRegistryLimits::default(),
+                context: MacroContext {
+                    quotation_context: Name::anonymous(),
+                    current_macro_scope: 0,
+                    current_recursion_depth: 0,
+                    max_recursion_depth: 1000,
+                },
+                state: MacroState::default(),
+                limits,
             },
-            state: MacroState::default(),
-            limits,
-        }
-    }
-
-    pub(in crate::source_check) fn report(
-        &self,
-        attempts: &[MacroAttempt],
-        vm_steps: u64,
-        syntax_visits: u64,
-    ) -> Result<Report, Failure> {
-        Report::from_attempts(self.bytes, attempts, vm_steps, syntax_visits)
+            self.bytes,
+        ))
     }
 
     pub(in crate::source_check) fn check(
@@ -417,7 +409,7 @@ impl Prepared {
         let base = base.ok_or_else(|| {
             Failure::input("imported macros require an admitted artifact receipt")
         })?;
-        let users = self.users(&base.receipt)?;
+        let (macro_inputs, ir_bytes) = self.into_inputs(&base.receipt, None)?;
         let inputs = names
             .iter()
             .zip(sources)
@@ -428,22 +420,11 @@ impl Prepared {
             &names[0],
             &fln::KVMap::new(),
             SourceModuleCheckLimits::new(limits),
-            SourceModuleDeferredMacroInputs {
-                compilation: MacroCompilationInputs::new(self.modules, self.partition, users),
-                registry_limits: MacroRegistryLimits::default(),
-                context: MacroContext {
-                    quotation_context: names[0].clone(),
-                    current_macro_scope: 0,
-                    current_recursion_depth: 0,
-                    max_recursion_depth: 1000,
-                },
-                state: MacroState::default(),
-                limits: MacroTreeLimits::default(),
-            },
+            macro_inputs,
             None,
         );
         let report = Report::from_attempts(
-            self.bytes,
+            ir_bytes,
             &result.attempts,
             result.completed_vm_usage.steps,
             result.tree_usage.visits,

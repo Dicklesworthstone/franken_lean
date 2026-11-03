@@ -493,6 +493,20 @@ fn macro_check(
     command.arg(entry).output().unwrap()
 }
 
+fn dormant_macro_provider_source() -> String {
+    format!(
+        "{}\n{}",
+        include_str!("../../fln-olean/fixtures/ir/AdmittedSourceMacro.lean"),
+        concat!(
+            "@[extern \"fln_missing_macro_native\", noinline]\n",
+            "public meta def absentMacroPrimitive (stx : Syntax) : Syntax := stx\n",
+            "@[macro Lean.Parser.Term.hole]\n",
+            "public meta def dormantMacro : Macro := fun stx _ state =>\n",
+            "  .ok (absentMacroPrimitive stx) state\n",
+        )
+    )
+}
+
 fn compile_macro_provider(
     reference: &std::path::Path,
     directory: &std::path::Path,
@@ -732,18 +746,7 @@ fn imported_macro_checking_runs_the_real_companion_and_keeps_admission_authority
     // is not needed by this program. Compile bodies only when dispatch selects
     // them, then preserve the existing typed refusal if the body is demanded.
     let dormant = root.join("dormant");
-    let dormant_source = format!(
-        "{}\n{}",
-        include_str!("../../fln-olean/fixtures/ir/AdmittedSourceMacro.lean"),
-        concat!(
-            "@[extern \"fln_missing_macro_native\", noinline]\n",
-            "public meta def absentMacroPrimitive (stx : Syntax) : Syntax := stx\n",
-            "@[macro Lean.Parser.Term.hole]\n",
-            "public meta def dormantMacro : Macro := fun stx _ state =>\n",
-            "  .ok (absentMacroPrimitive stx) state\n",
-        )
-    );
-    compile_macro_provider(&reference, &dormant, &dormant_source);
+    compile_macro_provider(&reference, &dormant, &dormant_macro_provider_source());
     let dormant_search = std::env::join_paths([&dormant, &library]).unwrap();
     let unused = macro_check(&entry, &dormant_search, &partition, &cache, None);
     assert_eq!(unused.status.code(), Some(0), "{unused:?}");
@@ -780,6 +783,12 @@ struct ImportedMacroProject {
 
 impl ImportedMacroProject {
     fn prepare() -> Option<Self> {
+        Self::prepare_with_source(include_str!(
+            "../../fln-olean/fixtures/ir/AdmittedSourceMacro.lean"
+        ))
+    }
+
+    fn prepare_with_source(source: &str) -> Option<Self> {
         let explicit_partition = std::env::var_os("FLN_REFERENCE_PARTITION")
             .or_else(|| std::env::var_os("FLN_BUILTIN_PARTITION"));
         let partition = explicit_partition
@@ -851,11 +860,7 @@ impl ImportedMacroProject {
         std::fs::create_dir(&root).unwrap();
         std::fs::create_dir(root.join("objects")).unwrap();
         std::fs::create_dir(root.join("client")).unwrap();
-        std::fs::write(
-            root.join("objects/AdmittedSourceMacro.lean"),
-            include_str!("../../fln-olean/fixtures/ir/AdmittedSourceMacro.lean"),
-        )
-        .unwrap();
+        std::fs::write(root.join("objects/AdmittedSourceMacro.lean"), source).unwrap();
         let compiled = Command::new(&reference)
             .current_dir(root.join("objects"))
             .env("LEAN_PATH", &library)
@@ -982,6 +987,15 @@ fn assert_macro_refusal(output: std::process::Output, exit: i32, class: &str, de
     assert!(error.contains(detail), "{error}");
 }
 
+// check-source accepts declarations and proofs; runtime personalities also
+// process queries. Keep each test on its documented command surface.
+const IMPORTED_MACRO_DECLARATIONS: &str = concat!(
+    "prelude\n",
+    "import AdmittedSourceMacro\n",
+    "def commandMacroValue : Nat := (11 : Bool)\n",
+    "theorem commandMacroValue_eq : Eq commandMacroValue 11 := Eq.refl commandMacroValue\n",
+);
+
 const IMPORTED_MACRO_CLIENT: &str = concat!(
     "prelude\n",
     "import AdmittedSourceMacro\n",
@@ -1003,7 +1017,7 @@ fn installed_imported_macros_drive_checked_source_and_runtime_commands() {
     assert!(oracle.status.success(), "{oracle:?}");
     assert_eq!(oracle.stdout, b"Nat : Type\ncommandMacroValue : Nat\n");
     assert!(oracle.stderr.is_empty(), "{oracle:?}");
-    let accepted = project.check(IMPORTED_MACRO_CLIENT);
+    let accepted = project.check(IMPORTED_MACRO_DECLARATIONS);
     assert!(accepted.contains("\"theorems\":1"), "{accepted}");
 
     let lean = project.native("lean", IMPORTED_MACRO_CLIENT, Some(&project.partition));
@@ -1066,12 +1080,16 @@ fn installed_imported_macros_drive_checked_source_and_runtime_commands() {
         for verb in ["check-source", "run", "lean"] {
             ImportedMacroProject::refused(project.native(verb, source, Some(&project.partition)));
         }
-        assert_eq!(project.check(IMPORTED_MACRO_CLIENT), accepted);
+        assert_eq!(project.check(IMPORTED_MACRO_DECLARATIONS), accepted);
     }
 
     // Without explicit policy the original frontend remains in use; the
     // otherwise ill-typed ascription must not silently acquire macro semantics.
-    ImportedMacroProject::refused(project.native("check-source", IMPORTED_MACRO_CLIENT, None));
+    ImportedMacroProject::refused(project.native(
+        "check-source",
+        IMPORTED_MACRO_DECLARATIONS,
+        None,
+    ));
     let ordinary = concat!(
         "prelude\nimport Init.Prelude\n",
         "def ordinaryValue : Nat := 11\n",
@@ -1088,36 +1106,91 @@ fn installed_imported_macros_drive_checked_source_and_runtime_commands() {
     let retained_ir = project.root.join("objects/AdmittedSourceMacro.ir.saved");
     std::fs::rename(&ir, &retained_ir).unwrap();
     assert_macro_refusal(
-        project.native("check-source", IMPORTED_MACRO_CLIENT, Some(&project.partition)),
+        project.native("check-source", IMPORTED_MACRO_DECLARATIONS, Some(&project.partition)),
         5,
         "capability",
-        concat!(
-            "registered macro admittedChooseTerm in AdmittedSourceMacro: ",
-            "macro compilation: IR execution refuses unclassified declaration admittedChooseTerm",
-        ),
+        "IR execution refuses unclassified declaration admittedChooseTerm",
     );
     std::fs::rename(&retained_ir, &ir).unwrap();
-    assert_eq!(project.check(IMPORTED_MACRO_CLIENT), accepted);
+    assert_eq!(project.check(IMPORTED_MACRO_DECLARATIONS), accepted);
 
     std::fs::write(&ir, b"not a Lean IR artifact").unwrap();
     assert_macro_refusal(
-        project.native("check-source", IMPORTED_MACRO_CLIENT, Some(&project.partition)),
+        project.native("check-source", IMPORTED_MACRO_DECLARATIONS, Some(&project.partition)),
         1,
         "codec",
         "AdmittedSourceMacro.ir:",
     );
     std::fs::write(&ir, &original_ir).unwrap();
-    assert_eq!(project.check(IMPORTED_MACRO_CLIENT), accepted);
+    assert_eq!(project.check(IMPORTED_MACRO_DECLARATIONS), accepted);
 
     let wrong_partition = project.root.join("wrong-partition.tsv");
     std::fs::write(&wrong_partition, "constant_count\t0\n").unwrap();
     assert_macro_refusal(
-        project.native("check-source", IMPORTED_MACRO_CLIENT, Some(&wrong_partition)),
+        project.native("check-source", IMPORTED_MACRO_DECLARATIONS, Some(&wrong_partition)),
         1,
         "policy-refusal",
         "IR execution requires the exact pinned census partition",
     );
-    assert_eq!(project.check(IMPORTED_MACRO_CLIENT), accepted);
+    assert_eq!(project.check(IMPORTED_MACRO_DECLARATIONS), accepted);
     assert_eq!(std::fs::read(&ir).unwrap(), original_ir);
     assert_eq!(std::fs::read(&olean).unwrap(), original_olean);
+}
+
+#[test]
+fn installed_runtime_compiles_only_dispatched_imported_macros() {
+    let Some(project) =
+        ImportedMacroProject::prepare_with_source(&dormant_macro_provider_source())
+    else {
+        return;
+    };
+    let oracle = project.oracle(IMPORTED_MACRO_CLIENT);
+    assert!(oracle.status.success(), "{oracle:?}");
+    let lean = project.native("lean", IMPORTED_MACRO_CLIENT, Some(&project.partition));
+    assert!(lean.status.success(), "{lean:?}");
+    assert_eq!(lean.stdout, oracle.stdout);
+    assert!(lean.stderr.is_empty(), "{lean:?}");
+
+    let executable = format!("{IMPORTED_MACRO_CLIENT}#eval commandMacroValue\n");
+    let run = project.native("run", &executable, Some(&project.partition));
+    assert!(run.status.success(), "{run:?}");
+    assert!(run.stderr.is_empty(), "{run:?}");
+    let stdout = String::from_utf8(run.stdout).unwrap();
+    assert!(stdout.contains("\"outcome\":\"complete\""), "{stdout}");
+    assert!(stdout.contains("\"kind\":\"nat\",\"value\":11"), "{stdout}");
+    assert_imported_macro_provenance(&stdout);
+    assert!(!stdout.contains("dormantMacro"), "{stdout}");
+    assert!(!stdout.contains("absentMacroPrimitive"), "{stdout}");
+
+    // Earlier checks and evaluations stay unpublished if a later command
+    // actually dispatches the unsupported macro.
+    let demanded_lean = format!("{IMPORTED_MACRO_CLIENT}def demanded : Nat := _\n");
+    let refused = project.native("lean", &demanded_lean, Some(&project.partition));
+    assert_eq!(refused.status.code(), Some(5), "{refused:?}");
+    let error = ImportedMacroProject::refused(refused);
+    assert!(error.contains("absentMacroPrimitive"), "{error}");
+
+    let demanded_run = format!("{executable}def demanded : Nat := _\n");
+    assert_macro_refusal(
+        project.native("run", &demanded_run, Some(&project.partition)),
+        5,
+        "capability",
+        "absentMacroPrimitive",
+    );
+
+    // Raw FLBC publication is allowed in macro mode, but a failed expansion
+    // must not publish the already executed prefix as a successful artifact.
+    let flbc = project.root.join("demanded.flbc");
+    let refused = Command::new(env!("CARGO_BIN_EXE_fln"))
+        .args(["run", "--json", "--jobs", "1", "--import-posture", "recheck"])
+        .arg("--emit-flbc")
+        .arg(&flbc)
+        .arg(project.source(&demanded_run))
+        .current_dir(project.root.join("client"))
+        .env("LEAN_PATH", project.search_path())
+        .env("FLN_MACRO_PARTITION", &project.partition)
+        .output()
+        .unwrap();
+    assert_macro_refusal(refused, 5, "capability", "absentMacroPrimitive");
+    assert!(!flbc.exists(), "a refused macro published an executable prefix");
 }

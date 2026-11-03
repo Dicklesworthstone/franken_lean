@@ -348,12 +348,25 @@ impl imported::SourceOleanImport {
         cancellation: Option<&dyn CancellationProbe>,
         presentation: crate::EvaluationPresentation,
     ) -> SourceMacroProgramExecution {
-        self.execute_program_with_imported_macros(
+        self.execute_program_with_macro_preparation(
             modules,
             entry,
             options,
             limits,
-            input,
+            || {
+                let registry = self.prepare_imported_macros(
+                    input.code,
+                    input.partition,
+                    input.user_declarations,
+                    input.registry_limits,
+                )?;
+                Ok(ModuleMacroSession::new(
+                    registry,
+                    input.context,
+                    input.state,
+                    input.limits,
+                ))
+            },
             cancellation,
             false,
             presentation,
@@ -376,12 +389,102 @@ impl imported::SourceOleanImport {
         presentation: crate::EvaluationPresentation,
         validate: &mut impl FnMut(&Name, &crate::SourceCommandBatchExecution) -> Result<(), E>,
     ) -> SourceMacroProgramExecution<E> {
-        self.execute_program_with_imported_macros(
+        self.execute_program_with_macro_preparation(
             modules,
             entry,
             options,
             limits,
-            input,
+            || {
+                let registry = self.prepare_imported_macros(
+                    input.code,
+                    input.partition,
+                    input.user_declarations,
+                    input.registry_limits,
+                )?;
+                Ok(ModuleMacroSession::new(
+                    registry,
+                    input.context,
+                    input.state,
+                    input.limits,
+                ))
+            },
+            cancellation,
+            true,
+            presentation,
+            validate,
+        )
+    }
+
+    /// Execute the same source graph while compiling registered macros on
+    /// demand. Every captured owner and registration is validated up front;
+    /// reaching an unsupported macro stops the program without a partial result.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_source_modules_with_deferred_imported_macros(
+        &self,
+        modules: &[SourceModuleInput<'_>],
+        entry: &Name,
+        options: &KVMap,
+        limits: SourceProgramLimits,
+        input: SourceModuleDeferredMacroInputs,
+        cancellation: Option<&dyn CancellationProbe>,
+        presentation: crate::EvaluationPresentation,
+    ) -> SourceMacroProgramExecution {
+        self.execute_program_with_macro_preparation(
+            modules,
+            entry,
+            options,
+            limits,
+            || {
+                let registry = self.prepare_imported_macros_deferred(
+                    input.compilation,
+                    input.registry_limits,
+                )?;
+                Ok(ModuleMacroSession::new(
+                    registry,
+                    input.context,
+                    input.state,
+                    input.limits,
+                ))
+            },
+            cancellation,
+            false,
+            presentation,
+            &mut |_, _| Ok::<(), std::convert::Infallible>(()),
+        )
+    }
+
+    /// Execute ordinary Lean source with demand-driven imported macros and
+    /// implicit Init edges. Each completed module must pass caller validation
+    /// before it is exported or any successor runs.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_lean_source_modules_with_deferred_imported_macros_and_validation<E>(
+        &self,
+        modules: &[SourceModuleInput<'_>],
+        entry: &Name,
+        options: &KVMap,
+        limits: SourceProgramLimits,
+        input: SourceModuleDeferredMacroInputs,
+        cancellation: Option<&dyn CancellationProbe>,
+        presentation: crate::EvaluationPresentation,
+        validate: &mut impl FnMut(&Name, &crate::SourceCommandBatchExecution) -> Result<(), E>,
+    ) -> SourceMacroProgramExecution<E> {
+        self.execute_program_with_macro_preparation(
+            modules,
+            entry,
+            options,
+            limits,
+            || {
+                let registry = self.prepare_imported_macros_deferred(
+                    input.compilation,
+                    input.registry_limits,
+                )?;
+                Ok(ModuleMacroSession::new(
+                    registry,
+                    input.context,
+                    input.state,
+                    input.limits,
+                ))
+            },
             cancellation,
             true,
             presentation,
@@ -390,13 +493,13 @@ impl imported::SourceOleanImport {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn execute_program_with_imported_macros<E>(
+    fn execute_program_with_macro_preparation<E>(
         &self,
         modules: &[SourceModuleInput<'_>],
         entry: &Name,
         options: &KVMap,
         limits: SourceProgramLimits,
-        input: SourceModuleMacroInputs<'_>,
+        prepare: impl FnOnce() -> Result<ModuleMacroSession, MacroRegistrationError>,
         cancellation: Option<&dyn CancellationProbe>,
         implicit_init: bool,
         presentation: crate::EvaluationPresentation,
@@ -416,13 +519,8 @@ impl imported::SourceOleanImport {
                 .into(),
             )));
         }
-        let registry = match self.prepare_imported_macros(
-            input.code,
-            input.partition,
-            input.user_declarations,
-            input.registry_limits,
-        ) {
-            Ok(registry) => registry,
+        let mut session = match prepare() {
+            Ok(session) => session,
             Err(error) => {
                 return SourceMacroProgramExecution::stopped(Outcome::Complete(Err(
                     SourceModuleCheckError::Source {
@@ -433,8 +531,6 @@ impl imported::SourceOleanImport {
                 )));
             }
         };
-        let mut session =
-            ModuleMacroSession::new(registry, input.context, input.state, input.limits);
         let cancellation = cancellation.map(ModuleCancellation);
         let outcome = match self.execute_source_modules_with_implicit_init(
             modules,

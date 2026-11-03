@@ -397,21 +397,21 @@ fn run_loaded(
             }
             let evaluation_presentation = evaluation_presentation(presentation);
             let mut macro_report = None;
-            let execution = if let Some(prepared) = &macro_inputs {
-                let users = match prepared.users(receipt) {
-                    Ok(users) => users,
+            let execution = if let Some(prepared) = macro_inputs {
+                let (macro_inputs, ir_bytes) = match prepared.into_inputs(receipt, Some(vm_limits)) {
+                    Ok(inputs) => inputs,
                     Err(error) => return Some(failure(error, presentation)),
                 };
                 if ordinary_lean {
-                    let executed = receipt.execute_lean_source_modules_with_imported_macros_and_validation(
+                    let executed = receipt.execute_lean_source_modules_with_deferred_imported_macros_and_validation(
                         &inputs, &names[0], &fln::KVMap::new(), limits,
-                        prepared.inputs(&users, Some(vm_limits)), None, evaluation_presentation,
+                        macro_inputs, None, evaluation_presentation,
                         &mut |module: &Name, commands: &fln::SourceCommandBatchExecution| {
                             validate_lean_module(module, commands, module == &names[0])
                         },
                     );
-                    macro_report = match prepared.report(
-                        &executed.attempts, executed.completed_vm_usage.steps,
+                    macro_report = match macros::Report::from_attempts(
+                        ir_bytes, &executed.attempts, executed.completed_vm_usage.steps,
                         executed.tree_usage.visits,
                     ) {
                         Ok(report) => Some(report),
@@ -424,12 +424,12 @@ fn run_loaded(
                         fln::source_check::modules::execution::SourceProgramExecutionError::Validation { error, .. } => error,
                     })
                 } else {
-                    let executed = receipt.execute_source_modules_with_imported_macros(
+                    let executed = receipt.execute_source_modules_with_deferred_imported_macros(
                         &inputs, &names[0], &fln::KVMap::new(), limits,
-                        prepared.inputs(&users, Some(vm_limits)), None, evaluation_presentation,
+                        macro_inputs, None, evaluation_presentation,
                     );
-                    macro_report = match prepared.report(
-                        &executed.attempts, executed.completed_vm_usage.steps,
+                    macro_report = match macros::Report::from_attempts(
+                        ir_bytes, &executed.attempts, executed.completed_vm_usage.steps,
                         executed.tree_usage.visits,
                     ) {
                         Ok(report) => Some(report),
