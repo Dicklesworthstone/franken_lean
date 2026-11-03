@@ -1,7 +1,7 @@
 //! Every conditional arm remains an ordinary, independently checked core term.
 #![forbid(unsafe_code)]
 use fln::{Budget, Engine, EngineAdmissionLimits, KVMap, SourceCheckLimits};
-fn check(source: &str) {
+fn check(source: &str) -> Engine {
     let limits = EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024));
     Engine::with_source_seed(limits)
         .unwrap()
@@ -14,7 +14,8 @@ fn check(source: &str) {
         )
         .unwrap_or_else(|e| panic!("{source}\n{e:?}"))
         .into_complete()
-        .unwrap();
+        .unwrap()
+        .engine
 }
 fn reject(source: &str) {
     let limits = EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024));
@@ -244,4 +245,79 @@ fn installed_proposition_conditional_example_checks() {
     check(include_str!(
         "../../../examples/native_proposition_conditionals.lean"
     ));
+}
+
+#[test]
+fn source_conditionals_keep_the_admitted_ite_and_dite_heads() {
+    use fln_core::expr::ExprNode;
+    use fln_core::name::Name;
+    use fln_env::constants::ConstantInfo;
+
+    let engine = check(
+        r#"
+        universe u
+        def inferred := if True then 3 else 4
+        def chosen (p : Prop) [Decidable p] (a b : Nat) : Nat := if p then a else b
+        def chosenBool (b : Bool) : Nat := if b then 1 else 2
+        def chosenProof (p : Prop) [Decidable p] (hp : p) : p :=
+          if h : p then h else hp
+        def chosenType (p : Prop) [Decidable p] (a b : Type) : Type := if p then a else b
+        def chosenSort {A : Sort u} (p : Prop) [Decidable p] (a b : A) : A :=
+          if p then a else b
+        def dependentSort {A : Sort u} (p : Prop) [Decidable p]
+            (yes : p -> A) (no : Not p -> A) : A :=
+          if evidence : p then yes evidence else no evidence
+        def shadowed (ite dite : Nat) (p : Prop) [Decidable p] : Nat :=
+          if p then ite else dite
+        def dependentShadow (dite : Nat) (p : Prop) [Decidable p] : Nat :=
+          if dite : p then 1 else 2
+        "#,
+    );
+    for (name, head) in [
+        ("inferred", "ite"),
+        ("chosen", "ite"),
+        ("chosenBool", "ite"),
+        ("chosenProof", "dite"),
+        ("chosenType", "ite"),
+        ("chosenSort", "ite"),
+        ("dependentSort", "dite"),
+        ("shadowed", "ite"),
+        ("dependentShadow", "dite"),
+    ] {
+        let Some(ConstantInfo::Defn(definition)) =
+            engine.environment().find(&Name::from_components([name]))
+        else {
+            panic!("{name} must be an admitted definition");
+        };
+        let mut body = &definition.value;
+        while let ExprNode::Lam { body: inner, .. } = body.node() {
+            body = inner;
+        }
+        let mut argument_count = 0;
+        while let ExprNode::App { f, .. } = body.node() {
+            argument_count += 1;
+            body = f;
+        }
+        assert!(
+            matches!(body.node(), ExprNode::Const { name, levels }
+                if name == &Name::from_components([head]) && levels.len() == 1),
+            "{name}: conditional must remain {head}, not its expanded recursor: {body:?}"
+        );
+        assert_eq!(
+            argument_count, 5,
+            "{name}: all conditional arguments remain"
+        );
+    }
+}
+
+#[test]
+fn plain_conditionals_do_not_introduce_an_unwritten_hypothesis() {
+    reject("theorem bad : True := if True then by assumption else True.intro");
+    check("theorem good : True := if h : True then by assumption else True.intro");
+    for source in [
+        "def bad (b : Bool) : b = true ∨ b = false := if b then Or.inl rfl else Or.inr rfl",
+        "def bad (b : Bool) : (if b then Nat else Bool) := if b then (0 : Nat) else true",
+    ] {
+        reject(source);
+    }
 }

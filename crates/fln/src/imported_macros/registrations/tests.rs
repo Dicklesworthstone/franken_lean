@@ -1507,3 +1507,290 @@ fn scoped_fallbacks_share_steps_and_attempts_and_reactivation_is_idempotent() {
         Outcome::Complete(Ok(RegisteredExpansion::Expanded { .. }))
     ));
 }
+
+fn prepare_deferred(
+    modules: &[MacroRegistrationModule<'_>],
+    code: Vec<IrModule>,
+    limits: MacroRegistryLimits,
+) -> RegisteredMacros {
+    let admitted = environment(
+        &modules
+            .iter()
+            .map(|module| module.checked)
+            .collect::<Vec<_>>(),
+    );
+    let declarations = users(&code);
+    RegisteredMacros::prepare_deferred(
+        modules,
+        &admitted,
+        MacroCompilationInputs::new(code, VerifiedPartition::user_fixture(), declarations),
+        limits,
+    )
+    .unwrap()
+}
+
+#[test]
+fn deferred_macros_compile_only_selected_candidates_and_share_successful_code() {
+    let module = checked(
+        "User",
+        &[owner("User.good"), owner("User.unavailable")],
+        &[],
+    );
+    let rows = journal(&[
+        ("choice", "User.good", None),
+        ("choice", "User.good", None),
+        ("unused", "User.unavailable", None),
+        ("choice", "User.unavailable", Some("Hidden")),
+    ]);
+    let modules = [MacroRegistrationModule {
+        checked: &module,
+        extensions: &rows,
+    }];
+    let code = code(vec![function("User.good", Behavior::Identity)]);
+    // The eager contract remains stronger: even this unused owner must compile.
+    assert!(matches!(
+        RegisteredMacros::prepare(
+            &modules,
+            &environment(&[&module]),
+            &code,
+            &VerifiedPartition::user_fixture(),
+            &users(&code),
+            MacroRegistryLimits::default(),
+        ),
+        Err(MacroRegistrationError::Compile { declaration, .. })
+            if declaration == name("User.unavailable")
+    ));
+    let registry = prepare_deferred(
+        &modules,
+        code,
+        MacroRegistryLimits {
+            max_macros: 2,
+            ..MacroRegistryLimits::default()
+        },
+    );
+    let chain = &registry.candidates[&name("choice")];
+    assert!(Arc::ptr_eq(&chain[0].compiled, &chain[1].compiled));
+    assert!(chain[0].compiled.compiled.get().is_none());
+    let report = run(&registry, MacroDispatchLimits::default());
+    assert!(matches!(
+        &report.outcome,
+        Outcome::Complete(Ok(RegisteredExpansion::Expanded { declaration, state, .. }))
+            if declaration == &name("User.good") && state.macro_scope == 18
+    ));
+    assert_eq!(report.attempts.len(), 1);
+    assert!(report.completed_vm_usage.steps > 0);
+    let compiled = chain[0].compiled.compiled.get().unwrap();
+    let projected = registry.project_imports(&[name("User")]).unwrap();
+    assert!(Arc::ptr_eq(
+        &chain[0].compiled,
+        &projected.candidates[&name("choice")][0].compiled,
+    ));
+    let repeated = run(&projected, MacroDispatchLimits::default());
+    assert_eq!(repeated.completed_vm_usage, report.completed_vm_usage);
+    assert!(std::ptr::eq(
+        compiled,
+        projected.candidates[&name("choice")][0]
+            .compiled
+            .compiled
+            .get()
+            .unwrap(),
+    ));
+    let active = registry.activate_scoped(&name("Hidden")).unwrap();
+    let stopped = run(&active, MacroDispatchLimits::default());
+    assert!(matches!(
+        stopped.outcome,
+        Outcome::Complete(Err(MacroExecutionError::Compile(_)))
+    ));
+    assert_eq!(stopped.attempts.len(), 1);
+    assert_eq!(stopped.attempts[0].declaration, name("User.unavailable"));
+    assert!(stopped.attempts[0].vm_usage.is_none());
+    assert_eq!(stopped.completed_vm_usage.steps, 0);
+    assert!(
+        active.candidates[&name("choice")][0]
+            .compiled
+            .compiled
+            .get()
+            .is_none()
+    );
+    // Activation and the failed candidate never change the retained parent.
+    assert!(matches!(
+        run(&registry, MacroDispatchLimits::default()).outcome,
+        Outcome::Complete(Ok(RegisteredExpansion::Expanded { declaration, .. }))
+            if declaration == name("User.good")
+    ));
+}
+
+#[test]
+fn deferred_preparation_checks_inactive_owners_and_complete_registration_limits() {
+    let module = checked(
+        "User",
+        &[owner("User.good"), owner("User.unavailable")],
+        &[],
+    );
+    let rows = journal(&[
+        ("choice", "User.good", None),
+        ("choice", "User.unavailable", Some("Hidden")),
+    ]);
+    let modules = [MacroRegistrationModule {
+        checked: &module,
+        extensions: &rows,
+    }];
+    let code = code(vec![function("User.good", Behavior::Identity)]);
+    let declarations = users(&code);
+    let inputs = MacroCompilationInputs::new(code, VerifiedPartition::user_fixture(), declarations);
+    let admitted = environment(&[&module]);
+    for limits in [
+        MacroRegistryLimits {
+            max_modules: 0,
+            ..MacroRegistryLimits::default()
+        },
+        MacroRegistryLimits {
+            max_declarations: 1,
+            ..MacroRegistryLimits::default()
+        },
+        MacroRegistryLimits {
+            max_macros: 1,
+            ..MacroRegistryLimits::default()
+        },
+        MacroRegistryLimits {
+            metadata: DecodeLimits {
+                max_entries: 1,
+                ..DecodeLimits::default()
+            },
+            ..MacroRegistryLimits::default()
+        },
+    ] {
+        assert!(
+            RegisteredMacros::prepare_deferred(&modules, &admitted, inputs.clone(), limits)
+                .unwrap_err()
+                .is_resource()
+        );
+    }
+    let incomplete = environment(&[&checked("User", &[owner("User.good")], &[])]);
+    assert!(matches!(
+        RegisteredMacros::prepare_deferred(
+            &modules,
+            &incomplete,
+            inputs.clone(),
+            MacroRegistryLimits::default(),
+        ),
+        Err(MacroRegistrationError::Owner { declaration, .. })
+            if declaration == name("User.unavailable")
+    ));
+    let foreign = journal(&[("unused", "User.foreign", Some("Hidden"))]);
+    assert!(matches!(
+        RegisteredMacros::prepare_deferred(
+            &[MacroRegistrationModule {
+                checked: &module,
+                extensions: &foreign,
+            }],
+            &admitted,
+            inputs,
+            MacroRegistryLimits::default(),
+        ),
+        Err(MacroRegistrationError::Owner { declaration, .. })
+            if declaration == name("User.foreign")
+    ));
+}
+
+#[test]
+fn deferred_compilation_limits_and_cancellation_never_publish_a_result_or_fall_back() {
+    use fln_core::outcome::InconclusiveCause;
+    use std::cell::Cell;
+
+    struct Polls(Cell<usize>);
+    impl CancellationProbe for Polls {
+        fn is_cancelled(&self) -> bool {
+            let remaining = self.0.get();
+            self.0.set(remaining.saturating_sub(1));
+            remaining <= 1
+        }
+    }
+
+    let module = checked("User", &[owner("User.good"), owner("User.first")], &[]);
+    let rows = journal(&[
+        ("choice", "User.good", None),
+        ("choice", "User.first", None),
+    ]);
+    let modules = [MacroRegistrationModule {
+        checked: &module,
+        extensions: &rows,
+    }];
+    let code = code(vec![
+        function("User.good", Behavior::Identity),
+        function("User.first", Behavior::Identity),
+    ]);
+    let declarations = users(&code);
+    let inputs = MacroCompilationInputs::new(code, VerifiedPartition::user_fixture(), declarations);
+    let admitted = environment(&[&module]);
+    let mut limits = MacroRegistryLimits::default();
+    limits.compilation.ir.max_work = 0;
+    let limited =
+        RegisteredMacros::prepare_deferred(&modules, &admitted, inputs.clone(), limits).unwrap();
+    for _ in 0..2 {
+        let stopped = run(&limited, MacroDispatchLimits::default());
+        assert!(matches!(
+            stopped.outcome,
+            Outcome::Inconclusive(Inconclusive {
+                cause: InconclusiveCause::DependencyUnavailable { .. },
+                ..
+            })
+        ));
+        assert_eq!(stopped.attempts.len(), 1);
+        assert_eq!(stopped.attempts[0].declaration, name("User.first"));
+        assert!(stopped.attempts[0].vm_usage.is_none());
+        assert_eq!(stopped.completed_vm_usage.steps, 0);
+        assert!(
+            limited.candidates[&name("choice")][0]
+                .compiled
+                .compiled
+                .get()
+                .is_none()
+        );
+    }
+    let registry = RegisteredMacros::prepare_deferred(
+        &modules,
+        &admitted,
+        inputs,
+        MacroRegistryLimits::default(),
+    )
+    .unwrap();
+    for polls in [1, 2] {
+        let cancellation = Polls(Cell::new(polls));
+        let stopped = registry.expand_root(
+            &input(),
+            &SourceText::from_utf8(b"").unwrap(),
+            &context(),
+            MacroState {
+                macro_scope: 17,
+                ..MacroState::default()
+            },
+            MacroDispatchLimits::default(),
+            Some(&cancellation),
+        );
+        assert!(matches!(
+            stopped.outcome,
+            Outcome::Inconclusive(Inconclusive {
+                cause: InconclusiveCause::Cancelled { .. },
+                ..
+            })
+        ));
+        assert_eq!(stopped.attempts.len(), polls - 1);
+        assert_eq!(stopped.completed_vm_usage.steps, 0);
+        assert_eq!(
+            registry.candidates[&name("choice")][0]
+                .compiled
+                .compiled
+                .get()
+                .is_some(),
+            polls == 2,
+        );
+    }
+    let recovered = run(&registry, MacroDispatchLimits::default());
+    assert!(matches!(
+        recovered.outcome,
+        Outcome::Complete(Ok(RegisteredExpansion::Expanded { declaration, state, .. }))
+            if declaration == name("User.first") && state.macro_scope == 18
+    ));
+    assert_eq!(recovered.attempts.len(), 1);
+}

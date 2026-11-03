@@ -339,6 +339,12 @@ fn run_loaded(
             if !explicit_world {
                 return None;
             }
+            let macro_inputs = match macros::Config::from_environment().and_then(|config| {
+                config.as_ref().map(|config| loaded.prepare_macros(config)).transpose()
+            }) {
+                Ok(prepared) => prepared,
+                Err(error) => return Some(failure(error, presentation)),
+            };
             if let Err(error) = preflight_publication(&publication) {
                 return Some(failure(error, presentation));
             }
@@ -379,8 +385,64 @@ fn run_loaded(
                     &empty
                 }
             };
+            if macro_inputs.is_some()
+                && matches!(&publication, SourcePublication::Flbc { sidecar: Some(_), .. })
+            {
+                return Some(failure(Failure::new(
+                    "capability",
+                    "source-closure sidecars do not yet bind imported macro IR; omit the sidecar request to execute or emit raw FLBC",
+                    false,
+                    5,
+                ), presentation));
+            }
             let evaluation_presentation = evaluation_presentation(presentation);
-            let execution = if ordinary_lean {
+            let mut macro_report = None;
+            let execution = if let Some(prepared) = macro_inputs {
+                let (macro_inputs, ir_bytes) = match prepared.into_inputs(receipt, Some(vm_limits)) {
+                    Ok(inputs) => inputs,
+                    Err(error) => return Some(failure(error, presentation)),
+                };
+                if ordinary_lean {
+                    let executed = receipt.execute_lean_source_modules_with_deferred_imported_macros_and_validation(
+                        &inputs, &names[0], &fln::KVMap::new(), limits,
+                        macro_inputs, None, evaluation_presentation,
+                        &mut |module: &Name, commands: &fln::SourceCommandBatchExecution| {
+                            validate_lean_module(module, commands, module == &names[0])
+                        },
+                    );
+                    macro_report = match macros::Report::from_attempts(
+                        ir_bytes, &executed.attempts, executed.completed_vm_usage.steps,
+                        executed.tree_usage.visits,
+                    ) {
+                        Ok(report) => Some(report),
+                        Err(error) => return Some(failure(error, presentation)),
+                    };
+                    macros::result(executed.outcome).map_err(|error| match error {
+                        fln::source_check::modules::execution::SourceProgramExecutionError::Source(error) => {
+                            module_failure(error, presentation, &names[0], &sources[0], &display)
+                        }
+                        fln::source_check::modules::execution::SourceProgramExecutionError::Validation { error, .. } => error,
+                    })
+                } else {
+                    let executed = receipt.execute_source_modules_with_deferred_imported_macros(
+                        &inputs, &names[0], &fln::KVMap::new(), limits,
+                        macro_inputs, None, evaluation_presentation,
+                    );
+                    macro_report = match macros::Report::from_attempts(
+                        ir_bytes, &executed.attempts, executed.completed_vm_usage.steps,
+                        executed.tree_usage.visits,
+                    ) {
+                        Ok(report) => Some(report),
+                        Err(error) => return Some(failure(error, presentation)),
+                    };
+                    macros::result(executed.outcome).map_err(|error| match error {
+                        fln::source_check::modules::execution::SourceProgramExecutionError::Source(error) => {
+                            module_failure(error, presentation, &names[0], &sources[0], &display)
+                        }
+                        fln::source_check::modules::execution::SourceProgramExecutionError::Validation { error, .. } => match error {},
+                    })
+                }
+            } else if ordinary_lean {
                 receipt.execute_lean_source_modules_with_validation(
                     &inputs, &names[0], &fln::KVMap::new(), limits, None, evaluation_presentation,
                     &mut |module: &Name, commands: &fln::SourceCommandBatchExecution| {
@@ -437,7 +499,7 @@ fn run_loaded(
                     };
                     // Validate and bound the complete report before linking
                     // either artifact. No recompile or second execution occurs.
-                    match render(&completed, &names[0], loaded.total_bytes, base.as_ref(), json, prepared.as_ref()) {
+                    match render(&completed, &names[0], loaded.total_bytes, base.as_ref(), json, prepared.as_ref(), macro_report.as_ref()) {
                         Ok(stdout) => match prepared.as_ref().map(|prepared| prepared.publish(fln::publish_file_atomic_new)).transpose() {
                             Ok(_) => MultiplexerOutput::success(stdout),
                             Err(error) => failure(error, presentation),
@@ -947,6 +1009,7 @@ fn render(
     base: Option<&OleanBase>,
     json: bool,
     publication: Option<&PreparedPublication<'_>>,
+    macro_report: Option<&macros::Report>,
 ) -> Result<String, Failure> {
     validate_exits(program)?;
     if program
@@ -1056,6 +1119,13 @@ fn render(
     }
     if json {
         append(&mut output, "]")?;
+    }
+    if let Some(report) = macro_report {
+        if json {
+            append(&mut output, &report.json())?;
+        } else {
+            append(&mut output, &format!("{}\n", report.sentence()))?;
+        }
     }
     if let Some(publication) = publication {
         publication.report(&mut output, json)?;
@@ -1529,7 +1599,7 @@ mod tests {
                 }
                 let mut program = SourceProgramExecution { modules };
                 let entry = Name::from_components(["Main"]);
-                assert!(render(&program, &entry, 0, None, true, None).is_ok());
+                assert!(render(&program, &entry, 0, None, true, None, None).is_ok());
                 // The `lean` presentation prints the entry's own output only: one
                 // `42`, though the dependency evaluated the same term.
                 match lean_output(&program, &entry, false, crate::WarningSink::Unreachable) {
@@ -1560,7 +1630,7 @@ mod tests {
                     Ok(_) => panic!("the lean presentation must not hide a dependency panic"),
                 }
                 for json in [false, true] {
-                    let error = match render(&program, &entry, 0, None, json, None) {
+                    let error = match render(&program, &entry, 0, None, json, None, None) {
                         Err(error) => error,
                         Ok(_) => panic!("a successful entry must not hide a dependency panic"),
                     };

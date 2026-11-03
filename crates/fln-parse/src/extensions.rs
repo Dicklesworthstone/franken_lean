@@ -73,6 +73,7 @@ use std::ops::Range;
 use std::rc::Rc;
 use std::sync::{Arc, OnceLock};
 
+mod artifacts;
 mod atoms;
 mod categories;
 pub(crate) use categories::{category_for_quotation, parse_category_quotation};
@@ -82,6 +83,7 @@ mod modules;
 mod quotation;
 mod scoped_rules;
 mod unexpanders;
+pub use artifacts::{ImportedSyntaxEntry, ImportedSyntaxModule};
 pub use modules::NativeSyntaxModule;
 pub use unexpanders::{Notations, Unexpander, UnexpanderItem};
 
@@ -751,6 +753,9 @@ pub struct ActiveGrammar {
     table: TokenTable,
     /// Categories introduced by native source, never guessed from a node kind.
     source_categories: BTreeSet<Name>,
+    /// Categories whose quotation parser is supplied by the native source
+    /// grammar. An artifact category row alone does not register that parser.
+    source_quotation_categories: BTreeSet<Name>,
     category_decls: BTreeMap<Name, Vec<usize>>,
     decls: Vec<Arc<SyntaxDecl>>,
     infix: BTreeMap<String, ExtensionInfix>,
@@ -772,6 +777,9 @@ pub struct ActiveGrammar {
     interpolated: BTreeSet<String>,
     /// Every active declaration's node kind.
     kinds: BTreeSet<Name>,
+    /// Explicit artifact kind rows, separate from parser activation: a kind
+    /// registration alone must never enable a hand-written parser alternative.
+    artifact_kinds: BTreeSet<Name>,
     /// Leading `term` declarations of the prefix shape `node k p (andthen (symbol s) (cat term
     /// q))` (`notation:25 "⊢ₛ " p:25`): by symbol, the kind and the operand's precedence `q`.
     prefixes: BTreeMap<String, (Name, u8)>,
@@ -997,6 +1005,7 @@ impl ActiveGrammar {
             category_decls,
             table: TokenTable::from_tokens(tokens),
             source_categories: BTreeSet::new(),
+            source_quotation_categories: BTreeSet::new(),
             decls,
             infix,
             infix_kinds,
@@ -1005,6 +1014,7 @@ impl ActiveGrammar {
             terms,
             interpolated,
             kinds,
+            artifact_kinds: BTreeSet::new(),
             prefixes,
             attrs,
             commands,
@@ -1017,6 +1027,12 @@ impl ActiveGrammar {
 
     pub fn table(&self) -> &TokenTable {
         &self.table
+    }
+
+    /// Whether an explicit artifact kind row is active in this lexical scope.
+    /// This is registration metadata, not evidence of an installed parser.
+    pub fn is_registered_artifact_kind(&self, kind: &Name) -> bool {
+        self.artifact_kinds.contains(kind)
     }
 }
 
@@ -1158,6 +1174,9 @@ pub struct FileGrammar {
     native_scoped: BTreeMap<Name, Vec<Arc<SyntaxDecl>>>,
     native_abbreviations: BTreeSet<Name>,
     native_categories: BTreeSet<Name>,
+    /// Receipt-bound artifact descriptions and their independently journaled
+    /// tokens/kinds. These are never census entries or native source exports.
+    artifact: artifacts::ArtifactGrammar,
     /// Inherited suffix length per native syntax kind. Source registrations
     /// prepend to it; exports retain only the file's own prefix, so diamond
     /// imports do not replay a dependency's macros as new registrations.
@@ -1279,6 +1298,7 @@ impl FileGrammar {
             native_scoped: BTreeMap::new(),
             native_abbreviations: BTreeSet::new(),
             native_categories: BTreeSet::new(),
+            artifact: artifacts::ArtifactGrammar::default(),
             native_rule_counts: BTreeMap::new(),
             scoped,
             scoped_tokens,
@@ -1371,6 +1391,7 @@ impl FileGrammar {
         self.scoped
             .keys()
             .chain(self.native_scoped.keys())
+            .chain(self.artifact.namespaces.iter())
             .chain(self.scoped_declared.keys())
             .chain(
                 self.rule_scopes
@@ -1514,6 +1535,8 @@ impl FileGrammar {
         }
         let mut tokens = self.base_tokens.clone();
         tokens.extend(self.declared_tokens.iter().cloned());
+        tokens.extend(self.artifact.tokens.iter().cloned());
+        let mut artifact_kinds = self.artifact.kinds.clone();
         let mut decls = if self.imports_entered {
             self.imported.clone()
         } else {
@@ -1524,6 +1547,7 @@ impl FileGrammar {
                 .collect()
         };
         decls.extend(self.native_imported.iter().cloned());
+        decls.extend(self.artifact.imported.iter().cloned());
         let own =
             |index: usize, tokens: &mut BTreeSet<String>, decls: &mut Vec<Arc<SyntaxDecl>>| {
                 let decl = &self.declared[index];
@@ -1549,6 +1573,8 @@ impl FileGrammar {
                             decls.push(Arc::clone(decl));
                         }
                     }
+                    self.artifact
+                        .activate(namespace, &mut tokens, &mut artifact_kinds, &mut decls);
                     for &index in self.scoped_declared.get(namespace).into_iter().flatten() {
                         if index < *declared_before {
                             own(index, &mut tokens, &mut decls);
@@ -1564,6 +1590,16 @@ impl FileGrammar {
             .extend(self.native_categories.iter().cloned());
         grammar
             .source_categories
+            .extend(self.artifact.categories.iter().cloned());
+        grammar.artifact_kinds = artifact_kinds;
+        grammar
+            .source_categories
+            .extend(self.declared_categories.keys().cloned());
+        grammar
+            .source_quotation_categories
+            .extend(self.native_categories.iter().cloned());
+        grammar
+            .source_quotation_categories
             .extend(self.declared_categories.keys().cloned());
         grammar.imports_entered = self.imports_entered;
         grammar.closure_kinds = Some(Arc::clone(&self.closure_kinds));
@@ -4020,15 +4056,30 @@ impl Run<'_> {
                 let (items, next) = self.parse(body, at, end, follow, depth + 1)?;
                 Some((vec![Syntax::node(kind.clone(), items)], next))
             }
-            Descr::Symbol(text) | Descr::NonReservedSymbol(text, _) => {
+            Descr::Symbol(text) => {
                 let text = text.trim();
-                if at >= end || self.text(at)? != text {
+                if at >= end
+                    || !matches!(&self.tokens[at].kind, TokenKind::Symbol(symbol) if symbol == text)
+                {
+                    return None;
+                }
+                Some((vec![self.atom(at, text)?], at + 1))
+            }
+            Descr::NonReservedSymbol(text, _) => {
+                let text = text.trim();
+                if at >= end
+                    || !matches!(
+                        &self.tokens[at].kind,
+                        TokenKind::Symbol(_) | TokenKind::Ident(_)
+                    )
+                    || self.text(at)? != text
+                {
                     return None;
                 }
                 Some((vec![self.atom(at, text)?], at + 1))
             }
             Descr::UnicodeSymbol(text, ascii, _) => {
-                if at >= end {
+                if at >= end || !matches!(&self.tokens[at].kind, TokenKind::Symbol(_)) {
                     return None;
                 }
                 let found = self.text(at)?;

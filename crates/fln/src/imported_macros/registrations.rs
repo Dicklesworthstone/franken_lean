@@ -27,7 +27,7 @@ mod recursive;
 use recursive::{ExpansionWork, RegistryExpansion, add_tree_usage, add_vm_usage};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 /// A checked module and its complete captured extension journal. For a
 /// module-system artifact, capture the final private part with its public and
@@ -159,18 +159,90 @@ impl fmt::Display for MacroRegistrationError {
 
 impl std::error::Error for MacroRegistrationError {}
 
+/// Owned, immutable inputs shared by demand-compiled macro closures.
+///
+/// Construction moves the decoded IR, verified partition and explicit user
+/// declarations into shared storage. It neither clones IR bodies nor grants
+/// execution authority: each selected closure still passes `compile`.
+#[derive(Debug, Clone)]
+pub struct MacroCompilationInputs {
+    code: Arc<[IrModule]>,
+    partition: Arc<VerifiedPartition>,
+    user_declarations: Arc<BTreeSet<Name>>,
+}
+
+impl MacroCompilationInputs {
+    pub fn new(
+        code: Vec<IrModule>,
+        partition: VerifiedPartition,
+        user_declarations: BTreeSet<Name>,
+    ) -> Self {
+        Self {
+            code: Arc::from(code),
+            partition: Arc::new(partition),
+            user_declarations: Arc::new(user_declarations),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct MacroCode {
+    compiled: OnceLock<CompiledMacro>,
+    deferred: Option<(MacroCompilationInputs, IrExecutionLimits)>,
+}
+
+impl MacroCode {
+    fn eager(compiled: CompiledMacro) -> Self {
+        Self {
+            compiled: OnceLock::from(compiled),
+            deferred: None,
+        }
+    }
+
+    fn deferred(inputs: MacroCompilationInputs, limits: IrExecutionLimits) -> Self {
+        Self {
+            compiled: OnceLock::new(),
+            deferred: Some((inputs, limits)),
+        }
+    }
+
+    fn resolve(&self, declaration: &Name) -> Result<&CompiledMacro, MacroExecutionError> {
+        if let Some(compiled) = self.compiled.get() {
+            return Ok(compiled);
+        }
+        let (inputs, limits) = self
+            .deferred
+            .as_ref()
+            .expect("uncompiled macro has retained inputs");
+        let result = compile(
+            &inputs.code,
+            declaration,
+            &inputs.partition,
+            &inputs.user_declarations,
+            *limits,
+        )?;
+        // A concurrent caller may have completed the same immutable closure.
+        // Only successes are retained; resource stops remain retryable and
+        // no lock is held across macro execution.
+        let _ = self.compiled.set(result);
+        Ok(self.compiled.get().expect("successful macro compilation"))
+    }
+}
+
 #[derive(Debug, Clone)]
 struct RegisteredMacro {
     module: Name,
     declaration: Name,
-    compiled: Arc<CompiledMacro>,
+    compiled: Arc<MacroCode>,
 }
 
 type CandidateTable = BTreeMap<Name, Arc<[RegisteredMacro]>>;
 
 /// Prepared global and scoped registrations. Every candidate, including inactive
-/// scoped candidates, has passed exact owner validation and the ordinary
-/// census-authorized imported-IR compiler. Clones share code and candidate chains.
+/// scoped candidates, has passed exact owner validation. Eager preparation also
+/// compiles every candidate; deferred preparation compiles a candidate before
+/// its first invocation through the same census-authorized imported-IR compiler.
+/// Clones share candidate chains and successful compilation cells.
 #[derive(Debug, Clone)]
 pub struct RegisteredMacros {
     candidates: Arc<CandidateTable>,
@@ -234,6 +306,40 @@ impl RegisteredMacros {
         user_declarations: &BTreeSet<Name>,
         limits: MacroRegistryLimits,
     ) -> Result<Self, MacroRegistrationError> {
+        Self::prepare_with(ordered_modules, admitted, limits, |declaration| {
+            compile(
+                code,
+                declaration,
+                partition,
+                user_declarations,
+                limits.compilation,
+            )
+            .map(MacroCode::eager)
+        })
+    }
+
+    /// Validate the complete supplied registration table without compiling
+    /// unused candidates. Missing or unsupported code is reported only when
+    /// its candidate is selected, and stops the chain rather than falling back.
+    /// Inactive scoped owners and all metadata still undergo the same checks
+    /// and consume the same registration limits as eager preparation.
+    pub fn prepare_deferred(
+        ordered_modules: &[MacroRegistrationModule<'_>],
+        admitted: &Environment,
+        inputs: MacroCompilationInputs,
+        limits: MacroRegistryLimits,
+    ) -> Result<Self, MacroRegistrationError> {
+        Self::prepare_with(ordered_modules, admitted, limits, |_| {
+            Ok(MacroCode::deferred(inputs.clone(), limits.compilation))
+        })
+    }
+
+    fn prepare_with(
+        ordered_modules: &[MacroRegistrationModule<'_>],
+        admitted: &Environment,
+        limits: MacroRegistryLimits,
+        mut prepare: impl FnMut(&Name) -> Result<MacroCode, MacroExecutionError>,
+    ) -> Result<Self, MacroRegistrationError> {
         if ordered_modules.len() > limits.max_modules {
             return Err(MacroRegistrationError::Limit("modules"));
         }
@@ -272,8 +378,7 @@ impl RegisteredMacros {
         let mut decoder = macros::Decoder::new(limits.metadata);
         let mut candidates: BTreeMap<Name, Vec<RegisteredMacro>> = BTreeMap::new();
         let mut scoped: BTreeMap<Name, BTreeMap<Name, Vec<RegisteredMacro>>> = BTreeMap::new();
-        let mut compiled: BTreeMap<Name, (Name, ConstantInfo, Arc<CompiledMacro>)> =
-            BTreeMap::new();
+        let mut compiled: BTreeMap<Name, (Name, ConstantInfo, Arc<MacroCode>)> = BTreeMap::new();
         for input in ordered_modules {
             let module = &input.checked.name;
             let rows = decoder.decode(input.extensions).map_err(|error| {
@@ -324,22 +429,13 @@ impl RegisteredMacros {
                         if compiled.len() >= limits.max_macros {
                             return Err(MacroRegistrationError::Limit("compiled macros"));
                         }
-                        let callable = Arc::new(
-                            compile(
-                                code,
-                                &row.declaration,
-                                partition,
-                                user_declarations,
-                                limits.compilation,
-                            )
-                            .map_err(|error| {
-                                MacroRegistrationError::Compile {
-                                    module: module.clone(),
-                                    declaration: row.declaration.clone(),
-                                    error: Box::new(error),
-                                }
-                            })?,
-                        );
+                        let callable = Arc::new(prepare(&row.declaration).map_err(|error| {
+                            MacroRegistrationError::Compile {
+                                module: module.clone(),
+                                declaration: row.declaration.clone(),
+                                error: Box::new(error),
+                            }
+                        })?);
                         compiled.insert(
                             row.declaration.clone(),
                             (module.clone(), (**owner).clone(), Arc::clone(&callable)),
@@ -966,6 +1062,26 @@ impl RegisteredMacros {
                 reference_functions: Vec::new(),
                 native_functions: Vec::new(),
             });
+            let uncompiled = candidate.compiled.compiled.get().is_none();
+            let resolved = candidate.compiled.resolve(&candidate.declaration);
+            if uncompiled && cancellation.is_some_and(CancellationProbe::is_cancelled) {
+                return Outcome::Inconclusive(Inconclusive::cancelled(
+                    "registered macro after compilation",
+                ));
+            }
+            let compiled = match resolved {
+                Ok(compiled) => compiled,
+                Err(MacroExecutionError::Compile(error)) if error.is_resource() => {
+                    // The compiler's limit errors do not expose consumption
+                    // counters. Preserve the dependency's non-answer without
+                    // inventing a ResourceUsage or converting it to a refusal
+                    // through the recursive expansion callback.
+                    return Outcome::Inconclusive(Inconclusive::dependency_unavailable(format!(
+                        "imported macro compilation resource stop: {error}"
+                    )));
+                }
+                Err(error) => return Outcome::Complete(Err(error)),
+            };
             let callback = RegistryExpansion::new(
                 self,
                 source,
@@ -974,7 +1090,7 @@ impl RegisteredMacros {
                 work.callback_depth,
                 work.conversions.clone(),
             );
-            let result = candidate.compiled.execute_with_methods(
+            let result = compiled.execute_with_methods(
                 input,
                 MacroInvocation {
                     source,

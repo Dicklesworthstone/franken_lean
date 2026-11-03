@@ -4,11 +4,12 @@
 //! from the supplied MacroM state and its own quotation context, while expansion
 //! work shares one graph-wide allowance. Only a complete graph publishes states.
 
+use super::execution::{SourceProgramExecution, SourceProgramExecutionError, SourceProgramLimits};
 use super::*;
 use crate::imported_ir::VerifiedPartition;
 use crate::imported_macros::registrations::{
-    MacroAttempt, MacroRegistrationError, MacroRegistryLimits, MacroTreeLimits, MacroTreeUsage,
-    RegisteredMacros,
+    MacroAttempt, MacroCompilationInputs, MacroRegistrationError, MacroRegistryLimits,
+    MacroTreeLimits, MacroTreeUsage, RegisteredMacros,
 };
 use crate::imported_macros::source::{
     FileSession, FileSessionReport, SourceMacroError, SourceMacroInvocation,
@@ -39,6 +40,18 @@ pub struct SourceModuleMacroInputs<'a> {
     pub limits: MacroTreeLimits,
 }
 
+/// Owned compilation inputs for source modules that compile imported macros on
+/// first use. Context, initial state and graph-wide expansion limits have the
+/// same meaning as in `SourceModuleMacroInputs`. No partial registration table
+/// can be supplied: the receipt still provides every captured journal.
+pub struct SourceModuleDeferredMacroInputs {
+    pub compilation: MacroCompilationInputs,
+    pub registry_limits: MacroRegistryLimits,
+    pub context: MacroContext,
+    pub state: MacroState,
+    pub limits: MacroTreeLimits,
+}
+
 /// A module graph admitted through the ordinary council path after expansion.
 /// Failure retains actual macro work, but publishes neither a checked prefix
 /// nor any terminal module state. Scoped activation is local to each module.
@@ -49,6 +62,33 @@ pub struct SourceMacroModuleCheck {
     pub attempts: Vec<MacroAttempt>,
     pub completed_vm_usage: ExecutionUsage,
     pub tree_usage: MacroTreeUsage,
+}
+
+/// Executed source modules and the macro work consumed by their real command
+/// streams. A failed module, caller validation, cancellation or macro resource
+/// stop exposes neither a partial program nor terminal module states. Runtime
+/// stops retain the ordinary program evidence, but withhold terminal states.
+#[derive(Debug)]
+pub struct SourceMacroProgramExecution<E = std::convert::Infallible> {
+    pub outcome: Outcome<Result<SourceProgramExecution, SourceProgramExecutionError<E>>>,
+    pub states: Option<BTreeMap<Name, MacroState>>,
+    pub attempts: Vec<MacroAttempt>,
+    pub completed_vm_usage: ExecutionUsage,
+    pub tree_usage: MacroTreeUsage,
+}
+
+impl<E> SourceMacroProgramExecution<E> {
+    fn stopped(
+        outcome: Outcome<Result<SourceProgramExecution, SourceProgramExecutionError<E>>>,
+    ) -> Self {
+        Self {
+            outcome,
+            states: None,
+            attempts: Vec::new(),
+            completed_vm_usage: empty_usage(),
+            tree_usage: MacroTreeUsage::default(),
+        }
+    }
 }
 
 impl SourceMacroModuleCheck {
@@ -108,12 +148,17 @@ pub(super) struct ModuleMacroSession {
 }
 
 impl ModuleMacroSession {
-    fn new(registry: RegisteredMacros, input: SourceModuleMacroInputs<'_>) -> Self {
+    fn new(
+        registry: RegisteredMacros,
+        context: MacroContext,
+        state: MacroState,
+        limits: MacroTreeLimits,
+    ) -> Self {
         Self {
             registry,
-            context: input.context,
-            state: input.state,
-            limits: input.limits,
+            context,
+            state,
+            limits,
             states: BTreeMap::new(),
             attempts: Vec::new(),
             completed_vm_usage: empty_usage(),
@@ -246,6 +291,28 @@ impl ModuleMacroSession {
         Ok(())
     }
 
+    fn finish_execution<E>(
+        self,
+        outcome: Outcome<Result<SourceProgramExecution, SourceProgramExecutionError<E>>>,
+    ) -> SourceMacroProgramExecution<E> {
+        let successful = match &outcome {
+            Outcome::Complete(Ok(program)) => program.modules.iter().all(|module| {
+                module.commands.batch.executions.iter().all(|execution| {
+                    matches!(execution.exit, fln_vm::interpreter::VmExit::Returned(_))
+                })
+            }),
+            _ => false,
+        };
+        let states = successful.then_some(self.states);
+        SourceMacroProgramExecution {
+            outcome,
+            states,
+            attempts: self.attempts,
+            completed_vm_usage: self.completed_vm_usage,
+            tree_usage: self.tree_usage,
+        }
+    }
+
     fn finish(
         self,
         outcome: Outcome<Result<SourceModuleCheck, SourceModuleCheckError>>,
@@ -262,6 +329,224 @@ impl ModuleMacroSession {
 }
 
 impl imported::SourceOleanImport {
+    /// Execute an explicit source graph with the receipt's imported node macros.
+    /// Expansion precedes ordinary elaboration, admission, compilation and VM
+    /// execution. Every module retains its exact import order and fresh macro
+    /// state; the graph shares one expansion allowance.
+    ///
+    /// This explicit adapter accepts the same registered-macro subset as
+    /// `check_source_modules_with_imported_macros`. Source templates, atomic
+    /// elaborator macros and tactic-boundary macros remain typed refusals.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_source_modules_with_imported_macros(
+        &self,
+        modules: &[SourceModuleInput<'_>],
+        entry: &Name,
+        options: &KVMap,
+        limits: SourceProgramLimits,
+        input: SourceModuleMacroInputs<'_>,
+        cancellation: Option<&dyn CancellationProbe>,
+        presentation: crate::EvaluationPresentation,
+    ) -> SourceMacroProgramExecution {
+        self.execute_program_with_macro_preparation(
+            modules,
+            entry,
+            options,
+            limits,
+            || {
+                let registry = self.prepare_imported_macros(
+                    input.code,
+                    input.partition,
+                    input.user_declarations,
+                    input.registry_limits,
+                )?;
+                Ok(ModuleMacroSession::new(
+                    registry,
+                    input.context,
+                    input.state,
+                    input.limits,
+                ))
+            },
+            cancellation,
+            false,
+            presentation,
+            &mut |_, _| Ok::<(), std::convert::Infallible>(()),
+        )
+    }
+
+    /// Execute ordinary Lean source with implicit Init edges and imported
+    /// macros. Validate each completed module before exporting it or running
+    /// a successor, exactly as the ordinary source-program entry point does.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_lean_source_modules_with_imported_macros_and_validation<E>(
+        &self,
+        modules: &[SourceModuleInput<'_>],
+        entry: &Name,
+        options: &KVMap,
+        limits: SourceProgramLimits,
+        input: SourceModuleMacroInputs<'_>,
+        cancellation: Option<&dyn CancellationProbe>,
+        presentation: crate::EvaluationPresentation,
+        validate: &mut impl FnMut(&Name, &crate::SourceCommandBatchExecution) -> Result<(), E>,
+    ) -> SourceMacroProgramExecution<E> {
+        self.execute_program_with_macro_preparation(
+            modules,
+            entry,
+            options,
+            limits,
+            || {
+                let registry = self.prepare_imported_macros(
+                    input.code,
+                    input.partition,
+                    input.user_declarations,
+                    input.registry_limits,
+                )?;
+                Ok(ModuleMacroSession::new(
+                    registry,
+                    input.context,
+                    input.state,
+                    input.limits,
+                ))
+            },
+            cancellation,
+            true,
+            presentation,
+            validate,
+        )
+    }
+
+    /// Execute the same source graph while compiling registered macros on
+    /// demand. Every captured owner and registration is validated up front;
+    /// reaching an unsupported macro stops the program without a partial result.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_source_modules_with_deferred_imported_macros(
+        &self,
+        modules: &[SourceModuleInput<'_>],
+        entry: &Name,
+        options: &KVMap,
+        limits: SourceProgramLimits,
+        input: SourceModuleDeferredMacroInputs,
+        cancellation: Option<&dyn CancellationProbe>,
+        presentation: crate::EvaluationPresentation,
+    ) -> SourceMacroProgramExecution {
+        self.execute_program_with_macro_preparation(
+            modules,
+            entry,
+            options,
+            limits,
+            || {
+                let registry = self
+                    .prepare_imported_macros_deferred(input.compilation, input.registry_limits)?;
+                Ok(ModuleMacroSession::new(
+                    registry,
+                    input.context,
+                    input.state,
+                    input.limits,
+                ))
+            },
+            cancellation,
+            false,
+            presentation,
+            &mut |_, _| Ok::<(), std::convert::Infallible>(()),
+        )
+    }
+
+    /// Execute ordinary Lean source with demand-driven imported macros and
+    /// implicit Init edges. Each completed module must pass caller validation
+    /// before it is exported or any successor runs.
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_lean_source_modules_with_deferred_imported_macros_and_validation<E>(
+        &self,
+        modules: &[SourceModuleInput<'_>],
+        entry: &Name,
+        options: &KVMap,
+        limits: SourceProgramLimits,
+        input: SourceModuleDeferredMacroInputs,
+        cancellation: Option<&dyn CancellationProbe>,
+        presentation: crate::EvaluationPresentation,
+        validate: &mut impl FnMut(&Name, &crate::SourceCommandBatchExecution) -> Result<(), E>,
+    ) -> SourceMacroProgramExecution<E> {
+        self.execute_program_with_macro_preparation(
+            modules,
+            entry,
+            options,
+            limits,
+            || {
+                let registry = self
+                    .prepare_imported_macros_deferred(input.compilation, input.registry_limits)?;
+                Ok(ModuleMacroSession::new(
+                    registry,
+                    input.context,
+                    input.state,
+                    input.limits,
+                ))
+            },
+            cancellation,
+            true,
+            presentation,
+            validate,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn execute_program_with_macro_preparation<E>(
+        &self,
+        modules: &[SourceModuleInput<'_>],
+        entry: &Name,
+        options: &KVMap,
+        limits: SourceProgramLimits,
+        prepare: impl FnOnce() -> Result<ModuleMacroSession, MacroRegistrationError>,
+        cancellation: Option<&dyn CancellationProbe>,
+        implicit_init: bool,
+        presentation: crate::EvaluationPresentation,
+        validate: &mut impl FnMut(&Name, &crate::SourceCommandBatchExecution) -> Result<(), E>,
+    ) -> SourceMacroProgramExecution<E> {
+        if cancellation.is_some_and(CancellationProbe::is_cancelled) {
+            return SourceMacroProgramExecution::stopped(Outcome::Inconclusive(
+                Inconclusive::cancelled("source-program macros/before-preparation"),
+            ));
+        }
+        if self.contexts.has_inherited_imports() {
+            return SourceMacroProgramExecution::stopped(Outcome::Complete(Err(
+                SourceModuleCheckError::ImportContext {
+                    module: entry.clone(),
+                    reason: "imported macro execution requires retained journals for the complete artifact closure",
+                }
+                .into(),
+            )));
+        }
+        let mut session = match prepare() {
+            Ok(session) => session,
+            Err(error) => {
+                return SourceMacroProgramExecution::stopped(Outcome::Complete(Err(
+                    SourceModuleCheckError::Source {
+                        module: entry.clone(),
+                        error: binding_error(error),
+                    }
+                    .into(),
+                )));
+            }
+        };
+        let cancellation = cancellation.map(ModuleCancellation);
+        let outcome = match self.execute_source_modules_with_implicit_init(
+            modules,
+            entry,
+            options,
+            limits,
+            cancellation
+                .as_ref()
+                .map(|probe| probe as &dyn ModuleCancellationProbe),
+            implicit_init,
+            presentation,
+            validate,
+            Some(&mut session),
+        ) {
+            Ok(outcome) => outcome.map_complete(Ok),
+            Err(error) => Outcome::Complete(Err(error)),
+        };
+        session.finish_execution(outcome)
+    }
+
     /// Check source modules with all imported node macros from this receipt.
     /// Each module sees only its declared import closure, in its own import
     /// order. Expansion enters the ordinary module driver and dual-check
@@ -283,6 +568,71 @@ impl imported::SourceOleanImport {
         input: SourceModuleMacroInputs<'_>,
         cancellation: Option<&dyn CancellationProbe>,
     ) -> SourceMacroModuleCheck {
+        self.check_source_modules_with_macro_preparation(
+            modules,
+            entry,
+            options,
+            limits,
+            || {
+                let registry = self.prepare_imported_macros(
+                    input.code,
+                    input.partition,
+                    input.user_declarations,
+                    input.registry_limits,
+                )?;
+                Ok(ModuleMacroSession::new(
+                    registry,
+                    input.context,
+                    input.state,
+                    input.limits,
+                ))
+            },
+            cancellation,
+        )
+    }
+
+    /// Check the same complete import world while compiling each macro only
+    /// when dispatch reaches it. Unused and inactive candidates need valid
+    /// checked owners but need not have executable closures in this native
+    /// Mirror slice. An invoked unsupported closure stops the check; it never
+    /// disappears from the table or falls back to an older candidate.
+    pub fn check_source_modules_with_deferred_imported_macros(
+        &self,
+        modules: &[SourceModuleInput<'_>],
+        entry: &Name,
+        options: &KVMap,
+        limits: SourceModuleCheckLimits,
+        input: SourceModuleDeferredMacroInputs,
+        cancellation: Option<&dyn CancellationProbe>,
+    ) -> SourceMacroModuleCheck {
+        self.check_source_modules_with_macro_preparation(
+            modules,
+            entry,
+            options,
+            limits,
+            || {
+                let registry = self
+                    .prepare_imported_macros_deferred(input.compilation, input.registry_limits)?;
+                Ok(ModuleMacroSession::new(
+                    registry,
+                    input.context,
+                    input.state,
+                    input.limits,
+                ))
+            },
+            cancellation,
+        )
+    }
+
+    fn check_source_modules_with_macro_preparation(
+        &self,
+        modules: &[SourceModuleInput<'_>],
+        entry: &Name,
+        options: &KVMap,
+        limits: SourceModuleCheckLimits,
+        prepare: impl FnOnce() -> Result<ModuleMacroSession, MacroRegistrationError>,
+        cancellation: Option<&dyn CancellationProbe>,
+    ) -> SourceMacroModuleCheck {
         if cancellation.is_some_and(CancellationProbe::is_cancelled) {
             return SourceMacroModuleCheck::stopped(Outcome::Inconclusive(
                 Inconclusive::cancelled("source-module macros/before-preparation"),
@@ -296,13 +646,8 @@ impl imported::SourceOleanImport {
                 },
             )));
         }
-        let registry = match self.prepare_imported_macros(
-            input.code,
-            input.partition,
-            input.user_declarations,
-            input.registry_limits,
-        ) {
-            Ok(registry) => registry,
+        let mut session = match prepare() {
+            Ok(session) => session,
             Err(error) => {
                 return SourceMacroModuleCheck::stopped(Outcome::Complete(Err(
                     SourceModuleCheckError::Source {
@@ -312,7 +657,6 @@ impl imported::SourceOleanImport {
                 )));
             }
         };
-        let mut session = ModuleMacroSession::new(registry, input);
         let cancellation = cancellation.map(ModuleCancellation);
         let outcome = match cache::run_collecting(
             &self.contexts.complete,

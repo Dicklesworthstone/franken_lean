@@ -225,8 +225,46 @@ impl SourceOleanImport {
         crate::imported_macros::registrations::RegisteredMacros,
         crate::imported_macros::registrations::MacroRegistrationError,
     > {
+        let modules = self.macro_registration_modules(limits)?;
+        crate::imported_macros::registrations::RegisteredMacros::prepare(
+            &modules,
+            self.contexts.complete.environment(),
+            code,
+            partition,
+            user_declarations,
+            limits,
+        )
+    }
+
+    /// Retain this receipt's complete checked macro table while compiling only
+    /// invoked candidates. All journals and owners, including inactive scoped
+    /// registrations, are validated before the registry is returned.
+    pub fn prepare_imported_macros_deferred(
+        &self,
+        inputs: crate::imported_macros::registrations::MacroCompilationInputs,
+        limits: crate::imported_macros::registrations::MacroRegistryLimits,
+    ) -> std::result::Result<
+        crate::imported_macros::registrations::RegisteredMacros,
+        crate::imported_macros::registrations::MacroRegistrationError,
+    > {
+        let modules = self.macro_registration_modules(limits)?;
+        crate::imported_macros::registrations::RegisteredMacros::prepare_deferred(
+            &modules,
+            self.contexts.complete.environment(),
+            inputs,
+            limits,
+        )
+    }
+
+    fn macro_registration_modules(
+        &self,
+        limits: crate::imported_macros::registrations::MacroRegistryLimits,
+    ) -> std::result::Result<
+        Vec<crate::imported_macros::registrations::MacroRegistrationModule<'_>>,
+        crate::imported_macros::registrations::MacroRegistrationError,
+    > {
         use crate::imported_macros::registrations::{
-            MacroRegistrationError, MacroRegistrationModule, RegisteredMacros,
+            MacroRegistrationError, MacroRegistrationModule,
         };
         if self.macro_journals.len() > limits.max_modules {
             return Err(MacroRegistrationError::Limit("modules"));
@@ -237,31 +275,24 @@ impl SourceOleanImport {
                 return Err(MacroRegistrationError::DuplicateModule(module.name.clone()));
             }
         }
-        let modules =
-            self.macro_journals
-                .iter()
-                .map(|(name, extensions)| {
-                    let checked = checked.get(name).copied().ok_or_else(|| {
-                        MacroRegistrationError::Owner {
+        self.macro_journals
+            .iter()
+            .map(|(name, extensions)| {
+                let checked =
+                    checked
+                        .get(name)
+                        .copied()
+                        .ok_or_else(|| MacroRegistrationError::Owner {
                             module: name.clone(),
                             declaration: Name::anonymous(),
                             reason: "captured macro journal lost its checked module",
-                        }
-                    })?;
-                    Ok(MacroRegistrationModule {
-                        checked,
-                        extensions,
-                    })
+                        })?;
+                Ok(MacroRegistrationModule {
+                    checked,
+                    extensions,
                 })
-                .collect::<std::result::Result<Vec<_>, MacroRegistrationError>>()?;
-        RegisteredMacros::prepare(
-            &modules,
-            self.contexts.complete.environment(),
-            code,
-            partition,
-            user_declarations,
-            limits,
-        )
+            })
+            .collect()
     }
 }
 
