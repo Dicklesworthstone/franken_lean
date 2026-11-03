@@ -728,3 +728,357 @@ fn imported_macro_checking_runs_the_real_companion_and_keeps_admission_authority
     assert!(stdout.contains("\"attempts\":0,"), "{stdout}");
     assert!(stdout.contains("\"vmSteps\":0,"), "{stdout}");
 }
+
+
+/// An actual pinned compiler produces the macro code and its checked owner;
+/// the installed native commands receive only the resulting artifact closure.
+struct ImportedMacroProject {
+    root: PathBuf,
+    reference: PathBuf,
+    library: PathBuf,
+    partition: PathBuf,
+}
+
+impl ImportedMacroProject {
+    fn prepare() -> Option<Self> {
+        let explicit_partition = std::env::var_os("FLN_REFERENCE_PARTITION")
+            .or_else(|| std::env::var_os("FLN_BUILTIN_PARTITION"));
+        let partition = explicit_partition
+            .clone()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                fln_core::checked_workspace_root!().join("contracts/builtin_partition.tsv")
+            });
+        if !partition.is_file() {
+            assert!(
+                explicit_partition.is_none()
+                    && std::env::var_os("FLN_REQUIRE_REFERENCE").is_none(),
+                "the configured macro execution partition is absent: {}",
+                partition.display()
+            );
+            eprintln!(
+                "SKIP imported macro commands: materialize the pinned partition at {}",
+                partition.display()
+            );
+            return None;
+        }
+        let library = std::env::var_os("FLN_REFERENCE_LIB")
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME").map(|home| {
+                    PathBuf::from(home)
+                        .join(".elan/toolchains")
+                        .join(format!("leanprover--lean4---{}", fln::OLEAN_PIN_TAG))
+                        .join("lib/lean")
+                })
+            })
+            .filter(|path| path.join("Init/Prelude.olean").is_file());
+        let reference = std::env::var_os("FLN_REFERENCE_LEAN")
+            .map(PathBuf::from)
+            .or_else(|| {
+                library.as_ref()?.parent()?.parent().map(|root| {
+                    root.join("bin")
+                        .join(format!("lean{}", std::env::consts::EXE_SUFFIX))
+                })
+            })
+            .filter(|path| path.is_file());
+        let (Some(reference), Some(library)) = (reference, library) else {
+            assert!(
+                std::env::var_os("FLN_REQUIRE_REFERENCE").is_none(),
+                "the installed macro test requires the pinned executable and Prelude artifacts"
+            );
+            eprintln!("SKIP imported macro commands: the pinned Reference is absent");
+            return None;
+        };
+        let version = Command::new(&reference).arg("--githash").output().unwrap();
+        assert!(version.status.success(), "{version:?}");
+        assert_eq!(
+            String::from_utf8(version.stdout).unwrap().trim(),
+            fln::OLEAN_PIN_COMMIT
+        );
+        fln::imported_ir::VerifiedPartition::from_pinned_tsv(
+            &std::fs::read_to_string(&partition).unwrap(),
+        )
+        .unwrap();
+
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "fln-installed-source-macros-{}-{stamp}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::create_dir(root.join("objects")).unwrap();
+        std::fs::create_dir(root.join("client")).unwrap();
+        std::fs::write(
+            root.join("objects/AdmittedSourceMacro.lean"),
+            include_str!("../../fln-olean/fixtures/ir/AdmittedSourceMacro.lean"),
+        )
+        .unwrap();
+        let compiled = Command::new(&reference)
+            .current_dir(root.join("objects"))
+            .env("LEAN_PATH", &library)
+            .args(["-o", "AdmittedSourceMacro.olean", "AdmittedSourceMacro.lean"])
+            .output()
+            .unwrap();
+        assert!(compiled.status.success(), "{compiled:?}; {root:?}");
+        assert_eq!(compiled.stdout, b"Nat : Type\nadmittedMacroValue : Nat\n");
+        assert!(compiled.stderr.is_empty(), "{compiled:?}");
+        assert!(root.join("objects/AdmittedSourceMacro.ir").is_file());
+        Some(Self {
+            root,
+            reference,
+            library,
+            partition,
+        })
+    }
+
+    fn source(&self, source: &str) -> PathBuf {
+        let path = self.root.join("client/Main.lean");
+        std::fs::write(&path, source).unwrap();
+        path
+    }
+
+    fn search_path(&self) -> std::ffi::OsString {
+        std::env::join_paths([self.root.join("objects"), self.library.clone()]).unwrap()
+    }
+
+    fn oracle(&self, source: &str) -> std::process::Output {
+        Command::new(&self.reference)
+            .arg(self.source(source))
+            .current_dir(self.root.join("client"))
+            .env("LEAN_PATH", self.search_path())
+            .output()
+            .unwrap()
+    }
+
+    fn native(
+        &self,
+        verb: &str,
+        source: &str,
+        partition: Option<&std::path::Path>,
+    ) -> std::process::Output {
+        let mut command = if verb == "lean" {
+            Command::new(env!("CARGO_BIN_EXE_lean"))
+        } else {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_fln"));
+            command.args([verb, "--json", "--jobs", "1", "--import-posture", "recheck"]);
+            command
+        };
+        command
+            .arg(self.source(source))
+            .current_dir(self.root.join("client"))
+            .env("LEAN_PATH", self.search_path())
+            .env("FLN_IMPORT_REUSE_DIR", self.root.join("records"))
+            .env_remove("FLN_MACRO_PARTITION");
+        if let Some(partition) = partition {
+            if verb == "check-source" {
+                command.arg("--imported-macros").arg(partition);
+            } else {
+                command.env("FLN_MACRO_PARTITION", partition);
+            }
+        }
+        command.output().unwrap()
+    }
+
+    fn check(&self, source: &str) -> String {
+        let output = self.native("check-source", source, Some(&self.partition));
+        assert!(output.status.success(), "{output:?}; {:?}", self.root);
+        assert!(output.stderr.is_empty(), "{output:?}");
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(stdout.contains("\"outcome\":\"complete\""), "{stdout}");
+        assert_eq!(stdout.lines().count(), 1, "{stdout}");
+        assert_imported_macro_provenance(&stdout);
+        stdout
+    }
+
+    fn refused(output: std::process::Output) -> String {
+        assert!(!output.status.success(), "{output:?}");
+        assert!(output.stdout.is_empty(), "partial success escaped: {output:?}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(!stderr.is_empty());
+        assert!(!stderr.contains("\"outcome\":\"complete\""), "{stderr}");
+        stderr
+    }
+}
+
+fn assert_imported_macro_provenance(report: &str) {
+    let (_, macros) = report
+        .split_once("\"importedMacros\":{")
+        .expect("an imported macro result must retain its execution provenance");
+    assert!(macros.starts_with("\"producer\":\"reference\","), "{report}");
+    for field in ["attempts", "vmSteps"] {
+        let key = format!("\"{field}\":");
+        let (_, value) = macros.split_once(&key).unwrap();
+        let (value, _) = value.split_once(',').unwrap();
+        let value: u64 = value.parse().unwrap();
+        assert!(value > 0, "macro {field} must record actual work: {report}");
+    }
+    let (_, reference) = macros.split_once("\"linkedReferenceFunctions\":[").unwrap();
+    let (reference, _) = reference.split_once(']').unwrap();
+    assert!(
+        reference.contains("{\"name\":\"admittedChooseTerm\",\"producer\":\"reference\"}"),
+        "{report}"
+    );
+    let (_, native) = macros.split_once("\"linkedNativeFunctions\":[").unwrap();
+    let (native, _) = native.split_once(']').unwrap();
+    // These are the three methods called by the real fixture's macro body.
+    // The report is a linked-closure inventory, not a per-function call trace.
+    for method in [
+        "mirror:Lean.Macro.resolveNamespace",
+        "mirror:Lean.Macro.resolveGlobalName",
+        "mirror:Lean.Macro.addMacroScope",
+    ] {
+        assert!(native.contains(&format!("\"{method}\"")), "{report}");
+    }
+}
+
+fn assert_macro_refusal(output: std::process::Output, exit: i32, class: &str, detail: &str) {
+    assert_eq!(output.status.code(), Some(exit), "{output:?}");
+    let error = ImportedMacroProject::refused(output);
+    assert!(error.contains(&format!("\"outcome\":\"{class}\"")), "{error}");
+    assert!(error.contains("\"authority\":false"), "{error}");
+    assert!(error.contains(detail), "{error}");
+}
+
+const IMPORTED_MACRO_CLIENT: &str = concat!(
+    "prelude\n",
+    "import AdmittedSourceMacro\n",
+    "def commandMacroValue : Nat := (11 : Bool)\n",
+    "theorem commandMacroValue_eq : Eq commandMacroValue 11 := Eq.refl commandMacroValue\n",
+    "#check (Nat : Bool)\n",
+    "#check commandMacroValue\n",
+);
+
+#[test]
+fn installed_imported_macros_drive_checked_source_and_runtime_commands() {
+    let Some(project) = ImportedMacroProject::prepare() else {
+        return;
+    };
+    // The client has no macro implementation source beside it. The changed
+    // meaning of type ascription therefore requires executing the imported IR.
+    assert!(!project.root.join("client/AdmittedSourceMacro.lean").exists());
+    let oracle = project.oracle(IMPORTED_MACRO_CLIENT);
+    assert!(oracle.status.success(), "{oracle:?}");
+    assert_eq!(oracle.stdout, b"Nat : Type\ncommandMacroValue : Nat\n");
+    assert!(oracle.stderr.is_empty(), "{oracle:?}");
+    let accepted = project.check(IMPORTED_MACRO_CLIENT);
+    assert!(accepted.contains("\"theorems\":1"), "{accepted}");
+
+    let lean = project.native("lean", IMPORTED_MACRO_CLIENT, Some(&project.partition));
+    assert!(lean.status.success(), "{lean:?}");
+    assert_eq!(lean.stdout, oracle.stdout);
+    assert!(lean.stderr.is_empty(), "{lean:?}");
+
+    // fln run exposes its documented raw Nat projection without needing Repr
+    // from a larger Init closure. The preceding checked theorem pins its value.
+    let executable = format!("{IMPORTED_MACRO_CLIENT}#eval commandMacroValue\n");
+    let run = project.native("run", &executable, Some(&project.partition));
+    assert!(run.status.success(), "{run:?}");
+    assert!(run.stderr.is_empty(), "{run:?}");
+    let stdout = String::from_utf8(run.stdout).unwrap();
+    assert!(
+        stdout.contains("\"schema\":\"fln.source-program/1\""),
+        "{stdout}"
+    );
+    assert!(stdout.contains("\"outcome\":\"complete\""), "{stdout}");
+    assert!(stdout.contains("\"kind\":\"nat\",\"value\":11"), "{stdout}");
+    assert_eq!(stdout.matches("\"event\":\"check\"").count(), 2, "{stdout}");
+    assert_imported_macro_provenance(&stdout);
+
+    // A source sidecar currently binds source and olean inputs, but not the
+    // imported executable macro IR. Refuse it before publishing either file.
+    let flbc = project.root.join("macro.flbc");
+    let sidecar = project.root.join("macro.sidecar");
+    let output = Command::new(env!("CARGO_BIN_EXE_fln"))
+        .args(["run", "--json", "--jobs", "1", "--import-posture", "recheck"])
+        .arg("--emit-flbc")
+        .arg(&flbc)
+        .arg("--emit-sidecar")
+        .arg(&sidecar)
+        .arg(project.source(&executable))
+        .current_dir(project.root.join("client"))
+        .env("LEAN_PATH", project.search_path())
+        .env("FLN_MACRO_PARTITION", &project.partition)
+        .output()
+        .unwrap();
+    assert_macro_refusal(
+        output,
+        5,
+        "capability",
+        "source-closure sidecars do not yet bind imported macro IR",
+    );
+    assert!(!flbc.exists(), "a refused sidecar published executable bytes");
+    assert!(!sidecar.exists(), "a refused sidecar published a manifest");
+
+    // Opt-in is not permission to accept a bad expansion result or false proof.
+    for source in [
+        "prelude\nimport AdmittedSourceMacro\ndef badMacroValue : Bool := (11 : Bool)\n",
+        concat!(
+            "prelude\nimport AdmittedSourceMacro\n",
+            "def commandMacroValue : Nat := (11 : Bool)\n",
+            "theorem wrong : Eq commandMacroValue 18 := Eq.refl commandMacroValue\n",
+        ),
+    ] {
+        let oracle = project.oracle(source);
+        assert!(!oracle.status.success(), "{oracle:?}");
+        for verb in ["check-source", "run", "lean"] {
+            ImportedMacroProject::refused(project.native(verb, source, Some(&project.partition)));
+        }
+        assert_eq!(project.check(IMPORTED_MACRO_CLIENT), accepted);
+    }
+
+    // Without explicit policy the original frontend remains in use; the
+    // otherwise ill-typed ascription must not silently acquire macro semantics.
+    ImportedMacroProject::refused(project.native("check-source", IMPORTED_MACRO_CLIENT, None));
+    let ordinary = concat!(
+        "prelude\nimport Init.Prelude\n",
+        "def ordinaryValue : Nat := 11\n",
+        "theorem ordinaryValue_eq : Eq ordinaryValue 11 := Eq.refl ordinaryValue\n",
+    );
+    let ordinary = project.native("check-source", ordinary, None);
+    assert!(ordinary.status.success(), "{ordinary:?}");
+    assert!(ordinary.stderr.is_empty(), "{ordinary:?}");
+
+    let ir = project.root.join("objects/AdmittedSourceMacro.ir");
+    let original_ir = std::fs::read(&ir).unwrap();
+    let olean = project.root.join("objects/AdmittedSourceMacro.olean");
+    let original_olean = std::fs::read(&olean).unwrap();
+    let retained_ir = project.root.join("objects/AdmittedSourceMacro.ir.saved");
+    std::fs::rename(&ir, &retained_ir).unwrap();
+    assert_macro_refusal(
+        project.native("check-source", IMPORTED_MACRO_CLIENT, Some(&project.partition)),
+        5,
+        "capability",
+        concat!(
+            "registered macro admittedChooseTerm in AdmittedSourceMacro: ",
+            "macro compilation: IR execution refuses unclassified declaration admittedChooseTerm",
+        ),
+    );
+    std::fs::rename(&retained_ir, &ir).unwrap();
+    assert_eq!(project.check(IMPORTED_MACRO_CLIENT), accepted);
+
+    std::fs::write(&ir, b"not a Lean IR artifact").unwrap();
+    assert_macro_refusal(
+        project.native("check-source", IMPORTED_MACRO_CLIENT, Some(&project.partition)),
+        1,
+        "codec",
+        "AdmittedSourceMacro.ir:",
+    );
+    std::fs::write(&ir, &original_ir).unwrap();
+    assert_eq!(project.check(IMPORTED_MACRO_CLIENT), accepted);
+
+    let wrong_partition = project.root.join("wrong-partition.tsv");
+    std::fs::write(&wrong_partition, "constant_count\t0\n").unwrap();
+    assert_macro_refusal(
+        project.native("check-source", IMPORTED_MACRO_CLIENT, Some(&wrong_partition)),
+        1,
+        "policy-refusal",
+        "IR execution requires the exact pinned census partition",
+    );
+    assert_eq!(project.check(IMPORTED_MACRO_CLIENT), accepted);
+    assert_eq!(std::fs::read(&ir).unwrap(), original_ir);
+    assert_eq!(std::fs::read(&olean).unwrap(), original_olean);
+}

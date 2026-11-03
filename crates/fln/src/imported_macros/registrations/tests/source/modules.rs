@@ -829,3 +829,39 @@ fn cancellation_after_macro_program_execution_withholds_successful_module_states
     assert!(stopped.completed_vm_usage.steps > 0);
     assert!(stopped.states.is_none());
 }
+
+#[test]
+fn runtime_vm_limits_withhold_macro_program_states_and_retain_macro_work() {
+    let (imported, code) = batches::artifact_import_fixture();
+    let main = name("Main");
+    let inputs = [SourceModuleInput {
+        name: &main,
+        source: b"prelude\nimport SourceLibrary\n#eval 7 + 11",
+    }];
+    let mut execution = execution_limits();
+    execution.vm.max_steps = 0;
+    let stopped = imported.execute_source_modules_with_imported_macros(
+        &inputs,
+        &main,
+        &KVMap::new(),
+        crate::source_check::modules::execution::SourceProgramLimits::new(execution),
+        SourceModuleMacroInputs {
+            code: &code,
+            partition: &VerifiedPartition::user_fixture(),
+            user_declarations: &users(&code),
+            registry_limits: MacroRegistryLimits::default(),
+            context: context(),
+            state: MacroState::default(),
+            limits: MacroTreeLimits::default(),
+        },
+        None,
+        crate::EvaluationPresentation::Raw,
+    );
+    assert!(
+        matches!(stopped.outcome, Outcome::Inconclusive(_)),
+        "{stopped:?}"
+    );
+    assert_eq!(stopped.attempts.len(), 2);
+    assert!(stopped.completed_vm_usage.steps > 0);
+    assert!(stopped.states.is_none());
+}

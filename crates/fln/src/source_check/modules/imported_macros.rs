@@ -52,10 +52,10 @@ pub struct SourceMacroModuleCheck {
     pub tree_usage: MacroTreeUsage,
 }
 
-
 /// Executed source modules and the macro work consumed by their real command
-/// streams. A failed module, caller validation, cancellation or resource stop
-/// exposes neither a partial program nor terminal module states.
+/// streams. A failed module, caller validation, cancellation or macro resource
+/// stop exposes neither a partial program nor terminal module states. Runtime
+/// stops retain the ordinary program evidence, but withhold terminal states.
 #[derive(Debug)]
 pub struct SourceMacroProgramExecution<E = std::convert::Infallible> {
     pub outcome: Outcome<Result<SourceProgramExecution, SourceProgramExecutionError<E>>>,
@@ -274,12 +274,19 @@ impl ModuleMacroSession {
         Ok(())
     }
 
-
     fn finish_execution<E>(
         self,
         outcome: Outcome<Result<SourceProgramExecution, SourceProgramExecutionError<E>>>,
     ) -> SourceMacroProgramExecution<E> {
-        let states = matches!(&outcome, Outcome::Complete(Ok(_))).then_some(self.states);
+        let successful = match &outcome {
+            Outcome::Complete(Ok(program)) => program.modules.iter().all(|module| {
+                module.commands.batch.executions.iter().all(|execution| {
+                    matches!(execution.exit, fln_vm::interpreter::VmExit::Returned(_))
+                })
+            }),
+            _ => false,
+        };
+        let states = successful.then_some(self.states);
         SourceMacroProgramExecution {
             outcome,
             states,
@@ -305,7 +312,6 @@ impl ModuleMacroSession {
 }
 
 impl imported::SourceOleanImport {
-
     /// Execute an explicit source graph with the receipt's imported node macros.
     /// Expansion precedes ordinary elaboration, admission, compilation and VM
     /// execution. Every module retains its exact import order and fresh macro

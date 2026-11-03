@@ -96,6 +96,48 @@ templates cannot yet be mixed into the imported-macro session. Hygiene starts
 from the adapter's explicit seed, rather than the pin's command-hash seed. An
 unsupported native macro operation or source construct is reported explicitly.
 
+## Executing programs with imported macros
+
+The installed `fln run` and native `lean` commands opt in separately through
+`FLN_MACRO_PARTITION`, using the same verified partition, checked ownership,
+complete registration table and adjacent IR companion loader as `check-source`:
+
+```sh
+FLN_MACRO_PARTITION="$PWD/contracts/builtin_partition.tsv" \
+  LEAN_PATH="/path/to/import/artifacts" fln run --json Main.lean
+FLN_MACRO_PARTITION="$PWD/contracts/builtin_partition.tsv" \
+  LEAN_PATH="/path/to/import/artifacts" lean Main.lean
+```
+
+The runtime route uses the same 64 MiB cumulative IR limit. An unset variable
+preserves ordinary runtime behavior and does not read IR companions. This mode
+requires a checked external artifact import; it does not execute a source file
+containing only local macro declarations.
+
+Expansion feeds the command's actual syntax into elaboration, dual-check
+admission, native compilation and execution. Definitions, examples, mutual
+declarations, public module exports, ordinary `#check` and `#eval` share one
+macro session per source module. A sibling's scoped activation or macro state
+cannot leak into another module. Expansion budgets accumulate over the graph,
+including work completed before a failure.
+
+Both checking and raw execution JSON include `linkedReferenceFunctions` and
+`linkedNativeFunctions` inside the existing `importedMacros` report. These
+identify the compiled closures used by attempted dispatches; they are not a
+dynamic per-function call trace. Reference-produced functions retain explicit
+producer labels. Native `lean` keeps its ordinary query and evaluation output.
+
+Raw `--emit-flbc` is supported. A source-closure sidecar request is refused
+before execution because that format does not yet bind macro IR and partition
+inputs. Neither output file is created by that refused request.
+
+This remains a bounded macro integration. It expands syntax already recognized
+by the native parser and validates the complete imported registration table;
+unsupported rows are not silently dropped. Imported parser grammars, atomic and
+tactic macro expansion, source templates, and macro execution under `#guard`,
+`#reduce` or `#guard_msgs` are not yet supported. Full stock `Init` macro
+execution is not claimed.
+
 ## Library API and limits
 
 `Engine::check_source_modules` and `Engine::check_source_modules_with_cancel`

@@ -1,15 +1,16 @@
-//! Explicit imported-macro checking over the same captured artifact closure.
+//! Explicit imported-macro source commands over the same captured artifact closure.
 //! The census remains pinned, every registration must prepare, and no ambient
 //! search root can supply code for an artifact selected from another root.
 use super::*;
 use fln::imported_ir::VerifiedPartition;
-use fln::imported_macros::registrations::{MacroRegistryLimits, MacroTreeLimits};
+use fln::imported_macros::registrations::{MacroAttempt, MacroRegistryLimits, MacroTreeLimits};
 use fln::imported_macros::{MacroContext, MacroState};
 use fln::source_check::modules::SourceModuleMacroInputs;
 use std::collections::BTreeSet;
 
 const DEFAULT_IR_BYTES: usize = 64 * 1024 * 1024;
 const MAX_PARTITION_BYTES: usize = 64 * 1024 * 1024;
+const MAX_REPORT_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Config {
@@ -18,6 +19,22 @@ pub(crate) struct Config {
 }
 
 impl Config {
+    /// Runtime personalities preserve their existing argument grammar. Their
+    /// imported-macro mode is an explicit environment opt-in using the same
+    /// verified policy and bounded companion loader as check-source.
+    pub(in crate::source_check) fn from_environment() -> Result<Option<Self>, Failure> {
+        let Some(partition) = std::env::var_os("FLN_MACRO_PARTITION") else {
+            return Ok(None);
+        };
+        if partition.is_empty() {
+            return Err(Failure::input("FLN_MACRO_PARTITION requires a census path"));
+        }
+        Ok(Some(Self {
+            partition: PathBuf::from(partition),
+            max_bytes: DEFAULT_IR_BYTES,
+        }))
+    }
+
     pub(in crate::source_check) fn take(
         arguments: Vec<OsString>,
     ) -> Result<(Vec<OsString>, Option<Self>), UsageError> {
@@ -110,20 +127,44 @@ pub(in crate::source_check) struct Prepared {
     bytes: usize,
 }
 
+/// Closure provenance for attempted macro dispatch, not a dynamic call trace.
 pub(in crate::source_check) struct Report {
     pub(in crate::source_check) attempts: usize,
     pub(in crate::source_check) vm_steps: u64,
     pub(in crate::source_check) syntax_visits: u64,
     ir_bytes: usize,
+    linked_json: String,
 }
 
 impl Report {
     pub(in crate::source_check) fn json(&self) -> String {
         format!(
-            ",\"importedMacros\":{{\"producer\":\"reference\",\"attempts\":{},\"vmSteps\":{},\"syntaxVisits\":{},\"irBytes\":{}}}",
-            self.attempts, self.vm_steps, self.syntax_visits, self.ir_bytes
+            ",\"importedMacros\":{{\"producer\":\"reference\",\"attempts\":{},\"vmSteps\":{},\"syntaxVisits\":{},\"irBytes\":{}{}}}",
+            self.attempts, self.vm_steps, self.syntax_visits, self.ir_bytes, self.linked_json
         )
     }
+
+    pub(in crate::source_check) fn sentence(&self) -> String {
+        format!(
+            "Imported macros: {} dispatch attempts, {} VM steps; linked user/library code produced by the Reference.",
+            self.attempts, self.vm_steps
+        )
+    }
+}
+
+fn push_report(output: &mut String, text: &str) -> Result<(), Failure> {
+    if output
+        .len()
+        .checked_add(text.len())
+        .is_none_or(|length| length > MAX_REPORT_BYTES)
+    {
+        return Err(Failure::resource("imported macro report exceeds 16 MiB"));
+    }
+    output
+        .try_reserve(text.len())
+        .map_err(|_| Failure::resource("could not reserve imported macro report"))?;
+    output.push_str(text);
+    Ok(())
 }
 
 fn read_failure(error: BoundedReadFailure) -> Failure {
@@ -190,8 +231,13 @@ impl Loaded {
         .map_err(read_failure)?;
         let text = std::str::from_utf8(&bytes)
             .map_err(|error| policy_failure(format!("imported-macro census: {error}")))?;
-        let partition = VerifiedPartition::from_pinned_tsv(text)
-            .map_err(|error| policy_failure(error.to_string()))?;
+        let partition = VerifiedPartition::from_pinned_tsv(text).map_err(|error| {
+            if error.is_resource() {
+                Failure::resource(error.to_string())
+            } else {
+                policy_failure(error.to_string())
+            }
+        })?;
         let mut modules = Vec::new();
         let mut names = Vec::new();
         let mut total = 0usize;
@@ -235,24 +281,13 @@ impl Loaded {
 }
 
 impl Prepared {
-    pub(in crate::source_check) fn check(
+    pub(in crate::source_check) fn users(
         &self,
-        loaded: &Loaded,
-        base: Option<&OleanBase>,
-        limits: fln::SourceCheckLimits,
-    ) -> Result<Outcome<(SourceFileCheck, Report)>, Failure> {
-        let Inputs::Modules { names, sources } = &loaded.inputs else {
-            return Err(Failure::input(
-                "imported macros require a named source module",
-            ));
-        };
-        let base = base.ok_or_else(|| {
-            Failure::input("imported macros require an admitted artifact receipt")
-        })?;
+        receipt: &SourceOleanImport,
+    ) -> Result<BTreeSet<Name>, Failure> {
         let mut users = BTreeSet::new();
         for (name, code) in self.names.iter().zip(&self.modules) {
-            let checked = base
-                .receipt
+            let checked = receipt
                 .checked
                 .modules
                 .iter()
@@ -281,6 +316,97 @@ impl Prepared {
                 }
             }
         }
+        Ok(users)
+    }
+
+    pub(in crate::source_check) fn inputs<'a>(
+        &'a self,
+        users: &'a BTreeSet<Name>,
+        vm: Option<fln::VmExecutionLimits>,
+    ) -> SourceModuleMacroInputs<'a> {
+        let mut limits = MacroTreeLimits::default();
+        if let Some(vm) = vm {
+            limits.dispatch.execution.vm = vm;
+        }
+        SourceModuleMacroInputs {
+            code: &self.modules,
+            partition: &self.partition,
+            user_declarations: users,
+            registry_limits: MacroRegistryLimits::default(),
+            context: MacroContext {
+                quotation_context: Name::anonymous(),
+                current_macro_scope: 0,
+                current_recursion_depth: 0,
+                max_recursion_depth: 1000,
+            },
+            state: MacroState::default(),
+            limits,
+        }
+    }
+
+    pub(in crate::source_check) fn report(
+        &self,
+        attempts: &[MacroAttempt],
+        vm_steps: u64,
+        syntax_visits: u64,
+    ) -> Result<Report, Failure> {
+        let mut reference = BTreeSet::new();
+        let mut native = BTreeSet::new();
+        for attempt in attempts {
+            reference.extend(
+                attempt
+                    .reference_functions
+                    .iter()
+                    .map(|function| &function.name),
+            );
+            native.extend(attempt.native_functions.iter().map(String::as_str));
+        }
+        let mut linked_json = String::new();
+        push_report(&mut linked_json, ",\"linkedReferenceFunctions\":[")?;
+        for (index, name) in reference.into_iter().enumerate() {
+            if index != 0 {
+                push_report(&mut linked_json, ",")?;
+            }
+            push_report(
+                &mut linked_json,
+                &format!(
+                    "{{\"name\":{},\"producer\":\"reference\"}}",
+                    json_string(&name.to_display_string())
+                ),
+            )?;
+        }
+        push_report(&mut linked_json, "],\"linkedNativeFunctions\":[")?;
+        for (index, name) in native.into_iter().enumerate() {
+            if index != 0 {
+                push_report(&mut linked_json, ",")?;
+            }
+            push_report(&mut linked_json, &json_string(name))?;
+        }
+        push_report(&mut linked_json, "]")?;
+        Ok(Report {
+            attempts: attempts.len(),
+            vm_steps,
+            syntax_visits,
+            ir_bytes: self.bytes,
+            linked_json,
+        })
+    }
+
+    pub(in crate::source_check) fn check(
+        &self,
+        loaded: &Loaded,
+        base: Option<&OleanBase>,
+        limits: fln::SourceCheckLimits,
+    ) -> Result<Outcome<(SourceFileCheck, Report)>, Failure> {
+        let Inputs::Modules { names, sources } = &loaded.inputs else {
+            return Err(Failure::input(
+                "imported macros require a named source module",
+            ));
+        };
+        let base = base.ok_or_else(|| {
+            Failure::input("imported macros require an admitted artifact receipt")
+        })?;
+        let users = self.users(&base.receipt)?;
         let inputs = names
             .iter()
             .zip(sources)
@@ -291,28 +417,14 @@ impl Prepared {
             &names[0],
             &fln::KVMap::new(),
             SourceModuleCheckLimits::new(limits),
-            SourceModuleMacroInputs {
-                code: &self.modules,
-                partition: &self.partition,
-                user_declarations: &users,
-                registry_limits: MacroRegistryLimits::default(),
-                context: MacroContext {
-                    quotation_context: names[0].clone(),
-                    current_macro_scope: 0,
-                    current_recursion_depth: 0,
-                    max_recursion_depth: 1000,
-                },
-                state: MacroState::default(),
-                limits: MacroTreeLimits::default(),
-            },
+            self.inputs(&users, None),
             None,
         );
-        let report = Report {
-            attempts: result.attempts.len(),
-            vm_steps: result.completed_vm_usage.steps,
-            syntax_visits: result.tree_usage.visits,
-            ir_bytes: self.bytes,
-        };
+        let report = self.report(
+            &result.attempts,
+            result.completed_vm_usage.steps,
+            result.tree_usage.visits,
+        )?;
         match result.outcome {
             Outcome::Complete(Ok(result)) => Ok(Outcome::Complete((result.checked, report))),
             Outcome::Complete(Err(error)) => {
@@ -327,6 +439,16 @@ impl Prepared {
             Outcome::Inconclusive(reason) => Ok(Outcome::Inconclusive(reason)),
             Outcome::InternalFault(fault) => Ok(Outcome::InternalFault(fault)),
         }
+    }
+}
+
+/// Preserve the library's inconclusive and fault variants at the command boundary.
+pub(in crate::source_check) fn result<T, E>(outcome: Outcome<Result<T, E>>) -> Result<Outcome<T>, E> {
+    match outcome {
+        Outcome::Complete(Ok(value)) => Ok(Outcome::Complete(value)),
+        Outcome::Complete(Err(error)) => Err(error),
+        Outcome::Inconclusive(reason) => Ok(Outcome::Inconclusive(reason)),
+        Outcome::InternalFault(fault) => Ok(Outcome::InternalFault(fault)),
     }
 }
 

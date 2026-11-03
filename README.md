@@ -227,9 +227,11 @@ macros from its admitted compiled imports. It loads the corresponding `.ir`
 companions, verifies the pinned execution partition, runs macros on Golem, and
 checks the resulting declarations with the kernel and independent checker.
 `--macro-max-bytes` bounds companion inputs; the JSON result exposes macro work
-and actual execution. This explicit mode does not run `#eval`, emit artifacts, or
-change the drop-in `lean` path. See [source-library checking and its current
-boundaries](docs/NATIVE_SOURCE_MODULES.md#checking-with-imported-macros).
+and actual execution. This checking mode does not run `#eval` or emit artifacts.
+For source execution, `FLN_MACRO_PARTITION=PARTITION.tsv fln run Main.lean` and
+`FLN_MACRO_PARTITION=PARTITION.tsv lean Main.lean` use the same admitted macro
+loader before native checking, compilation and execution. See
+[source-library checking and execution boundaries](docs/NATIVE_SOURCE_MODULES.md#checking-with-imported-macros).
 
 ### Imported IR execution and named globals
 

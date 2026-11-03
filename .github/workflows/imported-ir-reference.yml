@@ -8,8 +8,9 @@ on:
       - 'crates/fln/src/imported_ir/**'
       - 'crates/fln/src/imported_macros.rs'
       - 'crates/fln/src/imported_macros/**'
-      - 'crates/fln/src/source_check/modules/imported.rs'
-      - 'crates/fln/src/source_check/modules/imported_macros.rs'
+      - 'crates/fln/src/lib.rs'
+      - 'crates/fln/src/source_check.rs'
+      - 'crates/fln/src/source_check/**'
       - 'crates/fln-cli/src/lib.rs'
       - 'crates/fln-cli/src/source_check.rs'
       - 'crates/fln-cli/src/source_check/**'
@@ -102,6 +103,11 @@ jobs:
           cargo clippy --locked -p fln -p fln-cli --lib --tests -- -D warnings \
             2>&1 | tee target/imported-ir-reference/clippy.log || status=1
           files=(crates/fln/src/imported_ir/constructor_updates.rs
+            crates/fln/src/lib.rs
+            crates/fln/src/source_check/modules.rs
+            crates/fln/src/source_check/modules/execution.rs
+            crates/fln/src/source_check/modules/imported_macros.rs
+            crates/fln-cli/src/source_check/imports/execution.rs
             crates/fln-cli/src/lib.rs
             crates/fln-cli/src/source_check.rs
             crates/fln-cli/src/source_check/imports.rs
