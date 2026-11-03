@@ -53,6 +53,10 @@ pub(super) struct ArtifactGrammar {
     pub(super) kinds: BTreeSet<Name>,
     scoped_kinds: BTreeMap<Name, BTreeSet<Name>>,
     pub(super) categories: BTreeSet<Name>,
+    /// Only a validated explicit parser row registers a category quoter.
+    /// The key is its declaration, so ordinary scoped-parser activation also
+    /// controls whether this native quotation route is available.
+    pub(super) quotations: BTreeMap<Name, Name>,
     pub(super) owners: BTreeSet<Name>,
     pub(super) namespaces: BTreeSet<Name>,
     work: usize,
@@ -143,8 +147,9 @@ impl FileGrammar {
     /// symbol/term infix syntax, and leading/trailing custom-category syntax.
     /// A lone primitive production (such as `num`) is supported in a custom
     /// category. Unknown closures/aliases, scoped categories, ambiguous heads,
-    /// contextual column checks, category quotation parsers and unsupported
-    /// precedence forms are refused.
+    /// contextual column checks and unsupported precedence forms are refused.
+    /// The exact category quotation shape emitted by `declare_syntax_cat` uses
+    /// the native quotation parser, with its original envelope and captures.
     /// Scoped tokens/kinds activate lexically and remain independent of their
     /// parser rows. No absent token or kind row is fabricated from a descriptor.
     ///
@@ -180,6 +185,7 @@ impl FileGrammar {
             .collect();
         let mut names = self.constants.clone();
         let mut occupied = Heads::default();
+        let mut quotations = BTreeMap::new();
         for declaration in self
             .native_imported
             .iter()
@@ -240,8 +246,21 @@ impl FileGrammar {
                     if !names.insert(declaration.decl.clone()) {
                         return Err("an artifact parser declaration is already declared");
                     }
-                    let first = registration(declaration, &categories, &mut remaining)?;
+                    let (first, quotation) =
+                        registration(declaration, &categories, &mut remaining)?;
                     occupied.add(declaration, first)?;
+                    if let Some(category) = quotation {
+                        if self
+                            .native_categories
+                            .iter()
+                            .any(|native| native.leaf_view() == category.leaf_view())
+                        {
+                            return Err(
+                                "artifact quotation overlaps a native source category quoter",
+                            );
+                        }
+                        quotations.insert(declaration.decl.clone(), category);
+                    }
                 }
             }
         }
@@ -296,6 +315,11 @@ impl FileGrammar {
                 ImportedSyntaxEntry::Parser(declaration) => {
                     self.constants.insert(declaration.decl.clone());
                     self.artifact.owners.insert(declaration.decl.clone());
+                    if let Some(category) = quotations.remove(&declaration.decl) {
+                        self.artifact
+                            .quotations
+                            .insert(declaration.decl.clone(), category);
+                    }
                     match &declaration.scope {
                         Some(namespace) => {
                             self.artifact.namespaces.insert(namespace.clone());
@@ -363,7 +387,7 @@ fn registration(
     declaration: &SyntaxDecl,
     categories: &BTreeSet<Name>,
     remaining: &mut usize,
-) -> Result<Vec<String>, &'static str> {
+) -> Result<(Vec<String>, Option<Name>), &'static str> {
     let category = declaration
         .category
         .as_ref()
@@ -374,6 +398,16 @@ fn registration(
     charge(remaining)?;
     let term = simple(category).as_deref() == Some("term");
     let custom = !builtin_category(category);
+    if matches!(&declaration.descr, Descr::Node { kind, .. }
+        if *kind == Name::from_components(["Lean", "Parser", "Term", "quot"]))
+    {
+        let (opener, category) = category_quotation(declaration, categories)?;
+        let Descr::Node { body, .. } = &declaration.descr else {
+            unreachable!("category quotation root checked above")
+        };
+        descriptor(body, categories, remaining, 1)?;
+        return Ok((vec![opener], Some(category)));
+    }
     let (body, first) = match (&declaration.descr, declaration.leading) {
         (Descr::Node { kind, prec, body }, true) => {
             if kind.is_anonymous() || *prec > MAX_PREC {
@@ -435,7 +469,7 @@ fn registration(
                 {
                     return Err("artifact infix overlaps a builtin token");
                 }
-                return Ok(first);
+                return Ok((first, None));
             }
             if !custom {
                 return Err("artifact trailing parser for an unsupported builtin category");
@@ -462,7 +496,71 @@ fn registration(
     if descriptor(body, categories, remaining, 1)? {
         return Err("artifact parser production can succeed without consuming input");
     }
-    Ok(first)
+    Ok((first, None))
+}
+
+/// `Lean.Elab.Command.declareSyntaxCatQuotParser` in the pinned Syntax.lean
+/// emits one `term` parser with this exact node/sequence/category structure.
+/// Its opening symbol includes a trailing pretty-printing space; token
+/// matching trims that space just as ordinary ParserDescr.symbol does.
+///
+/// The native quotation reader builds precisely this envelope, including the
+/// inner category kind and its pseudo-antiquotations. No other reuse of
+/// `Term.quot`, category, delimiter, precedence or sequence is equivalent.
+fn category_quotation(
+    declaration: &SyntaxDecl,
+    categories: &BTreeSet<Name>,
+) -> Result<(String, Name), &'static str> {
+    let malformed = "artifact category quotation does not match its generated parser shape";
+    if !declaration.leading
+        || declaration.category.as_ref() != Some(&Name::from_components(["term"]))
+    {
+        return Err(malformed);
+    }
+    let Descr::Node {
+        prec: MAX_PREC,
+        body,
+        ..
+    } = &declaration.descr
+    else {
+        return Err(malformed);
+    };
+    let Descr::Node {
+        kind,
+        prec: MAX_PREC,
+        body,
+    } = body.as_ref()
+    else {
+        return Err(malformed);
+    };
+    let Descr::Binary(first, open, rest) = body.as_ref() else {
+        return Err(malformed);
+    };
+    let Descr::Binary(second, category, close) = rest.as_ref() else {
+        return Err(malformed);
+    };
+    let (Descr::Symbol(open), Descr::Cat(category, 0), Descr::Symbol(close)) =
+        (open.as_ref(), category.as_ref(), close.as_ref())
+    else {
+        return Err(malformed);
+    };
+    if simple(first).as_deref() != Some("andthen")
+        || simple(second).as_deref() != Some("andthen")
+        || builtin_category(category)
+        || !categories.contains(category)
+        || *kind != Name::str(category.clone(), "quot")
+        || close.trim() != ")"
+    {
+        return Err(malformed);
+    }
+    let LeafView::Str(suffix) = category.leaf_view() else {
+        return Err(malformed);
+    };
+    let opener = format!("`({suffix}|");
+    if open.trim() != opener || builtin_tokens().contains(opener.as_str()) {
+        return Err(malformed);
+    }
+    Ok((opener, category.clone()))
 }
 
 fn primitive(descr: &Descr) -> bool {

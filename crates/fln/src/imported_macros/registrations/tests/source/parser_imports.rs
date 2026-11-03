@@ -19,23 +19,23 @@ enum Fault {
     TokenBudgetSuffix,
 }
 
-fn constant(label: &str) -> Expr {
+pub(super) fn constant(label: &str) -> Expr {
     Expr::const_(name(label), vec![])
 }
 
-fn apply(label: &str, arguments: impl IntoIterator<Item = Expr>) -> Expr {
+pub(super) fn apply(label: &str, arguments: impl IntoIterator<Item = Expr>) -> Expr {
     arguments.into_iter().fold(constant(label), Expr::app)
 }
 
-fn string(text: &str) -> Expr {
+pub(super) fn string(text: &str) -> Expr {
     Expr::lit(Literal::Str(text.into()))
 }
 
-fn natural(value: u64) -> Expr {
+pub(super) fn natural(value: u64) -> Expr {
     Expr::lit(Literal::Nat(NatLit::from_u64(value)))
 }
 
-fn literal_name(label: &str) -> Expr {
+pub(super) fn literal_name(label: &str) -> Expr {
     label
         .split('.')
         .fold(constant("Lean.Name.anonymous"), |prefix, part| {
@@ -43,7 +43,7 @@ fn literal_name(label: &str) -> Expr {
         })
 }
 
-fn definition(label: &str, type_: Expr, value: Expr) -> ConstantInfo {
+pub(super) fn definition(label: &str, type_: Expr, value: Expr) -> ConstantInfo {
     ConstantInfo::Defn(DefinitionVal {
         base: ConstantVal {
             name: name(label),
@@ -82,7 +82,7 @@ fn descriptor(kind: &str, token: &str, unsupported: bool) -> Expr {
     )
 }
 
-fn scope(row: Obj, namespace: Option<&str>) -> Obj {
+pub(super) fn scope(row: Obj, namespace: Option<&str>) -> Obj {
     match namespace {
         None => Obj::mk_ctor(wire::SCOPE_GLOBAL, vec![row], &[]),
         Some(namespace) => Obj::mk_ctor(

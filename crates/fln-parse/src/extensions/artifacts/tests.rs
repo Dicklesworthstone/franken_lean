@@ -66,6 +66,41 @@ fn category(behavior: IdentBehavior) -> ImportedSyntaxEntry {
     }
 }
 
+fn category_quoter(scope: Option<&str>) -> ImportedSyntaxEntry {
+    // Literal shape of declareSyntaxCatQuotParser in the pinned Syntax.lean,
+    // including its trailing pretty-printing space on the opening symbol.
+    parser(
+        "artifactItem.quot",
+        "term",
+        scope,
+        Descr::Node {
+            kind: name("Lean.Parser.Term.quot"),
+            prec: MAX_PREC,
+            body: Box::new(Descr::Node {
+                kind: name("artifactItem.quot"),
+                prec: MAX_PREC,
+                body: Box::new(sequence(
+                    symbol("`(artifactItem| "),
+                    sequence(Descr::Cat(name("artifactItem"), 0), symbol(")")),
+                )),
+            }),
+        },
+    )
+}
+
+fn category_number() -> ImportedSyntaxEntry {
+    parser(
+        "Library.itemNumber",
+        "artifactItem",
+        None,
+        Descr::Node {
+            kind: name("Library.itemNumber"),
+            prec: MAX_PREC,
+            body: Box::new(Descr::Const(name("num"))),
+        },
+    )
+}
+
 fn parse(grammar: &FileGrammar, source: &str) -> Result<Syntax, String> {
     with_grammar(&grammar.grammar(), || {
         crate::parse_source_command(source.as_bytes())
@@ -352,6 +387,7 @@ fn artifact_categories_do_not_acquire_an_unregistered_quotation_parser() {
     assert!(parse(&file, "#check `(artifactItem| 1)").is_err());
 
     let before = file.grammar();
+    // A near match still cannot replace the quoter's fixed native envelope.
     let quotation = parser(
         "artifactItem.quot",
         "term",
@@ -360,7 +396,7 @@ fn artifact_categories_do_not_acquire_an_unregistered_quotation_parser() {
             kind: name("Lean.Parser.Term.quot"),
             prec: MAX_PREC,
             body: Box::new(Descr::Node {
-                kind: name("artifactItem.quot"),
+                kind: name("differentCategory.quot"),
                 prec: MAX_PREC,
                 body: Box::new(sequence(
                     symbol(opener),
@@ -377,6 +413,255 @@ fn artifact_categories_do_not_acquire_an_unregistered_quotation_parser() {
     );
     assert!(Rc::ptr_eq(&before, &file.grammar()));
     assert!(!file.grammar().table().contains("quotationMustNotLeak!"));
+}
+
+#[test]
+fn imported_category_quotations_preserve_the_generated_envelope_and_capture_kinds() {
+    let mut file = grammar();
+    file.import_artifact(&ImportedSyntaxModule {
+        entries: vec![
+            category(IdentBehavior::Default),
+            token("`(artifactItem|", None),
+            category_quoter(None),
+            category_number(),
+        ],
+    })
+    .unwrap();
+    let mut source_grammar = grammar();
+    for declaration in [
+        "declare_syntax_cat artifactItem",
+        "syntax (name := Library.itemNumber) num : artifactItem",
+    ] {
+        let syntax = parse(&source_grammar, declaration).unwrap();
+        source_grammar.declare(&syntax).unwrap();
+    }
+    // The existing native category-quotation path owns SourceInfo, the exact
+    // static/dynamic envelopes, capture kinds and antiquotation depth. Import
+    // activation must use that same path without changing any source leaves.
+    for source in [
+        "def q := `(artifactItem| 0x2a)",
+        "def q := `(artifactItem | 0x2a)",
+        "def q := f `(artifactItem| 42)",
+        "def q := `(artifactItem| $x)",
+        "def q := `(artifactItem| $x:artifactItem)",
+        "def q := `(artifactItem| $n:num)",
+        "def q := `(artifactItem| $(f `(artifactItem| 42)))",
+    ] {
+        assert_eq!(
+            parse(&file, source).unwrap_or_else(|error| panic!("{source}: {error}")),
+            parse(&source_grammar, source).unwrap(),
+            "{source}"
+        );
+    }
+    let generated = parse(&file, "def q := `(artifactItem| $x)").unwrap();
+    assert!(contains(&generated, "Lean.Parser.Term.quot"));
+    assert!(contains(&generated, "artifactItem.quot"));
+    assert!(contains(&generated, "artifactItem.pseudo.antiquot"));
+    assert!(!contains(&generated, "Lean.Parser.Term.dynamicQuot"));
+    let concrete = parse(&file, "def q := `(artifactItem| $n:num)").unwrap();
+    assert!(contains(&concrete, "Library.itemNumber"));
+    assert!(contains(&concrete, "num.antiquot"));
+    for source in [
+        "def q := `(artifactItem| 42 43)",
+        "def q := `(artifactItem| $x:str)",
+        "def q := `(artifactItem| $x:missing)",
+        "def q := `(artifactItem| $(f $outside))",
+        "def q := `(artifactItem| $(f `(artifactItem| 42))",
+        "def q := `(unregisteredCategory| 42)",
+        "def q := $x:artifactItem",
+    ] {
+        assert!(parse(&file, source).is_err(), "accepted {source}");
+    }
+    assert!(parse(&file, "def recovered := `(artifactItem| 7)").is_ok());
+    assert!(file.export_native().unwrap().is_empty());
+}
+
+#[test]
+fn imported_quotation_parser_activation_is_lexical_and_independent_of_token_rows() {
+    let mut file = grammar();
+    file.import_artifact(&ImportedSyntaxModule {
+        entries: vec![
+            category(IdentBehavior::Default),
+            token("`(artifactItem|", None),
+            category_quoter(Some("QuoteScope")),
+            category_number(),
+        ],
+    })
+    .unwrap();
+    let source = "def q := `(artifactItem| 42)";
+    let before = file.grammar();
+    assert!(before.table().contains("`(artifactItem|"));
+    assert!(with_grammar(&before, || category_for_quotation("`(artifactItem|")).is_none());
+    assert!(parse(&file, source).is_err());
+    let in_scope = file.grammar_opening(&[name("QuoteScope")]);
+    assert!(with_grammar(&in_scope, || crate::parse_source_command(source.as_bytes())).is_ok());
+    assert!(Rc::ptr_eq(&before, &file.grammar()));
+    file.apply(&ScopeCommand::Section(None));
+    file.apply(&ScopeCommand::OpenScoped(vec![name("QuoteScope")]));
+    assert!(parse(&file, source).is_ok());
+    file.apply(&ScopeCommand::End(None));
+    assert!(Rc::ptr_eq(&before, &file.grammar()));
+    assert!(parse(&file, source).is_err());
+
+    let mut without_token = grammar();
+    without_token
+        .import_artifact(&ImportedSyntaxModule {
+            entries: vec![category(IdentBehavior::Default), category_quoter(None)],
+        })
+        .unwrap();
+    assert!(!without_token.grammar().table().contains("`(artifactItem|"));
+    assert!(
+        !without_token
+            .grammar()
+            .is_registered_artifact_kind(&name("artifactItem.quot"))
+    );
+    assert!(without_token.export_native().unwrap().is_empty());
+}
+
+#[test]
+fn imported_quoters_cannot_bypass_an_ambiguous_native_category_suffix() {
+    let product = ImportedSyntaxModule {
+        entries: vec![
+            token("categoryJournalMarker!", None),
+            category(IdentBehavior::Default),
+            token("`(artifactItem|", None),
+            category_quoter(None),
+            category_number(),
+        ],
+    };
+    for local in [false, true] {
+        let mut file = grammar();
+        file.import_artifact(&product).unwrap();
+        let source = "def q := `(artifactItem| 42)";
+        assert!(parse(&file, source).is_ok());
+        if local {
+            let category = parse(&file, "declare_syntax_cat Other.artifactItem").unwrap();
+            file.declare(&category).unwrap();
+        } else {
+            file.import_native(&NativeSyntaxModule {
+                categories: [(name("Other.artifactItem"), IdentBehavior::Default)]
+                    .into_iter()
+                    .collect(),
+                ..NativeSyntaxModule::default()
+            })
+            .unwrap();
+        }
+        assert!(
+            with_grammar(&file.grammar(), || category_for_quotation(
+                "`(artifactItem|"
+            ))
+            .is_none()
+        );
+        assert!(
+            parse(&file, source).is_err(),
+            "generic descriptor dispatch chose a category after quotation refused its ambiguous suffix"
+        );
+        // A fully qualified dynamic quotation does not depend on the static
+        // suffix and still reaches exactly the requested category.
+        assert!(parse(&file, "def q := `(artifactItem | 42)").is_ok());
+    }
+
+    // When the native category already exists, refuse the conflicting parser
+    // journal before even its unrelated token rows become visible.
+    let mut file = grammar();
+    file.import_native(&NativeSyntaxModule {
+        categories: [(name("Other.artifactItem"), IdentBehavior::Default)]
+            .into_iter()
+            .collect(),
+        ..NativeSyntaxModule::default()
+    })
+    .unwrap();
+    let before = file.grammar();
+    assert_eq!(
+        file.import_artifact(&product),
+        Err("artifact quotation overlaps a native source category quoter")
+    );
+    assert!(Rc::ptr_eq(&before, &file.grammar()));
+    assert!(!file.grammar().table().contains("categoryJournalMarker!"));
+}
+
+#[test]
+fn malformed_imported_category_quoters_refuse_the_entire_journal() {
+    for fault in 0..8 {
+        let mut file = grammar();
+        file.import_artifact(&ImportedSyntaxModule {
+            entries: vec![category(IdentBehavior::Default), category_number()],
+        })
+        .unwrap();
+        let before = file.grammar();
+        let ImportedSyntaxEntry::Parser(mut quotation) = category_quoter(None) else {
+            unreachable!()
+        };
+        let declaration = Arc::make_mut(&mut quotation);
+        if fault == 0 {
+            declaration.leading = false;
+        }
+        if fault == 1 {
+            declaration.category = Some(name("tactic"));
+        }
+        let Descr::Node { prec, body, .. } = &mut declaration.descr else {
+            unreachable!()
+        };
+        if fault == 2 {
+            *prec -= 1;
+        }
+        let Descr::Node { kind, prec, body } = body.as_mut() else {
+            unreachable!()
+        };
+        if fault == 3 {
+            *kind = name("wrong.quot");
+        }
+        if fault == 4 {
+            *prec -= 1;
+        }
+        let Descr::Binary(_, open, rest) = body.as_mut() else {
+            unreachable!()
+        };
+        if fault == 5 {
+            **open = symbol("`(differentCategory|");
+        }
+        let Descr::Binary(_, category, close) = rest.as_mut() else {
+            unreachable!()
+        };
+        if fault == 6 {
+            **category = Descr::Cat(name("artifactItem"), 1);
+        }
+        if fault == 7 {
+            **close = symbol("]");
+        }
+        assert!(
+            file.import_artifact(&ImportedSyntaxModule {
+                entries: vec![
+                    token("mustNotLeak!", None),
+                    token("`(artifactItem|", None),
+                    ImportedSyntaxEntry::Parser(quotation)
+                ],
+            })
+            .is_err(),
+            "accepted malformed quotation {fault}"
+        );
+        assert!(Rc::ptr_eq(&before, &file.grammar()));
+        assert!(!file.grammar().table().contains("mustNotLeak!"));
+        assert!(!file.grammar().table().contains("`(artifactItem|"));
+        assert!(
+            with_grammar(&file.grammar(), || category_for_quotation(
+                "`(artifactItem|"
+            ))
+            .is_none()
+        );
+    }
+    let mut file = grammar();
+    assert!(
+        file.import_artifact(&ImportedSyntaxModule {
+            entries: vec![
+                token("`(artifactItem|", None),
+                category_quoter(None),
+                category(IdentBehavior::Default)
+            ],
+        })
+        .is_err(),
+        "quotation precedes its category registration"
+    );
 }
 
 #[test]

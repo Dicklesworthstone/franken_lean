@@ -754,7 +754,8 @@ pub struct ActiveGrammar {
     /// Categories introduced by native source, never guessed from a node kind.
     source_categories: BTreeSet<Name>,
     /// Categories whose quotation parser is supplied by the native source
-    /// grammar. An artifact category row alone does not register that parser.
+    /// grammar or an explicit validated artifact parser row. An artifact
+    /// category or token row alone does not register that parser.
     source_quotation_categories: BTreeSet<Name>,
     category_decls: BTreeMap<Name, Vec<usize>>,
     decls: Vec<Arc<SyntaxDecl>>,
@@ -1584,7 +1585,24 @@ impl FileGrammar {
                 Trail::Decl(index) => own(*index, &mut tokens, &mut decls),
             }
         }
+        let artifact_quotations: BTreeSet<_> = decls
+            .iter()
+            .filter_map(|declaration| self.artifact.quotations.get(&declaration.decl))
+            .cloned()
+            .collect();
         let mut grammar = ActiveGrammar::new(tokens, decls);
+        // These descriptors register the native quotation route. They must
+        // never fall back to generic descriptor execution: that route does
+        // not enter quotation depth and could choose a category after a
+        // colliding quotation suffix has correctly refused dispatch.
+        for candidates in grammar.terms.values_mut() {
+            candidates.retain(|&index| {
+                !self
+                    .artifact
+                    .quotations
+                    .contains_key(&grammar.decls[index].decl)
+            });
+        }
         grammar
             .source_categories
             .extend(self.native_categories.iter().cloned());
@@ -1601,6 +1619,9 @@ impl FileGrammar {
         grammar
             .source_quotation_categories
             .extend(self.declared_categories.keys().cloned());
+        grammar
+            .source_quotation_categories
+            .extend(artifact_quotations);
         grammar.imports_entered = self.imports_entered;
         grammar.closure_kinds = Some(Arc::clone(&self.closure_kinds));
         grammar.expander = Some(self.expander_for(&key.0));

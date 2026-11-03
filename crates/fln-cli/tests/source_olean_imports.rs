@@ -1734,3 +1734,157 @@ fn installed_imported_syntax_drives_macro_parsing_and_execution() {
     assert!(recovered.status.success(), "{recovered:?}");
     assert!(recovered.stderr.is_empty(), "{recovered:?}");
 }
+
+fn imported_category_provider_source() -> String {
+    // The actual Parser.Category declaration is supplied by Init.Notation.
+    // Keep its complete Prelude/Coe/Notation closure in the pinned library;
+    // the provider alone is selected for imported parser activation.
+    let provider = imported_syntax_provider_source();
+    let (header, body) = provider
+        .split_once("\nopen Lean\n")
+        .expect("the macro provider has an explicit import header");
+    format!(
+        "{header}\npublic import Init.Notation\npublic meta import Init.Notation\n\nopen Lean\n{body}\n{}",
+        concat!(
+            "declare_syntax_cat admittedData\n",
+            "syntax (name := admittedDatum) \"datum%\" num : admittedData\n",
+            "syntax (name := admittedUseDatum) \"useDatum%\" admittedData \"endDatum%\" : term\n",
+            "@[macro admittedUseDatum]\n",
+            "public meta def admittedUseDatumMacro : Macro := fun stx _ state =>\n",
+            "  .ok ((stx.getArg 1).getArg 1) state\n",
+            "syntax (name := admittedQuoteDatum) \"quoteDatum%\" term \"endQuote%\" : term\n",
+            "@[macro admittedQuoteDatum]\n",
+            "public meta def admittedQuoteDatumMacro : Macro := fun stx _ state =>\n",
+            "  .ok ((((stx.getArg 1).getArg 0).getArg 1).getArg 1) state\n",
+        ),
+    )
+}
+
+#[test]
+fn installed_custom_categories_keep_the_generated_quotation_journal() {
+    // The pin generates admittedData.quot in the same parser journal as the
+    // category. Selecting this whole module must accept and install that exact
+    // quotation description. Both forms reach an imported macro before ordinary
+    // elaboration; a quote-consuming macro extracts the quoted numeric syntax.
+    let Some(project) =
+        ImportedMacroProject::prepare_with_source(&imported_category_provider_source())
+    else {
+        return;
+    };
+    let selected = ["AdmittedSourceMacro"];
+    let declarations = format!(
+        "{IMPORTED_MACRO_DECLARATIONS}def categoryValue : Nat := useDatum% datum% 47 endDatum%\n\
+         theorem categoryValue_eq : Eq categoryValue 47 := Eq.refl categoryValue\n\
+         def quotedCategoryValue : Nat := quoteDatum% `(admittedData| datum% 51) endQuote%\n\
+         theorem quotedCategoryValue_eq : Eq quotedCategoryValue 51 := Eq.refl quotedCategoryValue\n"
+    );
+    let checked = project.native_with_syntax(
+        "check-source",
+        &declarations,
+        Some(&project.partition),
+        &selected,
+    );
+    assert!(checked.status.success(), "{checked:?}; {:?}", project.root);
+    assert!(checked.stderr.is_empty(), "{checked:?}");
+    let report = String::from_utf8(checked.stdout).unwrap();
+    assert!(report.contains("\"outcome\":\"complete\""), "{report}");
+    assert!(report.contains("\"theorems\":3"), "{report}");
+    assert_imported_macro_provenance(&report);
+    for name in ["admittedUseDatumMacro", "admittedQuoteDatumMacro"] {
+        assert!(
+            report.contains(&format!(
+                "{{\"name\":\"{name}\",\"producer\":\"reference\"}}"
+            )),
+            "{report}"
+        );
+    }
+
+    let queries = format!("{declarations}#check categoryValue\n#check quotedCategoryValue\n");
+    let oracle = project.oracle(&queries);
+    assert!(oracle.status.success(), "{oracle:?}");
+    assert_eq!(
+        oracle.stdout,
+        b"categoryValue : Nat\nquotedCategoryValue : Nat\n"
+    );
+    assert!(oracle.stderr.is_empty(), "{oracle:?}");
+    let lean = project.native_with_syntax("lean", &queries, Some(&project.partition), &selected);
+    assert!(lean.status.success(), "{lean:?}");
+    assert_eq!(lean.stdout, oracle.stdout);
+    assert!(lean.stderr.is_empty(), "{lean:?}");
+
+    let executable = format!(
+        "{queries}#eval useDatum% datum% 51 endDatum%\n\
+         #eval quoteDatum% `(admittedData| datum% 53) endQuote%\n"
+    );
+    let product = project.root.join("imported-category.flbc");
+    let emit = |source: &str, product: &std::path::Path| {
+        Command::new(env!("CARGO_BIN_EXE_fln"))
+            .args([
+                "run",
+                "--json",
+                "--jobs",
+                "1",
+                "--import-posture",
+                "recheck",
+            ])
+            .arg("--emit-flbc")
+            .arg(product)
+            .arg(project.source(source))
+            .current_dir(project.root.join("client"))
+            .env("LEAN_PATH", project.search_path())
+            .env("FLN_MACRO_PARTITION", &project.partition)
+            .env("FLN_SYNTAX_MODULES", selected.join(","))
+            .output()
+            .unwrap()
+    };
+    let emitted = emit(&executable, &product);
+    assert!(emitted.status.success(), "{emitted:?}");
+    assert!(emitted.stderr.is_empty(), "{emitted:?}");
+    let report = String::from_utf8(emitted.stdout).unwrap();
+    assert!(report.contains("\"kind\":\"nat\",\"value\":51"), "{report}");
+    assert!(report.contains("\"kind\":\"nat\",\"value\":53"), "{report}");
+    assert_eq!(
+        report.matches("\"event\":\"evaluation\"").count(),
+        2,
+        "{report}"
+    );
+    assert!(report.contains("\"emittedFlbc\":{\"path\":"), "{report}");
+    assert_imported_macro_provenance(&report);
+    let replay = Command::new(env!("CARGO_BIN_EXE_fln"))
+        .args(["flbc", "run", "--json"])
+        .arg(&product)
+        .env_remove("LEAN_PATH")
+        .env_remove("FLN_MACRO_PARTITION")
+        .env_remove("FLN_SYNTAX_MODULES")
+        .output()
+        .unwrap();
+    assert!(replay.status.success(), "{replay:?}");
+    assert!(replay.stderr.is_empty(), "{replay:?}");
+    let replay = String::from_utf8(replay.stdout).unwrap();
+    assert!(replay.contains("\"returnValue\":53,"), "{replay}");
+    assert!(replay.contains("\"sidecar\":null"), "{replay}");
+
+    let false_proof = format!(
+        "{declarations}theorem badCategory : Eq categoryValue 51 := Eq.refl categoryValue\n"
+    );
+    for verb in ["check-source", "run"] {
+        ImportedMacroProject::refused(project.native_with_syntax(
+            verb,
+            &false_proof,
+            Some(&project.partition),
+            &selected,
+        ));
+        ImportedMacroProject::refused(project.native(
+            verb,
+            &declarations,
+            Some(&project.partition),
+        ));
+    }
+    let malformed = format!("{executable}#eval useDatum% datum% endDatum%\n");
+    let refused_product = project.root.join("malformed-category.flbc");
+    ImportedMacroProject::refused(emit(&malformed, &refused_product));
+    assert!(
+        !refused_product.exists(),
+        "malformed category syntax published an executable prefix"
+    );
+}
