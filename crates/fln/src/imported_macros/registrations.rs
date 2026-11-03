@@ -70,6 +70,10 @@ pub enum MacroRegistrationError {
         module: Name,
         dependency: Name,
     },
+    MissingImport {
+        module: Name,
+        dependency: Name,
+    },
     MissingPrivateJournal(Name),
     Decode {
         module: Name,
@@ -110,6 +114,12 @@ impl fmt::Display for MacroRegistrationError {
             Self::ImportOrder { module, dependency } => write!(
                 f,
                 "macro module {} precedes dependency {}",
+                module.to_display_string(),
+                dependency.to_display_string()
+            ),
+            Self::MissingImport { module, dependency } => write!(
+                f,
+                "projected macro module {} is missing retained import {}",
                 module.to_display_string(),
                 dependency.to_display_string()
             ),
@@ -164,8 +174,14 @@ type CandidateTable = BTreeMap<Name, Arc<[RegisteredMacro]>>;
 #[derive(Debug, Clone)]
 pub struct RegisteredMacros {
     candidates: Arc<CandidateTable>,
+    /// The unactivated table, retained so projecting a module world cannot
+    /// inherit a caller's lexical `open scoped` state.
+    global: Arc<CandidateTable>,
     scoped: Arc<BTreeMap<Name, CandidateTable>>,
     active_scopes: BTreeSet<Name>,
+    /// Includes checked modules with no registrations. Their presence still
+    /// matters when validating a projected dependency order.
+    modules: Arc<BTreeMap<Name, Vec<Name>>>,
     /// Exact checked owners retained for binding an embedding registry to a
     /// later source-checking engine. Scope activation shares this provenance.
     owners: Arc<BTreeMap<Name, (Name, ConstantInfo)>>,
@@ -345,8 +361,10 @@ impl RegisteredMacros {
                 });
             }
         }
+        let global = Arc::new(dispatch_order(candidates));
         Ok(Self {
-            candidates: Arc::new(dispatch_order(candidates)),
+            candidates: Arc::clone(&global),
+            global,
             scoped: Arc::new(
                 scoped
                     .into_iter()
@@ -354,10 +372,132 @@ impl RegisteredMacros {
                     .collect(),
             ),
             active_scopes: BTreeSet::new(),
+            modules: Arc::new(
+                ordered_modules
+                    .iter()
+                    .map(|input| {
+                        (
+                            input.checked.name.clone(),
+                            input
+                                .checked
+                                .decoded
+                                .module
+                                .imports
+                                .iter()
+                                .map(|import| import.module.clone())
+                                .collect(),
+                        )
+                    })
+                    .collect(),
+            ),
             owners: Arc::new(
                 compiled
                     .into_iter()
                     .map(|(declaration, (module, owner, _))| (declaration, (module, owner)))
+                    .collect(),
+            ),
+        })
+    }
+
+    /// Select a checked source module's actual external import world. A graph's
+    /// union may have a different import order, so filtering its candidate
+    /// chains alone is insufficient. Restore global registrations, order each
+    /// chain by the requested postorder, and preserve every within-module tie.
+    /// All scoped registrations remain validated but start inactive.
+    pub(crate) fn project_imports(
+        &self,
+        ordered_modules: &[Name],
+    ) -> Result<Self, MacroRegistrationError> {
+        if ordered_modules.len() > self.modules.len() {
+            return Err(MacroRegistrationError::Limit("projected modules"));
+        }
+        let mut positions = BTreeMap::new();
+        for (index, module) in ordered_modules.iter().enumerate() {
+            if !self.modules.contains_key(module) {
+                return Err(MacroRegistrationError::Owner {
+                    module: module.clone(),
+                    declaration: Name::anonymous(),
+                    reason: "projected module has no retained macro journal",
+                });
+            }
+            if positions.insert(module, index).is_some() {
+                return Err(MacroRegistrationError::DuplicateModule(module.clone()));
+            }
+        }
+        for (module, &index) in &positions {
+            for dependency in &self.modules[*module] {
+                if self.modules.contains_key(dependency) && !positions.contains_key(dependency) {
+                    return Err(MacroRegistrationError::MissingImport {
+                        module: (*module).clone(),
+                        dependency: dependency.clone(),
+                    });
+                }
+                if positions
+                    .get(dependency)
+                    .is_some_and(|&position| position >= index)
+                {
+                    return Err(MacroRegistrationError::ImportOrder {
+                        module: (*module).clone(),
+                        dependency: dependency.clone(),
+                    });
+                }
+            }
+        }
+        let project = |table: &CandidateTable| -> Result<CandidateTable, MacroRegistrationError> {
+            let mut selected = CandidateTable::new();
+            for (kind, chain) in table {
+                let mut ordered = Vec::new();
+                ordered
+                    .try_reserve(chain.len())
+                    .map_err(|_| MacroRegistrationError::Limit("projected candidate allocation"))?;
+                for (ordinal, candidate) in chain.iter().enumerate() {
+                    if let Some(&position) = positions.get(&candidate.module) {
+                        ordered.push((std::cmp::Reverse(position), ordinal, candidate));
+                    }
+                }
+                if ordered.is_empty() {
+                    continue;
+                }
+                // The ordinal makes the sort key unique and preserves the pin's
+                // original entry order without an allocating stable sort.
+                ordered.sort_unstable_by_key(|(module, ordinal, _)| (*module, *ordinal));
+                let mut candidates = Vec::new();
+                candidates
+                    .try_reserve_exact(ordered.len())
+                    .map_err(|_| MacroRegistrationError::Limit("projected candidate allocation"))?;
+                candidates.extend(
+                    ordered
+                        .into_iter()
+                        .map(|(_, _, candidate)| candidate.clone()),
+                );
+                selected.insert(kind.clone(), Arc::from(candidates));
+            }
+            Ok(selected)
+        };
+        let global = Arc::new(project(&self.global)?);
+        let mut scoped = BTreeMap::new();
+        for (namespace, table) in self.scoped.iter() {
+            let table = project(table)?;
+            if !table.is_empty() {
+                scoped.insert(namespace.clone(), table);
+            }
+        }
+        Ok(Self {
+            candidates: Arc::clone(&global),
+            global,
+            scoped: Arc::new(scoped),
+            active_scopes: BTreeSet::new(),
+            modules: Arc::new(
+                ordered_modules
+                    .iter()
+                    .map(|module| (module.clone(), self.modules[module].clone()))
+                    .collect(),
+            ),
+            owners: Arc::new(
+                self.owners
+                    .iter()
+                    .filter(|(_, (module, _))| positions.contains_key(module))
+                    .map(|(declaration, owner)| (declaration.clone(), owner.clone()))
                     .collect(),
             ),
         })
@@ -426,8 +566,10 @@ impl RegisteredMacros {
         active_scopes.insert(namespace.clone());
         Ok(Self {
             candidates: Arc::new(candidates),
+            global: Arc::clone(&self.global),
             scoped: Arc::clone(&self.scoped),
             active_scopes,
+            modules: Arc::clone(&self.modules),
             owners: Arc::clone(&self.owners),
         })
     }

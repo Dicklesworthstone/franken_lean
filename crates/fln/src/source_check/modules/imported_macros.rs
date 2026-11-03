@@ -1,0 +1,337 @@
+//! Imported macros bound to each source module's exact checked import world.
+//!
+//! Registrations come from the receipt's retained journals. Every module starts
+//! from the supplied MacroM state and its own quotation context, while expansion
+//! work shares one graph-wide allowance. Only a complete graph publishes states.
+
+use super::*;
+use crate::imported_ir::VerifiedPartition;
+use crate::imported_macros::registrations::{
+    MacroAttempt, MacroRegistrationError, MacroRegistryLimits, MacroTreeLimits, MacroTreeUsage,
+    RegisteredMacros,
+};
+use crate::imported_macros::source::{
+    FileSession, FileSessionReport, SourceMacroError, SourceMacroInvocation,
+};
+use crate::imported_macros::{MacroContext, MacroState};
+use fln_env::modules::CancellationProbe as ModuleCancellationProbe;
+use fln_olean::ir::IrModule;
+use fln_vm::interpreter::{CancellationProbe, ExecutionUsage};
+use std::collections::BTreeSet;
+
+/// Explicit compilation inputs, initial MacroM state and expansion ceilings.
+/// The receipt supplies the complete registrations; callers cannot substitute
+/// a partial registry or an ambient native lookup environment.
+pub struct SourceModuleMacroInputs<'a> {
+    pub code: &'a [IrModule],
+    pub partition: &'a VerifiedPartition,
+    pub user_declarations: &'a BTreeSet<Name>,
+    pub registry_limits: MacroRegistryLimits,
+    /// Initial recursion and hygiene coordinates. Each module replaces only
+    /// `quotation_context` with its own name. This bounded source adapter does
+    /// not implement the pin frontend's command-hash hygiene seed.
+    pub context: MacroContext,
+    /// Independently cloned for each source module, never inherited from its
+    /// imports or a previously checked sibling.
+    pub state: MacroState,
+    /// Attempts, VM steps, visits and generated syntax accumulate over the
+    /// complete source graph, including modules preceding a failed module.
+    pub limits: MacroTreeLimits,
+}
+
+/// A module graph admitted through the ordinary council path after expansion.
+/// Failure retains actual macro work, but publishes neither a checked prefix
+/// nor any terminal module state. Scoped activation is local to each module.
+#[derive(Debug)]
+pub struct SourceMacroModuleCheck {
+    pub outcome: Outcome<Result<SourceModuleCheck, SourceModuleCheckError>>,
+    pub states: Option<BTreeMap<Name, MacroState>>,
+    pub attempts: Vec<MacroAttempt>,
+    pub completed_vm_usage: ExecutionUsage,
+    pub tree_usage: MacroTreeUsage,
+}
+
+impl SourceMacroModuleCheck {
+    fn stopped(outcome: Outcome<Result<SourceModuleCheck, SourceModuleCheckError>>) -> Self {
+        Self {
+            outcome,
+            states: None,
+            attempts: Vec::new(),
+            completed_vm_usage: empty_usage(),
+            tree_usage: MacroTreeUsage::default(),
+        }
+    }
+}
+
+fn empty_usage() -> ExecutionUsage {
+    ExecutionUsage {
+        steps: 0,
+        system_polls: 0,
+        peak_stack_depth: 0,
+    }
+}
+
+fn binding_error(error: MacroRegistrationError) -> SourceCheckError {
+    SourceCheckError::ImportedMacro {
+        file: 0,
+        command: 0,
+        offset: 0,
+        error: Box::new(SourceMacroError::Binding(Box::new(error))),
+    }
+}
+
+// The module importer and VM expose independent read-only probe traits. Keep
+// both existing APIs intact and forward every poll to the caller's same probe.
+struct ModuleCancellation<'a>(&'a dyn CancellationProbe);
+impl ModuleCancellationProbe for ModuleCancellation<'_> {
+    fn is_cancelled(&self) -> bool {
+        self.0.is_cancelled()
+    }
+}
+
+struct MacroCancellation<'a>(&'a dyn ModuleCancellationProbe);
+impl CancellationProbe for MacroCancellation<'_> {
+    fn is_cancelled(&self) -> bool {
+        self.0.is_cancelled()
+    }
+}
+
+pub(super) struct ModuleMacroSession {
+    registry: RegisteredMacros,
+    context: MacroContext,
+    state: MacroState,
+    limits: MacroTreeLimits,
+    states: BTreeMap<Name, MacroState>,
+    attempts: Vec<MacroAttempt>,
+    completed_vm_usage: ExecutionUsage,
+    tree_usage: MacroTreeUsage,
+}
+
+impl ModuleMacroSession {
+    fn new(registry: RegisteredMacros, input: SourceModuleMacroInputs<'_>) -> Self {
+        Self {
+            registry,
+            context: input.context,
+            state: input.state,
+            limits: input.limits,
+            states: BTreeMap::new(),
+            attempts: Vec::new(),
+            completed_vm_usage: empty_usage(),
+            tree_usage: MacroTreeUsage::default(),
+        }
+    }
+
+    fn remaining_limits(&self) -> MacroTreeLimits {
+        let mut remaining = self.limits;
+        remaining.dispatch.max_attempts = remaining
+            .dispatch
+            .max_attempts
+            .saturating_sub(self.attempts.len() as u64);
+        remaining.dispatch.execution.vm.max_steps = remaining
+            .dispatch
+            .execution
+            .vm
+            .max_steps
+            .saturating_sub(self.completed_vm_usage.steps);
+        remaining.max_visits = remaining.max_visits.saturating_sub(self.tree_usage.visits);
+        remaining.generation.max_nodes = remaining
+            .generation
+            .max_nodes
+            .saturating_sub(self.tree_usage.generated_nodes);
+        remaining.generation.max_bytes = remaining
+            .generation
+            .max_bytes
+            .saturating_sub(self.tree_usage.generated_bytes);
+        remaining
+    }
+
+    /// The driver supplies the authoritative mixed import order after replay,
+    /// and retains ordinary declaration recording and module source positions.
+    /// Binding is checked even for an empty forwarding module.
+    pub(super) fn check_module<T>(
+        &mut self,
+        module: &Name,
+        ordered_imports: &[Name],
+        engine: &Engine,
+        cancellation: Option<&dyn ModuleCancellationProbe>,
+        check: impl FnOnce(&mut FileSession<'_>) -> Result<Outcome<T>, SourceCheckError>,
+    ) -> Result<Outcome<T>, SourceCheckError> {
+        if cancellation.is_some_and(ModuleCancellationProbe::is_cancelled) {
+            return Ok(Outcome::Inconclusive(Inconclusive::cancelled(
+                "source-module macros/before-module",
+            )));
+        }
+        let registry = self
+            .registry
+            .project_imports(ordered_imports)
+            .map_err(binding_error)?;
+        registry
+            .validate_source_engine(engine)
+            .map_err(binding_error)?;
+        let mut context = self.context.clone();
+        context.quotation_context = module.clone();
+        let cancellation = cancellation.map(MacroCancellation);
+        let mut session = FileSession::new(SourceMacroInvocation {
+            registry: &registry,
+            context: &context,
+            state: self.state.clone(),
+            lookup: None,
+            limits: self.remaining_limits(),
+            cancellation: cancellation
+                .as_ref()
+                .map(|probe| probe as &dyn CancellationProbe),
+        });
+        let result = check(&mut session);
+        let successful = matches!(&result, Ok(Outcome::Complete(_)));
+        if let Err(reason) = self.record(module, session.finish(), successful) {
+            return Ok(Outcome::Inconclusive(reason));
+        }
+        result
+    }
+
+    fn record(
+        &mut self,
+        module: &Name,
+        mut report: FileSessionReport,
+        successful: bool,
+    ) -> Result<(), Inconclusive> {
+        let overflow =
+            || Inconclusive::dependency_unavailable("imported macro module graph usage overflow");
+        let usage = ExecutionUsage {
+            steps: self
+                .completed_vm_usage
+                .steps
+                .checked_add(report.completed_vm_usage.steps)
+                .ok_or_else(overflow)?,
+            system_polls: self
+                .completed_vm_usage
+                .system_polls
+                .checked_add(report.completed_vm_usage.system_polls)
+                .ok_or_else(overflow)?,
+            peak_stack_depth: self
+                .completed_vm_usage
+                .peak_stack_depth
+                .max(report.completed_vm_usage.peak_stack_depth),
+        };
+        let tree_usage = MacroTreeUsage {
+            visits: self
+                .tree_usage
+                .visits
+                .checked_add(report.tree_usage.visits)
+                .ok_or_else(overflow)?,
+            generated_nodes: self
+                .tree_usage
+                .generated_nodes
+                .checked_add(report.tree_usage.generated_nodes)
+                .ok_or_else(overflow)?,
+            generated_bytes: self
+                .tree_usage
+                .generated_bytes
+                .checked_add(report.tree_usage.generated_bytes)
+                .ok_or_else(overflow)?,
+        };
+        self.attempts
+            .try_reserve(report.attempts.len())
+            .map_err(|_| {
+                Inconclusive::dependency_unavailable(
+                    "imported macro module graph attempt allocation",
+                )
+            })?;
+        self.completed_vm_usage = usage;
+        self.tree_usage = tree_usage;
+        self.attempts.append(&mut report.attempts);
+        if successful {
+            self.states.insert(module.clone(), report.state);
+        }
+        Ok(())
+    }
+
+    fn finish(
+        self,
+        outcome: Outcome<Result<SourceModuleCheck, SourceModuleCheckError>>,
+    ) -> SourceMacroModuleCheck {
+        let states = matches!(&outcome, Outcome::Complete(Ok(_))).then_some(self.states);
+        SourceMacroModuleCheck {
+            outcome,
+            states,
+            attempts: self.attempts,
+            completed_vm_usage: self.completed_vm_usage,
+            tree_usage: self.tree_usage,
+        }
+    }
+}
+
+impl imported::SourceOleanImport {
+    /// Check source modules with all imported node macros from this receipt.
+    /// Each module sees only its declared import closure, in its own import
+    /// order. Expansion enters the ordinary module driver and dual-check
+    /// admission, preserving original source locations and declaration replay.
+    ///
+    /// Macro state resets per module; expansion allowances cover the whole
+    /// graph. This explicit adapter uses the current parser's existing syntax
+    /// kinds. Source-declared templates, module-system public admission, and
+    /// receipts built on previously imported artifacts are typed refusals.
+    /// Reusable source caches and persisted artifacts are not consulted.
+    pub fn check_source_modules_with_imported_macros(
+        &self,
+        modules: &[SourceModuleInput<'_>],
+        entry: &Name,
+        options: &KVMap,
+        limits: SourceModuleCheckLimits,
+        input: SourceModuleMacroInputs<'_>,
+        cancellation: Option<&dyn CancellationProbe>,
+    ) -> SourceMacroModuleCheck {
+        if cancellation.is_some_and(CancellationProbe::is_cancelled) {
+            return SourceMacroModuleCheck::stopped(Outcome::Inconclusive(
+                Inconclusive::cancelled("source-module macros/before-preparation"),
+            ));
+        }
+        if self.contexts.has_inherited_imports() {
+            return SourceMacroModuleCheck::stopped(Outcome::Complete(Err(
+                SourceModuleCheckError::ImportContext {
+                    module: entry.clone(),
+                    reason: "imported macro checking requires retained journals for the complete artifact closure",
+                },
+            )));
+        }
+        let registry = match self.prepare_imported_macros(
+            input.code,
+            input.partition,
+            input.user_declarations,
+            input.registry_limits,
+        ) {
+            Ok(registry) => registry,
+            Err(error) => {
+                return SourceMacroModuleCheck::stopped(Outcome::Complete(Err(
+                    SourceModuleCheckError::Source {
+                        module: entry.clone(),
+                        error: binding_error(error),
+                    },
+                )));
+            }
+        };
+        let mut session = ModuleMacroSession::new(registry, input);
+        let cancellation = cancellation.map(ModuleCancellation);
+        let outcome = match cache::run_collecting(
+            &self.contexts.complete,
+            modules,
+            entry,
+            options,
+            limits,
+            cancellation
+                .as_ref()
+                .map(|probe| probe as &dyn ModuleCancellationProbe),
+            cache::RunOptions {
+                cache: None,
+                collect_artifacts: false,
+                contexts: Some(&self.contexts),
+                records: None,
+                macros: Some(&mut session),
+            },
+        ) {
+            Ok(outcome) => outcome.map_complete(|run| Ok(run.result.checked)),
+            Err(error) => Outcome::Complete(Err(error)),
+        };
+        session.finish(outcome)
+    }
+}
