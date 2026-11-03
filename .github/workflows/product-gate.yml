@@ -114,6 +114,8 @@ jobs:
           # Its staging directory also supplies real generated output to the
           # sealed Rust-launch guard's anti-vacuity check.
           scripts/extract/census_materialize.sh
+          printf 'FLN_REFERENCE_PARTITION=%s/contracts/builtin_partition.tsv\n' \
+            "$GITHUB_WORKSPACE" >> "$GITHUB_ENV"
       - name: test (workspace, no fail-fast)
         if: ${{ !cancelled() }}
         # Five tests are skipped here BY NAME, and only these; each name is unique

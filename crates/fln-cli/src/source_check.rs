@@ -4,6 +4,7 @@ use fln::source_check::modules::imported::SourceOleanImport;
 use fln::source_check::modules::reuse::{ImportPosture, ImportPostureReport};
 mod imports;
 pub(super) mod lsp;
+pub(super) use imports::macros::Config as ImportedMacroConfig;
 
 /// An admitted or reused external import closure, with the posture report that says which.
 pub(super) type BuildBase = Option<(SourceOleanImport, ImportPostureReport)>;
@@ -173,6 +174,7 @@ pub(super) fn take_import_posture_option(
 pub(super) fn parse(arguments: Vec<OsString>) -> Result<MultiplexerCommand, UsageError> {
     let (arguments, jobs) = take_jobs_option(arguments)?;
     let (arguments, import_posture) = take_import_posture_option(arguments)?;
+    let (arguments, imported_macros) = ImportedMacroConfig::take(arguments)?;
     // Unlike the legacy path parser, this new surface refuses conflicting repeats.
     let mut json = false;
     let mut bytes = false;
@@ -209,12 +211,18 @@ pub(super) fn parse(arguments: Vec<OsString>) -> Result<MultiplexerCommand, Usag
     else {
         return Ok(MultiplexerCommand::Help);
     };
+    if imported_macros.is_some() && paths.len() != 1 {
+        return Err(UsageError(
+            "--imported-macros requires exactly one source entry".to_owned(),
+        ));
+    }
     Ok(MultiplexerCommand::SourceCheck {
         paths,
         max_bytes,
         json,
         jobs,
         import_posture,
+        imported_macros,
     })
 }
 
@@ -248,6 +256,7 @@ pub(super) fn run(
     json: bool,
     jobs: std::num::NonZeroUsize,
     posture: ImportPosture,
+    imported_macros: Option<ImportedMacroConfig>,
 ) -> MultiplexerOutput {
     if paths.len() > 4096 {
         return failed("resource", "source file count exceeds 4096", false, json, 3);
@@ -293,20 +302,40 @@ pub(super) fn run(
             };
             let mut limits = fln::SourceCheckLimits::new(admission);
             limits.max_bytes = max_bytes;
-            if let Err(error) = loaded.preflight(limits) {
-                return failed(error.class, &error.detail, error.authority, json, error.exit);
-            }
+            let macro_inputs = if let Some(config) = imported_macros.as_ref() {
+                // Headers and source bytes were checked by the loader. Body
+                // parsing belongs to the macro-aware checker after its exact
+                // imported grammar world is available, not this early preflight.
+                match loaded.prepare_macros(config) {
+                    Ok(inputs) => Some(inputs),
+                    Err(error) => return failed(error.class, &error.detail, error.authority, json, error.exit),
+                }
+            } else {
+                if let Err(error) = loaded.preflight(limits) {
+                    return failed(error.class, &error.detail, error.authority, json, error.exit);
+                }
+                None
+            };
             let (engine, olean_base) = match loaded.base_engine(seed, jobs, posture) {
                 Ok(base) => base,
                 Err(error) => return failed(error.class, &error.detail, error.authority, json, error.exit),
             };
-            let result = match loaded.check(&engine, olean_base.as_ref(), limits) {
+            let checked = if let Some(inputs) = macro_inputs.as_ref() {
+                inputs.check(&loaded, olean_base.as_ref(), limits)
+                    .map(|outcome| outcome.map_complete(|(checked, report)| (checked, Some(report))))
+            } else {
+                loaded.check(&engine, olean_base.as_ref(), limits)
+                    .map(|outcome| outcome.map_complete(|checked| (checked, None)))
+            };
+            let (result, macro_report) = match checked {
                 Ok(fln::Outcome::Complete(result)) => result,
                 Ok(fln::Outcome::Inconclusive(_)) => return failed("inconclusive", "source check exhausted its configured resources", false, json, 3),
                 Ok(fln::Outcome::InternalFault(_)) => return failed("internal-fault", "source check encountered an internal fault", false, json, 4),
                 Err(error) => return failed(error.class, &error.detail, error.authority, json, error.exit),
             };
             let olean_json = olean_base.as_ref().map_or_else(String::new, |base| base.json());
+            let executed = macro_report.as_ref().is_some_and(|report| report.vm_steps != 0);
+            let macro_json = macro_report.as_ref().map_or_else(String::new, |report| report.json());
             // The sources' own `axiom`s: admitted without proof, so every theorem that uses
             // one trusts it. The pin admits them silently; the report names how many.
             let axioms = result
@@ -329,7 +358,7 @@ pub(super) fn run(
                 })
                 .count();
             let stdout = if json {
-                format!("{{\"schema\":\"fln.source-check/1\",\"outcome\":\"complete\",\"authority\":true,\"files\":{},\"commands\":{},\"theorems\":{},\"axioms\":{axioms},\"sorryDeclarations\":{sorries},\"sourceBytes\":{},\"baseLogicalRoot\":{},\"resultLogicalRoot\":{},\"executed\":false{}}}\n",
+                format!("{{\"schema\":\"fln.source-check/1\",\"outcome\":\"complete\",\"authority\":true,\"files\":{},\"commands\":{},\"theorems\":{},\"axioms\":{axioms},\"sorryDeclarations\":{sorries},\"sourceBytes\":{},\"baseLogicalRoot\":{},\"resultLogicalRoot\":{},\"executed\":{executed}{macro_json}{}}}\n",
                     result.files, result.commands, result.theorems, loaded.total_bytes,
                     json_string(&result.base_logical_root.to_string()), json_string(&result.result_logical_root.to_string()), olean_json)
             } else {
@@ -346,12 +375,19 @@ pub(super) fn run(
                 } else {
                     format!(", {sorries} declarations use `sorry`")
                 };
-                format!("Checked {} source commands ({} theorems{axioms}{sorries}) in {} files{base}; K1 and independent checker agreed. No code executed.\n", result.commands, result.theorems, result.files)
+                let execution = macro_report.as_ref().map_or_else(
+                    || "No code executed.".to_owned(),
+                    |report| format!(
+                        "Imported macros: {} attempts, {} VM steps. Source evaluation commands were not executed.",
+                        report.attempts, report.vm_steps,
+                    ),
+                );
+                format!("Checked {} source commands ({} theorems{axioms}{sorries}) in {} files{base}; K1 and independent checker agreed. {execution}\n", result.commands, result.theorems, result.files)
             };
             // The process ends with this answer. Tearing down an imported closure
             // (65,404 declarations for `Init`) node by node took seconds; the
             // operating system reclaims it at exit in one step.
-            std::mem::forget((engine, olean_base, result, loaded));
+            std::mem::forget((engine, olean_base, result, loaded, macro_inputs));
             MultiplexerOutput::success(stdout)
         });
     match worker {

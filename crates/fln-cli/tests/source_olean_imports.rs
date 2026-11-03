@@ -371,3 +371,360 @@ fn an_opaque_needs_an_inhabited_type_and_only_the_files_axioms_are_counted() {
     assert!(stderr.contains("\"outcome\":\"elaboration\""), "{stderr}");
     assert!(stderr.contains("command 2,"), "{stderr}");
 }
+
+#[test]
+fn imported_macro_options_are_explicit_and_unambiguous() {
+    let entry = fixture("prelude");
+    for (arguments, message) in [
+        (
+            vec!["--macro-max-bytes", "1"],
+            "--macro-max-bytes requires --imported-macros",
+        ),
+        (
+            vec!["--imported-macros="],
+            "--imported-macros requires a census path",
+        ),
+        (
+            vec!["--imported-macros", "a.tsv", "--imported-macros=b.tsv"],
+            "--imported-macros may be supplied at most once",
+        ),
+        (
+            vec![
+                "--imported-macros",
+                "a.tsv",
+                "--macro-max-bytes=1",
+                "--macro-max-bytes",
+                "2",
+            ],
+            "--macro-max-bytes may be supplied at most once",
+        ),
+        (
+            vec!["--imported-macros", "a.tsv", "--macro-max-bytes=-1"],
+            "--macro-max-bytes requires a non-negative byte count",
+        ),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_fln"))
+            .arg("check-source")
+            .args(arguments)
+            .arg(&entry)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        assert!(output.stdout.is_empty(), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains(message),
+            "{output:?}"
+        );
+    }
+    for option in ["--imported-macros", "--macro-max-bytes"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_fln"))
+            .args(["check-source", option])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("requires a following value"),
+            "{output:?}"
+        );
+    }
+    let output = Command::new(env!("CARGO_BIN_EXE_fln"))
+        .args(["check-source", "--imported-macros", "a.tsv"])
+        .arg(&entry)
+        .arg(&entry)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("exactly one source entry"),
+        "{output:?}"
+    );
+}
+
+#[test]
+fn imported_macro_mode_requires_an_admitted_artifact_receipt() {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "fln-cli-macro-no-receipt-{}-{unique}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    let entry = root.join("Main.lean");
+    std::fs::write(&entry, "prelude\naxiom Token : Type\n").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_fln"))
+        .args(["check-source", "--json", "--imported-macros"])
+        .arg(root.join("not-read.tsv"))
+        .arg(&entry)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("external .olean import"), "{stderr}");
+    assert!(stderr.contains("\"authority\":false"), "{stderr}");
+}
+
+fn macro_check(
+    entry: &std::path::Path,
+    search: &std::ffi::OsStr,
+    partition: &std::path::Path,
+    cache: &std::path::Path,
+    bytes: Option<usize>,
+) -> std::process::Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_fln"));
+    command
+        .args([
+            "check-source",
+            "--json",
+            "--jobs",
+            "1",
+            "--import-posture",
+            "reuse-verified",
+            "--imported-macros",
+        ])
+        .arg(partition)
+        .env("LEAN_PATH", search)
+        .env("FLN_IMPORT_REUSE_DIR", cache);
+    if let Some(bytes) = bytes {
+        command.arg(format!("--macro-max-bytes={bytes}"));
+    }
+    command.arg(entry).output().unwrap()
+}
+
+fn compile_macro_provider(
+    reference: &std::path::Path,
+    directory: &std::path::Path,
+    source: &str,
+) {
+    std::fs::create_dir_all(directory).unwrap();
+    std::fs::write(directory.join("AdmittedSourceMacro.lean"), source).unwrap();
+    let output = Command::new(reference)
+        .current_dir(directory)
+        .args([
+            "-o",
+            "AdmittedSourceMacro.olean",
+            "AdmittedSourceMacro.lean",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}; {directory:?}");
+}
+
+#[test]
+fn imported_macro_checking_runs_the_real_companion_and_keeps_admission_authority() {
+    let reference = std::env::var_os("FLN_REFERENCE_LEAN").map(PathBuf::from);
+    let library = std::env::var_os("FLN_REFERENCE_LIB").map(PathBuf::from);
+    let partition = std::env::var_os("FLN_REFERENCE_PARTITION").map(PathBuf::from);
+    let (Some(reference), Some(library), Some(partition)) = (reference, library, partition) else {
+        assert!(
+            std::env::var_os("FLN_REQUIRE_REFERENCE").is_none(),
+            "imported macro CLI checking requires the pinned executable, library and partition"
+        );
+        eprintln!("SKIP: set FLN_REFERENCE_LEAN, FLN_REFERENCE_LIB and FLN_REFERENCE_PARTITION");
+        return;
+    };
+    let version = Command::new(&reference).arg("--githash").output().unwrap();
+    assert!(version.status.success(), "{version:?}");
+    assert_eq!(
+        String::from_utf8(version.stdout).unwrap().trim(),
+        fln_olean::format::PIN_COMMIT
+    );
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!(
+        "fln-cli-imported-macros-{}-{unique}",
+        std::process::id()
+    ));
+    let provider = root.join("provider");
+    let client = root.join("client");
+    let cache = root.join("reuse");
+    std::fs::create_dir_all(&client).unwrap();
+    compile_macro_provider(
+        &reference,
+        &provider,
+        include_str!("../../fln-olean/fixtures/ir/AdmittedSourceMacro.lean"),
+    );
+    // Keep the client outside the provider: local sources take precedence over
+    // LEAN_PATH, so co-location would never exercise imported macro artifacts.
+    let search = std::env::join_paths([&provider, &library]).unwrap();
+    let entry = client.join("Main.lean");
+    let source = concat!(
+        "prelude\nimport AdmittedSourceMacro\n",
+        "def expanded : Nat := (11 : Bool)\n",
+        "theorem expanded_eq : Eq expanded 11 := Eq.refl expanded\n",
+    );
+    std::fs::write(&entry, source).unwrap();
+    let oracle = Command::new(&reference)
+        .env("LEAN_PATH", &search)
+        .arg(&entry)
+        .output()
+        .unwrap();
+    assert!(oracle.status.success(), "{oracle:?}; {root:?}");
+    let accepted = macro_check(&entry, &search, &partition, &cache, None);
+    assert_eq!(accepted.status.code(), Some(0), "{accepted:?}; {root:?}");
+    assert!(accepted.stderr.is_empty(), "{accepted:?}");
+    let stdout = String::from_utf8(accepted.stdout).unwrap();
+    assert!(stdout.contains("\"theorems\":1"), "{stdout}");
+    assert!(stdout.contains("\"executed\":true"), "{stdout}");
+    assert!(
+        stdout.contains("\"importedMacros\":{\"producer\":\"reference\",\"attempts\":"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("\"vmSteps\":0,"), "{stdout}");
+
+    let ordinary = Command::new(env!("CARGO_BIN_EXE_fln"))
+        .args(["check-source", "--json"])
+        .env("LEAN_PATH", &search)
+        .env("FLN_IMPORT_REUSE_DIR", &cache)
+        .arg(&entry)
+        .output()
+        .unwrap();
+    assert_eq!(ordinary.status.code(), Some(1), "{ordinary:?}");
+    assert!(ordinary.stdout.is_empty(), "{ordinary:?}");
+
+    let bad = client.join("Bad.lean");
+    std::fs::write(
+        &bad,
+        concat!(
+            "prelude\nimport AdmittedSourceMacro\n",
+            "theorem bad : Eq (11 : Bool) 12 := Eq.refl 11\n",
+        ),
+    )
+    .unwrap();
+    let rejected_oracle = Command::new(&reference)
+        .env("LEAN_PATH", &search)
+        .arg(&bad)
+        .output()
+        .unwrap();
+    assert!(!rejected_oracle.status.success(), "{rejected_oracle:?}");
+    let rejected = macro_check(&bad, &search, &partition, &cache, None);
+    assert_eq!(rejected.status.code(), Some(1), "{rejected:?}");
+    assert!(rejected.stdout.is_empty(), "{rejected:?}");
+    assert!(!rejected.stderr.is_empty(), "{rejected:?}");
+
+    let zero = macro_check(&entry, &search, &partition, &cache, Some(0));
+    assert_eq!(zero.status.code(), Some(3), "{zero:?}");
+    assert!(zero.stdout.is_empty(), "{zero:?}");
+    assert!(
+        String::from_utf8_lossy(&zero.stderr).contains("resource"),
+        "{zero:?}"
+    );
+
+    let corrupt_partition = root.join("corrupt-partition.tsv");
+    let mut policy = std::fs::read(&partition).unwrap();
+    policy.extend_from_slice(b"\n");
+    std::fs::write(&corrupt_partition, policy).unwrap();
+    let corrupt = macro_check(&entry, &search, &corrupt_partition, &cache, None);
+    assert_eq!(corrupt.status.code(), Some(1), "{corrupt:?}");
+    assert!(corrupt.stdout.is_empty(), "{corrupt:?}");
+    assert!(
+        String::from_utf8_lossy(&corrupt.stderr).contains("policy-refusal"),
+        "{corrupt:?}"
+    );
+
+    // A later root has the right IR, but it cannot supply a companion for the
+    // .olean selected from the first root. A corrupt first companion is final too.
+    let shadow = root.join("shadow");
+    std::fs::create_dir_all(&shadow).unwrap();
+    for suffix in ["olean", "olean.server", "olean.private"] {
+        let relative = format!("AdmittedSourceMacro.{suffix}");
+        std::fs::copy(provider.join(&relative), shadow.join(relative)).unwrap();
+    }
+    let shadow_search = std::env::join_paths([&shadow, &provider, &library]).unwrap();
+    let missing = macro_check(&entry, &shadow_search, &partition, &cache, None);
+    assert_eq!(missing.status.code(), Some(5), "{missing:?}");
+    assert!(
+        String::from_utf8_lossy(&missing.stderr).contains("\"outcome\":\"capability\"")
+            && String::from_utf8_lossy(&missing.stderr).contains("\"authority\":false"),
+        "{missing:?}"
+    );
+    assert!(missing.stdout.is_empty(), "{missing:?}");
+    assert!(
+        String::from_utf8_lossy(&missing.stderr).contains("admittedChooseTerm"),
+        "{missing:?}"
+    );
+    std::fs::write(shadow.join("AdmittedSourceMacro.ir"), b"invalid IR").unwrap();
+    let corrupt = macro_check(&entry, &shadow_search, &partition, &cache, None);
+    assert_eq!(corrupt.status.code(), Some(1), "{corrupt:?}");
+    assert!(corrupt.stdout.is_empty(), "{corrupt:?}");
+    assert!(
+        String::from_utf8_lossy(&corrupt.stderr).contains("\"outcome\":\"codec\""),
+        "{corrupt:?}"
+    );
+
+    #[cfg(unix)]
+    {
+        let redirected = root.join("redirected");
+        std::fs::create_dir_all(&redirected).unwrap();
+        for suffix in ["olean", "olean.server", "olean.private"] {
+            let relative = format!("AdmittedSourceMacro.{suffix}");
+            std::fs::copy(provider.join(&relative), redirected.join(relative)).unwrap();
+        }
+        std::os::unix::fs::symlink(
+            provider.join("AdmittedSourceMacro.ir"),
+            redirected.join("AdmittedSourceMacro.ir"),
+        )
+        .unwrap();
+        let redirected_search = std::env::join_paths([&redirected, &library]).unwrap();
+        let refused = macro_check(&entry, &redirected_search, &partition, &cache, None);
+        assert_eq!(refused.status.code(), Some(1), "{refused:?}");
+        assert!(refused.stdout.is_empty(), "{refused:?}");
+        assert!(
+            String::from_utf8_lossy(&refused.stderr)
+                .contains("not a regular imported-macro IR file"),
+            "{refused:?}"
+        );
+    }
+
+    // A valid replacement IR defines the registered macro but calls a helper
+    // absent from the selected checked module. Unclassified IR is never
+    // automatically authorized just because its file has a familiar stem.
+    let foreign = root.join("foreign");
+    compile_macro_provider(
+        &reference,
+        &foreign,
+        concat!(
+            "module\nprelude\npublic import Init.Prelude\n",
+            "public meta import Init.Prelude\nopen Lean\n",
+            "@[noinline] public meta def unownedMacroHelper (stx : Syntax) : Syntax := stx.getArg 1\n",
+            "@[macro Lean.Parser.Term.typeAscription]\n",
+            "public meta def admittedChooseTerm : Macro := fun stx _ state =>\n",
+            "  .ok (unownedMacroHelper stx) state\n",
+        ),
+    );
+    std::fs::copy(
+        foreign.join("AdmittedSourceMacro.ir"),
+        shadow.join("AdmittedSourceMacro.ir"),
+    )
+    .unwrap();
+    let unowned = macro_check(&entry, &shadow_search, &partition, &cache, None);
+    assert_eq!(unowned.status.code(), Some(5), "{unowned:?}");
+    assert!(
+        String::from_utf8_lossy(&unowned.stderr).contains("\"outcome\":\"capability\"")
+            && String::from_utf8_lossy(&unowned.stderr).contains("\"authority\":false"),
+        "{unowned:?}"
+    );
+    assert!(unowned.stdout.is_empty(), "{unowned:?}");
+    assert!(
+        String::from_utf8_lossy(&unowned.stderr).contains("unownedMacroHelper"),
+        "{unowned:?}"
+    );
+
+    // Enabling the mode is different from actually running a macro.
+    let plain = client.join("Plain.lean");
+    std::fs::write(
+        &plain,
+        "prelude\nimport Init.Prelude\ntheorem plain : Eq Nat Nat := Eq.refl Nat\n",
+    )
+    .unwrap();
+    let idle = macro_check(&plain, &search, &partition, &cache, None);
+    assert_eq!(idle.status.code(), Some(0), "{idle:?}");
+    let stdout = String::from_utf8(idle.stdout).unwrap();
+    assert!(stdout.contains("\"executed\":false"), "{stdout}");
+    assert!(stdout.contains("\"attempts\":0,"), "{stdout}");
+    assert!(stdout.contains("\"vmSteps\":0,"), "{stdout}");
+}

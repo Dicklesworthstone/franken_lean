@@ -12,6 +12,7 @@
 use super::*;
 pub(super) mod editor;
 pub(super) mod execution;
+pub(super) mod macros;
 mod metadata;
 mod reuse;
 use fln::source_check::modules::imported::SourceOleanImport;
@@ -30,6 +31,8 @@ const MAX_OLEAN_BYTES: usize = 1 << 30;
 pub(super) struct OleanImport {
     name: Name,
     parts: [Vec<u8>; 3],
+    // The selected artifact's companion code must come from this same path.
+    artifact_path: PathBuf,
 }
 
 /// What the council admitted from `.olean` imports, for the report.
@@ -638,7 +641,11 @@ fn load_olean_closure(roots: &[Name], source_root: &Path) -> Result<Vec<OleanImp
             ))
         })?;
         pending.extend(imports);
-        loaded.push(OleanImport { name, parts });
+        loaded.push(OleanImport {
+            name,
+            parts,
+            artifact_path: base,
+        });
     }
     Ok(loaded)
 }
