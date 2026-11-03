@@ -1,13 +1,15 @@
 //! Module-system declarations and imports retain their private source scope.
 #![forbid(unsafe_code)]
 
+use fln::source_check::modules::imported::{SourceOleanImportError, SourceOleanImportLimits};
 use fln::source_check::modules::{
-    SourceModuleBuildError, SourceModuleCacheLimits, SourceModuleCheck, SourceModuleCheckError,
-    SourceModuleCheckLimits, SourceModuleSession,
+    SourceModuleCacheLimits, SourceModuleCheck, SourceModuleCheckError, SourceModuleCheckLimits,
+    SourceModuleSession,
 };
 use fln::{
-    Budget, Engine, EngineAdmissionLimits, KVMap, Name, OleanWriteBudget, Outcome,
-    SourceCheckError, SourceCheckLimits, SourceModuleInput,
+    Budget, Engine, EngineAdmissionLimits, KVMap, Name, OleanCheckError, OleanCheckLimits,
+    OleanModuleInput, OleanWriteBudget, Outcome, SourceCheckError, SourceCheckLimits,
+    SourceModuleInput,
 };
 
 fn n(text: &str) -> Name {
@@ -700,14 +702,14 @@ fn unsupported_import_modifiers_refuse_at_the_original_modifier_before_lookup() 
 }
 
 #[test]
-fn module_system_artifacts_refuse_until_split_visibility_can_be_encoded() {
+fn module_system_artifacts_preserve_private_proofs_and_require_their_companions() {
     let initial = Engine::builder().build_empty();
     let main = n("Main");
     let input = SourceModuleInput {
         name: &main,
         source: PRIVATE_ID.as_bytes(),
     };
-    let error = initial
+    let built = initial
         .compile_source_modules(
             &[input],
             &main,
@@ -715,12 +717,72 @@ fn module_system_artifacts_refuse_until_split_visibility_can_be_encoded() {
             limits(),
             OleanWriteBudget::default(),
         )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!(built.artifacts.len(), 1);
+    let artifact = &built.artifacts[0];
+    let parts = artifact.companions.as_ref().unwrap();
+    let public = fln_olean::region::OleanView::parse(&artifact.bytes)
+        .unwrap()
+        .module_data(fln::OleanWalkBudget::default())
+        .unwrap();
+    assert!(public.is_module);
+    assert!(public.const_names.is_empty());
+    let import_limits = || {
+        SourceOleanImportLimits::new(OleanCheckLimits::new(
+            4 * 1024 * 1024,
+            limits().source.admission.kernel,
+        ))
+    };
+    let missing = initial
+        .import_olean_modules_for_source(
+            &[OleanModuleInput {
+                name: &main,
+                artifact: &artifact.bytes,
+                server_artifact: None,
+                private_artifact: None,
+            }],
+            std::slice::from_ref(&main),
+            &KVMap::new(),
+            import_limits(),
+        )
         .unwrap_err();
-    assert!(matches!(
-        error,
-        SourceModuleBuildError::Check(SourceModuleCheckError::ImportContext { .. })
-    ));
-    assert!(error.to_string().contains("public/private split artifacts"));
+    assert!(matches!(missing, SourceOleanImportError::Check(error)
+    if matches!(*error, OleanCheckError::MissingCompanionParts {
+        missing_server: true, missing_private: true, ..
+    })));
+    let imported = initial
+        .import_olean_modules_for_source(
+            &[OleanModuleInput {
+                name: &main,
+                artifact: &artifact.bytes,
+                server_artifact: Some(&parts.server),
+                private_artifact: Some(&parts.private),
+            }],
+            std::slice::from_ref(&main),
+            &KVMap::new(),
+            import_limits(),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert!(
+        imported
+            .engine
+            .environment()
+            .contains(&private("Main", "identity"))
+    );
+    assert!(
+        imported
+            .engine
+            .check_source_files(
+                &[b"def leaked.{u} {A : Sort u} (x : A) : A := identity x"],
+                &KVMap::new(),
+                limits().source,
+            )
+            .is_err()
+    );
     assert!(initial.environment().is_empty());
 }
 

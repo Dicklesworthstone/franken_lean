@@ -739,22 +739,52 @@ fn assert_module_replay(base: &Engine) {
             .environment()
             .contains(&n("twiceStep"))
     );
-    // Public/private split artifact emission is an existing explicit frontier.
-    // Keep its refusal while checking replay through the supported legacy
-    // artifact writer; neither route may silently discard module visibility.
-    assert!(matches!(
-        public_session.compile(
+    // Source-data export preserves both worlds. Exercise cached replay of all
+    // companion regions as well as the legacy artifact path below.
+    let public_cold = public_session
+        .compile(
             &public_inputs,
             &n("OmegaClient"),
-            OleanWriteBudget::default()
-        ),
-        Err(fln::source_check::modules::SourceModuleBuildError::Check(
-            fln::source_check::modules::SourceModuleCheckError::ImportContext {
-                reason: "module-system .olean emission requires public/private split artifacts",
-                ..
-            }
-        ))
-    ));
+            OleanWriteBudget::default(),
+        )
+        .expect("public arithmetic source data retains split visibility")
+        .into_complete()
+        .expect("public arithmetic artifact compilation completes");
+    let public_warm = public_session
+        .compile(
+            &public_inputs,
+            &n("OmegaClient"),
+            OleanWriteBudget::default(),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!(
+        (public_warm.reused_modules, public_warm.elaborated_modules),
+        (2, 0)
+    );
+    assert!(public_warm.checked.checked.scope.arithmetic.is_some());
+    assert_eq!(
+        public_cold
+            .checked
+            .checked
+            .engine
+            .logical_root(&KVMap::new()),
+        public_warm
+            .checked
+            .checked
+            .engine
+            .logical_root(&KVMap::new()),
+    );
+    assert_eq!(public_cold.artifacts.len(), 2);
+    for (cold, warm) in public_cold.artifacts.iter().zip(&public_warm.artifacts) {
+        assert_eq!(cold.name, warm.name);
+        assert_eq!(cold.bytes, warm.bytes);
+        let cold = cold.companions.as_ref().unwrap();
+        let warm = warm.companions.as_ref().unwrap();
+        assert_eq!(cold.server, warm.server);
+        assert_eq!(cold.private, warm.private);
+    }
     let files = [
         (
             n("OmegaLibrary"),
