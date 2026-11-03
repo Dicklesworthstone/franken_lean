@@ -12132,8 +12132,8 @@ mod codec_tests {
             bytes,
             vec![
                 70, 76, 78, 70, 76, 66, 67, 0, // magic
-                15, 0, // wire version: complete constructor layout opcode 26
-                20, 0, // schema version: complete constructor allocation layouts
+                16, 0, // wire version: constructor shape opcode 27
+                21, 0, // schema version: tag-agnostic constructor shape tests
                 0, 0, 0, 0, // entry
                 1, 0, 0, 0, // function count
                 0, 0, 0, 0, // function id
@@ -12148,6 +12148,23 @@ mod codec_tests {
                 13, // Return
                 0, 0, // source
             ]
+        );
+
+        // Version advancement leaves this fixture's payload unchanged, while
+        // both previously accepted header versions must now be refused.
+        let mut old_wire = bytes.clone();
+        old_wire[8..10].copy_from_slice(&15u16.to_le_bytes());
+        assert_eq!(
+            decode_canonical(&old_wire, CodecLimits::default()),
+            Err(CodecError::UnsupportedWireVersion { seen: 15 })
+        );
+        let mut old_schema = bytes;
+        old_schema[10..12].copy_from_slice(&20u16.to_le_bytes());
+        assert_eq!(
+            decode_canonical(&old_schema, CodecLimits::default()),
+            Err(CodecError::Validation(
+                ValidationError::UnsupportedVersion { seen: 20 }
+            ))
         );
     }
 

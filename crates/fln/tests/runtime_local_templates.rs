@@ -134,18 +134,30 @@ fn unused_callback_results_still_run_their_required_first_stage() {
 }
 
 #[test]
-fn computed_initializers_and_unused_ordinary_arguments_keep_their_strict_work() {
+fn local_templates_preserve_used_work_and_budget_stops() {
     let programs = [
-        "def run (cost : Nat) : Nat := let helper : Nat -> Nat := let paid : Nat := spend cost; fun (x : Nat) => x; 42\n",
-        "def run (cost : Nat) : Nat := let keep (ignored : Nat) (A : Type) (x : A) : A := x; keep (spend cost) Nat 42\n",
+        (
+            "def run (cost : Nat) : Nat := let helper : Nat -> Nat := let paid : Nat := spend cost; fun (x : Nat) => x; 42\n",
+            "def run (cost : Nat) : Nat := let helper : Nat -> Nat := let paid : Nat := spend cost; fun (x : Nat) => paid + x; helper 42\n",
+        ),
+        (
+            "def run (cost : Nat) : Nat := let keep (ignored : Nat) (A : Type) (x : A) : A := x; keep (spend cost) Nat 42\n",
+            "def run (cost : Nat) : Nat := let keep (paid : Nat) (A : Type) (x : A) : Nat := paid + 42; keep (spend cost) Nat 42\n",
+        ),
     ];
-    for definitions in programs {
-        let program = |cost| format!("{SPEND}{definitions}#eval run {cost}");
+    for (unused, used) in programs {
+        // Pure unused work may disappear. Check its result and replay without
+        // requiring cost-dependent steps or a particular optimization here.
+        let erased = |cost| format!("{SPEND}{unused}#eval run {cost}");
+        execute(&erased(0), "42");
+        execute(&erased(30), "42");
+
+        let program = |cost| format!("{SPEND}{used}#eval run {cost}");
         let idle = execute(&program(0), "42");
-        let busy = execute(&program(30), "42");
+        let busy = execute(&program(30), "72");
         assert!(
             busy > idle + 30,
-            "initializer disappeared: {idle} vs {busy}"
+            "used computation disappeared: {idle} vs {busy}"
         );
         let base = engine();
         let options = KVMap::new();

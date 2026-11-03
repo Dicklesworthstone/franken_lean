@@ -324,6 +324,25 @@ fn recursive_local_closures_discard_unused_values_and_share_used_values() {
                 "callee prefix\n",
                 42,
             ),
+            (
+                r#"inductive TraceCase where
+  | nil : TraceCase
+  | cons : Nat -> TraceCase -> TraceCase
+#eval (match TraceCase.cons 7 TraceCase.nil with
+  | .nil => fun (callback : Bool -> Nat -> Nat) => fun n => callback false n
+  | .cons _head _tail => fun (_callback : Bool -> Nat -> Nat) =>
+    let prior : Nat := dbg_trace "case prefix"; 2
+    fun (_n : Nat) => prior + 40)
+  (fun (_ : Bool) => let unused : Nat := dbg_trace "unused callback"; 30; fun n => n + unused)
+  (dbg_trace "unused case operand"; 30)"#,
+                "case prefix\n",
+                42,
+            ),
+            (
+                r#"#eval (fun (n : Nat) => n + 2) (dbg_trace "used case operand"; 30)"#,
+                "used case operand\n",
+                32,
+            ),
         ] {
             check(
                 engine,

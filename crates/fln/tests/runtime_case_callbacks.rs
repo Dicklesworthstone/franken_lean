@@ -305,22 +305,30 @@ def mixed (xs : Chain) : Nat -> (Bool -> Nat -> Nat) -> Nat -> Nat :=
 }
 
 #[test]
-fn literal_producer_prefixes_and_computed_operands_stay_strict_even_when_unused() {
-    let source = |cost| {
+fn literal_producer_stages_keep_used_operands_and_allow_unused_beta_erasure() {
+    let source = |cost, used| {
+        let body = if used { "n + prior" } else { "42" };
         format!(
             r#"{DEFINITIONS}
 #eval (match Chain.cons 7 Chain.nil with
   | .nil => fun (callback : Bool -> Nat -> Nat) => let prior : Nat := spend 2; fun (n : Nat) => callback false (n + prior)
-  | .cons head tail => fun (callback : Bool -> Nat -> Nat) => let prior : Nat := spend 2; fun (n : Nat) => 42)
+  | .cons head tail => fun (callback : Bool -> Nat -> Nat) => let prior : Nat := spend 2; fun (n : Nat) => {body})
   (fun (_ : Bool) => let unused : Nat := spend 30; fun n => n + unused) (spend {cost})
 "#
         )
     };
-    let small = execute(&source(0), 42);
-    let large = execute(&source(30), 42);
+    // A literal lambda's genuinely unused operand is erased by the pin,
+    // including diagnostic computations. A strict producer prefix does not
+    // make that operand used. Keep this distinct from the used-operand check.
+    let erased_small = execute(&source(0, false), 42);
+    let erased_large = execute(&source(30, false), 42);
+    assert_eq!(erased_large, erased_small, "literal beta erasure");
+
+    let small = execute(&source(0, true), 2);
+    let large = execute(&source(30, true), 32);
     assert!(
         large > small + 30,
-        "unused computed argument was erased: {small} / {large}"
+        "used computed argument was erased: {small} / {large}"
     );
     execute(
         &format!(
