@@ -27,6 +27,9 @@
 //! src/Lean/Namespace.lean: sha256 2c57f58257d03fa961507c1cf7896dfdf15d22b47a8c3689d3bbaf0db09eab61
 //! stage0/stdlib/Lean/Namespace.c: sha256 8cf4f058beba378edd817ea2c953ce79b3219753a752392ae13544d95adcd528
 //! src/Lean/Linter/Deprecated.lean: sha256 a7f8f0d92b58d79b3b028eaeaad9f433f791a34517597f55654e7f5605b37c57
+//! src/Lean/Parser/Extension.lean: sha256 98e709d27527de027e6e7c6aff0b4fe2a624c6d9d8beb12df79a4b73d4115c99
+//! src/Lean/Parser/Basic.lean: sha256 52bc0d189a600e760fde91f55e1429d9a612b1a63452da063ee74de9ed3f3d8e
+//! src/Lean/Parser/Types.lean: sha256 450faec4439ebaf7c7656ffd881e8bfeb2e0104a3368b92956f8e1e2a6aed51d
 #![allow(dead_code)]
 
 pub const CLASS_NAME: usize = 0;
@@ -171,3 +174,100 @@ pub const LIST_CONS: u8 = 1;
 pub const LIST_CONS_HEAD: usize = 0;
 pub const LIST_CONS_TAIL: usize = 1;
 pub const LIST_CONS_POINTERS: usize = 2;
+
+pub const PARSER_EXTENSION: &str = "Lean.Parser.parserExtension";
+pub const PARSER_ENTRY_TOKEN: u8 = 0;
+pub const PARSER_TOKEN_VAL: usize = 0;
+pub const PARSER_TOKEN_POINTERS: usize = 1;
+pub const PARSER_TOKEN_SCALAR_BYTES: usize = 0;
+pub const PARSER_ENTRY_KIND: u8 = 1;
+pub const PARSER_KIND_VAL: usize = 0;
+pub const PARSER_KIND_POINTERS: usize = 1;
+pub const PARSER_KIND_SCALAR_BYTES: usize = 0;
+pub const PARSER_ENTRY_CATEGORY: u8 = 2;
+pub const PARSER_CATEGORY_CAT_NAME: usize = 0;
+pub const PARSER_CATEGORY_DECL_NAME: usize = 1;
+pub const PARSER_CATEGORY_BEHAVIOR_SCALAR: usize = 0;
+pub const PARSER_CATEGORY_POINTERS: usize = 2;
+pub const PARSER_CATEGORY_SCALAR_BYTES: usize = 1;
+pub const PARSER_ENTRY_PARSER: u8 = 3;
+pub const PARSER_PARSER_CAT_NAME: usize = 0;
+pub const PARSER_PARSER_DECL_NAME: usize = 1;
+pub const PARSER_PARSER_PRIO: usize = 2;
+pub const PARSER_PARSER_POINTERS: usize = 3;
+pub const PARSER_PARSER_SCALAR_BYTES: usize = 0;
+pub const PARSER_IDENT_DEFAULT: u8 = 0;
+pub const PARSER_IDENT_SYMBOL: u8 = 1;
+pub const PARSER_IDENT_BOTH: u8 = 2;
+pub const PARSER_SCOPE_GLOBAL_POINTERS: usize = 1;
+pub const PARSER_SCOPE_GLOBAL_ENTRY: usize = 0;
+pub const PARSER_SCOPE_SCOPED_POINTERS: usize = 2;
+pub const PARSER_SCOPE_SCOPED_NAMESPACE: usize = 0;
+pub const PARSER_SCOPE_SCOPED_ENTRY: usize = 1;
+pub const PARSER_DESCR_CONSTRUCTORS: &[(&str, usize)] = &[
+    ("Lean.ParserDescr.const", 1),
+    ("Lean.ParserDescr.unary", 2),
+    ("Lean.ParserDescr.binary", 3),
+    ("Lean.ParserDescr.node", 3),
+    ("Lean.ParserDescr.trailingNode", 4),
+    ("Lean.ParserDescr.symbol", 1),
+    ("Lean.ParserDescr.nonReservedSymbol", 2),
+    ("Lean.ParserDescr.cat", 2),
+    ("Lean.ParserDescr.parser", 1),
+    ("Lean.ParserDescr.nodeWithAntiquot", 3),
+    ("Lean.ParserDescr.sepBy", 4),
+    ("Lean.ParserDescr.sepBy1", 4),
+    ("Lean.ParserDescr.unicodeSymbol", 3),
+];
+#[rustfmt::skip]
+pub const PARSER_DESCR_CONSTRUCTOR_FIELDS: &[(&str, &[&str])] = &[
+    ("Lean.ParserDescr.const", &["Lean.Name"]),
+    ("Lean.ParserDescr.unary", &["Lean.Name", "Lean.ParserDescr"]),
+    ("Lean.ParserDescr.binary", &["Lean.Name", "Lean.ParserDescr", "Lean.ParserDescr"]),
+    ("Lean.ParserDescr.node", &["Lean.SyntaxNodeKind", "Nat", "Lean.ParserDescr"]),
+    ("Lean.ParserDescr.trailingNode", &["Lean.SyntaxNodeKind", "Nat", "Nat", "Lean.ParserDescr"]),
+    ("Lean.ParserDescr.symbol", &["String"]),
+    ("Lean.ParserDescr.nonReservedSymbol", &["String", "Bool"]),
+    ("Lean.ParserDescr.cat", &["Lean.Name", "Nat"]),
+    ("Lean.ParserDescr.parser", &["Lean.Name"]),
+    ("Lean.ParserDescr.nodeWithAntiquot", &["String", "Lean.SyntaxNodeKind", "Lean.ParserDescr"]),
+    ("Lean.ParserDescr.sepBy", &["Lean.ParserDescr", "String", "Lean.ParserDescr", "Bool"]),
+    ("Lean.ParserDescr.sepBy1", &["Lean.ParserDescr", "String", "Lean.ParserDescr", "Bool"]),
+    ("Lean.ParserDescr.unicodeSymbol", &["String", "String", "Bool"]),
+];
+pub const TRAILING_PARSER_TYPE: &str = "Lean.Parser.TrailingParser";
+pub const PARSER_TYPE: &str = "Lean.Parser.Parser";
+pub const PARSER_DESCR_TYPE: &str = "Lean.ParserDescr";
+pub const TRAILING_PARSER_DESCR_TYPE: &str = "Lean.TrailingParserDescr";
+pub const PARSER_TYPE_ALIASES: &[(&str, &str)] = &[
+    ("Lean.SyntaxNodeKind", "Lean.Name"),
+    ("Lean.TrailingParserDescr", "Lean.ParserDescr"),
+];
+pub const PARSER_NAME_CONSTRUCTOR_FIELDS: &[(&str, &[&str])] = &[
+    ("Lean.Name.anonymous", &[]),
+    ("Lean.Name.str", &["Lean.Name", "String"]),
+    ("Lean.Name.num", &["Lean.Name", "Nat"]),
+];
+#[rustfmt::skip]
+pub const PARSER_BOOL_CONSTRUCTOR_FIELDS: &[(&str, &[&str])] = &[
+    ("Bool.false", &[]),
+    ("Bool.true", &[]),
+];
+pub const PARSER_NAME_LITERAL_FORMS: &[(&str, usize)] = &[
+    ("Lean.Name.anonymous", 0),
+    ("Lean.Name.str", 2),
+    ("Lean.Name.num", 2),
+    ("Lean.Name.mkStr", 2),
+    ("Lean.Name.mkNum", 2),
+    ("Lean.Name.mkSimple", 1),
+    ("Lean.Name.mkStr1", 1),
+    ("Lean.Name.mkStr2", 2),
+    ("Lean.Name.mkStr3", 3),
+    ("Lean.Name.mkStr4", 4),
+    ("Lean.Name.mkStr5", 5),
+    ("Lean.Name.mkStr6", 6),
+    ("Lean.Name.mkStr7", 7),
+    ("Lean.Name.mkStr8", 8),
+];
+pub const PARSER_NAT_LITERAL_INSTANCE: &str = "instOfNatNat";
+pub const PARSER_NAT_LITERAL_PROJECTION: &str = "OfNat.ofNat";
