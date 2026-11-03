@@ -928,6 +928,7 @@ impl Engine {
                 collect_artifacts: true,
                 contexts: None,
                 records: None,
+                macros: None,
             },
         )
         .map_err(SourceModuleBuildError::Check)?

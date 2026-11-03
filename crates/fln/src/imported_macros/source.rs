@@ -228,8 +228,18 @@ pub(crate) struct FileSession<'a> {
     progress: Progress,
 }
 
+/// Internal observations consumed by a containing file/module transaction.
+/// The caller must withhold state until its complete admission transaction
+/// succeeds; attempts and usage remain observable on any typed stop.
+pub(crate) struct FileSessionReport {
+    pub(crate) state: MacroState,
+    pub(crate) attempts: Vec<MacroAttempt>,
+    pub(crate) completed_vm_usage: ExecutionUsage,
+    pub(crate) tree_usage: MacroTreeUsage,
+}
+
 impl<'a> FileSession<'a> {
-    fn new(invocation: SourceMacroInvocation<'a>) -> Self {
+    pub(crate) fn new(invocation: SourceMacroInvocation<'a>) -> Self {
         Self {
             registry: invocation.registry,
             context: invocation.context,
@@ -247,6 +257,15 @@ impl<'a> FileSession<'a> {
                 },
                 tree_usage: MacroTreeUsage::default(),
             },
+        }
+    }
+
+    pub(crate) fn finish(self) -> FileSessionReport {
+        FileSessionReport {
+            state: self.state,
+            attempts: self.progress.attempts,
+            completed_vm_usage: self.progress.usage,
+            tree_usage: self.progress.tree_usage,
         }
     }
 

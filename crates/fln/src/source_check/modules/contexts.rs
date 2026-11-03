@@ -36,6 +36,10 @@ fn unavailable(module: &Name, reason: &'static str) -> SourceModuleCheckError {
 }
 
 impl ImportContexts {
+    pub(super) fn has_inherited_imports(&self) -> bool {
+        !self.origin.imported_modules().is_empty()
+    }
+
     pub(super) fn capture(
         origin: &Engine,
         complete: &Engine,
@@ -320,6 +324,7 @@ impl imported::SourceOleanImport {
                 collect_artifacts: false,
                 contexts: Some(&self.contexts),
                 records: None,
+                macros: None,
             },
         )
         .map(|outcome| outcome.map_complete(|run| run.result.checked))
@@ -351,6 +356,7 @@ impl imported::SourceOleanImport {
                 collect_artifacts: true,
                 contexts: Some(&self.contexts),
                 records: None,
+                macros: None,
             },
         )
         .map_err(SourceModuleBuildError::Check)?;

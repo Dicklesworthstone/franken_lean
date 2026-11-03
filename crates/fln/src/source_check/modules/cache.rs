@@ -202,6 +202,7 @@ impl SourceModuleSession {
                     persisted,
                     write_budget,
                 }),
+                macros: None,
             },
         )
         .map_err(SourceModuleBuildError::Check)?
@@ -292,6 +293,7 @@ impl SourceModuleSession {
                 collect_artifacts: false,
                 contexts: self.contexts.as_deref(),
                 records: None,
+                macros: None,
             },
         )?;
         Ok(match outcome {
@@ -316,6 +318,8 @@ pub(super) struct RunOptions<'a> {
     pub(super) contexts: Option<&'a contexts::ImportContexts>,
     /// Persisted module records; consulted only when collecting artifacts.
     pub(super) records: Option<RecordOptions<'a>>,
+    /// Explicit macro work has no reusable-source or persisted-artifact key.
+    pub(super) macros: Option<&'a mut imported_macros::ModuleMacroSession>,
 }
 pub(super) struct RecordOptions<'a> {
     pub(super) persisted: PersistedModules<'a>,
@@ -355,6 +359,7 @@ pub(super) fn run(
             collect_artifacts: false,
             contexts: None,
             records: None,
+            macros: None,
         },
     )
 }
@@ -373,7 +378,16 @@ pub(super) fn run_collecting(
         collect_artifacts,
         contexts,
         records,
+        mut macros,
     } = run_options;
+    if macros.is_some()
+        && (cache.is_some() || collect_artifacts || records.is_some() || contexts.is_none())
+    {
+        return Err(SourceModuleCheckError::ImportContext {
+            module: entry.clone(),
+            reason: "imported macro checking requires an uncached, receipt-bound source-only run",
+        });
+    }
     let records = records.filter(|_| collect_artifacts);
     if cancellation.is_some_and(CancellationProbe::is_cancelled) {
         return Ok(Outcome::Inconclusive(Inconclusive::cancelled(
@@ -390,6 +404,23 @@ pub(super) fn run_collecting(
     } else {
         graph::Plan::new(modules, entry, base.imported_modules(), &mut meter)?
     };
+    if macros.is_some() {
+        for &index in &plan.order {
+            if plan.headers[index].module_system {
+                return Err(SourceModuleCheckError::Source {
+                    module: modules[index].name.clone(),
+                    error: SourceCheckError::Command {
+                        file: 0,
+                        command: 0,
+                        offset: 0,
+                        error: Box::new(EngineExecutionError::NotImplemented {
+                            feature: "module-system public admission with imported macros",
+                        }),
+                    },
+                });
+            }
+        }
+    }
     let mut artifacts = Vec::new();
     let base_logical_root = base.logical_root(options);
     let mut exports: BTreeMap<usize, Arc<replay::Export>> = BTreeMap::new();
@@ -422,6 +453,17 @@ pub(super) fn run_collecting(
                 .copied()
                 .map(contexts::Step::Source)
                 .collect(),
+        };
+        let macro_imports: Vec<_> = if macros.is_some() {
+            steps
+                .iter()
+                .filter_map(|step| match step {
+                    contexts::Step::External(name) => Some(name.clone()),
+                    contexts::Step::Source(_) => None,
+                })
+                .collect()
+        } else {
+            Vec::new()
         };
         let imported_base = match contexts {
             Some(contexts) => match contexts.project(&steps, &mut meter, cancellation)? {
@@ -719,38 +761,78 @@ pub(super) fn run_collecting(
                 let source = &module.source[header.body_start.0..];
                 let mut source_limits = limits.source;
                 source_limits.max_commands = source_limits.max_commands.saturating_sub(commands);
-                let result = if source.is_empty() {
-                    let root = imported.logical_root(options);
-                    Ok(Outcome::Complete(SourceFileCheck {
-                        engine: imported.clone(),
-                        files: 1,
-                        commands: 0,
-                        theorems: 0,
-                        base_logical_root: root,
-                        result_logical_root: root,
-                        scope: fln_elab::source::scope::SourceScope {
-                            private_module: header.module_system.then(|| module.name.clone()),
-                            source_module: Some(module.name.clone()),
-                            ..imported.base_source_scope()
-                        },
-                    }))
-                } else {
-                    imported.check_source_files_recording(
-                        &[source],
-                        options,
-                        source_limits,
-                        Some(&mut declarations),
-                        header.module_system.then_some(module.name),
-                        Some(module.name),
-                        public.as_mut(),
-                        Some((module.source, header.body_start)),
-                        None,
-                    )
+                let mut check = |session: Option<
+                    &mut crate::imported_macros::source::FileSession<'_>,
+                >| {
+                    if source.is_empty() {
+                        if session.is_some() {
+                            let grammar = grammar::SourceGrammar::for_engine(
+                                &imported,
+                                Some(module.name),
+                                header.module_system,
+                            )
+                            .map_err(|error| {
+                                SourceCheckError::Command {
+                                    file: 0,
+                                    command: 0,
+                                    offset: 0,
+                                    error: Box::new(error),
+                                }
+                            })?;
+                            if grammar.has_templates() {
+                                return Err(SourceCheckError::ImportedMacro {
+                                    file: 0,
+                                    command: 0,
+                                    offset: 0,
+                                    error: Box::new(
+                                        crate::imported_macros::source::SourceMacroError::TemplateGrammar,
+                                    ),
+                                });
+                            }
+                        }
+                        let root = imported.logical_root(options);
+                        Ok(Outcome::Complete(SourceFileCheck {
+                            engine: imported.clone(),
+                            files: 1,
+                            commands: 0,
+                            theorems: 0,
+                            base_logical_root: root,
+                            result_logical_root: root,
+                            scope: fln_elab::source::scope::SourceScope {
+                                private_module: header.module_system.then(|| module.name.clone()),
+                                source_module: Some(module.name.clone()),
+                                ..imported.base_source_scope()
+                            },
+                        }))
+                    } else {
+                        imported.check_source_files_recording(
+                            &[source],
+                            options,
+                            source_limits,
+                            Some(&mut declarations),
+                            header.module_system.then_some(module.name),
+                            Some(module.name),
+                            public.as_mut(),
+                            Some((module.source, header.body_start)),
+                            session,
+                        )
+                    }
+                };
+                let result = match macros.as_deref_mut() {
+                    Some(macros) => macros.check_module(
+                        module.name,
+                        &macro_imports,
+                        &imported,
+                        cancellation,
+                        |session| check(Some(session)),
+                    ),
+                    None => check(None),
                 }
                 .map_err(|mut error| {
                     match &mut error {
                         SourceCheckError::Scope { offset, .. }
-                        | SourceCheckError::Command { offset, .. } => {
+                        | SourceCheckError::Command { offset, .. }
+                        | SourceCheckError::ImportedMacro { offset, .. } => {
                             *offset = offset.saturating_add(header.body_start.0);
                         }
                         _ => {}

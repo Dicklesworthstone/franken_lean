@@ -29,6 +29,8 @@ mod recursive;
 
 mod recursive_reference;
 
+mod projection;
+
 fn name(text: &str) -> Name {
     Name::from_components(text.split('.'))
 }

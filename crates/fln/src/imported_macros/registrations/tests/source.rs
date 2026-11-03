@@ -12,6 +12,8 @@ use std::sync::Arc;
 
 mod batches;
 
+mod modules;
+
 fn admission() -> EngineAdmissionLimits {
     EngineAdmissionLimits::new(crate::Budget::for_stack_bytes(2 * 1024 * 1024))
 }

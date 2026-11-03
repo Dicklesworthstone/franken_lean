@@ -3,7 +3,7 @@
 //! The only test-only authority is the existing empty user-code partition.
 use super::*;
 use crate::imported_macros::source::SourceMacroFileCheck;
-use crate::source_check::modules::imported::SourceOleanImportLimits;
+use crate::source_check::modules::imported::{SourceOleanImport, SourceOleanImportLimits};
 use crate::source_check::{SourceCheckError, SourceCheckLimits, SourceFileCheck};
 use crate::{OleanCheckLimits, OleanModuleInput};
 use fln_core::expr::BinderInfo;
@@ -22,6 +22,25 @@ fn artifact_fixture() -> (Engine, RegisteredMacros) {
 fn artifact_fixture_with_extra_rows(
     extra_rows: &[(&str, &str, Option<&str>)],
 ) -> (Engine, RegisteredMacros) {
+    let (imported, code) = artifact_import_fixture_with_extra_rows(extra_rows);
+    let registry = imported
+        .prepare_imported_macros(
+            &code,
+            &VerifiedPartition::user_fixture(),
+            &users(&code),
+            MacroRegistryLimits::default(),
+        )
+        .unwrap();
+    (imported.engine, registry)
+}
+
+pub(super) fn artifact_import_fixture() -> (SourceOleanImport, Vec<IrModule>) {
+    artifact_import_fixture_with_extra_rows(&[])
+}
+
+pub(super) fn artifact_import_fixture_with_extra_rows(
+    extra_rows: &[(&str, &str, Option<&str>)],
+) -> (SourceOleanImport, Vec<IrModule>) {
     let seed = Engine::with_source_seed(admission())
         .unwrap()
         .into_complete()
@@ -151,15 +170,7 @@ fn artifact_fixture_with_extra_rows(
         preresolved_function(),
         function("SourceLibrary.attributeProbe", Behavior::Unsupported),
     ]);
-    let registry = imported
-        .prepare_imported_macros(
-            &code,
-            &VerifiedPartition::user_fixture(),
-            &users(&code),
-            MacroRegistryLimits::default(),
-        )
-        .unwrap();
-    (imported.engine, registry)
+    (imported, code)
 }
 
 /// Preserve the left identifier's spelling and exact backing source, but bind

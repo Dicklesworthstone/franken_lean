@@ -13,6 +13,7 @@ mod contexts;
 pub mod execution;
 mod graph;
 pub mod imported;
+mod imported_macros;
 pub mod persisted;
 mod replay;
 pub mod reuse;
@@ -22,6 +23,7 @@ pub use artifacts::{
 };
 pub use cache::{SourceModuleCacheLimits, SourceModuleSession, SourceModuleSessionCheck};
 pub use fln_parse::command_scope::imports::{SourceHeader, parse_source_header};
+pub use imported_macros::{SourceMacroModuleCheck, SourceModuleMacroInputs};
 
 /// Public imports preserve their export visibility in the module graph.
 /// Refuse unsupported phase/private-artifact modifiers at their original
