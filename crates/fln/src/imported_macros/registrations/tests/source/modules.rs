@@ -1210,7 +1210,7 @@ fn deferred_macro_program_limits_and_cancellation_withhold_successful_prefixes()
     let runtime_stop = execute_deferred_program(
         &imported,
         compilation.clone(),
-        &[files[1], ("Main", "prelude\nimport Lib\n#eval 7 + 11")],
+        &[("Main", "prelude\nimport SourceLibrary\n#eval 7 + 11")],
         MacroRegistryLimits::default(),
         execution,
         None,

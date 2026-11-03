@@ -3701,7 +3701,7 @@ impl Engine {
                 continue;
             }
             let parsed = match expanded.take() {
-                Some(ProgramCommandSyntax::Single(parsed)) => parsed,
+                Some(ProgramCommandSyntax::Single(parsed)) => *parsed,
                 Some(ProgramCommandSyntax::Mutual(_)) => {
                     return Err(EngineExecutionError::UnexpectedPublication {
                         detail: "an expanded mutual command escaped batch admission",

@@ -250,7 +250,7 @@ pub(crate) struct FileSessionReport {
 /// original source view remains attached; execution never prints/reparses an
 /// expansion or invokes a macro a second time for admission.
 pub(crate) enum ProgramCommandSyntax {
-    Single(ParsedSourceCommand),
+    Single(Box<ParsedSourceCommand>),
     Mutual(Vec<Syntax>),
 }
 
@@ -269,7 +269,7 @@ impl ProgramCommandSyntax {
             Self::Mutual(members) => {
                 Ok(crate::source_records::ScopedCommandSyntax::Mutual(members))
             }
-            Self::Single(parsed) => scoped_command(parsed),
+            Self::Single(parsed) => scoped_command(*parsed),
         }
     }
 }
@@ -484,7 +484,7 @@ impl<'a> FileSession<'a> {
                     crate::source_check::grammar::Resolution::Global(_)
                     | crate::source_check::grammar::Resolution::Constructor(_)));
         if existing_global {
-            return Outcome::Complete(Ok(ProgramCommandSyntax::Single(parsed)));
+            return Outcome::Complete(Ok(ProgramCommandSyntax::Single(Box::new(parsed))));
         }
         self.expand_syntax(
             engine,
@@ -502,11 +502,14 @@ impl<'a> FileSession<'a> {
                         parsed.with_expanded_query_term(syntax)
                     }
                 };
-                rewritten.map(ProgramCommandSyntax::Single).ok_or(match expected {
-                    SourceCommandKind::Definition => SourceMacroError::DeclarationRequired,
-                    SourceCommandKind::Example => SourceMacroError::ExampleRequired,
-                    _ => SourceMacroError::EvaluationRequired,
-                })
+                rewritten
+                    .map(Box::new)
+                    .map(ProgramCommandSyntax::Single)
+                    .ok_or(match expected {
+                        SourceCommandKind::Definition => SourceMacroError::DeclarationRequired,
+                        SourceCommandKind::Example => SourceMacroError::ExampleRequired,
+                        _ => SourceMacroError::EvaluationRequired,
+                    })
             })
         })
     }
