@@ -67,25 +67,32 @@ LEAN_PATH="$PWD/.lake/build/lib/lean" fln check-source consumer/Use.lean
 ```
 
 A package configured with `lakefile.lean` can use checked Lean definitions and
-file-local notation to compute its source and build directories:
+file-local notation to compute its source directories, build directory, and
+library module roots:
 
 ```lean
 import Lake
 open System Lake DSL
 
 def sourceFolder (part : String) : FilePath := FilePath.mk ("sources/" ++ part)
+def libraryRoots (suffix : String) : Array Lean.Name :=
+  #[Lean.Name.str Lean.Name.anonymous ("Pro" ++ suffix), `Support]
 
 package checked_proofs where
   srcDir := sourceFolder "lean"
   buildDir := FilePath.mk (".lake/" ++ "native")
 
-@[default_target] lean_lib Proofs where
+@[default_target] lean_lib Bundle where
   srcDir := "library"
+  roots := libraryRoots "ofs"
 ```
 
 Here `lake build +Proofs:olean` reads `sources/lean/library/Proofs.lean` and
-writes `.lake/native/lib/lean/Proofs.olean`. A library's default root is its
-declared name, and `@[default_target]` selects the ordered default-target list.
+writes `.lake/native/lib/lean/Proofs.olean`. The same library also owns `Support`
+and its submodules. Its declared name `Bundle` is not an additional root.
+Without a `roots` field, a library's default root is its declared name; an
+explicit `roots := #[]` instead leaves it with no roots. Root order and
+duplicates are preserved. `@[default_target]` selects the ordered default-target list.
 Without explicit fields, package `srcDir` is `.`, `buildDir` is `.lake/build`,
 and library `srcDir` is `.`. When both configuration files exist, TOML retains
 precedence.
@@ -95,16 +102,23 @@ It loads the real pinned `Init.System.FilePath` artifact closure using the
 selected import posture; that closure must be available through `LEAN_PATH`
 or the installed pinned toolchain. Every ordinary declaration and generated
 field definition is checked before any configuration expression executes.
-Fields have the actual `System.FilePath` type, including the imported String
-coercion. Only the selected fields' String projections execute on Golem;
+Directory fields have the actual `System.FilePath` type, including the imported
+String coercion; `roots` has type `Array Lean.Name`. Only the selected directory
+fields' String projections and roots arrays execute on Golem;
 unused closed definitions are checked but are not evaluated. No upstream Lake
 elaborator or loader executes, and no replacement logical FilePath is seeded.
+Names are read component by component, so the single quoted component `«A.B»`
+cannot become the hierarchical module `A.B`. Anonymous names, numeric components,
+and components containing dots, path separators, or other unsupported characters
+are refused. Each roots field is bounded to 256 names, 128 components per name,
+and 64 KiB of aggregate returned text. Execution budget exhaustion remains
+inconclusive rather than being accepted as an empty configuration.
 
 This configuration slice supports the ordinary `import Lake` header,
 top-level `package` and `lean_lib` after `open Lake DSL`, package `srcDir` and
-`buildDir`, and library `srcDir`. Layout `where` fields and empty configurations
+`buildDir`, and library `srcDir` and `roots`. Layout `where` fields and empty configurations
 are supported. Additional imports, commands such as `require`, `lean_exe` or
-scripts, other fields, custom roots, arbitrary declaration attributes,
+scripts, other fields, arbitrary declaration attributes,
 same-line field separators, and trailing local `where` declarations are
 explicitly refused. All configured directories must remain within the package.
 Bad types, invalid later declarations, unsafe execution, or failed evaluation

@@ -120,6 +120,8 @@ package demo where
   roots := selectedRoots ("Ex" ++ "tra")
 lean_lib Empty where
   roots := #[]
+lean_lib Literals where
+  roots := #[`Literal.Root, `Other]
 "#;
     let config = configured(&engine, declarations, limits)
         .unwrap_or_else(|error| panic!("{}: {}", error.class, error.detail));
@@ -132,6 +134,7 @@ lean_lib Empty where
         ["Demo.Extra", "Other", "Demo.Extra"]
     );
     assert!(config.targets[1].roots.is_empty());
+    assert_eq!(config.targets[2].roots, ["Literal.Root", "Other"]);
 
     // A field-free ordinary package retains Lake's defaults without evaluating
     // even one of the user's closed definitions.
@@ -185,6 +188,10 @@ lean_lib Empty where
         ),
         (
             "Lean.Name.str Lean.Name.anonymous \"Demo.Extra\"",
+            "quoted or special module-name components",
+        ),
+        (
+            "`«Literal.Root»",
             "quoted or special module-name components",
         ),
         (
