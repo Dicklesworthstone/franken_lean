@@ -381,6 +381,18 @@ fn imported_macro_options_are_explicit_and_unambiguous() {
             "--macro-max-bytes requires --imported-macros",
         ),
         (
+            vec!["--imported-syntax", "User.Notation"],
+            "--imported-syntax requires --imported-macros",
+        ),
+        (
+            vec!["--imported-macros=a.tsv", "--imported-syntax="],
+            "--imported-syntax: expected one imported module name",
+        ),
+        (
+            vec!["--imported-macros=a.tsv", "--imported-syntax=A B"],
+            "--imported-syntax: expected one imported module name",
+        ),
+        (
             vec!["--imported-macros="],
             "--imported-macros requires a census path",
         ),
@@ -416,7 +428,11 @@ fn imported_macro_options_are_explicit_and_unambiguous() {
             "{output:?}"
         );
     }
-    for option in ["--imported-macros", "--macro-max-bytes"] {
+    for option in [
+        "--imported-macros",
+        "--macro-max-bytes",
+        "--imported-syntax",
+    ] {
         let output = Command::new(env!("CARGO_BIN_EXE_fln"))
             .args(["check-source", option])
             .output()
@@ -903,6 +919,16 @@ impl ImportedMacroProject {
         source: &str,
         partition: Option<&std::path::Path>,
     ) -> std::process::Output {
+        self.native_with_syntax(verb, source, partition, &[])
+    }
+
+    fn native_with_syntax(
+        &self,
+        verb: &str,
+        source: &str,
+        partition: Option<&std::path::Path>,
+        syntax_modules: &[&str],
+    ) -> std::process::Output {
         let mut command = if verb == "lean" {
             Command::new(env!("CARGO_BIN_EXE_lean"))
         } else {
@@ -915,7 +941,8 @@ impl ImportedMacroProject {
             .current_dir(self.root.join("client"))
             .env("LEAN_PATH", self.search_path())
             .env("FLN_IMPORT_REUSE_DIR", self.root.join("records"))
-            .env_remove("FLN_MACRO_PARTITION");
+            .env_remove("FLN_MACRO_PARTITION")
+            .env_remove("FLN_SYNTAX_MODULES");
         if let Some(partition) = partition {
             if verb == "check-source" {
                 command.arg("--imported-macros").arg(partition);
@@ -923,11 +950,27 @@ impl ImportedMacroProject {
                 command.env("FLN_MACRO_PARTITION", partition);
             }
         }
+        if verb == "check-source" {
+            for module in syntax_modules {
+                command.arg("--imported-syntax").arg(module);
+            }
+        } else if !syntax_modules.is_empty() {
+            command.env("FLN_SYNTAX_MODULES", syntax_modules.join(","));
+        }
         command.output().unwrap()
     }
 
     fn check(&self, source: &str) -> String {
-        let output = self.native("check-source", source, Some(&self.partition));
+        self.check_with_syntax(source, &[])
+    }
+
+    fn check_with_syntax(&self, source: &str, syntax_modules: &[&str]) -> String {
+        let output = self.native_with_syntax(
+            "check-source",
+            source,
+            Some(&self.partition),
+            syntax_modules,
+        );
         assert!(output.status.success(), "{output:?}; {:?}", self.root);
         assert!(output.stderr.is_empty(), "{output:?}");
         let stdout = String::from_utf8(output.stdout).unwrap();
@@ -1036,17 +1079,161 @@ const IMPORTED_MACRO_CLIENT: &str = concat!(
 );
 
 #[test]
-fn installed_imported_macro_parsers_supply_their_own_tokens() {
+fn installed_imported_syntax_drives_checking_and_runtime_with_scoped_isolation() {
     let provider = format!(
         "{}\n{}",
         include_str!("../../fln-olean/fixtures/ir/AdmittedSourceMacro.lean"),
+        r#"
+public section
+
+syntax (name := admittedBoxTerm) "box%" term "end%" : term
+
+@[macro admittedBoxTerm]
+meta def admittedUnboxTerm : Macro := fun stx _ state =>
+  .ok (stx.getArg 1) state
+
+namespace ImportedBoxScope
+
+scoped syntax (name := admittedScopedBoxTerm) "scopedBox%" term "end%" : term
+
+@[scoped macro admittedScopedBoxTerm]
+meta def admittedUnboxScopedTerm : Macro := fun stx _ state =>
+  .ok (stx.getArg 1) state
+
+end ImportedBoxScope
+"#
+    );
+    let Some(project) = ImportedMacroProject::prepare_with_source(&provider) else {
+        return;
+    };
+    let selected = ["AdmittedSourceMacro"];
+    assert!(
+        !project
+            .root
+            .join("client/AdmittedSourceMacro.lean")
+            .exists()
+    );
+    let declarations = concat!(
+        "prelude\nimport AdmittedSourceMacro\n",
+        "def importedBoxValue : Nat := box% (11 : Bool) end%\n",
+        "theorem importedBoxValue_eq : Eq importedBoxValue 11 := Eq.refl importedBoxValue\n",
+        "section\nopen scoped ImportedBoxScope\n",
+        "def scopedBoxValue : Nat := scopedBox% (13 : Bool) end%\n",
+        "theorem scopedBoxValue_eq : Eq scopedBoxValue 13 := Eq.refl scopedBoxValue\n",
+        "end\n",
+    );
+    let client = format!("{declarations}#check box% (Nat : Bool) end%\n#check importedBoxValue\n");
+    let oracle = project.oracle(&client);
+    assert!(oracle.status.success(), "{oracle:?}; {:?}", project.root);
+    assert_eq!(oracle.stdout, b"Nat : Type\nimportedBoxValue : Nat\n");
+    assert!(oracle.stderr.is_empty(), "{oracle:?}");
+    let report = project.check_with_syntax(declarations, &selected);
+    assert!(report.contains("\"theorems\":2"), "{report}");
+    assert!(
+        report.contains("\"name\":\"admittedUnboxTerm\""),
+        "{report}"
+    );
+    assert!(
+        report.contains("ImportedBoxScope.admittedUnboxScopedTerm"),
+        "{report}"
+    );
+
+    let lean = project.native_with_syntax("lean", &client, Some(&project.partition), &selected);
+    assert!(lean.status.success(), "{lean:?}; {:?}", project.root);
+    assert_eq!(lean.stdout, oracle.stdout);
+    assert!(lean.stderr.is_empty(), "{lean:?}");
+    let run = project.native_with_syntax(
+        "run",
+        &format!("{client}#eval importedBoxValue\n#eval scopedBoxValue\n"),
+        Some(&project.partition),
+        &selected,
+    );
+    assert!(run.status.success(), "{run:?}; {:?}", project.root);
+    assert!(run.stderr.is_empty(), "{run:?}");
+    let report = String::from_utf8(run.stdout).unwrap();
+    assert!(report.contains("\"outcome\":\"complete\""), "{report}");
+    for value in [11, 13] {
+        assert!(
+            report.contains(&format!("\"kind\":\"nat\",\"value\":{value}")),
+            "{report}"
+        );
+    }
+    assert_imported_macro_provenance(&report);
+
+    for invalid in [
+        format!("{declarations}theorem bad : Eq importedBoxValue 19 := Eq.refl importedBoxValue\n"),
+        format!("{declarations}def leakedScope : Nat := scopedBox% (17 : Bool) end%\n"),
+    ] {
+        ImportedMacroProject::refused(project.native_with_syntax(
+            "check-source",
+            &invalid,
+            Some(&project.partition),
+            &selected,
+        ));
+    }
+    std::fs::write(
+        project.root.join("client/Left.lean"),
         concat!(
-            "public meta section\n",
-            "syntax (name := ownedGrammarToken) \"owned%[\" term \"]\" : term\n",
-            "@[macro ownedGrammarToken]\n",
-            "def customChooseTerm : Macro := admittedChooseTerm\n",
-            "end\n",
+            "prelude\nimport AdmittedSourceMacro\nopen scoped ImportedBoxScope\n",
+            "def leftValue : Nat := scopedBox% (23 : Bool) end%\n",
         ),
+    )
+    .unwrap();
+    let right = project.root.join("client/Right.lean");
+    std::fs::write(
+        &right,
+        concat!(
+            "prelude\nimport AdmittedSourceMacro\n",
+            "def rightValue : Nat := scopedBox% (29 : Bool) end%\n",
+        ),
+    )
+    .unwrap();
+    let joined = "prelude\nimport Left\nimport Right\ndef joinedValue : Nat := leftValue\n";
+    ImportedMacroProject::refused(project.native_with_syntax(
+        "check-source",
+        joined,
+        Some(&project.partition),
+        &selected,
+    ));
+    std::fs::write(
+        &right,
+        concat!(
+            "prelude\nimport AdmittedSourceMacro\nopen scoped ImportedBoxScope\n",
+            "def rightValue : Nat := scopedBox% (29 : Bool) end%\n",
+        ),
+    )
+    .unwrap();
+    let joined =
+        project.native_with_syntax("check-source", joined, Some(&project.partition), &selected);
+    assert!(joined.status.success(), "{joined:?}; {:?}", project.root);
+    assert!(joined.stderr.is_empty(), "{joined:?}");
+}
+
+#[test]
+fn installed_imported_command_syntax_admits_and_executes_real_artifact_expansions() {
+    let selected = ["AdmittedSourceMacro"];
+    let provider = format!(
+        "{}\n{}",
+        include_str!("../../fln-olean/fixtures/ir/AdmittedSourceMacro.lean"),
+        r#"
+public section
+
+syntax (name := admittedDeclare) "declare%" "[" command "]" : command
+
+@[macro admittedDeclare]
+meta def admittedDeclareCommand : Macro := fun stx _ state =>
+  .ok (stx.getArg 2) state
+
+namespace ImportedCommandScope
+
+scoped syntax (name := admittedScopedDeclare) "scopedDeclare%" "[" command "]" : command
+
+@[scoped macro admittedScopedDeclare]
+meta def admittedScopedDeclareCommand : Macro := fun stx _ state =>
+  .ok (stx.getArg 2) state
+
+end ImportedCommandScope
+"#
     );
     let Some(project) = ImportedMacroProject::prepare_with_source(&provider) else {
         return;
@@ -1057,77 +1244,101 @@ fn installed_imported_macro_parsers_supply_their_own_tokens() {
             .join("client/AdmittedSourceMacro.lean")
             .exists()
     );
+    // The pinned compiler constructs the command descriptors and their macro
+    // companions. The macro selects the parser's real command child; neither
+    // the fixture nor the native runner manufactures a declaration layout.
     let declarations = concat!(
         "prelude\nimport AdmittedSourceMacro\n",
-        "def expanded : Nat := owned%[11]\n",
-        "theorem expanded_eq : Eq expanded 11 := Eq.refl expanded\n",
+        "declare% [declare% [def importedCommandValue : Nat := (31 : Bool)]]\n",
+        "declare% [theorem importedCommandValue_eq : Eq importedCommandValue 31 := Eq.refl importedCommandValue]\n",
+        "section\nopen scoped ImportedCommandScope\n",
+        "scopedDeclare% [def scopedCommandValue : Nat := (37 : Bool)]\n",
+        "end\n",
     );
-    let source = format!("{declarations}#check expanded\n");
-    let oracle = project.oracle(&source);
+    let client = format!("{declarations}#check importedCommandValue\n#check scopedCommandValue\n");
+    let oracle = project.oracle(&client);
     assert!(oracle.status.success(), "{oracle:?}; {:?}", project.root);
-    assert_eq!(oracle.stdout, b"expanded : Nat\n");
+    assert_eq!(
+        oracle.stdout,
+        b"importedCommandValue : Nat\nscopedCommandValue : Nat\n"
+    );
     assert!(oracle.stderr.is_empty(), "{oracle:?}");
-    let checked = project.check(declarations);
-    assert!(checked.contains("\"theorems\":1"), "{checked}");
-    let lean = project.native("lean", &source, Some(&project.partition));
+
+    let accepted = project.check_with_syntax(declarations, &selected);
+    assert!(accepted.contains("\"theorems\":1"), "{accepted}");
+    for declaration in [
+        "admittedDeclareCommand",
+        "ImportedCommandScope.admittedScopedDeclareCommand",
+    ] {
+        assert!(
+            accepted.contains(&format!("\"name\":\"{declaration}\"")),
+            "{accepted}"
+        );
+    }
+
+    let lean = project.native_with_syntax("lean", &client, Some(&project.partition), &selected);
     assert!(lean.status.success(), "{lean:?}; {:?}", project.root);
     assert_eq!(lean.stdout, oracle.stdout);
     assert!(lean.stderr.is_empty(), "{lean:?}");
-    let run = project.native(
+    let run = project.native_with_syntax(
         "run",
-        &format!("{source}#eval owned%[13]\n"),
+        &format!("{client}#eval importedCommandValue\n#eval scopedCommandValue\n"),
         Some(&project.partition),
+        &selected,
     );
     assert!(run.status.success(), "{run:?}; {:?}", project.root);
     assert!(run.stderr.is_empty(), "{run:?}");
-    let stdout = String::from_utf8(run.stdout).unwrap();
-    assert!(stdout.contains("\"kind\":\"nat\",\"value\":13"), "{stdout}");
-    assert_imported_macro_provenance(&stdout);
-    let false_theorem =
-        format!("{declarations}theorem false_value : Eq expanded 12 := Eq.refl expanded\n");
-    assert!(!project.oracle(&false_theorem).status.success());
-    assert_macro_refusal(
-        project.native("check-source", &false_theorem, Some(&project.partition)),
-        1,
-        "elaboration",
-        "NotDefEq",
-    );
-    let malformed = format!("{declarations}def malformed : Nat := owned%[13\n");
-    assert!(!project.oracle(&malformed).status.success());
-    assert_macro_refusal(
-        project.native("check-source", &malformed, Some(&project.partition)),
-        1,
-        "input",
-        "parse refused source",
-    );
-    assert_macro_program_refusal(
-        project.native("run", &malformed, Some(&project.partition)),
-        1,
-        "input",
-        false,
-        "parse refused source",
-    );
-    let command_limit = fln::source_check::SourceCheckLimits::new(fln::EngineAdmissionLimits::new(
-        fln::Budget::for_stack_bytes(2 * 1024 * 1024),
-    ))
-    .max_commands;
-    let too_many = format!(
-        "prelude\nimport AdmittedSourceMacro\n{}",
-        "#check Nat\n".repeat(command_limit + 1)
-    );
-    assert_macro_program_refusal(
-        project.native("run", &too_many, Some(&project.partition)),
-        3,
-        "resource",
-        false,
-        "source commands",
-    );
+    let report = String::from_utf8(run.stdout).unwrap();
+    assert!(report.contains("\"outcome\":\"complete\""), "{report}");
+    for value in [31, 37] {
+        assert!(
+            report.contains(&format!("\"kind\":\"nat\",\"value\":{value}")),
+            "{report}"
+        );
+    }
+    assert_imported_macro_provenance(&report);
     assert!(
-        !project
-            .native("check-source", declarations, None)
-            .status
-            .success()
+        report.contains("\"name\":\"admittedDeclareCommand\""),
+        "{report}"
     );
+
+    let false_proof = concat!(
+        "declare% [theorem wrongCommandProof : Eq importedCommandValue 99 := ",
+        "Eq.refl importedCommandValue]\n",
+    );
+    let invalid = format!("{declarations}{false_proof}");
+    let oracle = project.oracle(&invalid);
+    assert!(!oracle.status.success(), "{oracle:?}");
+    ImportedMacroProject::refused(project.native_with_syntax(
+        "check-source",
+        &invalid,
+        Some(&project.partition),
+        &selected,
+    ));
+    // Runtime queries before the bad generated theorem remain buffered. No
+    // successful prefix may escape when its ordinary admission rejects it.
+    ImportedMacroProject::refused(project.native_with_syntax(
+        "run",
+        &format!("{client}#eval importedCommandValue\n{false_proof}"),
+        Some(&project.partition),
+        &selected,
+    ));
+
+    let inactive =
+        format!("{declarations}scopedDeclare% [def escapedCommandScope : Nat := (41 : Bool)]\n");
+    let oracle = project.oracle(&inactive);
+    assert!(!oracle.status.success(), "{oracle:?}");
+    ImportedMacroProject::refused(project.native_with_syntax(
+        "check-source",
+        &inactive,
+        Some(&project.partition),
+        &selected,
+    ));
+    // Registering macro bodies alone does not activate their artifact grammar.
+    for verb in ["check-source", "run", "lean"] {
+        ImportedMacroProject::refused(project.native(verb, declarations, Some(&project.partition)));
+    }
+    assert_eq!(project.check_with_syntax(declarations, &selected), accepted);
 }
 
 #[test]
@@ -1422,5 +1633,390 @@ fn installed_runtime_compiles_only_dispatched_imported_macros() {
     assert!(
         !flbc.exists(),
         "a refused macro published an executable prefix"
+    );
+}
+
+fn imported_syntax_provider_source() -> String {
+    // Extend this test's real provider without changing the registration table
+    // expected by the older eager-compilation fixtures.
+    format!(
+        "{}\n{}",
+        include_str!("../../fln-olean/fixtures/ir/AdmittedSourceMacro.lean"),
+        concat!(
+            "syntax (name := admittedWrap) \"admittedWrap%\" term \"endWrap%\" : term\n",
+            "@[macro admittedWrap]\n",
+            "public meta def admittedWrapMacro : Macro := fun stx _ state =>\n",
+            "  .ok (stx.getArg 1) state\n",
+            "syntax:65 (name := admittedPickRight) term:66 \" <+> \" term:65 : term\n",
+            "@[macro admittedPickRight]\n",
+            "public meta def admittedPickRightMacro : Macro := fun stx _ state =>\n",
+            "  .ok (stx.getArg 2) state\n",
+            "namespace AdmittedScope\n",
+            "scoped syntax (name := admittedScopedWrap) \"admittedScoped%\" term \"endScoped%\" : term\n",
+            "@[macro admittedScopedWrap]\n",
+            "public meta def admittedScopedMacro : Macro := fun stx _ state =>\n",
+            "  .ok (stx.getArg 1) state\n",
+            "end AdmittedScope\n",
+        ),
+    )
+}
+
+const IMPORTED_SYNTAX_DECLARATIONS: &str = concat!(
+    "prelude\n",
+    "import AdmittedSourceMacro\n",
+    "def commandMacroValue : Nat := (11 : Bool)\n",
+    "def syntaxMacroValue : Nat := admittedWrap% commandMacroValue endWrap%\n",
+    "theorem syntaxMacroValue_eq : Eq syntaxMacroValue 11 := Eq.refl syntaxMacroValue\n",
+    "def chosenMacroValue : Nat := 17 <+> 23\n",
+    "theorem chosenMacroValue_eq : Eq chosenMacroValue 23 := Eq.refl chosenMacroValue\n",
+    "open scoped AdmittedScope\n",
+    "def scopedMacroValue : Nat := admittedScoped% 29 endScoped%\n",
+    "theorem scopedMacroValue_eq : Eq scopedMacroValue 29 := Eq.refl scopedMacroValue\n",
+);
+
+#[test]
+fn installed_imported_syntax_drives_macro_parsing_and_execution() {
+    let Some(project) =
+        ImportedMacroProject::prepare_with_source(&imported_syntax_provider_source())
+    else {
+        return;
+    };
+    let selected = ["AdmittedSourceMacro"];
+    let checked = project.native_with_syntax(
+        "check-source",
+        IMPORTED_SYNTAX_DECLARATIONS,
+        Some(&project.partition),
+        &selected,
+    );
+    assert!(checked.status.success(), "{checked:?}; {:?}", project.root);
+    assert!(checked.stderr.is_empty(), "{checked:?}");
+    let report = String::from_utf8(checked.stdout).unwrap();
+    assert!(report.contains("\"outcome\":\"complete\""), "{report}");
+    assert!(report.contains("\"theorems\":3"), "{report}");
+    assert_imported_macro_provenance(&report);
+    for name in [
+        "admittedWrapMacro",
+        "admittedPickRightMacro",
+        "AdmittedScope.admittedScopedMacro",
+    ] {
+        assert!(
+            report.contains(&format!(
+                "{{\"name\":\"{name}\",\"producer\":\"reference\"}}"
+            )),
+            "{report}"
+        );
+    }
+
+    let queries = format!(
+        "{IMPORTED_SYNTAX_DECLARATIONS}#check syntaxMacroValue\n#check chosenMacroValue\n#check scopedMacroValue\n"
+    );
+    let oracle = project.oracle(&queries);
+    assert!(oracle.status.success(), "{oracle:?}");
+    assert_eq!(
+        oracle.stdout,
+        b"syntaxMacroValue : Nat\nchosenMacroValue : Nat\nscopedMacroValue : Nat\n"
+    );
+    assert!(oracle.stderr.is_empty(), "{oracle:?}");
+    let lean = project.native_with_syntax("lean", &queries, Some(&project.partition), &selected);
+    assert!(lean.status.success(), "{lean:?}");
+    assert_eq!(lean.stdout, oracle.stdout);
+    assert!(lean.stderr.is_empty(), "{lean:?}");
+
+    let executable = format!(
+        "{queries}#eval admittedWrap% (31 : Bool) endWrap%\n#eval 17 <+> admittedScoped% 37 endScoped%\n"
+    );
+    let run = project.native_with_syntax("run", &executable, Some(&project.partition), &selected);
+    assert!(run.status.success(), "{run:?}");
+    assert!(run.stderr.is_empty(), "{run:?}");
+    let report = String::from_utf8(run.stdout).unwrap();
+    assert!(report.contains("\"kind\":\"nat\",\"value\":31"), "{report}");
+    assert!(report.contains("\"kind\":\"nat\",\"value\":37"), "{report}");
+    assert_eq!(
+        report.matches("\"event\":\"evaluation\"").count(),
+        2,
+        "{report}"
+    );
+    assert_imported_macro_provenance(&report);
+
+    let product = project.root.join("imported-syntax.flbc");
+    let emitted = Command::new(env!("CARGO_BIN_EXE_fln"))
+        .args([
+            "run",
+            "--json",
+            "--jobs",
+            "1",
+            "--import-posture",
+            "recheck",
+        ])
+        .arg("--emit-flbc")
+        .arg(&product)
+        .arg(project.source(&executable))
+        .current_dir(project.root.join("client"))
+        .env("LEAN_PATH", project.search_path())
+        .env("FLN_MACRO_PARTITION", &project.partition)
+        .env("FLN_SYNTAX_MODULES", selected.join(","))
+        .output()
+        .unwrap();
+    assert!(emitted.status.success(), "{emitted:?}");
+    assert!(emitted.stderr.is_empty(), "{emitted:?}");
+    assert!(product.is_file());
+    let replay = Command::new(env!("CARGO_BIN_EXE_fln"))
+        .args(["flbc", "run", "--json"])
+        .arg(&product)
+        .env_remove("LEAN_PATH")
+        .env_remove("FLN_MACRO_PARTITION")
+        .env_remove("FLN_SYNTAX_MODULES")
+        .output()
+        .unwrap();
+    assert!(replay.status.success(), "{replay:?}");
+    assert!(replay.stderr.is_empty(), "{replay:?}");
+    let replay = String::from_utf8(replay.stdout).unwrap();
+    assert!(replay.contains("\"returnValue\":37,"), "{replay}");
+    assert!(replay.contains("\"sidecar\":null"), "{replay}");
+
+    // A parser selection grants no proof authority and cannot be silently
+    // omitted, borrowed from another closure or activated by a sibling.
+    let false_proof = format!(
+        "{IMPORTED_SYNTAX_DECLARATIONS}theorem bad : Eq chosenMacroValue 29 := Eq.refl chosenMacroValue\n"
+    );
+    for verb in ["check-source", "run", "lean"] {
+        ImportedMacroProject::refused(project.native_with_syntax(
+            verb,
+            &false_proof,
+            Some(&project.partition),
+            &selected,
+        ));
+        ImportedMacroProject::refused(project.native(
+            verb,
+            IMPORTED_SYNTAX_DECLARATIONS,
+            Some(&project.partition),
+        ));
+    }
+    assert_macro_refusal(
+        project.native_with_syntax(
+            "check-source",
+            IMPORTED_SYNTAX_DECLARATIONS,
+            Some(&project.partition),
+            &["Absent.Syntax"],
+        ),
+        5,
+        "capability",
+        "selected parser module is not in the admitted artifact closure",
+    );
+    assert_macro_program_refusal(
+        project.native_with_syntax(
+            "run",
+            &executable,
+            Some(&project.partition),
+            &["AdmittedSourceMacro", "AdmittedSourceMacro"],
+        ),
+        5,
+        "capability",
+        false,
+        "duplicate parser module AdmittedSourceMacro",
+    );
+    assert_macro_program_refusal(
+        project.native_with_syntax("run", &executable, None, &selected),
+        1,
+        "input",
+        false,
+        "FLN_SYNTAX_MODULES requires FLN_MACRO_PARTITION",
+    );
+
+    std::fs::write(
+        project.root.join("client/ScopedSibling.lean"),
+        concat!(
+            "prelude\nimport AdmittedSourceMacro\nopen scoped AdmittedScope\n",
+            "def siblingValue : Nat := admittedScoped% 41 endScoped%\n",
+        ),
+    )
+    .unwrap();
+    let leaked_scope = concat!(
+        "prelude\nimport AdmittedSourceMacro\nimport ScopedSibling\n",
+        "def mustNotLeak : Nat := admittedScoped% 43 endScoped%\n",
+    );
+    for verb in ["check-source", "run"] {
+        ImportedMacroProject::refused(project.native_with_syntax(
+            verb,
+            leaked_scope,
+            Some(&project.partition),
+            &selected,
+        ));
+    }
+    let activated_scope = concat!(
+        "prelude\nimport AdmittedSourceMacro\nimport ScopedSibling\n",
+        "open scoped AdmittedScope\n",
+        "def explicitScope : Nat := admittedScoped% 43 endScoped%\n",
+        "theorem explicitScope_eq : Eq explicitScope 43 := Eq.refl explicitScope\n",
+    );
+    let activated = project.native_with_syntax(
+        "check-source",
+        activated_scope,
+        Some(&project.partition),
+        &selected,
+    );
+    assert!(activated.status.success(), "{activated:?}");
+    assert!(activated.stderr.is_empty(), "{activated:?}");
+    let recovered = project.native_with_syntax(
+        "check-source",
+        IMPORTED_SYNTAX_DECLARATIONS,
+        Some(&project.partition),
+        &selected,
+    );
+    assert!(recovered.status.success(), "{recovered:?}");
+    assert!(recovered.stderr.is_empty(), "{recovered:?}");
+}
+
+fn imported_category_provider_source() -> String {
+    // The actual Parser.Category declaration is supplied by Init.Notation.
+    // Keep its complete Prelude/Coe/Notation closure in the pinned library;
+    // the provider alone is selected for imported parser activation.
+    let provider = imported_syntax_provider_source();
+    let (header, body) = provider
+        .split_once("\nopen Lean\n")
+        .expect("the macro provider has an explicit import header");
+    format!(
+        "{header}\npublic import Init.Notation\npublic meta import Init.Notation\n\nopen Lean\n{body}\n{}",
+        concat!(
+            "declare_syntax_cat admittedData\n",
+            "syntax (name := admittedDatum) \"datum%\" num : admittedData\n",
+            "syntax (name := admittedUseDatum) \"useDatum%\" admittedData \"endDatum%\" : term\n",
+            "@[macro admittedUseDatum]\n",
+            "public meta def admittedUseDatumMacro : Macro := fun stx _ state =>\n",
+            "  .ok ((stx.getArg 1).getArg 1) state\n",
+            "syntax (name := admittedQuoteDatum) \"quoteDatum%\" term \"endQuote%\" : term\n",
+            "@[macro admittedQuoteDatum]\n",
+            "public meta def admittedQuoteDatumMacro : Macro := fun stx _ state =>\n",
+            "  .ok ((((stx.getArg 1).getArg 0).getArg 1).getArg 1) state\n",
+        ),
+    )
+}
+
+#[test]
+fn installed_custom_categories_keep_the_generated_quotation_journal() {
+    // The pin generates admittedData.quot in the same parser journal as the
+    // category. Selecting this whole module must accept and install that exact
+    // quotation description. Both forms reach an imported macro before ordinary
+    // elaboration; a quote-consuming macro extracts the quoted numeric syntax.
+    let Some(project) =
+        ImportedMacroProject::prepare_with_source(&imported_category_provider_source())
+    else {
+        return;
+    };
+    let selected = ["AdmittedSourceMacro"];
+    let declarations = format!(
+        "{IMPORTED_MACRO_DECLARATIONS}def categoryValue : Nat := useDatum% datum% 47 endDatum%\n\
+         theorem categoryValue_eq : Eq categoryValue 47 := Eq.refl categoryValue\n\
+         def quotedCategoryValue : Nat := quoteDatum% `(admittedData| datum% 51) endQuote%\n\
+         theorem quotedCategoryValue_eq : Eq quotedCategoryValue 51 := Eq.refl quotedCategoryValue\n"
+    );
+    let checked = project.native_with_syntax(
+        "check-source",
+        &declarations,
+        Some(&project.partition),
+        &selected,
+    );
+    assert!(checked.status.success(), "{checked:?}; {:?}", project.root);
+    assert!(checked.stderr.is_empty(), "{checked:?}");
+    let report = String::from_utf8(checked.stdout).unwrap();
+    assert!(report.contains("\"outcome\":\"complete\""), "{report}");
+    assert!(report.contains("\"theorems\":3"), "{report}");
+    assert_imported_macro_provenance(&report);
+    for name in ["admittedUseDatumMacro", "admittedQuoteDatumMacro"] {
+        assert!(
+            report.contains(&format!(
+                "{{\"name\":\"{name}\",\"producer\":\"reference\"}}"
+            )),
+            "{report}"
+        );
+    }
+
+    let queries = format!("{declarations}#check categoryValue\n#check quotedCategoryValue\n");
+    let oracle = project.oracle(&queries);
+    assert!(oracle.status.success(), "{oracle:?}");
+    assert_eq!(
+        oracle.stdout,
+        b"categoryValue : Nat\nquotedCategoryValue : Nat\n"
+    );
+    assert!(oracle.stderr.is_empty(), "{oracle:?}");
+    let lean = project.native_with_syntax("lean", &queries, Some(&project.partition), &selected);
+    assert!(lean.status.success(), "{lean:?}");
+    assert_eq!(lean.stdout, oracle.stdout);
+    assert!(lean.stderr.is_empty(), "{lean:?}");
+
+    let executable = format!(
+        "{queries}#eval useDatum% datum% 51 endDatum%\n\
+         #eval quoteDatum% `(admittedData| datum% 53) endQuote%\n"
+    );
+    let product = project.root.join("imported-category.flbc");
+    let emit = |source: &str, product: &std::path::Path| {
+        Command::new(env!("CARGO_BIN_EXE_fln"))
+            .args([
+                "run",
+                "--json",
+                "--jobs",
+                "1",
+                "--import-posture",
+                "recheck",
+            ])
+            .arg("--emit-flbc")
+            .arg(product)
+            .arg(project.source(source))
+            .current_dir(project.root.join("client"))
+            .env("LEAN_PATH", project.search_path())
+            .env("FLN_MACRO_PARTITION", &project.partition)
+            .env("FLN_SYNTAX_MODULES", selected.join(","))
+            .output()
+            .unwrap()
+    };
+    let emitted = emit(&executable, &product);
+    assert!(emitted.status.success(), "{emitted:?}");
+    assert!(emitted.stderr.is_empty(), "{emitted:?}");
+    let report = String::from_utf8(emitted.stdout).unwrap();
+    assert!(report.contains("\"kind\":\"nat\",\"value\":51"), "{report}");
+    assert!(report.contains("\"kind\":\"nat\",\"value\":53"), "{report}");
+    assert_eq!(
+        report.matches("\"event\":\"evaluation\"").count(),
+        2,
+        "{report}"
+    );
+    assert!(report.contains("\"emittedFlbc\":{\"path\":"), "{report}");
+    assert_imported_macro_provenance(&report);
+    let replay = Command::new(env!("CARGO_BIN_EXE_fln"))
+        .args(["flbc", "run", "--json"])
+        .arg(&product)
+        .env_remove("LEAN_PATH")
+        .env_remove("FLN_MACRO_PARTITION")
+        .env_remove("FLN_SYNTAX_MODULES")
+        .output()
+        .unwrap();
+    assert!(replay.status.success(), "{replay:?}");
+    assert!(replay.stderr.is_empty(), "{replay:?}");
+    let replay = String::from_utf8(replay.stdout).unwrap();
+    assert!(replay.contains("\"returnValue\":53,"), "{replay}");
+    assert!(replay.contains("\"sidecar\":null"), "{replay}");
+
+    let false_proof = format!(
+        "{declarations}theorem badCategory : Eq categoryValue 51 := Eq.refl categoryValue\n"
+    );
+    for verb in ["check-source", "run"] {
+        ImportedMacroProject::refused(project.native_with_syntax(
+            verb,
+            &false_proof,
+            Some(&project.partition),
+            &selected,
+        ));
+        ImportedMacroProject::refused(project.native(
+            verb,
+            &declarations,
+            Some(&project.partition),
+        ));
+    }
+    let malformed = format!("{executable}#eval useDatum% datum% endDatum%\n");
+    let refused_product = project.root.join("malformed-category.flbc");
+    ImportedMacroProject::refused(emit(&malformed, &refused_product));
+    assert!(
+        !refused_product.exists(),
+        "malformed category syntax published an executable prefix"
     );
 }

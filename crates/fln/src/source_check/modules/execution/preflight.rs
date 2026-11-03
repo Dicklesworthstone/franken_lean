@@ -12,6 +12,38 @@ pub(super) fn check(
     limits: SourceModuleCheckLimits,
     implicit_init: bool,
 ) -> Result<(), SourceModuleCheckError> {
+    check_with_parsers(modules, limits, implicit_init, |_, _| Ok(()))
+}
+
+/// Install each module's checked artifact grammar before the syntax-only pass.
+/// The caller supplies the exact external import order; native source grammar
+/// exports still replay through the same bounded pass as ordinary programs.
+pub(super) fn check_with_parsers(
+    modules: &[SourceModuleInput<'_>],
+    limits: SourceModuleCheckLimits,
+    implicit_init: bool,
+    install: impl FnMut(&Name, &mut SourceGrammar) -> Result<(), SourceModuleCheckError>,
+) -> Result<(), SourceModuleCheckError> {
+    check_mode(modules, limits, implicit_init, false, install)
+}
+
+/// Artifact syntax cannot parse until its checked import receipt exists. Keep
+/// all header and graph checks available before that potentially costly import.
+pub(super) fn check_headers(
+    modules: &[SourceModuleInput<'_>],
+    limits: SourceModuleCheckLimits,
+    implicit_init: bool,
+) -> Result<(), SourceModuleCheckError> {
+    check_mode(modules, limits, implicit_init, true, |_, _| Ok(()))
+}
+
+fn check_mode(
+    modules: &[SourceModuleInput<'_>],
+    limits: SourceModuleCheckLimits,
+    implicit_init: bool,
+    defer_commands: bool,
+    mut install: impl FnMut(&Name, &mut SourceGrammar) -> Result<(), SourceModuleCheckError>,
+) -> Result<(), SourceModuleCheckError> {
     if modules.len() > limits.max_modules {
         return Err(SourceModuleCheckError::Limit {
             resource: "modules",
@@ -72,6 +104,12 @@ pub(super) fn check(
                 .collect()
         })
         .collect();
+    if defer_commands {
+        for root in 0..modules.len() {
+            graph::postorder(root, &dependencies, modules, &mut meter)?;
+        }
+        return Ok(());
+    }
     let mut completed = BTreeMap::<usize, NativeSyntaxModule>::new();
     let mut count = 0usize;
     for root in 0..modules.len() {
@@ -99,6 +137,7 @@ pub(super) fn check(
                     }
                 }
             }
+            install(module.name, &mut grammar)?;
             let commands = grammar.enter(|| super::commands(module.name, module.source, header))?;
             for (command, (at, source)) in commands.into_iter().enumerate() {
                 count = count

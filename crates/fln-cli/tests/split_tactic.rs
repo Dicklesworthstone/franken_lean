@@ -301,6 +301,94 @@ const REFUSED: &[(&str, &str, &str, &str)] = &[
 /// A `match` the pin splits (`case h_1`, `case h_2`) and this engine refuses.
 const MATCH: &str = "prelude\nimport Init.SimpLemmas\nexample (x : Nat) : (match x with | 0 => 1 | _ => 2) > 0 := by\n  split\n  all_goals sorry\n";
 
+/// Source conditionals must have the same heads as the imported conditional lemmas.
+/// A recursor with equivalent evaluation cannot replace `ite`/`dite` here: `simp only`
+/// and `rw` select the imported lemmas by their actual applications.
+const SOURCE_CONDITIONALS: &str = r#"prelude
+import Init.SimpLemmas
+import Init.ByCases
+set_option linter.unusedVariables false
+example : (if True then 1 else 2) = 1 := by simp only [ite_true]
+example : (if True then 1 else 2) = 1 := by simp only [if_true]
+example : (if False then 1 else 2) = 2 := by simp only [ite_false]
+example (c : Prop) [Decidable c] (a : Nat) : (if c then a else a) = a := by
+  simp only [ite_self]
+example (c : Prop) [Decidable c] (a b : Nat) (h : c) : (if c then a else b) = a := by
+  rw [if_pos h]
+example (c : Prop) [Decidable c] (a b : Nat) (h : ¬ c) : (if c then a else b) = b := by
+  rw [if_neg h]
+example (c : Prop) [Decidable c] (yes : c → Nat) (no : ¬ c → Nat) (h : c) :
+    (if h : c then yes h else no h) = yes h := by
+  rw [dif_pos h]
+example (c : Prop) [Decidable c] (yes : c → Nat) (no : ¬ c → Nat) (h : ¬ c) :
+    (if h : c then yes h else no h) = no h := by
+  rw [dif_neg h]
+example (b : Bool) (a c : Nat) : (if b then a else c) = ite (b = true) a c := rfl
+example (b : Bool) (h : b = true) (f : b = true → Nat) :
+    (if h : b then f h else 0) = f h := by
+  rw [dif_pos h]
+example (c : Prop) [Decidable c] (a : Nat) :
+    (if _ : c then a else a) = a := by
+  split <;> rfl
+example (c : Prop) [Decidable c] (a b : Nat) :
+    (if c then a else b) = (if c then a else b) := by
+  split <;> rfl
+def inferred (b : Bool) := if b then 17 else 19
+example : inferred true = 17 := rfl
+example : inferred false = 19 := rfl
+def shadow (h : Nat) (b : Bool) :=
+  let result := if h : b then (fun h : Nat => h + 1) 40 else 7
+  h + result
+example : shadow 1 true = 42 := rfl
+example : shadow 1 false = 8 := rfl
+example (p q : Prop) [Decidable p] [Decidable q]
+    (yes : p → q → Nat) (no : Nat) (hp : p) (hq : q) :
+    (if h : p then (if h : q then yes hp h else no) else no) = yes hp hq := by
+  rw [dif_pos hp, dif_pos hq]
+"#;
+
+/// Printing uses exactly the notation imported by this header. `Init.SimpLemmas`
+/// has no `ite` unexpander: the pin prints `ite`, while `dite` has binder syntax.
+const SOURCE_CONDITIONAL_PRINTING: &str = r#"prelude
+import Init.SimpLemmas
+set_option linter.unusedVariables false
+def choose (c : Prop) [Decidable c] (a b : Nat) : Nat := if c then a else b
+#print choose
+#check if 1 = 1 then 3 else 4
+#check fun (b : Bool) => if b then 1 else 2
+def chooseEvidence (c : Prop) [Decidable c] (yes : c → Nat) (no : ¬ c → Nat) : Nat :=
+  if h : c then yes h else no h
+#print chooseEvidence
+#check fun (c : Prop) [Decidable c] => if c then Nat.succ else Nat.pred
+#check if _ : True then 1 else 0
+def globalName : Nat := 9
+def shadowGlobal (p : Prop) [Decidable p] : Nat :=
+  dite p (fun globalName => 0) (fun other => globalName)
+#print shadowGlobal
+"#;
+
+const SOURCE_CONDITIONAL_PRINTED: &str = "def choose : (c : Prop) → [Decidable c] → Nat → Nat → Nat :=\n\
+fun c [Decidable c] a b => ite c a b\n\
+ite (1 = 1) 3 4 : Nat\n\
+fun b => ite (b = true) 1 2 : Bool → Nat\n\
+def chooseEvidence : (c : Prop) → [Decidable c] → (c → Nat) → (¬c → Nat) → Nat :=\n\
+fun c [Decidable c] yes no => if h : c then yes h else no h\n\
+fun c [Decidable c] => ite c Nat.succ Nat.pred : (c : Prop) → [Decidable c] → Nat → Nat\n\
+if x : True then 1 else 0 : Nat\n\
+def shadowGlobal : (p : Prop) → [Decidable p] → Nat :=\n\
+fun p [Decidable p] => if globalName : p then 0 else _root_.globalName\n";
+
+const SOURCE_CONDITIONAL_NOTATION: &str = "def choose : (c : Prop) → [Decidable c] → Nat → Nat → Nat :=\n\
+fun c [Decidable c] a b => if c then a else b\n\
+if 1 = 1 then 3 else 4 : Nat\n\
+fun b => if b = true then 1 else 2 : Bool → Nat\n\
+def chooseEvidence : (c : Prop) → [Decidable c] → (c → Nat) → (¬c → Nat) → Nat :=\n\
+fun c [Decidable c] yes no => if h : c then yes h else no h\n\
+fun c [Decidable c] => if c then Nat.succ else Nat.pred : (c : Prop) → [Decidable c] → Nat → Nat\n\
+if x : True then 1 else 0 : Nat\n\
+def shadowGlobal : (p : Prop) → [Decidable p] → Nat :=\n\
+fun p [Decidable p] => if globalName : p then 0 else _root_.globalName\n";
+
 fn pinned_lib() -> Option<PathBuf> {
     let lib = std::env::var_os("FLN_REFERENCE_LIB")
         .map(PathBuf::from)
@@ -399,6 +487,73 @@ fn split_cases_on_an_imported_ite_as_the_pin_does() {
     };
     let root = workspace();
     accepted(&lib, &root, "Imported.lean", IMPORTED, IMPORTED_EXPECTED);
+}
+
+#[test]
+fn source_conditionals_use_imported_ite_and_dite_lemmas() {
+    let Some(lib) = pinned_lib() else {
+        return;
+    };
+    let root = workspace();
+    accepted(&lib, &root, "SourceIf.lean", SOURCE_CONDITIONALS, "");
+}
+
+#[test]
+fn source_conditionals_print_with_the_imported_notation() {
+    let Some(lib) = pinned_lib() else {
+        return;
+    };
+    let root = workspace();
+    accepted(
+        &lib,
+        &root,
+        "PrintIf.lean",
+        SOURCE_CONDITIONAL_PRINTING,
+        SOURCE_CONDITIONAL_PRINTED,
+    );
+    let with_notation = SOURCE_CONDITIONAL_PRINTING.replacen(
+        "import Init.SimpLemmas",
+        "import Init.SimpLemmas\nimport Init.NotationExtra",
+        1,
+    );
+    accepted(
+        &lib,
+        &root,
+        "PrintIfNotation.lean",
+        &with_notation,
+        SOURCE_CONDITIONAL_NOTATION,
+    );
+}
+
+#[test]
+fn source_conditionals_do_not_refine_the_discriminant_or_leak_evidence() {
+    let Some(lib) = pinned_lib() else {
+        return;
+    };
+    let root = workspace();
+    for (name, body) in [
+        (
+            "NoRefinement.lean",
+            "example (b : Bool) : b = true ∨ b = false :=\n  if b then Or.inl rfl else Or.inr rfl\n",
+        ),
+        (
+            "NoEvidenceLeak.lean",
+            "def bad (b : Bool) : Nat :=\n  let n := if h : b then 1 else 2\n  h + n\n",
+        ),
+        (
+            "BothBranchesChecked.lean",
+            "def bad : Nat := if True then 1 else \"not a Nat\"\n",
+        ),
+    ] {
+        let program = format!("prelude\nimport Init.SimpLemmas\n{body}");
+        std::fs::write(root.join(name), program).unwrap();
+        if let Some((code, stdout)) = pinned(&lib, &root, name) {
+            assert_eq!(code, 1, "{name}: the pin moved: {stdout}");
+        }
+        let (code, stdout, stderr) = ours(&lib, &root, name);
+        assert_eq!(code, 1, "{name}: {stdout}{stderr}");
+        assert!(stdout.is_empty(), "{name}: {stdout}");
+    }
 }
 
 #[test]

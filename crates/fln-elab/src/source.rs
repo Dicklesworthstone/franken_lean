@@ -761,6 +761,14 @@ struct Context {
     // Coercions whose value was still open (`mkCoe`'s `.undef`), resumed by
     // instance synthesis and refused, as they were found, on its final pass.
     postponed_coercions: Vec<coercions::PostponedCoercion>,
+    // Set only after an unnamed WF conditional retained evidence while source
+    // inference was incomplete. Its private marker is reconsidered after
+    // ordinary metavariable instantiation; other declarations skip that walk.
+    deferred_conditional_forms: bool,
+    // Pure results for already-instantiated expressions. Immutable keys retain
+    // their inputs, and speculative contexts share this bounded optimization.
+    deferred_conditional_cache:
+        std::sync::Arc<std::sync::Mutex<std::collections::HashMap<Expr, Expr>>>,
     // Resumed argument failures are delayed source diagnostics, just like the
     // pin's synthetic metavariable errors. Tactic/recursion rollback restores
     // them; a selected declaration can never discard them or admit its holes.
@@ -884,6 +892,8 @@ impl Context {
             postponed_eliminators: Vec::new(),
             postponed_fields: Vec::new(),
             postponed_coercions: Vec::new(),
+            deferred_conditional_forms: false,
+            deferred_conditional_cache: Default::default(),
             postponed_application_errors: Vec::new(),
             pending_source_arguments: false,
             block_root_implicit_lambda: false,
@@ -964,9 +974,15 @@ impl Context {
         if !self.bound_metavars.is_empty() {
             self.settle_bound_metavars()?;
         }
-        self.txn
+        let value = self
+            .txn
             .instantiate_expr(value)
-            .map_err(|error| failure(SourceInferenceError::Universe(error)))
+            .map_err(|error| failure(SourceInferenceError::Universe(error)))?;
+        if self.deferred_conditional_forms {
+            self.canonicalize_deferred_conditionals(&value)
+        } else {
+            Ok(value)
+        }
     }
 
     fn substitute(&mut self, body: &Expr, argument: &Expr) -> Result<Expr, NatDefinitionElabError> {
@@ -2177,11 +2193,11 @@ impl Context {
             MatrixScope(Vec<Name>),
             CaptureRecursiveContext,
             MatchDiscriminant(matching::MatchParts<'a>, Option<Expr>),
-            ConditionalNext(matching::ConditionalBuild<'a>),
-            ConditionalBranch(matching::ConditionalBuild<'a>, matching::BranchBinders),
             NomatchDiscriminant(Arguments<'a>, Vec<Typed>, Option<Expr>),
             MatchNext(matching::MatchBuild<'a>),
             MatchBranch(matching::MatchBuild<'a>, matching::BranchBinders),
+            ConditionalNext(matching::ConditionalBuild<'a>),
+            ConditionalBranch(matching::ConditionalBuild<'a>),
             Ascription(&'a Syntax, Option<Expr>, bool),
             AscribedValue(Expr, Option<Expr>, bool),
             Noindex,
@@ -2306,7 +2322,8 @@ impl Context {
                                 | Task::MatchTerm(..)
                                 | Task::RefineTerm(..)
                         )
-                    );
+                    ) || matches!(tasks.last(), Some(Task::ConditionalBranch(state))
+                        if state.closes_scope());
                     let mut ready = pending.take_ready(self)?;
                     if ready.is_none()
                         && (tasks.is_empty() || closes_scope)
@@ -2374,7 +2391,8 @@ impl Context {
                             | Task::ProofTerm(..)
                             | Task::MatchTerm(..)
                             | Task::RefineTerm(..)
-                    ) {
+                    ) || matches!(&task, Task::ConditionalBranch(state) if state.closes_scope())
+                    {
                         // Every still-unresolved argument keeps its original
                         // scope. A later assignment cannot enter a lambda or
                         // structural branch after that scope has been closed.
@@ -3541,30 +3559,12 @@ impl Context {
                         Task::MatchDiscriminant(parts, expected) => {
                             let major = values.pop().expect("match discriminant visit");
                             tasks.push(match self.start_match(parts, major, expected)? {
+                                matching::MatchStart::Regular(state) => Task::MatchNext(*state),
+                                matching::MatchStart::Refined(proof) => Task::Proof(proof),
                                 matching::MatchStart::Conditional(state) => {
                                     Task::ConditionalNext(*state)
                                 }
-                                matching::MatchStart::Regular(state) => Task::MatchNext(*state),
-                                matching::MatchStart::Refined(proof) => Task::Proof(proof),
                             });
-                        }
-                        Task::ConditionalNext(mut state) => {
-                            match self.next_conditional_branch(&mut state)? {
-                                matching::MatchStep::Branch {
-                                    syntax,
-                                    expected,
-                                    binders,
-                                } => {
-                                    tasks.push(Task::ConditionalBranch(state, binders));
-                                    tasks.push(Task::Visit(syntax, Some(expected), true));
-                                }
-                                matching::MatchStep::Complete(term) => values.push(term),
-                            }
-                        }
-                        Task::ConditionalBranch(mut state, binders) => {
-                            let branch = values.pop().expect("conditional branch visit");
-                            self.accept_conditional_branch(&mut state, binders, branch)?;
-                            tasks.push(Task::ConditionalNext(state));
                         }
                         Task::MatchNext(mut state) => match self.next_match_branch(&mut state)? {
                             matching::MatchStep::Branch {
@@ -3581,6 +3581,20 @@ impl Context {
                             let branch = values.pop().expect("match branch visit");
                             self.accept_match_branch(&mut state, binders, branch)?;
                             tasks.push(Task::MatchNext(state));
+                        }
+                        Task::ConditionalNext(mut state) => {
+                            match self.next_conditional_branch(&mut state)? {
+                                matching::ConditionalStep::Branch { syntax, expected } => {
+                                    tasks.push(Task::ConditionalBranch(state));
+                                    tasks.push(Task::Visit(syntax, Some(expected), true));
+                                }
+                                matching::ConditionalStep::Complete(term) => values.push(term),
+                            }
+                        }
+                        Task::ConditionalBranch(mut state) => {
+                            let branch = values.pop().expect("conditional branch visit");
+                            self.accept_conditional_branch(&mut state, branch)?;
+                            tasks.push(Task::ConditionalNext(state));
                         }
                         Task::Noindex => {
                             let mut term = values.pop().expect("no_index term visit");

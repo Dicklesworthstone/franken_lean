@@ -34,6 +34,19 @@ impl Drop for EnteredCategory {
         WORK.with(|work| work.borrow_mut().nesting -= 1);
     }
 }
+
+/// Keep builtin command reentry in the same work and depth allowance as
+/// descriptor categories. An exhausted candidate cannot become a fallback.
+pub(super) fn bounded<T>(parse: impl FnOnce() -> Option<T>) -> Option<T> {
+    let _entered = EnteredCategory::enter()?;
+    let result = parse()?;
+    if WORK.with(|work| work.borrow().exhausted) {
+        None
+    } else {
+        Some(result)
+    }
+}
+
 /// All candidate descriptors share one work budget, including reentry through
 /// builtin term parsing. Exhaustion poisons the entire choice, not just the
 /// expensive candidate: otherwise an unexamined longer parse could be missed.

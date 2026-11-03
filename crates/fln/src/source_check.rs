@@ -847,9 +847,8 @@ impl Engine {
             )
             .map_err(|error| command_error(file, count, fln_parse::BytePos(0), error))?;
             if let Some(session) = macros.as_deref() {
-                session
-                    .registry()
-                    .install_source_parsers(&mut grammar)
+                grammar
+                    .import_artifact(session.parsers())
                     .map_err(|error| command_error(file, count, fln_parse::BytePos(0), error))?;
             }
             if macros.is_some() && grammar.has_templates() {

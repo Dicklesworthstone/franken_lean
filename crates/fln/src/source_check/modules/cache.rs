@@ -762,9 +762,8 @@ pub(super) fn run_collecting(
                                     error: Box::new(error),
                                 }
                             })?;
-                            session
-                                .registry()
-                                .install_source_parsers(&mut grammar)
+                            grammar
+                                .import_artifact(session.parsers())
                                 .map_err(|error| SourceCheckError::Command {
                                     file: 0,
                                     command: 0,

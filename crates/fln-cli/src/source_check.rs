@@ -316,12 +316,12 @@ pub(super) fn run(
                 }
                 None
             };
-            let (engine, olean_base) = match loaded.base_engine(seed, jobs, posture) {
+            let (engine, mut olean_base) = match loaded.base_engine(seed, jobs, posture) {
                 Ok(base) => base,
                 Err(error) => return failed(error.class, &error.detail, error.authority, json, error.exit),
             };
             let checked = if let Some(inputs) = macro_inputs {
-                inputs.check(&loaded, olean_base.as_ref(), limits)
+                inputs.check(&loaded, olean_base.as_mut(), limits)
                     .map(|outcome| outcome.map_complete(|(checked, report)| (checked, Some(report))))
             } else {
                 loaded.check(&engine, olean_base.as_ref(), limits)

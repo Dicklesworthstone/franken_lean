@@ -190,6 +190,14 @@ def parser_contract(text):
     for name, _ in booleans:
         lines.append(f'    ("Bool.{name}", &[]),')
     lines.append("];")
+    naturals = constructor_fields(declaration(prelude, "inductive", "Nat"), "Nat")
+    if naturals != [("zero", []), ("succ", [("n", "Nat")])]:
+        raise ValueError(f"Nat literal constructor drift: {naturals}")
+    lines += ["#[rustfmt::skip]", "pub const PARSER_NAT_CONSTRUCTOR_FIELDS: &[(&str, &[&str])] = &["]
+    for name, fields in naturals:
+        types = ", ".join(f'"{ty}"' for _, ty in fields)
+        lines.append(f'    ("Nat.{name}", &[{types}]),')
+    lines.append("];")
     helpers = [(name, len(fields)) for name, fields in names]
     for name, parameters, value in [
         ("mkStr", "(p : Name) (s : String)", "Name.str p s"),

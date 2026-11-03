@@ -193,7 +193,12 @@ pub fn declaration_warning_offset(source: &[u8]) -> Option<usize> {
 type PartitionTokens = (Vec<LexedToken>, Vec<(&'static str, BytePos)>);
 
 fn partition_tokens(view: &SourceView) -> Result<PartitionTokens, DefinitionParseError> {
-    let run = lex(view)?;
+    // Partitioning precedes lexical scope transitions. A receipt-bound scoped
+    // command must start its own slice even before `open scoped` is applied;
+    // parsing that slice still uses only the actually active grammar.
+    let run = crate::extensions::with_partition_token_table(|table| {
+        crate::lex_source_with_table(view, table)
+    })?;
     let diagnostics: Vec<_> = run
         .events
         .iter()
@@ -267,7 +272,7 @@ fn line_command(s: &str) -> bool {
                     | "init_quot"
                     | "docs_to_verso"
             )
-            || crate::extensions::is_command_keyword(s))
+            || crate::extensions::is_partition_command_keyword(s))
 }
 /// A doc comment: the lexer's one token for `/--` or `/-!` and its whole body.
 fn doc_comment(token: &LexedToken) -> bool {

@@ -18,6 +18,7 @@ const MAX_REPORT_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) struct Config {
     partition: PathBuf,
     max_bytes: usize,
+    syntax_modules: Vec<Name>,
 }
 
 impl Config {
@@ -25,15 +26,47 @@ impl Config {
     /// imported-macro mode is an explicit environment opt-in using the same
     /// verified policy and bounded companion loader as check-source.
     pub(in crate::source_check) fn from_environment() -> Result<Option<Self>, Failure> {
-        let Some(partition) = std::env::var_os("FLN_MACRO_PARTITION") else {
+        Self::environment(
+            std::env::var_os("FLN_MACRO_PARTITION"),
+            std::env::var_os("FLN_SYNTAX_MODULES"),
+        )
+    }
+
+    fn environment(
+        partition: Option<OsString>,
+        syntax: Option<OsString>,
+    ) -> Result<Option<Self>, Failure> {
+        let Some(partition) = partition else {
+            if syntax.is_some() {
+                return Err(Failure::input(
+                    "FLN_SYNTAX_MODULES requires FLN_MACRO_PARTITION",
+                ));
+            }
             return Ok(None);
         };
         if partition.is_empty() {
             return Err(Failure::input("FLN_MACRO_PARTITION requires a census path"));
         }
+        let syntax_modules = syntax
+            .map(|syntax| {
+                let syntax = syntax.to_str().ok_or_else(|| {
+                    Failure::input("FLN_SYNTAX_MODULES requires UTF-8 module names")
+                })?;
+                syntax
+                    .split(',')
+                    .map(|name| {
+                        syntax_module(std::ffi::OsStr::new(name.trim())).map_err(|detail| {
+                            Failure::input(format!("FLN_SYNTAX_MODULES: {detail}"))
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .transpose()?
+            .unwrap_or_default();
         Ok(Some(Self {
             partition: PathBuf::from(partition),
             max_bytes: DEFAULT_IR_BYTES,
+            syntax_modules,
         }))
     }
 
@@ -42,6 +75,7 @@ impl Config {
     ) -> Result<(Vec<OsString>, Option<Self>), UsageError> {
         let mut partition = None;
         let mut max_bytes = None;
+        let mut syntax_modules = Vec::new();
         let mut kept = Vec::with_capacity(arguments.len());
         let mut options = true;
         let mut arguments = arguments.into_iter();
@@ -55,6 +89,8 @@ impl Config {
                 Some(("--imported-macros", None))
             } else if options && argument == "--macro-max-bytes" {
                 Some(("--macro-max-bytes", None))
+            } else if options && argument == "--imported-syntax" {
+                Some(("--imported-syntax", None))
             } else if options {
                 argument.to_str().and_then(|text| {
                     text.strip_prefix("--imported-macros=")
@@ -62,6 +98,10 @@ impl Config {
                         .or_else(|| {
                             text.strip_prefix("--macro-max-bytes=")
                                 .map(|value| ("--macro-max-bytes", Some(OsString::from(value))))
+                        })
+                        .or_else(|| {
+                            text.strip_prefix("--imported-syntax=")
+                                .map(|value| ("--imported-syntax", Some(OsString::from(value))))
                         })
                 })
             } else {
@@ -86,6 +126,11 @@ impl Config {
                     ));
                 }
                 partition = Some(PathBuf::from(value));
+            } else if option == "--imported-syntax" {
+                syntax_modules.push(
+                    syntax_module(&value)
+                        .map_err(|detail| UsageError(format!("--imported-syntax: {detail}")))?,
+                );
             } else {
                 if max_bytes.is_some() {
                     return Err(UsageError(
@@ -110,14 +155,36 @@ impl Config {
                 "--macro-max-bytes requires --imported-macros".to_owned(),
             ));
         }
+        if !syntax_modules.is_empty() && partition.is_none() {
+            return Err(UsageError(
+                "--imported-syntax requires --imported-macros".to_owned(),
+            ));
+        }
         Ok((
             kept,
             partition.map(|partition| Self {
                 partition,
                 max_bytes: max_bytes.unwrap_or(DEFAULT_IR_BYTES),
+                syntax_modules,
             }),
         ))
     }
+}
+
+fn syntax_module(value: &std::ffi::OsStr) -> Result<Name, &'static str> {
+    let invalid = "expected one imported module name";
+    let value = value.to_str().ok_or(invalid)?;
+    if value.is_empty() || value.chars().any(char::is_control) {
+        return Err(invalid);
+    }
+    // Reuse the import grammar so quoted and structural names match the names
+    // in checked receipts. A selector cannot introduce another directive/body.
+    let source = format!("prelude\nimport {value}\n");
+    let mut header = parse_source_header(source.as_bytes()).map_err(|_| invalid)?;
+    if header.imports.len() != 1 || header.body_start.0 != source.len() {
+        return Err(invalid);
+    }
+    Ok(header.imports.remove(0))
 }
 
 /// Code and policy captured before admission; the receipt later supplies the
@@ -127,6 +194,7 @@ pub(in crate::source_check) struct Prepared {
     modules: Vec<fln::IrModule>,
     names: Vec<Name>,
     bytes: usize,
+    syntax_modules: Vec<Name>,
 }
 
 /// Closure provenance for attempted macro dispatch, not a dynamic call trace.
@@ -326,11 +394,40 @@ impl Loaded {
             modules,
             names,
             bytes: total,
+            syntax_modules: config.syntax_modules.clone(),
         })
     }
 }
 
 impl Prepared {
+    pub(in crate::source_check) fn has_imported_syntax(&self) -> bool {
+        !self.syntax_modules.is_empty()
+    }
+
+    pub(in crate::source_check) fn enable_syntax(
+        &self,
+        receipt: &mut SourceOleanImport,
+    ) -> Result<(), Failure> {
+        if self.has_imported_syntax() {
+            receipt
+                .enable_imported_syntax(
+                    &self.syntax_modules,
+                    fln::imported_parsers::ParserRegistryLimits::default(),
+                )
+                .map_err(|error| Failure {
+                    class: if error.is_resource() {
+                        "resource"
+                    } else {
+                        "capability"
+                    },
+                    authority: false,
+                    exit: if error.is_resource() { 3 } else { 5 },
+                    detail: error.to_string(),
+                })?;
+        }
+        Ok(())
+    }
+
     fn users(&self, receipt: &SourceOleanImport) -> Result<BTreeSet<Name>, Failure> {
         let mut users = BTreeSet::new();
         for (name, code) in self.names.iter().zip(&self.modules) {
@@ -398,7 +495,7 @@ impl Prepared {
     pub(in crate::source_check) fn check(
         self,
         loaded: &Loaded,
-        base: Option<&OleanBase>,
+        base: Option<&mut OleanBase>,
         limits: fln::SourceCheckLimits,
     ) -> Result<Outcome<(SourceFileCheck, Report)>, Failure> {
         let Inputs::Modules { names, sources } = &loaded.inputs else {
@@ -409,6 +506,7 @@ impl Prepared {
         let base = base.ok_or_else(|| {
             Failure::input("imported macros require an admitted artifact receipt")
         })?;
+        self.enable_syntax(&mut base.receipt)?;
         let (macro_inputs, ir_bytes) = self.into_inputs(&base.receipt, None)?;
         let inputs = names
             .iter()
@@ -463,6 +561,71 @@ pub(in crate::source_check) fn result<T, E>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn syntax_selection_preserves_structural_names_and_option_boundary() {
+        let (kept, config) = Config::take(
+            [
+                "--imported-syntax",
+                "User.Notation",
+                "--imported-macros=partition.tsv",
+                "--imported-syntax=«Quoted.Module»",
+                "--",
+                "--imported-syntax",
+            ]
+            .into_iter()
+            .map(OsString::from)
+            .collect(),
+        )
+        .unwrap();
+        assert_eq!(
+            config.unwrap().syntax_modules,
+            vec![
+                Name::from_components(["User", "Notation"]),
+                Name::from_components(["Quoted.Module"]),
+            ]
+        );
+        assert_eq!(
+            kept,
+            vec![OsString::from("--"), OsString::from("--imported-syntax")]
+        );
+        for invalid in ["", "A B", "A\nimport B", "A\naxiom bad : Nat"] {
+            assert!(syntax_module(std::ffi::OsStr::new(invalid)).is_err());
+        }
+    }
+
+    #[test]
+    fn runtime_syntax_selection_requires_macro_policy_and_complete_names() {
+        let failure = Config::environment(None, Some(OsString::from("User.Syntax"))).unwrap_err();
+        assert_eq!(failure.class, "input");
+        assert_eq!(
+            failure.detail,
+            "FLN_SYNTAX_MODULES requires FLN_MACRO_PARTITION"
+        );
+        for invalid in ["", "User.Syntax,", ",User.Syntax", "User Syntax"] {
+            assert!(
+                Config::environment(
+                    Some(OsString::from("partition.tsv")),
+                    Some(OsString::from(invalid)),
+                )
+                .is_err()
+            );
+        }
+        let selected = Config::environment(
+            Some(OsString::from("partition.tsv")),
+            Some(OsString::from("User.Syntax, Other.Notation")),
+        )
+        .unwrap_or_else(|error| panic!("{}", error.detail))
+        .unwrap();
+        assert_eq!(
+            selected.syntax_modules,
+            vec![
+                Name::from_components(["User", "Syntax"]),
+                Name::from_components(["Other", "Notation"]),
+            ]
+        );
+        assert!(matches!(Config::environment(None, None), Ok(None)));
+    }
 
     #[test]
     fn user_helpers_need_structural_ownership_in_the_selected_module() {

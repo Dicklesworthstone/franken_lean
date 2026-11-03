@@ -1,10 +1,13 @@
-//! Imported node macros on source declarations, anonymous examples, `#check` and raw `#eval`.
+//! Imported node macros on source declarations, custom commands, anonymous examples,
+//! `#check` and raw `#eval`.
 //!
-//! Standalone embedding registries use syntax the native parser already
-//! understands. Complete source-import receipts also attach checked, data-only
-//! parser descriptions, installed by the file and module drivers. The prepared
-//! registry owns the expansion pass: no template expansion runs before it or
-//! replays its results. The resulting native Syntax enters the same elaborator
+//! Standalone calls use the native parser. Module sessions also consume the
+//! receipt-bound parser product installed by the source driver. That product
+//! is closed parser-description data, and a standalone embedding registry
+//! supplies no imported grammar. Custom commands must expand to one named
+//! declaration. The prepared registry owns the
+//! expansion pass: no template expansion runs before it or replays its results.
+//! The resulting native Syntax enters the same elaborator
 //! and dual-check admission as `Engine::check_source_command`; raw evaluations
 //! then use the ordinary compiler, codec and Golem execution path.
 //!
@@ -55,6 +58,7 @@ pub struct SourceMacroInvocation<'a> {
 #[derive(Debug)]
 pub enum SourceMacroError {
     Binding(Box<MacroRegistrationError>),
+    ParserBinding(Box<crate::imported_parsers::ParserRegistrationError>),
     Execution(Box<MacroExecutionError>),
     Frontend(Box<EngineExecutionError>),
     Diagnostic {
@@ -82,6 +86,7 @@ impl std::fmt::Display for SourceMacroError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Binding(error) => write!(f, "source macro binding: {error}"),
+            Self::ParserBinding(error) => write!(f, "source parser binding: {error}"),
             Self::Execution(error) => write!(f, "source macro execution: {error}"),
             Self::Frontend(error) => write!(f, "{error}"),
             Self::Diagnostic {
@@ -141,6 +146,7 @@ impl SourceMacroError {
         match self {
             Self::Frontend(error) => crate::source_check::classify(error),
             Self::Binding(error) if error.is_resource() => ("resource", false, 3),
+            Self::ParserBinding(error) if error.is_resource() => ("resource", false, 3),
             Self::Execution(error)
                 if matches!(error.as_ref(),
                 MacroExecutionError::Compile(error) if error.is_resource()) =>
@@ -228,6 +234,7 @@ struct Progress {
 /// and file boundaries and are returned only with a complete checked batch.
 pub(crate) struct FileSession<'a> {
     registry: &'a RegisteredMacros,
+    parsers: fln_parse::extensions::ImportedSyntaxModule,
     context: &'a MacroContext,
     state: MacroState,
     lookup: Option<&'a dyn MacroLookup>,
@@ -292,6 +299,7 @@ impl<'a> FileSession<'a> {
     pub(crate) fn new(invocation: SourceMacroInvocation<'a>) -> Self {
         Self {
             registry: invocation.registry,
+            parsers: fln_parse::extensions::ImportedSyntaxModule::default(),
             context: invocation.context,
             state: invocation.state,
             lookup: invocation.lookup,
@@ -321,6 +329,14 @@ impl<'a> FileSession<'a> {
 
     pub(crate) fn registry(&self) -> RegisteredMacros {
         self.registry.clone()
+    }
+
+    pub(crate) fn set_parsers(&mut self, parsers: fln_parse::extensions::ImportedSyntaxModule) {
+        self.parsers = parsers;
+    }
+
+    pub(crate) fn parsers(&self) -> &fln_parse::extensions::ImportedSyntaxModule {
+        &self.parsers
     }
 
     pub(crate) fn cancelled(&self) -> Option<Inconclusive> {
@@ -451,6 +467,11 @@ impl<'a> FileSession<'a> {
                 ));
             }
         };
+        if self.is_imported_command(registry, &parsed) {
+            return self
+                .expand_imported_command(engine, registry, parsed, scope)
+                .map_complete(|result| result.map(Box::new).map(ProgramCommandSyntax::Single));
+        }
         let expected = parsed.kind();
         let declaration = matches!(
             expected,
@@ -530,7 +551,27 @@ impl<'a> FileSession<'a> {
         }
         let parsed = match crate::source_records::parse_scoped_command_without_expansion(source) {
             Ok(parsed) => parsed,
-            Err(error) => return frontend(error),
+            Err(error) => {
+                // Custom command roots are not declarations until their
+                // imported macro has produced one. Read the entered grammar's
+                // original syntax, without templates or reparsed expansion.
+                let Ok(parsed) = fln_parse::parse_source_command(source) else {
+                    return frontend(error);
+                };
+                if !self.is_imported_command(registry, &parsed) {
+                    return frontend(error);
+                }
+                return self
+                    .expand_imported_command(engine, registry, parsed, scope)
+                    .map_complete(|result| {
+                        result.and_then(|parsed| {
+                            parsed
+                                .into_definition()
+                                .map(ScopedCommandSyntax::Definition)
+                                .ok_or(SourceMacroError::DeclarationRequired)
+                        })
+                    });
+            }
         };
         match parsed {
             ScopedCommandSyntax::Mutual(mut members) => {
@@ -593,6 +634,62 @@ impl<'a> FileSession<'a> {
                     })
                 }),
         }
+    }
+
+    /// A parsed custom command needs both its receipt-bound command parser
+    /// and a currently active macro candidate. Token/kind rows alone and
+    /// registrations in other categories do not authorize this path. The
+    /// entered grammar has already applied lexical parser-scope activation.
+    fn is_imported_command(
+        &self,
+        registry: &RegisteredMacros,
+        parsed: &ParsedSourceCommand,
+    ) -> bool {
+        use fln_parse::extensions::{Descr, ImportedSyntaxEntry};
+        if parsed.kind() != SourceCommandKind::Definition {
+            return false;
+        }
+        let Some(kind) = parsed.syntax().kind() else {
+            return false;
+        };
+        if *kind == Name::from_components(["Lean", "Parser", "Command", "declaration"])
+            || registry.declarations(kind).next().is_none()
+        {
+            return false;
+        }
+        let command = Name::from_components(["command"]);
+        self.parsers.entries.iter().any(|entry| {
+            matches!(entry, ImportedSyntaxEntry::Parser(parser)
+                if parser.category.as_ref() == Some(&command)
+                    && parser.leading
+                    && matches!(&parser.descr, Descr::Node { kind: root, .. } if root == kind))
+        })
+    }
+
+    /// The caller has checked both registrations and the source preflight.
+    /// Expand the complete original tree once, then require one ordinary named
+    /// declaration. The usual elaborator and council still own its admission.
+    fn expand_imported_command(
+        &mut self,
+        engine: &Engine,
+        registry: &RegisteredMacros,
+        parsed: ParsedSourceCommand,
+        scope: &fln_elab::source::scope::SourceScope,
+    ) -> Outcome<Result<ParsedSourceCommand, SourceMacroError>> {
+        self.expand_syntax(
+            engine,
+            registry,
+            parsed.source_view().normalized(),
+            parsed.syntax(),
+            scope,
+        )
+        .map_complete(|result| {
+            result.and_then(|syntax| {
+                parsed
+                    .with_expanded_command_declaration(syntax)
+                    .ok_or(SourceMacroError::DeclarationRequired)
+            })
+        })
     }
 
     /// Expand the parser's existing binder/attribute tree, using its original
@@ -792,9 +889,8 @@ impl Engine {
     /// is published. Variable binders, executable attributes and mutual members
     /// use the same expansion pass. Native scope controls retain their ordinary
     /// semantics without command-root macro dispatch. Source-declared templates,
-    /// and module-system visibility remain separate capabilities. A registry
-    /// prepared by a source-import receipt installs its checked parser data;
-    /// a standalone embedding registry supplies no imported grammar.
+    /// artifact parser installation and module-system visibility remain separate
+    /// capabilities.
     pub fn check_source_files_with_imported_macros(
         &self,
         sources: &[&[u8]],

@@ -32,6 +32,7 @@
 pub mod capsule;
 pub mod imported_ir;
 pub mod imported_macros;
+pub mod imported_parsers;
 mod olean_imports;
 pub mod pretty;
 pub mod source_check;
@@ -2950,7 +2951,7 @@ impl Engine {
             private_module.is_some(),
         )?;
         if let Some(session) = macros.as_deref() {
-            session.registry().install_source_parsers(&mut grammar)?;
+            grammar.import_artifact(session.parsers())?;
         }
         if macros.is_some() && grammar.has_templates() {
             return Err(

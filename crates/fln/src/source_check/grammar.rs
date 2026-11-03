@@ -240,28 +240,25 @@ impl SourceGrammar {
             .map_err(|feature| EngineExecutionError::NotImplemented { feature })
     }
 
+    /// Install the receipt's exact parser projection before parsing this file.
+    /// Artifact entries carry no native templates and are not republished in
+    /// the source grammar journal. Their module/phase visibility is supplied
+    /// by the module driver's checked import world, including module-system
+    /// sources; it is independent of native source-template export semantics.
     pub(crate) fn import_artifact(
         &mut self,
         module: &fln_parse::extensions::ImportedSyntaxModule,
     ) -> Result<(), EngineExecutionError> {
-        if self.module_system && !module.is_empty() {
-            return Err(Self::module_phase_refusal());
-        }
-        self.file
-            .import_artifact(module)
-            .map_err(|feature| match feature {
-                "artifact parser description work past the budget"
-                | "artifact parser description depth past the budget"
-                | "artifact syntax token past the budget" => {
-                    crate::imported_macros::source::SourceMacroError::Binding(Box::new(
-                        crate::imported_macros::registrations::MacroRegistrationError::Limit(
-                            feature,
-                        ),
-                    ))
-                    .into_execution_error()
+        self.file.import_artifact(module).map_err(|feature| {
+            if feature.ends_with("past the budget") {
+                EngineExecutionError::ImportedMacro {
+                    disposition: ("resource", false, 3),
+                    message: format!("imported parser installation: {feature}"),
                 }
-                _ => EngineExecutionError::NotImplemented { feature },
-            })
+            } else {
+                EngineExecutionError::NotImplemented { feature }
+            }
+        })
     }
 
     pub(crate) fn export_native(

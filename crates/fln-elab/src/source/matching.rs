@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 mod conditional_order;
 mod mutual;
 mod nomatch;
-pub(super) use conditional_order::ConditionalBuild;
+pub(super) use conditional_order::{ConditionalBuild, ConditionalStep};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MatchError {

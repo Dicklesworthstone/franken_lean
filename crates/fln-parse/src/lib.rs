@@ -746,7 +746,7 @@ pub type DefinitionParseError = NatDefinitionParseError;
 /// Which supported source command produced a bounded command tree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SourceCommandKind {
-    /// A named source declaration (definition or theorem); never a query.
+    /// A source declaration or an entered command production; never a query.
     Definition,
     /// An anonymous declaration checked in a discarded environment successor.
     Example,
@@ -813,6 +813,21 @@ impl ParsedSourceCommand {
             && is_named_declaration_syntax(&self.syntax)
             && is_named_declaration_syntax(&syntax)
         {
+            self.syntax = syntax;
+            return Some(self);
+        }
+        None
+    }
+
+    /// Transfer an externally expanded command to the named-declaration path.
+    /// The caller must establish the original command's parser and macro
+    /// registrations before expanding it. Unlike [`Self::with_expanded_declaration`],
+    /// its original root may be a custom command kind, but its result must be
+    /// one canonical named declaration. Queries and anonymous examples cannot
+    /// cross this boundary. The original source view and epilogue survive;
+    /// elaboration and admission still validate the complete replacement tree.
+    pub fn with_expanded_command_declaration(mut self, syntax: Syntax) -> Option<Self> {
+        if self.kind == SourceCommandKind::Definition && is_named_declaration_syntax(&syntax) {
             self.syntax = syntax;
             return Some(self);
         }
@@ -956,12 +971,20 @@ fn null_node(args: Vec<Syntax>) -> Syntax {
 /// ([`extensions::with_grammar`]) the table is that grammar's: the file's imports and
 /// activated scopes.
 fn lex_source(view: &SourceView) -> Result<fln_syntax::run::LexRun, NatDefinitionParseError> {
+    extensions::with_token_table(|table| lex_source_with_table(view, table))
+}
+
+fn lex_source_with_table(
+    view: &SourceView,
+    table: &fln_syntax::token::TokenTable,
+) -> Result<fln_syntax::run::LexRun, NatDefinitionParseError> {
     let text = view.normalized();
-    extensions::with_token_table(|table| extensions::interpolate(text, table, lex_run(text, table)))
-        .map_err(|at| NatDefinitionParseError::OutsideSeedGrammar {
+    extensions::interpolate(text, table, lex_run(text, table)).map_err(|at| {
+        NatDefinitionParseError::OutsideSeedGrammar {
             at: view.to_original(at),
             expected: NatDefinitionExpectation::ScalarValue,
-        })
+        }
+    })
 }
 
 /// Whether a bracketed binder at `index` may start a dependent arrow
@@ -4642,7 +4665,8 @@ fn builtin_command(
 }
 
 /// A whole command read by a `command` declaration of the entered grammar (`extensions`), as the
-/// pin's tree; `None` when none reads it. The checker refuses it. Out of line, as
+/// pin's tree; `None` when none reads it. Admission requires an expanded named
+/// declaration. Out of line, as
 /// [`source_declaration`] is.
 #[inline(never)]
 fn extension_command(
@@ -6810,6 +6834,103 @@ mod nat_definition_tests {
         );
         assert_eq!(parsed.reconstruct_original(), source);
         assert_eq!(parsed.source_view().removed_count(), 1);
+    }
+
+    #[test]
+    fn externally_expanded_commands_retain_source_and_require_named_declarations() {
+        use extensions::{
+            Descr, FileGrammar, ImportedSyntaxEntry, ImportedSyntaxModule, SyntaxDecl,
+        };
+        let kind = Name::from_components(["Library", "declareCommand"]);
+        let mut grammar = FileGrammar::new(false, &[], None)
+            .unwrap()
+            .own_syntax_only();
+        grammar
+            .import_artifact(&ImportedSyntaxModule {
+                entries: vec![
+                    ImportedSyntaxEntry::Token {
+                        scope: None,
+                        token: "declare!".into(),
+                    },
+                    ImportedSyntaxEntry::Kind {
+                        scope: None,
+                        kind: kind.clone(),
+                    },
+                    ImportedSyntaxEntry::Parser(std::sync::Arc::new(SyntaxDecl {
+                        module: Name::from_components(["Library"]),
+                        decl: Name::from_components(["Library", "declareParser"]),
+                        category: Some(Name::from_components(["command"])),
+                        leading: true,
+                        priority: 1000,
+                        scope: None,
+                        descr: Descr::Node {
+                            kind: kind.clone(),
+                            prec: 1022,
+                            body: Box::new(Descr::Symbol("declare!".into())),
+                        },
+                    })),
+                ],
+            })
+            .unwrap();
+        let source = b"-- original command\r\ndeclare!\r\n";
+        let parsed =
+            extensions::with_grammar(&grammar.grammar(), || parse_source_command(source)).unwrap();
+        assert_eq!(parsed.syntax().kind(), Some(&kind));
+        let declaration = parse_source_command(b"def chosen : Nat := 42")
+            .unwrap()
+            .syntax()
+            .clone();
+        assert!(
+            parsed
+                .clone()
+                .with_expanded_declaration(declaration.clone())
+                .is_none()
+        );
+        let expanded = parsed
+            .clone()
+            .with_expanded_command_declaration(declaration.clone())
+            .unwrap();
+        assert_eq!(expanded.kind(), SourceCommandKind::Definition);
+        assert_eq!(expanded.syntax(), &declaration);
+        assert_eq!(expanded.source_view(), parsed.source_view());
+        assert_eq!(expanded.epilogue(), parsed.epilogue());
+        assert_eq!(expanded.reconstruct_original(), source);
+        assert_eq!(expanded.source_view().removed_count(), 2);
+        assert_eq!(
+            expanded.into_definition().unwrap().reconstruct_original(),
+            source
+        );
+
+        for source in [
+            b"#check Nat".as_slice(),
+            b"#eval 42",
+            b"example : Nat := 42",
+        ] {
+            let other = parse_source_command(source).unwrap();
+            assert!(
+                other
+                    .clone()
+                    .with_expanded_command_declaration(declaration.clone())
+                    .is_none()
+            );
+            assert!(
+                parsed
+                    .clone()
+                    .with_expanded_command_declaration(other.syntax().clone())
+                    .is_none()
+            );
+        }
+        for syntax in [
+            Syntax::node(parser_kind(&["Command", "namespace"]), vec![]),
+            null_node(vec![declaration.clone(), declaration]),
+        ] {
+            assert!(
+                parsed
+                    .clone()
+                    .with_expanded_command_declaration(syntax)
+                    .is_none()
+            );
+        }
     }
 
     #[test]

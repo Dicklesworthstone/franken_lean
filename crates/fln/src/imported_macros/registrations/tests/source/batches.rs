@@ -41,6 +41,35 @@ pub(super) fn artifact_import_fixture() -> (SourceOleanImport, Vec<IrModule>) {
 pub(super) fn artifact_import_fixture_with_extra_rows(
     extra_rows: &[(&str, &str, Option<&str>)],
 ) -> (SourceOleanImport, Vec<IrModule>) {
+    artifact_import_fixture_with_parser_metadata(extra_rows, &[], &[], &[])
+}
+
+/// Additional syntax data crosses the same public artifact-admission boundary
+/// as the original macro fixtures. Existing callers retain identical inputs.
+pub(super) fn artifact_import_fixture_with_parser_metadata(
+    extra_rows: &[(&str, &str, Option<&str>)],
+    extra_constants: &[ConstantInfo],
+    parser_rows: &[Obj],
+    extra_ir: &[IrDecl],
+) -> (SourceOleanImport, Vec<IrModule>) {
+    artifact_import_fixture_with_parser_dependency(
+        extra_rows,
+        extra_constants,
+        parser_rows,
+        extra_ir,
+        None,
+    )
+}
+
+/// A parser-only ancestor retains its own complete journal and declarations.
+/// Selecting a consumer's syntax must not silently select this journal too.
+pub(super) fn artifact_import_fixture_with_parser_dependency(
+    extra_rows: &[(&str, &str, Option<&str>)],
+    extra_constants: &[ConstantInfo],
+    parser_rows: &[Obj],
+    extra_ir: &[IrDecl],
+    dependency: Option<(&str, &[ConstantInfo], &[Obj])>,
+) -> (SourceOleanImport, Vec<IrModule>) {
     let seed = Engine::with_source_seed(admission())
         .unwrap()
         .into_complete()
@@ -86,6 +115,7 @@ pub(super) fn artifact_import_fixture_with_extra_rows(
             body.clone(),
         )
     }));
+    constants.extend_from_slice(extra_constants);
     let rows = [
         ("term_+_", "SourceLibrary.right", None),
         ("term_+_", "SourceLibrary.skip", None),
@@ -114,54 +144,107 @@ pub(super) fn artifact_import_fixture_with_extra_rows(
     })
     .collect::<Vec<_>>();
     let extension = name(macros::MACRO_EXTENSION);
+    let parser_extension = fln_olean::source_extensions::parsers::extension_name();
+    let mut extensions = vec![ModuleExtensionInput {
+        name: &extension,
+        entries: &rows,
+    }];
+    if !parser_rows.is_empty() {
+        extensions.push(ModuleExtensionInput {
+            name: &parser_extension,
+            entries: parser_rows,
+        });
+    }
+    let header = || OleanWriteHeader {
+        version: format::OLEAN_ACCEPTED_VERSIONS[0],
+        flags: 1,
+        lean_version: format::PIN_TAG.strip_prefix('v').unwrap(),
+        githash: format::PIN_COMMIT,
+        base_addr: (format::REGION_ALIGN * 2) as u64,
+    };
+    let dependency_name = dependency.map(|(label, _, _)| name(label));
+    let dependency_bytes = dependency.map(|(_, constants, rows)| {
+        encode_module_with_extensions(
+            ModuleWriteInput {
+                is_module: false,
+                imports: &[],
+                constants,
+                extra_const_names: &[],
+            },
+            &[ModuleExtensionInput {
+                name: &parser_extension,
+                entries: rows,
+            }],
+            header(),
+            WriteBudget::default(),
+        )
+        .unwrap()
+        .bytes
+    });
+    let imports: Vec<_> = dependency_name
+        .iter()
+        .map(|module| fln_olean::region::ModuleImport {
+            module: module.clone(),
+            import_all: false,
+            is_exported: false,
+            is_meta: false,
+        })
+        .collect();
     let bytes = encode_module_with_extensions(
         ModuleWriteInput {
             is_module: false,
-            imports: &[],
+            imports: &imports,
             constants: &constants,
             extra_const_names: &[],
         },
-        &[ModuleExtensionInput {
-            name: &extension,
-            entries: &rows,
-        }],
-        OleanWriteHeader {
-            version: format::OLEAN_ACCEPTED_VERSIONS[0],
-            flags: 1,
-            lean_version: format::PIN_TAG.strip_prefix('v').unwrap(),
-            githash: format::PIN_COMMIT,
-            base_addr: (format::REGION_ALIGN * 2) as u64,
-        },
+        &extensions,
+        header(),
         WriteBudget::default(),
     )
     .unwrap()
     .bytes;
     let module = name("SourceLibrary");
+    let mut inputs = Vec::new();
+    if let (Some(name), Some(bytes)) = (&dependency_name, &dependency_bytes) {
+        inputs.push(OleanModuleInput {
+            name,
+            artifact: bytes,
+            server_artifact: None,
+            private_artifact: None,
+        });
+    }
+    inputs.push(OleanModuleInput {
+        name: &module,
+        artifact: &bytes,
+        server_artifact: None,
+        private_artifact: None,
+    });
+    let total_bytes = bytes.len() + dependency_bytes.as_ref().map_or(0, Vec::len);
     let imported = seed
         .import_olean_modules_for_source(
-            &[OleanModuleInput {
-                name: &module,
-                artifact: &bytes,
-                server_artifact: None,
-                private_artifact: None,
-            }],
+            &inputs,
             std::slice::from_ref(&module),
             &KVMap::new(),
-            SourceOleanImportLimits::new(OleanCheckLimits::new(bytes.len(), admission().kernel)),
+            SourceOleanImportLimits::new(OleanCheckLimits::new(total_bytes, admission().kernel)),
         )
         .unwrap()
         .into_complete()
         .unwrap();
     for owner in owners {
         assert!(
-            imported.checked.modules[0]
+            imported
+                .checked
+                .modules
+                .iter()
+                .find(|checked| checked.name == module)
+                .unwrap()
                 .declarations
                 .iter()
                 .any(|row| row.name == name(owner))
         );
         assert!(!seed.environment().contains(&name(owner)));
     }
-    let code = code(vec![
+    let mut declarations = vec![
         selecting_function("SourceLibrary.right", 2),
         function("SourceLibrary.skip", Behavior::Unsupported),
         selecting_function("SourceLibrary.left", 0),
@@ -169,8 +252,9 @@ pub(super) fn artifact_import_fixture_with_extra_rows(
         super::super::lookup::has_decl_selector("SourceLibrary.hasDecl"),
         preresolved_function(),
         function("SourceLibrary.attributeProbe", Behavior::Unsupported),
-    ]);
-    (imported, code)
+    ];
+    declarations.extend_from_slice(extra_ir);
+    (imported, code(declarations))
 }
 
 /// Preserve the left identifier's spelling and exact backing source, but bind
