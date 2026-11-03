@@ -8,7 +8,7 @@
 //! the arithmetic, relation and connective notations of `Init` (with their precedences and
 //! associativity), numerals (`OfNat.ofNat _ n _`), non-dependent arrows, dependent
 //! binders grouped as the pin groups them (`{α β : Type}`, `(n m : Nat)`, `[Inhabited α]`),
-//! `∀` for propositions, `fun`, `×`, and the signature form of `#check ident`
+//! `∀` for propositions, `fun`, `×`, ordinary and proof-binding conditionals, and the signature form of `#check ident`
 //! (`Nat.succ (n : Nat) : Nat`, `delabConstWithSignature`).
 //!
 //! Lines break where the pin's do: each construct builds the [`format::Format`] the pin's
@@ -1716,13 +1716,12 @@ impl<'a> Printer<'a> {
 
     /// Whether a builtin delaborator this printer does not reproduce prints `function` applied
     /// to `count` arguments under the options in force (vendored
-    /// `PrettyPrinter/Delaborator/Builtins.lean:1262-1513`): `dite`'s `if h : c then …`,
-    /// `cond`'s `bif`, `⟨a, b⟩` of `PProd.mk`/`MProd.mk`, the ranges, `do`, the lazy binary
+    /// `PrettyPrinter/Delaborator/Builtins.lean:1280-1513`): `cond`'s `bif`,
+    /// `⟨a, b⟩` of `PProd.mk`/`MProd.mk`, the ranges, `do`, the lazy binary
     /// operators and name literals. Where one is switched off by `pp.notation` or `pp.explicit`,
     /// the application prints as one.
     fn builtin_unreproduced(&self, function: &str, count: usize) -> bool {
         match function {
-            "dite" => self.builtin_notation() && count >= 5,
             "cond" => self.builtin_notation() && count >= 4,
             "PProd.mk" | "MProd.mk" => self.builtin_notation() && count == 4,
             "Bind.bind" => self.builtin_notation() && count == 6,
@@ -1744,6 +1743,123 @@ impl<'a> Printer<'a> {
                     })
             }
         }
+    }
+
+    /// `unexpandIte` and `delabDIte` share the conditional syntax's explicit
+    /// groups (`Init/Notation.lean`, `termIfThenElse`/`termDepIfThenElse`). A
+    /// dependent conditional opens each proof lambda separately under the name
+    /// chosen from the first branch, as the pinned delaborator does.
+    fn conditional(&mut self, args: &[Expr], dependent: bool, outer: u32) -> Doc {
+        let [result_type, condition, _, yes, no, rest @ ..] = args else {
+            return Err(Unsupported("an incomplete conditional application"));
+        };
+        let condition = self.with_trailing(false, |printer| printer.doc(condition, 0))?;
+        let (binder, yes, no) = if dependent {
+            let ExprNode::Lam {
+                binder_name,
+                binder_type: yes_type,
+                body: yes_body,
+                ..
+            } = strip_mdata(yes).node()
+            else {
+                return Err(Unsupported(
+                    "a dependent conditional with a non-lambda branch",
+                ));
+            };
+            let ExprNode::Lam {
+                binder_type: no_type,
+                body: no_body,
+                ..
+            } = strip_mdata(no).node()
+            else {
+                return Err(Unsupported(
+                    "a dependent conditional with a non-lambda branch",
+                ));
+            };
+            if internal_name(binder_name) {
+                return Err(INTERNAL_BINDER);
+            }
+            let shown = self.bound_name(binder_name, yes_body);
+            let depth = self.names.len();
+            // `delabDIte` selects the first branch's unused name and reuses it
+            // in the second. Do not emit text that would capture an outer local
+            // used only by that second branch when safe shadowing kept its name.
+            if self.names.iter().enumerate().any(|(position, name)| {
+                name == &shown
+                    && no_body.has_loose_bvar(u32::try_from(depth - position).unwrap_or(u32::MAX))
+            }) {
+                return Err(Unsupported(
+                    "a conditional proof name shadowing its else branch",
+                ));
+            }
+            self.bind(shown.clone(), yes_type);
+            let yes = self.with_trailing(false, |printer| printer.doc(yes_body, 0));
+            self.unbind_to(depth);
+            let yes = yes?;
+            self.bind(shown.clone(), no_type);
+            let no = self.with_trailing(false, |printer| printer.doc(no_body, 0));
+            self.unbind_to(depth);
+            (Some(shown), yes, no?)
+        } else {
+            (
+                None,
+                self.with_trailing(false, |printer| printer.doc(yes, 0))?,
+                self.with_trailing(false, |printer| printer.doc(no, 0))?,
+            )
+        };
+        let mut header = Format::text("if").then(Format::Line);
+        if let Some(binder) = binder {
+            header = header
+                .then(Format::text(format!("{binder} :")))
+                .then(Format::Line);
+        }
+        let header = header.then(condition).then(Format::text(" then"));
+        let doc = node(
+            header
+                .nest(2)
+                .then(Format::Line)
+                .then(yes)
+                .fill()
+                .then(Format::Line.nest(-2))
+                .then(Format::text("else").then(Format::Line).then(no).fill())
+                .group(),
+        );
+        if rest.is_empty() {
+            // Like a `fun`, the else branch extends to the right: an operator
+            // after the conditional must sit outside parentheses around it.
+            return Ok(self.applied(doc, true, outer));
+        }
+        let mut type_ = result_type.clone();
+        let mut doc = paren_doc(doc, MAX_PREC - 1, MAX_PREC);
+        let mut open = false;
+        for (index, arg) in rest.iter().enumerate() {
+            self.tick()?;
+            let ExprNode::ForallE {
+                binder_type,
+                body,
+                binder_info: BinderInfo::Default,
+                ..
+            } = strip_mdata(&type_).node()
+            else {
+                return Err(Unsupported(
+                    "an applied conditional with an unavailable argument type",
+                ));
+            };
+            if annotation(binder_type, "optParam").is_some()
+                || annotation(binder_type, "autoParam").is_some()
+            {
+                return Err(Unsupported(
+                    "an applied conditional with a defaulted argument",
+                ));
+            }
+            type_ = body
+                .subst_loose(0, std::slice::from_ref(arg))
+                .map_err(|_| Unsupported("a conditional result with invalid bound variables"))?;
+            let (argument, bare) = self.argument(arg, index + 1 == rest.len())?;
+            doc = doc.then(Format::Line).then(argument);
+            open = bare;
+        }
+        Ok(self.applied(node(doc), open, outer))
     }
 
     /// The numeric literals of `delabOfNat`, `delabNeg` and `delabHDiv` (vendored
@@ -1843,6 +1959,9 @@ impl<'a> Printer<'a> {
                     "an application a builtin notation delaborator prints",
                 ));
             }
+            if text == "dite" && args.len() >= 5 && self.builtin_notation() {
+                return self.conditional(&args, true, outer);
+            }
             if self.numerals()
                 && let Some(printed) = self.numeric_literal(&text, &args, outer)
             {
@@ -1851,6 +1970,9 @@ impl<'a> Printer<'a> {
             // The source's own notations: their unexpanders are the newest.
             if unexpanding && let Some(printed) = self.notation(name, &args, outer) {
                 return printed;
+            }
+            if text == "ite" && args.len() >= 5 && unexpanding && self.registered("ite") {
+                return self.conditional(&args, false, outer);
             }
             // `notation:max "¬" p:40 => Not p`; `notation:max "!" b:40 => not b`
             // (`Init/Notation.lean`, `not` being `Bool.not`).
@@ -2138,8 +2260,8 @@ impl<'a> Printer<'a> {
                 let ctor = ctor.clone();
                 return self.structure_instance(&ctor, levels, &args);
             }
-            // Any other constant an imported `@[app_unexpander]` prints (`ite` as `if … then …
-            // else …`, `GetElem.getElem` as `xs[i]`, …) runs code this door does not reproduce:
+            // Any other constant an imported `@[app_unexpander]` prints
+            // (`GetElem.getElem` as `xs[i]`, …) runs code this door does not reproduce:
             // its application is refused rather than printed as an application. Where no
             // unexpander runs, the application prints as one.
             if unexpanding && self.imported_tags && self.unexpander_in_force(name) {
@@ -3358,5 +3480,220 @@ mod tests {
             "f ∘ g ∘ g"
         );
         assert_eq!(shown(&constant(&["Unit", "unit"])), "()");
+    }
+
+    /// The conditional syntax and binding rules are read from the pinned
+    /// `Init.Notation`, `Init.NotationExtra` and `delabDIte`; these are native
+    /// regression checks, not a claim of a live Reference comparison.
+    #[test]
+    fn conditional_notation_preserves_precedence_nesting_and_overapplication() {
+        let env = Environment::new();
+        let constant = |s: &str| Expr::const_(Name::from_components(s.split('.')), vec![]);
+        let nat = || constant("Nat");
+        let literal = |n| Expr::lit(Literal::Nat(NatLit::from_u64(n)));
+        let apply = |head: Expr, args: Vec<Expr>| args.into_iter().fold(head, Expr::app);
+        let conditional = |type_, yes, no| {
+            apply(
+                Expr::const_(name(&["ite"]), vec![Level::one()]),
+                vec![type_, constant("True"), constant("decision"), yes, no],
+            )
+        };
+        let selected = conditional(nat(), literal(1), literal(2));
+        let add = |a, b| {
+            apply(
+                constant("HAdd.hAdd"),
+                vec![nat(), nat(), nat(), constant("addition"), a, b],
+            )
+        };
+        let mut printer = Printer::new(&env);
+        for (expr, expected) in [
+            (selected.clone(), "if True then 1 else 2"),
+            (
+                Expr::app(constant("Nat.succ"), selected.clone()),
+                "Nat.succ (if True then 1 else 2)",
+            ),
+            (
+                add(selected.clone(), literal(3)),
+                "(if True then 1 else 2) + 3",
+            ),
+            (
+                add(literal(3), selected.clone()),
+                "3 + if True then 1 else 2",
+            ),
+            (
+                conditional(nat(), literal(0), selected.clone()),
+                "if True then 0 else if True then 1 else 2",
+            ),
+            (
+                conditional(nat(), selected.clone(), literal(0)),
+                "if True then if True then 1 else 2 else 0",
+            ),
+        ] {
+            assert_eq!(printer.expr(&expr, 0).unwrap(), expected);
+        }
+        let function = Expr::forall_e(Name::anonymous(), nat(), nat(), BinderInfo::Default);
+        let applied = Expr::app(
+            conditional(function, constant("f"), constant("g")),
+            literal(3),
+        );
+        assert_eq!(
+            printer.expr(&applied, 0).unwrap(),
+            "(if True then f else g) 3"
+        );
+
+        // Neither branch can absorb syntax outside the conditional when a
+        // branch is a lambda or another term extending to the right.
+        let lambda = Expr::lam(
+            name(&["x"]),
+            nat(),
+            Expr::bvar(0).unwrap(),
+            BinderInfo::Default,
+        );
+        let arrow = Expr::forall_e(Name::anonymous(), nat(), nat(), BinderInfo::Default);
+        let higher = conditional(arrow, lambda.clone(), lambda);
+        assert_eq!(
+            printer.expr(&Expr::app(higher, literal(3)), 0).unwrap(),
+            "(if True then fun x => x else fun x => x) 3"
+        );
+        printer.pp.notation = false;
+        assert!(!printer.expr(&selected, 0).unwrap().starts_with("if "));
+        printer.pp.notation = true;
+        printer.pp.universes = true;
+        assert!(!printer.expr(&selected, 0).unwrap().starts_with("if "));
+        printer.pp.universes = false;
+        printer.pp.explicit = true;
+        assert!(!printer.expr(&selected, 0).unwrap().starts_with("if "));
+    }
+
+    #[test]
+    fn conditional_proof_binders_share_a_name_without_capturing_outer_locals() {
+        let env = Environment::new();
+        let constant = |s: &str| Expr::const_(Name::from_components(s.split('.')), vec![]);
+        let var = |index| Expr::bvar(index).unwrap();
+        let apply = |head: Expr, args: Vec<Expr>| args.into_iter().fold(head, Expr::app);
+        let branch = |binder, domain, body| Expr::lam(binder, domain, body, BinderInfo::Default);
+        let dependent = |yes, no| {
+            apply(
+                Expr::const_(name(&["dite"]), vec![Level::one()]),
+                vec![
+                    constant("Nat"),
+                    constant("True"),
+                    constant("decision"),
+                    yes,
+                    no,
+                ],
+            )
+        };
+        let yes = branch(
+            name(&["h"]),
+            constant("True"),
+            Expr::app(constant("yes"), var(0)),
+        );
+        let no = branch(
+            name(&["other"]),
+            Expr::app(constant("Not"), constant("True")),
+            Expr::app(constant("no"), var(0)),
+        );
+        let mut printer = Printer::new(&env);
+        assert_eq!(
+            printer.expr(&dependent(yes, no), 0).unwrap(),
+            "if h : True then yes h else no h"
+        );
+        let yes = branch(
+            name(&["h"]),
+            constant("True"),
+            apply(constant("yes"), vec![var(1), var(0)]),
+        );
+        let no = branch(
+            name(&["elseProof"]),
+            Expr::app(constant("Not"), constant("True")),
+            apply(constant("no"), vec![var(1), var(0)]),
+        );
+        let outer = branch(name(&["h"]), constant("Nat"), dependent(yes, no));
+        assert_eq!(
+            printer.expr(&outer, 0).unwrap(),
+            "fun h => if h_1 : True then yes h h_1 else no h h_1"
+        );
+        let no = branch(
+            name(&["elseProof"]),
+            Expr::app(constant("Not"), constant("True")),
+            Expr::app(constant("no"), var(1)),
+        );
+        let yes = branch(name(&["h"]), constant("True"), constant("zero"));
+        let collision = branch(name(&["h"]), constant("Nat"), dependent(yes, no));
+        assert_eq!(
+            printer.expr(&collision, 0),
+            Err(Unsupported(
+                "a conditional proof name shadowing its else branch"
+            ))
+        );
+        assert!(
+            printer.names.is_empty(),
+            "failed branches restore their scope"
+        );
+        assert!(printer.types.is_empty());
+
+        let anonymous = dependent(
+            branch(Name::anonymous(), constant("True"), constant("zero")),
+            branch(
+                Name::anonymous(),
+                Expr::app(constant("Not"), constant("True")),
+                constant("one"),
+            ),
+        );
+        assert_eq!(
+            printer.expr(&anonymous, 0).unwrap(),
+            "if a : True then zero else one"
+        );
+        printer.pp.universes = true;
+        assert_eq!(
+            printer.expr(&anonymous, 0).unwrap(),
+            "if a : True then zero else one",
+            "the builtin dite delaborator does not depend on pp.universes"
+        );
+    }
+
+    #[test]
+    fn canonical_source_conditionals_print_and_reelaborate_through_both_checkers() {
+        let limits = EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024));
+        let base = Engine::with_source_seed(limits)
+            .unwrap()
+            .into_complete()
+            .unwrap();
+        let source = b"def choose (n : Nat) : Nat := if n = 0 then 1 else 2\n\
+                       def dependent (p : Prop) [decision : Decidable p]\n\
+                         (yes : p -> Nat) (no : Not p -> Nat) : Nat :=\n\
+                         if h : p then yes h else no h";
+        let checked = base
+            .check_source_files(&[source], &KVMap::new(), SourceCheckLimits::new(limits))
+            .unwrap()
+            .into_complete()
+            .unwrap();
+        let env = checked.engine.environment();
+        let mut printer = Printer::in_scope(env, &checked.scope);
+        assert_eq!(
+            printer.print_constant(&name(&["choose"]), false).unwrap(),
+            "def choose : Nat → Nat :=\nfun n => if n = 0 then 1 else 2"
+        );
+        let Some(ConstantInfo::Defn(declaration)) = env.find(&name(&["dependent"])) else {
+            panic!("checked dependent definition");
+        };
+        let value = printer.expr(&declaration.value, 0).unwrap();
+        assert!(value.contains("if h : p then yes h else no h"), "{value}");
+        let type_ = printer.expr(&declaration.base.type_, 0).unwrap();
+        let round_trip = format!(
+            "def again : {type_} := {value}\n\
+             theorem unchanged : again = dependent := by rfl"
+        );
+        checked
+            .engine
+            .check_source_files(
+                &[round_trip.as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits),
+            )
+            .unwrap_or_else(|error| panic!("{round_trip}\n{error:?}"))
+            .into_complete()
+            .unwrap();
     }
 }

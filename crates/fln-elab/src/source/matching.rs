@@ -12,6 +12,7 @@ use std::collections::{HashMap, HashSet};
 mod conditional_order;
 mod mutual;
 mod nomatch;
+pub(super) use conditional_order::ConditionalBuild;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MatchError {
@@ -119,6 +120,7 @@ pub(super) struct MatchPatterns<'a> {
     pub(super) fallback: Option<(Option<Name>, &'a Syntax)>,
 }
 pub(super) enum MatchStart<'a> {
+    Conditional(Box<ConditionalBuild<'a>>),
     Regular(Box<MatchBuild<'a>>),
     Refined(tactics::ProofState<'a>),
 }
@@ -148,7 +150,6 @@ pub(super) struct MatchBuild<'a> {
     levels: Vec<Level>,
     recursor: Typed,
     branches: std::collections::VecDeque<Branch<'a>>,
-    conditional_order: Option<conditional_order::ConditionalOrder>,
 }
 pub(super) struct BranchBinders {
     // Old indices whose direct field patterns lack an index-equation witness.
@@ -468,65 +469,15 @@ impl Context {
     pub(super) fn start_match<'a>(
         &mut self,
         parts: MatchParts<'a>,
-        mut major: Typed,
+        major: Typed,
         expected: Option<Expr>,
     ) -> Result<MatchStart<'a>, NatDefinitionElabError> {
-        if let Some(binds_evidence) = parts.conditional.as_ref().map(|c| c.binds_evidence) {
-            let mut type_ = self.whnf(&major.type_)?;
-            let boolean = Expr::const_(Name::from_components(["Bool"]), vec![]);
-            // A conditional never refines its condition, as the pin's `ite`/`dite` never do: the
-            // case split below is on a copy of the condition (`start_refined_match`), so a branch
-            // that needs `b` replaced (`if b then Or.inl rfl else Or.inr rfl` against
-            // `b = true ∨ b = false`) is refused, as at the pin. `if h : b` is the pin's
-            // `dite (b = true)`, its evidence `h : b = true`: the decided proposition below.
-            if type_ == boolean && binds_evidence {
-                major = Typed {
-                    value: [
-                        boolean.clone(),
-                        major.value,
-                        Expr::const_(Name::from_components(["Bool", "true"]), vec![]),
-                    ]
-                    .into_iter()
-                    .fold(
-                        Expr::const_(Name::from_components(["Eq"]), vec![Level::one()]),
-                        Expr::app,
-                    ),
-                    type_: Expr::sort(Level::zero()),
-                };
-                type_ = Expr::sort(Level::zero());
-            }
-            if type_ == Expr::sort(Level::zero()) {
-                // Keep the condition in the checked dictionary's type and both
-                // branches in the ordinary Decidable recursor. No source branch
-                // is selected by evaluating a proposition or a host Boolean.
-                // The instance problem is `Decidable c` for the condition as
-                // elaborated, as the pin's `ite` poses it. Normalizing `c` first
-                // turned `n < 5` into `Nat.le (Nat.succ n) 5`, which no stored
-                // instance path matches (bead fln-52qv).
-                let proposition = self.instantiate(&major.value)?;
-                let type_ = Expr::app(
-                    Expr::const_(Name::from_components(["Decidable"]), vec![]),
-                    proposition,
-                );
-                let dictionary = self.instance_hole(type_.clone())?;
-                // Retain the original proposition as a checked local value.
-                major = Typed {
-                    value: Expr::let_e(
-                        self.fresh_name()?,
-                        Expr::sort(Level::zero()),
-                        major.value,
-                        dictionary
-                            .lift_loose(0, 1)
-                            .map_err(|_| failure(SourceInferenceError::Scope))?,
-                        false,
-                    ),
-                    type_,
-                };
-                self.resolve_instances(false)?;
-            } else if type_ != boolean {
-                return Err(error(MatchError::ExpectedCondition));
-            }
+        if let Some(conditional) = parts.conditional {
+            return self
+                .start_conditional(conditional, major, expected)
+                .map(|state| MatchStart::Conditional(Box::new(state)));
         }
+        let mut major = major;
         // A match as written is refused where the pin refuses its patterns' types; the lowering
         // below would solve index equations the pin leaves alone (`pattern_typing`).
         if parts.written && parts.equation.is_none() && parts.conditional.is_none() {
@@ -687,7 +638,6 @@ impl Context {
                     // Replaced by the checked body before completion.
                     recursor: major,
                     branches: std::collections::VecDeque::new(),
-                    conditional_order: None,
                 });
             }
         }
@@ -872,12 +822,6 @@ impl Context {
                 syntax,
             });
         }
-        let conditional_order = self.order_well_founded_conditional(
-            parts.conditional.is_some(),
-            name,
-            &recursor,
-            &mut branches,
-        )?;
         Ok(MatchBuild {
             direct: None,
             recursive,
@@ -893,7 +837,6 @@ impl Context {
             levels: levels.clone(),
             recursor,
             branches,
-            conditional_order,
         })
     }
 
@@ -1016,7 +959,6 @@ impl Context {
             levels: Vec::new(),
             recursor: major.clone(),
             branches: std::collections::VecDeque::new(),
-            conditional_order: None,
         }))
     }
 
@@ -1572,19 +1514,15 @@ impl Context {
         if branch.constructor.num_fields > 256 {
             return Err(failure(SourceInferenceError::ResourceLimit));
         }
-        let minor_type = if let Some(order) = &mut state.conditional_order {
-            self.next_ordered_conditional_domain(order)?
-        } else {
-            let type_ = self.whnf(&state.recursor.type_)?;
-            let ExprNode::ForallE {
-                binder_type: minor_type,
-                ..
-            } = type_.node()
-            else {
-                return Err(error(MatchError::UnsupportedFamily));
-            };
-            minor_type.clone()
+        let type_ = self.whnf(&state.recursor.type_)?;
+        let ExprNode::ForallE {
+            binder_type: minor_type,
+            ..
+        } = type_.node()
+        else {
+            return Err(error(MatchError::UnsupportedFamily));
         };
+        let minor_type = minor_type.clone();
         let mut target = minor_type.clone();
         let mut locals = Vec::new();
         let mut constructor =
@@ -1898,9 +1836,7 @@ impl Context {
             value,
             type_: binders.type_,
         };
-        if !self.accept_ordered_conditional_minor(state, value.clone())? {
-            state.recursor = self.match_apply(state.recursor.clone(), value)?;
-        }
+        state.recursor = self.match_apply(state.recursor.clone(), value)?;
         Ok(())
     }
 }

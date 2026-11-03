@@ -2177,6 +2177,8 @@ impl Context {
             MatrixScope(Vec<Name>),
             CaptureRecursiveContext,
             MatchDiscriminant(matching::MatchParts<'a>, Option<Expr>),
+            ConditionalNext(matching::ConditionalBuild<'a>),
+            ConditionalBranch(matching::ConditionalBuild<'a>, matching::BranchBinders),
             NomatchDiscriminant(Arguments<'a>, Vec<Typed>, Option<Expr>),
             MatchNext(matching::MatchBuild<'a>),
             MatchBranch(matching::MatchBuild<'a>, matching::BranchBinders),
@@ -3539,9 +3541,30 @@ impl Context {
                         Task::MatchDiscriminant(parts, expected) => {
                             let major = values.pop().expect("match discriminant visit");
                             tasks.push(match self.start_match(parts, major, expected)? {
+                                matching::MatchStart::Conditional(state) => {
+                                    Task::ConditionalNext(*state)
+                                }
                                 matching::MatchStart::Regular(state) => Task::MatchNext(*state),
                                 matching::MatchStart::Refined(proof) => Task::Proof(proof),
                             });
+                        }
+                        Task::ConditionalNext(mut state) => {
+                            match self.next_conditional_branch(&mut state)? {
+                                matching::MatchStep::Branch {
+                                    syntax,
+                                    expected,
+                                    binders,
+                                } => {
+                                    tasks.push(Task::ConditionalBranch(state, binders));
+                                    tasks.push(Task::Visit(syntax, Some(expected), true));
+                                }
+                                matching::MatchStep::Complete(term) => values.push(term),
+                            }
+                        }
+                        Task::ConditionalBranch(mut state, binders) => {
+                            let branch = values.pop().expect("conditional branch visit");
+                            self.accept_conditional_branch(&mut state, binders, branch)?;
+                            tasks.push(Task::ConditionalNext(state));
                         }
                         Task::MatchNext(mut state) => match self.next_match_branch(&mut state)? {
                             matching::MatchStep::Branch {
