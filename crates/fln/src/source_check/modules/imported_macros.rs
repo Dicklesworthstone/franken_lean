@@ -190,6 +190,29 @@ impl ModuleMacroSession {
         remaining
     }
 
+    pub(super) fn install_grammar(
+        &self,
+        imports: &[Name],
+        engine: &Engine,
+        grammar: &mut grammar::SourceGrammar,
+    ) -> Result<(), SourceCheckError> {
+        let registry = self
+            .registry
+            .project_imports(imports)
+            .map_err(binding_error)?;
+        registry
+            .validate_source_engine(engine)
+            .map_err(binding_error)?;
+        registry
+            .install_source_parsers(grammar)
+            .map_err(|error| SourceCheckError::Command {
+                file: 0,
+                command: 0,
+                offset: 0,
+                error: Box::new(error),
+            })
+    }
+
     /// The driver supplies the authoritative mixed import order after replay,
     /// and retains ordinary declaration recording and module source positions.
     /// Binding is checked even for an empty forwarding module.

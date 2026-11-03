@@ -2949,6 +2949,9 @@ impl Engine {
             source_module,
             private_module.is_some(),
         )?;
+        if let Some(session) = macros.as_deref() {
+            session.registry().install_source_parsers(&mut grammar)?;
+        }
         if macros.is_some() && grammar.has_templates() {
             return Err(
                 imported_macros::source::SourceMacroError::TemplateGrammar.into_execution_error()

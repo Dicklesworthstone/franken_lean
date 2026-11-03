@@ -99,8 +99,14 @@ prefix or successor module state, and resource exhaustion remains inconclusive.
 
 This mode checks declarations and proofs. It does not execute `#eval` or a
 program's `main`, emit artifacts, or enable imported macros in the drop-in `lean`
-personality. It currently uses the parser's supported syntax kinds; source-declared
-templates cannot yet be mixed into the imported-macro session. Hygiene starts
+personality. Complete receipt-prepared registries also install their parser
+journals before parsing. Closed `ParserDescr` constructor data and the extracted
+Name/Nat/Bool literal forms are reconstructed from exact checked owners; token,
+kind, category and parser rows retain their order and scopes. The native parser's
+bounded descriptor subset still applies: executable `Parser` functions,
+computed descriptions, unresolved parser references and unsupported or ambiguous
+productions are explicit refusals. Source-declared templates cannot yet be mixed
+into the imported-macro session. Hygiene starts
 from the adapter's explicit seed, rather than the pin's command-hash seed. An
 unsupported native macro operation or source construct is reported explicitly.
 
@@ -139,10 +145,11 @@ Raw `--emit-flbc` is supported. A source-closure sidecar request is refused
 before execution because that format does not yet bind macro IR and partition
 inputs. Neither output file is created by that refused request.
 
-This remains a bounded macro integration. It expands syntax already recognized
-by the native parser and validates the complete imported registration table;
-unsupported rows are not silently dropped. Imported parser grammars, atomic and
-tactic macro expansion, source templates, and macro execution under `#guard`,
+This remains a bounded macro integration. It installs receipt-bound parser data
+in each module's actual import order and validates the complete imported
+registration table; unsupported rows are not silently dropped. Ordinary import
+mode does not activate this grammar. Atomic and tactic macro expansion, source
+templates, module-system grammar phases, and macro execution under `#guard`,
 `#reduce` or `#guard_msgs` are not yet supported. Full stock `Init` macro
 execution is not claimed.
 

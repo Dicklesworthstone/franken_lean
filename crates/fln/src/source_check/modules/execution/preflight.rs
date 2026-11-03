@@ -121,7 +121,7 @@ pub(super) fn check(
     Ok(())
 }
 
-fn check_command(
+pub(super) fn check_command(
     module: &Name,
     index: usize,
     at: fln_parse::BytePos,

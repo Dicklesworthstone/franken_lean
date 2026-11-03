@@ -361,13 +361,18 @@ fn run_loaded(
             ));
             limits.execution.vm = vm_limits;
             limits.modules.source.max_bytes = max_bytes;
-            let preflight = if ordinary_lean {
-                preflight_lean_source_program(&inputs, limits.modules)
-            } else {
-                preflight_source_program(&inputs, limits.modules)
-            };
-            if let Err(error) = preflight {
-                return Some(module_failure(error, presentation, &names[0], &sources[0], &display));
+            // Explicit imported syntax cannot be parsed against the seed world.
+            // The loader has checked headers/bytes; the macro-aware executor
+            // parses every body after admitting and installing its exact grammar.
+            if macro_inputs.is_none() {
+                let preflight = if ordinary_lean {
+                    preflight_lean_source_program(&inputs, limits.modules)
+                } else {
+                    preflight_source_program(&inputs, limits.modules)
+                };
+                if let Err(error) = preflight {
+                    return Some(module_failure(error, presentation, &names[0], &sources[0], &display));
+                }
             }
             let (_, base) = match loaded.base_engine(
                 || Ok(fln::Engine::from_environment(fln::Environment::new())),

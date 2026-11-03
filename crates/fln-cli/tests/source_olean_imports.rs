@@ -1036,6 +1036,101 @@ const IMPORTED_MACRO_CLIENT: &str = concat!(
 );
 
 #[test]
+fn installed_imported_macro_parsers_supply_their_own_tokens() {
+    let provider = format!(
+        "{}\n{}",
+        include_str!("../../fln-olean/fixtures/ir/AdmittedSourceMacro.lean"),
+        concat!(
+            "public meta section\n",
+            "syntax (name := ownedGrammarToken) \"owned%[\" term \"]\" : term\n",
+            "@[macro ownedGrammarToken]\n",
+            "def customChooseTerm : Macro := admittedChooseTerm\n",
+            "end\n",
+        ),
+    );
+    let Some(project) = ImportedMacroProject::prepare_with_source(&provider) else {
+        return;
+    };
+    assert!(
+        !project
+            .root
+            .join("client/AdmittedSourceMacro.lean")
+            .exists()
+    );
+    let declarations = concat!(
+        "prelude\nimport AdmittedSourceMacro\n",
+        "def expanded : Nat := owned%[11]\n",
+        "theorem expanded_eq : Eq expanded 11 := Eq.refl expanded\n",
+    );
+    let source = format!("{declarations}#check expanded\n");
+    let oracle = project.oracle(&source);
+    assert!(oracle.status.success(), "{oracle:?}; {:?}", project.root);
+    assert_eq!(oracle.stdout, b"expanded : Nat\n");
+    assert!(oracle.stderr.is_empty(), "{oracle:?}");
+    let checked = project.check(declarations);
+    assert!(checked.contains("\"theorems\":1"), "{checked}");
+    let lean = project.native("lean", &source, Some(&project.partition));
+    assert!(lean.status.success(), "{lean:?}; {:?}", project.root);
+    assert_eq!(lean.stdout, oracle.stdout);
+    assert!(lean.stderr.is_empty(), "{lean:?}");
+    let run = project.native(
+        "run",
+        &format!("{source}#eval owned%[13]\n"),
+        Some(&project.partition),
+    );
+    assert!(run.status.success(), "{run:?}; {:?}", project.root);
+    assert!(run.stderr.is_empty(), "{run:?}");
+    let stdout = String::from_utf8(run.stdout).unwrap();
+    assert!(stdout.contains("\"kind\":\"nat\",\"value\":13"), "{stdout}");
+    assert_imported_macro_provenance(&stdout);
+    let false_theorem =
+        format!("{declarations}theorem false_value : Eq expanded 12 := Eq.refl expanded\n");
+    assert!(!project.oracle(&false_theorem).status.success());
+    assert_macro_refusal(
+        project.native("check-source", &false_theorem, Some(&project.partition)),
+        1,
+        "elaboration",
+        "NotDefEq",
+    );
+    let malformed = format!("{declarations}def malformed : Nat := owned%[13\n");
+    assert!(!project.oracle(&malformed).status.success());
+    assert_macro_refusal(
+        project.native("check-source", &malformed, Some(&project.partition)),
+        1,
+        "input",
+        "parse refused source",
+    );
+    assert_macro_program_refusal(
+        project.native("run", &malformed, Some(&project.partition)),
+        1,
+        "input",
+        false,
+        "parse refused source",
+    );
+    let command_limit = fln::source_check::SourceCheckLimits::new(fln::EngineAdmissionLimits::new(
+        fln::Budget::for_stack_bytes(2 * 1024 * 1024),
+    ))
+    .max_commands;
+    let too_many = format!(
+        "prelude\nimport AdmittedSourceMacro\n{}",
+        "#check Nat\n".repeat(command_limit + 1)
+    );
+    assert_macro_program_refusal(
+        project.native("run", &too_many, Some(&project.partition)),
+        3,
+        "resource",
+        false,
+        "source commands",
+    );
+    assert!(
+        !project
+            .native("check-source", declarations, None)
+            .status
+            .success()
+    );
+}
+
+#[test]
 fn installed_imported_macros_drive_checked_source_and_runtime_commands() {
     let Some(project) = ImportedMacroProject::prepare() else {
         return;

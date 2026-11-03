@@ -368,7 +368,12 @@ impl imported::SourceOleanImport {
                 "source-program/before-plan",
             )));
         }
-        preflight::check(modules, limits.modules, implicit_init)?;
+        // An explicit macro session supplies checked artifact grammar. Its
+        // bodies must be parsed below, after the exact module world is built;
+        // the seed-only speculative pass cannot recognize those tokens.
+        if macros.is_none() {
+            preflight::check(modules, limits.modules, implicit_init)?;
+        }
         let mut meter = Meter {
             work: 0,
             bytes: 0,
@@ -383,6 +388,7 @@ impl imported::SourceOleanImport {
         )?;
         let mut exports = BTreeMap::<usize, replay::Export>::new();
         let mut completed_modules = Vec::new();
+        let mut source_commands = 0usize;
         for &index in &plan.order {
             if cancellation.is_some_and(CancellationProbe::is_cancelled) {
                 return Ok(Outcome::Inconclusive(Inconclusive::cancelled(
@@ -425,7 +431,7 @@ impl imported::SourceOleanImport {
             // Empty forwarding modules still import a grammar world. Enforce
             // its phase boundary before bypassing the command stream.
             let header = &plan.headers[index];
-            let grammar = grammar::SourceGrammar::for_engine_with_header(
+            let mut grammar = grammar::SourceGrammar::for_engine_with_header(
                 &engine,
                 Some(module.name),
                 header.module_system,
@@ -433,6 +439,21 @@ impl imported::SourceOleanImport {
                 &header.imports,
             )
             .map_err(|error| source_error(module.name, error))?;
+            let macro_imports: Vec<_> = steps
+                .iter()
+                .filter_map(|step| match step {
+                    contexts::Step::External(name) => Some(name.clone()),
+                    contexts::Step::Source(_) => None,
+                })
+                .collect();
+            if let Some(macros) = macros.as_deref() {
+                macros
+                    .install_grammar(&macro_imports, &engine, &mut grammar)
+                    .map_err(|error| SourceModuleCheckError::Source {
+                        module: module.name.clone(),
+                        error,
+                    })?;
+            }
             let public_imports = if plan.headers[index].module_system {
                 match visibility::imports(
                     &self.contexts.complete,
@@ -452,11 +473,34 @@ impl imported::SourceOleanImport {
             } else {
                 None
             };
+            let body =
+                grammar.enter(|| commands(module.name, module.source, &plan.headers[index]))?;
+            if macros.is_some() {
+                // Preserve the speculative pass's command/work limits and
+                // syntax checks, using the installed grammar rather than the
+                // seed. This grammar is local to the pass; execution below
+                // starts from a fresh file grammar and lexical scope.
+                source_commands = source_commands
+                    .checked_add(body.len())
+                    .filter(|count| *count <= limits.modules.source.max_commands)
+                    .ok_or(SourceModuleCheckError::Limit {
+                        resource: "source commands",
+                        limit: limits.modules.source.max_commands,
+                    })?;
+                for (command, (at, source)) in body.iter().enumerate() {
+                    preflight::check_command(
+                        module.name,
+                        command,
+                        *at,
+                        source,
+                        &mut grammar,
+                        &mut meter,
+                    )?;
+                }
+            }
             let mut public = public_imports.map(|engine| {
                 visibility::PublicWorld::new(module.name, engine, &mut meter, cancellation)
             });
-            let body =
-                grammar.enter(|| commands(module.name, module.source, &plan.headers[index]))?;
             let execute =
                 |session: Option<&mut crate::imported_macros::source::FileSession<'_>>| {
                     if body.is_empty() {
@@ -494,13 +538,6 @@ impl imported::SourceOleanImport {
                     }
                 };
             let result = if let Some(macros) = macros.as_deref_mut() {
-                let macro_imports: Vec<_> = steps
-                    .iter()
-                    .filter_map(|step| match step {
-                        contexts::Step::External(name) => Some(name.clone()),
-                        contexts::Step::Source(_) => None,
-                    })
-                    .collect();
                 macros.check_module(
                     module.name,
                     &macro_imports,

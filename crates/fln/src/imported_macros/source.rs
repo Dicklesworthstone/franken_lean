@@ -1,7 +1,8 @@
 //! Imported node macros on source declarations, anonymous examples, `#check` and raw `#eval`.
 //!
-//! This is an explicit embedding door for syntax the current parser already
-//! understands. It installs no artifact parser descriptions. The prepared
+//! Standalone embedding registries use syntax the native parser already
+//! understands. Complete source-import receipts also attach checked, data-only
+//! parser descriptions, installed by the file and module drivers. The prepared
 //! registry owns the expansion pass: no template expansion runs before it or
 //! replays its results. The resulting native Syntax enters the same elaborator
 //! and dual-check admission as `Engine::check_source_command`; raw evaluations
@@ -791,8 +792,9 @@ impl Engine {
     /// is published. Variable binders, executable attributes and mutual members
     /// use the same expansion pass. Native scope controls retain their ordinary
     /// semantics without command-root macro dispatch. Source-declared templates,
-    /// artifact parser installation and module-system visibility remain separate
-    /// capabilities.
+    /// and module-system visibility remain separate capabilities. A registry
+    /// prepared by a source-import receipt installs its checked parser data;
+    /// a standalone embedding registry supplies no imported grammar.
     pub fn check_source_files_with_imported_macros(
         &self,
         sources: &[&[u8]],

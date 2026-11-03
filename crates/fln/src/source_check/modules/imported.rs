@@ -234,6 +234,9 @@ impl SourceOleanImport {
             user_declarations,
             limits,
         )
+        .and_then(|registry| {
+            registry.with_source_parsers(&modules, self.contexts.complete.environment(), limits)
+        })
     }
 
     /// Retain this receipt's complete checked macro table while compiling only
@@ -254,6 +257,9 @@ impl SourceOleanImport {
             inputs,
             limits,
         )
+        .and_then(|registry| {
+            registry.with_source_parsers(&modules, self.contexts.complete.environment(), limits)
+        })
     }
 
     fn macro_registration_modules(
@@ -677,6 +683,7 @@ fn prepare_source_metadata(
     let mut reports = Vec::new();
     let mut macro_journals = Vec::new();
     let macro_extension = Name::from_components(metadata::macros::MACRO_EXTENSION.split('.'));
+    let parser_extension = metadata::parsers::extension_name();
     let mut capture_left = limits.max_capture_bytes;
     let mut entries_left = limits.metadata.max_entries;
     let mut defeq_tags = ReflexivityTags::default();
@@ -802,7 +809,7 @@ fn prepare_source_metadata(
                 if !block.entries.is_empty() {
                     report.uninterpreted.push(block.name.clone());
                 }
-                if block.name == macro_extension {
+                if block.name == macro_extension || block.name == parser_extension {
                     macro_blocks.push(block);
                 }
             }
