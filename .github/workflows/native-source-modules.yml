@@ -56,7 +56,7 @@ jobs:
           commands = [
               ['cargo', 'test', '--locked', '-p', 'fln-parse', 'command_scope', '--', '--nocapture'],
               ['cargo', 'test', '--locked', '-p', 'fln', '--test', 'source_module_check', '--test', 'source_module_session', '--test', 'source_module_artifacts', '--no-fail-fast'],
-              ['cargo', 'test', '--locked', '-p', 'fln', '--lib', 'simp_journals_survive_a_fresh_persisted_build_session'],
+              ['cargo', 'test', '--locked', '-p', 'fln', '--lib', 'source_check::modules::persisted::tests', '--no-fail-fast'],
               ['cargo', 'test', '--locked', '-p', 'fln-cli', '--test', 'source_module_check', '--', '--nocapture'],
               ['cargo', 'test', '--locked', '-p', 'fln', '--test', 'source_default_simp', '--test', 'source_instances', '--no-fail-fast'],
               ['cargo', 'test', '--locked', '-p', 'fln-cli', '--test', 'source_check'],

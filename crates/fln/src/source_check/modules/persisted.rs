@@ -372,6 +372,8 @@ impl SourceModuleRecord {
             fln_elab::source::scope::simp::defeq::journal_name(),
             fln_elab::source::scope::simp::equations::journal_name(),
             fln_elab::macro_inline::journal_name(),
+            fln_elab::implemented_by::journal_name(),
+            fln_elab::externs::journal_name(),
             fln_elab::records::imported::export::journal_name(),
             fln_elab::source::equation_theorems::journal::journal_name(),
         ]
@@ -1042,6 +1044,179 @@ mod tests {
             warm.checked.checked.result_logical_root,
             cold.checked.checked.result_logical_root
         );
+    }
+
+    fn executable_journal_graph(base: &str) -> [(&str, &str); 4] {
+        [
+            ("Base", base),
+            ("Left", "prelude\nimport Base"),
+            ("Right", "prelude\nimport Base"),
+            (
+                "Main",
+                "prelude\nimport Left\nimport Right\ndef use (A : Type) (x y : A) : A := logical A x y",
+            ),
+        ]
+    }
+
+    const IMPLEMENTED_BY_SOURCE: &str = "prelude\n\
+        def first.{u} (A : Sort u) (x y : A) : A := x\n\
+        def second.{u} (A : Sort u) (x y : A) : A := y\n\
+        @[implemented_by second] def logical.{v} (A : Sort v) (x y : A) : A := x";
+
+    const EXTERN_SOURCE: &str = r##"prelude
+@[extern c inline "#1" cpp "foreign_λ"] axiom logical.{u} : (A : Sort u) -> A -> A -> A
+@[extern "first", extern "last"] axiom last.{u} : (A : Sort u) -> A -> A
+@[extern] axiom adhoc.{u} : (A : Sort u) -> A -> A
+"##;
+
+    fn replay_executable_journal(base: &str) -> (SourceModuleBuild, SourceModuleBuild) {
+        let graph = executable_journal_graph(base);
+        let store = Memory::default();
+        let identity = checker(b"executable-journal-replay");
+        let run = || {
+            compile(&store, identity, fln_core::mode::Mode::DEFAULT, &graph)
+                .unwrap()
+                .into_complete()
+                .unwrap()
+        };
+        let cold = run();
+        assert_eq!((cold.elaborated_modules, cold.persisted_modules), (4, 0));
+        assert!(
+            cold.modules
+                .iter()
+                .all(|row| row.record_write == ModuleRecordWrite::Stored)
+        );
+        let warm = run();
+        assert_eq!(
+            (warm.elaborated_modules, warm.persisted_modules),
+            (0, 4),
+            "{:?}",
+            rows(&warm)
+        );
+        assert!(warm.modules.iter().all(|row| {
+            row.decision == ModuleDecision::Cached && row.record == ModuleRecordLookup::Hit
+        }));
+        assert_eq!(products(&warm), products(&cold));
+        assert_eq!(
+            warm.checked.checked.result_logical_root,
+            cold.checked.checked.result_logical_root
+        );
+        (cold, warm)
+    }
+
+    #[test]
+    fn implemented_by_journals_survive_a_fresh_persisted_diamond_build() {
+        use fln_elab::implemented_by::ImplementedByTable;
+
+        let (cold, warm) = replay_executable_journal(IMPLEMENTED_BY_SOURCE);
+        let before = ImplementedByTable::read(cold.checked.checked.engine.environment()).unwrap();
+        let after = ImplementedByTable::read(warm.checked.checked.engine.environment()).unwrap();
+        assert_eq!(after, before);
+        assert_eq!(after.get(&n("logical")), Some(&n("second")));
+    }
+
+    #[test]
+    fn extern_journals_survive_a_fresh_persisted_diamond_build() {
+        use fln_elab::externs::{ExternEntry, ExternTable};
+
+        let (cold, warm) = replay_executable_journal(EXTERN_SOURCE);
+        let before = ExternTable::read(cold.checked.checked.engine.environment()).unwrap();
+        let after = ExternTable::read(warm.checked.checked.engine.environment()).unwrap();
+        assert_eq!(after, before);
+        assert_eq!(
+            after.get(&n("logical")),
+            Some(
+                [
+                    ExternEntry::Inline {
+                        backend: n("c"),
+                        pattern: "#1".into(),
+                    },
+                    ExternEntry::Standard {
+                        backend: n("cpp"),
+                        symbol: "foreign_λ".into(),
+                    },
+                ]
+                .as_slice()
+            )
+        );
+        assert_eq!(
+            after.get(&n("last")),
+            Some(
+                [ExternEntry::Standard {
+                    backend: n("all"),
+                    symbol: "last".into(),
+                }]
+                .as_slice()
+            )
+        );
+        assert_eq!(
+            after.get(&n("adhoc")),
+            Some([ExternEntry::Adhoc { backend: n("all") }].as_slice())
+        );
+    }
+
+    #[test]
+    fn executable_journal_records_still_require_exact_artifact_metadata() {
+        for (source, alternate) in [
+            (
+                IMPLEMENTED_BY_SOURCE,
+                IMPLEMENTED_BY_SOURCE.replace("implemented_by second", "implemented_by first"),
+            ),
+            (
+                EXTERN_SOURCE,
+                EXTERN_SOURCE.replace("foreign_λ", "different_symbol"),
+            ),
+        ] {
+            let graph = executable_journal_graph(source);
+            let store = Memory::default();
+            let identity = checker(b"executable-journal-artifact-binding");
+            let run = || {
+                compile(&store, identity, fln_core::mode::Mode::DEFAULT, &graph)
+                    .unwrap()
+                    .into_complete()
+                    .unwrap()
+            };
+            let cold = run();
+            let key = key_of(&cold, "Base");
+            let original =
+                SourceModuleRecord::parse(&store.0.borrow()[&key], key, identity, &n("Base"))
+                    .unwrap();
+            let other = compile(
+                &Memory::default(),
+                identity,
+                fln_core::mode::Mode::DEFAULT,
+                &executable_journal_graph(&alternate),
+            )
+            .unwrap()
+            .into_complete()
+            .unwrap();
+            let different = other
+                .artifacts
+                .iter()
+                .find(|row| row.name == n("Base"))
+                .unwrap();
+            assert_ne!(different.bytes, original.artifact);
+            // The declarations are identical and both artifacts are valid. A
+            // forged record combines the original journal/root with another
+            // executable attribute map, so only the exact artifact check can
+            // establish that its published metadata still matches the replay.
+            let forged = SourceModuleRecord {
+                artifact: different.bytes.clone(),
+                ..original.clone()
+            };
+            store.save(key, &forged.to_bytes()).unwrap();
+            let recovered = run();
+            assert_eq!(
+                recovered.modules[0].record,
+                ModuleRecordLookup::Refused(ModuleRecordRefusal::Artifact),
+            );
+            assert_eq!(
+                (recovered.elaborated_modules, recovered.persisted_modules),
+                (1, 3)
+            );
+            assert_eq!(products(&recovered), products(&cold));
+            assert_eq!(store.0.borrow()[&key], original.to_bytes());
+        }
     }
 
     #[test]
