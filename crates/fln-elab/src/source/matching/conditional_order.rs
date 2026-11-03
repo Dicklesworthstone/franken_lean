@@ -3,6 +3,12 @@
 //! or introducing a recursor: ordinary conditional lemmas must see the same head.
 use super::*;
 
+const MAX_DEFERRED_CONDITIONAL_CACHE: usize = 65_536;
+
+fn deferred_conditional_tag() -> Name {
+    Name::from_components(["_fln", "source", "deferredIte"])
+}
+
 pub(in crate::source) struct ConditionalBuild<'a> {
     saved: LocalContext,
     function: Typed,
@@ -134,7 +140,19 @@ impl Context {
     ) -> Result<ConditionalStep<'a>, NatDefinitionElabError> {
         self.txn.lctx = state.saved.clone();
         let Some(syntax) = state.branches.pop_front() else {
-            let function = state.ordinary.as_ref().unwrap_or(&state.function).clone();
+            let mut function = state.ordinary.as_ref().unwrap_or(&state.function).clone();
+            if state.hidden_evidence && state.ordinary.is_none() {
+                // A numeral's carrier may be fixed by a later argument. Keep
+                // its original inference scope and reconsider the conditional
+                // only after its captured holes have actually been assigned.
+                let mut data = KVMap::new();
+                data.insert(
+                    deferred_conditional_tag(),
+                    fln_core::options::DataValue::OfBool(true),
+                );
+                function.value = Expr::mdata(data, function.value);
+                self.deferred_conditional_forms = true;
+            }
             return Ok(ConditionalStep::Complete(
                 self.finish_term(function, Some(&state.target))?,
             ));
@@ -229,5 +247,191 @@ impl Context {
             .ok_or_else(|| error(MatchError::UnsupportedFamily))?;
         state.function = self.match_apply(state.function.clone(), branch)?;
         Ok(())
+    }
+
+    /// Reconsider only our private WF conditionals after ordinary instantiation
+    /// has settled captured metavariables and beta-reduced their applications.
+    /// No hole loses its scope, and named/source `dite` terms carry no marker.
+    /// The iterative postorder preserves unchanged nodes and shared subterms.
+    pub(in crate::source) fn canonicalize_deferred_conditionals(
+        &mut self,
+        root: &Expr,
+    ) -> Result<Expr, NatDefinitionElabError> {
+        // Assignment changes have already produced a new input expression.
+        // This rewrite reads no environment or metavariable state, so an exact
+        // immutable expression key safely reuses work across speculative forks.
+        let cache = self.deferred_conditional_cache.clone();
+        let mut cache = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(result) = cache.get(root) {
+            return Ok(result.clone());
+        }
+        let tag = deferred_conditional_tag();
+        let mut done = HashMap::<usize, Expr>::new();
+        let mut pending = vec![(root, false)];
+        while let Some((term, exit)) = pending.pop() {
+            let key = term.allocation_identity();
+            if done.contains_key(&key) {
+                continue;
+            }
+            if let Some(result) = cache.get(term) {
+                done.insert(key, result.clone());
+                continue;
+            }
+            self.tick()?;
+            if !exit {
+                pending.push((term, true));
+                pending.extend(
+                    conditional_children(term)
+                        .into_iter()
+                        .flatten()
+                        .map(|child| (child, false)),
+                );
+                continue;
+            }
+            let child = |expr: &Expr| {
+                done.get(&expr.allocation_identity())
+                    .expect("conditional postorder child")
+                    .clone()
+            };
+            let unchanged = conditional_children(term)
+                .into_iter()
+                .flatten()
+                .all(|expr| child(expr).allocation_identity() == expr.allocation_identity());
+            let rebuilt = if unchanged {
+                term.clone()
+            } else {
+                match term.node() {
+                    ExprNode::App { f, a } => Expr::app(child(f), child(a)),
+                    ExprNode::Lam {
+                        binder_name,
+                        binder_type,
+                        body,
+                        binder_info,
+                    } => Expr::lam(
+                        binder_name.clone(),
+                        child(binder_type),
+                        child(body),
+                        *binder_info,
+                    ),
+                    ExprNode::ForallE {
+                        binder_name,
+                        binder_type,
+                        body,
+                        binder_info,
+                    } => Expr::forall_e(
+                        binder_name.clone(),
+                        child(binder_type),
+                        child(body),
+                        *binder_info,
+                    ),
+                    ExprNode::LetE {
+                        decl_name,
+                        type_,
+                        value,
+                        body,
+                        non_dep,
+                    } => Expr::let_e(
+                        decl_name.clone(),
+                        child(type_),
+                        child(value),
+                        child(body),
+                        *non_dep,
+                    ),
+                    ExprNode::MData { data, expr } => Expr::mdata(data.clone(), child(expr)),
+                    ExprNode::Proj {
+                        struct_name,
+                        idx,
+                        expr,
+                    } => Expr::proj(struct_name.clone(), *idx, child(expr)),
+                    _ => term.clone(),
+                }
+            };
+            let result = match rebuilt.node() {
+                ExprNode::MData { data, expr }
+                    if data.find(&tag) == Some(&fln_core::options::DataValue::OfBool(true))
+                        && !expr.has_expr_mvar() =>
+                {
+                    let value = ordinary_conditional(expr)?.unwrap_or_else(|| expr.clone());
+                    let mut data = data.clone();
+                    data.erase(&tag);
+                    if data.is_empty() {
+                        value
+                    } else {
+                        Expr::mdata(data, value)
+                    }
+                }
+                _ => rebuilt,
+            };
+            // Eviction cannot invalidate this traversal: its separate local
+            // memo retains every completed child until the root is finished.
+            if cache.len() >= MAX_DEFERRED_CONDITIONAL_CACHE {
+                cache.clear();
+            }
+            cache.insert(term.clone(), result.clone());
+            done.insert(key, result);
+        }
+        Ok(done
+            .remove(&root.allocation_identity())
+            .expect("conditional postorder root"))
+    }
+}
+
+/// A constant-branch `dite` is definitionally equal to the admitted `ite` at
+/// the same universe, result type, condition and dictionary. Removing each
+/// unused proof binder must also lower references to its surrounding binders.
+fn ordinary_conditional(value: &Expr) -> Result<Option<Expr>, NatDefinitionElabError> {
+    let (head, args) = operators::spine(value);
+    let ExprNode::Const { name, levels } = head.node() else {
+        return Ok(None);
+    };
+    if name != &Name::from_components(["dite"]) {
+        return Ok(None);
+    }
+    let [type_, condition, dictionary, yes, no] = args.as_slice() else {
+        return Ok(None);
+    };
+    let (ExprNode::Lam { body: yes, .. }, ExprNode::Lam { body: no, .. }) = (yes.node(), no.node())
+    else {
+        return Ok(None);
+    };
+    if yes.has_loose_bvar(0) || no.has_loose_bvar(0) {
+        return Ok(None);
+    }
+    let lower = |body: &Expr| {
+        body.subst_loose(0, &[Expr::sort(Level::zero())])
+            .map_err(|_| failure(SourceInferenceError::Scope))
+    };
+    Ok(Some(
+        [
+            type_.clone(),
+            condition.clone(),
+            dictionary.clone(),
+            lower(yes)?,
+            lower(no)?,
+        ]
+        .into_iter()
+        .fold(
+            Expr::const_(Name::from_components(["ite"]), levels.clone()),
+            Expr::app,
+        ),
+    ))
+}
+
+fn conditional_children(expr: &Expr) -> [Option<&Expr>; 3] {
+    match expr.node() {
+        ExprNode::App { f, a } => [Some(f), Some(a), None],
+        ExprNode::Lam {
+            binder_type, body, ..
+        }
+        | ExprNode::ForallE {
+            binder_type, body, ..
+        } => [Some(binder_type), Some(body), None],
+        ExprNode::LetE {
+            type_, value, body, ..
+        } => [Some(type_), Some(value), Some(body)],
+        ExprNode::MData { expr, .. } | ExprNode::Proj { expr, .. } => [Some(expr), None, None],
+        _ => [None, None, None],
     }
 }

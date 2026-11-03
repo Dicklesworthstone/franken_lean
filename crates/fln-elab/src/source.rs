@@ -761,6 +761,14 @@ struct Context {
     // Coercions whose value was still open (`mkCoe`'s `.undef`), resumed by
     // instance synthesis and refused, as they were found, on its final pass.
     postponed_coercions: Vec<coercions::PostponedCoercion>,
+    // Set only after an unnamed WF conditional retained evidence while source
+    // inference was incomplete. Its private marker is reconsidered after
+    // ordinary metavariable instantiation; other declarations skip that walk.
+    deferred_conditional_forms: bool,
+    // Pure results for already-instantiated expressions. Immutable keys retain
+    // their inputs, and speculative contexts share this bounded optimization.
+    deferred_conditional_cache:
+        std::sync::Arc<std::sync::Mutex<std::collections::HashMap<Expr, Expr>>>,
     // Resumed argument failures are delayed source diagnostics, just like the
     // pin's synthetic metavariable errors. Tactic/recursion rollback restores
     // them; a selected declaration can never discard them or admit its holes.
@@ -884,6 +892,8 @@ impl Context {
             postponed_eliminators: Vec::new(),
             postponed_fields: Vec::new(),
             postponed_coercions: Vec::new(),
+            deferred_conditional_forms: false,
+            deferred_conditional_cache: Default::default(),
             postponed_application_errors: Vec::new(),
             pending_source_arguments: false,
             block_root_implicit_lambda: false,
@@ -964,9 +974,15 @@ impl Context {
         if !self.bound_metavars.is_empty() {
             self.settle_bound_metavars()?;
         }
-        self.txn
+        let value = self
+            .txn
             .instantiate_expr(value)
-            .map_err(|error| failure(SourceInferenceError::Universe(error)))
+            .map_err(|error| failure(SourceInferenceError::Universe(error)))?;
+        if self.deferred_conditional_forms {
+            self.canonicalize_deferred_conditionals(&value)
+        } else {
+            Ok(value)
+        }
     }
 
     fn substitute(&mut self, body: &Expr, argument: &Expr) -> Result<Expr, NatDefinitionElabError> {

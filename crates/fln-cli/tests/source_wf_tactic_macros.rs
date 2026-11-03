@@ -173,6 +173,7 @@ termination_by n
 decreasing_by omega
 def wfSimp (n : Nat) : Nat :=
   have _h : (if n = 0 then 1 else 1) = 1 := by simp only [ite_self]
+  have _typed : (if n = 0 then 1 else 1) = (1 : Int) := by simp only [ite_self]
   if h : n = 0 then 0 else wfSimp (n - 1) + 1
 termination_by n
 decreasing_by omega
@@ -183,24 +184,30 @@ def wfRewrite (n : Nat) : Nat :=
   if h : n = 0 then 0 else wfRewrite (n - 1) + 1
 termination_by n
 decreasing_by omega
+def keepImplicit {value : Nat} (x : Nat) (_ : x = value) : Nat := x
+def downImplicit (n : Nat) : Nat :=
+  if 0 < n then keepImplicit (downImplicit (n - 1) + 1) rfl else 0
+termination_by n
+decreasing_by omega
 #eval downPositive 4
 #eval downNegative 4
 #eval downNested 4
 #eval downNamed 4
 #eval wfSimp 4
 #eval wfRewrite 4
+#eval downImplicit 4
 "#;
     std::fs::write(root.join(name), program).unwrap();
     if let Some((code, stdout)) = pinned(&lib, &root, name) {
         assert_eq!(
             (code, stdout.as_str()),
-            (0, "4\n4\n4\n4\n4\n4\n"),
+            (0, "4\n4\n4\n4\n4\n4\n4\n"),
             "{stdout}"
         );
     }
     let (code, stdout, stderr) = ours(&lib, &root, name);
     assert_eq!(code, 0, "{stdout}{stderr}");
-    assert_eq!(stdout, "4\n4\n4\n4\n4\n4\n", "{stderr}");
+    assert_eq!(stdout, "4\n4\n4\n4\n4\n4\n4\n", "{stderr}");
 
     for (name, tactic) in [
         ("NoSourceAssumption.lean", "assumption"),

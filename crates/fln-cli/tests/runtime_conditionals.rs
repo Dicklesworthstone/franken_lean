@@ -88,7 +88,10 @@ fn installed_conditionals_preserve_inference_recursion_and_local_scopes() {
     let source = root.join("Scopes.lean");
     std::fs::write(
         &source,
-        r#"def inferred (b : Bool) := if b then 17 else 19
+        r#"prelude
+import Init.Data.Nat.Basic
+import Init.Data.Repr
+def inferred (b : Bool) := if b then 17 else 19
 def higher (b : Bool) (n : Nat) : Nat :=
   (if b then (fun k : Nat => k + 1) else (fun k : Nat => k + 2)) n
 def count : Nat → Bool → Nat
