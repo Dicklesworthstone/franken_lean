@@ -221,6 +221,40 @@ impl SourceScope {
         Ok(effective)
     }
 
+    /// Select the world of an already parsed or expanded atomic mutual group.
+    /// Only complete, uniformly public data bundles enter the exported world.
+    pub fn for_mutual_declarations(
+        &self,
+        members: &[Syntax],
+    ) -> Result<Self, NatDefinitionElabError> {
+        let mut exported = 0;
+        let mut inductive = true;
+        for member in members {
+            exported += usize::from(self.for_declaration(member)?.exports_declaration());
+            let declaration = expect_node(
+                member,
+                &parser_kind(&["Command", "declaration"]),
+                2,
+                "mutual declaration",
+            )?;
+            inductive &= declaration[1].kind() == Some(&parser_kind(&["Command", "inductive"]));
+        }
+        if exported != 0 && (exported != members.len() || !inductive) {
+            return Err(refused(
+                "uniformly public mutual inductives or wholly private mutual blocks",
+            ));
+        }
+        // A complete public data bundle has one exported predecessor and
+        // one ordinary atomic admission. Never export a private sibling or
+        // expose a partial implementation just because another member is
+        // public. Explicit private members also override a public section.
+        let mut effective = self.clone();
+        if effective.private_module.is_some() {
+            effective.public_declarations = exported != 0;
+        }
+        Ok(effective)
+    }
+
     /// Source-command counterpart to [`Self::for_declaration`]. It preserves the
     /// atomic mutual route, exporting complete uniformly public data bundles.
     /// Queries/examples never become exports just by being in a public section.
@@ -231,33 +265,7 @@ impl SourceScope {
             return Ok(effective);
         }
         if let Some(members) = fln_parse::command_scope::mutual::parse(source)? {
-            let mut exported = 0;
-            let mut inductive = true;
-            for member in &members {
-                exported += usize::from(self.for_declaration(member)?.exports_declaration());
-                let declaration = expect_node(
-                    member,
-                    &parser_kind(&["Command", "declaration"]),
-                    2,
-                    "mutual declaration",
-                )?;
-                inductive &= declaration[1].kind() == Some(&parser_kind(&["Command", "inductive"]));
-            }
-            if exported != 0 && (exported != members.len() || !inductive) {
-                return Err(refused(
-                    "uniformly public mutual inductives or wholly private mutual blocks",
-                )
-                .into());
-            }
-            // A complete public data bundle has one exported predecessor and
-            // one ordinary atomic admission. Never export a private sibling or
-            // expose a partial implementation just because another member is
-            // public. Explicit private members also override a public section.
-            let mut effective = self.clone();
-            if effective.private_module.is_some() {
-                effective.public_declarations = exported != 0;
-            }
-            return Ok(effective);
+            return self.for_mutual_declarations(&members).map_err(Into::into);
         }
         let parsed = fln_parse::parse_source_command(source)?;
         if parsed.syntax().kind() == Some(&parser_kind(&["Command", "declaration"])) {
