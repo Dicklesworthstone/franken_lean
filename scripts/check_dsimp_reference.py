@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S python3 -I -S
 """Run the exact shared dsimp fixtures with the pinned test-only Lean oracle.
 
 No download, runtime delegation, golden regeneration, or repository mutation.

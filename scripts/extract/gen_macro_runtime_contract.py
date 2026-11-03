@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S python3 -I -S
 """Extract the macro runtime's constructor layouts from the exact pinned Lean.
 
 The generated constants are consumed by the native VM methods and the Syntax

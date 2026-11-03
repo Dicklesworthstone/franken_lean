@@ -39,4 +39,4 @@ jobs:
           echo "FLN_REFERENCE_LIB=$RUNNER_TEMP/lean-4.32.0-linux/lib/lean" >> "$GITHUB_ENV"
           echo "FLN_REFERENCE_LEAN=$RUNNER_TEMP/lean-4.32.0-linux/bin/lean" >> "$GITHUB_ENV"
       - name: Reproduce the false accept and publish only a validated fix to main
-        run: python3 .github/patches/fln-numeric-transparency/land.py
+        run: python3 -I -S .github/patches/fln-numeric-transparency/land.py

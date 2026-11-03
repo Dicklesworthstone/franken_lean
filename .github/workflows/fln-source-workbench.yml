@@ -992,7 +992,7 @@ jobs:
           done
           echo "FLN_REFERENCE_LIB=$RUNNER_TEMP/lean-4.32.0-linux/lib/lean" >> "$GITHUB_ENV"
       - name: Compare all 43 Array probes with the exact pinned Lean oracle
-        run: python3 crates/fln/tests/source_imported_arrays/check_oracle.py --lean "$FLN_REFERENCE_LIB/../../bin/lean"
+        run: python3 -I -S crates/fln/tests/source_imported_arrays/check_oracle.py --lean "$FLN_REFERENCE_LIB/../../bin/lean"
 
   mutable-loop-returns:
     if: >-
@@ -1066,7 +1066,7 @@ jobs:
         run: cargo test --locked --offline -p fln-elab --lib source::do_notation -- --test-threads=1
       - name: Require all 53 exact pinned mutable-return values and effect traces
         if: (success() || failure()) && steps.mutable-format.outcome == 'success'
-        run: python3 crates/fln/tests/source_do/for_loops/check_mutable_returns_oracle.py --lean "$FLN_REFERENCE_LIB/../../bin/lean"
+        run: python3 -I -S crates/fln/tests/source_do/for_loops/check_mutable_returns_oracle.py --lean "$FLN_REFERENCE_LIB/../../bin/lean"
       - name: Execute and replay mutable returns with all retained do-notation regressions
         if: (success() || failure()) && steps.mutable-format.outcome == 'success'
         run: cargo test --locked --offline -p fln --test source_do -- --nocapture --test-threads=1
@@ -1511,7 +1511,7 @@ jobs:
 
       - name: Check shared distance-measure observations and refusals with the exact Lean pin
         if: (success() || failure()) && steps.distance-format.outcome == 'success'
-        run: python3 crates/fln/tests/support/check_well_founded_distance_oracle.py --lean "$FLN_REFERENCE_LIB/../../bin/lean"
+        run: python3 -I -S crates/fln/tests/support/check_well_founded_distance_oracle.py --lean "$FLN_REFERENCE_LIB/../../bin/lean"
 
   distance-termination:
     if: >-
@@ -1668,7 +1668,7 @@ jobs:
 
       - name: Check shared while-loop observations and refusals with the exact Lean pin
         if: (success() || failure()) && steps.while-format.outcome == 'success'
-        run: python3 crates/fln/tests/support/observe_source_while_oracle.py --lean "$FLN_REFERENCE_LIB/../../bin/lean"
+        run: python3 -I -S crates/fln/tests/support/observe_source_while_oracle.py --lean "$FLN_REFERENCE_LIB/../../bin/lean"
 
   partial-callback-stages:
     if: >-
@@ -1814,7 +1814,7 @@ jobs:
 
       - name: Check shared while-loop observations and refusals with the exact Lean pin
         if: (success() || failure()) && steps.while-format.outcome == 'success'
-        run: python3 crates/fln/tests/support/check_source_while_oracle.py --lean "$FLN_REFERENCE_LIB/../../bin/lean"
+        run: python3 -I -S crates/fln/tests/support/check_source_while_oracle.py --lean "$FLN_REFERENCE_LIB/../../bin/lean"
 
   while-loop:
     if: >-

@@ -37,4 +37,4 @@ jobs:
           echo "FLN_REFERENCE_LIB=$RUNNER_TEMP/lean-4.32.0-linux/lib/lean" >> "$GITHUB_ENV"
           echo "FLN_REFERENCE_LEAN=$RUNNER_TEMP/lean-4.32.0-linux/bin/lean" >> "$GITHUB_ENV"
       - name: Compile, compare and land introductions and obtained witnesses
-        run: python3 .github/patches/fln-rintro-obtain/land.py
+        run: python3 -I -S .github/patches/fln-rintro-obtain/land.py

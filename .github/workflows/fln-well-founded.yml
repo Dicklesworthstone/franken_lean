@@ -38,4 +38,4 @@ jobs:
           echo "FLN_REFERENCE_LIB=$RUNNER_TEMP/lean-4.32.0-linux/lib/lean" >> "$GITHUB_ENV"
           echo "FLN_REFERENCE_LEAN=$RUNNER_TEMP/lean-4.32.0-linux/bin/lean" >> "$GITHUB_ENV"
       - name: Validate general measures and automatic lexicographic proofs
-        run: python3 .github/patches/fln-well-founded/validate.py
+        run: python3 -I -S .github/patches/fln-well-founded/validate.py

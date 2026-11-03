@@ -85,7 +85,7 @@ jobs:
             2>&1 | tee target/imported-ir-reference/macros.log || status=1
           cargo test --locked -p fln-vm --lib macro_native -- --nocapture \
             2>&1 | tee target/imported-ir-reference/macro-vm.log || status=1
-          python3 scripts/extract/gen_macro_runtime_contract.py \
+          python3 -I -S scripts/extract/gen_macro_runtime_contract.py \
             --lean "$FLN_REFERENCE_LEAN" --check \
             2>&1 | tee target/imported-ir-reference/macro-contract.log || status=1
           cargo clippy --locked -p fln --lib --tests -- -D warnings \

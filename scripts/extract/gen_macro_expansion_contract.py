@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S python3 -I -S
 """Extract the nested macro ABI from the published, exact pinned artifacts.
 
 The native fln-olean decoder reads the official release's Init/Prelude.ir and
