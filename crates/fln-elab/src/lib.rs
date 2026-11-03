@@ -982,7 +982,9 @@ fn bounded_infix_intrinsic(kind: &Name, allow_string: bool) -> Option<BoundedInf
     }
     if allow_string {
         // Init's plain `infix`/`infixl`/`infixr` notations: ordinary applications of the
-        // function each names (`Init/Notation.lean:272-428`, `Init/Core.lean:539-560`).
+        // function each names (`Init/Notation.lean`, `Init/Core.lean`,
+        // `Init/Control/Basic.lean`). Unlike `>>`, the monadic Boolean and bind
+        // notations do not thunk either operand or use expression-tree elaboration.
         for (spelling, constant) in [
             ("×", "Prod"),
             ("×'", "PProd"),
@@ -990,12 +992,21 @@ fn bounded_infix_intrinsic(kind: &Name, allow_string: bool) -> Option<BoundedInf
             ("∣", "Dvd.dvd"),
             ("⊆", "HasSubset.Subset"),
             ("⊂", "HasSSubset.SSubset"),
+            ("⊇", "Superset"),
+            ("⊃", "SSuperset"),
             ("∪", "Union.union"),
             ("∩", "Inter.inter"),
             ("\\", "SDiff.sdiff"),
             ("<$>", "Functor.map"),
+            ("<&>", "Functor.mapRev"),
+            ("<||>", "orM"),
+            ("<&&>", "andM"),
             (">>=", "Bind.bind"),
+            (">=>", "Bind.kleisliRight"),
+            ("<=<", "Bind.kleisliLeft"),
+            ("=<<", "Bind.bindLeft"),
             ("⊕", "Sum"),
+            ("⊕'", "PSum"),
             ("•", "HSMul.hSMul"),
             ("≍", "HEq"),
             ("≈", "HasEquiv.Equiv"),

@@ -2,11 +2,13 @@
 //! `Init.Data.Option.Basic`: the pin's `macro_rules` (`Init/Notation.lean:430-440`) make `x <*> y`
 //! `Seq.seq x fun _ : Unit => y`, and `x <* y` and `x *> y` `SeqLeft.seqLeft` and
 //! `SeqRight.seqRight` alike, elaborated as ordinary applications. The macro's names are its
-//! own: a local named `SeqRight` or `Unit` does not capture them. Not a pattern. `x <|> y` is
-//! `binop_lazy% HOrElse.hOrElse x y`, whose right operand is a `Unit` closure.
+//! own: a local named `SeqRight` or `Unit` does not capture them. Not a pattern. `x <|> y` and
+//! `x >> y` use `binop_lazy%` with `HOrElse.hOrElse` and `HAndThen.hAndThen`, respectively;
+//! their right operands are `Unit` closures. Init.Control.Basic's plain mixfix operators use
+//! ordinary applications of the declarations to which their notations resolve.
 //!
-//! Every program was run through the pinned `lean` v4.32.0 with the same header first
-//! (2026-10-30), and the pin is consulted again when it is present.
+//! The original applicative cases were run through pinned `lean` v4.32.0 with the same header
+//! (2026-10-30). All cases consult the pin when it is present.
 #![forbid(unsafe_code)]
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -130,6 +132,76 @@ fn applicative_notations_are_the_pins_applications() {
     }
     for (index, program) in REFUSED.iter().enumerate() {
         let entry = root.join(format!("Refused{index}.lean"));
+        std::fs::write(&entry, format!("{HEADER}{program}")).unwrap();
+        if let Some((code, _)) = pinned(&lib, &entry) {
+            assert_eq!(code, 1, "the pin rejects {program}");
+        }
+        let (code, stdout, stderr) = ours(&lib, &root, &entry);
+        assert_ne!(code, 0, "{program}: {stdout}");
+        assert!(stderr.contains("refused"), "{program}: {stderr}");
+    }
+}
+
+#[test]
+fn init_control_operators_elaborate_with_the_pins_argument_order_and_hygiene() {
+    let Some(lib) = pinned_lib() else {
+        return;
+    };
+    let root = workspace();
+    let accepted = [
+        "example : (some 2 <&> Nat.succ) = some 3 := rfl\n",
+        "def mapShadow (Functor : Nat) : Option Nat := some Functor <&> Nat.succ\n\
+         example : mapShadow 2 = some 3 := rfl\n",
+        "example : ((none : Option Nat) <&> Nat.succ) = none := rfl\n",
+        "example : (some false <||> some true : Option Bool) = some true := rfl\n",
+        "example : (some true <||> none : Option Bool) = some true := rfl\n",
+        "example : (some false <&&> none : Option Bool) = some false := rfl\n",
+        "example : (some true <&&> some false : Option Bool) = some false := rfl\n",
+        "example : (some true <||> some false <&&> some false : Option Bool) = some true := rfl\n",
+        "def up (n : Nat) : Option Nat := some (n + 1)\n\
+         def twice (n : Nat) : Option Nat := some (n * 2)\n\
+         example : (up >=> twice) 3 = some 8 := rfl\n\
+         example : (up <=< twice) 3 = some 7 := rfl\n\
+         example : (up =<< some 3) = some 4 := rfl\n\
+         example : (up =<< up =<< some 3) = some 5 := rfl\n\
+         example : (up >=> twice >=> up) 3 = some 9 := rfl\n",
+        "def bindShadow (Bind : Nat) : Option Nat := (fun n : Nat => some (Nat.succ n)) =<< some Bind\n\
+         example : bindShadow 3 = some 4 := rfl\n",
+        "def both : True ⊕' Nat := PSum.inl True.intro\n",
+        "def three : True ⊕' False ⊕' Nat := PSum.inr (PSum.inr 3)\n",
+        "def sumShadow (PSum : Nat) : True ⊕' Nat := _root_.PSum.inr PSum\n",
+        "instance : HasSubset Nat where Subset a b := a ≤ b\n\
+         instance : HasSSubset Nat where SSubset a b := a < b\n\
+         example (a b : Nat) : (a ⊇ b) = (b ≤ a) := rfl\n\
+         example (a b : Nat) : (a ⊃ b) = (b < a) := rfl\n",
+        "instance : HAndThen Bool Nat Nat where\n\
+           hAndThen b next := if b then next () else 7\n\
+         example : ((true : Bool) >> (12 : Nat)) = 12 := rfl\n\
+         example : ((false : Bool) >> (12 : Nat)) = 7 := rfl\n\
+         def lazyShadow (HAndThen Unit : Nat) : Nat := (true : Bool) >> (HAndThen + Unit)\n\
+         example : lazyShadow 4 2 = 6 := rfl\n",
+    ];
+    for (index, program) in accepted.iter().enumerate() {
+        let entry = root.join(format!("ControlAccepted{index}.lean"));
+        std::fs::write(&entry, format!("{HEADER}{program}")).unwrap();
+        if let Some((code, stdout)) = pinned(&lib, &entry) {
+            assert_eq!((code, stdout.as_str()), (0, ""), "the pin moved: {program}");
+        }
+        let (code, stdout, stderr) = ours(&lib, &root, &entry);
+        assert_eq!((code, stdout.as_str()), (0, ""), "{program}: {stderr}");
+    }
+    for (index, program) in [
+        "example : (some 2 <&> Nat.succ) = some 2 := rfl\n",
+        "example : (some true <||> some false : Option Bool) = some false := rfl\n",
+        "example : (some false <&&> some true : Option Bool) = some true := rfl\n",
+        "def bad : Option Nat := Nat.succ =<< some 3\n",
+        "def bad (a b c : Nat) := a ⊇ b ⊇ c\n",
+        "def bad : Nat := (true : Bool) >> (3 : Nat)\n",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let entry = root.join(format!("ControlRefused{index}.lean"));
         std::fs::write(&entry, format!("{HEADER}{program}")).unwrap();
         if let Some((code, _)) = pinned(&lib, &entry) {
             assert_eq!(code, 1, "the pin rejects {program}");

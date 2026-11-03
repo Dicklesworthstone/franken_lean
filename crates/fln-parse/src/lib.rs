@@ -361,10 +361,19 @@ enum BoundedInfix {
     Dvd,
     Subset,
     SSubset,
+    Superset,
+    SSuperset,
     Union,
     Inter,
     SDiff,
     FunctorMap,
+    /// Init.Control.Basic's right-associative mapping, monadic Boolean and bind operators.
+    FunctorMapRev,
+    MonadicOr,
+    MonadicAnd,
+    KleisliRight,
+    KleisliLeft,
+    BindLeft,
     /// `syntax:min term " <| " term:min` (`Init/Notation.lean:522`): application, right-nested.
     PipeLeft,
     /// `syntax:min term " |> " term:min1` (`Init/Notation.lean`): application, left-nested.
@@ -377,6 +386,7 @@ enum BoundedInfix {
     /// `infixr:30 " ⊕ " => Sum` (`Init/Core.lean`) and `infixr:73 " • " => HSMul.hSMul`
     /// (`Init/Notation.lean`).
     Sum,
+    PSum,
     SMul,
     /// `infixl:50 " <+: " => IsPrefix`, `" <:+ "` and `" <:+: "` (`Init/Data/List/Basic.lean`),
     /// declared in namespace `List`: their kinds are `List.«term_<+:_»` and so on.
@@ -394,6 +404,8 @@ enum BoundedInfix {
     HEq,
     /// `syntax:20 term:21 " <|> " term:20 : term` (`Init/Notation.lean`).
     OrElse,
+    /// `syntax:60 term:61 " >> " term:60 : term` (`Init/Notation.lean`): a lazy right operand.
+    AndThen,
     /// `infix:50 " ≈ " => HasEquiv.Equiv` (`Init/Core.lean`).
     Equiv,
     /// `syntax:50 term:51 " matches " sepBy1(term:51, " | ") : term` (`Lean.«term_Matches_|»`,
@@ -464,15 +476,24 @@ impl BoundedInfix {
             Self::Dvd => "∣",
             Self::Subset => "⊆",
             Self::SSubset => "⊂",
+            Self::Superset => "⊇",
+            Self::SSuperset => "⊃",
             Self::Union => "∪",
             Self::Inter => "∩",
             Self::SDiff => "\\",
             Self::FunctorMap => "<$>",
+            Self::FunctorMapRev => "<&>",
+            Self::MonadicOr => "<||>",
+            Self::MonadicAnd => "<&&>",
+            Self::KleisliRight => ">=>",
+            Self::KleisliLeft => "<=<",
+            Self::BindLeft => "=<<",
             Self::PipeLeft => "<|",
             Self::PipeRight => "|>",
             Self::PipeProj => "|>.",
             Self::Bind => ">>=",
             Self::Sum => "⊕",
+            Self::PSum => "⊕'",
             Self::SMul => "•",
             Self::RangeCo => "...<",
             Self::RangeCoDots => "...",
@@ -489,6 +510,7 @@ impl BoundedInfix {
             Self::SeqRight => "*>",
             Self::HEq => "≍",
             Self::OrElse => "<|>",
+            Self::AndThen => ">>",
             Self::Equiv => "≈",
             Self::Matches => "matches",
             Self::MatchesBar => "|",
@@ -552,16 +574,24 @@ impl BoundedInfix {
             Self::BoolOr => 30,
             Self::ListCons => 67,
             Self::Subst => 75,
-            Self::Mem | Self::NotMem | Self::Dvd | Self::Subset | Self::SSubset => 50,
+            Self::Mem
+            | Self::NotMem
+            | Self::Dvd
+            | Self::Subset
+            | Self::SSubset
+            | Self::Superset
+            | Self::SSuperset => 50,
             Self::Prod | Self::PProd => 35,
             Self::Comp => 90,
             Self::Union => 65,
             Self::Inter | Self::SDiff => 70,
-            Self::FunctorMap => 100,
+            Self::FunctorMap | Self::FunctorMapRev => 100,
+            Self::MonadicOr => 30,
+            Self::MonadicAnd => 35,
             Self::PipeLeft | Self::PipeRight | Self::Dollar => 10,
             Self::PipeProj => 10,
-            Self::Bind => 55,
-            Self::Sum => 30,
+            Self::Bind | Self::KleisliRight | Self::KleisliLeft | Self::BindLeft => 55,
+            Self::Sum | Self::PSum => 30,
             Self::SMul => 73,
             Self::RangeCo
             | Self::RangeCoDots
@@ -571,7 +601,7 @@ impl BoundedInfix {
             | Self::RangeOc => 10,
             Self::ListIsPrefix | Self::ListIsSuffix | Self::ListIsInfix => 50,
             Self::BoolXor => 33,
-            Self::Seq | Self::SeqLeft | Self::SeqRight => 60,
+            Self::Seq | Self::SeqLeft | Self::SeqRight | Self::AndThen => 60,
             Self::HEq => 50,
             Self::OrElse => 20,
             Self::Equiv | Self::Matches => 50,
@@ -599,11 +629,19 @@ impl BoundedInfix {
                 | Self::PProd
                 | Self::Comp
                 | Self::FunctorMap
+                | Self::FunctorMapRev
+                | Self::MonadicOr
+                | Self::MonadicAnd
+                | Self::KleisliRight
+                | Self::KleisliLeft
+                | Self::BindLeft
                 | Self::PipeLeft
                 | Self::Dollar
                 | Self::Sum
+                | Self::PSum
                 | Self::SMul
                 | Self::OrElse
+                | Self::AndThen
         )
     }
 
@@ -626,6 +664,8 @@ impl BoundedInfix {
                 | Self::Dvd
                 | Self::Subset
                 | Self::SSubset
+                | Self::Superset
+                | Self::SSuperset
                 | Self::SDiff
                 | Self::RangeCo
                 | Self::RangeCoDots
@@ -636,6 +676,24 @@ impl BoundedInfix {
                 | Self::HEq
                 | Self::Equiv
         )
+    }
+
+    /// An `infixr:p` or `infix:p` reads `term:p+1` on its left. A preceding
+    /// operator at `p` therefore cannot supply that operand after it reduces.
+    /// The other right-nesting forms below explicitly permit a looser left
+    /// operand (`<|` reads `term`, for example), so associativity alone is not
+    /// enough to decide this check.
+    const fn has_strict_left_operand(self) -> bool {
+        match self {
+            Self::Extension(operator) => operator.lhs_prec > operator.prec as u16,
+            Self::Arrow
+            | Self::Subst
+            | Self::Mem
+            | Self::NotMem
+            | Self::PipeLeft
+            | Self::Dollar => false,
+            _ => self.is_right_associative() || self.is_non_associative(),
+        }
     }
 
     fn syntax_kind(self) -> Name {
@@ -1072,15 +1130,24 @@ fn bounded_infix(kind: Option<&TokenKind>, grammar: DefinitionGrammar) -> Option
         "∣" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::Dvd),
         "⊆" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::Subset),
         "⊂" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::SSubset),
+        "⊇" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::Superset),
+        "⊃" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::SSuperset),
         "∪" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::Union),
         "∩" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::Inter),
         "\\" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::SDiff),
         "<$>" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::FunctorMap),
+        "<&>" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::FunctorMapRev),
+        "<||>" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::MonadicOr),
+        "<&&>" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::MonadicAnd),
         "<|" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::PipeLeft),
         "|>" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::PipeRight),
         "|>." if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::PipeProj),
         ">>=" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::Bind),
+        ">=>" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::KleisliRight),
+        "<=<" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::KleisliLeft),
+        "=<<" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::BindLeft),
         "⊕" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::Sum),
+        "⊕'" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::PSum),
         "...<" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::RangeCo),
         "..." if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::RangeCoDots),
         "...=" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::RangeCc),
@@ -1097,6 +1164,7 @@ fn bounded_infix(kind: Option<&TokenKind>, grammar: DefinitionGrammar) -> Option
         "*>" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::SeqRight),
         "≍" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::HEq),
         "<|>" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::OrElse),
+        ">>" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::AndThen),
         "≈" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::Equiv),
         "matches" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::Matches),
         "$" if grammar == DefinitionGrammar::Scalar => Some(BoundedInfix::Dollar),
@@ -2413,13 +2481,15 @@ fn push_bounded_infix(
         reduce_bounded_infix(view, tokens, frame, grammar)?;
     }
     // At equal precedence a non-associative operator reads `term:p+1` on both sides. The one before
-    // cannot be continued, and this one cannot take its result, except the arrow, a trailing parser
-    // with no left precedence (`a ⊨ f → b` is `(a ⊨ f) → b`). This one may still nest inside a
-    // right-associative operator's `term:p` (`q → a ⊨ f` is `q → (a ⊨ f)`).
+    // cannot be continued, except by the arrow, a trailing parser with no left precedence
+    // (`a ⊨ f → b` is `(a ⊨ f) → b`). A strict left operand also cannot take a preceding
+    // left-associative operator's result (`a <*> b >> c`); parentheses raise that result's
+    // precedence. A right-associative predecessor admits nesting (`a >> b <*> c`).
     if frame.operators.last().is_some_and(|previous| {
         previous.operator.right_precedence() == operator.left_precedence()
             && ((previous.operator.is_non_associative() && operator != BoundedInfix::Arrow)
-                || (operator.is_non_associative() && !previous.operator.is_right_associative()))
+                || (operator.has_strict_left_operand()
+                    && !previous.operator.is_right_associative()))
     }) {
         return Err(NatDefinitionParseError::OutsideSeedGrammar {
             at: original_position(view, tokens, index),
@@ -7657,6 +7727,105 @@ mod nat_definition_tests {
             .expect("String append composes left-associatively");
         let outer_append = operator_args(definition_value(&parsed), "term_++_");
         operator_args(&outer_append[0], "term_++_");
+    }
+
+    #[test]
+    fn init_control_infixes_keep_the_pins_trees_and_import_boundaries() {
+        for symbol in ["<&>", "<||>", "<&&>", ">=>", "<=<", "=<<", "⊕'", ">>"] {
+            let source = format!("def answer := a {symbol} b {symbol} c");
+            let parsed = parse_definition(source.as_bytes()).unwrap();
+            let kind = format!("term_{symbol}_");
+            let args = operator_args(definition_value(&parsed), &kind);
+            assert!(matches!(&args[0], Syntax::Ident { val, .. }
+                if *val == Name::from_components(["a"])));
+            operator_args(&args[2], &kind);
+            assert_eq!(
+                parsed.reconstruct_normalized().as_deref(),
+                Some(source.as_bytes()),
+            );
+        }
+        let parsed = parse_definition(b"def answer := a <||> b <&&> c >=> d >> e <&> f")
+            .expect("Init.Control.Basic's precedence ladder");
+        let or = operator_args(definition_value(&parsed), "term_<||>_");
+        let and = operator_args(&or[2], "term_<&&>_");
+        let kleisli = operator_args(&and[2], "term_>=>_");
+        let sequence = operator_args(&kleisli[2], "term_>>_");
+        operator_args(&sequence[2], "term_<&>_");
+        for term in [
+            "a <*> b >> c",
+            "a <* b >> c",
+            "a *> b >> c",
+            "a >>= b >=> c",
+            "a >>= b <=< c",
+            "a >>= b =<< c",
+            "a || b <||> c",
+            "a && b <&&> c",
+            "a || b ⊕' c",
+        ] {
+            let source = format!("def answer := {term}");
+            assert!(parse_definition(source.as_bytes()).is_err(), "{term}");
+        }
+        for (term, outer, inner) in [
+            ("a >> b <*> c", "term_>>_", "term_<*>_"),
+            ("a >=> b >>= c", "term_>=>_", "term_>>=_"),
+            ("a <||> b || c", "term_<||>_", "term_||_"),
+            ("a <&&> b && c", "term_<&&>_", "term_&&_"),
+        ] {
+            let source = format!("def answer := {term}");
+            let parsed = parse_definition(source.as_bytes()).unwrap();
+            let args = operator_args(definition_value(&parsed), outer);
+            operator_args(&args[2], inner);
+        }
+        for term in [
+            "(a <*> b) >> c",
+            "(a >>= b) >=> c",
+            "(a || b) <||> c",
+            "(a && b) <&&> c",
+        ] {
+            let source = format!("def answer := {term}");
+            assert!(parse_definition(source.as_bytes()).is_ok(), "{term}");
+        }
+        for symbol in ["⊇", "⊃"] {
+            let source = format!("def answer := a {symbol} b");
+            let parsed = parse_definition(source.as_bytes()).unwrap();
+            operator_args(definition_value(&parsed), &format!("term_{symbol}_"));
+            assert_eq!(
+                parsed.reconstruct_normalized().as_deref(),
+                Some(source.as_bytes()),
+            );
+            let chained = format!("def answer := a {symbol} b {symbol} c");
+            assert!(parse_definition(chained.as_bytes()).is_err());
+        }
+        for (symbol, module) in [
+            ("<&>", ["Init", "Control", "Basic"].as_slice()),
+            ("<||>", ["Init", "Control", "Basic"].as_slice()),
+            ("<&&>", ["Init", "Control", "Basic"].as_slice()),
+            (">=>", ["Init", "Control", "Basic"].as_slice()),
+            ("<=<", ["Init", "Control", "Basic"].as_slice()),
+            ("=<<", ["Init", "Control", "Basic"].as_slice()),
+            ("⊕'", ["Init", "Core"].as_slice()),
+            ("⊇", ["Init", "Core"].as_slice()),
+            ("⊃", ["Init", "Core"].as_slice()),
+            (">>", ["Init", "Notation"].as_slice()),
+        ] {
+            let source = format!("def answer := a {symbol} b");
+            for imported in [false, true] {
+                let imports = if imported {
+                    vec![Name::from_components(module.iter().copied())]
+                } else {
+                    vec![Name::from_components(["Init", "Prelude"])]
+                };
+                let grammar = extensions::FileGrammar::new(true, &imports, None).unwrap();
+                let result = extensions::with_grammar(&grammar.grammar(), || {
+                    parse_definition(source.as_bytes())
+                });
+                assert_eq!(
+                    result.is_ok(),
+                    imported,
+                    "{symbol}, imported={imported}: {result:?}"
+                );
+            }
+        }
     }
 
     #[test]
