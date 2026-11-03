@@ -278,11 +278,7 @@ impl Engine {
         }
         // Equation theorems the command names are generated and admitted first; the
         // command's own admissions follow them in one batch.
-        let syntaxes: Vec<&fln_syntax::tree::Syntax> = match &parsed {
-            ScopedCommandSyntax::Mutual(members) => members.iter().collect(),
-            ScopedCommandSyntax::Example(parsed) => vec![parsed.syntax()],
-            ScopedCommandSyntax::Definition(parsed) => vec![parsed.syntax()],
-        };
+        let syntaxes = parsed.syntaxes();
         let realized = match self.realize_equation_theorems(
             &syntaxes,
             &scope,
@@ -410,17 +406,21 @@ impl Engine {
     /// proof instance additionally passes both checkers in the public world.
     /// Every proof instance remains a theorem privately and an axiom publicly;
     /// the module driver publishes only after metadata can be replayed atomically.
+    ///
+    /// The original bytes retain source positions only; public signatures and
+    /// implementation bodies come from the supplied, already expanded syntax.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn admit_public_source_command_in_scope(
+    pub(crate) fn admit_public_scoped_command_syntax(
         &self,
         public: &Engine,
         source: &[u8],
+        parsed: ScopedCommandSyntax,
         options: &KVMap,
         limits: EngineAdmissionLimits,
         public_scope: &fln_elab::source::scope::SourceScope,
         private_scope: &fln_elab::source::scope::SourceScope,
     ) -> Result<Outcome<PublicSourceAdmission>, EngineExecutionError> {
-        let parsed = match parse_scoped_command(source)? {
+        let parsed = match parsed {
             ScopedCommandSyntax::Definition(parsed)
                 if fln_elab::source::is_definition_body(parsed.syntax())
                     && !public_scope
@@ -1377,6 +1377,17 @@ pub(crate) enum ScopedCommandSyntax {
     Example(fln_parse::ParsedSourceCommand),
     /// Every other declaration command.
     Definition(fln_parse::ParsedDefinition),
+}
+
+impl ScopedCommandSyntax {
+    /// The complete declaration trees, retaining mutual source order.
+    pub(crate) fn syntaxes(&self) -> Vec<&fln_syntax::tree::Syntax> {
+        match self {
+            Self::Mutual(members) => members.iter().collect(),
+            Self::Example(parsed) => vec![parsed.syntax()],
+            Self::Definition(parsed) => vec![parsed.syntax()],
+        }
+    }
 }
 
 /// Parse one command exactly as [`Engine::admit_source_command_in_scope`] does,

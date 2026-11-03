@@ -404,23 +404,6 @@ pub(super) fn run_collecting(
     } else {
         graph::Plan::new(modules, entry, base.imported_modules(), &mut meter)?
     };
-    if macros.is_some() {
-        for &index in &plan.order {
-            if plan.headers[index].module_system {
-                return Err(SourceModuleCheckError::Source {
-                    module: modules[index].name.clone(),
-                    error: SourceCheckError::Command {
-                        file: 0,
-                        command: 0,
-                        offset: 0,
-                        error: Box::new(EngineExecutionError::NotImplemented {
-                            feature: "module-system public admission with imported macros",
-                        }),
-                    },
-                });
-            }
-        }
-    }
     let mut artifacts = Vec::new();
     let base_logical_root = base.logical_root(options);
     let mut exports: BTreeMap<usize, Arc<replay::Export>> = BTreeMap::new();

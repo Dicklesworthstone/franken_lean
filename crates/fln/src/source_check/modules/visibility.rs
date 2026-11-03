@@ -3,6 +3,7 @@
 //! in that world, checks its implementation privately, and exports the checked signature.
 //! Every declaration still passes ordinary admission; no caller-authored proof is trusted.
 use super::*;
+use crate::source_records::ScopedCommandSyntax;
 
 /// This receipt is private to the source module driver. Its public engine never
 /// contains a private dependency or a module-local private declaration.
@@ -27,6 +28,12 @@ pub(crate) struct PrivateSourceAdmission {
     pub(crate) engine: Engine,
     pub(crate) admission: DeclarationBatchAdmission,
     pub(crate) traces: Vec<fln_elab::source::trace::SourceTrace>,
+}
+
+enum PrivateCommand<'a> {
+    Source,
+    Parsed(Box<ScopedCommandSyntax>),
+    Observed(&'a fln_parse::ParsedSourceCommand),
 }
 
 impl<'a> PublicWorld<'a> {
@@ -77,7 +84,7 @@ impl<'a> PublicWorld<'a> {
     fn stage_command_equations(
         &mut self,
         private: &Engine,
-        source: &[u8],
+        syntaxes: &[&fln_syntax::tree::Syntax],
         options: &KVMap,
         limits: EngineAdmissionLimits,
         scope: &fln_elab::source::scope::SourceScope,
@@ -86,7 +93,7 @@ impl<'a> PublicWorld<'a> {
         use fln_elab::source::equation_theorems::{self as equations, Request, Suffix};
         use fln_elab::source::scope::simp::equations as simp_equations;
 
-        if !crate::source_records::may_name_equation_theorems(source) {
+        if syntaxes.is_empty() {
             return Ok(Outcome::Complete(StagedPublicEquations {
                 public: self.engine.clone(),
                 private: private.clone(),
@@ -94,16 +101,10 @@ impl<'a> PublicWorld<'a> {
                 declarations: Vec::new(),
             }));
         }
-        let parsed = crate::source_records::parse_scoped_command(source)?;
-        let syntaxes: Vec<_> = match &parsed {
-            crate::source_records::ScopedCommandSyntax::Mutual(members) => members.iter().collect(),
-            crate::source_records::ScopedCommandSyntax::Example(parsed) => vec![parsed.syntax()],
-            crate::source_records::ScopedCommandSyntax::Definition(parsed) => vec![parsed.syntax()],
-        };
         // Resolve names in the real private lexical scope. A same-spelled
         // private definition must never trigger generation for a public one.
         let requests = match crate::source_records::elaboration_outcome(equations::requests(
-            &syntaxes,
+            syntaxes,
             private.environment(),
             scope,
             limits.kernel,
@@ -267,9 +268,76 @@ impl<'a> PublicWorld<'a> {
         source_base: &Environment,
         observed: Option<&fln_parse::ParsedSourceCommand>,
     ) -> Result<Outcome<PrivateSourceAdmission>, EngineExecutionError> {
-        let mut staged = match self.stage_command_equations(
+        let parsed = match observed {
+            Some(parsed) => PrivateCommand::Observed(parsed),
+            None if crate::source_records::may_name_equation_theorems(source) => {
+                PrivateCommand::Parsed(Box::new(crate::source_records::parse_scoped_command(
+                    source,
+                )?))
+            }
+            None => PrivateCommand::Source,
+        };
+        self.admit_private_command_parsed(
             private,
             source,
+            parsed,
+            options,
+            limits,
+            scope,
+            source_base,
+        )
+    }
+
+    /// Expanded private implementations may introduce public equation names
+    /// absent from the source text. Stage those equations from the exact tree,
+    /// and publish neither world until its complete command has been checked.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn admit_private_command_syntax(
+        &mut self,
+        private: &Engine,
+        source: &[u8],
+        parsed: ScopedCommandSyntax,
+        options: &KVMap,
+        limits: EngineAdmissionLimits,
+        scope: &fln_elab::source::scope::SourceScope,
+        source_base: &Environment,
+    ) -> Result<Outcome<PrivateSourceAdmission>, EngineExecutionError> {
+        self.admit_private_command_parsed(
+            private,
+            source,
+            PrivateCommand::Parsed(Box::new(parsed)),
+            options,
+            limits,
+            scope,
+            source_base,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn admit_private_command_parsed(
+        &mut self,
+        private: &Engine,
+        source: &[u8],
+        parsed: PrivateCommand<'_>,
+        options: &KVMap,
+        limits: EngineAdmissionLimits,
+        scope: &fln_elab::source::scope::SourceScope,
+        source_base: &Environment,
+    ) -> Result<Outcome<PrivateSourceAdmission>, EngineExecutionError> {
+        let syntaxes = match &parsed {
+            PrivateCommand::Parsed(parsed) => parsed.syntaxes(),
+            PrivateCommand::Observed(parsed)
+                if crate::source_records::may_name_equation_theorems(source) =>
+            {
+                vec![parsed.syntax()]
+            }
+            // Ordinary text and observed commands retain the lexical
+            // prefilter. Expanded commands always enter through Parsed.
+            PrivateCommand::Source | PrivateCommand::Observed(_) => Vec::new(),
+        };
+        let mut staged = match self.stage_command_equations(
+            private,
+            &syntaxes,
             options,
             limits,
             scope,
@@ -279,51 +347,70 @@ impl<'a> PublicWorld<'a> {
             Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
         };
-        let (mut checked, traces) = if let Some(parsed) = observed {
-            // Observed elaboration has no lazy prepass of its own. Keep the
-            // ordinary private equations and their receipts before collecting
-            // observations, just as the unobserved command path does.
-            let mut equations = match staged.private.realize_equation_theorems(
-                &[parsed.syntax()],
-                scope,
-                options,
-                limits,
-                Some(source_base),
-            )? {
-                Outcome::Complete(equations) => equations,
-                Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
-                Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
-            };
-            let engine = equations
-                .as_ref()
-                .map_or(&staged.private, |batch| &batch.engine);
-            let mut observed =
-                match engine.admit_observed_source_definition(parsed, options, limits, scope)? {
+        let (mut checked, traces) = match parsed {
+            PrivateCommand::Source => {
+                let checked = match staged.private.admit_source_command_in_scope_with_base(
+                    source,
+                    options,
+                    limits,
+                    scope,
+                    Some(source_base),
+                )? {
+                    Outcome::Complete(checked) => checked,
+                    Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                    Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                };
+                (checked, Vec::new())
+            }
+            PrivateCommand::Observed(parsed) => {
+                // Observed elaboration has no lazy prepass of its own. Keep the
+                // ordinary private equations and their receipts before collecting
+                // observations, just as the unobserved command path does.
+                let mut equations = match staged.private.realize_equation_theorems(
+                    &[parsed.syntax()],
+                    scope,
+                    options,
+                    limits,
+                    Some(source_base),
+                )? {
+                    Outcome::Complete(equations) => equations,
+                    Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                    Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                };
+                let engine = equations
+                    .as_ref()
+                    .map_or(&staged.private, |batch| &batch.engine);
+                let mut observed = match engine
+                    .admit_observed_source_definition(parsed, options, limits, scope)?
+                {
                     Outcome::Complete(observed) => observed,
                     Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
                     Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
                 };
-            if let Some(mut equations) = equations.take() {
-                equations
-                    .admissions
-                    .append(&mut observed.admission.admissions);
-                observed.admission.admissions = equations.admissions;
-                observed.admission.base_logical_root = equations.base_logical_root;
+                if let Some(mut equations) = equations.take() {
+                    equations
+                        .admissions
+                        .append(&mut observed.admission.admissions);
+                    observed.admission.admissions = equations.admissions;
+                    observed.admission.base_logical_root = equations.base_logical_root;
+                }
+                (observed.admission, observed.traces)
             }
-            (observed.admission, observed.traces)
-        } else {
-            let checked = match staged.private.admit_source_command_in_scope_with_base(
-                source,
-                options,
-                limits,
-                scope,
-                Some(source_base),
-            )? {
-                Outcome::Complete(checked) => checked,
-                Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
-                Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
-            };
-            (checked, Vec::new())
+            PrivateCommand::Parsed(parsed) => {
+                let checked = match staged.private.admit_scoped_command_syntax_with_base(
+                    source,
+                    *parsed,
+                    options,
+                    limits,
+                    scope,
+                    Some(source_base),
+                )? {
+                    Outcome::Complete(checked) => checked,
+                    Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                    Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                };
+                (checked, Vec::new())
+            }
         };
         if self
             .cancellation
@@ -368,9 +455,73 @@ impl<'a> PublicWorld<'a> {
                 "source-module/public-command",
             )));
         }
-        let mut equations = match self.stage_command_equations(
+        self.admit_command_parsed(
             private,
             source,
+            crate::source_records::parse_scoped_command(source)?,
+            options,
+            limits,
+            public_scope,
+            private_scope,
+            crate::source_records::may_name_equation_theorems(source),
+        )
+    }
+
+    /// Publish the expanded command through the ordinary separate public-type
+    /// and private-implementation checks. No source reparse may replace its tree.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn admit_command_syntax(
+        &mut self,
+        private: &Engine,
+        source: &[u8],
+        parsed: ScopedCommandSyntax,
+        options: &KVMap,
+        limits: EngineAdmissionLimits,
+        public_scope: &fln_elab::source::scope::SourceScope,
+        private_scope: &fln_elab::source::scope::SourceScope,
+    ) -> Result<Outcome<(Engine, DeclarationBatchAdmission)>, EngineExecutionError> {
+        self.admit_command_parsed(
+            private,
+            source,
+            parsed,
+            options,
+            limits,
+            public_scope,
+            private_scope,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn admit_command_parsed(
+        &mut self,
+        private: &Engine,
+        source: &[u8],
+        parsed: ScopedCommandSyntax,
+        options: &KVMap,
+        limits: EngineAdmissionLimits,
+        public_scope: &fln_elab::source::scope::SourceScope,
+        private_scope: &fln_elab::source::scope::SourceScope,
+        discover_equations: bool,
+    ) -> Result<Outcome<(Engine, DeclarationBatchAdmission)>, EngineExecutionError> {
+        if self
+            .cancellation
+            .is_some_and(CancellationProbe::is_cancelled)
+        {
+            return Ok(Outcome::Inconclusive(Inconclusive::cancelled(
+                "source-module/public-command",
+            )));
+        }
+        // The ordinary text path retains its cheap lexical prefilter. Expanded
+        // syntax always participates: a macro can introduce an equation name.
+        let syntaxes = if discover_equations {
+            parsed.syntaxes()
+        } else {
+            Vec::new()
+        };
+        let mut equations = match self.stage_command_equations(
+            private,
+            &syntaxes,
             options,
             limits,
             private_scope,
@@ -380,9 +531,10 @@ impl<'a> PublicWorld<'a> {
             Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
         };
-        let mut staged = match equations.private.admit_public_source_command_in_scope(
+        let mut staged = match equations.private.admit_public_scoped_command_syntax(
             &equations.public,
             source,
+            parsed,
             options,
             limits,
             public_scope,

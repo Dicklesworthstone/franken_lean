@@ -269,8 +269,10 @@ impl imported::SourceOleanImport {
     ///
     /// Macro state resets per module; expansion allowances cover the whole
     /// graph. This explicit adapter uses the current parser's existing syntax
-    /// kinds. Source-declared templates, module-system public admission, and
-    /// receipts built on previously imported artifacts are typed refusals.
+    /// kinds. Module-system sources retain separate public-signature and
+    /// private-implementation checks, selected from the expanded modifiers.
+    /// Source-declared templates and receipts built on previously imported
+    /// artifacts are typed refusals.
     /// Reusable source caches and persisted artifacts are not consulted.
     pub fn check_source_modules_with_imported_macros(
         &self,

@@ -1058,22 +1058,13 @@ impl Engine {
                     count += 1;
                     continue;
                 }
-                let scope = if public.is_some() {
-                    grammar
-                        .enter(|| scopes.command_scope(command))
-                        .map_err(EngineExecutionError::Frontend)
-                        .map_err(|error| command_error(file, count, start, error))?
-                } else {
-                    scopes.current.clone()
-                };
-                let exported = scope.exports_declaration() && public.is_some();
-                let (next, admitted) = if let Some(session) = macros.as_deref_mut() {
+                let expanded = if let Some(session) = macros.as_deref_mut() {
                     let parsed = match grammar.enter(|| {
                         session.expand_command(
                             &engine,
                             scopes.imported_macros().expect("imported macro file scope"),
                             command,
-                            &scope,
+                            &scopes.current,
                         )
                     }) {
                         Outcome::Complete(Ok(parsed)) => parsed,
@@ -1088,18 +1079,86 @@ impl Engine {
                         Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
                         Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
                     };
-                    match engine
-                        .admit_scoped_command_syntax_with_base(
-                            command,
-                            parsed,
-                            options,
-                            limits.admission,
-                            &scope,
-                            Some(&file_base),
-                        )
-                        .map_err(|error| command_error(file, count, start, error))?
-                    {
-                        Outcome::Complete(admitted) => (admitted.engine.clone(), admitted),
+                    Some(parsed)
+                } else {
+                    None
+                };
+                let scope = if public.is_some() {
+                    if let Some(parsed) = &expanded {
+                        // A macro may change declaration modifiers. Choose the
+                        // checking and export worlds from its exact result,
+                        // with each world's own instance activation chronology.
+                        let mut scope = match parsed {
+                            source_records::ScopedCommandSyntax::Mutual(members) => {
+                                scopes.current.for_mutual_declarations(members)
+                            }
+                            source_records::ScopedCommandSyntax::Example(parsed) => {
+                                scopes.current.for_declaration(parsed.syntax())
+                            }
+                            source_records::ScopedCommandSyntax::Definition(parsed) => {
+                                scopes.current.for_declaration(parsed.syntax())
+                            }
+                        }
+                        .map_err(DefinitionFrontendError::Elaborate)
+                        .map_err(EngineExecutionError::Frontend)
+                        .map_err(|error| command_error(file, count, start, error))?;
+                        if scope.exports_declaration() {
+                            scope.instance_scopes = scopes.public_scope().instance_scopes;
+                        }
+                        scope
+                    } else {
+                        grammar
+                            .enter(|| scopes.command_scope(command))
+                            .map_err(EngineExecutionError::Frontend)
+                            .map_err(|error| command_error(file, count, start, error))?
+                    }
+                } else {
+                    scopes.current.clone()
+                };
+                let exported = scope.exports_declaration() && public.is_some();
+                let (next, admitted) = if let Some(parsed) = expanded {
+                    let admitted = if let Some(public) = public.as_deref_mut() {
+                        if exported {
+                            public.admit_command_syntax(
+                                &engine,
+                                command,
+                                parsed,
+                                options,
+                                limits.admission,
+                                &scope,
+                                &scopes.current,
+                            )
+                        } else {
+                            public
+                                .admit_private_command_syntax(
+                                    &engine,
+                                    command,
+                                    parsed,
+                                    options,
+                                    limits.admission,
+                                    &scope,
+                                    &file_base,
+                                )
+                                .map(|outcome| {
+                                    outcome.map_complete(|result| (result.engine, result.admission))
+                                })
+                        }
+                    } else {
+                        engine
+                            .admit_scoped_command_syntax_with_base(
+                                command,
+                                parsed,
+                                options,
+                                limits.admission,
+                                &scope,
+                                Some(&file_base),
+                            )
+                            .map(|outcome| {
+                                outcome.map_complete(|admitted| (admitted.engine.clone(), admitted))
+                            })
+                    };
+                    match admitted.map_err(|error| command_error(file, count, start, error))? {
+                        Outcome::Complete(result) => result,
                         Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
                         Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
                     }
