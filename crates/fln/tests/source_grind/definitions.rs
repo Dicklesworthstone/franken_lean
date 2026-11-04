@@ -303,7 +303,10 @@ fn definition_equations_match_pinned_lean() {
             assert_eq!(defined.logical_root(&options), defined_root);
             assert!(!defined.environment().contains(&name("strip.eq_1")));
             assert_eq!(engine.logical_root(&options), before);
-            assert!(failures.is_empty(), "grind definition failures: {failures:?}");
+            assert!(
+                failures.is_empty(),
+                "grind definition failures: {failures:?}"
+            );
         })
         .unwrap()
         .join()

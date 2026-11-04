@@ -134,20 +134,34 @@ impl Fixture {
                 private_artifact: Some(private),
             })
             .collect();
+        let mut import_limits = SourceOleanImportLimits::new(OleanCheckLimits::new(
+            artifact_bytes,
+            Budget::for_stack_bytes(STACK),
+        ));
+        // Captured extension graphs can exceed their object-file byte count.
+        // Bound this Lean.Syntax fixture independently, as in source_grind.
+        import_limits.max_capture_bytes = 1024 * 1024 * 1024;
+        eprintln!(
+            "syntax methods: importing {} modules, {artifact_bytes} artifact bytes, {} capture-byte allowance",
+            inputs.len(),
+            import_limits.max_capture_bytes,
+        );
         let mut imported = Engine::from_environment(Environment::new())
             .import_olean_modules_for_source(
                 &inputs,
                 std::slice::from_ref(&module),
                 &KVMap::new(),
-                SourceOleanImportLimits::new(OleanCheckLimits::new(
-                    artifact_bytes,
-                    Budget::for_stack_bytes(STACK),
-                )),
+                import_limits,
             )
-            .unwrap()
+            .unwrap_or_else(|error| panic!("syntax methods import: {error:?}; {root:?}"))
             .into_complete()
             .unwrap();
         assert_eq!(imported.checked.modules.len(), names.len());
+        eprintln!(
+            "syntax methods: import complete ({} checked modules, {} metadata modules)",
+            imported.checked.modules.len(),
+            imported.modules.len(),
+        );
         let owner = imported
             .checked
             .modules

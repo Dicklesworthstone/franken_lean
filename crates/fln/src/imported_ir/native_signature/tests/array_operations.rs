@@ -286,7 +286,11 @@ fn swap_erasure_never_hides_data_or_an_incomplete_proof_suffix() {
 
 #[test]
 fn swaps_check_each_index_without_truncating_large_naturals() {
-    for bad in [IrNat::Small(2), IrNat::Small(u64::MAX), IrNat::Big(vec![0, 1])] {
+    for bad in [
+        IrNat::Small(2),
+        IrNat::Small(u64::MAX),
+        IrNat::Big(vec![0, 1]),
+    ] {
         for second_is_bad in [false, true] {
             for boxed in [false, true] {
                 for safe in [false, true] {
