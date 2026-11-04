@@ -172,7 +172,6 @@ fn installed_public_instances_refuse_hidden_dependencies_and_recover() {
     for declaration in [
         "public instance leaked : Pick Token := Pick.mk hidden",
         "public instance leaked : Pick (Box Token) := Pick.mk (Box.mk chosen)",
-        "@[no_expose] public instance leaked : Pick Token := Pick.mk Token.left",
         "public instance leaked : Pick Token := Token.left",
     ] {
         p.write(
@@ -185,6 +184,42 @@ fn installed_public_instances_refuse_hidden_dependencies_and_recover() {
         assert!(!lean.status.success(), "{declaration}");
         assert!(lean.stdout.is_empty());
     }
+    // A hidden public dictionary is supported; clients may select it without
+    // using its implementation in a public proof. Retain the original input.
+    p.write(
+        "Api.lean",
+        "module\nprelude\npublic import Base\nimport Secret\n@[no_expose] public instance leaked : Pick Token := Pick.mk Token.left",
+    );
+    for command in ["check-source", "run"] {
+        let report = p.complete(command);
+        assert!(report.contains("\"authority\":true"), "{report}");
+    }
+    assert!(p.lean_complete().is_empty());
+    let client = "prelude\nimport Api\nnoncomputable def client : Token := chosen";
+    p.write("Main.lean", client);
+    p.complete("check-source");
+    p.complete("run");
+    assert!(p.lean_complete().is_empty());
+
+    p.write(
+        "Main.lean",
+        "module\nprelude\npublic import Api\npublic def invented (P : Token -> Prop) (h : P Token.left) : P chosen := h",
+    );
+    for command in ["check-source", "run"] {
+        let error = p.refused(command);
+        assert!(error.contains("not definitionally equal"), "{error}");
+    }
+    let lean = p.lean();
+    assert!(!lean.status.success(), "{lean:?}");
+    assert!(lean.stdout.is_empty(), "{lean:?}");
+    assert!(
+        String::from_utf8_lossy(&lean.stderr).contains("not definitionally equal"),
+        "{lean:?}"
+    );
+    p.write("Main.lean", client);
+    p.complete("check-source");
+    p.complete("run");
+
     p.write(
         "Api.lean",
         "module\nprelude\npublic import Base\nimport Secret\n@[expose] public instance selected : Pick Token := Pick.mk Token.left",
