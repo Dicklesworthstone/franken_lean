@@ -124,7 +124,7 @@ fn reviewed_boxed_primitives_bind_the_generated_row_before_admitting_a_wrapper()
             );
         }
     }
-    for target in ["Nat.divExact", "Nat.gcd", "String.extract", "Int.add"] {
+    for target in ["Nat.divExact", "Nat.gcd", "String.extract", "Int.divExact"] {
         assert!(BoxedNative::from_row(row(target)).unwrap().is_none());
     }
 }

@@ -23,7 +23,11 @@ struct Review {
 pub(super) fn signature(
     row: &GeneratedExternRow,
 ) -> Result<Option<PrimitiveSignature>, IrExecutionError> {
-    let Some(review) = natural(row).or_else(|| string(row)).or_else(|| word(row)) else {
+    let Some(review) = natural(row)
+        .or_else(|| integer(row))
+        .or_else(|| string(row))
+        .or_else(|| word(row))
+    else {
         return Ok(None);
     };
     if row.name != review.name
@@ -90,6 +94,166 @@ fn natural(row: &GeneratedExternRow) -> Option<Review> {
                 &IrType::TObject
             },
         },
+    })
+}
+
+fn integer(row: &GeneratedExternRow) -> Option<Review> {
+    let (name, symbol, module, kind, ownership, parameters, result): (
+        _,
+        _,
+        _,
+        _,
+        _,
+        &'static [IrType],
+        &'static IrType,
+    ) = match row.id {
+        "extern:Int.add" => (
+            "Int.add",
+            "lean_int_add",
+            "Init.Data.Int.Basic",
+            "defn",
+            "abi((a1: borrowed_arg, a2: borrowed_arg) -> owned_res)",
+            &[IrType::TObject, IrType::TObject],
+            &IrType::TObject,
+        ),
+        "extern:Int.sub" => (
+            "Int.sub",
+            "lean_int_sub",
+            "Init.Data.Int.Basic",
+            "defn",
+            "abi((a1: borrowed_arg, a2: borrowed_arg) -> owned_res)",
+            &[IrType::TObject, IrType::TObject],
+            &IrType::TObject,
+        ),
+        "extern:Int.mul" => (
+            "Int.mul",
+            "lean_int_mul",
+            "Init.Data.Int.Basic",
+            "defn",
+            "abi((a1: borrowed_arg, a2: borrowed_arg) -> owned_res)",
+            &[IrType::TObject, IrType::TObject],
+            &IrType::TObject,
+        ),
+        "extern:Int.ediv" => (
+            "Int.ediv",
+            "lean_int_ediv",
+            "Init.Data.Int.DivMod.Basic",
+            "defn",
+            "abi((a1: borrowed_arg, a2: borrowed_arg) -> owned_res)",
+            &[IrType::TObject, IrType::TObject],
+            &IrType::TObject,
+        ),
+        "extern:Int.emod" => (
+            "Int.emod",
+            "lean_int_emod",
+            "Init.Data.Int.DivMod.Basic",
+            "defn",
+            "abi((a1: borrowed_arg, a2: borrowed_arg) -> owned_res)",
+            &[IrType::TObject, IrType::TObject],
+            &IrType::TObject,
+        ),
+        "extern:Int.tdiv" => (
+            "Int.tdiv",
+            "lean_int_div",
+            "Init.Data.Int.DivMod.Basic",
+            "defn",
+            "abi((a1: borrowed_arg, a2: borrowed_arg) -> owned_res)",
+            &[IrType::TObject, IrType::TObject],
+            &IrType::TObject,
+        ),
+        "extern:Int.tmod" => (
+            "Int.tmod",
+            "lean_int_mod",
+            "Init.Data.Int.DivMod.Basic",
+            "defn",
+            "abi((a1: borrowed_arg, a2: borrowed_arg) -> owned_res)",
+            &[IrType::TObject, IrType::TObject],
+            &IrType::TObject,
+        ),
+        "extern:Int.neg" => (
+            "Int.neg",
+            "lean_int_neg",
+            "Init.Data.Int.Basic",
+            "defn",
+            "abi((a: borrowed_arg) -> owned_res)",
+            &[IrType::TObject],
+            &IrType::TObject,
+        ),
+        "extern:Int.natAbs" => (
+            "Int.natAbs",
+            "lean_nat_abs",
+            "Init.Data.Int.Basic",
+            "defn",
+            "abi((i: borrowed_arg) -> owned_res)",
+            &[IrType::TObject],
+            &IrType::TObject,
+        ),
+        "extern:Int.ofNat" => (
+            "Int.ofNat",
+            "lean_nat_to_int",
+            "Init.Data.Int.Basic",
+            "ctor",
+            "abi((a: owned_arg) -> owned_res)",
+            &[IrType::TObject],
+            &IrType::TObject,
+        ),
+        "extern:Int.negSucc" => (
+            "Int.negSucc",
+            "lean_int_neg_succ_of_nat",
+            "Init.Data.Int.Basic",
+            "ctor",
+            "abi((a: owned_arg) -> owned_res)",
+            &[IrType::TObject],
+            &IrType::TObject,
+        ),
+        "extern:Int.decEq" => (
+            "Int.decEq",
+            "lean_int_dec_eq",
+            "Init.Data.Int.Basic",
+            "defn",
+            "abi((a1: borrowed_arg, a2: borrowed_arg) -> value)",
+            &[IrType::TObject, IrType::TObject],
+            &IrType::UInt8,
+        ),
+        "extern:Int.decLe" => (
+            "Int.decLe",
+            "lean_int_dec_le",
+            "Init.Data.Int.Basic",
+            "defn",
+            "abi((a1: borrowed_arg, a2: borrowed_arg) -> value)",
+            &[IrType::TObject, IrType::TObject],
+            &IrType::UInt8,
+        ),
+        "extern:Int.decLt" => (
+            "Int.decLt",
+            "lean_int_dec_lt",
+            "Init.Data.Int.Basic",
+            "defn",
+            "abi((a1: borrowed_arg, a2: borrowed_arg) -> value)",
+            &[IrType::TObject, IrType::TObject],
+            &IrType::UInt8,
+        ),
+        "extern:Int.decNonneg" => (
+            "Int.decNonneg",
+            "lean_int_dec_nonneg",
+            "Init.Data.Int.Basic",
+            "defn",
+            "abi((a: borrowed_arg) -> value)",
+            &[IrType::TObject],
+            &IrType::UInt8,
+        ),
+        // divExact has an erased proof in its compiler telescope. Its native
+        // closure requires a separate proof-slot bridge; never guess it from
+        // the two-argument C ABI.
+        _ => return None,
+    };
+    Some(Review {
+        name,
+        symbol,
+        module,
+        kind,
+        ownership,
+        signature: PrimitiveSignature { parameters, result },
     })
 }
 
@@ -181,7 +345,7 @@ fn word(row: &GeneratedExternRow) -> Option<Review> {
          $from_nat:literal, $to_nat:literal, $nat_result:ident, $nat_ownership:literal) => {{
             macro_rules! review {
                 ($operation:literal, $symbol:literal, $module:expr,
-                         $parameters:expr, $result:expr, $ownership:expr) => {
+                                 $parameters:expr, $result:expr, $ownership:expr) => {
                     Some(Review {
                         name: concat!($family, ".", $operation),
                         symbol: concat!($c, "_", $symbol),
