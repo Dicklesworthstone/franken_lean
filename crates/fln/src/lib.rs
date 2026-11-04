@@ -2953,11 +2953,6 @@ impl Engine {
         if let Some(session) = macros.as_deref() {
             grammar.import_artifact(session.parsers())?;
         }
-        if macros.is_some() && grammar.has_templates() {
-            return Err(
-                imported_macros::source::SourceMacroError::TemplateGrammar.into_execution_error()
-            );
-        }
         grammar.extend_scopes(&mut scopes);
         let mut queue: std::collections::VecDeque<Step<'_>> = commands
             .into_iter()
@@ -3045,6 +3040,9 @@ impl Engine {
                     private_module.is_some(),
                 )?;
                 grammar.extend_scopes(&mut scopes);
+            }
+            if let Some(session) = macros.as_deref_mut() {
+                session.set_templates(grammar.templates());
             }
             let local_stderr_capture = scopes.current.options.get_bool(
                 &Name::from_components(["stderrAsMessages"]),
@@ -3397,12 +3395,19 @@ impl Engine {
                     at: Some(original_offset),
                 })?
             {
-                if macros.is_some() {
-                    return Err(macro_error(
-                        command_index,
-                        original_offset,
-                        imported_macros::source::SourceMacroError::TemplateGrammar,
-                    ));
+                if let Some(session) = macros.as_deref() {
+                    session
+                        .check_native_syntax_declaration(
+                            scopes.imported_macros().expect("imported macro file scope"),
+                        )
+                        .map_err(|error| macro_error(command_index, original_offset, error))?;
+                    grammar.export_native().map_err(|error| {
+                        EngineExecutionError::BatchCommand {
+                            index: command_index,
+                            error: Box::new(error),
+                            at: Some(original_offset),
+                        }
+                    })?;
                 }
                 macro_pattern_warnings.extend(
                     grammar
@@ -3492,27 +3497,32 @@ impl Engine {
                 && (expanded.is_some()
                     || source_records::may_name_equation_theorems(command_source))
             {
-                let parsed = grammar.enter(|| {
-                    fln_parse::parse_source_command(command_source).and_then(|parsed| {
-                        grammar.expand_command(
-                            parsed,
-                            source_check::grammar::resolver(engine.environment(), &scope),
-                        )
+                // Mixed dispatch already returned the authoritative syntax.
+                // Re-expanding the source here would replay native templates
+                // solely to discard them during equation-name discovery.
+                let parsed = expanded.is_none().then(|| {
+                    grammar.enter(|| {
+                        fln_parse::parse_source_command(command_source).and_then(|parsed| {
+                            grammar.expand_command(
+                                parsed,
+                                source_check::grammar::resolver(engine.environment(), &scope),
+                            )
+                        })
                     })
                 });
                 let members = match &parsed {
-                    Ok(_) => None,
-                    Err(_) => grammar
+                    Some(Err(_)) => grammar
                         .enter(|| fln_parse::command_scope::mutual::parse(command_source))
                         .ok()
                         .flatten(),
+                    _ => None,
                 };
                 let syntaxes: Vec<&fln_syntax::tree::Syntax> = match &expanded {
                     Some(parsed) => parsed.syntaxes(),
                     None => match (&parsed, &members) {
-                        (Ok(parsed), _) => vec![parsed.syntax()],
-                        (Err(_), Some(members)) => members.iter().collect(),
-                        (Err(_), None) => Vec::new(),
+                        (Some(Ok(parsed)), _) => vec![parsed.syntax()],
+                        (_, Some(members)) => members.iter().collect(),
+                        _ => Vec::new(),
                     },
                 };
                 if !syntaxes.is_empty() {

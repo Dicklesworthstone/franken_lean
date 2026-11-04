@@ -83,9 +83,11 @@ mod macro_rules;
 mod modules;
 mod quotation;
 mod scoped_rules;
+mod template_dispatch;
 mod unexpanders;
 pub use artifacts::{ImportedSyntaxEntry, ImportedSyntaxModule};
 pub use modules::NativeSyntaxModule;
+pub use template_dispatch::TemplateExpansionError;
 pub use unexpanders::{Notations, Unexpander, UnexpanderItem};
 
 /// A `ParserDescr` (`Init/Prelude.lean`, `inductive ParserDescr`), one variant per constructor,
@@ -1756,6 +1758,7 @@ impl FileGrammar {
                     prechecked: true,
                     pattern: None,
                     source: None,
+                    starts_registration: true,
                     fallbacks: Vec::new(),
                 });
                 Declaration {
@@ -1827,6 +1830,7 @@ impl FileGrammar {
                     prechecked: true,
                     pattern: None,
                     source: None,
+                    starts_registration: true,
                     fallbacks: Vec::new(),
                 });
                 Declaration {
@@ -1891,6 +1895,7 @@ impl FileGrammar {
                         prechecked: false,
                         pattern: None,
                         source: None,
+                        starts_registration: true,
                         fallbacks: Vec::new(),
                     });
                 Declaration {
@@ -1971,6 +1976,14 @@ impl FileGrammar {
     /// The notation rules this file has declared, by node kind.
     pub fn rules(&self) -> impl Iterator<Item = (&Name, &NotationRule)> {
         self.rules.iter().map(|(kind, rule)| (kind, rule.as_ref()))
+    }
+
+    /// An immutable view of the quoted rules active at this exact source position.
+    /// A mixed MacroM dispatcher may execute one root at a time with
+    /// [`NotationRule::expand_root`]; it must not replay [`Self::expand`] over
+    /// that dispatcher's completed tree. Scope exits leave older snapshots intact.
+    pub fn active_template_rules(&self) -> Arc<BTreeMap<Name, Arc<NotationRule>>> {
+        self.active_rules(&self.top().trail)
     }
 
     /// `elabDeclareSyntaxCat`: the category, under the name as written, with its identifier
@@ -2733,6 +2746,10 @@ pub struct NotationRule {
     pub pattern: Option<Syntax>,
     /// Source buffer addressed by this clause's quotation spans, after pre-resolution.
     pub source: Option<Arc<[u8]>>,
+    /// The first clause of one macro registration. Later clauses in that same
+    /// registration share its MacroM scope; a new registration gets a fresh one.
+    /// Every complete chain starts with `true`, including after native replay.
+    pub starts_registration: bool,
     /// Remaining clauses in execution order. Each entry is a leaf, not another chain.
     pub fallbacks: Vec<NotationRule>,
 }

@@ -199,7 +199,7 @@ fn name(text: &str) -> Name {
 /// at the first atom/identifier even if that leaf has no position; the tail
 /// traversal skips positionless leaves. Input conversion already bounds this
 /// tree, and these walks use an explicit stack rather than host recursion.
-fn info_from_reference(reference: &Syntax) -> SourceInfo {
+pub(super) fn info_from_reference(reference: &Syntax) -> SourceInfo {
     let mut pending = vec![reference];
     let mut start = None;
     while let Some(current) = pending.pop() {

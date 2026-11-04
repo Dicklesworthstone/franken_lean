@@ -186,3 +186,50 @@ fn grammar_namespace_lookup_compares_structural_names_not_printed_prefixes() {
         Some(&Name::from_components(["Library.Parser", "Term"]))
     );
 }
+
+#[test]
+fn registration_groups_survive_scope_sorting_local_expiry_and_native_replay() {
+    let markers = |rules: &BTreeMap<Name, Arc<NotationRule>>| {
+        rules[&key()]
+            .cases()
+            .map(|rule| rule.starts_registration)
+            .collect::<Vec<_>>()
+    };
+    let mut file = base();
+    declare(&mut file, "namespace Choice");
+    declare(
+        &mut file,
+        "scoped macro_rules | `(picked! 0) => `(40) | `(picked! 1) => `(41)",
+    );
+    declare(&mut file, "end Choice");
+    declare(&mut file, "section");
+    declare(
+        &mut file,
+        "local macro_rules | `(picked! 2) => `(12) | `(picked! 3) => `(13)",
+    );
+    declare(
+        &mut file,
+        "macro_rules | `(picked! 4) => `(24) | `(picked! 5) => `(25)",
+    );
+    declare(&mut file, "open scoped Choice");
+    assert_eq!(
+        markers(&file.active_template_rules()),
+        [true, false, true, false, true, false, true]
+    );
+    let exported = file.export_native().unwrap();
+    assert_eq!(markers(&exported.rules), [true, false, true, false, true]);
+    declare(&mut file, "end");
+    assert_eq!(markers(&file.active_template_rules()), [true, false, true]);
+    assert_eq!(file.export_native().unwrap(), exported);
+    let mut consumer = grammar("Consumer");
+    consumer.import_native(&exported).unwrap();
+    assert_eq!(
+        markers(&consumer.active_template_rules()),
+        [true, false, true]
+    );
+    declare(&mut consumer, "open scoped Choice");
+    assert_eq!(
+        markers(&consumer.active_template_rules()),
+        [true, false, true, false, true]
+    );
+}

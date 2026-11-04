@@ -85,6 +85,17 @@ pub(super) fn variables(children: &[Syntax]) -> Result<Vec<(Vec<usize>, Name)>, 
 }
 
 pub(super) fn matches(rule: &NotationRule, args: &[Syntax]) -> Result<bool, &'static str> {
+    matches_with_budget(rule, args, &mut 0)
+}
+
+/// A mixed-dispatch registration may contain many source clauses. Keep their
+/// work in one budget even when earlier clauses fail before walking a node.
+pub(super) fn matches_with_budget(
+    rule: &NotationRule,
+    args: &[Syntax],
+    visited: &mut usize,
+) -> Result<bool, &'static str> {
+    charge_match(visited)?;
     let Some(pattern) = &rule.pattern else {
         return Ok(true);
     };
@@ -99,14 +110,10 @@ pub(super) fn matches(rule: &NotationRule, args: &[Syntax]) -> Result<bool, &'st
         .zip(args)
         .map(|(p, a)| (p, a, false))
         .collect();
-    let mut visited = 0;
     while let Some((pattern, value, literal)) = pending.pop() {
-        visited += 1;
-        if visited > MAX_TEMPLATE_NODES {
-            return Err("quoted macro matching past the node budget");
-        }
+        charge_match(visited)?;
         if let Some(sequence) = repetition::whole(pattern)? {
-            if !sequence.accepts(value, &mut visited)? {
+            if !sequence.accepts(value, visited)? {
                 return Ok(false);
             }
             continue;
@@ -116,7 +123,7 @@ pub(super) fn matches(rule: &NotationRule, args: &[Syntax]) -> Result<bool, &'st
                 return Ok(false);
             };
             if items.len() < tail.prefix.len() + tail.fixed_suffix.len()
-                || !tail.sequence.accepts(value, &mut visited)?
+                || !tail.sequence.accepts(value, visited)?
             {
                 return Ok(false);
             }
@@ -161,6 +168,14 @@ pub(super) fn matches(rule: &NotationRule, args: &[Syntax]) -> Result<bool, &'st
         }
     }
     Ok(true)
+}
+
+fn charge_match(visited: &mut usize) -> Result<(), &'static str> {
+    *visited = visited
+        .checked_add(1)
+        .filter(|visited| *visited <= MAX_TEMPLATE_NODES)
+        .ok_or("quoted macro matching past the node budget")?;
+    Ok(())
 }
 
 fn capture_kind_matches(pattern: &Syntax, value: &Syntax) -> Result<bool, &'static str> {

@@ -57,7 +57,7 @@ pub(in crate::extensions) fn checked(
     replace_antiquotations(contents)
 }
 
-pub(super) fn charge(visited: &mut usize) -> Result<(), &'static str> {
+pub(in crate::extensions) fn charge(visited: &mut usize) -> Result<(), &'static str> {
     *visited = visited
         .checked_add(1)
         .ok_or("macro template work overflow")?;
@@ -180,6 +180,16 @@ pub(in crate::extensions) fn instantiate(
     context: &Name,
     scope: u64,
 ) -> Result<Syntax, &'static str> {
+    instantiate_rhs(rule, &rule.rhs, args, context, scope)
+}
+
+pub(in crate::extensions) fn instantiate_rhs(
+    rule: &NotationRule,
+    rhs: &Syntax,
+    args: &[Syntax],
+    context: &Name,
+    scope: u64,
+) -> Result<Syntax, &'static str> {
     let mut visited = 0;
     let bound: BTreeMap<&Name, Cow<'_, Syntax>> = rule
         .variables
@@ -196,7 +206,7 @@ pub(in crate::extensions) fn instantiate(
         Iteration(repetition::Iteration<'a>),
         Build(SourceInfo, &'a Name, &'a [Syntax]),
     }
-    let mut steps = vec![Step::Visit(&rule.rhs)];
+    let mut steps = vec![Step::Visit(rhs)];
     let mut built = Vec::new();
     while let Some(step) = steps.pop() {
         match step {
@@ -375,6 +385,7 @@ mod tests {
             prechecked: false,
             pattern: None,
             source: None,
+            starts_registration: true,
             fallbacks: vec![],
         }
     }

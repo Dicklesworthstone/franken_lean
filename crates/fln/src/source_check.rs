@@ -864,16 +864,6 @@ impl Engine {
                     .import_artifact(session.parsers())
                     .map_err(|error| command_error(file, count, fln_parse::BytePos(0), error))?;
             }
-            if macros.is_some() && grammar.has_templates() {
-                return Err(SourceCheckError::ImportedMacro {
-                    file,
-                    command: count,
-                    offset: 0,
-                    error: Box::new(
-                        crate::imported_macros::source::SourceMacroError::TemplateGrammar,
-                    ),
-                });
-            }
             grammar.extend_scopes(&mut scopes);
             let commands = grammar.enter(|| partition_commands(source, file, count))?;
             if commands.len() > limits.max_commands.saturating_sub(count) {
@@ -926,6 +916,9 @@ impl Engine {
                 };
                 scopes.current.source_site =
                     Some(site.at_offset(fln_parse::BytePos(source_offset.0 + start.0)));
+                if let Some(session) = macros.as_deref_mut() {
+                    session.set_templates(grammar.templates());
+                }
                 let control =
                     grammar.enter(|| parse_control_command(command, start, file, count))?;
                 if let Some(control) = control {
@@ -1062,15 +1055,20 @@ impl Engine {
                     )
                     .map_err(|error| command_error(file, count, start, error))?
                 {
-                    if macros.is_some() {
-                        return Err(SourceCheckError::ImportedMacro {
-                            file,
-                            command: count,
-                            offset: start.0,
-                            error: Box::new(
-                                crate::imported_macros::source::SourceMacroError::TemplateGrammar,
-                            ),
-                        });
+                    if let Some(session) = macros.as_deref() {
+                        session
+                            .check_native_syntax_declaration(
+                                scopes.imported_macros().expect("imported macro file scope"),
+                            )
+                            .map_err(|error| SourceCheckError::ImportedMacro {
+                                file,
+                                command: count,
+                                offset: start.0,
+                                error: Box::new(error),
+                            })?;
+                        grammar
+                            .export_native()
+                            .map_err(|error| command_error(file, count, start, error))?;
                     }
                     grammar.extend_scopes(&mut scopes);
                     count += 1;

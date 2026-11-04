@@ -6,7 +6,8 @@
 //! is closed parser-description data, and a standalone embedding registry
 //! supplies no imported grammar. Custom commands must expand to one named
 //! declaration. The prepared registry owns the
-//! expansion pass: no template expansion runs before it or replays its results.
+//! expansion pass. Active quoted source templates join that same registry;
+//! no separate template pass runs before it or replays its results.
 //! The resulting native Syntax enters the same elaborator
 //! and dual-check admission as `Engine::check_source_command`; raw evaluations
 //! then use the ordinary compiler, codec and Golem execution path.
@@ -42,6 +43,7 @@ use fln_syntax::tree::Syntax;
 use fln_syntax::view::SourceView;
 use fln_vm::interpreter::{CancellationProbe, ExecutionUsage};
 use fln_vm::macro_native::MacroLookup;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 /// Explicit invocation state and ceilings for one source query. Reuse an
@@ -78,10 +80,12 @@ pub enum SourceMacroError {
     TacticExpansion {
         kind: Name,
     },
+    SyntaxDeclaration {
+        kind: Name,
+    },
     EvaluationRequired,
     DeclarationRequired,
     ExampleRequired,
-    TemplateGrammar,
     ScopeControl {
         kind: Name,
     },
@@ -115,6 +119,11 @@ impl std::fmt::Display for SourceMacroError {
                 "source macro adapter requires tactic evaluator dispatch for kind {}",
                 kind.to_display_string()
             ),
+            Self::SyntaxDeclaration { kind } => write!(
+                f,
+                "native source syntax declaration requires generated-reference macro dispatch for atomic kind {}",
+                kind.to_display_string()
+            ),
             Self::EvaluationRequired => {
                 write!(f, "source macro evaluation requires one ordinary #eval")
             }
@@ -124,10 +133,6 @@ impl std::fmt::Display for SourceMacroError {
             Self::ExampleRequired => {
                 write!(f, "source macro checking requires an anonymous example")
             }
-            Self::TemplateGrammar => write!(
-                f,
-                "imported macro file checking requires a grammar without source-declared templates"
-            ),
             Self::ScopeControl { kind } => write!(
                 f,
                 "source macro adapter cannot apply an expanded scope control of kind {}",
@@ -247,6 +252,7 @@ pub(crate) struct FileSession<'a> {
     cancellation: Option<&'a dyn CancellationProbe>,
     progress: Progress,
     tactics: Option<Arc<ImportedTactics>>,
+    templates: Arc<BTreeMap<Name, Arc<fln_parse::extensions::NotationRule>>>,
 }
 
 /// Internal observations consumed by a containing file/module transaction.
@@ -312,6 +318,7 @@ impl<'a> FileSession<'a> {
             limits: invocation.limits,
             cancellation: invocation.cancellation,
             tactics: None,
+            templates: Arc::new(BTreeMap::new()),
             progress: Progress {
                 state: None,
                 attempts: Vec::new(),
@@ -393,8 +400,12 @@ impl<'a> FileSession<'a> {
             Ok(view) => view,
             Err(error) => return Outcome::Complete(Err(error)),
         };
+        let registry = match self.template_registry(registry, scope) {
+            Ok(registry) => registry,
+            Err(error) => return Outcome::Complete(Err(error)),
+        };
         let runtime = Arc::new(ImportedTactics::new(
-            registry.clone(),
+            registry,
             view.normalized().clone(),
             self.context.clone(),
             self.state.clone(),
@@ -419,10 +430,50 @@ impl<'a> FileSession<'a> {
         &self.parsers
     }
 
+    pub(crate) fn set_templates(
+        &mut self,
+        templates: Arc<BTreeMap<Name, Arc<fln_parse::extensions::NotationRule>>>,
+    ) {
+        self.templates = templates;
+    }
+
+    fn template_registry(
+        &self,
+        registry: &RegisteredMacros,
+        scope: &fln_elab::source::scope::SourceScope,
+    ) -> Result<RegisteredMacros, SourceMacroError> {
+        let anonymous = Name::anonymous();
+        let module = scope
+            .source_module
+            .as_ref()
+            .or(scope.private_module.as_ref())
+            .unwrap_or(&anonymous);
+        registry
+            .with_source_templates(&self.templates, module)
+            .map_err(|error| SourceMacroError::Binding(Box::new(error)))
+    }
+
     pub(crate) fn cancelled(&self) -> Option<Inconclusive> {
         self.cancellation
             .is_some_and(CancellationProbe::is_cancelled)
             .then(|| Inconclusive::cancelled("imported macro source batch"))
+    }
+
+    /// Source grammar declarations currently construct parser descriptions and
+    /// quotation data directly. The pin elaborates generated references and
+    /// indices under active atomic macros, so an arbitrary artifact candidate
+    /// cannot be silently bypassed here. Inactive scoped candidates do not run.
+    pub(crate) fn check_native_syntax_declaration(
+        &self,
+        registry: &RegisteredMacros,
+    ) -> Result<(), SourceMacroError> {
+        for kind in ["num", "str", "ident", "char", "scientific", "name"] {
+            let kind = Name::from_components([kind]);
+            if registry.declarations(&kind).next().is_some() {
+                return Err(SourceMacroError::SyntaxDeclaration { kind });
+            }
+        }
+        Ok(())
     }
 
     /// Native scope transitions do not interpret arbitrary expanded command
@@ -732,9 +783,16 @@ impl<'a> FileSession<'a> {
         let Some(kind) = parsed.syntax().kind() else {
             return false;
         };
-        if *kind == Name::from_components(["Lean", "Parser", "Command", "declaration"])
-            || registry.declarations(kind).next().is_none()
-        {
+        if *kind == Name::from_components(["Lean", "Parser", "Command", "declaration"]) {
+            return false;
+        }
+        // parse_source_command has read this through the entered source
+        // grammar's command category. Its own quoted rule is a valid producer
+        // too; no artifact parser or checked macro owner is fabricated.
+        if self.templates.contains_key(kind) {
+            return true;
+        }
+        if registry.declarations(kind).next().is_none() {
             return false;
         }
         let command = Name::from_components(["command"]);
@@ -820,7 +878,10 @@ impl<'a> FileSession<'a> {
         } else {
             syntax
         };
-        self.expand_syntax(engine, registry, view.normalized(), &syntax, scope)
+        // Controls apply directly to the lexical scope; unlike a declaration,
+        // they do not bind an owned runtime provider before elaborating their
+        // terms. Preserve explicit deferred-dispatch refusals at this boundary.
+        self.expand_syntax_mode(engine, registry, view.normalized(), &syntax, scope, false)
             .map_complete(|result| {
                 result.and_then(|mut syntax| {
                     if variable {
@@ -849,11 +910,27 @@ impl<'a> FileSession<'a> {
         syntax: &Syntax,
         scope: &fln_elab::source::scope::SourceScope,
     ) -> Outcome<Result<Syntax, SourceMacroError>> {
+        self.expand_syntax_mode(engine, registry, source, syntax, scope, true)
+    }
+
+    fn expand_syntax_mode(
+        &mut self,
+        engine: &Engine,
+        registry: &RegisteredMacros,
+        source: &SourceText,
+        syntax: &Syntax,
+        scope: &fln_elab::source::scope::SourceScope,
+        runtime_macros: bool,
+    ) -> Outcome<Result<Syntax, SourceMacroError>> {
         match self.collect_tactics() {
             Outcome::Complete(()) => {}
             Outcome::Inconclusive(reason) => return Outcome::Inconclusive(reason),
             Outcome::InternalFault(fault) => return Outcome::InternalFault(fault),
         }
+        let registry = match self.template_registry(registry, scope) {
+            Ok(registry) => registry,
+            Err(error) => return Outcome::Complete(Err(error)),
+        };
         let remaining = self.remaining_limits();
         let mut progress = Progress {
             state: None,
@@ -871,7 +948,7 @@ impl<'a> FileSession<'a> {
             syntax,
             scope,
             SourceMacroInvocation {
-                registry,
+                registry: &registry,
                 context: self.context,
                 state: std::mem::take(&mut self.state),
                 lookup: self.lookup,
@@ -879,7 +956,7 @@ impl<'a> FileSession<'a> {
                 cancellation: self.cancellation,
             },
             &mut progress,
-            self.lookup.is_none() && self.cancellation.is_none(),
+            runtime_macros && self.lookup.is_none() && self.cancellation.is_none(),
         );
         if let Err(reason) = self.record(progress) {
             return Outcome::Inconclusive(reason);
@@ -979,9 +1056,11 @@ impl Engine {
     /// activation, while MacroState continues in command order. No failed prefix
     /// is published. Variable binders, executable attributes and mutual members
     /// use the same expansion pass. Native scope controls retain their ordinary
-    /// semantics without command-root macro dispatch. Source-declared templates,
-    /// artifact parser installation and module-system visibility remain separate
-    /// capabilities.
+    /// semantics without command-root macro dispatch. Active source quotations
+    /// join the same candidate registry, including its callback and tactic
+    /// boundaries. Atomic source templates and collisions with imported macros
+    /// on the same kind retain explicit capability refusals. Artifact parser
+    /// installation and module-system visibility remain separate capabilities.
     pub fn check_source_files_with_imported_macros(
         &self,
         sources: &[&[u8]],
