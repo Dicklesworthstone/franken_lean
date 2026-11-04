@@ -15,6 +15,7 @@ use std::collections::BTreeMap;
 
 mod array_proofs;
 mod boxed;
+mod primitives;
 
 pub(super) use boxed::{BoxedNative, boxed_row};
 
@@ -322,9 +323,9 @@ pub(super) fn validated_ir_arity(
     arity: usize,
 ) -> Result<usize, IrExecutionError> {
     let expected = ir_arity(row)?;
-    if let Some(array) = BoxedNative::from_row(row)? {
-        let runtime = array.runtime_parameters().len();
-        if arity == runtime || arity == array.arity() {
+    if let Some(primitive) = BoxedNative::from_row(row)? {
+        let runtime = primitive.runtime_parameters().len();
+        if arity == runtime || arity == primitive.arity() {
             return Ok(runtime);
         }
     } else if let Some(runtime) = erased_type_runtime_arity(row)? {
@@ -353,10 +354,10 @@ pub(super) fn validate_extern_signature(
     params: &[IrParam],
     result: &IrType,
 ) -> Result<(), IrExecutionError> {
-    if let Some(array) = BoxedNative::from_row(row)?
-        && params.len() == array.arity()
+    if let Some(primitive) = BoxedNative::from_row(row)?
+        && params.len() == primitive.arity()
     {
-        return array.validate_extern(row, params, result);
+        return primitive.validate_extern(row, params, result);
     }
     if row.id == "extern:Void.mk" && params.len() == 2 {
         erased_type_runtime_arity(row)?;

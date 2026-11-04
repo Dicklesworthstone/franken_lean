@@ -298,6 +298,9 @@ fn native_array_prototypes(reference: &std::path::Path) -> IrModule {
                     (row, true)
                 }
             };
+            if !row.name.starts_with("Array.") && !row.name.starts_with("ByteArray.") {
+                continue;
+            }
             let Some(bridge) = BoxedNative::from_row(row).unwrap() else {
                 continue;
             };
@@ -331,7 +334,7 @@ fn native_array_prototypes(reference: &std::path::Path) -> IrModule {
     }
 }
 
-fn assert_nat_replay(compiled: &CompiledIr, expected: &str) {
+pub(super) fn assert_nat_replay(compiled: &CompiledIr, expected: &str) {
     let bytes =
         flbc::encode_canonical(compiled.program.program(), flbc::CodecLimits::default()).unwrap();
     let replay = flbc::decode_canonical(&bytes, flbc::CodecLimits::default()).unwrap();
