@@ -2,6 +2,8 @@
 //! binding are exercised by their owning crates, not assumed by these fixtures.
 use super::*;
 
+mod abbreviations;
+
 fn name(label: &str) -> Name {
     Name::from_components(label.split('.'))
 }
@@ -829,10 +831,17 @@ fn unsupported_aliases_contextual_checks_and_nested_shapes_never_install() {
         ),
         Descr::Cat(name("term"), 65),
         Descr::Cat(name("unknownCategory"), 0),
+        Descr::NodeWithAntiquot(" ".into(), name("Library.piece"), Box::new(symbol("piece"))),
+        Descr::NodeWithAntiquot("piece".into(), Name::anonymous(), Box::new(symbol("piece"))),
         Descr::NodeWithAntiquot(
             "piece".into(),
             name("Library.piece"),
-            Box::new(symbol("piece")),
+            Box::new(Descr::Const(name("colGt"))),
+        ),
+        Descr::NodeWithAntiquot(
+            "piece".into(),
+            name("Library.piece"),
+            Box::new(Descr::Parser(name("Library.unresolved"))),
         ),
         Descr::TrailingNode {
             kind: name("Library.nested"),
@@ -843,6 +852,14 @@ fn unsupported_aliases_contextual_checks_and_nested_shapes_never_install() {
         Descr::Unary(
             name("many"),
             Box::new(Descr::Unary(name("optional"), Box::new(symbol("maybe")))),
+        ),
+        Descr::Unary(
+            name("many"),
+            Box::new(Descr::NodeWithAntiquot(
+                "piece".into(),
+                name("Library.piece"),
+                Box::new(Descr::Unary(name("optional"), Box::new(symbol("maybe")))),
+            )),
         ),
     ] {
         let mut file = grammar();

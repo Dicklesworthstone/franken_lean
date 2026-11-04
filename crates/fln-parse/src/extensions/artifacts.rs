@@ -435,7 +435,7 @@ fn registration(
                     "artifact category quotation parsers require their own supported registration",
                 );
             }
-            if first.is_empty() && !(custom && primitive(body)) {
+            if first.is_empty() && !(custom && primitive(body, 0)) {
                 return Err("artifact leading parser has no supported first token");
             }
             if !first.is_empty() && !reserved_heads(body, 0) {
@@ -575,9 +575,20 @@ fn category_quotation(
     Ok((opener, category.clone()))
 }
 
-fn primitive(descr: &Descr) -> bool {
-    matches!(descr, Descr::Const(name) if matches!(simple(name).as_deref(),
-        Some("ident" | "num" | "str" | "char" | "scientific" | "name" | "hole")))
+fn primitive(descr: &Descr, depth: usize) -> bool {
+    if depth > MAX_DESCR_DEPTH {
+        return false;
+    }
+    match descr {
+        Descr::Const(name) => matches!(
+            simple(name).as_deref(),
+            Some("ident" | "num" | "str" | "char" | "scientific" | "name" | "hole")
+        ),
+        Descr::Node { body, .. } | Descr::NodeWithAntiquot(_, _, body) => {
+            primitive(body, depth + 1)
+        }
+        _ => false,
+    }
 }
 
 fn check_root_kind(kind: &Name) -> Result<(), &'static str> {
@@ -606,7 +617,9 @@ fn reserved_heads(descr: &Descr, depth: usize) -> bool {
     }
     match descr {
         Descr::Symbol(_) | Descr::UnicodeSymbol(..) => true,
-        Descr::Node { body, .. } => reserved_heads(body, depth + 1),
+        Descr::Node { body, .. } | Descr::NodeWithAntiquot(_, _, body) => {
+            reserved_heads(body, depth + 1)
+        }
         Descr::Unary(name, body) if transparent(name) => reserved_heads(body, depth + 1),
         Descr::Binary(name, left, right) => match simple(name).as_deref() {
             Some("andthen") => reserved_heads(left, depth + 1),
@@ -685,6 +698,13 @@ fn descriptor(
             }
             descriptor(body, categories, remaining, depth + 1)
         }
+        Descr::NodeWithAntiquot(label, kind, body) => {
+            check_token(label.trim())?;
+            if kind.is_anonymous() {
+                return Err("anonymous artifact node-with-antiquotation kind");
+            }
+            descriptor(body, categories, remaining, depth + 1)
+        }
         Descr::Cat(category, precedence) => {
             let builtin = simple(category);
             if *precedence > MAX_PREC
@@ -719,7 +739,6 @@ fn descriptor(
         Descr::Parser(_) => {
             Err("artifact parser dependencies must be resolved from checked descriptions")
         }
-        Descr::NodeWithAntiquot(..) => Err("artifact node-with-antiquotation descriptions"),
         Descr::TrailingNode { .. } => Err("nested artifact trailing-node description"),
     }
 }

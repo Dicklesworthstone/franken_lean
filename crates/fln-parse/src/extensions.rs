@@ -3999,8 +3999,20 @@ impl Run<'_> {
                 Some(alias) if no_input(alias) || alias == "noWs" => Follow::End,
                 _ => Follow::Unknown,
             },
-            Descr::Node { body, .. } | Descr::NodeWithAntiquot(_, _, body) => {
-                self.first(body, depth + 1)
+            Descr::Node { body, .. } => self.first(body, depth + 1),
+            Descr::NodeWithAntiquot(_, _, body) => {
+                let first = self.first(body, depth + 1);
+                if !crate::quotations::inside() {
+                    return first;
+                }
+                match first {
+                    Follow::Texts(mut texts, nullable) => {
+                        texts.insert("$".into());
+                        Follow::Texts(texts, nullable)
+                    }
+                    Follow::End => texts(&["$"], true),
+                    Follow::Unknown => Follow::Unknown,
+                }
             }
             Descr::Unary(name, body) => match simple(name).as_deref() {
                 Some("optional" | "many") => match self.first(body, depth + 1) {
@@ -4110,9 +4122,40 @@ impl Run<'_> {
             return None;
         }
         match descr {
-            Descr::Node { kind, body, .. } | Descr::NodeWithAntiquot(_, kind, body) => {
+            Descr::Node { kind, body, .. } => {
                 let (items, next) = self.parse(body, at, end, follow, depth + 1)?;
                 Some((vec![Syntax::node(kind.clone(), items)], next))
+            }
+            Descr::NodeWithAntiquot(label, kind, body) => {
+                // Parser.Extension.descrToParser sets `anonymous := true`.
+                // Basic.withAntiquot prefers the whole-node capture on a tie,
+                // but keeps a longer concrete body (e.g. `$id := $value`). A
+                // failed capture is atomic and retries that body, which may
+                // own a different annotation such as `$n:num`.
+                let capture = crate::quotations::antiquotation(
+                    self.leaves,
+                    self.view,
+                    self.tokens,
+                    at,
+                    end,
+                    crate::quotations::Position::Node {
+                        label: label.clone(),
+                        kind: kind.clone(),
+                    },
+                )
+                .ok()
+                .flatten();
+                let parsed = self.parse(body, at, end, follow, depth + 1);
+                match (capture, parsed) {
+                    (Some((capture, next)), Some((_, consumed))) if next >= consumed => {
+                        Some((vec![capture], next))
+                    }
+                    (Some((capture, next)), None) => Some((vec![capture], next)),
+                    (_, Some((items, next))) => {
+                        Some((vec![Syntax::node(kind.clone(), items)], next))
+                    }
+                    (None, None) => None,
+                }
             }
             Descr::Symbol(text) => {
                 let text = text.trim();

@@ -504,6 +504,12 @@ pub(crate) enum Position {
     Token(&'static str),
     /// A source-defined category uses the same pseudo-kind convention as term.
     Category(Name),
+    /// `ParserDescr.nodeWithAntiquot` captures its whole node, with either an
+    /// anonymous capture or its declared label, independently of its body.
+    Node {
+        label: String,
+        kind: Name,
+    },
 }
 
 /// The antiquotation at `start` inside a quotation, ending by `end`: its tree and the token after
@@ -546,7 +552,9 @@ pub(crate) fn antiquotation(
         && text(tokens, next) == Some(":")
         && touching(tokens, next - 1, next)
         && touching(tokens, next, next + 1)
-        && matches!(tokens[next + 1].kind, TokenKind::Ident(_));
+        && (matches!(tokens[next + 1].kind, TokenKind::Ident(_))
+            || matches!(&position, Position::Node { label, .. }
+                if view.normalized().span_str(tokens[next + 1].extent) == Some(label.trim())));
     // An immediate colon belongs to the antiquotation, even when the name
     // after it is missing or malformed. Never return a truncated capture.
     if !named && next < end && text(tokens, next) == Some(":") && touching(tokens, next - 1, next) {
@@ -565,6 +573,9 @@ pub(crate) fn antiquotation(
             }
             (Position::Token(expected), actual) if expected == actual => {
                 Name::from_components([expected, "antiquot"])
+            }
+            (Position::Node { label, kind }, actual) if label.trim() == actual => {
+                Name::str(kind, "antiquot")
             }
             (Position::Term, "term") => Name::from_components(["term", "pseudo", "antiquot"]),
             (Position::Tactic, "tactic") => Name::from_components(["tactic", "pseudo", "antiquot"]),
@@ -592,6 +603,7 @@ pub(crate) fn antiquotation(
         let kind = match position {
             Position::Category(name) => Name::str(Name::str(name, "pseudo"), "antiquot"),
             Position::Token(name) => Name::from_components([name, "antiquot"]),
+            Position::Node { kind, .. } => Name::str(kind, "antiquot"),
             Position::Term => Name::from_components(["term", "pseudo", "antiquot"]),
             Position::Tactic => Name::from_components(["tactic", "pseudo", "antiquot"]),
             Position::TacticSeq => {
