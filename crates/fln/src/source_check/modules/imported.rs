@@ -8,7 +8,7 @@
 use crate::*;
 use fln_admission::reuse::{AdmittedImport, ImportCouncilError, ImportCouncilLimits, ImportHost};
 use fln_elab::instances::{self, InstanceRegistryError};
-use fln_olean::region::{OleanView, OpaqueExtensionBlock};
+use fln_olean::region::{OleanView, OpaqueExtensionBlock, SelectedExtensionBlock};
 use fln_olean::source_extensions::{self as metadata, DecodeLimits};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
@@ -83,7 +83,8 @@ pub struct SourceOleanImportLimits {
     pub metadata: DecodeLimits,
     /// Object traversal bound for each module's extension capture.
     pub capture: OleanWalkBudget,
-    /// Aggregate captured bytes, including uninterpreted extensions.
+    /// Aggregate captured byte charge, including uninterpreted extensions whose
+    /// payload bytes are validated and measured without being retained.
     pub max_capture_bytes: usize,
     pub max_roots: usize,
     /// How many closure modules the council checks at once. The import is the
@@ -100,7 +101,7 @@ pub struct SourceOleanImportLimits {
 impl SourceOleanImportLimits {
     /// Capture may use as many bytes as the caller allows the artifacts
     /// themselves, never fewer than 64 MiB. The pinned `Init` closure (601
-    /// modules, 350 MiB of `.olean` parts) captures 300 MiB of extension
+    /// modules, 350 MiB of `.olean` parts) charges 300 MiB of extension
     /// payloads, so a fixed 64 MiB made `import Init` a resource refusal.
     /// Modules are checked one at a time on the calling thread unless the
     /// caller sets `jobs`.
@@ -850,20 +851,29 @@ fn prepare_source_metadata(
     let macro_extension = Name::from_components(metadata::macros::MACRO_EXTENSION.split('.'));
     let mut parser_journals = Vec::new();
     let parser_extension = metadata::parsers::extension_name();
+    let retained: BTreeSet<_> = selected
+        .iter()
+        .cloned()
+        .chain([macro_extension.clone(), parser_extension.clone()])
+        .collect();
     let mut capture_left = limits.max_capture_bytes;
     let mut entries_left = limits.metadata.max_entries;
     let mut defeq_tags = ReflexivityTags::default();
     let mut backward_defeq_tags = ReflexivityTags::default();
     let mut metadata_decoder = metadata::Decoder::new(limits.metadata);
-    // Each module's capture reads only its own parts, so the walks run
-    // `limits.read_jobs` at once; the cumulative byte allowance is charged below
-    // in replay order, exactly as when one walk followed another.
+    // Keep only one wave of captures live. Uninterpreted entries are still
+    // walked and charged exactly, but their bytes need not be copied just to
+    // discard them. Replay and the aggregate allowance remain in import order.
     cancelled!("source-olean/capture");
-    let mut captures = capture_modules(&metadata_modules, &order, &inputs, &limits).into_iter();
+    let mut captures = capture_modules(&metadata_modules, &order, &inputs, &limits, &retained);
     for &index in &order {
         cancelled!("source-olean/capture");
         let module = &metadata_modules[index];
-        let captured = captures.next().ok_or(SourceOleanImportError::Internal(
+        let captured = captures.next();
+        // A new wave can spend time auditing before returning its first result.
+        // Cancellation during that work must win over a capture diagnostic.
+        cancelled!("source-olean/capture");
+        let captured = captured.ok_or(SourceOleanImportError::Internal(
             "a replayed module has no capture",
         ))??;
         let mut report = SourceMetadataReport {
@@ -906,13 +916,16 @@ fn prepare_source_metadata(
                     reason: "duplicate extension block",
                 });
             }
-            for payload in &block.entries {
-                capture_left = capture_left
-                    .checked_sub(payload.len())
-                    .ok_or(SourceOleanImportError::Limit("captured extension bytes"))?;
-            }
+            capture_left = capture_left
+                .checked_sub(block.payload_bytes)
+                .ok_or(SourceOleanImportError::Limit("captured extension bytes"))?;
+            let Some(entries) = block.entries else {
+                if block.entry_count != 0 {
+                    report.uninterpreted.push(block.name);
+                }
+                continue;
+            };
             if let Some(kind) = selected.iter().position(|name| name == &block.name) {
-                let entries = block.entries;
                 if kind == 14 || kind == 21 {
                     // A realized equation can carry the same tag in several
                     // modules with different compacted object layouts. Compare
@@ -973,9 +986,13 @@ fn prepare_source_metadata(
                 // every tag already decoded across the module boundaries.
                 blocks[kind].entries.extend(entries);
             } else {
-                if !block.entries.is_empty() {
+                if !entries.is_empty() {
                     report.uninterpreted.push(block.name.clone());
                 }
+                let block = OpaqueExtensionBlock {
+                    name: block.name,
+                    entries,
+                };
                 if block.name == macro_extension {
                     macro_blocks.push(block);
                 } else if block.name == parser_extension {
@@ -1853,16 +1870,18 @@ fn metadata_modules(
     check().map_err(|error| SourceOleanImportError::Check(Box::new(error)))
 }
 
-/// Every module's extension payloads, in replay `order`, `limits.read_jobs` modules
-/// at once. Each walk may use the whole capture allowance; the caller charges the
-/// cumulative allowance in order, so a closure over it is still refused.
+/// Selected payloads and exact counts for every other extension, in replay
+/// order. A wave holds at most `read_jobs` modules; consuming or dropping the
+/// iterator never captures a later wave speculatively. The caller can therefore
+/// stop on cancellation or an aggregate limit before reading the whole closure.
 fn capture_modules(
     modules: &[MetadataModule],
     order: &[usize],
     inputs: &BTreeMap<&Name, &OleanModuleInput<'_>>,
     limits: &SourceOleanImportLimits,
-) -> Vec<Result<Vec<OpaqueExtensionBlock>>> {
-    let capture = |index: usize| -> Result<Vec<OpaqueExtensionBlock>> {
+    retained: &BTreeSet<Name>,
+) -> impl Iterator<Item = Result<Vec<SelectedExtensionBlock>>> {
+    let capture = move |index: usize| -> Result<Vec<SelectedExtensionBlock>> {
         let module = &modules[index];
         let input = inputs
             .get(&module.name)
@@ -1884,37 +1903,47 @@ fn capture_modules(
             module: module.name.clone(),
             error,
         })?;
-        view.extension_payloads(limits.capture, limits.max_capture_bytes)
-            .map_err(|error| SourceOleanImportError::Capture {
-                module: module.name.clone(),
-                error,
-            })
+        view.selected_extension_payloads(limits.capture, limits.max_capture_bytes, |name| {
+            retained.contains(name)
+        })
+        .map_err(|error| SourceOleanImportError::Capture {
+            module: module.name.clone(),
+            error,
+        })
     };
-    let threads = limits.read_jobs.threads.get().min(order.len());
-    if threads <= 1 {
-        return order.iter().map(|&index| capture(index)).collect();
-    }
-    let next = std::sync::atomic::AtomicUsize::new(0);
-    let slots: Vec<std::sync::OnceLock<Result<Vec<OpaqueExtensionBlock>>>> =
-        order.iter().map(|_| std::sync::OnceLock::new()).collect();
-    std::thread::scope(|scope| {
-        for _ in 0..threads {
-            scope.spawn(|| {
-                loop {
-                    let at = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let (Some(slot), Some(&index)) = (slots.get(at), order.get(at)) else {
-                        return;
-                    };
-                    let _ = slot.set(capture(index));
-                }
-            });
+    capture_batches(order, limits.read_jobs, capture)
+}
+
+/// Bound retained results as well as active workers. A whole-closure result
+/// vector would retain every opaque payload even on the serial path.
+fn capture_batches<T: Send + Sync>(
+    order: &[usize],
+    jobs: OleanFrontierJobs,
+    capture: impl Fn(usize) -> T + Sync,
+) -> impl Iterator<Item = T> {
+    order.chunks(jobs.threads.get()).flat_map(move |batch| {
+        if batch.len() <= 1 {
+            return batch
+                .iter()
+                .map(|&index| capture(index))
+                .collect::<Vec<_>>();
         }
-    });
-    slots
-        .into_iter()
-        .zip(order)
-        .map(|(slot, &index)| slot.into_inner().unwrap_or_else(|| capture(index)))
-        .collect()
+        let slots: Vec<std::sync::OnceLock<T>> =
+            batch.iter().map(|_| std::sync::OnceLock::new()).collect();
+        std::thread::scope(|scope| {
+            for (slot, &index) in slots.iter().zip(batch) {
+                let capture = &capture;
+                scope.spawn(move || {
+                    let _ = slot.set(capture(index));
+                });
+            }
+        });
+        slots
+            .into_iter()
+            .zip(batch)
+            .map(|(slot, &index)| slot.into_inner().unwrap_or_else(|| capture(index)))
+            .collect()
+    })
 }
 
 /// Who makes a closure's metadata registrations. Production makes them through one
@@ -2624,6 +2653,167 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn capture_batches_bound_live_payloads_and_stop_when_consumer_stops() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Default)]
+        struct Counts {
+            started: AtomicUsize,
+            live: AtomicUsize,
+            peak: AtomicUsize,
+        }
+        struct Captured<'a> {
+            index: usize,
+            counts: &'a Counts,
+        }
+        impl Drop for Captured<'_> {
+            fn drop(&mut self) {
+                self.counts.live.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        let order: Vec<_> = (0..23).rev().collect();
+        for threads in [1, 3, 8] {
+            for stop_early in [false, true] {
+                let counts = Counts::default();
+                let mut captures = capture_batches(&order, limits(threads).read_jobs, |index| {
+                    counts.started.fetch_add(1, Ordering::SeqCst);
+                    let live = counts.live.fetch_add(1, Ordering::SeqCst) + 1;
+                    counts.peak.fetch_max(live, Ordering::SeqCst);
+                    Captured {
+                        index,
+                        counts: &counts,
+                    }
+                });
+                assert_eq!(counts.started.load(Ordering::SeqCst), 0);
+                for (position, &expected) in order.iter().enumerate() {
+                    let captured = captures.next().unwrap();
+                    assert_eq!(
+                        captured.index, expected,
+                        "replay order is independent of jobs"
+                    );
+                    let scheduled = ((position / threads + 1) * threads).min(order.len());
+                    assert_eq!(counts.started.load(Ordering::SeqCst), scheduled);
+                    drop(captured);
+                    if stop_early {
+                        break;
+                    }
+                }
+                if !stop_early {
+                    assert!(captures.next().is_none());
+                }
+                drop(captures);
+                assert_eq!(counts.live.load(Ordering::SeqCst), 0);
+                assert!(counts.peak.load(Ordering::SeqCst) <= threads);
+                assert_eq!(
+                    counts.started.load(Ordering::SeqCst),
+                    if stop_early { threads } else { order.len() },
+                    "cancellation or refusal must not capture another wave"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn unretained_metadata_keeps_order_and_charges_the_full_capture_budget() {
+        use fln_olean::extension_write::{ModuleExtensionInput, encode_module_with_extensions};
+        use fln_rt::obj::Obj;
+
+        let first = n("Foreign.first");
+        let empty = n("Foreign.empty");
+        let last = n("Foreign.last");
+        let encode = |imports: &[OleanModuleImport]| {
+            encode_module_with_extensions(
+                OleanModuleWriteInput {
+                    is_module: false,
+                    imports,
+                    constants: &[],
+                    extra_const_names: &[],
+                },
+                &[
+                    ModuleExtensionInput {
+                        name: &first,
+                        entries: &[Obj::mk_string("uninterpreted payload")],
+                    },
+                    ModuleExtensionInput {
+                        name: &empty,
+                        entries: &[],
+                    },
+                    ModuleExtensionInput {
+                        name: &last,
+                        entries: &[Obj::mk_string("still counted"), Obj::mk_string("twice")],
+                    },
+                ],
+                OleanWriteHeader {
+                    version: OLEAN_ACCEPTED_VERSIONS[0],
+                    flags: 1,
+                    lean_version: OLEAN_PIN_TAG.strip_prefix('v').unwrap(),
+                    githash: OLEAN_PIN_COMMIT,
+                    base_addr: (OLEAN_REGION_ALIGN as u64) * 2,
+                },
+                OleanWriteBudget::default(),
+            )
+            .unwrap()
+            .bytes
+        };
+        let base = n("Base");
+        let main = n("Main");
+        let artifacts = vec![
+            (
+                main.clone(),
+                [
+                    encode(&[OleanModuleImport {
+                        module: base.clone(),
+                        import_all: false,
+                        is_exported: false,
+                        is_meta: false,
+                    }]),
+                    vec![],
+                    vec![],
+                ],
+            ),
+            (base.clone(), [encode(&[]), vec![], vec![]]),
+        ];
+        let modules = inputs(&artifacts);
+        let captured_bytes: usize = modules
+            .iter()
+            .flat_map(|input| {
+                OleanView::parse(input.artifact)
+                    .unwrap()
+                    .extension_payloads(OleanWalkBudget::default(), 1 << 20)
+                    .unwrap()
+            })
+            .flat_map(|block| block.entries)
+            .map(|entry| entry.len())
+            .sum();
+        for threads in [1, 4] {
+            let mut bounds = limits(threads);
+            bounds.max_capture_bytes = captured_bytes;
+            let prepared =
+                prepare_source_metadata(&modules, std::slice::from_ref(&main), bounds, None)
+                    .unwrap()
+                    .into_complete()
+                    .unwrap();
+            assert_eq!(
+                prepared
+                    .reports
+                    .iter()
+                    .map(|row| &row.module)
+                    .collect::<Vec<_>>(),
+                vec![&base, &main]
+            );
+            for report in &prepared.reports {
+                assert_eq!(report.uninterpreted, vec![first.clone(), last.clone()]);
+            }
+            assert_eq!(prepared.decoded, metadata::SourceExtensions::default());
+            bounds.max_capture_bytes -= 1;
+            assert!(matches!(
+                prepare_source_metadata(&modules, std::slice::from_ref(&main), bounds, None),
+                Err(SourceOleanImportError::Limit("captured extension bytes"))
+            ));
+        }
+    }
+
+    #[test]
     fn metadata_preflight_refuses_aggregate_limits_before_council_work() {
         on_import_stack(|| {
             let base = n("Base");
@@ -2819,6 +3009,64 @@ pub(super) mod tests {
                 if matches!(&*error, OleanCheckError::ModuleDecode { module, .. } if module == &second)),
             "without cancellation the second public header must be read and refused"
         );
+    }
+
+    #[test]
+    fn metadata_cancellation_after_a_capture_wave_precedes_its_error() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct CancelAfterCapture {
+            calls: AtomicUsize,
+            before_capture: usize,
+        }
+        impl CancellationProbe for CancelAfterCapture {
+            fn is_cancelled(&self) -> bool {
+                self.calls.fetch_add(1, Ordering::Relaxed) >= self.before_capture
+            }
+        }
+        let base = n("Base");
+        let root = n("Main");
+        let artifacts = vec![
+            (
+                base.clone(),
+                [namespace_fixture(&[], &[], false), vec![], vec![]],
+            ),
+            (
+                root.clone(),
+                [namespace_fixture(&[base], &[], false), vec![], vec![]],
+            ),
+        ];
+        let modules = inputs(&artifacts);
+        for threads in [1, 3] {
+            let mut bounds = limits(threads);
+            bounds.capture.max_objects = 0;
+            // Before the first capture: preflight, each public header, the
+            // capture phase, and the first module. Cancel at the next sample,
+            // after next() has returned the wave's first capture error.
+            let cancel = CancelAfterCapture {
+                calls: AtomicUsize::new(0),
+                before_capture: modules.len() + 3,
+            };
+            assert!(matches!(
+                prepare_source_metadata(
+                    &modules,
+                    std::slice::from_ref(&root),
+                    bounds,
+                    Some(&cancel)
+                ),
+                Ok(Outcome::Inconclusive(_))
+            ));
+            assert_eq!(
+                cancel.calls.load(Ordering::Relaxed),
+                cancel.before_capture + 1
+            );
+            assert!(matches!(
+                prepare_source_metadata(&modules, std::slice::from_ref(&root), bounds, None),
+                Err(SourceOleanImportError::Capture {
+                    error: OleanRegionError::BudgetExhausted { .. },
+                    ..
+                })
+            ));
+        }
     }
 
     #[test]
