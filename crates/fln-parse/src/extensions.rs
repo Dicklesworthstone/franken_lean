@@ -1056,7 +1056,7 @@ fn heads(descr: &Descr, depth: usize) -> Vec<String> {
             vec![text.trim().to_string(), ascii.trim().to_string()]
         }
         Descr::Node { body, .. } | Descr::NodeWithAntiquot(_, _, body) => heads(body, depth + 1),
-        Descr::Unary(name, body) if transparent(name) => heads(body, depth + 1),
+        Descr::Unary(name, body) if input_wrapper(name) => heads(body, depth + 1),
         Descr::Binary(name, left, right) => match simple(name).as_deref() {
             Some("andthen") => heads(left, depth + 1),
             Some("orelse") => {
@@ -1110,7 +1110,7 @@ fn ends_with_atom(descr: &Descr, depth: usize) -> bool {
         Descr::Node { body, .. } | Descr::NodeWithAntiquot(_, _, body) => {
             ends_with_atom(body, depth + 1)
         }
-        Descr::Unary(name, body) if transparent(name) => ends_with_atom(body, depth + 1),
+        Descr::Unary(name, body) if input_wrapper(name) => ends_with_atom(body, depth + 1),
         // An interpolated string ends with its closing chunk.
         Descr::Unary(name, _) if simple(name).as_deref() == Some("interpolatedStr") => true,
         Descr::Binary(name, left, right) => match simple(name).as_deref() {
@@ -1120,6 +1120,12 @@ fn ends_with_atom(descr: &Descr, depth: usize) -> bool {
         },
         _ => false,
     }
+}
+
+/// Wrappers that preserve the input's head and endpoint. Unlike a transparent
+/// alias, `group` still produces its own syntax node in `Run::unary`.
+fn input_wrapper(name: &Name) -> bool {
+    transparent(name) || simple(name).as_deref() == Some("group")
 }
 
 /// The one-argument aliases that only shape pretty-printing, positions or backtracking: their
@@ -4168,13 +4174,19 @@ impl Run<'_> {
             }
             Descr::NonReservedSymbol(text, _) => {
                 let text = text.trim();
-                if at >= end
-                    || !matches!(
-                        &self.tokens[at].kind,
-                        TokenKind::Symbol(_) | TokenKind::Ident(_)
-                    )
-                    || self.text(at)? != text
-                {
+                if at >= end {
+                    return None;
+                }
+                // nonReservedSymbol compares an identifier's raw spelling,
+                // not its decoded Name: `«head»` must not match `head`.
+                let matches = match &self.tokens[at].kind {
+                    TokenKind::Symbol(symbol) => symbol == text,
+                    TokenKind::Ident(_) => {
+                        self.view.normalized().span_str(self.tokens[at].extent)? == text
+                    }
+                    _ => false,
+                };
+                if !matches {
                     return None;
                 }
                 Some((vec![self.atom(at, text)?], at + 1))
@@ -4276,7 +4288,8 @@ impl Run<'_> {
                         syntax
                     }
                     Some("tactic") => {
-                        crate::proofs::tactic(self.leaves, self.view, self.tokens, at..stop).ok()?
+                        crate::proofs::tactic_operand(self.leaves, self.view, self.tokens, at..stop)
+                            .ok()?
                     }
                     Some("command") if *prec == 0 => self.command_operand(at, stop)?,
                     _ => return None,

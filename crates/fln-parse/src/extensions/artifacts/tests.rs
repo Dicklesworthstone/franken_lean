@@ -3,6 +3,7 @@
 use super::*;
 
 mod abbreviations;
+mod tactics;
 
 fn name(label: &str) -> Name {
     Name::from_components(label.split('.'))

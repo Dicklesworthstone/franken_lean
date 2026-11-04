@@ -409,6 +409,7 @@ fn registration(
     }
     charge(remaining)?;
     let term = simple(category).as_deref() == Some("term");
+    let tactic = simple(category).as_deref() == Some("tactic");
     let custom = !builtin_category(category);
     if matches!(&declaration.descr, Descr::Node { kind, .. }
         if *kind == Name::from_components(["Lean", "Parser", "Term", "quot"]))
@@ -438,8 +439,8 @@ fn registration(
             if first.is_empty() && !(custom && primitive(body, 0)) {
                 return Err("artifact leading parser has no supported first token");
             }
-            if !first.is_empty() && !reserved_heads(body, 0) {
-                return Err("artifact leading parser requires reserved first tokens");
+            if !first.is_empty() && !dispatchable_heads(body, 0, tactic) {
+                return Err("artifact leading parser has unsupported first-token behavior");
             }
             (body.as_ref(), first)
         }
@@ -487,7 +488,7 @@ fn registration(
                 return Err("artifact trailing parser for an unsupported builtin category");
             }
             let first = heads(body, 0);
-            if first.is_empty() || !reserved_heads(body, 0) {
+            if first.is_empty() || !dispatchable_heads(body, 0, false) {
                 return Err("artifact trailing parser has no supported first token");
             }
             (body.as_ref(), first)
@@ -607,23 +608,30 @@ fn check_root_kind(kind: &Name) -> Result<(), &'static str> {
     }
 }
 
-// `LeadingIdentBehavior` and `NonReservedSymbol.includeIdent` select different
-// lookup tables. This adapter's disjoint reserved heads avoid those unsupported
-// mixed identifier/keyword choices; non-reserved symbols remain usable inside
-// an already selected production.
-fn reserved_heads(descr: &Descr, depth: usize) -> bool {
+// The builtin tactic category uses LeadingIdentBehavior.symbol: ordinary
+// `syntax "head" : tactic` therefore emits nonReservedSymbol head false.
+// Its exact spelling is already a key in the native tactic dispatch table,
+// without globally reserving that identifier. Other category behaviors and
+// includeIdent=true still need different lookup semantics and remain refused.
+fn dispatchable_heads(descr: &Descr, depth: usize, tactic: bool) -> bool {
     if depth > MAX_DESCR_DEPTH {
         return false;
     }
     match descr {
         Descr::Symbol(_) | Descr::UnicodeSymbol(..) => true,
+        Descr::NonReservedSymbol(_, false) => tactic,
         Descr::Node { body, .. } | Descr::NodeWithAntiquot(_, _, body) => {
-            reserved_heads(body, depth + 1)
+            dispatchable_heads(body, depth + 1, tactic)
         }
-        Descr::Unary(name, body) if transparent(name) => reserved_heads(body, depth + 1),
+        Descr::Unary(name, body) if input_wrapper(name) => {
+            dispatchable_heads(body, depth + 1, tactic)
+        }
         Descr::Binary(name, left, right) => match simple(name).as_deref() {
-            Some("andthen") => reserved_heads(left, depth + 1),
-            Some("orelse") => reserved_heads(left, depth + 1) && reserved_heads(right, depth + 1),
+            Some("andthen") => dispatchable_heads(left, depth + 1, tactic),
+            Some("orelse") => {
+                dispatchable_heads(left, depth + 1, tactic)
+                    && dispatchable_heads(right, depth + 1, tactic)
+            }
             _ => false,
         },
         _ => false,

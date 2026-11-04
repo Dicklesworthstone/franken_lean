@@ -78,6 +78,24 @@ pub(crate) fn tactic_seq(
     elimination::sequence(leaves, view, tokens, range)
 }
 
+/// One `tactic` argument, including the sequence-owning forms (`first`,
+/// `all_goals`, parentheses and braces). Plain tactic dispatch alone cannot
+/// construct those envelopes. A bare multi-tactic sequence is not an operand.
+pub(crate) fn tactic_operand(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    range: Range<usize>,
+) -> Result<Syntax, NatDefinitionParseError> {
+    let _open = OpenProof::enter(view, tokens, range.start)?;
+    let start = range.start;
+    let syntax = elimination::single_tactic(elimination::sequence(leaves, view, tokens, range)?);
+    if syntax.kind() == Some(&parser_kind(&["Tactic", "tacticSeq"])) {
+        return Err(refusal(view, tokens, start));
+    }
+    Ok(syntax)
+}
+
 /// The tactic sequence of a `decreasing_by` clause, `range` after its keyword, bounded as a
 /// proof block is.
 pub(super) fn tactic_sequence(
@@ -304,6 +322,8 @@ pub(crate) fn tactic(
             "left",
             "right",
             "rfl",
+            "eq_refl",
+            "apply_rfl",
             "symm",
             "change",
             "rw",
@@ -667,6 +687,8 @@ fn local_tactic(
         }
         "assumption"
         | "rfl"
+        | "eq_refl"
+        | "apply_rfl"
         | "contradiction"
         | "constructor"
         | "left"
@@ -774,6 +796,8 @@ fn local_tactic(
     // `rfl` is `macro "rfl" : tactic` in `Init/Tactics.lean`, whose kind is `tacticRfl`.
     let kind = match keyword {
         "rfl" => "tacticRfl",
+        "eq_refl" => "eqRefl",
+        "apply_rfl" => "applyRfl",
         // `macro "trivial" : tactic` (`Init/Tactics.lean`).
         "trivial" => "tacticTrivial",
         "rename_i" => "renameI",

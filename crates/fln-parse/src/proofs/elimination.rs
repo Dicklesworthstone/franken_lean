@@ -1571,7 +1571,7 @@ fn finish_elimination(
 
 /// A sequence of exactly one tactic as that tactic (`<;>`'s operands are `tactic`s); any other
 /// syntax is returned unchanged.
-fn single_tactic(syntax: Syntax) -> Syntax {
+pub(super) fn single_tactic(syntax: Syntax) -> Syntax {
     let unwrap = |syntax: &Syntax, kind: &str| match syntax {
         Syntax::Node {
             kind: found, args, ..
