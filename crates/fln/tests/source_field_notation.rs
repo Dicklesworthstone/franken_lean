@@ -571,6 +571,13 @@ def bad (A : Type) (pair : Pair Token) : A :=
   call pair"#,
             None,
         ),
+        (
+            r#"def sentinelPrefix : Token := Token.mk
+def bad : (A : Type) -> A -> A :=
+  let keep (value : _) [Inhabited Nat] := value
+  fun A value => keep value"#,
+            None,
+        ),
     ] {
         let error = base
             .check_source_files(&[source.as_bytes()], &options, limits())
@@ -582,6 +589,38 @@ def bad (A : Type) (pair : Pair Token) : A :=
         assert_eq!(base.logical_root(&options), root);
         for name in ["sentinelPrefix", "bad"] {
             assert!(!base.environment().contains(&Name::from_components([name])));
+        }
+    }
+}
+
+#[test]
+fn local_method_helpers_close_instance_goals_solved_by_their_callers() {
+    // Both helper spellings keep the same local dictionary. A written receiver
+    // tests ordinary local-function closure; `_` also tests field replay.
+    // The second proof observes the helper's explicit dictionary (7), which
+    // must override the ambient Nat default (0).
+    for receiver in ["Token", "_"] {
+        for argument in ["Nat.zero", "0"] {
+            let source = format!(
+                r#"inductive Token where
+  | mk
+  | other
+inductive Same (x : Token) : Token → Prop where
+  | refl : Same x x
+def Token.keep {{A : Type}} [Inhabited A] (self : Token) (value : A) : Token := self
+def delayed (token : Token) : Token :=
+  let call (x : {receiver}) (value : _) [Inhabited Nat] := x.keep value
+  call token {argument}
+theorem delayed_correct (token : Token) : Same (delayed token) token :=
+  @Same.refl token
+def Token.pick {{A : Type}} [Inhabited A] (self : Token) (value : A) : A := Inhabited.default
+def selected (token : Token) : Nat :=
+  let call (x : {receiver}) (value : _) [Inhabited Nat] := x.pick value
+  @call token {argument} ⟨7⟩
+theorem selected_correct (token : Token) : selected token = 7 := by rfl
+"#
+            );
+            check(&source);
         }
     }
 }

@@ -379,12 +379,23 @@ impl Context {
                 // A replayed application has already used its original
                 // finishing policy. In particular, do not insert implicits
                 // into an explicit application or an unfinished callee.
-                let term = if record.application.is_none() {
+                let mut term = if record.application.is_none() {
                     self.finish_optional_term(term, Some(&record.expected))?
                 } else {
                     term
                 };
-                let mut value = self.instantiate(&term.value)?;
+                // Replay can create goals after the original helper's binders
+                // closed. Their later solutions still belong inside the field
+                // placeholder's closed telescope, just as in finish_telescope.
+                term.value = self.instantiate(&term.value)?;
+                term.type_ = self.instantiate(&term.type_)?;
+                let outer = LocalContext::new();
+                self.capture_bound_metavars(&record.locals, &outer, &mut term)?;
+                if self.capture_bound_coercions(&record.locals, &outer, &term)? {
+                    term.value = self.instantiate(&term.value)?;
+                    term.type_ = self.instantiate(&term.type_)?;
+                }
+                let mut value = term.value;
                 for local in record.locals.iter().rev() {
                     self.tick()?;
                     let domain = self.instantiate(&local.type_)?;

@@ -555,7 +555,18 @@ impl Context {
             )));
         }
         value = self.close_recursive_lambdas(&build.lambdas, value)?;
-        for local in build.parameters[..build.header_parameters].iter().rev() {
+        // Header parameters close here rather than through finish_telescope.
+        // Goals solved by the continuation must keep their local dictionaries
+        // and inferred domains underneath these binders.
+        value.value = self.instantiate(&value.value)?;
+        value.type_ = self.instantiate(&value.type_)?;
+        let parameters = &build.parameters[..build.header_parameters];
+        self.capture_bound_metavars(parameters, &build.saved, &mut value)?;
+        if self.capture_bound_coercions(parameters, &build.saved, &value)? {
+            value.value = self.instantiate(&value.value)?;
+            value.type_ = self.instantiate(&value.type_)?;
+        }
+        for local in parameters.iter().rev() {
             self.tick()?;
             let domain = self.instantiate(&local.type_)?;
             value.value = value
