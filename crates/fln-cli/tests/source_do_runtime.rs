@@ -46,7 +46,9 @@ fn native_do_checks_executes_exports_and_replays_through_installed_commands() {
             .output()
             .unwrap(),
     );
-    assert!(run.contains("\"finalValue\":42"), "{run}");
+    assert!(run.contains("\"authority\":true"), "{run}");
+    assert!(run.contains("\"evaluations\":1"), "{run}");
+    assert!(run.contains("\"kind\":\"nat\",\"value\":42"), "{run}");
     let replay = success(
         Command::new(env!("CARGO_BIN_EXE_fln"))
             .args(["flbc", "run", "--json"])

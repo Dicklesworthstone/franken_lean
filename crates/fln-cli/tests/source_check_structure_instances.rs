@@ -239,15 +239,18 @@ const EMPTY_STRUCTURE_EXPECTED: &str = "{ } : E\n";
 /// Without `Init.NotationExtra`, whose macro the `Σ` notation is, the pin fails to print a `Sigma`
 /// at all ("failed to pretty print expression"); this door refuses it there.
 ///
-/// With `Init.NotationExtra` imported, a term holding binders this engine's elaboration
-/// introduced (an `if` it compiles to `Decidable.rec`, where the pin has `ite`) is refused too.
 /// Inside `open Int`, the pin prints `Int.negSucc 9` as `-[9+1]`, which is refused here too.
 const REFUSED: &[&str] = &[
     "prelude\nimport Init.Core\nstructure D where\n  x : Nat := 3\n#check ({ x := 1 + 2 } : D)\n",
-    "prelude\nimport Init.NotationExtra\n#check fun (n : Nat) => if n = 0 then 1 else 2\n",
     "prelude\nimport Init.Core\n#check Sigma fun (n : Nat) => Fin n\n",
     "prelude\nimport Init.Data.Int.Basic\nopen Int in\n#reduce Int.negSucc 9\n",
 ];
+
+// This original refusal fixture is now supported. Keep its complete program
+// as a positive oracle comparison instead of requiring a correct check to fail.
+const CONDITIONAL_CHECK: &str =
+    "prelude\nimport Init.NotationExtra\n#check fun (n : Nat) => if n = 0 then 1 else 2\n";
+const CONDITIONAL_CHECK_EXPECTED: &str = "fun n => if n = 0 then 1 else 2 : Nat → Nat\n";
 
 fn pinned_lib() -> Option<PathBuf> {
     let lib = std::env::var_os("FLN_REFERENCE_LIB")
@@ -470,6 +473,23 @@ fn a_structure_without_fields_prints_its_instance_as_the_pin_does() {
     let (code, stdout, stderr) = ours(&lib, &root, &entry);
     assert_eq!(code, 0, "{stderr}");
     assert_eq!(stdout, EMPTY_STRUCTURE_EXPECTED, "{stderr}");
+}
+
+#[test]
+fn conditional_checks_print_as_the_pin_does() {
+    let Some(lib) = pinned_lib() else {
+        return;
+    };
+    let root = workspace();
+    let entry = root.join("ConditionalCheck.lean");
+    std::fs::write(&entry, CONDITIONAL_CHECK).unwrap();
+    if let Some((code, stdout)) = pinned(&lib, &entry) {
+        assert_eq!((code, stdout.as_str()), (0, CONDITIONAL_CHECK_EXPECTED));
+    }
+    let (code, stdout, stderr) = ours(&lib, &root, &entry);
+    assert_eq!(code, 0, "{stderr}");
+    assert!(stderr.is_empty(), "{stderr}");
+    assert_eq!(stdout, CONDITIONAL_CHECK_EXPECTED);
 }
 
 #[test]

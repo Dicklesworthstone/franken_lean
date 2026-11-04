@@ -202,7 +202,7 @@ fn checked_io_results_print_once_refuse_unprintable_actions_and_guard_their_outp
             r#"{DEFINITIONS}#eval IO.print "first"
 #eval IO.eprintln "second"
 #eval (dbgTrace "traced" fun _ => (1 : Nat))
-#eval (panicCore (7 : Nat) "recover")
+#eval (@panicCore Nat (Inhabited.mk 7) "recover")
 #eval ([] : List Nat).head!
 #eval "after"
 "#
@@ -238,6 +238,21 @@ fn checked_io_results_print_once_refuse_unprintable_actions_and_guard_their_outp
         )),
         "{json}"
     );
+    // The fallback value belongs to the implicit Inhabited dictionary, not
+    // to a scalar argument. The old malformed application must stay refused.
+    let malformed = workspace.write(
+        "MalformedPanic.lean",
+        format!("{DEFINITIONS}#eval (panicCore (7 : Nat) \"recover\")\n"),
+    );
+    let refused = lean_io(&workspace, &malformed, &lib);
+    assert_eq!(refused.code, 1, "{refused:?}");
+    assert!(refused.stdout.is_empty(), "{refused:?}");
+    assert!(
+        refused.stderr.starts_with("lean: elaboration: "),
+        "{refused:?}"
+    );
+    assert!(refused.stderr.contains("Type mismatch"), "{refused:?}");
+
     // An action's output is a message of its own, as the pin's `#eval` logs it from inside
     // `withIsolatedStreams`: printed where the command is (after an earlier command's
     // warning), judged by a guard over it, and dropped with `drop info`, while the action's
