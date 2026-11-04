@@ -302,6 +302,48 @@ fn match_rhs_arguments_start_right_of_the_saved_pipe_as_at_the_pin() {
 }
 
 #[test]
+fn typed_lambda_headers_in_layout_checked_branches_match_the_pin() {
+    let Some(lib) = pinned_lib() else {
+        return;
+    };
+    let accepted = [
+        (
+            "def g (n : Nat) : Nat → Nat := match n with | n => fun x : Nat => n + x\nexample : g 1 2 = 3 := rfl\n",
+            "",
+        ),
+        (
+            "def g (n : Nat) : Nat → Nat := if true then fun x : Nat => n + x else fun x : Nat => n + x\nexample : g 1 2 = 3 := rfl\n",
+            "",
+        ),
+        (
+            "def g : Nat → Nat → Nat | n => fun x : Nat => n + x\nexample : g 1 2 = 3 := rfl\n",
+            "",
+        ),
+        (
+            "def g (n : Nat) : Nat → Nat := match n with | n => if true then fun x : Nat => n + x else fun x : Nat => n + x\nexample : g 1 2 = 3 := rfl\n",
+            "",
+        ),
+        (
+            "def g (n : Nat) : Nat → Nat := (match n with | n => fun x : Nat => n + x : Nat → Nat)\nexample : g 1 2 = 3 := rfl\n",
+            "",
+        ),
+        (
+            "def g (n : Nat) : Nat → Nat := match n with | n => fun (x : Nat) => n + x\nexample : g 1 2 = 3 := rfl\n",
+            "",
+        ),
+        (
+            "def g (n : Nat) : Nat → Nat := match n with | n => (fun x : Nat => n + x)\nexample : g 1 2 = 3 := rfl\n",
+            "",
+        ),
+    ];
+    let refused = [
+        "def g (n : Nat) : Nat → Nat := match n with | n => fun x : Nat\n",
+        "def g (n : Nat) : Nat := (match n with | n => fun x : Nat => n + x : Nat)\n",
+    ];
+    judge(&lib, &workspace(), &refused, &accepted);
+}
+
+#[test]
 fn unary_prefixes_preserve_the_match_alternatives_saved_column() {
     let Some(lib) = pinned_lib() else {
         return;

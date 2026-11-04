@@ -199,6 +199,10 @@ fn plan(
     // Per bracket depth, the binders (`∃ h : p, q`, `∀ x, p`, `Σ x, β x`) whose comma is still to
     // come: that comma is the binder's own, not one that ends an alternative's body.
     let mut binder_commas: Vec<usize> = Vec::new();
+    // `basicFun` owns the shared type in `fun x : T => e`. Its colon is not an outer
+    // ascription ending the enclosing match/conditional. Nested branch plans in T have their
+    // own arrows, so retain the enclosing plan counts as well as the bracket depth.
+    let mut lambda_headers = Vec::new();
     for at in range.clone() {
         if at < proof_end {
             continue;
@@ -517,6 +521,7 @@ fn plan(
             {
                 proof_end = proofs::block_extent(view, tokens, at, range.end)?;
             }
+            "fun" | "λ" => lambda_headers.push((depth, active.len(), conditionals.len())),
             "by" | "do" => {
                 if let Some(current) = active.last_mut()
                     && current.depth == depth
@@ -580,6 +585,7 @@ fn plan(
             ":" if lets.last().is_some_and(|(d, enclosing, _, _, _)| {
                 *d == depth && active.len() <= *enclosing
             }) => {}
+            ":" if lambda_headers.last() == Some(&(depth, active.len(), conditionals.len())) => {}
             ")" | "}" | "]" | "⦄" | "⟩" | "," | ":" => {
                 // The binder's own comma, and its type's `:` before it (`∃ h : p, q`).
                 if binder_commas.get(depth).is_some_and(|&open| open > 0) {
@@ -632,6 +638,12 @@ fn plan(
                 }
                 // A binder inside the brackets ended with them.
                 binder_commas.truncate(delimiters.len() + 1);
+                while lambda_headers
+                    .last()
+                    .is_some_and(|(d, _, _)| *d > delimiters.len())
+                {
+                    lambda_headers.pop();
+                }
             }
             "with"
                 if active
@@ -735,6 +747,11 @@ fn plan(
                         end: range.end,
                     });
                 }
+            }
+            "=>" | "↦"
+                if lambda_headers.last() == Some(&(depth, active.len(), conditionals.len())) =>
+            {
+                lambda_headers.pop();
             }
             "=>" | "↦" if active.last().is_some_and(|p| p.depth == depth) => {
                 let current = active.last_mut().expect("matching depth");
