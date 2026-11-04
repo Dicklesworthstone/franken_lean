@@ -23,6 +23,9 @@ const MAX_ROUNDS: usize = 5;
 pub(super) enum PatternKind {
     Local,
     Default,
+    /// An equation selected through its owning definition. This also permits
+    /// ground left-hand sides, as `mkEMatchEqTheorem` does at the pin.
+    Definition,
     EqualityLeft,
     EqualityRight,
     EqualityBoth,
@@ -70,8 +73,9 @@ fn parameter_at(parameters: &[Parameter], expression: &Expr) -> Option<usize> {
     parameters.iter().position(|parameter| parameter.id == *id)
 }
 
-/// Applications are the only pattern constructors in this fragment. Binding
-/// forms and projections need the pin's pattern preprocessing and stay opaque.
+/// Patterns use application trees, with a bare constant also permitted for a
+/// ground definition equation. Binding forms and projections need the pin's
+/// pattern preprocessing and stay opaque.
 fn variables(
     context: &mut Context,
     parameters: &[Parameter],
@@ -262,9 +266,10 @@ fn equality_pattern(
     expression: &Expr,
 ) -> Result<Option<Vec<Expr>>, Error> {
     let expression = normalize(context, expression)?;
-    if !matches!(expression.node(), ExprNode::App { .. })
-        || !pattern_head(context, parameters, &expression)?
-    {
+    let application = matches!(expression.node(), ExprNode::App { .. });
+    let ground_constant =
+        parameters.is_empty() && matches!(expression.node(), ExprNode::Const { .. });
+    if !(application || ground_constant) || !pattern_head(context, parameters, &expression)? {
         return Ok(None);
     }
     let Some(covered) = variables(context, parameters, &expression)? else {
@@ -316,7 +321,7 @@ impl Theorem {
                 let opened = context.substitute(body, &Expr::fvar(local.id))?;
                 type_ = normalize(context, &opened)?;
             }
-            if parameters.is_empty() {
+            if parameters.is_empty() && kind != PatternKind::Definition {
                 return Ok(None);
             }
             let mut conclusion = type_.clone();
@@ -355,7 +360,8 @@ impl Theorem {
                 backwards
             } else {
                 match kind {
-                    PatternKind::EqualityLeft
+                    PatternKind::Definition
+                    | PatternKind::EqualityLeft
                     | PatternKind::EqualityRight
                     | PatternKind::EqualityBoth => {
                         let sides = equality_target(&conclusion)
@@ -366,7 +372,13 @@ impl Theorem {
                         };
                         for (side, selected) in [
                             (&left, kind != PatternKind::EqualityRight),
-                            (&right, kind != PatternKind::EqualityLeft),
+                            (
+                                &right,
+                                matches!(
+                                    kind,
+                                    PatternKind::EqualityRight | PatternKind::EqualityBoth
+                                ),
+                            ),
                         ] {
                             if !selected {
                                 continue;
@@ -568,11 +580,16 @@ impl Quantifiers {
             return Ok(Vec::new());
         };
         if !found.iter().any(|found| *found) && theorem.level_params.is_empty() {
-            return Ok(if graph.equivalent(context, pattern, ground)? {
-                vec![substitution]
-            } else {
-                Vec::new()
-            });
+            if graph.equivalent(context, pattern, ground)? {
+                return Ok(vec![substitution]);
+            }
+            // A ground application need not have been internalized itself:
+            // `flip false` can match `flip (flip true)` after the inner call
+            // is equated with false. Continue through the same structural
+            // matcher instead of manufacturing the unseen pattern as a fact.
+            if !matches!(pattern.node(), ExprNode::App { .. }) {
+                return Ok(Vec::new());
+            }
         }
         match (pattern.node(), ground.node()) {
             (
@@ -658,10 +675,17 @@ impl Quantifiers {
         let mut instances = Vec::new();
         // Snapshot before matching: no theorem in this round can see terms
         // manufactured by an earlier theorem in the same round.
+        let ground_patterns = self
+            .theorems
+            .iter()
+            .any(|theorem| theorem.parameters.is_empty());
         let terms: Vec<_> = graph
             .nodes
             .iter()
-            .filter(|node| node.application.is_some())
+            .filter(|node| {
+                node.application.is_some()
+                    || (ground_patterns && matches!(node.term.node(), ExprNode::Const { .. }))
+            })
             .map(|node| node.term.clone())
             .collect();
         for (index, theorem) in self.theorems.clone().into_iter().enumerate() {

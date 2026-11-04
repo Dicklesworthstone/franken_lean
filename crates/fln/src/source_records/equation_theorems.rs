@@ -1,7 +1,7 @@
 //! Equation theorems a command names, generated before it is elaborated.
 //!
 //! The pin generates `f.eq_<n>`, `f.eq_def` and `f.eq_unfold` when it first resolves one of
-//! these reserved names, or when `rw [f]` asks for `f`'s equations, and adds them to the
+//! these reserved names, or when `rw [f]` or `grind [f]` asks for `f`'s equations, and adds them to the
 //! environment for good (`realizeConst`, vendored `Lean/Meta/Eqns.lean`). This engine reads
 //! the command's syntax for those references (`fln_elab::source::equation_theorems::requests`)
 //! and admits each generated theorem through K1 and the independent checker before the
@@ -18,6 +18,7 @@ pub(crate) fn may_name_equation_theorems(source: &[u8]) -> bool {
     source.windows(3).any(|window| window == b"eq_")
         || source.windows(2).any(|w| w == b"rw")
         || source.windows(7).any(|window| window == b"rewrite")
+        || source.windows(5).any(|window| window == b"grind")
 }
 
 impl Engine {
