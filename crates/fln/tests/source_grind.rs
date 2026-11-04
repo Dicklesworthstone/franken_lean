@@ -318,6 +318,38 @@ const ACCEPT: &[(&str, &str)] = &[
         "arithmetic_nested_congruence",
         "example (f g : Nat → Nat) (n : Nat) : f (g (n + 1)) = f (g (1 + n)) := by grind",
     ),
+    (
+        "arithmetic_predicate_congruence",
+        "example (P : Nat → Prop) (n : Nat) (h : P (n + 1)) : P (1 + n) := by grind",
+    ),
+    (
+        "arithmetic_nested_predicate_congruence",
+        "example (P : Bool → Prop) (f : Nat → Bool) (n : Nat) (h : P (f (n + 1))) : P (f (1 + n)) := by grind",
+    ),
+    (
+        "arithmetic_equal_predicate_congruence",
+        "example (P Q : Nat → Prop) (n : Nat) (hPQ : P = Q) (h : P (n + 1)) : Q (1 + n) := by grind",
+    ),
+    (
+        "arithmetic_predicate_bound_congruence",
+        "example (P : Int → Prop) (x y : Int) (hxy : x ≤ y) (hyx : y ≤ x) (h : P x) : P y := by grind",
+    ),
+    (
+        "arithmetic_curried_predicate_congruence",
+        "example (P : Nat → Nat → Prop) (n m : Nat) (h : P (n + 1) (m + 2)) : P (1 + n) (2 + m) := by grind",
+    ),
+    (
+        "arithmetic_quantified_predicate_congruence",
+        "example (P Q : Nat → Prop) (n : Nat) (h : P (n + 1)) (step : ∀ x, P x → Q x) : Q (1 + n) := by grind",
+    ),
+    (
+        "arithmetic_quantified_premise_congruence",
+        "example (P Q : Nat → Prop) (n : Nat) (h : P (1 + n)) (step : ∀ x, P (x + 1) → Q x) : Q n := by grind",
+    ),
+    (
+        "arithmetic_custom_add_control",
+        "def customAdd : Add Nat := ⟨fun left _ => left⟩\nexample (n : Nat) : @HAdd.hAdd Nat Nat Nat (@instHAdd Nat customAdd) n 1 = n := rfl",
+    ),
 ];
 
 const REFUSE: &[(&str, &str)] = &[
@@ -389,6 +421,26 @@ const REFUSE: &[(&str, &str)] = &[
     (
         "arithmetic_congruence_unequal_arguments",
         "example (f : Nat → Nat) (n : Nat) : f (n + 1) = f (n + 2) := by grind",
+    ),
+    (
+        "arithmetic_predicate_unequal_arguments",
+        "example (P : Nat → Prop) (n : Nat) (h : P (n + 1)) : P (n + 2) := by grind",
+    ),
+    (
+        "arithmetic_predicate_unrelated_heads",
+        "example (P Q : Nat → Prop) (n : Nat) (h : P (n + 1)) : Q (1 + n) := by grind",
+    ),
+    (
+        "arithmetic_predicate_one_way_bound",
+        "example (P : Int → Prop) (x y : Int) (hxy : x ≤ y) (h : P x) : P y := by grind",
+    ),
+    (
+        "arithmetic_curried_predicate_unequal_arguments",
+        "example (P : Nat → Nat → Prop) (n m : Nat) (h : P (n + 1) (m + 2)) : P (1 + n) (3 + m) := by grind",
+    ),
+    (
+        "arithmetic_predicate_custom_add",
+        "def customAdd : Add Nat := ⟨fun left _ => left⟩\nexample (P : Nat → Prop) (n : Nat) (h : P (@HAdd.hAdd Nat Nat Nat (@instHAdd Nat customAdd) n 1)) : P (@HAdd.hAdd Nat Nat Nat (@instHAdd Nat customAdd) 1 n) := by grind",
     ),
 ];
 

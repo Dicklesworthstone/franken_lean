@@ -586,16 +586,10 @@ impl State {
     fn arithmetic_congruence_candidates(
         &self,
         context: &mut Context,
-        propositions: &[Expr],
+        mut pending: Vec<(Expr, Expr)>,
     ) -> Result<Vec<Expr>, Error> {
-        // Query only aligned subterms of an already observed equality, such as
-        // the arguments of f (n + 1) = f (1 + n). An all-pairs query over the
-        // term graph would repeatedly run the solver on unrelated expressions.
-        let mut pending: Vec<_> = propositions
-            .iter()
-            .filter_map(equality_target)
-            .map(|(_, _, left, right)| (left, right))
-            .collect();
+        // Traverse aligned terms from observed equalities or applications with
+        // shared function classes. Unrelated graph terms need no solver query.
         let mut seen = HashSet::new();
         let mut candidates = Vec::new();
         while let Some((left, right)) = pending.pop() {
@@ -663,9 +657,21 @@ impl State {
                 .filter(|node| node.proposition)
                 .map(|node| node.term.clone()),
         );
-        let mut congruence = Some(candidates.clone());
+        let mut congruence = Some(
+            candidates
+                .iter()
+                .filter_map(equality_target)
+                .map(|(_, _, left, right)| (left, right))
+                .collect(),
+        );
+        let mut application_congruence = false;
         let mut candidates = VecDeque::from(candidates);
         loop {
+            // Let a newly proved argument equality reach congruence closure
+            // before unrelated application queries consume the remaining budget.
+            if application_congruence && !self.pending.is_empty() {
+                return Ok(None);
+            }
             if candidates.is_empty() {
                 // Direct arithmetic and newly derived propositional facts get
                 // the first chance to close the goal. An unrelated large
@@ -673,10 +679,16 @@ impl State {
                 if !self.pending.is_empty() {
                     return Ok(None);
                 }
-                let Some(observed) = congruence.take() else {
+                let pairs = if let Some(pairs) = congruence.take() {
+                    pairs
+                } else if !application_congruence {
+                    application_congruence = true;
+                    self.graph.arithmetic_arguments(context)?
+                } else {
                     return Ok(None);
                 };
-                candidates.extend(self.arithmetic_congruence_candidates(context, &observed)?);
+                candidates.extend(self.arithmetic_congruence_candidates(context, pairs)?);
+                continue;
             }
             let Some(proposition) = candidates.pop_front() else {
                 return Ok(None);

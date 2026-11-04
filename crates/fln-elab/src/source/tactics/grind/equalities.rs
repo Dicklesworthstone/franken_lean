@@ -295,6 +295,51 @@ impl Equalities {
         )
     }
 
+    /// Arithmetic can identify arguments of already observed applications even
+    /// when no explicit equality goal mentions them (for example P (n + 1)
+    /// and P (1 + n)). Only shared function classes can use those equalities.
+    pub fn arithmetic_arguments(&self, context: &mut Context) -> Result<Vec<(Expr, Expr)>, Error> {
+        let mut applications: HashMap<(usize, Expr), Vec<(usize, usize, Expr)>> = HashMap::new();
+        let mut seen = HashSet::new();
+        let mut pairs = Vec::new();
+        for node in &self.nodes {
+            context.tick()?;
+            let Some((function, argument)) = node.application else {
+                continue;
+            };
+            let type_ = normalize(context, &self.nodes[argument].type_)?;
+            if ![constant("Nat"), constant("Int")].contains(&type_) {
+                continue;
+            }
+            let ExprNode::App { a, .. } = node.term.node() else {
+                continue;
+            };
+            let peers = applications
+                .entry((self.root(function), type_))
+                .or_default();
+            for (other_function, other_argument, other_term) in peers.iter() {
+                context.tick()?;
+                let left = self.root(*other_argument);
+                let right = self.root(argument);
+                if left == right
+                    || !self.function_congruence(context, *other_function, function)?
+                    || !seen.insert((left.min(right), left.max(right)))
+                {
+                    continue;
+                }
+                if pairs.len() >= MAX_FACTS {
+                    return Err(failure(SourceInferenceError::ResourceLimit));
+                }
+                // Keep the parent's raw argument. Its separately interned node
+                // may expose a projected arithmetic field that omega treats as
+                // an atom instead of recognizing the original notation spine.
+                pairs.push((other_term.clone(), a.clone()));
+            }
+            peers.push((function, argument, a.clone()));
+        }
+        Ok(pairs)
+    }
+
     pub fn saturate(&mut self, context: &mut Context) -> Result<(), Error> {
         loop {
             let mut changed = false;
