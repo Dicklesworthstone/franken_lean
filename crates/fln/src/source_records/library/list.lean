@@ -1,3 +1,11 @@
+-- The Bool coercions are ordinary checked instances, as in Init.Coe.
+-- Spell out the common equality so constructing CoeSort needs no instance
+-- that is still being defined.
+instance boolToProp : Coe Bool Prop where
+  coe b := b = true
+instance boolToSort : CoeSort Bool Prop where
+  coe b := b = true
+
 universe u
 namespace List
 @[simp] theorem nil_append {α : Type u} (as : List α) : [] ++ as = as := rfl

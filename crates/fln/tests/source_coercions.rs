@@ -21,9 +21,14 @@ fn checked(base: &Engine, source: &str) -> Engine {
 }
 #[test]
 fn staged_coercion_library_is_admitted_by_both_checkers() {
+    let base = seed();
     checked(
-        &seed(),
+        &base,
         "structure Box where\n  value : Nat\ninstance boxToNat : Coe Box Nat := Coe.mk (fun x => x.value)\ndef unpack (x : Box) : Nat := Coe.coe x",
+    );
+    checked(
+        &base,
+        include_str!("../../../examples/native_conditionals.lean"),
     );
 }
 
