@@ -16,6 +16,9 @@ mod arrays_reference;
 #[path = "tests/array_proofs.rs"]
 mod array_proofs;
 
+#[path = "tests/array_operations.rs"]
+mod array_operations;
+
 #[path = "tests/boxed_primitives.rs"]
 mod boxed_primitives;
 
@@ -526,6 +529,10 @@ fn pinned_array_type_slots_are_erased_without_hiding_bad_data_or_authority() {
         Err(IrExecutionError::Unsupported { .. })
     ));
     for id in [
+        "extern:Array.mk",
+        "extern:Array.toList",
+        "extern:Array.pop",
+        "extern:Array.swapIfInBounds",
         "extern:Array.emptyWithCapacity",
         "extern:Array.mkEmpty",
         "extern:Array.push",

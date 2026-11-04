@@ -5,6 +5,13 @@ use crate::imported_ir::EntryArgument;
 use std::path::PathBuf;
 use std::process::Command;
 
+const LIBRARY_FUNCTIONS: [&str; 4] = [
+    "Array.reverse",
+    "Array.reverse._redArg",
+    "Array.reverse.loop",
+    "Array.reverse.loop._redArg",
+];
+
 #[test]
 fn live_pinned_arrays_match_reference_with_erased_proofs_and_canonical_replay() {
     let reference = std::env::var_os("FLN_REFERENCE_LEAN")
@@ -70,11 +77,21 @@ fn live_pinned_arrays_match_reference_with_erased_proofs_and_canonical_replay() 
     .unwrap();
     std::fs::write(dir.join("decoded-ir.txt"), format!("{module:#?}")).unwrap();
     // Supply the pin's actual full extern and boxed declarations for the
-    // reviewed array subset. Their bodies never acquire interpretation
-    // authority; only explicitly allowed fixture functions can be executed.
-    let prototypes = native_array_prototypes(&reference);
-    // The test-only partition does not stand in for the full library census.
-    let partition = VerifiedPartition::user_fixture();
+    // complete Array family. Native bodies never acquire interpretation
+    // authority. The actual Array.reverse library functions use the complete
+    // authenticated partition and ordinary compiler-helper witness checks.
+    let (prototypes, library) = native_array_prototypes(&reference);
+    let partition_path = std::env::var_os("FLN_REFERENCE_PARTITION")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            fln_core::checked_workspace_root!().join("contracts/builtin_partition.tsv")
+        });
+    let partition = VerifiedPartition::from_pinned_tsv(
+        &std::fs::read_to_string(&partition_path).unwrap_or_else(|error| {
+            panic!("actual library execution requires {partition_path:?}: {error}")
+        }),
+    )
+    .unwrap();
     let cases = [
         ("arrayNativeEmpty", 0),
         ("arrayNativeEmpty", 4),
@@ -112,21 +129,59 @@ fn live_pinned_arrays_match_reference_with_erased_proofs_and_canonical_replay() 
         ("byteArrayPartialRead", 0),
         ("byteArrayPartialRead", 255),
         ("byteArrayPartialRead", 256),
+        ("arrayNativeListRoundTrip", 0),
+        ("arrayNativeListRoundTrip", 42),
+        ("arrayNativeListRoundTrip", u64::MAX),
+        ("arrayNativePopEmpty", 0),
+        ("arrayNativePopEmpty", 1),
+        ("arrayNativePopEmpty", 4),
+        ("arrayNativeSwap", 0),
+        ("arrayNativeSwap", 42),
+        ("arrayNativeSwap", u64::MAX),
+        ("arrayNativeSwapIfInBounds", 0),
+        ("arrayNativeSwapIfInBounds", 1),
+        ("arrayNativeSwapIfInBounds", 2),
+        ("arrayNativeSwapIfInBounds", u64::MAX),
+        ("arrayPartialFromList", 0),
+        ("arrayPartialFromList", 42),
+        ("arrayPartialFromList", u64::MAX),
+        ("arrayPartialToList", 0),
+        ("arrayPartialToList", 42),
+        ("arrayPartialToList", u64::MAX),
+        ("arrayPartialPop", 0),
+        ("arrayPartialPop", 42),
+        ("arrayPartialPop", u64::MAX),
+        ("arrayPartialSwap", 0),
+        ("arrayPartialSwap", 42),
+        ("arrayPartialSwap", u64::MAX),
+        ("arrayPartialSwapProofs", 0),
+        ("arrayPartialSwapProofs", 42),
+        ("arrayPartialSwapProofs", u64::MAX),
+        ("arrayPartialSwapIfInBounds", 0),
+        ("arrayPartialSwapIfInBounds", 1),
+        ("arrayPartialSwapIfInBounds", 2),
+        ("arrayPartialSwapIfInBounds", u64::MAX),
+        ("arrayNativeHeapSwap", 0),
+        ("arrayNativeHeapSwap", 42),
+        ("arrayNativeHeapSwap", u64::MAX),
+        ("arrayLibraryReverse", 0),
+        ("arrayLibraryReverse", 42),
+        ("arrayLibraryReverse", u64::MAX),
+        ("arrayLibraryReverseSmall", 0),
+        ("arrayLibraryReverseSmall", 1),
+        ("arrayLibraryReverseSmall", 2),
+        ("arrayLibraryReverseSmall", 7),
     ];
-    let mut users: BTreeSet<_> = cases.iter().map(|(entry, _)| name(entry)).collect();
-    // Exact closed-value initializers emitted by this pinned fixture.
-    users.extend([
-        name("arrayPartialEmpty._closed_0"),
-        name("useArrayEmpty"),
-        name("arrayNativeHeap._closed_0"),
-        name("byteArrayNativeRoundTrip._closed_0"),
-        name("byteArrayNativeBounds._closed_0"),
-        name("useArrayPush"),
-        name("useArrayRead._redArg"),
-        name("useArrayWrite"),
-        name("useArrayWrite._redArg"),
-        name("useByteArrayRead._redArg"),
-    ]);
+    // Only exact function names emitted in this test's own source module are
+    // users. Imported library helpers are never added to this authority set.
+    let users: BTreeSet<_> = module
+        .decls
+        .iter()
+        .filter(|declaration| matches!(declaration, IrDecl::Function { .. }))
+        .map(|declaration| declaration.name().clone())
+        .collect();
+    let library_names: BTreeSet<_> = LIBRARY_FUNCTIONS.into_iter().map(name).collect();
+    assert!(users.is_disjoint(&library_names));
     let boxed_partials: BTreeSet<_> = module
         .decls
         .iter()
@@ -153,6 +208,13 @@ fn live_pinned_arrays_match_reference_with_erased_proofs_and_canonical_replay() 
         "Array.getInternal._boxed",
         "Array.set._boxed",
         "ByteArray.get._boxed",
+        // Constructor/projection values are eta-expanded by the pin into
+        // these user lambdas, whose bodies call Array.mk/toList natively.
+        "arrayPartialFromList._lam_0",
+        "arrayPartialToList._lam_0",
+        "Array.pop._boxed",
+        "Array.swap._boxed",
+        "Array.swapIfInBounds._boxed",
     ] {
         assert!(
             boxed_partials.contains(&name(target)),
@@ -199,7 +261,7 @@ fn live_pinned_arrays_match_reference_with_erased_proofs_and_canonical_replay() 
     );
 
     let mut observed = BTreeSet::new();
-    let modules = [module, prototypes];
+    let modules = [module, prototypes, library];
     for ((entry, value), expected) in cases.into_iter().zip(expected) {
         let compiled = compile(
             &modules,
@@ -221,10 +283,20 @@ fn live_pinned_arrays_match_reference_with_erased_proofs_and_canonical_replay() 
             compiled
                 .reference_functions()
                 .iter()
-                .all(
-                    |function| function.producer() == "reference" && users.contains(&function.name)
-                )
+                .all(|function| function.producer() == "reference"
+                    && (users.contains(&function.name) || library_names.contains(&function.name)))
         );
+        if entry.starts_with("arrayLibraryReverse") {
+            for target in ["Array.reverse._redArg", "Array.reverse.loop._redArg"] {
+                assert!(
+                    compiled
+                        .reference_functions()
+                        .iter()
+                        .any(|function| function.name == name(target)),
+                    "{entry}: actual library code {target} must be selected"
+                );
+            }
+        }
         let stopped = compiled.execute(
             ExecutionLimits {
                 max_steps: 0,
@@ -245,6 +317,11 @@ fn live_pinned_arrays_match_reference_with_erased_proofs_and_canonical_replay() 
         eprintln!("live Reference and Golem: {entry} {value} = {expected}");
     }
     for operation in [
+        "Array.mk",
+        "Array.toList",
+        "Array.pop",
+        "Array.swap",
+        "Array.swapIfInBounds",
         "Array.emptyWithCapacity",
         "Array.replicate",
         "Array.set!",
@@ -279,7 +356,7 @@ fn live_pinned_arrays_match_reference_with_erased_proofs_and_canonical_replay() 
     }
 }
 
-fn native_array_prototypes(reference: &std::path::Path) -> IrModule {
+fn native_array_prototypes(reference: &std::path::Path) -> (IrModule, IrModule) {
     let library = std::env::var_os("FLN_REFERENCE_LIB")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
@@ -291,6 +368,8 @@ fn native_array_prototypes(reference: &std::path::Path) -> IrModule {
                 .join("lib/lean")
         });
     let mut declarations = Vec::new();
+    let mut library_functions = Vec::new();
+    let library_names: BTreeSet<_> = LIBRARY_FUNCTIONS.into_iter().map(name).collect();
     let mut externs = BTreeSet::new();
     let mut wrappers = BTreeSet::new();
     for relative in [
@@ -300,9 +379,17 @@ fn native_array_prototypes(reference: &std::path::Path) -> IrModule {
         "Init/Data/ByteArray/Basic.ir",
     ] {
         let path = library.join(relative);
-        let module = crate::decode_ir_artifact(&std::fs::read(&path).unwrap(), 32 * 1024 * 1024)
+        let bytes = std::fs::read(&path).unwrap();
+        fln_olean::pin::check_pinned_header(&bytes)
+            .unwrap_or_else(|error| panic!("{path:?}: {error:?}"));
+        let module = crate::decode_ir_artifact(&bytes, 32 * 1024 * 1024)
             .unwrap_or_else(|error| panic!("{path:?}: {error:?}"));
         for declaration in module.decls {
+            if library_names.contains(declaration.name()) {
+                assert!(matches!(declaration, IrDecl::Function { .. }));
+                library_functions.push(declaration);
+                continue;
+            }
             let (row, is_boxed) = match crate::imported_ir::native_row(declaration.name()) {
                 Some(row) => (row, false),
                 None => {
@@ -336,16 +423,111 @@ fn native_array_prototypes(reference: &std::path::Path) -> IrModule {
             declarations.push(declaration);
         }
     }
-    assert_eq!(externs.len(), 19, "all reviewed raw native prototypes");
+    assert_eq!(
+        externs.len(),
+        24,
+        "20 Array and four proof-bearing ByteArray prototypes"
+    );
+    let array_census: BTreeSet<_> = fln_vm::extern_table_generated::EXTERN_ROWS
+        .iter()
+        .filter(|row| row.name.starts_with("Array."))
+        .map(|row| row.name)
+        .collect();
+    assert_eq!(
+        externs
+            .iter()
+            .copied()
+            .filter(|name| name.starts_with("Array."))
+            .collect::<BTreeSet<_>>(),
+        array_census,
+        "every Array census row must have an actual reviewed IR prototype"
+    );
     assert_eq!(
         wrappers, externs,
         "every raw prototype has its boxed wrapper"
     );
-    assert_eq!(declarations.len(), 38);
-    IrModule {
-        decls: declarations,
-        ..IrModule::default()
-    }
+    assert_eq!(declarations.len(), 48);
+    assert_eq!(library_functions.len(), LIBRARY_FUNCTIONS.len());
+    (
+        IrModule {
+            decls: declarations,
+            ..IrModule::default()
+        },
+        IrModule {
+            decls: library_functions,
+            ..IrModule::default()
+        },
+    )
+}
+
+#[test]
+fn boxed_list_array_conversions_preserve_heap_payloads_and_shared_arrays() {
+    use fln_olean::ir::IrCtorInfo;
+    let list = |x, tag, args: Vec<IrArg>| {
+        bind(
+            x,
+            IrExpr::Ctor {
+                info: IrCtorInfo {
+                    name: name(if tag == 0 { "List.nil" } else { "List.cons" }),
+                    cidx: tag,
+                    size: args.len() as u64,
+                    usize: 0,
+                    ssize: 0,
+                },
+                args,
+            },
+        )
+    };
+    let pap = |x, target| {
+        bind(
+            x,
+            IrExpr::Pap {
+                function: name(target),
+                args: vec![IrArg::Erased],
+            },
+        )
+    };
+    let ap = |x, function, argument| {
+        bind(
+            x,
+            IrExpr::Ap {
+                x: function,
+                args: vec![var(argument)],
+            },
+        )
+    };
+    let stmts = vec![
+        bind(1, IrExpr::Lit(IrLit::Num(IrNat::Big(vec![0, 1])))),
+        num(2, 23),
+        list(3, 0, vec![]),
+        list(4, 1, vec![var(2), var(3)]),
+        list(5, 1, vec![var(1), var(4)]),
+        pap(6, "Array.mk._boxed"),
+        ap(7, 6, 5),
+        pap(8, "Array.toList._boxed"),
+        ap(9, 8, 7),
+        ap(10, 6, 9),
+        pap(11, "Array.pop._boxed"),
+        ap(12, 11, 7),
+        ap(13, 11, 10),
+        num(14, 0),
+        call(15, "Array.get!Internal", &[14, 7, 14]),
+        call(16, "Array.get!Internal", &[14, 10, 14]),
+        num(17, 1),
+        call(18, "Array.get!Internal", &[14, 10, 17]),
+        call(19, "Array.size", &[12]),
+        call(20, "Array.size", &[13]),
+        call(21, "Array.size", &[7]),
+        call(22, "Nat.add", &[15, 16]),
+        call(23, "Nat.add", &[18, 22]),
+        call(24, "Nat.add", &[19, 20]),
+        call(25, "Nat.add", &[21, 24]),
+        call(26, "Nat.add", &[23, 25]),
+    ];
+    assert_nat(
+        &compile_declarations(vec![entry(stmts, 26)]).unwrap(),
+        "36893488147419103259",
+    );
 }
 
 pub(super) fn assert_nat_replay(compiled: &CompiledIr, expected: &str) {

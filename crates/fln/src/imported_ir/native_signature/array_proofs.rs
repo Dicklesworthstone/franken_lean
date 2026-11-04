@@ -9,7 +9,7 @@ use super::{ErasedOperands, GeneratedExternRow, IrExecutionError, Name, inferred
 pub(super) fn erased_operands(
     row: &GeneratedExternRow,
 ) -> Result<Option<ErasedOperands>, IrExecutionError> {
-    let (name, symbol, module, kind, runtime, ownership, safety, type_prefix) = match row.id {
+    let review = match row.id {
         "extern:Array.getInternal" => (
             "Array.getInternal",
             "lean_array_fget",
@@ -19,6 +19,7 @@ pub(super) fn erased_operands(
             "abi((a: borrowed_arg, i: borrowed_arg) -> owned_res)",
             "safe",
             true,
+            1,
         ),
         "extern:Array.getInternalBorrowed" => (
             "Array.getInternalBorrowed",
@@ -29,6 +30,7 @@ pub(super) fn erased_operands(
             "abi((a: borrowed_arg, i: borrowed_arg) -> owned_res)",
             "unsafe",
             true,
+            1,
         ),
         "extern:Array.set" => (
             "Array.set",
@@ -39,6 +41,20 @@ pub(super) fn erased_operands(
             "abi((a: owned_arg, i: borrowed_arg, v: owned_arg) -> raw_object)",
             "safe",
             true,
+            1,
+        ),
+        // Unlike get/set, swap retains a separate erased bounds proof for
+        // each index. Both slots remain in the pin's boxed closure ABI.
+        "extern:Array.swap" => (
+            "Array.swap",
+            "lean_array_fswap",
+            "Init.Data.Array.Basic",
+            "defn",
+            3,
+            "abi((a: owned_arg, i: borrowed_arg, j: borrowed_arg) -> raw_object)",
+            "safe",
+            true,
+            2,
         ),
         "extern:Array.uget" => (
             "Array.uget",
@@ -49,6 +65,7 @@ pub(super) fn erased_operands(
             "abi((a: borrowed_arg, i: value) -> raw_object)",
             "safe",
             true,
+            1,
         ),
         "extern:Array.ugetBorrowed" => (
             "Array.ugetBorrowed",
@@ -59,6 +76,7 @@ pub(super) fn erased_operands(
             "abi((a: borrowed_arg, i: value) -> borrowed_res)",
             "unsafe",
             true,
+            1,
         ),
         "extern:Array.uset" => (
             "Array.uset",
@@ -69,6 +87,7 @@ pub(super) fn erased_operands(
             "abi((a: owned_arg, i: value, v: owned_arg) -> raw_object)",
             "safe",
             true,
+            1,
         ),
         "extern:ByteArray.get" => (
             "ByteArray.get",
@@ -79,6 +98,7 @@ pub(super) fn erased_operands(
             "abi((a: borrowed_arg, i: borrowed_arg) -> value)",
             "safe",
             false,
+            1,
         ),
         "extern:ByteArray.set" => (
             "ByteArray.set",
@@ -89,6 +109,7 @@ pub(super) fn erased_operands(
             "abi((a: owned_arg, i: borrowed_arg, b: value) -> owned_res)",
             "safe",
             false,
+            1,
         ),
         "extern:ByteArray.uget" => (
             "ByteArray.uget",
@@ -99,6 +120,7 @@ pub(super) fn erased_operands(
             "abi((a: borrowed_arg, i: value) -> value)",
             "safe",
             false,
+            1,
         ),
         "extern:ByteArray.uset" => (
             "ByteArray.uset",
@@ -109,15 +131,18 @@ pub(super) fn erased_operands(
             "abi((a: owned_arg, i: value, v: value) -> raw_object)",
             "safe",
             false,
+            1,
         ),
         _ => return Ok(None),
     };
+    let (name, symbol, module, kind, runtime, ownership, safety, type_prefix, proof_suffix) =
+        review;
     if row.name != name
         || row.symbol != symbol
         || row.module != module
         || row.kind != kind
         || row.levels != u32::from(type_prefix)
-        || row.arity as usize != runtime + usize::from(type_prefix) + 1
+        || row.arity as usize != runtime + usize::from(type_prefix) + proof_suffix
         || row.effect != "pure"
         || row.safety != safety
         || row.ownership != ownership
@@ -134,6 +159,6 @@ pub(super) fn erased_operands(
     Ok(Some(ErasedOperands {
         runtime,
         type_prefix,
-        proof_suffix: true,
+        proof_suffix,
     }))
 }
