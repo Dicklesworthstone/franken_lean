@@ -378,7 +378,7 @@ fn native_boxed_telescope_and_reserved_names_cannot_be_supplied_by_user_ir() {
         IrExecutionLimits::default(),
     ), Err(IrExecutionError::UserOverridesCensus(found)) if found == name("Array.push._boxed")));
     for target in [
-        "UInt64.add._boxed",
+        "Int.add._boxed",
         "Void.mk._boxed",
         "ST.Prim.Ref.get._boxed",
     ] {

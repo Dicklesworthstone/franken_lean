@@ -22,14 +22,48 @@ pub(super) const NAMES: [&str; 18] = [
     "String.hash",
 ];
 
+pub(super) const WORD_FAMILIES: [&str; 5] = ["UInt8", "UInt16", "UInt32", "UInt64", "USize"];
+pub(super) const WORD_OPERATIONS: [&str; 18] = [
+    "add",
+    "sub",
+    "mul",
+    "div",
+    "mod",
+    "land",
+    "lor",
+    "xor",
+    "shiftLeft",
+    "shiftRight",
+    "complement",
+    "neg",
+    "log2",
+    "decEq",
+    "decLe",
+    "decLt",
+    "ofNat",
+    "toNat",
+];
+
+pub(super) fn names() -> Vec<String> {
+    NAMES
+        .into_iter()
+        .map(str::to_owned)
+        .chain(WORD_FAMILIES.into_iter().flat_map(|family| {
+            WORD_OPERATIONS
+                .into_iter()
+                .map(move |operation| format!("{family}.{operation}"))
+        }))
+        .collect()
+}
+
 fn row(target: &str) -> &'static GeneratedExternRow {
     crate::imported_ir::native_row(&name(target)).unwrap()
 }
 
 #[test]
 fn reviewed_boxed_primitives_bind_the_generated_row_before_admitting_a_wrapper() {
-    for target in NAMES {
-        let original = row(target);
+    for target in names() {
+        let original = row(&target);
         assert!(BoxedNative::from_row(original).unwrap().is_some());
         for changed in [
             GeneratedExternRow {
@@ -90,7 +124,7 @@ fn reviewed_boxed_primitives_bind_the_generated_row_before_admitting_a_wrapper()
             );
         }
     }
-    for target in ["Nat.divExact", "Nat.gcd", "String.extract", "UInt64.add"] {
+    for target in ["Nat.divExact", "Nat.gcd", "String.extract", "Int.add"] {
         assert!(BoxedNative::from_row(row(target)).unwrap().is_none());
     }
 }
@@ -125,6 +159,27 @@ fn primitive_prototypes_distinguish_borrowing_and_boxed_scalar_representations()
             IrType::UInt64,
             vec![IrType::Object],
             IrType::Object,
+        ),
+        (
+            "UInt16.add",
+            vec![(IrType::UInt16, false), (IrType::UInt16, false)],
+            IrType::UInt16,
+            vec![IrType::Tagged, IrType::Tagged],
+            IrType::Tagged,
+        ),
+        (
+            "UInt64.decLt",
+            vec![(IrType::UInt64, false), (IrType::UInt64, false)],
+            IrType::UInt8,
+            vec![IrType::Object, IrType::Object],
+            IrType::Tagged,
+        ),
+        (
+            "USize.ofNat",
+            vec![(IrType::TObject, true)],
+            IrType::USize,
+            vec![IrType::TObject],
+            IrType::TObject,
         ),
     ] {
         let native = row(target);
@@ -238,6 +293,240 @@ fn boxed_string_append_preserves_reused_consuming_captures_and_inputs() {
     )])
     .unwrap();
     assert_nat(&compiled, "7");
+}
+
+#[test]
+fn boxed_word_add_reuses_capture_and_preserves_full_width() {
+    let typed = |x, ty, expr| IrStmt::VDecl { x, ty, expr };
+    let compiled = compile_declarations(vec![entry(
+        vec![
+            num(1, u64::MAX),
+            typed(
+                2,
+                IrType::UInt64,
+                IrExpr::Fap {
+                    function: name("UInt64.ofNat"),
+                    args: vec![var(1)],
+                },
+            ),
+            num(3, 2),
+            typed(
+                4,
+                IrType::UInt64,
+                IrExpr::Fap {
+                    function: name("UInt64.ofNat"),
+                    args: vec![var(3)],
+                },
+            ),
+            typed(
+                5,
+                IrType::Object,
+                IrExpr::Box {
+                    ty: IrType::UInt64,
+                    x: 2,
+                },
+            ),
+            typed(
+                6,
+                IrType::Object,
+                IrExpr::Pap {
+                    function: name("UInt64.add._boxed"),
+                    args: vec![var(5)],
+                },
+            ),
+            typed(
+                7,
+                IrType::Object,
+                IrExpr::Box {
+                    ty: IrType::UInt64,
+                    x: 4,
+                },
+            ),
+            typed(
+                8,
+                IrType::Object,
+                IrExpr::Ap {
+                    x: 6,
+                    args: vec![var(7)],
+                },
+            ),
+            typed(
+                9,
+                IrType::Object,
+                IrExpr::Ap {
+                    x: 6,
+                    args: vec![var(5)],
+                },
+            ),
+            typed(10, IrType::UInt64, IrExpr::Unbox { x: 8 }),
+            typed(11, IrType::UInt64, IrExpr::Unbox { x: 9 }),
+            call(12, "UInt64.toNat", &[10]),
+            call(13, "UInt64.toNat", &[11]),
+            call(14, "Nat.add", &[12, 13]),
+        ],
+        14,
+    )])
+    .unwrap();
+    assert_nat(&compiled, &u64::MAX.to_string());
+    assert!(
+        compiled
+            .reference_functions()
+            .iter()
+            .all(|function| { function.name == name("Arity.main") }),
+        "native boxed wrappers never authorize interpreting toolchain bodies"
+    );
+}
+
+#[test]
+fn boxed_words_execute_native_arithmetic_decisions_and_conversions() {
+    for (family, ty, boxed, mask) in [
+        ("UInt8", IrType::UInt8, IrType::Tagged, u64::from(u8::MAX)),
+        (
+            "UInt16",
+            IrType::UInt16,
+            IrType::Tagged,
+            u64::from(u16::MAX),
+        ),
+        (
+            "UInt32",
+            IrType::UInt32,
+            IrType::TObject,
+            u64::from(u32::MAX),
+        ),
+        ("UInt64", IrType::UInt64, IrType::Object, u64::MAX),
+        ("USize", IrType::USize, IrType::TObject, usize::MAX as u64),
+    ] {
+        for (operation, operands, expected) in [
+            ("add", vec![mask, 2], 1),
+            ("sub", vec![0, 1], mask),
+            ("mul", vec![42, 7], 294 & mask),
+            ("div", vec![42, 7], 6),
+            ("div", vec![42, 0], 0),
+            ("mod", vec![43, 7], 1),
+            ("mod", vec![43, 0], 43),
+            ("land", vec![42, 7], 2),
+            ("lor", vec![42, 7], 47),
+            ("xor", vec![42, 7], 45),
+            ("shiftLeft", vec![42, 7], 5376 & mask),
+            ("shiftRight", vec![42, 2], 10),
+            ("complement", vec![42], mask - 42),
+            ("neg", vec![42], mask - 41),
+            ("log2", vec![42], 5),
+            ("decEq", vec![mask, mask], 1),
+            ("decEq", vec![mask, 0], 0),
+            ("decLe", vec![0, mask], 1),
+            ("decLe", vec![mask, 0], 0),
+            ("decLt", vec![0, mask], 1),
+            ("decLt", vec![mask, mask], 0),
+            ("ofNat", vec![u64::MAX], mask),
+            ("toNat", vec![mask], mask),
+        ] {
+            let declaration = boxed_word_program(family, &ty, &boxed, operation, &operands);
+            let compiled = compile_declarations(vec![declaration])
+                .unwrap_or_else(|error| panic!("{family}.{operation}: {error}"));
+            assert_nat(&compiled, &expected.to_string());
+            assert!(
+                compiled
+                    .native_externs()
+                    .contains(&format!("extern:{family}.{operation}"))
+            );
+            assert!(
+                compiled
+                    .reference_functions()
+                    .iter()
+                    .all(|function| function.name == name("Arity.main"))
+            );
+        }
+    }
+}
+
+fn boxed_word_program(
+    family: &str,
+    ty: &IrType,
+    boxed: &IrType,
+    operation: &str,
+    operands: &[u64],
+) -> IrDecl {
+    let mut statements = Vec::new();
+    let mut arguments = Vec::new();
+    for (index, &value) in operands.iter().enumerate() {
+        let input = (index as u64) * 3 + 1;
+        statements.push(num(input, value));
+        if operation == "ofNat" {
+            arguments.push(var(input));
+        } else {
+            statements.push(IrStmt::VDecl {
+                x: input + 1,
+                ty: ty.clone(),
+                expr: IrExpr::Fap {
+                    function: name(&format!("{family}.ofNat")),
+                    args: vec![var(input)],
+                },
+            });
+            statements.push(IrStmt::VDecl {
+                x: input + 2,
+                ty: boxed.clone(),
+                expr: IrExpr::Box {
+                    ty: ty.clone(),
+                    x: input + 1,
+                },
+            });
+            arguments.push(var(input + 2));
+        }
+    }
+    let last = arguments.pop().unwrap();
+    statements.push(IrStmt::VDecl {
+        x: 10,
+        ty: IrType::Object,
+        expr: IrExpr::Pap {
+            function: name(&format!("{family}.{operation}._boxed")),
+            args: arguments,
+        },
+    });
+    let decision = matches!(operation, "decEq" | "decLe" | "decLt");
+    let result_type = if decision {
+        IrType::Tagged
+    } else if operation == "toNat" {
+        if matches!(ty, IrType::UInt8 | IrType::UInt16) {
+            IrType::Tagged
+        } else {
+            IrType::TObject
+        }
+    } else {
+        boxed.clone()
+    };
+    statements.push(IrStmt::VDecl {
+        x: 11,
+        ty: result_type,
+        expr: IrExpr::Ap {
+            x: 10,
+            args: vec![last],
+        },
+    });
+    if operation == "toNat" {
+        return entry(statements, 11);
+    }
+    statements.push(IrStmt::VDecl {
+        x: 12,
+        ty: if decision { IrType::UInt8 } else { ty.clone() },
+        expr: IrExpr::Unbox { x: 11 },
+    });
+    statements.push(IrStmt::VDecl {
+        x: 13,
+        ty: if decision || matches!(ty, IrType::UInt8 | IrType::UInt16) {
+            IrType::Tagged
+        } else {
+            IrType::TObject
+        },
+        expr: IrExpr::Fap {
+            function: name(&format!(
+                "{}.toNat",
+                if decision { "UInt8" } else { family }
+            )),
+            args: vec![var(12)],
+        },
+    });
+    entry(statements, 13)
 }
 
 #[test]

@@ -210,7 +210,7 @@ impl BoxedNative {
 fn boxed_type(ty: &IrType) -> &IrType {
     match ty {
         IrType::Erased | IrType::USize | IrType::UInt32 => &IrType::TObject,
-        IrType::UInt8 => &IrType::Tagged,
+        IrType::UInt8 | IrType::UInt16 => &IrType::Tagged,
         IrType::UInt64 => &IrType::Object,
         _ => ty,
     }

@@ -1,4 +1,4 @@
-//! Exact pin-derived native telescopes for higher-order Nat and String code.
+//! Exact pin-derived native telescopes for higher-order primitive code.
 //! The generated census remains the ABI authority. These reviewed signatures
 //! supply the compiler's IR representations; input declarations cannot supply
 //! their own arity, ownership, scalar boxing, or implementation.
@@ -23,7 +23,7 @@ struct Review {
 pub(super) fn signature(
     row: &GeneratedExternRow,
 ) -> Result<Option<PrimitiveSignature>, IrExecutionError> {
-    let Some(review) = natural(row).or_else(|| string(row)) else {
+    let Some(review) = natural(row).or_else(|| string(row)).or_else(|| word(row)) else {
         return Ok(None);
     };
     if row.name != review.name
@@ -167,4 +167,239 @@ fn string(row: &GeneratedExternRow) -> Option<Review> {
         ownership,
         signature: PrimitiveSignature { parameters, result },
     })
+}
+
+/// Machine integers already have native scalar operations. Their higher-order
+/// entry points retain the exact compiler boxing convention rather than
+/// interpreting the Reference's generated `_boxed` bodies. The source anchors
+/// are Init.Prelude and Init.Data.UInt.{BasicAux,Basic,Log2}; in particular,
+/// `tagged_return` distinguishes the small-word conversions to Nat.
+fn word(row: &GeneratedExternRow) -> Option<Review> {
+    let (family, operation) = row.id.strip_prefix("extern:")?.split_once('.')?;
+    macro_rules! family {
+        ($family:literal, $c:literal, $ty:ident, $add_sub:literal, $order:literal,
+         $from_nat:literal, $to_nat:literal, $nat_result:ident, $nat_ownership:literal) => {{
+            macro_rules! review {
+                ($operation:literal, $symbol:literal, $module:expr,
+                         $parameters:expr, $result:expr, $ownership:expr) => {
+                    Some(Review {
+                        name: concat!($family, ".", $operation),
+                        symbol: concat!($c, "_", $symbol),
+                        module: $module,
+                        kind: "defn",
+                        ownership: $ownership,
+                        signature: PrimitiveSignature {
+                            parameters: $parameters,
+                            result: $result,
+                        },
+                    })
+                };
+            }
+            match operation {
+                "add" => review!(
+                    "add",
+                    "add",
+                    $add_sub,
+                    &[IrType::$ty, IrType::$ty],
+                    &IrType::$ty,
+                    "abi((a1: value, a2: value) -> value)"
+                ),
+                "sub" => review!(
+                    "sub",
+                    "sub",
+                    $add_sub,
+                    &[IrType::$ty, IrType::$ty],
+                    &IrType::$ty,
+                    "abi((a1: value, a2: value) -> value)"
+                ),
+                "mul" => review!(
+                    "mul",
+                    "mul",
+                    "Init.Data.UInt.Basic",
+                    &[IrType::$ty, IrType::$ty],
+                    &IrType::$ty,
+                    "abi((a1: value, a2: value) -> value)"
+                ),
+                "div" => review!(
+                    "div",
+                    "div",
+                    "Init.Data.UInt.Basic",
+                    &[IrType::$ty, IrType::$ty],
+                    &IrType::$ty,
+                    "abi((a1: value, a2: value) -> value)"
+                ),
+                "mod" => review!(
+                    "mod",
+                    "mod",
+                    "Init.Data.UInt.Basic",
+                    &[IrType::$ty, IrType::$ty],
+                    &IrType::$ty,
+                    "abi((a1: value, a2: value) -> value)"
+                ),
+                "land" => review!(
+                    "land",
+                    "land",
+                    "Init.Data.UInt.Basic",
+                    &[IrType::$ty, IrType::$ty],
+                    &IrType::$ty,
+                    "abi((a: value, b: value) -> value)"
+                ),
+                "lor" => review!(
+                    "lor",
+                    "lor",
+                    "Init.Data.UInt.Basic",
+                    &[IrType::$ty, IrType::$ty],
+                    &IrType::$ty,
+                    "abi((a: value, b: value) -> value)"
+                ),
+                "xor" => review!(
+                    "xor",
+                    "xor",
+                    "Init.Data.UInt.Basic",
+                    &[IrType::$ty, IrType::$ty],
+                    &IrType::$ty,
+                    "abi((a: value, b: value) -> value)"
+                ),
+                "shiftLeft" => review!(
+                    "shiftLeft",
+                    "shift_left",
+                    "Init.Data.UInt.Basic",
+                    &[IrType::$ty, IrType::$ty],
+                    &IrType::$ty,
+                    "abi((a: value, b: value) -> value)"
+                ),
+                "shiftRight" => review!(
+                    "shiftRight",
+                    "shift_right",
+                    "Init.Data.UInt.Basic",
+                    &[IrType::$ty, IrType::$ty],
+                    &IrType::$ty,
+                    "abi((a: value, b: value) -> value)"
+                ),
+                "complement" => review!(
+                    "complement",
+                    "complement",
+                    "Init.Data.UInt.Basic",
+                    &[IrType::$ty],
+                    &IrType::$ty,
+                    "abi((a: value) -> value)"
+                ),
+                "neg" => review!(
+                    "neg",
+                    "neg",
+                    "Init.Data.UInt.Basic",
+                    &[IrType::$ty],
+                    &IrType::$ty,
+                    "abi((a: value) -> value)"
+                ),
+                "log2" => review!(
+                    "log2",
+                    "log2",
+                    "Init.Data.UInt.Log2",
+                    &[IrType::$ty],
+                    &IrType::$ty,
+                    "abi((a: value) -> value)"
+                ),
+                "decEq" => review!(
+                    "decEq",
+                    "dec_eq",
+                    "Init.Prelude",
+                    &[IrType::$ty, IrType::$ty],
+                    &IrType::UInt8,
+                    "abi((a1: value, a2: value) -> value)"
+                ),
+                "decLe" => review!(
+                    "decLe",
+                    "dec_le",
+                    $order,
+                    &[IrType::$ty, IrType::$ty],
+                    &IrType::UInt8,
+                    "abi((a1: value, a2: value) -> value)"
+                ),
+                "decLt" => review!(
+                    "decLt",
+                    "dec_lt",
+                    $order,
+                    &[IrType::$ty, IrType::$ty],
+                    &IrType::UInt8,
+                    "abi((a1: value, a2: value) -> value)"
+                ),
+                "ofNat" => review!(
+                    "ofNat",
+                    "of_nat",
+                    $from_nat,
+                    &[IrType::TObject],
+                    &IrType::$ty,
+                    "abi((a: borrowed_arg) -> value)"
+                ),
+                "toNat" => review!(
+                    "toNat",
+                    "to_nat",
+                    $to_nat,
+                    &[IrType::$ty],
+                    &IrType::$nat_result,
+                    $nat_ownership
+                ),
+                _ => None,
+            }
+        }};
+    }
+    match family {
+        "UInt8" => family!(
+            "UInt8",
+            "lean_uint8",
+            UInt8,
+            "Init.Data.UInt.Basic",
+            "Init.Prelude",
+            "Init.Prelude",
+            "Init.Data.UInt.BasicAux",
+            Tagged,
+            "abi((a: value) -> owned_res)"
+        ),
+        "UInt16" => family!(
+            "UInt16",
+            "lean_uint16",
+            UInt16,
+            "Init.Data.UInt.Basic",
+            "Init.Data.UInt.Basic",
+            "Init.Data.UInt.BasicAux",
+            "Init.Data.UInt.BasicAux",
+            Tagged,
+            "abi((a: value) -> owned_res)"
+        ),
+        "UInt32" => family!(
+            "UInt32",
+            "lean_uint32",
+            UInt32,
+            "Init.Data.UInt.BasicAux",
+            "Init.Prelude",
+            "Init.Data.UInt.BasicAux",
+            "Init.Prelude",
+            TObject,
+            "abi((a: value) -> owned_res)"
+        ),
+        "UInt64" => family!(
+            "UInt64",
+            "lean_uint64",
+            UInt64,
+            "Init.Data.UInt.Basic",
+            "Init.Data.UInt.Basic",
+            "Init.Data.UInt.BasicAux",
+            "Init.Data.UInt.BasicAux",
+            TObject,
+            "abi((n: value) -> owned_res)"
+        ),
+        "USize" => family!(
+            "USize",
+            "lean_usize",
+            USize,
+            "Init.Data.UInt.BasicAux",
+            "Init.Data.UInt.BasicAux",
+            "Init.Data.UInt.BasicAux",
+            "Init.Data.UInt.BasicAux",
+            TObject,
+            "abi((n: value) -> owned_res)"
+        ),
+        _ => None,
+    }
 }
