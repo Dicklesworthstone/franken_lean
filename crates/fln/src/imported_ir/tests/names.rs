@@ -35,7 +35,7 @@ fn live_pinned_name_constructors_match_components_hashes_and_canonical_replay() 
     let partition_file = std::env::var_os("FLN_REFERENCE_PARTITION")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../contracts/builtin_partition.tsv")
+            fln_core::checked_workspace_root!().join("contracts/builtin_partition.tsv")
         });
     let partition =
         VerifiedPartition::from_pinned_tsv(&std::fs::read_to_string(partition_file).unwrap())

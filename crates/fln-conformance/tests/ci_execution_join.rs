@@ -177,29 +177,7 @@ const RIG_EXECUTION_SUMMARY_SCHEMA: &str = "fln.rig-execution-summary/1";
 ///
 /// **The only legitimate edit is a deletion**, and the equality check below forces one the
 /// moment a row leaves the population — see [`judge`].
-const UNEXECUTED_EVIDENCE_ALLOWANCE: &[&str] = &[
-    "fln-ffam",
-    "franken_lean-2jht",
-    "franken_lean-c24a",
-    "franken_lean-ext-observable-fixture-drift-gap-vqnu",
-    "fln-0bw5",
-    "fln-mandated-mutant-join-unwatched-uagk",
-    "fln-7li",
-    "fln-lld",
-    "fln-d18-product-half-rgsg",
-    "franken_lean-z8j.1.3",
-    "franken_lean-z8j.1.4",
-    "fln-32rr",
-    "fln-5njk",
-    "fln-frontier-oom-abort-w9dx",
-    "fln-fur.1",
-    "fln-extended-25-modules-council-4974-9m8q",
-    "fln-init-bnh-council-4444-b443",
-    "fln-init-chain-council-3116-kipb",
-    "fln-init-control-council-4698-1yyb",
-    "fln-init-core-council-4442-aiwk",
-    "fln-init-sizeof-council-3290-w4xk",
-];
+const UNEXECUTED_EVIDENCE_ALLOWANCE: &[&str] = &[];
 
 /// The high-water mark of [`UNEXECUTED_EVIDENCE_ALLOWANCE`], asserted by **equality**.
 ///
@@ -290,7 +268,13 @@ const UNEXECUTED_EVIDENCE_ALLOWANCE: &[&str] = &[
 /// needs the pin, and the pin-reaching test in that file is `#[ignore]`d, so CI never runs it. It
 /// shrinks when that differential's locator leaves `lib.rs`, or when these rows migrate off the
 /// surface.
-const UNEXECUTED_EVIDENCE_CEILING: usize = 21;
+/// 21 -> 0 on 2026-11-04: product-gate.yml now configures the whole workspace with the
+/// Reference installed. None of its five named skips is one of these cited tests. The real
+/// join measures zero after resolving the current library module aliases. This establishes
+/// configured reach only; it does not establish that a GitHub Actions run succeeded. The
+/// mutation campaign now plants an explicit pinless job, because no real unserved surface
+/// remains to use as its control.
+const UNEXECUTED_EVIDENCE_CEILING: usize = 0;
 
 /// Files whose text carries a pin coordinate for a reason other than reaching the pin.
 ///
@@ -345,6 +329,34 @@ const PIN_REACH_SCAN_EXCLUSION_CEILING: usize = 2;
 /// these rows are declared debts in [`FILE_GRANULAR_EVIDENCE_ALLOWANCE`] whose sanctioned
 /// repair is exactly that migration. See residue item 4 in the module header.
 const IGNORED_PRODUCER_ALLOWANCE: &[(&str, &str, &str)] = &[
+    (
+        "crates/fln-cli/tests/source_check_notations.rs",
+        "upstream_notation_printing_regressions_match_the_pin",
+        "a whole-Init differential explicitly dispatched with --ignored --exact and \
+         FLN_REQUIRE_REFERENCE=1 by contract-drift's upstream notation regression step. \
+         Ordinary cargo test does not execute these original upstream programs; the \
+         nonignored tests in this target hold the bounded notation cases, not this \
+         whole-Init comparison. The configured scheduled route is not a completed run",
+    ),
+    (
+        "crates/fln-cli/tests/source_equality_decisions.rs",
+        "installed_command_imports_headerless_init_and_repeated_tag_module_closure",
+        "a whole-Init and repeated-tag import regression explicitly dispatched with \
+         --ignored --exact and FLN_REQUIRE_REFERENCE=1 by contract-drift's installed Init \
+         import step. The nonignored installed natural-equality test holds its four \
+         native decisions against the pin, not this whole closure. Ordinary cargo test \
+         does not execute this regression and configured dispatch is not a successful run",
+    ),
+    (
+        "crates/fln/src/source_intrinsics/string_bootstrap/tests.rs",
+        "extract_pinned_string_dependency_inventory",
+        "an explicit data generator requiring FLN_REFERENCE_LIB and a caller-chosen \
+         FLN_STRING_INVENTORY_OUTPUT. It must never refresh expected data in ordinary \
+         tests. The nonignored actual_string_inventories_close_the_pin_and_share_only_successful_checks \
+         rechecks the frozen inventories against the pin's real declarations; checked-text, \
+         positioned and substring adapter tests execute and replay the native rows. \
+         Generating an inventory itself proves neither execution nor parity",
+    ),
     (
         "crates/fln-syntax/tests/pin_syntax_corpus.rs",
         "pin_syntax_corpus_against_the_pin",
@@ -743,7 +755,9 @@ const IGNORED_PRODUCER_ALLOWANCE: &[(&str, &str, &str)] = &[
 /// held-out String programs (bead `fln-ingress-string-field-projection-funz`), declared in the
 /// commit that adds it: each needs the whole pinned Init admitted, and the entry names the
 /// pin-gated unit tests that hold the native String rows per commit.
-const IGNORED_PRODUCER_CEILING: usize = 29;
+/// 29 -> 32 on 2026-11-04: disclose two existing scheduled whole-Init regressions and the
+/// existing explicit String inventory generator. No test becomes ignored in this change.
+const IGNORED_PRODUCER_CEILING: usize = 32;
 
 /// Scenario tokens that name a gate stage rather than an `fln.e2e/2` lane.
 const NON_E2E_SCENARIOS: &[&str] = &["quality_gate", "gate_self_test"];
@@ -1154,6 +1168,8 @@ struct Derivation {
     target_modules: BTreeMap<(String, String), BTreeMap<String, String>>,
     /// `<package>` → `(module path prefix, function)` for every lib unit test.
     lib_tests: BTreeMap<String, BTreeSet<(String, String)>>,
+    /// Physical lib source file → its logical module prefix, including literal path aliases.
+    lib_prefixes: BTreeMap<(String, String), String>,
     /// member directory → the package name its manifest **declares**. Read, never inferred
     /// from the directory name, which merely happens to match for all 33 members today.
     packages: BTreeMap<String, String>,
@@ -1163,13 +1179,214 @@ struct Derivation {
     /// stage makes citations to it unbound again, which is the correct direction.
     ci_manifest_packages: BTreeSet<String>,
     /// `(where, reason)` for everything that makes the layout-derived target set incomplete:
-    /// a manifest override, a directory-style target, a stem collision, a `#[path]` attribute.
+    /// a manifest override, a directory-style target, a stem collision, an unresolved path.
     granularity_preconditions: Vec<(String, String)>,
 }
 
 fn read(root: &Path, relative: &str) -> String {
     fs::read_to_string(root.join(relative))
         .unwrap_or_else(|error| fixture_panic!("{relative} must be readable: {error}"))
+}
+
+/// The suffix a physical descendant keeps when its ancestor file is aliased.
+fn physical_module_suffix(path: &str, ancestor: &str) -> Option<String> {
+    if path == ancestor {
+        return Some(String::new());
+    }
+    let directory = ancestor
+        .strip_suffix("/mod.rs")
+        .or_else(|| ancestor.strip_suffix(".rs"))?;
+    let relative = path
+        .strip_prefix(&format!("{directory}/"))?
+        .strip_suffix(".rs")?;
+    let relative = relative.strip_suffix("/mod").unwrap_or(relative);
+    Some(relative.replace('/', "::"))
+}
+
+/// Resolve literal file-module aliases before binding library test citations.
+/// Paths outside an inline module are relative to the declaring file's directory;
+/// descendants keep their physical suffix under the alias's logical prefix.
+/// Unsupported attributes, missing files, ambiguous aliases and cycles remain refusals.
+fn library_module_prefixes(
+    member: &str,
+    surfaces: &BTreeMap<String, String>,
+    preconditions: &mut Vec<(String, String)>,
+) -> BTreeMap<String, String> {
+    let candidates: BTreeMap<String, String> = surfaces
+        .keys()
+        .filter_map(|path| module_path_prefix(path).map(|prefix| (path.clone(), prefix)))
+        .collect();
+    let mut original: BTreeMap<String, String> = candidates
+        .iter()
+        .filter(|(path, _)| path.starts_with(&format!("{member}/src/")))
+        .map(|(path, prefix)| (path.clone(), prefix.clone()))
+        .collect();
+    let mut aliases = Vec::new();
+    let mut pending: Vec<_> = original.keys().cloned().collect();
+    let mut visited = BTreeSet::new();
+    while let Some(path) = pending.pop() {
+        if !visited.insert(path.clone()) {
+            continue;
+        }
+        let text = &surfaces[&path];
+        let modules: Vec<_> = file_module_declarations(text)
+            .into_iter()
+            .filter(|module| module.path.is_some())
+            .collect();
+        let attributes = text
+            .lines()
+            .filter(|line| line.trim_start().starts_with("#[path"))
+            .count();
+        if attributes != modules.len() {
+            preconditions.push((
+                path.clone(),
+                "carries an unmodelled path attribute".to_string(),
+            ));
+        }
+        let (directory, _) = path.rsplit_once('/').expect("a lib source has a directory");
+        for module in modules {
+            let relative = module.path.expect("only path attributes selected");
+            let mut components: Vec<_> = directory.split('/').collect();
+            let mut valid = !relative.starts_with('/') && !relative.contains('\\');
+            for component in relative.split('/') {
+                match component {
+                    "" | "." => {}
+                    ".." => valid &= components.pop().is_some(),
+                    value => components.push(value),
+                }
+            }
+            let target = components.join("/");
+            if !valid || !candidates.contains_key(&target) {
+                preconditions.push((
+                    path.clone(),
+                    format!(
+                        "path module {} does not resolve to one known lib source: {relative:?}",
+                        module.name
+                    ),
+                ));
+                continue;
+            }
+            // A library can share a source module with another workspace member. Keep its
+            // binding local to this package rather than overwriting the defining package's.
+            for (candidate, prefix) in &candidates {
+                if physical_module_suffix(candidate, &target).is_some()
+                    && !original.contains_key(candidate)
+                {
+                    original.insert(candidate.clone(), prefix.clone());
+                    pending.push(candidate.clone());
+                }
+            }
+            aliases.push((path.clone(), module.name, target));
+        }
+    }
+    let mut prefixes = original.clone();
+    for _ in 0..=aliases.len() {
+        let mut next = original.clone();
+        for path in original.keys() {
+            let mut chosen: Option<(usize, String)> = None;
+            for (parent, module, target) in &aliases {
+                let Some(suffix) = physical_module_suffix(path, target) else {
+                    continue;
+                };
+                let parent = &prefixes[parent];
+                let mut logical = if parent.is_empty() {
+                    module.clone()
+                } else {
+                    format!("{parent}::{module}")
+                };
+                if !suffix.is_empty() {
+                    logical.push_str("::");
+                    logical.push_str(&suffix);
+                }
+                match &chosen {
+                    Some((length, previous)) if *length == target.len() && *previous != logical => {
+                        preconditions
+                            .push((path.clone(), "has ambiguous module aliases".to_string()));
+                    }
+                    Some((length, _)) if *length >= target.len() => {}
+                    _ => chosen = Some((target.len(), logical)),
+                }
+            }
+            if let Some((_, logical)) = chosen {
+                next.insert(path.clone(), logical);
+            }
+        }
+        if next == prefixes {
+            return next;
+        }
+        prefixes = next;
+    }
+    preconditions.push((
+        member.to_string(),
+        "module path aliases contain a cycle".to_string(),
+    ));
+    prefixes
+}
+
+#[test]
+fn library_path_aliases_resolve_test_modules_and_physical_descendants() {
+    let surfaces = BTreeMap::from([
+        ("crates/x/src/lib.rs".to_string(), "mod parent;".to_string()),
+        (
+            "crates/x/src/parent.rs".to_string(),
+            "#[path = \"renamed.rs\"]\nmod logical;".to_string(),
+        ),
+        (
+            "crates/x/src/renamed.rs".to_string(),
+            "#[cfg(test)]\n#[path = \"renamed/checks.rs\"]\nmod tests;".to_string(),
+        ),
+        (
+            "crates/x/src/renamed/checks.rs".to_string(),
+            "#[path = \"../peer.rs\"]\nmod sibling;".to_string(),
+        ),
+        ("crates/x/src/renamed/child.rs".to_string(), String::new()),
+        (
+            "crates/x/src/peer.rs".to_string(),
+            "#[path = \"../../y/src/shared.rs\"]\nmod shared;".to_string(),
+        ),
+        ("crates/y/src/lib.rs".to_string(), String::new()),
+        ("crates/y/src/shared.rs".to_string(), String::new()),
+    ]);
+    let mut problems = Vec::new();
+    let prefixes = library_module_prefixes("crates/x", &surfaces, &mut problems);
+    assert!(problems.is_empty(), "{problems:?}");
+    for (file, expected) in [
+        ("lib.rs", ""),
+        ("parent.rs", "parent"),
+        ("renamed.rs", "parent::logical"),
+        ("renamed/checks.rs", "parent::logical::tests"),
+        ("renamed/child.rs", "parent::logical::child"),
+        ("peer.rs", "parent::logical::tests::sibling"),
+    ] {
+        assert_eq!(prefixes[&format!("crates/x/src/{file}")], expected);
+    }
+    assert_eq!(
+        prefixes["crates/y/src/shared.rs"],
+        "parent::logical::tests::sibling::shared"
+    );
+    let other = library_module_prefixes("crates/y", &surfaces, &mut problems);
+    assert_eq!(other["crates/y/src/shared.rs"], "shared");
+    assert!(problems.is_empty(), "{problems:?}");
+}
+
+#[test]
+fn library_path_aliases_refuse_missing_unknown_escaping_ambiguous_and_cyclic_shapes() {
+    for declaration in [
+        "#[path = \"absent.rs\"]\nmod child;",
+        "#[cfg(feature = \"unknown\")]\n#[path = \"known.rs\"]\nmod child;",
+        "#[path = \"../../../../outside.rs\"]\nmod child;",
+        "#[path = \"/crates/x/src/known.rs\"]\nmod child;",
+        "#[path = \"known.rs\"]\nmod first;\n#[path = \"known.rs\"]\nmod second;",
+        "#[path = \"lib.rs\"]\nmod recursive;",
+    ] {
+        let surfaces = BTreeMap::from([
+            ("crates/x/src/lib.rs".to_string(), declaration.to_string()),
+            ("crates/x/src/known.rs".to_string(), String::new()),
+        ]);
+        let mut problems = Vec::new();
+        library_module_prefixes("crates/x", &surfaces, &mut problems);
+        assert!(!problems.is_empty(), "{declaration}");
+    }
 }
 
 /// The package name a manifest **declares**. One definition, read by every site that needs it —
@@ -1569,11 +1786,18 @@ fn derive(root: &Path) -> Derivation {
     // The lib half: a `src/*.rs`'s unit tests compile into the crate's ONE lib target, so the
     // file is not a selectable unit at all. Keyed by package because that is what `-p` takes.
     let mut lib_tests: BTreeMap<String, BTreeSet<(String, String)>> = BTreeMap::new();
+    let mut lib_prefixes = BTreeMap::new();
     let mut cfg_gated: BTreeSet<(String, String, String)> = BTreeSet::new();
     let mut cfg_gated_modules: BTreeSet<(String, String, String)> = BTreeSet::new();
     for member in &members {
         let manifest = read(root, &format!("{member}/Cargo.toml"));
         let name = &packages[member];
+        let prefixes = library_module_prefixes(member, &surfaces, &mut preconditions);
+        lib_prefixes.extend(
+            prefixes
+                .iter()
+                .map(|(path, prefix)| ((name.clone(), path.clone()), prefix.clone())),
+        );
 
         // A `#[cfg(feature = "…")]` on a `mod` declaration removes that module — and every
         // `#[test]` inside it — from a default `cargo test`, with no `#[ignore]` anywhere.
@@ -1581,10 +1805,8 @@ fn derive(root: &Path) -> Derivation {
         // `lib.rs` carries the attribute, `poison.rs` carries the tests.
         let features_off = features_off_by_default(&manifest);
         let mut gated_roots: BTreeSet<String> = BTreeSet::new();
-        for (path, text) in &surfaces {
-            if !path.starts_with(&format!("{member}/src/")) || module_path_prefix(path).is_none() {
-                continue;
-            }
+        for (path, prefix) in &prefixes {
+            let text = &surfaces[path];
             for attribute in unmodelled_feature_cfgs(text) {
                 preconditions.push((
                     path.clone(),
@@ -1598,9 +1820,6 @@ fn derive(root: &Path) -> Derivation {
                 if !features_off.contains(&feature) {
                     continue;
                 }
-                let Some(prefix) = module_path_prefix(path) else {
-                    continue;
-                };
                 let path = if prefix.is_empty() {
                     module
                 } else {
@@ -1611,29 +1830,11 @@ fn derive(root: &Path) -> Derivation {
             }
         }
 
-        for (path, text) in &surfaces {
-            if !path.starts_with(&format!("{member}/src/")) || module_path_prefix(path).is_none() {
-                continue;
-            }
-            // A `#[path]` attribute decouples a module's name from its file, which is the one
-            // thing that makes `module_path_prefix` wrong rather than merely partial.
-            if text
-                .lines()
-                .any(|line| line.trim_start().starts_with("#[path"))
-            {
-                preconditions.push((
-                    path.clone(),
-                    "carries a #[path] attribute, so a module path can no longer be derived \
-                     from the file layout"
-                        .to_string(),
-                ));
-            }
-            let Some(prefix) = module_path_prefix(path) else {
-                continue;
-            };
+        for (path, prefix) in &prefixes {
+            let text = &surfaces[path];
             let gated = gated_roots
                 .iter()
-                .any(|root| prefix == *root || prefix.starts_with(&format!("{root}::")));
+                .any(|root| prefix == root || prefix.starts_with(&format!("{root}::")));
             for function in test_functions(text) {
                 if gated {
                     cfg_gated.insert((name.clone(), prefix.clone(), function.clone()));
@@ -1698,17 +1899,11 @@ fn derive(root: &Path) -> Derivation {
                         // whose layout prefix it begins with, longest prefix winning so
                         // `foo::bar` prefers `foo/bar.rs` over `foo.rs`.
                         let mut best: Option<(usize, String)> = None;
-                        for candidate in surfaces.keys() {
-                            let Some(member) = candidate.split("/src/").next() else {
-                                continue;
-                            };
-                            if packages.get(member).map(String::as_str) != Some(package) {
+                        for ((name, candidate), prefix) in &lib_prefixes {
+                            if name != package {
                                 continue;
                             }
-                            let Some(prefix) = module_path_prefix(candidate) else {
-                                continue;
-                            };
-                            if prefix.is_empty() || path.starts_with(prefix.as_str()) {
+                            if prefix.is_empty() || path.starts_with(&format!("{prefix}::")) {
                                 let score = prefix.len();
                                 if best.as_ref().is_none_or(|(best, _)| *best < score) {
                                     best = Some((score, candidate.clone()));
@@ -1778,6 +1973,7 @@ fn derive(root: &Path) -> Derivation {
         target_tests,
         target_modules,
         lib_tests,
+        lib_prefixes,
         packages,
         granularity_preconditions: preconditions,
     }
@@ -1901,13 +2097,13 @@ fn judge_granularity(d: &Derivation, allowance: &[&str], ceiling: usize) -> Vec<
                 .iter()
                 .find(|(member, _)| surface.starts_with(&format!("{member}/src/")))
                 .and_then(|(member, package)| {
-                    let prefix = module_path_prefix(surface)?;
+                    let prefix = d.lib_prefixes.get(&(package.clone(), surface.clone()))?;
                     let _ = member;
                     Some(
                         d.lib_tests
                             .get(package)?
                             .iter()
-                            .filter(|(p, _)| *p == prefix)
+                            .filter(|(p, _)| p == prefix)
                             .count(),
                     )
                 })
@@ -2015,12 +2211,11 @@ fn judge_granularity(d: &Derivation, allowance: &[&str], ceiling: usize) -> Vec<
                 // members is exactly where the next instance lands.
                 let ignored_here = d.ignored.iter().any(|(surface, function)| {
                     path.ends_with(function.as_str())
-                        && d.packages.iter().any(|(member, name)| {
-                            name == package && surface.starts_with(&format!("{member}/src/"))
-                        })
-                        && module_path_prefix(surface).is_some_and(|prefix| {
-                            prefix.is_empty() || path.starts_with(prefix.as_str())
-                        })
+                        && d.lib_prefixes
+                            .get(&(package.to_string(), surface.clone()))
+                            .is_some_and(|prefix| {
+                                prefix.is_empty() || path.starts_with(&format!("{prefix}::"))
+                            })
                 });
                 if ignored_here {
                     findings.push(format!(
@@ -2160,7 +2355,7 @@ fn judge_granularity(d: &Derivation, allowance: &[&str], ceiling: usize) -> Vec<
     // `the_ignored_producer_citation_census_matches_the_measured_population` fails in BOTH
     // directions when any field moves without the population, or the population without it:
     //
-    // ignored-producer-citation-census: surfaces=16 rows=13 citations=14 all-rows-declared=true
+    // ignored-producer-citation-census: surfaces=19 rows=13 citations=14 all-rows-declared=true
     //
     // `surfaces` rose 15 -> 16 with the declaration of the String extern probe differential in
     // crates/fln-cli/tests/string_extern_probes.rs (2026-10-26). `rows` and `citations` are
@@ -3707,11 +3902,60 @@ fn baseline() -> Derivation {
     d
 }
 
+/// A deliberate pinless model, independent of whether the real CI debt is now empty.
+/// Its source paths and discovery preconditions still come from the actual workspace.
+fn pinless_model() -> Derivation {
+    let mut d = baseline();
+    let surface = d
+        .targets
+        .values()
+        .find(|path| !d.pin_reaching.contains(*path))
+        .expect("a real pin-free integration source")
+        .clone();
+    d.jobs = vec![CiJob {
+        workflow: "planted-pinless-control.yml".to_string(),
+        id: "workspace".to_string(),
+        body: "      - run: cargo test --workspace\n".to_string(),
+    }];
+    d.rows = vec![TerminalRow {
+        bead: "fln-planted-pinfree-control".to_string(),
+        surfaces: [surface].into(),
+        scenarios: vec!["quality_gate".to_string()],
+        coarse: BTreeSet::new(),
+        fine: Vec::new(),
+    }];
+    assert!(
+        judge(&d, &[], 0).is_empty(),
+        "pinless model must start clean"
+    );
+    d
+}
+
+fn plant_pinless_member(d: &mut Derivation) -> &'static str {
+    let surface = d
+        .pin_reaching
+        .iter()
+        .find(|path| path.contains("/tests/"))
+        .expect("a real pin-reaching integration source")
+        .clone();
+    const BEAD: &str = "fln-planted-pinless-member";
+    d.rows.push(TerminalRow {
+        bead: BEAD.to_string(),
+        surfaces: [surface].into(),
+        scenarios: vec!["quality_gate".to_string()],
+        coarse: BTreeSet::new(),
+        fine: Vec::new(),
+    });
+    assert!(judge(d, &[BEAD], 1).is_empty());
+    BEAD
+}
+
 /// A CI job that installs the pin repairs the defect — and the declaration must shrink
 /// with it, in the same commit, or the guard reddens.
 #[test]
 fn mutant_ci_installs_the_pin_forces_the_declaration_to_shrink() {
-    let mut d = baseline();
+    let mut d = pinless_model();
+    let member = plant_pinless_member(&mut d);
     let workspace = d.check_sh_workspace;
     for job in &mut d.jobs {
         if !test_reach(job, workspace).is_empty() {
@@ -3719,11 +3963,7 @@ fn mutant_ci_installs_the_pin_forces_the_declaration_to_shrink() {
                 .push_str("      - run: elan toolchain install leanprover/lean4:v4.32.0\n");
         }
     }
-    let findings = judge(
-        &d,
-        UNEXECUTED_EVIDENCE_ALLOWANCE,
-        UNEXECUTED_EVIDENCE_CEILING,
-    );
+    let findings = judge(&d, &[member], 1);
     assert!(
         has(&findings, "population-shrank:"),
         "installing the pin in the job that runs the suite must empty the population and \
@@ -3739,7 +3979,7 @@ fn mutant_ci_installs_the_pin_forces_the_declaration_to_shrink() {
 /// declaring it without also raising the ceiling.
 #[test]
 fn mutant_a_new_row_on_a_pin_reaching_surface_reddens_and_resists_silencing() {
-    let mut d = baseline();
+    let mut d = pinless_model();
     // The plant target is DERIVED, not positional. This used to take the first
     // pin-reaching test surface, which was sound only while CI ran none of them: once
     // `fe9198dd` wired the four pin-dependent suites into a job that installs the pin,
@@ -3747,9 +3987,8 @@ fn mutant_a_new_row_on_a_pin_reaching_surface_reddens_and_resists_silencing() {
     // mutant passed nothing and asserted `[]`. A guard whose population is repaired out
     // from under it goes decorative, and only re-deriving the target keeps it live.
     //
-    // The `expect` is the anti-vacuity floor: when the last unrun pin-reaching surface is
-    // wired, this refuses loudly instead of silently testing nothing, which forces the
-    // deliberate decision about what this mutant should plant on next.
+    // The real population is now repaired; the explicit pinless job above supplies the
+    // missing-Reference premise while this target remains derived from real source.
     let surface = d
         .pin_reaching
         .iter()
@@ -3891,7 +4130,7 @@ fn the_differential_rig_is_pin_reaching_by_the_derived_rule() {
 #[test]
 fn mutant_a_two_piece_locator_on_a_pinless_ci_surface_reddens() {
     const PLANTED: &str = "fln-planted-two-piece";
-    let mut d = derive(&root());
+    let mut d = pinless_model();
     let surface = d
         .surfaces
         .keys()
@@ -3917,7 +4156,7 @@ fn mutant_a_two_piece_locator_on_a_pinless_ci_surface_reddens() {
     };
 
     // Control: the same row on the unplanted surface is not a finding.
-    let mut control = derive(&root());
+    let mut control = pinless_model();
     control.rows.push(row.clone());
     assert!(
         !names_the_plant(&judge(
@@ -3952,22 +4191,19 @@ fn mutant_a_two_piece_locator_on_a_pinless_ci_surface_reddens() {
 /// membership check would miss entirely.
 #[test]
 fn mutant_a_row_leaving_the_population_without_a_shrink_reddens() {
-    let mut d = baseline();
+    let mut d = pinless_model();
+    let member = plant_pinless_member(&mut d);
     // It must be a row that is IN the population. The first draft removed `rows[0]`, which
     // is not, so nothing changed and the mutant survived a guard that was working correctly
     // — a control that perturbs the wrong thing scores a kill it did not earn.
-    let declared: BTreeSet<&str> = UNEXECUTED_EVIDENCE_ALLOWANCE.iter().copied().collect();
+    let declared: BTreeSet<&str> = [member].into();
     let index = d
         .rows
         .iter()
         .position(|row| declared.contains(row.bead.as_str()))
         .expect("the population is non-empty, so some row carries a declared bead");
     let dropped = d.rows.remove(index).bead;
-    let findings = judge(
-        &d,
-        UNEXECUTED_EVIDENCE_ALLOWANCE,
-        UNEXECUTED_EVIDENCE_CEILING,
-    );
+    let findings = judge(&d, &[member], 1);
     assert!(
         has(&findings, "population-shrank:"),
         "removing {dropped} must demand the declaration shrink; got {findings:?}"
@@ -3992,7 +4228,8 @@ fn mutant_a_row_leaving_the_population_without_a_shrink_reddens() {
 /// it.
 #[test]
 fn mutant_no_ci_job_reaches_the_workspace_suite() {
-    let mut d = baseline();
+    let mut d = pinless_model();
+    let member = plant_pinless_member(&mut d);
     d.check_sh_workspace = false;
     for job in &mut d.jobs {
         // This leaves the job and its other command shapes intact while removing every direct
@@ -4000,11 +4237,7 @@ fn mutant_no_ci_job_reaches_the_workspace_suite() {
         // exactly the workspace-suite reachability premise that the mutant names.
         job.body = job.body.replace("cargo test", "cargo planted-test");
     }
-    let findings = judge(
-        &d,
-        UNEXECUTED_EVIDENCE_ALLOWANCE,
-        UNEXECUTED_EVIDENCE_CEILING,
-    );
+    let findings = judge(&d, &[member], 1);
     assert!(
         has(&findings, "unrun:"),
         "severing every workspace-suite route must report every cited surface as one no CI job runs, against an \
@@ -4024,13 +4257,10 @@ fn mutant_no_ci_job_reaches_the_workspace_suite() {
 /// because a libtest filter matched nothing and exited 0.
 #[test]
 fn mutant_an_empty_pin_reaching_scope_refuses_instead_of_reporting_clean() {
-    let mut d = baseline();
+    let mut d = pinless_model();
+    let member = plant_pinless_member(&mut d);
     d.pin_reaching.clear();
-    let findings = judge(
-        &d,
-        UNEXECUTED_EVIDENCE_ALLOWANCE,
-        UNEXECUTED_EVIDENCE_CEILING,
-    );
+    let findings = judge(&d, &[member], 1);
     assert!(
         has(&findings, "scan:"),
         "an empty pin-reaching set is a broken scan and must refuse; got {findings:?}"

@@ -261,10 +261,10 @@ pub struct FileModule {
 /// - The declaration must begin at **column zero**. Planted fixture source in a string literal
 ///   is usually indented, and an item nested in an inline `mod` is not a root child.
 /// - The item must end in `;`. An inline `mod x { … }` has no file to read.
-/// - A declaration carrying any `#[cfg…]` attribute is **not returned**, because whether it
-///   compiles depends on configuration this scan does not decide. Leaving it out costs a
-///   spurious unbound finding, which is loud. Indexing it would buy a silent pass for a
-///   function the binary may not contain.
+/// - `#[cfg(test)]` is true for both library and integration test binaries. Other `#[cfg…]`
+///   attributes are **not returned**, because this scan does not decide their configuration.
+///   Leaving them out costs a loud unbound finding; indexing them could bind a function the
+///   binary does not contain.
 pub fn file_module_declarations(source: &str) -> Vec<FileModule> {
     let lines: Vec<&str> = source.lines().collect();
     let mut found = Vec::new();
@@ -300,19 +300,40 @@ pub fn file_module_declarations(source: &str) -> Vec<FileModule> {
             .collect();
         if attributes
             .iter()
-            .any(|attribute| attribute.starts_with("#[cfg"))
+            .any(|attribute| attribute.starts_with("#[cfg") && *attribute != "#[cfg(test)]")
         {
             continue;
         }
-        let path = attributes.iter().find_map(|attribute| {
-            let value = attribute
-                .strip_prefix("#[path")?
-                .trim_start()
-                .strip_prefix('=')?;
-            let (_, tail) = value.split_once('"')?;
-            let (path, _) = tail.split_once('"')?;
-            Some(path.to_string())
-        });
+        let path_attributes: Vec<_> = attributes
+            .iter()
+            .filter(|attribute| attribute.starts_with("#[path"))
+            .collect();
+        let path = match path_attributes.as_slice() {
+            [] => None,
+            [attribute] => {
+                // Only ordinary, unescaped, one-line string literals are modeled. A raw,
+                // escaped or malformed attribute must not silently become the default path.
+                let Some(value) = attribute
+                    .strip_prefix("#[path")
+                    .and_then(|value| value.trim_start().strip_prefix('='))
+                    .and_then(|value| value.trim().strip_suffix(']'))
+                else {
+                    continue;
+                };
+                let Some(path) = value
+                    .trim()
+                    .strip_prefix('"')
+                    .and_then(|value| value.strip_suffix('"'))
+                else {
+                    continue;
+                };
+                if path.is_empty() || path.contains(['"', '\\']) {
+                    continue;
+                }
+                Some(path.to_string())
+            }
+            _ => continue,
+        };
         found.push(FileModule {
             name: name.to_string(),
             path,
@@ -559,10 +580,8 @@ pub fn test_function_citation(artifact: &str) -> Option<(&str, &str, &str)> {
 /// `src/lib.rs` → `""`; `src/foo.rs` → `"foo"`; `src/foo/mod.rs` → `"foo"`;
 /// `src/foo/bar.rs` → `"foo::bar"`. `src/main.rs` is a binary target and yields `None`.
 ///
-/// **Sound here because nothing overrides the layout**: measured at `29852ec1`, no source file
-/// in the workspace carries a `#[path` attribute, so a file's module path is its directory
-/// path. That precondition is checked by the caller, in the loud direction — a `#[path`
-/// appearing makes this incomplete and must refuse rather than mis-resolve.
+/// This describes the physical layout only. Callers must resolve declared `#[path]` module
+/// aliases before using the result as a logical module path, and refuse unsupported aliases.
 ///
 /// This is a **prefix**, not the whole libtest name: inner `mod tests { … }` nesting appends
 /// further components this does not model. Callers must therefore treat it as a *necessary*
@@ -1565,7 +1584,7 @@ fn discussion_only() {\n\
     }
 
     #[test]
-    fn file_module_declarations_returns_root_children_and_never_a_gated_or_inline_one() {
+    fn file_module_declarations_includes_test_cfg_but_not_unknown_cfg_or_inline_children() {
         // The shapes `crates/fln-checker/tests/admit.rs`, `mutual_inductives.rs` and
         // `lsp_proof_modules.rs` use, plus every shape that must NOT bind a citation.
         let source = concat!(
@@ -1575,6 +1594,10 @@ fn discussion_only() {\n\
             "pub(crate) mod shared;\n",
             "#[cfg(feature = \"dev-only\")]\nmod gated;\n",
             "#[cfg(test)]\n#[path = \"x/cfg_test.rs\"]\nmod cfg_test;\n",
+            "#[path = r\"raw.rs\"]\nmod raw_path;\n",
+            "#[path = \"escaped\\\\path.rs\"]\nmod escaped_path;\n",
+            "#[path = \"unfinished.rs]\nmod malformed_path;\n",
+            "#[path = \"one.rs\"]\n#[path = \"two.rs\"]\nmod duplicate_path;\n",
             "mod inline {\n    mod nested;\n}\n",
             "const PLANTED: &str = \"\n    mod planted;\n\";\n",
             "// mod commented;\n",
@@ -1601,6 +1624,10 @@ fn discussion_only() {\n\
                 FileModule {
                     name: "shared".to_string(),
                     path: None,
+                },
+                FileModule {
+                    name: "cfg_test".to_string(),
+                    path: Some("x/cfg_test.rs".to_string()),
                 },
             ]
         );

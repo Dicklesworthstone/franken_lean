@@ -1,5 +1,7 @@
 //! Real Reference-produced abbreviation descriptions and MacroM IR, loaded
 //! through the production import council and used without client syntax.
+#![forbid(unsafe_code)]
+
 use super::*;
 
 fn provider() -> String {

@@ -3,6 +3,8 @@
 //! requires additional Lean.Grind helper lemmas. Native proofs use ordinary
 //! logical eliminators from this smaller admitted environment. The full suite
 //! separately checks the complete import closure and arithmetic composition.
+#![forbid(unsafe_code)]
+
 use super::*;
 
 const LOGICAL_ROOTS: &[&str] = &["Init.Grind.Tactics", "Init.Classical"];

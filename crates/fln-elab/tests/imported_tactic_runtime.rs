@@ -1,5 +1,7 @@
 //! The native owned-Syntax boundary, independent of imported IR compilation.
 //! Every accepted result is a real closed theorem checked by the kernel.
+#![forbid(unsafe_code)]
+
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicU64, Ordering},

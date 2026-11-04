@@ -338,7 +338,7 @@ fn live_pinned_rfl_candidates_match_every_quotation_field() {
     let partition_path = std::env::var_os("FLN_REFERENCE_PARTITION")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../contracts/builtin_partition.tsv")
+            fln_core::checked_workspace_root!().join("contracts/builtin_partition.tsv")
         });
     let partition =
         VerifiedPartition::from_pinned_tsv(&std::fs::read_to_string(partition_path).unwrap())

@@ -1,4 +1,6 @@
 //! Imported tactic MacroM code, real parser journals and kernel-checked proofs.
+#![forbid(unsafe_code)]
+
 use super::*;
 
 fn provider() -> String {
