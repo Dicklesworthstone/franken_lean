@@ -359,6 +359,33 @@ fn actual_artifacts(fixture: Fixture) {
             && pair[1].declaration == name("atomicIdentifier")
     }));
 
+    // Opening an implicit lambda re-enters the term elaborators, not the
+    // macro dispatcher. An unsupported handler must run only once at the
+    // original body, just as it does without the implicit telescope.
+    let ordinary_body = "def ordinaryFallback : True := True.intro";
+    let implicit_body = "def implicitFallback : {α : Type} → True := True.intro";
+    for (label, body) in [
+        ("OrdinaryFallback", ordinary_body),
+        ("ImplicitFallback", implicit_body),
+    ] {
+        let oracle = fixture.oracle(label, body);
+        assert!(oracle.status.success(), "{label}: {oracle:?}");
+    }
+    let ordinary = fixture.check(ordinary_body, MacroTreeLimits::default());
+    let implicit = fixture.check(implicit_body, MacroTreeLimits::default());
+    succeeded(&ordinary);
+    succeeded(&implicit);
+    let attempts = |checked: &SourceMacroModuleCheck| {
+        checked
+            .attempts
+            .iter()
+            .filter(|attempt| attempt.declaration == name("atomicIdentifier"))
+            .count()
+    };
+    assert!(attempts(&ordinary) > 0);
+    assert_eq!(attempts(&implicit), attempts(&ordinary));
+    assert_eq!(fixture.imported.engine.logical_root(&options), base);
+
     let oracle = fixture.oracle("Queries", QUERIES);
     assert!(oracle.status.success(), "{oracle:?}; {:?}", fixture.root);
     assert!(String::from_utf8_lossy(&oracle.stdout).ends_with("2\n1\n1\n2\n"));
@@ -446,7 +473,7 @@ fn actual_artifacts(fixture: Fixture) {
         );
     }
 
-    let looping = "set_option maxRecDepth 32\ndef never : Nat := atomicLoop";
+    let looping = "def never : Nat := atomicLoop";
     let oracle = fixture.oracle("Nonterminating", looping);
     assert!(!oracle.status.success(), "{oracle:?}");
     assert!(

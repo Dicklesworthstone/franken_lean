@@ -2,7 +2,8 @@
 //! applied by `expandParen`, `expandTuple` and `expandTypeAscription`), bead
 //! `franken_lean-z8j.1.10`.
 //!
-//! The nearest enclosing parentheses, tuple or type ascription scope a `·`:
+//! Parentheses, tuples and type ascriptions bind only the `·` in their own
+//! scope whose complete hygiene identity matches the opening delimiter:
 //! - `(e)` with `·` in `e` is `fun x₁ … xₙ => e'`, one binder per `·` in source order;
 //! - `(e, f)` is `fun x₁ … xₙ => (e', f')`;
 //! - `(e : T)` is `((fun x₁ … xₙ => e') : T)`; `T` is not searched.
@@ -14,8 +15,9 @@
 //!
 //! The expansion runs inside `lower_pattern_matrices`' single bottom-up rebuild, before
 //! collection notation (which would turn a tuple into `Prod.mk` and lose its scope). By the
-//! time a node is rebuilt, every nested scope has already been expanded, so the `·` left in
-//! its own scope are exactly the ones it binds.
+//! time a node is rebuilt, every nested scope has already been processed. An
+//! unmatched quoted or antiquoted `·` is refused before lowering can erase
+//! its delimiter and expose it to an enclosing scope.
 use super::*;
 use fln_syntax::source::{ByteSpan, SourceInfo};
 
@@ -55,6 +57,14 @@ pub(super) fn is_cdot(syntax: &Syntax) -> bool {
     syntax.kind() == Some(&parser_kind(&["Term", "cdot"]))
 }
 
+fn matches_hygiene(syntax: &Syntax, hygiene: &Name) -> Result<bool, NatDefinitionElabError> {
+    if !is_cdot(syntax) {
+        return Ok(false);
+    }
+    let parts = expect_node(syntax, &parser_kind(&["Term", "cdot"]), 2, "cdot")?;
+    Ok(hygiene_info_name(&parts[1])? == hygiene)
+}
+
 /// A fresh binder name: the atomic numeric name do-notation's generated binders use
 /// (`do_control_name`). No source identifier can spell a numeric name, escaped or not, so it
 /// never captures one; it stands in for the pin's macro-scoped `x` / `x1`, … , which differ
@@ -80,13 +90,14 @@ impl Context {
         };
         // `paren`: `( e )`; `tuple`: `( [e "," [es]] )`; `typeAscription`: `( e ":" [T] )`.
         // Index 0 is the hygienic `(`; index 1 is the scope in all three.
-        let count = match args.get(1) {
-            Some(scope) => self.count_cdots(scope)?,
-            None => 0,
+        let (count, hygiene) = match args.get(1) {
+            Some(scope) => self.count_cdots(scope, args.first())?,
+            None => (0, None),
         };
         if count == 0 {
             return Ok(Syntax::Node { info, kind, args });
         }
+        let hygiene = hygiene.ok_or_else(|| failure(SourceInferenceError::Scope))?;
         let mut names = Vec::with_capacity(count);
         for _ in 0..count {
             let serial = self.next;
@@ -94,7 +105,7 @@ impl Context {
             names.push(hygienic(serial));
         }
         let scope = std::mem::replace(&mut args[1], null(Vec::new()));
-        let scope = self.replace_cdots(scope, &names)?;
+        let scope = self.replace_cdots(scope, &names, &hygiene)?;
         if kind == parser_kind(&["Term", "paren"]) {
             // `(e)` is the function itself.
             return Ok(function(&names, scope));
@@ -110,13 +121,35 @@ impl Context {
     }
 
     /// The `·` in `root`'s own scope: nested scopes are not entered. Iterative: a source tree is
-    /// unbounded in depth.
-    fn count_cdots(&mut self, root: &Syntax) -> Result<usize, NatDefinitionElabError> {
+    /// unbounded in depth. Native-generated ascriptions may have a bare opener;
+    /// inspect its hygiene only when a dot actually needs a binding scope.
+    fn count_cdots(
+        &mut self,
+        root: &Syntax,
+        opener: Option<&Syntax>,
+    ) -> Result<(usize, Option<Name>), NatDefinitionElabError> {
         let mut pending = vec![root];
         let mut count = 0usize;
+        let mut hygiene = None;
         while let Some(node) = pending.pop() {
             self.tick()?;
             if is_cdot(node) {
+                if hygiene.is_none() {
+                    let opener = opener.ok_or_else(|| failure(SourceInferenceError::Scope))?;
+                    hygiene = Some(parenthesis_hygiene_name(opener)?.clone());
+                }
+                let identity = hygiene
+                    .as_ref()
+                    .ok_or_else(|| failure(SourceInferenceError::Scope))?;
+                if !matches_hygiene(node, identity)? {
+                    // The pin visits enclosing binders before their children;
+                    // hasCDot never crosses a tuple/parenthesis boundary. Our
+                    // bottom-up lowering must not expose an unmatched dot by
+                    // replacing a tuple with Prod.mk or parentheses with a
+                    // lambda. Refuse it before removing that boundary. A later
+                    // user macro consuming such syntax remains unsupported.
+                    return Err(failure(SourceInferenceError::CdotOutsideParentheses));
+                }
                 count = count
                     .checked_add(1)
                     .ok_or_else(|| failure(SourceInferenceError::ResourceLimit))?;
@@ -126,7 +159,7 @@ impl Context {
                 pending.extend(args);
             }
         }
-        Ok(count)
+        Ok((count, hygiene))
     }
 
     /// Replace the `·` in `root`'s own scope, in source order, by `names`. Iterative, like the
@@ -135,6 +168,7 @@ impl Context {
         &mut self,
         root: Syntax,
         names: &[Name],
+        hygiene: &Name,
     ) -> Result<Syntax, NatDefinitionElabError> {
         enum Task {
             Visit(Syntax),
@@ -146,7 +180,7 @@ impl Context {
         while let Some(task) = tasks.pop() {
             self.tick()?;
             match task {
-                Task::Visit(node) if is_cdot(&node) => {
+                Task::Visit(node) if matches_hygiene(&node, hygiene)? => {
                     let name = next
                         .next()
                         .ok_or_else(|| failure(SourceInferenceError::Scope))?;
