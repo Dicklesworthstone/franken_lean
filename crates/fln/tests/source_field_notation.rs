@@ -21,7 +21,11 @@ fn engine() -> Engine {
 }
 
 fn check(source: &str) {
-    let result = engine().check_source_files(&[source.as_bytes()], &KVMap::new(), limits());
+    check_in(&engine(), source);
+}
+
+fn check_in(base: &Engine, source: &str) {
+    let result = base.check_source_files(&[source.as_bytes()], &KVMap::new(), limits());
     assert!(
         matches!(result, Ok(Outcome::Complete(_))),
         "{source}\n{result:?}"
@@ -34,8 +38,9 @@ fn delayed_method_arguments_wait_for_the_receivers_inferred_type_without_imports
     // has arguments (vendored `Lean/Elab/App.lean`). The equality constructor
     // checks the resumed method's receiver and argument order through both
     // admission seats, with no seeded declarations or imported artifacts.
-    let source = r#"prelude
-inductive Token where
+    // The raw command-stream API starts after the module header; the pin's
+    // source uses `prelude` to establish the same empty environment.
+    let source = r#"inductive Token where
   | mk
   | other
 inductive Same (x : Token) : Token → Prop where
@@ -474,7 +479,13 @@ theorem delayedDependent_correct (A : Type) (pair : Pair A) :
 fn delayed_methods_preserve_instance_output_parameters() {
     // The class instance determines the method's result after its receiver is
     // known; replay goes through the ordinary out-parameter application path.
-    check(
+    // As in source_coercions, the coercion library is admitted by both checkers.
+    let base = Engine::with_coercion_seed(limits().admission)
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    check_in(
+        &base,
         r#"inductive Token where
   | mk
   | other
@@ -543,7 +554,8 @@ def bad (left : Token) : Token :=
 def bad (left : Token) : Token :=
   let call (x : _) := x.missing Token.mk
   call left"#,
-            Some("UnknownField"),
+            // Token is an enum, so failed lookup reports this existing refusal.
+            Some("ExpectedRecordType"),
         ),
         (
             r#"def sentinelPrefix : Token := Token.mk

@@ -299,7 +299,8 @@ impl Equalities {
     /// when no explicit equality goal mentions them (for example P (n + 1)
     /// and P (1 + n)). Only shared function classes can use those equalities.
     pub fn arithmetic_arguments(&self, context: &mut Context) -> Result<Vec<(Expr, Expr)>, Error> {
-        let mut applications: HashMap<(usize, Expr), Vec<(usize, usize, Expr)>> = HashMap::new();
+        type Application = (usize, usize, Expr);
+        let mut applications: HashMap<(usize, Expr), Vec<Application>> = HashMap::new();
         let mut seen = HashSet::new();
         let mut pairs = Vec::new();
         for node in &self.nodes {
