@@ -64,8 +64,8 @@ const ACCEPT: &[(&str, &str, &[&str])] = &[
     ),
     (
         "pattern_equation_family",
-        "def flip : Bool → Bool\n  | false => true\n  | true => false\nexample : flip (flip true) = true := by grind only [flip]",
-        &["flip.eq_1", "flip.eq_2"],
+        "def grindFlipBool : Bool → Bool\n  | false => true\n  | true => false\nexample : grindFlipBool (grindFlipBool true) = true := by grind only [grindFlipBool]",
+        &["grindFlipBool.eq_1", "grindFlipBool.eq_2"],
     ),
     (
         "structural_recursive_equation_family",
@@ -194,6 +194,7 @@ fn definition_equations_match_pinned_lean() {
             let directory =
                 std::env::temp_dir().join(format!("fln-grind-definitions-{}", std::process::id()));
             std::fs::create_dir_all(&directory).unwrap();
+            let mut failures = Vec::new();
             for (label, source, success, diagnostic) in
                 ACCEPT
                     .iter()
@@ -207,6 +208,7 @@ fn definition_equations_match_pinned_lean() {
                         (*label, *source, false, Some(*expected))
                     }))
             {
+                eprintln!("grind definition: pin {label} (accept={success})");
                 let path = directory.join(format!("{label}.lean"));
                 std::fs::write(&path, format!("{HEADER}{source}\n")).unwrap();
                 let output = Command::new(&compiler)
@@ -219,18 +221,42 @@ fn definition_equations_match_pinned_lean() {
                     String::from_utf8_lossy(&output.stdout),
                     String::from_utf8_lossy(&output.stderr)
                 );
-                assert_eq!(output.status.success(), success, "pin {label}: {message}");
-                if let Some(expected) = diagnostic {
-                    assert!(
-                        message.contains(expected),
-                        "pin {label}: expected {expected:?}, got {message}"
+                // A signal or a process timeout must fail the refusal control.
+                let rejected = output.status.code() == Some(1)
+                    && message.lines().any(|line| {
+                        line.contains("error:")
+                            || line
+                                .split_once("error(")
+                                .is_some_and(|(_, detail)| detail.contains("):"))
+                    });
+                let matched = if success {
+                    output.status.success()
+                } else {
+                    rejected
+                };
+                if !matched {
+                    record_failure(
+                        &mut failures,
+                        &format!("pin_{label}"),
+                        format!(
+                            "expected success={success}, got {:?}: {message}",
+                            output.status
+                        ),
+                    );
+                }
+                if let Some(expected) = diagnostic
+                    && !message.contains(expected)
+                {
+                    record_failure(
+                        &mut failures,
+                        &format!("pin_goal_{label}"),
+                        format!("expected {expected:?}, got {message}"),
                     );
                 }
             }
             let engine = base_with_roots(&library, LOGICAL_ROOTS, 1);
             let options = KVMap::new();
             let before = engine.logical_root(&options);
-            let mut failures = Vec::new();
             for (label, source, equations) in ACCEPT {
                 eprintln!("grind definition: native {label}");
                 match engine.check_source_files(&[source.as_bytes()], &options, limits()) {
