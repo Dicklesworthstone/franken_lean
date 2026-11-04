@@ -14,6 +14,9 @@ use fln_olean::ir::{IrAlt, IrArg, IrDecl, IrExpr, IrModule, IrParam, IrStmt, IrT
 use std::collections::BTreeMap;
 
 mod array_proofs;
+mod boxed;
+
+pub(super) use boxed::{BoxedNative, boxed_row};
 
 #[derive(Clone, Copy)]
 struct ErasedOperands {
@@ -32,6 +35,11 @@ pub(super) fn erase_type_arguments(
 ) -> Result<(), IrExecutionError> {
     let mut bridges = BTreeMap::new();
     for (name, native) in natives {
+        // A boxed wrapper keeps the complete source telescope in its
+        // closure ABI. Only its native forwarding body discards these slots.
+        if native.boxed.is_some() {
+            continue;
+        }
         let Some(row) = fln_vm::extern_table_generated::EXTERN_ROWS
             .iter()
             .find(|row| row.id == native.id)

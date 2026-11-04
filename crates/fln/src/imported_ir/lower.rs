@@ -121,6 +121,7 @@ pub(super) fn compile(
     let native_map: BTreeMap<Name, &Native> = helper_natives
         .iter()
         .chain(supplied_natives.iter())
+        .filter(|(_, native)| native.boxed.is_none())
         .map(|(name, value)| (name.clone(), value))
         .collect();
     let mut native_order: Vec<_> = native_map.iter().collect();
@@ -152,11 +153,14 @@ pub(super) fn compile(
             (name.clone(), params.len())
         })
         .collect();
-    names.extend(
-        supplied_natives
-            .iter()
-            .map(|(name, native)| (name.clone(), native.arguments.len())),
-    );
+    names.extend(supplied_natives.iter().map(|(name, native)| {
+        (
+            name.clone(),
+            native
+                .boxed
+                .map_or(native.arguments.len(), |boxed| boxed.arity()),
+        )
+    }));
     let global_slots: BTreeMap<_, _> = initialization
         .into_iter()
         .flat_map(|plan| plan.globals.iter().enumerate())
@@ -354,12 +358,20 @@ pub(super) fn compile(
             let block = builder.block()?;
             let value = builder.global_value(block, name)?;
             builder.finish_block(block, Terminator::Return { value });
-        } else if supplied_natives.contains_key(name) {
+        } else if let Some(native) = supplied_natives.get(name) {
             let block = builder.block()?;
-            let args = (0..*arity)
+            let parameters = native
+                .boxed
+                .map_or(0..*arity, |boxed| boxed.runtime_parameters());
+            let args = parameters
                 .map(|i| ValueId::new((i + environment_parameters) as u32))
                 .collect();
-            let value = builder.native_call(block, name, args)?;
+            let target = if native.boxed.is_some() {
+                name.parent()
+            } else {
+                name.clone()
+            };
+            let value = builder.native_call(block, &target, args)?;
             builder.finish_block(block, Terminator::Return { value });
         } else {
             let Some(IrDecl::Function { body, params, .. }) = declarations.get(name) else {

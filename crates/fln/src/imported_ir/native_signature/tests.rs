@@ -199,6 +199,144 @@ fn native_partial_application_uses_the_runtime_suffix_and_preserves_its_capture(
 }
 
 #[test]
+fn native_boxed_partial_application_retains_type_capture_and_reusable_arrays() {
+    let compiled = compile_declarations(vec![entry(
+        vec![
+            num(1, 4),
+            call(2, "Array.emptyWithCapacity", &[1]),
+            bind(
+                3,
+                IrExpr::Pap {
+                    function: name("Array.push._boxed"),
+                    args: vec![IrArg::Erased, var(2)],
+                },
+            ),
+            num(4, 19),
+            bind(
+                5,
+                IrExpr::Ap {
+                    x: 3,
+                    args: vec![var(4)],
+                },
+            ),
+            num(6, 23),
+            bind(
+                7,
+                IrExpr::Ap {
+                    x: 3,
+                    args: vec![var(6)],
+                },
+            ),
+            call(8, "Array.size", &[2]),
+            call(9, "Array.size", &[5]),
+            call(10, "Array.size", &[7]),
+            call(11, "Nat.add", &[8, 9]),
+            call(12, "Nat.add", &[11, 10]),
+        ],
+        12,
+    )])
+    .unwrap();
+    assert_nat(&compiled, "2");
+    assert_eq!(
+        compiled
+            .native_externs()
+            .iter()
+            .filter(|id| *id == "extern:Array.push")
+            .count(),
+        1,
+        "the boxed adapter shares the primitive's canonical native row"
+    );
+}
+
+#[test]
+fn native_boxed_telescope_and_reserved_names_cannot_be_supplied_by_user_ir() {
+    let declaration = || {
+        entry(
+            vec![
+                num(1, 1),
+                call(2, "Array.emptyWithCapacity", &[1]),
+                num(3, 42),
+                bind(
+                    4,
+                    IrExpr::Fap {
+                        function: name("Array.push._boxed"),
+                        args: vec![IrArg::Erased, var(2), var(3)],
+                    },
+                ),
+                call(5, "Array.size", &[4]),
+            ],
+            5,
+        )
+    };
+    let prototype = || IrDecl::Extern {
+        name: name("Array.push._boxed"),
+        params: (0..3)
+            .map(|x| IrParam {
+                x,
+                borrow: false,
+                ty: IrType::TObject,
+            })
+            .collect(),
+        result: IrType::Object,
+        entries: vec![],
+    };
+    assert_nat(
+        &compile_declarations(vec![declaration(), prototype()]).unwrap(),
+        "1",
+    );
+    for mutation in 0..6 {
+        let mut wrong = prototype();
+        let IrDecl::Extern { params, result, .. } = &mut wrong else {
+            unreachable!()
+        };
+        match mutation {
+            0 => {
+                params.pop();
+            }
+            1 => params[0].ty = IrType::Erased,
+            2 => params[1].borrow = true,
+            3 => params[2].ty = IrType::UInt8,
+            4 => *result = IrType::UInt8,
+            _ => *result = IrType::Void,
+        }
+        assert!(matches!(
+            compile_declarations(vec![declaration(), wrong]),
+            Err(IrExecutionError::NativeContract { .. })
+        ));
+    }
+    let module = IrModule {
+        decls: vec![declaration(), prototype()],
+        ..IrModule::default()
+    };
+    assert!(matches!(compile(
+        &[module],
+        &name("Arity.main"),
+        &[],
+        &VerifiedPartition::user_fixture(),
+        &BTreeSet::from([name("Arity.main"), name("Array.push._boxed")]),
+        IrExecutionLimits::default(),
+    ), Err(IrExecutionError::UserOverridesCensus(found)) if found == name("Array.push._boxed")));
+    for target in ["Nat.add._boxed", "Void.mk._boxed", "ST.Prim.Ref.get._boxed"] {
+        let unsupported = entry(
+            vec![bind(
+                1,
+                IrExpr::Pap {
+                    function: name(target),
+                    args: vec![],
+                },
+            )],
+            1,
+        );
+        assert!(matches!(
+            compile_declarations(vec![unsupported]),
+            Err(IrExecutionError::Unsupported { .. })
+        ));
+    }
+    assert!(boxed_row(&Name::str(Name::anonymous(), "Array.push._boxed")).is_none());
+    assert!(boxed_row(&name("Array.push._boxed.other")).is_none());
+}
+
+#[test]
 fn supplied_extern_telescope_must_still_match_the_native_abi() {
     for arity in [2, 3] {
         let declaration = IrDecl::Extern {

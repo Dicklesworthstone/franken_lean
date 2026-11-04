@@ -206,6 +206,203 @@ fn native_array_partial_applications_remain_valid_but_erased_captures_are_refuse
 }
 
 #[test]
+fn native_boxed_array_readers_keep_pending_proofs_in_the_closure_arity() {
+    for (target, unsigned) in [
+        ("Array.getInternal", false),
+        ("Array.getInternalBorrowed", false),
+        ("Array.uget", true),
+        ("Array.ugetBorrowed", true),
+        ("ByteArray.get", false),
+        ("ByteArray.uget", true),
+    ] {
+        let byte = target.starts_with("ByteArray.");
+        let mut stmts = if byte {
+            byte_setup(unsigned, 0)
+        } else {
+            array_setup(unsigned, 0)
+        };
+        let captures = if byte {
+            vec![var(5)]
+        } else {
+            vec![IrArg::Erased, var(4)]
+        };
+        stmts.extend([
+            bind(
+                10,
+                IrExpr::Pap {
+                    function: name(&format!("{target}._boxed")),
+                    args: captures,
+                },
+            ),
+            bind(
+                11,
+                IrExpr::Ap {
+                    x: 10,
+                    args: vec![var(7), IrArg::Erased],
+                },
+            ),
+            bind(
+                12,
+                IrExpr::Ap {
+                    x: 10,
+                    args: vec![var(7), IrArg::Erased],
+                },
+            ),
+        ]);
+        if byte {
+            stmts.extend([
+                call(13, "UInt8.toNat", &[11]),
+                call(14, "UInt8.toNat", &[12]),
+            ]);
+        }
+        stmts.push(call(
+            15,
+            "Nat.add",
+            if byte { &[13, 14] } else { &[11, 12] },
+        ));
+        assert_nat(&compile_declarations(vec![entry(stmts, 15)]).unwrap(), "38");
+    }
+}
+
+#[test]
+fn native_boxed_array_writers_copy_reusable_captures_and_preserve_predecessors() {
+    for (getter, setter, unsigned) in [
+        ("Array.getInternal", "Array.set", false),
+        ("Array.uget", "Array.uset", true),
+        ("ByteArray.get", "ByteArray.set", false),
+        ("ByteArray.uget", "ByteArray.uset", true),
+    ] {
+        let byte = setter.starts_with("ByteArray.");
+        let mut stmts = if byte {
+            byte_setup(unsigned, 0)
+        } else {
+            array_setup(unsigned, 0)
+        };
+        let (array, first, second, captures) = if byte {
+            (5, 9, 4, vec![var(5)])
+        } else {
+            (4, 6, 3, vec![IrArg::Erased, var(4)])
+        };
+        stmts.extend([
+            bind(
+                10,
+                IrExpr::Pap {
+                    function: name(&format!("{setter}._boxed")),
+                    args: captures,
+                },
+            ),
+            bind(
+                11,
+                IrExpr::Ap {
+                    x: 10,
+                    args: vec![var(7), var(first), IrArg::Erased],
+                },
+            ),
+            bind(
+                12,
+                IrExpr::Ap {
+                    x: 10,
+                    args: vec![var(7), var(second), IrArg::Erased],
+                },
+            ),
+        ]);
+        if byte {
+            stmts.extend([
+                byte_call(13, getter, 11, None),
+                byte_call(14, getter, 12, None),
+                byte_call(15, getter, array, None),
+                call(16, "UInt8.toNat", &[13]),
+                call(17, "UInt8.toNat", &[14]),
+                call(18, "UInt8.toNat", &[15]),
+            ]);
+        } else {
+            stmts.extend([
+                array_call(16, getter, 11, None),
+                array_call(17, getter, 12, None),
+                array_call(18, getter, array, None),
+            ]);
+        }
+        stmts.extend([
+            call(19, "Nat.add", &[16, 17]),
+            call(20, "Nat.add", &[19, 18]),
+        ]);
+        assert_nat(&compile_declarations(vec![entry(stmts, 20)]).unwrap(), "80");
+    }
+}
+
+#[test]
+fn native_boxed_proof_arguments_never_hide_bad_scope_arity_or_bounds() {
+    let read = |captures: Vec<IrArg>, arguments: Vec<IrArg>, index| {
+        let mut stmts = array_setup(false, index);
+        stmts.extend([
+            bind(
+                8,
+                IrExpr::Pap {
+                    function: name("Array.getInternal._boxed"),
+                    args: captures,
+                },
+            ),
+            bind(
+                9,
+                IrExpr::Ap {
+                    x: 8,
+                    args: arguments,
+                },
+            ),
+        ]);
+        compile_declarations(vec![entry(stmts, 9)])
+    };
+    for captures in [vec![var(999), var(4)], vec![IrArg::Erased, var(999)]] {
+        assert!(matches!(
+            read(captures, vec![var(7), IrArg::Erased], 0),
+            Err(IrExecutionError::IrValidation(_))
+        ));
+    }
+    for arguments in [vec![var(999), IrArg::Erased], vec![var(7), var(999)]] {
+        assert!(matches!(
+            read(vec![IrArg::Erased, var(4)], arguments, 0),
+            Err(IrExecutionError::IrValidation(_))
+        ));
+    }
+    assert!(matches!(
+        read(
+            vec![IrArg::Erased, var(4), var(7), IrArg::Erased],
+            vec![IrArg::Erased],
+            0
+        ),
+        Err(IrExecutionError::IrValidation(_))
+    ));
+    for arguments in [vec![var(7)], vec![var(7), IrArg::Erased, IrArg::Erased]] {
+        let compiled = read(vec![IrArg::Erased, var(4)], arguments, 0).unwrap();
+        assert!(matches!(
+            compiled.execute(ExecutionLimits::default(), None).outcome,
+            Outcome::Complete(VmExit::Refused {
+                refusal: VmRefusal::ApplyResultOwnershipMismatch {
+                    expected: flbc::CallableResultOwnership::Owned,
+                    actual: flbc::CallableResultOwnership::Erased,
+                    ..
+                },
+                ..
+            })
+        ));
+    }
+    let out_of_bounds = read(vec![IrArg::Erased, var(4)], vec![var(7), IrArg::Erased], 1).unwrap();
+    assert!(matches!(
+        out_of_bounds
+            .execute(ExecutionLimits::default(), None)
+            .outcome,
+        Outcome::Complete(VmExit::Refused {
+            refusal: VmRefusal::ArrayIndexOutOfBounds { index: 1, size: 1 },
+            ..
+        })
+    ));
+    assert_nat(
+        &read(vec![IrArg::Erased, var(4)], vec![var(7), IrArg::Erased], 0).unwrap(),
+        "19",
+    );
+}
+
+#[test]
 fn discarded_array_proofs_never_authorize_out_of_bounds_access() {
     for (target, unsigned, write) in [
         ("Array.getInternal", false, false),

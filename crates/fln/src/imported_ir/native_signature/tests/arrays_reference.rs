@@ -88,6 +88,18 @@ fn live_pinned_arrays_match_reference_with_erased_proofs_and_canonical_replay() 
         ("arrayProofUSize", 42),
         ("byteArrayProofRoundTrip", 255),
         ("byteArrayProofUSize", 255),
+        ("arrayPartialPush", 0),
+        ("arrayPartialPush", 42),
+        ("arrayPartialPush", u64::MAX),
+        ("arrayPartialRead", 0),
+        ("arrayPartialRead", 42),
+        ("arrayPartialRead", u64::MAX),
+        ("arrayPartialWrite", 0),
+        ("arrayPartialWrite", 42),
+        ("arrayPartialWrite", u64::MAX),
+        ("byteArrayPartialRead", 0),
+        ("byteArrayPartialRead", 255),
+        ("byteArrayPartialRead", 256),
     ];
     let mut users: BTreeSet<_> = cases.iter().map(|(entry, _)| name(entry)).collect();
     // Exact closed-value initializers emitted by this pinned fixture.
@@ -95,7 +107,43 @@ fn live_pinned_arrays_match_reference_with_erased_proofs_and_canonical_replay() 
         name("arrayNativeHeap._closed_0"),
         name("byteArrayNativeRoundTrip._closed_0"),
         name("byteArrayNativeBounds._closed_0"),
+        name("useArrayPush"),
+        name("useArrayRead._redArg"),
+        name("useArrayWrite"),
+        name("useArrayWrite._redArg"),
+        name("useByteArrayRead._redArg"),
     ]);
+    let boxed_partials: BTreeSet<_> = module
+        .decls
+        .iter()
+        .flat_map(|declaration| {
+            let bodies = match declaration {
+                IrDecl::Function { body, .. } => body.bodies(),
+                IrDecl::Extern { .. } => Vec::new(),
+            };
+            bodies
+                .into_iter()
+                .flat_map(|body| body.stmts.iter())
+                .filter_map(|statement| match statement {
+                    IrStmt::VDecl {
+                        expr: IrExpr::Pap { function, .. },
+                        ..
+                    } => Some(function.clone()),
+                    _ => None,
+                })
+        })
+        .collect();
+    for target in [
+        "Array.push._boxed",
+        "Array.getInternal._boxed",
+        "Array.set._boxed",
+        "ByteArray.get._boxed",
+    ] {
+        assert!(
+            boxed_partials.contains(&name(target)),
+            "{target} optimized away; {dir:?}"
+        );
+    }
     let mut oracle_source = source.to_owned();
     for (entry, value) in cases {
         oracle_source.push_str(&format!("\n#eval {entry} {value}\n"));

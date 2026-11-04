@@ -767,6 +767,7 @@ fn compile_with_policy(
     let initializer_index = globals::index(modules, limits)?;
     for name in user_declarations {
         if native_row(name).is_some()
+            || native_signature::boxed_row(name).is_some()
             || fln_vm::macro_native::row_for_name(name).is_some()
             || classified_ancestor(partition, name).is_some()
         {
@@ -805,6 +806,25 @@ fn compile_with_policy(
                 name,
                 Native::with_output(row, arity, output_byte_limit.is_some())?,
             );
+            continue;
+        }
+        if let Some(row) = native_signature::boxed_row(&name) {
+            if initializer_index.named.contains_key(&name) {
+                return Err(globals::contract(
+                    &name,
+                    "initializer cannot replace a native boxed wrapper",
+                ));
+            }
+            let boxed = native_signature::BoxedNative::from_row(row)?
+                .ok_or_else(|| unsupported(&name, "unreviewed native boxed wrapper"))?;
+            if let Some(declaration) = declarations.get(&name) {
+                boxed.validate_declaration(declaration)?;
+            }
+            // Select the canonical runtime primitive separately. The boxed
+            // function forwards to it natively, with the original ownership
+            // contract, and never executes a supplied Reference wrapper body.
+            pending.insert(name.parent());
+            natives.insert(name, Native::boxed(row, boxed)?);
             continue;
         }
         if let Some(row) = fln_vm::macro_native::row_for_name(&name) {
@@ -1053,6 +1073,7 @@ fn inspect_body(
 struct Native {
     id: &'static str,
     ir_arity: usize,
+    boxed: Option<native_signature::BoxedNative>,
     reference_state_telescope: bool,
     state_runtime_arity: Option<usize>,
     arguments: Vec<flbc::ArgumentOwnership>,
@@ -1065,6 +1086,7 @@ impl Native {
         Self {
             id: row.id,
             ir_arity: row.borrowed.len(),
+            boxed: None,
             reference_state_telescope: false,
             state_runtime_arity: None,
             arguments: row.argument_ownership(),
@@ -1075,6 +1097,16 @@ impl Native {
 
     fn new(row: &'static GeneratedExternRow, arity: usize) -> Result<Self, IrExecutionError> {
         Self::with_output(row, arity, false)
+    }
+
+    fn boxed(
+        row: &'static GeneratedExternRow,
+        boxed: native_signature::BoxedNative,
+    ) -> Result<Self, IrExecutionError> {
+        let mut native = Self::new(row, native_signature::ir_arity(row)?)?;
+        native.ir_arity = boxed.arity();
+        native.boxed = Some(boxed);
+        Ok(native)
     }
 
     fn with_output(
@@ -1126,6 +1158,7 @@ impl Native {
         Ok(Self {
             id: row.id,
             ir_arity,
+            boxed: None,
             reference_state_telescope,
             state_runtime_arity,
             arguments,

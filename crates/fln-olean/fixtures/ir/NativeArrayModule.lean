@@ -72,3 +72,39 @@ public section
       (original.uget index h).toNat + (changed.uget index h').toNat
     else 0
   else 0
+
+-- Higher-order native array calls keep type/proof slots in the pin's generated
+-- `_boxed` closures. The noinline consumers force real PAP/AP instructions.
+@[noinline] def useArrayPush (push : Nat → Array Nat) (n : Nat) : Nat :=
+  let first := push n
+  let second := push (n + 1)
+  first.size + second.size + first[2]! + second[2]!
+
+@[noinline] def arrayPartialPush (n : Nat) : Nat :=
+  useArrayPush (Array.push (Array.replicate 2 n)) n
+
+@[noinline] def useArrayRead (a : Array Nat) (read : (i : Nat) → i < a.size → Nat)
+    (h : 0 < a.size) : Nat :=
+  read 0 h + read 0 h
+
+@[noinline] def arrayPartialRead (n : Nat) : Nat :=
+  let a := Array.replicate 2 n
+  if h : 0 < a.size then useArrayRead a a.getInternal h else 0
+
+@[noinline] def useArrayWrite (a : Array Nat)
+    (write : (i : Nat) → Nat → i < a.size → Array Nat) (h : 0 < a.size) (n : Nat) : Nat :=
+  let first := write 0 n h
+  let second := write 0 (n + 1) h
+  first[0]! + second[0]! + a[0]!
+
+@[noinline] def arrayPartialWrite (n : Nat) : Nat :=
+  let a := Array.replicate 2 n
+  if h : 0 < a.size then useArrayWrite a (@Array.set Nat a) h (n + 1) else 0
+
+@[noinline] def useByteArrayRead (a : ByteArray)
+    (read : (i : Nat) → i < a.size → UInt8) (h : 0 < a.size) : Nat :=
+  (read 0 h).toNat
+
+@[noinline] def byteArrayPartialRead (n : Nat) : Nat :=
+  let a := (ByteArray.emptyWithCapacity 1).push n.toUInt8
+  if h : 0 < a.size then useByteArrayRead a (@ByteArray.get a) h else 0
