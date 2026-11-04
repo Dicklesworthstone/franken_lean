@@ -12,12 +12,13 @@
 //! then use the ordinary compiler, codec and Golem execution path.
 //!
 //! Recursive expansion follows `Lean.expandMacros`, including its tactic
-//! boundary. Atomic macro dispatch belongs to term elaboration, which this
-//! bounded adapter does not replace. A surviving identifier, atom or missing
-//! node with an active registration is therefore refused explicitly. File and
-//! module sessions bind an owned runtime provider at the tactic boundary;
-//! standalone APIs and borrowed lookup/cancellation overrides retain an
-//! explicit refusal there rather than extending borrowed authority lifetimes.
+//! boundary. Atomic macro dispatch belongs to term elaboration: owned file and
+//! module sessions bind a runtime provider that expands identifiers and atoms
+//! only when the elaborator visits a term, preserving declaration and binder
+//! names. Generated terms and tactic expansions use that same provider.
+//! Standalone APIs and borrowed lookup/cancellation overrides retain an
+//! explicit refusal at these boundaries rather than extending borrowed
+//! authority lifetimes.
 
 use super::lookup::EnvironmentMacroLookup;
 use super::registrations::{
@@ -369,7 +370,7 @@ impl<'a> FileSession<'a> {
     }
 
     /// Only owned, default engine lookup authority may cross into SourceScope.
-    /// A borrowed override continues using the explicit tactic refusal from
+    /// A borrowed override continues using the explicit runtime refusal from
     /// expansion preflight; it is never dropped or given a longer lifetime.
     pub(crate) fn bind_tactics(
         &mut self,
@@ -1391,7 +1392,7 @@ fn expand_syntax_in_scope(
     scope: &fln_elab::source::scope::SourceScope,
     invocation: SourceMacroInvocation<'_>,
     progress: &mut Progress,
-    runtime_tactics: bool,
+    runtime_macros: bool,
 ) -> Outcome<Result<(Syntax, MacroState), SourceMacroError>> {
     let SourceMacroInvocation {
         registry,
@@ -1455,7 +1456,7 @@ fn expand_syntax_in_scope(
     };
     // Atomic and tactic dispatch belongs to their elaborators. Do not silently
     // ignore a registration that this recursive expansion pass leaves behind.
-    match deferred_candidate(registry, &syntax, runtime_tactics) {
+    match deferred_candidate(registry, &syntax, runtime_macros) {
         Ok(Some(error)) => return Outcome::Complete(Err(error)),
         Ok(None) => {}
         Err(reason) => return Outcome::Inconclusive(reason),
@@ -1536,7 +1537,7 @@ fn frontend<T>(error: EngineExecutionError) -> Outcome<Result<T, SourceMacroErro
 fn deferred_candidate(
     registry: &RegisteredMacros,
     syntax: &Syntax,
-    runtime_tactics: bool,
+    runtime_macros: bool,
 ) -> Result<Option<SourceMacroError>, Inconclusive> {
     let tactic = Name::from_components(["Lean", "Parser", "Term", "byTactic"]);
     let mut pending = vec![(syntax, false)];
@@ -1545,7 +1546,7 @@ fn deferred_candidate(
             Syntax::Node { kind, args, .. } => {
                 let in_tactic = in_tactic || *kind == tactic;
                 if in_tactic
-                    && (!runtime_tactics || *kind == tactic)
+                    && (!runtime_macros || *kind == tactic)
                     && registry.declarations(kind).next().is_some()
                 {
                     return Ok(Some(SourceMacroError::TacticExpansion {
@@ -1564,7 +1565,7 @@ fn deferred_candidate(
             Syntax::Missing => Name::from_components(["missing"]),
             Syntax::Atom { val, .. } => Name::str(Name::anonymous(), val),
         };
-        if !(in_tactic && runtime_tactics) && registry.declarations(&kind).next().is_some() {
+        if !runtime_macros && registry.declarations(&kind).next().is_some() {
             return Ok(Some(SourceMacroError::AtomicExpansion { kind }));
         }
     }

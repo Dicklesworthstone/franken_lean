@@ -376,7 +376,7 @@ fn live_pinned_integer_closures_match_signed_arithmetic_and_exact_native_prototy
         .decls
         .iter()
         .map(|declaration| {
-            let text = declaration.name().to_string();
+            let text = declaration.name().to_display_string();
             assert!(
                 roots.contains(text.split('.').next().unwrap()),
                 "unexpected fixture declaration: {text}"

@@ -76,8 +76,10 @@ pub trait TacticMacroExpander: Send + Sync {
         scope: &SourceScope,
     ) -> Result<TacticMacroExpansion, TacticMacroError>;
 
-    /// Root expansion for a term visited while a tactic is executing. Children
-    /// remain with the native term worklist; by blocks retain tactic dispatch.
+    /// Root expansion at a native term visit. Ordinary source visits dispatch
+    /// atomic syntax here; generated terms also dispatch nodes, since those
+    /// nodes have not passed through the source expansion pass. Children remain
+    /// with the native term worklist; by blocks retain tactic dispatch.
     fn expand_term(
         &self,
         syntax: &Syntax,

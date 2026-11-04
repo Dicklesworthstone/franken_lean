@@ -434,9 +434,9 @@ impl imported::SourceOleanImport {
     ///
     /// This explicit adapter accepts the same registered-macro subset as
     /// `check_source_modules_with_imported_macros`. Owned sessions execute
-    /// imported tactics at native tactic dispatch. Source templates, atomic
-    /// macros outside tactics, and borrowed cancellation overrides at the
-    /// tactic boundary remain explicit capability refusals.
+    /// imported tactics and atomic term macros at their native elaborator
+    /// boundaries. Source templates and borrowed cancellation overrides at
+    /// those runtime boundaries remain explicit capability refusals.
     #[allow(clippy::too_many_arguments)]
     pub fn execute_source_modules_with_imported_macros(
         &self,
