@@ -91,7 +91,7 @@ pub(crate) fn get_matches(
     )
 }
 
-pub(super) fn matches_inventory(
+pub(crate) fn matches_inventory(
     inventory: &str,
     environment: &Environment,
     implementations: &fln_elab::implemented_by::ImplementedByTable,

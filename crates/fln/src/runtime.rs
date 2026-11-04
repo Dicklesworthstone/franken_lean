@@ -54,6 +54,7 @@ pub(super) struct Preparation<'a> {
     // One immutable admitted environment per preparation; cache only successful reads.
     pub(super) externs: Option<fln_elab::externs::ExternTable>,
     implementations: Option<fln_elab::implemented_by::ImplementedByTable>,
+    name_model_checked: bool,
     noncomputable: Option<BTreeSet<Name>>,
     /// `@[macro_inline]` definitions, read once from this immutable environment.
     macro_inline: Option<BTreeSet<Name>>,
@@ -169,6 +170,7 @@ impl<'a> Preparation<'a> {
             visited: 0,
             externs: None,
             implementations: None,
+            name_model_checked: false,
             noncomputable: None,
             macro_inline: None,
             executable_opaques: None,
@@ -230,6 +232,7 @@ impl<'a> Preparation<'a> {
 
     pub(super) fn with_runtime_initializers(mut self, names: &'a BTreeSet<Name>) -> Self {
         self.runtime_initializers = Some(names);
+        self.name_model_checked = false;
         self
     }
 

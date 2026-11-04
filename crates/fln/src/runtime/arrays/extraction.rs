@@ -21,14 +21,19 @@ fn encoded(label: &Name) -> String {
 }
 
 pub(super) fn rows(environment: &Environment) -> Vec<String> {
+    rows_from(
+        environment,
+        ["Array.push", "Array.set", "Array.pop", "Array.modifyM"],
+    )
+}
+
+pub(in crate::runtime) fn rows_from(
+    environment: &Environment,
+    roots: impl IntoIterator<Item = &'static str>,
+) -> Vec<String> {
     let implementations = ImplementedByTable::read(environment).expect("actual pin selections");
     let externs = ExternTable::read(environment).expect("actual pin externs");
-    let mut pending = vec![
-        name("Array.push"),
-        name("Array.set"),
-        name("Array.pop"),
-        name("Array.modifyM"),
-    ];
+    let mut pending: Vec<_> = roots.into_iter().map(name).collect();
     let mut seen = BTreeSet::new();
     let mut seen_expressions = HashSet::new();
     let mut rows = BTreeMap::new();

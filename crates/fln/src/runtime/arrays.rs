@@ -751,6 +751,6 @@ impl Preparation<'_> {
 }
 
 #[cfg(test)]
-mod extraction;
+pub(in crate::runtime) mod extraction;
 #[cfg(test)]
 mod tests;
