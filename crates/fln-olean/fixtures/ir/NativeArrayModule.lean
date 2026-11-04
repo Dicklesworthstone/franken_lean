@@ -122,3 +122,134 @@ public section
 @[noinline] def byteArrayPartialRead (n : Nat) : Nat :=
   let a := (ByteArray.emptyWithCapacity 1).push n.toUInt8
   if h : 0 < a.size then useByteArrayRead a (@ByteArray.get a) h else 0
+
+-- Keep the list/native-array representation boundary visible in compiler IR.
+-- The positional fingerprint observes every payload and the order of swaps.
+@[noinline] def arrayListFingerprint : List Nat → Nat
+  | [] => 0
+  | n :: ns => n + 37 * arrayListFingerprint ns
+
+@[noinline] def arrayFromList (xs : List Nat) : Array Nat := Array.mk xs
+@[noinline] def arrayAsList (xs : Array Nat) : List Nat := xs.toList
+
+@[noinline] def arrayNativeListRoundTrip (n : Nat) : Nat :=
+  let source := [n, n + 1, n + 2]
+  let original := arrayFromList source
+  let changed := original.pop
+  arrayListFingerprint source + 2 * arrayListFingerprint (arrayAsList original) +
+    3 * arrayListFingerprint (arrayAsList changed)
+
+@[noinline] def arrayNativePopEmpty (n : Nat) : Nat :=
+  let original := Array.replicate n 7
+  let changed := original.pop
+  original.size + 10 * changed.size
+
+@[noinline] def arrayNativeSwap (n : Nat) : Nat :=
+  let original := arrayFromList [n, n + 1, n + 2]
+  if hi : 0 < original.size then
+    if hj : 2 < original.size then
+      let changed := original.swap 0 2 hi hj
+      arrayListFingerprint (arrayAsList original) +
+        2 * arrayListFingerprint (arrayAsList changed)
+    else 0
+  else 0
+
+@[noinline] def arrayNativeSwapIfInBounds (n : Nat) : Nat :=
+  let original := arrayFromList [11, 23, 47]
+  let changed := original.swapIfInBounds (n * n) 0
+  arrayListFingerprint (arrayAsList original) +
+    2 * arrayListFingerprint (arrayAsList changed)
+
+@[noinline, nospecialize] def useArrayFromList (build : List Nat → Array Nat) (n : Nat) : Nat :=
+  let first := build [n, n + 1]
+  let second := build []
+  arrayListFingerprint (arrayAsList first) + second.size
+
+@[noinline] def arrayPartialFromList (n : Nat) : Nat :=
+  useArrayFromList (@Array.mk Nat) n
+
+@[noinline, nospecialize] def useArrayToList (convert : Array Nat → List Nat) (n : Nat) : Nat :=
+  let original := arrayFromList [n, n + 1]
+  let first := convert original
+  let second := convert original
+  arrayListFingerprint first + 2 * arrayListFingerprint second + original.size
+
+@[noinline] def arrayPartialToList (n : Nat) : Nat :=
+  useArrayToList (@Array.toList Nat) n
+
+@[noinline, nospecialize] def useArrayPop (pop : Array Nat → Array Nat) (n : Nat) : Nat :=
+  let original := arrayFromList [n, n + 1, n + 2]
+  let first := pop original
+  let second := pop original
+  arrayListFingerprint (arrayAsList original) +
+    2 * arrayListFingerprint (arrayAsList first) +
+    3 * arrayListFingerprint (arrayAsList second)
+
+@[noinline] def arrayPartialPop (n : Nat) : Nat :=
+  useArrayPop (@Array.pop Nat) n
+
+@[noinline, nospecialize] def useArraySwap (a : Array Nat)
+    (swap : (i j : Nat) → i < a.size → j < a.size → Array Nat)
+    (hi : 0 < a.size) (hj : 2 < a.size) : Nat :=
+  let first := swap 0 2 hi hj
+  let second := swap 2 0 hj hi
+  arrayListFingerprint (arrayAsList a) +
+    2 * arrayListFingerprint (arrayAsList first) +
+    3 * arrayListFingerprint (arrayAsList second)
+
+@[noinline] def arrayPartialSwap (n : Nat) : Nat :=
+  let a := arrayFromList [n, n + 1, n + 2]
+  if hi : 0 < a.size then
+    if hj : 2 < a.size then useArraySwap a (@Array.swap Nat a) hi hj else 0
+  else 0
+
+-- This closure has captured every runtime operand while BOTH erased proofs
+-- remain pending. They must be consumed before the native swap is invoked.
+@[noinline, nospecialize] def useArraySwapProofs (a : Array Nat)
+    (finish : 0 < a.size → 2 < a.size → Array Nat)
+    (hi : 0 < a.size) (hj : 2 < a.size) : Nat :=
+  let first := finish hi hj
+  let second := finish hi hj
+  arrayListFingerprint (arrayAsList a) +
+    2 * arrayListFingerprint (arrayAsList first) +
+    3 * arrayListFingerprint (arrayAsList second)
+
+@[noinline] def arrayPartialSwapProofs (n : Nat) : Nat :=
+  let a := arrayFromList [n, n + 1, n + 2]
+  if hi : 0 < a.size then
+    if hj : 2 < a.size then useArraySwapProofs a (@Array.swap Nat a 0 2) hi hj else 0
+  else 0
+
+@[noinline, nospecialize] def useArraySwapIfInBounds
+    (swap : Nat → Nat → Array Nat) (n : Nat) : Nat :=
+  let first := swap 0 2
+  let second := swap (n * n) 0
+  arrayListFingerprint (arrayAsList first) +
+    2 * arrayListFingerprint (arrayAsList second)
+
+@[noinline] def arrayPartialSwapIfInBounds (n : Nat) : Nat :=
+  let a := arrayFromList [11, 23, 47]
+  useArraySwapIfInBounds (a.swapIfInBounds) n + arrayListFingerprint (arrayAsList a)
+
+@[noinline] def arrayNativeHeapSwap (n : Nat) : Nat :=
+  letI : Inhabited (Array Nat) := ⟨#[]⟩
+  let original : Array (Array Nat) := Array.mk [#[n], #[n + 1]]
+  if hi : 0 < original.size then
+    if hj : 1 < original.size then
+      let changed := original.swap 0 1 hi hj
+      let shorter := changed.pop
+      original[0]![0]! + 2 * changed[0]![0]! + 3 * shorter[0]![0]!
+    else 0
+  else 0
+
+-- Array.reverse and its loop come from the actual pinned library IR, with
+-- their library-code classification authenticated by the complete partition.
+@[noinline] def arrayLibraryReverse (n : Nat) : Nat :=
+  let original := arrayFromList [n, n + 1, n + 2, n + 3]
+  let changed := original.reverse
+  arrayListFingerprint (arrayAsList original) +
+    2 * arrayListFingerprint (arrayAsList changed)
+
+@[noinline] def arrayLibraryReverseSmall (n : Nat) : Nat :=
+  let original := Array.replicate n 7
+  original.reverse.size

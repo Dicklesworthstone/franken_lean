@@ -43,7 +43,7 @@ impl BoxedNative {
                 operands: ErasedOperands {
                     runtime: signature.parameters.len(),
                     type_prefix: false,
-                    proof_suffix: false,
+                    proof_suffix: 0,
                 },
                 parameters: signature.parameters,
                 result: signature.result,
@@ -58,7 +58,7 @@ impl BoxedNative {
             Some(ErasedOperands {
                 runtime,
                 type_prefix: true,
-                proof_suffix: false,
+                proof_suffix: 0,
             })
         } else {
             array_proofs::erased_operands(row)?
@@ -71,6 +71,13 @@ impl BoxedNative {
         // The ABI row alone cannot distinguish Object/TObject/Tagged or
         // identify which scalar carrier the compiler must box.
         let (parameters, result): (&'static [IrType], &'static IrType) = match row.id {
+            "extern:Array.mk" => (&[IrType::TObject], &IrType::Object),
+            "extern:Array.toList" => (&[IrType::Object], &IrType::TObject),
+            "extern:Array.pop" => (&[IrType::Object], &IrType::Object),
+            "extern:Array.swap" | "extern:Array.swapIfInBounds" => (
+                &[IrType::Object, IrType::TObject, IrType::TObject],
+                &IrType::Object,
+            ),
             "extern:Array.mkEmpty" | "extern:Array.emptyWithCapacity" => {
                 (&[IrType::TObject], &IrType::Object)
             }
@@ -127,9 +134,7 @@ impl BoxedNative {
     }
 
     pub(in crate::imported_ir) fn arity(self) -> usize {
-        self.operands.runtime
-            + usize::from(self.operands.type_prefix)
-            + usize::from(self.operands.proof_suffix)
+        self.operands.runtime + usize::from(self.operands.type_prefix) + self.operands.proof_suffix
     }
 
     pub(in crate::imported_ir) fn runtime_parameters(self) -> std::ops::Range<usize> {

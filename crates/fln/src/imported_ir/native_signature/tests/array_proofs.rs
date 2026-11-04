@@ -582,6 +582,7 @@ fn proof_bridges_bind_generated_metadata_and_keep_explicit_externs_native() {
 
     for id in [
         "extern:Array.getInternal",
+        "extern:Array.swap",
         "extern:Array.ugetBorrowed",
         "extern:ByteArray.set",
     ] {

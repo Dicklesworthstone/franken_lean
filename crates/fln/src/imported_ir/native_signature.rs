@@ -23,7 +23,7 @@ pub(super) use boxed::{BoxedNative, boxed_row};
 struct ErasedOperands {
     runtime: usize,
     type_prefix: bool,
-    proof_suffix: bool,
+    proof_suffix: usize,
 }
 
 /// The pin retains literal erased types and bounds proofs on reviewed direct
@@ -51,7 +51,7 @@ pub(super) fn erase_type_arguments(
             Some(ErasedOperands {
                 runtime,
                 type_prefix: true,
-                proof_suffix: false,
+                proof_suffix: 0,
             })
         } else {
             array_proofs::erased_operands(row)?
@@ -92,17 +92,16 @@ pub(super) fn erase_type_arguments(
                         if args.len() == bridge.runtime {
                             continue;
                         }
-                        let erased =
-                            usize::from(bridge.type_prefix) + usize::from(bridge.proof_suffix);
+                        let erased = usize::from(bridge.type_prefix) + bridge.proof_suffix;
                         if args.len() != bridge.runtime + erased
                             || (bridge.type_prefix && args.first() != Some(&IrArg::Erased))
-                            || (bridge.proof_suffix && args.last() != Some(&IrArg::Erased))
+                            || args[args.len() - bridge.proof_suffix..]
+                                .iter()
+                                .any(|argument| argument != &IrArg::Erased)
                         {
                             return Err(unsupported(name, "unreviewed native erased operand"));
                         }
-                        if bridge.proof_suffix {
-                            args.pop();
-                        }
+                        args.truncate(args.len() - bridge.proof_suffix);
                         if bridge.type_prefix {
                             args.remove(0);
                         }
@@ -112,7 +111,7 @@ pub(super) fn erase_type_arguments(
                         ..
                     } if bridges.get(function).is_some_and(|bridge| {
                         (bridge.type_prefix && args.first() == Some(&IrArg::Erased))
-                            || (bridge.proof_suffix
+                            || (bridge.proof_suffix != 0
                                 && (args.len() > bridge.runtime || args.contains(&IrArg::Erased)))
                     }) =>
                     {
@@ -135,6 +134,46 @@ pub(super) fn erase_type_arguments(
 
 fn erased_type_runtime_arity(row: &GeneratedExternRow) -> Result<Option<usize>, IrExecutionError> {
     let (name, symbol, module, kind, levels, runtime, ownership, safety) = match row.id {
+        "extern:Array.mk" => (
+            "Array.mk",
+            "lean_array_mk",
+            "Init.Prelude",
+            "ctor",
+            1,
+            1,
+            "abi((l: owned_arg) -> raw_object)",
+            "safe",
+        ),
+        "extern:Array.toList" => (
+            "Array.toList",
+            "lean_array_to_list",
+            "Init.Prelude",
+            "defn",
+            1,
+            1,
+            "abi((a: owned_arg) -> raw_object)",
+            "safe",
+        ),
+        "extern:Array.pop" => (
+            "Array.pop",
+            "lean_array_pop",
+            "Init.Data.Array.Basic",
+            "defn",
+            1,
+            1,
+            "abi((a: owned_arg) -> raw_object)",
+            "safe",
+        ),
+        "extern:Array.swapIfInBounds" => (
+            "Array.swapIfInBounds",
+            "lean_array_swap",
+            "Init.Data.Array.Basic",
+            "defn",
+            1,
+            3,
+            "abi((a: owned_arg, i: borrowed_arg, j: borrowed_arg) -> raw_object)",
+            "safe",
+        ),
         "extern:Array.emptyWithCapacity" => (
             "Array.emptyWithCapacity",
             "lean_mk_empty_array_with_capacity",
