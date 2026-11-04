@@ -488,21 +488,31 @@ fn authorize(
     }
 }
 
-// A compiler-generated reduced-arity body has no census row of its own.
-// Inherit only from a library declaration whose actual IR is the exact
-// erased-prefix forwarding wrapper. Select that wrapper too, so it receives
-// ordinary structural/type validation rather than becoming trusted metadata.
-fn reduced_arity_origin(
+// Compiler-generated reduced-arity bodies and closed values have no census
+// rows of their own. Inherit only through an exact erased-parameter library
+// forwarder. Closed values additionally require the pin's persistent return
+// increment (e.g. Init.Prelude's Array.empty). Select the owner too, so both
+// declarations receive ordinary structural/type validation.
+fn library_forwarding_origin(
     partition: &VerifiedPartition,
     declarations: &BTreeMap<Name, &IrDecl>,
     name: &Name,
     limits: IrExecutionLimits,
 ) -> Option<Name> {
+    use fln_core::name::LeafView;
     use fln_olean::ir::{IrArg, IrExpr};
     let origin = name.parent();
-    if Name::str(origin.clone(), "_redArg") != *name
+    let reduced = Name::str(origin.clone(), "_redArg") == *name;
+    let closed = matches!(name.leaf_view(), LeafView::Str(component)
+    if component.strip_prefix("_closed_").is_some_and(|index| {
+        !index.is_empty()
+            && (index == "0" || !index.starts_with('0'))
+            && index.bytes().all(|byte| byte.is_ascii_digit())
+    }));
+    if !(reduced || closed)
         || partition.classify(&origin) != Some(GraphClass::LibraryCode)
         || native_row(&origin).is_some()
+        || native_signature::boxed_row(&origin).is_some()
         || fln_vm::macro_native::row_for_name(&origin).is_some()
     {
         return None;
@@ -527,7 +537,9 @@ fn reduced_arity_origin(
         return None;
     };
     if original.len() as u64 > limits.ir.max_work
-        || params.len() >= original.len()
+        || params.len() > original.len()
+        || (reduced && params.len() == original.len())
+        || (closed && !params.is_empty())
         || check_type(name, result).is_err()
         || check_type(&origin, original_result).is_err()
         || result != original_result
@@ -547,19 +559,31 @@ fn reduced_arity_origin(
     {
         return None;
     }
-    let [
-        IrStmt::VDecl {
-            x,
-            ty,
-            expr: IrExpr::Fap { function, args },
-        },
-    ] = body.stmts.as_slice()
+    let (call, retained) = match body.stmts.as_slice() {
+        [call] if reduced => (call, None),
+        [
+            call,
+            IrStmt::Inc {
+                x,
+                n: 1,
+                checked: false,
+                persistent: true,
+            },
+        ] if closed => (call, Some(*x)),
+        _ => return None,
+    };
+    let IrStmt::VDecl {
+        x,
+        ty,
+        expr: IrExpr::Fap { function, args },
+    } = call
     else {
         return None;
     };
     if check_type(&origin, ty).is_err()
         || ty != result
         || function != name
+        || retained.is_some_and(|retained| retained != *x)
         || args.len() != params.len()
         || !args
             .iter()
@@ -839,7 +863,8 @@ fn compile_with_policy(
         }
         if let Err(error) = authorize(partition, user_declarations, &name) {
             if matches!(error, IrExecutionError::Unclassified(_))
-                && let Some(origin) = reduced_arity_origin(partition, &declarations, &name, limits)
+                && let Some(origin) =
+                    library_forwarding_origin(partition, &declarations, &name, limits)
             {
                 pending.insert(origin);
             } else {

@@ -401,6 +401,199 @@ fn library_reduced_arity_helpers_need_a_checked_erased_prefix_forwarder() {
 }
 
 #[test]
+fn library_closed_values_require_a_checked_persistent_return_forwarder() {
+    let fixture = |owner: &str, suffix: &str| {
+        let target = Name::str(name(owner), suffix);
+        let mut helper = function(
+            "unused",
+            0,
+            vec![binding(1, IrExpr::Lit(IrLit::Num(IrNat::Small(42))))],
+            IrArg::Var(1),
+        );
+        let IrDecl::Function { name, .. } = &mut helper else {
+            unreachable!()
+        };
+        *name = target.clone();
+        let mut wrapper = function(
+            owner,
+            1,
+            vec![
+                binding(
+                    2,
+                    IrExpr::Fap {
+                        function: target,
+                        args: vec![],
+                    },
+                ),
+                IrStmt::Inc {
+                    x: 2,
+                    n: 1,
+                    checked: false,
+                    persistent: true,
+                },
+            ],
+            IrArg::Var(2),
+        );
+        let IrDecl::Function { params, .. } = &mut wrapper else {
+            unreachable!()
+        };
+        params[0].ty = IrType::Erased;
+        params[0].borrow = false;
+        (wrapper, helper)
+    };
+    let prepare = |wrapper: IrDecl, helper: IrDecl, policy: &VerifiedPartition| {
+        let entry = helper.name().clone();
+        compile(
+            &[module(vec![wrapper, helper])],
+            &entry,
+            &[],
+            policy,
+            &BTreeSet::new(),
+            IrExecutionLimits::default(),
+        )
+    };
+    let policy = bounded_partition(&[("Library.constant", "library-code")]);
+    let (wrapper, helper) = fixture("Library.constant", "_closed_0");
+    let compiled = prepare(wrapper.clone(), helper.clone(), &policy).unwrap();
+    assert_eq!(returned(&compiled), "42");
+    assert_eq!(compiled.reference_functions().len(), 2);
+    assert!(
+        compiled
+            .reference_functions()
+            .iter()
+            .any(|f| f.name == name("Library.constant"))
+    );
+    // A constant owner may have no erased type arguments at all.
+    let mut no_arguments = wrapper.clone();
+    let IrDecl::Function { params, .. } = &mut no_arguments else {
+        unreachable!()
+    };
+    params.clear();
+    assert_eq!(
+        returned(&prepare(no_arguments, helper.clone(), &policy).unwrap()),
+        "42"
+    );
+    for mutation in 0..12 {
+        let mut changed = wrapper.clone();
+        let IrDecl::Function {
+            params,
+            result,
+            body,
+            sorry_dep,
+            ..
+        } = &mut changed
+        else {
+            unreachable!()
+        };
+        match mutation {
+            0 => params[0].ty = IrType::TObject,
+            1 => params[0].borrow = true,
+            2 => *result = IrType::Tagged,
+            3 => *sorry_dep = Some(name("sorryAx")),
+            4 => *body.terminal = IrTerminal::Ret(IrArg::Var(1)),
+            5 => {
+                body.stmts.pop();
+            }
+            6..=9 => {
+                let IrStmt::Inc {
+                    x,
+                    n,
+                    checked,
+                    persistent,
+                } = &mut body.stmts[1]
+                else {
+                    unreachable!()
+                };
+                match mutation {
+                    6 => *x = 1,
+                    7 => *n = 2,
+                    8 => *checked = true,
+                    _ => *persistent = false,
+                }
+            }
+            _ => {
+                let IrStmt::VDecl {
+                    expr: IrExpr::Fap { function, args },
+                    ..
+                } = &mut body.stmts[0]
+                else {
+                    unreachable!()
+                };
+                if mutation == 10 {
+                    args.push(IrArg::Erased);
+                } else {
+                    *function = name("Library.constant._closed_1");
+                }
+            }
+        }
+        assert!(
+            matches!(
+                prepare(changed, helper.clone(), &policy),
+                Err(IrExecutionError::Unclassified(_))
+            ),
+            "mutation {mutation}"
+        );
+    }
+    for suffix in [
+        "_closed_",
+        "_closed_00",
+        "_closed_+0",
+        "_closed_0.extra",
+        "unrelated",
+    ] {
+        let (wrapper, helper) = fixture("Library.constant", suffix);
+        assert!(matches!(
+            prepare(wrapper, helper, &policy),
+            Err(IrExecutionError::Unclassified(_))
+        ));
+    }
+    for class in ["toolchain-api", "user-facing-data"] {
+        let denied = bounded_partition(&[("Library.constant", class)]);
+        assert!(prepare(wrapper.clone(), helper.clone(), &denied).is_err());
+    }
+    for owner in ["Nat.add", "Nat.add._boxed", "Lean.addMacroScope"] {
+        let (wrapper, helper) = fixture(owner, "_closed_0");
+        let native = bounded_partition(&[(owner, "library-code")]);
+        assert!(prepare(wrapper, helper, &native).is_err(), "{owner}");
+    }
+    for mutation in 0..3 {
+        let mut changed = helper.clone();
+        let IrDecl::Function {
+            params,
+            result,
+            sorry_dep,
+            ..
+        } = &mut changed
+        else {
+            unreachable!()
+        };
+        match mutation {
+            0 => params.push(IrParam {
+                x: 9,
+                ty: IrType::Erased,
+                borrow: false,
+            }),
+            1 => *result = IrType::Tagged,
+            _ => *sorry_dep = Some(name("sorryAx")),
+        }
+        assert!(matches!(
+            prepare(wrapper.clone(), changed, &policy),
+            Err(IrExecutionError::Unclassified(_))
+        ));
+    }
+    // Selection must retain and validate the owner, even when entry is the helper.
+    let mut duplicate_binding = wrapper;
+    let IrDecl::Function { params, .. } = &mut duplicate_binding else {
+        unreachable!()
+    };
+    params[0].x = 2;
+    assert!(matches!(
+        prepare(duplicate_binding, helper, &policy),
+        Err(IrExecutionError::IrValidation(_))
+    ));
+}
+
+#[test]
 fn native_rows_override_forged_input_bodies() {
     let forged = function(
         "Nat.add",
