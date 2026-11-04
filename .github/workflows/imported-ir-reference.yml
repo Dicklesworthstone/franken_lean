@@ -18,7 +18,9 @@ on:
       - 'crates/fln/tests/source_imported_macros.rs'
       - 'crates/fln/tests/source_imported_atomic_macros.rs'
       - 'crates/fln/tests/source_imported_syntax_methods.rs'
+      - 'crates/fln/tests/source_grind.rs'
       - 'crates/fln/tests/source_grind/**'
+      - 'crates/fln/src/source_records/equation_theorems.rs'
       - 'crates/fln-elab/src/**'
       - 'crates/fln-rt/src/**'
       - 'crates/fln-vm/src/**'
@@ -32,7 +34,7 @@ permissions:
 jobs:
   verify:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 60
     env:
       CARGO_TERM_COLOR: never
       CARGO_INCREMENTAL: '0'
@@ -55,6 +57,12 @@ jobs:
           git rev-parse 'HEAD^{tree}' > target/imported-ir-reference/tree.txt
           rustup show active-toolchain
           rustc -Vv > target/imported-ir-reference/rustc.txt
+      - name: Check native Syntax runtime
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test --locked -p fln-vm --lib macro_native -- --nocapture \
+            2>&1 | tee target/imported-ir-reference/macro-vm.log
       - name: Install the SUITE.lock Reference for test-only code generation
         shell: bash
         run: |
@@ -93,22 +101,19 @@ jobs:
           status=0
           cargo test --locked -p fln --lib imported_ir:: -- --nocapture \
             2>&1 | tee target/imported-ir-reference/tests.log || status=1
+          cargo test --locked -p fln --test source_imported_syntax_methods -- --nocapture \
+            2>&1 | tee target/imported-ir-reference/syntax-methods.log || status=1
+          cargo test --locked -p fln --test source_grind \
+            definitions::definition_equations_match_pinned_lean -- --exact --nocapture --test-threads=1 \
+            2>&1 | tee target/imported-ir-reference/grind-definitions.log || status=1
           cargo test --locked -p fln --lib imported_macros:: -- --nocapture \
             2>&1 | tee target/imported-ir-reference/macros.log || status=1
           cargo test --locked --no-fail-fast -p fln \
-            --test source_imported_macros --test source_imported_atomic_macros \
-            --test source_imported_syntax_methods -- --nocapture \
+            --test source_imported_macros --test source_imported_atomic_macros -- --nocapture \
             2>&1 | tee target/imported-ir-reference/source-macros.log || status=1
           cargo test --locked -p fln --test source_grind \
             modifiers::selected_theorem_directions_match_the_live_pin -- --exact --nocapture \
             2>&1 | tee target/imported-ir-reference/grind-modifiers.log || status=1
-          cargo test --locked -p fln --test source_grind \
-            definitions::definition_equations_match_pinned_lean -- --exact --nocapture --test-threads=1 \
-            2>&1 | tee target/imported-ir-reference/grind-definitions.log || status=1
-          cargo test --locked -p fln-cli --test source_olean_imports -- --nocapture \
-            2>&1 | tee target/imported-ir-reference/cli-macros.log || status=1
-          cargo test --locked -p fln-vm --lib macro_native -- --nocapture \
-            2>&1 | tee target/imported-ir-reference/macro-vm.log || status=1
           python3 -I -S scripts/extract/gen_macro_runtime_contract.py \
             --lean "$FLN_REFERENCE_LEAN" --check \
             2>&1 | tee target/imported-ir-reference/macro-contract.log || status=1
@@ -116,6 +121,13 @@ jobs:
             2>&1 | tee target/imported-ir-reference/clippy.log || status=1
           files=(crates/fln/src/imported_ir/constructor_updates.rs
             crates/fln/src/lib.rs
+            crates/fln/src/imported_ir/native_signature.rs
+            crates/fln/src/source_records/equation_theorems.rs
+            crates/fln/tests/source_imported_syntax_methods.rs
+            crates/fln/tests/source_grind.rs
+            crates/fln-elab/src/source/equation_theorems.rs
+            crates/fln-elab/src/source/tactics/grind.rs
+            crates/fln-elab/src/source/tactics/grind/quantifiers.rs
             crates/fln/src/source_check/modules.rs
             crates/fln/src/source_check/modules/imported.rs
             crates/fln/src/source_check/modules/execution.rs
@@ -133,6 +145,10 @@ jobs:
           while IFS= read -r path; do files+=("$path"); done < <(
             git ls-files 'crates/fln/src/imported_ir/constructor_updates/*.rs' \
               'crates/fln/src/imported_ir/constructor_updates/**/*.rs' \
+              'crates/fln/src/imported_ir/native_signature/*.rs' \
+              'crates/fln/src/imported_ir/native_signature/**/*.rs' \
+              'crates/fln/tests/source_grind/*.rs' \
+              'crates/fln/tests/source_grind/**/*.rs' \
               'crates/fln/src/imported_macros/*.rs' \
               'crates/fln/src/imported_macros/**/*.rs' \
               'crates/fln-vm/src/interpreter/macro_native/**/*.rs')
@@ -146,6 +162,8 @@ jobs:
             cp "$path" "$copy"
             rustfmt --edition 2024 --config skip_children=true "$copy" || status=1
           done
+          cargo test --locked -p fln-cli --test source_olean_imports -- --nocapture \
+            2>&1 | tee target/imported-ir-reference/cli-macros.log || status=1
           exit "$status"
       - name: Retain exact generated artifacts and verification logs
         if: always()
