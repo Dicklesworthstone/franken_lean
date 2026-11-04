@@ -461,6 +461,10 @@ impl Quantifiers {
             self.tick(context)?;
             pattern = expr;
         }
+        // Keep the ground spelling for theorem application: reducing a
+        // dictionary projection can hide arithmetic from the theory hook.
+        // Matching and the instance's domain check retain checked conversion.
+        let original_ground = ground;
         let ground = normalize(context, ground)?;
         let ground = &ground;
         if let Some(index) = parameter_at(&theorem.parameters, pattern) {
@@ -472,7 +476,7 @@ impl Quantifiers {
                 });
             }
             let mut substitution = substitution;
-            substitution.terms[index] = Some(ground.clone());
+            substitution.terms[index] = Some(original_ground.clone());
             return Ok(vec![substitution]);
         }
         let Some(found) = variables(context, &theorem.parameters, pattern)? else {

@@ -517,6 +517,14 @@ const REFUSE: &[(&str, &str)] = &[
         "arithmetic_predicate_custom_add",
         "def customAdd : Add Nat := ⟨fun left _ => left⟩\nexample (P : Nat → Prop) (n : Nat) (h : P (@HAdd.hAdd Nat Nat Nat (@instHAdd Nat customAdd) n 1)) : P (@HAdd.hAdd Nat Nat Nat (@instHAdd Nat customAdd) 1 n) := by grind",
     ),
+    (
+        "arithmetic_quantified_predicate_unequal_arguments",
+        "example (P Q : Nat → Prop) (n : Nat) (h : P (n + 1)) (step : ∀ x, P x → Q x) : Q (2 + n) := by grind",
+    ),
+    (
+        "arithmetic_quantified_predicate_custom_add",
+        "def grindQuantifiedCustomAdd : Add Nat := ⟨fun left _ => left⟩\nexample (P Q : Nat → Prop) (n : Nat) (h : P (@HAdd.hAdd Nat Nat Nat (@instHAdd Nat grindQuantifiedCustomAdd) n 1)) (step : ∀ x, P x → Q x) : Q (1 + n) := by grind",
+    ),
 ];
 
 // A semicolon belongs to try's tactic sequence; a separate line follows try.
