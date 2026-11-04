@@ -102,6 +102,9 @@ jobs:
           cargo test --locked -p fln --test source_grind \
             modifiers::selected_theorem_directions_match_the_live_pin -- --exact --nocapture \
             2>&1 | tee target/imported-ir-reference/grind-modifiers.log || status=1
+          cargo test --locked -p fln --test source_grind \
+            definitions::definition_equations_match_pinned_lean -- --exact --nocapture --test-threads=1 \
+            2>&1 | tee target/imported-ir-reference/grind-definitions.log || status=1
           cargo test --locked -p fln-cli --test source_olean_imports -- --nocapture \
             2>&1 | tee target/imported-ir-reference/cli-macros.log || status=1
           cargo test --locked -p fln-vm --lib macro_native -- --nocapture \

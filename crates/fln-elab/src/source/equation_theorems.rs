@@ -1073,7 +1073,7 @@ impl Context {
 pub enum Request {
     /// `f.eq_<n>`, `f.eq_def` or `f.eq_unfold`, by its full name.
     Name(Name),
-    /// All of `f`'s equations, as `rw [f]` asks (`getEqnsFor?`).
+    /// All of `f`'s equations, as `rw [f]` and `grind [f]` ask (`getEqnsFor?`).
     Equations(Name),
 }
 
@@ -1086,7 +1086,8 @@ fn equation_like_leaf(name: &Name) -> bool {
 
 /// The equation theorems `syntax` refers to that are not generated yet, in source order: each
 /// identifier that resolves in `scope` to an equation-like name of a definition, and each
-/// `rw [f]`/`rewrite [f]` rule naming a definition. The pin generates them when it resolves
+/// `rw [f]`/`rewrite [f]` rule or `grind [f]` parameter naming a definition.
+/// The pin generates them when it resolves
 /// the name (its reserved-name action); a reference later elaborated as a local still asks
 /// here, so this may ask for more than the pin generates, never less.
 pub fn requests(
@@ -1098,6 +1099,7 @@ pub fn requests(
     let mut context = Context::scoped(env, kernel, scope);
     let declaration_id = parser_kind(&["Command", "declId"]);
     let rewrite_rule = parser_kind(&["Tactic", "rwRule"]);
+    let grind_lemma = parser_kind(&["Tactic", "grindLemma"]);
     let explicit = parser_kind(&["Term", "explicit"]);
     let mut found: Vec<Request> = Vec::new();
     let mut pending: Vec<&Syntax> = syntaxes.iter().rev().copied().collect();
@@ -1118,11 +1120,12 @@ pub fn requests(
             }
             Syntax::Node { kind, .. } if kind == &declaration_id => {}
             Syntax::Node { kind, args, .. } => {
-                if kind == &rewrite_rule
+                if (kind == &rewrite_rule || kind == &grind_lemma)
                     && let [_, term] = args.as_slice()
                 {
                     let ident = match term {
-                        Syntax::Node { kind, args, .. } if kind == &explicit && args.len() == 2 => {
+                        Syntax::Node { kind: term_kind, args, .. }
+                            if kind == &rewrite_rule && term_kind == &explicit && args.len() == 2 => {
                             &args[1]
                         }
                         _ => term,
@@ -1131,7 +1134,11 @@ pub fn requests(
                         && let (Some(resolved), _) = context.resolve_unambiguous_identifier_name(ident)?
                         && safe_definition(env, &resolved).is_some()
                         && !is_matcher_name(&resolved)
-                        && !equations_generated(env, &resolved)
+                        // Rechecking a selected definition's existing family
+                        // also validates its recorded equation provenance;
+                        // an arbitrary declaration called `f.eq_1` is not an
+                        // equation producer.
+                        && (kind == &grind_lemma || !equations_generated(env, &resolved))
                     {
                         found.push(Request::Equations(resolved));
                     }

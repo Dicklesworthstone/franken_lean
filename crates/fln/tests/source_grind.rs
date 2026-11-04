@@ -14,6 +14,8 @@ use fln_elab::arithmetic::{
 use fln_elab::source::{SourceInferenceError, scope::SourceScope};
 use std::{collections::BTreeSet, path::Path, process::Command};
 
+#[path = "source_grind/definitions.rs"]
+mod definitions;
 #[path = "source_grind/existentials.rs"]
 mod existentials;
 #[path = "source_grind/modifiers.rs"]

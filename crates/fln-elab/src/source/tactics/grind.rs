@@ -964,58 +964,33 @@ impl Context {
         Ok(terms)
     }
 
-    fn grind_lemma(&mut self, syntax: &Syntax) -> Result<(Typed, Vec<Name>), Error> {
+    fn grind_global_lemma(&mut self, resolved: &Name) -> Result<(Typed, Vec<Name>), Error> {
+        let info = self
+            .txn
+            .env
+            .find(resolved)
+            .cloned()
+            .ok_or_else(unsupported)?;
+        if !matches!(
+            info,
+            fln_env::constants::ConstantInfo::Thm(_)
+                | fln_env::constants::ConstantInfo::Axiom(_)
+                | fln_env::constants::ConstantInfo::Ctor(_)
+        ) {
+            return Err(unsupported());
+        }
+        let base = info.constant_val();
         let mut level_params = Vec::new();
-        let evidence = if let Syntax::Ident { val, .. } = syntax {
-            // Bare local names are redundant parameters at the pin, which
-            // already activates quantified hypotheses automatically.
-            if self.txn.lctx.find_by_user_name(val).is_some() {
-                return Err(unsupported());
-            }
-            let resolved = self
-                .resolve_source_name(val)?
-                .ok_or_else(|| failure(SourceInferenceError::UnknownConstant(val.clone())))?;
-            let info = self
-                .txn
-                .env
-                .find(&resolved)
-                .cloned()
-                .ok_or_else(unsupported)?;
-            if !matches!(
-                info,
-                fln_env::constants::ConstantInfo::Thm(_)
-                    | fln_env::constants::ConstantInfo::Axiom(_)
-                    | fln_env::constants::ConstantInfo::Ctor(_)
-            ) {
-                // Definition selections need their equation theorem producer.
-                return Err(unsupported());
-            }
-            let base = info.constant_val();
-            for _ in &base.level_params {
-                // These names belong to this matching template, never to the
-                // caller's universe context. Every one must be instantiated
-                // from the selected ground applications before proof use.
-                level_params.push(self.fresh_name()?);
-            }
-            let levels: Vec<_> = level_params.iter().cloned().map(Level::param).collect();
-            Typed {
-                value: Expr::const_(resolved, levels.clone()),
-                type_: self.instantiate_params(&base.type_, &base.level_params, &levels)?,
-            }
-        } else {
-            // As for rewrite/simp, do not re-enter the proof driver through a
-            // syntax client while this proof worklist frame is active.
-            let mut pending = vec![syntax];
-            while let Some(term) = pending.pop() {
-                self.tick()?;
-                if let Syntax::Node { kind, args, .. } = term {
-                    if kind == &parser_kind(&["Term", "byTactic"]) {
-                        return Err(unsupported());
-                    }
-                    pending.extend(args);
-                }
-            }
-            self.term(syntax, None)?
+        for _ in &base.level_params {
+            // These names belong to this matching template, never to the
+            // caller's universe context. Every one must be instantiated
+            // from the selected ground applications before proof use.
+            level_params.push(self.fresh_name()?);
+        }
+        let levels: Vec<_> = level_params.iter().cloned().map(Level::param).collect();
+        let evidence = Typed {
+            value: Expr::const_(resolved.clone(), levels.clone()),
+            type_: self.instantiate_params(&base.type_, &base.level_params, &levels)?,
         };
         let evidence = Typed {
             value: normalize(self, &evidence.value)?,
@@ -1025,6 +1000,91 @@ impl Context {
             return Err(unsupported());
         }
         Ok((evidence, level_params))
+    }
+
+    /// A selected definition contributes its admitted equations, each with its
+    /// left-hand side as a trigger. The source command stream realizes those
+    /// equations through both checker seats before this tactic can read them.
+    fn grind_definition_equations(
+        &mut self,
+        syntax: &Syntax,
+        modifier: Option<PatternKind>,
+    ) -> Result<Option<Vec<Name>>, Error> {
+        let Syntax::Ident { val, .. } = syntax else {
+            return Ok(None);
+        };
+        if self.txn.lctx.find_by_user_name(val).is_some() {
+            return Ok(None);
+        }
+        let (Some(resolved), explicit_target) = self.resolve_unambiguous_identifier_name(syntax)?
+        else {
+            return Ok(None);
+        };
+        if !explicit_target && self.txn.lctx.find_by_user_name(&resolved).is_some() {
+            return Ok(None);
+        }
+        let Some(fln_env::constants::ConstantInfo::Defn(definition)) = self.txn.env.find(&resolved)
+        else {
+            return Ok(None);
+        };
+        if definition.safety != fln_env::constants::DefinitionSafety::Safe {
+            return Err(unsupported());
+        }
+        let reducibility = crate::reducibility::table(&self.txn.env).map_err(|problem| {
+            failure(SourceInferenceError::Unification(Box::new(
+                UnificationError::Reducibility(problem),
+            )))
+        })?;
+        if reducibility.get(&resolved).map_or(
+            definition.hints == fln_env::constants::ReducibilityHints::Abbrev,
+            |status| status == crate::reducibility::Reducibility::Reducible,
+        ) || !matches!(
+            modifier,
+            None | Some(PatternKind::Default | PatternKind::EqualityLeft)
+        ) {
+            // At the pin, reducible definitions are already unfolded and an
+            // explicit definition selection accepts only `=` or default.
+            return Err(unsupported());
+        }
+        let Some((_, equations)) = self.rewrite_rule_equations(syntax)? else {
+            return Err(unsupported());
+        };
+        Ok(Some(equations))
+    }
+
+    fn grind_lemma(&mut self, syntax: &Syntax) -> Result<(Typed, Vec<Name>), Error> {
+        if let Syntax::Ident { val, .. } = syntax {
+            // Bare local names are redundant parameters at the pin, which
+            // already activates quantified hypotheses automatically.
+            if self.txn.lctx.find_by_user_name(val).is_some() {
+                return Err(unsupported());
+            }
+            let resolved = self
+                .resolve_source_name(val)?
+                .ok_or_else(|| failure(SourceInferenceError::UnknownConstant(val.clone())))?;
+            return self.grind_global_lemma(&resolved);
+        }
+        // As for rewrite/simp, do not re-enter the proof driver through a
+        // syntax client while this proof worklist frame is active.
+        let mut pending = vec![syntax];
+        while let Some(term) = pending.pop() {
+            self.tick()?;
+            if let Syntax::Node { kind, args, .. } = term {
+                if kind == &parser_kind(&["Term", "byTactic"]) {
+                    return Err(unsupported());
+                }
+                pending.extend(args);
+            }
+        }
+        let evidence = self.term(syntax, None)?;
+        let evidence = Typed {
+            value: normalize(self, &evidence.value)?,
+            type_: normalize(self, &evidence.type_)?,
+        };
+        if !is_prop(self, &evidence.type_)? {
+            return Err(unsupported());
+        }
+        Ok((evidence, Vec::new()))
     }
 
     pub(super) fn grind_proof_goal(
@@ -1091,6 +1151,21 @@ impl Context {
                 }
             }
             for (parameter, modifier) in parameters {
+                if let Some(equations) = self.grind_definition_equations(parameter, modifier)? {
+                    for equation in equations {
+                        self.tick()?;
+                        let (evidence, level_params) = self.grind_global_lemma(&equation)?;
+                        if !state.quantifiers.register(
+                            self,
+                            &evidence,
+                            &level_params,
+                            PatternKind::Definition,
+                        )? {
+                            return Err(unsupported());
+                        }
+                    }
+                    continue;
+                }
                 let (evidence, level_params) = self.grind_lemma(parameter)?;
                 if matches!(evidence.type_.node(), ExprNode::ForallE { .. }) {
                     if !state.quantifiers.register(
