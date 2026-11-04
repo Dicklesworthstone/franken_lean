@@ -6,6 +6,9 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+#[path = "source_olean_imports/abbreviations.rs"]
+mod abbreviations;
+
 fn fixture(case: &str) -> PathBuf {
     fln_core::checked_manifest_dir!()
         .join("tests/fixtures/olean_imports")
