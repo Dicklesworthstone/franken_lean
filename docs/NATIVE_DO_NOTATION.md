@@ -7,16 +7,17 @@ The operations resolve from the current environment; local `[Bind M]` and
 `[Pure M]` dictionaries work in generic functions.
 
 ```lean
-class Pure (f : Type -> Type) where
-  pure : {A : Type} -> A -> f A
-class Bind (m : Type -> Type) where
-  bind : {A B : Type} -> m A -> (A -> m B) -> m B
+prelude
+import Init.Data.Repr
 
-def map {M : Type -> Type} [Pure M] [Bind M]
+def mapping {M : Type -> Type} [Pure M] [Bind M]
     {A B : Type} (f : A -> B) (action : M A) : M B := do
   let x ← action
   return (f x)
 ```
+
+The import supplies the standard `Pure`, `Bind`, and `Id` declarations and
+the result printers used by the executable example below.
 
 The implemented syntax includes named `let x ← action` (also `<-`), optional
 binding type annotations, pure `let x := value`, expression statements,
@@ -45,13 +46,11 @@ kernel-checked equalities; these are semantic checking tests, not Golem runs.
 `cargo test --locked -p fln-parse --test do_notation` additionally checks source
 reconstruction and 600-element/nested sequences on a 128 KiB thread stack.
 
-This does not yet implement mutable variables, loops, pattern bindings,
-do-specific `if`/`match`, exception syntax, nested-action shorthand, or early
-return. Those do elements are refused, never silently treated as plain
-sequencing. Ordinary conditional/match expressions can appear inside actions;
-a type ascription on the whole expression may be necessary for result
-inference. `Pure`/`Bind` must be declared or imported; the parser does not
-manufacture axioms or builtin instances.
+These examples cover immutable sequencing. Broader control-flow cases and
+their refusals are exercised separately in the `source_do` suite and the
+installed control-flow tests, including `source_do_mutation`. `Pure`/`Bind`
+must be declared or imported; the parser does not manufacture axioms or
+builtin instances.
 
 ## Executable specialization
 
@@ -66,14 +65,10 @@ checked environment.
 A source execution stream admits parametric definitions as checked templates
 and registers instances through the ordinary source-admission path. They do not
 produce phantom VM results; concrete `#eval` commands compile their reachable
-specializations. For example, after the class declarations above:
+specializations. For example, using the imports and definition above:
 
 ```lean
-def Id (A : Type) : Type := A
-instance idPure : Pure Id := { pure := fun a => a }
-instance idBind : Bind Id := { bind := fun a k => k a }
-
-#eval (map (M := Id) (fun (x : Nat) => x + 1) 41 : Id Nat)
+#eval (mapping (M := Id) (fun (x : Nat) => x + 1) 41 : Id Nat)
 ```
 
 This executes to `42` on Golem. The runtime regressions also cover nested `do`
