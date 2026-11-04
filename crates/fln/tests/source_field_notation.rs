@@ -29,6 +29,36 @@ fn check(source: &str) {
 }
 
 #[test]
+fn delayed_method_arguments_wait_for_the_receivers_inferred_type_without_imports() {
+    // `resolveLValLoop` postpones unknown receivers whether or not the field
+    // has arguments (vendored `Lean/Elab/App.lean`). The equality constructor
+    // checks the resumed method's receiver and argument order through both
+    // admission seats, with no seeded declarations or imported artifacts.
+    let source = r#"prelude
+inductive Token where
+  | mk
+  | other
+inductive Same (x : Token) : Token → Prop where
+  | refl : Same x x
+def Token.choose (x fallback : Token) : Token := x
+def delayed (left right : Token) : Token :=
+  let f (x : _) := x.choose right
+  f left
+theorem delayed_correct (left right : Token) : Same (delayed left right) left :=
+  @Same.refl left
+"#;
+    let result = Engine::builder().build_empty().check_source_files(
+        &[source.as_bytes()],
+        &KVMap::new(),
+        limits(),
+    );
+    assert!(
+        matches!(result, Ok(Outcome::Complete(_))),
+        "{source}\n{result:?}"
+    );
+}
+
+#[test]
 fn collections_resolve_methods_and_insert_the_receiver_after_function_arguments() {
     check(
         "def size.{u} {A : Type u} (xs : List A) : Nat := xs.length\n\
@@ -381,5 +411,165 @@ fn methods_execute_through_the_same_compiler_and_vm() {
             fln_vm::interpreter::nat_decimal(&value.value).as_deref(),
             Some(expected)
         );
+    }
+}
+
+#[test]
+fn delayed_methods_replay_named_expected_and_dependent_arguments() {
+    // Accepted by the pinned executable over Init.Prelude. These declarations
+    // use the ordinary source seed here; the separate Token test starts empty.
+    check(
+        r#"inductive Token where
+  | mk
+  | other
+inductive Tag where
+  | mk
+inductive Same {A : Type} (x : A) : A → Prop where
+  | refl : Same x x
+def Token.choose (self fallback : Token) : Token := self
+def Token.after (tag : Tag) (self : Token) (fallback : Token) : Token := self
+def Token.expect {A : Type} (self : Token) (make : Token → A) : A := make self
+structure Wrap where
+  token : Token
+def Token.wrap (self fallback : Token) : Wrap := { token := self }
+structure Operation where
+  run : Token → Token
+structure Pair (A : Type) where
+  value : A
+def Pair.take {A : Type} (self : Pair A) (tag : Tag) : A := self.value
+def delayedNamed (left right : Token) : Token :=
+  let call (x : _) := x.after (fallback := right) Tag.mk
+  call left
+theorem delayedNamed_correct (left right : Token) : Same (delayedNamed left right) left :=
+  @Same.refl Token left
+def delayedExpected (left : Token) : Token :=
+  let call (x : _) : Token := x.expect (fun _ => .mk)
+  call left
+theorem delayedExpected_correct (left : Token) : Same (delayedExpected left) Token.mk :=
+  @Same.refl Token Token.mk
+def delayedChain (left right : Token) : Token :=
+  let call (x : _) := (x.wrap right).token
+  call left
+theorem delayedChain_correct (left right : Token) : Same (delayedChain left right) left :=
+  @Same.refl Token left
+def delayedField (operation : Operation) (value : Token) : Token :=
+  let call (x : _) := x.run value
+  call operation
+theorem delayedField_correct (operation : Operation) (value : Token) :
+    Same (delayedField operation value) (operation.run value) :=
+  @Same.refl Token (operation.run value)
+def delayedDependent (A : Type) (pair : Pair A) : A :=
+  let Carrier := A
+  let saved := pair
+  let call (tag : Carrier) (x : _) := x.take Tag.mk
+  call pair.value saved
+theorem delayedDependent_correct (A : Type) (pair : Pair A) :
+    Same (delayedDependent A pair) pair.value :=
+  @Same.refl A pair.value
+"#,
+    );
+}
+
+#[test]
+fn delayed_methods_preserve_instance_output_parameters() {
+    // The class instance determines the method's result after its receiver is
+    // known; replay goes through the ordinary out-parameter application path.
+    check(
+        r#"inductive Token where
+  | mk
+  | other
+inductive Tag where
+  | mk
+inductive Same {A : Type} (x : A) : A → Prop where
+  | refl : Same x x
+class Convert (A : Type) (B : outParam Type) where
+  convert : A → B
+instance : Convert Token Tag where
+  convert _ := Tag.mk
+def Token.change {B : Type} [Convert Token B] (self : Token) (argument : Token) : B :=
+  Convert.convert self
+def delayedOutput (value : Token) : Tag :=
+  let call (x : _) := x.change Token.mk
+  call value
+theorem delayedOutput_correct (value : Token) : Same (delayedOutput value) Tag.mk :=
+  @Same.refl Tag Tag.mk
+structure WrappedTag where
+  value : Tag
+instance : Coe Tag WrappedTag where
+  coe value := { value := value }
+def delayedCoercedOutput (value : Token) : WrappedTag :=
+  let call (x : _) : WrappedTag := x.change Token.mk
+  call value
+theorem delayedCoercedOutput_correct (value : Token) :
+    Same (delayedCoercedOutput value) (WrappedTag.mk Tag.mk) :=
+  @Same.refl WrappedTag (WrappedTag.mk Tag.mk)
+"#,
+    );
+}
+
+#[test]
+fn delayed_method_failures_do_not_capture_later_binders_or_publish_source() {
+    let options = KVMap::new();
+    let base = engine()
+        .check_source_files(
+            &[br#"inductive Token where
+  | mk
+  | other
+inductive Tag where
+  | mk
+structure Pair (A : Type) where
+  value : A
+def Token.choose (x fallback : Token) : Token := x
+def Pair.take {A : Type} (self : Pair A) (tag : Tag) : A := self.value
+"#],
+            &options,
+            limits(),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap()
+        .engine;
+    let root = base.logical_root(&options);
+    for (source, detail) in [
+        (
+            r#"def sentinelPrefix : Token := Token.mk
+def bad (left : Token) : Token :=
+  let call (x : _) := x.choose Tag.mk
+  call left"#,
+            Some("TypeMismatch"),
+        ),
+        (
+            r#"def sentinelPrefix : Token := Token.mk
+def bad (left : Token) : Token :=
+  let call (x : _) := x.missing Token.mk
+  call left"#,
+            Some("UnknownField"),
+        ),
+        (
+            r#"def sentinelPrefix : Token := Token.mk
+def bad : (A : Type) -> Pair A -> A :=
+  let call (x : _) := x.take Tag.mk
+  fun A pair => call pair"#,
+            None,
+        ),
+        (
+            r#"def sentinelPrefix : Token := Token.mk
+def bad (A : Type) (pair : Pair Token) : A :=
+  let call (x : _) := x.take Tag.mk
+  call pair"#,
+            None,
+        ),
+    ] {
+        let error = base
+            .check_source_files(&[source.as_bytes()], &options, limits())
+            .expect_err("a delayed method must still check its arguments and captured scope");
+        assert_eq!(error.disposition().0, "elaboration", "{source}\n{error}");
+        if let Some(detail) = detail {
+            assert!(format!("{error:?}").contains(detail), "{source}\n{error}");
+        }
+        assert_eq!(base.logical_root(&options), root);
+        for name in ["sentinelPrefix", "bad"] {
+            assert!(!base.environment().contains(&Name::from_components([name])));
+        }
     }
 }

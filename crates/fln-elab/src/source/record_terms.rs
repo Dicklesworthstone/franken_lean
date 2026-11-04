@@ -117,6 +117,30 @@ pub(super) enum FieldResolution {
         receiver: Typed,
         base: Name,
     },
+    /// Lookup must wait for the receiver's carrier. The owning application
+    /// retains its arguments until that carrier determines the method telescope.
+    Blocked {
+        receiver: Typed,
+        path: Name,
+        at: Option<Syntax>,
+    },
+}
+
+/// Resume an already elaborated receiver on the ordinary term worklist. Syntax
+/// arguments keep their original lexical context and expected-type inference.
+pub(super) struct FieldApplication<'a> {
+    pub(super) receiver: Typed,
+    pub(super) path: Name,
+    pub(super) arguments: &'a [Syntax],
+    pub(super) explicit: bool,
+    pub(super) finish: bool,
+}
+
+#[derive(Clone)]
+struct DeferredFieldApplication {
+    arguments: Vec<Syntax>,
+    explicit: bool,
+    finish: bool,
 }
 
 /// A field application's receiver and its field path, with the syntax the path is spelled at
@@ -139,6 +163,7 @@ pub(super) struct PostponedField {
     receiver: Typed,
     path: Name,
     at: Option<Syntax>,
+    application: Option<DeferredFieldApplication>,
     locals: Vec<LocalDecl>,
     lctx: LocalContext,
     options: KVMap,
@@ -171,12 +196,36 @@ fn owned_args(mut syntax: Syntax) -> Result<Vec<Syntax>, NatDefinitionElabError>
 }
 
 impl Context {
+    /// The whole application is synthetic, not just its unresolved field head.
+    /// Its arguments cannot be checked before lookup supplies their telescope.
+    pub(super) fn postpone_field_application(
+        &mut self,
+        receiver: Typed,
+        path: &Name,
+        at: &Syntax,
+        arguments: &[Syntax],
+        explicit: bool,
+        finish: bool,
+    ) -> Result<Typed, NatDefinitionElabError> {
+        self.postpone_field(
+            receiver,
+            path,
+            Some(at),
+            Some(DeferredFieldApplication {
+                arguments: arguments.to_vec(),
+                explicit,
+                finish,
+            }),
+        )
+    }
+
     fn postpone_field(
         &mut self,
         receiver: Typed,
         path: &Name,
         at: Option<&Syntax>,
-    ) -> Result<FieldResolution, NatDefinitionElabError> {
+        application: Option<DeferredFieldApplication>,
+    ) -> Result<Typed, NatDefinitionElabError> {
         let mut captured = self.txn.lctx.decls().to_vec();
         let outer = LocalContext::new();
         // The closed holes below also abstract the types of their parameters.
@@ -262,15 +311,16 @@ impl Context {
             receiver,
             path: path.clone(),
             at: at.cloned(),
+            application,
             locals,
             lctx: self.txn.lctx.clone(),
             options: self.txn.options.clone(),
             scope: self.source_scope.clone(),
         });
-        Ok(FieldResolution::Value(Typed {
+        Ok(Typed {
             value,
             type_: expected,
-        }))
+        })
     }
 
     /// The pin's `resolveLValLoop` postpones field notation while its receiver
@@ -293,16 +343,47 @@ impl Context {
                 {
                     return Ok(false);
                 }
-                let field = self.resolve_field_path(
-                    record.receiver.clone(),
-                    &record.path,
-                    false,
-                    record.at.as_ref(),
-                )?;
-                let mut term = self.field_value(field, Some(&record.expected))?;
+                let mut term = if let Some(application) = &record.application {
+                    let at = record
+                        .at
+                        .as_ref()
+                        .ok_or_else(|| failure(SourceInferenceError::Scope))?;
+                    let term = self.term_prepared_with_field(
+                        at,
+                        Some(record.expected.clone()),
+                        Some(FieldApplication {
+                            receiver: record.receiver.clone(),
+                            path: record.path.clone(),
+                            arguments: &application.arguments,
+                            explicit: application.explicit,
+                            finish: application.finish,
+                        }),
+                    )?;
+                    if !application.finish {
+                        // An unfinished projection is a callee, so keep its
+                        // implicit telescope while assigning the result type.
+                        self.constrain_type(&term.type_, &record.expected)?;
+                    }
+                    term
+                } else {
+                    let field = self.resolve_field_path(
+                        record.receiver.clone(),
+                        &record.path,
+                        false,
+                        record.at.as_ref(),
+                    )?;
+                    self.field_value(field, Some(&record.expected))?
+                };
                 let type_ = self.instantiate(&term.type_)?;
                 term.type_ = self.zeta_locals(&type_)?;
-                let term = self.finish_optional_term(term, Some(&record.expected))?;
+                // A replayed application has already used its original
+                // finishing policy. In particular, do not insert implicits
+                // into an explicit application or an unfinished callee.
+                let term = if record.application.is_none() {
+                    self.finish_optional_term(term, Some(&record.expected))?
+                } else {
+                    term
+                };
                 let mut value = self.instantiate(&term.value)?;
                 for local in record.locals.iter().rev() {
                     self.tick()?;
@@ -618,13 +699,16 @@ impl Context {
         has_arguments: bool,
         at: Option<&Syntax>,
     ) -> Result<FieldResolution, NatDefinitionElabError> {
-        if !has_arguments
-            && self.overload_depth == 0
+        if self.overload_depth == 0
             && self
                 .application_type_unavailable(&receiver.type_)?
                 .is_some()
         {
-            return self.postpone_field(receiver, path, at);
+            return Ok(FieldResolution::Blocked {
+                receiver,
+                path: path.clone(),
+                at: at.cloned(),
+            });
         }
         if let LeafView::Num(index) = path.leaf_view()
             && path.parent().is_anonymous()
@@ -709,12 +793,16 @@ impl Context {
             }
             let base = match head.node() {
                 ExprNode::MVar { .. } => {
-                    if !has_arguments && self.overload_depth == 0 {
-                        return self.postpone_field(receiver, field, None);
+                    if self.overload_depth == 0 {
+                        return Ok(FieldResolution::Blocked {
+                            receiver,
+                            path: field.clone(),
+                            at: None,
+                        });
                     }
-                    // The pin defaults unresolved receiver types here (for
-                    // example `(2).succ` and `(1.5).abs`) without demanding
-                    // that unrelated synthetic goals are already solvable.
+                    // Speculative overload candidates cannot publish a
+                    // deferred lookup. Try eligible default instances without
+                    // requiring unrelated synthetic goals to be solvable.
                     self.resolve_instances_with_defaults()?;
                     let instantiated = self.instantiate(&receiver.type_)?;
                     if instantiated == receiver.type_ {
@@ -875,16 +963,16 @@ impl Context {
         field: FieldResolution,
         expected: Option<&Expr>,
     ) -> Result<Typed, NatDefinitionElabError> {
-        let FieldResolution::Method {
-            function,
-            receiver,
-            base,
-        } = field
-        else {
-            let FieldResolution::Value(value) = field else {
-                unreachable!()
-            };
-            return Ok(value);
+        let (function, receiver, base) = match field {
+            FieldResolution::Method {
+                function,
+                receiver,
+                base,
+            } => (function, receiver, base),
+            FieldResolution::Value(value) => return Ok(value),
+            FieldResolution::Blocked { receiver, path, at } => {
+                return self.postpone_field(receiver, &path, at.as_ref(), None);
+            }
         };
         // A bare qualified method still applies its receiver. Preserve the
         // whole term's expectation here, just as the explicit projection and

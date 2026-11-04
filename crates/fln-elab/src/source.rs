@@ -2086,13 +2086,24 @@ impl Context {
         syntax: &Syntax,
         expected: Option<Expr>,
     ) -> Result<Typed, NatDefinitionElabError> {
+        self.term_prepared_with_field(syntax, expected, None)
+    }
+
+    /// Deferred field applications reenter the same worklist as ordinary
+    /// applications, retaining named arguments, expected types and outParams.
+    fn term_prepared_with_field<'a>(
+        &mut self,
+        syntax: &'a Syntax,
+        expected: Option<Expr>,
+        initial_field: Option<record_terms::FieldApplication<'a>>,
+    ) -> Result<Typed, NatDefinitionElabError> {
         // Scoped term and tactic options are dynamically restored even when a
         // failed elaboration leaves its worklist before the closing frame.
         // Speculative retries restore their own complete Context checkpoints.
         let options = self.txn.options.clone();
         let pending_source_arguments = self.pending_source_arguments;
         let blocked = self.no_implicit_lambda_types.len();
-        let result = self.term_prepared_scoped(syntax, expected, None);
+        let result = self.term_prepared_scoped(syntax, expected, None, initial_field);
         self.txn.options = options;
         self.pending_source_arguments = pending_source_arguments;
         self.no_implicit_lambda_types.truncate(blocked);
@@ -2107,7 +2118,7 @@ impl Context {
         let options = self.txn.options.clone();
         let pending_source_arguments = self.pending_source_arguments;
         let blocked = self.no_implicit_lambda_types.len();
-        let result = self.term_prepared_scoped(syntax, None, Some(proof));
+        let result = self.term_prepared_scoped(syntax, None, Some(proof), None);
         self.txn.options = options;
         self.pending_source_arguments = pending_source_arguments;
         self.no_implicit_lambda_types.truncate(blocked);
@@ -2119,6 +2130,7 @@ impl Context {
         syntax: &'a Syntax,
         expected: Option<Expr>,
         initial_proof: Option<tactics::ProofState<'a>>,
+        initial_field: Option<record_terms::FieldApplication<'a>>,
     ) -> Result<Typed, NatDefinitionElabError> {
         use application::postponed;
         let without_implicit_lambda = std::mem::take(&mut self.block_root_implicit_lambda);
@@ -2291,12 +2303,26 @@ impl Context {
             MatchTerm(tactics::ProofState<'a>, tactics::ProofGoal),
             RefineTerm(tactics::ProofState<'a>, tactics::ProofGoal, usize),
         }
-        let mut tasks = vec![match initial_proof {
-            Some(proof) => Task::Proof(proof),
-            None if without_implicit_lambda => Task::VisitWithoutImplicitLambda(syntax, expected),
-            None => Task::Visit(syntax, expected, true),
-        }];
         let mut values: Vec<Typed> = Vec::new();
+        let mut tasks = vec![if let Some(field) = initial_field {
+            values.push(field.receiver);
+            Task::Projection(
+                field.path,
+                syntax,
+                field.arguments,
+                expected,
+                field.explicit,
+                field.finish,
+            )
+        } else {
+            match initial_proof {
+                Some(proof) => Task::Proof(proof),
+                None if without_implicit_lambda => {
+                    Task::VisitWithoutImplicitLambda(syntax, expected)
+                }
+                None => Task::Visit(syntax, expected, true),
+            }
+        }];
         enum Attempt<'a> {
             Proof(tactics::backtrack::Checkpoint<'a>, postponed::Queue<'a>),
             LocalFunction(Box<local_functions::Checkpoint<'a>>, postponed::Queue<'a>),
@@ -3523,6 +3549,29 @@ impl Context {
                                 !arguments.iter().all(application::is_ellipsis),
                                 Some(at),
                             )? {
+                                record_terms::FieldResolution::Blocked {
+                                    receiver,
+                                    path,
+                                    at: blocked_at,
+                                } => {
+                                    let term = self.postpone_field_application(
+                                        receiver,
+                                        &path,
+                                        blocked_at.as_ref().unwrap_or(at),
+                                        arguments,
+                                        explicit,
+                                        finish,
+                                    )?;
+                                    values.push(if finish {
+                                        if explicit {
+                                            self.finish_explicit_term(term, expected.as_ref())?
+                                        } else {
+                                            self.finish_optional_term(term, expected.as_ref())?
+                                        }
+                                    } else {
+                                        term
+                                    });
+                                }
                                 record_terms::FieldResolution::Value(term)
                                     if arguments.is_empty() =>
                                 {
