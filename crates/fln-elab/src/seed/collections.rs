@@ -245,6 +245,6 @@ pub(super) fn option_seed_declarations() -> [Declaration; 6] {
 }
 
 /// Option must already be available because List.head? returns it.
-pub(super) fn list_seed_declarations() -> [Declaration; 9] {
+pub(super) fn list_seed_declarations() -> [Declaration; 11] {
     list::declarations()
 }

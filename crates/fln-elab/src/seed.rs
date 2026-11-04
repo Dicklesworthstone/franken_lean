@@ -702,23 +702,18 @@ pub fn semi_out_param_seed_declaration() -> Declaration {
 /// frontend. Order is part of the deterministic seed contract: scalar types
 /// precede intrinsic signatures, and collection families precede their checked
 /// operation bodies. This is not a complete Prelude ingestion path.
-pub fn source_seed_declarations() -> [Declaration; 100] {
-    let mut declarations = source_seed_declarations_iter();
-    std::array::from_fn(|_| {
-        declarations
-            .next()
-            .expect("the fixed source seed has 100 declarations")
-    })
+pub fn source_seed_declarations() -> Vec<Declaration> {
+    source_seed_declarations_iter().collect()
 }
 
 /// Construct the same canonical source sequence one bounded batch at a time.
 ///
 /// Runtime contract checks run inside nested type/proof preparation. Returning
-/// the entire `[Declaration; 100]` there materializes tens of kilobytes of stack
+/// the entire seed there would materialize tens of kilobytes of stack
 /// even when most declarations are discarded. Factories below are function
 /// pointers, not eager declaration values; only the next small related group
-/// is constructed. The array-returning compatibility API remains available to
-/// callers that deliberately need the whole sequence.
+/// is constructed. Callers that need the whole sequence can collect it through
+/// `source_seed_declarations` without a separately maintained array length.
 pub fn source_seed_declarations_iter() -> impl Iterator<Item = Declaration> {
     // A single declaration needs no allocation just to iterate it. Related
     // groups contain at most twelve declarations and move into a heap iterator.
@@ -934,8 +929,8 @@ mod tests {
         assert_eq!(declarations[82], quotient_sound_seed_declaration());
         assert_eq!(declarations[83], propext_seed_declaration());
         assert_eq!(
-            declarations[99],
-            decidable_option::option_equality_decision_seed_declaration()
+            declarations.last(),
+            Some(&decidable_option::option_equality_decision_seed_declaration())
         );
         assert!(
             source_intrinsic_seed_declaration(&Name::from_components(["Nat", "modCore"])).is_none(),
@@ -945,15 +940,15 @@ mod tests {
 
     #[test]
     fn seed_stream_and_early_drop_fit_a_small_stack_without_changing_declarations() {
-        // Build the compatibility array on the ordinary test stack, then move
-        // only a Vec handle into the bounded thread. No full-seed value may be
-        // returned on that thread, including during iterator destruction.
-        let expected = Vec::from(source_seed_declarations());
+        // Build the complete sequence on the ordinary test stack, then move
+        // only its Vec handle into the bounded thread. No full-seed value may
+        // be returned on that thread, including during iterator destruction.
+        let expected = source_seed_declarations();
         std::thread::Builder::new()
             .name("bounded-source-seed".into())
             .stack_size(64 * 1024)
             .spawn(move || {
-                assert_eq!(expected.len(), 100);
+                assert_eq!(expected.len(), 102);
                 // Include every boundary inside a multi-declaration batch and
                 // the exhausted iterator, not just a completed traversal.
                 for prefix in 0..=expected.len() {

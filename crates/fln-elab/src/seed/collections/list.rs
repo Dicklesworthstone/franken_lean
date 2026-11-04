@@ -11,6 +11,12 @@ fn cons(alpha: Expr, universe: Level, head: Expr, tail: Expr) -> Expr {
     app(constant("List.cons", vec![universe]), [alpha, head, tail])
 }
 
+fn smart_mark(tag: &str, value: Expr) -> Expr {
+    let mut data = fln_core::options::KVMap::new();
+    data.insert(name(tag), fln_core::options::DataValue::OfBool(true));
+    Expr::mdata(data, value)
+}
+
 fn family() -> Declaration {
     let mut terms = Terms::new();
     let alpha = terms.local("α", Expr::sort(type_level("u")), BinderInfo::Default);
@@ -126,6 +132,101 @@ fn map() -> Declaration {
     );
     terms.definition(
         "List.map",
+        &["u", "v"],
+        &[alpha, beta, function, value],
+        list_beta,
+        body,
+    )
+}
+
+// The same pin-format companions used for imported definitions keep the
+// recursive calls folded. They are checked candidates, and selecting an
+// alternative still requires conversion against the original application.
+fn append_smart() -> Declaration {
+    let mut terms = Terms::new();
+    let alpha = terms.parameter("α", "u");
+    let list_alpha = list(fv(&alpha), level("u"));
+    let left = terms.local("as", list_alpha.clone(), BinderInfo::Default);
+    let right = terms.local("bs", list_alpha.clone(), BinderInfo::Default);
+    let major = terms.local("t", list_alpha.clone(), BinderInfo::Default);
+    let head = terms.local("head", fv(&alpha), BinderInfo::Default);
+    let tail = terms.local("tail", list_alpha.clone(), BinderInfo::Default);
+    let ih = terms.local("ih", list_alpha.clone(), BinderInfo::Default);
+    let motive = terms.lam(&[major], list_alpha.clone());
+    let recursive = app(
+        constant("List.append", vec![level("u")]),
+        [fv(&alpha), fv(&tail), fv(&right)],
+    );
+    let step = smart_mark(
+        "sunfoldMatchAlt",
+        cons(fv(&alpha), level("u"), fv(&head), recursive),
+    );
+    let step = terms.lam(&[head, tail, ih], step);
+    let body = smart_mark(
+        "sunfoldMatch",
+        app(
+            constant("List.rec", vec![type_level("u"), level("u")]),
+            [
+                fv(&alpha),
+                motive,
+                smart_mark("sunfoldMatchAlt", fv(&right)),
+                step,
+                fv(&left),
+            ],
+        ),
+    );
+    terms.definition(
+        "List.append._sunfold",
+        &["u"],
+        &[alpha, left, right],
+        list_alpha,
+        body,
+    )
+}
+
+fn map_smart() -> Declaration {
+    let mut terms = Terms::new();
+    let alpha = terms.parameter("α", "u");
+    let beta = terms.parameter("β", "v");
+    let list_alpha = list(fv(&alpha), level("u"));
+    let list_beta = list(fv(&beta), level("v"));
+    let function_type = terms.arrow(fv(&alpha), fv(&beta));
+    let function = terms.local("f", function_type, BinderInfo::Default);
+    let value = terms.local("xs", list_alpha.clone(), BinderInfo::Default);
+    let major = terms.local("t", list_alpha.clone(), BinderInfo::Default);
+    let head = terms.local("head", fv(&alpha), BinderInfo::Default);
+    let tail = terms.local("tail", list_alpha, BinderInfo::Default);
+    let ih = terms.local("ih", list_beta.clone(), BinderInfo::Default);
+    let motive = terms.lam(&[major], list_beta.clone());
+    let recursive = app(
+        constant("List.map", vec![level("u"), level("v")]),
+        [fv(&alpha), fv(&beta), fv(&function), fv(&tail)],
+    );
+    let step = smart_mark(
+        "sunfoldMatchAlt",
+        cons(
+            fv(&beta),
+            level("v"),
+            Expr::app(fv(&function), fv(&head)),
+            recursive,
+        ),
+    );
+    let step = terms.lam(&[head, tail, ih], step);
+    let body = smart_mark(
+        "sunfoldMatch",
+        app(
+            constant("List.rec", vec![type_level("v"), level("u")]),
+            [
+                fv(&alpha),
+                motive,
+                smart_mark("sunfoldMatchAlt", nil(fv(&beta), level("v"))),
+                step,
+                fv(&value),
+            ],
+        ),
+    );
+    terms.definition(
+        "List.map._sunfold",
         &["u", "v"],
         &[alpha, beta, function, value],
         list_beta,
@@ -274,12 +375,14 @@ fn tail() -> Declaration {
     terms.definition("List.tail", &["u"], &[alpha, value], list_alpha, body)
 }
 
-pub(super) fn declarations() -> [Declaration; 9] {
+pub(super) fn declarations() -> [Declaration; 11] {
     [
         family(),
         length(),
         append(),
+        append_smart(),
         map(),
+        map_smart(),
         foldr(),
         foldl(),
         reverse(),

@@ -202,6 +202,7 @@ Inhabited.mk	unprotected
 Inhabited.rec	unprotected
 List	unprotected
 List.append	protected
+List.append._sunfold	unprotected
 List.cons	unprotected
 List.foldl	unprotected
 List.foldr	unprotected
@@ -209,6 +210,7 @@ List.head?	unprotected
 List.instAppend	unprotected
 List.length	unprotected
 List.map	unprotected
+List.map._sunfold	unprotected
 List.nil	unprotected
 List.rec	unprotected
 List.reverse	unprotected

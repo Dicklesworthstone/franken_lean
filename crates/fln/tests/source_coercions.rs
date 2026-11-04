@@ -30,6 +30,10 @@ fn staged_coercion_library_is_admitted_by_both_checkers() {
         &base,
         include_str!("../../../examples/native_conditionals.lean"),
     );
+    checked(
+        &base,
+        include_str!("../../../examples/native_collections.lean"),
+    );
 }
 
 #[test]
