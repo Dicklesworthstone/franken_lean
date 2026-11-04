@@ -392,6 +392,29 @@ const REFUSE: &[(&str, &str)] = &[
     ),
 ];
 
+// A semicolon belongs to try's tactic sequence; a separate line follows try.
+// Bind both failure classes to the live pin before checking the native driver.
+const GOAL_ACCOUNTING: &[(&str, &str, &str, &str)] = &[
+    (
+        "semicolon_restores_the_try_state",
+        "example (a : Nat) : a + 0 = a := by try grind; rfl",
+        "unsolved goals",
+        "UnsolvedGoals",
+    ),
+    (
+        "separate_tactic_sees_no_goals",
+        "example (a : Nat) : a + 0 = a := by\n  try grind\n  rfl",
+        "No goals to be solved",
+        "NoGoals",
+    ),
+    (
+        "arithmetic_success_preserves_goal_accounting",
+        "example (i j k : Nat) (h : i + 3 ≤ j) (h2 : j + 4 ≤ k) : i + 7 ≤ k := by\n  try grind\n  rfl",
+        "No goals to be solved",
+        "NoGoals",
+    ),
+];
+
 const UNSUPPORTED: &[(&str, &str)] = &[
     (
         "explicit_ematch_configuration",
@@ -538,6 +561,24 @@ fn ground_and_quantified_grind_proofs_and_refusals_match_the_live_pin() {
                     );
                 }
             }
+            for (label, source, diagnostic, _) in GOAL_ACCOUNTING {
+                let path = directory.join(format!("{label}.lean"));
+                std::fs::write(&path, format!("{HEADER}{source}\n")).unwrap();
+                let result = Command::new(&compiler)
+                    .arg("-j1")
+                    .arg(&path)
+                    .output()
+                    .unwrap();
+                let output = format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&result.stdout),
+                    String::from_utf8_lossy(&result.stderr)
+                );
+                assert!(
+                    !result.status.success() && output.contains(*diagnostic),
+                    "pin {label}: expected {diagnostic:?}, got {output}"
+                );
+            }
             let engine = base(&library);
             assert_arithmetic_provider_boundary(&engine);
             let options = KVMap::new();
@@ -644,31 +685,29 @@ fn ground_and_quantified_grind_proofs_and_refusals_match_the_live_pin() {
                 }
                 other => record_failure(&mut failures, "ematch_recovery", format!("{other:?}")),
             }
-            // Arithmetic now closes this goal. The subsequent rfl must see the
-            // empty goal list, rather than recovering a swallowed solver stop.
-            let after_arithmetic = "example (a : Nat) : a + 0 = a := by try grind; rfl";
-            let label = "arithmetic success preserves goal accounting";
-            eprintln!("grind: native {label}");
-            match engine.check_source_files(&[after_arithmetic.as_bytes()], &options, limits()) {
-                Err(error) => {
-                    if !format!("{error:?}").contains("NoGoals") {
-                        record_failure(&mut failures, label, format!("{error:?}"));
+            for (label, source, _, diagnostic) in GOAL_ACCOUNTING {
+                eprintln!("grind: native {label}");
+                match engine.check_source_files(&[source.as_bytes()], &options, limits()) {
+                    Err(error) => {
+                        if !format!("{error:?}").contains(*diagnostic) {
+                            record_failure(&mut failures, label, format!("{error:?}"));
+                        }
+                    }
+                    Ok(Outcome::Complete(_)) => record_failure(
+                        &mut failures,
+                        label,
+                        "try grind silently skipped an unsupported arithmetic goal".into(),
+                    ),
+                    Ok(Outcome::Inconclusive(reason)) => {
+                        record_failure(&mut failures, label, format!("inconclusive: {reason:?}"))
+                    }
+                    Ok(Outcome::InternalFault(fault)) => {
+                        record_failure(&mut failures, label, format!("internal fault: {fault:?}"))
                     }
                 }
-                Ok(Outcome::Complete(_)) => record_failure(
-                    &mut failures,
-                    label,
-                    "try grind silently skipped an unsupported arithmetic goal".into(),
-                ),
-                Ok(Outcome::Inconclusive(reason)) => {
-                    record_failure(&mut failures, label, format!("inconclusive: {reason:?}"))
+                if engine.logical_root(&options) != before {
+                    record_failure(&mut failures, label, "input logical root mutated".into());
                 }
-                Ok(Outcome::InternalFault(fault)) => {
-                    record_failure(&mut failures, label, format!("internal fault: {fault:?}"))
-                }
-            }
-            if engine.logical_root(&options) != before {
-                record_failure(&mut failures, label, "input logical root mutated".into());
             }
             assert!(
                 failures.is_empty(),

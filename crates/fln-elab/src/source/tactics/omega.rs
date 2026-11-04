@@ -147,6 +147,52 @@ fn relation_expression(comparison: &Comparison) -> Expr {
     }
 }
 fn comparison(proposition: &Expr) -> Option<Comparison> {
+    // Grind's abbreviation reduction exposes a class field as a projection
+    // even when the dictionary itself stays semireducible. Recognize only the
+    // pinned arithmetic dictionaries: an arbitrary LE/LT instance need not
+    // express the natural or integer ordering.
+    let mut projected_head = proposition;
+    let mut projected_arguments = Vec::new();
+    loop {
+        match projected_head.node() {
+            ExprNode::App { f, a } if projected_arguments.len() < 2 => {
+                projected_arguments.push(a);
+                projected_head = f;
+            }
+            ExprNode::MData { expr, .. } => projected_head = expr,
+            _ => break,
+        }
+    }
+    if let ExprNode::Proj {
+        struct_name,
+        idx: 0,
+        expr: dictionary,
+    } = projected_head.node()
+        && projected_arguments.len() == 2
+    {
+        for (natural, le, lt) in [
+            (true, "instLENat", "instLTNat"),
+            (false, "Int.instLEInt", "Int.instLTInt"),
+        ] {
+            let relation = if *struct_name == Name::from_components(["LE"])
+                && is_constant(dictionary, le)
+            {
+                Some(Relation::Le)
+            } else if *struct_name == Name::from_components(["LT"]) && is_constant(dictionary, lt) {
+                Some(Relation::Lt)
+            } else {
+                None
+            };
+            if let Some(relation) = relation {
+                return Some(Comparison {
+                    relation,
+                    natural,
+                    left: projected_arguments[1].clone(),
+                    right: projected_arguments[0].clone(),
+                });
+            }
+        }
+    }
     let (head, arguments) = application(proposition)?;
     for (natural, prefix, le, lt) in [
         (true, "Nat", "instLENat", "instLTNat"),
@@ -814,6 +860,44 @@ impl Context {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn projected_orderings_require_the_pinned_dictionary_and_field() {
+        let left = Expr::fvar(FVarId(Name::from_components(["i"])));
+        let right = Expr::fvar(FVarId(Name::from_components(["j"])));
+        let projected = |class: &str, index, dictionary: &str| {
+            apply(
+                Expr::proj(Name::from_components([class]), index, constant(dictionary)),
+                [left.clone(), right.clone()],
+            )
+        };
+        for (class, dictionary, natural, strict) in [
+            ("LE", "instLENat", true, false),
+            ("LT", "instLTNat", true, true),
+            ("LE", "Int.instLEInt", false, false),
+            ("LT", "Int.instLTInt", false, true),
+        ] {
+            let found = comparison(&projected(class, 0, dictionary)).unwrap();
+            assert_eq!(found.natural, natural);
+            assert_eq!(matches!(found.relation, Relation::Lt), strict);
+            assert_eq!(found.left, left);
+            assert_eq!(found.right, right);
+        }
+        for (class, index, dictionary) in [
+            ("LE", 0, "customOrdering"),
+            ("LT", 0, "customOrdering"),
+            ("LE", 0, "instLTNat"),
+            ("LT", 0, "instLENat"),
+            ("LE", 1, "instLENat"),
+            ("LT", 1, "Int.instLTInt"),
+            ("Custom", 0, "instLENat"),
+        ] {
+            assert!(comparison(&projected(class, index, dictionary)).is_none());
+        }
+        let ordering = Expr::proj(Name::from_components(["LE"]), 0, constant("instLENat"));
+        assert!(comparison(&Expr::app(ordering, left.clone())).is_none());
+        assert!(comparison(&Expr::app(projected("LE", 0, "instLENat"), right)).is_none());
+    }
 
     #[test]
     fn implication_hypotheses_are_propositions_under_raw_imax_levels() {
