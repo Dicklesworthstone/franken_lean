@@ -17,6 +17,7 @@ on:
       - 'crates/fln-cli/tests/source_olean_imports.rs'
       - 'crates/fln/tests/source_imported_macros.rs'
       - 'crates/fln/tests/source_imported_atomic_macros.rs'
+      - 'crates/fln/tests/source_imported_syntax_methods.rs'
       - 'crates/fln/tests/source_grind/**'
       - 'crates/fln-elab/src/**'
       - 'crates/fln-rt/src/**'
@@ -95,7 +96,8 @@ jobs:
           cargo test --locked -p fln --lib imported_macros:: -- --nocapture \
             2>&1 | tee target/imported-ir-reference/macros.log || status=1
           cargo test --locked --no-fail-fast -p fln \
-            --test source_imported_macros --test source_imported_atomic_macros -- --nocapture \
+            --test source_imported_macros --test source_imported_atomic_macros \
+            --test source_imported_syntax_methods -- --nocapture \
             2>&1 | tee target/imported-ir-reference/source-macros.log || status=1
           cargo test --locked -p fln --test source_grind \
             modifiers::selected_theorem_directions_match_the_live_pin -- --exact --nocapture \

@@ -9,6 +9,7 @@ use fln_rt::syntax_abi_generated as layout;
 
 const MAX_NAME_NODES: u64 = 1_000_000;
 const MAX_NAME_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_SYNTAX_NODES: u64 = 1_000_000;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum Intrinsic {
@@ -22,6 +23,13 @@ pub(super) enum Intrinsic {
     GetKind,
     SetKind,
     GetArgs,
+    SetArgs,
+    SetArg,
+    IsAtom,
+    GetAtomVal,
+    SetAtomVal,
+    GetHeadInfo,
+    SetInfo,
     IsMissing,
     IsIdent,
     GetId,
@@ -45,6 +53,13 @@ impl Intrinsic {
             "mirror:Lean.Syntax.getKind" => Self::GetKind,
             "mirror:Lean.Syntax.setKind" => Self::SetKind,
             "mirror:Lean.Syntax.getArgs" => Self::GetArgs,
+            "mirror:Lean.Syntax.setArgs" => Self::SetArgs,
+            "mirror:Lean.Syntax.setArg" => Self::SetArg,
+            "mirror:Lean.Syntax.isAtom" => Self::IsAtom,
+            "mirror:Lean.Syntax.getAtomVal" => Self::GetAtomVal,
+            "mirror:Lean.Syntax.setAtomVal" => Self::SetAtomVal,
+            "mirror:Lean.Syntax.getHeadInfo" => Self::GetHeadInfo,
+            "mirror:Lean.Syntax.setInfo" => Self::SetInfo,
             "mirror:Lean.Syntax.isMissing" => Self::IsMissing,
             "mirror:Lean.Syntax.isIdent" => Self::IsIdent,
             "mirror:Lean.Syntax.getId" => Self::GetId,
@@ -79,12 +94,16 @@ impl Intrinsic {
                 | Self::IsOfKind
                 | Self::GetArg
                 | Self::SetKind
+                | Self::SetArgs
+                | Self::SetAtomVal
+                | Self::SetInfo
                 | Self::GetCurrNamespace => 2,
                 Self::AddMacroScope
                 | Self::MacroAddMacroScope
                 | Self::HasDecl
                 | Self::ResolveNamespace
                 | Self::ResolveGlobalName
+                | Self::SetArg
                 | Self::ExpandMacro => 3,
                 _ => 1,
             },
@@ -227,11 +246,106 @@ impl Intrinsic {
                 };
                 Ok(IntrinsicResult::raw_object(children))
             }
-            Self::IsMissing | Self::IsIdent => {
+            Self::SetArgs => {
+                let value = if matches!(syntax_kind(&args[0])?, SyntaxKind::Node) {
+                    args[1]
+                        .try_array_view()
+                        .ok_or(VmRefusal::InvalidArrayObject)?;
+                    Obj::mk_ctor(
+                        layout::SYNTAX_NODE.tag,
+                        vec![
+                            child(&args[0], 0)?,
+                            child(&args[0], 1)?,
+                            args[1].clone_ref(),
+                        ],
+                        &[],
+                    )
+                } else {
+                    args[0].clone_ref()
+                };
+                Ok(IntrinsicResult::raw_object(value))
+            }
+            Self::SetArg => {
+                let value = if matches!(syntax_kind(&args[0])?, SyntaxKind::Node) {
+                    let index = nat_as_usize(&args[1], "Lean.Syntax.setArg", 1)?;
+                    let children = child(&args[0], 2)?;
+                    let (size, _) = children
+                        .try_array_view()
+                        .ok_or(VmRefusal::InvalidArrayObject)?;
+                    if let Some(index) = index.filter(|index| *index < size) {
+                        syntax_kind(&args[2])?;
+                        limit("syntax argument count", MAX_SYNTAX_NODES, size as u64)?;
+                        // The original syntax retains its reference, so the
+                        // safe array membrane copies before replacing a child.
+                        let children = children
+                            .try_array_set(index, args[2].clone_ref())
+                            .ok_or(VmRefusal::InvalidArrayObject)?;
+                        Obj::mk_ctor(
+                            layout::SYNTAX_NODE.tag,
+                            vec![child(&args[0], 0)?, child(&args[0], 1)?, children],
+                            &[],
+                        )
+                    } else {
+                        args[0].clone_ref()
+                    }
+                } else {
+                    args[0].clone_ref()
+                };
+                Ok(IntrinsicResult::raw_object(value))
+            }
+            Self::GetAtomVal => {
+                let text = if matches!(syntax_kind(&args[0])?, SyntaxKind::Atom) {
+                    let text = child(&args[0], 1)?;
+                    string(&text)?;
+                    text
+                } else {
+                    Obj::mk_string("")
+                };
+                Ok(IntrinsicResult::raw_object(text))
+            }
+            Self::SetAtomVal => {
+                let value = if matches!(syntax_kind(&args[0])?, SyntaxKind::Atom) {
+                    string(&args[1])?;
+                    Obj::mk_ctor(
+                        layout::SYNTAX_ATOM.tag,
+                        vec![child(&args[0], 0)?, args[1].clone_ref()],
+                        &[],
+                    )
+                } else {
+                    args[0].clone_ref()
+                };
+                Ok(IntrinsicResult::raw_object(value))
+            }
+            Self::GetHeadInfo => Ok(IntrinsicResult::raw_object(get_head_info(&args[0])?)),
+            Self::SetInfo => {
+                // The pin's telescope takes SourceInfo before Syntax.
+                let kind = syntax_kind(&args[1])?;
+                let value = if let SyntaxKind::Missing = kind {
+                    args[1].clone_ref()
+                } else {
+                    source_info(&args[0])?;
+                    let expected = match kind {
+                        SyntaxKind::Node => layout::SYNTAX_NODE,
+                        SyntaxKind::Atom => layout::SYNTAX_ATOM,
+                        SyntaxKind::Ident => layout::SYNTAX_IDENT,
+                        SyntaxKind::Missing => unreachable!(),
+                    };
+                    let mut fields = Vec::with_capacity(expected.object_fields);
+                    fields.push(args[0].clone_ref());
+                    for index in 1..expected.object_fields {
+                        fields.push(child(&args[1], index)?);
+                    }
+                    Obj::mk_ctor(expected.tag, fields, &[])
+                };
+                Ok(IntrinsicResult::raw_object(value))
+            }
+            Self::IsMissing | Self::IsIdent | Self::IsAtom => {
                 let kind = syntax_kind(&args[0])?;
                 let matches = matches!(
                     (self, kind),
-                    (Self::IsMissing, SyntaxKind::Missing) | (Self::IsIdent, SyntaxKind::Ident)
+                    (Self::IsMissing, SyntaxKind::Missing)
+                        | (Self::IsIdent, SyntaxKind::Ident)
+                        | (Self::IsAtom, SyntaxKind::Atom)
                 );
                 Ok(IntrinsicResult::scalar(Obj::mk_nat(usize::from(matches))))
             }
@@ -427,6 +541,73 @@ enum SyntaxKind {
     Node,
     Atom,
     Ident,
+}
+
+/// Validate the discriminator and extracted layout without decoding source
+/// positions against a particular file. The syntax conversion boundary owns
+/// that check; these operations preserve the exact SourceInfo object.
+fn source_info(value: &Obj) -> Result<bool, VmRefusal> {
+    if value.is_scalar() {
+        return if value.unbox() == layout::SOURCE_NONE_TAG {
+            Ok(true)
+        } else {
+            Err(VmRefusal::InvalidCtorObject)
+        };
+    }
+    if value.obj_tag() == usize::from(layout::SOURCE_ORIGINAL.tag) {
+        check_layout(value, layout::SOURCE_ORIGINAL)?;
+    } else if value.obj_tag() == usize::from(layout::SOURCE_SYNTHETIC.tag) {
+        check_layout(value, layout::SOURCE_SYNTHETIC)?;
+    } else {
+        return Err(VmRefusal::InvalidCtorObject);
+    }
+    Ok(false)
+}
+
+fn get_head_info(value: &Obj) -> Result<Obj, IntrinsicFailure> {
+    let mut current = value.clone_ref();
+    let mut pending = Vec::new();
+    let mut visited = 0u64;
+    loop {
+        visited += 1;
+        limit("syntax head-info nodes", MAX_SYNTAX_NODES, visited)?;
+        match syntax_kind(&current)? {
+            SyntaxKind::Missing => {}
+            SyntaxKind::Atom | SyntaxKind::Ident => {
+                let info = child(&current, 0)?;
+                source_info(&info)?;
+                // A token with SourceInfo.none is still the first token.
+                // getHeadInfo? returns `some none`, never searches past it.
+                return Ok(info);
+            }
+            SyntaxKind::Node => {
+                let info = child(&current, 0)?;
+                if !source_info(&info)? {
+                    return Ok(info);
+                }
+                let children = child(&current, 2)?;
+                let (size, _) = children
+                    .try_array_view()
+                    .ok_or(VmRefusal::InvalidArrayObject)?;
+                if size != 0 {
+                    current = children.array_child(0);
+                    if size > 1 {
+                        pending.push((children, 1, size));
+                    }
+                    continue;
+                }
+            }
+        }
+        // Keep only each ancestor's next sibling, rather than recursing on
+        // the host stack or materializing every child of a wide syntax node.
+        let Some((children, index, size)) = pending.pop() else {
+            return Ok(Obj::mk_nat(layout::SOURCE_NONE_TAG));
+        };
+        current = children.array_child(index);
+        if index + 1 < size {
+            pending.push((children, index + 1, size));
+        }
+    }
 }
 
 fn check_layout(value: &Obj, expected: layout::CtorLayout) -> Result<(), VmRefusal> {

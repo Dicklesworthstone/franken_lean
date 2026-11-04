@@ -6,6 +6,7 @@ use super::*;
 use fln_comp::flbc;
 
 mod lookup;
+mod syntax_editing;
 
 fn atom(text: &str) -> Obj {
     Obj::mk_ctor(
@@ -39,6 +40,13 @@ fn invoke(intrinsic: Intrinsic, args: &[Obj]) -> Obj {
         Intrinsic::GetKind => "mirror:Lean.Syntax.getKind",
         Intrinsic::SetKind => "mirror:Lean.Syntax.setKind",
         Intrinsic::GetArgs => "mirror:Lean.Syntax.getArgs",
+        Intrinsic::SetArgs => "mirror:Lean.Syntax.setArgs",
+        Intrinsic::SetArg => "mirror:Lean.Syntax.setArg",
+        Intrinsic::IsAtom => "mirror:Lean.Syntax.isAtom",
+        Intrinsic::GetAtomVal => "mirror:Lean.Syntax.getAtomVal",
+        Intrinsic::SetAtomVal => "mirror:Lean.Syntax.setAtomVal",
+        Intrinsic::GetHeadInfo => "mirror:Lean.Syntax.getHeadInfo",
+        Intrinsic::SetInfo => "mirror:Lean.Syntax.setInfo",
         Intrinsic::IsMissing => "mirror:Lean.Syntax.isMissing",
         Intrinsic::IsIdent => "mirror:Lean.Syntax.isIdent",
         Intrinsic::GetId => "mirror:Lean.Syntax.getId",

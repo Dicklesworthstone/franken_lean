@@ -1,5 +1,6 @@
 prelude
 import Init
+import Lean.Syntax
 
 set_option trace.compiler.ir.result true
 
@@ -107,6 +108,24 @@ def optionNone (_ : Unit) : Option Lean.Syntax := none
   value.setKind kind
 
 @[noinline] def syntaxGetArgs (value : Lean.Syntax) : Array Lean.Syntax := value.getArgs
+
+@[noinline] def syntaxSetArgs (value : Lean.Syntax) (args : Array Lean.Syntax) : Lean.Syntax :=
+  value.setArgs args
+
+@[noinline] def syntaxSetArg (value : Lean.Syntax) (index : Nat) (arg : Lean.Syntax) : Lean.Syntax :=
+  value.setArg index arg
+
+@[noinline] def syntaxIsAtom (value : Lean.Syntax) : Bool := value.isAtom
+
+@[noinline] def syntaxGetAtomVal (value : Lean.Syntax) : String := value.getAtomVal
+
+@[noinline] def syntaxSetAtomVal (value : Lean.Syntax) (text : String) : Lean.Syntax :=
+  value.setAtomVal text
+
+@[noinline] def syntaxGetHeadInfo (value : Lean.Syntax) : Lean.SourceInfo := value.getHeadInfo
+
+@[noinline] def syntaxSetInfo (info : Lean.SourceInfo) (value : Lean.Syntax) : Lean.Syntax :=
+  value.setInfo info
 
 @[noinline] def syntaxIsMissing (value : @& Lean.Syntax) : Bool := value.isMissing
 
