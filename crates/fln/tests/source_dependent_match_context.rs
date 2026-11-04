@@ -240,6 +240,66 @@ def wrong (n : Nat) (token : Token n) : Nat :=
     );
 }
 
+fn reference_directory(
+    parent: &std::path::Path,
+    prefix: &str,
+    next: &std::sync::atomic::AtomicU64,
+) -> std::path::PathBuf {
+    for _ in 0..128 {
+        let sequence = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = parent.join(format!("{prefix}-{sequence}"));
+        match std::fs::create_dir(&path) {
+            Ok(()) => return path,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => panic!("cannot create oracle directory {}: {error}", path.display()),
+        }
+    }
+    panic!("oracle directory namespace exhausted for {prefix}");
+}
+
+#[test]
+fn oracle_directories_preserve_collisions_and_isolate_concurrent_inputs() {
+    use std::sync::atomic::AtomicU64;
+    let parent = reference_directory(
+        &std::env::temp_dir(),
+        &format!("fln-dependent-match-allocation-{}", std::process::id()),
+        &AtomicU64::new(0),
+    );
+    let existing = parent.join("case-0");
+    std::fs::create_dir(&existing).unwrap();
+    std::fs::write(existing.join("case.lean"), b"retained input").unwrap();
+    let next = AtomicU64::new(0);
+    let fresh = reference_directory(&parent, "case", &next);
+    assert_eq!(fresh, parent.join("case-1"));
+    assert_eq!(
+        std::fs::read(existing.join("case.lean")).unwrap(),
+        b"retained input"
+    );
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..8)
+            .map(|index| {
+                let parent = &parent;
+                let next = &next;
+                scope.spawn(move || {
+                    let path = reference_directory(parent, "case", next);
+                    std::fs::write(path.join("case.lean"), index.to_string()).unwrap();
+                    (path, index)
+                })
+            })
+            .collect();
+        let mut paths = std::collections::BTreeSet::new();
+        for handle in handles {
+            let (path, index) = handle.join().unwrap();
+            assert!(paths.insert(path.clone()));
+            assert_eq!(
+                std::fs::read_to_string(path.join("case.lean")).unwrap(),
+                index.to_string()
+            );
+        }
+        assert_eq!(paths.len(), 8);
+    });
+}
+
 fn reference(source: &str, accepted: bool, expected: Option<usize>) {
     use std::path::PathBuf;
     use std::process::Command;
@@ -292,15 +352,16 @@ fn reference(source: &str, accepted: bool, expected: Option<usize>) {
     let Some(binary) = binary else {
         return;
     };
-    let root = std::env::temp_dir().join(format!(
+    let prefix = format!(
         "fln-dependent-match-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos()
-    ));
-    std::fs::create_dir(&root).unwrap();
+    );
+    static NEXT_REFERENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let root = reference_directory(&std::env::temp_dir(), &prefix, &NEXT_REFERENCE);
     let path = root.join("case.lean");
     std::fs::write(&path, source).unwrap();
     let result = Command::new(binary).arg(&path).output().unwrap();
