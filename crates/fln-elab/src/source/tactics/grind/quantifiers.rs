@@ -16,6 +16,22 @@ const MAX_MATCH_DEPTH: usize = 128;
 // internalized by the ground engine; instances become terms in the next round.
 const MAX_ROUNDS: usize = 5;
 
+/// The places the pin permits a selected theorem to use as triggers. A
+/// direction selects patterns; it never reverses or otherwise changes the
+/// theorem's proof.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum PatternKind {
+    Local,
+    Default,
+    EqualityLeft,
+    EqualityRight,
+    EqualityBoth,
+    Forward,
+    Backward,
+    LeftRight,
+    RightLeft,
+}
+
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct Substitution {
     terms: Vec<Option<Expr>>,
@@ -236,12 +252,36 @@ fn collect_group(
     Ok(None)
 }
 
+/// Equality modifiers use the selected side itself, not an arbitrary child
+/// covering the same variables. This fragment admits ordinary application
+/// patterns; the pin's preprocessing of forbidden heads and generalization
+/// gadgets remain explicit capability boundaries.
+fn equality_pattern(
+    context: &mut Context,
+    parameters: &[Parameter],
+    expression: &Expr,
+) -> Result<Option<Vec<Expr>>, Error> {
+    let expression = normalize(context, expression)?;
+    if !matches!(expression.node(), ExprNode::App { .. })
+        || !pattern_head(context, parameters, &expression)?
+    {
+        return Ok(None);
+    }
+    let Some(covered) = variables(context, parameters, &expression)? else {
+        return Ok(None);
+    };
+    Ok(covered
+        .iter()
+        .all(|covered| *covered)
+        .then(|| vec![expression]))
+}
+
 impl Theorem {
     fn prepare(
         context: &mut Context,
         evidence: &Typed,
         level_params: &[Name],
-        local: bool,
+        kind: PatternKind,
     ) -> Result<Option<Self>, Error> {
         let saved = context.txn.lctx.clone();
         let result = (|| {
@@ -292,9 +332,7 @@ impl Theorem {
                 conclusion = normalize(context, body)?;
             }
             let mut patterns = Vec::new();
-            let mut backwards = vec![conclusion.clone()];
-            backwards.extend(premises.iter().cloned());
-            if local {
+            let places = if kind == PatternKind::Local {
                 for place in premises.iter().chain(std::iter::once(&conclusion)) {
                     for (pattern, covered) in candidates(context, &parameters, place)? {
                         if covered.iter().all(|covered| *covered) {
@@ -312,10 +350,57 @@ impl Theorem {
                 {
                     patterns.push(group);
                 }
-                backwards = vec![conclusion];
+                let mut backwards = vec![conclusion];
                 backwards.extend(premises.into_iter().rev());
-            }
-            if let Some(group) = collect_group(context, &parameters, &backwards)?
+                backwards
+            } else {
+                match kind {
+                    PatternKind::EqualityLeft
+                    | PatternKind::EqualityRight
+                    | PatternKind::EqualityBoth => {
+                        let sides = equality_target(&conclusion)
+                            .map(|(_, _, left, right)| (left, right))
+                            .or_else(|| binary(&conclusion, "Iff"));
+                        let Some((left, right)) = sides else {
+                            return Ok(None);
+                        };
+                        for (side, selected) in [
+                            (&left, kind != PatternKind::EqualityRight),
+                            (&right, kind != PatternKind::EqualityLeft),
+                        ] {
+                            if !selected {
+                                continue;
+                            }
+                            // Both directions must independently cover every
+                            // parameter; merging their coverage would silently
+                            // turn `_=_` into a different multi-pattern.
+                            let Some(group) = equality_pattern(context, &parameters, side)? else {
+                                return Ok(None);
+                            };
+                            if !patterns.contains(&group) {
+                                patterns.push(group);
+                            }
+                        }
+                        Vec::new()
+                    }
+                    PatternKind::Forward => premises,
+                    PatternKind::Backward => vec![conclusion],
+                    PatternKind::LeftRight => {
+                        premises.push(conclusion);
+                        premises
+                    }
+                    PatternKind::Default | PatternKind::RightLeft => {
+                        if kind == PatternKind::RightLeft {
+                            premises.reverse();
+                        }
+                        let mut places = vec![conclusion];
+                        places.extend(premises);
+                        places
+                    }
+                    PatternKind::Local => unreachable!("local patterns selected above"),
+                }
+            };
+            if let Some(group) = collect_group(context, &parameters, &places)?
                 && !patterns.contains(&group)
             {
                 patterns.push(group);
@@ -380,9 +465,9 @@ impl Quantifiers {
         context: &mut Context,
         evidence: &Typed,
         level_params: &[Name],
-        local: bool,
+        kind: PatternKind,
     ) -> Result<bool, Error> {
-        let Some(theorem) = Theorem::prepare(context, evidence, level_params, local)? else {
+        let Some(theorem) = Theorem::prepare(context, evidence, level_params, kind)? else {
             return Ok(false);
         };
         if self.theorems.len() >= MAX_THEOREMS {
