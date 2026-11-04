@@ -89,7 +89,7 @@ fn push_field(
         frames.push(frame(record));
         // The value's arguments start right of the first field (`checkColGt`).
         let mut value = term_binders::frame(frames, prefix);
-        value.argument_floor = Some(floor);
+        value.argument_floor = Some((floor, NatDefinitionExpectation::RecordField));
         frames.push(value);
     }
     Ok(())
@@ -443,13 +443,10 @@ pub(super) fn line_break(
 }
 
 pub(super) fn column(view: &SourceView, tokens: &[LexedToken], at: usize) -> usize {
-    let pos = tokens[at].extent.start();
-    pos.0
-        - view
-            .normalized()
-            .line_start(view.normalized().line_of(pos))
-            .expect("token line")
-            .0
+    view.normalized()
+        .position_of(tokens[at].extent.start())
+        .expect("token position")
+        .scalar_column
 }
 
 #[cfg(test)]

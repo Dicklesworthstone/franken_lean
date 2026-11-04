@@ -265,6 +265,81 @@ fn a_right_hand_side_left_of_its_pipe_is_refused_as_at_the_pin() {
 
 /// Each refused program is rejected by the pin and refused here; each accepted one prints the
 /// pin's stdout in both.
+#[test]
+fn match_rhs_arguments_start_right_of_the_saved_pipe_as_at_the_pin() {
+    let Some(lib) = pinned_lib() else {
+        return;
+    };
+    let function = "def f (n m : Nat) : Nat := n + m\n";
+    let refused = [
+        "def g (n : Nat) : Nat :=\n  match n with\n  | n => f n\n  1\n",
+        "def g (n : Nat) : Nat :=\n  match n with\n  | n => f n\n 1\n",
+        "def g : Nat → Nat\n  | n => f n\n  1\n",
+        "def g (n : Nat) : Nat :=\n  match n with\n  | n => let x := n; f x\n  1\n",
+        "def g (n : Nat) : Nat :=\n  match n with\n  | n => match n with\n    | n => f n\n    1\n",
+        "def g (n : Nat) : Nat → Nat :=\n  match n with\n  | n => fun (x : Nat) => f n\n  x\n",
+    ]
+    .map(|body| format!("{function}{body}"));
+    let accepted = [
+        "def g (n : Nat) : Nat :=\n  match n with\n  | n => f n\n   1\nexample : g 1 = 2 := rfl\n",
+        "def g : Nat → Nat\n  | n => f n\n   1\nexample : g 1 = 2 := rfl\n",
+        "def g (n : Nat) : Nat :=\n  match n with\n  | n => (f n\n  1)\nexample : g 1 = 2 := rfl\n",
+        "def g (n : Nat) : Nat :=\n  match n with\n  | n => n\n  + 1\nexample : g 1 = 2 := rfl\n",
+        "def g (n : Nat) : Nat :=\n  match n with\n  | n =>\n  f n 1\nexample : g 1 = 2 := rfl\n",
+        "def g (n : Nat) : Nat :=\n  match n with\n  | n => (let x := n; f x\n  1)\nexample : g 1 = 2 := rfl\n",
+        "def g (n : Nat) : Nat :=\n  match n with\n  | n => match n with\n    | n => f n\n     1\nexample : g 1 = 2 := rfl\n",
+        "def g (n : Nat) : Nat → Nat :=\n  match n with\n  | n => fun (x : Nat) => (f n\n  x)\nexample : g 1 1 = 2 := rfl\n",
+        // A pattern function can itself take an application argument outside its alternatives.
+        "def g : Nat → Nat := fun\n  | n => f n\n  1\nexample : g 1 = 2 := rfl\n",
+    ]
+    .map(|body| format!("{function}{body}"));
+    let refused = refused.iter().map(String::as_str).collect::<Vec<_>>();
+    let accepted = accepted
+        .iter()
+        .map(|program| (program.as_str(), ""))
+        .collect::<Vec<_>>();
+    judge(&lib, &workspace(), &refused, &accepted);
+}
+
+#[test]
+fn unary_prefixes_preserve_the_match_alternatives_saved_column() {
+    let Some(lib) = pinned_lib() else {
+        return;
+    };
+    let prefix = "def f (_n _m : Nat) : Bool := true\n\
+                  def g (n : Nat) : Bool :=\n  match n with\n  | n => !f n\n";
+    let refused = format!("{prefix}  1\n");
+    let accepted = format!("{prefix}   1\nexample : g 1 = false := rfl\n");
+    judge(&lib, &workspace(), &[&refused], &[(&accepted, "")]);
+}
+
+#[test]
+fn saved_columns_count_unicode_scalars_across_crlf_and_record_fields() {
+    let Some(lib) = pinned_lib() else {
+        return;
+    };
+    // The inline pipe is scalar column 38, byte column 40. Its first legal argument is 39.
+    let prefix = "def f (n m : Nat) : Nat := n + m\r\n\
+                  def g (ν : Nat) : Nat := match ν with | ν => f ν\r\n";
+    let refused = format!("{prefix}{}1\r\n", " ".repeat(38));
+    let accepted = format!(
+        "{prefix}{}1\r\nexample : g 1 = 2 := rfl\r\n",
+        " ".repeat(39)
+    );
+    // The first field is scalar column 21, byte column 22. The old byte floor refused 22.
+    let record = format!(
+        "structure Q where\n  a : Nat\ndef f (n : Nat) : Nat := n\n\
+         def q : Q := {{ /-λ-/ a := f\n{}2 }}\nexample : q.a = 2 := rfl\n",
+        " ".repeat(22)
+    );
+    judge(
+        &lib,
+        &workspace(),
+        &[&refused],
+        &[(&accepted, ""), (&record, "")],
+    );
+}
+
 fn judge(lib: &Path, root: &Path, refused: &[&str], accepted: &[(&str, &str)]) {
     for (index, program) in refused.iter().enumerate() {
         let entry = root.join(format!("Refused{index}.lean"));

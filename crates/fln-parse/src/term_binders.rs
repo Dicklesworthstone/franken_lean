@@ -93,7 +93,7 @@ pub(super) fn frame(
         operands: Vec::new(),
         operators: Vec::new(),
         command_position: parents.last().is_none_or(|frame| frame.command_position),
-        argument_floor: None,
+        argument_floor: parents.last().and_then(|frame| frame.argument_floor),
     }
 }
 

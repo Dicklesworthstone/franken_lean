@@ -13,7 +13,11 @@ mod fallback;
 mod if_let;
 use do_scopes::DoScopes;
 
-pub(super) type Splices = HashMap<usize, (usize, Syntax)>;
+#[derive(Default)]
+pub(super) struct Splices {
+    pub(super) terms: HashMap<usize, (usize, Syntax)>,
+    pub(super) argument_floor: Option<(usize, NatDefinitionExpectation)>,
+}
 struct Alternative {
     pipe: usize,
     /// `| p | q => e`: the pipes after the first, each separating a group of patterns that
@@ -1566,15 +1570,17 @@ fn let_values(
     updates: &HashSet<usize>,
 ) -> Result<Syntax, NatDefinitionParseError> {
     enum Task {
-        Value(Range<usize>),
+        Value(Range<usize>, Option<(usize, NatDefinitionExpectation)>),
         Close(Vec<LetBindingTokens>),
         Parentheses(usize, usize, usize),
     }
-    let mut tasks = vec![Task::Value(range)];
+    let parent_floor = splices.argument_floor;
+    let mut tasks = vec![Task::Value(range, parent_floor)];
     let mut values = Vec::new();
     while let Some(task) = tasks.pop() {
         match task {
-            Task::Value(range) => {
+            Task::Value(range, argument_floor) => {
+                splices.argument_floor = argument_floor;
                 let mut head = range.start;
                 while head < range.end && is_symbol(tokens, head, "(") {
                     head += 1;
@@ -1600,7 +1606,7 @@ fn let_values(
                         depth == wrappers && (end..range.end).all(|at| is_symbol(tokens, at, ")"));
                     if enclosed {
                         tasks.push(Task::Parentheses(range.start, range.end, wrappers));
-                        tasks.push(Task::Value(head..end));
+                        tasks.push(Task::Value(head..end, None));
                         continue;
                     }
                 }
@@ -1619,14 +1625,29 @@ fn let_values(
                 {
                     return Err(refuse(view, tokens, range.start));
                 }
-                let bodies = bindings.iter().map(|b| b.value.clone()).collect::<Vec<_>>();
+                let bodies = bindings
+                    .iter()
+                    .map(|binding| {
+                        Task::Value(
+                            binding.value.clone(),
+                            Some((
+                                character_column(view, tokens, binding.keyword),
+                                NatDefinitionExpectation::LetSeparator,
+                            )),
+                        )
+                    })
+                    .collect::<Vec<_>>();
                 tasks.push(Task::Close(bindings));
-                tasks.push(Task::Value(body_start..range.end));
-                tasks.extend(bodies.into_iter().rev().map(Task::Value));
+                tasks.push(Task::Value(body_start..range.end, argument_floor));
+                tasks.extend(bodies.into_iter().rev());
             }
             Task::Close(bindings) => {
                 let mut value = values.pop().expect("let continuation follows its values");
                 for binding in bindings.into_iter().rev() {
+                    splices.argument_floor = Some((
+                        character_column(view, tokens, binding.keyword),
+                        NatDefinitionExpectation::LetSeparator,
+                    ));
                     let local_value = values.pop().expect("let value precedes its continuation");
                     // A binding by equations, or with a termination hint, is not read here.
                     if binding.equations || binding.termination.is_some() {
@@ -1647,7 +1668,9 @@ fn let_values(
                     // The binder parser owns these domains and their child
                     // matches; leave every value/continuation splice untouched.
                     for parameter in &binding.parameters {
-                        splices.retain(|start, _| !parameter.type_range.contains(start));
+                        splices
+                            .terms
+                            .retain(|start, _| !parameter.type_range.contains(start));
                     }
                     let parameters =
                         bounded_binder_syntax(leaves, view, tokens, binding.parameters, grammar)?;
@@ -1721,6 +1744,7 @@ fn let_values(
     if values.len() != 1 {
         return Err(refuse(view, tokens, 0));
     }
+    splices.argument_floor = parent_floor;
     Ok(values.pop().expect("one local value"))
 }
 
@@ -1788,7 +1812,7 @@ fn parse_planned(
     {
         return parse_compound(leaves, view, tokens, range, grammar, equations);
     }
-    let mut splices = Splices::new();
+    let mut splices = Splices::default();
     let updates = record_terms::update_openers(tokens, range.clone());
     branch_value(leaves, view, tokens, range, grammar, &mut splices, &updates)
 }
@@ -1877,7 +1901,7 @@ fn build_conditional(
         let syntax = statement_conditional(
             leaves, view, tokens, &plan, then_at, condition, yes, otherwise,
         )?;
-        splices.insert(plan.start, (plan.end, syntax));
+        splices.terms.insert(plan.start, (plan.end, syntax));
         return Ok(());
     }
     let else_at = plan.else_at.expect("ordinary conditional requires else");
@@ -1902,7 +1926,7 @@ fn build_conditional(
     let syntax = term_conditional(
         leaves, view, tokens, &plan, grammar, splices, updates, condition, yes, no,
     )?;
-    splices.insert(plan.start, (plan.end, syntax));
+    splices.terms.insert(plan.start, (plan.end, syntax));
     Ok(())
 }
 
@@ -2053,7 +2077,7 @@ fn build_bool_conditional(
             parts.push(leaves.leaf(separator)?);
         }
     }
-    splices.insert(
+    splices.terms.insert(
         plan.start,
         (
             plan.end,
@@ -2164,6 +2188,18 @@ fn build_match(
         }
     }
     let mut alternatives = Vec::new();
+    // Pattern functions may finish their alternatives before an application argument to the
+    // function itself. The match/equation RHS path below has no such outer application.
+    let argument_floor = plan
+        .alternatives
+        .first()
+        .filter(|_| !plan.function)
+        .map(|alt| {
+            (
+                character_column(view, tokens, alt.pipe),
+                NatDefinitionExpectation::MatchAlternative,
+            )
+        });
     for alt in plan.alternatives {
         let arrow = alt.arrow.expect("validated alternative");
         let mut groups = Vec::new();
@@ -2186,6 +2222,7 @@ fn build_match(
             groups.push(null_node(patterns));
             group_start = separator + 1;
         }
+        let parent_floor = std::mem::replace(&mut splices.argument_floor, argument_floor);
         let rhs = if plan.statement {
             bounded_do_sequence_spliced(
                 leaves,
@@ -2195,7 +2232,7 @@ fn build_match(
                 grammar,
                 splices,
                 updates,
-            )?
+            )
         } else {
             branch_value(
                 leaves,
@@ -2205,8 +2242,10 @@ fn build_match(
                 grammar,
                 splices,
                 updates,
-            )?
+            )
         };
+        splices.argument_floor = parent_floor;
+        let rhs = rhs?;
         alternatives.push(Syntax::node(
             parser_kind(&["Term", "matchAlt"]),
             vec![
@@ -2227,7 +2266,7 @@ fn build_match(
         if plan.end != range.end {
             return Err(refuse(view, tokens, plan.end));
         }
-        if !splices.is_empty() {
+        if !splices.terms.is_empty() {
             return Err(refuse(view, tokens, range.start));
         }
         return Ok(Some(alternatives));
@@ -2268,7 +2307,7 @@ fn build_match(
             ],
         )
     };
-    splices.insert(plan.start, (plan.end, syntax));
+    splices.terms.insert(plan.start, (plan.end, syntax));
     Ok(None)
 }
 
@@ -2280,7 +2319,7 @@ fn parse_compound(
     grammar: DefinitionGrammar,
     equations: bool,
 ) -> Result<Syntax, NatDefinitionParseError> {
-    let mut splices = Splices::new();
+    let mut splices = Splices::default();
     let updates: HashSet<_> = record_terms::update_openers(tokens, range.clone());
     for planned in plan(view, tokens, range.clone(), equations)? {
         match planned {
@@ -2311,7 +2350,7 @@ fn parse_compound(
         }
     }
     let result = branch_value(leaves, view, tokens, range, grammar, &mut splices, &updates)?;
-    if !splices.is_empty() {
+    if !splices.terms.is_empty() {
         return Err(refuse(view, tokens, 0));
     }
     Ok(result)
@@ -2320,6 +2359,80 @@ fn parse_compound(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn typed_lambda_headers_stay_inside_match_and_conditional_branches() {
+        for source in [
+            "def g n := match n with | n => fun x : Nat => n + x",
+            "def g n := if true then fun x : Nat => n + x else fun x : Nat => n + x",
+            "def g : Nat → Nat → Nat | n => fun x : Nat => n + x",
+            "def g n := match n with | n => fun x : Nat => match x with | x => n + x",
+            "def g n := match n with | n => fun f : Nat → Nat => f n",
+            "def g n := match n with | n => (fun x : Nat => n + x)",
+            "def g n := match n with | n => fun (x : Nat) => n + x",
+        ] {
+            let parsed = parse_definition(source.as_bytes())
+                .unwrap_or_else(|error| panic!("{source}\n{error:?}"));
+            assert_eq!(parsed.reconstruct_original(), source.as_bytes());
+        }
+        for source in [
+            "def g n := match n with | n => fun x : Nat",
+            "def g n := if true then fun x : Nat else n",
+        ] {
+            assert!(parse_definition(source.as_bytes()).is_err(), "{source}");
+        }
+    }
+    #[test]
+    fn match_rhs_arguments_respect_the_saved_pipe_position() {
+        for source in [
+            "def g n := match n with\n  | n => f n\n  1",
+            "def g n := match n with\n  | n => f n\n 1",
+            "def g : Nat → Nat\n  | n => f n\n  1",
+            "def g n := match n with\n  | n => let x := n; f x\n  1",
+            "def g n := match n with\n  | n => fun x => f x\n  1",
+            "def g n := match n with\n  | n => !f n\n  1",
+            "def g n := match n with\n  | n => match n with\n    | n => f n\n    1",
+        ] {
+            assert!(parse_definition(source.as_bytes()).is_err(), "{source}");
+        }
+        for source in [
+            "def g n := match n with\n  | n => f n\n   1",
+            "def g : Nat → Nat\n  | n => f n\n   1",
+            "def g n := match n with\n  | n => (f n\n  1)",
+            "def g n := match n with\n  | n => n\n  + 1",
+            "def g n := match n with\n  | n =>\n  f n 1",
+            "def g n := match n with\n  | n => (let x := n; f x\n  1)",
+            "def g n := match n with\n  | n => fun x => (f x\n  1)",
+            "def g n := match n with\n  | n => !f n\n   1",
+        ] {
+            let parsed = parse_definition(source.as_bytes())
+                .unwrap_or_else(|error| panic!("{source}\n{error:?}"));
+            assert_eq!(parsed.reconstruct_original(), source.as_bytes());
+            assert_eq!(parsed.reconstruct_normalized().unwrap(), source.as_bytes());
+        }
+    }
+    #[test]
+    fn saved_pipe_columns_count_scalars_and_refusals_keep_original_crlf_bytes() {
+        let prefix = "def g (ν : Nat) : Nat := match ν with | ν => f ν";
+        let column = prefix.chars().position(|ch| ch == '|').unwrap();
+        for (indent, accepted) in [(column, false), (column + 1, true)] {
+            let source = format!("{prefix}\r\n{}1\r\n", " ".repeat(indent));
+            let parsed = parse_definition(source.as_bytes());
+            if accepted {
+                let parsed = parsed.unwrap();
+                assert_eq!(parsed.reconstruct_original(), source.as_bytes());
+                assert_eq!(
+                    parsed.reconstruct_normalized().unwrap(),
+                    source.replace("\r\n", "\n").as_bytes()
+                );
+            } else {
+                assert!(matches!(parsed,
+                    Err(NatDefinitionParseError::OutsideSeedGrammar {
+                        at,
+                        expected: NatDefinitionExpectation::MatchAlternative,
+                    }) if at.0 == source.rfind('1').unwrap()));
+            }
+        }
+    }
     #[test]
     fn equation_rows_never_drop_the_tokens_after_a_closed_row() {
         // A `;` closes a row whose value is not a proof; what follows is refused (the pin

@@ -163,6 +163,6 @@ pub(super) fn build(
         parser_kind(&["Term", "nativeDoFailureValue"]),
         vec![value, leaves.leaf(p.pipe)?, otherwise, continuation],
     );
-    splices.insert(p.assignment + 1, (p.end, value));
+    splices.terms.insert(p.assignment + 1, (p.end, value));
     Ok(())
 }

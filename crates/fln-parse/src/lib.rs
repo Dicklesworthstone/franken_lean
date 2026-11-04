@@ -303,10 +303,9 @@ struct BoundedTermFrame {
     /// including for prefix frames nested inside them; closing the bracket restores its parent.
     command_position: bool,
     /// The column an application argument in this frame starts right of, when a construct saved
-    /// one for this frame (`checkColGt` against its `withPosition`): a structure instance's
-    /// first field, for a field's value. A bracket opens its own frame without one
-    /// (`withoutPosition`).
-    argument_floor: Option<usize>,
+    /// one for this frame (`checkColGt` against its `withPosition`), together with the syntax
+    /// expected when that construct ends. Brackets clear the saved position (`withoutPosition`).
+    argument_floor: Option<(usize, NatDefinitionExpectation)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2398,16 +2397,15 @@ fn push_bounded_operand(
             }
         }
     }
-    // A structure instance saves its first field's position (`structInstFields (sepByIndent …)`,
-    // vendored `Lean/Parser/Term.lean:353`), so an argument in a field's value starts right of it
-    // too: `{ a := f` with `2` on the next line left of `a` ends the field before `2`, and the
-    // pin then expects `}`.
-    if let Some(floor) = frame.argument_floor {
+    // A structure instance saves its first field's position (`Term.lean:353`); matchAlts saves
+    // its first pipe's (`Term.lean:280`). Their RHS arguments start strictly right of it, while
+    // the RHS's first term and infix operators are governed by their own grammar rules.
+    if let Some((floor, expected)) = frame.argument_floor {
         for (_, at) in application.iter().skip(1) {
             if record_terms::column(view, tokens, *at) <= floor {
                 return Err(NatDefinitionParseError::OutsideSeedGrammar {
                     at: original_position(view, tokens, *at),
-                    expected: NatDefinitionExpectation::RecordField,
+                    expected,
                 });
             }
         }
@@ -3745,6 +3743,9 @@ fn bounded_term_frames(
     let arrows = term_binders::arrow_openers(tokens, range.clone());
     let mut lists = collections::Lists::default();
     let (mut frames, mut cursor) = initial_bounded_frames(view, tokens, range.clone(), sequence)?;
+    for frame in &mut frames {
+        frame.argument_floor = splices.argument_floor;
+    }
     while cursor < range.end {
         let index = cursor;
         cursor += 1;
@@ -3862,7 +3863,7 @@ fn bounded_term_layout(
         cursor = next;
         return Ok(Some(cursor));
     }
-    if let Some((end, syntax)) = splices.remove(&index) {
+    if let Some((end, syntax)) = splices.terms.remove(&index) {
         if end > range.end {
             return Err(NatDefinitionParseError::OutsideSeedGrammar {
                 at: original_position(view, tokens, index),
@@ -3944,8 +3945,9 @@ fn bounded_term_layout(
     Ok(None)
 }
 
-/// Contextual keywords take precedence over identifiers. Build their prefix
-/// separately so its temporaries are gone before an ordinary atom is read.
+/// Contextual keywords take precedence over identifiers. Binders also enter here so named
+/// patterns never retain the large compound dispatcher's frame while parsing their headers.
+/// Build prefixes separately so their temporaries are gone before an ordinary atom is read.
 #[inline(never)]
 fn bounded_term_prefix(
     leaves: &Leaves,
@@ -3970,6 +3972,10 @@ fn bounded_term_prefix(
             term_do::Prefix::element(view, tokens, cursor, end)
         }?;
         term_locals::Prefix::Do(Box::new(prefix))
+    } else if matches!(&tokens[index].kind, TokenKind::Symbol(symbol)
+        if matches!(symbol.as_str(), "forall" | "∀" | "∃" | "Σ" | "Σ'" | "fun" | "λ"))
+    {
+        term_binders::Prefix::start(leaves, view, tokens, index, cursor, end)?.into()
     } else if term_locals::word(tokens, index, "dbg_trace")
         || term_locals::word(tokens, index, "assert!")
     {
@@ -4116,7 +4122,9 @@ fn bounded_term_compound_token(
             if grammar == DefinitionGrammar::Scalar && symbol == "calc" =>
         {
             let (term, end) = proofs::calculation(leaves, view, tokens, index, range.end)?;
-            splices.retain(|start, _| *start < index || *start >= end);
+            splices
+                .terms
+                .retain(|start, _| *start < index || *start >= end);
             frames
                 .last_mut()
                 .expect("root term frame")
@@ -4234,7 +4242,9 @@ fn bounded_term_compound_token(
             // Tactic arguments are parsed by their own bounded term call.
             // Its returned syntax already owns these matches. That parser
             // bounds how deeply by blocks re-enter it.
-            splices.retain(|start, _| *start < index || *start >= end);
+            splices
+                .terms
+                .retain(|start, _| *start < index || *start >= end);
             frames
                 .last_mut()
                 .expect("root term frame")
@@ -4341,7 +4351,7 @@ fn bounded_term_compound_token(
                 operands: Vec::new(),
                 operators: Vec::new(),
                 command_position: frames.last().is_none_or(|frame| frame.command_position),
-                argument_floor: None,
+                argument_floor: frames.last().and_then(|frame| frame.argument_floor),
             });
         }
         // A syntax quotation, and inside one an antiquotation, as an operand
@@ -4416,17 +4426,6 @@ fn bounded_term_compound_token(
                 .application
                 .push((term, index));
             return Ok(next);
-        }
-        Some(TokenKind::Symbol(symbol))
-            if grammar == DefinitionGrammar::Scalar
-                && matches!(
-                    symbol.as_str(),
-                    "forall" | "∀" | "∃" | "Σ" | "Σ'" | "fun" | "λ"
-                ) =>
-        {
-            let prefix =
-                term_binders::Prefix::start(leaves, view, tokens, index, &mut cursor, range.end)?;
-            frames.push(term_binders::frame(frames, prefix));
         }
         Some(TokenKind::Symbol(symbol))
             if grammar == DefinitionGrammar::Scalar && (symbol == "." || symbol == "·") =>

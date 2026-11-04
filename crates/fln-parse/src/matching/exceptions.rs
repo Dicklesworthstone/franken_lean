@@ -280,6 +280,7 @@ pub(super) fn build(
     for c in p.catches {
         if c.pattern {
             let (end, handler) = splices
+                .terms
                 .remove(&c.keyword)
                 .ok_or_else(|| refuse(view, tokens, c.keyword))?;
             if end != c.end || handler.kind() != Some(&parser_kind(&["Term", "doCatchMatch"])) {
@@ -346,7 +347,7 @@ pub(super) fn build(
             ],
         )]),
     };
-    splices.insert(
+    splices.terms.insert(
         p.start,
         (
             p.end,
