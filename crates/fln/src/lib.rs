@@ -7116,14 +7116,11 @@ fn executable_lambda(
     let Declaration::Defn(definition) = declaration else {
         return Ok(None);
     };
-    // Catalog eta can give a Const/App alias a first-order signature. Only a
-    // real lambda spine is a publishable local closure; executing `copy` as a
-    // zero-argument program is an arity error. Exclude that shape before
-    // preparing a signature whose normalized body would be discarded.
-    if !matches!(
-        definition.value.node(),
-        fln_core::expr::ExprNode::Lam { .. }
-    ) {
+    // Projection lowering can expose an alias's actual function value. Bind
+    // that prepared lambda using its checked declaration's interface. A
+    // residual Const/App alias is still not a local closure: catalog eta alone
+    // must not turn it into a zero-argument executable function.
+    if !matches!(prepared.node(), fln_core::expr::ExprNode::Lam { .. }) {
         return Ok(None);
     }
     let Some(mut signature) = preparation.signature(definition, false)? else {

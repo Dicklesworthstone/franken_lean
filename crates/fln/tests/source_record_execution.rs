@@ -25,6 +25,44 @@ fn value(result: &DefinitionBatchExecution, expected: &str) {
 const POINT: &str = "structure Point where\n  x : Nat\n  y : Nat\n";
 
 #[test]
+fn function_valued_instance_projections_execute_original_examples_and_replay() {
+    let base = engine();
+    let options = KVMap::new();
+    let root = base.logical_root(&options);
+    for (example, evaluation, expected) in [
+        (
+            include_str!("../../../examples/native_instances.lean"),
+            "#eval nested 2 3",
+            "7",
+        ),
+        (
+            include_str!("../../../examples/native_records.lean"),
+            "#eval chosen 4 5",
+            "11",
+        ),
+    ] {
+        let source = format!("{example}\n{evaluation}\n");
+        let completed = base
+            .execute_source_commands_with_checks(source.as_bytes(), &options, limits())
+            .unwrap_or_else(|error| panic!("{source}\n{error:?}"))
+            .into_complete()
+            .unwrap();
+        value(&completed.batch, expected);
+        let execution = completed.batch.executions.last().unwrap();
+        let replay =
+            fln::execute_flbc_artifact(&execution.flbc_artifact, &options, Default::default())
+                .unwrap()
+                .into_complete()
+                .unwrap();
+        let VmExit::Returned(returned) = replay else {
+            panic!("replay must return the selected dictionary's value");
+        };
+        assert_eq!(fln::nat_decimal(&returned.value).as_deref(), Some(expected));
+        assert_eq!(base.logical_root(&options), root);
+    }
+}
+
+#[test]
 fn nullary_proof_definitions_are_checked_without_becoming_runtime_entries() {
     let base = engine();
     let options = KVMap::new();
