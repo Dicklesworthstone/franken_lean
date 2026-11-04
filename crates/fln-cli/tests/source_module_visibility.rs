@@ -362,11 +362,20 @@ fn unsupported_visibility_refuses_before_missing_import_io() {
             assert!(error.contains("not implemented"), "{error}");
         }
     }
-    for modifier in ["public", "meta", "expose"] {
+    for modifier in ["meta", "expose"] {
         p.write("Main.lean", &format!("module\nprelude\n{modifier} {ID}"));
         p.refused("check-source");
         p.refused("run");
     }
+    // Public definitions are supported. Preserve the original public input
+    // as a positive control rather than refusing every visibility modifier.
+    p.write("Main.lean", &format!("module\nprelude\npublic {ID}"));
+    for command in ["check-source", "run"] {
+        let report = p.complete(command);
+        assert!(report.contains("\"authority\":true"), "{report}");
+        assert!(report.contains("\"commands\":1"), "{report}");
+    }
+    assert!(p.lean_complete().is_empty());
     p.write("Main.lean", PRIVATE_ID);
     p.complete("check-source");
 }
