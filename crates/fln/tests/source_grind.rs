@@ -14,6 +14,9 @@ use fln_elab::arithmetic::{
 use fln_elab::source::{SourceInferenceError, scope::SourceScope};
 use std::{collections::BTreeSet, path::Path, process::Command};
 
+#[path = "source_grind/existentials.rs"]
+mod existentials;
+
 const STACK: usize = 128 * 1024 * 1024;
 const ROOTS: &[&str] = &[
     "Init.Grind.Tactics",
@@ -39,7 +42,11 @@ fn record_failure(failures: &mut Vec<String>, label: &str, detail: String) {
     failures.push(label.to_owned());
 }
 fn base(library: &Path) -> Engine {
-    let roots: Vec<_> = ROOTS.iter().map(|text| name(text)).collect();
+    base_with_roots(library, ROOTS, 4)
+}
+
+fn base_with_roots(library: &Path, modules: &[&str], threads: usize) -> Engine {
+    let roots: Vec<_> = modules.iter().map(|text| name(text)).collect();
     let mut pending = roots.clone();
     let mut seen = BTreeSet::new();
     let mut names = Vec::new();
@@ -84,7 +91,7 @@ fn base(library: &Path) -> Engine {
     // Captured extension graphs have their own encoding and can exceed the
     // underlying object-file bytes; keep this allowance independent as well.
     import_limits.max_capture_bytes = 1024 * 1024 * 1024;
-    import_limits.jobs.threads = std::num::NonZeroUsize::new(4).unwrap();
+    import_limits.jobs.threads = std::num::NonZeroUsize::new(threads).unwrap();
     import_limits.jobs.worker_stack_bytes = STACK;
     import_limits.read_jobs = import_limits.jobs;
     eprintln!(
@@ -181,6 +188,58 @@ const ACCEPT: &[(&str, &str)] = &[
     (
         "forall_goal",
         "example : ∀ (a b : Nat), a = b → b = a := by grind",
+    ),
+    (
+        "existential_elimination",
+        "example (P : Nat → Prop) (Q : Prop) (h : ∃ x, P x) (step : ∀ x, P x → Q) : Q := by grind only []",
+    ),
+    (
+        "nested_existential_elimination",
+        "example (R : Nat → Nat → Prop) (Q : Prop) (h : ∃ x y, R x y) (step : ∀ x y, R x y → Q) : Q := by grind",
+    ),
+    (
+        "existential_conjunction_and_equality",
+        "example (f : Nat → Nat) (n m : Nat) (h : ∃ x, x = n ∧ f x = m) : f n = m := by grind",
+    ),
+    (
+        "existential_arithmetic",
+        "example (n : Nat) (h : ∃ x, n < x ∧ x ≤ n) : False := by grind",
+    ),
+    (
+        "existential_from_implication",
+        "example (P : Nat → Prop) (Q R : Prop) (hq : Q) (step : Q → ∃ x, P x) (finish : ∀ x, P x → R) : R := by grind",
+    ),
+    (
+        "existential_after_disjunction_split",
+        "example (P : Nat → Prop) (Q R : Prop) (h : (∃ x, P x) ∨ Q) (hp : ∀ x, P x → R) (hq : Q → R) : R := by grind",
+    ),
+    (
+        "existential_polymorphic_domain",
+        "universe u\nexample {α : Sort u} (P : α → Prop) (Q : Prop) (h : ∃ x, P x) (step : ∀ x, P x → Q) : Q := by grind",
+    ),
+    (
+        "existential_dependent_witness",
+        "example (A : Nat → Type) (P : ∀ n, A n → Prop) (Q : Prop) (h : ∃ n, ∃ x : A n, P n x) (step : ∀ n (x : A n), P n x → Q) : Q := by grind",
+    ),
+    (
+        "negated_existential",
+        "example (P : Nat → Prop) (a : Nat) (h : ¬ ∃ x, P x) (ha : P a) : False := by grind",
+    ),
+    (
+        "existential_goal",
+        "example (P : Nat → Prop) (a : Nat) (h : P a) : ∃ x, P x := by grind",
+    ),
+    (
+        "existential_witness_transport",
+        "example (P Q : Nat → Prop) (h : ∃ x, P x) (step : ∀ x, P x → Q x) : ∃ x, Q x := by grind",
+    ),
+    (
+        "existential_nested_goal",
+        "example (R : Nat → Nat → Prop) (a b : Nat) (h : R a b) : ∃ x y, R x y := by grind",
+    ),
+    (
+        "existential_dependent_goal",
+        "example (A : Nat → Type) (P : ∀ n, A n → Prop) (n : Nat) (x : A n) (h : P n x) : ∃ n, ∃ y : A n, P n y := by grind",
     ),
     (
         "negative_goal",
@@ -363,6 +422,22 @@ const REFUSE: &[(&str, &str)] = &[
         "example (P Q : Prop) (h : P) : P ∧ Q := by grind",
     ),
     (
+        "existential_witness_is_not_arbitrary",
+        "example (P : Nat → Prop) (a : Nat) (h : ∃ x, P x) : P a := by grind",
+    ),
+    (
+        "existential_witnesses_are_distinct",
+        "example (P Q : Nat → Prop) (h : ∃ x, P x) (h' : ∃ y, Q y) (bad : ∀ x, P x → Q x → False) : False := by grind",
+    ),
+    (
+        "existential_unrelated_predicate",
+        "example (P Q : Nat → Prop) (h : ∃ x, P x) : ∃ x, Q x := by grind",
+    ),
+    (
+        "existential_missing_inhabitant",
+        "example {α : Type} (P : α → Prop) (h : ∀ x, P x) : ∃ x, P x := by grind",
+    ),
+    (
         "converse",
         "example (P Q : Prop) (h : P → Q) (hq : Q) : P := by grind",
     ),
@@ -483,6 +558,11 @@ const UNSUPPORTED: &[(&str, &str)] = &[
 ];
 
 const EXHAUST: &str = "example (P : Nat → Prop) (f : Nat → Nat) (a : Nat) (ha : P a) (step : ∀ x, P x → P (f x)) : False := by grind";
+const EXISTENTIAL_EXHAUST: &str = "example (P : Nat → Prop) (R : Nat → Nat → Prop) (a : Nat) (ha : P a) (step : ∀ x, P x → ∃ y, P y ∧ R x y) : False := by grind";
+const EXHAUST_CASES: &[(&str, &str)] = &[
+    ("instantiation_limit", EXHAUST),
+    ("existential_instantiation_limit", EXISTENTIAL_EXHAUST),
+];
 
 fn cancelled(_: &[LinearConstraint], _: OmegaLimits) -> OmegaOutcome {
     OmegaOutcome::Inconclusive {
@@ -594,7 +674,7 @@ fn ground_and_quantified_grind_proofs_and_refusals_match_the_live_pin() {
                 (true, ACCEPT),
                 (false, REFUSE),
                 (true, UNSUPPORTED),
-                (false, &[("instantiation_limit", EXHAUST)][..]),
+                (false, EXHAUST_CASES),
             ] {
                 for (label, source) in cases {
                     let path = directory.join(format!("{label}.lean"));
@@ -701,22 +781,20 @@ fn ground_and_quantified_grind_proofs_and_refusals_match_the_live_pin() {
                     record_failure(&mut failures, label, "input logical root mutated".into());
                 }
             }
-            eprintln!("grind: native instantiation budget and recovery");
-            match engine.check_source_files(&[EXHAUST.as_bytes()], &options, limits()) {
-                Err(error) if error.disposition().2 == 3 => {}
-                Ok(Outcome::Inconclusive(_)) => {}
-                other => record_failure(
-                    &mut failures,
-                    "instantiation_limit",
-                    format!("typed resource non-answer required: {other:?}"),
-                ),
-            }
-            if engine.logical_root(&options) != before {
-                record_failure(
-                    &mut failures,
-                    "instantiation_limit",
-                    "input logical root mutated".into(),
-                );
+            for (label, source) in EXHAUST_CASES {
+                eprintln!("grind: native {label} and recovery");
+                match engine.check_source_files(&[source.as_bytes()], &options, limits()) {
+                    Err(error) if error.disposition().2 == 3 => {}
+                    Ok(Outcome::Inconclusive(_)) => {}
+                    other => record_failure(
+                        &mut failures,
+                        label,
+                        format!("typed resource non-answer required: {other:?}"),
+                    ),
+                }
+                if engine.logical_root(&options) != before {
+                    record_failure(&mut failures, label, "input logical root mutated".into());
+                }
             }
             let recovery = ACCEPT
                 .iter()

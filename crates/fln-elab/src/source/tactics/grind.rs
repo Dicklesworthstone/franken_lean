@@ -10,6 +10,7 @@
 use super::*;
 use std::collections::{HashMap, HashSet, VecDeque};
 mod equalities;
+mod existentials;
 mod quantifiers;
 use equalities::Equalities;
 use quantifiers::Quantifiers;
@@ -170,6 +171,9 @@ struct State {
     /// An unsuccessful theory query needs another attempt only after a new
     /// fact arrives. Branches clone this cache and then add their assumption.
     arithmetic_attempts: HashMap<Expr, usize>,
+    /// Each existential fact is opened once along a search branch. Its witness
+    /// remains local to the resulting Exists.elim proof, never a chosen value.
+    opened_existentials: HashSet<Expr>,
 }
 
 impl State {
@@ -300,6 +304,7 @@ impl State {
                 proof: fact.value.clone(),
             });
             if *body == constant("False") {
+                self.negated_existential(context, binder_type, &fact.value)?;
                 let iff = apply(
                     constant("Iff.intro"),
                     [
@@ -745,6 +750,9 @@ impl State {
     ) -> Result<Option<Expr>, Error> {
         if let Some(proof) = self.saturate(context, target)? {
             return Ok(Some(proof));
+        }
+        if let Some(fact) = self.unopened_existential(context)? {
+            return self.eliminate_existential(context, target, depth, &fact);
         }
         let mut propositions = vec![target.clone()];
         propositions.extend(
