@@ -892,6 +892,16 @@ jobs:
           cargo test --locked -p fln --test source_imported_arrays \
             actual_imported_bounded_word_construction_executes_and_replays \
             -- --exact --nocapture || rc=1
+          # Run the complete String fixtures with their actual Prelude context,
+          # then exercise admitted imports and computed Name layout contracts.
+          # The ordinary quality gate can skip these when the pin is absent.
+          cargo test --locked -p fln --lib \
+            source_intrinsics::string_bootstrap::tests -- --nocapture || rc=1
+          cargo test --locked -p fln --lib \
+            runtime::implemented_by::tests -- --nocapture || rc=1
+          cargo test --locked -p fln \
+            --test runtime_imported_string_internal \
+            --test source_imported_structure_parents --no-fail-fast -- --nocapture || rc=1
           cargo test --locked -p fln-cli \
             --test source_equality_decisions --no-fail-fast -- --nocapture || rc=1
           cargo test --locked -p fln \
