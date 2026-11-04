@@ -218,7 +218,7 @@ fn interpretation_syntax(
     };
     let head = Syntax::Ident {
         info: *info,
-        raw_val: *raw_val,
+        raw_val: raw_val.clone(),
         val: if scope.user_name(candidate) != *candidate {
             candidate.clone()
         } else {

@@ -30,7 +30,7 @@ fn atom(text: &str) -> Syntax {
 fn identifier(name: Name) -> Syntax {
     Syntax::Ident {
         info: SourceInfo::None,
-        raw_val: ByteSpan::default(),
+        raw_val: ByteSpan::default().into(),
         val: name,
         preresolved: Vec::new(),
     }

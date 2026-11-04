@@ -77,13 +77,22 @@ pub(crate) fn elaboration_outcome<T>(
     };
     if let NatDefinitionElabError::Inference(
         SourceInferenceError::ArithmeticInconclusive(reason)
-        | SourceInferenceError::NativeEvaluationInconclusive(reason),
+        | SourceInferenceError::NativeEvaluationInconclusive(reason)
+        | SourceInferenceError::TacticMacro(fln_elab::tactic_macros::TacticMacroError::Inconclusive(
+            reason,
+        )),
     ) = &error
     {
         return Ok(Outcome::Inconclusive((**reason).clone()));
     }
     if let NatDefinitionElabError::Inference(SourceInferenceError::NativeEvaluation(
         fln_elab::native::NativeEvaluationError::Fault(fault),
+    )) = &error
+    {
+        return Ok(Outcome::InternalFault(fault.clone()));
+    }
+    if let NatDefinitionElabError::Inference(SourceInferenceError::TacticMacro(
+        fln_elab::tactic_macros::TacticMacroError::InternalFault(fault),
     )) = &error
     {
         return Ok(Outcome::InternalFault(fault.clone()));
@@ -1082,6 +1091,7 @@ impl Engine {
         }
         if !fln_elab::source::is_record(syntax) {
             if scope != &fln_elab::source::scope::SourceScope::default()
+                || scope.tactic_macros.is_some()
                 || fln_elab::source::instance_registration_is_local(parsed.syntax())
                     .map_err(DefinitionFrontendError::Elaborate)
                     .map_err(EngineExecutionError::Frontend)?
@@ -1714,7 +1724,7 @@ mod tests {
                     let SourceInfo::Original { pos, .. } = info else {
                         panic!("a parsed member name retains its original position");
                     };
-                    assert_eq!(view.normalized().span_str(*raw_val), Some("second"));
+                    assert_eq!(raw_val.text(view.normalized()), Some("second"));
                     assert_eq!(pos.0, view.normalized().as_str().find("second").unwrap());
                     assert_eq!(view.to_original(*pos).0, source.find("second").unwrap());
                     named_member = true;

@@ -552,7 +552,7 @@ impl Expander<'_> {
                             };
                             built.push(Syntax::Ident {
                                 info: self.quotation.output_info(),
-                                raw_val: *raw_val,
+                                raw_val: raw_val.clone(),
                                 val,
                                 preresolved: preresolved.clone(),
                             });
@@ -652,7 +652,7 @@ impl Expander<'_> {
         Ok(MappedSyntax {
             syntax: Syntax::Ident {
                 info: self.quotation.output_info(),
-                raw_val,
+                raw_val: raw_val.into(),
                 val: hygienic,
                 preresolved,
             },
@@ -1056,7 +1056,7 @@ mod tests {
                 trailing: span(at + 1, at + 1),
                 end_pos: BytePos(at + 1),
             },
-            raw_val: span(at, at + 1),
+            raw_val: span(at, at + 1).into(),
             val: Name::from_components([name]),
             preresolved: Vec::new(),
         }

@@ -15,7 +15,7 @@ fn atom(text: &str) -> Syntax {
 fn constructor(label: &str) -> Syntax {
     Syntax::Ident {
         info: SourceInfo::None,
-        raw_val: ByteSpan::default(),
+        raw_val: ByteSpan::default().into(),
         // Notation refers to the root constructor, even inside a namespace
         // defining its own List or an opened namespace containing cons/nil.
         val: Name::from_components(["_root_", "List", label]),
@@ -72,7 +72,7 @@ pub(super) fn is_notation(syntax: &Syntax) -> bool {
 fn root_ident(components: &[&str]) -> Syntax {
     Syntax::Ident {
         info: SourceInfo::None,
-        raw_val: ByteSpan::default(),
+        raw_val: ByteSpan::default().into(),
         val: Name::from_components(std::iter::once("_root_").chain(components.iter().copied())),
         preresolved: Vec::new(),
     }
@@ -325,7 +325,7 @@ fn expand_subtype(args: Vec<Syntax>, pattern: bool) -> Result<Syntax, NatDefinit
     );
     let head = Syntax::Ident {
         info: SourceInfo::None,
-        raw_val: ByteSpan::default(),
+        raw_val: ByteSpan::default().into(),
         val: Name::from_components(["_root_", "Subtype"]),
         preresolved: Vec::new(),
     };
@@ -335,7 +335,7 @@ fn expand_subtype(args: Vec<Syntax>, pattern: bool) -> Result<Syntax, NatDefinit
 fn pair(first: Syntax, second: Syntax) -> Syntax {
     let head = Syntax::Ident {
         info: SourceInfo::None,
-        raw_val: ByteSpan::default(),
+        raw_val: ByteSpan::default().into(),
         // The macro's quoted `Prod.mk` is resolved where the macro is defined.
         val: Name::from_components(["_root_", "Prod", "mk"]),
         preresolved: Vec::new(),
@@ -437,7 +437,7 @@ impl Context {
             // binders and namespaces; ordinary constant checking still applies.
             return Ok(Syntax::Ident {
                 info: SourceInfo::None,
-                raw_val: ByteSpan::default(),
+                raw_val: ByteSpan::default().into(),
                 val: Name::from_components(["_root_", "Unit", "unit"]),
                 preresolved: Vec::new(),
             });
@@ -481,7 +481,7 @@ impl Context {
             if array {
                 let to_array = Syntax::Ident {
                     info: SourceInfo::None,
-                    raw_val: ByteSpan::default(),
+                    raw_val: ByteSpan::default().into(),
                     // The macro's quoted `List.toArray` is resolved where it is defined.
                     val: Name::from_components(["_root_", "List", "toArray"]),
                     preresolved: Vec::new(),
@@ -524,7 +524,7 @@ mod tests {
             Name::from_components(["hygieneInfo"]),
             vec![Syntax::Ident {
                 info: SourceInfo::None,
-                raw_val: ByteSpan::default(),
+                raw_val: ByteSpan::default().into(),
                 val: Name::anonymous(),
                 preresolved: Vec::new(),
             }],

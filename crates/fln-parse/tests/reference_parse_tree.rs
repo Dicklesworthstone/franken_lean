@@ -884,7 +884,7 @@ fn null_node(args: Vec<Syntax>) -> Syntax {
 fn hygiene_ident() -> Syntax {
     Syntax::Ident {
         info: SourceInfo::None,
-        raw_val: ByteSpan::empty_at(BytePos(0)),
+        raw_val: ByteSpan::empty_at(BytePos(0)).into(),
         val: Name::anonymous(),
         preresolved: Vec::new(),
     }

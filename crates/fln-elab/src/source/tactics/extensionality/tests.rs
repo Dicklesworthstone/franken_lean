@@ -80,6 +80,7 @@ fn every_funext_budget_stop_restores_binders_metavariables_and_siblings() {
             cursor: 0,
             work: vec![Work::Goal(sibling.clone())],
             controls: Vec::new(),
+            owned_frame: None,
         };
         let args = [
             Syntax::atom(fln_syntax::source::SourceInfo::None, "funext"),

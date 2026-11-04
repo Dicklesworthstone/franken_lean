@@ -19,7 +19,7 @@ fn null(args: Vec<Syntax>) -> Syntax {
 fn root(name: &str) -> Syntax {
     Syntax::Ident {
         info: SourceInfo::None,
-        raw_val: ByteSpan::default(),
+        raw_val: ByteSpan::default().into(),
         val: Name::from_components(std::iter::once("_root_").chain(name.split('.'))),
         preresolved: Vec::new(),
     }

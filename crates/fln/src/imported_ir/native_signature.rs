@@ -135,6 +135,16 @@ pub(super) fn erase_type_arguments(
 
 fn erased_type_runtime_arity(row: &GeneratedExternRow) -> Result<Option<usize>, IrExecutionError> {
     let (name, symbol, module, kind, levels, runtime, ownership, safety) = match row.id {
+        "extern:Array.emptyWithCapacity" => (
+            "Array.emptyWithCapacity",
+            "lean_mk_empty_array_with_capacity",
+            "Init.Prelude",
+            "defn",
+            1,
+            1,
+            "abi((capacity: borrowed_arg) -> raw_object)",
+            "safe",
+        ),
         "extern:Array.mkEmpty" => (
             "Array.mkEmpty",
             "lean_mk_empty_array_with_capacity",

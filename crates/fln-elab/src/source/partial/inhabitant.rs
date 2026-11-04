@@ -44,7 +44,7 @@ impl Context {
             }
             let syntax = Syntax::Ident {
                 info: fln_syntax::source::SourceInfo::None,
-                raw_val: fln_syntax::source::ByteSpan::default(),
+                raw_val: fln_syntax::source::ByteSpan::default().into(),
                 // A user's local or namespace named default cannot redirect an
                 // elaborator support operation to a different declaration.
                 val: Name::from_components(

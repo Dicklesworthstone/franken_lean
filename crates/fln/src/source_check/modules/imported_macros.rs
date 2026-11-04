@@ -305,9 +305,16 @@ impl ModuleMacroSession {
         });
         session.set_parsers(parsers);
         let result = check(&mut session);
-        let successful = matches!(&result, Ok(Outcome::Complete(_)));
-        if let Err(reason) = self.record(module, session.finish(), successful) {
+        let (finished, report) = session.finish();
+        let successful = matches!(&result, Ok(Outcome::Complete(_)))
+            && matches!(&finished, Outcome::Complete(()));
+        if let Err(reason) = self.record(module, report, successful) {
             return Ok(Outcome::Inconclusive(reason));
+        }
+        match finished {
+            Outcome::Complete(()) => {}
+            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
         }
         result
     }
@@ -426,8 +433,10 @@ impl imported::SourceOleanImport {
     /// state; the graph shares one expansion allowance.
     ///
     /// This explicit adapter accepts the same registered-macro subset as
-    /// `check_source_modules_with_imported_macros`. Source templates, atomic
-    /// elaborator macros and tactic-boundary macros remain typed refusals.
+    /// `check_source_modules_with_imported_macros`. Owned sessions execute
+    /// imported tactics at native tactic dispatch. Source templates, atomic
+    /// macros outside tactics, and borrowed cancellation overrides at the
+    /// tactic boundary remain explicit capability refusals.
     #[allow(clippy::too_many_arguments)]
     pub fn execute_source_modules_with_imported_macros(
         &self,

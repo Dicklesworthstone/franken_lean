@@ -8,6 +8,8 @@ use std::process::Command;
 
 #[path = "source_olean_imports/abbreviations.rs"]
 mod abbreviations;
+#[path = "source_olean_imports/tactics.rs"]
+mod tactics;
 
 fn fixture(case: &str) -> PathBuf {
     fln_core::checked_manifest_dir!()
@@ -968,6 +970,12 @@ impl ImportedMacroProject {
     }
 
     fn check_with_syntax(&self, source: &str, syntax_modules: &[&str]) -> String {
+        let report = self.check_with_syntax_report(source, syntax_modules);
+        assert_imported_macro_provenance(&report);
+        report
+    }
+
+    fn check_with_syntax_report(&self, source: &str, syntax_modules: &[&str]) -> String {
         let output = self.native_with_syntax(
             "check-source",
             source,
@@ -978,8 +986,8 @@ impl ImportedMacroProject {
         assert!(output.stderr.is_empty(), "{output:?}");
         let stdout = String::from_utf8(output.stdout).unwrap();
         assert!(stdout.contains("\"outcome\":\"complete\""), "{stdout}");
+        assert!(stdout.contains("\"authority\":true"), "{stdout}");
         assert_eq!(stdout.lines().count(), 1, "{stdout}");
-        assert_imported_macro_provenance(&stdout);
         stdout
     }
 
@@ -996,7 +1004,7 @@ impl ImportedMacroProject {
     }
 }
 
-fn assert_imported_macro_provenance(report: &str) {
+fn assert_imported_macro_execution(report: &str) -> &str {
     let (_, macros) = report
         .split_once("\"importedMacros\":{")
         .expect("an imported macro result must retain its execution provenance");
@@ -1011,6 +1019,11 @@ fn assert_imported_macro_provenance(report: &str) {
         let value: u64 = value.parse().unwrap();
         assert!(value > 0, "macro {field} must record actual work: {report}");
     }
+    macros
+}
+
+fn assert_imported_macro_provenance(report: &str) {
+    let macros = assert_imported_macro_execution(report);
     let (_, reference) = macros.split_once("\"linkedReferenceFunctions\":[").unwrap();
     let (reference, _) = reference.split_once(']').unwrap();
     assert!(

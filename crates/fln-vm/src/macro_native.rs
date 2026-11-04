@@ -138,6 +138,13 @@ impl MirrorRow {
 
 pub const ROWS: &[MirrorRow] = &[
     MirrorRow {
+        id: "mirror:Lean.Name.str._override",
+        name: "Lean.Name.str._override",
+        borrowed: generated::NAME_STR_BORROWED,
+        parameters: generated::NAME_STR_PARAMETERS,
+        result_type: generated::NAME_STR_RESULT,
+    },
+    MirrorRow {
         id: "mirror:Lean.Name.mkStr1",
         name: "Lean.Name.mkStr1",
         borrowed: generated::NAME_MK_STR1_BORROWED,

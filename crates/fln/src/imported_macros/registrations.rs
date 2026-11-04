@@ -24,6 +24,9 @@ use fln_vm::interpreter::{CancellationProbe, ExecutionUsage};
 use fln_vm::macro_native::MacroLookup;
 
 mod recursive;
+#[cfg(test)]
+#[path = "registrations/runtime_lifetime_tests.rs"]
+mod runtime_lifetime_tests;
 use recursive::{ExpansionWork, RegistryExpansion, add_tree_usage, add_vm_usage};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -189,6 +192,7 @@ impl MacroCompilationInputs {
 struct MacroCode {
     compiled: OnceLock<CompiledMacro>,
     deferred: Option<(MacroCompilationInputs, IrExecutionLimits)>,
+    native: Option<super::native_tactics::NativeTacticMacro>,
 }
 
 impl MacroCode {
@@ -196,6 +200,7 @@ impl MacroCode {
         Self {
             compiled: OnceLock::from(compiled),
             deferred: None,
+            native: None,
         }
     }
 
@@ -203,6 +208,15 @@ impl MacroCode {
         Self {
             compiled: OnceLock::new(),
             deferred: Some((inputs, limits)),
+            native: None,
+        }
+    }
+
+    fn native(native: super::native_tactics::NativeTacticMacro) -> Self {
+        Self {
+            compiled: OnceLock::new(),
+            deferred: None,
+            native: Some(native),
         }
     }
 
@@ -234,6 +248,7 @@ struct RegisteredMacro {
     module: Name,
     declaration: Name,
     compiled: Arc<MacroCode>,
+    no_fallback: bool,
 }
 
 type CandidateTable = BTreeMap<Name, Arc<[RegisteredMacro]>>;
@@ -306,7 +321,12 @@ impl RegisteredMacros {
         user_declarations: &BTreeSet<Name>,
         limits: MacroRegistryLimits,
     ) -> Result<Self, MacroRegistrationError> {
-        Self::prepare_with(ordered_modules, admitted, limits, |declaration| {
+        Self::prepare_with(ordered_modules, admitted, limits, |module, declaration| {
+            if let Some(native) =
+                super::native_tactics::NativeTacticMacro::identify(module, declaration, partition)
+            {
+                return Ok(MacroCode::native(native));
+            }
             compile(
                 code,
                 declaration,
@@ -329,8 +349,15 @@ impl RegisteredMacros {
         inputs: MacroCompilationInputs,
         limits: MacroRegistryLimits,
     ) -> Result<Self, MacroRegistrationError> {
-        Self::prepare_with(ordered_modules, admitted, limits, |_| {
-            Ok(MacroCode::deferred(inputs.clone(), limits.compilation))
+        Self::prepare_with(ordered_modules, admitted, limits, |module, declaration| {
+            match super::native_tactics::NativeTacticMacro::identify(
+                module,
+                declaration,
+                &inputs.partition,
+            ) {
+                Some(native) => Ok(MacroCode::native(native)),
+                None => Ok(MacroCode::deferred(inputs.clone(), limits.compilation)),
+            }
         })
     }
 
@@ -338,7 +365,7 @@ impl RegisteredMacros {
         ordered_modules: &[MacroRegistrationModule<'_>],
         admitted: &Environment,
         limits: MacroRegistryLimits,
-        mut prepare: impl FnMut(&Name) -> Result<MacroCode, MacroExecutionError>,
+        mut prepare: impl FnMut(&Name, &Name) -> Result<MacroCode, MacroExecutionError>,
     ) -> Result<Self, MacroRegistrationError> {
         if ordered_modules.len() > limits.max_modules {
             return Err(MacroRegistrationError::Limit("modules"));
@@ -387,6 +414,12 @@ impl RegisteredMacros {
                     error,
                 }
             })?;
+            let no_fallback = decoder
+                .decode_no_fallback(input.extensions)
+                .map_err(|error| MacroRegistrationError::Decode {
+                    module: module.clone(),
+                    error,
+                })?;
             let mut owners = BTreeMap::new();
             for declaration in &input.checked.decoded.constants {
                 if owners.insert(declaration.name(), declaration).is_some() {
@@ -394,6 +427,22 @@ impl RegisteredMacros {
                         module: module.clone(),
                         declaration: declaration.name().clone(),
                         reason: "checked module repeats a declaration owner",
+                    });
+                }
+            }
+            for tagged in &no_fallback {
+                let owner = owners
+                    .get(tagged)
+                    .ok_or_else(|| MacroRegistrationError::Owner {
+                        module: module.clone(),
+                        declaration: tagged.clone(),
+                        reason: "no_fallback tag is not owned by this checked module",
+                    })?;
+                if admitted.find(tagged) != Some(*owner) {
+                    return Err(MacroRegistrationError::Owner {
+                        module: module.clone(),
+                        declaration: tagged.clone(),
+                        reason: "no_fallback owner differs from checked declaration",
                     });
                 }
             }
@@ -429,13 +478,14 @@ impl RegisteredMacros {
                         if compiled.len() >= limits.max_macros {
                             return Err(MacroRegistrationError::Limit("compiled macros"));
                         }
-                        let callable = Arc::new(prepare(&row.declaration).map_err(|error| {
-                            MacroRegistrationError::Compile {
-                                module: module.clone(),
-                                declaration: row.declaration.clone(),
-                                error: Box::new(error),
-                            }
-                        })?);
+                        let callable =
+                            Arc::new(prepare(module, &row.declaration).map_err(|error| {
+                                MacroRegistrationError::Compile {
+                                    module: module.clone(),
+                                    declaration: row.declaration.clone(),
+                                    error: Box::new(error),
+                                }
+                            })?);
                         compiled.insert(
                             row.declaration.clone(),
                             (module.clone(), (**owner).clone(), Arc::clone(&callable)),
@@ -452,6 +502,7 @@ impl RegisteredMacros {
                     .map_err(|_| MacroRegistrationError::Limit("candidate allocation"))?;
                 chain.push(RegisteredMacro {
                     module: module.clone(),
+                    no_fallback: no_fallback.contains(&row.declaration),
                     declaration: row.declaration,
                     compiled: callable,
                 });
@@ -750,8 +801,58 @@ impl RegisteredMacros {
             state,
             &mut report,
             &mut work,
+            None,
         );
         report
+    }
+
+    pub(crate) fn tactic_candidate_no_fallback(&self, kind: &Name, index: usize) -> Option<bool> {
+        self.candidates
+            .get(kind)?
+            .get(index)
+            .map(|candidate| candidate.no_fallback)
+    }
+
+    /// A tactic evaluator must interleave one macro with elaborating its
+    /// expansion before trying the next. Selecting a candidate here retains
+    /// this complete registry for nested MacroM.expandMacro? callbacks.
+    /// A selected candidate uses evalTactic's already fresh reader scope;
+    /// ordinary term dispatch continues allocating one scope per candidate.
+    pub(crate) fn expand_runtime_root(
+        &self,
+        input: &Syntax,
+        invocation: MacroDispatchInvocation<'_>,
+        limits: MacroTreeLimits,
+        candidate: Option<usize>,
+    ) -> (MacroDispatch, MacroTreeUsage) {
+        let MacroDispatchInvocation {
+            source,
+            context,
+            state,
+            lookup,
+        } = invocation;
+        let mut report = MacroDispatch::empty();
+        let mut work = ExpansionWork::new(limits);
+        work.usage.visits = 1;
+        report.outcome = if limits.max_visits == 0 {
+            stopped("runtime macro syntax visits", 0, 1)
+        } else {
+            self.expand(
+                input,
+                ExpansionContext {
+                    source,
+                    context,
+                    reference: None,
+                    lookup,
+                    cancellation: None,
+                },
+                state,
+                &mut report,
+                &mut work,
+                candidate,
+            )
+        };
+        (report, work.usage)
     }
 
     /// The pin's default `Init.Meta.Defs.expandMacros` traversal: expand a node
@@ -904,6 +1005,7 @@ impl RegisteredMacros {
                         state,
                         report,
                         work,
+                        None,
                     ) {
                         Outcome::Complete(Ok(RegisteredExpansion::Expanded {
                             syntax: next,
@@ -990,6 +1092,7 @@ impl RegisteredMacros {
         mut state: MacroState,
         report: &mut MacroDispatch,
         work: &mut ExpansionWork,
+        selected: Option<usize>,
     ) -> Outcome<Result<RegisteredExpansion, MacroExecutionError>> {
         let ExpansionContext {
             source,
@@ -1020,11 +1123,13 @@ impl RegisteredMacros {
                 Name::str(Name::anonymous(), val)
             }
         };
-        for candidate in self
+        for (_, candidate) in self
             .candidates
             .get(&kind)
             .into_iter()
             .flat_map(|chain| chain.iter())
+            .enumerate()
+            .filter(|(index, _)| selected.is_none_or(|selected| selected == *index))
         {
             if cancellation.is_some_and(CancellationProbe::is_cancelled) {
                 return Outcome::Inconclusive(Inconclusive::cancelled(
@@ -1043,13 +1148,15 @@ impl RegisteredMacros {
                     "host allocation for macro attempts",
                 ));
             }
-            let fresh_scope = state.macro_scope;
-            let Some(next_scope) = fresh_scope.checked_add(1) else {
-                return stopped("registered macro scope counter", u64::MAX - 1, u64::MAX);
-            };
-            state.macro_scope = next_scope;
             let mut current = context.clone();
-            current.current_macro_scope = fresh_scope;
+            if selected.is_none() {
+                let fresh_scope = state.macro_scope;
+                let Some(next_scope) = fresh_scope.checked_add(1) else {
+                    return stopped("registered macro scope counter", u64::MAX - 1, u64::MAX);
+                };
+                state.macro_scope = next_scope;
+                current.current_macro_scope = fresh_scope;
+            }
             let mut execution = limits.execution;
             execution.vm.max_steps -= report.completed_vm_usage.steps;
             // Reserve the outer attempt before re-entry so observations retain
@@ -1062,26 +1169,6 @@ impl RegisteredMacros {
                 reference_functions: Vec::new(),
                 native_functions: Vec::new(),
             });
-            let uncompiled = candidate.compiled.compiled.get().is_none();
-            let resolved = candidate.compiled.resolve(&candidate.declaration);
-            if uncompiled && cancellation.is_some_and(CancellationProbe::is_cancelled) {
-                return Outcome::Inconclusive(Inconclusive::cancelled(
-                    "registered macro after compilation",
-                ));
-            }
-            let compiled = match resolved {
-                Ok(compiled) => compiled,
-                Err(MacroExecutionError::Compile(error)) if error.is_resource() => {
-                    // The compiler's limit errors do not expose consumption
-                    // counters. Preserve the dependency's non-answer without
-                    // inventing a ResourceUsage or converting it to a refusal
-                    // through the recursive expansion callback.
-                    return Outcome::Inconclusive(Inconclusive::dependency_unavailable(format!(
-                        "imported macro compilation resource stop: {error}"
-                    )));
-                }
-                Err(error) => return Outcome::Complete(Err(error)),
-            };
             let callback = RegistryExpansion::new(
                 self,
                 source,
@@ -1090,19 +1177,47 @@ impl RegisteredMacros {
                 work.callback_depth,
                 work.conversions.clone(),
             );
-            let result = compiled.execute_with_methods(
-                input,
-                MacroInvocation {
-                    source,
-                    context: &current,
-                    state: &state,
-                    lookup,
-                },
-                execution,
-                cancellation,
-                Some(&callback),
-                reference,
-            );
+            let invocation = MacroInvocation {
+                source,
+                context: &current,
+                state: &state,
+                lookup,
+            };
+            let result = if let Some(native) = candidate.compiled.native {
+                // Native toolchain macros occupy their actual registration
+                // position. A failed expanded tactic may still reach a later
+                // user candidate, while recursive Macro.expandMacro? observes
+                // this same immutable registry and native expansion shape.
+                native.execute(input, invocation, execution, cancellation, reference)
+            } else {
+                let uncompiled = candidate.compiled.compiled.get().is_none();
+                let resolved = candidate.compiled.resolve(&candidate.declaration);
+                if uncompiled && cancellation.is_some_and(CancellationProbe::is_cancelled) {
+                    return Outcome::Inconclusive(Inconclusive::cancelled(
+                        "registered macro after compilation",
+                    ));
+                }
+                let compiled = match resolved {
+                    Ok(compiled) => compiled,
+                    Err(MacroExecutionError::Compile(error)) if error.is_resource() => {
+                        // The compiler's limit errors do not expose consumption
+                        // counters. Preserve the dependency's non-answer without
+                        // inventing usage or converting it to a callback refusal.
+                        return Outcome::Inconclusive(Inconclusive::dependency_unavailable(
+                            format!("imported macro compilation resource stop: {error}"),
+                        ));
+                    }
+                    Err(error) => return Outcome::Complete(Err(error)),
+                };
+                compiled.execute_with_methods(
+                    input,
+                    invocation,
+                    execution,
+                    cancellation,
+                    Some(&callback),
+                    reference,
+                )
+            };
             let nested = callback.into_progress();
             add_tree_usage(&mut work.usage, nested.tree_usage);
             if let Some(usage) = result.vm_usage {

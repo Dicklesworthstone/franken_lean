@@ -214,6 +214,7 @@ impl<'a> RegistryExpansion<'a> {
                 state,
                 &mut report,
                 &mut work,
+                None,
             );
             usage = report.completed_vm_usage;
             {

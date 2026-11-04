@@ -2565,7 +2565,7 @@ impl Expander {
             let name = Name::from_components(parts.iter().copied());
             Syntax::Ident {
                 info: SourceInfo::None,
-                raw_val: ByteSpan::empty_at(BytePos(0)),
+                raw_val: ByteSpan::empty_at(BytePos(0)).into(),
                 val: Name::from_components(["_root_"]).append_core(&name),
                 preresolved: vec![Preresolved::Decl {
                     name,
@@ -2633,7 +2633,7 @@ impl Expander {
             let absolute = Name::from_components(["_root_"]).append_core(&declaration);
             Ok(Syntax::Ident {
                 info: SourceInfo::None,
-                raw_val: ByteSpan::empty_at(BytePos(0)),
+                raw_val: ByteSpan::empty_at(BytePos(0)).into(),
                 val: fln_syntax::hygiene::add_macro_scope(&self.context, &absolute, scope)
                     .map_err(|_| "an interpolation name that cannot take a macro scope")?,
                 preresolved: vec![Preresolved::Decl {
@@ -2936,7 +2936,7 @@ const MAX_TEMPLATE_NODES: usize = 4096;
 fn synthetic_ident(name: Name) -> Syntax {
     Syntax::Ident {
         info: fln_syntax::source::SourceInfo::None,
-        raw_val: ByteSpan::empty_at(BytePos(0)),
+        raw_val: ByteSpan::empty_at(BytePos(0)).into(),
         val: name,
         preresolved: Vec::new(),
     }

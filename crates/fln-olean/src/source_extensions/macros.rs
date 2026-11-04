@@ -13,6 +13,9 @@ use std::collections::BTreeSet;
 #[path = "macro_registration_format.rs"]
 mod format;
 pub use format::MACRO_EXTENSION;
+#[path = "macros/tactic_policy.rs"]
+mod tactic_policy;
+pub use tactic_policy::NO_FALLBACK_EXTENSION;
 
 /// One registration, in the order exported by its owning module.
 #[derive(Debug, Clone, PartialEq, Eq)]

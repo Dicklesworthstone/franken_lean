@@ -146,7 +146,7 @@ fn instantiate_iteration_body(
             preresolved,
         } => Ok(Syntax::Ident {
             info: *info,
-            raw_val: *raw_val,
+            raw_val: raw_val.clone(),
             val: fln_syntax::hygiene::add_macro_scope(context, val, scope)
                 .map_err(|_| "a template name that cannot take a macro scope")?,
             preresolved: preresolved.clone(),
@@ -298,7 +298,7 @@ pub(in crate::extensions) fn instantiate(
                 charge(&mut visited)?;
                 built.push(Syntax::Ident {
                     info: *info,
-                    raw_val: *raw_val,
+                    raw_val: raw_val.clone(),
                     val: fln_syntax::hygiene::add_macro_scope(context, val, scope)
                         .map_err(|_| "a template name that cannot take a macro scope")?,
                     preresolved: preresolved.clone(),

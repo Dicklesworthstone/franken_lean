@@ -457,7 +457,7 @@ fn nested_callbacks_preserve_the_callers_reference_and_source_metadata() {
             trailing: ByteSpan::new(BytePos(8), BytePos(10)).unwrap(),
             end_pos: BytePos(8),
         },
-        raw_val: ByteSpan::new(BytePos(2), BytePos(8)).unwrap(),
+        raw_val: ByteSpan::new(BytePos(2), BytePos(8)).unwrap().into(),
         val: name("shadow"),
         preresolved: vec![Preresolved::Decl {
             name: name("Library.actual"),

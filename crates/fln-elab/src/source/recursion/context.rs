@@ -25,7 +25,7 @@ pub(super) struct Build {
 fn identifier(name: Name) -> Syntax {
     Syntax::Ident {
         info: fln_syntax::source::SourceInfo::None,
-        raw_val: fln_syntax::source::ByteSpan::default(),
+        raw_val: fln_syntax::source::ByteSpan::default().into(),
         val: name,
         preresolved: Vec::new(),
     }
@@ -350,7 +350,7 @@ impl Context {
                         .into_iter()
                         .map(|name| Syntax::Ident {
                             info: fln_syntax::source::SourceInfo::None,
-                            raw_val: fln_syntax::source::ByteSpan::default(),
+                            raw_val: fln_syntax::source::ByteSpan::default().into(),
                             val: name,
                             preresolved: Vec::new(),
                         })

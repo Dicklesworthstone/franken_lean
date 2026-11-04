@@ -82,6 +82,9 @@ def optionNone (_ : Unit) : Option Lean.Syntax := none
 
 @[noinline] def nameMkStr1 (value : String) : Lean.Name := Lean.Name.mkStr1 value
 
+@[noinline] def nameStr (parent : Lean.Name) (value : String) : Lean.Name :=
+  .str parent value
+
 @[noinline] def addMacroScope (context value : Lean.Name) (scope : Nat) : Lean.Name :=
   Lean.addMacroScope context value scope
 

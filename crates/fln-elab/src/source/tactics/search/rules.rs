@@ -269,6 +269,7 @@ mod tests {
             cursor: 0,
             work: vec![Work::Goal(sibling.clone())],
             controls: Vec::new(),
+            owned_frame: None,
         };
         let args = arguments();
         let before = original.txn.budget.heartbeats_consumed;
@@ -320,6 +321,7 @@ mod tests {
             cursor: 0,
             work: Vec::new(),
             controls: Vec::new(),
+            owned_frame: None,
         };
         let error = context
             .apply_rule_proof_goal(&mut proof, goal.clone(), &arguments(), false)

@@ -375,7 +375,8 @@ impl Doc<'_> {
                 end_pos: BytePos(pos),
             },
             raw_val: ByteSpan::new(BytePos(at), BytePos(pos))
-                .unwrap_or_else(|| ByteSpan::empty_at(BytePos(at))),
+                .unwrap_or_else(|| ByteSpan::empty_at(BytePos(at)))
+                .into(),
             val: name,
             preresolved: Vec::new(),
         };

@@ -12,6 +12,7 @@ const MAX_NAME_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum Intrinsic {
+    NameStr,
     MkStr1,
     AddMacroScope,
     MacroAddMacroScope,
@@ -34,6 +35,7 @@ pub(super) enum Intrinsic {
 impl Intrinsic {
     pub(super) fn for_row(row: &str) -> Option<Self> {
         Some(match row {
+            "mirror:Lean.Name.str._override" => Self::NameStr,
             "mirror:Lean.Name.mkStr1" => Self::MkStr1,
             "mirror:Lean.addMacroScope" => Self::AddMacroScope,
             "mirror:Lean.Macro.addMacroScope" => Self::MacroAddMacroScope,
@@ -73,7 +75,11 @@ impl Intrinsic {
             row,
             args,
             match self {
-                Self::IsOfKind | Self::GetArg | Self::SetKind | Self::GetCurrNamespace => 2,
+                Self::NameStr
+                | Self::IsOfKind
+                | Self::GetArg
+                | Self::SetKind
+                | Self::GetCurrNamespace => 2,
                 Self::AddMacroScope
                 | Self::MacroAddMacroScope
                 | Self::HasDecl
@@ -87,6 +93,20 @@ impl Intrinsic {
             Self::ExpandMacro => Err(IntrinsicFailure::Refused(
                 VmRefusal::MacroExpansionUnavailable,
             )),
+            Self::NameStr => {
+                let parent = name(&args[0])?;
+                let text = string(&args[1])?;
+                // Bound the whole result, including the new component, before
+                // allocating its native Name and computed-hash ABI carrier.
+                let mut budget =
+                    NameBudget::new("name constructor nodes", "name constructor bytes");
+                budget.name(&parent)?;
+                budget.nodes(1)?;
+                budget.text(text)?;
+                Ok(IntrinsicResult::raw_object(inject_name(&Name::str(
+                    parent, text,
+                ))))
+            }
             Self::MkStr1 => {
                 let text = string(&args[0])?;
                 limit("name bytes", MAX_NAME_BYTES, text.len() as u64)?;

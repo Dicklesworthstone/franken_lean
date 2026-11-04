@@ -59,7 +59,7 @@ fn positive_template() -> QuotationTemplate {
         args: vec![
             QuotationTemplate::Literal(Syntax::Ident {
                 info: info(1, 2),
-                raw_val: span(1, 2),
+                raw_val: span(1, 2).into(),
                 val: Name::from_components(["literal"]),
                 preresolved: Vec::new(),
             }),
@@ -67,7 +67,7 @@ fn positive_template() -> QuotationTemplate {
                 hole_info: info(3, 4),
                 value: QuotedSyntax::from_source(Syntax::Ident {
                     info: info(80, 86),
-                    raw_val: span(80, 86),
+                    raw_val: span(80, 86).into(),
                     val: Name::from_components(["caller"]),
                     preresolved: Vec::new(),
                 }),

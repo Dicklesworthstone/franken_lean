@@ -75,7 +75,7 @@ fn atom(s: &str) -> Syntax {
 fn ident(name: Name) -> Syntax {
     Syntax::Ident {
         info: fln_syntax::source::SourceInfo::None,
-        raw_val: fln_syntax::source::ByteSpan::empty_at(fln_syntax::source::BytePos(0)),
+        raw_val: fln_syntax::source::ByteSpan::empty_at(fln_syntax::source::BytePos(0)).into(),
         val: name,
         preresolved: Vec::new(),
     }

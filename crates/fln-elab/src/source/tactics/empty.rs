@@ -138,6 +138,7 @@ impl Context {
             cursor: 0,
             work: Vec::new(),
             controls: Vec::new(),
+            owned_frame: None,
         }
     }
 

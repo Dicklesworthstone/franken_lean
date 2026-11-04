@@ -6,6 +6,20 @@ public import Init
 public section
 
 -- These are compiler-produced user functions, run by Golem from their .ir.
+@[noinline] def arrayNativeEmpty (n : Nat) : Nat :=
+  let original : Array Nat := Array.emptyWithCapacity n
+  let changed := original.push 42
+  original.size + changed.size + changed[0]!
+
+@[noinline, nospecialize] def useArrayEmpty (empty : Nat → Array Nat) (n : Nat) : Nat :=
+  let original := empty n
+  let second := empty (n + 1)
+  let changed := original.push n
+  original.size + second.size + changed.size + changed[0]!
+
+@[noinline] def arrayPartialEmpty (n : Nat) : Nat :=
+  useArrayEmpty (@Array.emptyWithCapacity Nat) n
+
 @[noinline] def arrayNativeRoundTrip (n : Nat) : Nat :=
   let original := Array.replicate 3 n
   let changed := original.set! 1 (n + 7)

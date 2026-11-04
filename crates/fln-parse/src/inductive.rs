@@ -26,7 +26,7 @@ fn raw_ident(
         TokenKind::Ident(_) => Ok(leaves.leaf(at)?),
         TokenKind::Symbol(text) if crate::spells_identifier(text) => Ok(Syntax::Ident {
             info: leaves.leaf(at)?.info(),
-            raw_val: token.extent,
+            raw_val: token.extent.into(),
             val: Name::from_components([text.as_str()]),
             preresolved: Vec::new(),
         }),

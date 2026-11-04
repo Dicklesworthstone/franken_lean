@@ -28,9 +28,11 @@ use std::collections::{BTreeSet, HashSet};
 
 mod confinement;
 pub mod lookup;
+mod native_tactics;
 pub mod registrations;
 pub mod source;
 mod syntax;
+mod tactics;
 pub use syntax::{SyntaxConversionError, SyntaxLimits};
 
 /// The read-only shape of the pin's Macro.Context.

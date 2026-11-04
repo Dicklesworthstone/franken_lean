@@ -422,7 +422,8 @@ fn imported_macro_batches_observe_prior_admissions_and_preserve_resolved_syntax(
         assert_declared_value(&checked.engine, declaration, value);
     }
     assert_eq!(report.attempts.len(), 5);
-    assert_eq!(report.state.as_ref().unwrap().macro_scope, 22);
+    // Pin evalTactic (Tactic/Basic.lean:194) allocates a scope even for native rfl.
+    assert_eq!(report.state.as_ref().unwrap().macro_scope, 17 + 5 + 1);
     assert!(report.attempts.iter().any(|attempt| {
         attempt
             .native_functions
@@ -915,7 +916,8 @@ fn imported_macro_batches_expand_mutual_signatures_and_bodies_before_atomic_admi
     assert_declared_value(&checked.engine, "Group.first", 11);
     assert_declared_value(&checked.engine, "Group.second", 11);
     assert_eq!(report.attempts.len(), 8);
-    assert_eq!(report.state.as_ref().unwrap().macro_scope, 25);
+    // The native rfl after the mutual block also enters evalTactic's fresh scope.
+    assert_eq!(report.state.as_ref().unwrap().macro_scope, 17 + 8 + 1);
     assert_eq!(engine.logical_root(&KVMap::new()), before);
 
     let invalid = batch(
@@ -978,7 +980,8 @@ example : unpack (MacroTree.leaf 11) = 11 := by rfl
     }
     assert_declared_value(&checked.engine, "unpack (MacroTree.leaf 11)", 11);
     assert_eq!(report.attempts.len(), 4);
-    assert_eq!(report.state.as_ref().unwrap().macro_scope, 21);
+    // Four macro attempts plus the example's native rfl each allocate a scope.
+    assert_eq!(report.state.as_ref().unwrap().macro_scope, 17 + 4 + 1);
     assert_eq!(engine.logical_root(&KVMap::new()), before);
 }
 

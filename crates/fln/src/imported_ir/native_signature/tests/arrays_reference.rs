@@ -47,7 +47,12 @@ fn live_pinned_arrays_match_reference_with_erased_proofs_and_canonical_replay() 
     std::fs::write(dir.join("NativeArrayModule.lean"), source).unwrap();
     let generated = Command::new(&reference)
         .current_dir(&dir)
-        .args(["-o", "NativeArrayModule.olean", "NativeArrayModule.lean"])
+        .args([
+            "-j1",
+            "-o",
+            "NativeArrayModule.olean",
+            "NativeArrayModule.lean",
+        ])
         .output()
         .unwrap();
     std::fs::write(dir.join("compile.stdout"), &generated.stdout).unwrap();
@@ -71,6 +76,11 @@ fn live_pinned_arrays_match_reference_with_erased_proofs_and_canonical_replay() 
     // The test-only partition does not stand in for the full library census.
     let partition = VerifiedPartition::user_fixture();
     let cases = [
+        ("arrayNativeEmpty", 0),
+        ("arrayNativeEmpty", 4),
+        ("arrayPartialEmpty", 0),
+        ("arrayPartialEmpty", 4),
+        ("arrayPartialEmpty", 17),
         ("arrayNativeRoundTrip", 0),
         ("arrayNativeRoundTrip", 42),
         ("arrayNativeRoundTrip", u64::MAX),
@@ -106,6 +116,8 @@ fn live_pinned_arrays_match_reference_with_erased_proofs_and_canonical_replay() 
     let mut users: BTreeSet<_> = cases.iter().map(|(entry, _)| name(entry)).collect();
     // Exact closed-value initializers emitted by this pinned fixture.
     users.extend([
+        name("arrayPartialEmpty._closed_0"),
+        name("useArrayEmpty"),
         name("arrayNativeHeap._closed_0"),
         name("byteArrayNativeRoundTrip._closed_0"),
         name("byteArrayNativeBounds._closed_0"),
@@ -136,6 +148,7 @@ fn live_pinned_arrays_match_reference_with_erased_proofs_and_canonical_replay() 
         })
         .collect();
     for target in [
+        "Array.emptyWithCapacity._boxed",
         "Array.push._boxed",
         "Array.getInternal._boxed",
         "Array.set._boxed",
@@ -153,7 +166,7 @@ fn live_pinned_arrays_match_reference_with_erased_proofs_and_canonical_replay() 
     std::fs::write(dir.join("Oracle.lean"), oracle_source).unwrap();
     let oracle = Command::new(&reference)
         .current_dir(&dir)
-        .arg("Oracle.lean")
+        .args(["-j1", "Oracle.lean"])
         .output()
         .unwrap();
     std::fs::write(dir.join("oracle.stdout"), &oracle.stdout).unwrap();
@@ -232,6 +245,7 @@ fn live_pinned_arrays_match_reference_with_erased_proofs_and_canonical_replay() 
         eprintln!("live Reference and Golem: {entry} {value} = {expected}");
     }
     for operation in [
+        "Array.emptyWithCapacity",
         "Array.replicate",
         "Array.set!",
         "Array.usize",
@@ -322,12 +336,12 @@ fn native_array_prototypes(reference: &std::path::Path) -> IrModule {
             declarations.push(declaration);
         }
     }
-    assert_eq!(externs.len(), 18, "all reviewed raw native prototypes");
+    assert_eq!(externs.len(), 19, "all reviewed raw native prototypes");
     assert_eq!(
         wrappers, externs,
         "every raw prototype has its boxed wrapper"
     );
-    assert_eq!(declarations.len(), 36);
+    assert_eq!(declarations.len(), 38);
     IrModule {
         decls: declarations,
         ..IrModule::default()

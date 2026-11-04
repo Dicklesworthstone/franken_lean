@@ -1693,7 +1693,7 @@ fn encode_syntax(syntax: &Syntax, source: &SourceText) -> String {
             val,
             preresolved,
         } => {
-            let raw = source.span_str(*raw_val).unwrap_or_default();
+            let raw = raw_val.text(source).unwrap_or_default();
             let encoded_preresolved = preresolved
                 .iter()
                 .map(encode_preresolved)

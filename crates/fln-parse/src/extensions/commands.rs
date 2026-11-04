@@ -64,7 +64,9 @@ impl Run<'_> {
                     Syntax::Atom { info, .. } => shift_info(info)?,
                     Syntax::Ident { info, raw_val, .. } => {
                         shift_info(info)?;
-                        *raw_val = shift_span(*raw_val)?;
+                        if let Some(source) = raw_val.source_span() {
+                            *raw_val = shift_span(source)?.into();
+                        }
                     }
                     Syntax::Missing => {}
                 }

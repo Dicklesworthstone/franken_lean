@@ -58,6 +58,7 @@ fn proof(ctx: &Context, goal: &ProofGoal, siblings: Vec<Work<'static>>) -> Proof
         cursor: 0,
         work: siblings,
         controls: Vec::new(),
+        owned_frame: None,
     }
 }
 

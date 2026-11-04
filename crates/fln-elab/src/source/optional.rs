@@ -74,7 +74,7 @@ impl Context {
             vec![
                 Syntax::Ident {
                     info: SourceInfo::None,
-                    raw_val: ByteSpan::default(),
+                    raw_val: ByteSpan::default().into(),
                     val: Name::from_components(["_root_", "optParam"]),
                     preresolved: Vec::new(),
                 },

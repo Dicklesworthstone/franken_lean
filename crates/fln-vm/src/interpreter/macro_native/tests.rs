@@ -29,6 +29,7 @@ fn node(kind: Name, children: Vec<Obj>) -> Obj {
 
 fn invoke(intrinsic: Intrinsic, args: &[Obj]) -> Obj {
     let id = match intrinsic {
+        Intrinsic::NameStr => "mirror:Lean.Name.str._override",
         Intrinsic::MkStr1 => "mirror:Lean.Name.mkStr1",
         Intrinsic::AddMacroScope => "mirror:Lean.addMacroScope",
         Intrinsic::MacroAddMacroScope => "mirror:Lean.Macro.addMacroScope",
@@ -51,6 +52,66 @@ fn invoke(intrinsic: Intrinsic, args: &[Obj]) -> Obj {
         Ok(value) => value.into_object(),
         Err(_) => panic!("native {id} refused a valid input"),
     }
+}
+
+#[test]
+fn native_name_constructor_preserves_components_hash_and_shared_inputs() {
+    let parent = Name::num(Name::from_components(["Parent", "scope"]), u64::MAX);
+    let parent_value = inject_name(&parent);
+    for component in ["", "A.B", "λ\0🙂"] {
+        let text = Obj::mk_string(component);
+        let result = invoke(
+            Intrinsic::NameStr,
+            &[parent_value.clone_ref(), text.clone_ref()],
+        );
+        let expected = Name::str(parent.clone(), component);
+        // The converter validates every stored computed hash, not just the
+        // name's component sequence.
+        assert_eq!(Conversion::new().project_name(&result).unwrap(), expected);
+        assert_eq!(
+            Conversion::new().project_name(&parent_value).unwrap(),
+            parent
+        );
+        assert_eq!(string(&text).unwrap(), component);
+    }
+    for args in [
+        vec![Obj::mk_nat(1), Obj::mk_string("x")],
+        vec![inject_name(&parent), Obj::mk_nat(0)],
+        vec![
+            Obj::mk_ctor(1, vec![Obj::mk_nat(0), Obj::mk_string("forged")], &[0; 8]),
+            Obj::mk_string("x"),
+        ],
+    ] {
+        assert!(
+            Intrinsic::NameStr
+                .invoke("mirror:Lean.Name.str._override", &args)
+                .is_err()
+        );
+    }
+    let oversized_parent = inject_name(&Name::str(
+        Name::anonymous(),
+        "p".repeat((MAX_NAME_BYTES / 2) as usize),
+    ));
+    let oversized_component = Obj::mk_string(&"s".repeat((MAX_NAME_BYTES / 2 + 1) as usize));
+    assert!(matches!(
+        Intrinsic::NameStr.invoke(
+            "mirror:Lean.Name.str._override",
+            &[oversized_parent, oversized_component]
+        ),
+        Err(IntrinsicFailure::MirrorResource {
+            resource: "name constructor bytes",
+            ..
+        })
+    ));
+    assert_eq!(
+        Conversion::new()
+            .project_name(&invoke(
+                Intrinsic::NameStr,
+                &[Obj::mk_nat(0), Obj::mk_string("recovered")]
+            ))
+            .unwrap(),
+        Name::str(Name::anonymous(), "recovered")
+    );
 }
 
 #[test]

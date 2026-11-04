@@ -71,7 +71,9 @@ impl BoxedNative {
         // The ABI row alone cannot distinguish Object/TObject/Tagged or
         // identify which scalar carrier the compiler must box.
         let (parameters, result): (&'static [IrType], &'static IrType) = match row.id {
-            "extern:Array.mkEmpty" => (&[IrType::TObject], &IrType::Object),
+            "extern:Array.mkEmpty" | "extern:Array.emptyWithCapacity" => {
+                (&[IrType::TObject], &IrType::Object)
+            }
             "extern:Array.push" => (&[IrType::Object, IrType::TObject], &IrType::Object),
             "extern:Array.size" => (&[IrType::Object], &IrType::Tagged),
             "extern:Array.replicate" => (&[IrType::TObject, IrType::TObject], &IrType::Object),

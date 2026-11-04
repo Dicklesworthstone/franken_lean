@@ -713,7 +713,7 @@ pub(super) fn preresolve(
                     Resolution::Global(global) | Resolution::Constructor(global) => {
                         built.push(Syntax::Ident {
                             info: *info,
-                            raw_val: *raw_val,
+                            raw_val: raw_val.clone(),
                             // Macro matching uses the written identifier, even
                             // after a quotation has resolved its declaration.
                             // Anchor the name only after recursive expansion.

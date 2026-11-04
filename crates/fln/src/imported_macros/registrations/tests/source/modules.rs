@@ -123,9 +123,11 @@ fn module_macro_contexts_name_the_current_source_module() {
     assert_eq!(checked.checked.theorems, 2);
     assert_eq!(report.attempts.len(), 2);
     for module in ["Lib", "Main"] {
+        // Each module runs one macro and one native rfl; evalTactic always
+        // allocates its fresh scope (pin Tactic/Basic.lean:194).
         assert_eq!(
             report.states.as_ref().unwrap()[&name(module)].macro_scope,
-            18
+            17 + 1 + 1
         );
     }
 }
@@ -174,7 +176,9 @@ fn module_macros_follow_import_closures_and_never_borrow_a_siblings_lookup_world
     }
     assert_eq!(report.attempts.len(), 6);
     let states = report.states.as_ref().unwrap();
-    for (module, scope) in [("A", 19), ("B", 17), ("C", 18), ("Main", 20)] {
+    // Only Main has native tactic calls: its three rfl proofs each allocate
+    // evalTactic's fresh scope in addition to the three macro attempts.
+    for (module, scope) in [("A", 19), ("B", 17), ("C", 18), ("Main", 20 + 3)] {
         assert_eq!(states[&name(module)].macro_scope, scope, "{module}");
     }
     assert!(states[&name("B")].expanded_macro_declarations.is_empty());

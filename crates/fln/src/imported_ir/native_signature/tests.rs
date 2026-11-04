@@ -520,6 +520,7 @@ fn pinned_array_type_slots_are_erased_without_hiding_bad_data_or_authority() {
         Err(IrExecutionError::Unsupported { .. })
     ));
     for id in [
+        "extern:Array.emptyWithCapacity",
         "extern:Array.mkEmpty",
         "extern:Array.push",
         "extern:Array.size",
@@ -555,6 +556,131 @@ fn pinned_array_type_slots_are_erased_without_hiding_bad_data_or_authority() {
         ] {
             assert!(erased_type_runtime_arity(&changed).is_err());
         }
+    }
+}
+
+#[test]
+fn empty_with_capacity_keeps_its_full_native_telescope_and_boxed_capture() {
+    let prototype = |boxed: bool| IrDecl::Extern {
+        name: name(if boxed {
+            "Array.emptyWithCapacity._boxed"
+        } else {
+            "Array.emptyWithCapacity"
+        }),
+        params: vec![
+            IrParam {
+                x: 1,
+                ty: if boxed {
+                    IrType::TObject
+                } else {
+                    IrType::Erased
+                },
+                borrow: false,
+            },
+            IrParam {
+                x: 2,
+                ty: IrType::TObject,
+                borrow: !boxed,
+            },
+        ],
+        result: IrType::Object,
+        entries: vec![],
+    };
+    let caller = |boxed: bool| {
+        let mut stmts = vec![num(1, 4)];
+        if boxed {
+            stmts.push(bind(
+                2,
+                IrExpr::Pap {
+                    function: name("Array.emptyWithCapacity._boxed"),
+                    args: vec![IrArg::Erased],
+                },
+            ));
+            stmts.push(bind(
+                3,
+                IrExpr::Ap {
+                    x: 2,
+                    args: vec![var(1)],
+                },
+            ));
+        } else {
+            stmts.push(bind(
+                3,
+                IrExpr::Fap {
+                    function: name("Array.emptyWithCapacity"),
+                    args: vec![IrArg::Erased, var(1)],
+                },
+            ));
+        }
+        stmts.extend([
+            num(4, 42),
+            call(5, "Array.push", &[3, 4]),
+            call(6, "Array.size", &[5]),
+        ]);
+        entry(stmts, 6)
+    };
+    for boxed in [false, true] {
+        let compiled =
+            compile_declarations(vec![caller(boxed), prototype(false), prototype(true)]).unwrap();
+        assert_nat(&compiled, "1");
+        assert!(
+            compiled
+                .native_externs()
+                .iter()
+                .any(|row| row == "extern:Array.emptyWithCapacity")
+        );
+        for mutation in 0..7 {
+            let mut changed = prototype(boxed);
+            let IrDecl::Extern { params, result, .. } = &mut changed else {
+                unreachable!()
+            };
+            match mutation {
+                0 => params[0].ty = IrType::UInt8,
+                1 => params[0].borrow = true,
+                2 => params[1].ty = IrType::Object,
+                3 => params[1].borrow = !params[1].borrow,
+                4 => *result = IrType::TObject,
+                5 => *result = IrType::Void,
+                _ => {
+                    params.clear();
+                }
+            }
+            assert!(
+                matches!(
+                    compile_declarations(vec![caller(boxed), changed, prototype(!boxed)]),
+                    Err(IrExecutionError::NativeContract { .. })
+                ),
+                "boxed={boxed}, mutation={mutation}"
+            );
+        }
+    }
+    // The existing runtime-only extern form is intentionally still accepted;
+    // its one capacity operand is fixed by the generated ABI.
+    let mut native_form = prototype(false);
+    let IrDecl::Extern { params, .. } = &mut native_form else {
+        unreachable!()
+    };
+    params.remove(0);
+    assert_nat(
+        &compile_declarations(vec![caller(false), native_form]).unwrap(),
+        "1",
+    );
+    // Only the exact erased literal may disappear from a raw call. A data
+    // operand in that position and an out-of-scope capacity both refuse.
+    for (operand, replacement) in [(0, var(1)), (1, var(999))] {
+        let mut changed = caller(false);
+        let IrDecl::Function { body, .. } = &mut changed else {
+            unreachable!()
+        };
+        let IrStmt::VDecl {
+            expr: IrExpr::Fap { args, .. },
+            ..
+        } = &mut body.stmts[1]
+        else {
+            unreachable!()
+        };
+        args[operand] = replacement;
+        assert!(compile_declarations(vec![changed, prototype(false)]).is_err());
     }
 }
 

@@ -192,6 +192,8 @@ pub fn assert_member_in_group(
                 },
             ) => {
                 assert_eq!((a, ap), (b, bp));
+                let ar = ar.source_span().expect("a parsed source identifier");
+                let br = br.source_span().expect("a standalone source identifier");
                 assert_eq!(ar.start().0, br.start().0 + normalized_offset);
                 assert_eq!(ar.end().0, br.end().0 + normalized_offset);
             }

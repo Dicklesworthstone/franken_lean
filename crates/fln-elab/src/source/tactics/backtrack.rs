@@ -123,6 +123,10 @@ impl<'a> Checkpoint<'a> {
 /// cancellation and every resource outcome propagate, including nested K1 stops.
 pub(in crate::source) fn recoverable(problem: &NatDefinitionElabError) -> bool {
     match problem {
+        NatDefinitionElabError::Inference(SourceInferenceError::TacticMacro(reason)) => {
+            matches!(reason, crate::tactic_macros::TacticMacroError::Diagnostic { .. })
+        }
+        NatDefinitionElabError::Inference(SourceInferenceError::OwnedMacroSuspension { .. }) => false,
         NatDefinitionElabError::Inference(SourceInferenceError::Tactic(reason)) => {
             !matches!(
                 reason,

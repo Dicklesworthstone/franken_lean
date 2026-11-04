@@ -12,7 +12,11 @@ fn private(module: &str, declaration: &str) -> Name {
 fn module_macro_visibility_follows_public_and_private_import_forwarding() {
     let (imported, code) = batches::artifact_import_fixture();
     let before = imported.engine.logical_root(&KVMap::new());
-    for (visibility, expected, main_scope) in [("import", 18, 17), ("public import", 11, 19)] {
+    // Pin evalTactic's unconditional fresh scope includes Main's native rfl,
+    // even when the private import forwards no macro candidates to Main.
+    for (visibility, expected, main_scope) in
+        [("import", 18, 17 + 1), ("public import", 11, 19 + 1)]
+    {
         let library = format!(
             "module\nprelude\n{visibility} SourceLibrary\n\
              def localOnly : Nat := 7 + 11"

@@ -174,6 +174,19 @@ pub(crate) fn classify(error: &EngineExecutionError) -> (&'static str, bool, u8)
         )) => match reason {
             SourceInferenceError::ArithmeticInconclusive(_)
             | SourceInferenceError::NativeEvaluationInconclusive(_) => ("inconclusive", false, 3),
+            SourceInferenceError::TacticMacro(error) => match error {
+                fln_elab::tactic_macros::TacticMacroError::Diagnostic { .. } => ("macro", false, 1),
+                fln_elab::tactic_macros::TacticMacroError::Unsupported(_) => {
+                    ("capability", false, 5)
+                }
+                fln_elab::tactic_macros::TacticMacroError::Inconclusive(_) => {
+                    ("inconclusive", false, 3)
+                }
+                fln_elab::tactic_macros::TacticMacroError::InternalFault(_) => {
+                    ("internal-fault", false, 4)
+                }
+            },
+            SourceInferenceError::OwnedMacroSuspension { .. } => ("capability", false, 5),
             // A native evaluation this engine could not run is not a verdict on the source.
             SourceInferenceError::NativeEvaluation(
                 fln_elab::native::NativeEvaluationError::Fault(_),
@@ -1088,7 +1101,7 @@ impl Engine {
                 } else {
                     None
                 };
-                let scope = if public.is_some() {
+                let mut scope = if public.is_some() {
                     if let Some(parsed) = &expanded {
                         // A macro may change declaration modifiers. Choose the
                         // checking and export worlds from its exact result,
@@ -1120,6 +1133,25 @@ impl Engine {
                 } else {
                     scopes.current.clone()
                 };
+                if let Some(session) = macros.as_deref_mut() {
+                    match session.bind_tactics(
+                        scopes.imported_macros().expect("imported macro file scope"),
+                        command,
+                        &mut scope,
+                    ) {
+                        Outcome::Complete(Ok(())) => {}
+                        Outcome::Complete(Err(error)) => {
+                            return Err(SourceCheckError::ImportedMacro {
+                                file,
+                                command: count,
+                                offset: start.0,
+                                error: Box::new(error),
+                            });
+                        }
+                        Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                        Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                    }
+                }
                 let exported = scope.exports_declaration() && public.is_some();
                 let (next, admitted) = if let Some(parsed) = expanded {
                     let admitted = if let Some(public) = public.as_deref_mut() {

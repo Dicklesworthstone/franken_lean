@@ -101,13 +101,10 @@ fn nested_command_operands_preserve_full_trivia_and_unicode_crlf_positions() {
                 info, raw_val, val, ..
             } if *val == name("α") => {
                 identifiers += 1;
+                assert_eq!(raw_val.text(parsed.source_view().normalized()), Some("α"));
+                assert_eq!(info.pos(false), Some(raw_val.span().start()));
                 assert_eq!(
-                    parsed.source_view().normalized().span_str(*raw_val),
-                    Some("α")
-                );
-                assert_eq!(info.pos(false), Some(raw_val.start()));
-                assert_eq!(
-                    parsed.source_view().to_original(raw_val.start()).0,
+                    parsed.source_view().to_original(raw_val.span().start()).0,
                     source.find('α').unwrap()
                 );
             }

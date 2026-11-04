@@ -251,7 +251,7 @@ fn actual_artifacts(reference: PathBuf, library: PathBuf, partition: PathBuf) {
                 assert_eq!(scopes.name, name("Nat"));
                 assert_eq!(scopes.context, context.quotation_context);
                 assert_eq!(scopes.scopes, [0]);
-                assert_eq!((raw_val.start().0, raw_val.end().0), (8, 11));
+                assert_eq!((raw_val.span().start().0, raw_val.span().end().0), (8, 11));
                 assert!(
                     matches!(info, fln_syntax::source::SourceInfo::Original { pos, end_pos, .. } if pos.0 == 8 && end_pos.0 == 11)
                 );

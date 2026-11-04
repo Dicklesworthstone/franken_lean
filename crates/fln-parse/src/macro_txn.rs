@@ -1728,9 +1728,19 @@ impl CanonRow {
                     val,
                     preresolved,
                 } => {
-                    self.byte(3);
-                    self.source_info(*info)?;
-                    self.span(*raw_val)?;
+                    // Preserve existing source-bound identities. Owned raw
+                    // substrings have a separate tag and retain the complete
+                    // backing string, since macros can inspect more than the
+                    // selected slice through Substring.Raw.str.
+                    if let Some(backing) = raw_val.owned_backing() {
+                        self.byte(4);
+                        self.source_info(*info)?;
+                        self.bytes(backing.as_bytes());
+                    } else {
+                        self.byte(3);
+                        self.source_info(*info)?;
+                    }
+                    self.span(raw_val.span())?;
                     self.name(val);
                     self.preresolved(preresolved);
                 }

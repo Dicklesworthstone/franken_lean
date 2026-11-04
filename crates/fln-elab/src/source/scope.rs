@@ -101,6 +101,10 @@ pub struct SourceScope {
     /// the engine for the command it is about to elaborate, so it evaluates in that command's
     /// world. Like [`Self::arithmetic`], never exported as module metadata.
     pub native: Option<crate::native::NativeProvider>,
+    /// Per-command imported MacroM execution. It produces untrusted Syntax for
+    /// the native tactic/term driver, never declarations or admission receipts.
+    /// Like the native evaluator, it is not exported or a lexical scope effect.
+    pub tactic_macros: Option<crate::tactic_macros::TacticMacroProvider>,
     /// Options `set_option` set and [`options::admit`] honors, until the end of the enclosing
     /// section or namespace. Every elaboration in this scope starts with them.
     pub options: KVMap,
@@ -130,6 +134,7 @@ impl PartialEq for SourceScope {
             // The evaluator `native_decide` reaches is per-command plumbing the lean door
             // supplies, never a scope effect: two scopes differing only by it are equal.
             native: _,
+            tactic_macros: _,
             options,
         } = self;
         namespace == &other.namespace
@@ -565,6 +570,15 @@ impl Context {
             self.tick()?;
             match syntax {
                 Syntax::Node { kind, args, .. } => {
+                    // `exact` sends its complete operand to the ordinary term
+                    // elaborator, which preserves declaration metadata and
+                    // local-name priority. It is not one of the tactic paths
+                    // which extracts identifier spelling without resolution.
+                    if kind == &parser_kind(&["Tactic", "exact"]) && args.len() == 2 {
+                        pending.push((&args[0], true));
+                        pending.push((&args[1], false));
+                        continue;
+                    }
                     let specialized = specialized
                         || kind.parent() == parser_kind(&["Tactic"])
                         || kind == &parser_kind(&["Term", "match"])
@@ -1033,7 +1047,7 @@ pub(super) fn example_in_context(
         vec![
             Syntax::Ident {
                 info: SourceInfo::None,
-                raw_val: ByteSpan::empty_at(BytePos(0)),
+                raw_val: ByteSpan::empty_at(BytePos(0)).into(),
                 val: name.clone(),
                 preresolved: Vec::new(),
             },
@@ -1172,6 +1186,7 @@ mod tests {
             frontier_recursors: false,
             arithmetic: None,
             native: None,
+            tactic_macros: None,
             options: KVMap::new(),
         };
         let env = [
@@ -1368,6 +1383,7 @@ mod tests {
             frontier_recursors: false,
             arithmetic: None,
             native: None,
+            tactic_macros: None,
             options: KVMap::new(),
         };
         let resolve = |scope: &SourceScope, name: &str, protected: &ProtectedNames| {
@@ -1447,6 +1463,7 @@ mod tests {
             frontier_recursors: false,
             arithmetic: None,
             native: None,
+            tactic_macros: None,
             options: KVMap::new(),
         };
         let names = [n("Outer.x"), n("A.x"), n("B.x"), n("A.y"), n("B.y"), n("x")];

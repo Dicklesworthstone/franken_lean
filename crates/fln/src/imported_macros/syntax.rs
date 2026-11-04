@@ -1,21 +1,24 @@
 //! The bounded Syntax boundary for imported macros. Constructor layouts come
 //! from the pinned compiler's IR, exercised by the macro fixture. Source spans
-//! stay attached to the caller's exact source buffer: a foreign backing string
-//! is refused instead of silently changing `Substring.Raw.str` on reinjection.
+//! in SourceInfo stay attached to the caller's exact source buffer. Identifier
+//! raw substrings may own a separate backing, retained without relocation or
+//! changes to `Substring.Raw.str` when a later macro receives the syntax.
 
 use fln_core::name::{LeafView, Name};
 use fln_rt::convert::{Conversion, ConvertError, inject_name};
 use fln_rt::obj::Obj;
 use fln_rt::syntax_abi_generated as abi;
 use fln_syntax::source::{BytePos, ByteSpan, SourceInfo, SourceText};
-use fln_syntax::tree::{Preresolved, Syntax};
+use fln_syntax::tree::{Preresolved, RawIdentifier, Syntax};
 use std::collections::HashSet;
+use std::sync::Arc;
 
 /// Limits for one syntax conversion, including names and pre-resolved lists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SyntaxLimits {
     pub max_nodes: usize,
-    /// Source bytes plus copied atom, name-component and field-name bytes.
+    /// Source bytes plus copied atom, name-component, field-name and complete
+    /// owned identifier backing bytes (including text outside the substring).
     pub max_bytes: usize,
 }
 
@@ -243,6 +246,24 @@ fn inject_span(source: &SourceText, backing: &Obj, value: ByteSpan) -> Result<Ob
     ))
 }
 
+fn inject_identifier(
+    source: &SourceText,
+    source_backing: &Obj,
+    raw: &RawIdentifier,
+    budget: &mut Budget,
+) -> Result<Obj> {
+    if let Some(span) = raw.source_span() {
+        return inject_span(source, source_backing, span);
+    }
+    let backing = budget.string(raw.backing(source))?;
+    let span = raw.span();
+    Ok(Obj::mk_ctor(
+        abi::SUBSTRING_RAW.tag,
+        vec![backing, nat(span.start().0), nat(span.end().0)],
+        &[],
+    ))
+}
+
 fn inject_info(source: &SourceText, backing: &Obj, info: SourceInfo) -> Result<Obj> {
     Ok(match info {
         SourceInfo::None => Obj::mk_nat(abi::SOURCE_NONE_TAG),
@@ -365,7 +386,7 @@ pub(super) fn inject_counted(
                         abi::SYNTAX_IDENT.tag,
                         vec![
                             inject_info(source, &backing, *info)?,
-                            inject_span(source, &backing, *raw_val)?,
+                            inject_identifier(source, &backing, raw_val, &mut budget)?,
                             budget.name(val)?,
                             inject_preresolved(preresolved, &mut budget)?,
                         ],
@@ -475,6 +496,59 @@ impl Projection<'_> {
             position(&child(value, 1)?)?,
             position(&child(value, 2)?)?,
         )
+    }
+
+    fn identifier(&mut self, value: &Obj) -> Result<RawIdentifier> {
+        self.budget.nodes(1)?;
+        layout(value, abi::SUBSTRING_RAW)?;
+        let backing = child(value, 0)?;
+        let identity = backing.identity_token();
+        let start = position(&child(value, 1)?)?;
+        let end = position(&child(value, 2)?)?;
+        if self.checked_sources.contains(&identity) {
+            return span(self.source, start, end).map(RawIdentifier::from);
+        }
+        let (_, _, _, bytes) = backing
+            .try_borrow_string_view()
+            .ok_or(SyntaxConversionError::Malformed("string layout"))?;
+        let length = bytes
+            .len()
+            .checked_sub(1)
+            .ok_or(SyntaxConversionError::Malformed(
+                "empty string representation",
+            ))?;
+        // The source was paid for by Budget::new. Its first equal-sized
+        // comparison may reuse that allowance; every other backing must pay
+        // its full size before UTF-8 validation, comparison or allocation.
+        let prepaid = self.checked_sources.is_empty() && length == self.source.len_bytes();
+        if !prepaid {
+            self.budget.text(length)?;
+        }
+        let text = string(&backing)?;
+        if text == self.source.as_str() {
+            self.checked_sources
+                .try_reserve(1)
+                .map_err(|_| SyntaxConversionError::Allocation)?;
+            self.checked_sources.insert(identity);
+            return span(self.source, start, end).map(RawIdentifier::from);
+        }
+        if prepaid {
+            self.budget.text(length)?;
+        }
+        self.budget.nodes(1)?;
+        let span = ByteSpan::new(start, end)
+            .filter(|span| text.get(span.start().0..span.end().0).is_some())
+            .ok_or(SyntaxConversionError::Malformed(
+                "identifier substring is not a UTF-8 range",
+            ))?;
+        let mut owned = String::new();
+        owned
+            .try_reserve_exact(text.len())
+            .map_err(|_| SyntaxConversionError::Allocation)?;
+        owned.push_str(text);
+        RawIdentifier::owned(Arc::from(owned), span).ok_or(SyntaxConversionError::Malformed(
+            "identifier substring is not a UTF-8 range",
+        ))
     }
 
     fn info(&mut self, value: &Obj) -> Result<SourceInfo> {
@@ -672,7 +746,7 @@ pub(super) fn project_counted(
                             layout(&value, abi::SYNTAX_IDENT)?;
                             Syntax::Ident {
                                 info: projection.info(&child(&value, 0)?)?,
-                                raw_val: projection.span(&child(&value, 1)?)?,
+                                raw_val: projection.identifier(&child(&value, 1)?)?,
                                 val: projection.name(&child(&value, 2)?)?,
                                 preresolved: projection.preresolved(&child(&value, 3)?)?,
                             }

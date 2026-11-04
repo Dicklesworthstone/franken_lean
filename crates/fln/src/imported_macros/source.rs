@@ -14,14 +14,17 @@
 //! Recursive expansion follows `Lean.expandMacros`, including its tactic
 //! boundary. Atomic macro dispatch belongs to term elaboration, which this
 //! bounded adapter does not replace. A surviving identifier, atom or missing
-//! node with an active registration is therefore refused explicitly, as is a
-//! registered macro left behind the tactic-evaluator boundary.
+//! node with an active registration is therefore refused explicitly. File and
+//! module sessions bind an owned runtime provider at the tactic boundary;
+//! standalone APIs and borrowed lookup/cancellation overrides retain an
+//! explicit refusal there rather than extending borrowed authority lifetimes.
 
 use super::lookup::EnvironmentMacroLookup;
 use super::registrations::{
     MacroAttempt, MacroDispatchInvocation, MacroRegistrationError, MacroTreeLimits,
     MacroTreeResult, MacroTreeUsage, RegisteredMacros,
 };
+use super::tactics::ImportedTactics;
 use super::{MacroContext, MacroExecutionError, MacroState};
 use crate::source_check::{SourceCheckError, SourceCheckLimits, SourceFileCheck};
 use crate::{
@@ -38,6 +41,7 @@ use fln_syntax::tree::Syntax;
 use fln_syntax::view::SourceView;
 use fln_vm::interpreter::{CancellationProbe, ExecutionUsage};
 use fln_vm::macro_native::MacroLookup;
+use std::sync::Arc;
 
 /// Explicit invocation state and ceilings for one source query. Reuse an
 /// immutable registry or one of its scoped successors; no activation escapes
@@ -241,6 +245,7 @@ pub(crate) struct FileSession<'a> {
     limits: MacroTreeLimits,
     cancellation: Option<&'a dyn CancellationProbe>,
     progress: Progress,
+    tactics: Option<Arc<ImportedTactics>>,
 }
 
 /// Internal observations consumed by a containing file/module transaction.
@@ -305,6 +310,7 @@ impl<'a> FileSession<'a> {
             lookup: invocation.lookup,
             limits: invocation.limits,
             cancellation: invocation.cancellation,
+            tactics: None,
             progress: Progress {
                 state: None,
                 attempts: Vec::new(),
@@ -318,13 +324,86 @@ impl<'a> FileSession<'a> {
         }
     }
 
-    pub(crate) fn finish(self) -> FileSessionReport {
-        FileSessionReport {
-            state: self.state,
-            attempts: self.progress.attempts,
-            completed_vm_usage: self.progress.usage,
-            tree_usage: self.progress.tree_usage,
+    pub(crate) fn finish(mut self) -> (Outcome<()>, FileSessionReport) {
+        let outcome = self.collect_tactics();
+        (
+            outcome,
+            FileSessionReport {
+                state: self.state,
+                attempts: self.progress.attempts,
+                completed_vm_usage: self.progress.usage,
+                tree_usage: self.progress.tree_usage,
+            },
+        )
+    }
+
+    fn collect_tactics(&mut self) -> Outcome<()> {
+        let Some(tactics) = self.tactics.take() else {
+            return Outcome::Complete(());
+        };
+        let report = match tactics.take_report() {
+            Ok(report) => report,
+            Err(fln_elab::tactic_macros::TacticMacroError::Inconclusive(reason)) => {
+                return Outcome::Inconclusive(*reason);
+            }
+            Err(fln_elab::tactic_macros::TacticMacroError::InternalFault(fault)) => {
+                return Outcome::InternalFault(fault);
+            }
+            Err(error) => {
+                return Outcome::InternalFault(fln_core::outcome::InternalFault::new(
+                    "FL-INV-07",
+                    format!("unexpected tactic macro reporting error: {error}"),
+                ));
+            }
+        };
+        self.state = report.state;
+        match self.record(Progress {
+            state: None,
+            attempts: report.attempts,
+            usage: report.vm_usage,
+            tree_usage: report.tree_usage,
+        }) {
+            Ok(()) => Outcome::Complete(()),
+            Err(reason) => Outcome::Inconclusive(reason),
         }
+    }
+
+    /// Only owned, default engine lookup authority may cross into SourceScope.
+    /// A borrowed override continues using the explicit tactic refusal from
+    /// expansion preflight; it is never dropped or given a longer lifetime.
+    pub(crate) fn bind_tactics(
+        &mut self,
+        registry: &RegisteredMacros,
+        source: &[u8],
+        scope: &mut fln_elab::source::scope::SourceScope,
+    ) -> Outcome<Result<(), SourceMacroError>> {
+        // Never retain another command's owned provider when this invocation
+        // has a borrowed capability or stops while reporting previous work.
+        scope.tactic_macros = None;
+        match self.collect_tactics() {
+            Outcome::Complete(()) => {}
+            Outcome::Inconclusive(reason) => return Outcome::Inconclusive(reason),
+            Outcome::InternalFault(fault) => return Outcome::InternalFault(fault),
+        }
+        if self.lookup.is_some() || self.cancellation.is_some() {
+            return Outcome::Complete(Ok(()));
+        }
+        let view = match source_view(source) {
+            Ok(view) => view,
+            Err(error) => return Outcome::Complete(Err(error)),
+        };
+        let runtime = Arc::new(ImportedTactics::new(
+            registry.clone(),
+            view.normalized().clone(),
+            self.context.clone(),
+            self.state.clone(),
+            self.remaining_limits(),
+        ));
+        scope.tactic_macros = Some(fln_elab::tactic_macros::TacticMacroProvider(
+            runtime.clone(),
+        ));
+        self.tactics = Some(runtime);
+        Outcome::Complete(Ok(()))
     }
 
     pub(crate) fn registry(&self) -> RegisteredMacros {
@@ -769,28 +848,12 @@ impl<'a> FileSession<'a> {
         syntax: &Syntax,
         scope: &fln_elab::source::scope::SourceScope,
     ) -> Outcome<Result<Syntax, SourceMacroError>> {
-        let mut remaining = self.limits;
-        remaining.dispatch.max_attempts = remaining
-            .dispatch
-            .max_attempts
-            .saturating_sub(self.progress.attempts.len() as u64);
-        remaining.dispatch.execution.vm.max_steps = remaining
-            .dispatch
-            .execution
-            .vm
-            .max_steps
-            .saturating_sub(self.progress.usage.steps);
-        remaining.max_visits = remaining
-            .max_visits
-            .saturating_sub(self.progress.tree_usage.visits);
-        remaining.generation.max_nodes = remaining
-            .generation
-            .max_nodes
-            .saturating_sub(self.progress.tree_usage.generated_nodes);
-        remaining.generation.max_bytes = remaining
-            .generation
-            .max_bytes
-            .saturating_sub(self.progress.tree_usage.generated_bytes);
+        match self.collect_tactics() {
+            Outcome::Complete(()) => {}
+            Outcome::Inconclusive(reason) => return Outcome::Inconclusive(reason),
+            Outcome::InternalFault(fault) => return Outcome::InternalFault(fault),
+        }
+        let remaining = self.remaining_limits();
         let mut progress = Progress {
             state: None,
             attempts: Vec::new(),
@@ -815,6 +878,7 @@ impl<'a> FileSession<'a> {
                 cancellation: self.cancellation,
             },
             &mut progress,
+            self.lookup.is_none() && self.cancellation.is_none(),
         );
         if let Err(reason) = self.record(progress) {
             return Outcome::Inconclusive(reason);
@@ -825,6 +889,32 @@ impl<'a> FileSession<'a> {
                 syntax
             })
         })
+    }
+
+    fn remaining_limits(&self) -> MacroTreeLimits {
+        let mut remaining = self.limits;
+        remaining.dispatch.max_attempts = remaining
+            .dispatch
+            .max_attempts
+            .saturating_sub(self.progress.attempts.len() as u64);
+        remaining.dispatch.execution.vm.max_steps = remaining
+            .dispatch
+            .execution
+            .vm
+            .max_steps
+            .saturating_sub(self.progress.usage.steps);
+        remaining.max_visits = remaining
+            .max_visits
+            .saturating_sub(self.progress.tree_usage.visits);
+        remaining.generation.max_nodes = remaining
+            .generation
+            .max_nodes
+            .saturating_sub(self.progress.tree_usage.generated_nodes);
+        remaining.generation.max_bytes = remaining
+            .generation
+            .max_bytes
+            .saturating_sub(self.progress.tree_usage.generated_bytes);
+        remaining
     }
 
     fn record(&mut self, mut progress: Progress) -> Result<(), Inconclusive> {
@@ -899,7 +989,7 @@ impl Engine {
         invocation: SourceMacroInvocation<'_>,
     ) -> SourceMacroFileCheck {
         let mut session = FileSession::new(invocation);
-        let outcome = if let Err(error) = session.registry.validate_source_engine(self) {
+        let mut outcome = if let Err(error) = session.registry.validate_source_engine(self) {
             Outcome::Complete(Err(SourceCheckError::ImportedMacro {
                 file: 0,
                 command: 0,
@@ -922,13 +1012,19 @@ impl Engine {
                 Err(error) => Outcome::Complete(Err(error)),
             }
         };
-        let state = matches!(&outcome, Outcome::Complete(Ok(_))).then_some(session.state);
+        let (finished, report) = session.finish();
+        match finished {
+            Outcome::Complete(()) => {}
+            Outcome::Inconclusive(reason) => outcome = Outcome::Inconclusive(reason),
+            Outcome::InternalFault(fault) => outcome = Outcome::InternalFault(fault),
+        }
+        let state = matches!(&outcome, Outcome::Complete(Ok(_))).then_some(report.state);
         SourceMacroFileCheck {
             outcome,
             state,
-            attempts: session.progress.attempts,
-            completed_vm_usage: session.progress.usage,
-            tree_usage: session.progress.tree_usage,
+            attempts: report.attempts,
+            completed_vm_usage: report.completed_vm_usage,
+            tree_usage: report.tree_usage,
         }
     }
 
@@ -1223,6 +1319,7 @@ fn expand_in_scope(
             scope,
             invocation,
             progress,
+            false,
         );
         let (syntax, state) = match expanded {
             Outcome::Complete(Ok(result)) => result,
@@ -1294,6 +1391,7 @@ fn expand_syntax_in_scope(
     scope: &fln_elab::source::scope::SourceScope,
     invocation: SourceMacroInvocation<'_>,
     progress: &mut Progress,
+    runtime_tactics: bool,
 ) -> Outcome<Result<(Syntax, MacroState), SourceMacroError>> {
     let SourceMacroInvocation {
         registry,
@@ -1357,7 +1455,7 @@ fn expand_syntax_in_scope(
     };
     // Atomic and tactic dispatch belongs to their elaborators. Do not silently
     // ignore a registration that this recursive expansion pass leaves behind.
-    match deferred_candidate(registry, &syntax) {
+    match deferred_candidate(registry, &syntax, runtime_tactics) {
         Ok(Some(error)) => return Outcome::Complete(Err(error)),
         Ok(None) => {}
         Err(reason) => return Outcome::Inconclusive(reason),
@@ -1438,6 +1536,7 @@ fn frontend<T>(error: EngineExecutionError) -> Outcome<Result<T, SourceMacroErro
 fn deferred_candidate(
     registry: &RegisteredMacros,
     syntax: &Syntax,
+    runtime_tactics: bool,
 ) -> Result<Option<SourceMacroError>, Inconclusive> {
     let tactic = Name::from_components(["Lean", "Parser", "Term", "byTactic"]);
     let mut pending = vec![(syntax, false)];
@@ -1445,7 +1544,10 @@ fn deferred_candidate(
         let kind = match syntax {
             Syntax::Node { kind, args, .. } => {
                 let in_tactic = in_tactic || *kind == tactic;
-                if in_tactic && registry.declarations(kind).next().is_some() {
+                if in_tactic
+                    && (!runtime_tactics || *kind == tactic)
+                    && registry.declarations(kind).next().is_some()
+                {
                     return Ok(Some(SourceMacroError::TacticExpansion {
                         kind: kind.clone(),
                     }));
@@ -1462,7 +1564,7 @@ fn deferred_candidate(
             Syntax::Missing => Name::from_components(["missing"]),
             Syntax::Atom { val, .. } => Name::str(Name::anonymous(), val),
         };
-        if registry.declarations(&kind).next().is_some() {
+        if !(in_tactic && runtime_tactics) && registry.declarations(&kind).next().is_some() {
             return Ok(Some(SourceMacroError::AtomicExpansion { kind }));
         }
     }

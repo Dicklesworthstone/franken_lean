@@ -791,7 +791,7 @@ pub(super) mod expansions {
     fn ident(components: &[&str]) -> Syntax {
         Syntax::Ident {
             info: fln_syntax::source::SourceInfo::None,
-            raw_val: fln_syntax::source::ByteSpan::default(),
+            raw_val: fln_syntax::source::ByteSpan::default().into(),
             val: Name::from_components(std::iter::once("_root_").chain(components.iter().copied())),
             preresolved: Vec::new(),
         }

@@ -47,6 +47,9 @@ use crate::source::{ByteSpan, SourceInfo, SourceText};
 use fln_core::name::Name;
 use std::fmt;
 
+mod raw_identifier;
+pub use raw_identifier::{OwnedIdentifier, RawIdentifier};
+
 /// `Lean.SyntaxNodeKind` — `abbrev SyntaxNodeKind := Name` (Prelude.lean:4919).
 pub type SyntaxNodeKind = Name;
 
@@ -73,12 +76,12 @@ pub enum Syntax {
     Atom { info: SourceInfo, val: String },
     /// An identifier.
     ///
-    /// `raw_val` is the literal substring from the input, held as a span for the reason
-    /// given on [`ByteSpan`]: carrying a copy of the text would let a span and its text
-    /// disagree about which text they belong to.
+    /// `raw_val` retains the exact `Substring.Raw` backing. Parser output uses
+    /// a span in the surrounding source; generated quotations may own another
+    /// immutable string and its validated substring offsets.
     Ident {
         info: SourceInfo,
-        raw_val: ByteSpan,
+        raw_val: RawIdentifier,
         val: Name,
         preresolved: Vec<Preresolved>,
     },
@@ -131,7 +134,7 @@ impl Clone for Syntax {
                 }) => {
                     built.push(Syntax::Ident {
                         info: *info,
-                        raw_val: *raw_val,
+                        raw_val: raw_val.clone(),
                         val: val.clone(),
                         preresolved: preresolved.clone(),
                     });
@@ -675,7 +678,7 @@ mod tests {
         // ident: raw span, parsed Name, and preresolved candidates.
         let ident = Syntax::Ident {
             info,
-            raw_val: ByteSpan::new(BytePos(0), BytePos(3)).expect("fwd"),
+            raw_val: ByteSpan::new(BytePos(0), BytePos(3)).expect("fwd").into(),
             val: name(&["Nat", "succ"]),
             preresolved: vec![
                 Preresolved::Namespace { ns: name(&["Nat"]) },
@@ -729,7 +732,7 @@ mod tests {
             Syntax::atom(SourceInfo::None, "x"),
             Syntax::Ident {
                 info: SourceInfo::None,
-                raw_val: span,
+                raw_val: span.into(),
                 val: Name::anonymous(),
                 preresolved: Vec::new(),
             },
@@ -805,13 +808,15 @@ mod tests {
         assert_ne!(
             Syntax::Ident {
                 info: SourceInfo::None,
-                raw_val: span,
+                raw_val: span.into(),
                 val: Name::anonymous(),
                 preresolved: Vec::new(),
             },
             Syntax::Ident {
                 info: SourceInfo::None,
-                raw_val: ByteSpan::new(BytePos(0), BytePos(2)).expect("forward span"),
+                raw_val: ByteSpan::new(BytePos(0), BytePos(2))
+                    .expect("forward span")
+                    .into(),
                 val: Name::anonymous(),
                 preresolved: Vec::new(),
             }

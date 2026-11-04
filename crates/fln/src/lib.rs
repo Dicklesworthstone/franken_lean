@@ -3472,6 +3472,20 @@ impl Engine {
             } else {
                 scopes.current.clone()
             };
+            if let Some(session) = macros.as_deref_mut() {
+                match session.bind_tactics(
+                    scopes.imported_macros().expect("imported macro file scope"),
+                    command_source,
+                    &mut scope,
+                ) {
+                    Outcome::Complete(Ok(())) => {}
+                    Outcome::Complete(Err(error)) => {
+                        return Err(macro_error(command_index, original_offset, error));
+                    }
+                    Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                    Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                }
+            }
             // The equation theorems this command names, generated and admitted before it, as
             // the pin's reserved-name action adds them when it resolves the name.
             if public.is_none()

@@ -24,6 +24,7 @@ mod false_or_by_contra;
 mod grind;
 mod guard;
 mod guard_hyp;
+pub(in crate::source) mod imported_macros;
 mod index_equations;
 mod introductions;
 mod omega;
@@ -668,6 +669,7 @@ pub(super) struct ProofState<'a> {
     cursor: usize,
     work: Vec<Work<'a>>,
     controls: Vec<control::Frame<'a>>,
+    owned_frame: Option<imported_macros::OwnedFrame<'a>>,
 }
 /// A local a tactic adds: a hypothesis (`have`) or a definition with its value (`let`).
 /// `replaces` is the hypothesis `replace` supersedes, cleared once the new one is in place
@@ -795,6 +797,7 @@ pub(super) enum ProofAction<'a> {
         goal: ProofGoal,
     },
     Complete(Typed),
+    OwnedComplete(imported_macros::TacticCompletion),
 }
 
 impl Context {
@@ -847,6 +850,7 @@ impl Context {
             cursor: 0,
             work: vec![Work::Goal(goal)],
             controls: Vec::new(),
+            owned_frame: None,
         })
     }
 
@@ -870,6 +874,7 @@ impl Context {
             cursor: 0,
             work: goals.into_iter().rev().map(Work::Goal).collect(),
             controls: Vec::new(),
+            owned_frame: None,
         })
     }
 
@@ -1084,6 +1089,76 @@ impl Context {
         self.close_proof_goal(goal, value)
     }
 
+    /// The primitive `eq_refl` candidate is homogeneous equality only. It
+    /// must not absorb the later `apply_rfl` candidate's approximation policy:
+    /// imported user registrations can occur between native alternatives.
+    fn eq_refl_proof_goal(
+        &mut self,
+        goal: ProofGoal,
+        approximate: bool,
+    ) -> Result<(), NatDefinitionElabError> {
+        let target = self.whnf(&goal.target)?;
+        let (level, alpha, left, right) =
+            equality_target(&target).ok_or_else(|| error(TacticError::ApplyMismatch))?;
+        self.constrain_primitive_reflexivity(&[(left.clone(), right)], approximate)?;
+        let value = [alpha, left].into_iter().fold(
+            Expr::const_(Name::from_components(["Eq", "refl"]), vec![level]),
+            Expr::app,
+        );
+        self.close_proof_goal(goal, value)
+    }
+
+    /// The native `apply_rfl` slice handles Eq and HEq. Other relations need
+    /// the imported `[refl]` discrimination tree, so they remain a capability
+    /// stop instead of being reported as a proved absence of a reflexivity rule.
+    fn apply_rfl_proof_goal(&mut self, goal: ProofGoal) -> Result<(), NatDefinitionElabError> {
+        let target = self.whnf(&goal.target)?;
+        if let Some((level, alpha, left, beta, right)) = equality::heterogeneous_target(&target) {
+            self.constrain_primitive_reflexivity(
+                &[(alpha.clone(), beta), (left.clone(), right)],
+                true,
+            )?;
+            let value = [alpha, left].into_iter().fold(
+                Expr::const_(Name::from_components(["HEq", "refl"]), vec![level]),
+                Expr::app,
+            );
+            return self.close_proof_goal(goal, value);
+        }
+        if equality_target(&target).is_some() {
+            return self.eq_refl_proof_goal(goal, true);
+        }
+        if matches!(target.node(), ExprNode::App { f, .. } if matches!(f.node(), ExprNode::App { .. }))
+        {
+            return Err(error(TacticError::UnsupportedTactic(parser_kind(&[
+                "Tactic", "applyRfl",
+            ]))));
+        }
+        Err(error(TacticError::ApplyMismatch))
+    }
+
+    fn constrain_primitive_reflexivity(
+        &mut self,
+        sides: &[(Expr, Expr)],
+        approximate: bool,
+    ) -> Result<(), NatDefinitionElabError> {
+        let saved = self.txn.quasi_pattern_approx;
+        if approximate {
+            self.txn.quasi_pattern_approx = true;
+        }
+        let pending = self.equations.len();
+        let result = sides
+            .iter()
+            .try_for_each(|(left, right)| self.constrain(left, right));
+        self.txn.quasi_pattern_approx = saved;
+        result?;
+        // Lean's immediate isDefEq must decide the equation now; a suspended
+        // equation does not make a successful tactic candidate.
+        if self.equations.len() > pending {
+            return Err(error(TacticError::ApplyMismatch));
+        }
+        Ok(())
+    }
+
     /// The two sides of an `Iff`, `Eq` or `HEq` goal under `rfl`'s own order. The pin's `rfl`
     /// macro tries `exact Iff.rfl`, `exact HEq.rfl` and `eq_refl` (vendored
     /// `Init/Core.lean:1042`, `Init/Tactics.lean:430-432`), which compare the sides under the
@@ -1206,6 +1281,9 @@ impl Context {
             ) {
                 self.skip_empty_goal_controls(proof)?;
                 if let Some(&instruction) = proof.instructions.get(proof.cursor) {
+                    if self.imported_tactic(proof, instruction)? {
+                        continue;
+                    }
                     if instruction.kind() == Some(&parser_kind(&["Tactic", "traceState"]))
                         || instruction.kind() == Some(&parser_kind(&["Tactic", "traceMessage"]))
                         || instruction.kind() == Some(&conv::conv_kind("convTrace_state"))
@@ -1248,6 +1326,11 @@ impl Context {
                 self.skip_empty_goal_controls(proof)?;
                 if proof.cursor != proof.instructions.len() {
                     return Err(no_goals(proof.instructions.get(proof.cursor).copied()));
+                }
+                if proof.owned_frame.is_some() {
+                    return Ok(ProofAction::OwnedComplete(
+                        imported_macros::TacticCompletion::Frontier(Vec::new()),
+                    ));
                 }
                 self.observe_proof_end(proof.extent.as_deref(), &[])?;
                 self.txn.lctx = proof.saved.clone();
@@ -1347,8 +1430,20 @@ impl Context {
                 if self.suspend_tactic_options(proof, &goal)? {
                     continue;
                 }
+                if let Some(frontier) = proof.open_frontier(&goal) {
+                    return Ok(ProofAction::OwnedComplete(frontier));
+                }
                 let count = 1 + proof.work.iter().filter(|row| matches!(row, Work::Goal(goal) if !self.txn.mvars.is_assigned(&goal.id))).count();
                 return Err(error(TacticError::UnsolvedGoals { count }));
+            };
+            // Give the runtime macro driver the complete visible frontier,
+            // before any native tactic or lexical control consumes this step.
+            proof.work.push(Work::Goal(goal));
+            if self.imported_tactic(proof, instruction)? {
+                continue;
+            }
+            let Some(Work::Goal(goal)) = proof.work.pop() else {
+                return Err(failure(SourceInferenceError::Scope));
             };
             if let Syntax::Node { kind, args, .. } = instruction
                 && control::is_scope(kind)
@@ -1368,6 +1463,15 @@ impl Context {
                 return Ok(ProofAction::Attempt(spec));
             } else if conv::is_conv_kind(kind) {
                 self.conv_instruction(proof, goal, instruction)?;
+            } else if kind == &parser_kind(&["Tactic", "paren"]) {
+                let [open, body, close] = args.as_slice() else {
+                    return Err(error(TacticError::MalformedScript));
+                };
+                expect_atom(open, "(", "parenthesized tactic opening")?;
+                expect_atom(close, ")", "parenthesized tactic closing")?;
+                let body = self.proof_instructions(body)?;
+                proof.work.push(Work::Goal(goal));
+                self.start_macro_scope(proof, body)?;
             } else if kind == &parser_kind(&["Tactic", "skip"]) {
                 proof.work.push(Work::Goal(goal));
             } else if kind == &parser_kind(&["Tactic", "traceState"])
@@ -2023,6 +2127,23 @@ impl Context {
                 };
                 expect_atom(keyword, "rfl", "reflexivity tactic")?;
                 self.rfl_proof_goal(goal)?;
+            } else if kind == &parser_kind(&["Tactic", "eqRefl"])
+                || kind == &parser_kind(&["Tactic", "applyRfl"])
+            {
+                let [keyword] = args.as_slice() else {
+                    return Err(error(TacticError::MalformedScript));
+                };
+                let approximate = kind == &parser_kind(&["Tactic", "applyRfl"]);
+                expect_atom(
+                    keyword,
+                    if approximate { "apply_rfl" } else { "eq_refl" },
+                    "primitive reflexivity tactic",
+                )?;
+                if approximate {
+                    self.apply_rfl_proof_goal(goal)?;
+                } else {
+                    self.eq_refl_proof_goal(goal, false)?;
+                }
             } else if kind == &parser_kind(&["Tactic", "tacticTrivial"]) {
                 let [keyword] = args.as_slice() else {
                     return Err(error(TacticError::MalformedScript));
@@ -2071,6 +2192,11 @@ impl Context {
             } else {
                 let apply = kind == &parser_kind(&["Tactic", "apply"]);
                 if !apply && kind != &parser_kind(&["Tactic", "exact"]) {
+                    if proof.builtin_root(instruction) {
+                        return Ok(ProofAction::OwnedComplete(
+                            imported_macros::TacticCompletion::NoElaborator,
+                        ));
+                    }
                     return Err(error(TacticError::UnsupportedTactic(kind.clone())));
                 }
                 let [keyword, term] = args.as_slice() else {

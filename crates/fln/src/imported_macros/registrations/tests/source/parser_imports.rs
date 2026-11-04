@@ -311,9 +311,11 @@ fn artifact_syntax_without_local_declaration_expands_and_kernel_checks_values_an
             .contains(&name("chosen_ok"))
     );
     assert_eq!(report.attempts.len(), 1);
+    // The chosen_ok proof also enters evalTactic's unconditional fresh scope
+    // (pin Tactic/Basic.lean:194), although rfl has no imported macro candidate.
     assert_eq!(
         report.states.as_ref().unwrap()[&name("Main")].macro_scope,
-        18
+        17 + 1 + 1
     );
     assert!(
         imported.checked.modules[0]
@@ -406,9 +408,10 @@ fn imported_artifact_syntax_executes_evaluations_and_keeps_program_failures_tran
     assert_declared_value(&batch.engine, "chosen", 42);
     assert!(batch.engine.environment().contains(&name("chosen_ok")));
     assert_eq!(report.attempts.len(), 2, "each custom syntax expands once");
+    // Two choose! expansions and chosen_ok's native rfl each allocate a scope.
     assert_eq!(
         report.states.as_ref().unwrap()[&name("Main")].macro_scope,
-        19
+        17 + 2 + 1
     );
     assert!(report.completed_vm_usage.steps > 0);
 
@@ -504,9 +507,10 @@ fn imported_artifact_syntax_reaches_deferred_program_execution_without_publishin
     assert_declared_value(&batch.engine, "chosen", 42);
     assert!(batch.engine.environment().contains(&name("chosen_ok")));
     assert_eq!(complete.attempts.len(), 2);
+    // Deferred execution retains the same two macro scopes and native rfl scope.
     assert_eq!(
         complete.states.as_ref().unwrap()[&name("Main")].macro_scope,
-        19
+        17 + 2 + 1
     );
     assert!(complete.completed_vm_usage.steps > 0);
 

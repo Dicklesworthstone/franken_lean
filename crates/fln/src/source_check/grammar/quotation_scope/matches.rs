@@ -23,7 +23,7 @@ fn global_ident(syntax: &Syntax, global: Name) -> Result<Syntax, EngineExecution
     };
     Ok(Syntax::Ident {
         info: *info,
-        raw_val: *raw_val,
+        raw_val: raw_val.clone(),
         val: val.clone(),
         preresolved: vec![Preresolved::Decl {
             name: global,

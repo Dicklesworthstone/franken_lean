@@ -159,6 +159,15 @@ pub enum SourceInferenceError {
     NativeEvaluation(crate::native::NativeEvaluationError),
     /// `native_decide`'s evaluation stopped before an answer (FL-INV-07).
     NativeEvaluationInconclusive(Box<fln_core::outcome::Inconclusive>),
+    /// Imported macro execution retains its diagnostic/nonanswer distinction.
+    TacticMacro(crate::tactic_macros::TacticMacroError),
+    /// A generated tree's delayed callee belongs to an enclosing source
+    /// argument. Carry only its identity and failure until that checkpoint can
+    /// replay the original argument; no generated Syntax escapes its owner.
+    OwnedMacroSuspension {
+        blocker: MVarId,
+        problem: Box<NatDefinitionElabError>,
+    },
     UnresolvedHoles {
         count: usize,
     },
@@ -422,6 +431,10 @@ impl std::fmt::Display for SourceInferenceError {
             Self::NativeEvaluationInconclusive(reason) => {
                 write!(f, "native evaluation did not complete: {:?}", reason.cause)
             }
+            Self::TacticMacro(error) => write!(f, "{error}"),
+            Self::OwnedMacroSuspension { problem, .. } => {
+                write!(f, "imported macro awaits an enclosing argument: {problem}")
+            }
             Self::Record(error) => write!(f, "{error}"),
             Self::TypeObligation(outcome) => {
                 write!(f, "source type obligation failed: {outcome:?}")
@@ -508,6 +521,20 @@ impl std::error::Error for SourceInferenceError {}
 struct Typed {
     value: Expr,
     type_: Expr,
+}
+
+enum TermResult {
+    Term(Typed),
+    Tactic(tactics::imported_macros::TacticCompletion),
+}
+
+impl TermResult {
+    fn term(self) -> Result<Typed, NatDefinitionElabError> {
+        match self {
+            Self::Term(term) => Ok(term),
+            Self::Tactic(_) => Err(failure(SourceInferenceError::Scope)),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -632,6 +659,10 @@ struct Context {
     // their successful alternative. Outside speculation, ordinary final K1
     // admission retains its existing error boundary.
     attempt_depth: usize,
+    // Host-owned generated trees nest only while their evaluator is alive.
+    tactic_macro_depth: usize,
+    // Term macro dispatch is active inside by proofs, including native tactics.
+    tactic_macro_terms: usize,
     // Opaque assertions remain parameter assumptions until their continuations
     // have been checked. Visibility comes from lctx, including after rollback.
     opaque_locals: std::collections::HashSet<FVarId>,
@@ -843,6 +874,8 @@ impl Context {
             source_scope: SourceScope::default(),
             diagnostic_declaration: None,
             attempt_depth: 0,
+            tactic_macro_depth: 0,
+            tactic_macro_terms: 0,
             opaque_locals: std::collections::HashSet::new(),
             deferred_local_functions: Vec::new(),
             local_function_lifting: local_functions::lifting::Lifting::default(),
@@ -2103,11 +2136,13 @@ impl Context {
         let options = self.txn.options.clone();
         let pending_source_arguments = self.pending_source_arguments;
         let blocked = self.no_implicit_lambda_types.len();
-        let result = self.term_prepared_scoped(syntax, expected, None, initial_field);
+        let macro_terms = self.tactic_macro_terms;
+        let result = self.term_prepared_scoped(syntax, expected, None, initial_field, true);
         self.txn.options = options;
         self.pending_source_arguments = pending_source_arguments;
         self.no_implicit_lambda_types.truncate(blocked);
-        result
+        self.tactic_macro_terms = macro_terms;
+        result.and_then(TermResult::term)
     }
 
     fn run_decreasing_proof<'a>(
@@ -2118,11 +2153,14 @@ impl Context {
         let options = self.txn.options.clone();
         let pending_source_arguments = self.pending_source_arguments;
         let blocked = self.no_implicit_lambda_types.len();
-        let result = self.term_prepared_scoped(syntax, None, Some(proof), None);
+        let macro_terms = self.tactic_macro_terms;
+        self.tactic_macro_terms += 1;
+        let result = self.term_prepared_scoped(syntax, None, Some(proof), None, true);
         self.txn.options = options;
         self.pending_source_arguments = pending_source_arguments;
         self.no_implicit_lambda_types.truncate(blocked);
-        result
+        self.tactic_macro_terms = macro_terms;
+        result.and_then(TermResult::term)
     }
 
     fn term_prepared_scoped<'a>(
@@ -2131,7 +2169,8 @@ impl Context {
         expected: Option<Expr>,
         initial_proof: Option<tactics::ProofState<'a>>,
         initial_field: Option<record_terms::FieldApplication<'a>>,
-    ) -> Result<Typed, NatDefinitionElabError> {
+        initial_finish: bool,
+    ) -> Result<TermResult, NatDefinitionElabError> {
         use application::postponed;
         let without_implicit_lambda = std::mem::take(&mut self.block_root_implicit_lambda);
         /// An application's explicit arguments: a plain list (`Term.app`), or the elements of
@@ -2189,6 +2228,7 @@ impl Context {
         }
         enum Task<'a> {
             RestoreOptions(KVMap),
+            RestoreMacroTerms(usize),
             DoJoinValue(Name, &'a Syntax, Option<Expr>),
             DoBindJoinStart(Name, &'a Syntax, &'a Syntax, Expr, bool),
             DoBindJoinBody(LocalContext, FVarId, Name, &'a Syntax, Expr),
@@ -2320,21 +2360,26 @@ impl Context {
                 None if without_implicit_lambda => {
                     Task::VisitWithoutImplicitLambda(syntax, expected)
                 }
-                None => Task::Visit(syntax, expected, true),
+                None => Task::Visit(syntax, expected, initial_finish),
             }
         }];
         enum Attempt<'a> {
-            Proof(tactics::backtrack::Checkpoint<'a>, postponed::Queue<'a>),
+            Proof(
+                Box<tactics::backtrack::Checkpoint<'a>>,
+                postponed::Queue<'a>,
+            ),
             LocalFunction(Box<local_functions::Checkpoint<'a>>, postponed::Queue<'a>),
             Argument(Box<postponed::Checkpoint<'a>>),
         }
         let mut attempts: Vec<Attempt<'_>> = Vec::new();
         let inherited_pending_arguments = self.pending_source_arguments;
         let mut pending = postponed::Queue::default();
+        let mut tactic_result = None;
         loop {
             let mut blocked_application = None;
             let mut containing_argument = None;
             let mut blocked_initial_application = None;
+            let mut escaping_owned_blocker = None;
             let result = (|| {
                 loop {
                     self.pending_source_arguments =
@@ -2386,6 +2431,15 @@ impl Context {
                             }
                             if self.resolve_next_default_instance()? {
                                 continue;
+                            }
+                            if self.tactic_macro_depth != 0
+                                && let Some(blocker) = blockers.into_iter().next()
+                            {
+                                // This queue borrows an owned generated tree.
+                                // Its containing source argument must replay it
+                                // before a closing scope discards that tree.
+                                escaping_owned_blocker = Some(blocker.clone());
+                                return Err(blocker.problem);
                             }
                         }
                     }
@@ -2606,7 +2660,16 @@ impl Context {
                         Task::RestoreImplicitLambda(length) => {
                             self.no_implicit_lambda_types.truncate(length);
                         }
+                        Task::RestoreMacroTerms(previous) => {
+                            self.tactic_macro_terms = previous;
+                        }
                         Task::Visit(syntax, expected, finish) => {
+                            if let Some(term) =
+                                self.imported_tactic_term(syntax, expected.clone(), finish)?
+                            {
+                                values.push(term);
+                                continue;
+                            }
                             // The pin's implicit lambda (`binders::start_implicit_lambda`). The
                             // body is this same term, visited again against the type that
                             // remains, which starts with no implicit binder.
@@ -3124,6 +3187,8 @@ impl Context {
                                 if kind == &parser_kind(&["Term", "byTactic"])
                                     || kind == &parser_kind(&["Term", "byTactic'"])
                                 {
+                                    tasks.push(Task::RestoreMacroTerms(self.tactic_macro_terms));
+                                    self.tactic_macro_terms += 1;
                                     tasks.push(Task::Proof(self.start_proof(syntax, expected)?));
                                     continue;
                                 }
@@ -3817,7 +3882,8 @@ impl Context {
                                     values.len(),
                                 );
                                 let branch = checkpoint.begin(self, attempts.len())?;
-                                attempts.push(Attempt::Proof(checkpoint, pending.clone()));
+                                attempts
+                                    .push(Attempt::Proof(Box::new(checkpoint), pending.clone()));
                                 tasks.push(Task::Proof(branch));
                             }
                             tactics::ProofAction::AttemptComplete(index) => {
@@ -3845,7 +3911,7 @@ impl Context {
                                 checkpoint.finish(self, &mut proof);
                                 if let Some(mut next) = checkpoint.next_iteration(self, &proof) {
                                     proof = next.begin(self, attempts.len())?;
-                                    attempts.push(Attempt::Proof(next, pending.clone()));
+                                    attempts.push(Attempt::Proof(Box::new(next), pending.clone()));
                                 }
                                 tasks.push(Task::Proof(proof));
                             }
@@ -3993,6 +4059,12 @@ impl Context {
                                 });
                             }
                             tactics::ProofAction::Complete(term) => values.push(term),
+                            tactics::ProofAction::OwnedComplete(result) => {
+                                if !tasks.is_empty() || !values.is_empty() || !attempts.is_empty() {
+                                    return Err(failure(SourceInferenceError::Scope));
+                                }
+                                tactic_result = Some(result);
+                            }
                         },
                         Task::SimpaTerm(mut proof, goal, args) => {
                             let term = values.pop().expect("simpa evidence visit");
@@ -4880,14 +4952,39 @@ impl Context {
                         }
                     }
                 }
+                if let Some(result) = tactic_result.take() {
+                    return Ok(TermResult::Tactic(result));
+                }
                 let [result] = values.as_slice() else {
                     return Err(failure(SourceInferenceError::Scope));
                 };
-                Ok(result.clone())
+                Ok(TermResult::Term(result.clone()))
             })();
             match result {
                 Ok(value) => return Ok(value),
-                Err(problem) => {
+                Err(mut problem) => {
+                    if let Some(blocker) = escaping_owned_blocker {
+                        return Err(failure(SourceInferenceError::OwnedMacroSuspension {
+                            blocker: blocker.id,
+                            problem: Box::new(blocker.problem),
+                        }));
+                    }
+                    let suspended = matches!(
+                        problem,
+                        NatDefinitionElabError::Inference(
+                            SourceInferenceError::OwnedMacroSuspension { .. }
+                        )
+                    );
+                    if let NatDefinitionElabError::Inference(
+                        SourceInferenceError::OwnedMacroSuspension {
+                            blocker,
+                            problem: original,
+                        },
+                    ) = problem
+                    {
+                        blocked_application = Some(blocker);
+                        problem = *original;
+                    }
                     if let Some(blocker) = &blocked_application
                         && containing_argument.is_none()
                     {
@@ -4915,6 +5012,20 @@ impl Context {
                                 // refund the unsuccessful attempt's budget.
                                 tasks.push(application);
                                 continue;
+                            }
+                            if self.tactic_macro_depth != 0 {
+                                return Err(failure(SourceInferenceError::OwnedMacroSuspension {
+                                    blocker: blocked_application
+                                        .expect("unowned blocked application"),
+                                    problem: Box::new(problem),
+                                }));
+                            }
+                            if suspended {
+                                return Err(failure(SourceInferenceError::TacticMacro(
+                                    crate::tactic_macros::TacticMacroError::Unsupported(
+                                        "a generated term awaits an argument outside the current source driver".into(),
+                                    ),
+                                )));
                             }
                             return Err(problem);
                         }
@@ -6338,7 +6449,7 @@ fn definition_elaboration(
                     vec![
                         Syntax::Ident {
                             info: fln_syntax::source::SourceInfo::None,
-                            raw_val: fln_syntax::source::ByteSpan::default(),
+                            raw_val: fln_syntax::source::ByteSpan::default().into(),
                             val: Name::anonymous(),
                             preresolved: Vec::new(),
                         },
@@ -7096,7 +7207,7 @@ fn opaque_without_value(
     };
     let identifier = |components: &[&str]| Syntax::Ident {
         info: fln_syntax::source::SourceInfo::None,
-        raw_val: fln_syntax::source::ByteSpan::default(),
+        raw_val: fln_syntax::source::ByteSpan::default().into(),
         val: Name::from_components(components.iter().copied()),
         preresolved: Vec::new(),
     };

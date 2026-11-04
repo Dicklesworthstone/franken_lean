@@ -41,6 +41,7 @@ SCALARS = {
 }
 FUNCTIONS = {
     "NAME_MK_STR1": "nameMkStr1",
+    "NAME_STR": "nameStr",
     "ADD_MACRO_SCOPE": "addMacroScope",
     "MACRO_ADD_MACRO_SCOPE": "macroAddMacroScope",
     "SYNTAX_IS_OF_KIND": "syntaxIsOfKind",
@@ -69,12 +70,25 @@ def generate(lean):
                             timeout=30)
     if actual.stdout.strip() != pin:
         raise ValueError(f"Reference commit mismatch: expected {pin}, got {actual.stdout.strip()}")
-    compiled = subprocess.run([lean, "--stdin"], input=FIXTURE.read_text(),
+    compiled = subprocess.run([lean, "-j1", "--stdin"], input=FIXTURE.read_text(),
                               capture_output=True, text=True, timeout=120)
     if compiled.returncode:
         sys.stderr.write(compiled.stdout + compiled.stderr)
         raise ValueError("macro layout fixture did not compile")
     trace = compiled.stdout + compiled.stderr
+    # The computed-field constructor is a compiler-emitted override. Bind its
+    # native row to the actual forwarded callee, not merely a wrapper whose
+    # source-level telescope happens to match.
+    name_str = re.search(
+        r"(?m)^    def FrankenLean\.MacroLayout\.nameStr \((x_\d+) : tobj\) "
+        r"\((x_\d+) : obj\) : tobj :=\n(.*?)(?=^    def |^\[|\Z)", trace, re.S,
+    )
+    if name_str is None or re.fullmatch(
+        rf"\s*let (x_\d+) : tobj := Lean\.Name\.str\._override "
+        rf"{re.escape(name_str[1])} {re.escape(name_str[2])};\s*ret \1\s*",
+        name_str[3],
+    ) is None:
+        raise ValueError("Name.str constructor wrapper does not forward the reviewed override")
     layouts = {}
     pattern = r"ctor_(\d+)(?:\.(\d+)\.(\d+))?\[([^\]]+)\]([^;\n]*);"
     for match in re.finditer(pattern, trace):

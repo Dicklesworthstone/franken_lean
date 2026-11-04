@@ -41,7 +41,7 @@ fn input(seed: u64) -> MacroExpansionInput {
             ))),
             1 => args.push(QuotationTemplate::Literal(Syntax::Ident {
                 info: info(point),
-                raw_val: span((point % 400) as usize, (point % 400) as usize + 1),
+                raw_val: span((point % 400) as usize, (point % 400) as usize + 1).into(),
                 val: Name::from_components([format!("i{point}").as_str()]),
                 preresolved: Vec::new(),
             })),

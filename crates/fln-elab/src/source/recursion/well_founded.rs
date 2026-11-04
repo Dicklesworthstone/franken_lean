@@ -322,7 +322,7 @@ fn automatic_decreasing_proof() -> Syntax {
             .map(|constructor| {
                 let identifier = Syntax::Ident {
                     info: fln_syntax::source::SourceInfo::None,
-                    raw_val: fln_syntax::source::ByteSpan::default(),
+                    raw_val: fln_syntax::source::ByteSpan::default().into(),
                     val: Name::from_components(["_root_", family, "Lex", constructor]),
                     preresolved: Vec::new(),
                 };

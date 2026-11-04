@@ -28,7 +28,7 @@ fn leaf() -> Syntax {
             trailing: span(3, 4),
             end_pos: BytePos(3),
         },
-        raw_val: span(1, 3),
+        raw_val: span(1, 3).into(),
         val: Name::num(name("Main._hyg"), 17),
         preresolved: vec![
             Preresolved::Namespace { ns: name("N") },

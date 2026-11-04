@@ -106,7 +106,9 @@ pub fn parse(source: &[u8]) -> Result<Option<Vec<Syntax>>, DefinitionParseError>
                         Syntax::Atom { info, .. } => shift(info),
                         Syntax::Ident { info, raw_val, .. } => {
                             shift(info);
-                            *raw_val = span(*raw_val);
+                            if let Some(source) = raw_val.source_span() {
+                                *raw_val = span(source).into();
+                            }
                         }
                         Syntax::Missing => {}
                     }

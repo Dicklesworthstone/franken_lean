@@ -191,9 +191,9 @@ pub struct SourceMetadataReport {
 #[derive(Debug)]
 pub struct SourceOleanImport {
     pub(super) contexts: super::contexts::ImportContexts,
-    /// Macro rows from the same final journals used by admission, in import
-    /// replay order. Keep these private: callers need not reconstruct or pair
-    /// artifact payloads with the public checking records.
+    /// Macro registrations and tactic fallback policies from the same final
+    /// journals used by admission, in import replay order. Keep these private:
+    /// callers need not pair artifact payloads with public checking records.
     pub(super) macro_journals: Vec<(Name, Vec<OpaqueExtensionBlock>)>,
     /// Parser rows from those same complete journals. They remain inert on
     /// ordinary source paths. The imported-macro adapter installs only modules
@@ -849,12 +849,18 @@ fn prepare_source_metadata(
     let mut reports = Vec::new();
     let mut macro_journals = Vec::new();
     let macro_extension = Name::from_components(metadata::macros::MACRO_EXTENSION.split('.'));
+    let no_fallback_extension =
+        Name::from_components(metadata::macros::NO_FALLBACK_EXTENSION.split('.'));
     let mut parser_journals = Vec::new();
     let parser_extension = metadata::parsers::extension_name();
     let retained: BTreeSet<_> = selected
         .iter()
         .cloned()
-        .chain([macro_extension.clone(), parser_extension.clone()])
+        .chain([
+            macro_extension.clone(),
+            no_fallback_extension.clone(),
+            parser_extension.clone(),
+        ])
         .collect();
     let mut capture_left = limits.max_capture_bytes;
     let mut entries_left = limits.metadata.max_entries;
@@ -993,7 +999,7 @@ fn prepare_source_metadata(
                     name: block.name,
                     entries,
                 };
-                if block.name == macro_extension {
+                if block.name == macro_extension || block.name == no_fallback_extension {
                     macro_blocks.push(block);
                 } else if block.name == parser_extension {
                     parser_blocks.push(block);

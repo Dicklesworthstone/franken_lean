@@ -21,7 +21,7 @@ use fln_parse::registry::GrammarEpoch;
 use fln_parse::state::null_kind;
 use fln_syntax::hygiene::{ExpansionOrigin, ExpansionPath};
 use fln_syntax::source::{BytePos, ByteSpan, SourceInfo};
-use fln_syntax::tree::Syntax;
+use fln_syntax::tree::{RawIdentifier, Syntax};
 use std::fmt::Write as _;
 use std::path::Path;
 
@@ -199,6 +199,31 @@ fn positive_expansion_input() -> MacroExpansionInput {
             }],
         },
     }
+}
+
+#[test]
+fn macro_cache_identity_keeps_owned_identifier_backing_and_source_identity() {
+    let identity = |raw_val| {
+        let input = MacroExpansionInput {
+            coordinates: expansion_coordinates(),
+            quotation: quotation(),
+            template: QuotationTemplate::Literal(Syntax::Ident {
+                info: SourceInfo::None,
+                raw_val,
+                val: Name::from_components(["target"]),
+                preresolved: Vec::new(),
+            }),
+        };
+        MacroInvocationIdentity::from_expansion_input(&input).unwrap()
+    };
+    let first = RawIdentifier::owned("target first".into(), span(0, 6)).unwrap();
+    let second = RawIdentifier::owned("target second".into(), span(0, 6)).unwrap();
+    let shifted = RawIdentifier::owned("target first".into(), span(1, 6)).unwrap();
+    let first_id = identity(first.clone());
+    assert_eq!(first_id, identity(first));
+    assert_ne!(first_id, identity(second));
+    assert_ne!(first_id, identity(shifted));
+    assert_ne!(first_id, identity(span(0, 6).into()));
 }
 
 fn failing_expansion_input() -> MacroExpansionInput {

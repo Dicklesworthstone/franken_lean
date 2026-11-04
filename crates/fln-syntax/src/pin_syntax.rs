@@ -246,7 +246,7 @@ fn read_tree(lines: &mut Lines<'_>, source: &[u8]) -> Result<Syntax, PinSyntaxEr
                 cursor.end().map_err(|reason| error(n, &reason))?;
                 Syntax::Ident {
                     info,
-                    raw_val: raw,
+                    raw_val: raw.into(),
                     val,
                     preresolved,
                 }
@@ -323,6 +323,12 @@ fn print_tree(root: &Syntax, source: &[u8], out: &mut String) -> Result<(), PinS
                 val,
                 preresolved,
             } => {
+                let raw_val = raw_val.source_span().ok_or_else(|| {
+                    error(
+                        0,
+                        "the pin parser-tree format cannot represent owned identifier backing",
+                    )
+                })?;
                 let text = source
                     .get(raw_val.start().0..raw_val.end().0)
                     .and_then(|bytes| std::str::from_utf8(bytes).ok())

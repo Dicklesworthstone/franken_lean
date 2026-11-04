@@ -28,7 +28,7 @@ fn environment(declaration: &Name) -> Environment {
 fn identifier(value: Name) -> Syntax {
     Syntax::Ident {
         info: SourceInfo::None,
-        raw_val: span(0, 5),
+        raw_val: span(0, 5).into(),
         val: value,
         preresolved: Vec::new(),
     }

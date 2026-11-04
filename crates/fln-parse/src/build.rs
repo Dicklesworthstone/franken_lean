@@ -141,13 +141,13 @@ fn leaf_for(text: &SourceText, entry: Attached, token: &LexedToken) -> Syntax {
         Attached::Missing { .. } => return Syntax::Missing,
     };
     match &token.kind {
-        // `raw_val` is a ByteSpan, and it is the lexer's extent verbatim. Upstream holds the
+        // `raw_val` is source-backed, with the lexer's extent verbatim. Upstream holds the
         // substring; ours holds the span for the reason ByteSpan itself documents — carrying a
         // copy of the text would let a span and its text disagree about which text they are.
         // Either way it is CARRIED, not rebuilt.
         TokenKind::Ident(name) => Syntax::Ident {
             info,
-            raw_val: token.extent,
+            raw_val: token.extent.into(),
             val: name.clone(),
             preresolved: Vec::new(),
         },
@@ -464,11 +464,12 @@ mod tests {
             return;
         };
         assert_eq!(
-            *raw_val, tokens[index].extent,
+            raw_val.source_span(),
+            Some(tokens[index].extent),
             "raw_val is the LEXER's extent, carried verbatim"
         );
         assert_eq!(
-            &raw[raw_val.start().0..raw_val.end().0],
+            &raw[raw_val.span().start().0..raw_val.span().end().0],
             "Nat.succ",
             "and it slices the source spelling"
         );

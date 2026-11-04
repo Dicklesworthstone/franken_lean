@@ -52,7 +52,7 @@ fn limit(resource: &'static str, limit: usize) -> EngineExecutionError {
 fn ident(value: &Name) -> Syntax {
     Syntax::Ident {
         info: SourceInfo::None,
-        raw_val: ByteSpan::empty_at(BytePos(0)),
+        raw_val: ByteSpan::empty_at(BytePos(0)).into(),
         val: value.clone(),
         preresolved: Vec::new(),
     }
@@ -523,7 +523,7 @@ mod tests {
                 trailing: ByteSpan::new(BytePos(3), BytePos(4)).unwrap(),
                 end_pos: BytePos(3),
             },
-            raw_val: ByteSpan::new(BytePos(1), BytePos(3)).unwrap(),
+            raw_val: ByteSpan::new(BytePos(1), BytePos(3)).unwrap().into(),
             val: value.clone(),
             preresolved: vec![
                 Preresolved::Namespace { ns: owner.clone() },

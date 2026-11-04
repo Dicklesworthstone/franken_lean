@@ -2552,7 +2552,7 @@ fn hygiene_info(pos: BytePos, trailing: ByteSpan) -> Syntax {
                 trailing,
                 end_pos: pos,
             },
-            raw_val: ByteSpan::empty_at(pos),
+            raw_val: ByteSpan::empty_at(pos).into(),
             val: Name::anonymous(),
             preresolved: Vec::new(),
         }],
@@ -2579,7 +2579,7 @@ pub(crate) fn hygiene_info_after(previous: &mut Syntax) -> Syntax {
         Name::str(Name::anonymous(), "hygieneInfo"),
         vec![Syntax::Ident {
             info: SourceInfo::None,
-            raw_val: ByteSpan::empty_at(BytePos(0)),
+            raw_val: ByteSpan::empty_at(BytePos(0)).into(),
             val: Name::anonymous(),
             preresolved: Vec::new(),
         }],
@@ -3622,7 +3622,7 @@ fn dot_term(
             projection_receiver(view, tokens, frame, index)?.ok_or_else(refusal)?;
         let field = Syntax::Ident {
             info: leaves.leaf(cursor)?.info(),
-            raw_val: tokens[cursor].extent,
+            raw_val: tokens[cursor].extent.into(),
             val: Name::from_components([text.as_str()]),
             preresolved: Vec::new(),
         };

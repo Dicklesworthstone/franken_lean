@@ -21,7 +21,7 @@ fn local(context: &mut Context, text: &str, type_: Expr) -> Expr {
 fn syntax() -> Syntax {
     Syntax::Ident {
         info: SourceInfo::None,
-        raw_val: ByteSpan::default(),
+        raw_val: ByteSpan::default().into(),
         val: name("hp"),
         preresolved: Vec::new(),
     }

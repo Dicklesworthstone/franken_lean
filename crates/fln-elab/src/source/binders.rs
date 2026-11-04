@@ -882,7 +882,7 @@ impl Context {
                 vec![
                     Syntax::Ident {
                         info: SourceInfo::None,
-                        raw_val: fln_syntax::source::ByteSpan::default(),
+                        raw_val: fln_syntax::source::ByteSpan::default().into(),
                         val: head.clone(),
                         preresolved: Vec::new(),
                     },
@@ -952,7 +952,7 @@ impl Context {
                         self.fresh_name()?;
                         Syntax::Ident {
                             info: SourceInfo::None,
-                            raw_val: fln_syntax::source::ByteSpan::default(),
+                            raw_val: fln_syntax::source::ByteSpan::default().into(),
                             val: Name::num(Name::anonymous(), serial),
                             preresolved: Vec::new(),
                         }
@@ -1002,7 +1002,7 @@ impl Context {
                 vec![
                     Syntax::Ident {
                         info: SourceInfo::None,
-                        raw_val: fln_syntax::source::ByteSpan::default(),
+                        raw_val: fln_syntax::source::ByteSpan::default().into(),
                         val: Name::from_components(["Exists"]),
                         preresolved: Vec::new(),
                     },
@@ -1074,7 +1074,7 @@ impl Context {
                 vec![
                     Syntax::Ident {
                         info: SourceInfo::None,
-                        raw_val: fln_syntax::source::ByteSpan::default(),
+                        raw_val: fln_syntax::source::ByteSpan::default().into(),
                         val: Name::from_components(["Nat", "succ"]),
                         preresolved: Vec::new(),
                     },

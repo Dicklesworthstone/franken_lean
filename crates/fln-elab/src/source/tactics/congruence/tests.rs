@@ -100,6 +100,7 @@ fn every_congruence_budget_stop_restores_the_transaction_and_sibling_work() {
             cursor: 0,
             work: vec![Work::Goal(sibling.clone())],
             controls: Vec::new(),
+            owned_frame: None,
         };
         let args = [
             Syntax::Atom {

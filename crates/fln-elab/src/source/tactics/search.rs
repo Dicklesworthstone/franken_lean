@@ -428,6 +428,7 @@ impl Context {
             cursor: 0,
             work: Vec::new(),
             controls: Vec::new(),
+            owned_frame: None,
         };
         self.apply_proof_term(&mut proof, goal.clone(), term, instance_start)?;
         Ok(proof.work)
@@ -530,6 +531,7 @@ mod tests {
             cursor: 0,
             work: Vec::new(),
             controls: Vec::new(),
+            owned_frame: None,
         };
         let instance_start = context.instance_goals.len();
         let before = context.txn.budget.heartbeats_consumed;
@@ -633,6 +635,7 @@ mod tests {
             cursor: 0,
             work: vec![Work::Goal(second.clone())],
             controls: Vec::new(),
+            owned_frame: None,
         };
         let selection = Selection {
             all_goals: true,

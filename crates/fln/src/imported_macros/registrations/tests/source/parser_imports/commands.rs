@@ -249,9 +249,11 @@ fn imported_custom_commands_admit_named_declarations_between_ordinary_commands()
             .iter()
             .all(|attempt| attempt.declaration == name("SourceLibrary.commandMacro"))
     );
+    // Two command expansions plus verified's native rfl enter fresh scopes;
+    // pin evalTactic (Tactic/Basic.lean:194) does so before candidate lookup.
     assert_eq!(
         report.states.as_ref().unwrap()[&name("Main")].macro_scope,
-        19
+        17 + 2 + 1
     );
     assert_eq!(imported.engine.logical_root(&KVMap::new()), before);
     assert!(!imported.engine.environment().contains(&name("first")));

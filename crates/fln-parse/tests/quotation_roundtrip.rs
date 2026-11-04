@@ -16,8 +16,8 @@ use fln_parse::state::null_kind;
 use fln_syntax::hygiene::{
     ExpansionOrigin, ExpansionPath, OriginKind, SyntaxPath, extract_macro_scopes,
 };
-use fln_syntax::source::{BytePos, ByteSpan, SourceInfo};
-use fln_syntax::tree::{Preresolved, Syntax};
+use fln_syntax::source::{BytePos, ByteSpan, SourceInfo, SourceText};
+use fln_syntax::tree::{Preresolved, RawIdentifier, Syntax};
 
 fn span(start: usize, end: usize) -> ByteSpan {
     ByteSpan::new(BytePos(start), BytePos(end)).expect("forward span")
@@ -56,7 +56,7 @@ fn quotation() -> QuotationContext {
 fn ident(text: &str, start: usize, preresolved: Vec<Preresolved>) -> Syntax {
     Syntax::Ident {
         info: original(start, start + text.len()),
-        raw_val: span(start, start + text.len()),
+        raw_val: span(start, start + text.len()).into(),
         val: Name::from_components([text]),
         preresolved,
     }
@@ -67,6 +67,30 @@ fn complete(input: MacroExpansionInput) -> MacroExpansion {
         Outcome::Complete(Ok(expansion)) => expansion,
         other => panic!("expected a completed expansion, got {other:?}"),
     }
+}
+
+#[test]
+fn quotation_hygiene_preserves_owned_raw_text_without_reanchoring_it() {
+    let raw = RawIdentifier::owned("prefix α suffix".into(), span(7, 9)).unwrap();
+    let literal = Syntax::Ident {
+        info: SourceInfo::None,
+        raw_val: raw.clone(),
+        val: Name::from_components(["α"]),
+        preresolved: Vec::new(),
+    };
+    let expansion = complete(MacroExpansionInput {
+        coordinates: coordinates(Mode::Sound, 1),
+        quotation: quotation(),
+        template: QuotationTemplate::Literal(literal),
+    });
+    let Syntax::Ident { raw_val, val, .. } = expansion.syntax() else {
+        panic!("expected an expanded identifier")
+    };
+    assert_eq!(*raw_val, raw);
+    assert_eq!(raw_val.owned_backing(), Some("prefix α suffix"));
+    let unrelated = SourceText::from_utf8(b"caller source").unwrap();
+    assert_eq!(raw_val.text(&unrelated), Some("α"));
+    assert_ne!(*val, Name::from_components(["α"]));
 }
 
 fn full_template() -> QuotationTemplate {

@@ -20,6 +20,7 @@ impl Context {
             cursor: 0,
             work: Vec::new(),
             controls: Vec::new(),
+            owned_frame: None,
         };
         if config.constructor {
             match self.construct_proof_goal_ordered(
