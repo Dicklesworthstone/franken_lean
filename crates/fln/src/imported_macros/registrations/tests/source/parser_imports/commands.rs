@@ -260,6 +260,50 @@ fn imported_custom_commands_admit_named_declarations_between_ordinary_commands()
 }
 
 #[test]
+fn mixed_imported_commands_expand_native_templates_in_their_declarations_once() {
+    let (imported, code) = command_fixture(Payload::Definition, Some(2));
+    let before = imported.engine.logical_root(&KVMap::new());
+    let report = check(
+        &imported,
+        &code,
+        &[(
+            "Main",
+            "prelude\nimport SourceLibrary\n\
+             macro \"nativeValue\" : term => `(0 + 11)\n\
+             declare! (def mixedCommand : Nat := nativeValue)\n\
+             theorem verified : mixedCommand = 11 := by rfl",
+        )],
+        MacroTreeLimits::default(),
+        None,
+    );
+    let checked = succeeded(&report);
+    assert_declared_value(&checked.checked.engine, "mixedCommand", 11);
+    assert_eq!(checked.checked.theorems, 1);
+    assert_eq!(report.attempts.len(), 4);
+    assert_eq!(
+        report.attempts[0].declaration,
+        name("SourceLibrary.commandMacro")
+    );
+    assert!(
+        report.attempts[1]
+            .native_functions
+            .iter()
+            .any(|name| name == "source-template:quoted")
+    );
+    assert_eq!(
+        report.states.as_ref().unwrap()[&name("Main")].macro_scope,
+        22
+    );
+    assert_eq!(imported.engine.logical_root(&KVMap::new()), before);
+    assert!(
+        !imported
+            .engine
+            .environment()
+            .contains(&name("mixedCommand"))
+    );
+}
+
+#[test]
 fn imported_custom_command_declarations_reach_program_execution() {
     let (imported, code) = command_fixture(Payload::Definition, Some(2));
     let declarations = users(&code);

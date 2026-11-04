@@ -744,71 +744,60 @@ pub(super) fn run_collecting(
                 let source = &module.source[header.body_start.0..];
                 let mut source_limits = limits.source;
                 source_limits.max_commands = source_limits.max_commands.saturating_sub(commands);
-                let mut check = |session: Option<
-                    &mut crate::imported_macros::source::FileSession<'_>,
-                >| {
-                    if source.is_empty() {
-                        if let Some(session) = session {
-                            let mut grammar = grammar::SourceGrammar::for_engine(
-                                &imported,
-                                Some(module.name),
-                                header.module_system,
-                            )
-                            .map_err(|error| {
-                                SourceCheckError::Command {
-                                    file: 0,
-                                    command: 0,
-                                    offset: 0,
-                                    error: Box::new(error),
-                                }
-                            })?;
-                            grammar
-                                .import_artifact(session.parsers())
+                let mut check =
+                    |session: Option<&mut crate::imported_macros::source::FileSession<'_>>| {
+                        if source.is_empty() {
+                            if let Some(session) = session {
+                                let mut grammar = grammar::SourceGrammar::for_engine(
+                                    &imported,
+                                    Some(module.name),
+                                    header.module_system,
+                                )
                                 .map_err(|error| SourceCheckError::Command {
                                     file: 0,
                                     command: 0,
                                     offset: 0,
                                     error: Box::new(error),
                                 })?;
-                            if grammar.has_templates() {
-                                return Err(SourceCheckError::ImportedMacro {
-                                    file: 0,
-                                    command: 0,
-                                    offset: 0,
-                                    error: Box::new(
-                                        crate::imported_macros::source::SourceMacroError::TemplateGrammar,
-                                    ),
-                                });
+                                grammar
+                                    .import_artifact(session.parsers())
+                                    .map_err(|error| SourceCheckError::Command {
+                                        file: 0,
+                                        command: 0,
+                                        offset: 0,
+                                        error: Box::new(error),
+                                    })?;
                             }
+                            let root = imported.logical_root(options);
+                            Ok(Outcome::Complete(SourceFileCheck {
+                                engine: imported.clone(),
+                                files: 1,
+                                commands: 0,
+                                theorems: 0,
+                                base_logical_root: root,
+                                result_logical_root: root,
+                                scope: fln_elab::source::scope::SourceScope {
+                                    private_module: header
+                                        .module_system
+                                        .then(|| module.name.clone()),
+                                    source_module: Some(module.name.clone()),
+                                    ..imported.base_source_scope()
+                                },
+                            }))
+                        } else {
+                            imported.check_source_files_recording(
+                                &[source],
+                                options,
+                                source_limits,
+                                Some(&mut declarations),
+                                header.module_system.then_some(module.name),
+                                Some(module.name),
+                                public.as_mut(),
+                                Some((module.source, header.body_start)),
+                                session,
+                            )
                         }
-                        let root = imported.logical_root(options);
-                        Ok(Outcome::Complete(SourceFileCheck {
-                            engine: imported.clone(),
-                            files: 1,
-                            commands: 0,
-                            theorems: 0,
-                            base_logical_root: root,
-                            result_logical_root: root,
-                            scope: fln_elab::source::scope::SourceScope {
-                                private_module: header.module_system.then(|| module.name.clone()),
-                                source_module: Some(module.name.clone()),
-                                ..imported.base_source_scope()
-                            },
-                        }))
-                    } else {
-                        imported.check_source_files_recording(
-                            &[source],
-                            options,
-                            source_limits,
-                            Some(&mut declarations),
-                            header.module_system.then_some(module.name),
-                            Some(module.name),
-                            public.as_mut(),
-                            Some((module.source, header.body_start)),
-                            session,
-                        )
-                    }
-                };
+                    };
                 let result = match macros.as_deref_mut() {
                     Some(macros) => macros.check_module(
                         module.name,

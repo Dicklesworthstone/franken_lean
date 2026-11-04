@@ -299,11 +299,11 @@ impl SourceGrammar {
         with_grammar(&self.file.grammar(), parse)
     }
 
-    /// Imported executable macros own their expansion pass. Source-template
-    /// journals require a separate mixed-dispatch implementation before they
-    /// can participate in that pass without replaying an expansion.
-    pub(crate) fn has_templates(&self) -> bool {
-        self.file.rules().next().is_some()
+    /// The exact lexical template view for the imported MacroM dispatcher.
+    /// The dispatcher performs root expansion inside its ordinary traversal;
+    /// no independent native expansion pass runs before or after it.
+    pub(crate) fn templates(&self) -> Arc<BTreeMap<Name, Arc<NotationRule>>> {
+        self.file.active_template_rules()
     }
 
     /// The notations active here, as a printer applies them

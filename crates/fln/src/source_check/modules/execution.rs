@@ -3,7 +3,7 @@
 //! Source exports retain declarations and metadata; evaluation candidates and
 //! scratch queries never become another module's declarations.
 use super::*;
-use crate::imported_macros::source::{FileSession, SourceMacroError};
+use crate::imported_macros::source::FileSession;
 use crate::{EngineExecutionLimits, EvaluationPresentation, SourceCommandBatchExecution};
 
 mod preflight;
@@ -539,14 +539,6 @@ impl imported::SourceOleanImport {
                     grammar
                         .import_artifact(session.parsers())
                         .map_err(source_command_error)?;
-                    if grammar.has_templates() {
-                        return Err(SourceCheckError::ImportedMacro {
-                            file: 0,
-                            command: 0,
-                            offset: header.body_start.0,
-                            error: Box::new(SourceMacroError::TemplateGrammar),
-                        });
-                    }
                 }
                 let body = grammar
                     .enter(|| command_bytes(module.source, header))

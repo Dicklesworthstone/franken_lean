@@ -85,3 +85,99 @@ fn an_unscoped_cdot_is_refused_with_the_pins_message() {
         );
     }
 }
+
+fn with_quotation_scopes(source: &str, scopes: &[u64]) -> fln_syntax::tree::Syntax {
+    use fln_core::name::Name;
+    use fln_syntax::tree::Syntax;
+
+    fn visit(syntax: &mut Syntax, scopes: &mut std::slice::Iter<'_, u64>) {
+        let Syntax::Node { kind, args, .. } = syntax else {
+            return;
+        };
+        if *kind == Name::from_components(["hygieneInfo"]) {
+            let [Syntax::Ident { val, .. }] = args.as_mut_slice() else {
+                panic!("parsed hygiene identifier")
+            };
+            *val = fln_syntax::hygiene::add_macro_scope(
+                &Name::from_components(["ImportedQuotation"]),
+                &Name::anonymous(),
+                *scopes.next().expect("one identity per delimiter/dot"),
+            )
+            .unwrap();
+        } else {
+            for argument in args {
+                visit(argument, scopes);
+            }
+        }
+    }
+
+    let mut syntax = fln_parse::parse_definition(source.as_bytes())
+        .unwrap()
+        .syntax()
+        .clone();
+    let mut scopes = scopes.iter();
+    visit(&mut syntax, &mut scopes);
+    assert!(scopes.next().is_none());
+    syntax
+}
+
+#[test]
+fn lowering_cannot_expose_quoted_dots_across_erased_delimiters() {
+    // Admit an ordinary Prod and a checked pair through the real source path:
+    // neither a missing type nor an invented constructor can cause the refusals.
+    let environment = engine()
+        .check_source_files(
+            &[b"structure Prod (A B : Type) where\n fst : A\n snd : B\n\
+                def pairWitness : Nat \xc3\x97 Nat := (1, 2)"],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits()),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap()
+        .engine;
+    let source_scope = fln_elab::source::scope::SourceScope::default();
+    let mixed = "def mixedBoundary : Nat → Nat → Nat := ((Nat.add · ·))";
+
+    // A matched inner parenthesis still produces a kernel-checked function.
+    let matched = with_quotation_scopes(mixed, &[7, 8, 8, 8]);
+    let candidate = fln_elab::elaborate_definition_in_scope_with_budget(
+        &matched,
+        environment.environment(),
+        limits().kernel,
+        &source_scope,
+    )
+    .unwrap();
+    assert!(matches!(
+        fln_kernel::check(environment.environment(), &candidate, limits().kernel),
+        Outcome::Complete(fln_kernel::verdict::Verdict::Accepted { .. })
+    ));
+
+    for (source, scopes) in [
+        // Tuple lowering must not expose its unmatched dot to the outer paren.
+        (
+            "def tupleBoundary : Nat → Nat × Nat := ((Nat.succ ·, 0))",
+            vec![7, 8, 7],
+        ),
+        // Creating a lambda for one matching dot must not expose a second,
+        // mismatched dot when the inner parentheses disappear.
+        (mixed, vec![7, 8, 8, 7]),
+    ] {
+        let syntax = with_quotation_scopes(source, &scopes);
+        let result = fln_elab::elaborate_definition_in_scope_with_budget(
+            &syntax,
+            environment.environment(),
+            limits().kernel,
+            &source_scope,
+        );
+        assert!(
+            matches!(
+                result,
+                Err(fln_elab::NatDefinitionElabError::Inference(
+                    fln_elab::source::SourceInferenceError::CdotOutsideParentheses
+                ))
+            ),
+            "{source}: {result:?}"
+        );
+    }
+}

@@ -27,6 +27,7 @@ mod recursive;
 #[cfg(test)]
 #[path = "registrations/runtime_lifetime_tests.rs"]
 mod runtime_lifetime_tests;
+mod templates;
 use recursive::{ExpansionWork, RegistryExpansion, add_tree_usage, add_vm_usage};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -193,6 +194,7 @@ struct MacroCode {
     compiled: OnceLock<CompiledMacro>,
     deferred: Option<(MacroCompilationInputs, IrExecutionLimits)>,
     native: Option<super::native_tactics::NativeTacticMacro>,
+    template: Option<Arc<fln_parse::extensions::NotationRule>>,
 }
 
 impl MacroCode {
@@ -201,6 +203,7 @@ impl MacroCode {
             compiled: OnceLock::from(compiled),
             deferred: None,
             native: None,
+            template: None,
         }
     }
 
@@ -209,6 +212,7 @@ impl MacroCode {
             compiled: OnceLock::new(),
             deferred: Some((inputs, limits)),
             native: None,
+            template: None,
         }
     }
 
@@ -217,6 +221,7 @@ impl MacroCode {
             compiled: OnceLock::new(),
             deferred: None,
             native: Some(native),
+            template: None,
         }
     }
 
@@ -1183,7 +1188,16 @@ impl RegisteredMacros {
                 state: &state,
                 lookup,
             };
-            let result = if let Some(native) = candidate.compiled.native {
+            let result = if let Some(template) = &candidate.compiled.template {
+                templates::execute(
+                    template,
+                    input,
+                    invocation,
+                    execution,
+                    cancellation,
+                    reference,
+                )
+            } else if let Some(native) = candidate.compiled.native {
                 // Native toolchain macros occupy their actual registration
                 // position. A failed expanded tactic may still reach a later
                 // user candidate, while recursive Macro.expandMacro? observes
@@ -1249,13 +1263,17 @@ impl RegisteredMacros {
                                 .map(|_| unreachable!("failed generated conversion cannot expand"))
                         });
                     }
-                    if next.expanded_macro_declarations.try_reserve(1).is_err() {
+                    if candidate.compiled.template.is_none()
+                        && next.expanded_macro_declarations.try_reserve(1).is_err()
+                    {
                         return Outcome::Inconclusive(Inconclusive::dependency_unavailable(
                             "host allocation for expanded macro declarations",
                         ));
                     }
-                    next.expanded_macro_declarations
-                        .insert(0, candidate.declaration.clone());
+                    if candidate.compiled.template.is_none() {
+                        next.expanded_macro_declarations
+                            .insert(0, candidate.declaration.clone());
+                    }
                     if let Err(error) =
                         inject_state(&next, &mut StateBudget::new(limits.execution.syntax))
                     {
@@ -1388,6 +1406,9 @@ pub enum RegisteredExpansion {
 #[derive(Debug)]
 pub struct MacroAttempt {
     pub module: Name,
+    /// Callable owner for imported macros. Native quoted templates use an
+    /// explicitly synthetic `_fln.sourceTemplate.<kind>` label: no compiled
+    /// Lean declaration or checked owner is claimed for their source data.
     pub declaration: Name,
     /// Inclusive of completed recursive callbacks made by this invocation.
     /// Use the dispatch total, not a sum of attempts, for aggregate work.

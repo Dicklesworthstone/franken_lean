@@ -411,22 +411,7 @@ impl Context {
             return Err(failure(SourceInferenceError::Scope));
         }
         if kind == &parser_kind(&["Term", "tuple"]) {
-            let opener = expect_node(
-                &args[0],
-                &parser_kind(&["Term", "hygienicLParen"]),
-                2,
-                "empty tuple hygienic opener",
-            )?;
-            expect_atom(&opener[0], "(", "empty tuple opener")?;
-            let hygiene = expect_node(
-                &opener[1],
-                &Name::from_components(["hygieneInfo"]),
-                1,
-                "empty tuple hygiene information",
-            )?;
-            if !matches!(hygiene, [Syntax::Ident { val, .. }] if val.is_anonymous()) {
-                return Err(failure(SourceInferenceError::Scope));
-            }
+            parenthesis_hygiene_name(&args[0])?;
             expect_atom(&args[2], ")", "empty tuple closer")?;
             if !expect_null_args(&args[1], "tuple optional body")?.is_empty() {
                 return self.expand_pairs(std::mem::replace(&mut args[1], null(Vec::new())));
@@ -520,12 +505,16 @@ mod tests {
     }
 
     fn empty_tuple() -> Syntax {
+        empty_tuple_with_hygiene(Name::anonymous())
+    }
+
+    fn empty_tuple_with_hygiene(name: Name) -> Syntax {
         let hygiene = Syntax::node(
             Name::from_components(["hygieneInfo"]),
             vec![Syntax::Ident {
                 info: SourceInfo::None,
                 raw_val: ByteSpan::default().into(),
-                val: Name::anonymous(),
+                val: name,
                 preresolved: Vec::new(),
             }],
         );
@@ -544,11 +533,19 @@ mod tests {
 
     #[test]
     fn empty_tuple_expands_to_the_fixed_global_unit_constant() {
-        let expanded = context()
-            .expand_collection_node(empty_tuple(), false)
-            .unwrap();
-        assert!(matches!(&expanded, Syntax::Ident { val, .. }
-            if val == &Name::from_components(["_root_", "Unit", "unit"])));
+        let quoted = fln_syntax::hygiene::add_macro_scope(
+            &Name::from_components(["ImportedQuotation"]),
+            &Name::anonymous(),
+            7,
+        )
+        .unwrap();
+        for hygiene in [Name::anonymous(), quoted] {
+            let expanded = context()
+                .expand_collection_node(empty_tuple_with_hygiene(hygiene), false)
+                .unwrap();
+            assert!(matches!(&expanded, Syntax::Ident { val, .. }
+                if val == &Name::from_components(["_root_", "Unit", "unit"])));
+        }
     }
 
     #[test]

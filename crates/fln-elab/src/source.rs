@@ -2267,6 +2267,9 @@ impl Context {
             RecordNext(record_terms::RecordBuild<'a>),
             RecordField(record_terms::RecordBuild<'a>, record_terms::RecordTarget),
             Visit(&'a Syntax, Option<Expr>, bool),
+            /// Enter the term elaborators after macro dispatch, or where the
+            /// pin resolves an application head without expanding its macros.
+            Elaborate(&'a Syntax, Option<Expr>, bool),
             /// `no_implicit_lambda% e`: `e`, its expected type marked for as long as it is visited.
             VisitWithoutImplicitLambda(&'a Syntax, Option<Expr>),
             RestoreImplicitLambda(usize),
@@ -2463,6 +2466,7 @@ impl Context {
                         pending.finish(self)?;
                         break;
                     };
+                    let expand_macro = matches!(&task, Task::Visit(..));
                     self.tick()?;
                     if matches!(
                         &task,
@@ -2663,21 +2667,32 @@ impl Context {
                         Task::RestoreMacroTerms(previous) => {
                             self.tactic_macro_terms = previous;
                         }
-                        Task::Visit(syntax, expected, finish) => {
-                            if let Some(term) =
-                                self.imported_tactic_term(syntax, expected.clone(), finish)?
-                            {
-                                values.push(term);
-                                continue;
+                        Task::Visit(syntax, expected, finish)
+                        | Task::Elaborate(syntax, expected, finish) => {
+                            if expand_macro {
+                                let locals =
+                                    self.observes_term(syntax).then(|| self.txn.lctx.clone());
+                                if let Some(term) =
+                                    self.imported_tactic_term(syntax, expected.clone(), finish)?
+                                {
+                                    if let Some(locals) = locals {
+                                        self.observe_term(syntax, term.clone(), locals)?;
+                                    }
+                                    values.push(term);
+                                    continue;
+                                }
                             }
                             // The pin's implicit lambda (`binders::start_implicit_lambda`). The
-                            // body is this same term, visited again against the type that
-                            // remains, which starts with no implicit binder.
+                            // body is this same term against the type that remains.
+                            // elabImplicitLambdaAux enters elabUsingElabFns directly:
+                            // an unsupported macro must not execute a second time.
                             if finish
                                 && let Some(type_) = &expected
                                 && let Some(state) = self.start_implicit_lambda(syntax, type_)?
                             {
-                                tasks.push(Task::BinderNext(state));
+                                let expected = self.telescope_body_expected(&state)?;
+                                tasks.push(Task::BinderBody(state));
+                                tasks.push(Task::Elaborate(syntax, expected, true));
                                 continue;
                             }
                             if self.observes_term(syntax) {
@@ -3487,6 +3502,10 @@ impl Context {
                                     }
                                     let (head, explicit) =
                                         self.explicit_application_head(&parts[0])?;
+                                    // A parenthesized head enters elabTerm, unlike a
+                                    // bare identifier resolved by elabAppFnId. Preserve
+                                    // that boundary when no explicit `@` was found.
+                                    let head = if explicit { head } else { &parts[0] };
                                     tasks.push(Task::StartApplication(
                                         head, arguments, expected, explicit,
                                     ));
@@ -3520,6 +3539,7 @@ impl Context {
                                     }
                                     let (head, explicit) =
                                         self.explicit_application_head(&parts[function])?;
+                                    let head = if explicit { head } else { &parts[function] };
                                     tasks.push(Task::StartApplication(
                                         head,
                                         std::slice::from_ref(&parts[argument]),
@@ -4237,7 +4257,16 @@ impl Context {
                                 }
                                 None => {
                                     tasks.push(Task::Function(arguments, expected, explicit));
-                                    tasks.push(Task::Visit(head, None, false));
+                                    tasks.push(
+                                        if matches!(head, Syntax::Ident { .. })
+                                            || head.kind()
+                                                == Some(&parser_kind(&["Term", "explicitUniv"]))
+                                        {
+                                            Task::Elaborate(head, None, false)
+                                        } else {
+                                            Task::Visit(head, None, false)
+                                        },
+                                    );
                                 }
                             }
                         }

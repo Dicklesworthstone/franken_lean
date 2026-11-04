@@ -16,6 +16,8 @@ use std::{collections::BTreeSet, path::Path, process::Command};
 
 #[path = "source_grind/existentials.rs"]
 mod existentials;
+#[path = "source_grind/modifiers.rs"]
+mod modifiers;
 
 const STACK: usize = 128 * 1024 * 1024;
 const ROOTS: &[&str] = &[
@@ -310,6 +312,10 @@ const ACCEPT: &[(&str, &str)] = &[
         "opaque stamp : Nat → Nat := fun x => x\naxiom stamp_eq (x : Nat) : stamp x = x\nexample (a : Nat) : stamp (stamp a) = a := by grind only [stamp_eq]",
     ),
     (
+        "explicit_pattern_direction",
+        "opaque stamp : Nat → Nat := fun x => x\naxiom stamp_eq (x : Nat) : stamp x = x\nexample (a : Nat) : stamp a = a := by grind [= stamp_eq]",
+    ),
+    (
         "polymorphic_theorem",
         "universe u\nopaque marker {α : Type u} (x : α) : α := x\naxiom marker_eq {α : Type u} (x : α) : marker x = x\nexample (a : Nat) : marker (marker a) = a := by grind [marker_eq]\nexample {α : Type u} (a : α) : marker a = a := by grind only [marker_eq]",
     ),
@@ -554,10 +560,6 @@ const UNSUPPORTED: &[(&str, &str)] = &[
     (
         "explicit_ematch_configuration",
         "example (a : Nat) : a = a := by grind (ematch := 1)",
-    ),
-    (
-        "explicit_pattern_direction",
-        "opaque stamp : Nat → Nat := fun x => x\naxiom stamp_eq (x : Nat) : stamp x = x\nexample (a : Nat) : stamp a = a := by grind [= stamp_eq]",
     ),
     (
         "minimal_pattern_selection",

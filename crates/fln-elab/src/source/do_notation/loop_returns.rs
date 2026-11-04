@@ -215,12 +215,15 @@ impl Context {
         }
     }
 
+    // Keep the continuation on the heap before returning it: moving this
+    // syntax-rich value through the preparation result and caller duplicates
+    // large slots on the bounded host stack even though the worklist is on the heap.
     pub(super) fn prepare_returning_loop(
         &mut self,
         syntax: Syntax,
         suffix: Option<Syntax>,
         parent: Option<&LoopScope>,
-    ) -> Result<(LoopBuild, Syntax, LoopScope, Syntax), NatDefinitionElabError> {
+    ) -> Result<(Box<LoopBuild>, Syntax, LoopScope, Syntax), NatDefinitionElabError> {
         self.tick()?;
         let (syntax, state) =
             if syntax.kind() == Some(&parser_kind(&["Term", "nativeDoReturningMutFor"])) {
@@ -282,7 +285,7 @@ impl Context {
             accumulator: accumulator.clone(),
         };
         Ok((
-            LoopBuild {
+            Box::new(LoopBuild {
                 header,
                 accumulator,
                 parameter,
@@ -292,7 +295,7 @@ impl Context {
                 join,
                 suffix,
                 parent: parent.map(|parent| parent.targets.clone()),
-            },
+            }),
             sequence,
             scope,
             normal,
@@ -358,7 +361,7 @@ impl Context {
 
     pub(super) fn finish_returning_loop(
         &mut self,
-        build: LoopBuild,
+        build: Box<LoopBuild>,
         body: Syntax,
     ) -> Result<Syntax, NatDefinitionElabError> {
         self.tick()?;

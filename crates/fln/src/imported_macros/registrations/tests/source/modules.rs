@@ -587,6 +587,126 @@ fn imported_macro_programs_execute_expansions_in_exact_module_and_scope_worlds()
 }
 
 #[test]
+fn mixed_macro_programs_replay_native_templates_through_source_imports() {
+    let (imported, code) = batches::artifact_import_fixture();
+    let before = imported.engine.logical_root(&KVMap::new());
+    let files = [
+        (
+            "Main",
+            "prelude\nimport Forward\n\
+             def throughBoth : Nat := 0 + libraryValue\n\
+             #eval throughBoth\n#eval sourceToImported\n#eval 0 + libraryPick[2]\n\
+             #eval 0 + libraryValue\n\
+             section\nlocal macro_rules | `(libraryValue) => `(23)\n\
+             #eval 0 + libraryValue\nend\n\
+             #eval 0 + libraryValue",
+        ),
+        ("Forward", "prelude\nimport NativeLibrary\n"),
+        (
+            "NativeLibrary",
+            "prelude\nimport SourceLibrary\n\
+             macro \"libraryValue\" : term => `(17)\n\
+             macro \"importedResult\" : term => `(7 + 11)\n\
+             syntax \"libraryPick[\" num \"]\" : term\n\
+             macro_rules | `(libraryPick[1]) => `(11) | `(libraryPick[2]) => `(22)\n\
+             macro_rules | `(libraryPick[3]) => `(33)\n\
+             def sourceToImported : Nat := importedResult",
+        ),
+    ];
+    let report = execute_program(&imported, &code, &files, MacroTreeLimits::default(), None);
+    let program = executed(&report);
+    assert_eq!(
+        program_values(program, "Main"),
+        [17, 11, 22, 17, 23, 17]
+            .into_iter()
+            .map(crate::ClosedVmValue::Scalar)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        report.states.as_ref().unwrap()[&name("Main")].macro_scope,
+        33
+    );
+    assert_eq!(imported.engine.logical_root(&KVMap::new()), before);
+    assert!(!imported.engine.environment().contains(&name("throughBoth")));
+}
+
+#[test]
+fn mixed_macro_module_checks_forward_templates_through_empty_modules() {
+    let (imported, code) = batches::artifact_import_fixture();
+    let report = check(
+        &imported,
+        &code,
+        &[
+            (
+                "Main",
+                "prelude\nimport Forward\n\
+                 def fromImported : Nat := 0 + libraryValue\n\
+                 theorem checkedBoth : fromImported = fromNative := by rfl",
+            ),
+            ("Forward", "prelude\nimport NativeLibrary\n"),
+            (
+                "NativeLibrary",
+                "prelude\nimport SourceLibrary\n\
+                 macro \"libraryValue\" : term => `(11)\n\
+                 macro \"nativeToImported\" : term => `(7 + 11)\n\
+                 def fromNative : Nat := nativeToImported",
+            ),
+        ],
+        MacroTreeLimits::default(),
+        None,
+    );
+    let checked = succeeded(&report);
+    assert_eq!(checked.checked.theorems, 1);
+    assert_declared_value(&checked.checked.engine, "fromImported", 11);
+    assert_declared_value(&checked.checked.engine, "fromNative", 11);
+    assert_eq!(report.attempts.len(), 6);
+    let states = report.states.as_ref().unwrap();
+    assert_eq!(states[&name("NativeLibrary")].macro_scope, 20);
+    assert_eq!(states[&name("Forward")].macro_scope, 17);
+    assert_eq!(states[&name("Main")].macro_scope, 21);
+}
+
+#[test]
+fn mixed_program_grammar_declarations_do_not_bypass_active_atomic_macros() {
+    let (imported, code) = batches::artifact_import_fixture_with_extra_rows(&[(
+        "ident",
+        "SourceLibrary.diagnostic",
+        Some("SourceAtoms"),
+    )]);
+    let before = imported.engine.logical_root(&KVMap::new());
+    let report = execute_program(
+        &imported,
+        &code,
+        &[(
+            "Main",
+            "prelude\nimport SourceLibrary\n\
+             macro \"existingValue\" : term => `(11)\n\
+             def checkedPrefix : Nat := 0 + existingValue\n\
+             open scoped SourceAtoms\n\
+             macro \"blockedValue\" : term => `(11)",
+        )],
+        MacroTreeLimits::default(),
+        None,
+    );
+    let Outcome::Complete(Err(error)) = &report.outcome else {
+        panic!("native grammar declaration bypassed an active atomic macro");
+    };
+    assert!(
+        format!("{error:?}").contains("generated-reference macro dispatch"),
+        "{error:?}"
+    );
+    assert_eq!(report.attempts.len(), 3);
+    assert!(report.states.is_none());
+    assert_eq!(imported.engine.logical_root(&KVMap::new()), before);
+    assert!(
+        !imported
+            .engine
+            .environment()
+            .contains(&name("checkedPrefix"))
+    );
+}
+
+#[test]
 fn imported_macro_programs_keep_expanded_public_and_mutual_admission_trees() {
     let (imported, code) = batches::artifact_import_fixture();
     let report = execute_program(
@@ -753,7 +873,7 @@ fn imported_macro_programs_share_budgets_across_definition_and_evaluation_work()
 }
 
 #[test]
-fn imported_macro_programs_preserve_control_dispatch_and_template_refusals() {
+fn mixed_macro_programs_preserve_control_dispatch_and_accept_source_templates() {
     for (kind, source) in [
         (
             "Lean.Parser.Command.openScoped",
@@ -792,18 +912,22 @@ fn imported_macro_programs_preserve_control_dispatch_and_template_refusals() {
     }
     let (imported, code) = batches::artifact_import_fixture();
     let source = "prelude\nimport SourceLibrary\nnotation \"seven\" => 7\n#eval seven";
-    let stopped = execute_program(
+    let report = execute_program(
         &imported,
         &code,
         &[("Main", source)],
         MacroTreeLimits::default(),
         None,
     );
-    assert!(
-        matches!(stopped.outcome, Outcome::Complete(Err(_))),
-        "{stopped:?}"
+    assert_eq!(
+        program_values(executed(&report), "Main"),
+        vec![crate::ClosedVmValue::Scalar(7)]
     );
-    assert!(stopped.states.is_none());
+    assert_eq!(report.attempts.len(), 1);
+    assert_eq!(
+        report.states.as_ref().unwrap()[&name("Main")].macro_scope,
+        18
+    );
 }
 
 #[test]

@@ -1,6 +1,6 @@
-//! Actual higher-order Nat/String IR with every reviewed native prototype.
+//! Actual higher-order primitive IR with every reviewed native prototype.
 use super::arrays_reference::assert_nat_replay;
-use super::boxed_primitives::NAMES;
+use super::boxed_primitives::{WORD_FAMILIES, names};
 use super::*;
 use crate::imported_ir::EntryArgument;
 use std::path::{Path, PathBuf};
@@ -86,9 +86,9 @@ fn live_pinned_boxed_primitives_preserve_values_captures_and_canonical_replay() 
                 })
         })
         .collect();
-    for target in NAMES {
+    for target in names() {
         assert!(
-            boxed_partials.contains(&Name::str(name(target), "_boxed")),
+            boxed_partials.contains(&Name::str(name(&target), "_boxed")),
             "{target} partial application optimized away; {dir:?}"
         );
     }
@@ -115,6 +115,31 @@ fn live_pinned_boxed_primitives_preserve_values_captures_and_canonical_replay() 
         ]
         .map(name),
     );
+    // These are the new fixture's own public families and their compiler
+    // helpers. Native primitive names are separately reserved by selection;
+    // no blanket namespace grant is used for the imported toolchain modules.
+    let word_prefixes: Vec<_> = WORD_FAMILIES
+        .into_iter()
+        .flat_map(|family| {
+            std::iter::once(name(&format!("{}Boxed", family.to_ascii_lowercase()))).chain(
+                ["Transform", "Decision", "FromNat", "ToNat"]
+                    .into_iter()
+                    .map(move |suffix| name(&format!("use{family}{suffix}"))),
+            )
+        })
+        .collect();
+    users.extend(module.decls.iter().filter_map(|declaration| {
+        let declaration = declaration.name();
+        word_prefixes
+            .iter()
+            .any(|prefix| {
+                declaration == prefix
+                    || declaration
+                        .to_display_string()
+                        .starts_with(&format!("{}.", prefix.to_display_string()))
+            })
+            .then(|| declaration.clone())
+    }));
     let mut oracle_source = source.to_owned();
     for (entry, arguments) in &cases {
         oracle_source.push_str(&format!("\n#eval {entry}"));
@@ -217,7 +242,7 @@ fn live_pinned_boxed_primitives_preserve_values_captures_and_canonical_replay() 
         observed.extend(compiled.native_externs().iter().cloned());
         eprintln!("live Reference and Golem: {entry} {arguments:?} = {expected}");
     }
-    for target in NAMES {
+    for target in names() {
         assert!(
             observed.contains(&format!("extern:{target}")),
             "{target} not linked"
@@ -277,6 +302,19 @@ fn cases() -> Vec<(&'static str, Vec<EntryArgument>)> {
     ] {
         cases.push(("stringBoxedEq", vec![string(a), string(b)]));
     }
+    for entry in [
+        "uint8Boxed",
+        "uint16Boxed",
+        "uint32Boxed",
+        "uint64Boxed",
+        "usizeBoxed",
+    ] {
+        for operation in 0..18 {
+            for (a, b) in [(0, 0), (42, 7), (255, 8), (65_535, 32), (u64::MAX, 64)] {
+                cases.push((entry, vec![nat(operation), nat(a), nat(b)]));
+            }
+        }
+    }
     cases
 }
 
@@ -291,7 +329,24 @@ fn native_prototypes(reference: &Path) -> IrModule {
                 .unwrap()
                 .join("lib/lean")
         });
-    let wanted: BTreeSet<_> = NAMES.into_iter().collect();
+    native_prototypes_from_library(&library)
+}
+
+#[test]
+fn pinned_native_primitive_prototypes_match_boxed_and_unboxed_contracts() {
+    let Some(library) = std::env::var_os("FLN_REFERENCE_LIB") else {
+        assert!(
+            std::env::var_os("FLN_REQUIRE_REFERENCE").is_none(),
+            "pinned Reference artifacts required for native primitive prototypes"
+        );
+        eprintln!("SKIP: native primitive prototypes require FLN_REFERENCE_LIB");
+        return;
+    };
+    native_prototypes_from_library(Path::new(&library));
+}
+
+fn native_prototypes_from_library(library: &Path) -> IrModule {
+    let wanted: BTreeSet<_> = names().into_iter().collect();
     let mut externs = BTreeSet::new();
     let mut wrappers = BTreeSet::new();
     let mut declarations = Vec::new();
@@ -300,9 +355,15 @@ fn native_prototypes(reference: &Path) -> IrModule {
         "Init/Data/String/Defs.ir",
         "Init/Data/String/Bootstrap.ir",
         "Init/Data/String/Length.ir",
+        "Init/Data/UInt/BasicAux.ir",
+        "Init/Data/UInt/Basic.ir",
+        "Init/Data/UInt/Log2.ir",
     ] {
         let path = library.join(relative);
-        let module = crate::decode_ir_artifact(&std::fs::read(&path).unwrap(), 32 * 1024 * 1024)
+        let bytes = std::fs::read(&path).unwrap();
+        fln_olean::pin::check_pinned_header(&bytes)
+            .unwrap_or_else(|error| panic!("{path:?}: {error:?}"));
+        let module = crate::decode_ir_artifact(&bytes, 32 * 1024 * 1024)
             .unwrap_or_else(|error| panic!("{path:?}: {error:?}"));
         for declaration in module.decls {
             let (row, is_boxed) = match crate::imported_ir::native_row(declaration.name()) {
@@ -319,25 +380,37 @@ fn native_prototypes(reference: &Path) -> IrModule {
             }
             let bridge = BoxedNative::from_row(row).unwrap().unwrap();
             if is_boxed {
-                bridge.validate_declaration(&declaration).unwrap();
-                assert!(wrappers.insert(row.name));
+                bridge
+                    .validate_declaration(&declaration)
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "{} boxed prototype in {path:?}: {error}; {declaration:?}",
+                            row.name
+                        )
+                    });
+                assert!(wrappers.insert(row.name.to_owned()));
             } else {
                 let IrDecl::Extern { params, result, .. } = &declaration else {
                     panic!("{} is not an extern in {path:?}", row.name)
                 };
-                validate_extern_signature(row, params, result).unwrap();
+                validate_extern_signature(row, params, result).unwrap_or_else(|error| {
+                    panic!(
+                        "{} native prototype in {path:?}: {error}; {declaration:?}",
+                        row.name
+                    )
+                });
                 assert_eq!(
                     validated_ir_arity(row, params.len()).unwrap(),
                     bridge.arity()
                 );
-                assert!(externs.insert(row.name));
+                assert!(externs.insert(row.name.to_owned()));
             }
             declarations.push(declaration);
         }
     }
     assert_eq!(externs, wanted, "all reviewed native raw prototypes");
     assert_eq!(wrappers, wanted, "all reviewed compiler boxed prototypes");
-    assert_eq!(declarations.len(), 36);
+    assert_eq!(declarations.len(), wanted.len() * 2);
     IrModule {
         decls: declarations,
         ..IrModule::default()

@@ -30,6 +30,13 @@ fn exports_are_deltas_and_a_forwarding_module_has_no_macro_effect() {
     let delta = extension.export_native().unwrap();
     assert!(delta.declarations.is_empty());
     assert_eq!(delta.rules[&kind].cases().count(), 2);
+    assert_eq!(
+        delta.rules[&kind]
+            .cases()
+            .map(|rule| rule.starts_registration)
+            .collect::<Vec<_>>(),
+        [true, false]
+    );
     assert_eq!(cases(&extension, &kind), 3);
     let mut forward = grammar("Forward");
     forward
@@ -37,6 +44,13 @@ fn exports_are_deltas_and_a_forwarding_module_has_no_macro_effect() {
         .unwrap();
     forward.import_native(&delta).unwrap();
     assert_eq!(cases(&forward, &kind), 3);
+    assert_eq!(
+        forward.rules[&kind]
+            .cases()
+            .map(|rule| rule.starts_registration)
+            .collect::<Vec<_>>(),
+        [true, false, true]
+    );
     assert!(forward.export_native().unwrap().is_empty());
     let before = cases(&forward, &kind);
     forward
@@ -141,4 +155,45 @@ fn unsupported_imported_registration_cannot_resurrect_an_old_rule_on_replay() {
     );
     assert_eq!(cases(&consumer, &kind), 0);
     assert!(consumer.export_native().is_err());
+}
+
+#[test]
+fn incomplete_or_scope_split_registrations_refuse_before_import_mutation() {
+    let (mut core, kind) = library();
+    declare(
+        &mut core,
+        "macro_rules | `(choose! 0) => `(1) | `(choose! 1) => `(2)",
+    );
+    let exported = core.export_native().unwrap();
+    for leading_continuation in [true, false] {
+        let mut invalid = exported.clone();
+        invalid
+            .categories
+            .insert(Name::from_components(["fresh"]), IdentBehavior::Default);
+        if leading_continuation {
+            Arc::make_mut(invalid.rules.get_mut(&kind).unwrap()).starts_registration = false;
+        } else {
+            invalid.rule_scopes.insert(
+                kind.clone(),
+                vec![
+                    Some(Name::from_components(["First"])),
+                    Some(Name::from_components(["Second"])),
+                    None,
+                ],
+            );
+        }
+        let mut consumer = grammar("Consumer");
+        let generation = consumer.generation;
+        assert!(consumer.import_native(&invalid).is_err());
+        assert_eq!(consumer.generation, generation);
+        assert!(consumer.rules.is_empty());
+        assert!(consumer.native_rule_counts.is_empty());
+        assert!(
+            !consumer
+                .categories
+                .contains_key(&Name::from_components(["fresh"]))
+        );
+        consumer.import_native(&exported).unwrap();
+        assert_eq!(cases(&consumer, &kind), 3);
+    }
 }

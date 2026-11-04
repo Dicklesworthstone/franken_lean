@@ -230,7 +230,7 @@ impl Context {
                 }
                 Task::FinishLoop(build) => {
                     let body = values.pop().ok_or_else(invalid)?;
-                    values.push(self.finish_returning_loop(*build, body)?);
+                    values.push(self.finish_returning_loop(build, body)?);
                 }
                 Task::Conditional(
                     syntax,
@@ -503,7 +503,7 @@ impl Context {
             block.loop_scope.as_ref(),
         )?;
         work.push(Task::Resume(block));
-        work.push(Task::FinishLoop(Box::new(build)));
+        work.push(Task::FinishLoop(build));
         work.push(Task::Block(Block::new(
             sequence,
             Some(normal),

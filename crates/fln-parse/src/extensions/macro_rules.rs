@@ -88,6 +88,7 @@ pub(super) fn declare(file: &mut FileGrammar, args: &[Syntax]) -> Result<(), &'s
                 prechecked: false,
                 pattern: Some(Syntax::node(kind.clone(), children)),
                 source: None,
+                starts_registration: false,
                 fallbacks: Vec::new(),
             })
         });
@@ -195,6 +196,9 @@ pub(super) fn declare(file: &mut FileGrammar, args: &[Syntax]) -> Result<(), &'s
         if cases.is_empty() {
             continue;
         }
+        // One command produces one macro function for each syntax kind, with
+        // its clauses tried top-to-bottom inside that function's fresh scope.
+        cases[0].starts_registration = true;
         let added = cases.len();
         let previous_count = file.rules.get(&kind).map_or(0, |rule| rule.cases().count());
         if let Some(previous) = file.rules.get(&kind) {

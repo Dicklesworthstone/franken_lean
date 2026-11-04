@@ -285,7 +285,15 @@ impl Context {
         expected: Option<Expr>,
         finish: bool,
     ) -> Result<Option<Typed>, NatDefinitionElabError> {
-        if self.tactic_macro_terms == 0 {
+        // The source pass expands nodes, but deliberately leaves atoms and
+        // identifiers for actual term positions. In particular, a declaration
+        // name or binder must never be rewritten by an `ident` registration.
+        // Generated terms have not passed through that source pass, so their
+        // nodes must also dispatch here. Missing syntax is handled directly by
+        // the term elaborator, as in the pin's elabTermAux.
+        if matches!(syntax, Syntax::Missing)
+            || (self.tactic_macro_terms == 0 && matches!(syntax, Syntax::Node { .. }))
+        {
             return Ok(None);
         }
         let Some(provider) = self.source_scope.tactic_macros.clone() else {
@@ -312,12 +320,15 @@ impl Context {
         }
         let expanded = self.lower_pattern_matrices(&expanded)?;
         let depth = self.tactic_macro_depth;
+        let terms = self.tactic_macro_terms;
         let options = self.txn.options.clone();
         let implicit = self.no_implicit_lambda_types.len();
         let pending_arguments = self.pending_source_arguments;
         self.tactic_macro_depth += 1;
+        self.tactic_macro_terms += 1;
         let result = self.term_prepared_scoped(&expanded, expected, None, None, finish);
         self.tactic_macro_depth = depth;
+        self.tactic_macro_terms = terms;
         self.txn.options = options;
         self.no_implicit_lambda_types.truncate(implicit);
         self.pending_source_arguments = pending_arguments;

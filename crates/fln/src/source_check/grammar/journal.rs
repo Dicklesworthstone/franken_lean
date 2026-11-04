@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 mod descriptions;
 
-const MAGIC: &[u8] = b"FLNSOURCEGRAMMAR\x05";
+const MAGIC: &[u8] = b"FLNSOURCEGRAMMAR\x06";
 const MAX_ROWS: usize = 4096;
 const MAX_BYTES: usize = 64 * 1024 * 1024;
 const MAX_ROW_BYTES: usize = 4 * 1024 * 1024;
@@ -169,7 +169,11 @@ fn encode_case(
         &PinTrees {
             header: node(
                 "template",
-                vec![node("variables", variables), atom(rule.prechecked)],
+                vec![
+                    node("variables", variables),
+                    atom(rule.prechecked),
+                    atom(rule.starts_registration),
+                ],
             ),
             commands: std::iter::once(rule.rhs.clone())
                 .chain(rule.pattern.iter().cloned())
@@ -197,7 +201,7 @@ fn decode_case(row: &Syntax) -> Result<NotationRule, EngineExecutionError> {
     if !trees.messages.is_empty() {
         return Err(malformed());
     }
-    let [variables, prechecked] = children(&trees.header, "template")? else {
+    let [variables, prechecked, starts_registration] = children(&trees.header, "template")? else {
         return Err(malformed());
     };
     let variables = children(variables, "variables")?
@@ -225,6 +229,7 @@ fn decode_case(row: &Syntax) -> Result<NotationRule, EngineExecutionError> {
         prechecked: as_bool(prechecked)?,
         pattern: trees.commands.get(1).cloned(),
         source: Some(Arc::from(source)),
+        starts_registration: as_bool(starts_registration)?,
         fallbacks: Vec::new(),
     })
 }
@@ -240,7 +245,16 @@ fn encode_rules(
         return Err(malformed());
     }
     if let Some(rule) = rule {
+        if !rule.starts_registration {
+            return Err(malformed());
+        }
+        let mut previous_scope = None;
         for (index, case) in rule.cases().enumerate() {
+            let scope = scopes.and_then(|scopes| scopes[index].as_ref());
+            if !case.starts_registration && scope != previous_scope {
+                return Err(malformed());
+            }
+            previous_scope = scope;
             let source = case
                 .source
                 .as_deref()
@@ -251,13 +265,7 @@ fn encode_rules(
                 .checked_add(bytes)
                 .filter(|bytes| *bytes <= MAX_ROW_BYTES)
                 .ok_or_else(|| limit("native grammar rule bytes", MAX_ROW_BYTES))?;
-            rules.push(node(
-                "scopedRule",
-                vec![
-                    optional_name(scopes.and_then(|scopes| scopes[index].as_ref())),
-                    row,
-                ],
-            ));
+            rules.push(node("scopedRule", vec![optional_name(scope), row]));
         }
     }
     Ok(node("rules", rules))
@@ -272,8 +280,13 @@ fn decode_rules(rules: &Syntax) -> Result<DecodedRules, EngineExecutionError> {
         let [scope, rule] = children(row, "scopedRule")? else {
             return Err(malformed());
         };
-        scopes.push(as_optional_name(scope)?);
-        cases.push(decode_case(rule)?);
+        let scope = as_optional_name(scope)?;
+        let rule = decode_case(rule)?;
+        if !rule.starts_registration && (cases.is_empty() || scopes.last() != Some(&scope)) {
+            return Err(malformed());
+        }
+        scopes.push(scope);
+        cases.push(rule);
     }
     if cases.is_empty() {
         return Ok((None, scopes));
@@ -539,6 +552,7 @@ mod tests {
             prechecked: true,
             pattern: None,
             source: Some(Arc::clone(&source)),
+            starts_registration: true,
             fallbacks: Vec::new(),
         });
         let declaration = Arc::new(SyntaxDecl {
@@ -635,6 +649,111 @@ mod tests {
     }
 
     #[test]
+    fn registration_boundaries_survive_journals_and_scoped_replay() {
+        let mut library =
+            SourceGrammar::for_header(Some(&Name::from_components(["Lib"])), false, false, &[]);
+        for command in [
+            "syntax (name := picked) \"picked! \" num : term",
+            "macro_rules | `(picked! $n:num) => `($n)",
+            "namespace Choice",
+            "scoped macro_rules | `(picked! 0) => `(40) | `(picked! 1) => `(41)",
+            "end Choice",
+        ] {
+            if let Some(control) = fln_parse::command_scope::parse(command.as_bytes()).unwrap() {
+                library.observe(&control);
+            } else {
+                assert!(
+                    library
+                        .declare(command.as_bytes(), |_| Resolution::Unchecked)
+                        .unwrap()
+                );
+            }
+        }
+        let kind = Name::from_components(["picked"]);
+        let exported = library.export_native().unwrap();
+        let recorded = library.record(&Environment::new()).unwrap();
+        let mut loaded = grammar();
+        load(&recorded, &mut loaded).unwrap();
+        assert_eq!(
+            loaded.rules().find(|(name, _)| **name == kind).unwrap().1,
+            exported.rules[&kind].as_ref()
+        );
+        let markers = |file: &FileGrammar| {
+            file.active_template_rules()[&kind]
+                .cases()
+                .map(|rule| rule.starts_registration)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(markers(&loaded), [true]);
+        loaded.apply(
+            &fln_parse::command_scope::parse(b"open scoped Choice")
+                .unwrap()
+                .unwrap(),
+        );
+        assert_eq!(markers(&loaded), [true, false, true]);
+    }
+
+    #[test]
+    fn incomplete_and_scope_split_journal_registrations_are_refused() {
+        let first = NotationRule {
+            variables: Vec::new(),
+            rhs: Syntax::Missing,
+            prechecked: false,
+            pattern: None,
+            source: None,
+            starts_registration: true,
+            fallbacks: Vec::new(),
+        };
+        let continuation = NotationRule {
+            starts_registration: false,
+            ..first.clone()
+        };
+        let row = |rule: &NotationRule, scope: Option<&Name>| {
+            let (encoded, _) = encode_case(rule, &[]).unwrap();
+            node("scopedRule", vec![optional_name(scope), encoded])
+        };
+        let first_scope = Name::from_components(["First"]);
+        let second_scope = Name::from_components(["Second"]);
+        for rows in [
+            vec![row(&continuation, None)],
+            vec![
+                row(&first, Some(&first_scope)),
+                row(&continuation, Some(&second_scope)),
+            ],
+        ] {
+            assert!(decode_rules(&node("rules", rows)).is_err());
+        }
+        assert!(encode_rules(Some(&Arc::new(continuation.clone())), None, None).is_err());
+        let complete = Arc::new(NotationRule {
+            fallbacks: vec![continuation],
+            ..first
+        });
+        assert!(
+            encode_rules(
+                Some(&complete),
+                None,
+                Some(&vec![Some(first_scope), Some(second_scope)]),
+            )
+            .is_err()
+        );
+        assert!(decode_rules(&encode_rules(Some(&complete), None, None).unwrap()).is_ok());
+    }
+
+    #[test]
+    fn a_complete_older_journal_cannot_guess_registration_boundaries() {
+        let mut payload = encode(node("usage", Vec::new()), &[], &[])
+            .unwrap()
+            .to_vec();
+        payload[MAGIC.len() - 1] = 5;
+        let environment = Environment::new()
+            .register_extension(descriptor())
+            .unwrap()
+            .push_extension_entry(&name(), payload)
+            .unwrap();
+        assert!(SourceGrammar::for_environment(&environment, None, false).is_err());
+    }
+
+    #[test]
     fn damaged_and_oversized_native_journals_fail_before_returning_a_grammar() {
         for payload in [
             Arc::<[u8]>::from(&MAGIC[..MAGIC.len() - 1]),
@@ -642,6 +761,8 @@ mod tests {
             Arc::from(b"FLNSOURCEGRAMMAR\x01".as_slice()),
             Arc::from(b"FLNSOURCEGRAMMAR\x02".as_slice()),
             Arc::from(b"FLNSOURCEGRAMMAR\x03".as_slice()),
+            Arc::from(b"FLNSOURCEGRAMMAR\x04".as_slice()),
+            Arc::from(b"FLNSOURCEGRAMMAR\x05".as_slice()),
         ] {
             let env = Environment::new()
                 .register_extension(descriptor())

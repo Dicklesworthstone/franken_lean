@@ -25,6 +25,16 @@ fn alternative(shape: layout::CtorLayout, label: &str, body: IrBody) -> IrAlt {
 /// Expand either one child or the unchanged input root. Preserve a diagnostic
 /// EStateM result; unwrap `some`, and return the original query for `none`.
 fn recursive_function(text: &str, child: Option<u64>) -> IrDecl {
+    recursive_function_fallback(text, child, true)
+}
+
+/// A missing child registration leaves the original root, making a missing
+/// callback snapshot observable instead of repairable by the outer tree walk.
+pub(super) fn recursive_function_requiring_child(text: &str, child: u64) -> IrDecl {
+    recursive_function_fallback(text, Some(child), false)
+}
+
+fn recursive_function_fallback(text: &str, child: Option<u64>, return_query: bool) -> IrDecl {
     let mut declaration = function(text, Behavior::Identity);
     let IrDecl::Function { body, .. } = &mut declaration else {
         unreachable!()
@@ -88,7 +98,11 @@ fn recursive_function(text: &str, child: Option<u64>) -> IrDecl {
                                 body: IrBody {
                                     stmts: vec![bind(
                                         10,
-                                        ctor(layout::RESULT_OK, "EStateM.Result.ok", &[query, 7]),
+                                        ctor(
+                                            layout::RESULT_OK,
+                                            "EStateM.Result.ok",
+                                            &[if return_query { query } else { 0 }, 7],
+                                        ),
                                     )],
                                     terminal: Box::new(IrTerminal::Ret(IrArg::Var(10))),
                                 },

@@ -13,7 +13,7 @@ mod equalities;
 mod existentials;
 mod quantifiers;
 use equalities::Equalities;
-use quantifiers::Quantifiers;
+use quantifiers::{PatternKind, Quantifiers};
 
 type Error = NatDefinitionElabError;
 const MAX_FACTS: usize = 256;
@@ -244,7 +244,8 @@ impl State {
     }
 
     fn expand(&mut self, context: &mut Context, fact: Typed) -> Result<(), Error> {
-        self.quantifiers.register(context, &fact, &[], true)?;
+        self.quantifiers
+            .register(context, &fact, &[], PatternKind::Local)?;
         self.observe(context, &fact.type_)?;
         self.graph.add(context, &fact)?;
         self.truth_equality(context, &fact)?;
@@ -831,7 +832,93 @@ impl State {
 }
 
 impl Context {
-    fn grind_parameters<'a>(&mut self, syntax: &'a Syntax) -> Result<Vec<&'a Syntax>, Error> {
+    fn grind_pattern_kind(&mut self, syntax: &Syntax) -> Result<Option<PatternKind>, Error> {
+        let parts = expect_null_args(syntax, "grind modifier")?;
+        if parts.is_empty() {
+            return Ok(None);
+        }
+        let [modifier] = parts else {
+            return Err(unsupported());
+        };
+        let [modifier] = expect_node(
+            modifier,
+            &parser_kind(&["Attr", "grindMod"]),
+            1,
+            "grind modifier",
+        )?
+        else {
+            return Err(unsupported());
+        };
+        let Syntax::Node { kind, args, .. } = modifier else {
+            return Err(unsupported());
+        };
+        for (node, atoms, selection) in [
+            ("grindEq", &["="][..], PatternKind::EqualityLeft),
+            ("grindEqRhs", &["=", "_"][..], PatternKind::EqualityRight),
+            (
+                "grindEqBoth",
+                &["_", "=", "_"][..],
+                PatternKind::EqualityBoth,
+            ),
+        ] {
+            if *kind != parser_kind(&["Attr", node]) {
+                continue;
+            }
+            if args.len() != atoms.len() + 1 {
+                return Err(unsupported());
+            }
+            for (atom, text) in args.iter().zip(atoms) {
+                expect_atom(atom, text, "grind equality modifier")?;
+            }
+            if !expect_null_args(&args[atoms.len()], "grind generalization")?.is_empty() {
+                return Err(unsupported());
+            }
+            return Ok(Some(selection));
+        }
+        for (node, spellings, generalize, selection) in [
+            ("grindFwd", ["→", "->"], false, PatternKind::Forward),
+            ("grindBwd", ["←", "<-"], true, PatternKind::Backward),
+            ("grindLR", ["⇒", "=>"], false, PatternKind::LeftRight),
+            ("grindRL", ["⇐", "<="], false, PatternKind::RightLeft),
+            ("grindDef", [".", "·"], true, PatternKind::Default),
+        ] {
+            if *kind != parser_kind(&["Attr", node]) {
+                continue;
+            }
+            if args.len() != 1 + usize::from(generalize)
+                || (generalize && !expect_null_args(&args[1], "grind generalization")?.is_empty())
+            {
+                return Err(unsupported());
+            }
+            let [token] = expect_node(
+                &args[0],
+                &Name::from_components(["patternIgnore"]),
+                1,
+                "grind direction",
+            )?
+            else {
+                return Err(unsupported());
+            };
+            for spelling in spellings {
+                if let Ok([atom]) = expect_node(
+                    token,
+                    &Name::from_components(["token", spelling]),
+                    1,
+                    "grind direction token",
+                ) {
+                    expect_atom(atom, spelling, "grind direction")?;
+                    return Ok(Some(selection));
+                }
+            }
+            return Err(unsupported());
+        }
+        Err(unsupported())
+    }
+
+    fn grind_parameters<'a>(
+        &mut self,
+        syntax: &'a Syntax,
+    ) -> Result<Vec<(&'a Syntax, Option<PatternKind>)>, Error> {
         let parts = expect_null_args(syntax, "grind parameters")?;
         if parts.is_empty() {
             return Ok(Vec::new());
@@ -872,10 +959,7 @@ impl Context {
             else {
                 return Err(unsupported());
             };
-            if !expect_null_args(modifier, "grind modifier")?.is_empty() {
-                return Err(unsupported());
-            }
-            terms.push(term);
+            terms.push((term, self.grind_pattern_kind(modifier)?));
         }
         Ok(terms)
     }
@@ -1006,17 +1090,22 @@ impl Context {
                     )?;
                 }
             }
-            for parameter in parameters {
+            for (parameter, modifier) in parameters {
                 let (evidence, level_params) = self.grind_lemma(parameter)?;
                 if matches!(evidence.type_.node(), ExprNode::ForallE { .. }) {
-                    if !state
-                        .quantifiers
-                        .register(self, &evidence, &level_params, false)?
-                    {
+                    if !state.quantifiers.register(
+                        self,
+                        &evidence,
+                        &level_params,
+                        modifier.unwrap_or(PatternKind::Default),
+                    )? {
                         return Err(unsupported());
                     }
                 } else {
-                    if !level_params.is_empty() || matches!(parameter, Syntax::Ident { .. }) {
+                    if modifier.is_some()
+                        || !level_params.is_empty()
+                        || matches!(parameter, Syntax::Ident { .. })
+                    {
                         // A bare declaration uses the pin's theorem-pattern
                         // path even when ground. In particular, `[falseAx]`
                         // is invalid, while the explicit proof `[(falseAx)]`

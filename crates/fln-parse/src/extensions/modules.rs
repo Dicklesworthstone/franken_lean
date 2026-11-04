@@ -108,12 +108,22 @@ impl FileGrammar {
             }
         }
         for (kind, rule) in &module.rules {
+            if !rule.starts_registration {
+                return Err("an imported macro chain starts inside a registration");
+            }
             if rule.fallbacks.len() >= MAX_TEMPLATE_NODES
                 || rule.fallbacks.iter().any(|rule| !rule.fallbacks.is_empty())
             {
                 return Err("an imported macro has a nested or oversized fallback chain");
             }
-            for rule in rule.cases() {
+            let scopes = module.rule_scopes.get(kind);
+            let mut previous_scope = None;
+            for (index, rule) in rule.cases().enumerate() {
+                let scope = scopes.and_then(|scopes| scopes[index].as_ref());
+                if !rule.starts_registration && scope != previous_scope {
+                    return Err("an imported macro registration has inconsistent scopes");
+                }
+                previous_scope = scope;
                 if let Some(pattern) = &rule.pattern {
                     let Syntax::Node {
                         kind: pattern_kind,
@@ -253,6 +263,7 @@ pub(super) fn flat_case(rule: &NotationRule) -> NotationRule {
         prechecked: rule.prechecked,
         pattern: rule.pattern.clone(),
         source: rule.source.clone(),
+        starts_registration: rule.starts_registration,
         fallbacks: Vec::new(),
     }
 }

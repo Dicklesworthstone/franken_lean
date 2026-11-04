@@ -877,6 +877,35 @@ fn elaborate_atom(
     })
 }
 
+fn hygiene_info_name(syntax: &Syntax) -> Result<&Name, NatDefinitionElabError> {
+    let [Syntax::Ident { val, .. }] = expect_node(
+        syntax,
+        &Name::from_components(["hygieneInfo"]),
+        1,
+        "hygiene information",
+    )?
+    else {
+        return Err(NatDefinitionElabError::UnexpectedSyntax {
+            expected: "hygiene information identifier",
+        });
+    };
+    // The parser starts with an anonymous name; quotations add macro scopes
+    // (Lean/Parser/Extra.lean, hygieneInfo). This is a scope identity, not a
+    // term reference, so a quoted name must remain intact for cdot matching.
+    Ok(val)
+}
+
+fn parenthesis_hygiene_name(syntax: &Syntax) -> Result<&Name, NatDefinitionElabError> {
+    let opener = expect_node(
+        syntax,
+        &parser_kind(&["Term", "hygienicLParen"]),
+        2,
+        "Lean.Parser.Term.hygienicLParen",
+    )?;
+    expect_atom(&opener[0], "(", "parenthesized term opener")?;
+    hygiene_info_name(&opener[1])
+}
+
 fn parenthesized_inner(syntax: &Syntax) -> Result<Option<&Syntax>, NatDefinitionElabError> {
     let Syntax::Node { kind, .. } = syntax else {
         return Ok(None);
@@ -890,29 +919,7 @@ fn parenthesized_inner(syntax: &Syntax) -> Result<Option<&Syntax>, NatDefinition
         3,
         "Lean.Parser.Term.paren",
     )?;
-    let opener = expect_node(
-        &parts[0],
-        &parser_kind(&["Term", "hygienicLParen"]),
-        2,
-        "Lean.Parser.Term.hygienicLParen",
-    )?;
-    expect_atom(&opener[0], "(", "parenthesized term opener")?;
-    let hygiene = expect_node(
-        &opener[1],
-        &Name::str(Name::anonymous(), "hygieneInfo"),
-        1,
-        "parenthesized term hygiene information",
-    )?;
-    let [Syntax::Ident { val, .. }] = hygiene else {
-        return Err(NatDefinitionElabError::UnexpectedSyntax {
-            expected: "anonymous parenthesis hygiene identifier",
-        });
-    };
-    if !val.is_anonymous() {
-        return Err(NatDefinitionElabError::UnexpectedSyntax {
-            expected: "anonymous parenthesis hygiene identifier",
-        });
-    }
+    parenthesis_hygiene_name(&parts[0])?;
     expect_atom(&parts[2], ")", "parenthesized term closer")?;
     Ok(Some(&parts[1]))
 }
