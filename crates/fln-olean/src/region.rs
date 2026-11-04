@@ -323,6 +323,20 @@ pub struct OpaqueExtensionBlock {
     pub entries: Vec<Vec<u8>>,
 }
 
+/// One fully audited extension block whose payload bytes are retained only
+/// when selected. Block order, structural names, entry counts and exact byte
+/// charges are preserved even for omitted payloads. Selection does not grant
+/// permission to skip graph validation or its cumulative capture allowance.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SelectedExtensionBlock {
+    pub name: Name,
+    /// `Some`, including an empty vector, exactly when the block was selected.
+    pub entries: Option<Vec<Vec<u8>>>,
+    pub entry_count: usize,
+    /// Total bytes full capture would produce for this block's entries.
+    pub payload_bytes: usize,
+}
+
 /// One losslessly decoded `Lean.Import` row at the pinned epoch.
 ///
 /// The field inventory and physical pointer/scalar split come from
@@ -1350,6 +1364,28 @@ impl<'a> OleanView<'a> {
         budget: WalkBudget,
         max_payload_bytes: usize,
     ) -> RResult<Vec<OpaqueExtensionBlock>> {
+        self.selected_extension_payloads(budget, max_payload_bytes, |_| true)
+            .map(|blocks| {
+                blocks
+                    .into_iter()
+                    .map(|block| OpaqueExtensionBlock {
+                        name: block.name,
+                        entries: block.entries.expect("every extension block was selected"),
+                    })
+                    .collect()
+            })
+    }
+
+    /// Audit every extension entry and retain exact payloads only for selected
+    /// blocks. Omitted entries have the same byte charge and graph validation
+    /// as full capture, including dependency objects and unreachable objects.
+    /// The selector runs once per block; it changes neither order nor limits.
+    pub fn selected_extension_payloads(
+        &self,
+        budget: WalkBudget,
+        max_payload_bytes: usize,
+        selected: impl Fn(&Name) -> bool,
+    ) -> RResult<Vec<SelectedExtensionBlock>> {
         // Establish the complete ModuleData shape before interpreting fields.
         self.module_data(budget)?;
         self.walk(budget)?;
@@ -1415,27 +1451,43 @@ impl<'a> OleanView<'a> {
                 "extension payload not an array",
                 &mut walk_budget,
             )?;
-            let mut payloads = Vec::new();
+            let entry_count = usize::try_from(length).map_err(|_| RegionError::DecodeShape {
+                offset: entries,
+                reason: "extension entry count does not fit the host address space",
+            })?;
+            let mut payloads = selected(&name).then(Vec::new);
+            let before = remaining;
             for ordinal in 0..length {
                 walk_budget.visit()?;
                 let pointer = self.read_u64(entries + 24 + 8 * ordinal)?;
-                let payload = capture
-                    .capture(pointer, remaining)
-                    .map_err(|fault| match fault {
-                        fln_rt::region::RegionFault::CaptureBudgetExhausted {
-                            required, ..
-                        } => RegionError::PayloadBudgetExhausted {
+                let map_capture_fault = |fault| match fault {
+                    fln_rt::region::RegionFault::CaptureBudgetExhausted { required, .. } => {
+                        RegionError::PayloadBudgetExhausted {
                             required: (max_payload_bytes - remaining).saturating_add(required),
                             budget: max_payload_bytes,
-                        },
-                        other => map_fault(other),
-                    })?;
-                remaining -= payload.len();
-                payloads.push(payload);
+                        }
+                    }
+                    other => map_fault(other),
+                };
+                let bytes = if let Some(payloads) = &mut payloads {
+                    let payload = capture
+                        .capture(pointer, remaining)
+                        .map_err(map_capture_fault)?;
+                    let bytes = payload.len();
+                    payloads.push(payload);
+                    bytes
+                } else {
+                    capture
+                        .captured_size(pointer, remaining)
+                        .map_err(map_capture_fault)?
+                };
+                remaining -= bytes;
             }
-            blocks.push(OpaqueExtensionBlock {
+            blocks.push(SelectedExtensionBlock {
                 name,
                 entries: payloads,
+                entry_count,
+                payload_bytes: before - remaining,
             });
         }
         Ok(blocks)
@@ -1896,6 +1948,14 @@ mod dependency_address_dispatch_tests {
             .unwrap()
             .extension_payloads(WalkBudget::default(), 1024)
             .unwrap_err();
+        assert_eq!(
+            OleanView::parse_with_dependencies(&private, &[&public])
+                .unwrap()
+                .selected_extension_payloads(WalkBudget::default(), 1024, |_| false)
+                .unwrap_err(),
+            error,
+            "omitting all payloads still audits unreachable dependency objects"
+        );
         assert!(
             matches!(error, RegionError::NonPersistentRc { offset, rc: 1 } if offset == base + object as u64)
         );

@@ -1009,44 +1009,9 @@ impl<'a> SubgraphCapture<'a> {
     /// Unknown categories and invalid child pointers are refused by the shared
     /// reader; an exhausted allowance never returns a partial payload.
     pub fn capture(&self, root: u64, max_bytes: usize) -> RResult<Vec<u8>> {
-        if max_bytes < 8 {
-            return Err(RegionFault::CaptureBudgetExhausted {
-                required: 8,
-                limit: max_bytes,
-            });
-        }
+        let (reachable, total) = self.reachable_objects(root, max_bytes)?;
         if is_scalar_word(root) {
             return Ok(root.to_le_bytes().to_vec());
-        }
-        let mut pending = vec![root];
-        let mut reachable = std::collections::BTreeSet::new();
-        let mut total = 8usize;
-        while let Some(pointer) = pending.pop() {
-            if is_scalar_word(pointer) {
-                continue;
-            }
-            let index = *self
-                .addresses
-                .get(&pointer)
-                .ok_or(RegionFault::PtrOutOfBounds {
-                    offset: 0,
-                    ptr: pointer,
-                })?;
-            if !reachable.insert(index) {
-                continue;
-            }
-            let object = &self.objects[index];
-            let step = &object.step;
-            let bytes = self.regions[object.region].0;
-            let required = total.saturating_add(round8(step.size));
-            if required > max_bytes {
-                return Err(RegionFault::CaptureBudgetExhausted {
-                    required,
-                    limit: max_bytes,
-                });
-            }
-            total = required;
-            pending.extend(step.ptr_fields.iter().map(|&field| read_u64(bytes, field)));
         }
         let mut output = Vec::with_capacity(total);
         output.extend_from_slice(&[0; 8]);
@@ -1086,6 +1051,63 @@ impl<'a> SubgraphCapture<'a> {
         }
         write_u64(&mut output, 0, relocated[&self.addresses[&root]]);
         Ok(output)
+    }
+
+    /// The exact byte length [`Self::capture`] would produce, with the same
+    /// reachable-object traversal and allowance. The complete source regions
+    /// were validated when this index was constructed. No payload is copied or
+    /// relocated, so callers can charge uninterpreted entries without retaining
+    /// their object bytes.
+    pub fn captured_size(&self, root: u64, max_bytes: usize) -> RResult<usize> {
+        self.reachable_objects(root, max_bytes)
+            .map(|(_, total)| total)
+    }
+
+    fn reachable_objects(
+        &self,
+        root: u64,
+        max_bytes: usize,
+    ) -> RResult<(std::collections::BTreeSet<usize>, usize)> {
+        if max_bytes < 8 {
+            return Err(RegionFault::CaptureBudgetExhausted {
+                required: 8,
+                limit: max_bytes,
+            });
+        }
+        if is_scalar_word(root) {
+            return Ok((std::collections::BTreeSet::new(), 8));
+        }
+        let mut pending = vec![root];
+        let mut reachable = std::collections::BTreeSet::new();
+        let mut total = 8usize;
+        while let Some(pointer) = pending.pop() {
+            if is_scalar_word(pointer) {
+                continue;
+            }
+            let index = *self
+                .addresses
+                .get(&pointer)
+                .ok_or(RegionFault::PtrOutOfBounds {
+                    offset: 0,
+                    ptr: pointer,
+                })?;
+            if !reachable.insert(index) {
+                continue;
+            }
+            let object = &self.objects[index];
+            let step = &object.step;
+            let bytes = self.regions[object.region].0;
+            let required = total.saturating_add(round8(step.size));
+            if required > max_bytes {
+                return Err(RegionFault::CaptureBudgetExhausted {
+                    required,
+                    limit: max_bytes,
+                });
+            }
+            total = required;
+            pending.extend(step.ptr_fields.iter().map(|&field| read_u64(bytes, field)));
+        }
+        Ok((reachable, total))
     }
 }
 

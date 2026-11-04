@@ -123,6 +123,10 @@ fn opaque_subgraph_capture_preserves_bytes_sharing_and_relocation() {
     let root = u64::from_le_bytes(bytes[..8].try_into().unwrap());
     let index = SubgraphCapture::new(&bytes, BASE_A).expect("index");
     let captured = index.capture(root, bytes.len()).expect("capture");
+    assert_eq!(
+        index.captured_size(root, bytes.len()).unwrap(),
+        captured.len()
+    );
     // Independent existing writer and materializer establish that all payload
     // categories and shared edges survived, rather than checking just a digest.
     assert_eq!(
@@ -136,6 +140,13 @@ fn opaque_subgraph_capture_preserves_bytes_sharing_and_relocation() {
         Err(RegionFault::CaptureBudgetExhausted { .. })
     ));
     assert_eq!(index.capture(root, captured.len()).unwrap(), captured);
+    for budget in 0..=captured.len() {
+        assert_eq!(
+            index.captured_size(root, budget),
+            index.capture(root, budget).map(|payload| payload.len()),
+            "sizing and copying have identical byte-boundary refusals at {budget}"
+        );
+    }
 
     let mut relocated = bytes.clone();
     relocate(&mut relocated, BASE_A, BASE_B).unwrap();
@@ -183,6 +194,10 @@ fn opaque_capture_across_three_regions_preserves_shared_graphs_in_load_order() {
     let expected = compact(&expected_value, 0).unwrap();
     let captured = index.capture(later_root, expected.len()).unwrap();
     assert_eq!(
+        index.captured_size(later_root, expected.len()).unwrap(),
+        expected.len()
+    );
+    assert_eq!(
         captured, expected,
         "independent writer pins all categories and sharing"
     );
@@ -193,6 +208,12 @@ fn opaque_capture_across_three_regions_preserves_shared_graphs_in_load_order() {
         Err(RegionFault::CaptureBudgetExhausted { .. })
     ));
     assert_eq!(index.capture(later_root, expected.len()).unwrap(), expected);
+    assert_eq!(
+        index.captured_size(later_root, expected.len() - 1),
+        index
+            .capture(later_root, expected.len() - 1)
+            .map(|payload| payload.len())
+    );
     assert_eq!(
         index.capture(earlier_root, earlier.len()).unwrap(),
         compact(&sample_graph(), 0).unwrap()
@@ -431,11 +452,22 @@ fn opaque_subgraph_capture_excludes_unreachable_objects_and_refuses_bad_roots() 
         compact(&wanted, 0).unwrap()
     );
     assert_eq!(index.capture(155, 8).unwrap(), 155u64.to_le_bytes());
+    assert_eq!(index.captured_size(155, 8).unwrap(), 8);
+    assert_eq!(
+        index.captured_size(155, 7),
+        index.capture(155, 7).map(|payload| payload.len())
+    );
     for invalid in [BASE_A, entry + 8, BASE_A + bytes.len() as u64] {
         assert!(matches!(
             index.capture(invalid, bytes.len()),
             Err(RegionFault::PtrOutOfBounds { .. })
         ));
+        assert_eq!(
+            index.captured_size(invalid, bytes.len()),
+            index
+                .capture(invalid, bytes.len())
+                .map(|payload| payload.len())
+        );
     }
     // An in-range pointer into an object's body must not pass as an object root.
     let mut corrupt = bytes.clone();
