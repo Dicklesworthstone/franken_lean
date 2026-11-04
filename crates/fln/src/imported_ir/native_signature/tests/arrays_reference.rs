@@ -64,9 +64,11 @@ fn live_pinned_arrays_match_reference_with_erased_proofs_and_canonical_replay() 
     )
     .unwrap();
     std::fs::write(dir.join("decoded-ir.txt"), format!("{module:#?}")).unwrap();
-    // Only this fixture's explicitly allowed user functions are supplied.
-    // The test-only partition does not stand in for the full library census;
-    // all native calls still bind to the canonical generated ABI contracts.
+    // Supply the pin's actual full extern and boxed declarations for the
+    // reviewed array subset. Their bodies never acquire interpretation
+    // authority; only explicitly allowed fixture functions can be executed.
+    let prototypes = native_array_prototypes(&reference);
+    // The test-only partition does not stand in for the full library census.
     let partition = VerifiedPartition::user_fixture();
     let cases = [
         ("arrayNativeRoundTrip", 0),
@@ -184,9 +186,10 @@ fn live_pinned_arrays_match_reference_with_erased_proofs_and_canonical_replay() 
     );
 
     let mut observed = BTreeSet::new();
+    let modules = [module, prototypes];
     for ((entry, value), expected) in cases.into_iter().zip(expected) {
         let compiled = compile(
-            std::slice::from_ref(&module),
+            &modules,
             &name(entry),
             &[EntryArgument::Nat(IrNat::Small(value))],
             &partition,
@@ -259,6 +262,72 @@ fn live_pinned_arrays_match_reference_with_erased_proofs_and_canonical_replay() 
                 .any(|operation| observed.contains(&format!("extern:{operation}"))),
             "{alternatives:?} optimized away; {dir:?}"
         );
+    }
+}
+
+fn native_array_prototypes(reference: &std::path::Path) -> IrModule {
+    let library = std::env::var_os("FLN_REFERENCE_LIB")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            reference
+                .parent()
+                .unwrap()
+                .parent()
+                .unwrap()
+                .join("lib/lean")
+        });
+    let mut declarations = Vec::new();
+    let mut externs = BTreeSet::new();
+    let mut wrappers = BTreeSet::new();
+    for relative in [
+        "Init/Prelude.ir",
+        "Init/Data/Array/Basic.ir",
+        "Init/Data/Array/Set.ir",
+        "Init/Data/ByteArray/Basic.ir",
+    ] {
+        let path = library.join(relative);
+        let module = crate::decode_ir_artifact(&std::fs::read(&path).unwrap(), 32 * 1024 * 1024)
+            .unwrap_or_else(|error| panic!("{path:?}: {error:?}"));
+        for declaration in module.decls {
+            let (row, is_boxed) = match crate::imported_ir::native_row(declaration.name()) {
+                Some(row) => (row, false),
+                None => {
+                    let Some(row) = boxed_row(declaration.name()) else {
+                        continue;
+                    };
+                    (row, true)
+                }
+            };
+            let Some(bridge) = BoxedNative::from_row(row).unwrap() else {
+                continue;
+            };
+            if is_boxed {
+                bridge.validate_declaration(&declaration).unwrap();
+                assert!(wrappers.insert(row.name));
+            } else {
+                let IrDecl::Extern { params, result, .. } = &declaration else {
+                    panic!("reviewed extern {} is a function in {path:?}", row.name);
+                };
+                assert_eq!(params.len(), bridge.arity());
+                validate_extern_signature(row, params, result).unwrap();
+                assert_eq!(
+                    validated_ir_arity(row, params.len()).unwrap(),
+                    bridge.runtime_parameters().len()
+                );
+                assert!(externs.insert(row.name));
+            }
+            declarations.push(declaration);
+        }
+    }
+    assert_eq!(externs.len(), 18, "all reviewed raw native prototypes");
+    assert_eq!(
+        wrappers, externs,
+        "every raw prototype has its boxed wrapper"
+    );
+    assert_eq!(declarations.len(), 36);
+    IrModule {
+        decls: declarations,
+        ..IrModule::default()
     }
 }
 

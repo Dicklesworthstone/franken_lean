@@ -941,7 +941,14 @@ fn compile_with_policy(
     if erased_worlds || updated_constructors.changed {
         let signatures = natives
             .iter()
-            .map(|(name, native)| (name.clone(), native.arguments.len()))
+            .map(|(name, native)| {
+                (
+                    name.clone(),
+                    native
+                        .boxed
+                        .map_or(native.arguments.len(), |boxed| boxed.arity()),
+                )
+            })
             .collect();
         validate_ir_types(
             std::slice::from_ref(&selected_module),

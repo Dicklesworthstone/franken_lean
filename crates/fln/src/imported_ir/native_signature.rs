@@ -322,7 +322,12 @@ pub(super) fn validated_ir_arity(
     arity: usize,
 ) -> Result<usize, IrExecutionError> {
     let expected = ir_arity(row)?;
-    if let Some(runtime) = erased_type_runtime_arity(row)? {
+    if let Some(array) = BoxedNative::from_row(row)? {
+        let runtime = array.runtime_parameters().len();
+        if arity == runtime || arity == array.arity() {
+            return Ok(runtime);
+        }
+    } else if let Some(runtime) = erased_type_runtime_arity(row)? {
         if arity == runtime || (row.id == "extern:Void.mk" && arity == runtime + 1) {
             return Ok(runtime);
         }
@@ -348,6 +353,11 @@ pub(super) fn validate_extern_signature(
     params: &[IrParam],
     result: &IrType,
 ) -> Result<(), IrExecutionError> {
+    if let Some(array) = BoxedNative::from_row(row)?
+        && params.len() == array.arity()
+    {
+        return array.validate_extern(row, params, result);
+    }
     if row.id == "extern:Void.mk" && params.len() == 2 {
         erased_type_runtime_arity(row)?;
         if params[0].ty != IrType::Erased

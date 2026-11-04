@@ -13,8 +13,8 @@
 //! authority for runtime ownership, effects and bounds checks.
 
 use super::{
-    ErasedOperands, GeneratedExternRow, IrDecl, IrExecutionError, IrType, Name, array_proofs,
-    erased_type_runtime_arity,
+    ErasedOperands, GeneratedExternRow, IrDecl, IrExecutionError, IrParam, IrType, Name, Ownership,
+    array_proofs, erased_type_runtime_arity, extern_row,
 };
 
 /// Recognize the compiler's structural suffix, not a dotted-name string or
@@ -30,6 +30,8 @@ pub(in crate::imported_ir) fn boxed_row(name: &Name) -> Option<&'static Generate
 #[derive(Clone, Copy)]
 pub(in crate::imported_ir) struct BoxedNative {
     operands: ErasedOperands,
+    parameters: &'static [IrType],
+    result: &'static IrType,
 }
 
 impl BoxedNative {
@@ -50,7 +52,65 @@ impl BoxedNative {
         } else {
             array_proofs::erased_operands(row)?
         };
-        Ok(operands.map(|operands| Self { operands }))
+        let Some(operands) = operands else {
+            return Ok(None);
+        };
+        // These types come from the pin's actual extern declarations in
+        // Init.Prelude, Init.Data.Array.{Basic,Set} and ByteArray.Basic.
+        // The ABI row alone cannot distinguish Object/TObject/Tagged or
+        // identify which scalar carrier the compiler must box.
+        let (parameters, result): (&'static [IrType], &'static IrType) = match row.id {
+            "extern:Array.mkEmpty" => (&[IrType::TObject], &IrType::Object),
+            "extern:Array.push" => (&[IrType::Object, IrType::TObject], &IrType::Object),
+            "extern:Array.size" => (&[IrType::Object], &IrType::Tagged),
+            "extern:Array.replicate" => (&[IrType::TObject, IrType::TObject], &IrType::Object),
+            "extern:Array.set!" | "extern:Array.set" => (
+                &[IrType::Object, IrType::TObject, IrType::TObject],
+                &IrType::Object,
+            ),
+            "extern:Array.get!Internal" | "extern:Array.get!InternalBorrowed" => (
+                &[IrType::TObject, IrType::Object, IrType::TObject],
+                &IrType::TObject,
+            ),
+            "extern:Array.usize" => (&[IrType::Object], &IrType::USize),
+            "extern:Array.getInternal" | "extern:Array.getInternalBorrowed" => {
+                (&[IrType::Object, IrType::TObject], &IrType::TObject)
+            }
+            "extern:Array.uget" | "extern:Array.ugetBorrowed" => {
+                (&[IrType::Object, IrType::USize], &IrType::TObject)
+            }
+            "extern:Array.uset" => (
+                &[IrType::Object, IrType::USize, IrType::TObject],
+                &IrType::Object,
+            ),
+            "extern:ByteArray.get" => (&[IrType::Object, IrType::TObject], &IrType::UInt8),
+            "extern:ByteArray.set" => (
+                &[IrType::Object, IrType::TObject, IrType::UInt8],
+                &IrType::Object,
+            ),
+            "extern:ByteArray.uget" => (&[IrType::Object, IrType::USize], &IrType::UInt8),
+            "extern:ByteArray.uset" => (
+                &[IrType::Object, IrType::USize, IrType::UInt8],
+                &IrType::Object,
+            ),
+            _ => {
+                return Err(IrExecutionError::NativeContract {
+                    declaration: Name::from_components(row.name.split('.')),
+                    detail: "array primitive has no reviewed native IR types".to_owned(),
+                });
+            }
+        };
+        if parameters.len() != operands.runtime {
+            return Err(IrExecutionError::NativeContract {
+                declaration: Name::from_components(row.name.split('.')),
+                detail: "array IR types differ from the reviewed runtime arity".to_owned(),
+            });
+        }
+        Ok(Some(Self {
+            operands,
+            parameters,
+            result,
+        }))
     }
 
     pub(in crate::imported_ir) fn arity(self) -> usize {
@@ -62,6 +122,47 @@ impl BoxedNative {
     pub(in crate::imported_ir) fn runtime_parameters(self) -> std::ops::Range<usize> {
         let start = usize::from(self.operands.type_prefix);
         start..start + self.operands.runtime
+    }
+
+    fn parameter_type(self, index: usize) -> &'static IrType {
+        let runtime = self.runtime_parameters();
+        if runtime.contains(&index) {
+            &self.parameters[index - runtime.start]
+        } else {
+            &IrType::Erased
+        }
+    }
+
+    /// Raw externs retain Erased slots and the original borrowing. Accept
+    /// only this exact full telescope, separately from the existing native
+    /// operand form. A prototype never supplies its own ABI or runtime arity.
+    pub(super) fn validate_extern(
+        self,
+        row: &GeneratedExternRow,
+        params: &[IrParam],
+        result: &IrType,
+    ) -> Result<(), IrExecutionError> {
+        let ownership = Ownership::parse(row.ownership)
+            .and_then(|ownership| ownership.argument_ownership(self.operands.runtime))
+            .map_err(|error| IrExecutionError::NativeContract {
+                declaration: Name::from_components(row.name.split('.')),
+                detail: error.to_string(),
+            })?;
+        let runtime = self.runtime_parameters();
+        if params.len() != self.arity()
+            || result != self.result
+            || params.iter().enumerate().any(|(index, parameter)| {
+                let borrowed = runtime.contains(&index)
+                    && ownership[index - runtime.start] == extern_row::ArgumentOwnership::Borrowed;
+                parameter.ty != *self.parameter_type(index) || parameter.borrow != borrowed
+            })
+        {
+            return Err(IrExecutionError::NativeContract {
+                declaration: Name::from_components(row.name.split('.')),
+                detail: "array extern differs from its reviewed erased telescope".to_owned(),
+            });
+        }
+        Ok(())
     }
 
     pub(in crate::imported_ir) fn validate_declaration(
@@ -77,10 +178,11 @@ impl BoxedNative {
             } => (params, result, sorry_dep.is_some()),
             IrDecl::Extern { params, result, .. } => (params, result, false),
         };
-        let object = |ty: &IrType| matches!(ty, IrType::Object | IrType::TObject | IrType::Tagged);
         if params.len() != self.arity()
-            || params.iter().any(|p| p.borrow || !object(&p.ty))
-            || !object(result)
+            || params.iter().enumerate().any(|(index, parameter)| {
+                parameter.borrow || parameter.ty != *boxed_type(self.parameter_type(index))
+            })
+            || result != boxed_type(self.result)
             || sorry
         {
             return Err(IrExecutionError::NativeContract {
@@ -89,5 +191,13 @@ impl BoxedNative {
             });
         }
         Ok(())
+    }
+}
+
+fn boxed_type(ty: &IrType) -> &IrType {
+    match ty {
+        IrType::Erased | IrType::USize => &IrType::TObject,
+        IrType::UInt8 => &IrType::Tagged,
+        _ => ty,
     }
 }

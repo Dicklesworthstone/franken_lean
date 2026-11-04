@@ -249,6 +249,57 @@ fn native_boxed_partial_application_retains_type_capture_and_reusable_arrays() {
 }
 
 #[test]
+fn native_boxed_partial_application_keeps_its_arity_after_constructor_normalization() {
+    let compiled = compile_declarations(vec![entry(
+        vec![
+            num(1, 1),
+            call(2, "Array.emptyWithCapacity", &[1]),
+            bind(
+                3,
+                IrExpr::Pap {
+                    function: name("Array.push._boxed"),
+                    args: vec![IrArg::Erased, var(2)],
+                },
+            ),
+            num(4, 42),
+            bind(
+                5,
+                IrExpr::Ctor {
+                    info: fln_olean::ir::IrCtorInfo {
+                        name: name("Arity.box"),
+                        cidx: 0,
+                        size: 1,
+                        usize: 0,
+                        ssize: 0,
+                    },
+                    args: vec![IrArg::Erased],
+                },
+            ),
+            IrStmt::Set {
+                x: 5,
+                i: 0,
+                y: var(4),
+            },
+            bind(6, IrExpr::Proj { i: 0, x: 5 }),
+            bind(
+                7,
+                IrExpr::Ap {
+                    x: 3,
+                    args: vec![var(6)],
+                },
+            ),
+            num(8, 0),
+            call(9, "Array.get!Internal", &[8, 7, 8]),
+        ],
+        9,
+    )])
+    .unwrap();
+    // Fresh-constructor stores force a second type-validation pass. The
+    // captured erased type still leaves one data argument pending there.
+    assert_nat(&compiled, "42");
+}
+
+#[test]
 fn native_boxed_telescope_and_reserved_names_cannot_be_supplied_by_user_ir() {
     let declaration = || {
         entry(
@@ -270,11 +321,13 @@ fn native_boxed_telescope_and_reserved_names_cannot_be_supplied_by_user_ir() {
     };
     let prototype = || IrDecl::Extern {
         name: name("Array.push._boxed"),
-        params: (0..3)
-            .map(|x| IrParam {
-                x,
+        params: [IrType::TObject, IrType::Object, IrType::TObject]
+            .into_iter()
+            .enumerate()
+            .map(|(x, ty)| IrParam {
+                x: x as u64,
                 borrow: false,
-                ty: IrType::TObject,
+                ty,
             })
             .collect(),
         result: IrType::Object,
@@ -284,7 +337,7 @@ fn native_boxed_telescope_and_reserved_names_cannot_be_supplied_by_user_ir() {
         &compile_declarations(vec![declaration(), prototype()]).unwrap(),
         "1",
     );
-    for mutation in 0..6 {
+    for mutation in 0..8 {
         let mut wrong = prototype();
         let IrDecl::Extern { params, result, .. } = &mut wrong else {
             unreachable!()
@@ -297,7 +350,9 @@ fn native_boxed_telescope_and_reserved_names_cannot_be_supplied_by_user_ir() {
             2 => params[1].borrow = true,
             3 => params[2].ty = IrType::UInt8,
             4 => *result = IrType::UInt8,
-            _ => *result = IrType::Void,
+            5 => *result = IrType::Void,
+            6 => params[1].ty = IrType::Tagged,
+            _ => *result = IrType::TObject,
         }
         assert!(matches!(
             compile_declarations(vec![declaration(), wrong]),

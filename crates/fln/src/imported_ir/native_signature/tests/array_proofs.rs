@@ -447,6 +447,136 @@ fn discarded_array_proofs_never_authorize_out_of_bounds_access() {
 }
 
 #[test]
+fn full_native_array_externs_require_exact_erased_types_and_borrowing() {
+    for (target, unsigned, parameters, result) in [
+        (
+            "Array.getInternal",
+            false,
+            vec![
+                (IrType::Erased, false),
+                (IrType::Object, true),
+                (IrType::TObject, true),
+                (IrType::Erased, false),
+            ],
+            IrType::TObject,
+        ),
+        (
+            "Array.ugetBorrowed",
+            true,
+            vec![
+                (IrType::Erased, false),
+                (IrType::Object, true),
+                (IrType::USize, false),
+                (IrType::Erased, false),
+            ],
+            IrType::TObject,
+        ),
+        (
+            "ByteArray.get",
+            false,
+            vec![
+                (IrType::Object, true),
+                (IrType::TObject, true),
+                (IrType::Erased, false),
+            ],
+            IrType::UInt8,
+        ),
+        (
+            "ByteArray.uget",
+            true,
+            vec![
+                (IrType::Object, true),
+                (IrType::USize, false),
+                (IrType::Erased, false),
+            ],
+            IrType::UInt8,
+        ),
+    ] {
+        let byte = target.starts_with("ByteArray.");
+        let mut stmts = if byte {
+            byte_setup(unsigned, 0)
+        } else {
+            array_setup(unsigned, 0)
+        };
+        stmts.push(if byte {
+            byte_call(10, target, 5, None)
+        } else {
+            array_call(10, target, 4, None)
+        });
+        if byte {
+            stmts.push(call(11, "UInt8.toNat", &[10]));
+        }
+        let caller = entry(stmts, if byte { 11 } else { 10 });
+        let prototype = || IrDecl::Extern {
+            name: name(target),
+            params: parameters
+                .iter()
+                .enumerate()
+                .map(|(index, (ty, borrow))| IrParam {
+                    x: index as u64 + 1,
+                    ty: ty.clone(),
+                    borrow: *borrow,
+                })
+                .collect(),
+            result: result.clone(),
+            entries: vec![],
+        };
+        assert_nat(
+            &compile_declarations(vec![caller.clone(), prototype()]).unwrap(),
+            "19",
+        );
+        // Exercise every erased, object and scalar slot, including whether
+        // it borrows. No supplied prototype can shift the runtime interval.
+        for index in 0..parameters.len() {
+            for change_type in [false, true] {
+                let mut wrong = prototype();
+                let IrDecl::Extern { params, .. } = &mut wrong else {
+                    unreachable!()
+                };
+                if change_type {
+                    params[index].ty = if params[index].ty == IrType::Erased {
+                        IrType::TObject
+                    } else {
+                        IrType::Erased
+                    };
+                } else {
+                    params[index].borrow = !params[index].borrow;
+                }
+                assert!(
+                    matches!(
+                        compile_declarations(vec![caller.clone(), wrong]),
+                        Err(IrExecutionError::NativeContract { .. })
+                    ),
+                    "{target} parameter {index}, type={change_type}"
+                );
+            }
+        }
+        let mut wrong_result = prototype();
+        let IrDecl::Extern { result, .. } = &mut wrong_result else {
+            unreachable!()
+        };
+        *result = IrType::Void;
+        assert!(matches!(
+            compile_declarations(vec![caller.clone(), wrong_result]),
+            Err(IrExecutionError::NativeContract { .. })
+        ));
+        if !byte {
+            for missing in [0, parameters.len() - 1] {
+                let mut partial = prototype();
+                let IrDecl::Extern { params, .. } = &mut partial else {
+                    unreachable!()
+                };
+                params.remove(missing);
+                assert!(matches!(
+                    compile_declarations(vec![caller.clone(), partial]),
+                    Err(IrExecutionError::NativeContract { .. })
+                ));
+            }
+        }
+    }
+}
+
+#[test]
 fn proof_bridges_bind_generated_metadata_and_keep_explicit_externs_native() {
     use super::super::array_proofs::erased_operands;
 
