@@ -211,7 +211,7 @@ fn boxed_type(ty: &IrType) -> &IrType {
     match ty {
         IrType::Erased | IrType::USize | IrType::UInt32 => &IrType::TObject,
         IrType::UInt8 | IrType::UInt16 => &IrType::Tagged,
-        IrType::UInt64 => &IrType::Object,
+        IrType::UInt64 | IrType::Float | IrType::Float32 => &IrType::Object,
         _ => ty,
     }
 }

@@ -27,6 +27,7 @@ pub(super) fn signature(
         .or_else(|| integer(row))
         .or_else(|| string(row))
         .or_else(|| word(row))
+        .or_else(|| floating(row))
     else {
         return Ok(None);
     };
@@ -52,6 +53,119 @@ pub(super) fn signature(
         });
     }
     Ok(Some(review.signature))
+}
+
+/// The pin boxes Float/Float32 closures as constructor objects, including
+/// Float32 even though its bit-conversion partner UInt32 boxes as TObject.
+/// Keep the bit boundary explicit: ofBits/toBits retain the native public
+/// NaN normalization contract rather than acting as unchecked casts.
+fn floating(row: &GeneratedExternRow) -> Option<Review> {
+    let (family, operation) = row.id.strip_prefix("extern:")?.split_once('.')?;
+    // The pinned formatter repeatedly indents nested macro matchers.
+    #[rustfmt::skip]
+    macro_rules! family {
+        ($family:literal, $c:literal, $float:ident, $word:ident) => {{
+            macro_rules! review {
+                (
+                    $operation:literal,
+                    $symbol:literal,
+                    $parameters:expr,
+                    $result:expr,
+                    $ownership:literal
+                ) => {
+                    Some(Review {
+                        name: concat!($family, ".", $operation),
+                        symbol: concat!($c, "_", $symbol),
+                        module: concat!("Init.Data.", $family),
+                        kind: "opaque",
+                        ownership: $ownership,
+                        signature: PrimitiveSignature {
+                            parameters: $parameters,
+                            result: $result,
+                        },
+                    })
+                };
+            }
+            match operation {
+                "add" => review!(
+                    "add",
+                    "add",
+                    &[IrType::$float, IrType::$float],
+                    &IrType::$float,
+                    "abi((a: value, b: value) -> value)"
+                ),
+                "sub" => review!(
+                    "sub",
+                    "sub",
+                    &[IrType::$float, IrType::$float],
+                    &IrType::$float,
+                    "abi((a: value, b: value) -> value)"
+                ),
+                "mul" => review!(
+                    "mul",
+                    "mul",
+                    &[IrType::$float, IrType::$float],
+                    &IrType::$float,
+                    "abi((a: value, b: value) -> value)"
+                ),
+                "div" => review!(
+                    "div",
+                    "div",
+                    &[IrType::$float, IrType::$float],
+                    &IrType::$float,
+                    "abi((a: value, b: value) -> value)"
+                ),
+                "neg" => review!(
+                    "neg",
+                    "negate",
+                    &[IrType::$float],
+                    &IrType::$float,
+                    "abi((a: value) -> value)"
+                ),
+                "beq" => review!(
+                    "beq",
+                    "beq",
+                    &[IrType::$float, IrType::$float],
+                    &IrType::UInt8,
+                    "abi((a: value, b: value) -> value)"
+                ),
+                "decLe" => review!(
+                    "decLe",
+                    "decLe",
+                    &[IrType::$float, IrType::$float],
+                    &IrType::UInt8,
+                    "abi((a: value, b: value) -> value)"
+                ),
+                "decLt" => review!(
+                    "decLt",
+                    "decLt",
+                    &[IrType::$float, IrType::$float],
+                    &IrType::UInt8,
+                    "abi((a: value, b: value) -> value)"
+                ),
+                "ofBits" => review!(
+                    "ofBits",
+                    "of_bits",
+                    &[IrType::$word],
+                    &IrType::$float,
+                    "abi((u: value) -> value)"
+                ),
+                "toBits" => review!(
+                    "toBits",
+                    "to_bits",
+                    &[IrType::$float],
+                    &IrType::$word,
+                    "abi((d: value) -> value)"
+                ),
+                _ => None,
+            }
+        }};
+    }
+    match family {
+        "Float" => family!("Float", "lean_float", Float, UInt64),
+        "Float32" => family!("Float32", "lean_float32", Float32, UInt32),
+        _ => None,
+    }
 }
 
 fn natural(row: &GeneratedExternRow) -> Option<Review> {
@@ -340,12 +454,19 @@ fn string(row: &GeneratedExternRow) -> Option<Review> {
 /// `tagged_return` distinguishes the small-word conversions to Nat.
 fn word(row: &GeneratedExternRow) -> Option<Review> {
     let (family, operation) = row.id.strip_prefix("extern:")?.split_once('.')?;
+    #[rustfmt::skip]
     macro_rules! family {
         ($family:literal, $c:literal, $ty:ident, $add_sub:literal, $order:literal,
          $from_nat:literal, $to_nat:literal, $nat_result:ident, $nat_ownership:literal) => {{
             macro_rules! review {
-                ($operation:literal, $symbol:literal, $module:expr,
-                                 $parameters:expr, $result:expr, $ownership:expr) => {
+                (
+                    $operation:literal,
+                    $symbol:literal,
+                    $module:expr,
+                    $parameters:expr,
+                    $result:expr,
+                    $ownership:expr
+                ) => {
                     Some(Review {
                         name: concat!($family, ".", $operation),
                         symbol: concat!($c, "_", $symbol),
