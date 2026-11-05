@@ -1007,6 +1007,12 @@ pub(super) fn encode_pending(
         let artifact = product.encode(remaining)?;
         remaining.max_bytes -= artifact.report.file_bytes;
         remaining.max_objects -= artifact.report.runtime_objects;
+        if let Some(companions) = &artifact.companions {
+            remaining.max_bytes -=
+                companions.server_report.file_bytes + companions.private_report.file_bytes;
+            remaining.max_objects -= companions.server_report.runtime_objects
+                + companions.private_report.runtime_objects;
+        }
         artifacts.push(artifact);
     }
     if cancellation.is_some_and(CancellationProbe::is_cancelled) {

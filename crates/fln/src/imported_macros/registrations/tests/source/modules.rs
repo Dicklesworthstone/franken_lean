@@ -1765,3 +1765,294 @@ fn deferred_lean_programs_keep_implicit_init_edges_and_stop_at_module_validation
     assert!(stopped.states.is_none());
     assert_eq!(imported.engine.logical_root(&KVMap::new()), before);
 }
+
+pub(super) fn compile_deferred(
+    imported: &SourceOleanImport,
+    compilation: MacroCompilationInputs,
+    files: &[(&str, &str)],
+    macro_limits: MacroTreeLimits,
+    write_budget: crate::OleanWriteBudget,
+    cancellation: Option<&dyn CancellationProbe>,
+) -> crate::source_check::modules::SourceMacroModuleBuild {
+    let names: Vec<_> = files.iter().map(|(label, _)| name(label)).collect();
+    let inputs: Vec<_> = files
+        .iter()
+        .zip(&names)
+        .map(|((_, source), name)| SourceModuleInput {
+            name,
+            source: source.as_bytes(),
+        })
+        .collect();
+    imported.compile_source_modules_with_deferred_imported_macros(
+        &inputs,
+        &name("Main"),
+        &KVMap::new(),
+        SourceModuleCheckLimits::new(SourceCheckLimits::new(admission())),
+        SourceModuleDeferredMacroInputs {
+            compilation,
+            registry_limits: MacroRegistryLimits::default(),
+            context: context(),
+            state: MacroState {
+                macro_scope: 17,
+                ..MacroState::default()
+            },
+            limits: macro_limits,
+        },
+        write_budget,
+        cancellation,
+    )
+}
+
+#[test]
+fn imported_macro_builds_emit_recheckable_artifacts_with_real_implicit_imports() {
+    let (imported, code) = batches::artifact_import_fixture();
+    let before = imported.engine.logical_root(&KVMap::new());
+    let declarations = users(&code);
+    let compilation =
+        MacroCompilationInputs::new(code, VerifiedPartition::user_fixture(), declarations);
+    let files = [
+        ("Main", "import Lib\ndef second : Nat := 13 + 17"),
+        ("Init", "prelude"),
+        (
+            "Lib",
+            "prelude\nimport SourceLibrary\ndef first : Nat := 7 + 11",
+        ),
+    ];
+    let built = compile_deferred(
+        &imported,
+        compilation.clone(),
+        &files,
+        MacroTreeLimits::default(),
+        crate::OleanWriteBudget::default(),
+        None,
+    );
+    let Outcome::Complete(Ok(product)) = &built.outcome else {
+        panic!("{built:?}")
+    };
+    assert_eq!(
+        product.checked.module_order,
+        [name("Init"), name("Lib"), name("Main")]
+    );
+    assert_eq!(product.elaborated_modules, 3);
+    assert_eq!(product.reused_modules, 0);
+    assert_eq!(product.persisted_modules, 0);
+    assert_eq!(built.attempts.len(), 4);
+    assert!(built.completed_vm_usage.steps > 0);
+    assert_eq!(built.states.as_ref().unwrap().len(), 3);
+    assert_declared_value(&product.checked.checked.engine, "first", 11);
+    assert_declared_value(&product.checked.checked.engine, "second", 17);
+    let imports: Vec<_> = product
+        .artifacts
+        .iter()
+        .map(|artifact| crate::OleanModuleInput {
+            name: &artifact.name,
+            artifact: &artifact.bytes,
+            server_artifact: None,
+            private_artifact: None,
+        })
+        .collect();
+    let rechecked = imported
+        .engine
+        .check_olean_modules(
+            &imports,
+            &KVMap::new(),
+            crate::OleanCheckLimits::new(4 * 1024 * 1024, admission().kernel),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_declared_value(&rechecked.engine, "first", 11);
+    assert_declared_value(&rechecked.engine, "second", 17);
+    assert_eq!(
+        rechecked.engine.logical_root(&KVMap::new()),
+        product.checked.checked.result_logical_root
+    );
+    let repeated = compile_deferred(
+        &imported,
+        compilation,
+        &[files[2], files[0], files[1]],
+        MacroTreeLimits::default(),
+        crate::OleanWriteBudget::default(),
+        None,
+    );
+    let Outcome::Complete(Ok(repeated_product)) = &repeated.outcome else {
+        panic!("{repeated:?}")
+    };
+    let bytes = |product: &crate::source_check::modules::SourceModuleBuild| {
+        product
+            .artifacts
+            .iter()
+            .map(|artifact| (artifact.name.clone(), artifact.bytes.clone()))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(bytes(product), bytes(repeated_product));
+    assert_eq!(repeated.states, built.states);
+    assert_eq!(repeated.completed_vm_usage, built.completed_vm_usage);
+    assert_eq!(imported.engine.logical_root(&KVMap::new()), before);
+}
+
+#[test]
+fn imported_macro_build_failures_withhold_artifacts_and_states_and_recover() {
+    let (imported, code) = batches::artifact_import_fixture();
+    let before = imported.engine.logical_root(&KVMap::new());
+    let declarations = users(&code);
+    let compilation =
+        MacroCompilationInputs::new(code, VerifiedPartition::user_fixture(), declarations);
+    let library = (
+        "Lib",
+        "prelude\nimport SourceLibrary\ndef first : Nat := 7 + 11",
+    );
+    let main = ("Main", "prelude\nimport Lib\ndef second : Nat := 13 + 17");
+    let good = compile_deferred(
+        &imported,
+        compilation.clone(),
+        &[library, main],
+        MacroTreeLimits::default(),
+        crate::OleanWriteBudget::default(),
+        None,
+    );
+    let Outcome::Complete(Ok(product)) = &good.outcome else {
+        panic!("{good:?}")
+    };
+    let bytes: u64 = product.artifacts.iter().map(|a| a.report.file_bytes).sum();
+    let failed = compile_deferred(
+        &imported,
+        compilation.clone(),
+        &[
+            library,
+            (
+                "Main",
+                "prelude\nimport Lib\ntheorem impossible (P : Prop) : P := by rfl",
+            ),
+        ],
+        MacroTreeLimits::default(),
+        crate::OleanWriteBudget::default(),
+        None,
+    );
+    assert!(
+        matches!(failed.outcome, Outcome::Complete(Err(_))),
+        "{failed:?}"
+    );
+    assert!(failed.states.is_none());
+    assert!(!failed.attempts.is_empty());
+    let limited = compile_deferred(
+        &imported,
+        compilation.clone(),
+        &[library, main],
+        MacroTreeLimits::default(),
+        crate::OleanWriteBudget {
+            max_bytes: bytes - 1,
+            ..Default::default()
+        },
+        None,
+    );
+    assert!(
+        matches!(
+            limited.outcome,
+            Outcome::Complete(Err(
+                crate::source_check::modules::SourceModuleBuildError::Encode { .. }
+            ))
+        ),
+        "{limited:?}"
+    );
+    assert!(limited.states.is_none());
+    assert_eq!(limited.attempts.len(), good.attempts.len());
+    assert_eq!(limited.completed_vm_usage, good.completed_vm_usage);
+    let mut macro_limits = MacroTreeLimits::default();
+    macro_limits.dispatch.max_attempts = 1;
+    let stopped = compile_deferred(
+        &imported,
+        compilation.clone(),
+        &[library, main],
+        macro_limits,
+        crate::OleanWriteBudget::default(),
+        None,
+    );
+    assert!(
+        matches!(stopped.outcome, Outcome::Inconclusive(_)),
+        "{stopped:?}"
+    );
+    assert!(stopped.states.is_none());
+    let recovered = compile_deferred(
+        &imported,
+        compilation,
+        &[library, main],
+        MacroTreeLimits::default(),
+        crate::OleanWriteBudget::default(),
+        None,
+    );
+    let Outcome::Complete(Ok(recovered_product)) = recovered.outcome else {
+        panic!("{recovered:?}")
+    };
+    assert_eq!(
+        recovered_product.checked.checked.result_logical_root,
+        product.checked.checked.result_logical_root
+    );
+    assert_eq!(recovered.states, good.states);
+    assert_eq!(imported.engine.logical_root(&KVMap::new()), before);
+    assert!(!imported.engine.environment().contains(&name("first")));
+}
+
+#[test]
+fn cancellation_at_macro_artifact_publication_withholds_all_module_states() {
+    struct Polls {
+        count: Cell<usize>,
+        stop_at: usize,
+    }
+    impl CancellationProbe for Polls {
+        fn is_cancelled(&self) -> bool {
+            let count = self.count.get() + 1;
+            self.count.set(count);
+            count >= self.stop_at
+        }
+    }
+    let (imported, code) = batches::artifact_import_fixture();
+    let before = imported.engine.logical_root(&KVMap::new());
+    let declarations = users(&code);
+    let compilation =
+        MacroCompilationInputs::new(code, VerifiedPartition::user_fixture(), declarations);
+    let files = [(
+        "Main",
+        "prelude\nimport SourceLibrary\ndef first : Nat := 7 + 11",
+    )];
+    let counter = Polls {
+        count: Cell::new(0),
+        stop_at: usize::MAX,
+    };
+    let complete = compile_deferred(
+        &imported,
+        compilation.clone(),
+        &files,
+        MacroTreeLimits::default(),
+        crate::OleanWriteBudget::default(),
+        Some(&counter),
+    );
+    assert!(
+        matches!(complete.outcome, Outcome::Complete(Ok(_))),
+        "{complete:?}"
+    );
+    let cancellation = Polls {
+        count: Cell::new(0),
+        stop_at: counter.count.get(),
+    };
+    let stopped = compile_deferred(
+        &imported,
+        compilation,
+        &files,
+        MacroTreeLimits::default(),
+        crate::OleanWriteBudget::default(),
+        Some(&cancellation),
+    );
+    assert!(
+        matches!(stopped.outcome, Outcome::Inconclusive(_)),
+        "{stopped:?}"
+    );
+    assert!(
+        format!("{:?}", stopped.outcome).contains("source-modules/before-build-publication"),
+        "{stopped:?}"
+    );
+    assert!(stopped.states.is_none());
+    assert_eq!(stopped.attempts.len(), complete.attempts.len());
+    assert_eq!(stopped.completed_vm_usage, complete.completed_vm_usage);
+    assert_eq!(imported.engine.logical_root(&KVMap::new()), before);
+}

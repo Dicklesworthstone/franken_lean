@@ -380,12 +380,10 @@ pub(super) fn run_collecting(
         records,
         mut macros,
     } = run_options;
-    if macros.is_some()
-        && (cache.is_some() || collect_artifacts || records.is_some() || contexts.is_none())
-    {
+    if macros.is_some() && (cache.is_some() || records.is_some() || contexts.is_none()) {
         return Err(SourceModuleCheckError::ImportContext {
             module: entry.clone(),
-            reason: "imported macro checking requires an uncached, receipt-bound source-only run",
+            reason: "imported macro processing requires an uncached, receipt-bound run",
         });
     }
     let records = records.filter(|_| collect_artifacts);
