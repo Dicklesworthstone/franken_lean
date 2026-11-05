@@ -211,7 +211,7 @@ example : Nested.walk (.children (.cons (.leaf 15) (.cons (.child (.some (.leaf 
 #[test]
 fn nested_container_layers_preserve_polymorphic_results_and_uniform_parameters() {
     check(
-        r#"inductive NestedValue (α : Type u) where
+        r#"inductive NestedValue (α : Type u) : Type u where
   | leaf : α → NestedValue α
   | children : List (Option (NestedValue α)) → NestedValue α
 def firstValue (fallback : α) : NestedValue α → α
@@ -232,10 +232,14 @@ fn nested_history_supports_propositions_depending_on_the_major_premise() {
         r#"inductive ProofTree where
   | leaf : Nat → ProofTree
   | child : Option ProofTree → ProofTree
+theorem ProofTree.childCongr (left right : ProofTree) (h : left = right) :
+    ProofTree.child (Option.some left) = ProofTree.child (Option.some right) := by
+  cases h
+  rfl
 def ProofTree.reflexive : (tree : ProofTree) → tree = tree
   | .leaf _ => rfl
   | .child .none => rfl
-  | .child (.some subtree) => congrArg (fun (tree : ProofTree) => ProofTree.child (Option.some tree)) (ProofTree.reflexive subtree)
+  | .child (.some subtree) => ProofTree.childCongr subtree subtree (ProofTree.reflexive subtree)
 termination_by structural tree => tree
 theorem reflexive_tree (tree : ProofTree) : tree = tree := ProofTree.reflexive tree
 "#,

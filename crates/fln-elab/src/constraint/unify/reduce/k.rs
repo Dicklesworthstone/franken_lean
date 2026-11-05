@@ -8,6 +8,8 @@
 //! Like beta/iota, it is a reduction aid, not an input typing judgment.
 use super::*;
 
+/// An admitted rule guarded by assignment-free type conversion. Nested
+/// constructor iota shares the same heap comparison as nullary K reduction.
 pub(super) struct Candidate {
     pub(super) pending: Vec<(Expr, Expr)>,
     pub(super) result: Expr,

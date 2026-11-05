@@ -260,9 +260,17 @@ impl Context {
                         }
                         Some(ConstantInfo::Rec(recursor)) => {
                             let major = recursor_major(&recursor)?;
+                            let Some(ConstantInfo::Induct(owner)) = recursor
+                                .all
+                                .first()
+                                .and_then(|name| self.txn.env.find(name))
+                            else {
+                                break;
+                            };
                             if recursor.is_unsafe
                                 || recursor.all.is_empty()
-                                || recursor.num_motives as usize != recursor.all.len()
+                                || Some(recursor.num_motives as usize)
+                                    != recursor.all.len().checked_add(owner.num_nested as usize)
                                 || levels.len() != recursor.base.level_params.len()
                                 || major >= arguments.len()
                             {
@@ -703,7 +711,7 @@ impl Context {
         Ok(head)
     }
 
-    /// Ordinary constructor reduction for unnested single or mutual families.
+    /// Ordinary constructor reduction for single, mutual, and nested families.
     /// Unknown majors use the separate, sufficient K gate or remain stuck.
     fn source_iota(
         &mut self,
@@ -716,8 +724,11 @@ impl Context {
         let ExprNode::Const { levels, .. } = rec_head.node() else {
             return Ok(None);
         };
-        // The owner is selected by the major's constructor and the recursor's
-        // ordered rules. `all[0]` is only the first member of a mutual block.
+        // The major's constructor selects the rule family. A nested auxiliary
+        // eliminates the original container, while `all` still names only the
+        // main inductive block. Its parameters and universes can therefore
+        // differ from the constructor's; the instantiated major domain below
+        // establishes which container application this recursor eliminates.
         let family_name = match major_head.node() {
             ExprNode::Const { name, .. } => match self.txn.env.find(name) {
                 Some(ConstantInfo::Ctor(ctor)) => ctor.induct.clone(),
@@ -731,17 +742,25 @@ impl Context {
         let Some(ConstantInfo::Induct(family)) = self.txn.env.find(&family_name).cloned() else {
             return Ok(None);
         };
-        if family.is_unsafe
+        let Some(ConstantInfo::Induct(owner)) = recursor
+            .all
+            .first()
+            .and_then(|name| self.txn.env.find(name))
+            .cloned()
+        else {
+            return Ok(None);
+        };
+        if recursor.is_unsafe
+            || levels.len() != recursor.base.level_params.len()
+            || family.is_unsafe
             || family.num_indices != recursor.num_indices
-            || family.num_params != recursor.num_params
-            || family.all != recursor.all
             || recursor.rules.len() != family.ctors.len()
         {
             return Ok(None);
         }
         // A nested block's recursor also takes a motive per auxiliary family, and minors for
         // the auxiliaries' constructors, which are not constants of their own.
-        let nested = family.num_nested as usize;
+        let nested = owner.num_nested as usize;
         for (rule, constructor) in recursor.rules.iter().zip(&family.ctors) {
             self.tick()?;
             if &rule.ctor != constructor {
@@ -758,10 +777,10 @@ impl Context {
             if !members.insert(member)
                 || &info.base.name != member
                 || info.is_unsafe
-                || info.num_nested != family.num_nested
+                || info.num_nested != owner.num_nested
                 || info.all != recursor.all
                 || info.num_params != recursor.num_params
-                || info.base.level_params != family.base.level_params
+                || info.base.level_params != owner.base.level_params
             {
                 return Ok(None);
             }
@@ -770,10 +789,14 @@ impl Context {
                 .ok_or_else(|| failure(SourceInferenceError::ResourceLimit))?;
         }
         let all_minors = recursor.num_minors as usize;
-        if !members.contains(&family_name)
+        let auxiliary = !members.contains(&family_name);
+        if (auxiliary && nested == 0)
             || Some(recursor.num_motives as usize) != members.len().checked_add(nested)
             || (nested == 0 && all_minors != minors)
             || (nested != 0 && all_minors <= minors)
+            || (recursor.base.level_params != owner.base.level_params
+                && (recursor.base.level_params.len() != owner.base.level_params.len() + 1
+                    || recursor.base.level_params[1..] != owner.base.level_params))
         {
             return Ok(None);
         }
@@ -833,7 +856,7 @@ impl Context {
             }
             _ => return Ok(None),
         };
-        let Some(ConstantInfo::Ctor(ctor)) = self.txn.env.find(&constructor_name) else {
+        let Some(ConstantInfo::Ctor(ctor)) = self.txn.env.find(&constructor_name).cloned() else {
             return Ok(None);
         };
         if ctor.is_unsafe
@@ -843,7 +866,16 @@ impl Context {
         {
             return Ok(None);
         }
-        let compatible = if recursor.base.level_params == family.base.level_params {
+        let compatible = if auxiliary {
+            self.source_nested_major_matches(
+                recursor,
+                levels,
+                arguments,
+                &ctor,
+                &constructor_levels,
+                major_arguments,
+            )?
+        } else if recursor.base.level_params == family.base.level_params {
             *levels == constructor_levels
         } else {
             recursor.base.level_params.len() == family.base.level_params.len() + 1
@@ -872,6 +904,52 @@ impl Context {
             result = Expr::app(result, argument.clone());
         }
         Ok(Some(result))
+    }
+
+    /// A restored auxiliary recursor consumes a specialized container such as
+    /// `List (Tree α)`, not the main family's parameter telescope. Check its
+    /// actual major type before firing an admitted rule for `List.cons`.
+    fn source_nested_major_matches(
+        &mut self,
+        recursor: &RecursorVal,
+        levels: &[Level],
+        arguments: &[Expr],
+        constructor: &fln_env::constants::ConstructorVal,
+        constructor_levels: &[Level],
+        constructor_arguments: &[Expr],
+    ) -> Result<bool, NatDefinitionElabError> {
+        let major = recursor_major(recursor)?;
+        if major >= arguments.len() {
+            return Ok(false);
+        }
+        let mut telescope =
+            self.instantiate_params(&recursor.base.type_, &recursor.base.level_params, levels)?;
+        for argument in arguments.iter().rev().take(major) {
+            self.tick()?;
+            let ExprNode::ForallE { body, .. } = telescope.node() else {
+                return Ok(false);
+            };
+            telescope = self.substitute(body, argument)?;
+        }
+        let ExprNode::ForallE { binder_type, .. } = telescope.node() else {
+            return Ok(false);
+        };
+        let mut result = self.instantiate_params(
+            &constructor.base.type_,
+            &constructor.base.level_params,
+            constructor_levels,
+        )?;
+        for argument in constructor_arguments.iter().rev() {
+            self.tick()?;
+            let ExprNode::ForallE { body, .. } = result.node() else {
+                return Ok(false);
+            };
+            result = self.substitute(body, argument)?;
+        }
+        Ok(result == *binder_type
+            || (!result.has_loose_bvars()
+                && !binder_type.has_loose_bvars()
+                && self.coercion_kernel_eq(result, binder_type.clone())?))
     }
 }
 
@@ -940,6 +1018,219 @@ mod tests {
         }
         expr
     }
+
+    #[test]
+    fn source_nested_auxiliary_iota_checks_the_instantiated_container_type() {
+        use crate::inductive::{ConstructorSpec, InductiveSpec};
+        use crate::records::{RecordBudget, fresh, fv};
+
+        fn publish(env: &Environment, declaration: Declaration) -> Environment {
+            let Outcome::Complete(admitted) = admit(env, declaration, Budget::DEFAULT) else {
+                panic!("nested reduction fixture must reach a kernel verdict");
+            };
+            let CouncilOutcome::Agreed(checked) = convene(&Council::nobody_was_asked(), admitted)
+            else {
+                panic!("nested reduction fixture must be admitted");
+            };
+            let Outcome::Complete(Published::BlockCommitted(publication)) = checked.publish(
+                DeclarationBudget::default(),
+                CollisionBudget::default(),
+                None,
+            ) else {
+                panic!("nested reduction fixture must publish");
+            };
+            publication.environment
+        }
+        let option_name = Name::from_components(["Option"]);
+        let option = crate::seed::source_seed_declarations_iter()
+            .find(|declaration| {
+                matches!(declaration, Declaration::Inductive(block)
+                    if block.types.iter().any(|family| family.base.name == option_name))
+            })
+            .expect("the seed includes the ordinary Option family");
+        let env = publish(&environment(), option);
+        let mut used = std::collections::HashSet::new();
+        let universe = Level::param(Name::from_components(["u"]));
+        let alpha = fresh(
+            &mut used,
+            "A",
+            Expr::sort(universe.clone().succ().unwrap()),
+            BinderInfo::Default,
+        );
+        let tree = Expr::app(
+            Expr::const_(
+                Name::from_components(["ReductionTree"]),
+                vec![universe.clone()],
+            ),
+            fv(&alpha),
+        );
+        let value = fresh(&mut used, "value", fv(&alpha), BinderInfo::Default);
+        let children = fresh(
+            &mut used,
+            "child",
+            Expr::app(
+                Expr::const_(option_name.clone(), vec![universe.clone()]),
+                tree,
+            ),
+            BinderInfo::Default,
+        );
+        let declaration = crate::inductive::nested_inductive_declaration(
+            &env,
+            &[InductiveSpec {
+                name: Name::from_components(["ReductionTree"]),
+                level_params: vec![Name::from_components(["u"])],
+                parameters: vec![alpha],
+                indices: Vec::new(),
+                constructors: vec![
+                    ConstructorSpec {
+                        name: Name::from_components(["leaf"]),
+                        fields: vec![value],
+                        result_indices: Vec::new(),
+                    },
+                    ConstructorSpec {
+                        name: Name::from_components(["child"]),
+                        fields: vec![children],
+                        result_indices: Vec::new(),
+                    },
+                ],
+                result_level: universe.succ().unwrap(),
+            }],
+            RecordBudget::default(),
+            &[vec![Vec::new(), Vec::new()]],
+        )
+        .unwrap()
+        .expect("Option creates a nested auxiliary");
+        let env = publish(&env, declaration);
+        let tree_of = |element| {
+            Expr::app(
+                Expr::const_(
+                    Name::from_components(["ReductionTree"]),
+                    vec![Level::zero()],
+                ),
+                element,
+            )
+        };
+        let option_of = |element| {
+            Expr::app(
+                Expr::const_(option_name.clone(), vec![Level::zero()]),
+                element,
+            )
+        };
+        let lambda = |domain, body| Expr::lam(Name::anonymous(), domain, body, BinderInfo::Default);
+        let nat = nat_const();
+        let tree_nat = tree_of(nat.clone());
+        let prefix = [
+            nat.clone(),
+            lambda(tree_nat.clone(), nat.clone()),
+            lambda(option_of(tree_nat.clone()), nat.clone()),
+            lambda(nat.clone(), Expr::bvar(0).unwrap()),
+            lambda(
+                option_of(tree_nat.clone()),
+                lambda(nat.clone(), Expr::bvar(0).unwrap()),
+            ),
+            Expr::lit(Literal::Nat(NatLit::from_u64(0))),
+            lambda(
+                tree_nat.clone(),
+                lambda(nat.clone(), Expr::bvar(0).unwrap()),
+            ),
+        ];
+        let apply = |major| {
+            prefix.iter().cloned().chain([major]).fold(
+                Expr::const_(
+                    Name::from_components(["ReductionTree", "rec_1"]),
+                    vec![Level::one(), Level::zero()],
+                ),
+                Expr::app,
+            )
+        };
+        let leaf = |element, value| {
+            [element, value].into_iter().fold(
+                Expr::const_(
+                    Name::from_components(["ReductionTree", "leaf"]),
+                    vec![Level::zero()],
+                ),
+                Expr::app,
+            )
+        };
+        let some = |element, value| {
+            [element, value].into_iter().fold(
+                Expr::const_(
+                    Name::from_components(["Option", "some"]),
+                    vec![Level::zero()],
+                ),
+                Expr::app,
+            )
+        };
+        let answer = Expr::lit(Literal::Nat(NatLit::from_u64(42)));
+        let input = apply(some(tree_nat, leaf(nat.clone(), answer.clone())));
+        let declaration = Declaration::Defn(DefinitionVal {
+            base: fln_env::constants::ConstantVal {
+                name: Name::from_components(["validNestedReduction"]),
+                level_params: Vec::new(),
+                type_: nat,
+            },
+            value: input.clone(),
+            hints: fln_env::constants::ReducibilityHints::Abbrev,
+            safety: DefinitionSafety::Safe,
+            all: vec![Name::from_components(["validNestedReduction"])],
+        });
+        let Outcome::Complete(verdict) = fln_kernel::check(&env, &declaration, Budget::DEFAULT)
+        else {
+            panic!("the valid auxiliary application must reach a verdict");
+        };
+        assert!(verdict.is_accepted(), "{verdict:?}");
+        let mut context = Context::new(&env, Budget::DEFAULT);
+        assert_eq!(context.whnf(&input).unwrap(), answer);
+        let budget = UnificationBudget::new(Budget::DEFAULT);
+        let locals = context.txn.lctx.clone();
+        assert_eq!(
+            context.txn.whnf_with(&input, &locals, budget).unwrap(),
+            answer
+        );
+        // Container parameters can be definitionally equal without having the
+        // same syntax. The unifier's guard must reduce on its existing heap
+        // machine, rather than recurse into another solver or assign holes.
+        let alias = Expr::let_e(
+            Name::from_components(["A"]),
+            Expr::sort(Level::one()),
+            nat_const(),
+            Expr::bvar(0).unwrap(),
+            false,
+        );
+        let convertible = apply(some(tree_of(alias.clone()), leaf(alias, answer.clone())));
+        assert_eq!(context.whnf(&convertible).unwrap(), answer);
+        assert_eq!(
+            context
+                .txn
+                .whnf_with(&convertible, &locals, budget)
+                .unwrap(),
+            answer
+        );
+        for wrong in [
+            apply(some(bool_(), truth())),
+            apply(some(tree_of(bool_()), leaf(bool_(), truth()))),
+        ] {
+            assert_eq!(context.whnf(&wrong).unwrap(), wrong);
+            assert_eq!(
+                context.txn.whnf_with(&wrong, &locals, budget).unwrap(),
+                wrong
+            );
+        }
+        let unknown = context.hole(Expr::sort(Level::one())).unwrap();
+        let child = context.hole(tree_of(unknown.clone())).unwrap();
+        let blocked = apply(some(tree_of(unknown), child));
+        let metavariables = context.txn.mvars.clone();
+        let universes = context.txn.universes.clone();
+        assert_eq!(context.whnf(&blocked).unwrap(), blocked);
+        assert_eq!(
+            context.txn.whnf_with(&blocked, &locals, budget).unwrap(),
+            blocked
+        );
+        assert_eq!(context.txn.mvars, metavariables);
+        assert_eq!(context.txn.universes, universes);
+        assert_eq!(context.txn.env, env);
+    }
+
     #[test]
     fn source_iota_budget_exhaustion_is_typed_and_does_not_publish_state() {
         let env = environment();
