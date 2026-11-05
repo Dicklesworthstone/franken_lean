@@ -8,7 +8,8 @@ use fln_hash::domain::{Domain, DomainHasher};
 
 /// Beside the outputs, under the package's build directory.
 pub(crate) const FILE: &str = "fln-build.snapshot";
-const SCHEMA: &str = "fln.lake-build-snapshot/1";
+const SCHEMA: &str = "fln.lake-build-snapshot/2";
+const LEGACY_SCHEMA: &str = "fln.lake-build-snapshot/1";
 /// More than a build may hold (256 modules, 4,096 imports, Init's 601 external modules).
 const MAX_LINES: usize = 1 << 20;
 
@@ -18,6 +19,12 @@ pub(crate) fn digest(bytes: &[u8]) -> String {
     hasher.update(b"fln.lake-file/1\0");
     hasher.update(bytes);
     hasher.finalize().to_hex()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CompanionDigests {
+    pub(crate) server: String,
+    pub(crate) private: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,8 +38,35 @@ pub(crate) struct ModuleRow {
     /// Relative to the package root.
     pub(crate) artifact: String,
     pub(crate) artifact_digest: String,
+    pub(crate) companions: Option<CompanionDigests>,
     pub(crate) key: Option<String>,
     pub(crate) decision: String,
+}
+
+impl ModuleRow {
+    pub(crate) fn output_files(&self) -> Vec<(String, &str)> {
+        let mut files = vec![(self.artifact.clone(), self.artifact_digest.as_str())];
+        if let Some(parts) = &self.companions {
+            let artifact = std::path::Path::new(&self.artifact);
+            files.extend([
+                (
+                    artifact
+                        .with_extension("olean.server")
+                        .display()
+                        .to_string(),
+                    parts.server.as_str(),
+                ),
+                (
+                    artifact
+                        .with_extension("olean.private")
+                        .display()
+                        .to_string(),
+                    parts.private.as_str(),
+                ),
+            ]);
+        }
+        files
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,6 +148,9 @@ impl Snapshot {
                 module.key.as_deref().unwrap_or("-"),
                 &module.decision,
             ]));
+            if let Some(parts) = &module.companions {
+                text.push_str(&line(&["companions", &parts.server, &parts.private]));
+            }
             for import in &module.imports {
                 text.push_str(&line(&["import", import]));
             }
@@ -133,7 +170,8 @@ impl Snapshot {
     /// before it, and `end` as the last line.
     pub(crate) fn parse(text: &str) -> Result<Self, String> {
         let mut lines = text.split('\n');
-        if lines.next() != Some(SCHEMA) {
+        let schema = lines.next();
+        if !matches!(schema, Some(SCHEMA | LEGACY_SCHEMA)) {
             return Err(format!("not a {SCHEMA} snapshot"));
         }
         let mut snapshot = Snapshot {
@@ -183,9 +221,26 @@ impl Snapshot {
                         source_digest: fields[3].clone(),
                         artifact: fields[4].clone(),
                         artifact_digest: fields[5].clone(),
+                        companions: None,
                         key: (fields[6] != "-").then(|| fields[6].clone()),
                         decision: fields[7].clone(),
                         imports: Vec::new(),
+                    });
+                }
+                ("companions", 3)
+                    if schema == Some(SCHEMA) && stage == 2 && owner == Some(true) =>
+                {
+                    let module = snapshot.modules.last_mut().ok_or_else(bad)?;
+                    if module.companions.is_some()
+                        || !module.imports.is_empty()
+                        || fields[1].is_empty()
+                        || fields[2].is_empty()
+                    {
+                        return Err(bad());
+                    }
+                    module.companions = Some(CompanionDigests {
+                        server: fields[1].clone(),
+                        private: fields[2].clone(),
                     });
                 }
                 ("external", 3) if index >= 2 => {
@@ -242,6 +297,7 @@ mod tests {
                 imports: vec!["Init".to_owned(), "Lib.Base".to_owned()],
                 artifact: ".lake/build/lib/lean/Lib/Top.olean".to_owned(),
                 artifact_digest: digest(b"artifact"),
+                companions: None,
                 key: None,
                 decision: "elaborated".to_owned(),
             }],
@@ -261,11 +317,41 @@ mod tests {
         for broken in [
             String::new(),
             text.replace("end\n", ""),
-            text.replace("fln.lake-build-snapshot/1", "fln.lake-build-snapshot/0"),
+            text.replace(SCHEMA, "fln.lake-build-snapshot/0"),
             text.replace("posture\t", "posture\tx\t"),
             format!("{text}module\tlate\n"),
             text.replace("import\tInit\n", "import\tInit\textra\n"),
             text.replace("\\t", "\\q"),
+        ] {
+            assert!(Snapshot::parse(&broken).is_err(), "{broken}");
+        }
+    }
+
+    #[test]
+    fn whole_families_round_trip_and_legacy_snapshots_remain_readable() {
+        let mut snapshot = sample();
+        assert_eq!(
+            Snapshot::parse(&snapshot.to_text().replace(SCHEMA, LEGACY_SCHEMA)).unwrap(),
+            snapshot
+        );
+        snapshot.modules[0].companions = Some(CompanionDigests {
+            server: digest(b"server"),
+            private: digest(b"private"),
+        });
+        let text = snapshot.to_text();
+        assert_eq!(Snapshot::parse(&text).unwrap(), snapshot);
+        assert_eq!(snapshot.modules[0].output_files().len(), 3);
+        let row = text
+            .lines()
+            .find(|line| line.starts_with("companions\t"))
+            .unwrap();
+        for broken in [
+            text.replace(SCHEMA, LEGACY_SCHEMA),
+            text.replace(row, "companions\tone"),
+            text.replace(row, "companions\t\tprivate"),
+            text.replace(row, &format!("{row}\n{row}")),
+            text.replace(row, &format!("import\tLate\n{row}")),
+            text.replace("end\n", &format!("{row}\nend\n")),
         ] {
             assert!(Snapshot::parse(&broken).is_err(), "{broken}");
         }

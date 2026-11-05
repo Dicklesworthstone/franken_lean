@@ -358,32 +358,33 @@ fn explain_report(directory: &Path, target: Option<&str>) -> std::result::Result
             }
         }
         if let Some(row) = row {
-            let artifact = root.join(&row.artifact);
-            match std::fs::read(&artifact) {
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    if rebuild.is_empty() {
-                        output_only = true;
-                    }
-                    rebuild.push("output missing".to_owned());
-                    outputs.push(Changed {
-                        module: display.clone(),
-                        kind: "output",
-                        subject: row.artifact.clone(),
-                        old: Some(row.artifact_digest.clone()),
-                        new: None,
-                    });
-                }
-                Err(error) => unknown.push(format!("output unreadable: {error}")),
-                Ok(bytes) => {
-                    let digest = snapshot::digest(&bytes);
-                    if digest != row.artifact_digest {
+            for (artifact, previous_digest) in row.output_files() {
+                match std::fs::read(root.join(&artifact)) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        if rebuild.is_empty() {
+                            output_only = true;
+                        }
+                        rebuild.push("output missing".to_owned());
                         outputs.push(Changed {
                             module: display.clone(),
                             kind: "output",
-                            subject: row.artifact.clone(),
-                            old: Some(row.artifact_digest.clone()),
-                            new: Some(digest),
+                            subject: artifact,
+                            old: Some(previous_digest.to_owned()),
+                            new: None,
                         });
+                    }
+                    Err(error) => unknown.push(format!("output unreadable: {error}")),
+                    Ok(bytes) => {
+                        let digest = snapshot::digest(&bytes);
+                        if digest != previous_digest {
+                            outputs.push(Changed {
+                                module: display.clone(),
+                                kind: "output",
+                                subject: artifact,
+                                old: Some(previous_digest.to_owned()),
+                                new: Some(digest),
+                            });
+                        }
                     }
                 }
             }

@@ -52,6 +52,9 @@ impl Drop for Package {
 const CONFIG: &str = "name = \"checked\"\ndefaultTargets = [\"Library\"]\n[[lean_lib]]\nname = \"Library\"\nroots = [\"Lib\"]\n";
 const BASE: &str = "prelude\ndef Lib.identity (A : Type) (a : A) : A := a\n";
 const TOP: &str = "prelude\nimport Lib.Base\ndef Lib.again (A : Type) (a : A) : A := Lib.identity A a\ntheorem Lib.proof (P : Prop) (h : P) : P := h\n";
+const MODULE_BASE: &str = "module\nprelude\npublic inductive Token where\n | left\n | right\nprivate def hidden (x : Token) : Token := x\n@[expose] public def identity (x : Token) : Token := x\nprivate theorem localProof (P : Prop) (h : P) : P := h\npublic theorem keep (P : Prop) (h : P) : P := localProof P h\n";
+const MODULE_TOP: &str = "module\nprelude\npublic import Lib.Base\npublic theorem forwards (P : Prop) (h : P) : P := keep P h\n";
+const FAMILY_PARTS: [&str; 3] = ["olean", "olean.server", "olean.private"];
 
 fn success(output: &Output) -> String {
     assert!(output.status.success(), "{output:?}");
@@ -77,6 +80,240 @@ fn library() -> Package {
     package.write("Lib/Base.lean", BASE);
     package.write("Lib/Top.lean", TOP);
     package
+}
+
+fn module_library() -> Package {
+    let package = Package::new(CONFIG);
+    package.write("Lib/Base.lean", MODULE_BASE);
+    package.write("Lib/Top.lean", MODULE_TOP);
+    package
+}
+
+fn family_bytes(package: &Package, module: &str) -> Vec<Vec<u8>> {
+    FAMILY_PARTS
+        .iter()
+        .map(|part| std::fs::read(package.artifact(module).with_extension(part)).unwrap())
+        .collect()
+}
+
+#[test]
+fn module_families_build_rebuild_and_reimport_with_public_visibility() {
+    let package = module_library();
+    let targets = ["+Lib.Top:olean", "+Lib.Base:olean"];
+    let report = success(&package.build(&targets));
+    assert!(report.contains("\"modules_built\":2"), "{report}");
+    for module in ["Lib.Base", "Lib.Top"] {
+        for part in FAMILY_PARTS {
+            let path = package.artifact(module).with_extension(part);
+            assert!(path.is_file(), "{}", path.display());
+            assert!(report.contains(&path.display().to_string()), "{report}");
+        }
+        assert!(!package.artifact(module).with_extension("ir").exists());
+    }
+    let original = family_bytes(&package, "Lib.Base");
+    success(&package.build(&targets));
+    assert_eq!(family_bytes(&package, "Lib.Base"), original);
+    for part in FAMILY_PARTS {
+        std::fs::write(package.artifact("Lib.Base").with_extension(part), b"forged").unwrap();
+    }
+    success(&package.build(&targets));
+    assert_eq!(family_bytes(&package, "Lib.Base"), original);
+
+    // Separate packages and processes consume only the published artifact search
+    // path. No source fallback can accidentally make the companions unnecessary.
+    let client = Package::new("name = \"consumer\"\n[[lean_lib]]\nname = \"Consumer\"\n");
+    client.write(
+        "Consumer.lean",
+        "module\nprelude\npublic import Lib.Top\npublic theorem consumerProof (P : Prop) (h : P) : P := forwards P h\n",
+    );
+    let library = package.0.join(".lake/build/lib/lean");
+    let output = Command::new(env!("CARGO_BIN_EXE_lake"))
+        .arg("--dir")
+        .arg(&client.0)
+        .args(["--json", "build", "+Consumer:olean"])
+        .env("LEAN_PATH", &library)
+        .env("FLN_IMPORT_REUSE_DIR", client.0.join(".records"))
+        .output()
+        .unwrap();
+    success(&output);
+    assert_eq!(family_bytes(&client, "Consumer").len(), 3);
+    let search = std::env::join_paths([client.0.join(".lake/build/lib/lean"), library]).unwrap();
+    let probes = Package::new("name = \"probes\"\n");
+    let cases = [
+        (
+            "theorem use (P : Token -> Prop) (x : Token) (h : P x) : P (identity x) := h\ntheorem useProof (P : Prop) (h : P) : P := consumerProof P h",
+            true,
+        ),
+        (
+            "theorem wrong (P : Token -> Prop) (h : P Token.left) : P (identity Token.right) := h",
+            false,
+        ),
+        ("def stolen (x : Token) : Token := hidden x", false),
+        (
+            "theorem stolen (P : Prop) (h : P) : P := localProof P h",
+            false,
+        ),
+    ];
+    let reference = pinned_family_reference();
+    for (index, (body, accepted)) in cases.into_iter().enumerate() {
+        let file = format!("Probe{index}.lean");
+        probes.write(&file, format!("module\nprelude\nimport Consumer\n{body}\n"));
+        let output = Command::new(env!("CARGO_BIN_EXE_fln"))
+            .args(["check-source", "--json", "--import-posture", "recheck"])
+            .arg(probes.0.join(&file))
+            .current_dir(&probes.0)
+            .env("LEAN_PATH", &search)
+            .env("FLN_IMPORT_REUSE_DIR", probes.0.join(".records"))
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(if accepted { 0 } else { 1 }),
+            "{file}: {output:?}"
+        );
+        if let Some(binary) = &reference {
+            let output = Command::new(binary)
+                .arg(probes.0.join(&file))
+                .current_dir(&probes.0)
+                .env("LEAN_PATH", &search)
+                .output()
+                .unwrap();
+            assert_eq!(
+                output.status.success(),
+                accepted,
+                "pinned Reference {file}: {output:?}"
+            );
+        }
+    }
+}
+
+fn pinned_family_reference() -> Option<PathBuf> {
+    let row = include_str!("../../../SUITE.lock")
+        .lines()
+        .find(|line| line.starts_with("reference leanprover/lean4 "))
+        .unwrap();
+    let field = |key: &str| {
+        row.split_whitespace()
+            .find_map(|word| word.strip_prefix(key))
+            .unwrap()
+    };
+    let binary = std::env::var_os("FLN_REFERENCE_LEAN")
+        .or_else(|| std::env::var_os("FLN_REFERENCE_BIN"))
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("FLN_REFERENCE_LIB")
+                .map(|lib| PathBuf::from(lib).join("../../bin/lean"))
+        })
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| {
+                PathBuf::from(home)
+                    .join(".elan/toolchains")
+                    .join(format!("leanprover--lean4---{}", field("tag=")))
+                    .join("bin/lean")
+            })
+        })
+        .filter(|binary| binary.is_file());
+    let Some(binary) = binary else {
+        assert!(
+            std::env::var_os("FLN_REQUIRE_REFERENCE").is_none(),
+            "pinned Reference required"
+        );
+        eprintln!("SKIP: pinned Reference absent; native artifact reimports still run");
+        return None;
+    };
+    let output = Command::new(&binary).arg("--githash").output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap().trim(),
+        field("commit=")
+    );
+    Some(binary)
+}
+
+#[test]
+fn module_family_failures_preserve_all_previous_parts_and_ir() {
+    let package = library();
+    success(&package.build(&["+Lib.Top:olean"]));
+    assert!(
+        !package
+            .artifact("Lib.Base")
+            .with_extension("olean.private")
+            .exists()
+    );
+    package.write("Lib/Base.lean", MODULE_BASE);
+    package.write("Lib/Top.lean", MODULE_TOP);
+    success(&package.build(&["+Lib.Top:olean"]));
+    let base = family_bytes(&package, "Lib.Base");
+    let top = family_bytes(&package, "Lib.Top");
+    package.write(
+        "Lib/Bad.lean",
+        "module\nprelude\npublic theorem bad (P Q : Prop) (h : P) : Q := h\n",
+    );
+    failure(&package.build(&["+Lib.Top:olean", "+Lib.Bad:olean"]));
+    assert_eq!(family_bytes(&package, "Lib.Base"), base);
+    assert_eq!(family_bytes(&package, "Lib.Top"), top);
+    for part in FAMILY_PARTS {
+        assert!(!package.artifact("Lib.Bad").with_extension(part).exists());
+    }
+    package.write(
+        "Lib/Base.lean",
+        "prelude\ndef replacement (P : Prop) (h : P) : P := h\n",
+    );
+    assert!(failure(&package.build(&["+Lib.Base:olean"])).contains("coordinated replacement"));
+    assert_eq!(family_bytes(&package, "Lib.Base"), base);
+    package.write("Lib/Base.lean", MODULE_BASE);
+    let ir = package.artifact("Lib.Base").with_extension("ir");
+    std::fs::write(&ir, b"existing executable IR").unwrap();
+    assert!(failure(&package.build(&["+Lib.Top:olean"])).contains("coordinated replacement"));
+    assert_eq!(std::fs::read(ir).unwrap(), b"existing executable IR");
+    assert_eq!(family_bytes(&package, "Lib.Base"), base);
+    assert_eq!(family_bytes(&package, "Lib.Top"), top);
+}
+
+#[test]
+fn module_family_preflight_checks_every_companion_before_replacing_any_module() {
+    let package = module_library();
+    for part in FAMILY_PARTS {
+        package.write(
+            &format!(".lake/build/lib/lean/Lib/Base.{part}"),
+            format!("previous {part}"),
+        );
+    }
+    let previous = family_bytes(&package, "Lib.Base");
+    std::fs::create_dir_all(package.artifact("Lib.Top").with_extension("olean.private")).unwrap();
+    let error = failure(&package.build(&["+Lib.Top:olean"]));
+    assert!(error.contains("not a regular file"), "{error}");
+    assert_eq!(family_bytes(&package, "Lib.Base"), previous);
+    assert!(!package.artifact("Lib.Top").exists());
+    assert!(
+        !package
+            .artifact("Lib.Top")
+            .with_extension("olean.server")
+            .exists()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn dangling_ir_and_companion_symlinks_cannot_bypass_family_preflight() {
+    for part in ["ir", "olean.server", "olean.private"] {
+        let package = module_library();
+        package.write(
+            ".lake/build/lib/lean/Lib/Base.olean",
+            "previous public root",
+        );
+        std::os::unix::fs::symlink(
+            package.0.join("absent"),
+            package.artifact("Lib.Base").with_extension(part),
+        )
+        .unwrap();
+        assert!(failure(&package.build(&["+Lib.Top:olean"])).contains("symlink"));
+        assert_eq!(
+            std::fs::read(package.artifact("Lib.Base")).unwrap(),
+            b"previous public root"
+        );
+        assert!(!package.artifact("Lib.Top").exists());
+    }
 }
 
 #[test]
