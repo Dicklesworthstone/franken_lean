@@ -21,6 +21,10 @@ structure CacheDictionary where
   second : Nat
 def cacheFactory (n : Nat) : CacheDictionary := CacheDictionary.mk n n
 def cacheRuntimeWork (n : Nat) : Nat := n + 1
+inductive CacheTree where
+  | leaf : Nat → CacheTree
+  | pair : CacheTree → CacheTree → CacheTree
+def cacheLeafFactory (n : Nat) : CacheTree := CacheTree.leaf n
 "#],
             &KVMap::new(),
             SourceCheckLimits::new(limits),
@@ -155,4 +159,96 @@ fn unfinished_factory_evaluation_does_not_publish_and_can_retry() {
     limited.limits = IngressLimits::default();
     assert_eq!(limited.instance_factory_value(&input).unwrap(), expected);
     assert_eq!(limited.specializations.factory_values.len(), 1);
+}
+
+#[test]
+fn shared_factory_subterms_fit_the_bound_for_completed_administrative_work() {
+    fn tree(mut leaf: Expr) -> Expr {
+        for _ in 0..25 {
+            leaf = call("CacheTree.pair", [leaf.clone(), leaf]);
+        }
+        leaf
+    }
+    let engine = engine();
+    let root = engine.logical_root(&KVMap::new());
+    let source = tree(call("cacheLeafFactory", [nat::literal(42)]));
+    let separate = call(
+        "CacheTree.pair",
+        [
+            tree(call("cacheLeafFactory", [nat::literal(42)])),
+            tree(call("cacheLeafFactory", [nat::literal(42)])),
+        ],
+    );
+    let shared = call("CacheTree.pair", [source.clone(), source]);
+    let expected = tree(call("CacheTree.leaf", [nat::literal(42)]));
+    let expected = call("CacheTree.pair", [expected.clone(), expected]);
+    let limits = IngressLimits {
+        max_nodes: 2048,
+        ..IngressLimits::default()
+    };
+    let mut left = Preparation::new(&engine.environment, limits);
+    let mut right = Preparation::new(&engine.environment, limits);
+    assert_eq!(
+        left.instance_factory_value(&shared).unwrap(),
+        Some(expected.clone())
+    );
+    assert_eq!(
+        right.instance_factory_value(&separate).unwrap(),
+        Some(expected)
+    );
+    assert_eq!(left.visited, right.visited);
+    assert_eq!(engine.logical_root(&KVMap::new()), root);
+
+    let mut limited = Preparation::new(
+        &engine.environment,
+        IngressLimits {
+            max_nodes: 32,
+            ..IngressLimits::default()
+        },
+    );
+    assert!(matches!(
+        limited.instance_factory_value(&separate),
+        Err(IngressError::ResourceLimit {
+            resource: IngressResource::Nodes,
+            limit: 32,
+            observed: 33
+        })
+    ));
+    assert!(limited.specializations.factory_values.is_empty());
+}
+
+#[test]
+fn local_factory_reuse_keeps_unselected_computations_and_callers_separate() {
+    let engine = engine();
+    let branch = call("cacheFactory", [Expr::bvar(0).unwrap()]);
+    let input = call("CacheDictionary.mk", [branch.clone(), branch]);
+    let expected_branch = call(
+        "CacheDictionary.mk",
+        [Expr::bvar(0).unwrap(), Expr::bvar(0).unwrap()],
+    );
+    let expected = call(
+        "CacheDictionary.mk",
+        [expected_branch.clone(), expected_branch],
+    );
+    let mut preparation = Preparation::new(&engine.environment, IngressLimits::default());
+    assert_eq!(
+        preparation.scoped_instance_factory_value(&input).unwrap(),
+        Some(expected)
+    );
+    let complete = preparation.visited;
+    assert!(preparation.specializations.factory_values.is_empty());
+    assert!(preparation.instance_factory_value(&input).unwrap().is_none());
+    let before = preparation.visited;
+    assert!(
+        preparation.scoped_instance_factory_value(&input).unwrap().is_some()
+    );
+    assert_eq!(preparation.visited - before, complete);
+    let shared = call("cacheLeafFactory", [nat::literal(42)]);
+    let computed = call("cacheLeafFactory", [call("cacheRuntimeWork", [nat::literal(0)])]);
+    let input = call(
+        "CacheTree.pair",
+        [shared.clone(), call("CacheTree.pair", [shared, computed])],
+    );
+    assert!(preparation.instance_factory_value(&input).unwrap().is_none());
+    assert!(!preparation.specializations.factory_values.contains_key(&input));
 }
