@@ -918,6 +918,54 @@ fn actual_imported_bounded_word_construction_executes_and_replays() {
 }
 
 #[test]
+fn actual_imported_array_traversals_visit_only_native_windows() {
+    with_actual_import(false, |engine| {
+        let mut failures = Vec::new();
+        collect_case_failure(&mut failures, "native Array bounded fold", || {
+            execution::native_fold_window(engine);
+        });
+        collect_case_failure(&mut failures, "native Array early termination", || {
+            execution::native_early_iteration(engine);
+        });
+        for (label, source) in [
+            (
+                "native Array iteration aliases",
+                include_str!("source_imported_arrays/programs.lean"),
+            ),
+            (
+                "native Array fold aliases",
+                include_str!("source_imported_arrays/folds.lean"),
+            ),
+        ] {
+            collect_case_failure(&mut failures, label, || {
+                execution::native_aliasing(engine, label, source);
+            });
+        }
+        for (label, source, count) in [
+            (
+                "native Array iteration effects",
+                include_str!("source_imported_arrays/effects.lean"),
+                20,
+            ),
+            (
+                "native Array fold effects",
+                include_str!("source_imported_arrays/fold_effects.lean"),
+                14,
+            ),
+        ] {
+            collect_case_failure(&mut failures, label, || {
+                execution::program(engine, label, source, count);
+            });
+        }
+        assert!(
+            failures.is_empty(),
+            "native Array traversals must preserve fixed-window work, shared inputs, and effects:\n{}",
+            failures.join("\n"),
+        );
+    });
+}
+
+#[test]
 fn actual_imported_array_iteration_executes_replays_and_preserves_authority() {
     with_actual_import(true, |engine| {
         let before = engine.logical_root(&KVMap::new());
@@ -941,7 +989,7 @@ fn actual_imported_array_iteration_executes_replays_and_preserves_authority() {
             (
                 "dynamic Array programs",
                 include_str!("source_imported_arrays/programs.lean"),
-                23,
+                25,
             ),
             (
                 "observable Array effects",
@@ -956,10 +1004,13 @@ fn actual_imported_array_iteration_executes_replays_and_preserves_authority() {
         collect_case_failure(&mut failures, "checked bodies and safe override", || {
             authority::checked_bodies_and_safe_override(engine);
         });
+        collect_case_failure(&mut failures, "native Array early termination", || {
+            execution::native_early_iteration(engine);
+        });
         assert_eq!(engine.logical_root(&KVMap::new()), before);
         assert!(
             failures.is_empty(),
-            "all 43 Array evaluations and every authority control must succeed:\n{}",
+            "all 45 Array evaluations and every authority control must succeed:\n{}",
             failures.join("\n"),
         );
     });
@@ -1074,7 +1125,7 @@ fn actual_imported_array_folds_execute_replay_and_preserve_authority() {
             (
                 "bounded and higher-order Array folds",
                 include_str!("source_imported_arrays/folds.lean"),
-                13,
+                15,
             ),
             (
                 "Array fold Monad sequencing and short-circuit",
@@ -1092,10 +1143,13 @@ fn actual_imported_array_folds_execute_replay_and_preserve_authority() {
         collect_case_failure(&mut failures, "Array fold VM budget and recovery", || {
             folds::execution_budget(engine);
         });
+        collect_case_failure(&mut failures, "native Array bounded fold", || {
+            execution::native_fold_window(engine);
+        });
         assert_eq!(engine.logical_root(&KVMap::new()), before);
         assert!(
             failures.is_empty(),
-            "all 27 Array fold evaluations and every rollback/resource control must succeed:\n{}",
+            "all 29 Array fold evaluations and every rollback/resource control must succeed:\n{}",
             failures.join("\n"),
         );
     });

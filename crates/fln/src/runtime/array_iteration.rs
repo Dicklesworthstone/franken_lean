@@ -1,10 +1,10 @@
-//! Private executable bridges for the pin's List-backed Array representation.
+//! Private executable bridges for the pin's Array iteration.
 //!
-//! The Array record still contains its logical List. Under the complete pinned
-//! contract, List.forIn' visits exactly those elements in the same order, with
-//! one callback bind per element and pure only on exhaustion or `done`. The
-//! callback receives the original Array membership proof, not List membership.
-//! No unsafe body, native Array ABI, or LawfulMonad equation is used here.
+//! Native arrays retain the checked indexed loop, including early termination
+//! before touching the remaining elements. Logical records keep the List
+//! bridge. Both preserve callback order, one bind per element, and pure only
+//! on exhaustion or `done`, without executing an unsafe body or using Monad
+//! laws. Callbacks retain the original Array membership proof.
 use super::*;
 
 #[derive(Default)]
@@ -277,6 +277,19 @@ impl Preparation<'_> {
                 ));
             }
         };
+
+        // Native size/get operations make the authenticated safe loop operate
+        // directly on Array storage. In particular, an early `done` must not
+        // first allocate a List containing every unvisited element.
+        if self.native_arrays_enabled()? {
+            definition.base.name = private_name();
+            definition.hints = ReducibilityHints::Abbrev;
+            definition.all.clear();
+            let adapter = definition.base.name.clone();
+            self.remember_array_definition(definition)?;
+            self.array_iteration.adapter = Some(adapter.clone());
+            return Ok(adapter);
+        }
 
         // Keep the admitted interface, including universe order, dependent
         // domains and binder kinds. The generated declaration remains private.
