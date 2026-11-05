@@ -5,14 +5,17 @@
 //! the result would discard it. Intrinsics, recursors, executable axioms, unsafe
 //! bodies never become compile-time dictionary evidence. Ordinary specialization
 //! accepts closed inputs only; method projection additionally permits already-bound
-//! locals as inert values, without caching expressions in that caller's scope.
+//! locals as inert values. Completed subexpressions are reused only within one
+//! invocation, whose bound variables all remain relative to that caller. No
+//! caller-relative result is published in the global specialization cache.
 use super::*;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 mod projections;
 
 enum Task {
     Value(Expr),
+    Remember(Expr),
     Constructor(Expr, usize),
     Application(usize),
     Continue(VecDeque<Expr>),
@@ -55,18 +58,33 @@ impl Preparation<'_> {
         }
         // The scoped path also enforces executable noncomputable/native-carrier
         // guards. Never inherit an entry from the closed metadata evaluator,
-        // nor record an expression whose de Bruijn indices belong to a caller.
+        // nor publish an expression whose de Bruijn indices belong to a caller.
         if !allow_bound_locals && let Some(value) = self.specializations.factory_values.get(input) {
             return Ok(Some(value.clone()));
         }
         let mut tasks = vec![Task::Value(input.clone())];
         let mut values = Vec::new();
+        // Beta/zeta expansion can copy a validated dictionary into several
+        // fields, and the enclosing factory then evaluates those fields again.
+        // Remember completed administrative work by exact syntax, not allocation
+        // identity. This table cannot cross caller scopes or evaluator policies.
+        let mut completed: HashMap<Expr, Expr> = HashMap::new();
         let limit = self.limits.max_nodes;
         while let Some(task) = tasks.pop() {
             self.tick()?;
             reserve(&mut values, limit)?;
             match task {
                 Task::Value(expression) => {
+                    if matches!(
+                        expression.node(),
+                        ExprNode::App { .. } | ExprNode::LetE { .. } | ExprNode::Proj { .. }
+                    ) {
+                        if let Some(value) = completed.get(&expression) {
+                            values.push(value.clone());
+                            continue;
+                        }
+                        push(&mut tasks, Task::Remember(expression.clone()), limit)?;
+                    }
                     let (head, arguments) = self.spine(&expression)?;
                     // The checked IO world index is inert type metadata. Its
                     // opaque carrier must not be evaluated while selecting a
@@ -240,6 +258,30 @@ impl Preparation<'_> {
                         }
                         _ => return Ok(None),
                     }
+                }
+                Task::Remember(input) => {
+                    let value = values
+                        .last()
+                        .ok_or_else(|| unsupported("instance factory completed value"))?;
+                    let additional = usize::from(!completed.contains_key(&input));
+                    let observed = completed.len().saturating_add(additional);
+                    if observed > limit {
+                        return Err(IngressError::ResourceLimit {
+                            resource: IngressResource::Nodes,
+                            limit,
+                            observed,
+                        });
+                    }
+                    completed
+                        .try_reserve(additional)
+                        .map_err(|_| IngressError::AllocationFailure {
+                            resource: IngressResource::Nodes,
+                            requested: observed,
+                        })?;
+                    // Every operand, including an unselected field or unused
+                    // initializer, has completed before this task is reached.
+                    // An error or resource stop never inserts a partial value.
+                    completed.insert(input, value.clone());
                 }
                 Task::Constructor(mut head, count) => {
                     let start = values
