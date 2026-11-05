@@ -703,6 +703,10 @@ impl<'a> Preparation<'a> {
                             tasks.push(Task::Visit(applied));
                             continue;
                         }
+                        if let Some(eliminated) = self.singleton_proof_recursor(&head, &args)? {
+                            tasks.push(Task::Visit(eliminated));
+                            continue;
+                        }
                         if matches!(head.node(), ExprNode::Const { name: n, levels }
                             if n == &name("Bool.rec") && levels.len() == 1)
                             && args.len() == 4
