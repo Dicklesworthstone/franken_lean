@@ -274,3 +274,142 @@ fn every_native_index_budget_stop_can_retry_without_publishing_partial_order() {
     }
     assert_eq!(env, original);
 }
+
+fn provider_with_inner_type_let() -> Expr {
+    forall(
+        "A",
+        type_(),
+        Expr::let_e(
+            name("Alias"),
+            type_(),
+            Expr::bvar(0).unwrap(),
+            Expr::app(constant("Mark"), Expr::bvar(0).unwrap()),
+            false,
+        ),
+        BinderInfo::Default,
+    )
+}
+
+#[test]
+fn local_provider_classification_preserves_locals_and_existing_assignments() {
+    let env = fixture();
+    let registry = InstanceRegistry::read(&env).unwrap();
+    let mut ctx = context(&env);
+    ctx.txn.lctx.add_param(
+        FVarId(name("retained")),
+        name("retained"),
+        constant("Token"),
+        BinderInfo::Default,
+    );
+    let family = ctx
+        .hole(forall("A", type_(), type_(), BinderInfo::Default))
+        .unwrap();
+    let ExprNode::MVar { id } = family.node() else {
+        unreachable!("fresh family hole")
+    };
+    let id = id.clone();
+    ctx.txn
+        .assign_mvar(
+            id.clone(),
+            constant("Mark"),
+            AssignmentJustification::DirectDefEq,
+        )
+        .unwrap();
+    let before_locals = ctx.txn.lctx.clone();
+    let before_next = ctx.next;
+    let before_assignment = ctx.txn.mvars.get_assignment(&id).cloned();
+    for provider in [
+        provider_with_inner_type_let(),
+        forall(
+            "A",
+            type_(),
+            Expr::app(family, Expr::bvar(0).unwrap()),
+            BinderInfo::Default,
+        ),
+    ] {
+        assert_eq!(
+            ctx.local_instance_class(&provider, &registry).unwrap(),
+            Some(name("Mark"))
+        );
+        assert_eq!(ctx.txn.lctx, before_locals);
+        assert_eq!(ctx.next, before_next);
+        assert_eq!(
+            ctx.txn.mvars.get_assignment(&id).cloned(),
+            before_assignment
+        );
+        assert_eq!(ctx.txn.env, env);
+    }
+}
+
+#[test]
+fn local_provider_discovery_keeps_the_pinned_application_head_filter() {
+    let env = fixture();
+    let registry = InstanceRegistry::read(&env).unwrap();
+    let mut ctx = context(&env);
+    let family_type = forall("A", type_(), type_(), BinderInfo::Default);
+    let let_head = Expr::let_e(
+        name("Family"),
+        family_type,
+        constant("Mark"),
+        Expr::bvar(0).unwrap(),
+        false,
+    );
+    let lambda_head = Expr::lam(
+        name("A"),
+        type_(),
+        Expr::app(constant("Mark"), Expr::bvar(0).unwrap()),
+        BinderInfo::Default,
+    );
+    for (head, expected) in [(let_head, None), (lambda_head, Some(name("Mark")))] {
+        let provider = forall(
+            "A",
+            type_(),
+            Expr::app(head, Expr::bvar(0).unwrap()),
+            BinderInfo::Default,
+        );
+        assert_eq!(
+            ctx.local_instance_class(&provider, &registry).unwrap(),
+            expected
+        );
+    }
+    assert!(ctx.txn.lctx.is_empty());
+    assert_eq!(ctx.txn.env, env);
+}
+
+#[test]
+fn local_provider_discovery_reports_budget_stops_and_can_retry() {
+    let env = fixture();
+    let registry = InstanceRegistry::read(&env).unwrap();
+    let provider = provider_with_inner_type_let();
+    let mut control = context(&env);
+    assert_eq!(
+        control.local_instance_class(&provider, &registry).unwrap(),
+        Some(name("Mark"))
+    );
+    let used = control.txn.budget.heartbeats_consumed;
+    assert!(used > 1);
+    for allowance in 1..used {
+        let mut stopped = context(&env);
+        let before_locals = stopped.txn.lctx.clone();
+        let before_next = stopped.next;
+        stopped.txn.budget.max_heartbeats = allowance;
+        let error = stopped
+            .local_instance_class(&provider, &registry)
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                NatDefinitionElabError::Inference(SourceInferenceError::ResourceLimit)
+            ),
+            "allowance {allowance}: {error:?}"
+        );
+        assert_eq!(stopped.txn.lctx, before_locals);
+        assert_eq!(stopped.next, before_next);
+        assert_eq!(stopped.txn.env, env);
+        stopped.txn.budget.max_heartbeats = control.txn.budget.max_heartbeats;
+        assert_eq!(
+            stopped.local_instance_class(&provider, &registry).unwrap(),
+            Some(name("Mark"))
+        );
+    }
+}

@@ -194,8 +194,8 @@ fn hints_never_invent_missing_dictionaries_or_publish_a_bad_prefix() {
     );
 }
 
-fn imported_state(lib: &Path) -> Engine {
-    let root = Name::from_components(["Init", "Control", "State"]);
+fn imported_module(lib: &Path, module: &str, max_bytes: usize) -> Engine {
+    let root = Name::from_components(module.split('.'));
     let mut pending = vec![root.clone()];
     let mut seen = BTreeSet::new();
     let mut names = Vec::new();
@@ -237,7 +237,7 @@ fn imported_state(lib: &Path) -> Engine {
             &[root],
             &KVMap::new(),
             SourceOleanImportLimits::new(OleanCheckLimits::new(
-                256 * 1024 * 1024,
+                max_bytes,
                 limits().admission.kernel,
             )),
         )
@@ -255,7 +255,7 @@ fn the_real_state_transformer_stack_elaborates_without_abstracting_its_state_par
     std::thread::Builder::new()
         .stack_size(STACK)
         .spawn(move || {
-            let base = imported_state(&lib);
+            let base = imported_module(&lib, "Init.Control.State", 256 * 1024 * 1024);
             let source = r#"
 def k4 {σ : Type} : StateT σ Id σ := getThe σ
 def f2 {σ δ : Type} : StateT δ (StateT σ Id) σ := getThe σ
@@ -306,7 +306,7 @@ fn only_apply_and_rfl_take_a_quasi_pattern_solution_for_a_captured_local() {
     std::thread::Builder::new()
         .stack_size(STACK)
         .spawn(move || {
-            let base = imported_state(&lib);
+            let base = imported_module(&lib, "Init.Control.State", 256 * 1024 * 1024);
             let source = r#"
 def lifted {σ δ : Type} : StateT δ (StateT σ Id) σ := do
   let s : σ ← monadLift (get : StateT σ Id σ)
@@ -371,7 +371,7 @@ fn a_metavariable_argument_is_approximated_first_order_at_once() {
     std::thread::Builder::new()
         .stack_size(STACK)
         .spawn(move || {
-            let base = imported_state(&lib);
+            let base = imported_module(&lib, "Init.Control.State", 256 * 1024 * 1024);
             let source = r#"
 universe u v
 def ex1 {σ : Type u} {m : Type u → Type v} [Functor m] {α : Type u} (x : StateT σ m α) (s : σ) : m α :=
@@ -434,7 +434,7 @@ fn an_abbreviated_expected_type_is_approximated_as_written() {
     std::thread::Builder::new()
         .stack_size(STACK)
         .spawn(move || {
-            let base = imported_state(&lib);
+            let base = imported_module(&lib, "Init.Control.State", 256 * 1024 * 1024);
             let source = r#"
 abbrev DelabM := Id
 abbrev Delab := DelabM Nat
@@ -486,7 +486,7 @@ fn a_definition_expected_type_is_unfolded_for_first_order_approximation() {
     std::thread::Builder::new()
         .stack_size(STACK)
         .spawn(move || {
-            let base = imported_state(&lib);
+            let base = imported_module(&lib, "Init.Control.State", 256 * 1024 * 1024);
             let source = r#"
 def D := Id Nat
 example : D := pure 1
@@ -515,6 +515,26 @@ theorem viaDef_eq : viaDef = (1 : Nat) := rfl
                 .unwrap_err();
             assert_eq!(error.disposition().0, "elaboration", "{error:?}");
             assert_eq!(base.logical_root(&KVMap::new()), root);
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[test]
+fn parameterized_local_instances_elaborate_the_unmodified_upstream_2199_case() {
+    let Some(lib) = pin() else {
+        return;
+    };
+    let source = include_str!("../../../vendor/lean4-src/tests/elab/2199.lean");
+    reference(&lib, source, true);
+    std::thread::Builder::new()
+        .stack_size(STACK)
+        .spawn(move || {
+            // The unchanged upstream file uses implicit Init, whose ~350 MiB
+            // artifact closure is larger than the StateT fixture above.
+            let base = imported_module(&lib, "Init", 512 * 1024 * 1024);
+            checked(&base, source);
         })
         .unwrap()
         .join()

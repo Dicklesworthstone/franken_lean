@@ -115,8 +115,132 @@ fn class_valued_lets_follow_local_instance_recency() {
     );
 }
 
+const LOCAL_PROVIDERS: &str = r#"class ProviderAt (index : Nat) where
+  value : Nat
+class ProviderNeeds (index : Nat) where
+  witness : Nat
+class ProviderValue (A : Type) (a : A) where
+  value : A
+abbrev ProviderAlias (index : Nat) := ProviderAt index
+def ProviderHidden (index : Nat) := ProviderAt index
+"#;
+
 #[test]
-fn ordinary_functions_and_opaque_type_aliases_are_not_local_instances() {
+fn ordinary_local_providers_infer_explicit_implicit_and_dependent_parameters() {
+    let base = checked(&engine(), LOCAL_PROVIDERS);
+    checked(
+        &base,
+        r#"def provided (index : Nat) (provider : forall k : Nat, ProviderAt k) : ProviderAt index := inferInstance
+theorem provided_eq (index : Nat) (provider : forall k : Nat, ProviderAt k) : provided index provider = provider index := rfl
+def implicitProvided (index : Nat) (provider : forall {k : Nat}, ProviderAt k) : ProviderAt index := inferInstance
+theorem implicitProvided_eq (index : Nat) (provider : forall {k : Nat}, ProviderAt k) : implicitProvided index provider = provider (k := index) := rfl
+def dependentProvided {A : Type} (a : A) (provider : forall (B : Type) (b : B), ProviderValue B b) : ProviderValue A a := inferInstance
+theorem dependentProvided_eq {A : Type} (a : A) (provider : forall (B : Type) (b : B), ProviderValue B b) : dependentProvided a provider = provider A a := rfl
+"#,
+    );
+}
+
+#[test]
+fn local_provider_discovery_reduces_telescope_lets_and_reducible_results() {
+    let base = checked(&engine(), LOCAL_PROVIDERS);
+    let result = checked(
+        &base,
+        r#"def aliasedProvider (index : Nat) (provider : forall k : Nat, ProviderAlias k) : ProviderAt index := inferInstance
+theorem aliasedProvider_eq (index : Nat) (provider : forall k : Nat, ProviderAlias k) : aliasedProvider index provider = provider index := rfl
+def innerLetProvider (index : Nat) (provider : forall k : Nat, let j := k; ProviderAt j) : ProviderAt index := inferInstance
+theorem innerLetProvider_eq (index : Nat) (provider : forall k : Nat, let j := k; ProviderAt j) : innerLetProvider index provider = provider index := rfl
+def bothLetProvider (index : Nat) (provider : let N := Nat; forall k : N, let j := k; ProviderAt j) : ProviderAt index := inferInstance
+theorem bothLetProvider_eq (index : Nat) (provider : let N := Nat; forall k : N, let j := k; ProviderAt j) : bothLetProvider index provider = provider index := rfl
+def fromLet (index : Nat) : Nat :=
+  let provider : forall k : Nat, ProviderAt k := fun k => { value := k + 10 }
+  (inferInstance : ProviderAt index).value
+def fromHave (index : Nat) : Nat := by
+  have provider : forall k : Nat, ProviderAt k := fun k => { value := k + 20 }
+  exact (inferInstance : ProviderAt index).value
+theorem fromLet_eq (index : Nat) : fromLet index = index + 10 := rfl
+theorem fromHave_eq (index : Nat) : fromHave index = index + 20 := rfl
+"#,
+    );
+    let completed = result
+        .execute_source_commands_with_checks(
+            b"#eval fromLet 4\n#eval fromHave 2",
+            &KVMap::new(),
+            fln::EngineExecutionLimits::new(limits().admission.kernel),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let values: Vec<_> = completed
+        .batch
+        .source_evaluation_indices
+        .iter()
+        .map(|&index| fln::closed_vm_value(&completed.batch.executions[index].exit).unwrap())
+        .collect();
+    assert_eq!(
+        values,
+        [
+            Some(fln::ClosedVmValue::Scalar(14)),
+            Some(fln::ClosedVmValue::Scalar(22))
+        ]
+    );
+}
+
+#[test]
+fn local_providers_keep_recency_and_backtrack_failed_prerequisites() {
+    let base = checked(&engine(), LOCAL_PROVIDERS);
+    let result = checked(
+        &base,
+        r#"def recentProvider (index : Nat) (older newer : forall k : Nat, ProviderAt k) : ProviderAt index := inferInstance
+theorem recentProvider_eq (index : Nat) (older newer : forall k : Nat, ProviderAt k) : recentProvider index older newer = newer index := rfl
+def fallbackProvider (index : Nat) (older : forall k : Nat, ProviderAt k) (newer : forall (k : Nat) [ProviderNeeds k], ProviderAt k) : ProviderAt index := inferInstance
+theorem fallbackProvider_eq (index : Nat) (older : forall k : Nat, ProviderAt k) (newer : forall (k : Nat) [ProviderNeeds k], ProviderAt k) : fallbackProvider index older newer = older index := rfl
+def availableProvider (index : Nat) [ProviderNeeds index] (older : forall k : Nat, ProviderAt k) (newer : forall (k : Nat) [ProviderNeeds k], ProviderAt k) : ProviderAt index := inferInstance
+theorem availableProvider_eq (index : Nat) [ProviderNeeds index] (older : forall k : Nat, ProviderAt k) (newer : forall (k : Nat) [ProviderNeeds k], ProviderAt k) : availableProvider index older newer = newer index := rfl
+"#,
+    );
+    let root = result.logical_root(&KVMap::new());
+    let wrong = "theorem wrong (index : Nat) (older newer : forall k : Nat, ProviderAt k) : recentProvider index older newer = older index := rfl";
+    assert!(
+        result
+            .check_source_files(&[wrong.as_bytes()], &KVMap::new(), limits())
+            .is_err()
+    );
+    assert_eq!(result.logical_root(&KVMap::new()), root);
+}
+
+#[test]
+fn local_providers_do_not_guess_arguments_or_unfold_hidden_class_results() {
+    let base = checked(
+        &engine(),
+        &format!("{LOCAL_PROVIDERS}\naxiom providerWitness : forall k : Nat, ProviderAt k"),
+    );
+    let root = base.logical_root(&KVMap::new());
+    for source in [
+        "def bad (index : Nat) (provider : Nat -> ProviderAt index) : ProviderAt index := inferInstance",
+        "def bad (index : Nat) (provider : forall k : Nat, ProviderHidden k) : ProviderAt index := inferInstance",
+        "def bad (index : Nat) (provider : forall (k : Nat) [ProviderNeeds k], let j := k; ProviderAt j) : ProviderAt index := inferInstance",
+        "def bad (index : Nat) (provider : forall A : Type, A) : ProviderAt index := inferInstance",
+        "def bad (index : Nat) : ProviderAt index := let Alias : Nat -> Type := ProviderAt; let provider : forall k : Nat, Alias k := providerWitness; inferInstance",
+        "def bad (index : Nat) : ProviderAt index := inferInstance",
+    ] {
+        let error = base
+            .check_source_files(&[source.as_bytes()], &KVMap::new(), limits())
+            .unwrap_err();
+        assert_eq!(
+            error.disposition(),
+            ("elaboration", false, 1),
+            "{source}: {error:?}"
+        );
+        assert_eq!(base.logical_root(&KVMap::new()), root);
+    }
+    checked(
+        &base,
+        "def recovered (index : Nat) (provider : forall k : Nat, ProviderAt k) : ProviderAt index := inferInstance",
+    );
+}
+
+#[test]
+fn uninferrable_functions_and_opaque_type_aliases_do_not_supply_instances() {
     checked(
         &engine(),
         "def functionDictionary (f : Nat -> Inhabited Nat) : Inhabited Nat := inferInstance\ntheorem functionIgnored (f : Nat -> Inhabited Nat) : functionDictionary f = instInhabitedNat := by rfl\ndef Alias : Type := Inhabited Nat\ndef aliasDictionary (i : Alias) : Inhabited Nat := inferInstance\ntheorem aliasIgnored (i : Alias) : aliasDictionary i = instInhabitedNat := by rfl\ndef localAlias : Nat := let A : Type := Inhabited Nat; let i : A := Inhabited.mk 9; default\ntheorem localAliasIgnored : localAlias = 0 := by rfl",
