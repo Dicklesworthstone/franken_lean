@@ -2060,6 +2060,11 @@ fn finish_bounded_application(
                 Syntax::Atom { val, .. } if val == "no_index" => {
                     Some(parser_kind(&["Term", "noindex"]))
                 }
+                // The pin's `noImplicitLambda` also consumes exactly one
+                // `termParser maxPrec`, before ordinary application.
+                Syntax::Atom { val, .. } if val == "no_implicit_lambda%" => {
+                    Some(parser_kind(&["Term", "noImplicitLambda"]))
+                }
                 // `syntax:max "↑" term:max : term` (`coeNotation`, `Init/Coe.lean`), at the root.
                 Syntax::Atom { val, .. } if val == "↑" => {
                     Some(Name::from_components(["coeNotation"]))
@@ -2117,7 +2122,7 @@ fn finish_bounded_application(
             Some(TokenKind::Ident(_))
         )
         && !(grammar == DefinitionGrammar::Scalar
-            && matches!(tokens.get(*first_index).map(|token| &token.kind), Some(TokenKind::Symbol(symbol)) if matches!(symbol.as_str(), "(" | "@")))
+            && matches!(tokens.get(*first_index).map(|token| &token.kind), Some(TokenKind::Symbol(symbol)) if matches!(symbol.as_str(), "(" | "@" | "no_implicit_lambda%")))
         // Inside a quotation, an antiquotation heads an application (`$f $a`).
         && !(grammar == DefinitionGrammar::Scalar
             && quotations::inside()
@@ -4258,6 +4263,7 @@ fn bounded_term_compound_token(
                     || symbol == "inferInstanceAs"
                     || symbol == "@&"
                     || symbol == "no_index"
+                    || symbol == "no_implicit_lambda%"
                     || symbol == "↑") =>
         {
             // `"inferInstanceAs" (("$" <|> "<|") term:minPrec <|> term:argPrec)`

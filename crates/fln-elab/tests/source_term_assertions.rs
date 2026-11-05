@@ -41,6 +41,29 @@ fn refused(source: &str) {
         );
     }
 }
+
+#[test]
+fn no_implicit_lambda_preserves_explicit_binders_and_inferred_terms() {
+    for source in [
+        "def wrapped : {n : Nat} -> Nat := no_implicit_lambda% (fun {n} => n)",
+        "def inferred := no_implicit_lambda% 7",
+        "def nested : Nat := no_implicit_lambda% (no_implicit_lambda% 7)",
+        "def applied : Nat := no_implicit_lambda% (fun (n : Nat) => n) 7",
+        "def applied (f : {α : Type} -> α -> α) : Nat := no_implicit_lambda% f 7",
+    ] {
+        accepted(source);
+    }
+}
+
+#[test]
+fn no_implicit_lambda_blocks_automatic_binders_only_inside_its_term() {
+    accepted("def automatic : {n : Nat} -> Nat := 7");
+    refused("def blocked : {n : Nat} -> Nat := no_implicit_lambda% 7");
+    accepted(
+        "def restored : Nat := let explicit : {n : Nat} -> Nat := no_implicit_lambda% (fun {n} => n); let automatic : {n : Nat} -> Nat := 7; @automatic 0",
+    );
+    accepted("def ordinary : Nat := (fun (n : Nat) => no_implicit_lambda% n) 7");
+}
 #[test]
 fn named_and_inferred_assertions_construct_checked_local_evidence() {
     accepted("theorem relay (P : Prop) (p : P) : P := have h : P := p; h");
