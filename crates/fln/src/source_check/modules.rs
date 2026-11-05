@@ -24,8 +24,8 @@ pub use artifacts::{
 pub use cache::{SourceModuleCacheLimits, SourceModuleSession, SourceModuleSessionCheck};
 pub use fln_parse::command_scope::imports::{SourceHeader, parse_source_header};
 pub use imported_macros::{
-    SourceMacroModuleCheck, SourceMacroProgramExecution, SourceModuleDeferredMacroInputs,
-    SourceModuleMacroInputs,
+    SourceMacroModuleBuild, SourceMacroModuleCheck, SourceMacroProgramExecution,
+    SourceModuleDeferredMacroInputs, SourceModuleMacroInputs,
 };
 
 /// Public imports preserve their export visibility in the module graph.

@@ -45,6 +45,7 @@ pub struct SourceModuleMacroInputs<'a> {
 /// first use. Context, initial state and graph-wide expansion limits have the
 /// same meaning as in `SourceModuleMacroInputs`. No partial registration table
 /// can be supplied: the receipt still provides every captured journal.
+#[derive(Clone)]
 pub struct SourceModuleDeferredMacroInputs {
     pub compilation: MacroCompilationInputs,
     pub registry_limits: MacroRegistryLimits,
@@ -63,6 +64,31 @@ pub struct SourceMacroModuleCheck {
     pub attempts: Vec<MacroAttempt>,
     pub completed_vm_usage: ExecutionUsage,
     pub tree_usage: MacroTreeUsage,
+}
+
+/// Checked module artifacts and the macro work consumed while producing them.
+/// Artifacts and terminal macro states are published together only after the
+/// complete graph passes admission and encoding. Macro builds do not consult
+/// source caches or persisted records.
+#[derive(Debug)]
+pub struct SourceMacroModuleBuild {
+    pub outcome: Outcome<Result<SourceModuleBuild, SourceModuleBuildError>>,
+    pub states: Option<BTreeMap<Name, MacroState>>,
+    pub attempts: Vec<MacroAttempt>,
+    pub completed_vm_usage: ExecutionUsage,
+    pub tree_usage: MacroTreeUsage,
+}
+
+impl SourceMacroModuleBuild {
+    fn stopped(outcome: Outcome<Result<SourceModuleBuild, SourceModuleBuildError>>) -> Self {
+        Self {
+            outcome,
+            states: None,
+            attempts: Vec::new(),
+            completed_vm_usage: empty_usage(),
+            tree_usage: MacroTreeUsage::default(),
+        }
+    }
 }
 
 /// Executed source modules and the macro work consumed by their real command
@@ -374,6 +400,20 @@ impl ModuleMacroSession {
             self.states.insert(module.clone(), report.state);
         }
         Ok(())
+    }
+
+    fn finish_build(
+        self,
+        outcome: Outcome<Result<SourceModuleBuild, SourceModuleBuildError>>,
+    ) -> SourceMacroModuleBuild {
+        let states = matches!(&outcome, Outcome::Complete(Ok(_))).then_some(self.states);
+        SourceMacroModuleBuild {
+            outcome,
+            states,
+            attempts: self.attempts,
+            completed_vm_usage: self.completed_vm_usage,
+            tree_usage: self.tree_usage,
+        }
     }
 
     fn finish_execution<E>(
@@ -760,6 +800,112 @@ impl imported::SourceOleanImport {
             },
             cancellation,
         )
+    }
+
+    /// Compile source modules using their receipt-bound imported macros and
+    /// selected parser journals. Implicit Init imports, public/private module
+    /// visibility, export checks and writer limits are the ordinary artifact
+    /// pipeline's. Macro compilation remains deferred until actual dispatch.
+    ///
+    /// This uncached path re-elaborates every source module. Neither a source
+    /// record nor an artifact can substitute for expansion under this call's
+    /// code, context, state and budgets. No artifact or terminal state escapes
+    /// a failed expansion, admission, encoding or cancellation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn compile_source_modules_with_deferred_imported_macros(
+        &self,
+        modules: &[SourceModuleInput<'_>],
+        entry: &Name,
+        options: &KVMap,
+        limits: SourceModuleCheckLimits,
+        input: SourceModuleDeferredMacroInputs,
+        write_budget: OleanWriteBudget,
+        cancellation: Option<&dyn CancellationProbe>,
+    ) -> SourceMacroModuleBuild {
+        if cancellation.is_some_and(CancellationProbe::is_cancelled) {
+            return SourceMacroModuleBuild::stopped(Outcome::Inconclusive(
+                Inconclusive::cancelled("source-module macros/before-build-preparation"),
+            ));
+        }
+        if let Err(error) = artifacts::validate_base(&self.contexts.complete, modules) {
+            return SourceMacroModuleBuild::stopped(Outcome::Complete(Err(error)));
+        }
+        if self.contexts.has_inherited_imports() {
+            return SourceMacroModuleBuild::stopped(Outcome::Complete(Err(
+                SourceModuleBuildError::Check(SourceModuleCheckError::ImportContext {
+                    module: entry.clone(),
+                    reason: "imported macro builds require retained journals for the complete artifact closure",
+                }),
+            )));
+        }
+        let prepared = (|| {
+            let parsers = self.module_parsers(input.registry_limits)?;
+            let registry = self
+                .prepare_imported_macros_deferred(input.compilation, input.registry_limits)
+                .map_err(binding_error)?;
+            Ok(ModuleMacroSession::new(
+                registry,
+                parsers,
+                input.context,
+                input.state,
+                input.limits,
+            ))
+        })();
+        let mut session = match prepared {
+            Ok(session) => session,
+            Err(error) => {
+                if let Some(reason) = parser_resource(&error) {
+                    return SourceMacroModuleBuild::stopped(Outcome::Inconclusive(reason));
+                }
+                return SourceMacroModuleBuild::stopped(Outcome::Complete(Err(
+                    SourceModuleBuildError::Check(SourceModuleCheckError::Source {
+                        module: entry.clone(),
+                        error,
+                    }),
+                )));
+            }
+        };
+        let module_cancellation = cancellation.map(ModuleCancellation);
+        let outcome = match cache::run_collecting(
+            &self.contexts.complete,
+            modules,
+            entry,
+            options,
+            limits,
+            module_cancellation
+                .as_ref()
+                .map(|probe| probe as &dyn ModuleCancellationProbe),
+            cache::RunOptions {
+                cache: None,
+                collect_artifacts: true,
+                contexts: Some(&self.contexts),
+                records: None,
+                macros: Some(&mut session),
+            },
+        ) {
+            Ok(Outcome::Complete(run)) => {
+                match artifacts::encode_pending(&run.artifacts, write_budget, cancellation) {
+                    Ok(outcome) => outcome.map_complete(|artifacts| {
+                        Ok(SourceModuleBuild {
+                            checked: run.result.checked,
+                            artifacts,
+                            reused_modules: run.result.reused_modules,
+                            elaborated_modules: run.result.elaborated_modules,
+                            persisted_modules: run.persisted_modules,
+                            modules: run.provenance,
+                        })
+                    }),
+                    Err(error) => Outcome::Complete(Err(error)),
+                }
+            }
+            Ok(Outcome::Inconclusive(reason)) => Outcome::Inconclusive(reason),
+            Ok(Outcome::InternalFault(fault)) => Outcome::InternalFault(fault),
+            Err(error) => match module_parser_resource(&error) {
+                Some(reason) => Outcome::Inconclusive(reason),
+                None => Outcome::Complete(Err(SourceModuleBuildError::Check(error))),
+            },
+        };
+        session.finish_build(outcome)
     }
 
     fn check_source_modules_with_macro_preparation(

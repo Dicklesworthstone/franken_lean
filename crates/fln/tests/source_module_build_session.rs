@@ -406,3 +406,70 @@ fn cache_cannot_lend_a_removed_dependency_or_export_an_unbound_seed() {
         Err(SourceModuleBuildError::UnboundBase)
     ));
 }
+
+#[test]
+fn module_companions_consume_aggregate_writer_budgets_on_cold_and_warm_builds() {
+    let files = [
+        (
+            "Main",
+            "module\nprelude\nimport Lib\ndef mainIdentity.{u} {A : Sort u} (x : A) : A := x",
+        ),
+        (
+            "Lib",
+            "module\nprelude\ndef libraryIdentity.{u} {A : Sort u} (x : A) : A := x",
+        ),
+    ];
+    let mut retained = session();
+    let good = build(&mut retained, &files);
+    let mut bytes = 0;
+    let mut objects = 0;
+    for artifact in &good.artifacts {
+        let companions = artifact.companions.as_ref().unwrap();
+        bytes += artifact.report.file_bytes
+            + companions.server_report.file_bytes
+            + companions.private_report.file_bytes;
+        objects += artifact.report.runtime_objects
+            + companions.server_report.runtime_objects
+            + companions.private_report.runtime_objects;
+    }
+    for budget in [
+        OleanWriteBudget {
+            max_bytes: bytes - 1,
+            ..Default::default()
+        },
+        OleanWriteBudget {
+            max_objects: objects - 1,
+            ..Default::default()
+        },
+    ] {
+        let mut cold = session();
+        for current in [&mut cold, &mut retained] {
+            assert!(matches!(
+                compile(current, &files, budget, None),
+                Err(SourceModuleBuildError::Encode { .. })
+            ));
+        }
+        assert_eq!(cold.retained_modules(), 0);
+        assert_eq!(retained.retained_modules(), 2);
+    }
+    let exact = compile(
+        &mut retained,
+        &files,
+        OleanWriteBudget {
+            max_bytes: bytes,
+            max_objects: objects,
+        },
+        None,
+    )
+    .unwrap()
+    .into_complete()
+    .unwrap();
+    assert_eq!(exact.reused_modules, 2);
+    for (expected, actual) in good.artifacts.iter().zip(&exact.artifacts) {
+        assert_eq!(actual.bytes, expected.bytes);
+        let expected = expected.companions.as_ref().unwrap();
+        let actual = actual.companions.as_ref().unwrap();
+        assert_eq!(actual.server, expected.server);
+        assert_eq!(actual.private, expected.private);
+    }
+}

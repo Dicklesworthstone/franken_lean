@@ -655,3 +655,53 @@ fn module_export_routing_uses_the_expanded_command_declaration() {
     assert_eq!(report.attempts.len(), 1);
     assert!(report.states.is_none());
 }
+
+#[test]
+fn imported_custom_commands_build_real_artifacts_without_native_preflight_rejection() {
+    let (imported, code) = command_fixture(Payload::Definition, Some(2));
+    let before = imported.engine.logical_root(&KVMap::new());
+    let declarations = users(&code);
+    let compilation =
+        MacroCompilationInputs::new(code, VerifiedPartition::user_fixture(), declarations);
+    let built = super::super::modules::compile_deferred(
+        &imported,
+        compilation,
+        &[(
+            "Main",
+            "prelude\nimport SourceLibrary\ndeclare! (def answer : Nat := 42)",
+        )],
+        MacroTreeLimits::default(),
+        crate::OleanWriteBudget::default(),
+        None,
+    );
+    let Outcome::Complete(Ok(product)) = &built.outcome else {
+        panic!("{built:?}")
+    };
+    assert_eq!(built.attempts.len(), 1);
+    assert_eq!(
+        built.attempts[0].declaration,
+        name("SourceLibrary.commandMacro")
+    );
+    assert!(built.states.is_some());
+    assert_eq!(product.artifacts.len(), 1);
+    assert_eq!(product.artifacts[0].report.constants, 1);
+    let artifact = &product.artifacts[0];
+    let rechecked = imported
+        .engine
+        .check_olean_modules(
+            &[crate::OleanModuleInput {
+                name: &artifact.name,
+                artifact: &artifact.bytes,
+                server_artifact: None,
+                private_artifact: None,
+            }],
+            &KVMap::new(),
+            crate::OleanCheckLimits::new(4 * 1024 * 1024, admission().kernel),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_declared_value(&rechecked.engine, "answer", 42);
+    assert_eq!(imported.engine.logical_root(&KVMap::new()), before);
+    assert!(!imported.engine.environment().contains(&name("answer")));
+}
