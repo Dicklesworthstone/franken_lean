@@ -141,6 +141,8 @@ enum Task {
     },
     Callee(Expr),
     Apply(usize),
+    PartialOperand(Box<global::PartialCallPlan>),
+    PartialBody(Box<global::PartialCallPlan>),
     Lam {
         name: Name,
         type_: Expr,
@@ -679,6 +681,12 @@ impl<'a> Preparation<'a> {
                             tasks.push(Task::Visit(reduced));
                             continue;
                         }
+                        if let Some(plan) = self.partial_stage_plan(&head, &args)? {
+                            let (continuation, operand) = self.next_partial_stage(plan)?;
+                            tasks.push(continuation);
+                            tasks.push(Task::Visit(operand));
+                            continue;
+                        }
                         if let Some(producer) = self.global_producer(&head, &args)? {
                             tasks.push(Task::Visit(producer));
                             continue;
@@ -1046,6 +1054,12 @@ impl<'a> Preparation<'a> {
                                 tasks.push(Task::Visit(specialized));
                                 continue;
                             }
+                            if let Some(plan) = self.partial_stage_plan(&expr, &[])? {
+                                let (continuation, operand) = self.next_partial_stage(plan)?;
+                                tasks.push(continuation);
+                                tasks.push(Task::Visit(operand));
+                                continue;
+                            }
                             if let Some(producer) = self.global_producer(&expr, &[])? {
                                 tasks.push(Task::Visit(producer));
                                 continue;
@@ -1177,6 +1191,20 @@ impl<'a> Preparation<'a> {
                         });
                     }
                     values.push(selected);
+                }
+                Task::PartialOperand(mut plan) => {
+                    let value = pop(&mut values)?;
+                    self.accept_partial_operand(&mut plan, value)?;
+                    let (continuation, input) = self.next_partial_stage(plan)?;
+                    tasks.push(continuation);
+                    tasks.push(Task::Visit(input));
+                }
+                Task::PartialBody(plan) => {
+                    let body = pop(&mut values)?;
+                    // These operands were prepared in their final let scopes.
+                    // Re-visiting or lifting them would invalidate the exact
+                    // local closure identities used to select this call.
+                    values.push(self.finish_partial_stage(plan, body)?);
                 }
                 Task::Apply(count) => {
                     let start = values

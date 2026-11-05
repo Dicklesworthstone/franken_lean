@@ -115,6 +115,101 @@ def nestedRun (offset : Nat) : Nat :=
 }
 
 #[test]
+fn recursive_consumers_keep_known_stages_before_computed_callback_tails() {
+    for (source, expected) in [
+        (
+            r#"
+#eval nestedConsumer
+  (fun a b =>
+    let outer := Nat.add a b
+    fun acc =>
+      let saved := Nat.add outer acc
+      Nat.add saved) 3
+"#,
+            "30",
+        ),
+        (
+            r#"
+#eval nestedConsumer
+  (fun a b =>
+    let outer := Nat.add a b
+    fun acc =>
+      let saved := Nat.add outer acc
+      let action : Nat -> Nat := fun state => Nat.add saved state
+      action) 3
+"#,
+            "30",
+        ),
+        (
+            r#"
+def stateSuffix (saved : Nat) : Nat -> Nat :=
+  let captured := Nat.add saved 1
+  fun state => Nat.add captured state
+
+#eval nestedConsumer
+  (fun a b =>
+    let outer := Nat.add a b
+    fun acc => stateSuffix (Nat.add outer acc)) 3
+"#,
+            "34",
+        ),
+    ] {
+        execute(&format!("{NESTED_PARTIAL}{source}"), expected);
+    }
+}
+
+#[test]
+fn recursive_consumers_match_late_closed_callback_forwarding() {
+    // Child preparation exposes a closed suffix. Ordinary local registration
+    // then forwards it as one flat residual stage; the recursive consumer must
+    // select that exact interface after preparation, not predict two stages.
+    execute(
+        r#"
+def closedSuffix : Nat -> Nat :=
+  (fun (_ : Nat) => fun state => Nat.add state 1) 0
+
+partial def closedTailConsumer
+    (f : Nat -> Nat -> Nat -> Nat -> Nat) (n : Nat) : Nat :=
+  if n == 0 then f n 2 3 1 else
+    Nat.add (f n 2 3 1) (closedTailConsumer f (Nat.pred n))
+
+#eval closedTailConsumer
+  (fun a b =>
+    let paid := Nat.add a b
+    fun acc => closedSuffix) 3
+"#,
+        "8",
+    );
+}
+
+#[test]
+fn recursive_middle_callbacks_keep_captures_when_the_consumer_is_under_applied() {
+    // The callback's final let scope includes the preceding bias operand.
+    // Both supplied bindings must remain outside the missing n lambda, and
+    // offset must keep its original outer slot after the one-time lift.
+    for (offset, expected) in [(10, "77"), (0, "37")] {
+        execute(
+            &format!(
+                "\
+partial def middle (bias : Nat) (f : Nat -> Nat -> Nat -> Nat -> Nat) (n : Nat) : Nat :=
+  if n == 0 then Nat.add (f n 2 3 1) bias else
+    Nat.add (f n 2 3 1) (middle bias f (Nat.pred n))
+def middleRun (offset : Nat) : Nat :=
+  let loop := middle 7
+    (fun a b =>
+      let outer := Nat.add (Nat.add a b) offset
+      fun acc =>
+        let saved := Nat.add outer acc
+        Nat.add saved)
+  loop 3
+#eval middleRun {offset}"
+            ),
+            expected,
+        );
+    }
+}
+
+#[test]
 fn discarded_nested_callback_results_still_execute_the_second_prefix() {
     let source = |cost| {
         format!(
