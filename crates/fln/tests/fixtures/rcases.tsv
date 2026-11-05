@@ -25,3 +25,26 @@ default_unpack	accept	theorem f (p q : Prop) (h : p ∧ q) : q := by rcases h; a
 default_empty	accept	theorem f (h : False) : False := by rcases h
 default_abstract	reject	theorem f (p : Prop) (h : p) : p := by rcases h; exact h
 default_removes_subject	reject	theorem f (p q : Prop) (h : p ∧ q) : p ∧ q := by rcases h; exact h
+rfl_right_orientation	accept	theorem f (n m : Nat) (h : n = m) : n = n := by rcases h with rfl; exact Eq.refl n
+rfl_dependent_hypothesis	accept	theorem f (n m : Nat) (h : n = m) (P : Nat → Prop) (hn : P n) : P m := by rcases h with rfl; exact hn
+rfl_proof_dependent_hypothesis	accept	theorem f (n m : Nat) (h : n = m) (P : n = m → Prop) (hp : P h) : P h := by rcases h with rfl; exact hp
+nested_rfl_right	accept	theorem f (n : Nat) (h : (0 = n) ∧ (n = 0)) : n = 0 := by rcases h with ⟨rfl, hz⟩; exact hz
+nested_rfl_left	accept	theorem f (n : Nat) (h : (n = 0) ∧ (n = 0)) : n = 0 := by rcases h with ⟨rfl, hz⟩; exact hz
+nested_rfl_annotation	accept	theorem f (n : Nat) (h : (0 = n) ∧ (n = 0)) : n = 0 := by rcases h with ⟨rfl, (hz : 0 = 0)⟩; exact hz
+rfl_alternatives	accept	theorem f (n : Nat) (h : (n = 0) ∨ (n = 0)) : n = 0 := by rcases h with rfl | rfl; rfl; rfl
+clear_leaf	accept	theorem f (p : Prop) (h : p) : True := by rcases h with -; exact True.intro
+clear_required_index	accept	theorem f (n : Nat) (h : n = n) : n = n := by rcases n with -; rfl
+clear_nested_tail	accept	theorem f (p q r : Prop) (h : p ∧ q ∧ r) : r := by rcases h with ⟨-, -, hr⟩; exact hr
+explicit_implicit_field	accept	inductive Hidden : Prop where | mk {n : Nat} (h : n = 0)\ntheorem f (h : Hidden) (k : (n : Nat) → n = 0 → True) : True := by rcases h with @⟨n, hn⟩; exact k n hn
+explicit_nested_tail	accept	inductive Hidden : Prop where | mk {n : Nat} (h : n = 0)\ninductive Wrapped : Prop where | mk (h : Hidden)\ntheorem f (h : Wrapped) (k : (n : Nat) → n = 0 → True) : True := by rcases h with @⟨n, hn⟩; exact k n hn
+rfl_failed_branch_restores_context	accept	theorem f (n : Nat) (h : (n = 0) ∧ True) : (n = 0) ∧ True := by\n  first\n  | rcases h with ⟨rfl, (bad : False)⟩\n  | exact h
+rfl_removes_right_name	reject	theorem f (n m : Nat) (h : n = m) : m = m := by rcases h with rfl; exact Eq.refl m
+rfl_requires_equation	reject	theorem f (h : True) : True := by rcases h with rfl; exact True.intro
+rfl_does_not_search_other_equations	reject	theorem f (n : Nat) (h : n = 0) : True := by rcases n with rfl; exact True.intro
+rfl_requires_variable_endpoint	reject	theorem f (h : 0 = 0) : True := by rcases h with rfl; exact True.intro
+rfl_occurs_check	reject	theorem f (n : Nat) (h : n = Nat.succ n) : True := by rcases h with rfl; exact True.intro
+clear_hides_evidence	reject	theorem f (p : Prop) (h : p) : p := by rcases h with -; exact h
+clear_dependent_hypothesis	reject	theorem f (n : Nat) (h : n = n) : n = n := by rcases n with -; exact h
+clear_dependent_let_value	reject	theorem f (p : Prop) (h : p) : p := by let witness : p := h; rcases h with -; exact witness
+clear_alternative_is_local	reject	theorem f (p : Prop) (h : p ∨ p) : p := by rcases h with - | hp; assumption; exact hp
+explicit_field_annotation_checked	reject	inductive Hidden : Prop where | mk {n : Nat} (h : n = 0)\ntheorem f (h : Hidden) : True := by rcases h with @⟨(n : Prop), hn⟩; exact True.intro

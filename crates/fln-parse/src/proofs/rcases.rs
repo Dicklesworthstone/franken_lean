@@ -1,10 +1,10 @@
 //! `obtain`, `rcases`, `rintro` and `ext` with their `rcases` patterns (`Init/RCases.lean`):
 //! - `rcasesPat`: a name (`one`), `_` (`ignore`), `-` (`clear`), `⟨p, …⟩` (`tuple`) or `(p)`
-//!   (`paren`);
+//!   (`paren`), or `@p` (`explicit`);
 //! - `rcasesPatMed`: patterns separated by `|`;
 //! - `rcasesPatLo`: a `Med` with an optional `: T`.
 //!
-//! Patterns nest through brackets only, at most [`PATTERN_NESTING`] deep; deeper ones are
+//! Brackets and explicit prefixes nest at most [`PATTERN_NESTING`] deep; deeper patterns are
 //! refused rather than recursed into on a small host stack.
 use super::*;
 
@@ -61,7 +61,14 @@ impl Patterns<'_> {
         let mut units = Vec::new();
         let mut at = range.start;
         while at < range.end {
-            if is(self.tokens, at, "(") {
+            let start = at;
+            while is(self.tokens, at, "@") {
+                at += 1;
+                if at >= range.end || depth + at - start >= PATTERN_NESTING {
+                    return Err(self.refuse(start));
+                }
+            }
+            if at == start && is(self.tokens, at, "(") {
                 let close = matching(self.tokens, at)
                     .filter(|&close| close < range.end)
                     .ok_or_else(|| self.refuse(at))?;
@@ -69,7 +76,7 @@ impl Patterns<'_> {
                 at = close + 1;
                 continue;
             }
-            let end = if is(self.tokens, at, "⟨") {
+            let end = if is(self.tokens, at, "⟨") || is(self.tokens, at, "(") {
                 matching(self.tokens, at)
                     .filter(|&close| close < range.end)
                     .ok_or_else(|| self.refuse(at))?
@@ -79,7 +86,7 @@ impl Patterns<'_> {
             };
             units.push(Syntax::node(
                 kind(&["rintroPat", "one"]),
-                vec![self.pat(at..end, 0)?],
+                vec![self.pat(start..end, depth)?],
             ));
             at = end;
         }
@@ -201,6 +208,19 @@ impl Patterns<'_> {
                 ),
                 _ => return Err(self.refuse(first)),
             });
+        }
+        if is(self.tokens, first, "@") {
+            // The pinned production is `"@" noWs rcasesPat`.
+            if self.tokens[first].extent.end() != self.tokens[first + 1].extent.start() {
+                return Err(self.refuse(first + 1));
+            }
+            return Ok(Syntax::node(
+                kind(&["rcasesPat", "explicit"]),
+                vec![
+                    self.leaves.leaf(first)?,
+                    self.pat(first + 1..range.end, depth + 1)?,
+                ],
+            ));
         }
         let last = range.end - 1;
         let closes = |open: &str, close: &str| {
@@ -486,4 +506,37 @@ fn atom_at(leaves: &Leaves, at: usize, text: &str) -> Result<Syntax, NatDefiniti
         info: leaf.info(),
         val: text.to_string(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_recursive_patterns_preserve_source_and_enforce_no_whitespace() {
+        for source in [
+            "theorem f : True := by rcases h with @⟨n, rfl⟩",
+            "theorem f : True := by rintro @⟨n, -⟩ (h | @⟨x, hx⟩)",
+            "theorem f : True := by obtain @⟨n, (h : n = n)⟩ := witness",
+            "theorem f : True := by\r\n  rintro @(⟨«n», _⟩) /- after pattern -/ h",
+        ] {
+            let parsed = parse_source_command(source.as_bytes()).unwrap();
+            assert_eq!(parsed.reconstruct_original(), source.as_bytes());
+        }
+        for pattern in ["@", "@ ⟨n, h⟩", "@/- comment -/⟨n, h⟩"] {
+            for tactic in ["rcases h with", "rintro", "obtain"] {
+                let source = format!("theorem f : True := by {tactic} {pattern}");
+                assert!(parse_source_command(source.as_bytes()).is_err(), "{source}");
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_prefix_nesting_is_bounded() {
+        let prefixes = "@".repeat(PATTERN_NESTING + 1);
+        for tactic in ["rcases h with", "rintro", "obtain"] {
+            let source = format!("theorem f : True := by {tactic} {prefixes}⟨n, h⟩");
+            assert!(parse_source_command(source.as_bytes()).is_err(), "{source}");
+        }
+    }
 }

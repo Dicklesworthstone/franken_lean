@@ -1,14 +1,17 @@
 //! Native recursive case patterns, lowered to the ordinary checked case compiler.
 //! Pattern trees and the resulting goal forest are traversed on heap worklists.
-//! No branch is solved by the pattern itself; each live minor remains a goal.
+//! Constructors and equality transports remain ordinary checked proof terms.
 use super::*;
 use fln_env::constants::ConstantInfo;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 mod derived;
 
 #[derive(Clone)]
 enum Pattern<'a> {
     One(Option<Name>),
+    Substitute,
+    Clear,
+    Explicit(usize),
     Tuple(Vec<usize>),
     Alts(Vec<usize>),
     Typed(usize, &'a Syntax),
@@ -16,20 +19,26 @@ enum Pattern<'a> {
 
 enum Parse<'a> {
     Visit(&'a Syntax),
+    Explicit,
     Tuple(usize),
     Alts(usize),
     Typed(&'a Syntax),
 }
 
 #[derive(Clone)]
+struct TrackedLocal {
+    value: Expr,
+}
+
+#[derive(Clone)]
 struct Subject {
-    name: Name,
+    local: TrackedLocal,
     pattern: usize,
     rename: bool,
 }
 
 enum Step<'a> {
-    Match(ProofGoal, Vec<Subject>),
+    Match(ProofGoal, Vec<Subject>, Vec<TrackedLocal>),
     Emit(Work<'a>),
 }
 
@@ -71,6 +80,55 @@ fn pattern_name(arena: &[Pattern<'_>], mut index: usize) -> Option<Name> {
             _ => return None,
         }
     }
+}
+
+fn pattern_tuple(arena: &[Pattern<'_>], mut index: usize) -> (bool, Vec<usize>) {
+    let mut explicit = false;
+    loop {
+        match &arena[index] {
+            Pattern::Explicit(inner) => {
+                explicit = true;
+                index = *inner;
+            }
+            Pattern::Tuple(items) => return (explicit, items.clone()),
+            _ => return (explicit, vec![index]),
+        }
+    }
+}
+
+/// The case compiler preserves dependent locals' names while recreating their
+/// identities. Pending constructor fields have fresh names until their own
+/// patterns run. Refuse ambiguous fallback names instead of selecting a shadow.
+fn case_local(
+    before: &LocalContext,
+    after: &ProofGoal,
+    tracked: &TrackedLocal,
+) -> Option<TrackedLocal> {
+    let ExprNode::FVar { id } = tracked.value.node() else {
+        return Some(tracked.clone());
+    };
+    if after.lctx.find(id).is_some() {
+        return Some(tracked.clone());
+    }
+    let original = before.find(id)?;
+    let unique = |context: &LocalContext| {
+        context
+            .decls()
+            .iter()
+            .filter(|local| local.user_name == original.user_name)
+            .take(2)
+            .count()
+            == 1
+    };
+    if original.user_name.is_anonymous() || !unique(before) || !unique(&after.lctx) {
+        return None;
+    }
+    after
+        .lctx
+        .find_by_user_name(&original.user_name)
+        .map(|local| TrackedLocal {
+            value: Expr::fvar(local.id.clone()),
+        })
 }
 
 impl Context {
@@ -140,21 +198,34 @@ impl Context {
                         };
                         expect_atom(hole, "_", "rcases wildcard")?;
                         Pattern::One(None)
+                    } else if node == &kind(&["rcasesPat", "clear"]) {
+                        let [dash] = args.as_slice() else {
+                            return Err(malformed());
+                        };
+                        expect_atom(dash, "-", "rcases clear")?;
+                        Pattern::Clear
+                    } else if node == &kind(&["rcasesPat", "explicit"]) {
+                        let [at, inner] = args.as_slice() else {
+                            return Err(malformed());
+                        };
+                        expect_atom(at, "@", "explicit rcases pattern")?;
+                        pending.push(Parse::Explicit);
+                        pending.push(Parse::Visit(inner));
+                        continue;
                     } else if node == &kind(&["rcasesPat", "one"]) {
                         let [Syntax::Ident { val, .. }] = args.as_slice() else {
                             return Err(malformed());
                         };
                         if val == &Name::from_components(["rfl"]) {
-                            return Err(error(TacticError::UnsupportedTactic(kind(&["rcases"]))));
+                            Pattern::Substitute
+                        } else {
+                            Pattern::One(Some(val.clone()))
                         }
-                        Pattern::One(Some(val.clone()))
                     } else {
-                        // Clearing, equality substitution and explicit patterns are not
-                        // no-op names. Until implemented they remain hard refusals, even
-                        // inside a tactic alternative, rather than hiding a valid branch.
                         return Err(error(TacticError::UnsupportedTactic(node.clone())));
                     }
                 }
+                Parse::Explicit => Pattern::Explicit(values.pop().ok_or_else(malformed)?),
                 Parse::Tuple(count) => {
                     let start = values.len().checked_sub(count).ok_or_else(malformed)?;
                     Pattern::Tuple(values.split_off(start))
@@ -267,11 +338,16 @@ impl Context {
             goal,
             arena,
             vec![Subject {
-                name: local.user_name,
+                local: TrackedLocal {
+                    value: Expr::fvar(local.id),
+                },
                 pattern,
                 rename: false,
             }],
+            Vec::new(),
+            true,
         )
+        .map(|_| ())
     }
 
     fn update_rcases_local(
@@ -308,56 +384,150 @@ impl Context {
         self.txn.lctx = context;
     }
 
+    fn remap_rcases_local(
+        &mut self,
+        tracked: &mut TrackedLocal,
+        substitutions: &[(FVarId, Expr)],
+    ) -> Result<(), NatDefinitionElabError> {
+        tracked.value = self.specialize_locals(&tracked.value, substitutions)?;
+        Ok(())
+    }
+
+    /// Match the pin's `tryClearMany'`: defer deletion until all patterns and
+    /// introductions finish, include forward dependencies through types and let
+    /// values, then keep any local still required by the target or a survivor.
+    fn finish_rcases_clears(
+        &mut self,
+        proof: &mut ProofState<'_>,
+        goal: ProofGoal,
+        clears: &[TrackedLocal],
+    ) -> Result<ProofGoal, NatDefinitionElabError> {
+        self.txn.lctx = goal.lctx.clone();
+        let mut removed = HashSet::new();
+        for clear in clears {
+            self.tick()?;
+            if let ExprNode::FVar { id } = clear.value.node()
+                && goal.lctx.find(id).is_some()
+            {
+                removed.insert(id.clone());
+            }
+        }
+        if removed.is_empty() {
+            return Ok(goal);
+        }
+        let mut candidates = Vec::new();
+        for local in goal.lctx.decls() {
+            self.tick()?;
+            let mut reads = self.elimination_reads(&local.type_)?;
+            if let Some(value) = &local.value {
+                reads.extend(self.elimination_reads(value)?);
+            }
+            if removed.contains(&local.id) || !reads.is_disjoint(&removed) {
+                removed.insert(local.id.clone());
+                candidates.push(local.id.clone());
+            }
+        }
+        self.try_clear_proof_locals(proof, goal, &candidates)
+    }
+
     fn run_rcases_patterns<'a>(
         &mut self,
         proof: &mut ProofState<'a>,
         goal: ProofGoal,
         mut arena: Vec<Pattern<'_>>,
         subjects: Vec<Subject>,
-    ) -> Result<(), NatDefinitionElabError> {
-        let mut pending = vec![Step::Match(goal, subjects)];
+        clears: Vec<TrackedLocal>,
+        finish: bool,
+    ) -> Result<HashMap<MVarId, Vec<TrackedLocal>>, NatDefinitionElabError> {
+        let mut pending = vec![Step::Match(goal, subjects, clears)];
         let mut output = Vec::new();
+        let mut deferred = HashMap::new();
         while let Some(step) = pending.pop() {
             self.tick()?;
-            let (mut goal, mut subjects) = match step {
+            let (mut goal, mut subjects, mut clears) = match step {
                 Step::Emit(work) => {
                     output.push(work);
                     continue;
                 }
-                Step::Match(goal, subjects) => (goal, subjects),
+                Step::Match(goal, subjects, clears) => (goal, subjects, clears),
             };
             self.txn.lctx = goal.lctx.clone();
             let Some(subject) = subjects.pop() else {
+                let start = proof.work.len();
+                if finish {
+                    goal = self.finish_rcases_clears(proof, goal, &clears)?;
+                } else {
+                    deferred.insert(goal.id.clone(), clears);
+                }
                 output.push(Work::Goal(goal));
+                output.extend(proof.work.split_off(start).into_iter().rev());
                 continue;
             };
-            let local = goal
-                .lctx
-                .find_by_user_name(&subject.name)
-                .cloned()
-                .ok_or_else(|| error(TacticError::EliminationLocal))?;
+            let local = match subject.local.value.node() {
+                ExprNode::FVar { id } => goal.lctx.find(id).cloned(),
+                _ => None,
+            };
             match arena[subject.pattern].clone() {
                 Pattern::One(name) => {
                     if subject.rename
                         && let Some(name) = name
+                        && let Some(local) = local
                     {
                         self.update_rcases_local(&mut goal, &local.id, Some(name), None);
                     }
-                    pending.push(Step::Match(goal, subjects));
+                    pending.push(Step::Match(goal, subjects, clears));
+                }
+                Pattern::Clear => {
+                    clears.push(subject.local);
+                    pending.push(Step::Match(goal, subjects, clears));
+                }
+                Pattern::Substitute => {
+                    let local = local.ok_or_else(|| error(TacticError::SubstitutionLocal))?;
+                    let start = proof.work.len();
+                    let substitutions = self.substitute_rcases_equality(proof, goal, &local.id)?;
+                    let Some(Work::Goal(child)) = proof.work.pop() else {
+                        return Err(malformed());
+                    };
+                    self.txn.lctx = child.lctx.clone();
+                    for subject in &mut subjects {
+                        self.tick()?;
+                        if substitutions.first().is_some_and(|(variable, _)| {
+                            matches!(subject.local.value.node(), ExprNode::FVar { id } if id == variable)
+                        }) {
+                            // The eliminated field's name disappears with it;
+                            // a replacement variable keeps its original name.
+                            subject.rename = false;
+                        }
+                        self.remap_rcases_local(&mut subject.local, &substitutions)?;
+                    }
+                    for clear in &mut clears {
+                        self.remap_rcases_local(clear, &substitutions)?;
+                    }
+                    pending.extend(proof.work.split_off(start).into_iter().map(Step::Emit));
+                    pending.push(Step::Match(child, subjects, clears));
                 }
                 Pattern::Typed(inner, syntax) => {
                     let type_ = self.type_term(syntax)?;
-                    if !self.proof_types_match(&local.type_, &type_)? {
+                    let actual = match &local {
+                        Some(local) => local.type_.clone(),
+                        None => self
+                            .known_type(&subject.local.value)?
+                            .ok_or_else(|| error(TacticError::EliminationLocal))?,
+                    };
+                    if !self.proof_types_match(&actual, &type_)? {
                         return Err(error(TacticError::ApplyMismatch));
                     }
-                    self.update_rcases_local(&mut goal, &local.id, None, Some(type_));
+                    if let Some(local) = local {
+                        self.update_rcases_local(&mut goal, &local.id, None, Some(type_));
+                    }
                     subjects.push(Subject {
                         pattern: inner,
                         ..subject
                     });
-                    pending.push(Step::Match(goal, subjects));
+                    pending.push(Step::Match(goal, subjects, clears));
                 }
-                Pattern::Tuple(_) | Pattern::Alts(_) => {
+                Pattern::Tuple(_) | Pattern::Alts(_) | Pattern::Explicit(_) => {
+                    let local = local.ok_or_else(|| error(TacticError::EliminationLocal))?;
                     let type_ = self.whnf(&local.type_)?;
                     let mut head = &type_;
                     while let ExprNode::App { f, .. } = head.node() {
@@ -380,16 +550,13 @@ impl Context {
                     for (index, constructor) in family.ctors.iter().enumerate() {
                         self.tick()?;
                         let selected = alternatives.get(index).copied().unwrap_or(0);
-                        let patterns =
+                        let (explicit, patterns) =
                             if index + 1 == family.ctors.len() && alternatives.len() > index + 1 {
                                 let next = arena.len();
                                 arena.push(Pattern::Alts(alternatives[index..].to_vec()));
-                                vec![next]
+                                (false, vec![next])
                             } else {
-                                match &arena[selected] {
-                                    Pattern::Tuple(items) => items.clone(),
-                                    _ => vec![selected],
-                                }
+                                pattern_tuple(&arena, selected)
                             };
                         let Some(ConstantInfo::Ctor(ctor)) =
                             self.txn.env.find(constructor).cloned()
@@ -414,13 +581,19 @@ impl Context {
                             else {
                                 return Err(malformed());
                             };
-                            let pattern = if *binder_info != BinderInfo::Default {
+                            let pattern = if !explicit && *binder_info != BinderInfo::Default {
                                 0
                             } else if field + 1 == ctor.num_fields && patterns.len() > consumed + 1
                             {
                                 let next = arena.len();
                                 arena.push(Pattern::Tuple(patterns[consumed..].to_vec()));
-                                next
+                                if explicit {
+                                    let wrapper = arena.len();
+                                    arena.push(Pattern::Explicit(next));
+                                    wrapper
+                                } else {
+                                    next
+                                }
                             } else {
                                 let next = patterns.get(consumed).copied().unwrap_or(0);
                                 consumed += 1;
@@ -429,15 +602,12 @@ impl Context {
                             telescope = body.clone();
                             let name = self.fresh_name()?;
                             names.push(name.clone());
-                            field_plans.push(Subject {
-                                name,
-                                pattern,
-                                rename: true,
-                            });
+                            field_plans.push((name, pattern));
                         }
                         field_names.insert(constructor.clone(), names);
                     }
                     let start = proof.work.len();
+                    let previous = goal.lctx.clone();
                     self.eliminate_proof_goal_with_indices(
                         proof,
                         goal,
@@ -450,13 +620,37 @@ impl Context {
                         pending.push(match work {
                             Work::Goal(child) => {
                                 let mut next = subjects.clone();
-                                for field in field_plans.iter().rev() {
+                                for subject in &mut next {
                                     self.tick()?;
-                                    if child.lctx.find_by_user_name(&field.name).is_some() {
-                                        next.push(field.clone());
+                                    subject.local =
+                                        case_local(&previous, &child, &subject.local)
+                                            .ok_or_else(|| error(TacticError::EliminationLocal))?;
+                                }
+                                let mut next_clears = Vec::new();
+                                for clear in &clears {
+                                    self.tick()?;
+                                    // Indexed refinement can replace an index by
+                                    // a constructor expression or another field.
+                                    // Until that compiler exposes its complete
+                                    // substitution map, do not silently lose a
+                                    // requested clear whose identity disappeared.
+                                    let clear = case_local(&previous, &child, clear)
+                                        .ok_or_else(|| error(TacticError::UnsupportedEliminator))?;
+                                    next_clears.push(clear);
+                                }
+                                for (name, pattern) in field_plans.iter().rev() {
+                                    self.tick()?;
+                                    if let Some(local) = child.lctx.find_by_user_name(name) {
+                                        next.push(Subject {
+                                            local: TrackedLocal {
+                                                value: Expr::fvar(local.id.clone()),
+                                            },
+                                            pattern: *pattern,
+                                            rename: true,
+                                        });
                                     }
                                 }
-                                Step::Match(child, next)
+                                Step::Match(child, next, next_clears)
                             }
                             work @ Work::Close(..) => Step::Emit(work),
                             _ => return Err(malformed()),
@@ -466,6 +660,6 @@ impl Context {
             }
         }
         proof.work.extend(output.into_iter().rev());
-        Ok(())
+        Ok(deferred)
     }
 }

@@ -32,3 +32,21 @@ obtain_removed_subject	reject	theorem f (p q : Prop) (h : p ∧ q) : p ∧ q := 
 obtain_incomplete_branch	reject	theorem f (p : Prop) (h : p ∨ p) : p := by obtain hp | hp := h; exact hp
 obtain_opaque_witness	accept	theorem f : True := by obtain h : True; exact True.intro; assumption
 obtain_opaque_default_witness	accept	theorem f : True := by obtain : True; exact True.intro; assumption
+rintro_nested_rfl	accept	theorem f (n : Nat) : (∃ m, n = m) → n = n := by rintro ⟨m, rfl⟩; exact Eq.refl n
+rintro_rfl_then_continuation	accept	theorem f (n : Nat) : (m : Nat) → n = m → n = n := by rintro m rfl; exact Eq.refl n
+rintro_clear_keeps_target_dependencies	accept	theorem f : (n : Nat) → n = n → n = n := by rintro - h; rfl
+rintro_clear_nested_dependencies	accept	theorem f (P : Nat → Prop) : (∃ n, P n) → True := by rintro ⟨-, h⟩; exact True.intro
+rintro_clear_after_substitution	accept	theorem f (n : Nat) : (∃ m, m = n) → n = n := by rintro ⟨-, rfl⟩; rfl
+rintro_explicit_implicit_field	accept	inductive Hidden : Prop where | mk {n : Nat} (h : n = 0)\ntheorem f (k : (n : Nat) → n = 0 → True) : Hidden → True := by rintro @⟨n, hn⟩; exact k n hn
+obtain_nested_rfl	accept	theorem f (n : Nat) (h : ∃ m, n = m) : n = n := by obtain ⟨m, rfl⟩ := h; exact Eq.refl n
+obtain_rfl_witness_goal	accept	theorem f (n : Nat) (h : ∃ m, n = m) : n = n := by obtain ⟨m, rfl⟩ : ∃ m, n = m; exact h; exact Eq.refl n
+obtain_clear_field	accept	theorem f (p q : Prop) (h : p ∧ q) : q := by obtain ⟨-, hq⟩ := h; exact hq
+obtain_explicit_implicit_field	accept	inductive Hidden : Prop where | mk {n : Nat} (h : n = 0)\ntheorem f (h : Hidden) (k : (n : Nat) → n = 0 → True) : True := by obtain @⟨n, hn⟩ := h; exact k n hn
+obtain_clear_witness_goal	accept	theorem f : True := by obtain - : True; exact True.intro; exact True.intro
+rintro_rfl_shadowed_names	accept	theorem f (n : Nat) : (m : Nat) → n = m → n = n := by rintro n rfl; rfl
+rintro_rfl_requires_equation	reject	theorem f : Nat → True := by rintro rfl; exact True.intro
+rintro_clear_waits_for_later_binders	reject	theorem f : (n : Nat) → n = n → n = n := by rintro - h; exact h
+rintro_clear_removes_evidence	reject	theorem f (p : Prop) : p → p := by rintro -; assumption
+obtain_clear_removes_original	reject	theorem f (p : Prop) (h : p) : p := by obtain - := h; exact h
+obtain_rfl_removes_right_name	reject	theorem f (n m : Nat) (h : n = m) : m = m := by obtain rfl := h; exact Eq.refl m
+obtain_rfl_witness_requires_variable	reject	theorem f : True := by obtain rfl : 0 = 0; rfl; exact True.intro
