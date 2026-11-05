@@ -1392,7 +1392,7 @@ impl Engine {
         )
     }
 
-    fn admit_existing_deriving(
+    pub(super) fn admit_existing_deriving(
         &self,
         request: &fln_elab::source::deriving::ExistingDeriving,
         names: Option<&Environment>,
@@ -1473,7 +1473,14 @@ impl Engine {
                 successor.engine.environment = fln_elab::reducibility::register(
                     successor.engine.environment(),
                     &derived.instance,
-                    fln_elab::reducibility::Reducibility::ImplicitReducible,
+                    if matches!(
+                        successor.engine.environment().find(&derived.instance),
+                        Some(ConstantInfo::Thm(_))
+                    ) {
+                        fln_elab::reducibility::Reducibility::Semireducible
+                    } else {
+                        fln_elab::reducibility::Reducibility::ImplicitReducible
+                    },
                 )
                 .map_err(|error| {
                     frontend(fln_elab::source::SourceInferenceError::Unification(

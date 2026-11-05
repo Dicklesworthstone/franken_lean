@@ -5,6 +5,8 @@
 use super::*;
 use crate::source_records::ScopedCommandSyntax;
 
+mod deriving;
+
 /// This receipt is private to the source module driver. Its public engine never
 /// contains a private dependency or a module-local private declaration.
 pub(crate) struct PublicWorld<'a> {
@@ -531,6 +533,26 @@ impl<'a> PublicWorld<'a> {
             Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
         };
+        let deriving = match deriving::prepare(
+            &parsed,
+            &equations.private,
+            limits,
+            (public_scope, private_scope),
+        )? {
+            Outcome::Complete(deriving) => deriving,
+            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+        };
+        if let Some(plan) = deriving {
+            return self.admit_deriving_plan(
+                source,
+                plan,
+                equations,
+                private,
+                (options, limits),
+                (public_scope, private_scope),
+            );
+        }
         let mut staged = match equations.private.admit_public_scoped_command_syntax(
             &equations.public,
             source,

@@ -6,6 +6,7 @@ use super::*;
 use fln_env::constants::{ConstantInfo, InductiveVal};
 mod beq;
 mod decidable_eq;
+mod nonempty;
 mod repr;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -15,6 +16,7 @@ pub enum DerivingError {
     CannotDerive(Name),
     CannotDeriveBEq(Name),
     CannotDeriveDecidableEq(Name),
+    CannotDeriveNonempty(Name),
     CannotDeriveRepr(Name),
 }
 
@@ -55,6 +57,11 @@ impl std::fmt::Display for DerivingError {
                 "failed to generate DecidableEq instance for {}",
                 name.to_display_string()
             ),
+            Self::CannotDeriveNonempty(name) => write!(
+                f,
+                "failed to generate Nonempty instance for {}",
+                name.to_display_string()
+            ),
         }
     }
 }
@@ -91,6 +98,19 @@ pub struct ExistingDeriving {
 
 pub fn is_command(syntax: &Syntax) -> bool {
     syntax.kind() == Some(&parser_kind(&["Command", "deriving"]))
+}
+
+/// Public module publication gives proof handlers a checked private body and
+/// an independently checked opaque interface. Resolve aliases exactly as the
+/// handler dispatcher does before choosing that publication path.
+pub fn is_proof_handler(
+    handler: &Name,
+    environment: &Environment,
+    kernel: Budget,
+    scope: &SourceScope,
+) -> Result<bool, NatDefinitionElabError> {
+    let mut context = Context::scoped(environment, kernel, scope)?;
+    Ok(context.resolve_source_name(handler)?.as_ref() == Some(&named("Nonempty")))
 }
 
 fn command_parts(syntax: &Syntax) -> Result<(&[Syntax], &[Syntax]), NatDefinitionElabError> {
@@ -656,7 +676,12 @@ pub fn elaborate_handler_with_names(
     let is_repr = handler_name.as_ref() == Some(&named("Repr"));
     let is_beq = handler_name.as_ref() == Some(&named("BEq"));
     let is_decidable_eq = handler_name.as_ref() == Some(&named("DecidableEq"));
-    if !is_repr && !is_beq && !is_decidable_eq && handler_name.as_ref() != Some(&named("Inhabited"))
+    let is_nonempty = handler_name.as_ref() == Some(&named("Nonempty"));
+    if !is_repr
+        && !is_beq
+        && !is_decidable_eq
+        && !is_nonempty
+        && handler_name.as_ref() != Some(&named("Inhabited"))
     {
         return Err(failure(SourceInferenceError::Deriving(
             DerivingError::UnsupportedHandler(handler.clone()),
@@ -668,7 +693,7 @@ pub fn elaborate_handler_with_names(
     let Some(ConstantInfo::Induct(family)) = environment.find(type_name) else {
         return Err(unsupported(type_name));
     };
-    if family.is_unsafe || (family.num_indices != 0 && !is_repr) {
+    if family.is_unsafe || (family.num_indices != 0 && !is_repr && !is_nonempty) {
         return Err(unsupported(type_name));
     }
     let budget = crate::records::RecordBudget::default();
@@ -734,6 +759,14 @@ pub fn elaborate_handler_with_names(
         return match decidable_eq::elaborate(&mut context, family, &parameters, &target) {
             Err(error) if normal_failure(&error) => Err(failure(SourceInferenceError::Deriving(
                 DerivingError::CannotDeriveDecidableEq(type_name.clone()),
+            ))),
+            result => result,
+        };
+    }
+    if is_nonempty {
+        return match nonempty::elaborate(&mut context, family, &parameters, &target) {
+            Err(error) if normal_failure(&error) => Err(failure(SourceInferenceError::Deriving(
+                DerivingError::CannotDeriveNonempty(type_name.clone()),
             ))),
             result => result,
         };

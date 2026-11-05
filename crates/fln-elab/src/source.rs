@@ -681,6 +681,10 @@ struct Context {
     equations: Vec<SourceEquation>,
     stalled_flush: Option<StalledFlush>,
     instance_goals: Vec<MVarId>,
+    // Generated untyped binders can acquire a class type only after their
+    // introduction, without becoming local instances. Ordinary typed locals
+    // remain eligible; deriving marks just those late-inferred arguments.
+    excluded_local_instances: std::collections::HashSet<FVarId>,
     // Inference/instance goals closed over before they were solved (`instances.rs`).
     bound_metavars: Vec<instances::BoundMetavar>,
     // Nesting of pending instance synthesis started by unification, the pin's
@@ -890,6 +894,7 @@ impl Context {
             equations: Vec::new(),
             stalled_flush: None,
             instance_goals: Vec::new(),
+            excluded_local_instances: Default::default(),
             bound_metavars: Vec::new(),
             synth_pending_depth: 0,
             overload_depth: 0,
