@@ -1,15 +1,15 @@
-//! Proof-valued deriving keeps the checked implementation in the full world
-//! and exposes only the signature obtained from that successful admission.
+//! Derived proofs and hidden helpers retain their checked implementations in
+//! the full world. Only independently checked interfaces enter public replay.
 use super::*;
 use crate::source_records::elaboration_outcome;
-use fln_elab::source::deriving::{DerivingTarget, ExistingDeriving};
+use fln_elab::source::deriving::{DerivingTarget, ExistingDeriving, HandlerPublication};
 use fln_elab::source::scope::SourceScope;
 use fln_env::constants::AxiomVal;
 
 pub(super) struct Plan {
     base: Option<fln_parse::ParsedDefinition>,
     request: ExistingDeriving,
-    proofs: Vec<bool>,
+    publications: Vec<HandlerPublication>,
 }
 
 pub(super) fn prepare(
@@ -74,28 +74,32 @@ pub(super) fn prepare(
         }
         _ => return Ok(Outcome::Complete(None)),
     };
-    let mut proofs = Vec::new();
+    let mut publications = Vec::new();
     for handler in &request.handlers {
-        let proof = match elaboration_outcome(fln_elab::source::deriving::is_proof_handler(
-            handler,
-            private.environment(),
-            limits.kernel,
-            private_scope,
-        ))? {
-            Outcome::Complete(proof) => proof,
-            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
-            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
-        };
-        proofs.push(proof);
+        let publication =
+            match elaboration_outcome(fln_elab::source::deriving::handler_publication(
+                handler,
+                private.environment(),
+                limits.kernel,
+                private_scope,
+            ))? {
+                Outcome::Complete(publication) => publication,
+                Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+            };
+        publications.push(publication);
     }
-    if !proofs.iter().any(|proof| *proof) {
+    if publications
+        .iter()
+        .all(|publication| *publication == HandlerPublication::Exposed)
+    {
         return Ok(Outcome::Complete(None));
     }
     request.scope = public_scope.clone();
     Ok(Outcome::Complete(Some(Plan {
         base,
         request,
-        proofs,
+        publications,
     })))
 }
 
@@ -126,10 +130,10 @@ impl PublicWorld<'_> {
             admissions: equations.admissions,
             declarations: equations.declarations,
         };
-        let mut proof_scope = private_scope.clone();
-        proof_scope.public_declarations = true;
+        let mut body_scope = private_scope.clone();
+        body_scope.public_declarations = true;
         if plan.base.is_some() {
-            proof_scope.expose_definitions = public_scope.expose_definitions;
+            body_scope.expose_definitions = public_scope.expose_definitions;
         }
         if let Some(base) = plan.base {
             let checked = match staged.public.admit_scoped_command_syntax_with_base(
@@ -150,7 +154,7 @@ impl PublicWorld<'_> {
                 Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
             }
         }
-        for (handler, proof) in plan.request.handlers.iter().zip(plan.proofs) {
+        for (handler, publication) in plan.request.handlers.iter().zip(plan.publications) {
             for target in &plan.request.targets {
                 self.meter.work(1).map_err(execution_error)?;
                 if self
@@ -164,26 +168,36 @@ impl PublicWorld<'_> {
                 let request = ExistingDeriving {
                     handlers: vec![handler.clone()],
                     targets: vec![target.clone()],
-                    scope: if proof {
-                        proof_scope.clone()
-                    } else {
+                    scope: if publication == HandlerPublication::Exposed {
                         public_scope.clone()
+                    } else {
+                        body_scope.clone()
                     },
                 };
-                let outcome = if proof {
-                    self.stage_derived_proof(&mut staged, &request, options, limits)?
-                } else {
-                    let checked = match staged.public.admit_existing_deriving(
-                        &request,
-                        Some(staged.private.environment()),
-                        options,
-                        limits,
-                    )? {
-                        Outcome::Complete(checked) => checked,
-                        Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
-                        Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
-                    };
-                    self.stage_derived_data(&mut staged, checked, options, limits)?
+                let outcome = match publication {
+                    HandlerPublication::Proof => {
+                        self.stage_derived_proof(&mut staged, &request, options, limits)?
+                    }
+                    HandlerPublication::HiddenHashHelper => {
+                        self.stage_derived_hashable(&mut staged, &request, options, limits)?
+                    }
+                    HandlerPublication::Exposed => {
+                        let checked = match staged.public.admit_existing_deriving(
+                            &request,
+                            Some(staged.private.environment()),
+                            options,
+                            limits,
+                        )? {
+                            Outcome::Complete(checked) => checked,
+                            Outcome::Inconclusive(reason) => {
+                                return Ok(Outcome::Inconclusive(reason));
+                            }
+                            Outcome::InternalFault(fault) => {
+                                return Ok(Outcome::InternalFault(fault));
+                            }
+                        };
+                        self.stage_derived_data(&mut staged, checked, options, limits)?
+                    }
                 };
                 match outcome {
                     Outcome::Complete(()) => {}
@@ -329,6 +343,84 @@ impl PublicWorld<'_> {
         staged.private = checked.engine;
         staged.admissions.extend(checked.admissions);
         staged.declarations.push(interface);
+        Ok(Outcome::Complete(()))
+    }
+
+    fn stage_derived_hashable(
+        &mut self,
+        staged: &mut Staged,
+        request: &ExistingDeriving,
+        options: &KVMap,
+        limits: EngineAdmissionLimits,
+    ) -> Result<Outcome<()>, EngineExecutionError> {
+        // The pin emits @[no_expose] on the hash helper, so its body can use
+        // private constructors and instances. The public dictionary only names
+        // that helper and must still pass both judges in the public world.
+        let checked = match staged
+            .private
+            .admit_existing_deriving(request, None, options, limits)?
+        {
+            Outcome::Complete(checked) => checked,
+            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+        };
+        let [helper, dictionary] = checked.admissions.as_slice() else {
+            return Err(EngineExecutionError::UnexpectedPublication {
+                detail: "Hashable deriving must admit its complete helper and dictionary",
+            });
+        };
+        let (Declaration::Defn(helper), Declaration::Defn(dictionary)) =
+            (&helper.declaration, &dictionary.declaration)
+        else {
+            return Err(EngineExecutionError::UnexpectedPublication {
+                detail: "Hashable deriving must retain its checked definition kinds",
+            });
+        };
+        if helper.safety != DefinitionSafety::Safe
+            || dictionary.safety != DefinitionSafety::Safe
+            || helper.base.name != Name::str(dictionary.base.name.clone(), "hash")
+        {
+            return Err(EngineExecutionError::UnexpectedPublication {
+                detail: "Hashable deriving requires its actual safe auxiliary definition",
+            });
+        }
+        let name = dictionary.base.name.clone();
+        // Build an interface only from the successful helper admission. Its
+        // public check rejects any private dependency in the generated header.
+        let interface = Declaration::Axiom(AxiomVal {
+            base: helper.base.clone(),
+            is_unsafe: false,
+        });
+        let declarations = [interface, Declaration::Defn(dictionary.clone())];
+        self.meter
+            .work(declarations.len())
+            .map_err(execution_error)?;
+        let public = match staged
+            .public
+            .admit_declarations(&declarations, options, limits)
+            .map_err(EngineExecutionError::from)?
+        {
+            Outcome::Complete(public) => public,
+            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+        };
+        let next = match public.engine.register_checked_source_instance(
+            &name,
+            1000,
+            None,
+            false,
+            limits.kernel,
+        )? {
+            Outcome::Complete(next) => next,
+            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+        };
+        // Each world registered its own checked instance exactly once. No
+        // replay of the public metadata may duplicate the private journal.
+        staged.public = next;
+        staged.private = checked.engine;
+        staged.admissions.extend(checked.admissions);
+        staged.declarations.extend(declarations);
         Ok(Outcome::Complete(()))
     }
 }

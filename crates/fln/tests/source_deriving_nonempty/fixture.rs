@@ -133,6 +133,9 @@ pub(super) fn admitted(library: &Path) -> Engine {
         "Classical.ofNonempty",
         "instNonemptyOfInhabited",
         "Pi.instNonempty",
+        // The genuine private-constructor Provider's generated noConfusion
+        // definitions require this original equality eliminator wrapper.
+        "Eq.ndrec",
     ]
     .map(name)
     .into_iter()

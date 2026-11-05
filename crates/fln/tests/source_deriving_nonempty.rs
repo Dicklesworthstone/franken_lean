@@ -16,6 +16,9 @@ use std::sync::OnceLock;
 #[path = "source_deriving_nonempty/fixture.rs"]
 mod fixture;
 
+#[path = "fixtures/private_constructor_deriving/mod.rs"]
+mod private_constructor_fixture;
+
 const STACK: usize = 16 * 1024 * 1024;
 const BYTES: usize = 128 * 1024 * 1024;
 
@@ -440,6 +443,44 @@ deriving Nonempty
 def recovered : Nonempty Recovery := inferInstance
 "#,
         );
+    });
+}
+
+#[test]
+fn legacy_standalone_nonempty_accepts_private_constructors_without_requested_exposure() {
+    with_foundation(|base| {
+        // Native private-constructor syntax is not implemented. Import the
+        // actual pin's complete artifact before exercising legacy derivation.
+        let imported = private_constructor_fixture::admitted(base, admission());
+        let local = checked(
+            &imported,
+            "deriving instance Nonempty for LegacyProof\ndef witness : Nonempty LegacyProof := inferInstance",
+        );
+        let environment = local.environment();
+        // Imported-module suffix naming is a separate existing limitation;
+        // select the actual derived dictionary through its checked registry.
+        let registry = InstanceRegistry::read(environment).unwrap();
+        let derived: Vec<_> = registry
+            .candidates(&name("Nonempty"))
+            .iter()
+            .filter(|instance| !imported.environment().contains(&instance.declaration))
+            .collect();
+        assert_eq!(derived.len(), 1);
+        let label = &derived[0].declaration;
+        let Some(ConstantInfo::Thm(proof)) = environment.find(label) else {
+            panic!("legacy deriving retains the checked proof of its private constructor");
+        };
+        assert!(references(
+            &proof.value,
+            &private("Provider", "LegacyProof.mk")
+        ));
+        assert_eq!(
+            ReducibilityTable::effective(environment)
+                .unwrap()
+                .status(label),
+            Reducibility::Semireducible
+        );
+        assert!(!imported.environment().contains(label));
     });
 }
 

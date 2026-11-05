@@ -329,7 +329,7 @@ impl Engine {
     ) -> Result<Outcome<DeclarationBatchAdmission>, EngineExecutionError> {
         let parsed = match parsed {
             ScopedCommandSyntax::Deriving(syntax) => {
-                let request =
+                let mut request =
                     match elaboration_outcome(fln_elab::source::deriving::prepare_existing(
                         &syntax,
                         self.environment(),
@@ -340,6 +340,11 @@ impl Engine {
                         Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
                         Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
                     };
+                // Preparing a public target selects exposed data publication,
+                // but this direct path has no public world to publish into.
+                // Hidden helpers and proof handlers must see only an exposure
+                // attribute actually requested in the surrounding scope.
+                request.scope.expose_definitions = scope.expose_definitions;
                 return self.admit_existing_deriving(&request, None, options, limits);
             }
             ScopedCommandSyntax::Mutual(members) => {

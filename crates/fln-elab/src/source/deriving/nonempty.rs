@@ -32,44 +32,6 @@ fn class_type(context: &mut Context, carrier: &Expr) -> Result<Typed, NatDefinit
     call(context, "Nonempty", &[carrier])
 }
 
-fn private_name(context: &mut Context, name: &Name) -> Result<bool, NatDefinitionElabError> {
-    let mut prefix = name.clone();
-    while !prefix.is_anonymous() {
-        context.tick()?;
-        if prefix == named("_private") {
-            return Ok(true);
-        }
-        prefix = prefix.parent();
-    }
-    Ok(false)
-}
-
-/// `withoutExposeFromCtors` inspects every member of a mutual family. A
-/// requested expose attribute on a public type with any private constructor is
-/// an error even though the derived instance is a theorem with a hidden proof.
-fn check_exposure(
-    context: &mut Context,
-    family: &InductiveVal,
-) -> Result<(), NatDefinitionElabError> {
-    if !context.source_scope.expose_definitions || private_name(context, &family.base.name)? {
-        return Ok(());
-    }
-    for name in &family.all {
-        context.tick()?;
-        let Some(ConstantInfo::Induct(member)) = context.txn.env.find(name).cloned() else {
-            return Err(unsupported(&family.base.name));
-        };
-        for constructor in &member.ctors {
-            if private_name(context, constructor)? {
-                return Err(NatDefinitionElabError::UnexpectedSyntax {
-                    expected: "Nonempty deriving without expose for a public type with private constructors",
-                });
-            }
-        }
-    }
-    Ok(())
-}
-
 fn local(
     context: &mut Context,
     name: Name,

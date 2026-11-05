@@ -6,6 +6,7 @@ use super::*;
 use fln_env::constants::{ConstantInfo, InductiveVal};
 mod beq;
 mod decidable_eq;
+mod hashable;
 mod nonempty;
 mod repr;
 
@@ -16,6 +17,7 @@ pub enum DerivingError {
     CannotDerive(Name),
     CannotDeriveBEq(Name),
     CannotDeriveDecidableEq(Name),
+    CannotDeriveHashable(Name),
     CannotDeriveNonempty(Name),
     CannotDeriveRepr(Name),
 }
@@ -55,6 +57,11 @@ impl std::fmt::Display for DerivingError {
             Self::CannotDeriveDecidableEq(name) => write!(
                 f,
                 "failed to generate DecidableEq instance for {}",
+                name.to_display_string()
+            ),
+            Self::CannotDeriveHashable(name) => write!(
+                f,
+                "failed to generate Hashable instance for {}",
                 name.to_display_string()
             ),
             Self::CannotDeriveNonempty(name) => write!(
@@ -100,17 +107,32 @@ pub fn is_command(syntax: &Syntax) -> bool {
     syntax.kind() == Some(&parser_kind(&["Command", "deriving"]))
 }
 
-/// Public module publication gives proof handlers a checked private body and
-/// an independently checked opaque interface. Resolve aliases exactly as the
-/// handler dispatcher does before choosing that publication path.
-pub fn is_proof_handler(
+/// The pin's generated declaration visibility, never admission authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HandlerPublication {
+    Exposed,
+    HiddenHashHelper,
+    Proof,
+}
+
+/// Resolve aliases exactly as the handler dispatcher does before selecting
+/// which generated bodies need a checked private implementation. Hashable
+/// deliberately hides its auxiliary function even in an exposed section.
+pub fn handler_publication(
     handler: &Name,
     environment: &Environment,
     kernel: Budget,
     scope: &SourceScope,
-) -> Result<bool, NatDefinitionElabError> {
+) -> Result<HandlerPublication, NatDefinitionElabError> {
     let mut context = Context::scoped(environment, kernel, scope)?;
-    Ok(context.resolve_source_name(handler)?.as_ref() == Some(&named("Nonempty")))
+    let handler = context.resolve_source_name(handler)?;
+    Ok(if handler.as_ref() == Some(&named("Nonempty")) {
+        HandlerPublication::Proof
+    } else if handler.as_ref() == Some(&named("Hashable")) {
+        HandlerPublication::HiddenHashHelper
+    } else {
+        HandlerPublication::Exposed
+    })
 }
 
 fn command_parts(syntax: &Syntax) -> Result<(&[Syntax], &[Syntax]), NatDefinitionElabError> {
@@ -318,6 +340,44 @@ fn unsupported(name: &Name) -> NatDefinitionElabError {
     failure(SourceInferenceError::Deriving(
         DerivingError::UnsupportedFamily(name.clone()),
     ))
+}
+
+fn private_name(context: &mut Context, name: &Name) -> Result<bool, NatDefinitionElabError> {
+    let mut prefix = name.clone();
+    while !prefix.is_anonymous() {
+        context.tick()?;
+        if prefix == named("_private") {
+            return Ok(true);
+        }
+        prefix = prefix.parent();
+    }
+    Ok(false)
+}
+
+/// `withoutExposeFromCtors` inspects every member of a mutual family. A
+/// requested expose attribute on a public type with any private constructor is
+/// an error even when its generated helper or proof body remains hidden.
+fn check_exposure(
+    context: &mut Context,
+    family: &InductiveVal,
+) -> Result<(), NatDefinitionElabError> {
+    if !context.source_scope.expose_definitions || private_name(context, &family.base.name)? {
+        return Ok(());
+    }
+    for name in &family.all {
+        context.tick()?;
+        let Some(ConstantInfo::Induct(member)) = context.txn.env.find(name).cloned() else {
+            return Err(unsupported(&family.base.name));
+        };
+        for constructor in &member.ctors {
+            if private_name(context, constructor)? {
+                return Err(NatDefinitionElabError::UnexpectedSyntax {
+                    expected: "deriving without expose for a public type with private constructors",
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 fn normal_failure(error: &NatDefinitionElabError) -> bool {
@@ -676,10 +736,12 @@ pub fn elaborate_handler_with_names(
     let is_repr = handler_name.as_ref() == Some(&named("Repr"));
     let is_beq = handler_name.as_ref() == Some(&named("BEq"));
     let is_decidable_eq = handler_name.as_ref() == Some(&named("DecidableEq"));
+    let is_hashable = handler_name.as_ref() == Some(&named("Hashable"));
     let is_nonempty = handler_name.as_ref() == Some(&named("Nonempty"));
     if !is_repr
         && !is_beq
         && !is_decidable_eq
+        && !is_hashable
         && !is_nonempty
         && handler_name.as_ref() != Some(&named("Inhabited"))
     {
@@ -693,7 +755,7 @@ pub fn elaborate_handler_with_names(
     let Some(ConstantInfo::Induct(family)) = environment.find(type_name) else {
         return Err(unsupported(type_name));
     };
-    if family.is_unsafe || (family.num_indices != 0 && !is_repr && !is_nonempty) {
+    if family.is_unsafe || (family.num_indices != 0 && !is_repr && !is_hashable && !is_nonempty) {
         return Err(unsupported(type_name));
     }
     let budget = crate::records::RecordBudget::default();
@@ -759,6 +821,14 @@ pub fn elaborate_handler_with_names(
         return match decidable_eq::elaborate(&mut context, family, &parameters, &target) {
             Err(error) if normal_failure(&error) => Err(failure(SourceInferenceError::Deriving(
                 DerivingError::CannotDeriveDecidableEq(type_name.clone()),
+            ))),
+            result => result,
+        };
+    }
+    if is_hashable {
+        return match hashable::elaborate(&mut context, family, &parameters, &target) {
+            Err(error) if normal_failure(&error) => Err(failure(SourceInferenceError::Deriving(
+                DerivingError::CannotDeriveHashable(type_name.clone()),
             ))),
             result => result,
         };
