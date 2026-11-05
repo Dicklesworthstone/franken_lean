@@ -1247,6 +1247,231 @@ fn erased_dynamic_contracts_do_not_authorize_mismatches_or_overapplication() {
 }
 
 #[test]
+fn erased_partial_applications_transfer_owned_captures_through_stages_and_replay() {
+    let _guard = lock();
+    for mode in ["full", "partial", "staged"] {
+        for terminal in [false, true] {
+            let mut code = vec![
+                Instruction::String {
+                    dst: r(0),
+                    value: "erased-capture".to_string(),
+                },
+                Instruction::Nat {
+                    dst: r(1),
+                    value: 20,
+                },
+                Instruction::Nat {
+                    dst: r(2),
+                    value: 22,
+                },
+                Instruction::Closure {
+                    dst: r(3),
+                    function: fid(1),
+                    captures: Vec::new(),
+                    capture_ownership: Vec::new(),
+                },
+            ];
+            let (closure, args, argument_ownership) = if mode == "staged" {
+                code.extend([
+                    Instruction::Apply {
+                        dst: r(4),
+                        closure: r(3),
+                        args: vec![r(0)],
+                        argument_ownership: vec![ArgumentOwnership::Owned],
+                        result_ownership: CallableResultOwnership::Erased,
+                    },
+                    Instruction::Apply {
+                        dst: r(5),
+                        closure: r(4),
+                        args: vec![r(1)],
+                        argument_ownership: vec![ArgumentOwnership::Borrowed],
+                        result_ownership: CallableResultOwnership::Erased,
+                    },
+                    Instruction::Apply {
+                        dst: r(6),
+                        closure: r(5),
+                        args: vec![r(2)],
+                        argument_ownership: vec![ArgumentOwnership::Borrowed],
+                        result_ownership: CallableResultOwnership::Erased,
+                    },
+                ]);
+                // Reusing the partial closure transfers another owned handle
+                // to the same captured value; the first result stays alive.
+                (r(5), vec![r(2)], vec![ArgumentOwnership::Borrowed])
+            } else if mode == "partial" {
+                (r(3), vec![r(0)], vec![ArgumentOwnership::Owned])
+            } else {
+                (
+                    r(3),
+                    vec![r(0), r(1), r(2)],
+                    vec![
+                        ArgumentOwnership::Owned,
+                        ArgumentOwnership::Borrowed,
+                        ArgumentOwnership::Borrowed,
+                    ],
+                )
+            };
+            code.push(if terminal {
+                Instruction::TailApply {
+                    closure,
+                    args,
+                    argument_ownership,
+                    result_ownership: CallableResultOwnership::Erased,
+                }
+            } else {
+                Instruction::Apply {
+                    dst: r(7),
+                    closure,
+                    args,
+                    argument_ownership,
+                    result_ownership: CallableResultOwnership::Erased,
+                }
+            });
+            if !terminal {
+                code.push(Instruction::Return { src: r(7) });
+            }
+            let source = validated(vec![
+                function_with_callable_result(
+                    0,
+                    Vec::new(),
+                    CallableResultOwnership::Erased,
+                    8,
+                    code,
+                ),
+                function_with_callable_result(
+                    1,
+                    vec![
+                        ArgumentOwnership::Owned,
+                        ArgumentOwnership::Borrowed,
+                        ArgumentOwnership::Borrowed,
+                    ],
+                    CallableResultOwnership::Erased,
+                    3,
+                    vec![Instruction::Return { src: r(0) }],
+                ),
+            ]);
+            let owned = insert_ownership(&source, OwnershipLimits::default()).unwrap();
+            let bytes = encode_canonical(owned.program(), CodecLimits::default()).unwrap();
+            let decoded = decode_canonical(&bytes, CodecLimits::default()).unwrap();
+            let replay = validate_ownership_candidate(
+                &source,
+                decoded,
+                owned.witness().clone(),
+                OwnershipLimits::default(),
+            )
+            .unwrap();
+            shadow::enable();
+            for program in [&source, replay.program()] {
+                let completed = returned(execute(program, ExecutionLimits::default(), None));
+                if mode == "partial" {
+                    let (arity, captures) = completed.value.closure_shell_parts().unwrap();
+                    assert_eq!(arity, 4);
+                    assert_eq!(captures.len(), 2);
+                    assert_eq!(captures[0].unbox(), 1);
+                    assert_eq!(string_contents(&captures[1]), "erased-capture");
+                    assert_eq!(completed.usage.peak_stack_depth, 1);
+                } else {
+                    assert_eq!(string_contents(&completed.value), "erased-capture");
+                }
+            }
+            let (events, live) = shadow::disable_and_drain();
+            assert_eq!(live, 0, "{mode}, terminal={terminal}");
+            assert!(events.iter().all(|event| !matches!(
+                event.kind,
+                shadow::EventKind::DoubleRelease | shadow::EventKind::ForeignPointer
+            )));
+        }
+    }
+}
+
+#[test]
+fn erased_partial_applications_preserve_typed_contracts_and_unique_capture_refusal() {
+    let _guard = lock();
+    for (callee_result, call_result, argument) in [
+        (
+            CallableResultOwnership::Owned,
+            CallableResultOwnership::Erased,
+            ArgumentOwnership::Owned,
+        ),
+        (
+            CallableResultOwnership::Erased,
+            CallableResultOwnership::Scalar,
+            ArgumentOwnership::Owned,
+        ),
+        (
+            CallableResultOwnership::Erased,
+            CallableResultOwnership::OwnedOrScalar,
+            ArgumentOwnership::Owned,
+        ),
+        (
+            CallableResultOwnership::Erased,
+            CallableResultOwnership::Erased,
+            ArgumentOwnership::Unique,
+        ),
+    ] {
+        let source = validated(vec![
+            function_with_callable_result(
+                0,
+                Vec::new(),
+                call_result,
+                3,
+                vec![
+                    Instruction::String {
+                        dst: r(0),
+                        value: "refused-erased-capture".to_string(),
+                    },
+                    Instruction::Closure {
+                        dst: r(1),
+                        function: fid(1),
+                        captures: Vec::new(),
+                        capture_ownership: Vec::new(),
+                    },
+                    Instruction::Apply {
+                        dst: r(2),
+                        closure: r(1),
+                        args: vec![r(0)],
+                        argument_ownership: vec![argument],
+                        result_ownership: call_result,
+                    },
+                    Instruction::Return { src: r(2) },
+                ],
+            ),
+            function_with_callable_result(
+                1,
+                vec![argument, ArgumentOwnership::Borrowed],
+                callee_result,
+                2,
+                vec![Instruction::Return { src: r(0) }],
+            ),
+        ]);
+        let owned = insert_ownership(&source, OwnershipLimits::default()).unwrap();
+        let bytes = encode_canonical(owned.program(), CodecLimits::default()).unwrap();
+        let replay = decode_canonical(&bytes, CodecLimits::default()).unwrap();
+        shadow::enable();
+        for program in [&source, &replay] {
+            let outcome = execute(program, ExecutionLimits::default(), None);
+            if argument == ArgumentOwnership::Unique {
+                assert!(matches!(outcome, Outcome::Complete(VmExit::Refused {
+                    refusal: VmRefusal::ApplyUniquePartial { function, argument: 0 }, ..
+                }) if function == fid(1)));
+            } else {
+                assert!(matches!(outcome, Outcome::Complete(VmExit::Refused {
+                    refusal: VmRefusal::ApplyResultOwnershipMismatch {
+                        function, expected: CallableResultOwnership::Owned, actual,
+                    }, ..
+                }) if function == fid(1) && actual == call_result));
+            }
+        }
+        let (events, live) = shadow::disable_and_drain();
+        assert_eq!(live, 0, "refused partial application retains no captures");
+        assert!(events.iter().all(|event| !matches!(
+            event.kind,
+            shadow::EventKind::DoubleRelease | shadow::EventKind::ForeignPointer
+        )));
+    }
+}
+
+#[test]
 fn nat_callable_union_still_refuses_strings_and_negative_mpz() {
     let _guard = lock();
     for negative_mpz in [false, true] {

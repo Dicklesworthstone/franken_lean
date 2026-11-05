@@ -4246,6 +4246,14 @@ fn validate_inspected_apply(
     if let Some(actual) = result_ownership
         && argument_count <= required
         && actual != expected_result_ownership
+        // An erased callable retains its erased result interface while
+        // being applied in stages. The newly created partial closure is an
+        // owned ABI value, which schema v16's Erased contract transfers just
+        // like a completed erased result. Typed callables and saturated
+        // calls still require their exact declared result disposition.
+        && !(argument_count < required
+            && actual == CallableResultOwnership::Erased
+            && callee.result_ownership == CallableResultOwnership::Erased)
     {
         return Err(VmRefusal::ApplyResultOwnershipMismatch {
             function,
