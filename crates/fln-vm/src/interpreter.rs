@@ -6107,14 +6107,10 @@ fn dispatch_intrinsic(
             expect_arity(row, args, 2)?;
             let left = uint64_argument(&args[0], "UInt64.mixHash", 0)?;
             let right = uint64_argument(&args[1], "UInt64.mixHash", 1)?;
-            let m: u64 = 0xc6a4_a793_5bd1_e995;
-            let r: u32 = 47;
-            let mut k = right.wrapping_mul(m);
-            k ^= k >> r;
-            k = k.wrapping_mul(m);
-            let mut h = left ^ k;
-            h = h.wrapping_mul(m);
-            Ok(uint64_result(h))
+            // The pinned mixer XORs the scrambled key with its multiplier.
+            // Share the term plane's already-qualified compatibility primitive;
+            // classic Murmur's second multiplication produces different hashes.
+            Ok(uint64_result(fln_core::lean_hash::mix_hash(left, right)))
         }
         IntrinsicImplementation::USizeAdd
         | IntrinsicImplementation::USizeSub
@@ -10692,6 +10688,39 @@ mod tests {
         ); // -1 < 1
         assert_eq!(i32_val(invoke("extern:Int32.ofInt", &[i(-50000)])), -50000);
         assert_eq!(int_i64(invoke("extern:Int32.toInt", &[n(0xFFFF_FFFF)])), -1);
+    }
+
+    #[test]
+    fn uint64_mix_hash_matches_pinned_vectors_and_native_ownership() {
+        // Exact Lean v4.32.0 executable observations, including zero, input
+        // order, the high bit, and a nested product hash. Inputs use the real
+        // boxed UInt64 carrier, so scalar result validation runs as well.
+        let word = |value: u64| Obj::mk_ctor(0, Vec::new(), &value.to_ne_bytes());
+        for (left, right, expected) in [
+            (0, 0, 3_866_779_316_627_607_737),
+            (7, 11, 14_200_442_188_093_677_519),
+            (11, 7, 16_711_882_385_117_503_612),
+            (u64::MAX, 1_u64 << 63, 3_117_938_936_229_954_994),
+        ] {
+            assert_eq!(
+                u64_val(invoke("extern:mixHash", &[word(left), word(right)])),
+                expected,
+                "mixHash({left}, {right})",
+            );
+        }
+        let first = invoke("extern:mixHash", &[word(0), word(7)]).unwrap();
+        assert_eq!(
+            u64_val(invoke("extern:mixHash", &[first, word(11)])),
+            6_296_794_202_839_683_667,
+        );
+        assert!(matches!(
+            invoke("extern:mixHash", &[word(0)]),
+            Err(VmRefusal::IntrinsicArity {
+                expected: 2,
+                actual: 1,
+                ..
+            }),
+        ));
     }
 
     #[test]
