@@ -5,6 +5,7 @@
 //! equation backend. Where a constructor split or structural root needs Nat's
 //! fields, expose only one constructor layer and keep the predecessor compact.
 use super::*;
+use crate::tactic_macros::TacticMacroError;
 use fln_bignum::nat::BigNat;
 use fln_core::expr::{Literal, NatLit};
 
@@ -16,9 +17,24 @@ enum Value {
     Char(char),
 }
 
+fn literal_kind(kind: &Name) -> bool {
+    ["num", "str", "char"]
+        .iter()
+        .any(|literal| *kind == Name::from_components([*literal]))
+}
+
 pub(super) struct LiteralPattern<'a> {
     value: Value,
     syntax: Cow<'a, Syntax>,
+}
+
+impl LiteralPattern<'_> {
+    pub(super) fn expanded_syntax(&self) -> Option<&Syntax> {
+        match &self.syntax {
+            Cow::Owned(syntax) => Some(syntax),
+            Cow::Borrowed(_) => None,
+        }
+    }
 }
 
 impl Context {
@@ -26,7 +42,44 @@ impl Context {
         &mut self,
         syntax: &'a Syntax,
     ) -> Result<Option<LiteralPattern<'a>>, NatDefinitionElabError> {
-        let Syntax::Node { kind, args, .. } = syntax else {
+        // Match.expandMacrosInPatterns expands literal nodes before pattern
+        // decoding, while leaving identifier pattern binders alone. The source
+        // pass defers these atoms, so use the same owned provider, Macro.State
+        // and budgets as term visits. Matrix storage owns any replacement.
+        let mut syntax = Cow::Borrowed(syntax);
+        if let Some(provider) = self.source_scope.tactic_macros.clone() {
+            if !syntax.kind().is_some_and(literal_kind) {
+                return Ok(None);
+            }
+            let mut depth = self.tactic_macro_depth;
+            loop {
+                self.tick()?;
+                let Some(expanded) = provider
+                    .0
+                    .expand_term(syntax.as_ref(), depth, &self.txn.env, &self.source_scope)
+                    .map_err(tactics::imported_macros::macro_error)?
+                else {
+                    break;
+                };
+                if !expanded.kind().is_some_and(literal_kind) {
+                    return Err(tactics::imported_macros::macro_error(
+                        TacticMacroError::Unsupported(
+                            "literal macros producing nonliteral patterns require general pattern expansion"
+                                .into(),
+                        ),
+                    ));
+                }
+                syntax = Cow::Owned(expanded);
+                depth = depth.checked_add(1).ok_or_else(|| {
+                    tactics::imported_macros::macro_error(TacticMacroError::Inconclusive(Box::new(
+                        fln_core::outcome::Inconclusive::dependency_unavailable(
+                            "pattern macro recursion depth overflow",
+                        ),
+                    )))
+                })?;
+            }
+        }
+        let Syntax::Node { kind, args, .. } = syntax.as_ref() else {
             return Ok(None);
         };
         let natural = kind == &Name::from_components(["num"]);
@@ -55,10 +108,7 @@ impl Context {
         } else {
             Value::Char(super::super::character::decode_character(val)?)
         };
-        Ok(Some(LiteralPattern {
-            value,
-            syntax: Cow::Borrowed(syntax),
-        }))
+        Ok(Some(LiteralPattern { value, syntax }))
     }
 
     fn same_pattern_literal(
@@ -249,6 +299,13 @@ impl Context {
                 vec![function, null(arguments)],
             )
         };
+        // This operand is already decoded, including compact predecessors
+        // created while splitting Nat constructors. It is compiler input now,
+        // not a new source literal eligible for another macro expansion.
+        let syntax = Syntax::node(
+            parser_kind(&["Term", "flnPreparedPatternLiteral"]),
+            vec![syntax],
+        );
         let operands = vec![identifier(subject.clone()), syntax];
         let test = if matches!(value, Value::Nat(_)) {
             application(identifier(Name::from_components(["Nat", "beq"])), operands)

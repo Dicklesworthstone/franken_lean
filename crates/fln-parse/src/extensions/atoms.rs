@@ -5,7 +5,9 @@
 //! eagerly rewriting those leaves changes the program before elaboration.
 use super::*;
 
-pub(super) fn is_kind(kind: &Name) -> bool {
+/// Syntax kinds whose macros run at native term or pattern positions, not on
+/// every literal or identifier appearing in a source command.
+pub fn is_kind(kind: &Name) -> bool {
     ["num", "str", "ident", "char", "scientific", "name"]
         .iter()
         .any(|name| *kind == Name::from_components([*name]))

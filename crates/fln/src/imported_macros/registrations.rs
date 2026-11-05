@@ -907,6 +907,31 @@ impl RegisteredMacros {
         limits: MacroTreeLimits,
         cancellation: Option<&dyn CancellationProbe>,
     ) -> MacroTreeDispatch {
+        self.expand_tree_mode(input, invocation, limits, cancellation, false)
+    }
+
+    /// Source commands contain literal data as well as terms: universe levels,
+    /// projection indices and quoted names must reach their native consumers
+    /// unchanged. The owned elaborator provider expands deferred literal nodes
+    /// only when those consumers actually visit a term or literal pattern.
+    pub(crate) fn expand_source_tree_with_context(
+        &self,
+        input: &Syntax,
+        invocation: MacroDispatchInvocation<'_>,
+        limits: MacroTreeLimits,
+        cancellation: Option<&dyn CancellationProbe>,
+    ) -> MacroTreeDispatch {
+        self.expand_tree_mode(input, invocation, limits, cancellation, true)
+    }
+
+    fn expand_tree_mode(
+        &self,
+        input: &Syntax,
+        invocation: MacroDispatchInvocation<'_>,
+        limits: MacroTreeLimits,
+        cancellation: Option<&dyn CancellationProbe>,
+        defer_atomic: bool,
+    ) -> MacroTreeDispatch {
         let MacroDispatchInvocation {
             source,
             context,
@@ -927,6 +952,7 @@ impl RegisteredMacros {
             state,
             &mut report,
             &mut work,
+            defer_atomic,
         );
         MacroTreeDispatch {
             outcome,
@@ -943,6 +969,7 @@ impl RegisteredMacros {
         mut state: MacroState,
         report: &mut MacroDispatch,
         work: &mut ExpansionWork,
+        defer_atomic: bool,
     ) -> Outcome<Result<MacroTreeResult, MacroExecutionError>> {
         let ExpansionContext {
             source,
@@ -994,7 +1021,9 @@ impl RegisteredMacros {
                         built.push(syntax);
                         continue;
                     };
-                    if *kind == tactic {
+                    if *kind == tactic
+                        || (defer_atomic && fln_parse::extensions::is_atomic_macro_kind(kind))
+                    {
                         built.push(syntax);
                         continue;
                     }

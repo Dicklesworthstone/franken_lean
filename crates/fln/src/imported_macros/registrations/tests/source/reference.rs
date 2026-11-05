@@ -343,4 +343,75 @@ fn live_imported_ir_changes_source_checks_with_the_pins_order_and_scoped_behavio
         assert_declared_value(&checked.engine, declaration, value);
     }
     assert_eq!(engine.logical_root(&KVMap::new()), before);
+
+    // Source atomic templates use actual native term/pattern positions, while
+    // generated compound terms reenter the unchanged pinned artifact macros.
+    let atomic_client = r#"
+structure AtomicPair where
+  fst : Nat
+  snd : Nat
+section
+local macro_rules | `(1) => `(5 + 2)
+local macro_rules | `(2) => `(11)
+local macro_rules | `("source") => `(23)
+def mixedAtomicGenerated : Nat := 1
+def mixedAtomicUniverse : Sort 1 := Nat
+def mixedAtomicProjection : Nat := (AtomicPair.mk (Nat.succ Nat.zero) Nat.zero).1
+def mixedAtomicString : Nat := "source"
+def mixedAtomicChoose : Nat -> Nat
+  | 2 => 42
+  | _ => 0
+end
+def mixedAtomicPattern : Nat := mixedAtomicChoose 11
+theorem mixedAtomicPattern_eq : Eq mixedAtomicPattern 42 := Eq.refl mixedAtomicPattern
+"#;
+    let expected = [
+        ("mixedAtomicGenerated", 11),
+        ("mixedAtomicProjection", 1),
+        ("mixedAtomicString", 23),
+        ("mixedAtomicPattern", 42),
+    ];
+    let mut oracle = format!("import NativeSourceMacroModule\n{atomic_client}");
+    for (declaration, _) in expected {
+        oracle.push_str(&format!("#eval {declaration}\n"));
+    }
+    std::fs::write(dir.join("AtomicSourceClient.lean"), oracle).unwrap();
+    let result = Command::new(&reference)
+        .current_dir(&dir)
+        .env("LEAN_PATH", &dir)
+        .arg("AtomicSourceClient.lean")
+        .output()
+        .unwrap();
+    std::fs::write(dir.join("atomic-source.stdout"), &result.stdout).unwrap();
+    std::fs::write(dir.join("atomic-source.stderr"), &result.stderr).unwrap();
+    assert!(result.status.success(), "{dir:?}: {result:?}");
+    assert_eq!(result.stdout, b"11\n1\n23\n42\n");
+    assert!(result.stderr.is_empty());
+    let report = engine.check_source_files_with_imported_macros(
+        &[atomic_client.as_bytes()],
+        &KVMap::new(),
+        crate::source_check::SourceCheckLimits::new(admission()),
+        SourceMacroInvocation {
+            registry: &registry,
+            context: &context(),
+            state: MacroState::default(),
+            lookup: None,
+            limits: MacroTreeLimits::default(),
+            cancellation: None,
+        },
+    );
+    let Outcome::Complete(Ok(checked)) = &report.outcome else {
+        panic!("{dir:?}: {report:?}")
+    };
+    assert!(report.state.is_some());
+    for (declaration, value) in expected {
+        assert_declared_value(&checked.engine, declaration, value);
+    }
+    assert!(report.attempts.iter().any(|attempt| {
+        attempt.declaration == name("sourceChooseRight")
+            && attempt.reference_functions.iter().any(|function| {
+                function.name == name("sourceChooseRight") && function.producer() == "reference"
+            })
+    }));
+    assert_eq!(engine.logical_root(&KVMap::new()), before);
 }

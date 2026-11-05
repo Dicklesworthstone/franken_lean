@@ -341,6 +341,18 @@ fn recursive_output_cycles_do_not_evade_detection_with_fresh_holes() {
     assert!(!has_constant(&value.value, "looping"));
 }
 
+#[test]
+fn local_function_domains_are_inferred_after_dependent_parameters() {
+    let env = fln_elab::seed::bootstrap_nat_environment(budget()).unwrap();
+    // The missing domain is captured over both A and x : A before the call infers Nat.
+    accepted(
+        "def inferred : Nat :=
+          let keep (A : Type) (x : A) (value : _) := value
+          keep Nat 3 7",
+        &env,
+    );
+}
+
 fn dependent_pair() -> Environment {
     let mut env = fln_elab::seed::bootstrap_nat_environment(budget()).unwrap();
     let mut locals = LocalContext::new();

@@ -75,6 +75,7 @@ use std::sync::{Arc, OnceLock};
 
 mod artifacts;
 mod atoms;
+pub use atoms::is_kind as is_atomic_macro_kind;
 mod categories;
 pub(crate) use categories::{category_for_quotation, parse_category_quotation};
 mod commands;
