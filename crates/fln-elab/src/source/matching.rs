@@ -33,6 +33,7 @@ pub enum MatchError {
     InaccessibleParameter,
     DuplicateVariable,
     UnreachableRow,
+    UnsupportedGeneralization,
 }
 impl std::fmt::Display for MatchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -61,6 +62,9 @@ impl std::fmt::Display for MatchError {
             }
             Self::DuplicateVariable => "constructor pattern repeats a variable",
             Self::UnreachableRow => "pattern matrix contains a redundant or unreachable source row",
+            Self::UnsupportedGeneralization => {
+                "disabled match generalization requires an ordinary nonrecursive unindexed match"
+            }
         })
     }
 }
@@ -77,6 +81,43 @@ pub(super) struct MatchParts<'a> {
     /// A `match` as written in the source, not one a sugar or the compiler produced.
     written: bool,
     conditional: Option<ConditionalParts<'a>>,
+    generalizing: bool,
+}
+
+/// Read the canonical optional `Term.generalizingParam`. Omitting it has the
+/// same dependent-local behavior as `true` at the pin.
+pub(super) fn generalizing_annotation(syntax: &Syntax) -> Result<bool, NatDefinitionElabError> {
+    let values = expect_null_args(syntax, "optional generalizing parameter")?;
+    let [value] = values else {
+        return if values.is_empty() {
+            Ok(true)
+        } else {
+            Err(error(MatchError::InvalidPattern))
+        };
+    };
+    let parts = expect_node(
+        value,
+        &parser_kind(&["Term", "generalizingParam"]),
+        5,
+        "match generalizing parameter",
+    )?;
+    expect_atom(&parts[0], "(", "generalizing parameter opening")?;
+    expect_atom(&parts[1], "generalizing", "generalizing parameter keyword")?;
+    expect_atom(&parts[2], ":=", "generalizing parameter assignment")?;
+    expect_atom(&parts[4], ")", "generalizing parameter closing")?;
+    let value = parts[3].kind() == Some(&parser_kind(&["Term", "trueVal"]));
+    let literal = expect_node(
+        &parts[3],
+        &parser_kind(&["Term", if value { "trueVal" } else { "falseVal" }]),
+        1,
+        "literal generalizing parameter",
+    )?;
+    expect_atom(
+        &literal[0],
+        if value { "true" } else { "false" },
+        "generalizing Boolean",
+    )?;
+    Ok(value)
 }
 #[derive(Clone, Copy)]
 struct ConditionalParts<'a> {
@@ -278,6 +319,7 @@ impl Context {
                 alternatives: &[],
                 generated: true,
                 written: false,
+                generalizing: true,
                 conditional: Some(ConditionalParts {
                     binds_evidence: dependent,
                     binding,
@@ -311,6 +353,7 @@ impl Context {
                 alternatives: &[],
                 generated: true,
                 written: false,
+                generalizing: true,
                 conditional: Some(ConditionalParts {
                     binds_evidence,
                     binding,
@@ -327,7 +370,7 @@ impl Context {
             "match expression",
         )?;
         expect_atom(&parts[0], "match", "match keyword")?;
-        expect_empty_null(&parts[1], "unsupported generalizing annotation")?;
+        let generalizing = generalizing_annotation(&parts[1])?;
         expect_empty_null(&parts[2], "unsupported explicit motive")?;
         let [discriminant] = expect_null_args(&parts[3], "single discriminant")? else {
             return Err(error(MatchError::InvalidPattern));
@@ -372,6 +415,7 @@ impl Context {
             written: matches!(&parts[0], Syntax::Atom { info, .. }
                 if matches!(info, fln_syntax::source::SourceInfo::Original { .. })),
             conditional: None,
+            generalizing,
         })
     }
 
@@ -448,7 +492,12 @@ impl Context {
                 .abstract_fvar(id, 0)
                 .map_err(|_| failure(SourceInferenceError::Scope))?
         } else {
-            target.clone()
+            // The pin's motive abstracts the discriminant expression itself,
+            // including an application such as `inst a a` in Prelude's
+            // of_decide_eq_self_eq_true. Preserve the whole computed term as
+            // one binder; no local dependency or captured proof is rewritten.
+            let value = self.instantiate(&major.value)?;
+            self.kabstract(target, &value)?
         };
         let mut motive = Expr::lam(
             Name::anonymous(),
@@ -490,6 +539,9 @@ impl Context {
                 parts.alternatives,
             )?;
         }
+        if !parts.generalizing && (parts.generated || parts.equation.is_some()) {
+            return Err(error(MatchError::UnsupportedGeneralization));
+        }
         if let Some(state) = self.repeated_matrix_field(parts, &major, expected.as_ref())? {
             return Ok(MatchStart::Regular(Box::new(state)));
         }
@@ -498,6 +550,9 @@ impl Context {
         // equation-refining backend; typing faults and resource stops propagate.
         let recursive = self.is_recursive_match(&major.value);
         let well_founded = self.well_founded_continuation().is_some();
+        if !parts.generalizing && (recursive || well_founded) {
+            return Err(error(MatchError::UnsupportedGeneralization));
+        }
         if well_founded && parts.equation.is_some() {
             // That backend substitutes the whole local dependency cone. A
             // well-founded call must preserve original captured arguments;
@@ -565,6 +620,9 @@ impl Context {
         }
         if family.ctors.len() > 256 {
             return Err(failure(SourceInferenceError::ResourceLimit));
+        }
+        if !parts.generalizing && family.num_indices != 0 {
+            return Err(error(MatchError::UnsupportedGeneralization));
         }
         let recursor_name = Name::str(name.clone(), "rec");
         let Some(ConstantInfo::Rec(rec)) = self.txn.env.find(&recursor_name).cloned() else {
@@ -687,7 +745,7 @@ impl Context {
         let mut generalized = Vec::new();
         if recursive {
             self.recursive_indices(name, &parameters, &indices)?;
-        } else {
+        } else if parts.generalizing {
             // An ordinary, unindexed discriminant can also occur in a local's
             // type (Token n, Nat.below motive n). Generalize that dependent
             // telescope before specializing it to each constructor.
