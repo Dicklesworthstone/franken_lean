@@ -884,7 +884,13 @@ impl imported::SourceOleanImport {
             },
         ) {
             Ok(Outcome::Complete(run)) => {
-                match artifacts::encode_pending(&run.artifacts, write_budget, cancellation) {
+                match artifacts::encode_pending(
+                    &run.artifacts,
+                    write_budget,
+                    module_cancellation
+                        .as_ref()
+                        .map(|probe| probe as &dyn ModuleCancellationProbe),
+                ) {
                     Ok(outcome) => outcome.map_complete(|artifacts| {
                         Ok(SourceModuleBuild {
                             checked: run.result.checked,
