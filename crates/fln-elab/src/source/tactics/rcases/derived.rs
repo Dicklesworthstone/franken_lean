@@ -20,7 +20,7 @@ fn annotation(syntax: &Syntax) -> Result<Option<&Syntax>, NatDefinitionElabError
 }
 
 enum IntroStep<'a> {
-    Introduce(ProofGoal, usize),
+    Introduce(ProofGoal, usize, Vec<TrackedLocal>),
     Emit(Work<'a>),
 }
 
@@ -83,39 +83,56 @@ impl Context {
         if patterns.is_empty() {
             return Err(malformed());
         }
-        let mut pending = vec![IntroStep::Introduce(goal, 0)];
+        let mut pending = vec![IntroStep::Introduce(goal, 0, Vec::new())];
         let mut output = Vec::new();
         while let Some(step) = pending.pop() {
             self.tick()?;
-            let (mut goal, index) = match step {
+            let (mut goal, index, clears) = match step {
                 IntroStep::Emit(work) => {
                     output.push(work);
                     continue;
                 }
-                IntroStep::Introduce(goal, index) => (goal, index),
+                IntroStep::Introduce(goal, index, clears) => (goal, index, clears),
             };
             let Some(&pattern) = patterns.get(index) else {
+                let start = proof.work.len();
+                let goal = self.finish_rcases_clears(proof, goal, &clears)?;
                 output.push(Work::Goal(goal));
+                output.extend(proof.work.split_off(start).into_iter().rev());
                 continue;
             };
             self.txn.lctx = goal.lctx.clone();
             let name = self.fresh_name()?;
             self.introduce_proof_binder(&mut goal, name.clone())?;
             goal.lctx = self.txn.lctx.clone();
+            let id = goal
+                .lctx
+                .find_by_user_name(&name)
+                .ok_or_else(malformed)?
+                .id
+                .clone();
             let start = proof.work.len();
-            self.run_rcases_patterns(
+            let mut deferred = self.run_rcases_patterns(
                 proof,
                 goal,
                 arena.clone(),
                 vec![Subject {
-                    name,
+                    local: TrackedLocal {
+                        value: Expr::fvar(id),
+                    },
                     pattern,
                     rename: true,
+                    expected: None,
                 }],
+                clears,
+                false,
             )?;
             for work in proof.work.split_off(start) {
                 pending.push(match work {
-                    Work::Goal(child) => IntroStep::Introduce(child, index + 1),
+                    Work::Goal(child) => {
+                        let clears = deferred.remove(&child.id).ok_or_else(malformed)?;
+                        IntroStep::Introduce(child, index + 1, clears)
+                    }
                     work @ Work::Close(..) => IntroStep::Emit(work),
                     _ => return Err(malformed()),
                 });
@@ -146,8 +163,8 @@ impl Context {
             [assignment, values] => {
                 expect_atom(assignment, ":=", "obtain assignment")?;
                 let targets = separated(values, ",")?;
-                if targets.len() != 1 {
-                    return Err(error(TacticError::UnsupportedTactic(kind(&["obtain"]))));
+                if targets.is_empty() {
+                    return Err(malformed());
                 }
                 let pattern = pattern.cloned().unwrap_or_else(|| {
                     Syntax::node(kind(&["rcasesPat", "ignore"]), vec![atom("_")])
@@ -163,12 +180,20 @@ impl Context {
                         type_.clone(),
                     ],
                 );
+                let mut arguments = Vec::new();
+                for target in targets {
+                    self.tick()?;
+                    if !arguments.is_empty() {
+                        arguments.push(atom(","));
+                    }
+                    arguments.push(Syntax::node(
+                        kind(&["elimTarget"]),
+                        vec![null(vec![]), target.clone()],
+                    ));
+                }
                 let args = vec![
                     atom("rcases"),
-                    null(vec![Syntax::node(
-                        kind(&["elimTarget"]),
-                        vec![null(vec![]), targets[0].clone()],
-                    )]),
+                    null(arguments),
                     null(vec![atom("with"), pattern]),
                 ];
                 self.rcases_proof_goal(proof, goal, &args)
@@ -201,7 +226,7 @@ impl Context {
                 };
                 self.txn
                     .lctx
-                    .add_param(id, name.clone(), type_, BinderInfo::Default);
+                    .add_param(id.clone(), name, type_, BinderInfo::Default);
                 goal.introduced.push(local);
                 goal.lctx = self.txn.lctx.clone();
                 // The pin's assert/intro1 leaves the whole witness inaccessible.
@@ -211,10 +236,15 @@ impl Context {
                     goal,
                     arena,
                     vec![Subject {
-                        name,
+                        local: TrackedLocal {
+                            value: Expr::fvar(id),
+                        },
                         pattern,
                         rename: false,
+                        expected: None,
                     }],
+                    Vec::new(),
+                    true,
                 )?;
                 // LIFO: prove the witness before any branch can use it.
                 proof.work.push(Work::Goal(witness));

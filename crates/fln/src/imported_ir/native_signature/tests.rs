@@ -389,7 +389,7 @@ fn native_boxed_telescope_and_reserved_names_cannot_be_supplied_by_user_ir() {
     for target in [
         "Int.divExact._boxed",
         "Void.mk._boxed",
-        "ST.Prim.Ref.get._boxed",
+        "ST.Prim.Ref.ptrEq._boxed",
     ] {
         let unsupported = entry(
             vec![bind(

@@ -177,6 +177,106 @@ fn multiple_recursive_fields_select_distinct_deeper_subtrees() {
 }
 
 #[test]
+fn nested_option_and_list_descendants_keep_distinct_history_and_changing_arguments() {
+    let source = r#"inductive Nested where
+  | leaf : Nat → Nested
+  | child : Option Nested → Nested
+  | children : List Nested → Nested
+def Nested.walk (tree : Nested) (acc : Nat) : Nat := match tree with
+  | .leaf n => n + acc
+  | .child .none => acc
+  | .child (.some t) => Nested.walk t (acc + 1)
+  | .children .nil => acc
+  | .children (.cons t .nil) => Nested.walk t (acc + 2)
+  | .children (.cons first (.cons second _)) => Nested.walk first acc + Nested.walk second acc
+termination_by structural tree
+theorem nested_child (t : Nested) (acc : Nat) : Nested.walk (.child (.some t)) acc = Nested.walk t (acc + 1) := rfl
+theorem nested_children (a b : Nested) (rest : List Nested) (acc : Nat) : Nested.walk (.children (.cons a (.cons b rest))) acc = Nested.walk a acc + Nested.walk b acc := rfl
+example : Nested.walk (.children (.cons (.leaf 15) (.cons (.child (.some (.leaf 20))) .nil))) 3 = 42 := rfl
+"#;
+    let checked = check(source);
+    let wrong = "theorem wrong_child (left right : Nested) : Nested.walk (.children (.cons left (.cons right .nil))) 0 = Nested.walk left 0 + Nested.walk left 0 := rfl\n";
+    let root = checked.engine.logical_root(&KVMap::new());
+    assert!(
+        checked
+            .engine
+            .check_source_files(&[wrong.as_bytes()], &KVMap::new(), limits())
+            .is_err(),
+        "a sibling's history entry cannot be reused for another child"
+    );
+    assert_eq!(checked.engine.logical_root(&KVMap::new()), root);
+    reference(&format!("{source}{wrong}"), false);
+}
+
+#[test]
+fn nested_container_layers_preserve_polymorphic_results_and_uniform_parameters() {
+    check(
+        r#"inductive NestedValue (α : Type u) : Type u where
+  | leaf : α → NestedValue α
+  | children : List (Option (NestedValue α)) → NestedValue α
+def firstValue (fallback : α) : NestedValue α → α
+  | .leaf value => value
+  | .children .nil => fallback
+  | .children (.cons .none _) => fallback
+  | .children (.cons (.some child) _) => firstValue fallback child
+termination_by structural tree => tree
+theorem firstValue_step (fallback : α) (child : NestedValue α) (rest : List (Option (NestedValue α))) : firstValue fallback (.children (.cons (.some child) rest)) = firstValue fallback child := rfl
+example : firstValue 0 (.children (.cons (.some (.children (.cons (.some (.leaf 42)) .nil))) .nil)) = 42 := rfl
+"#,
+    );
+}
+
+#[test]
+fn nested_history_supports_propositions_depending_on_the_major_premise() {
+    check(
+        r#"inductive ProofTree where
+  | leaf : Nat → ProofTree
+  | child : Option ProofTree → ProofTree
+theorem ProofTree.childCongr (left right : ProofTree) (h : left = right) :
+    ProofTree.child (Option.some left) = ProofTree.child (Option.some right) := by
+  cases h
+  rfl
+def ProofTree.reflexive : (tree : ProofTree) → tree = tree
+  | .leaf _ => rfl
+  | .child .none => rfl
+  | .child (.some subtree) => ProofTree.childCongr subtree subtree (ProofTree.reflexive subtree)
+termination_by structural tree => tree
+theorem reflexive_tree (tree : ProofTree) : tree = tree := ProofTree.reflexive tree
+"#,
+    );
+}
+
+#[test]
+fn nested_history_refuses_the_original_major_other_values_and_unused_bad_calls() {
+    let base = engine();
+    let root = base.logical_root(&KVMap::new());
+    let program = |body| {
+        format!(
+            "inductive Nested where\n | leaf : Nat → Nested\n | child : Option Nested → Nested\ndef loop (other : Nested) (tree : Nested) : Nat := match tree with\n | .leaf n => n\n | .child .none => 0\n | .child (.some subtree) => {body}\ntermination_by structural tree\n"
+        )
+    };
+    check(&format!(
+        "{}theorem loop_ground : loop (.leaf 0) (.child (.some (.leaf 42))) = 42 := rfl\n",
+        program("loop other subtree")
+    ));
+    for body in [
+        "loop other (.child (.some subtree))",
+        "loop other other",
+        "let unused := loop other (.child (.some subtree)); loop other subtree",
+        "let invalid : Bool := subtree; loop other subtree",
+    ] {
+        let source = program(body);
+        assert!(
+            base.check_source_files(&[source.as_bytes()], &KVMap::new(), limits())
+                .is_err(),
+            "{source}"
+        );
+        assert_eq!(base.logical_root(&KVMap::new()), root);
+        reference(&source, false);
+    }
+}
+
+#[test]
 fn invalid_self_calls_and_original_typing_are_not_hidden_by_dictionary_search() {
     let base = engine();
     let root = base.logical_root(&KVMap::new());

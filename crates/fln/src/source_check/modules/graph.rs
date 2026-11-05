@@ -4,9 +4,6 @@ pub(super) struct Plan {
     pub(super) headers: Vec<SourceHeader>,
     pub(super) order: Vec<usize>,
     pub(super) entry: usize,
-    dependencies: Vec<Vec<usize>>,
-    exported_imports: Vec<Vec<Name>>,
-    exported_dependencies: Vec<Vec<usize>>,
 }
 impl Plan {
     pub(super) fn new(
@@ -60,8 +57,6 @@ impl Plan {
                 })?;
         let mut headers = Vec::new();
         let mut dependencies = Vec::new();
-        let mut exported_imports = Vec::new();
-        let mut exported_dependencies = Vec::new();
         let mut imports = 0usize;
         for module in modules {
             meter.work(1)?;
@@ -100,35 +95,6 @@ impl Plan {
                     }
                 })?);
             }
-            let visible: Vec<_> = if header.module_system {
-                // Select import rows before resolving graph edges. A private
-                // occurrence of A before `public import B; public import A`
-                // must not move A ahead of B in a consumer's instance order.
-                let mut visible = Vec::new();
-                if has_init {
-                    visible.push(Name::from_components(["Init"]));
-                }
-                visible.extend(
-                    header
-                        .import_specs
-                        .iter()
-                        .filter(|import| import.public_at.is_some())
-                        .map(|import| import.module.clone()),
-                );
-                visible
-            } else {
-                header.imports.clone()
-            };
-            meter.work(visible.len())?;
-            // Every visible row was resolved above. Already admitted external
-            // imports retain their names but have no source graph edge.
-            exported_dependencies.push(
-                visible
-                    .iter()
-                    .filter_map(|name| by_name.get(name).copied())
-                    .collect(),
-            );
-            exported_imports.push(visible);
             headers.push(header);
             dependencies.push(direct);
         }
@@ -145,64 +111,7 @@ impl Plan {
             headers,
             order,
             entry,
-            dependencies,
-            exported_imports,
-            exported_dependencies,
         })
-    }
-
-    /// Imports visible through this module to its consumers. The pin's
-    /// implicit Init rows use Import's default `isExported = true`, even in a
-    /// module-system file; explicitly public imports follow in source order,
-    /// and unmodified imports remain private.
-    pub(super) fn visible_imports(&self, module: usize) -> &[Name] {
-        &self.exported_imports[module]
-    }
-
-    pub(super) fn dependencies_of(
-        &self,
-        module: usize,
-        modules: &[SourceModuleInput<'_>],
-        meter: &mut Meter,
-    ) -> Result<Vec<usize>, SourceModuleCheckError> {
-        self.dependencies_in(module, modules, meter, false)
-    }
-
-    pub(super) fn public_dependencies_of(
-        &self,
-        module: usize,
-        modules: &[SourceModuleInput<'_>],
-        meter: &mut Meter,
-    ) -> Result<Vec<usize>, SourceModuleCheckError> {
-        self.dependencies_in(module, modules, meter, true)
-    }
-
-    fn dependencies_in(
-        &self,
-        module: usize,
-        modules: &[SourceModuleInput<'_>],
-        meter: &mut Meter,
-        public_root: bool,
-    ) -> Result<Vec<usize>, SourceModuleCheckError> {
-        // Ordinary imports in a module-system file are private. Check those
-        // dependencies in the file itself without exposing them to consumers.
-        meter.work(self.dependencies.len())?;
-        let visible: Vec<_> = self
-            .dependencies
-            .iter()
-            .enumerate()
-            .map(|(index, imports)| {
-                if (index != module || public_root) && self.headers[index].module_system {
-                    self.exported_dependencies[index].clone()
-                } else {
-                    imports.clone()
-                }
-            })
-            .collect();
-        let mut order = postorder(module, &visible, modules, meter)?;
-        let last = order.pop();
-        debug_assert_eq!(last, Some(module));
-        Ok(order)
     }
 }
 

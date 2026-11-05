@@ -1,4 +1,4 @@
-//! Course-of-values fallback for a single inductive family with local indices.
+//! Course-of-values fallback for a single, possibly nested family with local indices.
 //!
 //! Use the admitted family's below/brecOn definitions, not an unchecked self
 //! declaration. A private below parameter is generalized by ordinary dependent
@@ -179,6 +179,19 @@ impl Context {
             value: target.clone(),
             type_,
         })?;
+        // A nested block's auxiliary families have no source function in this
+        // candidate. Give them the pin's empty motive, PUnit at the very same
+        // universe. Their below dictionaries still retain every main-family
+        // descendant; only their own unused results are units. A carrier built
+        // from `target` could capture the outer major or indices and cease to
+        // be constant when the main functional abstracts those binders.
+        let neutral = Typed {
+            value: Expr::const_(
+                Name::from_components(["PUnit", "unit"]),
+                vec![universe.clone()],
+            ),
+            type_: Expr::const_(Name::from_components(["PUnit"]), vec![universe.clone()]),
+        };
         let mut motive = Expr::lam(
             major.user_name.clone(),
             family_type.clone(),
@@ -203,7 +216,7 @@ impl Context {
         let mut universes = if definition.base.level_params.len() == levels.len() {
             Vec::new()
         } else {
-            vec![universe]
+            vec![universe.clone()]
         };
         universes.extend(levels.iter().cloned());
         if universes.len() != definition.base.level_params.len() {
@@ -221,6 +234,21 @@ impl Context {
             recursor = self.course_apply(recursor, parameter.clone())?;
         }
         recursor = self.course_apply(recursor, motive)?;
+        for _ in 0..family.num_nested {
+            self.tick()?;
+            let type_ = self.whnf(&recursor.type_)?;
+            let ExprNode::ForallE { binder_type, .. } = type_.node() else {
+                return Err(error(RecursionError::NotDecreasing));
+            };
+            let motive = self.mutual_constant_function(
+                binder_type.clone(),
+                &Typed {
+                    value: neutral.type_.clone(),
+                    type_: Expr::sort(universe.clone()),
+                },
+            )?;
+            recursor = self.match_apply(recursor, motive)?;
+        }
         for index in &indices {
             recursor = self.course_apply(recursor, Expr::fvar(index.id.clone()))?;
         }
@@ -325,6 +353,15 @@ impl Context {
                 type_: functional_type.clone(),
             },
         )?;
+        for _ in 0..family.num_nested {
+            self.tick()?;
+            let type_ = self.whnf(&result.type_)?;
+            let ExprNode::ForallE { binder_type, .. } = type_.node() else {
+                return Err(error(RecursionError::NotDecreasing));
+            };
+            let functional = self.mutual_constant_function(binder_type.clone(), &neutral)?;
+            result = self.match_apply(result, functional)?;
+        }
         for position in &recursion.varying {
             result = self.course_apply(
                 result,
@@ -445,8 +482,13 @@ impl Context {
     ) -> Result<Expr, NatDefinitionElabError> {
         let (head, mut args) = self.course_spine(&below.type_)?;
         let expected_head = Name::str(family.clone(), "below");
+        let Some(ConstantInfo::Induct(info)) = self.txn.env.find(family) else {
+            return Err(error(RecursionError::NotDecreasing));
+        };
+        let motives = info.all.len().saturating_add(info.num_nested as usize);
         if !matches!(head.node(), ExprNode::Const { name, .. } if name == &expected_head)
-            || args.len() != parameters + requested.len() + 1
+            || info.all.len() != 1
+            || args.len() != parameters + motives + requested.len()
         {
             return Err(error(RecursionError::NotDecreasing));
         }

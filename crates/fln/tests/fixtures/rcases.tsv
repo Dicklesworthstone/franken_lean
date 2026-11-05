@@ -25,3 +25,50 @@ default_unpack	accept	theorem f (p q : Prop) (h : p ∧ q) : q := by rcases h; a
 default_empty	accept	theorem f (h : False) : False := by rcases h
 default_abstract	reject	theorem f (p : Prop) (h : p) : p := by rcases h; exact h
 default_removes_subject	reject	theorem f (p q : Prop) (h : p ∧ q) : p ∧ q := by rcases h; exact h
+rfl_right_orientation	accept	theorem f (n m : Nat) (h : n = m) : n = n := by rcases h with rfl; exact Eq.refl n
+rfl_dependent_hypothesis	accept	theorem f (n m : Nat) (h : n = m) (P : Nat → Prop) (hn : P n) : P m := by rcases h with rfl; exact hn
+rfl_proof_dependent_hypothesis	accept	theorem f (n m : Nat) (h : n = m) (P : n = m → Prop) (hp : P h) : P h := by rcases h with rfl; exact hp
+nested_rfl_right	accept	theorem f (n : Nat) (h : (0 = n) ∧ (n = 0)) : n = 0 := by rcases h with ⟨rfl, hz⟩; exact hz
+nested_rfl_left	accept	theorem f (n : Nat) (h : (n = 0) ∧ (n = 0)) : n = 0 := by rcases h with ⟨rfl, hz⟩; exact hz
+nested_rfl_annotation	accept	theorem f (n : Nat) (h : (0 = n) ∧ (n = 0)) : n = 0 := by rcases h with ⟨rfl, (hz : 0 = 0)⟩; exact hz
+annotation_infers_non_nat_literal_carrier	accept	inductive Token : Type where | zero\ninstance : OfNat Token 0 := ⟨Token.zero⟩\ntheorem f (h : ((0 : Token) = 0) ∧ True) : True := by rcases h with ⟨(hz : 0 = 0), ht⟩; exact ht
+rfl_alternatives	accept	theorem f (n : Nat) (h : (n = 0) ∨ (n = 0)) : n = 0 := by rcases h with rfl | rfl; rfl; rfl
+clear_leaf	accept	theorem f (p : Prop) (h : p) : True := by rcases h with -; exact True.intro
+clear_required_index	accept	theorem f (n : Nat) (h : n = n) : n = n := by rcases n with -; rfl
+clear_nested_tail	accept	theorem f (p q r : Prop) (h : p ∧ q ∧ r) : r := by rcases h with ⟨-, -, hr⟩; exact hr
+explicit_implicit_field	accept	inductive Hidden : Prop where | mk {n : Nat} (h : n = 0)\ntheorem f (h : Hidden) (k : (n : Nat) → n = 0 → True) : True := by rcases h with @⟨n, hn⟩; exact k n hn
+explicit_nested_tail	accept	inductive Hidden : Prop where | mk {n : Nat} (h : n = 0)\ninductive Wrapped : Prop where | mk (h : Hidden)\ntheorem f (h : Wrapped) (k : (n : Nat) → n = 0 → True) : True := by rcases h with @⟨n, hn⟩; exact k n hn
+rfl_failed_branch_restores_context	accept	theorem f (n : Nat) (h : (n = 0) ∧ True) : (n = 0) ∧ True := by\n  first\n  | rcases h with ⟨rfl, (bad : False)⟩\n  | exact h
+rfl_removes_right_name	reject	theorem f (n m : Nat) (h : n = m) : m = m := by rcases h with rfl; exact Eq.refl m
+rfl_requires_equation	reject	theorem f (h : True) : True := by rcases h with rfl; exact True.intro
+rfl_does_not_search_other_equations	reject	theorem f (n : Nat) (h : n = 0) : True := by rcases n with rfl; exact True.intro
+rfl_requires_variable_endpoint	reject	theorem f (h : 0 = 0) : True := by rcases h with rfl; exact True.intro
+rfl_occurs_check	reject	theorem f (n : Nat) (h : n = Nat.succ n) : True := by rcases h with rfl; exact True.intro
+clear_hides_evidence	reject	theorem f (p : Prop) (h : p) : p := by rcases h with -; exact h
+clear_dependent_hypothesis	reject	theorem f (n : Nat) (h : n = n) : n = n := by rcases n with -; exact h
+clear_dependent_let_value	reject	theorem f (p : Prop) (h : p) : p := by let witness : p := h; rcases h with -; exact witness
+clear_alternative_is_local	reject	theorem f (p : Prop) (h : p ∨ p) : p := by rcases h with - | hp; assumption; exact hp
+explicit_field_annotation_checked	reject	inductive Hidden : Prop where | mk {n : Nat} (h : n = 0)\ntheorem f (h : Hidden) : True := by rcases h with @⟨(n : Prop), hn⟩; exact True.intro
+multiple_pairs	accept	theorem f (p q r s : Prop) (h : p ∧ q) (k : r ∧ s) : q ∧ s := by rcases h, k with ⟨⟨hp, hq⟩, ⟨hr, hs⟩⟩; exact And.intro hq hs
+multiple_branch_product	accept	theorem f (p q r s : Prop) (h : p ∨ q) (k : r ∨ s) : (p ∨ q) ∧ (r ∨ s) := by rcases h, k with ⟨hp | hq, hr | hs⟩; exact And.intro (Or.inl hp) (Or.inl hr); exact And.intro (Or.inl hp) (Or.inr hs); exact And.intro (Or.inr hq) (Or.inl hr); exact And.intro (Or.inr hq) (Or.inr hs)
+multiple_dependent_case_target	accept	inductive Pack : Type where | mk (n : Nat)\ntheorem f (P : Pack → Prop) (x : Pack) (h : P x ∧ P x) : P x := by rcases x, h with ⟨⟨n⟩, ⟨ha, hb⟩⟩; exact hb
+multiple_shadowed_dependent_target	accept	inductive Pack : Type where | mk (n : Nat)\ntheorem f (P : Pack → Prop) (x : Pack) (h : P x) (h : P x ∧ P x) : P x := by rcases x, h with ⟨⟨n⟩, ⟨ha, hb⟩⟩; exact hb
+multiple_rfl_remaps_later_target	accept	theorem f (n : Nat) (h : n = 0) (k : (n = 0) ∧ True) : n = 0 := by rcases h, k with ⟨rfl, ⟨hz, ht⟩⟩; exact hz
+multiple_computed_dependent_telescope	accept	inductive Holds : Nat → Prop where | mk (n : Nat) : Holds n\ntheorem f (n : Nat) : Holds (Nat.succ n) := by rcases (Nat.succ n), (Holds.mk (Nat.succ n)) with ⟨k, h⟩; exact h
+multiple_dependent_equations	accept	inductive Holds : Nat → Prop where | mk (n : Nat) : Holds n\ntheorem f (n : Nat) : Holds (Nat.succ n) := by rcases he : (Nat.succ n), hh : (Holds.mk (Nat.succ n)) with ⟨k, h⟩; exact h
+multiple_tail_patterns	accept	theorem f (p q r : Prop) (hp : p) (h : q ∧ r) : q ∧ r := by rcases hp, h with ⟨_, hq, hr⟩; exact And.intro hq hr
+multiple_missing_pattern	accept	theorem f (p q r : Prop) (h : p ∧ q) (k : r) : q ∧ r := by rcases h, k with ⟨⟨hp, hq⟩⟩; exact And.intro hq k
+multiple_repeated_target_leaf	accept	theorem f (p q : Prop) (h : p ∧ q) : q := by rcases h, h with ⟨⟨hp, hq⟩, _⟩; exact hq
+multiple_default_leaves_targets	accept	theorem f (p q : Prop) (h : p ∧ q) (k : q) : p ∧ q := by rcases h, k; exact h
+multiple_annotation_frozen_before_shadow	accept	theorem f (p q : Prop) (h : p ∧ q) (k : q) : q := by rcases h, k with ⟨⟨q, hq⟩, (hk : q)⟩; exact k
+indexed_clear_replaced_by_constant	accept	inductive ZeroOnly : Nat → Prop where | mk : ZeroOnly 0\ntheorem f (n : Nat) (h : ZeroOnly n) : True := by rcases n, h with ⟨-, ⟨⟩⟩; exact True.intro
+indexed_clear_replaced_by_field	accept	inductive Holds : Nat → Prop where | mk (n : Nat) : Holds n\ntheorem f (n : Nat) (h : Holds n) : True := by rcases n, h with ⟨-, ⟨k⟩⟩; exact True.intro
+multiple_failure_restores_context	accept	theorem f (n : Nat) (h : n = 0) (k : (n = 0) ∧ True) : n = 0 := by\n  first\n  | rcases h, k with ⟨rfl, ⟨(bad : False), _⟩⟩\n  | exact h
+multiple_unknown_later_target	reject	theorem f (h : False) : True := by rcases h, missing with ⟨⟨⟩, _⟩
+multiple_target_cannot_use_earlier_pattern	reject	theorem f (p q : Prop) (h : p ∧ q) : q := by rcases h, hq with ⟨⟨hp, hq⟩, _⟩; exact hq
+multiple_wrong_later_annotation	reject	theorem f (h : False) (k : True) : True := by rcases h, k with ⟨⟨⟩, (_ : Nat)⟩
+multiple_annotation_retains_original_scope	reject	theorem f (n : Nat) (h : n = 0) (k : n = 0) : True := by rcases h, k with ⟨rfl, (hk : n = 0)⟩; exact True.intro
+multiple_repeated_target_destructure	reject	theorem f (p q : Prop) (h : p ∧ q) : q := by rcases h, h with ⟨⟨hp, hq⟩, ⟨_, _⟩⟩; exact hq
+indexed_clear_removes_replacement_field	reject	inductive Holds : Nat → Prop where | mk (n : Nat) : Holds n\ntheorem f (p : Prop) (use : Nat → p) (n : Nat) (h : Holds n) : p := by rcases n, h with ⟨-, ⟨k⟩⟩; exact use k
+indexed_clear_removes_dependent_let	reject	inductive Holds : Nat → Prop where | mk (n : Nat) : Holds n\ntheorem f (p : Prop) (use : Nat → p) (n : Nat) (h : Holds n) : p := by let saved : Nat := n; rcases n, h with ⟨-, ⟨k⟩⟩; exact use saved
+refined_constructor_field_cannot_rename_expression	reject	inductive Holds : Nat → Prop where | mk (n : Nat) : Holds n\ntheorem f (p : Prop) (use : Nat → p) (n : Nat) (h : Holds (Nat.succ n)) : p := by rcases h with ⟨k⟩; exact use k

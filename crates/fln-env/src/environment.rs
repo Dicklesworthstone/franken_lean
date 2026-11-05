@@ -26,7 +26,7 @@ use fln_hash::root::LogicalRoot;
 use crate::constants::{ConstantInfo, DefinitionSafety, QuotKind, ReducibilityHints};
 use crate::extensions::{
     CheckpointError, CheckpointLimits, CheckpointSemantics, ExtensionCheckpoint,
-    ExtensionDescriptor, ExtensionState, ProofBudget,
+    ExtensionDescriptor, ExtensionEntry, ExtensionState, ProofBudget,
 };
 #[cfg(test)]
 use crate::extensions::{MergeSemantics, PayloadProvenance};
@@ -203,8 +203,10 @@ pub struct PreparedDeclarationAdmission {
     /// Never exposed. See [`DeclarationPublication::digest`].
     provisional_digest: Digest,
     usage: DeclarationUsage,
-    /// The base this plan was decided against, held as an O(1) persistent snapshot.
-    base: Environment,
+    /// The exact declaration trie this plan was decided against, held as an O(1)
+    /// persistent snapshot. Journals and metadata validators do not affect the
+    /// measured insertion weight and are taken from the commit environment.
+    base_constants: PMap<Name, Arc<ConstantInfo>>,
     /// The insertion weight to charge, **measured** rather than supplied.
     admission_weight: u64,
     collision_budget: CollisionBudget,
@@ -235,7 +237,7 @@ impl PreparedDeclarationAdmission {
     /// publish a measured insertion weight taken against a different trie shape.
     pub fn is_valid_for(&self, env: &Environment) -> bool {
         self.schema == DECLARATION_PLAN_SCHEMA
-            && self.base.constants.is_same_structure(&env.constants)
+            && self.base_constants.is_same_structure(&env.constants)
     }
 
     /// Revalidate against `env` and publish exactly once.
@@ -319,6 +321,7 @@ impl PreparedDeclarationAdmission {
                         constants,
                         digests,
                         extensions: env.extensions.clone(),
+                        metadata_validation: env.metadata_validation.clone(),
                     },
                     digest: self.provisional_digest,
                     usage: self.usage,
@@ -828,6 +831,8 @@ pub enum EnvError {
 pub enum DeclarationDeltaError {
     /// The candidate changed an extension before the module-apply replay phase.
     ExtensionStateChanged,
+    /// A declaration-only transition replaced its retained metadata validator.
+    MetadataValidationChanged,
     /// The requested addition list names a declaration the base already owns.
     AdditionConflictsWithBase { name: Name },
     /// The input list repeats a name, so it cannot describe a one-name-one-constant delta.
@@ -1004,6 +1009,11 @@ pub struct Environment {
     /// every call, which made admitting n declarations O(n^2) in hashing.
     digests: PMap<Name, NamedDigest>,
     extensions: PMap<Name, Arc<ExtensionState>>,
+    /// Complete, independently checked declarations retained only to validate
+    /// an imported public journal's exact prefix. This snapshot never participates
+    /// in declaration lookup or kernel admission; its journals are the public
+    /// baseline, and it carries no further validation snapshot.
+    metadata_validation: Option<Arc<Environment>>,
 }
 
 impl Environment {
@@ -1035,6 +1045,81 @@ impl Environment {
         self.constants.is_same_structure(&other.constants)
     }
 
+    /// Whether both snapshots retain the same imported metadata validation
+    /// context by construction. This is a conservative O(1) cache test; it
+    /// never substitutes a declaration count or journal digest for identity.
+    pub fn has_same_metadata_validation(&self, other: &Self) -> bool {
+        match (&self.metadata_validation, &other.metadata_validation) {
+            (None, None) => true,
+            (Some(left), Some(right)) => Arc::ptr_eq(left, right),
+            _ => false,
+        }
+    }
+
+    /// Bind exact imported public metadata to its checked complete implementation.
+    ///
+    /// This is a low-level import-pipeline operation, not declaration admission.
+    /// The caller must already have checked both declaration worlds and activated
+    /// these exact exported journals against `checked_complete`. The Reference
+    /// exports some metadata for hidden constructors, classes, and aliases; those
+    /// rows remain valid without making their implementation declarations visible.
+    ///
+    /// Only the current journal prefixes receive this validation context. New or
+    /// changed rows must validate against the visible environment. Retaining the
+    /// exact persistent journal payloads also avoids treating a digest collision
+    /// as authority. The logical root still includes every actual journal byte;
+    /// the separately retained implementation cannot change logical lookup.
+    #[must_use]
+    pub fn with_imported_metadata_validation(&self, checked_complete: &Self) -> Self {
+        let validation = Environment {
+            constants: checked_complete.constants.clone(),
+            digests: checked_complete.digests.clone(),
+            extensions: self.extensions.clone(),
+            metadata_validation: None,
+        };
+        Environment {
+            constants: self.constants.clone(),
+            digests: self.digests.clone(),
+            extensions: self.extensions.clone(),
+            metadata_validation: Some(Arc::new(validation)),
+        }
+    }
+
+    /// Exact journal entries paired with the declarations that may validate them.
+    ///
+    /// An unchanged imported prefix uses its complete checked implementation.
+    /// The first changed descriptor or payload ends that prefix permanently;
+    /// appended rows, even byte-identical copies, use the logical environment.
+    /// Readers must still validate every row and must select candidates only
+    /// when their owners are visible through ordinary [`Self::contains`].
+    pub fn metadata_validation_entries(
+        &self,
+        name: &Name,
+    ) -> impl Iterator<Item = (&ExtensionEntry, &Environment)> {
+        let current = self.extension(name);
+        let validation = self.metadata_validation.as_deref();
+        let baseline = validation.and_then(|env| env.extension(name));
+        let mut prefix = matches!((current, baseline), (Some(current), Some(baseline))
+            if current.descriptor == baseline.descriptor);
+        let mut prior = baseline.into_iter().flat_map(ExtensionState::entries);
+        current
+            .into_iter()
+            .flat_map(ExtensionState::entries)
+            .map(move |entry| {
+                if prefix {
+                    prefix = prior
+                        .next()
+                        .is_some_and(|old| Arc::ptr_eq(&old.payload, &entry.payload));
+                }
+                let environment = if prefix {
+                    validation.unwrap_or(self)
+                } else {
+                    self
+                };
+                (entry, environment)
+            })
+    }
+
     /// The constant named `name` with the digest this environment computed for
     /// it, to carry into another environment without re-hashing.
     pub fn entry(&self, name: &Name) -> Option<EnvironmentEntry> {
@@ -1060,6 +1145,7 @@ impl Environment {
                 .insert(name.clone(), NamedDigest::new(entry.digest)),
             constants: self.constants.insert(name, entry.info),
             extensions: self.extensions.clone(),
+            metadata_validation: self.metadata_validation.clone(),
         })
     }
 
@@ -1099,6 +1185,9 @@ impl Environment {
     ) -> Result<(), DeclarationDeltaError> {
         if self.extensions != base.extensions {
             return Err(DeclarationDeltaError::ExtensionStateChanged);
+        }
+        if !self.has_same_metadata_validation(base) {
+            return Err(DeclarationDeltaError::MetadataValidationChanged);
         }
         let expected = base
             .len()
@@ -1184,6 +1273,7 @@ impl Environment {
             digests: self.digests.insert(name.clone(), NamedDigest::new(digest)),
             constants: self.constants.insert(name, Arc::new(info)),
             extensions: self.extensions.clone(),
+            metadata_validation: self.metadata_validation.clone(),
         })
     }
 
@@ -1247,6 +1337,7 @@ impl Environment {
                     constants,
                     digests,
                     extensions: self.extensions.clone(),
+                    metadata_validation: self.metadata_validation.clone(),
                 })
             })
     }
@@ -1369,7 +1460,7 @@ impl Environment {
             info: Arc::new(info),
             provisional_digest,
             usage,
-            base: self.clone(),
+            base_constants: self.constants.clone(),
             admission_weight: u64::try_from(usage.expanded_weight).unwrap_or(u64::MAX),
             collision_budget,
         }))
@@ -1390,6 +1481,7 @@ impl Environment {
             extensions: self
                 .extensions
                 .insert(name, Arc::new(ExtensionState::new(descriptor))),
+            metadata_validation: self.metadata_validation.clone(),
         })
     }
 
@@ -1409,6 +1501,7 @@ impl Environment {
             constants: self.constants.clone(),
             digests: self.digests.clone(),
             extensions: self.extensions.insert(extension.clone(), Arc::new(next)),
+            metadata_validation: self.metadata_validation.clone(),
         })
     }
 
@@ -1499,6 +1592,7 @@ impl Environment {
                         constants: self.constants.clone(),
                         digests: self.digests.clone(),
                         extensions: self.extensions.insert(name.clone(), Arc::new(state)),
+                        metadata_validation: self.metadata_validation.clone(),
                     })
                     .map_err(EnvError::Checkpoint)
             },
@@ -1740,6 +1834,137 @@ mod tests {
             carried.with_entry(alpha),
             Err(EnvError::DuplicateDeclaration { name }) if name == n("alpha")
         ));
+    }
+
+    #[test]
+    fn imported_metadata_validation_never_publishes_private_declarations() {
+        let complete = Environment::new()
+            .add_decl(axiom("visible"))
+            .unwrap()
+            .add_decl(axiom("private"))
+            .unwrap();
+        let public = Environment::new()
+            .with_entry(complete.entry(&n("visible")).unwrap())
+            .unwrap()
+            .register_extension(descriptor("metadata"))
+            .unwrap()
+            .push_extension_entry(&n("metadata"), vec![11])
+            .unwrap()
+            .push_extension_entry(&n("metadata"), vec![22])
+            .unwrap();
+        let bound = public.with_imported_metadata_validation(&complete);
+        assert_eq!(bound.len(), public.len());
+        assert!(bound.find(&n("private")).is_none());
+        assert!(!bound.contains(&n("private")));
+        assert!(bound.has_same_declarations(&public));
+        assert_eq!(
+            bound.logical_root(&KVMap::new()),
+            public.logical_root(&KVMap::new())
+        );
+        assert_ne!(
+            bound, public,
+            "validated-reader caches must bind this context"
+        );
+        assert_eq!(
+            bound.verify_declaration_delta(&public, &[]),
+            Err(DeclarationDeltaError::MetadataValidationChanged)
+        );
+        assert_eq!(bound.verify_declaration_delta(&bound.clone(), &[]), Ok(()));
+        let rebound = bound.with_imported_metadata_validation(&complete);
+        assert_eq!(
+            rebound.verify_declaration_delta(&bound, &[]),
+            Err(DeclarationDeltaError::MetadataValidationChanged),
+            "declaration-only transitions must preserve the exact retained authority"
+        );
+        assert_eq!(
+            bound
+                .metadata_validation_entries(&n("metadata"))
+                .map(|(_, validation)| validation.contains(&n("private")))
+                .collect::<Vec<_>>(),
+            [true, true]
+        );
+        let local = bound
+            .add_decl(axiom("local"))
+            .unwrap()
+            .push_extension_entry(&n("metadata"), vec![22])
+            .unwrap();
+        assert_eq!(
+            local
+                .metadata_validation_entries(&n("metadata"))
+                .map(|(_, validation)| (
+                    validation.contains(&n("private")),
+                    validation.contains(&n("local")),
+                ))
+                .collect::<Vec<_>>(),
+            [(true, false), (true, false), (false, true)],
+            "an appended copy is a local row, and baseline validation is immutable"
+        );
+        assert_ne!(
+            local.logical_root(&KVMap::new()),
+            bound.logical_root(&KVMap::new())
+        );
+    }
+
+    #[test]
+    fn imported_metadata_validation_ends_at_the_first_changed_payload_or_contract() {
+        let complete = Environment::new().add_decl(axiom("private")).unwrap();
+        let public = Environment::new()
+            .register_extension(descriptor("metadata"))
+            .unwrap()
+            .push_extension_entry(&n("metadata"), vec![11])
+            .unwrap()
+            .push_extension_entry(&n("metadata"), vec![22])
+            .unwrap();
+        let bound = public.with_imported_metadata_validation(&complete);
+        let rebuilt = ExtensionState::new(descriptor("metadata"))
+            .push_entry(vec![11])
+            .push_entry(vec![22]);
+        let same = Environment {
+            extensions: bound.extensions.insert(n("metadata"), Arc::new(rebuilt)),
+            ..bound.clone()
+        };
+        assert!(
+            same.metadata_validation_entries(&n("metadata"))
+                .all(|(_, validation)| !validation.contains(&n("private"))),
+            "independently copied bytes require logical validation or a checked rebind"
+        );
+        assert!(
+            same.with_imported_metadata_validation(&complete)
+                .metadata_validation_entries(&n("metadata"))
+                .all(|(_, validation)| validation.contains(&n("private")))
+        );
+        let changed = ExtensionState::new(descriptor("metadata"))
+            .push_entry(vec![99])
+            .push_entry(vec![22]);
+        let changed = Environment {
+            extensions: bound.extensions.insert(n("metadata"), Arc::new(changed)),
+            ..bound.clone()
+        };
+        assert!(
+            changed
+                .metadata_validation_entries(&n("metadata"))
+                .all(|(_, validation)| !validation.contains(&n("private")))
+        );
+        assert_ne!(
+            changed.logical_root(&KVMap::new()),
+            bound.logical_root(&KVMap::new())
+        );
+        let mut contract = descriptor("metadata");
+        contract.provenance = PayloadProvenance::Opaque;
+        let changed_contract = ExtensionState::new(contract)
+            .push_entry(vec![11])
+            .push_entry(vec![22]);
+        let changed_contract = Environment {
+            extensions: bound
+                .extensions
+                .insert(n("metadata"), Arc::new(changed_contract)),
+            ..bound
+        };
+        assert!(
+            changed_contract
+                .metadata_validation_entries(&n("metadata"))
+                .all(|(_, validation)| !validation.contains(&n("private")))
+        );
     }
 
     #[test]

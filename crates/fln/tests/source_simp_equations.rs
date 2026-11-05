@@ -417,8 +417,8 @@ fn private_and_hidden_public_proofs_publish_equations_once_before_later_simp() {
     let initial = Engine::builder().build_empty();
     let api_name = name("Api");
     let main_name = name("Main");
-    let main = "prelude\nimport Api\n\
-        theorem witness.{u} {A : Sort u} (x : A) : wrap x = x := by simp";
+    let main = "module\nprelude\npublic import Api\n\
+        public theorem witness.{u} {A : Sort u} (x : A) : wrap x = x := by simp";
     let module_limits = SourceModuleCheckLimits::new(SourceCheckLimits::new(limits()));
     for (visibility, proof) in [
         ("", "wrap.eq_1 x"),

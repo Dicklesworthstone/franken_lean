@@ -53,7 +53,7 @@ fn module_exports_reach_public_headers_hidden_bodies_and_transitive_importers() 
         local_aliases.targets(&fln::Name::from_components(["first"])),
         [fln::Name::from_components(["Values", "Token", "first"])]
     );
-    let main = "prelude\nimport Middle\ndef value : Token := first\ntheorem t : identity 7 = 7 := rfl\ntheorem useWitness (P : Prop) (h : P) : P := witness P h";
+    let main = "module\nprelude\npublic import Middle\npublic section\ndef value : Token := first\ntheorem t : identity 7 = 7 := rfl\ntheorem useWitness (P : Prop) (h : P) : P := witness P h";
     let imported = check_modules(&[
         ("Main", main),
         ("Middle", "module\nprelude\npublic import Api"),

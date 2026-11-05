@@ -13,6 +13,7 @@ pub(super) mod array_iteration;
 pub(super) mod arrays;
 pub(super) mod diagnostics;
 pub(super) mod float;
+pub(super) mod hash;
 pub(super) mod io;
 mod nat_div_mod;
 pub(super) mod st;

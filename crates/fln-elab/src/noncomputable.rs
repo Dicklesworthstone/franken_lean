@@ -134,7 +134,7 @@ pub fn read(env: &Environment) -> Result<BTreeSet<Name>, NoncomputableError> {
         return Err(NoncomputableError::Limit);
     }
     let mut names = BTreeSet::new();
-    for entry in extension.entries() {
+    for (entry, validation) in env.metadata_validation_entries(&extension_name()) {
         if entry.payload.len() > MAX_ENTRY_BYTES {
             return Err(NoncomputableError::Limit);
         }
@@ -147,13 +147,14 @@ pub fn read(env: &Environment) -> Result<BTreeSet<Name>, NoncomputableError> {
         if !bytes.is_empty() {
             return Err(NoncomputableError::Malformed);
         }
-        if !env.contains(&name) {
+        if !validation.contains(&name) {
             return Err(NoncomputableError::UnknownDeclaration(name));
         }
         if !names.insert(name.clone()) {
             return Err(NoncomputableError::Duplicate(name));
         }
     }
+    names.retain(|name| env.contains(name));
     Ok(names)
 }
 

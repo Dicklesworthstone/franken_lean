@@ -3,15 +3,8 @@ import Init.Data.Array.Basic
 import Init.Data.List.Control
 import Init.Data.String.Defs
 
-def dynamicNatArray (first step : Nat) : Array Nat :=
-  List.toArray [first, first + step, first + step + step]
-
 def dynamicStringArray (first second : String) : Array String :=
   List.toArray [first, second]
-
-def arrayDigits (xs : Array Nat) (initial : Nat) : Id Nat :=
-  Array.forIn' (m := Id) xs initial
-    (fun x _ acc => Pure.pure (ForInStep.yield (acc * 10 + x)))
 
 def arraySum (xs : Array Nat) (initial : Nat) : Id Nat := do
   let mut total := initial
@@ -117,6 +110,22 @@ def arrayStringStages (xs : Array String) (capturedText : String) : String :=
   let first := stage "!"
   String.append first (stage "?")
 
+-- FLN_NATIVE_ALIAS_DEFINITIONS_BEGIN
+def dynamicNatArray (first step : Nat) : Array Nat :=
+  List.toArray [first, first + step, first + step + step]
+
+def arrayDigits (xs : Array Nat) (initial : Nat) : Id Nat :=
+  Array.forIn' (m := Id) xs initial
+    (fun x _ acc => Pure.pure (ForInStep.yield (acc * 10 + x)))
+
+-- The loop's source must remain live while a callback updates an accumulator
+-- that initially shares its storage, including an element not yet visited.
+def aliasingArrayIteration (xs : Array Nat) : Id (Array Nat) :=
+  Array.forIn' (m := Id) xs xs
+    (fun x _ acc => Pure.pure
+      (ForInStep.yield (Array.set! acc 1 (Array.getD acc 1 0 + x))))
+-- FLN_NATIVE_ALIAS_DEFINITIONS_END
+
 -- FLN_EXPECT_NAT 4123
 #eval arrayDigits (dynamicNatArray 1 1) 4
 -- FLN_EXPECT_NAT 7
@@ -163,3 +172,9 @@ def arrayStringStages (xs : Array String) (capturedText : String) : String :=
 #eval arrayStringReuse (dynamicStringArray "a" "b") "!"
 -- FLN_EXPECT_STRING :a:b!:a:b?
 #eval arrayStringStages (dynamicStringArray "a" "b") ":"
+-- FLN_NATIVE_ALIAS_EVALUATIONS_BEGIN
+-- FLN_EXPECT_NAT 183
+#eval arrayDigits (aliasingArrayIteration (dynamicNatArray 1 1)) 0
+-- FLN_EXPECT_NAT 123183
+#eval let xs := dynamicNatArray 1 1; let changed := aliasingArrayIteration xs; Id.run (arrayDigits xs 0) * 1000 + Id.run (arrayDigits changed 0)
+-- FLN_NATIVE_ALIAS_EVALUATIONS_END

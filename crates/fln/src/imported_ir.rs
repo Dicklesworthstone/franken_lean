@@ -12,11 +12,11 @@
 //! Its RC annotations are replaced by Golem's checked managed ownership, not
 //! executed as additional retains/releases on already managed values.
 //!
-//! An explicit capability initializes the named globals needed by a selected
-//! executable, once per execution. This does not perform whole-module startup,
-//! admit kernel declarations or replace the sovereign compiler. Every linked
-//! interpreted function retains Reference provenance in the compiled object
-//! and its execution report.
+//! Explicit capabilities initialize either the selected named-global closure
+//! or every initialization journal in the supplied module order, once per
+//! execution. Neither admits kernel declarations nor replaces the sovereign
+//! compiler. Every linked interpreted function retains Reference provenance
+//! in the compiled object and its execution report.
 
 use fln_comp::{fir, flbc};
 use fln_core::name::Name;
@@ -25,6 +25,7 @@ use fln_hash::ir_graph::{GraphArchiveLimits, GraphClass};
 pub use fln_olean::ir::IrNat;
 use fln_olean::ir::{IrBody, IrDecl, IrModule, IrStmt, IrTerminal, IrType};
 use fln_olean::ir_archive::CensusPartition;
+pub use fln_olean::ir_archive::parse_name_key;
 use fln_olean::ir_types::{IrTypeValidationError, validate_ir_types};
 use fln_olean::ir_validate::IrValidationLimits;
 use fln_vm::extern_row::{self, Ownership};
@@ -129,6 +130,12 @@ pub struct IrExecutionOptions {
     /// as are phase-sensitive runtime services in selected code. Unselected
     /// named initializers are not run, including any effects they might perform.
     pub initialize_globals: bool,
+    /// Replay all named initializers and standalone actions in the supplied
+    /// modules, preserving module and journal order. Imports must precede their
+    /// consumers. Every action is authorized and validated before any executes;
+    /// an initializer reading a later global is refused. Host effects still
+    /// require their separate capabilities. This includes named initialization.
+    pub initialize_modules: bool,
 }
 
 #[derive(Debug)]
@@ -651,6 +658,7 @@ pub fn compile_with_captured_output(
             limits,
             capture_output_bytes: Some(max_output_bytes),
             initialize_globals: false,
+            initialize_modules: false,
         },
     )
 }
@@ -747,6 +755,7 @@ fn compile_with_policy(
         limits,
         capture_output_bytes: output_byte_limit,
         initialize_globals,
+        initialize_modules,
     } = options;
     let count = modules
         .iter()
@@ -789,6 +798,9 @@ fn compile_with_policy(
         }
     }
     let initializer_index = globals::index(modules, limits)?;
+    if initialize_modules {
+        globals::validate_actions(&initializer_index, &declarations)?;
+    }
     for name in user_declarations {
         if native_row(name).is_some()
             || native_signature::boxed_row(name).is_some()
@@ -802,6 +814,14 @@ fn compile_with_policy(
         }
     }
     let mut pending = BTreeSet::from([entry.clone()]);
+    if initialize_modules {
+        pending.extend(
+            initializer_index
+                .journal
+                .iter()
+                .map(|(name, _)| name.clone()),
+        );
+    }
     let mut selected = BTreeMap::new();
     let mut natives = BTreeMap::new();
     let mut work = 0u64;
@@ -891,7 +911,7 @@ fn compile_with_policy(
         // satisfy structural budgets before the selected module is cloned.
         inspect_body(&name, body, &mut work, limits)?;
         if let Some(initializer) = initializer_index.named.get(&name) {
-            if !initialize_globals {
+            if !initialize_globals && !initialize_modules {
                 return Err(globals::contract(
                     &name,
                     "requires explicit initialized-global capability",
@@ -903,6 +923,7 @@ fn compile_with_policy(
                 initializer,
                 &declarations,
                 &initializer_index,
+                initialize_modules,
             )?;
             pending.insert(initializer.clone());
             selected.insert(name, *declaration);
@@ -923,8 +944,14 @@ fn compile_with_policy(
         }
         selected.insert(name, *declaration);
     }
-    let initialization = initialize_globals
-        .then(|| globals::plan(&initializer_index, &selected, limits))
+    let initialization = (initialize_globals || initialize_modules)
+        .then(|| {
+            if initialize_modules {
+                globals::plan_journals(&initializer_index, &selected, limits)
+            } else {
+                globals::plan(&initializer_index, &selected, limits)
+            }
+        })
         .transpose()?;
     let mut selected_module = IrModule {
         decls: selected.values().map(|decl| (*decl).clone()).collect(),

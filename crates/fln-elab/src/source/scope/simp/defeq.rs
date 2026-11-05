@@ -150,7 +150,7 @@ fn read_tags(
     if state.len() > MAX_ROWS {
         return Err(limit());
     }
-    for entry in state.entries() {
+    for (entry, validation) in environment.metadata_validation_entries(&descriptor.name) {
         tick()?;
         if entry.payload.len() > MAX_ENTRY_BYTES {
             return Err(limit());
@@ -166,13 +166,13 @@ fn read_tags(
             return Err(malformed());
         };
         let name = crate::instances::read_name(&mut bytes).map_err(codec)?;
-        if !bytes.is_empty()
-            || !environment.find(&name).is_some_and(taggable)
-            || !names.insert(name)
+        if !bytes.is_empty() || !validation.find(&name).is_some_and(taggable) || !names.insert(name)
         {
             return Err(malformed());
         }
     }
+    strict.retain(|name| environment.contains(name));
+    backward.retain(|name| environment.contains(name));
     Ok((strict, backward))
 }
 

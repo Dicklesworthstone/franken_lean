@@ -114,6 +114,10 @@ pub struct InstanceRegistry {
     /// Priority updates preserve search order but still clear a prior lexical
     /// erasure, so their event position is distinct from `InstanceEntry::order`.
     updates: BTreeMap<Name, (usize, Option<Name>)>,
+    /// Class identity established while validating each ordinary journal row.
+    /// Cross-journal checks must not re-resolve hidden implementation declarations
+    /// through the logical environment after validating their imported rows.
+    instance_classes: BTreeMap<Name, Name>,
     /// Erased global/local rows retained only for `native_instances`: erasure
     /// changes candidate availability, never a declaration's reducibility.
     inactive: Vec<InstanceEntry>,
@@ -222,6 +226,23 @@ fn beta(function: &Expr, args: &[Expr]) -> Option<Expr> {
 impl InstanceRegistry {
     pub fn read(env: &Environment) -> Result<Self, InstanceRegistryError> {
         let (mut out, _) = Self::read_unsorted(env)?;
+        out.classes.retain(|name| env.contains(name));
+        for (class, entries) in &mut out.instances {
+            entries.retain(|row| env.contains(class) && env.contains(&row.declaration));
+        }
+        for classes in out.scoped.values_mut() {
+            for (class, entries) in classes {
+                entries.retain(|row| env.contains(class) && env.contains(&row.declaration));
+            }
+        }
+        out.imported.classes.retain(|name, _| env.contains(name));
+        out.imported.instances.retain(|name, _| env.contains(name));
+        out.imported
+            .instance_classes
+            .retain(|name, class| env.contains(name) && env.contains(class));
+        out.instance_classes
+            .retain(|name, class| env.contains(name) && env.contains(class));
+        out.updates.retain(|name, _| env.contains(name));
         for entries in out.instances.values_mut() {
             entries.sort_by(|a, b| {
                 b.priority
@@ -253,8 +274,11 @@ impl InstanceRegistry {
         // priority in place, just as the Reference's DiscrTree.insertVal does;
         // re-registering an existing instance does not make it a newer peer.
         let mut positions = Positions::new();
-        for (order, entry) in extension.entries().enumerate() {
-            out.apply_row(env, &mut positions, order, &entry.payload)?;
+        for (order, (entry, validation)) in env
+            .metadata_validation_entries(&extension_name())
+            .enumerate()
+        {
+            out.apply_row(validation, &mut positions, order, &entry.payload)?;
         }
         out.imported = imported::read(env)?;
         for name in out.imported.classes.keys() {
@@ -263,12 +287,19 @@ impl InstanceRegistry {
             }
         }
         for (name, parameters) in &out.imported.instances {
-            let class = validate_instance(env, name)?;
-            if !out.classes.contains(&class) {
-                return Err(InstanceRegistryError::UnknownClass(class));
+            let class = out
+                .imported
+                .instance_classes
+                .get(name)
+                .ok_or(InstanceRegistryError::Malformed)?;
+            if !out.classes.contains(class) {
+                return Err(InstanceRegistryError::UnknownClass(class.clone()));
+            }
+            if out.instance_classes.get(name) != Some(class) {
+                return Err(InstanceRegistryError::Malformed);
             }
             let registered_scope = out.scoped.iter().find_map(|(scope, classes)| {
-                classes.get(&class).and_then(|rows| {
+                classes.get(class).and_then(|rows| {
                     rows.iter()
                         .any(|row| &row.declaration == name)
                         .then_some(scope)
@@ -321,6 +352,8 @@ impl InstanceRegistry {
                 {
                     return Err(InstanceRegistryError::Malformed);
                 }
+                self.instance_classes
+                    .insert(declaration.clone(), class.clone());
                 let scope = if tag == 3 {
                     Some(read_name(&mut bytes)?)
                 } else {
@@ -525,6 +558,7 @@ type ScopedEntry = Option<(
 /// This does not identify the declarations against which rows are validated:
 /// equal journal digests and constant counts can describe different branches.
 /// A cached validated view must also be bound to its environment.
+#[cfg(test)]
 pub(crate) fn registry_identity(env: &Environment) -> (Option<[u8; 32]>, Option<[u8; 32]>) {
     (
         env.extension(&extension_name())
@@ -814,6 +848,121 @@ mod tests {
             InstanceRegistry::read(&env),
             Err(InstanceRegistryError::Malformed)
         );
+    }
+
+    #[test]
+    fn checked_public_metadata_cannot_activate_private_instance_candidates() {
+        use fln_core::level::Level;
+        use fln_env::constants::{AxiomVal, ConstantVal};
+        let n = |name: &str| Name::from_components([name]);
+        let declaration = |name: &str, type_: Expr| {
+            ConstantInfo::Axiom(AxiomVal {
+                base: ConstantVal {
+                    name: n(name),
+                    level_params: Vec::new(),
+                    type_,
+                },
+                is_unsafe: false,
+            })
+        };
+        let class = n("C");
+        let mut complete = Environment::new()
+            .add_decl(declaration("C", Expr::sort(Level::one())))
+            .unwrap()
+            .add_decl(declaration("PrivateClass", Expr::sort(Level::one())))
+            .unwrap();
+        for name in ["public", "private", "scopedPrivate"] {
+            complete = complete
+                .add_decl(declaration(name, Expr::const_(class.clone(), Vec::new())))
+                .unwrap();
+        }
+        for name in [&class, &n("PrivateClass")] {
+            complete = imported::register_class(
+                &complete,
+                name,
+                &imported::ClassParameters {
+                    out_params: Vec::new(),
+                    out_level_params: Vec::new(),
+                },
+            )
+            .unwrap();
+        }
+        for (name, priority, scope) in [
+            ("public", 1000, None),
+            ("private", 2000, None),
+            ("scopedPrivate", 3000, Some(n("Namespace"))),
+        ] {
+            complete = imported::register_instance(
+                &complete,
+                &n(name),
+                &imported::InstanceParameters {
+                    priority,
+                    synth_order: Vec::new(),
+                    scope,
+                    keys: Vec::new(),
+                },
+            )
+            .unwrap();
+        }
+        complete = defaults::register(&complete, &n("private"), 4000).unwrap();
+        let mut projected = Environment::new();
+        for name in [&class, &n("public")] {
+            projected = projected.with_entry(complete.entry(name).unwrap()).unwrap();
+        }
+        for (name, state) in complete.extensions() {
+            projected = projected
+                .register_extension(state.descriptor.clone())
+                .unwrap();
+            for entry in state.entries() {
+                projected = projected
+                    .push_extension_entry(name, entry.payload.clone())
+                    .unwrap();
+            }
+        }
+        assert!(InstanceRegistry::read(&projected).is_err());
+        let bound = projected.with_imported_metadata_validation(&complete);
+        let registry = InstanceRegistry::read(&bound).unwrap();
+        assert!(!registry.is_class(&n("PrivateClass")));
+        assert_eq!(
+            registry
+                .candidates(&class)
+                .iter()
+                .map(|row| &row.declaration)
+                .collect::<Vec<_>>(),
+            [&n("public")]
+        );
+        assert!(defaults::read(&bound).unwrap().is_empty());
+        let mut scopes = scoped::ActiveScopes::default();
+        scopes.activate(&bound, &n("Namespace")).unwrap();
+        let opened = InstanceRegistry::read_with_scopes(&bound, &scopes).unwrap();
+        // Scope activation rebuilds insertion positions from the selected
+        // events, so its order clock differs from the dormant journal's clock.
+        // The selected declarations and their priorities must remain identical.
+        assert_eq!(
+            opened
+                .candidates(&class)
+                .iter()
+                .map(|row| (&row.declaration, row.priority))
+                .collect::<Vec<_>>(),
+            [(&n("public"), 1000)]
+        );
+        assert_eq!(
+            InstanceRegistry::read(&complete)
+                .unwrap()
+                .candidates(&class)[0]
+                .declaration,
+            n("private")
+        );
+        let suffix = bound
+            .push_extension_entry(
+                &extension_name(),
+                instance_payload(2, &class, &n("private"), 9000, None).unwrap(),
+            )
+            .unwrap();
+        assert!(
+            matches!(InstanceRegistry::read(&suffix), Err(InstanceRegistryError::UnknownDeclaration(name)) if name == n("private"))
+        );
+        assert!(!bound.contains(&n("private")));
     }
     #[test]
     fn a_cached_registry_is_reread_exactly_when_what_it_reads_changes() {

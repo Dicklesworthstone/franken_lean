@@ -21,6 +21,7 @@ pub(super) struct Arguments {
     max_bytes: usize,
     capture_output: Option<usize>,
     initialize_globals: bool,
+    initialize_modules: bool,
     json: bool,
     vm: fln::VmExecutionLimits,
 }
@@ -41,6 +42,18 @@ fn parse_name(value: OsString, option: &str) -> Result<fln::Name, UsageError> {
     Ok(fln::Name::from_components(text.split('.')))
 }
 
+fn parse_name_key(value: OsString, option: &str) -> Result<fln::Name, UsageError> {
+    let value = text(value, option)?;
+    let name = fln::imported_ir::parse_name_key(&value, 16 * 1024, 128)
+        .map_err(|error| UsageError(format!("{option}: {error}")))?;
+    if name.is_anonymous() {
+        return Err(UsageError(format!(
+            "{option} requires a non-anonymous name"
+        )));
+    }
+    Ok(name)
+}
+
 pub(super) fn parse(arguments: Vec<OsString>) -> Result<MultiplexerCommand, UsageError> {
     let mut args = arguments.into_iter();
     let mut entry = None;
@@ -53,6 +66,7 @@ pub(super) fn parse(arguments: Vec<OsString>) -> Result<MultiplexerCommand, Usag
     let mut max_bytes = OLEAN_INSPECT_DEFAULT_MAX_BYTES;
     let mut capture_output = None;
     let mut initialize_globals = false;
+    let mut initialize_modules = false;
     let mut json = false;
     let mut vm = fln::VmExecutionLimits::user_program();
     let mut options = true;
@@ -73,11 +87,15 @@ pub(super) fn parse(arguments: Vec<OsString>) -> Result<MultiplexerCommand, Usag
         match flag.as_str() {
             "--help" | "-h" => return Ok(MultiplexerCommand::Help),
             "--json" => json = true,
-            "--entry" => {
+            "--entry" | "--entry-key" => {
                 if entry.is_some() {
                     return Err(UsageError("--entry may be supplied only once".to_owned()));
                 }
-                entry = Some(parse_name(value()?, "--entry")?);
+                entry = Some(if flag == "--entry-key" {
+                    parse_name_key(value()?, &flag)?
+                } else {
+                    parse_name(value()?, &flag)?
+                });
             }
             "--partition" => {
                 if partition.is_some() {
@@ -87,8 +105,12 @@ pub(super) fn parse(arguments: Vec<OsString>) -> Result<MultiplexerCommand, Usag
                 }
                 partition = Some(PathBuf::from(value()?));
             }
-            "--user" => {
-                users.insert(parse_name(value()?, "--user")?);
+            "--user" | "--user-key" => {
+                users.insert(if flag == "--user-key" {
+                    parse_name_key(value()?, &flag)?
+                } else {
+                    parse_name(value()?, &flag)?
+                });
             }
             "--module" => {
                 let module = parse_name(value()?, "--module")?;
@@ -112,6 +134,14 @@ pub(super) fn parse(arguments: Vec<OsString>) -> Result<MultiplexerCommand, Usag
                     ));
                 }
                 initialize_globals = true;
+            }
+            "--initialize-modules" => {
+                if initialize_modules {
+                    return Err(UsageError(
+                        "--initialize-modules may be supplied only once".to_owned(),
+                    ));
+                }
+                initialize_modules = true;
             }
             "--capture-output" => {
                 if capture_output.is_some() {
@@ -142,7 +172,13 @@ pub(super) fn parse(arguments: Vec<OsString>) -> Result<MultiplexerCommand, Usag
             _ => return Err(UsageError(format!("unknown ir run option {flag:?}"))),
         }
     }
-    let entry = entry.ok_or_else(|| UsageError("ir run requires --entry NAME".to_owned()))?;
+    let entry = entry
+        .ok_or_else(|| UsageError("ir run requires --entry NAME or --entry-key KEY".to_owned()))?;
+    if initialize_globals && initialize_modules {
+        return Err(UsageError(
+            "--initialize-globals and --initialize-modules are mutually exclusive".to_owned(),
+        ));
+    }
     let partition = partition.ok_or_else(|| {
         UsageError("ir run requires --partition PATH to the pinned census".to_owned())
     })?;
@@ -172,6 +208,7 @@ pub(super) fn parse(arguments: Vec<OsString>) -> Result<MultiplexerCommand, Usag
         max_bytes,
         capture_output,
         initialize_globals,
+        initialize_modules,
         json,
         vm,
     }))
@@ -448,7 +485,14 @@ fn run_uncaptured(arguments: Arguments) -> MultiplexerOutput {
         bytes_read = loaded.bytes_read();
         loaded_names = loaded.module_names().to_vec();
         missing_ir = loaded.missing_ir_modules().to_vec();
-        modules = loaded.into_modules();
+        modules = if arguments.initialize_modules {
+            match loaded.into_modules_in_initialization_order() {
+                Ok(modules) => modules,
+                Err(error) => return module_load_failure(error, arguments.json),
+            }
+        } else {
+            loaded.into_modules()
+        };
     }
     let compiled = fln::imported_ir::compile_with_options(
         &modules,
@@ -460,6 +504,7 @@ fn run_uncaptured(arguments: Arguments) -> MultiplexerOutput {
             limits: IrExecutionLimits::default(),
             capture_output_bytes: arguments.capture_output,
             initialize_globals: arguments.initialize_globals,
+            initialize_modules: arguments.initialize_modules,
         },
     );
     let compiled = match compiled {
@@ -556,9 +601,15 @@ fn run_uncaptured(arguments: Arguments) -> MultiplexerOutput {
                 .collect::<Vec<_>>()
                 .join(",")
         };
-        let initialization_fields = if arguments.initialize_globals {
+        let initialization_fields = if arguments.initialize_globals || arguments.initialize_modules
+        {
             format!(
-                ",\"initializeGlobals\":true,\"initializationFailure\":{}",
+                ",\"{}\":true,\"initializationFailure\":{}",
+                if arguments.initialize_modules {
+                    "initializeModules"
+                } else {
+                    "initializeGlobals"
+                },
                 execution
                     .initialization_failure
                     .as_ref()
@@ -623,7 +674,9 @@ fn run_uncaptured(arguments: Arguments) -> MultiplexerOutput {
                 ));
             }
         }
-        if arguments.initialize_globals {
+        if arguments.initialize_modules {
+            text.push_str("module initialization: complete supplied journals in import order\n");
+        } else if arguments.initialize_globals {
             text.push_str("global initialization: selected named dependency closure\n");
         }
         if let Some(failure) = &execution.initialization_failure {
@@ -796,6 +849,53 @@ mod tests {
     }
 
     #[test]
+    fn structural_names_preserve_generated_initializer_identity() {
+        let key = r#"a/s"_private"/s"User.Main"/n0/s"initFn""#;
+        let argv = [
+            "--entry-key",
+            key,
+            "--partition",
+            "p.tsv",
+            "--user-key",
+            key,
+            "--user",
+            "_private.User.Main.0.initFn",
+            "--initialize-modules",
+            "input.ir",
+        ];
+        let MultiplexerCommand::IrRun(args) = parse(argv.map(OsString::from).to_vec()).unwrap()
+        else {
+            panic!("IR run parser");
+        };
+        let expected = fln::Name::str(
+            fln::Name::num(fln::Name::from_components(["_private", "User.Main"]), 0),
+            "initFn",
+        );
+        assert_eq!(args.entry, expected);
+        assert!(args.users.contains(&expected));
+        assert!(args.users.contains(&name("_private.User.Main.0.initFn")));
+        assert_eq!(args.users.len(), 2);
+        for invalid in ["", "a", "User.main", "a/n", "a/n18446744073709551616"] {
+            assert!(
+                parse_name_key(invalid.into(), "--user-key").is_err(),
+                "{invalid}"
+            );
+        }
+        let too_many = format!("a{}", "/n0".repeat(129));
+        assert!(parse_name_key(too_many.into(), "--user-key").is_err());
+        let duplicate = [
+            "--entry",
+            "main",
+            "--entry-key",
+            key,
+            "--partition",
+            "p.tsv",
+            "input.ir",
+        ];
+        assert!(parse(duplicate.map(OsString::from).to_vec()).is_err());
+    }
+
+    #[test]
     fn global_initialization_is_explicit_unique_and_composes_with_both_input_modes() {
         for tail in [
             vec!["input.ir"],
@@ -853,6 +953,58 @@ mod tests {
         };
         assert!(!args.initialize_globals);
         assert_eq!(args.paths, [PathBuf::from("--initialize-globals")]);
+    }
+
+    #[test]
+    fn complete_module_initialization_is_explicit_and_separate_from_selected_globals() {
+        for input in [
+            vec!["input.ir"],
+            vec!["--module", "User.Main", "--search-path", "lib"],
+        ] {
+            let argv = [
+                "--entry",
+                "User.main",
+                "--partition",
+                "p.tsv",
+                "--initialize-modules",
+            ]
+            .into_iter()
+            .chain(input)
+            .map(OsString::from)
+            .collect();
+            let MultiplexerCommand::IrRun(args) = parse(argv).unwrap() else {
+                panic!("IR run parser")
+            };
+            assert!(args.initialize_modules);
+            assert!(!args.initialize_globals);
+        }
+        for flags in [
+            vec!["--initialize-modules", "--initialize-modules"],
+            vec!["--initialize-modules", "--initialize-globals"],
+            vec!["--initialize-globals", "--initialize-modules"],
+        ] {
+            let argv = ["--entry", "User.main", "--partition", "p.tsv"]
+                .into_iter()
+                .chain(flags)
+                .chain(["input.ir"])
+                .map(OsString::from)
+                .collect();
+            assert!(parse(argv).is_err());
+        }
+        let argv = [
+            "--entry",
+            "User.main",
+            "--partition",
+            "p.tsv",
+            "--",
+            "--initialize-modules",
+        ];
+        let MultiplexerCommand::IrRun(args) = parse(argv.map(OsString::from).to_vec()).unwrap()
+        else {
+            panic!("IR run parser")
+        };
+        assert!(!args.initialize_modules);
+        assert_eq!(args.paths, [PathBuf::from("--initialize-modules")]);
     }
 
     #[test]

@@ -38,11 +38,30 @@ pub(super) fn artifact_import_fixture() -> (SourceOleanImport, Vec<IrModule>) {
     artifact_import_fixture_with_extra_rows(&[])
 }
 
-/// Artifact export requires every base declaration to be represented by the
-/// import receipt. Carry the constructed seed in the library artifact and
-/// admit the complete world from an empty engine, without ambient declarations.
-pub(super) fn artifact_build_fixture() -> (SourceOleanImport, Vec<IrModule>, Vec<u8>) {
-    artifact_import_fixture_inner(&[], &[], &[], &[], None, true)
+pub(super) type FixtureArtifacts = Vec<(Name, Vec<u8>)>;
+
+/// Artifact export requires every declaration to belong to its checked import
+/// receipt. Keep the ordinary checking fixture's ambient seed separate: this
+/// fixture encodes the checked foundation alongside the library and imports
+/// the complete module into an empty engine through both checkers.
+pub(super) fn artifact_build_fixture() -> (SourceOleanImport, Vec<IrModule>, FixtureArtifacts) {
+    artifact_build_fixture_with_parser_metadata(&[], &[], &[], &[])
+}
+
+pub(super) fn artifact_build_fixture_with_parser_metadata(
+    extra_rows: &[(&str, &str, Option<&str>)],
+    extra_constants: &[ConstantInfo],
+    parser_rows: &[Obj],
+    extra_ir: &[IrDecl],
+) -> (SourceOleanImport, Vec<IrModule>, FixtureArtifacts) {
+    artifact_import_fixture_with_foundation(
+        extra_rows,
+        extra_constants,
+        parser_rows,
+        extra_ir,
+        None,
+        true,
+    )
 }
 
 pub(super) fn artifact_import_fixture_with_extra_rows(
@@ -77,7 +96,7 @@ pub(super) fn artifact_import_fixture_with_parser_dependency(
     extra_ir: &[IrDecl],
     dependency: Option<(&str, &[ConstantInfo], &[Obj])>,
 ) -> (SourceOleanImport, Vec<IrModule>) {
-    let (imported, code, _) = artifact_import_fixture_inner(
+    let (imported, code, _) = artifact_import_fixture_with_foundation(
         extra_rows,
         extra_constants,
         parser_rows,
@@ -88,14 +107,14 @@ pub(super) fn artifact_import_fixture_with_parser_dependency(
     (imported, code)
 }
 
-fn artifact_import_fixture_inner(
+fn artifact_import_fixture_with_foundation(
     extra_rows: &[(&str, &str, Option<&str>)],
     extra_constants: &[ConstantInfo],
     parser_rows: &[Obj],
     extra_ir: &[IrDecl],
     dependency: Option<(&str, &[ConstantInfo], &[Obj])>,
-    bind_seed: bool,
-) -> (SourceOleanImport, Vec<IrModule>, Vec<u8>) {
+    include_foundation: bool,
+) -> (SourceOleanImport, Vec<IrModule>, FixtureArtifacts) {
     let seed = Engine::with_source_seed(admission())
         .unwrap()
         .into_complete()
@@ -129,10 +148,10 @@ fn artifact_import_fixture_inner(
         "SourceLibrary.preresolved",
         "SourceLibrary.attributeProbe",
     ];
-    let mut constants: Vec<_> = if bind_seed {
+    let mut constants: Vec<_> = if include_foundation {
         seed.environment()
             .constants()
-            .map(|(_, constant)| constant.clone())
+            .map(|(_, declaration)| declaration.clone())
             .collect()
     } else {
         Vec::new()
@@ -253,13 +272,23 @@ fn artifact_import_fixture_inner(
         server_artifact: None,
         private_artifact: None,
     });
+    // Retain the exact physical inputs for rechecking emitted artifacts from
+    // an empty engine; an admitted base cannot replace their import closure.
+    let retained = if include_foundation {
+        inputs
+            .iter()
+            .map(|input| (input.name.clone(), input.artifact.to_vec()))
+            .collect()
+    } else {
+        Vec::new()
+    };
     let total_bytes = bytes.len() + dependency_bytes.as_ref().map_or(0, Vec::len);
-    let origin = if bind_seed {
+    let base = if include_foundation {
         Engine::builder().build_empty()
     } else {
         seed.clone()
     };
-    let imported = origin
+    let imported = base
         .import_olean_modules_for_source(
             &inputs,
             std::slice::from_ref(&module),
@@ -269,6 +298,13 @@ fn artifact_import_fixture_inner(
         .unwrap()
         .into_complete()
         .unwrap();
+    if include_foundation {
+        assert_eq!(
+            imported.engine.imported_environment(),
+            Some(imported.engine.environment()),
+            "the artifact build foundation must be bound by ordinary import admission"
+        );
+    }
     for owner in owners {
         assert!(
             imported
@@ -293,7 +329,7 @@ fn artifact_import_fixture_inner(
         function("SourceLibrary.attributeProbe", Behavior::Unsupported),
     ];
     declarations.extend_from_slice(extra_ir);
-    (imported, code(declarations), bytes)
+    (imported, code(declarations), retained)
 }
 
 /// Preserve the left identifier's spelling and exact backing source, but bind

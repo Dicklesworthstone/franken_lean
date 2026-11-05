@@ -29,6 +29,17 @@ struct Entry {
     body: Expr,
 }
 
+/// Prefix operands are lifted into their final strict-let scopes before any
+/// child is prepared. Their exact local interfaces select the private callee;
+/// the finished call body is then wrapped without revisiting those operands.
+pub(in crate::runtime) struct PartialCallPlan {
+    origin: Name,
+    entry: Entry,
+    arguments: Vec<Expr>,
+    prepared: Vec<Expr>,
+    interfaces: Vec<Option<ValueType>>,
+}
+
 #[derive(Default)]
 pub(in crate::runtime) struct Store {
     entries: Vec<Entry>,
@@ -276,11 +287,11 @@ impl Preparation<'_> {
         Ok(Some(entry))
     }
 
-    pub(super) fn partial_stage_call(
+    pub(in crate::runtime) fn partial_stage_plan(
         &mut self,
         head: &Expr,
         args: &[Expr],
-    ) -> Result<Option<Expr>, IngressError> {
+    ) -> Result<Option<Box<PartialCallPlan>>, IngressError> {
         let ExprNode::Const { name, levels } = head.node() else {
             return Ok(None);
         };
@@ -297,17 +308,168 @@ impl Preparation<'_> {
         let Some(entry) = self.partial_stage(name, args)? else {
             return Ok(None);
         };
-        let entry = self.partial_callback_stage(name, entry, args)?;
-        if entry.name == *name {
-            return Ok(None);
+        let mut arguments = Vec::new();
+        for argument in args {
+            self.tick()?;
+            reserve(&mut arguments, self.limits.max_application_args)?;
+            arguments.push(argument.clone());
         }
-        self.apply_partial_stage(&entry, args)
+        // Keep this larger continuation off the ordinary work-frame enum.
+        // The same fallible allocation moves through every prefix operand.
+        let plan = Box::try_new(PartialCallPlan {
+            origin: name.clone(),
+            entry,
+            arguments,
+            prepared: Vec::new(),
+            interfaces: Vec::new(),
+        })
+        .map_err(|_| IngressError::AllocationFailure {
+            resource: IngressResource::PendingTasks,
+            requested: 1,
+        })?;
+        Ok(Some(plan))
+    }
+
+    /// Schedule one initializer at a time. Its final scope already includes
+    /// every earlier prefix binding, but no missing parameter or surplus
+    /// operand. This is the ordinary typed-let initializer path on raw syntax.
+    pub(in crate::runtime) fn next_partial_stage(
+        &mut self,
+        mut plan: Box<PartialCallPlan>,
+    ) -> Result<(Task, Expr), IngressError> {
+        self.tick()?;
+        let index = plan.prepared.len();
+        let supplied = plan.arguments.len().min(plan.entry.parameters.len());
+        if index < supplied {
+            let offset = self.producer_depth(index)?;
+            let value = self.lift(&plan.arguments[index], offset)?;
+            let value = self.administrative_callable_value(&value)?;
+            let value = self.annotate_callable_tail(&value, &plan.entry.parameters[index].type_)?;
+            return Ok((Task::PartialOperand(plan), value));
+        }
+        plan.entry = self.partial_callback_stage(&plan.origin, plan.entry, &plan.interfaces)?;
+        let body = self
+            .partial_stage_body(&plan.entry, &plan.arguments)?
+            .ok_or_else(|| unsupported("partial stage application"))?;
+        Ok((Task::PartialBody(plan), body))
+    }
+
+    pub(in crate::runtime) fn accept_partial_operand(
+        &mut self,
+        plan: &mut PartialCallPlan,
+        value: Expr,
+    ) -> Result<(), IngressError> {
+        self.tick()?;
+        let index = plan.prepared.len();
+        let parameter = plan
+            .entry
+            .parameters
+            .get(index)
+            .ok_or_else(|| unsupported("partial stage operand stack"))?;
+        let value = self.local_function(&value, &parameter.type_)?;
+        let interface = if matches!(plan.entry.parameter_types[index], ValueType::Closure(_)) {
+            // Read only prepared metadata. Late closed-tail forwarding and
+            // internal captured aliases now agree with the value the compiler
+            // receives. Captures outside this operand stay unknown; ordinary
+            // ingress still checks every exact argument and return interface.
+            self.refine_expression_captures(&value)?;
+            self.staged_result(&value, &[])?
+        } else {
+            // Scalar and Array operands need no closure-table traversal.
+            None
+        };
+        reserve(&mut plan.prepared, self.limits.max_context_depth)?;
+        reserve(&mut plan.interfaces, self.limits.max_context_depth)?;
+        plan.prepared.push(value);
+        plan.interfaces.push(interface);
+        Ok(())
+    }
+
+    pub(in crate::runtime) fn finish_partial_stage(
+        &mut self,
+        plan: Box<PartialCallPlan>,
+        mut body: Expr,
+    ) -> Result<Expr, IngressError> {
+        for (parameter, value) in plan.entry.parameters.iter().zip(plan.prepared).rev() {
+            self.tick()?;
+            body = Expr::let_e(
+                parameter.name.clone(),
+                parameter.type_.clone(),
+                value,
+                body,
+                false,
+            );
+        }
+        Ok(body)
+    }
+
+    /// Unit-level driver for the same work frames used by runtime traversal.
+    /// It is never called from production preparation, which keeps every
+    /// operand and continuation on its one explicit work stack.
+    #[cfg(test)]
+    pub(super) fn partial_stage_call(
+        &mut self,
+        head: &Expr,
+        args: &[Expr],
+    ) -> Result<Option<Expr>, IngressError> {
+        let Some(mut plan) = self.partial_stage_plan(head, args)? else {
+            return Ok(None);
+        };
+        loop {
+            let (continuation, input) = self.next_partial_stage(plan)?;
+            match continuation {
+                Task::PartialOperand(mut next) => {
+                    let value = self.expression_worklist(input)?;
+                    self.accept_partial_operand(&mut next, value)?;
+                    plan = next;
+                }
+                Task::PartialBody(next) => {
+                    if next.entry.name == next.origin {
+                        return Ok(None);
+                    }
+                    let body = self.expression_worklist(input)?;
+                    return self.finish_partial_stage(next, body).map(Some);
+                }
+                _ => return Err(unsupported("partial stage test continuation")),
+            }
+        }
     }
 
     /// One strict binding per supplied prefix operand, followed by the prefix
     /// result and then any surplus operands. Callback-specialized recursive
     /// entries use this same staging operation as the ordinary Partial path.
     fn apply_partial_stage(
+        &mut self,
+        entry: &Entry,
+        args: &[Expr],
+    ) -> Result<Option<Expr>, IngressError> {
+        let supplied = args.len().min(entry.parameters.len());
+        let Some(mut value) = self.partial_stage_body(entry, args)? else {
+            return Ok(None);
+        };
+        for (index, (parameter, argument)) in entry.parameters[..supplied]
+            .iter()
+            .zip(args)
+            .enumerate()
+            .rev()
+        {
+            self.tick()?;
+            let offset = self.producer_depth(index)?;
+            value = Expr::let_e(
+                parameter.name.clone(),
+                parameter.type_.clone(),
+                self.lift(argument, offset)?,
+                value,
+                false,
+            );
+        }
+        Ok(Some(value))
+    }
+
+    /// Build the call below its prefix bindings. Supplied arguments belong
+    /// outside any missing-parameter lambdas; surplus arguments remain raw
+    /// until apply_producer places them after the strict prefix result.
+    fn partial_stage_body(
         &mut self,
         entry: &Entry,
         args: &[Expr],
@@ -350,22 +512,6 @@ impl Preparation<'_> {
                 return Err(unsupported("partial stage remaining representation"));
             };
             value = self.typed_callable_result(value, remaining, callback)?;
-        }
-        for (index, (parameter, argument)) in entry.parameters[..supplied]
-            .iter()
-            .zip(args)
-            .enumerate()
-            .rev()
-        {
-            self.tick()?;
-            let offset = self.producer_depth(index)?;
-            value = Expr::let_e(
-                parameter.name.clone(),
-                parameter.type_.clone(),
-                self.lift(argument, offset)?,
-                value,
-                false,
-            );
         }
         Ok(Some(value))
     }

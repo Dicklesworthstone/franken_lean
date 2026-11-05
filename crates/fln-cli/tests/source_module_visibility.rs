@@ -141,13 +141,13 @@ fn installed_imports_keep_private_siblings_and_transitive_imports_hidden() {
     );
     p.write(
         "Main.lean",
-        "prelude\nimport B\ndef use.{u} {A : Sort u} (x : A) : A := identity x",
+        "module\nprelude\npublic import B\npublic def use.{u} {A : Sort u} (x : A) : A := identity x",
     );
     p.refused("check-source");
     p.refused("run");
     p.write(
         "Main.lean",
-        "prelude\nimport B\nimport A\ndef use.{u} {A : Sort u} (x : A) : A := identity x",
+        "module\nprelude\npublic import B\npublic import A\npublic def use.{u} {A : Sort u} (x : A) : A := identity x",
     );
     p.complete("check-source");
     p.complete("run");
@@ -186,7 +186,7 @@ fn installed_public_imports_reexport_the_selected_api_without_private_names() {
     p.write("Facade.lean", "module\nprelude\npublic import Wrapper");
     p.write(
         "Main.lean",
-        "prelude\nimport Facade\ndef use.{u} {A : Sort u} (x : A) : A := identity x",
+        "module\nprelude\npublic import Facade\npublic def use.{u} {A : Sort u} (x : A) : A := identity x",
     );
     assert!(p.complete("check-source").contains("\"files\":5"));
     p.complete("run");
@@ -206,7 +206,7 @@ fn installed_public_imports_reexport_the_selected_api_without_private_names() {
     for declaration in ["hidden", "localUse"] {
         p.write(
             "Main.lean",
-            &format!("prelude\nimport Facade\ndef stolen.{{u}} {{A : Sort u}} (x : A) : A := {declaration} x"),
+            &format!("module\nprelude\npublic import Facade\npublic def stolen.{{u}} {{A : Sort u}} (x : A) : A := {declaration} x"),
         );
         p.refused("check-source");
         p.refused("run");
@@ -338,11 +338,7 @@ fn installed_public_scoped_instances_keep_activation_before_later_global_registr
 #[test]
 fn unsupported_visibility_refuses_before_missing_import_io() {
     let p = Project::new();
-    for clause in [
-        "meta import Missing",
-        "public meta import Missing",
-        "import all Missing",
-    ] {
+    for clause in ["meta import Missing", "public meta import Missing"] {
         p.write(
             "Main.lean",
             &format!("\u{feff}module\r\nprelude\r\n{clause}"),
@@ -361,6 +357,16 @@ fn unsupported_visibility_refuses_before_missing_import_io() {
             assert!(error.contains("\"authority\":false"), "{error}");
             assert!(error.contains("not implemented"), "{error}");
         }
+    }
+    p.write("Main.lean", "module\nprelude\nimport all Missing");
+    for command in ["check-source", "run"] {
+        let error = p.refused(command);
+        assert!(error.contains("Missing"), "{error}");
+        assert!(
+            !error.contains("`import all` private import visibility"),
+            "{error}"
+        );
+        assert!(!error.contains("not implemented"), "{error}");
     }
     for modifier in ["meta", "expose"] {
         p.write("Main.lean", &format!("module\nprelude\n{modifier} {ID}"));

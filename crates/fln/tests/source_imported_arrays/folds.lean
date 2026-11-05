@@ -13,9 +13,6 @@ def boundedArrayDigits (xs : Array Nat) (initial start stop : Nat) : Id Nat :=
 def defaultArrayDigits (xs : Array Nat) (initial : Nat) : Id Nat :=
   Array.foldlM (m := Id) (fun acc x => Pure.pure (acc * 10 + x)) initial xs
 
-def pureArrayDigits (xs : Array Nat) (initial : Nat) : Nat :=
-  Array.foldl (fun acc x => acc * 10 + x) initial xs
-
 def applyArrayFold
     (fold : (Nat -> Nat -> Id Nat) -> Nat -> Array Nat -> Nat -> Nat -> Id Nat)
     (xs : Array Nat) (initial : Nat) : Id Nat :=
@@ -38,6 +35,17 @@ def useCapturedArrayFold
 
 def ownedArrayFold (xs : Array String) (initial : String) : String :=
   Array.foldl (fun acc x => String.append (String.append acc "|") x) initial xs
+
+-- FLN_NATIVE_ALIAS_DEFINITIONS_BEGIN
+def pureArrayDigits (xs : Array Nat) (initial : Nat) : Nat :=
+  Array.foldl (fun acc x => acc * 10 + x) initial xs
+
+-- The accumulator initially aliases the source. Updating a future source slot
+-- must copy the accumulator, so the next callback still receives the old value.
+def aliasingArrayFold (xs : Array Nat) : Array Nat :=
+  Array.foldl
+    (fun acc x => Array.set! acc 1 (Array.getD acc 1 0 + x)) xs xs
+-- FLN_NATIVE_ALIAS_DEFINITIONS_END
 
 -- Dynamic array arguments exercise omitted stop := Array.size as well as
 -- explicit half-open bounds, without replacing the imported Array functions.
@@ -68,3 +76,9 @@ def ownedArrayFold (xs : Array String) (initial : String) : String :=
 #eval useCapturedArrayFold (capturedArrayFold "<" ">") (foldInput 1 1)
 -- FLN_EXPECT_STRING S|red|green
 #eval ownedArrayFold (List.toArray ["red", "green"]) "S"
+-- FLN_NATIVE_ALIAS_EVALUATIONS_BEGIN
+-- FLN_EXPECT_NAT 183
+#eval pureArrayDigits (aliasingArrayFold (List.toArray [1, 2, 3])) 0
+-- FLN_EXPECT_NAT 123183
+#eval let xs := List.toArray [1, 2, 3]; let changed := aliasingArrayFold xs; pureArrayDigits xs 0 * 1000 + pureArrayDigits changed 0
+-- FLN_NATIVE_ALIAS_EVALUATIONS_END

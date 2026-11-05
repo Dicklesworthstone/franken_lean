@@ -374,6 +374,97 @@ fn a_missing_output_rebuilds_its_module_alone_and_a_changed_one_is_only_reported
     );
 }
 
+#[test]
+fn companion_outputs_have_the_same_content_and_missing_file_decisions_as_public_roots() {
+    let package = Package::new("\"Lib\"");
+    package.write("Lib/Base.lean", "module\nprelude\nprivate theorem hidden (P : Prop) (h : P) : P := h\npublic theorem Lib.proof (P : Prop) (h : P) : P := hidden P h\n");
+    package.write("Lib/Top.lean", "module\nprelude\npublic import Lib.Base\npublic theorem Lib.top (P : Prop) (h : P) : P := Lib.proof P h\n");
+    package.built("+Lib.Top:olean", None);
+    for part in ["olean.server", "olean.private"] {
+        let relative = format!(".lake/build/lib/lean/Lib/Base.{part}");
+        let path = package.0.join(&relative);
+        let original = std::fs::read(&path).unwrap();
+        std::fs::write(&path, b"forged companion").unwrap();
+        let forged = package.explained(&[], None);
+        assert_eq!(forged.field("reference_decision"), "up-to-date");
+        assert_eq!(
+            forged.changed("changed_outputs"),
+            vec![[
+                "Lib.Base".to_owned(),
+                "output".to_owned(),
+                relative.clone(),
+                digest(&original),
+                digest(b"forged companion"),
+            ]]
+        );
+        std::fs::rename(&path, path.with_extension(format!("{part}.retained"))).unwrap();
+        let missing = package.explained(&[], None);
+        assert_eq!(
+            missing.decisions(),
+            decisions(&[("Lib.Base", "rebuild"), ("Lib.Top", "up-to-date")])
+        );
+        assert_eq!(
+            missing.changed("changed_outputs"),
+            vec![[
+                "Lib.Base".to_owned(),
+                "output".to_owned(),
+                relative,
+                digest(&original),
+                String::new(),
+            ]]
+        );
+        package.built("+Lib.Top:olean", None);
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        assert!(
+            package
+                .explained(&[], None)
+                .changed("changed_outputs")
+                .is_empty()
+        );
+    }
+}
+
+#[test]
+fn an_external_private_companion_change_rebuilds_its_import_cone() {
+    let producer = Package::new("\"Ext\"");
+    let source = "module\nprelude\npublic theorem Ext.proof (P : Prop) (h : P) : P := h\n";
+    producer.write("Ext/Base.lean", source);
+    producer.built("+Ext.Base:olean", None);
+    let search = producer.0.join(".lake/build/lib/lean");
+    let public = std::fs::read(search.join("Ext/Base.olean")).unwrap();
+    let private = std::fs::read(search.join("Ext/Base.olean.private")).unwrap();
+    let consumer = Package::new("\"Lib\"");
+    consumer.write("Lib/Base.lean", "module\nprelude\npublic import Ext.Base\npublic theorem Lib.proof (P : Prop) (h : P) : P := Ext.proof P h\n");
+    consumer.write("Lib/Top.lean", "module\nprelude\npublic import Lib.Base\npublic theorem Lib.top (P : Prop) (h : P) : P := Lib.proof P h\n");
+    consumer.built("+Lib.Top:olean", Some(&search));
+    producer.write(
+        "Ext/Base.lean",
+        format!("{source}private theorem implementation (P : Prop) (h : P) : P := h\n"),
+    );
+    producer.built("+Ext.Base:olean", None);
+    assert_eq!(
+        std::fs::read(search.join("Ext/Base.olean")).unwrap(),
+        public
+    );
+    assert_ne!(
+        std::fs::read(search.join("Ext/Base.olean.private")).unwrap(),
+        private
+    );
+    let explanation = consumer.explained(&[], Some(&search));
+    assert_eq!(
+        explanation.decisions(),
+        decisions(&[("Lib.Base", "rebuild"), ("Lib.Top", "rebuild")])
+    );
+    assert!(
+        explanation
+            .changed("changed_inputs")
+            .iter()
+            .any(|row| row[1] == "external" && row[2] == "Ext.Base" && row[3] != row[4]),
+        "{}",
+        explanation.0
+    );
+}
+
 /// An external `.olean` that changed is named with its old and new hashes, and only
 /// the modules whose import cone contains it rebuild.
 #[test]

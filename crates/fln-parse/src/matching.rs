@@ -2104,6 +2104,48 @@ fn build_bool_conditional(
     Ok(())
 }
 
+/// The pin's optional `Term.generalizingParam`, including the distinct
+/// `trueVal`/`falseVal` nodes. Contextual words become atoms while retaining
+/// the original leaf's trivia and byte extent.
+fn generalizing_parameter(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    start: usize,
+    end: usize,
+) -> Result<(Syntax, usize), NatDefinitionParseError> {
+    if !is_symbol(tokens, start, "(") || !term_locals::word(tokens, start + 1, "generalizing") {
+        return Ok((null_node(vec![]), start));
+    }
+    if start + 5 > end || !is_symbol(tokens, start + 2, ":=") || !is_symbol(tokens, start + 4, ")")
+    {
+        return Err(refuse(view, tokens, start));
+    }
+    let (value, kind) = if term_locals::word(tokens, start + 3, "true") {
+        ("true", "trueVal")
+    } else if term_locals::word(tokens, start + 3, "false") {
+        ("false", "falseVal")
+    } else {
+        return Err(refuse(view, tokens, start + 3));
+    };
+    Ok((
+        null_node(vec![Syntax::node(
+            parser_kind(&["Term", "generalizingParam"]),
+            vec![
+                leaves.leaf(start)?,
+                Syntax::atom(leaves.leaf(start + 1)?.info(), "generalizing"),
+                leaves.leaf(start + 2)?,
+                Syntax::node(
+                    parser_kind(&["Term", kind]),
+                    vec![Syntax::atom(leaves.leaf(start + 3)?.info(), value)],
+                ),
+                leaves.leaf(start + 4)?,
+            ],
+        )]),
+        start + 5,
+    ))
+}
+
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
 fn build_match(
@@ -2120,10 +2162,15 @@ fn build_match(
     let with = plan.with.expect("validated match header");
     let equation_root = equations && plan.start == range.start;
     let mut discriminators = Vec::new();
+    let (generalizing, first_discriminant) = if equation_root || plan.function || plan.catch {
+        (null_node(vec![]), plan.start + 1)
+    } else {
+        generalizing_parameter(leaves, view, tokens, plan.start + 1, with)?
+    };
     let discriminant_columns = if equation_root || plan.function || plan.catch {
         Vec::new()
     } else {
-        columns(tokens, plan.start + 1..with)
+        columns(tokens, first_discriminant..with)
     };
     let arity = if plan.catch {
         1
@@ -2304,7 +2351,7 @@ fn build_match(
             vec![
                 leaves.leaf(plan.start)?,
                 null_node(vec![]), // optional dependent parameter
-                null_node(vec![]), // optional generalizing parameter
+                generalizing,
                 null_node(vec![]), // optional motive
                 null_node(discriminators),
                 leaves.leaf(with)?,
@@ -2316,7 +2363,7 @@ fn build_match(
             parser_kind(&["Term", "match"]),
             vec![
                 leaves.leaf(plan.start)?,
-                null_node(vec![]),
+                generalizing,
                 null_node(vec![]),
                 null_node(discriminators),
                 leaves.leaf(with)?,
@@ -2813,5 +2860,40 @@ mod conditional_tests {
             .unwrap()
             .join()
             .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod generalizing_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_generalizing_parameters_keep_the_pinned_tree_and_original_trivia() {
+        for value in ["false", "true"] {
+            let source = format!(
+                "def choose (b : Bool) : Nat :=\r\n  match (/- flag -/ generalizing := {value}) b with\r\n  | true => 7\r\n  | false => 9\r\n"
+            );
+            let parsed = parse_definition(source.as_bytes()).unwrap();
+            assert_eq!(parsed.reconstruct_original(), source.as_bytes());
+            let mut pending = vec![parsed.syntax()];
+            let mut found = None;
+            while let Some(node) = pending.pop() {
+                if node.kind() == Some(&parser_kind(&["Term", "generalizingParam"])) {
+                    found = Some(node);
+                    break;
+                }
+                if let Syntax::Node { args, .. } = node {
+                    pending.extend(args);
+                }
+            }
+            let Some(Syntax::Node { args, .. }) = found else {
+                panic!("missing pinned generalizingParam node");
+            };
+            assert_eq!(args.len(), 5);
+            assert_eq!(
+                args[3].kind(),
+                Some(&parser_kind(&["Term", &format!("{value}Val")]))
+            );
+        }
     }
 }

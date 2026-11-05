@@ -271,6 +271,7 @@ pub(crate) struct FileSessionReport {
 pub(crate) enum ProgramCommandSyntax {
     Single(Box<ParsedSourceCommand>),
     Mutual(Vec<Syntax>),
+    Deriving(Syntax),
 }
 
 impl ProgramCommandSyntax {
@@ -278,6 +279,7 @@ impl ProgramCommandSyntax {
         match self {
             Self::Single(parsed) => vec![parsed.syntax()],
             Self::Mutual(members) => members.iter().collect(),
+            Self::Deriving(syntax) => vec![syntax],
         }
     }
 
@@ -289,6 +291,9 @@ impl ProgramCommandSyntax {
                 Ok(crate::source_records::ScopedCommandSyntax::Mutual(members))
             }
             Self::Single(parsed) => scoped_command(*parsed),
+            Self::Deriving(syntax) => {
+                Ok(crate::source_records::ScopedCommandSyntax::Deriving(syntax))
+            }
         }
     }
 }
@@ -297,6 +302,9 @@ pub(crate) fn scoped_command(
     parsed: ParsedSourceCommand,
 ) -> Result<crate::source_records::ScopedCommandSyntax, EngineExecutionError> {
     use crate::source_records::ScopedCommandSyntax;
+    if fln_elab::source::deriving::is_command(parsed.syntax()) {
+        return Ok(ScopedCommandSyntax::Deriving(parsed.syntax().clone()));
+    }
     match parsed.kind() {
         SourceCommandKind::Example => Ok(ScopedCommandSyntax::Example(parsed)),
         SourceCommandKind::Definition => parsed
@@ -598,6 +606,25 @@ impl<'a> FileSession<'a> {
                 ));
             }
         };
+        if fln_elab::source::deriving::is_command(parsed.syntax()) {
+            return self
+                .expand_syntax(
+                    engine,
+                    registry,
+                    parsed.source_view().normalized(),
+                    parsed.syntax(),
+                    scope,
+                )
+                .map_complete(|result| {
+                    result.and_then(|syntax| {
+                        if fln_elab::source::deriving::is_command(&syntax) {
+                            Ok(ProgramCommandSyntax::Deriving(syntax))
+                        } else {
+                            Err(SourceMacroError::DeclarationRequired)
+                        }
+                    })
+                });
+        }
         if self.is_imported_command(registry, &parsed) {
             return self
                 .expand_imported_command(engine, registry, parsed, scope)
@@ -705,6 +732,22 @@ impl<'a> FileSession<'a> {
             }
         };
         match parsed {
+            ScopedCommandSyntax::Deriving(syntax) => {
+                let view = match source_view(source) {
+                    Ok(view) => view,
+                    Err(error) => return Outcome::Complete(Err(error)),
+                };
+                self.expand_syntax(engine, registry, view.normalized(), &syntax, scope)
+                    .map_complete(|result| {
+                        result.and_then(|syntax| {
+                            if fln_elab::source::deriving::is_command(&syntax) {
+                                Ok(ScopedCommandSyntax::Deriving(syntax))
+                            } else {
+                                Err(SourceMacroError::DeclarationRequired)
+                            }
+                        })
+                    })
+            }
             ScopedCommandSyntax::Mutual(mut members) => {
                 let view = match source_view(source) {
                     Ok(view) => view,

@@ -1,7 +1,7 @@
 //! Metered beta/delta/zeta/iota reduction for native unification.
 //!
 //! Eliminator majors use heap continuations rather than recursive calls. Only
-//! registered, safe single/mutual-family recursors and initialized quotient
+//! registered, safe single/mutual/nested-family recursors and initialized quotient
 //! primitives reduce. A blocked major is rebuilt once; it is never re-entered in a loop.
 //! This module has no declaration-publication authority. Assignment validation
 //! and all-or-nothing publication remain in the parent solver.
@@ -305,9 +305,17 @@ impl Engine<'_> {
                                 // guess the layout of unsupported recursor families. A
                                 // nested block's recursor has a motive per auxiliary
                                 // family too, in the same layout; `iota` checks the family.
+                                let Some(ConstantInfo::Induct(owner)) = recursor
+                                    .all
+                                    .first()
+                                    .and_then(|name| self.work.env.find(name))
+                                else {
+                                    break;
+                                };
                                 if recursor.is_unsafe
                                     || recursor.all.is_empty()
-                                    || count(recursor.num_motives)? < recursor.all.len()
+                                    || Some(count(recursor.num_motives)?)
+                                        != recursor.all.len().checked_add(count(owner.num_nested)?)
                                     || recursor.base.level_params.len() != levels.len()
                                 {
                                     break;
@@ -546,17 +554,23 @@ impl Engine<'_> {
                         }
                         let reduced =
                             self.iota(&rec_head, &recursor, &outer, prefix, &head, &args)?;
-                        if let Some(result) = reduced {
+                        if let Some(candidate) = &reduced
+                            && candidate.pending.is_empty()
+                        {
                             // The reversed spine starts with arguments after
                             // the major. Keep these for a function-valued result.
                             outer.truncate(outer.len() - major - 1);
-                            head = result;
+                            head = candidate.result.clone();
                             args = outer;
                             continue 'reduce;
                         }
                         let position = outer.len() - major - 1;
                         outer[position] = self.rebuild_application(head, args)?;
-                        if let Some(candidate) = self.k_candidate(&rec_head, &recursor, &outer)? {
+                        let candidate = match reduced {
+                            Some(candidate) => Some(candidate),
+                            None => self.k_candidate(&rec_head, &recursor, &outer)?,
+                        };
+                        if let Some(candidate) = candidate {
                             let comparison = Box::new(k::Comparison {
                                 candidate,
                                 blocked_head: rec_head,
@@ -595,7 +609,7 @@ impl Engine<'_> {
             continuations.push(Continuation::KLeft { comparison, right });
             return self.demand(left, memo, continuations);
         }
-        // A conversion match licenses exactly the admitted nullary rule.
+        // A conversion match licenses exactly the admitted rule.
         // Arguments after the major still apply to its result.
         comparison
             .arguments
@@ -793,7 +807,7 @@ impl Engine<'_> {
         prefix: usize,
         major_head: &Expr,
         major_arguments: &[Expr],
-    ) -> Result<Option<Expr>, UnificationError> {
+    ) -> Result<Option<k::Candidate>, UnificationError> {
         // Earlier equations may have assigned universe metavariables. Resolve
         // them before checking compatibility, without assigning holes merely
         // to enable a reduction.
@@ -817,24 +831,31 @@ impl Engine<'_> {
         let Some(ConstantInfo::Ctor(ctor)) = self.work.env.find(constructor_name) else {
             return Ok(None);
         };
-        // `all` names the entire mutual block, not the owner of this recursor.
-        // A rule may fire only for a constructor of its own selected family;
-        // neither its position in `all` nor a spelling such as `T.rec` is authority.
+        // `all` names the main block. A restored nested auxiliary instead
+        // eliminates its original container, with its own parameters and
+        // universes. Its actual major-domain equation is checked below.
         let family_name = &ctor.induct;
         let Some(ConstantInfo::Induct(family)) = self.work.env.find(family_name) else {
             return Ok(None);
         };
-        if family.is_unsafe
+        let Some(ConstantInfo::Induct(owner)) = recursor
+            .all
+            .first()
+            .and_then(|name| self.work.env.find(name))
+        else {
+            return Ok(None);
+        };
+        if recursor.is_unsafe
+            || levels.len() != recursor.base.level_params.len()
+            || family.is_unsafe
             || family.num_indices != recursor.num_indices
-            || family.num_params != recursor.num_params
-            || family.all != recursor.all
             || recursor.rules.len() != family.ctors.len()
         {
             return Ok(None);
         }
         // A nested block's recursor also takes a motive per auxiliary family, and minors for
         // the auxiliaries' constructors, which are not constants of their own.
-        let nested = count(family.num_nested)?;
+        let nested = count(owner.num_nested)?;
         for (rule, constructor) in recursor.rules.iter().zip(&family.ctors) {
             self.meter.node()?;
             if &rule.ctor != constructor {
@@ -854,10 +875,10 @@ impl Engine<'_> {
             if !members.insert(member)
                 || &info.base.name != member
                 || info.is_unsafe
-                || info.num_nested != family.num_nested
+                || info.num_nested != owner.num_nested
                 || info.all != recursor.all
                 || info.num_params != recursor.num_params
-                || info.base.level_params != family.base.level_params
+                || info.base.level_params != owner.base.level_params
             {
                 return Ok(None);
             }
@@ -866,10 +887,14 @@ impl Engine<'_> {
                 .ok_or(UnificationError::ExpressionScope)?;
         }
         let all_minors = count(recursor.num_minors)?;
-        if !members.contains(family_name)
+        let auxiliary = !members.contains(family_name);
+        if (auxiliary && nested == 0)
             || Some(count(recursor.num_motives)?) != members.len().checked_add(nested)
             || (nested == 0 && all_minors != minors)
             || (nested != 0 && all_minors <= minors)
+            || (recursor.base.level_params != owner.base.level_params
+                && (recursor.base.level_params.len() != owner.base.level_params.len() + 1
+                    || recursor.base.level_params[1..] != owner.base.level_params))
         {
             return Ok(None);
         }
@@ -885,17 +910,36 @@ impl Engine<'_> {
         {
             return Ok(None);
         }
-        let compatible = if recursor.base.level_params == family.base.level_params {
-            levels == constructor_levels
-        } else {
-            recursor.base.level_params.len() == family.base.level_params.len() + 1
-                && recursor.base.level_params[1..] == family.base.level_params
-                && levels.len() == constructor_levels.len() + 1
-                && levels[1..] == *constructor_levels
-        };
-        if !compatible {
-            return Ok(None);
+        if !auxiliary {
+            let compatible = if recursor.base.level_params == family.base.level_params {
+                levels == constructor_levels
+            } else {
+                recursor.base.level_params.len() == family.base.level_params.len() + 1
+                    && recursor.base.level_params[1..] == family.base.level_params
+                    && levels.len() == constructor_levels.len() + 1
+                    && levels[1..] == *constructor_levels
+            };
+            if !compatible {
+                return Ok(None);
+            }
         }
+        let pending = if auxiliary {
+            let constructor = ctor.clone();
+            let Some(equation) = self.nested_major_equation(
+                recursor,
+                levels,
+                arguments,
+                &constructor,
+                constructor_levels,
+                major_arguments,
+            )?
+            else {
+                return Ok(None);
+            };
+            vec![equation]
+        } else {
+            Vec::new()
+        };
         let mut selected = None;
         for rule in &recursor.rules {
             self.meter.node()?;
@@ -927,7 +971,61 @@ impl Engine<'_> {
             self.meter.node()?;
             result = Expr::app(result, argument.clone());
         }
-        Ok(Some(result))
+        Ok(Some(k::Candidate { pending, result }))
+    }
+
+    /// Compare a specialized container's actual type without assigning holes.
+    /// The enclosing reduction machine evaluates this equation on its heap
+    /// continuations, using the caller's transparency just like the K guard.
+    fn nested_major_equation(
+        &mut self,
+        recursor: &RecursorVal,
+        levels: &[Level],
+        arguments: &[Expr],
+        constructor: &fln_env::constants::ConstructorVal,
+        constructor_levels: &[Level],
+        constructor_arguments: &[Expr],
+    ) -> Result<Option<(Expr, Expr)>, UnificationError> {
+        let (_, major) = recursor_positions(recursor)?;
+        if major >= arguments.len() {
+            return Ok(None);
+        }
+        self.scan(&recursor.base.type_)?;
+        let mut telescope = crate::universe::parameters::instantiate(
+            || self.meter.node(),
+            || UnificationError::ExpressionScope,
+            &recursor.base.type_,
+            &recursor.base.level_params,
+            levels,
+        )?;
+        for argument in arguments.iter().rev().take(major) {
+            self.meter.node()?;
+            let ExprNode::ForallE { body, .. } = telescope.node() else {
+                return Ok(None);
+            };
+            telescope = self.substitute(body, argument)?;
+        }
+        let ExprNode::ForallE { binder_type, .. } = telescope.node() else {
+            return Ok(None);
+        };
+        let domain = self.instantiate(binder_type)?;
+        self.scan(&constructor.base.type_)?;
+        let mut result = crate::universe::parameters::instantiate(
+            || self.meter.node(),
+            || UnificationError::ExpressionScope,
+            &constructor.base.type_,
+            &constructor.base.level_params,
+            constructor_levels,
+        )?;
+        for argument in constructor_arguments.iter().rev() {
+            self.meter.node()?;
+            let ExprNode::ForallE { body, .. } = result.node() else {
+                return Ok(None);
+            };
+            result = self.substitute(body, argument)?;
+        }
+        let result = self.instantiate(&result)?;
+        Ok(Some((domain, result)))
     }
 
     /// Expose one constructor layer of a compact numeral, never a unary tree.

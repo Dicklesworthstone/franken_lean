@@ -12,6 +12,7 @@ use std::collections::{HashMap, HashSet};
 mod conditional_order;
 mod mutual;
 mod nomatch;
+pub(in crate::source) mod split_info;
 pub(super) use conditional_order::{ConditionalBuild, ConditionalStep};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,6 +33,7 @@ pub enum MatchError {
     InaccessibleParameter,
     DuplicateVariable,
     UnreachableRow,
+    UnsupportedGeneralization,
 }
 impl std::fmt::Display for MatchError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -60,6 +62,9 @@ impl std::fmt::Display for MatchError {
             }
             Self::DuplicateVariable => "constructor pattern repeats a variable",
             Self::UnreachableRow => "pattern matrix contains a redundant or unreachable source row",
+            Self::UnsupportedGeneralization => {
+                "disabled match generalization requires an ordinary nonrecursive unindexed match"
+            }
         })
     }
 }
@@ -76,6 +81,43 @@ pub(super) struct MatchParts<'a> {
     /// A `match` as written in the source, not one a sugar or the compiler produced.
     written: bool,
     conditional: Option<ConditionalParts<'a>>,
+    generalizing: bool,
+}
+
+/// Read the canonical optional `Term.generalizingParam`. Omitting it has the
+/// same dependent-local behavior as `true` at the pin.
+pub(super) fn generalizing_annotation(syntax: &Syntax) -> Result<bool, NatDefinitionElabError> {
+    let values = expect_null_args(syntax, "optional generalizing parameter")?;
+    let [value] = values else {
+        return if values.is_empty() {
+            Ok(true)
+        } else {
+            Err(error(MatchError::InvalidPattern))
+        };
+    };
+    let parts = expect_node(
+        value,
+        &parser_kind(&["Term", "generalizingParam"]),
+        5,
+        "match generalizing parameter",
+    )?;
+    expect_atom(&parts[0], "(", "generalizing parameter opening")?;
+    expect_atom(&parts[1], "generalizing", "generalizing parameter keyword")?;
+    expect_atom(&parts[2], ":=", "generalizing parameter assignment")?;
+    expect_atom(&parts[4], ")", "generalizing parameter closing")?;
+    let value = parts[3].kind() == Some(&parser_kind(&["Term", "trueVal"]));
+    let literal = expect_node(
+        &parts[3],
+        &parser_kind(&["Term", if value { "trueVal" } else { "falseVal" }]),
+        1,
+        "literal generalizing parameter",
+    )?;
+    expect_atom(
+        &literal[0],
+        if value { "true" } else { "false" },
+        "generalizing Boolean",
+    )?;
+    Ok(value)
 }
 #[derive(Clone, Copy)]
 struct ConditionalParts<'a> {
@@ -118,6 +160,8 @@ impl MatchParts<'_> {
 pub(super) struct MatchPatterns<'a> {
     pub(super) constructors: HashMap<Name, (Vec<Option<Name>>, &'a Syntax)>,
     pub(super) fallback: Option<(Option<Name>, &'a Syntax)>,
+    /// Written constructor order and field names, which recursor argument order loses.
+    split_info: Option<KVMap>,
 }
 pub(super) enum MatchStart<'a> {
     Conditional(Box<ConditionalBuild<'a>>),
@@ -150,6 +194,7 @@ pub(super) struct MatchBuild<'a> {
     levels: Vec<Level>,
     recursor: Typed,
     branches: std::collections::VecDeque<Branch<'a>>,
+    split_info: Option<KVMap>,
 }
 pub(super) struct BranchBinders {
     // Old indices whose direct field patterns lack an index-equation witness.
@@ -274,6 +319,7 @@ impl Context {
                 alternatives: &[],
                 generated: true,
                 written: false,
+                generalizing: true,
                 conditional: Some(ConditionalParts {
                     binds_evidence: dependent,
                     binding,
@@ -307,6 +353,7 @@ impl Context {
                 alternatives: &[],
                 generated: true,
                 written: false,
+                generalizing: true,
                 conditional: Some(ConditionalParts {
                     binds_evidence,
                     binding,
@@ -323,7 +370,7 @@ impl Context {
             "match expression",
         )?;
         expect_atom(&parts[0], "match", "match keyword")?;
-        expect_empty_null(&parts[1], "unsupported generalizing annotation")?;
+        let generalizing = generalizing_annotation(&parts[1])?;
         expect_empty_null(&parts[2], "unsupported explicit motive")?;
         let [discriminant] = expect_null_args(&parts[3], "single discriminant")? else {
             return Err(error(MatchError::InvalidPattern));
@@ -368,6 +415,7 @@ impl Context {
             written: matches!(&parts[0], Syntax::Atom { info, .. }
                 if matches!(info, fln_syntax::source::SourceInfo::Original { .. })),
             conditional: None,
+            generalizing,
         })
     }
 
@@ -444,7 +492,12 @@ impl Context {
                 .abstract_fvar(id, 0)
                 .map_err(|_| failure(SourceInferenceError::Scope))?
         } else {
-            target.clone()
+            // The pin's motive abstracts the discriminant expression itself,
+            // including an application such as `inst a a` in Prelude's
+            // of_decide_eq_self_eq_true. Preserve the whole computed term as
+            // one binder; no local dependency or captured proof is rewritten.
+            let value = self.instantiate(&major.value)?;
+            self.kabstract(target, &value)?
         };
         let mut motive = Expr::lam(
             Name::anonymous(),
@@ -486,6 +539,9 @@ impl Context {
                 parts.alternatives,
             )?;
         }
+        if !parts.generalizing && (parts.generated || parts.equation.is_some()) {
+            return Err(error(MatchError::UnsupportedGeneralization));
+        }
         if let Some(state) = self.repeated_matrix_field(parts, &major, expected.as_ref())? {
             return Ok(MatchStart::Regular(Box::new(state)));
         }
@@ -494,6 +550,9 @@ impl Context {
         // equation-refining backend; typing faults and resource stops propagate.
         let recursive = self.is_recursive_match(&major.value);
         let well_founded = self.well_founded_continuation().is_some();
+        if !parts.generalizing && (recursive || well_founded) {
+            return Err(error(MatchError::UnsupportedGeneralization));
+        }
         if well_founded && parts.equation.is_some() {
             // That backend substitutes the whole local dependency cone. A
             // well-founded call must preserve original captured arguments;
@@ -562,6 +621,9 @@ impl Context {
         if family.ctors.len() > 256 {
             return Err(failure(SourceInferenceError::ResourceLimit));
         }
+        if !parts.generalizing && family.num_indices != 0 {
+            return Err(error(MatchError::UnsupportedGeneralization));
+        }
         let recursor_name = Name::str(name.clone(), "rec");
         let Some(ConstantInfo::Rec(rec)) = self.txn.env.find(&recursor_name).cloned() else {
             return Err(error(MatchError::UnsupportedFamily));
@@ -588,10 +650,15 @@ impl Context {
             }
         };
         let recursive = self.recursive_match(&major.value);
-        // A match is a single-family case split, not mutual function recursion.
-        // The latter needs a separate call-graph and decreasing-argument proof,
-        // and so does recursion through a nested occurrence.
+        // Direct hypotheses do not expose descendants inside a nested field.
+        // A single nested family can retry with its admitted below dictionary;
+        // mutual function recursion still needs a separate call-graph proof.
         if recursive && rec.num_motives > 1 {
+            if family.all.len() == 1 && family.num_nested != 0 {
+                return Err(failure(SourceInferenceError::Recursion(
+                    recursion::RecursionError::NotDecreasing,
+                )));
+            }
             return Err(error(MatchError::UnsupportedFamily));
         }
         // A sole variable/wildcard pattern does not refine any index. Lower it
@@ -638,6 +705,7 @@ impl Context {
                     // Replaced by the checked body before completion.
                     recursor: major,
                     branches: std::collections::VecDeque::new(),
+                    split_info: None,
                 });
             }
         }
@@ -677,7 +745,7 @@ impl Context {
         let mut generalized = Vec::new();
         if recursive {
             self.recursive_indices(name, &parameters, &indices)?;
-        } else {
+        } else if parts.generalizing {
             // An ordinary, unindexed discriminant can also occur in a local's
             // type (Token n, Nat.below motive n). Generalize that dependent
             // telescope before specializing it to each constructor.
@@ -787,7 +855,10 @@ impl Context {
         let MatchPatterns {
             constructors: mut patterns,
             fallback,
+            split_info,
         } = self.match_patterns(parts, name, &family.ctors, &family_type)?;
+        let split_info =
+            split_info.filter(|_| !recursive && family.num_indices == 0 && rec.num_motives == 1);
         let mut branches = std::collections::VecDeque::new();
         let mut seen = HashSet::new();
         for rule in &rec.rules {
@@ -837,6 +908,7 @@ impl Context {
             levels: levels.clone(),
             recursor,
             branches,
+            split_info,
         })
     }
 
@@ -959,6 +1031,7 @@ impl Context {
             levels: Vec::new(),
             recursor: major.clone(),
             branches: std::collections::VecDeque::new(),
+            split_info: None,
         }))
     }
 
@@ -1035,9 +1108,11 @@ impl Context {
             return Ok(MatchPatterns {
                 constructors: patterns,
                 fallback: None,
+                split_info: None,
             });
         }
         let mut fallback = None;
+        let mut order = Vec::new();
         for (index, syntax) in parts.alternatives.iter().enumerate() {
             self.tick()?;
             let alt = expect_node(
@@ -1275,6 +1350,7 @@ impl Context {
                 {
                     return Err(error(MatchError::DuplicateVariable));
                 }
+                order.push(constructor_name.clone());
                 if patterns
                     .insert(constructor_name, (fields, &alt[3]))
                     .is_some()
@@ -1302,9 +1378,18 @@ impl Context {
                 return Err(error(MatchError::DuplicateConstructor));
             }
         }
+        let split_info =
+            (!parts.generated && parts.equation.is_none() && fallback.is_none()).then(|| {
+                split_info::encode(
+                    order
+                        .iter()
+                        .map(|constructor| (constructor, patterns[constructor].0.as_slice())),
+                )
+            });
         Ok(MatchPatterns {
             constructors: patterns,
             fallback,
+            split_info,
         })
     }
 
@@ -1503,6 +1588,9 @@ impl Context {
                     result.value,
                     false,
                 );
+            }
+            if let Some(info) = &state.split_info {
+                result.value = Expr::mdata(info.clone(), result.value);
             }
             return Ok(MatchStep::Complete(
                 self.finish_term(result, Some(&state.target))?,

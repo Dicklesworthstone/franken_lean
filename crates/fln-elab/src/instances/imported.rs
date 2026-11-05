@@ -33,6 +33,7 @@ pub struct InstanceParameters {
 pub(super) struct Metadata {
     pub classes: BTreeMap<Name, ClassParameters>,
     pub instances: BTreeMap<Name, InstanceParameters>,
+    pub instance_classes: BTreeMap<Name, Name>,
 }
 
 pub(super) fn name() -> Name {
@@ -135,8 +136,8 @@ fn validate_order(
     env: &Environment,
     declaration: &Name,
     parameters: &InstanceParameters,
-) -> Result<(), InstanceRegistryError> {
-    validate_instance(env, declaration)?;
+) -> Result<Name, InstanceRegistryError> {
+    let class = validate_instance(env, declaration)?;
     let info = env
         .find(declaration)
         .ok_or_else(|| InstanceRegistryError::UnknownDeclaration(declaration.clone()))?;
@@ -159,10 +160,11 @@ fn validate_order(
     {
         return Err(InstanceRegistryError::Malformed);
     }
-    Ok(())
+    Ok(class)
 }
 
 /// The imported-instance journal's content identity, if the journal exists.
+#[cfg(test)]
 pub(super) fn journal_digest(env: &Environment) -> Option<[u8; 32]> {
     env.extension(&name())
         .map(|extension| extension.content_digest().0)
@@ -193,7 +195,7 @@ pub(super) fn export_classes(
             .ok_or(InstanceRegistryError::Limit)?;
         Ok(())
     };
-    for entry in extension.entries() {
+    for (entry, validation) in env.metadata_validation_entries(&name()) {
         charge(work_left, 1)?;
         charge(work_left, entry.payload.len())?;
         bytes_read += entry.payload.len();
@@ -217,8 +219,8 @@ pub(super) fn export_classes(
         if !bytes.is_empty() {
             return Err(InstanceRegistryError::Malformed);
         }
-        validate_class(env, &class)?;
-        let info = env
+        validate_class(validation, &class)?;
+        let info = validation
             .find(&class)
             .ok_or(InstanceRegistryError::Malformed)?
             .constant_val();
@@ -253,8 +255,8 @@ pub(super) fn read(env: &Environment) -> Result<Metadata, InstanceRegistryError>
         return Err(InstanceRegistryError::Limit);
     }
     let mut result = Metadata::default();
-    for entry in extension.entries() {
-        result.apply(env, &entry.payload)?;
+    for (entry, validation) in env.metadata_validation_entries(&name()) {
+        result.apply(validation, &entry.payload)?;
     }
     Ok(result)
 }
@@ -298,7 +300,8 @@ impl Metadata {
                     synth_order: indices(&mut bytes)?,
                     keys: super::discr_tree::read_keys(&mut bytes)?,
                 };
-                validate_order(env, &declaration, &parameters)?;
+                let class = validate_order(env, &declaration, &parameters)?;
+                self.instance_classes.insert(declaration.clone(), class);
                 self.instances.insert(declaration, parameters);
             }
             _ => return Err(InstanceRegistryError::Malformed),

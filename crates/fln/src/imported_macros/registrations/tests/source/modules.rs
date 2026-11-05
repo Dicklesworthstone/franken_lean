@@ -2,7 +2,7 @@
 //! constructed compiler inputs test native integration, not Reference parity.
 use super::*;
 use crate::SourceModuleInput;
-use crate::source_check::modules::imported::{SourceOleanImport, SourceOleanImportLimits};
+use crate::source_check::modules::imported::SourceOleanImport;
 use crate::source_check::modules::{
     SourceMacroModuleCheck, SourceModuleCheck, SourceModuleCheckError, SourceModuleCheckLimits,
     SourceModuleDeferredMacroInputs, SourceModuleMacroInputs,
@@ -1805,7 +1805,7 @@ pub(super) fn compile_deferred(
 
 #[test]
 fn imported_macro_builds_emit_recheckable_artifacts_with_real_implicit_imports() {
-    let (imported, code, library_bytes) = batches::artifact_build_fixture();
+    let (imported, code, retained) = batches::artifact_build_fixture();
     let before = imported.engine.logical_root(&KVMap::new());
     let declarations = users(&code);
     let compilation =
@@ -1841,33 +1841,32 @@ fn imported_macro_builds_emit_recheckable_artifacts_with_real_implicit_imports()
     assert_eq!(built.states.as_ref().unwrap().len(), 3);
     assert_declared_value(&product.checked.checked.engine, "first", 11);
     assert_declared_value(&product.checked.checked.engine, "second", 17);
-    let mut imports: Vec<_> = product
-        .artifacts
+    let mut imports: Vec<_> = retained
         .iter()
-        .map(|artifact| crate::OleanModuleInput {
-            name: &artifact.name,
-            artifact: &artifact.bytes,
+        .map(|(name, artifact)| crate::OleanModuleInput {
+            name,
+            artifact,
             server_artifact: None,
             private_artifact: None,
         })
         .collect();
-    let library_name = name("SourceLibrary");
-    imports.push(crate::OleanModuleInput {
-        name: &library_name,
-        artifact: &library_bytes,
-        server_artifact: None,
-        private_artifact: None,
-    });
+    imports.extend(
+        product
+            .artifacts
+            .iter()
+            .map(|artifact| crate::OleanModuleInput {
+                name: &artifact.name,
+                artifact: &artifact.bytes,
+                server_artifact: None,
+                private_artifact: None,
+            }),
+    );
     let rechecked = Engine::builder()
         .build_empty()
-        .import_olean_modules_for_source(
+        .check_olean_modules(
             &imports,
-            &[name("Main")],
             &KVMap::new(),
-            SourceOleanImportLimits::new(crate::OleanCheckLimits::new(
-                4 * 1024 * 1024,
-                admission().kernel,
-            )),
+            crate::OleanCheckLimits::new(4 * 1024 * 1024, admission().kernel),
         )
         .unwrap()
         .into_complete()

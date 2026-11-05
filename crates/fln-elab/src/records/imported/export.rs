@@ -28,14 +28,16 @@ fn projection_index(env: &Environment) -> Result<Arc<BTreeSet<Name>>, RecordErro
         let cached = last.as_ref()?;
         let same_journals = [extension_name(), inheritance::descriptor().name]
             .iter()
-            .all(|name| {
-                env.extension(name).map(|state| state.content_digest())
-                    == cached
-                        .environment
-                        .extension(name)
-                        .map(|state| state.content_digest())
-            });
-        (env.has_same_declarations(&cached.environment) && same_journals)
+            .all(
+                |name| match (env.extension(name), cached.environment.extension(name)) {
+                    (None, None) => true,
+                    (Some(left), Some(right)) => std::ptr::eq(left, right),
+                    _ => false,
+                },
+            );
+        (env.has_same_declarations(&cached.environment)
+            && env.has_same_metadata_validation(&cached.environment)
+            && same_journals)
             .then(|| Arc::clone(&cached.projections))
     });
     if let Some(projections) = hit {
@@ -49,6 +51,7 @@ fn projection_index(env: &Environment) -> Result<Arc<BTreeSet<Name>>, RecordErro
             .structures
             .into_iter()
             .flat_map(|row| row.fields.into_iter().map(|field| field.projection))
+            .filter(|name| env.contains(name))
             .collect(),
     );
     LAST_PROJECTIONS.with(|last| {
@@ -118,7 +121,7 @@ fn visit(
     result: &Environment,
     expected: &ExtensionDescriptor,
     meter: &mut Meter,
-    mut read: impl FnMut(bool, &[u8], &mut Meter) -> Result<(), RecordError>,
+    mut read: impl FnMut(bool, &[u8], &Environment, &mut Meter) -> Result<(), RecordError>,
 ) -> Result<(), RecordError> {
     let prior = base.extension(&expected.name);
     let Some(current) = result.extension(&expected.name) else {
@@ -140,7 +143,10 @@ fn visit(
     let inherited_count = prior.map_or(0, |old| old.len());
     let mut inherited = prior.map(|old| old.entries());
     let mut bytes_left = MAX_BYTES;
-    for (index, row) in current.entries().enumerate() {
+    for (index, (row, validation)) in result
+        .metadata_validation_entries(&expected.name)
+        .enumerate()
+    {
         meter.charge(1)?;
         if index < inherited_count {
             let old = inherited
@@ -159,7 +165,7 @@ fn visit(
             .checked_sub(row.payload.len())
             .ok_or(RecordError::ResourceLimit)?;
         meter.payload(&row.payload)?;
-        read(index >= inherited_count, &row.payload, meter)?;
+        read(index >= inherited_count, &row.payload, validation, meter)?;
     }
     Ok(())
 }
@@ -211,12 +217,12 @@ pub fn registrations(
         result,
         &descriptor(),
         &mut meter,
-        |is_owned, payload, meter| {
+        |is_owned, payload, validation, meter| {
             let mut bytes = payload;
             let row = decode(&mut bytes, &mut cells_left)?;
-            let parents = validate(result, &row, &mut meter.remaining)?;
+            let parents = validate(validation, &row, &mut meter.remaining)?;
             if is_owned {
-                owned(base, result, &row)?;
+                owned(base, validation, &row)?;
                 owned_names.insert(row.name.clone());
                 structures.push(row.clone());
             }
@@ -235,9 +241,9 @@ pub fn registrations(
         result,
         &inheritance::descriptor(),
         &mut meter,
-        |is_owned, payload, meter| {
+        |is_owned, payload, validation, meter| {
             let row = inheritance::decode(payload)?;
-            inheritance::validate(result, &row, &mut meter.remaining)?;
+            inheritance::validate(validation, &row, &mut meter.remaining)?;
             if !native_fields.insert((row.record.clone(), row.field))
                 || !native_parents.insert((row.record.clone(), row.parent.clone()))
             {

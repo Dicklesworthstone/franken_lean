@@ -127,7 +127,7 @@ fn public_source_imports_preserve_external_dictionary_order_and_private_boundari
         vec![(INSTANCE, vec![instance("b", 1000)])],
     );
     let receipt = imported(&p);
-    let main = "prelude\nimport Wrapper\ndef use [d : Class] : Class := d\nnoncomputable def chosen : Family use := valueA";
+    let main = "module\nprelude\npublic import Wrapper\npublic section\ndef use [d : Class] : Class := d\nnoncomputable def chosen : Family use := valueA";
     for wrapper in [
         "module\nprelude\nimport A\npublic import B\npublic import A\ndef localUse [d : Class] : Class := d\nnoncomputable def localChoice : Family localUse := valueB",
         "module\nprelude\nimport B\npublic import A\nnoncomputable def localSecret : Class := onlyB",
@@ -140,7 +140,8 @@ fn public_source_imports_preserve_external_dictionary_order_and_private_boundari
         p.write("Main.lean", main);
         p.success();
     }
-    let leaking = "prelude\nimport Wrapper\nnoncomputable def leak : Class := onlyB";
+    let leaking =
+        "module\nprelude\npublic import Wrapper\npublic noncomputable def leak : Class := onlyB";
     let names = [n("Wrapper"), n("Main")];
     let sources = [
         "module\nprelude\nimport B\npublic import A\nnoncomputable def localSecret : Class := onlyB",

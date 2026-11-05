@@ -7,6 +7,7 @@ use fln_core::level::Level;
 mod locals;
 mod projections;
 pub(super) mod query;
+mod singletons;
 
 // Bool.false is the existing, checked scalar-zero binding. Source typing forbids
 // observing a proof as a Bool; this representation exists only after admission.

@@ -290,13 +290,89 @@ impl Context {
         self.substitute_proof_goal_preserving_names(proof, goal, name, false)
     }
 
+    /// The `rfl` case pattern calls the pin's `substEq`, rather than searching
+    /// for an unrelated equation about the selected local. Keep its right-hand
+    /// endpoint preference and return the actual transport substitutions so
+    /// subsequent patterns and deferred clears follow recreated dependents.
+    pub(super) fn substitute_rcases_equality(
+        &mut self,
+        proof: &mut ProofState<'_>,
+        mut goal: ProofGoal,
+        id: &FVarId,
+    ) -> Result<Vec<(FVarId, Expr)>, NatDefinitionElabError> {
+        self.txn.lctx = goal.lctx.clone();
+        self.resolve_instances(false)?;
+        self.flush(false)?;
+        let selected = goal
+            .lctx
+            .find(id)
+            .cloned()
+            .ok_or_else(|| error(TacticError::SubstitutionLocal))?;
+        // The shared transport currently selects by user name. Never let a
+        // shadowed name redirect this ID-selected pattern to another equation.
+        if goal
+            .lctx
+            .find_by_user_name(&selected.user_name)
+            .is_none_or(|visible| visible.id != selected.id)
+        {
+            return Err(error(TacticError::SubstitutionLocal));
+        }
+        let type_ = self.whnf(&selected.type_)?;
+        let evidence = self
+            .homogeneous_equality_evidence(&Typed {
+                value: Expr::fvar(id.clone()),
+                type_: type_.clone(),
+            })?
+            .ok_or_else(|| {
+                error(TacticError::SubstitutionNoEquation {
+                    local: selected.user_name.clone(),
+                })
+            })?;
+        let name = if equality_target(&type_).is_some() {
+            selected.user_name.clone()
+        } else {
+            let derived = FVarId(self.fresh_name()?);
+            let name = derived.0.clone();
+            self.txn.lctx.add_let(
+                derived.clone(),
+                name.clone(),
+                evidence.type_,
+                evidence.value,
+            );
+            goal.introduced.push(
+                self.txn
+                    .lctx
+                    .find(&derived)
+                    .expect("inserted equality bridge")
+                    .clone(),
+            );
+            goal.lctx = self.txn.lctx.clone();
+            name
+        };
+        self.substitute_homogeneous_proof_goal(proof, goal, &name, Some(&selected.id), false, true)
+    }
+
     pub(super) fn substitute_proof_goal_preserving_names(
+        &mut self,
+        proof: &mut ProofState<'_>,
+        goal: ProofGoal,
+        name: &Name,
+        aliases: bool,
+    ) -> Result<(), NatDefinitionElabError> {
+        self.substitute_proof_goal_with_substitutions(proof, goal, name, aliases)
+            .map(|_| ())
+    }
+
+    /// Preserve the exact context maps of both heterogeneous transport stages.
+    /// A dependent local recreated by the first stage can be substituted by the
+    /// second; callers must apply the steps in order, without name lookup.
+    pub(super) fn substitute_proof_goal_with_substitutions(
         &mut self,
         proof: &mut ProofState<'_>,
         mut goal: ProofGoal,
         name: &Name,
         aliases: bool,
-    ) -> Result<(), NatDefinitionElabError> {
+    ) -> Result<Vec<eliminate::CaseSubstitution>, NatDefinitionElabError> {
         self.txn.lctx = goal.lctx.clone();
         self.resolve_instances(false)?;
         self.flush(false)?;
@@ -307,8 +383,16 @@ impl Context {
             .ok_or_else(|| error(TacticError::SubstitutionLocal))?;
         let type_ = self.whnf(&selected.type_)?;
         if heterogeneous_target(&type_).is_none() {
-            return self.substitute_homogeneous_proof_goal(proof, goal, name, None, aliases);
+            return self
+                .substitute_homogeneous_proof_goal(proof, goal, name, None, aliases, false)
+                .map(|replacements| {
+                    vec![eliminate::CaseSubstitution {
+                        eliminated: 1,
+                        replacements,
+                    }]
+                });
         }
+        let mut substitutions = Vec::new();
         // At most two dependent transports: first identify local endpoint
         // types, then identify their values. Arbitrary equations between type
         // applications are not assumed injective and remain unsupported.
@@ -380,15 +464,20 @@ impl Context {
                     .clone(),
             );
             goal.lctx = self.txn.lctx.clone();
-            self.substitute_homogeneous_proof_goal(
+            let replacements = self.substitute_homogeneous_proof_goal(
                 proof,
                 goal,
                 &derived_name,
                 same_type.then_some(&selected.id),
                 aliases,
+                false,
             )?;
+            substitutions.push(eliminate::CaseSubstitution {
+                eliminated: 1,
+                replacements,
+            });
             if same_type {
-                return Ok(());
+                return Ok(substitutions);
             }
             let Some(Work::Goal(child)) = proof.work.pop() else {
                 return Err(error(TacticError::MalformedScript));
@@ -405,7 +494,8 @@ impl Context {
         name: &Name,
         hide: Option<&FVarId>,
         aliases: bool,
-    ) -> Result<(), NatDefinitionElabError> {
+        right_first: bool,
+    ) -> Result<Vec<(FVarId, Expr)>, NatDefinitionElabError> {
         self.txn.lctx = goal.lctx.clone();
         self.resolve_instances(false)?;
         self.flush(false)?;
@@ -436,10 +526,22 @@ impl Context {
             };
             let left_variable = self.substitution_endpoint(&left)?;
             let right_variable = self.substitution_endpoint(&right)?;
-            for (candidate, replacement, reverse) in [
+            let orientations = [
                 (&left_variable, &right, true),
                 (&right_variable, &left, false),
-            ] {
+            ];
+            let orientations = if right_first {
+                // `substEq` commits to the RHS when it is a variable. A cyclic
+                // RHS does not authorize trying the opposite orientation.
+                if matches!(right_variable.node(), ExprNode::FVar { .. }) {
+                    &orientations[1..]
+                } else {
+                    &orientations[..1]
+                }
+            } else {
+                &orientations[..]
+            };
+            for &(candidate, replacement, reverse) in orientations {
                 let ExprNode::FVar { id } = candidate.node() else {
                     continue;
                 };
@@ -577,6 +679,9 @@ impl Context {
             }
         }
         child.lctx = self.txn.lctx.clone();
+        if let Some(tag) = self.goal_tags.get(&goal.id).cloned() {
+            self.goal_tags.insert(child.id.clone(), tag);
+        }
         self.txn.lctx = goal.lctx.clone();
         let value = Expr::fvar(variable);
         let evidence = if reverse {
@@ -595,6 +700,6 @@ impl Context {
         }
         proof.work.push(Work::Close(goal, result));
         proof.work.push(Work::Goal(child));
-        Ok(())
+        Ok(replacements)
     }
 }

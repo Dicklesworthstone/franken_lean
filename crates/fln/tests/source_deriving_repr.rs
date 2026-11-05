@@ -923,7 +923,7 @@ theorem chain_ne : Not (Chain.cons 7 (Chain.cons 9 Chain.nil) = Chain.cons 7 (Ch
             }
             let hidden = imported
                 .check_source_modules(
-                    &[private_input, SourceModuleInput { name: &main, source: b"prelude\nimport Library" }],
+                    &[private_input, SourceModuleInput { name: &main, source: b"module\nprelude\npublic import Library" }],
                     &main,
                     &KVMap::new(),
                     SourceModuleCheckLimits::new(SourceCheckLimits::new(admission())),

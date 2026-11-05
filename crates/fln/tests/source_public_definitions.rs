@@ -48,7 +48,174 @@ const SECRET: &str = "prelude\nimport Base\ndef secret : Bit := Bit.on";
 const API: &str = "module\nprelude\npublic import Base\nimport Secret\ndef localValue : Bit := secret\npublic def chosen : Bit := localValue\npublic opaque sealed : Bit := localValue\ndef checkedInside (P : Bit -> Prop) (h : P Bit.on) : P chosen := h";
 
 #[test]
-fn public_definition_and_opaque_keep_checked_bodies_only_in_the_defining_module() {
+fn legacy_imports_replay_checked_hidden_bodies_and_transitive_private_dependencies() {
+    let names = [n("Main"), n("Api"), n("Base"), n("Secret")];
+    let inputs = [
+        SourceModuleInput {
+            name: &names[0],
+            source:
+                b"prelude\nimport Api\ndef witness (P : Bit -> Prop) (h : P Bit.on) : P chosen := h",
+        },
+        SourceModuleInput {
+            name: &names[1],
+            source: API.as_bytes(),
+        },
+        SourceModuleInput {
+            name: &names[2],
+            source: BASE.as_bytes(),
+        },
+        SourceModuleInput {
+            name: &names[3],
+            source: SECRET.as_bytes(),
+        },
+    ];
+    let options = KVMap::new();
+    let base = Engine::builder().build_empty();
+    let receipt = fln::source_check::modules::imported::SourceOleanImport::empty(&options);
+    for result in [
+        base.check_source_modules(&inputs, &names[0], &options, limits()),
+        receipt.check_source_modules(&inputs, &names[0], &options, limits(), None),
+    ] {
+        let result = result.unwrap().into_complete().unwrap();
+        let env = result.checked.engine.environment();
+        assert!(matches!(
+            env.find(&n("chosen")),
+            Some(ConstantInfo::Defn(_))
+        ));
+        assert!(matches!(
+            env.find(&n("sealed")),
+            Some(ConstantInfo::Opaque(_))
+        ));
+        assert!(env.contains(&n("secret")));
+        assert!(env.contains(&private("Api", "localValue")));
+        assert!(env.contains(&n("witness")));
+        assert!(!env.contains(&n("localValue")));
+    }
+    // Loading a checked private implementation does not create an unmangled
+    // source alias for a private declaration in another module.
+    let mut hidden_name = inputs;
+    hidden_name[0].source = b"prelude\nimport Api\ndef leak : Bit := localValue";
+    for result in [
+        base.check_source_modules(&hidden_name, &names[0], &options, limits()),
+        receipt.check_source_modules(&hidden_name, &names[0], &options, limits(), None),
+    ] {
+        assert!(
+            matches!(result, Err(SourceModuleCheckError::Source { module, .. }) if module == n("Main"))
+        );
+    }
+}
+
+#[test]
+fn legacy_private_dependency_edits_and_import_modes_do_not_reuse_stale_bodies() {
+    use fln::source_check::modules::{SourceModuleCacheLimits, SourceModuleSession};
+    let names = [n("Main"), n("Api"), n("Base"), n("Secret")];
+    let inputs = [
+        SourceModuleInput {
+            name: &names[0],
+            source: b"prelude\nimport Api\ndef witness (P : Bit -> Prop) (h : P Bit.on) : P chosen := h",
+        },
+        SourceModuleInput {
+            name: &names[1],
+            source: b"module\nprelude\npublic import Base\nimport Secret\ndef localValue : Bit := secret\npublic def chosen : Bit := localValue",
+        },
+        SourceModuleInput {
+            name: &names[2],
+            source: BASE.as_bytes(),
+        },
+        SourceModuleInput {
+            name: &names[3],
+            source: SECRET.as_bytes(),
+        },
+    ];
+    let options = KVMap::new();
+    for mut session in [
+        SourceModuleSession::new(
+            Engine::builder().build_empty(),
+            options.clone(),
+            limits(),
+            SourceModuleCacheLimits::default(),
+        ),
+        SourceModuleSession::from_imports(
+            fln::source_check::modules::imported::SourceOleanImport::empty(&options),
+            options,
+            limits(),
+            SourceModuleCacheLimits::default(),
+        ),
+    ] {
+        let cold = session
+            .check(&inputs, &names[0])
+            .unwrap()
+            .into_complete()
+            .unwrap();
+        let warm = session
+            .check(&inputs, &names[0])
+            .unwrap()
+            .into_complete()
+            .unwrap();
+        assert_eq!((cold.elaborated_modules, warm.reused_modules), (4, 4));
+        assert_eq!(
+            cold.checked.checked.result_logical_root,
+            warm.checked.checked.result_logical_root
+        );
+        let mut modern = inputs;
+        modern[0].source = b"module\nprelude\npublic import Api";
+        let modern = session
+            .check(&modern, &names[0])
+            .unwrap()
+            .into_complete()
+            .unwrap();
+        assert_eq!((modern.reused_modules, modern.elaborated_modules), (3, 1));
+        let env = modern.checked.checked.engine.environment();
+        assert!(matches!(
+            env.find(&n("chosen")),
+            Some(ConstantInfo::Axiom(_))
+        ));
+        assert!(!env.contains(&n("secret")));
+        assert!(!env.contains(&private("Api", "localValue")));
+        let legacy = session
+            .check(&inputs, &names[0])
+            .unwrap()
+            .into_complete()
+            .unwrap();
+        assert_eq!((legacy.reused_modules, legacy.elaborated_modules), (3, 1));
+        assert_eq!(
+            legacy.checked.checked.result_logical_root,
+            cold.checked.checked.result_logical_root
+        );
+        let mut changed = inputs;
+        changed[3].source = b"prelude\nimport Base\ndef secret : Bit := Bit.off";
+        assert!(matches!(
+            session.check(&changed, &names[0]),
+            Err(SourceModuleCheckError::Source { module, .. }) if module == names[0]
+        ));
+        assert_eq!(session.retained_modules(), 4);
+        let recovered = session
+            .check(&inputs, &names[0])
+            .unwrap()
+            .into_complete()
+            .unwrap();
+        assert_eq!(recovered.reused_modules, 4);
+        assert_eq!(
+            recovered.checked.checked.result_logical_root,
+            cold.checked.checked.result_logical_root
+        );
+        changed[0].source =
+            b"prelude\nimport Api\ndef witness (P : Bit -> Prop) (h : P Bit.off) : P chosen := h";
+        let rebuilt = session
+            .check(&changed, &names[0])
+            .unwrap()
+            .into_complete()
+            .unwrap();
+        assert_eq!((rebuilt.reused_modules, rebuilt.elaborated_modules), (1, 3));
+        assert_ne!(
+            rebuilt.checked.checked.result_logical_root,
+            cold.checked.checked.result_logical_root
+        );
+    }
+}
+
+#[test]
+fn public_definition_and_opaque_hide_checked_bodies_from_modern_imports() {
     let base = Engine::builder().build_empty();
     let local = complete(&base, &[("Api", API), ("Base", BASE), ("Secret", SECRET)]);
     let client = complete(
@@ -56,7 +223,7 @@ fn public_definition_and_opaque_keep_checked_bodies_only_in_the_defining_module(
         &[
             (
                 "Main",
-                "prelude\nimport Api\nnoncomputable def used : Bit := chosen\nnoncomputable def usedOpaque : Bit := sealed",
+                "module\nprelude\npublic import Api\npublic section\nnoncomputable def used : Bit := chosen\nnoncomputable def usedOpaque : Bit := sealed",
             ),
             ("Api", API),
             ("Base", BASE),
@@ -124,8 +291,7 @@ fn exposing_a_body_cannot_use_private_dependencies_and_hiding_does_not_make_it_r
             matches!(check(&base, &[("Api", &api), ("Base", BASE), ("Secret", SECRET)]), Err(SourceModuleCheckError::Source { module, .. }) if module == n("Api"))
         );
     }
-    let invalid =
-        "prelude\nimport Api\ntheorem invented (P : Bit -> Prop) (h : P Bit.on) : P chosen := h";
+    let invalid = "module\nprelude\npublic import Api\npublic theorem invented (P : Bit -> Prop) (h : P Bit.on) : P chosen := h";
     assert!(
         matches!(check(&base, &[("Main", invalid), ("Api", API), ("Base", BASE), ("Secret", SECRET)]), Err(SourceModuleCheckError::Source { module, .. }) if module == n("Main"))
     );
@@ -156,7 +322,7 @@ fn hidden_definition_headers_and_bodies_use_their_own_instance_histories() {
     let base = Engine::builder().build_empty();
     let foundation = "prelude\ninductive Token where\n| left\n| right\nclass Pick where\n  value : Token\ndef selected [p : Pick] : Token := p.value";
     let api = "module\nprelude\npublic import Base\npublic instance visible : Pick := Pick.mk Token.left\nprivate instance hidden : Pick := Pick.mk Token.right\npublic def witness (P : Token -> Prop) (h : P Token.left) : P selected := h\npublic def chosen : Token := selected\ndef checkBody (P : Token -> Prop) (h : P Token.right) : P chosen := h";
-    let main = "prelude\nimport Api\ntheorem use (P : Token -> Prop) (h : P Token.left) : P selected := witness P h";
+    let main = "module\nprelude\npublic import Api\npublic theorem use (P : Token -> Prop) (h : P Token.left) : P selected := witness P h";
     let imported = complete(&base, &[("Main", main), ("Api", api), ("Base", foundation)]);
     assert!(matches!(
         imported.checked.engine.environment().find(&n("witness")),
@@ -216,7 +382,10 @@ fn hidden_unsafe_implementations_never_become_safe_exported_assumptions() {
     assert!(
         matches!(local.checked.engine.environment().find(&n("untrusted")), Some(ConstantInfo::Defn(d)) if d.safety == fln_env::constants::DefinitionSafety::Unsafe)
     );
-    let imported = complete(&base, &[("Main", "prelude\nimport Api"), ("Api", api)]);
+    let imported = complete(
+        &base,
+        &[("Main", "module\nprelude\npublic import Api"), ("Api", api)],
+    );
     assert!(
         matches!(imported.checked.engine.environment().find(&n("untrusted")), Some(ConstantInfo::Axiom(d)) if d.is_unsafe)
     );
@@ -228,8 +397,7 @@ fn hidden_unsafe_implementations_never_become_safe_exported_assumptions() {
 fn abbreviation_and_opaque_exposure_defaults_follow_declaration_kind() {
     let base = Engine::builder().build_empty();
     let api = "module\nprelude\npublic import Base\nimport Secret\npublic abbrev reduced : Bit := Bit.on\n@[no_expose] public abbrev hidden : Bit := secret\n@[expose] public section\ndef exposed : Bit := Bit.on\n@[no_expose] def rehidden : Bit := secret\nopaque sealed : Bit := secret\n@[expose] opaque visibleOpaque : Bit := Bit.on\nend";
-    let main =
-        "prelude\nimport Api\ntheorem reduction (P : Bit -> Prop) (h : P Bit.on) : P reduced := h";
+    let main = "module\nprelude\npublic import Api\npublic theorem reduction (P : Bit -> Prop) (h : P Bit.on) : P reduced := h";
     let imported = complete(
         &base,
         &[
@@ -277,7 +445,8 @@ fn hidden_data_instances_keep_private_dictionaries_but_export_real_search_entrie
         "prelude\ninductive Bit where\n| off\n| on\nclass Pick (A : Type) where\n  value : A";
     let secret = "prelude\nimport Base\ndef hiddenDictionary : Pick Bit := Pick.mk Bit.on";
     let api = "module\nprelude\npublic import Base\nimport Secret\n@[no_expose] public instance selected : Pick Bit := hiddenDictionary\ndef locally (P : Bit -> Prop) (h : P Bit.on) : P Pick.value := h";
-    let main = "prelude\nimport Api\nnoncomputable def client : Bit := Pick.value";
+    let main =
+        "module\nprelude\npublic import Api\npublic noncomputable def client : Bit := Pick.value";
     let imported = complete(
         &base,
         &[
@@ -297,7 +466,7 @@ fn hidden_data_instances_keep_private_dictionaries_but_export_real_search_entrie
             .any(|row| row.declaration == n("selected"))
     );
     assert!(!env.contains(&n("hiddenDictionary")));
-    let bad = "prelude\nimport Api\ntheorem invented (P : Bit -> Prop) (h : P Bit.on) : P Pick.value := h";
+    let bad = "module\nprelude\npublic import Api\npublic theorem invented (P : Bit -> Prop) (h : P Bit.on) : P Pick.value := h";
     assert!(
         check(
             &base,
@@ -316,7 +485,7 @@ fn hidden_data_instances_keep_private_dictionaries_but_export_real_search_entrie
 fn hidden_implementation_edits_cannot_publish_stale_interfaces_or_partial_cache_updates() {
     use fln::source_check::modules::{SourceModuleCacheLimits, SourceModuleSession};
     let names = [n("Main"), n("Api"), n("Base"), n("Secret")];
-    let main = "prelude\nimport Api\nnoncomputable def use : Bit := chosen";
+    let main = "module\nprelude\npublic import Api\npublic noncomputable def use : Bit := chosen";
     let inputs = [
         SourceModuleInput {
             name: &names[0],
@@ -458,7 +627,7 @@ fn cancellation_at_every_observed_module_checkpoint_never_publishes_half_an_inte
 }
 
 #[test]
-fn hidden_local_and_where_helpers_are_checked_but_never_exported() {
+fn hidden_local_and_where_helpers_are_checked_but_hidden_from_modern_imports() {
     let base = Engine::builder().build_empty();
     let api = "module\nprelude\npublic import Base\nimport Secret\npublic def chosen : Bit :=\n  let rec helper : Bit :=\n    let rec nested : Bit := secret\n    nested\n  helper\npublic opaque sealed : Bit := value where\n  value : Bit := secret\ndef checkedHelper (P : Bit -> Prop) (h : P Bit.on) : P chosen.helper.nested := h";
     let local = complete(&base, &[("Api", api), ("Base", BASE), ("Secret", SECRET)]);
@@ -478,7 +647,7 @@ fn hidden_local_and_where_helpers_are_checked_but_never_exported() {
         &[
             (
                 "Main",
-                "prelude\nimport Api\nnoncomputable def use : Bit := chosen",
+                "module\nprelude\npublic import Api\npublic noncomputable def use : Bit := chosen",
             ),
             ("Api", api),
             ("Base", BASE),
@@ -497,8 +666,8 @@ fn hidden_local_and_where_helpers_are_checked_but_never_exported() {
         );
     }
     for source in [
-        "prelude\nimport Api\nnoncomputable def leak : Bit := chosen.helper",
-        "prelude\nimport Api\nnoncomputable def leak : Bit := sealed.value",
+        "module\nprelude\npublic import Api\npublic noncomputable def leak : Bit := chosen.helper",
+        "module\nprelude\npublic import Api\npublic noncomputable def leak : Bit := sealed.value",
     ] {
         assert!(
             check(
@@ -526,7 +695,10 @@ fn hidden_helpers_close_polymorphic_captures_without_changing_public_signatures(
         panic!("helper");
     };
     assert_eq!(helper.base.level_params.len(), 1);
-    let imported = complete(&base, &[("Main", "prelude\nimport Api"), ("Api", api)]);
+    let imported = complete(
+        &base,
+        &[("Main", "module\nprelude\npublic import Api"), ("Api", api)],
+    );
     assert_eq!(
         local
             .checked
@@ -575,7 +747,7 @@ fn hidden_instance_helpers_do_not_duplicate_owner_metadata() {
         &[
             (
                 "Main",
-                "prelude\nimport Api\nnoncomputable def use : Bit := Pick.value",
+                "module\nprelude\npublic import Api\npublic noncomputable def use : Bit := Pick.value",
             ),
             ("Api", api),
             ("Base", foundation),
@@ -619,7 +791,7 @@ fn hidden_helpers_preserve_safety_and_noncomputable_classification() {
     let imported = complete(
         &base,
         &[
-            ("Main", "prelude\nimport Api"),
+            ("Main", "module\nprelude\npublic import Api"),
             ("Api", api),
             ("Base", BASE),
             ("Secret", SECRET),
@@ -690,7 +862,7 @@ fn hidden_proof_instance_helpers_remain_private_checked_implementations() {
         &[
             (
                 "Main",
-                "prelude\nimport Api\ntheorem use : Truth := Law.proof",
+                "module\nprelude\npublic import Api\npublic theorem use : Truth := Law.proof",
             ),
             ("Api", api),
             ("Base", foundation),

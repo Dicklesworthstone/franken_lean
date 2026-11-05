@@ -55,6 +55,80 @@ fn check_both(
 const BASE: &str = "prelude\ninductive Token where\n| left\n| right\n| extra\nclass Pick (A : Type) where\n  value : A\nstructure Box (A : Type) where\n  value : A\ndef chosen {A : Type} [p : Pick A] : A := p.value";
 const HEADER: &str = "module\nprelude\npublic import Base\n";
 
+/// At the pin, `processHeaderCore` selects `.private` for a legacy root and
+/// `.exported` for a `module` root. A hidden dictionary therefore reduces only
+/// in the legacy client; selecting it is not permission to expose its body in
+/// the modern public interface.
+#[test]
+fn legacy_imports_can_reduce_hidden_public_instance_implementations() {
+    let api = format!(
+        "{HEADER}@[no_expose] public instance dictionary : Pick Token := Pick.mk Token.left"
+    );
+    let legacy =
+        "prelude\nimport Api\ndef witness (P : Token -> Prop) (h : P Token.left) : P chosen := h";
+    for result in check_both(&[("Main", legacy), ("Api", &api), ("Base", BASE)]) {
+        let checked = result.unwrap().into_complete().unwrap();
+        let env = checked.checked.engine.environment();
+        assert!(env.contains(&n("witness")));
+        assert!(matches!(
+            env.find(&n("dictionary")),
+            Some(fln::ConstantInfo::Defn(_))
+        ));
+        assert_eq!(
+            InstanceRegistry::read(env)
+                .unwrap()
+                .candidates(&n("Pick"))
+                .len(),
+            1
+        );
+    }
+    let modern = "module\nprelude\npublic import Api\npublic def witness (P : Token -> Prop) (h : P Token.left) : P chosen := h";
+    for result in check_both(&[("Main", modern), ("Api", &api), ("Base", BASE)]) {
+        assert!(
+            matches!(result, Err(SourceModuleCheckError::Source { module, .. }) if module == n("Main"))
+        );
+    }
+}
+
+#[test]
+fn legacy_imports_replay_private_instance_journals_without_public_name_aliases() {
+    // Meta/Instances.lean exports a private registration only in the `.private`
+    // journal. Its newer equal-priority entry wins there, while modern imports
+    // retain the separate public history.
+    let api = format!(
+        "{HEADER}public instance visible : Pick Token := Pick.mk Token.left\nprivate instance hidden : Pick Token := Pick.mk Token.right"
+    );
+    for (main, expected, private_present) in [
+        (
+            "prelude\nimport Api\ndef witness (P : Token -> Prop) (h : P Token.right) : P chosen := h",
+            private("Api", "hidden"),
+            true,
+        ),
+        (
+            "module\nprelude\npublic import Api\npublic def witness (P : Token -> Prop) (h : P Token.left) : P chosen := h",
+            n("visible"),
+            false,
+        ),
+    ] {
+        for result in check_both(&[("Main", main), ("Api", &api), ("Base", BASE)]) {
+            let checked = result.unwrap().into_complete().unwrap();
+            let env = checked.checked.engine.environment();
+            let registry = InstanceRegistry::read(env).unwrap();
+            let candidates = registry.candidates(&n("Pick"));
+            assert_eq!(candidates[0].declaration, expected);
+            assert_eq!(candidates.len(), if private_present { 2 } else { 1 });
+            assert_eq!(env.contains(&private("Api", "hidden")), private_present);
+            assert!(!env.contains(&n("hidden")));
+        }
+    }
+    let bad = "prelude\nimport Api\ndef leak : Pick Token := hidden";
+    for result in check_both(&[("Main", bad), ("Api", &api), ("Base", BASE)]) {
+        assert!(
+            matches!(result, Err(SourceModuleCheckError::Source { module, .. }) if module == n("Main"))
+        );
+    }
+}
+
 #[test]
 fn named_and_anonymous_parameterized_public_instances_export_reducible_dictionaries() {
     let api = format!(
@@ -120,7 +194,7 @@ fn public_and_private_instance_priorities_keep_independent_recency() {
             "{HEADER}public instance (priority := 2000) first : Pick Token := Pick.mk Token.left\nprivate instance (priority := 2000) hidden : Pick Token := Pick.mk Token.right\npublic instance (priority := 500) lower : Pick Token := Pick.mk Token.extra\ndef localChoice : Token := chosen\ndef localCorrect (P : Token -> Prop) (h : P Token.right) : P localChoice := h\n@[expose] public def publicChoice : Token := chosen\n{tail}"
         );
         let main = format!(
-            "prelude\nimport Api\ndef observed : Token := chosen\ndef correct (P : Token -> Prop) (h : P Token.{outside}) : P observed := h\ndef earlier (P : Token -> Prop) (h : P Token.left) : P publicChoice := h"
+            "module\nprelude\npublic import Api\npublic section\ndef observed : Token := chosen\ndef correct (P : Token -> Prop) (h : P Token.{outside}) : P observed := h\ndef earlier (P : Token -> Prop) (h : P Token.left) : P publicChoice := h"
         );
         for result in check_both(&[("Main", &main), ("Api", &api), ("Base", BASE)]) {
             let checked = result.unwrap().into_complete().unwrap();
@@ -130,7 +204,7 @@ fn public_and_private_instance_priorities_keep_independent_recency() {
             assert!(!env.contains(&private("Api", "hidden")));
             assert!(!env.contains(&private("Api", "localChoice")));
         }
-        let wrong = "prelude\nimport Api\ndef observed : Token := chosen\ndef wrong (P : Token -> Prop) (h : P Token.right) : P observed := h".to_owned();
+        let wrong = "module\nprelude\npublic import Api\npublic section\ndef observed : Token := chosen\ndef wrong (P : Token -> Prop) (h : P Token.right) : P observed := h".to_owned();
         for result in check_both(&[("Main", &wrong), ("Api", &api), ("Base", BASE)]) {
             assert!(
                 matches!(result, Err(SourceModuleCheckError::Source { module, .. }) if module == n("Main"))
@@ -144,7 +218,7 @@ fn public_sections_export_instances_and_restore_the_private_default() {
     let api = format!(
         "{HEADER}public section\ninstance visible : Pick Token := Pick.mk Token.left\nprivate instance (priority := 2000) hidden : Pick Token := Pick.mk Token.right\nend\ninstance (priority := 3000) restored : Pick Token := Pick.mk Token.extra\ndef localChoice : Token := chosen\ndef localCorrect (P : Token -> Prop) (h : P Token.extra) : P localChoice := h"
     );
-    let main = "prelude\nimport Api\ndef observed : Token := chosen\ndef correct (P : Token -> Prop) (h : P Token.left) : P observed := h";
+    let main = "module\nprelude\npublic import Api\npublic section\ndef observed : Token := chosen\ndef correct (P : Token -> Prop) (h : P Token.left) : P observed := h";
     for result in check_both(&[("Main", main), ("Api", &api), ("Base", BASE)]) {
         let checked = result.unwrap().into_complete().unwrap();
         let env = checked.checked.engine.environment();
@@ -214,8 +288,7 @@ fn proof_class_instances_export_checked_interfaces_even_with_explicit_exposure()
         let api = format!(
             "module\nprelude\npublic class Law (P : Prop) : Prop where\n  proof : P\n{prefix} instance law (P : Prop) (h : P) : Law P := Law.mk h"
         );
-        let main =
-            "prelude\nimport Api\ntheorem used (P : Prop) (h : P) : P := @Law.proof P (law P h)";
+        let main = "module\nprelude\npublic import Api\npublic theorem used (P : Prop) (h : P) : P := @Law.proof P (law P h)";
         let local = check_both(&[("Api", &api)])
             .into_iter()
             .map(|result| result.unwrap().into_complete().unwrap())
@@ -263,7 +336,7 @@ fn changed_or_failed_public_instances_do_not_publish_stale_cached_dictionaries()
     );
     let names = [n("Main"), n("Api"), n("Base")];
     let good = format!("{HEADER}public instance dictionary : Pick Token := Pick.mk Token.left");
-    let main = "prelude\nimport Api\ndef observed : Token := chosen\ndef correct (P : Token -> Prop) (h : P Token.left) : P observed := h";
+    let main = "module\nprelude\npublic import Api\npublic section\ndef observed : Token := chosen\ndef correct (P : Token -> Prop) (h : P Token.left) : P observed := h";
     let files = [
         SourceModuleInput {
             name: &names[0],
@@ -324,7 +397,7 @@ fn no_expose_overrides_explicit_and_inherited_data_instance_exposure() {
     ] {
         let api = format!("{HEADER}{declaration}");
         for result in check_both(&[
-            ("Main", "prelude\nimport Api"),
+            ("Main", "module\nprelude\npublic import Api"),
             ("Api", &api),
             ("Base", BASE),
         ]) {

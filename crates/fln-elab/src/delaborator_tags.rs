@@ -232,7 +232,7 @@ impl DelaboratorTags {
         }
         let mut tags = Self::default();
         let mut total = 0usize;
-        for entry in extension.entries() {
+        for (entry, validation) in env.metadata_validation_entries(&journal_name()) {
             if entry.payload.len() > MAX_ENTRY_BYTES {
                 return Err(DelaboratorTagError::Limit);
             }
@@ -260,7 +260,7 @@ impl DelaboratorTags {
             bytes = rest;
             for _ in 0..count {
                 let tag = decode(&mut bytes)?;
-                validate(env, &tag)?;
+                validate(validation, &tag)?;
                 match tag {
                     DelaboratorTag::AnonymousConstructor(name) => {
                         if !tags.anonymous_constructor.insert(name.clone()) {
@@ -281,6 +281,9 @@ impl DelaboratorTags {
                 return Err(DelaboratorTagError::Malformed);
             }
         }
+        tags.anonymous_constructor.retain(|name| env.contains(name));
+        tags.nodot.retain(|name| env.contains(name));
+        tags.unexpanded.retain(|name, _| env.contains(name));
         Ok(tags)
     }
 

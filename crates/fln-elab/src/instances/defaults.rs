@@ -41,9 +41,9 @@ pub fn read(env: &Environment) -> Result<Vec<DefaultInstance>, InstanceRegistryE
     if extension.len() > MAX_ROWS {
         return Err(InstanceRegistryError::Limit);
     }
-    let registry = InstanceRegistry::read(env)?;
+    let (registry, _) = InstanceRegistry::read_unsorted(env)?;
     let mut result = Vec::new();
-    for (order, entry) in extension.entries().enumerate() {
+    for (order, (entry, validation)) in env.metadata_validation_entries(&name()).enumerate() {
         if entry.payload.len() > MAX_ENTRY_BYTES {
             return Err(InstanceRegistryError::Limit);
         }
@@ -60,9 +60,12 @@ pub fn read(env: &Environment) -> Result<Vec<DefaultInstance>, InstanceRegistryE
         if !bytes.is_empty() {
             return Err(InstanceRegistryError::Malformed);
         }
-        let class = validate_instance(env, &declaration)?;
+        let class = validate_instance(validation, &declaration)?;
         if !registry.is_class(&class) {
             return Err(InstanceRegistryError::UnknownClass(class));
+        }
+        if !env.contains(&class) || !env.contains(&declaration) {
+            continue;
         }
         result.push(DefaultInstance {
             class,

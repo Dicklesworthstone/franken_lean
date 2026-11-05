@@ -642,6 +642,10 @@ struct Context {
     // before their bodies may see private imports. Both environments remain
     // untrusted elaborator inputs; complete bodies require ordinary admission.
     private_proof_body: Option<(Environment, SourceScope)>,
+    // A public deriving command resolves and checks in the exported world,
+    // while fresh generated names must also avoid its private predecessor.
+    // This snapshot is consulted only by name generation.
+    generated_name_environment: Option<Environment>,
     public_theorem_signature: Option<ConstantVal>,
     private_definition_body: bool,
     public_definition_header: Option<public_body::Header>,
@@ -677,6 +681,10 @@ struct Context {
     equations: Vec<SourceEquation>,
     stalled_flush: Option<StalledFlush>,
     instance_goals: Vec<MVarId>,
+    // Generated untyped binders can acquire a class type only after their
+    // introduction, without becoming local instances. Ordinary typed locals
+    // remain eligible; deriving marks just those late-inferred arguments.
+    excluded_local_instances: std::collections::HashSet<FVarId>,
     // Inference/instance goals closed over before they were solved (`instances.rs`).
     bound_metavars: Vec<instances::BoundMetavar>,
     // Nesting of pending instance synthesis started by unification, the pin's
@@ -865,6 +873,7 @@ impl Context {
             trace_local_names: std::collections::HashMap::new(),
             unnamed_fields: std::collections::HashSet::new(),
             private_proof_body: None,
+            generated_name_environment: None,
             public_theorem_signature: None,
             private_definition_body: false,
             public_definition_header: None,
@@ -885,6 +894,7 @@ impl Context {
             equations: Vec::new(),
             stalled_flush: None,
             instance_goals: Vec::new(),
+            excluded_local_instances: Default::default(),
             bound_metavars: Vec::new(),
             synth_pending_depth: 0,
             overload_depth: 0,
@@ -5849,6 +5859,10 @@ impl Context {
             })?;
         self.source_scope.instance_scopes = scope.instance_scopes;
         self.source_scope.local_reducibility = scope.local_reducibility;
+        // Compiler availability is bound to the exact predecessor alongside
+        // its declaration and metadata identities. Keep the public declaration
+        // policy, but use the private world's provider once its body is entered.
+        self.source_scope.computability = scope.computability;
         self.registry_cache = crate::instances::RegistryCache::default();
         self.alias_cache = crate::aliases::AliasCache::default();
         self.protected_cache = crate::protected_names::ProtectedCache::default();

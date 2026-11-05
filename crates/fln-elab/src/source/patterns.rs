@@ -995,7 +995,14 @@ impl Context {
             6,
             "pattern matrix",
         )?;
-        expect_empty_null(&parts[1], "generalizing annotation")?;
+        if !matching::generalizing_annotation(&parts[1])? {
+            // Matrix lowering needs the relationships between its generated
+            // columns. Until it can retain those with captured source locals,
+            // never discard an explicit request to disable generalization.
+            return Err(failure(SourceInferenceError::Match(
+                matching::MatchError::UnsupportedGeneralization,
+            )));
+        }
         expect_empty_null(&parts[2], "explicit motive")?;
         let discriminants = sequence(&parts[3])?;
         let alts = expect_node(

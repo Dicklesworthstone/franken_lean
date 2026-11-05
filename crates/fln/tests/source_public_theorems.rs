@@ -51,7 +51,7 @@ fn complete(base: &Engine, files: &[(&str, &str)]) -> SourceModuleCheck {
 
 const SECRET: &str = "prelude\ndef importedProof (P : Prop) (h : P) : P := h";
 const API: &str = "module\nprelude\nimport Secret\nnamespace API\ndef localProof (P : Prop) (h : P) : P := importedProof P h\npublic theorem witness (P : Prop) (h : P) : P := localProof P h\nend API";
-const MAIN: &str = "prelude\nimport Api\ntheorem client (P : Prop) (h : P) : P := API.witness P h";
+const MAIN: &str = "module\nprelude\npublic import Api\npublic theorem client (P : Prop) (h : P) : P := API.witness P h";
 
 #[test]
 fn checked_private_proofs_export_only_their_exact_safe_signatures() {
@@ -158,7 +158,7 @@ fn public_headers_and_private_proofs_select_their_own_instance_histories() {
     let base = Engine::builder().build_empty();
     let foundation = "prelude\ninductive Token where\n| left\n| right\nclass Pick (A : Type) where\n  value : A\ndef chosen {A : Type} [p : Pick A] : A := p.value";
     let api = "module\nprelude\npublic import Base\npublic instance visible : Pick Token := Pick.mk Token.left\nprivate instance hidden : Pick Token := Pick.mk Token.right\npublic theorem header (P : Token -> Prop) (h : P Token.left) : P chosen := h\npublic theorem body (P : Token -> Prop) (h : P Token.right) : P Token.right := by\n  have selected : P chosen := h\n  exact selected";
-    let main = "prelude\nimport Api\ntheorem publicHeader (P : Token -> Prop) (h : P Token.left) : P Token.left := header P h\ntheorem privateBody (P : Token -> Prop) (h : P Token.right) : P Token.right := body P h";
+    let main = "module\nprelude\npublic import Api\npublic theorem publicHeader (P : Token -> Prop) (h : P Token.left) : P Token.left := header P h\npublic theorem privateBody (P : Token -> Prop) (h : P Token.right) : P Token.right := body P h";
     let imported = complete(&base, &[("Main", main), ("Api", api), ("Base", foundation)]);
     for name in ["header", "body"] {
         assert!(matches!(
@@ -193,7 +193,10 @@ fn public_sections_hide_proofs_even_under_inherited_exposure_and_restore_private
             .find(&private("Api", "restored")),
         Some(ConstantInfo::Thm(_))
     ));
-    let imported = complete(&base, &[("Main", "prelude\nimport Api"), ("Api", api)]);
+    let imported = complete(
+        &base,
+        &[("Main", "module\nprelude\npublic import Api"), ("Api", api)],
+    );
     for name in ["first", "inherited"] {
         assert!(matches!(
             imported.checked.engine.environment().find(&n(name)),
@@ -260,7 +263,7 @@ fn equation_style_public_theorems_preserve_authored_statement_binders() {
     let base = Engine::builder().build_empty();
     let api = "module\nprelude\npublic theorem equation (P : Prop) : P -> P\n| h => h";
     let local = complete(&base, &[("Api", api)]);
-    let main = "prelude\nimport Api\ntheorem used (P : Prop) (h : P) : P := equation P h";
+    let main = "module\nprelude\npublic import Api\npublic theorem used (P : Prop) (h : P) : P := equation P h";
     let imported = complete(&base, &[("Main", main), ("Api", api)]);
     assert_eq!(
         local
@@ -351,7 +354,7 @@ fn public_simp_and_protected_attributes_work_in_both_worlds_without_exposing_pro
         .into_complete()
         .unwrap();
     let api = "module\nprelude\npublic inductive Good : Prop where\n| make\n@[simp] public theorem good : Good := Good.make\n@[simp] public theorem notFalse : Not False := by\n  intro h\n  exact h\nnamespace API\n@[expose] public def wrap (n : Nat) : Nat := n\n@[simp] public protected theorem unwrap (n : Nat) : wrap n = n := by rfl\nend API\ntheorem localUse : Good := by simp\ntheorem localEquation (n : Nat) : API.wrap n = n := by simp";
-    let main = "prelude\nimport Api\ntheorem importedProp : Good := by simp\ntheorem importedEquation (n : Nat) : API.wrap n = n := by simp\ntheorem importedRefutation : Not False := by simp";
+    let main = "module\nprelude\npublic import Api\npublic theorem importedProp : Good := by simp\npublic theorem importedEquation (n : Nat) : API.wrap n = n := by simp\npublic theorem importedRefutation : Not False := by simp";
     let local = complete(&base, &[("Api", api)]);
     let imported = complete(&base, &[("Main", main), ("Api", api)]);
     for checked in [&local, &imported] {
@@ -366,8 +369,7 @@ fn public_simp_and_protected_attributes_work_in_both_worlds_without_exposing_pro
         assert!(matches!(env.find(&n(name)), Some(ConstantInfo::Axiom(_))));
     }
     assert!(!env.contains(&private("Api", "localUse")));
-    let unqualified =
-        "prelude\nimport Api\nopen API\ntheorem inaccessible (n : Nat) : wrap n = n := unwrap n";
+    let unqualified = "module\nprelude\npublic import Api\nopen API\npublic theorem inaccessible (n : Nat) : wrap n = n := unwrap n";
     assert!(
         matches!(check(&base, &[("Main", unqualified), ("Api", api)]), Err(SourceModuleCheckError::Source { module, .. }) if module == n("Main"))
     );
@@ -400,7 +402,7 @@ fn public_proof_helpers_are_independently_checked_and_stay_in_the_private_world(
         &[
             (
                 "Main",
-                "prelude\nimport Api\ntheorem client (P : Prop) (h : P) : P := witness P h",
+                "module\nprelude\npublic import Api\npublic theorem client (P : Prop) (h : P) : P := witness P h",
             ),
             ("Api", api),
         ],
@@ -412,8 +414,9 @@ fn public_proof_helpers_are_independently_checked_and_stay_in_the_private_world(
     ));
     for name in ["witness.helper", "fromWhere.helper"] {
         assert!(!env.contains(&n(name)));
-        let client =
-            format!("prelude\nimport Api\ntheorem leak (P : Prop) (h : P) : P := {name} P h");
+        let client = format!(
+            "module\nprelude\npublic import Api\npublic theorem leak (P : Prop) (h : P) : P := {name} P h"
+        );
         assert!(
             matches!(check(&base, &[("Main", &client), ("Api", api)]), Err(SourceModuleCheckError::Source { module, .. }) if module == n("Main"))
         );
@@ -454,7 +457,7 @@ fn dead_and_nested_public_proof_helpers_keep_names_and_do_not_publish_on_failure
 #[test]
 fn execution_retains_each_polymorphic_proof_helper_receipt_without_exporting_it() {
     let api = "module\nprelude\npublic theorem poly.{u} {A : Sort u} (P : A -> Prop) (x : A) (h : P x) : P x :=\n  let rec helper (y : A) (hy : P y) : P y := hy\n  helper x h\nprivate theorem localUse.{u} {A : Sort u} (P : A -> Prop) (x : A) (h : P x) : P x := poly.helper P x h";
-    let main = "prelude\nimport Api\ntheorem client.{u} {A : Sort u} (P : A -> Prop) (x : A) (h : P x) : P x := poly P x h";
+    let main = "module\nprelude\npublic import Api\npublic theorem client.{u} {A : Sort u} (P : A -> Prop) (x : A) (h : P x) : P x := poly P x h";
     let names = [n("Main"), n("Api")];
     let inputs = [
         SourceModuleInput {

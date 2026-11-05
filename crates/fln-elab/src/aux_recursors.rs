@@ -157,7 +157,7 @@ impl AuxRecursors {
             return Err(AuxRecursorError::Limit);
         }
         let mut names = BTreeSet::new();
-        for entry in extension.entries() {
+        for (entry, validation) in env.metadata_validation_entries(&journal_name()) {
             if entry.payload.len() > MAX_ENTRY_BYTES {
                 return Err(AuxRecursorError::Limit);
             }
@@ -181,7 +181,7 @@ impl AuxRecursors {
             bytes = rest;
             for _ in 0..count {
                 let name = read_name(&mut bytes).map_err(codec)?;
-                validate(env, &name)?;
+                validate(validation, &name)?;
                 if !names.insert(name.clone()) {
                     return Err(AuxRecursorError::Duplicate(name));
                 }
@@ -190,6 +190,7 @@ impl AuxRecursors {
                 return Err(AuxRecursorError::Malformed);
             }
         }
+        names.retain(|name| env.contains(name));
         Ok(Self { names })
     }
 

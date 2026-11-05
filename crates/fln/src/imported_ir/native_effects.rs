@@ -31,6 +31,12 @@ pub(super) fn erase_state_arguments(
 ) -> Result<bool, IrExecutionError> {
     let mut state = BTreeMap::new();
     for (name, native) in natives {
+        // The compiler routes first-class externs through a boxed wrapper.
+        // Its closure must retain sigma/alpha/world until full application;
+        // the reviewed native forwarding body alone discards those slots.
+        if native.boxed.is_some() {
+            continue;
+        }
         if let Some(arity) = native.state_runtime_arity {
             state.insert(name.clone(), (arity, native.reference_state_telescope));
         }

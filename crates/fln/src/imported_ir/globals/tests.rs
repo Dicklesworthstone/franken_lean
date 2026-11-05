@@ -100,6 +100,7 @@ fn prepare(module: &IrModule, limits: IrExecutionLimits) -> Result<CompiledIr, I
             limits,
             initialize_globals: true,
             capture_output_bytes: None,
+            initialize_modules: false,
         },
     )
 }
@@ -589,6 +590,197 @@ fn output_statements(text: &str) -> Vec<IrStmt> {
             },
         ),
     ]
+}
+
+fn startup_module(action_tag: u64) -> IrModule {
+    let mut module = module();
+    module.decls.extend([
+        initializer("before", None, 0),
+        initializer("after", Some("g"), action_tag),
+    ]);
+    for (index, text) in [(1, "global;"), (2, "before;"), (3, "after;")] {
+        let IrDecl::Function { body, .. } = &mut module.decls[index] else {
+            unreachable!()
+        };
+        body.stmts.splice(0..0, output_statements(text));
+    }
+    module.initializers.insert(
+        0,
+        InitEntry {
+            declaration: name("before"),
+            initializer: None,
+        },
+    );
+    module.initializers.push(InitEntry {
+        declaration: name("after"),
+        initializer: None,
+    });
+    module
+}
+
+fn prepare_startup(module: &IrModule, max_output: usize) -> Result<CompiledIr, IrExecutionError> {
+    compile_with_options(
+        std::slice::from_ref(module),
+        &name("g"),
+        &[],
+        &partition(),
+        &module
+            .decls
+            .iter()
+            .map(|decl| decl.name().clone())
+            .collect(),
+        IrExecutionOptions {
+            initialize_modules: true,
+            capture_output_bytes: Some(max_output),
+            ..IrExecutionOptions::default()
+        },
+    )
+}
+
+#[test]
+fn journals_with_only_standalone_actions_run_without_global_storage() {
+    let mut module = startup_module(0);
+    module
+        .initializers
+        .retain(|entry| entry.initializer.is_none());
+    module.decls[0] = IrDecl::Function {
+        name: name("g"),
+        params: vec![],
+        result: IrType::TObject,
+        body: IrBody {
+            stmts: vec![binding(
+                0,
+                IrType::TObject,
+                IrExpr::Lit(IrLit::Num(IrNat::Small(42))),
+            )],
+            terminal: Box::new(IrTerminal::Ret(IrArg::Var(0))),
+        },
+        sorry_dep: None,
+    };
+    let compiled = prepare_startup(&module, 64).unwrap();
+    let plan = compiled.initialization.as_ref().unwrap();
+    assert!(plan.globals.is_empty());
+    assert_eq!(plan.steps.len(), 2);
+    for _ in 0..2 {
+        let report = compiled.execute(ExecutionLimits::default(), None);
+        assert!(report.initialization_failure.is_none());
+        assert_eq!(
+            report.captured_output.as_ref().unwrap().bytes,
+            b"before;after;"
+        );
+        let Outcome::Complete(VmExit::Returned(result)) = report.outcome else {
+            panic!("{report:?}")
+        };
+        assert_eq!(crate::nat_decimal(&result.value).as_deref(), Some("42"));
+    }
+}
+
+#[test]
+fn complete_journals_run_unreferenced_actions_in_order_once_per_execution() {
+    let module = startup_module(0);
+    // The narrower capability must not silently start executing extra effects.
+    assert!(matches!(
+        prepare(&module, IrExecutionLimits::default()),
+        Err(IrExecutionError::InitializerContract {
+            detail: "supplied modules also require standalone initialization actions",
+            ..
+        })
+    ));
+    let compiled = prepare_startup(&module, 128).unwrap();
+    assert_eq!(compiled.initialization.as_ref().unwrap().globals.len(), 1);
+    for initializer in ["before", "initG", "after"] {
+        assert!(compiled.reference_functions().iter().any(|function| {
+            function.name == name(initializer) && function.producer() == "reference"
+        }));
+    }
+    let mut steps = 0;
+    for _ in 0..2 {
+        let report = compiled.execute(ExecutionLimits::default(), None);
+        assert_eq!(
+            report.captured_output.unwrap().bytes,
+            b"before;global;after;"
+        );
+        assert!(report.initialization_failure.is_none());
+        let Outcome::Complete(VmExit::Returned(result)) = report.outcome else {
+            panic!("{:?}", report.outcome)
+        };
+        assert_eq!(crate::nat_decimal(&result.value).as_deref(), Some("42"));
+        steps = result.usage.steps;
+    }
+    for max_steps in [0, steps / 2, steps - 1] {
+        let report = compiled.execute(
+            ExecutionLimits {
+                max_steps,
+                ..ExecutionLimits::default()
+            },
+            None,
+        );
+        assert!(matches!(report.outcome, Outcome::Inconclusive(_)));
+        assert!(report.initialization_failure.is_none());
+    }
+    assert_eq!(
+        compiled
+            .execute(ExecutionLimits::default(), None)
+            .captured_output
+            .unwrap()
+            .bytes,
+        b"before;global;after;"
+    );
+}
+
+#[test]
+fn standalone_initializer_failures_keep_the_action_identity_and_stop_the_journal() {
+    for tag in [1, 2] {
+        let mut module = startup_module(tag);
+        // Failing before the global exercises action indices independently of
+        // storage slots; no global cell or entry result may be published.
+        module.initializers.swap(0, 2);
+        module.decls[3] = initializer("after", None, tag);
+        let IrDecl::Function { body, .. } = &mut module.decls[3] else {
+            unreachable!()
+        };
+        body.stmts.splice(0..0, output_statements("failed;"));
+        let compiled = prepare_startup(&module, 128).unwrap();
+        let report = compiled.execute(ExecutionLimits::default(), None);
+        assert_eq!(report.captured_output.unwrap().bytes, b"failed;");
+        assert!(matches!(
+            report.outcome,
+            Outcome::Complete(VmExit::Refused { .. })
+        ));
+        let failure = report.initialization_failure.unwrap();
+        assert_eq!(failure.declaration, name("after"));
+        assert_eq!(failure.initializer, name("after"));
+        assert_eq!(failure.malformed, tag == 2);
+        assert_eq!(failure.result.header().tag as u64, tag);
+    }
+    let compiled = prepare_startup(&startup_module(0), 7).unwrap();
+    let report = compiled.execute(ExecutionLimits::default(), None);
+    assert_eq!(report.captured_output.unwrap().bytes, b"before;");
+    assert!(matches!(report.outcome, Outcome::Inconclusive(_)));
+    assert!(report.initialization_failure.is_none());
+}
+
+#[test]
+fn complete_journals_reject_forward_reads_and_validate_unreferenced_actions() {
+    let mut module = startup_module(0);
+    module.initializers.swap(1, 2);
+    assert!(matches!(prepare_startup(&module, 128),
+        Err(IrExecutionError::InitializerContract { declaration, detail })
+        if declaration == name("after") && detail == "module initializer reads a global before its journal entry"
+    ));
+    module.initializers.swap(1, 2);
+    let IrDecl::Function { params, .. } = &mut module.decls[2] else {
+        unreachable!()
+    };
+    params.clear();
+    assert!(matches!(prepare_startup(&module, 128),
+        Err(IrExecutionError::InitializerContract { declaration, .. }) if declaration == name("before")
+    ));
+    let mut module = startup_module(0);
+    module.initializers[0].declaration = name("missingAction");
+    assert!(matches!(prepare_startup(&module, 128),
+        Err(IrExecutionError::MissingDeclaration(declaration)) if declaration == name("missingAction")
+    ));
 }
 
 #[test]

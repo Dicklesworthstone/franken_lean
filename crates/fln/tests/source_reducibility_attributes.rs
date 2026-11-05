@@ -336,7 +336,7 @@ public def visible : Nat := 5
             &[
                 SourceModuleInput {
                     name: &client,
-                    source: b"prelude\nimport LocalTransparency\ntheorem client : 1 = 1 := proof 1",
+                    source: b"module\nprelude\npublic import LocalTransparency\npublic theorem client : 1 = 1 := proof 1",
                 },
                 SourceModuleInput {
                     name: &module,

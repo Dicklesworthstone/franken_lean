@@ -291,7 +291,8 @@ fn unselected_standalone_actions_in_other_modules_cannot_be_silently_omitted() {
     // silently dropped merely because no selected declaration calls it.
     let users = BTreeSet::from([name("g"), name("initG"), name("C.read")]);
     let partition = bounded_partition(&[]);
-    for modules in [vec![a.clone(), b.clone(), c.clone()], vec![c, b, a]] {
+    let ordered = vec![a.clone(), b.clone(), c.clone()];
+    for modules in [ordered.clone(), vec![c, b, a]] {
         assert!(matches!(
             compile_with_options(
                 &modules,
@@ -307,5 +308,28 @@ fn unselected_standalone_actions_in_other_modules_cannot_be_silently_omitted() {
             Err(IrExecutionError::InitializerContract { declaration, .. })
                 if declaration == name("g")
         ));
+    }
+    let startup = IrExecutionOptions {
+        initialize_modules: true,
+        ..IrExecutionOptions::default()
+    };
+    assert!(matches!(compile_with_options(
+        &ordered, &name("C.read"), &[], &partition, &users, startup,
+    ), Err(IrExecutionError::Unclassified(declaration)) if declaration == name("B.advance")));
+    let users = users.into_iter().chain([name("B.advance")]).collect();
+    let reversed: Vec<_> = ordered.iter().rev().cloned().collect();
+    assert!(matches!(compile_with_options(
+        &reversed, &name("C.read"), &[], &partition, &users, startup,
+    ), Err(IrExecutionError::InitializerContract { declaration, detail })
+        if declaration == name("B.advance")
+            && detail == "module initializer reads a global before its journal entry"));
+    let compiled =
+        compile_with_options(&ordered, &name("C.read"), &[], &partition, &users, startup).unwrap();
+    for _ in 0..2 {
+        let report = compiled.execute(ExecutionLimits::default(), None);
+        let Outcome::Complete(VmExit::Returned(result)) = report.outcome else {
+            panic!("{:?}", report.outcome)
+        };
+        assert_eq!(crate::nat_decimal(&result.value).as_deref(), Some("43"));
     }
 }

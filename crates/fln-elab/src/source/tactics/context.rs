@@ -490,7 +490,7 @@ impl Context {
         Ok(child)
     }
 
-    fn inherit_goal_tag(&mut self, parent: &ProofGoal, child: &ProofGoal) {
+    pub(super) fn inherit_goal_tag(&mut self, parent: &ProofGoal, child: &ProofGoal) {
         if let Some(tag) = self.goal_tags.get(&parent.id).cloned() {
             self.goal_tags.insert(child.id.clone(), tag);
         }

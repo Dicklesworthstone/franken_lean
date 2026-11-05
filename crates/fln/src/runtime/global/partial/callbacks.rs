@@ -3,50 +3,24 @@
 //! remain ordinary runtime operands. Every self edge must forward those exact
 //! parameters, and the cloned body still passes ordinary catalog/FIR checking.
 use super::*;
-use fln_comp::ingress::ClosureSignature;
-use fln_env::constants::{ConstantVal, ReducibilityHints};
 
 impl Preparation<'_> {
     pub(super) fn partial_callback_stage(
         &mut self,
         origin: &Name,
         entry: Entry,
-        arguments: &[Expr],
+        interfaces: &[Option<ValueType>],
     ) -> Result<Entry, IngressError> {
         let mut parameters = entry.parameter_types.clone();
         let mut selected = Vec::new();
-        for (index, (parameter, argument)) in entry.parameters.iter().zip(arguments).enumerate() {
+        for (index, &actual) in interfaces.iter().enumerate() {
             self.tick()?;
             if !matches!(parameters[index], ValueType::Closure(_)) {
                 continue;
             }
-            let Some(literal) = self.inert_callable(argument)? else {
+            let Some(actual @ ValueType::Closure(_)) = actual else {
                 continue;
             };
-            let literal = self.administrative_callable_value(&literal)?;
-            let definition = DefinitionVal {
-                base: ConstantVal {
-                    name: Name::anonymous(),
-                    level_params: Vec::new(),
-                    type_: parameter.type_.clone(),
-                },
-                value: literal,
-                hints: ReducibilityHints::Abbrev,
-                safety: DefinitionSafety::Safe,
-                all: Vec::new(),
-            };
-            let Some(signature) = self.signature(&definition, false)? else {
-                continue;
-            };
-            if signature.parameters.is_empty() {
-                continue;
-            }
-            let actual = self.stage_interface(ClosureSignature {
-                parameter_ownership: borrowed_runtime_parameters(signature.parameters.len())?,
-                parameters: signature.parameters,
-                result: signature.result,
-                result_ownership: signature.result_ownership,
-            })?;
             if actual == parameters[index] {
                 continue;
             }

@@ -336,8 +336,35 @@ fn load_sources(
     Ok(modules)
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct CompanionArtifacts {
+    server: Vec<u8>,
+    private: Vec<u8>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct ModuleArtifacts {
+    exported: Vec<u8>,
+    companions: Option<CompanionArtifacts>,
+}
+
+impl ModuleArtifacts {
+    /// Install both companions before publishing the family's public root.
+    fn parts(&self) -> impl Iterator<Item = (&'static str, &[u8])> {
+        self.companions
+            .iter()
+            .flat_map(|parts| {
+                [
+                    ("olean.server", parts.server.as_slice()),
+                    ("olean.private", parts.private.as_slice()),
+                ]
+            })
+            .chain(std::iter::once(("olean", self.exported.as_slice())))
+    }
+}
+
 struct Compilation {
-    artifacts: BTreeMap<Name, Vec<u8>>,
+    artifacts: BTreeMap<Name, ModuleArtifacts>,
     elaborated_modules: usize,
     reused_modules: usize,
     /// Modules re-admitted from persisted records (bead `franken_lean-z8j.1.1`).
@@ -478,13 +505,15 @@ fn compile(
             }
         }
         for artifact in built.artifacts {
-            if artifact.companions.is_some() {
-                return Err(Failure::unsupported(
-                    "module-system .olean publication requires coordinated public/private split artifacts",
-                ));
-            }
+            let family = ModuleArtifacts {
+                exported: artifact.bytes,
+                companions: artifact.companions.map(|parts| CompanionArtifacts {
+                    server: parts.server,
+                    private: parts.private,
+                }),
+            };
             if let Some(previous) = artifacts.get(&artifact.name) {
-                if previous != &artifact.bytes {
+                if previous != &family {
                     return Err(Failure::new(
                         "internal-fault",
                         "shared module produced inconsistent artifacts",
@@ -492,13 +521,15 @@ fn compile(
                 }
                 continue;
             }
-            artifact_bytes = artifact_bytes
-                .checked_add(artifact.bytes.len())
-                .filter(|n| *n <= MAX_ARTIFACT_BYTES)
-                .ok_or_else(|| {
-                    Failure::new("resource", "aggregate artifact bytes exceed 64 MiB")
-                })?;
-            artifacts.insert(artifact.name, artifact.bytes);
+            for (_, bytes) in family.parts() {
+                artifact_bytes = artifact_bytes
+                    .checked_add(bytes.len())
+                    .filter(|n| *n <= MAX_ARTIFACT_BYTES)
+                    .ok_or_else(|| {
+                        Failure::new("resource", "aggregate artifact bytes exceed 64 MiB")
+                    })?;
+            }
+            artifacts.insert(artifact.name, family);
         }
     }
     Ok(Compilation {
@@ -512,10 +543,22 @@ fn compile(
     })
 }
 
+/// Replace conventional Lake paths under one publisher lock, rolling back all
+/// touched members on failure. Readers opening flat paths independently do not
+/// receive the immutable-generation guarantee of `fln::ArtifactStore`.
 fn publish(
     root: &Path,
     directory: &Path,
-    artifacts: &BTreeMap<Name, Vec<u8>>,
+    artifacts: &BTreeMap<Name, ModuleArtifacts>,
+) -> Result<Vec<PathBuf>, Failure> {
+    publish_with(root, directory, artifacts, fln::publish_file_atomic)
+}
+
+fn publish_with(
+    root: &Path,
+    directory: &Path,
+    artifacts: &BTreeMap<Name, ModuleArtifacts>,
+    mut write: impl FnMut(&[u8], &Path) -> std::io::Result<()>,
 ) -> Result<Vec<PathBuf>, Failure> {
     check_path(root, directory, true)?;
     std::fs::create_dir_all(directory).map_err(|error| Failure::io(directory, error))?;
@@ -528,60 +571,85 @@ fn publish(
         .open(&lock_path)
         .map_err(|error| Failure::io(&lock_path, error))?;
     drop(lock_file);
-    struct BuildLock(PathBuf);
+    struct BuildLock {
+        path: PathBuf,
+        release: bool,
+    }
     impl Drop for BuildLock {
         fn drop(&mut self) {
-            let _ = std::fs::remove_file(&self.0);
+            if self.release {
+                let _ = std::fs::remove_file(&self.path);
+            }
         }
     }
-    let _lock = BuildLock(lock_path);
+    let mut lock = BuildLock {
+        path: lock_path,
+        release: true,
+    };
     let mut outputs = Vec::new();
     let mut previous_bytes = 0usize;
     // All source checks, encodings and output preflights precede publication.
-    for (name, bytes) in artifacts {
+    for (name, family) in artifacts {
         let mut relative = source_import_relative_path(name)?;
         relative.set_extension("olean");
         let path = directory.join(relative);
-        check_path(root, &path, true)?;
-        for suffix in ["olean.server", "olean.private", "ir"] {
-            if path.with_extension(suffix).exists() {
-                return Err(Failure::unsupported(format!(
-                    "existing artifact family at {} requires coordinated replacement",
-                    path.display()
-                )));
+        // This facet cannot regenerate executable IR or retire old companions.
+        // Refuse either case before replacing any member of any module family.
+        for suffix in ["ir", "olean.server", "olean.private"] {
+            if suffix != "ir" && family.companions.is_some() {
+                continue;
+            }
+            let existing = path.with_extension(suffix);
+            check_path(root, &existing, true)?;
+            match std::fs::symlink_metadata(&existing) {
+                Ok(_) => {
+                    return Err(Failure::unsupported(format!(
+                        "existing artifact {} requires coordinated replacement",
+                        existing.display()
+                    )));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(Failure::io(&existing, error)),
             }
         }
-        let previous = match std::fs::symlink_metadata(&path) {
-            Ok(metadata) if metadata.is_file() => {
-                let old = read_bounded(
-                    &path,
-                    MAX_ARTIFACT_BYTES - previous_bytes,
-                    "previous Lake artifact",
-                )?;
-                previous_bytes += old.len();
-                Some(old)
-            }
-            Ok(_) => {
-                return Err(Failure::input(format!(
-                    "output is not a regular file: {}",
-                    path.display()
-                )));
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(error) => return Err(Failure::io(&path, error)),
-        };
-        outputs.push((path, bytes, previous));
+        for (suffix, bytes) in family.parts() {
+            let path = path.with_extension(suffix);
+            check_path(root, &path, true)?;
+            let previous = match std::fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.is_file() => {
+                    let old = read_bounded(
+                        &path,
+                        MAX_ARTIFACT_BYTES - previous_bytes,
+                        "previous Lake artifact",
+                    )?;
+                    previous_bytes += old.len();
+                    Some(old)
+                }
+                Ok(_) => {
+                    return Err(Failure::input(format!(
+                        "output is not a regular file: {}",
+                        path.display()
+                    )));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(Failure::io(&path, error)),
+            };
+            outputs.push((path, bytes, previous));
+        }
     }
+    // Once replacements begin, an unwind must leave the same incomplete-build
+    // marker as a crash. Only completion or a complete rollback releases it.
+    lock.release = false;
     for (index, (path, bytes, _)) in outputs.iter().enumerate() {
         let result = std::fs::create_dir_all(path.parent().expect("artifact parent"))
-            .and_then(|()| fln::publish_file_atomic(bytes, path));
+            .and_then(|()| write(bytes, path));
         if let Err(error) = result {
             let mut rollback = Vec::new();
             // The atomic writer may report a directory-sync failure after its
             // rename, so the failing output also belongs in the rollback set.
             for (prior, _, previous) in outputs[..=index].iter().rev() {
                 let restored = match previous {
-                    Some(bytes) => fln::publish_file_atomic(bytes, prior),
+                    Some(bytes) => write(bytes, prior),
                     None => match std::fs::remove_file(prior) {
                         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
                         result => result,
@@ -591,6 +659,7 @@ fn publish(
                     rollback.push(format!("{}: {error}", prior.display()));
                 }
             }
+            lock.release = rollback.is_empty();
             return Err(Failure::new(
                 "io",
                 format!(
@@ -599,12 +668,17 @@ fn publish(
                     if rollback.is_empty() {
                         String::new()
                     } else {
-                        format!("; rollback failed: {}", rollback.join("; "))
+                        format!(
+                            "; rollback failed: {}; build lock retained at {}",
+                            rollback.join("; "),
+                            lock.path.display()
+                        )
                     }
                 ),
             ));
         }
     }
+    lock.release = true;
     Ok(outputs.into_iter().map(|(path, _, _)| path).collect())
 }
 
@@ -800,7 +874,7 @@ fn record_snapshot(
     libraries: &[Library],
     entries: &[Name],
     modules: &BTreeMap<Name, Module>,
-    artifacts: &BTreeMap<Name, Vec<u8>>,
+    artifacts: &BTreeMap<Name, ModuleArtifacts>,
     output_dir: &Path,
     provenance: &[ModuleProvenance],
     posture: ImportPosture,
@@ -814,7 +888,7 @@ fn record_snapshot(
     };
     let mut rows = Vec::new();
     let mut external = BTreeSet::new();
-    for (name, bytes) in artifacts {
+    for (name, family) in artifacts {
         let module = modules
             .get(name)
             .ok_or("an artifact has no source module")?;
@@ -836,7 +910,14 @@ fn record_snapshot(
             source_digest: snapshot::digest(&module.source),
             imports: module.imports.iter().map(Name::to_display_string).collect(),
             artifact: relative(&output_dir.join(artifact)),
-            artifact_digest: snapshot::digest(bytes),
+            artifact_digest: snapshot::digest(&family.exported),
+            companions: family
+                .companions
+                .as_ref()
+                .map(|parts| snapshot::CompanionDigests {
+                    server: snapshot::digest(&parts.server),
+                    private: snapshot::digest(&parts.private),
+                }),
             key: row.and_then(|row| row.key).map(|key| key.to_hex()),
             decision: row
                 .map_or("elaborated", |row| row.decision.as_str())
@@ -930,4 +1011,159 @@ pub(super) fn lean_configuration_for_presence(
         )),
     };
     result.map_err(|error| error.render_as(json, "fln.lake-check-build/1", "lake check-build"))
+}
+
+#[cfg(test)]
+mod publication_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    struct Directory(PathBuf);
+    impl Directory {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "fln-family-publication-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path.canonicalize().unwrap())
+        }
+    }
+    impl Drop for Directory {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn family(prefix: &str) -> ModuleArtifacts {
+        ModuleArtifacts {
+            exported: format!("{prefix} public").into_bytes(),
+            companions: Some(CompanionArtifacts {
+                server: format!("{prefix} server").into_bytes(),
+                private: format!("{prefix} private").into_bytes(),
+            }),
+        }
+    }
+
+    #[test]
+    fn family_rollback_restores_existing_files_and_removes_only_new_outputs() {
+        let directory = Directory::new();
+        let a = Name::from_components(["A"]);
+        let b = Name::from_components(["B"]);
+        let old = family("old");
+        for (part, bytes) in old.parts() {
+            std::fs::write(directory.0.join("A.olean").with_extension(part), bytes).unwrap();
+        }
+        let artifacts = BTreeMap::from([(a, family("new A")), (b, family("new B"))]);
+        let failed_path = directory.0.join("B.olean");
+        let mut injected = false;
+        let mut written = Vec::new();
+        let error = publish_with(&directory.0, &directory.0, &artifacts, |bytes, path| {
+            fln::publish_file_atomic(bytes, path)?;
+            written.push(path.file_name().unwrap().to_string_lossy().into_owned());
+            if path == failed_path && !injected {
+                injected = true;
+                // Model the real writer's directory-sync failure after rename.
+                return Err(std::io::Error::other("injected after rename"));
+            }
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(
+            error.detail.contains("injected after rename"),
+            "{}",
+            error.detail
+        );
+        assert!(
+            !error.detail.contains("rollback failed"),
+            "{}",
+            error.detail
+        );
+        assert_eq!(
+            &written[..6],
+            [
+                "A.olean.server",
+                "A.olean.private",
+                "A.olean",
+                "B.olean.server",
+                "B.olean.private",
+                "B.olean"
+            ]
+        );
+        for (part, bytes) in old.parts() {
+            assert_eq!(
+                std::fs::read(directory.0.join("A.olean").with_extension(part)).unwrap(),
+                bytes
+            );
+            assert!(!directory.0.join("B.olean").with_extension(part).exists());
+        }
+        assert!(!directory.0.join(".fln-olean-build.lock").exists());
+        assert_eq!(
+            publish(&directory.0, &directory.0, &artifacts)
+                .unwrap_or_else(|error| panic!("{}", error.detail))
+                .len(),
+            6
+        );
+        for (name, family) in &artifacts {
+            for (part, bytes) in family.parts() {
+                assert_eq!(
+                    std::fs::read(
+                        directory
+                            .0
+                            .join(name.to_display_string())
+                            .with_extension(part)
+                    )
+                    .unwrap(),
+                    bytes
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn incomplete_family_rollback_retains_the_lock_and_refuses_the_next_build() {
+        let directory = Directory::new();
+        let old = family("old");
+        for (part, bytes) in old.parts() {
+            std::fs::write(directory.0.join("A.olean").with_extension(part), bytes).unwrap();
+        }
+        let artifacts = BTreeMap::from([(Name::from_components(["A"]), family("new"))]);
+        let failed_path = directory.0.join("A.olean.private");
+        let mut injected = false;
+        let error = publish_with(&directory.0, &directory.0, &artifacts, |bytes, path| {
+            if path == failed_path {
+                if injected {
+                    return Err(std::io::Error::other("injected rollback failure"));
+                }
+                injected = true;
+                fln::publish_file_atomic(bytes, path)?;
+                return Err(std::io::Error::other("injected after rename"));
+            }
+            fln::publish_file_atomic(bytes, path)
+        })
+        .unwrap_err();
+        assert!(error.detail.contains("rollback failed"), "{}", error.detail);
+        assert!(
+            error.detail.contains("build lock retained"),
+            "{}",
+            error.detail
+        );
+        assert!(directory.0.join(".fln-olean-build.lock").is_file());
+        assert_eq!(
+            std::fs::read(directory.0.join("A.olean.server")).unwrap(),
+            old.companions.unwrap().server
+        );
+        assert_eq!(
+            std::fs::read(directory.0.join("A.olean")).unwrap(),
+            old.exported
+        );
+        let error = publish(&directory.0, &directory.0, &artifacts).unwrap_err();
+        assert!(
+            error.detail.contains(".fln-olean-build.lock"),
+            "{}",
+            error.detail
+        );
+    }
 }

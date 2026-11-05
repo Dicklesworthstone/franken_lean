@@ -204,7 +204,7 @@ impl RecordDefaults {
         let mut remaining = MAX_NODES;
         let mut bytes_left = MAX_BYTES;
         let mut registry = Self::default();
-        for entry in extension.entries() {
+        for (entry, validation) in env.metadata_validation_entries(&extension_name()) {
             if entry.payload.len() > MAX_PAYLOAD {
                 return Err(RecordError::ResourceLimit);
             }
@@ -230,7 +230,7 @@ impl RecordDefaults {
                 field,
                 helper,
             };
-            validate(env, &row, &mut remaining)?;
+            validate(validation, &row, &mut remaining)?;
             if registry
                 .helpers
                 .insert((row.record, row.field), row.helper)
@@ -239,6 +239,9 @@ impl RecordDefaults {
                 return Err(RecordError::DuplicateField);
             }
         }
+        registry
+            .helpers
+            .retain(|(record, _), helper| env.contains(record) && env.contains(helper));
         Ok(registry)
     }
 }
@@ -253,7 +256,12 @@ pub fn register_defaults(
         return Ok(env.clone());
     }
     let mut registry = RecordDefaults::read(env)?;
-    if registry.helpers.len().saturating_add(rows.len()) > MAX_ROWS {
+    if env
+        .extension(&extension_name())
+        .map_or(0, |state| state.len())
+        .saturating_add(rows.len())
+        > MAX_ROWS
+    {
         return Err(RecordError::ResourceLimit);
     }
     let mut remaining = MAX_NODES;

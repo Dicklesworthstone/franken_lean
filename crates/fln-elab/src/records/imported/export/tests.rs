@@ -38,6 +38,61 @@ fn projection_index_reuses_the_validated_world_and_requires_registered_identity(
 }
 
 #[test]
+fn imported_structure_metadata_validates_private_shapes_without_exposing_them() {
+    let complete = register(&base(), &rows()).unwrap();
+    let mut public = Environment::new();
+    for (name, _) in complete.constants() {
+        let text = name.to_display_string();
+        if name == &n("Parent.mk") || text == "Child" || text.starts_with("Child.") {
+            continue;
+        }
+        public = public.with_entry(complete.entry(name).unwrap()).unwrap();
+    }
+    for (name, state) in complete.extensions() {
+        public = public.register_extension(state.descriptor.clone()).unwrap();
+        for entry in state.entries() {
+            public = public
+                .push_extension_entry(name, entry.payload.clone())
+                .unwrap();
+        }
+    }
+    assert!(ImportedStructures::read(&public).is_err());
+    let bound = public.with_imported_metadata_validation(&complete);
+    let structures = ImportedStructures::read(&bound).unwrap();
+    assert!(structures.get(&n("Parent")).is_some());
+    assert!(structures.get(&n("Child")).is_none());
+    assert!(
+        RecordParents::read(&bound)
+            .unwrap()
+            .parents(&n("Child"))
+            .is_empty()
+    );
+    assert!(is_registered_projection(&bound, &n("Parent.value")).unwrap());
+    assert!(!is_registered_projection(&bound, &n("Child.extra")).unwrap());
+    assert!(!bound.contains(&n("Parent.mk")));
+    assert!(!bound.contains(&n("Child")));
+    assert!(
+        projection_index(&public).is_err(),
+        "the cached validator is not transferable"
+    );
+    let copied_row = complete
+        .extension(&extension_name())
+        .unwrap()
+        .entries()
+        .next()
+        .unwrap()
+        .payload
+        .clone();
+    let changed = bound
+        .push_extension_entry(&extension_name(), copied_row)
+        .unwrap();
+    assert!(
+        ImportedStructures::read(&changed).is_err(),
+        "new rows must see the visible constructors"
+    );
+}
+
+#[test]
 fn projection_index_revalidates_structure_payloads_and_descriptor_policies() {
     let raw = base();
     let registered = register(&raw, &rows()).unwrap();

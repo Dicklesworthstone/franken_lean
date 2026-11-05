@@ -144,14 +144,14 @@ fn installed_public_section_instances_keep_private_overrides_local() {
         "Api.lean",
         "module\nprelude\npublic import Base\npublic section\ninstance selected : Pick Token := Pick.mk Token.left\nprivate instance (priority := 2000) hidden : Pick Token := Pick.mk Token.right\nend\ninstance (priority := 3000) afterSection : Pick Token := Pick.mk Token.right\ndef localChoice : Token := chosen\ndef localCorrect (P : Token -> Prop) (h : P Token.right) : P localChoice := h",
     );
-    let consumer = "prelude\nimport Api\ndef observed : Token := chosen\ndef correct (P : Token -> Prop) (h : P Token.left) : P observed := h";
+    let consumer = "module\nprelude\npublic import Api\npublic section\ndef observed : Token := chosen\ndef correct (P : Token -> Prop) (h : P Token.left) : P observed := h";
     p.write("Main.lean", consumer);
     p.complete("check-source");
     p.complete("run");
     assert!(p.lean_complete().is_empty());
     p.write(
         "Main.lean",
-        "prelude\nimport Api\ndef observed : Token := chosen\ndef wrong (P : Token -> Prop) (h : P Token.right) : P observed := h",
+        "module\nprelude\npublic import Api\npublic section\ndef observed : Token := chosen\ndef wrong (P : Token -> Prop) (h : P Token.right) : P observed := h",
     );
     p.refused("check-source");
     p.refused("run");

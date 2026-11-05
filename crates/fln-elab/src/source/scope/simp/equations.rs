@@ -80,7 +80,7 @@ fn read(env: &Environment, remaining: &mut usize) -> Result<State, SimpSetError>
     if state.len() > MAX_ROWS || state.payload_bytes() > (MAX_ROWS * MAX_BYTES) as u128 {
         return Err(SimpSetError::Limit);
     }
-    for row in state.entries() {
+    for (row, validation) in env.metadata_validation_entries(&expected.name) {
         if row.payload.len() > MAX_BYTES {
             return Err(SimpSetError::Limit);
         }
@@ -92,7 +92,7 @@ fn read(env: &Environment, remaining: &mut usize) -> Result<State, SimpSetError>
         let (&operation, rest) = bytes.split_first().ok_or(SimpSetError::Malformed)?;
         bytes = rest;
         let origin = crate::instances::read_name(&mut bytes).map_err(codec)?;
-        let Some(ConstantInfo::Defn(_)) = env.find(&origin) else {
+        let Some(ConstantInfo::Defn(_)) = validation.find(&origin) else {
             return Err(SimpSetError::UnknownDeclaration(origin));
         };
         let [flags] = bytes else {
@@ -117,9 +117,9 @@ fn read(env: &Environment, remaining: &mut usize) -> Result<State, SimpSetError>
                 let theorem = Name::str(origin.clone(), "eq_1");
                 if !policy.exposed
                     || !policy.nonrecursive
-                    || !matches!(env.find(&origin), Some(ConstantInfo::Defn(d))
+                    || !matches!(validation.find(&origin), Some(ConstantInfo::Defn(d))
                         if d.safety == DefinitionSafety::Safe)
-                    || !matches!(env.find(&theorem), Some(ConstantInfo::Thm(t))
+                    || !matches!(validation.find(&theorem), Some(ConstantInfo::Thm(t))
                         if t.all.as_slice() == std::slice::from_ref(&theorem))
                     || result.generated.insert(origin, *flags == 1).is_some()
                 {
@@ -129,6 +129,8 @@ fn read(env: &Environment, remaining: &mut usize) -> Result<State, SimpSetError>
             _ => return Err(SimpSetError::Malformed),
         }
     }
+    result.definitions.retain(|name, _| env.contains(name));
+    result.generated.retain(|name, _| env.contains(name));
     Ok(result)
 }
 

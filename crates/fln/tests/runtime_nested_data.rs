@@ -187,6 +187,48 @@ fn ordinary_nested_matches_execute_from_the_imported_prelude() {
 }
 
 #[test]
+fn nested_structural_calls_execute_descendant_results_and_replay() {
+    with_fixture(|engine, _, compiler| {
+        let definitions = format!(
+            r#"{TREE}
+def total (tree : NestedTree) (acc : Nat) : Nat := match tree with
+  | .leaf n => n + acc
+  | .node .nil => acc
+  | .node (.cons child .nil) => total child (acc + 1)
+  | .node (.cons first (.cons second _)) => total first acc + total second acc
+termination_by structural tree
+"#
+        );
+        let value = "NestedTree.node (List.cons (NestedTree.leaf 15) (List.cons (NestedTree.node (List.cons (NestedTree.leaf 20) List.nil)) List.nil))";
+        let source = format!("{definitions}#eval total ({value}) 3\n");
+        reference(compiler, &source, "42");
+        run(engine, &source, 42);
+    });
+}
+
+#[test]
+fn nested_structural_history_does_not_execute_unused_sibling_results() {
+    with_fixture(|engine, _, compiler| {
+        let definitions = format!(
+            r#"{TREE}
+partial def spin (n : Nat) : Nat := spin n
+def first : NestedTree → Nat
+  | .leaf 0 => spin 0
+  | .leaf (n + 1) => n + 1
+  | .node .nil => 0
+  | .node (.cons child _) => first child
+termination_by structural tree => tree
+"#
+        );
+        let source = format!(
+            "{definitions}#eval first (NestedTree.node (List.cons (NestedTree.leaf 42) (List.cons (NestedTree.leaf 0) List.nil)))\n"
+        );
+        reference(compiler, &source, "42");
+        run(engine, &source, 42);
+    });
+}
+
+#[test]
 fn nested_folds_execute_the_original_and_auxiliary_members() {
     with_fixture(|_, engine, compiler| {
         for (entry, ty, value) in [

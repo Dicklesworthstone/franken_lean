@@ -1,9 +1,10 @@
 //! A private executable bridge for the pin's selected bounded Array fold.
 //!
-//! The logical Array record contains a List. Extracting [start, stop) clamps
-//! to that list and folding it preserves the pin's callback order, one bind
-//! per visited element, and pure only at exhaustion. This uses no Monad laws,
-//! unsafe body, or native Array representation.
+//! Authenticated native arrays use the checked logical fold's indexed loop,
+//! without materializing their contents as a List. The logical representation
+//! retains a List slice bridge. Both preserve the pin's callback order, one
+//! bind per visited element, and pure only at exhaustion, without Monad laws
+//! or executing the selected unsafe body.
 use super::*;
 
 #[derive(Default)]
@@ -63,6 +64,20 @@ impl Preparation<'_> {
                 ));
             }
         };
+
+        // The safe logical body already clamps Nat bounds and indexes exactly
+        // the visited elements. Its complete helper closure was authenticated
+        // above; native Array.size/get lowering makes that same loop efficient
+        // without allocating a List for the entire array before every fold.
+        if self.native_arrays_enabled()? {
+            definition.base.name = private_name();
+            definition.hints = ReducibilityHints::Abbrev;
+            definition.all.clear();
+            let adapter = definition.base.name.clone();
+            self.remember_array_fold_definition(definition)?;
+            self.array_fold.adapter = Some(adapter.clone());
+            return Ok(adapter);
+        }
 
         // Keep the admitted interface and its binder kinds. The executable
         // template is private and never replaces the logical declaration.

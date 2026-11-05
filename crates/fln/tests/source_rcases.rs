@@ -53,7 +53,7 @@ fn verify(engine: &Engine, stack: usize) {
         );
         eprintln!("RCASES {id} {}", if accepted { "accept" } else { "reject" });
     }
-    assert_eq!(counts, [16, 11]);
+    assert_eq!(counts, [45, 29]);
     engine
         .check_source_files(
             &[b"def retry : Nat := 42"],

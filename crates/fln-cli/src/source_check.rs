@@ -37,10 +37,14 @@ pub(super) struct ModuleBuildContext {
 
 enum ModuleBuildKind {
     Ordinary(Box<fln::source_check::modules::SourceModuleSession>),
-    ImportedMacros {
-        base: Box<imports::MacroBuildBase>,
-        limits: Box<fln::source_check::modules::SourceModuleCheckLimits>,
-    },
+    ImportedMacros(Box<ImportedMacroBuildContext>),
+}
+
+// Keep the captured inputs and large admission limits in one allocation. The
+// ordinary build variant must not carry the macro-only payload inline.
+struct ImportedMacroBuildContext {
+    base: imports::MacroBuildBase,
+    limits: fln::source_check::modules::SourceModuleCheckLimits,
 }
 
 pub(super) struct ModuleMacroReport {
@@ -63,10 +67,10 @@ impl ModuleBuildContext {
                     .map_err(|error| (error.class, error.detail, error.authority))?;
             return Ok((
                 Self {
-                    kind: ModuleBuildKind::ImportedMacros {
-                        base: Box::new(base),
-                        limits: Box::new(limits),
-                    },
+                    kind: ModuleBuildKind::ImportedMacros(Box::new(ImportedMacroBuildContext {
+                        base,
+                        limits,
+                    })),
                 },
                 Some(report),
             ));
@@ -122,14 +126,15 @@ impl ModuleBuildContext {
                 .compile_with_records(modules, entry, write_budget, records, None)
                 .map(|outcome| outcome.map_complete(|built| (built, None)))
                 .map_err(failure),
-            ModuleBuildKind::ImportedMacros { base, limits } => {
+            ModuleBuildKind::ImportedMacros(context) => {
+                let ImportedMacroBuildContext { base, limits } = context.as_mut();
                 let result = base
                     .receipt
                     .compile_source_modules_with_deferred_imported_macros(
                         modules,
                         entry,
                         &fln::KVMap::new(),
-                        **limits,
+                        *limits,
                         base.input.clone(),
                         write_budget,
                         None,

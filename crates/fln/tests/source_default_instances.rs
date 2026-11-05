@@ -443,7 +443,10 @@ fn private_defaults_stay_private_and_public_headers_use_only_public_candidates()
     );
     let imported = modules(
         &base,
-        &[("Library", private), ("Main", "prelude\nimport Library")],
+        &[
+            ("Library", private),
+            ("Main", "module\nprelude\npublic import Library"),
+        ],
     )
     .unwrap();
     assert!(owned_defaults(&base, &imported).is_empty());
@@ -460,7 +463,7 @@ fn private_defaults_stay_private_and_public_headers_use_only_public_candidates()
                 ("Library", private),
                 (
                     "Main",
-                    "prelude\nimport Library\ndef leak := let value : _ := supplied; value"
+                    "module\nprelude\npublic import Library\npublic def leak := let value : _ := supplied; value"
                 )
             ]
         )
@@ -481,7 +484,7 @@ public theorem publicValue : publicSelection = 7 := by rfl";
             ("Library", both),
             (
                 "Main",
-                "prelude\nimport Library\ndef imported := let value : _ := supplied; value\ntheorem importedValue : imported = 7 := by rfl",
+                "module\nprelude\npublic import Library\npublic section\ndef imported := let value : _ := supplied; value\ntheorem importedValue : imported = 7 := by rfl",
             ),
         ],
     )
@@ -516,7 +519,7 @@ fn global_attributes_export_visible_candidates_even_from_private_sections() {
             ("Library", library),
             (
                 "Main",
-                "prelude\nimport Library\ndef imported := let value : _ := supplied; value\ntheorem importedValue : imported = 7 := by rfl",
+                "module\nprelude\npublic import Library\npublic section\ndef imported := let value : _ := supplied; value\ntheorem importedValue : imported = 7 := by rfl",
             ),
         ],
     )
@@ -577,7 +580,7 @@ end";
             ("Library", library),
             (
                 "Main",
-                "prelude\nimport Library\ndef another := let value : _ := typeFromProof; value\ntheorem isNatAgain : another = Nat := by rfl",
+                "module\nprelude\npublic import Library\npublic section\ndef another := let value : _ := typeFromProof; value\ntheorem isNatAgain : another = Nat := by rfl",
             ),
         ],
     )

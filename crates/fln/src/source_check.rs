@@ -1115,7 +1115,12 @@ impl Engine {
                     };
                     Some(parsed)
                 } else {
-                    None
+                    grammar
+                        .enter(|| source_records::parse_deriving_command(command))
+                        .map_err(|error| command_error(file, count, start, error))?
+                        .map(|parsed| {
+                            source_records::ScopedCommandSyntax::Deriving(parsed.syntax().clone())
+                        })
                 };
                 let mut scope = if public.is_some() {
                     if let Some(parsed) = &expanded {
@@ -1123,6 +1128,15 @@ impl Engine {
                         // checking and export worlds from its exact result,
                         // with each world's own instance activation chronology.
                         let mut scope = match parsed {
+                            source_records::ScopedCommandSyntax::Deriving(syntax) => {
+                                fln_elab::source::deriving::prepare_existing(
+                                    syntax,
+                                    engine.environment(),
+                                    limits.admission.kernel,
+                                    &scopes.current,
+                                )
+                                .map(|request| request.scope)
+                            }
                             source_records::ScopedCommandSyntax::Mutual(members) => {
                                 scopes.current.for_mutual_declarations(members)
                             }

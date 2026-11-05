@@ -12,6 +12,7 @@ struct ExtensionSuffix {
 pub(super) struct Export {
     pub(super) declarations: Vec<Declaration>,
     extensions: Vec<ExtensionSuffix>,
+    private: Option<Box<Export>>,
 }
 fn extension_error(
     module: &Name,
@@ -44,6 +45,22 @@ pub(super) fn supports_artifact_extension(descriptor: &ExtensionDescriptor) -> b
 }
 
 impl Export {
+    /// A module-system file has two independently checked views. Legacy roots
+    /// import the private implementation, including its private journals; modern
+    /// roots continue to use the exported interface. Both follow normal replay.
+    pub(super) fn with_private(mut self, private: Self) -> Self {
+        self.private = Some(Box::new(private));
+        self
+    }
+
+    pub(super) fn for_import(&self, private: bool) -> &Self {
+        if private {
+            self.private.as_deref().unwrap_or(self)
+        } else {
+            self
+        }
+    }
+
     /// Each journal this module appended to, with the rows it appended, in order.
     pub(super) fn journal_suffixes(
         &self,
@@ -149,10 +166,27 @@ impl Export {
         Ok(Self {
             declarations,
             extensions,
+            private: None,
         })
     }
 
     pub(super) fn replay(
+        &self,
+        engine: Engine,
+        module: &Name,
+        options: &KVMap,
+        meter: &mut Meter,
+        cancellation: Option<&dyn CancellationProbe>,
+    ) -> Result<Outcome<Engine>, SourceModuleCheckError> {
+        let engine = match self.replay_declarations(engine, module, options, meter, cancellation)? {
+            Outcome::Complete(engine) => engine,
+            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+        };
+        self.replay_metadata(engine, module, meter, cancellation)
+    }
+
+    pub(super) fn replay_declarations(
         &self,
         mut engine: Engine,
         module: &Name,
@@ -178,6 +212,16 @@ impl Export {
                 Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
             };
         }
+        Ok(Outcome::Complete(engine))
+    }
+
+    pub(super) fn replay_metadata(
+        &self,
+        mut engine: Engine,
+        module: &Name,
+        meter: &mut Meter,
+        cancellation: Option<&dyn CancellationProbe>,
+    ) -> Result<Outcome<Engine>, SourceModuleCheckError> {
         for suffix in &self.extensions {
             meter.work(1)?;
             let name = &suffix.descriptor.name;

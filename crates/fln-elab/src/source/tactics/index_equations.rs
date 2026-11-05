@@ -221,7 +221,7 @@ impl Context {
         levels: &[Level],
         parameters: &[Expr],
         indices: &[Expr],
-    ) -> Result<(), NatDefinitionElabError> {
+    ) -> Result<eliminate::CaseBranches, NatDefinitionElabError> {
         let saved = goal.lctx.clone();
         self.txn.lctx = saved.clone();
         let mut telescope =
@@ -313,7 +313,7 @@ impl Context {
             names: equations,
             induction_major: induction.then(|| major.id.clone()),
         };
-        self.eliminate_proof_goal_with_indices(
+        self.eliminate_proof_goal_with_substitutions(
             proof,
             inner,
             input,
@@ -336,8 +336,9 @@ impl Context {
         proof: &mut ProofState<'_>,
         mut goal: ProofGoal,
         equations: &[Name],
-    ) -> Result<Option<ProofGoal>, NatDefinitionElabError> {
+    ) -> Result<(Option<ProofGoal>, Vec<eliminate::CaseSubstitution>), NatDefinitionElabError> {
         let mut pending: VecDeque<_> = equations.iter().cloned().collect();
+        let mut substitutions = Vec::new();
         loop {
             let mut progress = false;
             let mut deferred = VecDeque::new();
@@ -362,18 +363,23 @@ impl Context {
                     }
                     if let Some(term) = self.refute_index_evidence(&homogeneous, &goal.target)? {
                         self.close_proof_goal(goal, term)?;
-                        return Ok(None);
+                        return Ok((None, substitutions));
                     }
                 }
                 let saved = self.clone();
                 let work = proof.work.len();
-                match self.substitute_proof_goal_preserving_names(proof, goal.clone(), &name, true)
-                {
-                    Ok(()) => {
+                match self.substitute_proof_goal_with_substitutions(
+                    proof,
+                    goal.clone(),
+                    &name,
+                    true,
+                ) {
+                    Ok(steps) => {
                         let Some(Work::Goal(child)) = proof.work.pop() else {
                             return Err(error(TacticError::MalformedScript));
                         };
                         goal = child;
+                        substitutions.extend(steps);
                         progress = true;
                         continue;
                     }
@@ -394,7 +400,9 @@ impl Context {
                 let saved = self.clone();
                 let work = proof.work.len();
                 match self.inject_named_proof_goal(proof, goal.clone(), &name, &[]) {
-                    Ok(()) if self.txn.mvars.is_assigned(&goal.id) => return Ok(None),
+                    Ok(()) if self.txn.mvars.is_assigned(&goal.id) => {
+                        return Ok((None, substitutions));
+                    }
                     Ok(()) => {
                         let Some(Work::Goal(child)) = proof.work.pop() else {
                             return Err(error(TacticError::MalformedScript));
@@ -419,7 +427,7 @@ impl Context {
             }
             if !progress || deferred.is_empty() {
                 self.txn.lctx = goal.lctx.clone();
-                return Ok(Some(goal));
+                return Ok((Some(goal), substitutions));
             }
             pending = deferred;
         }

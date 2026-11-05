@@ -402,6 +402,17 @@ pub(super) fn run_collecting(
     } else {
         graph::Plan::new(modules, entry, base.imported_modules(), &mut meter)?
     };
+    if plan.headers.iter().any(|header| header.module_system)
+        && contexts.map_or(
+            !base.imported_modules().is_empty() || base.has_checked_runtime_imports(),
+            contexts::ImportContexts::has_inherited_imports,
+        )
+    {
+        return Err(SourceModuleCheckError::ImportContext {
+            module: entry.clone(),
+            reason: "modern artifact imports require a retained SourceOleanImport receipt from an unambiguous import origin",
+        });
+    }
     let mut artifacts = Vec::new();
     let base_logical_root = base.logical_root(options);
     let mut exports: BTreeMap<usize, Arc<replay::Export>> = BTreeMap::new();
@@ -426,28 +437,35 @@ pub(super) fn run_collecting(
                 "source-modules/before-module",
             )));
         }
-        let dependencies = plan.dependencies_of(index, modules, &mut meter)?;
         let steps = match contexts {
             Some(contexts) => contexts.order(index, &plan, modules, &mut meter)?,
-            None => dependencies
-                .iter()
-                .copied()
-                .map(contexts::Step::Source)
-                .collect(),
+            None => contexts::source_order(index, &plan, modules, &mut meter, false)?,
         };
+        let dependencies: Vec<_> = steps
+            .iter()
+            .filter_map(|step| match step {
+                contexts::Step::Source(dependency, _) => Some(*dependency),
+                contexts::Step::External(_, _) => None,
+            })
+            .collect();
+        if macros.is_some() {
+            contexts
+                .expect("macro processing requires retained contexts")
+                .require_syntax_views(&steps)?;
+        }
         let macro_imports: Vec<_> = if macros.is_some() {
             steps
                 .iter()
                 .filter_map(|step| match step {
-                    contexts::Step::External(name) => Some(name.clone()),
-                    contexts::Step::Source(_) => None,
+                    contexts::Step::External(name, _) => Some(name.clone()),
+                    contexts::Step::Source(_, _) => None,
                 })
                 .collect()
         } else {
             Vec::new()
         };
         let imported_base = match contexts {
-            Some(contexts) => match contexts.project(&steps, &mut meter, cancellation)? {
+            Some(contexts) => match contexts.project(&steps, options, &mut meter, cancellation)? {
                 Outcome::Complete(engine) => engine,
                 Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
                 Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
@@ -524,8 +542,8 @@ pub(super) fn run_collecting(
                 let steps: Vec<_> = steps
                     .iter()
                     .map(|step| match step {
-                        contexts::Step::External(name) => KeyStep::External(name.clone()),
-                        contexts::Step::Source(dependency) => KeyStep::Source(
+                        contexts::Step::External(name, _) => KeyStep::External(name.clone()),
+                        contexts::Step::Source(dependency, _) => KeyStep::Source(
                             modules[*dependency].name.clone(),
                             *result_roots
                                 .get(dependency)
@@ -544,39 +562,24 @@ pub(super) fn run_collecting(
                 )
             });
             let mut imported = imported_base;
-            for step in steps {
-                if cancellation.is_some_and(CancellationProbe::is_cancelled) {
-                    return Ok(Outcome::Inconclusive(Inconclusive::cancelled(
-                        "source-modules/before-import",
-                    )));
-                }
-                let dependency = match step {
-                    contexts::Step::Source(dependency) => dependency,
-                    contexts::Step::External(name) => {
-                        imported = match contexts
-                            .expect("external steps require import contexts")
-                            .replay_metadata(
-                            &name,
-                            imported,
-                            options,
-                            &mut meter,
-                            cancellation,
-                        )? {
-                            Outcome::Complete(engine) => engine,
-                            Outcome::Inconclusive(reason) => {
-                                return Ok(Outcome::Inconclusive(reason));
-                            }
-                            Outcome::InternalFault(fault) => {
-                                return Ok(Outcome::InternalFault(fault));
-                            }
-                        };
-                        continue;
-                    }
+            let source_views: BTreeMap<_, _> = steps
+                .iter()
+                .filter_map(|step| match step {
+                    contexts::Step::Source(dependency, private) => Some((*dependency, *private)),
+                    contexts::Step::External(_, _) => None,
+                })
+                .collect();
+            for dependency in &plan.order {
+                let Some(&private) = source_views.get(dependency) else {
+                    continue;
                 };
-                let export = exports.get(&dependency).expect("postorder predecessor");
-                imported = match export.replay(
+                let export = exports
+                    .get(dependency)
+                    .expect("postorder predecessor")
+                    .for_import(private);
+                imported = match export.replay_declarations(
                     imported,
-                    modules[dependency].name,
+                    modules[*dependency].name,
                     options,
                     &mut meter,
                     cancellation,
@@ -587,6 +590,52 @@ pub(super) fn run_collecting(
                 };
                 replayed_declarations += export.declarations.len();
             }
+            for step in &steps {
+                if cancellation.is_some_and(CancellationProbe::is_cancelled) {
+                    return Ok(Outcome::Inconclusive(Inconclusive::cancelled(
+                        "source-modules/before-import",
+                    )));
+                }
+                let replayed = match step {
+                    contexts::Step::Source(dependency, private) => exports
+                        .get(dependency)
+                        .expect("postorder predecessor")
+                        .for_import(*private)
+                        .replay_metadata(
+                            imported,
+                            modules[*dependency].name,
+                            &mut meter,
+                            cancellation,
+                        )?,
+                    contexts::Step::External(name, private) => contexts
+                        .expect("external steps require import contexts")
+                        .replay_metadata(name, *private, imported, &mut meter, cancellation)?,
+                };
+                imported = match replayed {
+                    Outcome::Complete(engine) => engine,
+                    Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                    Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                };
+            }
+            imported = match contexts::finish_imports(
+                imported,
+                contexts::ImportReplay {
+                    base,
+                    contexts,
+                    index,
+                    plan: &plan,
+                    modules,
+                    options,
+                    cancellation,
+                    exported_roots: false,
+                },
+                |dependency| &exports[&dependency],
+                &mut meter,
+            )? {
+                Outcome::Complete(engine) => engine,
+                Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+            };
             // Header-only modules and persisted hits still import a grammar
             // world; neither may bypass its visibility and phase boundary.
             if plan.headers[index].module_system {
@@ -833,7 +882,13 @@ pub(super) fn run_collecting(
                 let export = Arc::new(if let Some(public) = public {
                     let export = public.finish()?;
                     replayed_declarations += export.declarations.len();
-                    export
+                    export.with_private(replay::Export::capture(
+                        module.name,
+                        imported.environment(),
+                        checked.engine.environment(),
+                        declarations,
+                        &mut meter,
+                    )?)
                 } else {
                     replay::Export::capture(
                         module.name,

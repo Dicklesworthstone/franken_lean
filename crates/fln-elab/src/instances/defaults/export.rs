@@ -142,7 +142,7 @@ fn class_memberships(
             return Err(InstanceRegistryError::Limit);
         }
         let mut positions = BTreeMap::<Name, (Name, Option<Name>)>::new();
-        for entry in extension.entries() {
+        for (entry, validation) in env.metadata_validation_entries(&instances::extension_name()) {
             meter.charge(1)?;
             meter.payload(&entry.payload)?;
             let mut bytes = entry
@@ -155,7 +155,7 @@ fn class_memberships(
                 if !bytes.is_empty() || !classes.insert(class.clone()) {
                     return Err(InstanceRegistryError::Malformed);
                 }
-                validate_class(env, &class)?;
+                validate_class(validation, &class)?;
                 continue;
             }
             if !(1..=3).contains(&tag) || !classes.contains(&class) {
@@ -168,7 +168,7 @@ fn class_memberships(
             } else {
                 None
             };
-            if !bytes.is_empty() || !env.contains(&declaration) {
+            if !bytes.is_empty() || !validation.contains(&declaration) {
                 return Err(InstanceRegistryError::Malformed);
             }
             if let Some((old_class, old_scope)) = positions.get(&declaration) {

@@ -359,9 +359,13 @@ impl Engine {
         // The compiler's existing resolver validates every recursive sibling
         // and explicit replacement. A forged suffix must not select a body,
         // and an unsupported opaque/unsafe main must not run its logical value.
-        let mut preparation = crate::runtime::Preparation::new(self.environment(), limits.ingress)
-            .with_executable_opaques(&self.executable_opaques)
-            .with_runtime_initializers(&self.runtime_initializers);
+        let runtime = self
+            .runtime_environment(limits.ingress)
+            .map_err(MainExecutionError::Preparation)?;
+        let mut preparation =
+            crate::runtime::Preparation::new(&runtime.environment, limits.ingress)
+                .with_executable_opaques(&runtime.executable_opaques)
+                .with_runtime_initializers(&runtime.runtime_initializers);
         if preparation
             .executable_definition(&requested)
             .map_err(MainExecutionError::Preparation)?
@@ -383,14 +387,14 @@ impl Engine {
         match contract {
             ReturnContract::Unit => {
                 tick(&mut visited, limits)?;
-                if !unit_contract_matches(self.environment(), &result) {
+                if !unit_contract_matches(&runtime.environment, &result) {
                     return Err(MainExecutionError::UnsupportedContract {
                         family: "Unit/PUnit",
                     });
                 }
                 for label in ["PUnit", "PUnit.unit", "Unit"] {
                     crate::source_intrinsics::check_selected_extern_attribute(
-                        self.environment(),
+                        &runtime.environment,
                         &name(label),
                         &mut None,
                         &mut visited,
@@ -401,7 +405,7 @@ impl Engine {
             }
             ReturnContract::UInt32 => {
                 if !crate::source_intrinsics::io::results::word_contract_matches(
-                    self.environment(),
+                    &runtime.environment,
                     &mut None,
                     &mut visited,
                     limits.ingress,

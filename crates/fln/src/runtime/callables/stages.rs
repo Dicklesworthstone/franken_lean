@@ -63,7 +63,7 @@ impl Preparation<'_> {
     /// captures that lie outside this lambda are unknown, never guessed from a
     /// runtime value. Ordinary ingress remains the authority for every argument,
     /// capture and exact return interface.
-    fn staged_result(
+    pub(in crate::runtime) fn staged_result(
         &mut self,
         body: &Expr,
         parameters: &[ValueType],

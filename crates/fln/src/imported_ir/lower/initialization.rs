@@ -178,16 +178,16 @@ impl Builder<'_> {
         let environment = self.boxed(block, ValueType::Array, Operation::Array { items: cells })?;
         self.global_environment = Some(environment);
 
-        for (slot, global) in plan.globals.iter().enumerate() {
+        for (step_index, step) in plan.steps.iter().enumerate() {
             let (function, arity) = self
                 .tables
                 .targets
-                .get(&global.initializer)
+                .get(&step.initializer)
                 .copied()
-                .ok_or_else(|| IrExecutionError::MissingDeclaration(global.initializer.clone()))?;
+                .ok_or_else(|| IrExecutionError::MissingDeclaration(step.initializer.clone()))?;
             if arity != 1 {
                 return Err(unsupported(
-                    &global.initializer,
+                    &step.initializer,
                     "initializer without its single erased world parameter",
                 ));
             }
@@ -201,7 +201,7 @@ impl Builder<'_> {
             // return a private envelope, so neither can reach later actions.
             let failure = self.block()?;
             let io_error = self.initialization_shape(failure, result, 1)?;
-            let index = self.nat(failure, &IrNat::Small(slot as u64))?;
+            let index = self.nat(failure, &IrNat::Small(step_index as u64))?;
             let error_block = self.block()?;
             let error = self.initialization_envelope(error_block, 1, vec![index, result])?;
             self.finish_block(error_block, Terminator::Return { value: error });
@@ -219,14 +219,16 @@ impl Builder<'_> {
             );
 
             let ready = self.block()?;
-            let value = self.initialization_payload(ready, result, 0)?;
-            let value = self.initialization_envelope(ready, 1, vec![value])?;
-            let cell = self.global_cell(ready, slot)?;
-            self.native_call(
-                ready,
-                &Name::from_components(["ST", "Prim", "Ref", "set"]),
-                vec![cell, value],
-            )?;
+            if let Some(slot) = step.global_slot {
+                let value = self.initialization_payload(ready, result, 0)?;
+                let value = self.initialization_envelope(ready, 1, vec![value])?;
+                let cell = self.global_cell(ready, slot)?;
+                self.native_call(
+                    ready,
+                    &Name::from_components(["ST", "Prim", "Ref", "set"]),
+                    vec![cell, value],
+                )?;
+            }
             self.finish_block(
                 block,
                 Terminator::BranchZero {
@@ -333,6 +335,17 @@ mod tests {
                     declaration: name(global),
                     initializer: name(initializer),
                 })
+                .collect(),
+            steps: rows
+                .iter()
+                .enumerate()
+                .map(
+                    |(slot, (global, initializer))| globals::InitializationStep {
+                        declaration: name(global),
+                        initializer: name(initializer),
+                        global_slot: Some(slot),
+                    },
+                )
                 .collect(),
         }
     }

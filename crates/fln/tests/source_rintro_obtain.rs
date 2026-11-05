@@ -60,7 +60,7 @@ fn verify(engine: &Engine, stack: usize) {
             if accepted { "accept" } else { "reject" }
         );
     }
-    assert_eq!(counts, [36, 25]);
+    assert_eq!(counts, [84, 53]);
     engine
         .check_source_files(
             &[b"def retry : Nat := 42"],

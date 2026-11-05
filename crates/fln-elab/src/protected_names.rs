@@ -162,7 +162,7 @@ impl ProtectedNames {
             return Err(ProtectedError::Limit);
         }
         let mut names = BTreeSet::new();
-        for entry in extension.entries() {
+        for (entry, validation) in env.metadata_validation_entries(&extension_name()) {
             if entry.payload.len() > MAX_ENTRY_BYTES {
                 return Err(ProtectedError::Limit);
             }
@@ -184,7 +184,7 @@ impl ProtectedNames {
             bytes = rest;
             for _ in 0..count {
                 let name = read_name(&mut bytes).map_err(codec)?;
-                if !env.contains(&name) {
+                if !validation.contains(&name) {
                     return Err(ProtectedError::UnknownDeclaration(name));
                 }
                 if names.contains(&name) {
@@ -196,6 +196,7 @@ impl ProtectedNames {
                 return Err(ProtectedError::Malformed);
             }
         }
+        names.retain(|name| env.contains(name));
         Ok(Self { names })
     }
 
@@ -223,25 +224,21 @@ impl ProtectedNames {
 /// it validates against (by count). A failed read is never kept.
 #[derive(Clone, Default)]
 pub(crate) struct ProtectedCache {
-    last: std::cell::RefCell<Option<(CacheKey, std::sync::Arc<ProtectedNames>)>>,
+    last: std::cell::RefCell<Option<(Environment, std::sync::Arc<ProtectedNames>)>>,
 }
-
-/// The journal's digest (if any) and the environment's constant count.
-type CacheKey = (Option<[u8; 32]>, usize);
 
 impl ProtectedCache {
     pub(crate) fn read(
         &self,
         env: &Environment,
     ) -> Result<std::sync::Arc<ProtectedNames>, ProtectedError> {
-        let key = (journal_digest(env), env.len());
         if let Some((cached, names)) = self.last.borrow().as_ref()
-            && *cached == key
+            && cached == env
         {
             return Ok(std::sync::Arc::clone(names));
         }
         let names = std::sync::Arc::new(ProtectedNames::read(env)?);
-        *self.last.borrow_mut() = Some((key, std::sync::Arc::clone(&names)));
+        *self.last.borrow_mut() = Some((env.clone(), std::sync::Arc::clone(&names)));
         Ok(names)
     }
 }

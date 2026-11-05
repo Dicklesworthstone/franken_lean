@@ -4,6 +4,7 @@
 //! Search uses an explicit stack and never turns exhaustion into "not found".
 use super::*;
 use crate::instances::{InstanceRegistry, InstanceRegistryError, result_head};
+use fln_env::constants::ConstantInfo;
 
 pub(super) mod audit;
 mod first_order;
@@ -328,6 +329,87 @@ impl Context {
         // definitions nor local type aliases. Candidate matching can still
         // use the ordinary unifier after this eligibility check.
         self.whnf_with_transparency(type_, UnificationTransparency::Abbreviations, false)
+    }
+
+    /// The pin's `Meta.isClass?` also discovers local providers whose result
+    /// becomes a class only after opening their telescope. Ordinary binders
+    /// are eligible; candidate matching must still infer every argument before
+    /// it can publish an answer. Opening the telescope creates only temporary
+    /// local parameters, never arguments to be solved by instance search.
+    fn local_instance_class(
+        &mut self,
+        type_: &Expr,
+        registry: &InstanceRegistry,
+    ) -> Result<Option<Name>, NatDefinitionElabError> {
+        let mut target = self.instance_type(type_)?;
+        // `isClassQuick?` can inspect a syntactic class head beneath binders
+        // without allocating locals. Most ordinary function types are ruled
+        // out here too. Reduce only the uncertain telescope below.
+        let mut head = &target;
+        loop {
+            self.tick()?;
+            match head.node() {
+                ExprNode::ForallE { body, .. } | ExprNode::MData { expr: body, .. } => {
+                    head = body;
+                }
+                ExprNode::App { f, .. } => {
+                    head = f;
+                    while let ExprNode::App { f, .. } = head.node() {
+                        self.tick()?;
+                        head = f;
+                    }
+                    // The pin inspects an application's function without
+                    // reducing arbitrary heads. In particular, a let or
+                    // projection in function position is not a provider.
+                    match head.node() {
+                        ExprNode::Const { .. } => {}
+                        ExprNode::Lam { .. } | ExprNode::MVar { .. } => break,
+                        _ => return Ok(None),
+                    }
+                }
+                ExprNode::Const { name, .. } => {
+                    if registry.is_class(name) {
+                        return Ok(Some(name.clone()));
+                    }
+                    if !matches!(self.txn.env.find(name), Some(ConstantInfo::Defn(_))) {
+                        return Ok(None);
+                    }
+                    break;
+                }
+                ExprNode::LetE { .. } | ExprNode::Proj { .. } | ExprNode::MVar { .. } => break,
+                _ => return Ok(None),
+            }
+        }
+        if !matches!(target.node(), ExprNode::ForallE { .. }) {
+            return Ok(None);
+        }
+        // `isClassExpensive?` uses a reducible telescope, not synthetic
+        // arguments to be solved by instance search. Keep these fresh locals
+        // and all reduction state in a child context; only spent work survives.
+        let mut trial = self.clone();
+        let result = (|| {
+            while let ExprNode::ForallE {
+                binder_name,
+                binder_type,
+                body,
+                binder_info,
+            } = target.node()
+            {
+                trial.tick()?;
+                let id = FVarId(trial.fresh_name()?);
+                let next = trial.substitute(body, &Expr::fvar(id.clone()))?;
+                trial.txn.lctx.add_param(
+                    id,
+                    binder_name.clone(),
+                    binder_type.clone(),
+                    *binder_info,
+                );
+                target = trial.instance_type(&next)?;
+            }
+            Ok(result_head(&target).filter(|name| registry.is_class(name)))
+        })();
+        self.txn.budget.heartbeats_consumed = trial.txn.budget.heartbeats_consumed;
+        result
     }
 
     /// Before a `fun` or `∀` closes over `locals`, take unsolved inference and instance goals
@@ -1009,15 +1091,17 @@ impl Context {
             // Target binders give candidate terms their scope, but do not
             // extend the local-instance population of this search. This also
             // holds for recursive prerequisites under those binders.
-            if !ambient.contains(&local.id) || self.is_matrix_hypothesis(local) {
+            if !ambient.contains(&local.id)
+                || self.is_matrix_hypothesis(local)
+                || self.excluded_local_instances.contains(&local.id)
+            {
                 continue;
             }
             let eligible = if local.binder_info == BinderInfo::InstImplicit {
                 true
             } else {
-                let type_ = self.instance_type(&local.type_)?;
-                !matches!(type_.node(), ExprNode::ForallE { .. })
-                    && result_head(&type_).is_some_and(|name| name == class)
+                self.local_instance_class(&local.type_, registry)?
+                    .is_some_and(|name| name == class)
             };
             if eligible {
                 candidates.push(Candidate::Local(local.id.clone()));

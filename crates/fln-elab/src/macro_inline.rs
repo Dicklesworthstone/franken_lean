@@ -134,7 +134,7 @@ pub fn read(env: &Environment) -> Result<BTreeSet<Name>, MacroInlineError> {
         return Err(MacroInlineError::Limit);
     }
     let mut names = BTreeSet::new();
-    for entry in extension.entries() {
+    for (entry, validation) in env.metadata_validation_entries(&journal_name()) {
         if entry.payload.len() > MAX_ENTRY_BYTES {
             return Err(MacroInlineError::Limit);
         }
@@ -146,11 +146,12 @@ pub fn read(env: &Environment) -> Result<BTreeSet<Name>, MacroInlineError> {
         if !bytes.is_empty() {
             return Err(MacroInlineError::Malformed);
         }
-        eligible(env, &name)?;
+        eligible(validation, &name)?;
         if !names.insert(name.clone()) {
             return Err(MacroInlineError::Duplicate(name));
         }
     }
+    names.retain(|name| env.contains(name));
     Ok(names)
 }
 
