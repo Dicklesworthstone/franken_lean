@@ -105,7 +105,7 @@ impl PreparedEvaluation {
         budget: Budget,
         scope: &SourceScope,
     ) -> Result<Self, NatDefinitionElabError> {
-        let mut context = Context::scoped(environment, budget, scope);
+        let mut context = Context::scoped(environment, budget, scope)?;
         let guard = syntax.kind() == Some(&parser_kind(&["Command", "guardCmd"]));
         let term = if guard {
             guard_term(syntax, &mut context).and_then(|term| {

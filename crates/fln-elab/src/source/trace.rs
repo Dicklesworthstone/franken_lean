@@ -57,7 +57,7 @@ pub fn elaborate_definition(
     scope: &SourceScope,
 ) -> Result<ObservedDeclaration, NatDefinitionElabError> {
     let scope = scope.for_declaration(syntax)?;
-    let mut context = Context::scoped(environment, kernel, &scope);
+    let mut context = Context::scoped(environment, kernel, &scope)?;
     context.traces.enable();
     let declaration = definition_in_context(syntax, &mut context)?;
     let local_functions = context.lift_local_functions(&declaration)?;
@@ -83,7 +83,7 @@ pub fn elaborate_example(
     kernel: Budget,
     scope: &SourceScope,
 ) -> Result<(Declaration, Vec<SourceTrace>), NatDefinitionElabError> {
-    let mut context = Context::scoped(environment, kernel, scope);
+    let mut context = Context::scoped(environment, kernel, scope)?;
     context.traces.enable();
     let declaration = scope::example_in_context(syntax, name, &mut context)?;
     let traces = context.observations()?;

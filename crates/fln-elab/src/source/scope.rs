@@ -90,6 +90,9 @@ pub struct SourceScope {
     /// `attribute [local simp] x`'s rules, in order: `simp`'s default set until this scope ends.
     /// They are never registered, as the pin keeps local attributes out of the `.olean`.
     pub local_simp: Vec<simp::SimpEntry>,
+    /// Local reducibility attributes affect elaboration until this scope ends.
+    /// Their temporary tables never enter admission or module export journals.
+    pub local_reducibility: crate::reducibility::LocalReducibility,
     /// Set only by an engine in `frontier` mode: a compiled declaration may then apply
     /// a recursor the pin's code generator refuses (`codegen.rs`, bead
     /// `franken_lean-z8j.1.6.6`). Not a lexical scope; every command inherits it.
@@ -129,6 +132,7 @@ impl PartialEq for SourceScope {
             variables,
             instance_scopes,
             local_simp,
+            local_reducibility,
             frontier_recursors,
             arithmetic,
             // The evaluator `native_decide` reaches is per-command plumbing the lean door
@@ -149,6 +153,7 @@ impl PartialEq for SourceScope {
             && variables == &other.variables
             && instance_scopes == &other.instance_scopes
             && local_simp == &other.local_simp
+            && local_reducibility == &other.local_reducibility
             && frontier_recursors == &other.frontier_recursors
             && arithmetic == &other.arithmetic
             && options == &other.options
@@ -618,8 +623,25 @@ impl Context {
         Ok(())
     }
 
-    pub(super) fn scoped(env: &Environment, kernel: Budget, scope: &SourceScope) -> Self {
-        let mut context = Self::new(env, kernel);
+    pub(super) fn scoped(
+        env: &Environment,
+        kernel: Budget,
+        scope: &SourceScope,
+    ) -> Result<Self, NatDefinitionElabError> {
+        // A module's public header cannot see private definitions or hidden
+        // bodies. Their local statuses have no meaning in that projected world;
+        // the private body receives the complete scope at its own entry.
+        let environment = if scope.exports_declaration() {
+            scope.local_reducibility.visible_in(env).environment(env)
+        } else {
+            scope.local_reducibility.environment(env)
+        }
+        .map_err(|error| {
+            failure(SourceInferenceError::Unification(Box::new(
+                UnificationError::Reducibility(error),
+            )))
+        })?;
+        let mut context = Self::new(&environment, kernel);
         context.source_scope = scope.clone();
         // The evaluator is the entry point's to enable (`Context::native`): a route that does
         // not carry the axioms on to admission must not run `native_decide`.
@@ -628,7 +650,7 @@ impl Context {
         context.txn.lctx = scope.variables.locals().clone();
         scope.variables.restore_inference(&mut context.txn);
         context.next = scope.variables.next();
-        context
+        Ok(context)
     }
 
     pub(super) fn resolve_source_name(
@@ -976,7 +998,7 @@ pub fn elaborate_example(
     kernel: Budget,
     scope: &SourceScope,
 ) -> Result<Declaration, NatDefinitionElabError> {
-    let mut context = Context::scoped(env, kernel, scope);
+    let mut context = Context::scoped(env, kernel, scope)?;
     example_in_context(syntax, name, &mut context)
 }
 
@@ -989,7 +1011,7 @@ pub fn elaborate_example_with_axioms(
     kernel: Budget,
     scope: &SourceScope,
 ) -> Result<(Declaration, Vec<Declaration>), NatDefinitionElabError> {
-    let mut context = Context::scoped(env, kernel, scope);
+    let mut context = Context::scoped(env, kernel, scope)?;
     context.native = scope.native.clone();
     let declaration = example_in_context(syntax, name, &mut context)?;
     Ok((declaration, std::mem::take(&mut context.native_axioms)))
@@ -1183,6 +1205,7 @@ mod tests {
             variables: variables::SectionVariables::default(),
             instance_scopes: crate::instances::scoped::ActiveScopes::default(),
             local_simp: Vec::new(),
+            local_reducibility: crate::reducibility::LocalReducibility::default(),
             frontier_recursors: false,
             arithmetic: None,
             native: None,
@@ -1380,6 +1403,7 @@ mod tests {
             variables: variables::SectionVariables::default(),
             instance_scopes: crate::instances::scoped::ActiveScopes::default(),
             local_simp: Vec::new(),
+            local_reducibility: crate::reducibility::LocalReducibility::default(),
             frontier_recursors: false,
             arithmetic: None,
             native: None,
@@ -1460,6 +1484,7 @@ mod tests {
             variables: variables::SectionVariables::default(),
             instance_scopes: crate::instances::scoped::ActiveScopes::default(),
             local_simp: Vec::new(),
+            local_reducibility: crate::reducibility::LocalReducibility::default(),
             frontier_recursors: false,
             arithmetic: None,
             native: None,

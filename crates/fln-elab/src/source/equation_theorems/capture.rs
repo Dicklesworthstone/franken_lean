@@ -114,7 +114,7 @@ impl Context {
         // is bound to a local while the alternatives elaborate (see `capture`).
         let mut scope = self.source_scope.clone();
         scope.variables = Default::default();
-        let mut cx = Context::scoped(&self.txn.env, self.kernel, &scope);
+        let mut cx = Context::scoped(&self.txn.env, self.kernel, &scope).ok()?;
         cx.txn.lctx = LocalContext::new();
         cx.level_params = definition.base.level_params.clone();
         cx.capture(definition, &discriminants, &alternatives, sections)

@@ -496,7 +496,7 @@ pub fn elaborate_handler(
     kernel: Budget,
     scope: &SourceScope,
 ) -> Result<DerivedInstance, NatDefinitionElabError> {
-    let mut context = Context::scoped(environment, kernel, scope);
+    let mut context = Context::scoped(environment, kernel, scope)?;
     let handler_name = context.resolve_source_name(handler)?;
     let is_repr = handler_name.as_ref() == Some(&named("Repr"));
     let is_beq = handler_name.as_ref() == Some(&named("BEq"));

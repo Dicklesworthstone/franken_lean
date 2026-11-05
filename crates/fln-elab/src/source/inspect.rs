@@ -93,7 +93,7 @@ pub fn declaration(
     kind: ObservationKind,
 ) -> Result<Option<SourceObservation>, NatDefinitionElabError> {
     let scope = scope.for_declaration(syntax)?;
-    let mut context = Context::scoped(environment, kernel, &scope);
+    let mut context = Context::scoped(environment, kernel, &scope)?;
     declaration_in_context(syntax, &mut context, offset, kind)
 }
 

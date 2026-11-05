@@ -1,8 +1,8 @@
-//! Global source reducibility updates over already checked declarations.
+//! Source reducibility updates over already checked declarations.
 //!
-//! Validation follows the pin's Lean/ReducibilityAttrs.lean:126–158. A global
-//! attribute is restricted to this file and to the permitted previous statuses;
-//! it is not an unrestricted setter for the imported reducibility journal.
+//! Validation follows the pin's Lean/ReducibilityAttrs.lean. Global attributes
+//! enter the persistent journal; local attributes live only in SourceScope and
+//! are projected into a temporary environment for each elaboration.
 use super::*;
 use fln_elab::reducibility::{Reducibility, ReducibilityError};
 use fln_elab::source::scope::SourceScope;
@@ -33,7 +33,7 @@ pub(super) fn registry_error(
 pub(super) fn apply(
     environment: &Environment,
     file_base: &Environment,
-    scope: &SourceScope,
+    scope: &mut SourceScope,
     attribute: ReducibilityAttribute,
     position @ (file, command, offset): (usize, usize, usize),
 ) -> Result<Environment, SourceCheckError> {
@@ -49,12 +49,8 @@ pub(super) fn apply(
         offset,
         message,
     };
-    match attribute.scope {
-        AttributeScope::Local => {
-            return Err(refuse(
-                "local reducibility attributes require lexical restoration, which is not yet implemented".into(),
-            ));
-        }
+    let local = match attribute.scope {
+        AttributeScope::Local => true,
         AttributeScope::Scoped => {
             return Err(refuse(if scope.namespace.is_anonymous() {
                 "scoped reducibility attributes must be used inside namespaces".into()
@@ -62,8 +58,8 @@ pub(super) fn apply(
                 "failed to set reducibility status: the scoped modifier is not recommended for this kind of attribute".into()
             }));
         }
-        AttributeScope::Global => {}
-    }
+        AttributeScope::Global => false,
+    };
     let status = match attribute.status {
         ReducibilityStatus::Reducible => Reducibility::Reducible,
         ReducibilityStatus::Semireducible => Reducibility::Semireducible,
@@ -71,6 +67,7 @@ pub(super) fn apply(
         ReducibilityStatus::ImplicitReducible => Reducibility::ImplicitReducible,
     };
     let mut next = environment.clone();
+    let mut overrides = scope.local_reducibility.clone();
     for requested in attribute.declarations {
         let name = scope
             .resolve(&requested, |name| next.contains(name))
@@ -87,26 +84,31 @@ pub(super) fn apply(
                 name.to_display_string(),
             )));
         }
-        if file_base.contains(&name) {
+        if !local && file_base.contains(&name) {
             return Err(refuse(format!(
                 "failed to set reducibility status: `{}` has not been defined in this file",
                 name.to_display_string(),
             )));
         }
-        let old = fln_elab::reducibility::table(&next)
+        // Local status takes precedence even when validating a global update,
+        // as getReducibilityStatusCore reads reducibilityExtra before core.
+        let effective = if scope.exports_declaration() {
+            overrides.visible_in(&next).environment(&next)
+        } else {
+            overrides.environment(&next)
+        }
+        .map_err(|error| registry_error(error, position))?;
+        let old = fln_elab::reducibility::table(&effective)
             .map_err(|error| registry_error(error, position))?
             .status(&name);
         let allowed = match status {
-            Reducibility::Reducible | Reducibility::ImplicitReducible => {
-                old == Reducibility::Semireducible
-            }
-            Reducibility::Irreducible => {
-                matches!(
-                    old,
-                    Reducibility::Semireducible | Reducibility::ImplicitReducible
-                )
-            }
-            Reducibility::Semireducible => false,
+            Reducibility::Reducible => !local && old == Reducibility::Semireducible,
+            Reducibility::ImplicitReducible => old == Reducibility::Semireducible,
+            Reducibility::Irreducible => matches!(
+                old,
+                Reducibility::Semireducible | Reducibility::ImplicitReducible
+            ),
+            Reducibility::Semireducible => local && old == Reducibility::Irreducible,
         };
         if !allowed {
             return Err(refuse(format!(
@@ -114,9 +116,96 @@ pub(super) fn apply(
                 name.to_display_string(),
             )));
         }
-        next = fln_elab::reducibility::register(&next, &name, status)
-            .map_err(|error| registry_error(error, position))?;
+        if local {
+            overrides = overrides
+                .with_status(&next, &name, status)
+                .map_err(|error| registry_error(error, position))?;
+        } else {
+            next = fln_elab::reducibility::register(&next, &name, status)
+                .map_err(|error| registry_error(error, position))?;
+        }
     }
-    // The whole command succeeds before the batch can observe this successor.
+    // Neither a local prefix nor persistent metadata escapes a failed batch.
+    scope.local_reducibility = overrides;
     Ok(next)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn name(text: &str) -> Name {
+        Name::from_components(text.split('.'))
+    }
+
+    #[test]
+    fn failed_attribute_batches_leave_the_active_scope_and_journal_unchanged() {
+        let limits = EngineAdmissionLimits::new(Budget::for_stack_bytes(2 << 20));
+        let base = Engine::with_source_seed(limits)
+            .unwrap()
+            .into_complete()
+            .unwrap();
+        let checked = base
+            .check_source_files(
+                &[b"def first : Nat := 1\ndef second : Nat := 2"],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits),
+            )
+            .unwrap()
+            .into_complete()
+            .unwrap()
+            .engine;
+        let env = checked.environment();
+        let before = fln_elab::reducibility::journal_digest(env);
+        let mut scope = SourceScope::default();
+        let original = scope.clone();
+        let attribute = |status, declarations: &[&str]| ReducibilityAttribute {
+            declarations: declarations.iter().map(|text| name(text)).collect(),
+            status,
+            scope: AttributeScope::Local,
+        };
+        assert!(
+            apply(
+                env,
+                base.environment(),
+                &mut scope,
+                attribute(ReducibilityStatus::Irreducible, &["first", "missing"]),
+                (0, 0, 0),
+            )
+            .is_err()
+        );
+        assert_eq!(scope, original);
+        let unchanged = apply(
+            env,
+            base.environment(),
+            &mut scope,
+            attribute(ReducibilityStatus::Irreducible, &["first"]),
+            (0, 0, 0),
+        )
+        .unwrap();
+        assert_eq!(&unchanged, env);
+        let active = scope.clone();
+        // The first transition is legal; the second must discard that prefix.
+        assert!(
+            apply(
+                env,
+                base.environment(),
+                &mut scope,
+                attribute(ReducibilityStatus::Semireducible, &["first", "second"]),
+                (0, 0, 0),
+            )
+            .is_err()
+        );
+        assert_eq!(scope, active);
+        assert_eq!(fln_elab::reducibility::journal_digest(env), before);
+        let effective = scope.local_reducibility.environment(env).unwrap();
+        assert_eq!(
+            fln_elab::reducibility::table(&effective)
+                .unwrap()
+                .status(&name("first")),
+            Reducibility::Irreducible
+        );
+        let repeated = scope.local_reducibility.environment(&effective).unwrap();
+        assert_eq!(effective, repeated);
+    }
 }

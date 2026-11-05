@@ -180,7 +180,7 @@ pub fn deprecation_entry(
         Some(written) => {
             let mut declaration_scope = scope.clone();
             declaration_scope.namespace = scope.user_name(declared).parent();
-            let mut context = Context::scoped(environment, kernel, &declaration_scope);
+            let mut context = Context::scoped(environment, kernel, &declaration_scope)?;
             let resolved = context
                 .resolve_source_name(written)?
                 .filter(|name| context.txn.env.contains(name))

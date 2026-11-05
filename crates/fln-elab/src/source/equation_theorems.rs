@@ -1096,7 +1096,7 @@ pub fn requests(
     scope: &SourceScope,
     kernel: Budget,
 ) -> Result<Vec<Request>, NatDefinitionElabError> {
-    let mut context = Context::scoped(env, kernel, scope);
+    let mut context = Context::scoped(env, kernel, scope)?;
     let declaration_id = parser_kind(&["Command", "declId"]);
     let rewrite_rule = parser_kind(&["Tactic", "rwRule"]);
     let grind_lemma = parser_kind(&["Tactic", "grindLemma"]);
