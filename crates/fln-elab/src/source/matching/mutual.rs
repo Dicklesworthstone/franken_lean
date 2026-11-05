@@ -13,7 +13,7 @@ impl Context {
     /// type. Every fresh binder is private and closed capture-avoidantly. A
     /// malformed or differently returning telescope fails rather than erasing
     /// a premise. This is term construction, never declaration admission.
-    fn mutual_constant_function(
+    pub(in crate::source) fn mutual_constant_function(
         &mut self,
         type_: Expr,
         constant: &Typed,

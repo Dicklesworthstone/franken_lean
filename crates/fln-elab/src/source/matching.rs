@@ -588,10 +588,15 @@ impl Context {
             }
         };
         let recursive = self.recursive_match(&major.value);
-        // A match is a single-family case split, not mutual function recursion.
-        // The latter needs a separate call-graph and decreasing-argument proof,
-        // and so does recursion through a nested occurrence.
+        // Direct hypotheses do not expose descendants inside a nested field.
+        // A single nested family can retry with its admitted below dictionary;
+        // mutual function recursion still needs a separate call-graph proof.
         if recursive && rec.num_motives > 1 {
+            if family.all.len() == 1 && family.num_nested != 0 {
+                return Err(failure(SourceInferenceError::Recursion(
+                    recursion::RecursionError::NotDecreasing,
+                )));
+            }
             return Err(error(MatchError::UnsupportedFamily));
         }
         // A sole variable/wildcard pattern does not refine any index. Lower it
