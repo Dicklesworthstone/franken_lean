@@ -176,6 +176,82 @@ fn checked_named_defaults_follow_the_pin_after_a_physical_import() {
 }
 
 #[test]
+fn inherited_overrides_and_proof_helpers_survive_a_physical_module_roundtrip() {
+    use fln_elab::reducibility::{Reducibility, known_status};
+
+    // Every default here overrides an inherited leaf. None needs the native
+    // physical-prefix registry whose artifact writer is still unsupported.
+    let base = r#"prelude
+inductive Token where | left | right
+structure Parent (A : Type) (P : Prop) where
+  value : A
+  run : A -> A
+  holds : P
+"#;
+    let child = r#"prelude
+import Base
+structure Child (A : Type) (fallback : A) (P : Prop) (witness : P) extends Parent A P where
+  value := later
+  run x := fallback
+  holds := witness
+  later : A
+structure Grandchild (A : Type) (fallback : A) (P : Prop) (witness : P)
+    extends Child A fallback P witness
+"#;
+    let built = compiled(&[
+        ("Main", "prelude\nimport Child"),
+        ("Child", child),
+        ("Base", base),
+    ]);
+    let receipt = imported(&built);
+    let probe = r#"def selected (P : Prop) (w : P) : Grandchild Token Token.right P w :=
+  { later := Token.left }
+theorem laterWins (P : Prop) (w : P) (Q : Token -> Prop) (h : Q Token.left) :
+  Q (selected P w).value := h
+theorem parameterWins (P : Prop) (w : P) (Q : Token -> Prop) (h : Q Token.right) :
+  Q ((selected P w).run Token.left) := h
+theorem proofDefault (P : Prop) (w : P) : P := (selected P w).holds
+"#;
+    let bad = r#"theorem wrong (P : Prop) (w : P) (Q : Token -> Prop) (h : Q Token.right) :
+  Q (({ later := Token.left } : Grandchild Token Token.right P w).value) := h
+"#;
+    for engine in [&built.checked.checked.engine, &receipt.engine] {
+        for (record, suffix) in [("Child", "_default"), ("Grandchild", "_inherited_default")] {
+            for field in ["value", "run", "holds"] {
+                let helper = name(&format!("{record}.{field}.{suffix}"));
+                assert!(
+                    matches!(
+                        engine.environment().find(&helper),
+                        Some(fln::ConstantInfo::Defn(_))
+                    ),
+                    "a data or proof default stays a checked definition: {helper:?}",
+                );
+                assert_eq!(
+                    known_status(engine.environment(), &helper).unwrap(),
+                    Some(Reducibility::Semireducible),
+                );
+            }
+        }
+        assert!(matches!(
+            engine.environment().find(&name("Parent.holds")),
+            Some(fln::ConstantInfo::Thm(_))
+        ));
+        engine
+            .check_source_files(&[probe.as_bytes()], &KVMap::new(), limits().source)
+            .unwrap()
+            .into_complete()
+            .unwrap();
+        assert!(
+            engine
+                .check_source_files(&[bad.as_bytes()], &KVMap::new(), limits().source)
+                .is_err()
+        );
+    }
+    aliases::reference_import(&built, &format!("prelude\nimport Main\n{probe}"), true);
+    aliases::reference_import(&built, &format!("prelude\nimport Main\n{bad}"), false);
+}
+
+#[test]
 fn polymorphic_and_proof_structures_preserve_checked_interfaces() {
     let built = compiled(&[(
         "Main",

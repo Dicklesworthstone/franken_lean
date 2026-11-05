@@ -109,6 +109,7 @@ impl Context {
         let defaults = crate::records::defaults::RecordDefaults::read(&self.txn.env)
             .map_err(|problem| failure(SourceInferenceError::Record(problem)))?;
         let mut native = false;
+        let mut native_helpers = BTreeSet::new();
         let mut pending = vec![root.clone()];
         let mut seen = BTreeSet::new();
         while let Some(record) = pending.pop() {
@@ -128,8 +129,9 @@ impl Context {
             for index in 0..row.fields.len() {
                 self.tick()?;
                 let index = u32::try_from(index).map_err(|_| limit())?;
-                if defaults.helper(&record, index).is_some() {
+                if let Some(helper) = defaults.helper(&record, index) {
                     native = true;
+                    native_helpers.insert(helper.clone());
                 }
             }
             for parent in row.parents.iter().map(|parent| &parent.name).chain(
@@ -143,7 +145,40 @@ impl Context {
         }
         let order = self.imported_parent_order(&structures, &root, None)?;
         let leaves = self.imported_record_leaves(&structures, &root)?;
+        let mut flat_defaults = Vec::new();
+        for field in &leaves {
+            self.tick()?;
+            let direct = crate::records::defaults::helper_name(&root, &field.name);
+            if self.txn.env.contains(&direct) {
+                if !native_helpers.contains(&direct) {
+                    flat_defaults.push(field);
+                }
+                continue;
+            }
+            let inherited = Name::str(root.append_core(&field.name), "_inherited_default");
+            if !self.txn.env.contains(&inherited) {
+                continue;
+            }
+            // A frozen inherited helper may originate at an ancestor's override.
+            // Follow the same declared-default order as its generator; inherited
+            // helpers from intermediate parents are never fresh declarations.
+            // Registered native prefixes remain usable by the physical path.
+            for owner in order.iter().skip(1) {
+                self.tick()?;
+                let helper = crate::records::defaults::helper_name(owner, &field.name);
+                if !self.txn.env.contains(&helper)
+                    || !self.record_has_flat_field(&structures, owner, &field.name)?
+                {
+                    continue;
+                }
+                if !native_helpers.contains(&helper) {
+                    flat_defaults.push(field);
+                }
+                break;
+            }
+        }
         if native
+            && flat_defaults.is_empty()
             && !leaves.iter().any(|field| {
                 self.txn.env.contains(&Name::str(
                     root.append_core(&field.name),
@@ -161,6 +196,40 @@ impl Context {
             .keys()
             .any(|name| !leaves.iter().any(|leaf| &leaf.name == name))
         {
+            // The physical path may use the supplied parent object, but must
+            // not silently fall back to an older default for an omitted field
+            // whose selected default is a flat override, including an inherited one.
+            for field in &flat_defaults {
+                self.tick()?;
+                if frame.fields.contains_key(&field.name)
+                    || frame.fields.keys().any(|parent| {
+                        frame
+                            .parents
+                            .get(parent)
+                            .is_some_and(|fields| fields.contains(&field.name))
+                    })
+                {
+                    continue;
+                }
+                let mut supplied = false;
+                for source in &frame.sources {
+                    match self.record_field(source.clone(), &field.name) {
+                        Ok(_) => {
+                            supplied = true;
+                            break;
+                        }
+                        Err(NatDefinitionElabError::Inference(
+                            SourceInferenceError::RecordTerm(RecordTermError::UnknownField(_)),
+                        )) => {}
+                        Err(problem) => return Err(problem),
+                    }
+                }
+                if !supplied {
+                    return Err(NatDefinitionElabError::UnexpectedSyntax {
+                        expected: "flat field syntax when an inherited override remains omitted",
+                    });
+                }
+            }
             return Ok(None);
         }
         let mut parents = Vec::new();

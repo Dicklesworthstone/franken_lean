@@ -175,7 +175,7 @@ fn field(
     ) {
         return Err(refuse(view, tokens, range.start));
     }
-    let (groups, colon) = bounded_binders(
+    let (groups, colon) = signature_binders(
         view,
         &tokens[..range.end],
         range.start + 1,

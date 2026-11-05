@@ -16,6 +16,9 @@ pub struct SourceRecord {
     pub declarations: Vec<Declaration>,
     /// References only: the caller registers these after admitting the full batch.
     pub defaults: Vec<RecordDefault>,
+    /// Every generated default helper, including flat helpers outside the physical registry.
+    /// Admission preserves these as definitions with ordinary default transparency.
+    pub default_helpers: Vec<Name>,
     /// Parent metadata and instance registrations are published only after checking.
     pub parents: Vec<RecordParent>,
     pub parent_instances: Vec<Name>,
@@ -111,6 +114,14 @@ fn simple_fields(fields: &[Syntax]) -> Result<Vec<(Syntax, BinderInfo)>, NatDefi
         }
     }
     Ok(output)
+}
+
+struct DefaultOverride {
+    name: Name,
+    signature: Syntax,
+    value: Syntax,
+    from_subobject: bool,
+    tactic: bool,
 }
 
 impl Context {
@@ -230,6 +241,7 @@ pub(super) fn elaborate_record_scoped(
         })?;
     context.refuse_auto_bound_dependencies(&autos, &parameters)?;
     parameters.splice(0..0, autos);
+    let record_header = context.txn.lctx.clone();
     let mut inheritance = context.record_parents(&parts[3], name, is_class, budget)?;
     let mut labels = std::mem::take(&mut inheritance.labels);
     let mut inferred = inheritance.level.clone();
@@ -318,6 +330,8 @@ pub(super) fn elaborate_record_scoped(
     // The pin elaborates every field's type before any default value, so a default's
     // deprecated constants are reported after all the types' (`deprecated.rs`).
     let mut default_uses = Vec::new();
+    let mut written_fields = std::collections::HashSet::new();
+    let mut overrides = Vec::new();
     for (field, style) in fields {
         context.tick()?;
         let parts = expect_node(
@@ -332,6 +346,7 @@ pub(super) fn elaborate_record_scoped(
         // checker read the field before its tree was the pin's: the constructor then takes `P`,
         // where the pin's takes `autoParam P _` (`autoParam` is a reducible `P`).
         let tactic_default;
+        let mut is_tactic_default = false;
         let default = match expect_null_args(&parts[3], "field default")? {
             [] => None,
             [syntax] if syntax.kind() == Some(&parser_kind(&["Term", "binderTactic"])) => {
@@ -342,6 +357,7 @@ pub(super) fn elaborate_record_scoped(
                     "field tactic",
                 )?;
                 expect_atom(&tactic[0], ":=", "field tactic assignment")?;
+                is_tactic_default = true;
                 tactic_default = Syntax::node(
                     parser_kind(&["Term", "byTactic"]),
                     vec![tactic[1].clone(), tactic[2].clone()],
@@ -363,10 +379,33 @@ pub(super) fn elaborate_record_scoped(
         let Syntax::Ident { val: user_name, .. } = &parts[1] else {
             return Err(failure(SourceInferenceError::Scope));
         };
-        if !labels.insert(user_name.clone()) {
+        if !written_fields.insert(user_name.clone()) {
             return Err(failure(SourceInferenceError::Record(
                 crate::records::RecordError::DuplicateField,
             )));
+        }
+        if !labels.insert(user_name.clone()) {
+            let Some(value) = default else {
+                return Err(failure(SourceInferenceError::Record(
+                    crate::records::RecordError::DuplicateField,
+                )));
+            };
+            let inherited = context
+                .txn
+                .lctx
+                .find_by_user_name(user_name)
+                .ok_or_else(|| failure(SourceInferenceError::Scope))?;
+            // Only the flat leaf traversal can distinguish a real inherited
+            // field from an indirect parent projection. Validate that below,
+            // after every new field is available to the default.
+            overrides.push(DefaultOverride {
+                name: user_name.clone(),
+                signature: parts[2].clone(),
+                value: value.clone(),
+                from_subobject: inherited.value.is_some(),
+                tactic: is_tactic_default,
+            });
+            continue;
         }
         if parameters
             .len()
@@ -536,6 +575,31 @@ pub(super) fn elaborate_record_scoped(
             }
         }
     }
+    // Defaults may read later fields and section variables, so elaborate
+    // inherited overrides before selecting the record's section parameters.
+    // A fresh flat context prevents a removed leaf from resolving to an older
+    // physical-parent alias while its default is being elaborated.
+    let mut declared_defaults: Vec<_> = defaults.iter().map(|row| row.helper.clone()).collect();
+    if !overrides.is_empty() {
+        let provisional = RecordSpec {
+            name: name.clone(),
+            level_params: Vec::new(),
+            parameters: parameters.clone(),
+            fields: output.clone(),
+            result_level: result_level.clone(),
+            is_class,
+        };
+        let saved = std::mem::replace(&mut context.txn.lctx, record_header);
+        let generated =
+            context.record_default_overrides(&provisional, &inheritance, &overrides, budget);
+        context.txn.lctx = saved;
+        for helper in generated? {
+            if let Declaration::Defn(definition) = &helper {
+                declared_defaults.push(definition.base.name.clone());
+            }
+            helpers.push(helper);
+        }
+    }
     let mut parameters = parameters;
     for param in &mut parameters {
         param.type_ = context.instantiate(&param.type_)?;
@@ -664,7 +728,25 @@ pub(super) fn elaborate_record_scoped(
     };
     let mut declarations =
         record_declarations(&spec, budget).map_err(|e| failure(SourceInferenceError::Record(e)))?;
-    declarations.extend(context.record_flat_constructor(&spec, &inheritance, &defaults, budget)?);
+    let flat_constructor = Name::str(Name::str(name.clone(), "mk"), "_flat_ctor");
+    let flat_declarations =
+        context.record_flat_constructor(&spec, &inheritance, &declared_defaults, budget)?;
+    let mut default_helpers = Vec::new();
+    for helper in &helpers {
+        context.tick()?;
+        if let Declaration::Defn(definition) = helper {
+            default_helpers.push(definition.base.name.clone());
+        }
+    }
+    for helper in &flat_declarations {
+        context.tick()?;
+        if let Declaration::Defn(definition) = helper
+            && definition.base.name != flat_constructor
+        {
+            default_helpers.push(definition.base.name.clone());
+        }
+    }
+    declarations.extend(flat_declarations);
     let (copied, copied_instances) = context.copied_parent_projections(
         &spec,
         inheritance.copied,
@@ -723,9 +805,10 @@ pub(super) fn elaborate_record_scoped(
         is_class,
         declarations,
         defaults,
+        default_helpers,
         parents: inheritance.parents,
         parent_instances,
-        flat_constructor: Name::str(Name::str(name.clone(), "mk"), "_flat_ctor"),
+        flat_constructor,
         structure,
     })
 }
