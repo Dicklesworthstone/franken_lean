@@ -239,6 +239,7 @@ impl Preparation<'_> {
             || self.native_array_operation(&target)?
             || self.legacy_array_access_target(&target)?.is_some()
             || self.bounded_word_contract(&target)?
+            || self.hash_mixer_contract(&target)?
             || match source_intrinsics::io::fs::Operation::from_name(&target) {
                 Some(operation) => source_intrinsics::io::fs::primitive_matches(
                     self.environment,

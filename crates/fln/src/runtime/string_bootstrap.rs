@@ -17,6 +17,7 @@ use super::*;
 use crate::source_intrinsics::string_bootstrap::{self, Domain, Operation};
 use fln_comp::fir::EffectClass;
 use fln_comp::flbc::{ArgumentOwnership, ResultOwnership};
+mod hash;
 
 pub(super) struct Store {
     next_adapter: u64,
@@ -31,6 +32,7 @@ pub(super) struct Store {
     byte: Option<[Name; 3]>,
     word64: Option<[Name; 3]>,
     word_to_nat: Option<(IntrinsicBinding, Expr)>,
+    hash: hash::Store,
     byte_view: Option<Expr>,
     verified: string_bootstrap::VerifiedDependencies,
 }
@@ -47,6 +49,7 @@ impl Default for Store {
             byte: None,
             word64: None,
             word_to_nat: None,
+            hash: hash::Store::default(),
             byte_view: None,
             verified: string_bootstrap::VerifiedDependencies::default(),
         }
@@ -126,6 +129,7 @@ impl Preparation<'_> {
             .iter()
             .flatten()
             .chain(self.string_bootstrap.word_to_nat.iter())
+            .chain(self.string_bootstrap.hash.bindings.iter().flatten())
             .find(|(binding, _)| &binding.name == requested)
             .map(|(binding, _)| binding.clone())
     }
@@ -136,6 +140,7 @@ impl Preparation<'_> {
             .iter()
             .flatten()
             .chain(self.string_bootstrap.word_to_nat.iter())
+            .chain(self.string_bootstrap.hash.bindings.iter().flatten())
             .find(|(binding, _)| &binding.name == requested)
             .map(|(_, type_)| type_.clone())
     }
@@ -908,6 +913,9 @@ impl Preparation<'_> {
         head: &Expr,
         arguments: &[Expr],
     ) -> Result<Option<Expr>, IngressError> {
+        if let Some(value) = self.hash_mixer_call(head, arguments)? {
+            return Ok(Some(value));
+        }
         let ExprNode::Const {
             name: requested,
             levels,
