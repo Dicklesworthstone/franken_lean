@@ -42,7 +42,8 @@ jobs:
       - name: Check inherited structure defaults and transactional refusals
         run: cargo test --locked -p fln --test source_record_defaults
       - name: Check structure defaults through physical module export and import
-        run: cargo test --locked -p fln --test source_module_artifacts classes::structures::
+        run: |
+          cargo test --locked -p fln --test source_module_artifacts classes::structures::
       - name: Check native and polymorphic equality decisions through both engines
         run: |
           cargo test --locked -p fln --test source_equality_decisions --test source_generic_decisions --test source_decisions --test source_decision_tactics
