@@ -1805,7 +1805,7 @@ pub(super) fn compile_deferred(
 
 #[test]
 fn imported_macro_builds_emit_recheckable_artifacts_with_real_implicit_imports() {
-    let (imported, code) = batches::artifact_import_fixture();
+    let (imported, code, retained) = batches::artifact_build_fixture();
     let before = imported.engine.logical_root(&KVMap::new());
     let declarations = users(&code);
     let compilation =
@@ -1841,18 +1841,28 @@ fn imported_macro_builds_emit_recheckable_artifacts_with_real_implicit_imports()
     assert_eq!(built.states.as_ref().unwrap().len(), 3);
     assert_declared_value(&product.checked.checked.engine, "first", 11);
     assert_declared_value(&product.checked.checked.engine, "second", 17);
-    let imports: Vec<_> = product
-        .artifacts
+    let mut imports: Vec<_> = retained
         .iter()
-        .map(|artifact| crate::OleanModuleInput {
-            name: &artifact.name,
-            artifact: &artifact.bytes,
+        .map(|(name, artifact)| crate::OleanModuleInput {
+            name,
+            artifact,
             server_artifact: None,
             private_artifact: None,
         })
         .collect();
-    let rechecked = imported
-        .engine
+    imports.extend(
+        product
+            .artifacts
+            .iter()
+            .map(|artifact| crate::OleanModuleInput {
+                name: &artifact.name,
+                artifact: &artifact.bytes,
+                server_artifact: None,
+                private_artifact: None,
+            }),
+    );
+    let rechecked = Engine::builder()
+        .build_empty()
         .check_olean_modules(
             &imports,
             &KVMap::new(),
@@ -1893,7 +1903,7 @@ fn imported_macro_builds_emit_recheckable_artifacts_with_real_implicit_imports()
 
 #[test]
 fn imported_macro_build_failures_withhold_artifacts_and_states_and_recover() {
-    let (imported, code) = batches::artifact_import_fixture();
+    let (imported, code, _) = batches::artifact_build_fixture();
     let before = imported.engine.logical_root(&KVMap::new());
     let declarations = users(&code);
     let compilation =
@@ -2006,7 +2016,7 @@ fn cancellation_at_macro_artifact_publication_withholds_all_module_states() {
             count >= self.stop_at
         }
     }
-    let (imported, code) = batches::artifact_import_fixture();
+    let (imported, code, _) = batches::artifact_build_fixture();
     let before = imported.engine.logical_root(&KVMap::new());
     let declarations = users(&code);
     let compilation =

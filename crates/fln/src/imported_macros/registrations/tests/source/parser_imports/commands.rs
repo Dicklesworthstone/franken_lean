@@ -133,6 +133,22 @@ fn command_rows(kind: &str, declaration: &str, token: &str, namespace: Option<&s
 }
 
 fn command_fixture(payload: Payload, selected: Option<u64>) -> (SourceOleanImport, Vec<IrModule>) {
+    let (imported, code, _) = command_fixture_with_foundation(payload, selected, false);
+    (imported, code)
+}
+
+fn command_artifact_fixture(
+    payload: Payload,
+    selected: Option<u64>,
+) -> (SourceOleanImport, Vec<IrModule>, batches::FixtureArtifacts) {
+    command_fixture_with_foundation(payload, selected, true)
+}
+
+fn command_fixture_with_foundation(
+    payload: Payload,
+    selected: Option<u64>,
+    include_foundation: bool,
+) -> (SourceOleanImport, Vec<IrModule>, batches::FixtureArtifacts) {
     let mut constants = Vec::new();
     for declaration in crate::imported_parsers::fixture_declarations() {
         match declaration {
@@ -196,16 +212,29 @@ fn command_fixture(payload: Payload, selected: Option<u64>) -> (SourceOleanImpor
         ]
     });
     let ir = selected.map(|index| selecting_function("SourceLibrary.commandMacro", index));
-    let (mut imported, code) = batches::artifact_import_fixture_with_parser_metadata(
-        registrations.as_ref().map_or(&[], |rows| rows.as_slice()),
-        &constants,
-        &rows,
-        ir.as_slice(),
-    );
+    let extra_rows = registrations
+        .as_ref()
+        .map_or(&[][..], |rows| rows.as_slice());
+    let (mut imported, code, retained) = if include_foundation {
+        batches::artifact_build_fixture_with_parser_metadata(
+            extra_rows,
+            &constants,
+            &rows,
+            ir.as_slice(),
+        )
+    } else {
+        let (imported, code) = batches::artifact_import_fixture_with_parser_metadata(
+            extra_rows,
+            &constants,
+            &rows,
+            ir.as_slice(),
+        );
+        (imported, code, Vec::new())
+    };
     imported
         .enable_imported_syntax(&[name("SourceLibrary")], ParserRegistryLimits::default())
         .unwrap();
-    (imported, code)
+    (imported, code, retained)
 }
 
 #[test]
@@ -658,7 +687,7 @@ fn module_export_routing_uses_the_expanded_command_declaration() {
 
 #[test]
 fn imported_custom_commands_build_real_artifacts_without_native_preflight_rejection() {
-    let (imported, code) = command_fixture(Payload::Definition, Some(2));
+    let (imported, code, retained) = command_artifact_fixture(Payload::Definition, Some(2));
     let before = imported.engine.logical_root(&KVMap::new());
     let declarations = users(&code);
     let compilation =
@@ -686,15 +715,25 @@ fn imported_custom_commands_build_real_artifacts_without_native_preflight_reject
     assert_eq!(product.artifacts.len(), 1);
     assert_eq!(product.artifacts[0].report.constants, 1);
     let artifact = &product.artifacts[0];
-    let rechecked = imported
-        .engine
+    let mut inputs: Vec<_> = retained
+        .iter()
+        .map(|(name, artifact)| crate::OleanModuleInput {
+            name,
+            artifact,
+            server_artifact: None,
+            private_artifact: None,
+        })
+        .collect();
+    inputs.push(crate::OleanModuleInput {
+        name: &artifact.name,
+        artifact: &artifact.bytes,
+        server_artifact: None,
+        private_artifact: None,
+    });
+    let rechecked = Engine::builder()
+        .build_empty()
         .check_olean_modules(
-            &[crate::OleanModuleInput {
-                name: &artifact.name,
-                artifact: &artifact.bytes,
-                server_artifact: None,
-                private_artifact: None,
-            }],
+            &inputs,
             &KVMap::new(),
             crate::OleanCheckLimits::new(4 * 1024 * 1024, admission().kernel),
         )
