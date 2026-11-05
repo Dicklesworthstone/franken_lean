@@ -755,7 +755,7 @@ impl Engine<'_> {
         // (`numScopeArgs`): past the pattern prefix, the solution is constant in the remaining
         // arguments, `?F (n - 99) =?= Nat` giving `?F := fun _ => Nat`.
         let mut constant_suffix = Vec::new();
-        for argument in &arguments {
+        for (index, argument) in arguments.iter().enumerate() {
             // A local already in the metavariable's own context is no pattern variable unless
             // `quasiPatternApprox` is set (`processAssignment`, vendored
             // `Lean/Meta/ExprDefEq.lean:1317`). Term elaboration runs without it, so
@@ -763,8 +763,7 @@ impl Engine<'_> {
             // and never becomes `?m := fun σ => StateT σ Id σ`.
             let pattern_argument = match argument.node() {
                 ExprNode::FVar { id: local_id }
-                    if constant_suffix.is_empty()
-                        && !distinct.contains(local_id)
+                    if !distinct.contains(local_id)
                         && locals.contains(local_id)
                         && (self.work.quasi_pattern_approx
                             || !declaration.lctx.contains(local_id)) =>
@@ -777,24 +776,50 @@ impl Engine<'_> {
                 if declaration.scope_args != Some(arguments.len()) {
                     return Err(UnificationError::Deferred(UnificationDeferred::NotAPattern));
                 }
-                function_type = self.whnf(&function_type, locals)?;
-                let ExprNode::ForallE {
-                    binder_name,
-                    binder_type,
-                    body,
-                    binder_info,
-                } = function_type.node()
-                else {
-                    return Err(UnificationError::Deferred(UnificationDeferred::NotAPattern));
-                };
-                // Only a nondependent binder: the pin abstracts a dependent suffix over fresh
-                // locals (`forallBoundedTelescope`), which this approximation does not do.
-                if body.has_loose_bvars() {
-                    return Err(UnificationError::Deferred(UnificationDeferred::NotAPattern));
+                // The pin's `forallBoundedTelescope` opens the whole remaining suffix with
+                // fresh locals. Substituting the actual arguments here would specialize later
+                // binder domains instead of constructing a function valid for every argument.
+                for _ in locals.decls() {
+                    self.meter.node()?;
                 }
-                constant_suffix.push((binder_name.clone(), binder_type.clone(), *binder_info));
-                function_type = body.clone();
-                continue;
+                let mut suffix_locals = locals.clone();
+                let mut application_type = function_type.clone();
+                for argument in &arguments[index..] {
+                    function_type = self.whnf(&function_type, &suffix_locals)?;
+                    let ExprNode::ForallE {
+                        binder_name,
+                        binder_type,
+                        body,
+                        binder_info,
+                    } = function_type.node()
+                    else {
+                        return Err(UnificationError::Deferred(UnificationDeferred::NotAPattern));
+                    };
+                    let fresh = self.fresh()?;
+                    suffix_locals.add_param(
+                        fresh.clone(),
+                        binder_name.clone(),
+                        binder_type.clone(),
+                        *binder_info,
+                    );
+                    constant_suffix.push((
+                        fresh.clone(),
+                        binder_name.clone(),
+                        binder_type.clone(),
+                        *binder_info,
+                    ));
+                    function_type = self.substitute(body, &Expr::fvar(fresh))?;
+
+                    // Typing hints constrain the original applied equation in `locals`, not
+                    // the fresh telescope. Its result type must use the actual arguments.
+                    application_type = self.whnf(&application_type, locals)?;
+                    let ExprNode::ForallE { body, .. } = application_type.node() else {
+                        return Err(UnificationError::Deferred(UnificationDeferred::NotAPattern));
+                    };
+                    application_type = self.substitute(body, argument)?;
+                }
+                function_type = application_type;
+                break;
             };
             distinct.insert(local_id.clone());
             function_type = self.whnf(&function_type, locals)?;
@@ -812,13 +837,17 @@ impl Engine<'_> {
         }
         let mut value = self.instantiate(rhs)?;
         if !constant_suffix.is_empty() {
-            // The suffix binders' domains come from the instantiated telescope; the value
-            // mentions none of them, so it needs no lifting under them.
+            // The value is constant in the fresh suffix, but a later binder's domain may
+            // mention an earlier one. Close those dependencies with the same capture-avoiding
+            // abstraction used for the ordinary pattern prefix.
             if value.has_loose_bvars() {
                 return Err(UnificationError::LooseBoundVariable);
             }
-            for (name, domain, style) in constant_suffix.into_iter().rev() {
-                self.meter.tick()?;
+            for (local, name, domain, style) in constant_suffix.into_iter().rev() {
+                self.scan(&value)?;
+                value = value
+                    .abstract_fvar(&local, 0)
+                    .map_err(|_| UnificationError::ExpressionScope)?;
                 value = Expr::lam(name, domain, value, style);
             }
         }
