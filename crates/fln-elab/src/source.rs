@@ -5859,6 +5859,10 @@ impl Context {
             })?;
         self.source_scope.instance_scopes = scope.instance_scopes;
         self.source_scope.local_reducibility = scope.local_reducibility;
+        // Compiler availability is bound to the exact predecessor alongside
+        // its declaration and metadata identities. Keep the public declaration
+        // policy, but use the private world's provider once its body is entered.
+        self.source_scope.computability = scope.computability;
         self.registry_cache = crate::instances::RegistryCache::default();
         self.alias_cache = crate::aliases::AliasCache::default();
         self.protected_cache = crate::protected_names::ProtectedCache::default();

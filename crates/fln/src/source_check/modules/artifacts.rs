@@ -211,23 +211,24 @@ impl ArtifactData {
         // name, and retains every explicit import row after it.
         let mut imports = Vec::new();
         for (index, module) in header.imports.iter().enumerate() {
-            let is_exported = if header.module_system && (header.prelude || index != 0) {
-                let explicit = index - usize::from(!header.prelude);
-                let spec = header
-                    .import_specs
-                    .get(explicit)
-                    .filter(|spec| spec.module == *module)
-                    .ok_or_else(|| SourceModuleCheckError::ImportContext {
-                        module: name.clone(),
-                        reason: "module artifact imports differ from their checked header",
-                    })?;
-                spec.public_at.is_some()
-            } else {
-                true
-            };
+            let (is_exported, import_all) =
+                if header.module_system && (header.prelude || index != 0) {
+                    let explicit = index - usize::from(!header.prelude);
+                    let spec = header
+                        .import_specs
+                        .get(explicit)
+                        .filter(|spec| spec.module == *module)
+                        .ok_or_else(|| SourceModuleCheckError::ImportContext {
+                            module: name.clone(),
+                            reason: "module artifact imports differ from their checked header",
+                        })?;
+                    (spec.public_at.is_some(), spec.all_at.is_some())
+                } else {
+                    (true, false)
+                };
             imports.push(OleanModuleImport {
                 module: module.clone(),
-                import_all: false,
+                import_all,
                 is_exported,
                 is_meta: false,
             });

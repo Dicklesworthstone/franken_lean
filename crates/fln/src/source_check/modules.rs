@@ -29,17 +29,14 @@ pub use imported_macros::{
 };
 
 /// Public imports preserve their export visibility in the module graph.
-/// Refuse unsupported phase/private-artifact modifiers at their original
+/// Refuse unsupported execution-phase modifiers at their original
 /// position before resolving or admitting the requested import.
 pub fn validate_source_header(
     module: &Name,
     header: &SourceHeader,
 ) -> Result<(), SourceModuleCheckError> {
     for import in &header.import_specs {
-        let unsupported = [
-            (import.meta_at, "`meta import` execution phases"),
-            (import.all_at, "`import all` private import visibility"),
-        ];
+        let unsupported = [(import.meta_at, "`meta import` execution phases")];
         if let Some((at, feature)) = unsupported
             .into_iter()
             .find_map(|(at, feature)| at.map(|at| (at, feature)))
@@ -114,6 +111,10 @@ pub enum SourceModuleCheckError {
         module: Name,
         reason: &'static str,
     },
+    ImportDeclarations {
+        module: Name,
+        error: Box<OleanCheckError>,
+    },
     Cycle(Name),
     UnreachableModule(Name),
     Limit {
@@ -186,6 +187,11 @@ impl std::fmt::Display for SourceModuleCheckError {
             Self::Source { module, error } => {
                 write!(f, "module `{}`: {error}", module.to_display_string())
             }
+            Self::ImportDeclarations { module, error } => write!(
+                f,
+                "checking exported import `{}`: {error}",
+                module.to_display_string()
+            ),
             Self::Replay { module, error } => write!(
                 f,
                 "importing checked module `{}`: {error}",

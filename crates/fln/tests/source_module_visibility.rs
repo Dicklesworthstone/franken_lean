@@ -305,8 +305,9 @@ fn public_imports_reexport_transitively_without_exposing_private_dependencies_or
 
 #[test]
 fn public_import_row_order_controls_instances_independently_of_earlier_private_rows() {
-    // The module itself sees both import kinds in written order. Its modern
-    // consumer sees only public rows, so equal-priority winning instances differ.
+    // Both local views retain the root's first-discovery order. A downstream
+    // modern root skips the private edge before discovering public rows, so its
+    // equal-priority winner differs (pinned private/public #synth controls).
     for (imports, inside, outside) in [
         (
             "import A\npublic import B\npublic import A",
@@ -320,7 +321,7 @@ fn public_import_row_order_controls_instances_independently_of_earlier_private_r
         ),
     ] {
         let wrapper = format!(
-            "module\nprelude\n{imports}\ndef localChoice : Token := Pick.value\ndef localProof (P : Token -> Prop) (h : P Token.{inside}) : P localChoice := h\n@[expose] public def exportedChoice : Token := Pick.value\ndef publicChoiceProof (P : Token -> Prop) (h : P Token.{outside}) : P exportedChoice := h"
+            "module\nprelude\n{imports}\ndef localChoice : Token := Pick.value\ndef localProof (P : Token -> Prop) (h : P Token.{inside}) : P localChoice := h\n@[expose] public def exportedChoice : Token := Pick.value\ndef publicChoiceProof (P : Token -> Prop) (h : P Token.{inside}) : P exportedChoice := h"
         );
         let main = format!(
             "module\nprelude\npublic import Wrapper\npublic section\ndef chosen : Token := Pick.value\ndef choiceProof (P : Token -> Prop) (h : P Token.{outside}) : P chosen := h"
@@ -716,7 +717,6 @@ fn unsupported_import_modifiers_refuse_at_the_original_modifier_before_lookup() 
     for (clause, modifier) in [
         ("meta import Missing", "meta"),
         ("public meta import Missing", "meta"),
-        ("import all Missing", "all"),
     ] {
         let source = format!("\u{feff}module\r\nprelude\r\n{clause}");
         let error = check(&initial, &[("Main", &source)]).unwrap_err();
@@ -725,6 +725,17 @@ fn unsupported_import_modifiers_refuse_at_the_original_modifier_before_lookup() 
             matches!(error, SourceModuleCheckError::Source { error: SourceCheckError::Command { offset, .. }, .. } if offset == source.find(modifier).unwrap())
         );
     }
+}
+
+#[test]
+fn import_all_resolves_its_declared_module_before_source_checking() {
+    let initial = Engine::builder().build_empty();
+    let error = check(&initial, &[("Main", "module\nprelude\nimport all Missing")]).unwrap_err();
+    assert!(
+        matches!(error, SourceModuleCheckError::MissingModule { importer, module }
+        if importer == n("Main") && module == n("Missing"))
+    );
+    assert!(initial.environment().is_empty());
 }
 
 #[test]

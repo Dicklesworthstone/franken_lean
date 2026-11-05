@@ -338,11 +338,7 @@ fn installed_public_scoped_instances_keep_activation_before_later_global_registr
 #[test]
 fn unsupported_visibility_refuses_before_missing_import_io() {
     let p = Project::new();
-    for clause in [
-        "meta import Missing",
-        "public meta import Missing",
-        "import all Missing",
-    ] {
+    for clause in ["meta import Missing", "public meta import Missing"] {
         p.write(
             "Main.lean",
             &format!("\u{feff}module\r\nprelude\r\n{clause}"),
@@ -361,6 +357,16 @@ fn unsupported_visibility_refuses_before_missing_import_io() {
             assert!(error.contains("\"authority\":false"), "{error}");
             assert!(error.contains("not implemented"), "{error}");
         }
+    }
+    p.write("Main.lean", "module\nprelude\nimport all Missing");
+    for command in ["check-source", "run"] {
+        let error = p.refused(command);
+        assert!(error.contains("Missing"), "{error}");
+        assert!(
+            !error.contains("`import all` private import visibility"),
+            "{error}"
+        );
+        assert!(!error.contains("not implemented"), "{error}");
     }
     for modifier in ["meta", "expose"] {
         p.write("Main.lean", &format!("module\nprelude\n{modifier} {ID}"));

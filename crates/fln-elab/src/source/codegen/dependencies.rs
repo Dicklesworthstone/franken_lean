@@ -6,6 +6,8 @@ use super::*;
 use crate::externs::{ExternReadError, ExternTable};
 use crate::implemented_by::{ImplementedByReadError, ImplementedByTable};
 
+#[cfg(test)]
+mod computability_tests;
 mod well_founded;
 
 #[derive(Default)]
@@ -21,12 +23,22 @@ impl Dependencies {
     pub(super) fn read(context: &mut Context) -> Result<Self, NatDefinitionElabError> {
         // Hold the same immutable snapshot across all three reads. Charge row
         // visits and payload bytes before the decoder can allocate their names.
-        let env = context.txn.env.clone();
+        let logical = context.txn.env.clone();
+        let provider = context.source_scope.computability.clone();
         let mut charge = |amount| {
             for _ in 0..amount {
                 context.tick()?;
             }
             Ok(())
+        };
+        // Exported axioms can have independently checked imported code. The
+        // compiler's isolated view includes those bodies and the current local
+        // metadata suffix; typing, erasure and name resolution still use the
+        // unchanged logical transaction. Refresh on every read, including the
+        // admitted successor of a deferred partial-definition group.
+        let env = match provider {
+            Some(provider) => provider.0.environment(&logical, &mut charge)?,
+            None => logical,
         };
         if let Some(extension) = env.extension(&crate::noncomputable::journal_name()) {
             charge(extension.len())?;
@@ -160,7 +172,7 @@ mod tests {
     fn n(s: &str) -> Name {
         Name::from_components(s.split('.'))
     }
-    fn environment() -> fln_env::environment::Environment {
+    pub(super) fn environment() -> fln_env::environment::Environment {
         let mut env = crate::seed::bootstrap_nat_environment(Budget::DEFAULT).unwrap();
         for name in ["hidden", "usable", "alternate"] {
             env = env
@@ -181,14 +193,14 @@ mod tests {
         }
         crate::noncomputable::register(&env, &n("hidden")).unwrap()
     }
-    fn term(name: &str) -> Typed {
+    pub(super) fn term(name: &str) -> Typed {
         Typed {
             type_: Expr::const_(n("Nat"), vec![]),
             value: Expr::const_(n(name), vec![]),
         }
     }
 
-    fn axiom_environment() -> fln_env::environment::Environment {
+    pub(super) fn axiom_environment() -> fln_env::environment::Environment {
         let env = crate::seed::bootstrap_nat_environment(Budget::DEFAULT).unwrap();
         env.add_decl(ConstantInfo::Axiom(fln_env::constants::AxiomVal {
             base: ConstantVal {

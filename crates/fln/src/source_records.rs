@@ -327,6 +327,22 @@ impl Engine {
         limits: EngineAdmissionLimits,
         scope: &fln_elab::source::scope::SourceScope,
     ) -> Result<Outcome<DeclarationBatchAdmission>, EngineExecutionError> {
+        let mut current_scope = scope.clone();
+        current_scope.computability = self.computability_provider();
+        self.admit_parsed_command_with_bound_scope(source, parsed, options, limits, &current_scope)
+    }
+
+    /// The caller has bound compiler dependency analysis to these exact checked
+    /// predecessors. Public admission uses its paired private predecessor while
+    /// every logical operation below continues to use `self.environment()`.
+    fn admit_parsed_command_with_bound_scope(
+        &self,
+        source: &[u8],
+        parsed: ScopedCommandSyntax,
+        options: &KVMap,
+        limits: EngineAdmissionLimits,
+        scope: &fln_elab::source::scope::SourceScope,
+    ) -> Result<Outcome<DeclarationBatchAdmission>, EngineExecutionError> {
         let parsed = match parsed {
             ScopedCommandSyntax::Deriving(syntax) => {
                 let mut request =
@@ -448,6 +464,15 @@ impl Engine {
         public_scope: &fln_elab::source::scope::SourceScope,
         private_scope: &fln_elab::source::scope::SourceScope,
     ) -> Result<Outcome<PublicSourceAdmission>, EngineExecutionError> {
+        // Logical elaboration stays in the selected world. Public compiler
+        // dependency analysis additionally sees the checked private predecessor,
+        // including earlier local bodies hidden behind public axiom headers.
+        let mut public_scope = public_scope.clone();
+        public_scope.computability = Some(public.public_computability_provider(self));
+        let public_scope = &public_scope;
+        let mut private_scope = private_scope.clone();
+        private_scope.computability = self.computability_provider();
+        let private_scope = &private_scope;
         let parsed = match parsed {
             ScopedCommandSyntax::Deriving(syntax) => {
                 // Resolve in the complete predecessor before entering the
@@ -514,7 +539,7 @@ impl Engine {
             }
             parsed => {
                 return Ok(
-                    match public.admit_parsed_command_in_scope(
+                    match public.admit_parsed_command_with_bound_scope(
                         source,
                         parsed,
                         options,

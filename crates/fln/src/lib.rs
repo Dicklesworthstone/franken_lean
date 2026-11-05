@@ -69,6 +69,7 @@ use fln_comp::ingress::{
 };
 pub mod ir;
 mod runtime;
+mod runtime_imports;
 pub use fln_comp::ingress::{IngressError, IngressLimits, ScalarConstructorBinding};
 pub use fln_core::diag::{
     DiagnosticChannel, DiagnosticColorPolicy, DiagnosticEpoch, DiagnosticFormat,
@@ -1236,6 +1237,7 @@ impl EngineBuilder {
             checker_environment: None,
             imported_modules: std::sync::Arc::default(),
             imported_environment: None,
+            checked_runtime_imports: None,
             imported_module_dependencies: std::sync::Arc::default(),
             executable_opaques: std::sync::Arc::default(),
             runtime_initializers: std::sync::Arc::default(),
@@ -1253,6 +1255,7 @@ impl EngineBuilder {
             checker_environment: None,
             imported_modules: std::sync::Arc::default(),
             imported_environment: None,
+            checked_runtime_imports: None,
             imported_module_dependencies: std::sync::Arc::default(),
             // An environment of unknown provenance runs no opaque value.
             executable_opaques: std::sync::Arc::default(),
@@ -1278,6 +1281,7 @@ impl EngineBuilder {
             checker_environment: None,
             imported_modules: std::sync::Arc::default(),
             imported_environment: None,
+            checked_runtime_imports: None,
             imported_module_dependencies: std::sync::Arc::default(),
             executable_opaques: std::sync::Arc::default(),
             runtime_initializers: std::sync::Arc::default(),
@@ -1501,6 +1505,8 @@ pub struct Engine {
     /// imports. Later admission preserves this snapshot so artifact production
     /// can detect any ambient declarations or extension changes.
     imported_environment: Option<Environment>,
+    /// Complete checked import bodies used only by executable preparation.
+    checked_runtime_imports: Option<std::sync::Arc<runtime_imports::CheckedRuntimeImports>>,
     /// Direct import edges retained from each checked module's decoded header.
     imported_module_dependencies: std::sync::Arc<BTreeMap<Name, Vec<Name>>>,
     /// Admitted opaques whose stored values have executable meaning: handed
@@ -1718,6 +1724,7 @@ impl Engine {
             checker_environment: None,
             imported_modules: std::sync::Arc::default(),
             imported_environment: None,
+            checked_runtime_imports: None,
             imported_module_dependencies: std::sync::Arc::default(),
             executable_opaques: std::sync::Arc::default(),
             runtime_initializers: std::sync::Arc::default(),
@@ -1743,6 +1750,7 @@ impl Engine {
             checker_environment: None,
             imported_modules: std::sync::Arc::default(),
             imported_environment: None,
+            checked_runtime_imports: None,
             imported_module_dependencies: std::sync::Arc::default(),
             executable_opaques: std::sync::Arc::default(),
             runtime_initializers: std::sync::Arc::default(),
@@ -1768,6 +1776,7 @@ impl Engine {
     fn base_source_scope(&self) -> fln_elab::source::scope::SourceScope {
         fln_elab::source::scope::SourceScope {
             frontier_recursors: self.mode.permits_frontier(),
+            computability: self.computability_provider(),
             arithmetic: Some(fln_elab::arithmetic::ArithmeticProvider(
                 if self.mode.permits_frontier() {
                     fln_anvil::omega::solve_with_integer_search
@@ -1972,6 +1981,7 @@ impl Engine {
             checker_environment: admitted.checker_environment,
             imported_modules: admitted.imported_modules,
             imported_environment: admitted.imported_environment,
+            checked_runtime_imports: self.checked_runtime_imports.clone(),
             imported_module_dependencies: admitted.imported_module_dependencies,
             executable_opaques: admitted.executable_opaques,
             runtime_initializers: admitted.runtime_initializers,
@@ -6331,6 +6341,7 @@ impl Engine {
             runtime_type,
             io_result_types,
             fir,
+            runtime_root,
         } = prepared;
         // Optimization may change cost, never whether the program lowers.
         let lowered = fln_comp::fir::optimize(&fir, limits.ingress.fir)
@@ -6347,7 +6358,7 @@ impl Engine {
         let executable = fln_comp::flbc::decode_canonical(&flbc_artifact, limits.flbc_codec)
             .map_err(EngineExecutionError::Codec)?;
         let cache_context = ExecutionCacheContext::new(
-            ContentRoot::new(admission.base_logical_root.0.0),
+            ContentRoot::new(runtime_root.0.0),
             source_run_build_profile().0,
             self.mode,
         );
@@ -6459,17 +6470,39 @@ impl Engine {
         // Never use an unchecked header to make the compiler accept the call.
         // A companion body names itself, so it is compiled where both checkers
         // have admitted it.
-        let executable_environment = if companion.is_some()
+        let executable_engine = if companion.is_some()
             || matches!(&admission.declaration,
             Declaration::Defn(definition) if definition.safety == DefinitionSafety::Unsafe)
         {
-            admission.engine.environment()
+            &admission.engine
         } else {
-            self.environment()
+            self
         };
+        let runtime = executable_engine
+            .runtime_environment(limits.ingress)
+            .map_err(EngineExecutionError::Ingress)?;
+        let executable_environment = &runtime.environment;
+        // Ordinary safe entries compile against the predecessor, so their
+        // newly admitted name is not part of the overlay above. It still must
+        // not replace a private imported implementation that source lookup
+        // deliberately cannot see. Successor-based entries are checked by the
+        // overlay itself before reaching this point.
+        if let Declaration::Defn(definition) = &admission.declaration
+            && !executable_engine
+                .environment()
+                .contains(&definition.base.name)
+            && executable_environment.contains(&definition.base.name)
+        {
+            return Err(EngineExecutionError::Ingress(
+                IngressError::UnsupportedNode {
+                    kind: "local declaration collides with a private runtime import",
+                },
+            ));
+        }
+        let runtime_root = executable_environment.logical_root(options);
         let mut preparation = runtime::Preparation::new(executable_environment, limits.ingress)
-            .with_executable_opaques(&self.executable_opaques)
-            .with_runtime_initializers(&self.runtime_initializers);
+            .with_executable_opaques(&runtime.executable_opaques)
+            .with_runtime_initializers(&runtime.runtime_initializers);
         let evaluated = match entry {
             source_evaluation::Entry::Value | source_evaluation::Entry::SourceValue => None,
             source_evaluation::Entry::Evaluation => preparation
@@ -6556,6 +6589,7 @@ impl Engine {
             runtime_type,
             io_result_types,
             fir: ingress.into_fir(),
+            runtime_root,
         }))
     }
 }
@@ -6565,6 +6599,7 @@ struct PreparedDefinition {
     runtime_type: Expr,
     io_result_types: Option<source_evaluation::IoResultTypes>,
     fir: fln_comp::fir::ValidatedProgram,
+    runtime_root: LogicalRoot,
 }
 
 /// Execute a validated FLBC program on the Golem VM with the given option map
@@ -7933,6 +7968,7 @@ fn native_scope(
         merged.insert(name.clone(), value.clone());
     }
     let mut scope = scope.clone();
+    scope.computability = engine.computability_provider();
     scope.native = Some(source_execution::CommandEvaluator::provider(
         engine, &merged, limits,
     ));

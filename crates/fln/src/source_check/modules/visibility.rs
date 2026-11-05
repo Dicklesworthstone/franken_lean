@@ -832,37 +832,53 @@ pub(super) fn imports<'e>(
 ) -> Result<Outcome<(Engine, usize)>, SourceModuleCheckError> {
     let steps = match contexts {
         Some(contexts) => contexts.public_order(index, plan, modules, meter)?,
-        None => plan
-            .public_dependencies_of(index, modules, meter)?
-            .into_iter()
-            .map(contexts::Step::Source)
-            .collect(),
+        None => contexts::source_order(index, plan, modules, meter, true)?,
     };
     let mut engine = match contexts {
-        Some(contexts) => match contexts.project(&steps, meter, cancellation)? {
+        Some(contexts) => match contexts.project(&steps, options, meter, cancellation)? {
             Outcome::Complete(engine) => engine,
             Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
         },
         None => base.clone(),
     };
+    let sources: BTreeSet<_> = steps
+        .iter()
+        .filter_map(|step| match step {
+            contexts::Step::Source(dependency, _) => Some(*dependency),
+            contexts::Step::External(_, _) => None,
+        })
+        .collect();
     let mut replayed_declarations = 0usize;
-    for step in steps {
+    for &dependency in &plan.order {
+        if !sources.contains(&dependency) {
+            continue;
+        }
+        let export = export(dependency);
+        replayed_declarations += export.declarations.len();
+        engine = match export.replay_declarations(
+            engine,
+            modules[dependency].name,
+            options,
+            meter,
+            cancellation,
+        )? {
+            Outcome::Complete(engine) => engine,
+            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+        };
+    }
+    for step in &steps {
         let replayed = match step {
-            contexts::Step::Source(dependency) => {
-                let export = export(dependency);
-                replayed_declarations += export.declarations.len();
-                export.replay(
-                    engine,
-                    modules[dependency].name,
-                    options,
-                    meter,
-                    cancellation,
-                )?
-            }
-            contexts::Step::External(name) => contexts
+            contexts::Step::Source(dependency, _) => export(*dependency).replay_metadata(
+                engine,
+                modules[*dependency].name,
+                meter,
+                cancellation,
+            )?,
+            contexts::Step::External(name, private) => contexts
                 .expect("external import steps have retained contexts")
-                .replay_metadata(&name, engine, options, meter, cancellation)?,
+                .replay_metadata(name, *private, engine, meter, cancellation)?,
         };
         engine = match replayed {
             Outcome::Complete(engine) => engine,
@@ -870,6 +886,25 @@ pub(super) fn imports<'e>(
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
         };
     }
+    engine = match contexts::finish_imports(
+        engine,
+        contexts::ImportReplay {
+            base,
+            contexts,
+            index,
+            plan,
+            modules,
+            options,
+            cancellation,
+            exported_roots: true,
+        },
+        export,
+        meter,
+    )? {
+        Outcome::Complete(engine) => engine,
+        Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+        Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+    };
     Ok(Outcome::Complete((engine, replayed_declarations)))
 }
 

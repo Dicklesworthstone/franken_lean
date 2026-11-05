@@ -53,8 +53,12 @@ impl Export {
         self
     }
 
-    pub(super) fn for_legacy_import(&self) -> &Self {
-        self.private.as_deref().unwrap_or(self)
+    pub(super) fn for_import(&self, private: bool) -> &Self {
+        if private {
+            self.private.as_deref().unwrap_or(self)
+        } else {
+            self
+        }
     }
 
     /// Each journal this module appended to, with the rows it appended, in order.
@@ -168,6 +172,22 @@ impl Export {
 
     pub(super) fn replay(
         &self,
+        engine: Engine,
+        module: &Name,
+        options: &KVMap,
+        meter: &mut Meter,
+        cancellation: Option<&dyn CancellationProbe>,
+    ) -> Result<Outcome<Engine>, SourceModuleCheckError> {
+        let engine = match self.replay_declarations(engine, module, options, meter, cancellation)? {
+            Outcome::Complete(engine) => engine,
+            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+        };
+        self.replay_metadata(engine, module, meter, cancellation)
+    }
+
+    pub(super) fn replay_declarations(
+        &self,
         mut engine: Engine,
         module: &Name,
         options: &KVMap,
@@ -192,6 +212,16 @@ impl Export {
                 Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
             };
         }
+        Ok(Outcome::Complete(engine))
+    }
+
+    pub(super) fn replay_metadata(
+        &self,
+        mut engine: Engine,
+        module: &Name,
+        meter: &mut Meter,
+        cancellation: Option<&dyn CancellationProbe>,
+    ) -> Result<Outcome<Engine>, SourceModuleCheckError> {
         for suffix in &self.extensions {
             meter.work(1)?;
             let name = &suffix.descriptor.name;

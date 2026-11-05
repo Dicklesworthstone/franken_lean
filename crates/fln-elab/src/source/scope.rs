@@ -1,6 +1,7 @@
 //! Explicit command scope for native source elaboration. It carries no admission
 //! authority and never installs aliases or unchecked constants in the environment.
 use super::*;
+pub mod computability;
 pub mod executable;
 pub mod options;
 mod reserved;
@@ -100,6 +101,11 @@ pub struct SourceScope {
     /// The embedding engine's untrusted arithmetic accelerator. This capability
     /// is inherited by lexical scopes but is never exported as module metadata.
     pub arithmetic: Option<crate::arithmetic::ArithmeticProvider>,
+    /// Checked imported implementation material for compiler dependency analysis.
+    /// The provider receives the current transaction on each query; its result
+    /// never replaces the logical environment used by elaboration or admission.
+    /// This is inherited plumbing, not a lexical or exported module effect.
+    pub computability: Option<computability::ComputabilityProvider>,
     /// The embedding engine's native evaluator for `native_decide` (`crate::native`): set by
     /// the engine for the command it is about to elaborate, so it evaluates in that command's
     /// world. Like [`Self::arithmetic`], never exported as module metadata.
@@ -135,6 +141,7 @@ impl PartialEq for SourceScope {
             local_reducibility,
             frontier_recursors,
             arithmetic,
+            computability,
             // The evaluator `native_decide` reaches is per-command plumbing the lean door
             // supplies, never a scope effect: two scopes differing only by it are equal.
             native: _,
@@ -156,6 +163,7 @@ impl PartialEq for SourceScope {
             && local_reducibility == &other.local_reducibility
             && frontier_recursors == &other.frontier_recursors
             && arithmetic == &other.arithmetic
+            && computability == &other.computability
             && options == &other.options
     }
 }
@@ -1208,6 +1216,7 @@ mod tests {
             local_reducibility: crate::reducibility::LocalReducibility::default(),
             frontier_recursors: false,
             arithmetic: None,
+            computability: None,
             native: None,
             tactic_macros: None,
             options: KVMap::new(),
@@ -1406,6 +1415,7 @@ mod tests {
             local_reducibility: crate::reducibility::LocalReducibility::default(),
             frontier_recursors: false,
             arithmetic: None,
+            computability: None,
             native: None,
             tactic_macros: None,
             options: KVMap::new(),
@@ -1487,6 +1497,7 @@ mod tests {
             local_reducibility: crate::reducibility::LocalReducibility::default(),
             frontier_recursors: false,
             arithmetic: None,
+            computability: None,
             native: None,
             tactic_macros: None,
             options: KVMap::new(),

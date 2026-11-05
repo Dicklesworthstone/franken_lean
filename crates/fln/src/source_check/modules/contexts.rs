@@ -6,6 +6,14 @@ use fln_env::environment::EnvironmentEntry;
 use std::sync::Arc;
 
 #[derive(Debug)]
+struct PublicModule {
+    decoded: Arc<DecodedOlean>,
+    before: Environment,
+    after: Environment,
+    same_syntax: bool,
+}
+
+#[derive(Debug)]
 struct ExternalModule {
     imports: Vec<Name>,
     import_specs: Vec<OleanModuleImport>,
@@ -15,6 +23,7 @@ struct ExternalModule {
     unavailable: bool,
     before: Environment,
     after: Environment,
+    public: Option<PublicModule>,
 }
 
 /// Private provenance, independent of the public, caller-editable import report.
@@ -24,11 +33,325 @@ pub(super) struct ImportContexts {
     declarations: Engine,
     pub(super) complete: Engine,
     modules: BTreeMap<Name, ExternalModule>,
+    declaration_order: Vec<Name>,
+    check_limits: Option<OleanCheckLimits>,
 }
 
+#[derive(Debug, Clone)]
 pub(super) enum Step {
-    Source(usize),
-    External(Name),
+    Source(usize, bool),
+    External(Name, bool),
+}
+
+/// The data part of the pin's import lattice. A later edge can upgrade a
+/// module's visibility without moving its first-discovery journal position.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+struct ImportFlags {
+    all: bool,
+    exported: bool,
+    data: bool,
+}
+
+impl ImportFlags {
+    fn child(self, edge: &OleanModuleImport, legacy: bool) -> Self {
+        Self {
+            all: legacy || self.all && edge.import_all,
+            exported: self.exported && edge.is_exported,
+            data: self.data && (edge.is_exported || self.all),
+        }
+    }
+
+    fn join(self, other: Self) -> Self {
+        Self {
+            all: self.all || other.all,
+            exported: self.exported || other.exported,
+            data: self.data || other.data,
+        }
+    }
+}
+
+fn source_imports(header: &SourceHeader) -> Vec<OleanModuleImport> {
+    let implicit = header.imports.len() - header.import_specs.len();
+    header.imports[..implicit]
+        .iter()
+        .map(|module| OleanModuleImport {
+            module: module.clone(),
+            import_all: false,
+            is_exported: true,
+            is_meta: false,
+        })
+        .chain(header.import_specs.iter().map(|import| OleanModuleImport {
+            module: import.module.clone(),
+            import_all: import.all_at.is_some(),
+            is_exported: !header.module_system || import.public_at.is_some(),
+            is_meta: import.meta_at.is_some(),
+        }))
+        .collect()
+}
+
+#[derive(Clone, Copy)]
+enum Projection {
+    Local,
+    Exported,
+    Runtime { exported_roots: bool },
+}
+
+/// Source-only checking uses the same flag joins and journal order as mixed
+/// source/artifact checking; source bytes and private cache stamps own its data.
+pub(super) fn source_order(
+    index: usize,
+    plan: &graph::Plan,
+    modules: &[SourceModuleInput<'_>],
+    meter: &mut Meter,
+    public_root: bool,
+) -> Result<Vec<Step>, SourceModuleCheckError> {
+    order_in(
+        None,
+        index,
+        plan,
+        modules,
+        meter,
+        if public_root {
+            Projection::Exported
+        } else {
+            Projection::Local
+        },
+    )
+}
+
+fn order_in(
+    contexts: Option<&ImportContexts>,
+    index: usize,
+    plan: &graph::Plan,
+    modules: &[SourceModuleInput<'_>],
+    meter: &mut Meter,
+    projection: Projection,
+) -> Result<Vec<Step>, SourceModuleCheckError> {
+    enum Visit {
+        Enter(Name, ImportFlags),
+        Finish(Name),
+    }
+    meter.work(modules.len())?;
+    let local: BTreeMap<_, _> = modules
+        .iter()
+        .enumerate()
+        .map(|(i, module)| (module.name, i))
+        .collect();
+    if let Some(contexts) = contexts {
+        for module in modules {
+            if contexts.modules.contains_key(module.name)
+                || contexts.origin.imported_modules().contains(module.name)
+            {
+                return Err(SourceModuleCheckError::DuplicateModule(module.name.clone()));
+            }
+        }
+    }
+    let public_root = matches!(projection, Projection::Exported);
+    let legacy =
+        matches!(projection, Projection::Runtime { .. }) || !plan.headers[index].module_system;
+    let root = ImportFlags {
+        all: true,
+        exported: true,
+        data: true,
+    };
+    let mut imports = source_imports(&plan.headers[index]);
+    if matches!(
+        projection,
+        Projection::Runtime {
+            exported_roots: true
+        }
+    ) {
+        imports.retain(|edge| edge.is_exported);
+    }
+    meter.work(imports.len())?;
+    let mut pending: Vec<_> = imports
+        .iter()
+        .rev()
+        .map(|edge| Visit::Enter(edge.module.clone(), root.child(edge, legacy)))
+        .collect();
+    let mut flags = BTreeMap::<Name, ImportFlags>::new();
+    let mut order = Vec::new();
+    while let Some(visit) = pending.pop() {
+        meter.work(1)?;
+        let (name, incoming) = match visit {
+            Visit::Enter(name, incoming) => (name, incoming),
+            Visit::Finish(name) => {
+                order.push(name);
+                continue;
+            }
+        };
+        if !incoming.data {
+            continue;
+        }
+        let old = flags.get(&name).copied();
+        let merged = old.unwrap_or_default().join(incoming);
+        if old == Some(merged) {
+            continue;
+        }
+        let imports = if let Some(&source) = local.get(&name) {
+            source_imports(&plan.headers[source])
+        } else if let Some(contexts) = contexts {
+            if let Some(module) = contexts.modules.get(&name) {
+                module.import_specs.clone()
+            } else if contexts.origin.imported_modules().contains(&name) {
+                continue;
+            } else {
+                return Err(SourceModuleCheckError::MissingModule {
+                    importer: modules[index].name.clone(),
+                    module: name,
+                });
+            }
+        } else {
+            // Plan::new already checked that this is a named import admitted
+            // by the immutable base. Modern use requires a retained receipt.
+            continue;
+        };
+        flags.insert(name.clone(), merged);
+        if old.is_none() {
+            pending.push(Visit::Finish(name));
+        }
+        meter.work(imports.len())?;
+        pending.extend(
+            imports
+                .iter()
+                .rev()
+                .map(|edge| Visit::Enter(edge.module.clone(), merged.child(edge, legacy))),
+        );
+    }
+    let mut selected = Vec::new();
+    for name in order {
+        let flags = flags[&name];
+        if public_root && !flags.exported {
+            continue;
+        }
+        let private = !public_root && flags.all;
+        if let Some(&source) = local.get(&name) {
+            if source != index {
+                selected.push(Step::Source(source, private));
+            }
+        } else {
+            selected.push(Step::External(name, private));
+        }
+    }
+    Ok(selected)
+}
+
+/// Inputs already validated by the source graph. The implementation closure
+/// is separate from logical visibility and never contributes lookup constants.
+pub(super) struct ImportReplay<'a> {
+    pub(super) base: &'a Engine,
+    pub(super) contexts: Option<&'a ImportContexts>,
+    pub(super) index: usize,
+    pub(super) plan: &'a graph::Plan,
+    pub(super) modules: &'a [SourceModuleInput<'a>],
+    pub(super) options: &'a KVMap,
+    pub(super) cancellation: Option<&'a dyn CancellationProbe>,
+    pub(super) exported_roots: bool,
+}
+
+/// Retain the checked implementation and metadata-validation contexts after
+/// exact logical import replay. Both use the same selected source root, never
+/// the unrelated union of roots present in an artifact receipt.
+pub(super) fn finish_imports<'e>(
+    mut logical: Engine,
+    request: ImportReplay<'_>,
+    export: impl Fn(usize) -> &'e replay::Export,
+    meter: &mut Meter,
+) -> Result<Outcome<Engine>, SourceModuleCheckError> {
+    if !request.plan.headers[request.index].module_system {
+        return Ok(Outcome::Complete(logical));
+    }
+    let steps = order_in(
+        request.contexts,
+        request.index,
+        request.plan,
+        request.modules,
+        meter,
+        Projection::Runtime {
+            exported_roots: request.exported_roots,
+        },
+    )?;
+    if steps.is_empty() {
+        return Ok(Outcome::Complete(logical));
+    }
+    let mut private = match request.contexts {
+        Some(contexts) => {
+            match contexts.project(&steps, request.options, meter, request.cancellation)? {
+                Outcome::Complete(engine) => engine,
+                Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+            }
+        }
+        None => request.base.clone(),
+    };
+    let sources: BTreeSet<_> = steps
+        .iter()
+        .filter_map(|step| match step {
+            Step::Source(dependency, _) => Some(*dependency),
+            Step::External(_, _) => None,
+        })
+        .collect();
+    for &dependency in &request.plan.order {
+        if !sources.contains(&dependency) {
+            continue;
+        }
+        private = match export(dependency).for_import(true).replay_declarations(
+            private,
+            request.modules[dependency].name,
+            request.options,
+            meter,
+            request.cancellation,
+        )? {
+            Outcome::Complete(engine) => engine,
+            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+        };
+    }
+    for step in &steps {
+        let replayed = match step {
+            Step::Source(dependency, _) => export(*dependency).for_import(true).replay_metadata(
+                private,
+                request.modules[*dependency].name,
+                meter,
+                request.cancellation,
+            )?,
+            Step::External(name, _) => request
+                .contexts
+                .expect("external runtime imports have checked provenance")
+                .replay_metadata(name, true, private, meter, request.cancellation)?,
+        };
+        private = match replayed {
+            Outcome::Complete(engine) => engine,
+            Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+            Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+        };
+    }
+    logical.environment = logical
+        .environment
+        .with_imported_metadata_validation(private.environment());
+    let public_base = logical.environment.clone();
+    Ok(Outcome::Complete(
+        logical.with_checked_runtime_imports(public_base, &private),
+    ))
+}
+
+fn exported_header_agrees(exported: &ConstantInfo, private: &ConstantInfo) -> bool {
+    if exported == private {
+        return true;
+    }
+    let ConstantInfo::Axiom(header) = exported else {
+        return false;
+    };
+    if &header.base != private.constant_val() {
+        return false;
+    }
+    let unsafe_body = match private {
+        ConstantInfo::Defn(value) => value.safety == DefinitionSafety::Unsafe,
+        ConstantInfo::Thm(_) => false,
+        ConstantInfo::Opaque(value) => value.is_unsafe,
+        _ => return false,
+    };
+    header.is_unsafe == unsafe_body
 }
 
 fn unavailable(module: &Name, reason: &'static str) -> SourceModuleCheckError {
@@ -40,7 +363,7 @@ fn unavailable(module: &Name, reason: &'static str) -> SourceModuleCheckError {
 
 impl ImportContexts {
     pub(super) fn has_inherited_imports(&self) -> bool {
-        !self.origin.imported_modules().is_empty()
+        !self.origin.imported_modules().is_empty() || self.origin.has_checked_runtime_imports()
     }
 
     /// Public checking reports are observations, not editable provenance.
@@ -101,6 +424,7 @@ impl ImportContexts {
                         unavailable,
                         before,
                         after,
+                        public: None,
                     },
                 )
             })
@@ -110,7 +434,97 @@ impl ImportContexts {
             declarations: checked.engine.clone(),
             complete: complete.clone(),
             modules,
+            declaration_order: checked
+                .modules
+                .iter()
+                .map(|module| module.name.clone())
+                .collect(),
+            check_limits: None,
         }
+    }
+
+    /// Pair actual primary-part declarations and journals with the complete
+    /// artifact receipt. A public header is never synthesized from a body.
+    pub(super) fn retain_public(
+        &mut self,
+        mut exported: BTreeMap<Name, DecodedOlean>,
+        public: Option<(Self, BTreeSet<Name>)>,
+        checked: &CheckedOleanSet,
+        limits: OleanCheckLimits,
+    ) -> Result<(), imported::SourceOleanImportError> {
+        if exported.is_empty() && public.is_none() {
+            return Ok(());
+        }
+        let (mut public, same_syntax) =
+            public.ok_or(imported::SourceOleanImportError::Internal(
+                "exported artifacts have no matching metadata capture",
+            ))?;
+        let checked_modules: BTreeMap<_, _> = checked
+            .modules
+            .iter()
+            .map(|module| (&module.name, &module.decoded))
+            .collect();
+        for (name, module) in &mut self.modules {
+            let decoded =
+                exported
+                    .remove(name)
+                    .ok_or(imported::SourceOleanImportError::Internal(
+                        "missing exported declaration snapshot",
+                    ))?;
+            let journals =
+                public
+                    .modules
+                    .remove(name)
+                    .ok_or(imported::SourceOleanImportError::Internal(
+                        "missing exported metadata snapshot",
+                    ))?;
+            if decoded.module.imports != module.import_specs
+                || decoded.module.is_module != module.is_module
+                || journals.import_specs != module.import_specs
+                || journals.is_module != module.is_module
+            {
+                return Err(imported::SourceOleanImportError::Internal(
+                    "exported and private module headers disagree",
+                ));
+            }
+            // A repeated theorem can have another checked proof representative
+            // in the aggregate environment. Compare the exact private artifact
+            // that the council checked, not an unrelated representative entry.
+            let private =
+                checked_modules
+                    .get(name)
+                    .ok_or(imported::SourceOleanImportError::Internal(
+                        "exported snapshot has no completed private artifact check",
+                    ))?;
+            let implementations: BTreeMap<_, _> = private
+                .constants
+                .iter()
+                .map(|constant| (constant.name(), constant))
+                .collect();
+            for constant in &decoded.constants {
+                let private = implementations.get(constant.name());
+                if !private.is_some_and(|private| exported_header_agrees(constant, private)) {
+                    return Err(imported::SourceOleanImportError::Metadata {
+                        module: name.clone(),
+                        declaration: constant.name().clone(),
+                        reason: "exported declaration does not match its checked private implementation",
+                    });
+                }
+            }
+            module.public = Some(PublicModule {
+                decoded: Arc::new(decoded),
+                before: journals.before,
+                after: journals.after,
+                same_syntax: same_syntax.contains(name),
+            });
+        }
+        if !exported.is_empty() || !public.modules.is_empty() {
+            return Err(imported::SourceOleanImportError::Internal(
+                "exported snapshots escaped the checked module set",
+            ));
+        }
+        self.check_limits = Some(limits);
+        Ok(())
     }
 
     /// Two captures, field by field: each retained engine and, per module, its
@@ -132,6 +546,15 @@ impl ImportContexts {
             self.modules.keys().collect::<Vec<_>>(),
             other.modules.keys().collect::<Vec<_>>(),
             "{what}: modules"
+        );
+        assert_eq!(
+            self.declaration_order, other.declaration_order,
+            "{what}: declaration order"
+        );
+        assert_eq!(
+            self.check_limits.is_some(),
+            other.check_limits.is_some(),
+            "{what}: checked view limits"
         );
         for ((name, left), right) in self.modules.iter().zip(other.modules.values()) {
             let module = name.to_display_string();
@@ -155,11 +578,31 @@ impl ImportContexts {
             );
             assert!(left.before == right.before, "{what}: {module}: before");
             assert!(left.after == right.after, "{what}: {module}: after");
+            match (&left.public, &right.public) {
+                (Some(left), Some(right)) => {
+                    assert_eq!(
+                        left.same_syntax, right.same_syntax,
+                        "{what}: {module}: syntax projection"
+                    );
+                    assert_eq!(
+                        left.decoded, right.decoded,
+                        "{what}: {module}: exported declarations"
+                    );
+                    assert!(
+                        left.before == right.before,
+                        "{what}: {module}: exported before"
+                    );
+                    assert!(
+                        left.after == right.after,
+                        "{what}: {module}: exported after"
+                    );
+                }
+                (None, None) => {}
+                _ => panic!("{what}: {module}: different exported snapshot availability"),
+            }
         }
     }
 
-    /// One heap DFS handles both kinds of import, so a local registration
-    /// between two external imports stays between them. Shared imports run once.
     pub(super) fn order(
         &self,
         index: usize,
@@ -167,7 +610,7 @@ impl ImportContexts {
         modules: &[SourceModuleInput<'_>],
         meter: &mut Meter,
     ) -> Result<Vec<Step>, SourceModuleCheckError> {
-        self.order_in(index, plan, modules, meter, false)
+        order_in(Some(self), index, plan, modules, meter, Projection::Local)
     }
 
     pub(super) fn public_order(
@@ -177,87 +620,64 @@ impl ImportContexts {
         modules: &[SourceModuleInput<'_>],
         meter: &mut Meter,
     ) -> Result<Vec<Step>, SourceModuleCheckError> {
-        self.order_in(index, plan, modules, meter, true)
+        order_in(
+            Some(self),
+            index,
+            plan,
+            modules,
+            meter,
+            Projection::Exported,
+        )
     }
 
-    fn order_in(
+    /// The optional macro/parser product currently binds one journal per
+    /// module. Reuse it for an exported view only when that exact journal is
+    /// unchanged; a distinct private grammar needs its own checked product.
+    pub(super) fn require_syntax_views(
         &self,
-        index: usize,
-        plan: &graph::Plan,
-        modules: &[SourceModuleInput<'_>],
-        meter: &mut Meter,
-        public_root: bool,
-    ) -> Result<Vec<Step>, SourceModuleCheckError> {
-        meter.work(modules.len())?;
-        let local: BTreeMap<_, _> = modules
-            .iter()
-            .enumerate()
-            .map(|(i, m)| (m.name, i))
-            .collect();
-        for module in modules {
-            if self.modules.contains_key(module.name)
-                || self.origin.imported_modules().contains(module.name)
-            {
-                return Err(SourceModuleCheckError::DuplicateModule(module.name.clone()));
-            }
-        }
-        let mut seen = BTreeSet::new();
-        let mut pending = vec![(modules[index].name.clone(), false)];
-        let mut order = Vec::new();
-        while let Some((name, finish)) = pending.pop() {
-            meter.work(1)?;
-            if finish {
-                if let Some(&source) = local.get(&name) {
-                    if source != index {
-                        order.push(Step::Source(source));
-                    }
-                } else if self.modules.contains_key(&name) {
-                    order.push(Step::External(name));
-                }
+        steps: &[Step],
+    ) -> Result<(), SourceModuleCheckError> {
+        for step in steps {
+            let Step::External(name, false) = step else {
                 continue;
-            }
-            if !seen.insert(name.clone()) {
-                continue;
-            }
-            let imports = if let Some(&source) = local.get(&name) {
-                if plan.headers[index].module_system && (source != index || public_root) {
-                    plan.visible_imports(source)
-                } else {
-                    &plan.headers[source].imports
-                }
-            } else if let Some(module) = self.modules.get(&name) {
-                &module.imports
-            } else if self.origin.imported_modules().contains(&name) {
-                continue;
-            } else {
-                return Err(SourceModuleCheckError::MissingModule {
-                    importer: modules[index].name.clone(),
-                    module: name,
-                });
             };
-            meter.work(imports.len())?;
-            pending.push((name, true));
-            pending.extend(imports.iter().rev().cloned().map(|name| (name, false)));
+            let module = &self.modules[name];
+            if module.is_module
+                && !module
+                    .public
+                    .as_ref()
+                    .is_some_and(|public| public.same_syntax)
+            {
+                return Err(unavailable(
+                    name,
+                    "distinct exported and private macro/parser journals require separate checked syntax products",
+                ));
+            }
         }
-        Ok(order)
+        Ok(())
     }
 
     pub(super) fn project(
         &self,
         steps: &[Step],
+        options: &KVMap,
         meter: &mut Meter,
         cancellation: Option<&dyn CancellationProbe>,
     ) -> Result<Outcome<Engine>, SourceModuleCheckError> {
         meter.work(steps.len())?;
-        // The private planner emits each external module once. When the whole
-        // set is present, retain its original council projection, including the
-        // chosen representative of subsumed repeated proofs. This is not a
-        // subset reconstruction and must not require identical raw copies.
-        if steps
+        let selected: BTreeMap<_, _> = steps
             .iter()
-            .filter(|step| matches!(step, Step::External(_)))
-            .count()
-            == self.modules.len()
+            .filter_map(|step| match step {
+                Step::External(name, private) => Some((name, *private)),
+                Step::Source(_, _) => None,
+            })
+            .collect();
+        // Preserve the complete council projection, including subsumed proof
+        // representatives, only for the exact full private declaration set.
+        if selected.len() == self.modules.len()
+            && selected
+                .iter()
+                .all(|(name, private)| *private || !self.modules[*name].is_module)
         {
             if cancellation.is_some_and(CancellationProbe::is_cancelled) {
                 return Ok(Outcome::Inconclusive(Inconclusive::cancelled(
@@ -271,31 +691,89 @@ impl ImportContexts {
             || engine.imported_environment.as_ref() == Some(&engine.environment);
         let mut imported = (*engine.imported_modules).clone();
         let mut dependencies = (*engine.imported_module_dependencies).clone();
-        for step in steps {
-            let Step::External(name) = step else { continue };
+        // Declaration readiness follows the checked dependency order. Journal
+        // replay separately retains first discovery even after an all-upgrade.
+        for name in &self.declaration_order {
+            let Some(&private) = selected.get(name) else {
+                continue;
+            };
             let module = &self.modules[name];
-            if module.unavailable {
-                return Err(unavailable(
-                    name,
-                    "an exact checked declaration snapshot for this import is unavailable",
-                ));
+            if cancellation.is_some_and(CancellationProbe::is_cancelled) {
+                return Ok(Outcome::Inconclusive(Inconclusive::cancelled(
+                    "source-modules/project-import",
+                )));
             }
-            for entry in &module.entries {
-                meter.work(1)?;
-                if cancellation.is_some_and(CancellationProbe::is_cancelled) {
-                    return Ok(Outcome::Inconclusive(Inconclusive::cancelled(
-                        "source-modules/project-import",
-                    )));
+            if module.is_module && !private {
+                let public = module.public.as_ref().ok_or_else(|| {
+                    unavailable(
+                        name,
+                        "the retained import has no checked exported-file provenance",
+                    )
+                })?;
+                meter.work(public.decoded.constants.len())?;
+                let mut limits = self.check_limits.ok_or_else(|| {
+                    unavailable(
+                        name,
+                        "the retained import has no exported-file admission limits",
+                    )
+                })?;
+                limits.admission = meter.limits.source.admission;
+                engine =
+                    match engine.check_decoded_olean((*public.decoded).clone(), options, limits) {
+                        Ok(Outcome::Complete(checked)) => checked.engine,
+                        Ok(Outcome::Inconclusive(reason)) => {
+                            return Ok(Outcome::Inconclusive(reason));
+                        }
+                        Ok(Outcome::InternalFault(fault)) => {
+                            return Ok(Outcome::InternalFault(fault));
+                        }
+                        Err(error) => match fln_admission::frontier_error_verdict(error) {
+                            fln_admission::OleanModuleVerdict::Inconclusive(reason) => {
+                                return Ok(Outcome::Inconclusive(reason));
+                            }
+                            fln_admission::OleanModuleVerdict::InternalFault(fault) => {
+                                return Ok(Outcome::InternalFault(fault));
+                            }
+                            fln_admission::OleanModuleVerdict::Failed(error) => {
+                                return Err(SourceModuleCheckError::ImportDeclarations {
+                                    module: name.clone(),
+                                    error: Box::new(error),
+                                });
+                            }
+                            _ => {
+                                return Err(unavailable(
+                                    name,
+                                    "an exported declaration check returned no verdict",
+                                ));
+                            }
+                        },
+                    };
+            } else {
+                if module.unavailable {
+                    return Err(unavailable(
+                        name,
+                        "an exact checked declaration snapshot for this import is unavailable",
+                    ));
                 }
-                engine.environment = crate::merge_frontier_entry(engine.environment, entry)
-                    .map_err(|_| unavailable(name, "conflicting checked import declarations"))?;
+                for entry in &module.entries {
+                    meter.work(1)?;
+                    if cancellation.is_some_and(CancellationProbe::is_cancelled) {
+                        return Ok(Outcome::Inconclusive(Inconclusive::cancelled(
+                            "source-modules/project-import",
+                        )));
+                    }
+                    engine.environment = crate::merge_frontier_entry(engine.environment, entry)
+                        .map_err(|_| {
+                            unavailable(name, "conflicting checked import declarations")
+                        })?;
+                }
+                // A projection of a strict subset has no inherited independent
+                // checker map; ordinary admission reconstructs its exact map.
+                engine.checker_environment = None;
             }
             imported.insert(name.clone());
             dependencies.insert(name.clone(), module.imports.clone());
         }
-        // The full closure's checker projection is not valid for a subset. The
-        // ordinary admission path constructs a checker for the projected world.
-        engine.checker_environment = None;
         engine.imported_modules = Arc::new(imported);
         engine.imported_module_dependencies = Arc::new(dependencies);
         engine.imported_environment = bound.then(|| engine.environment.clone());
@@ -305,15 +783,25 @@ impl ImportContexts {
     pub(super) fn replay_metadata(
         &self,
         name: &Name,
+        private: bool,
         engine: Engine,
-        options: &KVMap,
         meter: &mut Meter,
         cancellation: Option<&dyn CancellationProbe>,
     ) -> Result<Outcome<Engine>, SourceModuleCheckError> {
         let module = &self.modules[name];
-        let export =
-            replay::Export::capture(name, &module.before, &module.after, Vec::new(), meter)?;
-        let mut engine = match export.replay(engine, name, options, meter, cancellation)? {
+        let (before, after) = if module.is_module && !private {
+            let public = module.public.as_ref().ok_or_else(|| {
+                unavailable(
+                    name,
+                    "the retained import has no exported metadata provenance",
+                )
+            })?;
+            (&public.before, &public.after)
+        } else {
+            (&module.before, &module.after)
+        };
+        let export = replay::Export::capture(name, before, after, Vec::new(), meter)?;
+        let mut engine = match export.replay_metadata(engine, name, meter, cancellation)? {
             Outcome::Complete(engine) => engine,
             Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
@@ -326,6 +814,9 @@ impl ImportContexts {
                 )));
             }
             let declaration = entry.declaration().name();
+            if !engine.environment.contains(declaration) {
+                continue;
+            }
             if self.complete.executable_opaques.contains(declaration) {
                 Arc::make_mut(&mut engine.executable_opaques).insert(declaration.clone());
             }
@@ -340,6 +831,9 @@ impl ImportContexts {
 impl imported::SourceOleanImport {
     /// Check each source module in its own declared import world. The retained
     /// import receipt, not caller-mutated public report fields, owns the bases.
+    /// Modern modules require a receipt whose origin has no inherited imports
+    /// or earlier runtime import binding; a raw/incremental Engine lacks the
+    /// exported-file provenance needed to reconstruct those views faithfully.
     pub fn check_source_modules(
         &self,
         modules: &[SourceModuleInput<'_>],

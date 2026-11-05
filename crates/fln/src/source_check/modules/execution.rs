@@ -411,6 +411,14 @@ impl imported::SourceOleanImport {
             &mut meter,
             implicit_init,
         )?;
+        if self.contexts.has_inherited_imports()
+            && plan.headers.iter().any(|header| header.module_system)
+        {
+            return Err(SourceModuleCheckError::ImportContext {
+                module: entry.clone(),
+                reason: "modern artifact imports require a retained SourceOleanImport receipt from an unambiguous import origin",
+            }.into());
+        }
         if let Some(session) = macros.as_deref() {
             let indices: BTreeMap<_, _> = modules
                 .iter()
@@ -424,11 +432,12 @@ impl imported::SourceOleanImport {
                 |module, grammar| {
                     let index = *indices.get(module).expect("planned source module");
                     let steps = self.contexts.order(index, &plan, modules, &mut meter)?;
+                    self.contexts.require_syntax_views(&steps)?;
                     let imports: Vec<_> = steps
                         .iter()
                         .filter_map(|step| match step {
-                            contexts::Step::External(name) => Some(name.clone()),
-                            contexts::Step::Source(_) => None,
+                            contexts::Step::External(name, _) => Some(name.clone()),
+                            contexts::Step::Source(_, _) => None,
                         })
                         .collect();
                     session
@@ -450,27 +459,58 @@ impl imported::SourceOleanImport {
                 )));
             }
             let steps = self.contexts.order(index, &plan, modules, &mut meter)?;
-            let mut engine = match self.contexts.project(&steps, &mut meter, cancellation)? {
-                Outcome::Complete(engine) => engine,
-                Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
-                Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
-            };
+            let mut engine =
+                match self
+                    .contexts
+                    .project(&steps, options, &mut meter, cancellation)?
+                {
+                    Outcome::Complete(engine) => engine,
+                    Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                    Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                };
+            let source_views: BTreeMap<_, _> = steps
+                .iter()
+                .filter_map(|step| match step {
+                    contexts::Step::Source(dependency, private) => Some((*dependency, *private)),
+                    contexts::Step::External(_, _) => None,
+                })
+                .collect();
+            for dependency in &plan.order {
+                let Some(&private) = source_views.get(dependency) else {
+                    continue;
+                };
+                let export = exports
+                    .get(dependency)
+                    .expect("postorder source predecessor")
+                    .for_import(private);
+                engine = match export.replay_declarations(
+                    engine,
+                    modules[*dependency].name,
+                    options,
+                    &mut meter,
+                    cancellation,
+                )? {
+                    Outcome::Complete(engine) => engine,
+                    Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                    Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                };
+            }
             for step in &steps {
                 let replayed = match step {
-                    contexts::Step::External(name) => self.contexts.replay_metadata(
+                    contexts::Step::External(name, private) => self.contexts.replay_metadata(
                         name,
+                        *private,
                         engine,
-                        options,
                         &mut meter,
                         cancellation,
                     )?,
-                    contexts::Step::Source(dependency) => exports
+                    contexts::Step::Source(dependency, private) => exports
                         .get(dependency)
                         .expect("postorder source predecessor")
-                        .replay(
+                        .for_import(*private)
+                        .replay_metadata(
                             engine,
                             modules[*dependency].name,
-                            options,
                             &mut meter,
                             cancellation,
                         )?,
@@ -481,6 +521,25 @@ impl imported::SourceOleanImport {
                     Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
                 };
             }
+            engine = match contexts::finish_imports(
+                engine,
+                contexts::ImportReplay {
+                    base: &self.contexts.complete,
+                    contexts: Some(&self.contexts),
+                    index,
+                    plan: &plan,
+                    modules,
+                    options,
+                    cancellation,
+                    exported_roots: false,
+                },
+                |dependency| &exports[&dependency],
+                &mut meter,
+            )? {
+                Outcome::Complete(engine) => engine,
+                Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+            };
             let module = modules[index];
             let header = &plan.headers[index];
             // Preserve the ordinary path's grammar/phase check at this point.
@@ -582,8 +641,8 @@ impl imported::SourceOleanImport {
                 let macro_imports: Vec<_> = steps
                     .iter()
                     .filter_map(|step| match step {
-                        contexts::Step::External(name) => Some(name.clone()),
-                        contexts::Step::Source(_) => None,
+                        contexts::Step::External(name, _) => Some(name.clone()),
+                        contexts::Step::Source(_, _) => None,
                     })
                     .collect();
                 macros.check_module(
@@ -618,20 +677,19 @@ impl imported::SourceOleanImport {
             })?;
             let public_export = public.map(visibility::PublicWorld::finish).transpose()?;
             if index != plan.entry {
+                let declarations = declarations(&completed, &mut meter)?;
+                let private = replay::Export::capture(
+                    module.name,
+                    engine.environment(),
+                    completed.batch.engine.environment(),
+                    declarations,
+                    &mut meter,
+                )?;
                 exports.insert(
                     index,
                     match public_export {
-                        Some(export) => export,
-                        None => {
-                            let declarations = declarations(&completed, &mut meter)?;
-                            replay::Export::capture(
-                                module.name,
-                                engine.environment(),
-                                completed.batch.engine.environment(),
-                                declarations,
-                                &mut meter,
-                            )?
-                        }
+                        Some(public) => public.with_private(private),
+                        None => private,
                     },
                 );
             }

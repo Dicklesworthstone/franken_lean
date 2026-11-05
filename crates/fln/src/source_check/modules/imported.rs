@@ -769,6 +769,14 @@ struct PreparedMetadata {
     decoded: metadata::SourceExtensions,
     macro_journals: Vec<(Name, Vec<OpaqueExtensionBlock>)>,
     parser_journals: Vec<(Name, Vec<OpaqueExtensionBlock>)>,
+    public: Option<Box<PreparedMetadata>>,
+    exported: BTreeMap<Name, DecodedOlean>,
+}
+
+struct MetadataBudget {
+    capture_left: usize,
+    entries_left: usize,
+    decoder: metadata::Decoder,
 }
 
 struct MetadataModule {
@@ -782,6 +790,84 @@ fn prepare_source_metadata(
     roots: &[Name],
     limits: SourceOleanImportLimits,
     cancellation: Option<&dyn CancellationProbe>,
+) -> Result<Outcome<PreparedMetadata>> {
+    let mut budget = MetadataBudget {
+        capture_left: limits.max_capture_bytes,
+        entries_left: limits.metadata.max_entries,
+        decoder: metadata::Decoder::new(limits.metadata),
+    };
+    let mut private = match prepare_source_metadata_view(
+        modules,
+        roots,
+        limits,
+        cancellation,
+        false,
+        &mut budget,
+    )? {
+        Outcome::Complete(prepared) => prepared,
+        Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+        Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+    };
+    if modules.iter().all(|input| input.server_artifact.is_none()) {
+        return Ok(Outcome::Complete(private));
+    }
+    // The ordinary importer still checks every complete private chain first.
+    // Retain the actual exported file, including the independent byte reading,
+    // for a later public projection through the same admission door. Never
+    // manufacture an axiom by stripping a checked private declaration's body.
+    let inputs: BTreeMap<_, _> = modules.iter().map(|input| (input.name, input)).collect();
+    let mut declarations_left = limits.check.max_declarations;
+    let mut has_module = false;
+    for report in &private.reports {
+        if cancellation.is_some_and(CancellationProbe::is_cancelled) {
+            return Ok(Outcome::Inconclusive(Inconclusive::cancelled(
+                "source-olean/exported-declarations",
+            )));
+        }
+        let input = inputs
+            .get(&report.module)
+            .ok_or(SourceOleanImportError::Internal(
+                "a replayed module lost its exported artifact",
+            ))?;
+        let decoded =
+            decode_olean_artifact(input.artifact, limits.check.decode).map_err(|error| {
+                SourceOleanImportError::Check(Box::new(OleanCheckError::ModuleDecode {
+                    module: report.module.clone(),
+                    error,
+                }))
+            })?;
+        declarations_left = declarations_left
+            .checked_sub(decoded.constants.len())
+            .ok_or(SourceOleanImportError::Limit("exported declarations"))?;
+        has_module |= decoded.module.is_module;
+        private.exported.insert(report.module.clone(), decoded);
+    }
+    if has_module {
+        private.public = Some(Box::new(
+            match prepare_source_metadata_view(
+                modules,
+                roots,
+                limits,
+                cancellation,
+                true,
+                &mut budget,
+            )? {
+                Outcome::Complete(prepared) => prepared,
+                Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+            },
+        ));
+    }
+    Ok(Outcome::Complete(private))
+}
+
+fn prepare_source_metadata_view(
+    modules: &[OleanModuleInput<'_>],
+    roots: &[Name],
+    limits: SourceOleanImportLimits,
+    cancellation: Option<&dyn CancellationProbe>,
+    public: bool,
+    budget: &mut MetadataBudget,
 ) -> Result<Outcome<PreparedMetadata>> {
     macro_rules! cancelled {
         ($at:literal) => {
@@ -862,16 +948,25 @@ fn prepare_source_metadata(
             parser_extension.clone(),
         ])
         .collect();
-    let mut capture_left = limits.max_capture_bytes;
-    let mut entries_left = limits.metadata.max_entries;
+    let MetadataBudget {
+        capture_left,
+        entries_left,
+        decoder: metadata_decoder,
+    } = budget;
     let mut defeq_tags = ReflexivityTags::default();
     let mut backward_defeq_tags = ReflexivityTags::default();
-    let mut metadata_decoder = metadata::Decoder::new(limits.metadata);
     // Keep only one wave of captures live. Uninterpreted entries are still
     // walked and charged exactly, but their bytes need not be copied just to
     // discard them. Replay and the aggregate allowance remain in import order.
     cancelled!("source-olean/capture");
-    let mut captures = capture_modules(&metadata_modules, &order, &inputs, &limits, &retained);
+    let mut captures = capture_modules(
+        &metadata_modules,
+        &order,
+        &inputs,
+        &limits,
+        &retained,
+        public,
+    );
     for &index in &order {
         cancelled!("source-olean/capture");
         let module = &metadata_modules[index];
@@ -922,7 +1017,7 @@ fn prepare_source_metadata(
                     reason: "duplicate extension block",
                 });
             }
-            capture_left = capture_left
+            *capture_left = capture_left
                 .checked_sub(block.payload_bytes)
                 .ok_or(SourceOleanImportError::Limit("captured extension bytes"))?;
             let Some(entries) = block.entries else {
@@ -945,8 +1040,8 @@ fn prepare_source_metadata(
                     };
                     let before = metadata_decoder.remaining_limits().max_entries;
                     let count =
-                        tags.capture(&module.name, &block.name, entries, &mut metadata_decoder)?;
-                    entries_left = entries_left
+                        tags.capture(&module.name, &block.name, entries, metadata_decoder)?;
+                    *entries_left = entries_left
                         .checked_sub(before - metadata_decoder.remaining_limits().max_entries)
                         .ok_or(SourceOleanImportError::Limit("metadata entries"))?;
                     if kind == 14 {
@@ -956,7 +1051,7 @@ fn prepare_source_metadata(
                     }
                     continue;
                 }
-                entries_left = entries_left
+                *entries_left = entries_left
                     .checked_sub(entries.len())
                     .ok_or(SourceOleanImportError::Limit("metadata entries"))?;
                 match kind {
@@ -1022,6 +1117,8 @@ fn prepare_source_metadata(
         decoded,
         macro_journals,
         parser_journals,
+        public: None,
+        exported: BTreeMap::new(),
     }))
 }
 
@@ -1058,7 +1155,70 @@ impl Engine {
             decoded,
             macro_journals,
             parser_journals,
+            public,
+            exported,
         } = prepared;
+        let public_contexts = if let Some(public) = public {
+            // Metadata validates against the same complete checked declarations
+            // as the private journals, including compiler-only implementation
+            // targets. Only the actual exported journal suffixes are retained
+            // for public replay; this successor's private constants never become
+            // the source public world.
+            let snapshot = CheckedOleanSet {
+                engine: checked.engine.clone(),
+                base_logical_root: checked.base_logical_root,
+                result_logical_root: checked.result_logical_root,
+                modules: checked
+                    .modules
+                    .iter()
+                    .map(|module| CheckedOleanModule {
+                        name: module.name.clone(),
+                        decoded: module.decoded.clone(),
+                        base_logical_root: module.base_logical_root,
+                        result_logical_root: module.result_logical_root,
+                        declarations: module.declarations.clone(),
+                    })
+                    .collect(),
+            };
+            match self.activate_prepared_source_metadata_with::<R>(
+                snapshot,
+                roots,
+                options,
+                limits,
+                cancellation,
+                *public,
+            )? {
+                Outcome::Complete(public) => {
+                    let private_macros: BTreeMap<_, _> = macro_journals
+                        .iter()
+                        .map(|(name, rows)| (name, rows))
+                        .collect();
+                    let private_parsers: BTreeMap<_, _> = parser_journals
+                        .iter()
+                        .map(|(name, rows)| (name, rows))
+                        .collect();
+                    let public_parsers: BTreeMap<_, _> = public
+                        .parser_journals
+                        .iter()
+                        .map(|(name, rows)| (name, rows))
+                        .collect();
+                    let same_syntax = public
+                        .macro_journals
+                        .iter()
+                        .filter_map(|(name, rows)| {
+                            (private_macros.get(name) == Some(&rows)
+                                && private_parsers.get(name) == public_parsers.get(name))
+                            .then_some(name.clone())
+                        })
+                        .collect();
+                    Some((public.contexts, same_syntax))
+                }
+                Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+            }
+        } else {
+            None
+        };
         if reports.len() != order.len()
             || reports
                 .iter()
@@ -1753,7 +1913,9 @@ impl Engine {
             engine.imported_environment = Some(engine.environment.clone());
         }
         let result_logical_root = engine.logical_root(options);
-        let contexts = super::contexts::ImportContexts::capture(self, &engine, &checked, journals);
+        let mut contexts =
+            super::contexts::ImportContexts::capture(self, &engine, &checked, journals);
+        contexts.retain_public(exported, public_contexts, &checked, limits.check)?;
         cancelled!("source-olean/after-context-capture");
         Ok(Outcome::Complete(SourceOleanImport {
             macro_journals,
@@ -1886,6 +2048,7 @@ fn capture_modules(
     inputs: &BTreeMap<&Name, &OleanModuleInput<'_>>,
     limits: &SourceOleanImportLimits,
     retained: &BTreeSet<Name>,
+    public: bool,
 ) -> impl Iterator<Item = Result<Vec<SelectedExtensionBlock>>> {
     let capture = move |index: usize| -> Result<Vec<SelectedExtensionBlock>> {
         let module = &modules[index];
@@ -1894,7 +2057,7 @@ fn capture_modules(
             .ok_or(SourceOleanImportError::Internal(
                 "preflight module lost its artifact",
             ))?;
-        let view = if module.is_module {
+        let view = if module.is_module && !public {
             let (Some(server), Some(private)) = (input.server_artifact, input.private_artifact)
             else {
                 return Err(SourceOleanImportError::Internal(
