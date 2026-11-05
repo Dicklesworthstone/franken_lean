@@ -184,15 +184,19 @@ impl Plan {
         meter: &mut Meter,
         public_root: bool,
     ) -> Result<Vec<usize>, SourceModuleCheckError> {
-        // Ordinary imports in a module-system file are private. Check those
-        // dependencies in the file itself without exposing them to consumers.
+        // Modern roots respect each module's exported imports. At the pin a
+        // legacy root selects the private level for the entire transitive graph,
+        // ignoring module-system import annotations along the way.
         meter.work(self.dependencies.len())?;
         let visible: Vec<_> = self
             .dependencies
             .iter()
             .enumerate()
             .map(|(index, imports)| {
-                if (index != module || public_root) && self.headers[index].module_system {
+                if self.headers[module].module_system
+                    && (index != module || public_root)
+                    && self.headers[index].module_system
+                {
                     self.exported_dependencies[index].clone()
                 } else {
                     imports.clone()

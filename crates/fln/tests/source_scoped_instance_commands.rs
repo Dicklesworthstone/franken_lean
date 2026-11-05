@@ -223,7 +223,7 @@ fn public_scoped_proof_instances_export_only_their_checked_interfaces() {
         },
         SourceModuleInput {
             name: &consumer,
-            source: b"prelude\nimport Library\nopen scoped API\ntheorem client : Truth := @Law.proof Truth (chosenLaw Truth)",
+            source: b"module\nprelude\npublic import Library\nopen scoped API\npublic theorem client : Truth := @Law.proof Truth (chosenLaw Truth)",
         },
     ];
     let engine = Engine::builder().build_empty();

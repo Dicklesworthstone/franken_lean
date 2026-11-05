@@ -88,8 +88,7 @@ const BASE: &str = "prelude\ninductive Truth : Prop where\n| make\nclass Law (P 
 const HEADER: &str = "module\nprelude\npublic import Base\n";
 const SECRET: &str = "prelude\nimport Base\ndef hiddenProof : Truth := Truth.make\ndef Hidden (P : Prop) : Prop := P\ninductive Secret : Prop where\n| make";
 const API: &str = "module\nprelude\npublic import Base\nimport Secret\nnamespace API\ndef localProof : Truth := hiddenProof\npublic instance witness : Law Truth := Law.mk localProof\nend API";
-const MAIN: &str =
-    "prelude\nimport Api\ntheorem client : Truth := @Law.proof Truth (chosenLaw Truth)";
+const MAIN: &str = "module\nprelude\npublic import Api\npublic theorem client : Truth := @Law.proof Truth (chosenLaw Truth)";
 
 #[test]
 fn private_checked_theorems_export_safe_proof_interfaces_and_instance_metadata() {
@@ -147,7 +146,7 @@ fn literal_infer_instance_consumes_an_imported_proof_interface() {
         .unwrap();
     let names = [n("Main"), n("Api")];
     let sources = [
-        "prelude\nimport Api\ntheorem proof : True := @Law.proof True (inferInstance : Law True)",
+        "module\nprelude\npublic import Api\npublic theorem proof : True := @Law.proof True (inferInstance : Law True)",
         "module\nprelude\npublic class Law (P : Prop) : Prop where\n  proof : P\nprivate theorem hidden : True := True.intro\npublic instance lawful : Law True := Law.mk hidden",
     ];
     let inputs: Vec<_> = names
@@ -286,7 +285,7 @@ fn named_anonymous_and_private_priorities_keep_distinct_checked_histories() {
         panic!("missing private choice");
     };
     assert!(references(&selected.value, &private("Api", "API.hidden")));
-    let main = "prelude\nimport Api\ndef selected : Law Truth := chosenLaw Truth\ntheorem evidence : Truth := @Law.proof Truth selected";
+    let main = "module\nprelude\npublic import Api\npublic def selected : Law Truth := chosenLaw Truth\npublic theorem evidence : Truth := @Law.proof Truth selected";
     let imported = checked(&[("Main", main), ("Api", &api), ("Base", BASE)]);
     let env = imported.checked.engine.environment();
     let registry = InstanceRegistry::read(env).unwrap();
@@ -340,7 +339,7 @@ fn anonymous_public_proof_names_avoid_private_and_public_predecessors() {
         );
         assert_eq!(local_statuses.status(name), Reducibility::Semireducible);
     }
-    let main = "prelude\nimport Api\ndef selected : Law Truth := chosenLaw Truth\ntheorem evidence : Truth := @Law.proof Truth selected";
+    let main = "module\nprelude\npublic import Api\npublic def selected : Law Truth := chosenLaw Truth\npublic theorem evidence : Truth := @Law.proof Truth selected";
     let imported = checked(&[("Main", main), ("Api", &api), ("Base", BASE)]);
     let env = imported.checked.engine.environment();
     assert!(!env.contains(&hidden));
@@ -380,7 +379,7 @@ fn proof_exposure_attributes_and_section_defaults_choose_the_correct_body_world(
     ] {
         let api = format!("{HEADER}import Secret\n{declaration}");
         let result = checked(&[
-            ("Main", "prelude\nimport Api"),
+            ("Main", "module\nprelude\npublic import Api"),
             ("Api", &api),
             ("Secret", SECRET),
             ("Base", BASE),
@@ -394,7 +393,10 @@ fn proof_exposure_attributes_and_section_defaults_choose_the_correct_body_world(
         "{HEADER}@[expose] public instance exposed : Law Truth := Law.mk Truth.make\npublic instance data : Pick := Pick.mk Token.left\npublic section\ninstance inherited : Law Truth := Law.mk Truth.make\nend\ninstance restored : Law Truth := Law.mk Truth.make"
     );
     let result = checked(&[
-        ("Main", "prelude\nimport Api\ndef value : Token := chosen"),
+        (
+            "Main",
+            "module\nprelude\npublic import Api\npublic def value : Token := chosen",
+        ),
         ("Api", &api),
         ("Base", BASE),
     ]);
@@ -435,7 +437,7 @@ fn hidden_header_dependencies_bad_proofs_and_exposed_private_bodies_are_refused(
         let api = format!("{HEADER}import Secret\n{declaration}");
         assert!(
             matches!(
-                check(&[("Main", "prelude\nimport Api"), ("Api", &api), ("Secret", SECRET), ("Base", BASE)]),
+                check(&[("Main", "module\nprelude\npublic import Api"), ("Api", &api), ("Secret", SECRET), ("Base", BASE)]),
                 Err(SourceModuleCheckError::Source { module, .. }) if module == n("Api")
             ),
             "{declaration}"
@@ -451,7 +453,7 @@ fn proof_instances_preserve_body_used_section_variables_and_rigid_header_univers
     let imported = checked(&[
         (
             "Main",
-            "prelude\nimport Api\ntheorem used (P : Prop) (proof : P) : P := @Law.proof P (fromBody P proof)",
+            "module\nprelude\npublic import Api\npublic theorem used (P : Prop) (proof : P) : P := @Law.proof P (fromBody P proof)",
         ),
         ("Api", &api),
         ("Base", BASE),

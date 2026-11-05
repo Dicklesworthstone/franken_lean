@@ -12,6 +12,7 @@ struct ExtensionSuffix {
 pub(super) struct Export {
     pub(super) declarations: Vec<Declaration>,
     extensions: Vec<ExtensionSuffix>,
+    private: Option<Box<Export>>,
 }
 fn extension_error(
     module: &Name,
@@ -44,6 +45,18 @@ pub(super) fn supports_artifact_extension(descriptor: &ExtensionDescriptor) -> b
 }
 
 impl Export {
+    /// A module-system file has two independently checked views. Legacy roots
+    /// import the private implementation, including its private journals; modern
+    /// roots continue to use the exported interface. Both follow normal replay.
+    pub(super) fn with_private(mut self, private: Self) -> Self {
+        self.private = Some(Box::new(private));
+        self
+    }
+
+    pub(super) fn for_legacy_import(&self) -> &Self {
+        self.private.as_deref().unwrap_or(self)
+    }
+
     /// Each journal this module appended to, with the rows it appended, in order.
     pub(super) fn journal_suffixes(
         &self,
@@ -149,6 +162,7 @@ impl Export {
         Ok(Self {
             declarations,
             extensions,
+            private: None,
         })
     }
 

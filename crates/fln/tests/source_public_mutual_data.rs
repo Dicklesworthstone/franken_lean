@@ -79,7 +79,7 @@ end
 fn public_families_export_constructors_recursors_and_execute_in_the_importer() {
     let base = engine();
     let api = format!("module\nprelude\nnamespace API\n{DATA}def secret : Nat := 89\nend API");
-    let client = "prelude\nimport Api\ndef built : API.Tree Nat := API.Tree.node (API.Forest.cons (API.Tree.leaf 7) API.Forest.nil)\ndef inspect (t : API.Tree Nat) : Nat := match t with | API.Tree.leaf n => n | API.Tree.node _ => 23";
+    let client = "module\nprelude\npublic import Api\npublic section\ndef built : API.Tree Nat := API.Tree.node (API.Forest.cons (API.Tree.leaf 7) API.Forest.nil)\ndef inspect (t : API.Tree Nat) : Nat := match t with | API.Tree.leaf n => n | API.Tree.node _ => 23";
     let imported = complete(&base, &[("Main", client), ("Api", &api)]);
     let env = imported.checked.engine.environment();
     for family in ["API.Tree", "API.Forest"] {
@@ -122,7 +122,7 @@ fn public_section_defaults_and_explicit_private_groups_restore_lexical_visibilit
         &[
             (
                 "Main",
-                "prelude\nimport Api\ndef tree : Tree Nat := Tree.leaf 31",
+                "module\nprelude\npublic import Api\npublic def tree : Tree Nat := Tree.leaf 31",
             ),
             ("Api", &api),
         ],
@@ -179,7 +179,7 @@ fn public_mutual_propositions_retain_their_prop_only_recursors() {
         &[
             (
                 "Main",
-                "prelude\nimport Api\ntheorem proof : P := P.step start",
+                "module\nprelude\npublic import Api\npublic theorem proof : P := P.step start",
             ),
             ("Api", api),
         ],
@@ -226,7 +226,7 @@ fn public_mutual_data_runs_through_the_actual_source_module_execution_graph() {
     let modules = [
         SourceModuleInput {
             name: &names[0],
-            source: b"prelude\nimport Facade\n#eval selected",
+            source: b"module\nprelude\npublic import Facade\n#eval selected",
         },
         SourceModuleInput {
             name: &names[1],

@@ -220,7 +220,7 @@ impl ImportContexts {
                 continue;
             }
             let imports = if let Some(&source) = local.get(&name) {
-                if source != index || public_root {
+                if plan.headers[index].module_system && (source != index || public_root) {
                     plan.visible_imports(source)
                 } else {
                     &plan.headers[source].imports

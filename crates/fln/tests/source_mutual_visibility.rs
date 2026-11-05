@@ -187,7 +187,7 @@ fn private_mutual_names_do_not_escape_an_import_or_become_public() {
     ] {
         let main = n("Main");
         let lib = n("Lib");
-        let source = format!("prelude\nimport Lib\ndef leak : Nat := {use_}");
+        let source = format!("module\nprelude\npublic import Lib\npublic def leak : Nat := {use_}");
         assert!(
             base.check_source_modules(
                 &[

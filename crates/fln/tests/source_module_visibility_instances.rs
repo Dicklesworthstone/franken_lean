@@ -127,7 +127,10 @@ fn derived_inhabited_instances_and_helpers_remain_private_and_resolve_locally() 
     }
     let imported = checked(
         &base,
-        &[("Main", "prelude\nimport Library"), ("Library", source)],
+        &[
+            ("Main", "module\nprelude\npublic import Library"),
+            ("Library", source),
+        ],
     );
     assert_eq!(
         fln_elab::instances::InstanceRegistry::read(imported.checked.engine.environment()).unwrap(),

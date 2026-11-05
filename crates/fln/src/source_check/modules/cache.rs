@@ -574,6 +574,11 @@ pub(super) fn run_collecting(
                     }
                 };
                 let export = exports.get(&dependency).expect("postorder predecessor");
+                let export = if plan.headers[index].module_system {
+                    export.as_ref()
+                } else {
+                    export.for_legacy_import()
+                };
                 imported = match export.replay(
                     imported,
                     modules[dependency].name,
@@ -833,7 +838,13 @@ pub(super) fn run_collecting(
                 let export = Arc::new(if let Some(public) = public {
                     let export = public.finish()?;
                     replayed_declarations += export.declarations.len();
-                    export
+                    export.with_private(replay::Export::capture(
+                        module.name,
+                        imported.environment(),
+                        checked.engine.environment(),
+                        declarations,
+                        &mut meter,
+                    )?)
                 } else {
                     replay::Export::capture(
                         module.name,

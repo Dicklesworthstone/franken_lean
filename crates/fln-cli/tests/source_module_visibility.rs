@@ -141,13 +141,13 @@ fn installed_imports_keep_private_siblings_and_transitive_imports_hidden() {
     );
     p.write(
         "Main.lean",
-        "prelude\nimport B\ndef use.{u} {A : Sort u} (x : A) : A := identity x",
+        "module\nprelude\npublic import B\npublic def use.{u} {A : Sort u} (x : A) : A := identity x",
     );
     p.refused("check-source");
     p.refused("run");
     p.write(
         "Main.lean",
-        "prelude\nimport B\nimport A\ndef use.{u} {A : Sort u} (x : A) : A := identity x",
+        "module\nprelude\npublic import B\npublic import A\npublic def use.{u} {A : Sort u} (x : A) : A := identity x",
     );
     p.complete("check-source");
     p.complete("run");
@@ -186,7 +186,7 @@ fn installed_public_imports_reexport_the_selected_api_without_private_names() {
     p.write("Facade.lean", "module\nprelude\npublic import Wrapper");
     p.write(
         "Main.lean",
-        "prelude\nimport Facade\ndef use.{u} {A : Sort u} (x : A) : A := identity x",
+        "module\nprelude\npublic import Facade\npublic def use.{u} {A : Sort u} (x : A) : A := identity x",
     );
     assert!(p.complete("check-source").contains("\"files\":5"));
     p.complete("run");
@@ -206,7 +206,7 @@ fn installed_public_imports_reexport_the_selected_api_without_private_names() {
     for declaration in ["hidden", "localUse"] {
         p.write(
             "Main.lean",
-            &format!("prelude\nimport Facade\ndef stolen.{{u}} {{A : Sort u}} (x : A) : A := {declaration} x"),
+            &format!("module\nprelude\npublic import Facade\npublic def stolen.{{u}} {{A : Sort u}} (x : A) : A := {declaration} x"),
         );
         p.refused("check-source");
         p.refused("run");
