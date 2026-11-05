@@ -58,6 +58,62 @@ fn inferred_parameterized_dictionaries_can_contain_polymorphic_methods() {
 }
 
 #[test]
+fn scoped_polymorphic_dictionaries_cross_global_consumers_without_losing_captures() {
+    let source = r#"
+class PickAt (n : Nat) where
+  pick : {A : Type} -> A -> A -> A
+instance pickAt (n : Nat) : PickAt n :=
+  { pick := fun x y => match n with | 0 => x | _ + 1 => y }
+def consume {n : Nat} {A : Type} [PickAt n] (x y : A) : A :=
+  PickAt.pick (n := n) x y
+def forwardNat (n : Nat) : Nat := consume (n := n) 41 42
+def forwardBool (n : Nat) : Bool := consume (n := n) false true
+def forwardString (n : Nat) : String := consume (n := n) "a" "xyz"
+"#;
+    for (body, expected) in [
+        ("forwardNat 0", "41"),
+        ("forwardNat 1", "42"),
+        ("if forwardBool 0 then 9 else 42", "42"),
+        ("if forwardBool 1 then 42 else 9", "42"),
+        ("String.length (forwardString 1)", "3"),
+    ] {
+        execute(&format!("{source}#eval {body}"), expected);
+    }
+}
+
+#[test]
+fn scoped_polymorphic_dictionary_specialization_keeps_computed_siblings_strict() {
+    let source = r#"
+class PickAt (n : Nat) where
+  pick : {A : Type} -> A -> A -> A
+  unused : Nat
+def count (n : Nat) : Nat := match n with | 0 => 0 | k + 1 => count k + 1
+instance pickAt (n : Nat) : PickAt n :=
+  { pick := fun x _ => x, unused := count n }
+def consume {n : Nat} {A : Type} [PickAt n] (x y : A) : A :=
+  PickAt.pick (n := n) x y
+def forward (n : Nat) : Nat := consume (n := n) 42 9
+#eval forward 30
+"#;
+    let error = engine()
+        .execute_source_definitions(&[source.as_bytes()], &KVMap::new(), limits())
+        .expect_err("an unselected computation cannot become inert dictionary evidence");
+    let mut cause = &error;
+    while let fln::EngineExecutionError::BatchCommand { error, .. } = cause {
+        cause = error;
+    }
+    assert!(
+        matches!(
+            cause,
+            fln::EngineExecutionError::Ingress(
+                fln_comp::ingress::IngressError::UnsupportedCallableSignature { .. }
+            )
+        ),
+        "{error:?}"
+    );
+}
+
+#[test]
 fn value_indexed_factories_expose_methods_before_runtime_catalog_selection() {
     execute(
         r#"

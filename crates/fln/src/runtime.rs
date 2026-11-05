@@ -576,6 +576,13 @@ impl<'a> Preparation<'a> {
                             tasks.push(Task::Visit(replacement));
                             continue;
                         }
+                        // Scoped dictionary specialization can expose a method
+                        // after the initial projection pass. Instantiate its
+                        // polymorphic type arguments before visiting its body.
+                        if let Some(projected) = self.inline_generated_projection(&head, &args)? {
+                            tasks.push(Task::Visit(projected));
+                            continue;
+                        }
                         if let Some(decision) = self.native_natural_decision_call(&head, &args)? {
                             tasks.push(Task::Visit(decision));
                             continue;

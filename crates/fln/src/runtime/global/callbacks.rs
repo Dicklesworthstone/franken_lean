@@ -6,6 +6,21 @@ use super::*;
 mod computed;
 
 impl Preparation<'_> {
+    /// A dictionary whose complete construction is inert can be substituted
+    /// locally even when its method lambdas capture already-bound values.
+    /// Dynamic receivers remain runtime values, and caller-relative expressions
+    /// never enter the global specialization cache.
+    fn inert_instance_constructor(&mut self, input: &Expr) -> Result<Option<Expr>, IngressError> {
+        let Some(value) = self.scoped_instance_factory_value(input)? else {
+            return Ok(None);
+        };
+        let (head, _) = self.spine(&value)?;
+        let constructor = matches!(head.node(), ExprNode::Const { name, .. }
+            if matches!(self.environment.find(name), Some(ConstantInfo::Ctor(ctor))
+                if !ctor.is_unsafe));
+        Ok(constructor.then_some(value))
+    }
+
     /// Typed identity lets can hide a literal consumer or callback after
     /// dictionary projection. Expose only lambda construction, its aliases,
     /// and checked administrative field selection. A computed initializer still
@@ -444,8 +459,8 @@ impl Preparation<'_> {
         }
     }
 
-    /// Known staged and polymorphic literals can be substituted into a safe
-    /// consumer before closure conversion. This bounded specialization does
+    /// Known staged/polymorphic literals and scoped inert dictionaries can be
+    /// substituted into a safe consumer before closure conversion. This does
     /// not invent a generic runtime ABI or convert between closure interfaces.
     /// Opaque/dynamic callbacks are never reinterpreted, and strict producers
     /// are not inert lambdas. The normal FIR checker still sees every call.
@@ -486,15 +501,24 @@ impl Preparation<'_> {
                 observed: args.len(),
             });
         }
-        let mut literal = false;
+        let mut candidate = false;
         for argument in args {
             self.tick()?;
-            if self.inert_callable(argument)?.is_some() {
-                literal = true;
+            if self.inert_callable(argument)?.is_some()
+                || (argument.has_loose_bvars()
+                    && matches!(
+                        argument.node(),
+                        ExprNode::App { .. }
+                            | ExprNode::Proj { .. }
+                            | ExprNode::LetE { .. }
+                            | ExprNode::MData { .. }
+                    ))
+            {
+                candidate = true;
                 break;
             }
         }
-        if !literal {
+        if !candidate {
             return Ok(None);
         }
         definition.base.type_ = self.universe_instance(
@@ -519,7 +543,10 @@ impl Preparation<'_> {
             let (
                 ExprNode::Lam { body: next, .. },
                 ExprNode::ForallE {
-                    binder_type, body, ..
+                    binder_type,
+                    body,
+                    binder_info,
+                    ..
                 },
             ) = (value.node(), normal.node())
             else {
@@ -528,6 +555,14 @@ impl Preparation<'_> {
             selected |= self.staged_callback(argument, binder_type)?;
             if !selected && let Some(literal) = self.inert_callable(argument)? {
                 selected = self.generic_callable_literal(&literal, binder_type)?;
+            }
+            if !selected
+                && *binder_info == BinderInfo::InstImplicit
+                && argument.has_loose_bvars()
+                && self.value_type(binder_type)?.is_none()
+                && self.inert_instance_constructor(argument)?.is_some()
+            {
+                selected = true;
             }
             type_ = self.substitution(body, argument)?;
             value = next.clone();
@@ -580,6 +615,7 @@ impl Preparation<'_> {
                 ExprNode::ForallE {
                     binder_type: domain,
                     body: result,
+                    binder_info,
                     ..
                 },
             ) = (value.node(), normal.node())
@@ -596,6 +632,18 @@ impl Preparation<'_> {
             }
             let offset = self.producer_depth(bindings.len())?;
             let argument = self.lift(argument, offset)?;
+            if *binder_info == BinderInfo::InstImplicit
+                && self.value_type(domain)?.is_none()
+                && let Some(instance) = self.inert_instance_constructor(&argument)?
+            {
+                // All operands, including unselected fields and initializers,
+                // passed the existing inert-factory check. Copy only that
+                // constructor syntax; ordinary operands keep their strict lets.
+                value = self.substitution(body, &instance)?;
+                type_ = self.substitution(result, &instance)?;
+                consumed += 1;
+                continue;
+            }
             let literal = self.inert_callable(&argument)?;
             let generic = match &literal {
                 Some(lambda) => self.generic_callable_literal(lambda, domain)?,
