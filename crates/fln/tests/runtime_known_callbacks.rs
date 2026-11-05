@@ -72,6 +72,84 @@ fn known_staged_callbacks_execute_through_the_ordinary_higher_order_consumer() {
     );
 }
 
+const NESTED_PARTIAL: &str = r#"
+partial def nestedConsumer (f : Nat -> Nat -> Nat -> Nat -> Nat) (n : Nat) : Nat :=
+  if n == 0 then f n 2 3 1 else
+    Nat.add (f n 2 3 1) (nestedConsumer f (Nat.pred n))
+"#;
+
+#[test]
+fn recursive_consumers_preserve_nested_callback_result_stages() {
+    // Both arithmetic lets are used. The callback has a two-argument prefix,
+    // then a one-argument prefix, then its final state closure.
+    execute(
+        &format!(
+            "{NESTED_PARTIAL}\
+#eval nestedConsumer
+  (fun a b =>
+    let outer := Nat.add a b
+    fun acc =>
+      let saved := Nat.add outer acc
+      fun state => Nat.add saved state) 3"
+        ),
+        "30",
+    );
+    // Equal interfaces share the recursive variant while captures stay
+    // dynamic; an ordinary flat callback still uses its distinct interface.
+    execute(
+        &format!(
+            "{NESTED_PARTIAL}\
+def nestedRun (offset : Nat) : Nat :=
+  nestedConsumer
+    (fun a b =>
+      let outer := Nat.add (Nat.add a b) offset
+      fun acc =>
+        let saved := Nat.add outer acc
+        fun state => Nat.add saved state) 3
+#eval Nat.add (nestedRun 0)
+  (Nat.add (nestedRun 10)
+    (nestedConsumer (fun a b acc state => Nat.add (Nat.add (Nat.add a b) acc) state) 3))"
+        ),
+        "130",
+    );
+}
+
+#[test]
+fn discarded_nested_callback_results_still_execute_the_second_prefix() {
+    let source = |cost| {
+        format!(
+            "{SPEND}\
+partial def ignoreNested (f : Nat -> Nat -> Nat -> Nat) (n second : Nat) : Nat :=
+  let first := f n
+  let unused := first second
+  if n == 0 then 42 else ignoreNested f (Nat.pred n) second
+#eval ignoreNested
+  (fun n =>
+    let outer := Nat.add n 1
+    fun acc =>
+      let paid := spend acc
+      fun state => Nat.add (Nat.add outer paid) state) 3 {cost}"
+        )
+    };
+    let idle = execute(&source(0), "42");
+    let busy = execute(&source(30), "42");
+    assert!(
+        busy > idle + 30,
+        "the second strict prefix disappeared: {idle} vs {busy}"
+    );
+    let base = engine();
+    let options = KVMap::new();
+    let root = base.logical_root(&options);
+    let mut bounded = limits();
+    bounded.vm.max_steps = idle;
+    assert!(matches!(
+        base.execute_source_definitions(&[source(30).as_bytes()], &options, bounded)
+            .unwrap(),
+        Outcome::Inconclusive(_)
+    ));
+    assert_eq!(base.logical_root(&options), root);
+}
+
 fn assert_foreign_extern_is_not_inlined(definition: &str, target: &str, query: &str) {
     let options = KVMap::new();
     let clean = engine()

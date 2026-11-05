@@ -7,6 +7,135 @@ use fln_comp::ingress::ClosureSignature;
 use fln_env::constants::{ConstantVal, ReducibilityHints};
 
 impl Preparation<'_> {
+    /// Recover literal suffix stages before a recursive consumer fixes its
+    /// callback interface. A Pi telescope alone flattens every returned
+    /// closure, including a second strict prefix inside the callback's result.
+    /// Inspect only the returned value path: strict lets remain in the original
+    /// executable, and unknown computed/captured results remain conservative.
+    fn refine_partial_callback_result(
+        &mut self,
+        signature: &mut ExecutableSignature,
+        declared_type: &Expr,
+    ) -> Result<(), IngressError> {
+        if !matches!(signature.result, ValueType::Closure(_)) {
+            return Ok(());
+        }
+        let mut type_ = declared_type.clone();
+        let mut depth = 0usize;
+        for _ in &signature.parameters {
+            self.tick()?;
+            let ExprNode::ForallE { body, .. } = type_.node() else {
+                return Err(unsupported("partial callback result telescope"));
+            };
+            type_ = body.clone();
+            depth = depth.saturating_add(1);
+            self.producer_depth(depth)?;
+        }
+        let mut body = signature.body.clone();
+        let mut actual = signature.result;
+        let mut stages = Vec::new();
+        while matches!(actual, ValueType::Closure(_)) {
+            // The residual type must not depend on a peeled parameter or a
+            // local binding. Closed types need no lifting as the metadata walk
+            // enters strict-let scopes; open/dependent tails keep the old ABI.
+            if type_.has_loose_bvars() {
+                return Ok(());
+            }
+            loop {
+                self.tick()?;
+                match body.node() {
+                    ExprNode::MData { expr, .. } => body = expr.clone(),
+                    ExprNode::LetE { body: next, .. } => {
+                        depth = depth.saturating_add(1);
+                        self.producer_depth(depth)?;
+                        body = next.clone();
+                    }
+                    _ => break,
+                }
+            }
+            if !matches!(body.node(), ExprNode::Lam { .. }) {
+                return Ok(());
+            }
+            // A prepared synthetic lambda can own a shorter fixed prefix than
+            // its syntax suggests. Its registered interface takes precedence.
+            let mut registered = None;
+            for index in (0..self.lambdas.len()).rev() {
+                self.tick()?;
+                let lambda = &self.lambdas[index];
+                if lambda.lambda == body {
+                    registered = Some(ClosureSignature {
+                        parameters: lambda.parameters.clone(),
+                        parameter_ownership: lambda.parameter_ownership.clone(),
+                        result: lambda.result,
+                        result_ownership: lambda.result_ownership,
+                    });
+                    break;
+                }
+            }
+            if let Some(registered) = registered {
+                actual = self.stage_interface(registered)?;
+                break;
+            }
+            // Match ordinary local preparation's value-only normalization,
+            // without preparing a body or reentering the expression worklist.
+            body = self.administrative_callable_value(&body)?;
+            let mut parameters = Vec::new();
+            while let ExprNode::Lam {
+                binder_type,
+                body: next,
+                ..
+            } = body.node()
+            {
+                self.tick()?;
+                let ExprNode::ForallE {
+                    binder_type: domain,
+                    body: result,
+                    ..
+                } = type_.node()
+                else {
+                    return Ok(());
+                };
+                if self.normalize_type(binder_type)? != *domain {
+                    return Ok(());
+                }
+                let Some(parameter) = self.value_type(domain)? else {
+                    return Ok(());
+                };
+                depth = depth.saturating_add(1);
+                self.producer_depth(depth)?;
+                reserve(&mut parameters, self.limits.max_context_depth)?;
+                parameters.push(parameter);
+                body = next.clone();
+                type_ = result.clone();
+                if type_.has_loose_bvars() {
+                    return Ok(());
+                }
+            }
+            let Some(result) = self.value_type(&type_)? else {
+                return Ok(());
+            };
+            reserve(&mut stages, self.limits.max_context_depth)?;
+            stages.push(ClosureSignature {
+                parameter_ownership: borrowed_runtime_parameters(parameters.len())?,
+                parameters,
+                result,
+                result_ownership: result_ownership(result),
+            });
+            actual = result;
+        }
+        for mut stage in stages.into_iter().rev() {
+            self.tick()?;
+            stage.result = actual;
+            stage.result_ownership = result_ownership(actual);
+            actual = self.stage_interface(stage)?;
+        }
+        if actual != signature.result && self.same_stage_telescope(actual, signature.result)? {
+            signature.result = actual;
+            signature.result_ownership = result_ownership(actual);
+        }
+        Ok(())
+    }
+
     pub(super) fn partial_callback_stage(
         &mut self,
         origin: &Name,
@@ -35,12 +164,14 @@ impl Preparation<'_> {
                 safety: DefinitionSafety::Safe,
                 all: Vec::new(),
             };
-            let Some(signature) = self.signature(&definition, false)? else {
+            let definition = self.normalize_definition_signature(&definition)?;
+            let Some(mut signature) = self.prepared_signature(&definition, false)? else {
                 continue;
             };
             if signature.parameters.is_empty() {
                 continue;
             }
+            self.refine_partial_callback_result(&mut signature, &definition.base.type_)?;
             let actual = self.stage_interface(ClosureSignature {
                 parameter_ownership: borrowed_runtime_parameters(signature.parameters.len())?,
                 parameters: signature.parameters,
