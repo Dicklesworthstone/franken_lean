@@ -162,6 +162,10 @@ impl Context {
                 environment.contains(&user_name)
                     || environment.contains(&self.source_scope.private_name(&user_name))
             })
+            || self.generated_name_environment.as_ref().is_some_and(|environment| {
+                environment.contains(&user_name)
+                    || environment.contains(&self.source_scope.private_name(&user_name))
+            })
         {
             self.tick()?;
             user_name = candidate(Some(next));

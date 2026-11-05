@@ -270,9 +270,14 @@ impl Scopes {
     ) -> Result<Vec<(Name, Name)>, TransitionError> {
         self.observe_namespaces(env)
             .map_err(TransitionError::Registry)?;
-        let namespaces = self
-            .resolve_open_in(&self.current, namespace)
-            .map_err(TransitionError::Scope)?;
+        // `export _root_ (...)` names the root namespace itself; ordinary
+        // namespace labels still use the qualified/opened namespace resolver.
+        let namespaces = if namespace == &Name::from_components(["_root_"]) {
+            vec![Name::anonymous()]
+        } else {
+            self.resolve_open_in(&self.current, namespace)
+                .map_err(TransitionError::Scope)?
+        };
         if namespaces.is_empty() {
             return Err(TransitionError::Scope(format!(
                 "unknown namespace `{}`",

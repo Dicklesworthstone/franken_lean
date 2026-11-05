@@ -458,13 +458,17 @@ fn where_declarations_carry_doc_comments() {
     }
 }
 
-/// `deriving instance C for T` parses as the pin's `Command.deriving`; the checker does not derive
-/// instances, so it refuses the file, which the pin accepts, rather than ignoring the command.
+/// A standalone deriving command admits its real dictionary: the chosen
+/// constructor reduces in proofs, and a false equation about it is refused.
 #[test]
-fn deriving_commands_are_refused_not_ignored() {
+fn deriving_commands_check_their_generated_instances() {
     let (engine, limits) = engine();
-    let source =
+    let declarations =
         "inductive Shade where\n  | dark\n  | light\nderiving instance Inhabited for Shade\n";
+    check(&format!(
+        "{declarations}theorem selected : (default : Shade) = Shade.dark := by rfl"
+    ));
+    let source = format!("{declarations}theorem wrong : (default : Shade) = Shade.light := by rfl");
     assert!(
         !matches!(
             engine.check_source_files(

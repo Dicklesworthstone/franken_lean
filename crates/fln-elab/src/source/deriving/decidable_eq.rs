@@ -478,6 +478,95 @@ fn compare_constructor(
     context.match_apply(function, value(receiver))
 }
 
+/// The pin's enum path always creates `T.ofNat`, even if a previous deriving
+/// command has already chosen a fresh instance name. Keep that real, checked
+/// lookup declaration so repeated enum derivation has the same duplicate-name
+/// rejection. Out-of-range naturals select the final constructor.
+fn enum_of_nat(
+    context: &mut Context,
+    info: &InductiveVal,
+    target: &Expr,
+) -> Result<Option<Declaration>, NatDefinitionElabError> {
+    if info.num_params != 0
+        || info.num_indices != 0
+        || info.all.len() != 1
+        || info.ctors.is_empty()
+        || info.is_rec
+        || info.is_unsafe
+        || matches!(info.base.type_.node(), ExprNode::Sort { level } if level.is_zero())
+    {
+        return Ok(None);
+    }
+    for name in &info.ctors {
+        context.tick()?;
+        if !matches!(context.txn.env.find(name), Some(ConstantInfo::Ctor(ctor)) if ctor.num_fields == 0)
+        {
+            return Ok(None);
+        }
+    }
+    fn table(
+        context: &mut Context,
+        info: &InductiveVal,
+        target: &Expr,
+        index: &LocalDecl,
+        start: usize,
+        end: usize,
+    ) -> Result<Typed, NatDefinitionElabError> {
+        context.tick()?;
+        if start + 1 == end {
+            return typed(
+                context,
+                Expr::const_(
+                    info.ctors[start].clone(),
+                    info.base
+                        .level_params
+                        .iter()
+                        .cloned()
+                        .map(Level::param)
+                        .collect(),
+                ),
+            );
+        }
+        let middle = start + (end - start) / 2;
+        let low = table(context, info, target, index, start, middle)?;
+        let high = table(context, info, target, index, middle, end)?;
+        let bound = Typed {
+            value: Expr::lit(Literal::Nat(fln_core::expr::NatLit::from_u64(
+                (middle - 1) as u64,
+            ))),
+            type_: nat_const(),
+        };
+        let condition = call(context, "Nat.ble", &[value(index), bound])?;
+        let motive = typed(
+            context,
+            Expr::lam(
+                Name::anonymous(),
+                Expr::const_(named("Bool"), Vec::new()),
+                target.clone(),
+                BinderInfo::Default,
+            ),
+        )?;
+        call(context, "Bool.rec", &[motive, high, low, condition])
+    }
+    let saved = context.txn.lctx.clone();
+    let index = local(context, named("n"), nat_const(), BinderInfo::Default)?;
+    let body = table(context, info, target, &index, 0, info.ctors.len())?;
+    let term = close(context, body, &[index])?;
+    context.txn.lctx = saved;
+    let name = Name::str(info.base.name.clone(), "ofNat");
+    Ok(Some(Declaration::Defn(DefinitionVal {
+        base: ConstantVal {
+            name: name.clone(),
+            level_params: info.base.level_params.clone(),
+            type_: term.type_,
+        },
+        value: term.value,
+        hints: ReducibilityHints::Abbrev,
+        safety: DefinitionSafety::Safe,
+        all: vec![name],
+    })))
+}
+
 pub(super) fn elaborate(
     context: &mut Context,
     info: &InductiveVal,
@@ -605,11 +694,16 @@ pub(super) fn elaborate(
             all: vec![name],
         })
     };
+    let mut declarations = Vec::new();
+    if let Some(of_nat) = enum_of_nat(context, info, target)? {
+        declarations.push(of_nat);
+    }
+    declarations.extend([
+        definition(helper, helper_term),
+        definition(instance.clone(), instance_term),
+    ]);
     Ok(DerivedInstance {
-        declarations: vec![
-            definition(helper, helper_term),
-            definition(instance.clone(), instance_term),
-        ],
+        declarations,
         instance,
     })
 }

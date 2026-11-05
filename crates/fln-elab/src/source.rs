@@ -642,6 +642,10 @@ struct Context {
     // before their bodies may see private imports. Both environments remain
     // untrusted elaborator inputs; complete bodies require ordinary admission.
     private_proof_body: Option<(Environment, SourceScope)>,
+    // A public deriving command resolves and checks in the exported world,
+    // while fresh generated names must also avoid its private predecessor.
+    // This snapshot is consulted only by name generation.
+    generated_name_environment: Option<Environment>,
     public_theorem_signature: Option<ConstantVal>,
     private_definition_body: bool,
     public_definition_header: Option<public_body::Header>,
@@ -865,6 +869,7 @@ impl Context {
             trace_local_names: std::collections::HashMap::new(),
             unnamed_fields: std::collections::HashSet::new(),
             private_proof_body: None,
+            generated_name_environment: None,
             public_theorem_signature: None,
             private_definition_body: false,
             public_definition_header: None,

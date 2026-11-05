@@ -71,6 +71,137 @@ pub struct DerivingRequest {
     pub is_record: bool,
 }
 
+/// An existing, resolved inductive type selected by a standalone command.
+/// Record metadata, rather than the number of constructors, determines whether
+/// its deriving handler should retain field names and registered defaults.
+#[derive(Debug, Clone)]
+pub struct DerivingTarget {
+    pub name: Name,
+    pub is_record: bool,
+}
+
+/// A standalone command's checked lookup results, without any publication
+/// authority. Each proposed helper and dictionary still needs ordinary admission.
+#[derive(Debug, Clone)]
+pub struct ExistingDeriving {
+    pub handlers: Vec<Name>,
+    pub targets: Vec<DerivingTarget>,
+    pub scope: SourceScope,
+}
+
+pub fn is_command(syntax: &Syntax) -> bool {
+    syntax.kind() == Some(&parser_kind(&["Command", "deriving"]))
+}
+
+fn command_parts(syntax: &Syntax) -> Result<(&[Syntax], &[Syntax]), NatDefinitionElabError> {
+    let parts = expect_node(
+        syntax,
+        &parser_kind(&["Command", "deriving"]),
+        6,
+        "standalone deriving command",
+    )?;
+    expect_atom(&parts[0], "deriving", "deriving keyword")?;
+    expect_empty_null(&parts[1], "a computable deriving command")?;
+    expect_atom(&parts[2], "instance", "deriving instance keyword")?;
+    expect_atom(&parts[4], "for", "deriving target keyword")?;
+    let handlers = expect_null_args(&parts[3], "deriving handlers")?;
+    let targets = expect_null_args(&parts[5], "deriving targets")?;
+    if handlers.is_empty()
+        || handlers.len().is_multiple_of(2)
+        || targets.is_empty()
+        || targets.len().is_multiple_of(2)
+    {
+        return Err(NatDefinitionElabError::UnexpectedSyntax {
+            expected: "nonempty separated deriving handlers and type names",
+        });
+    }
+    Ok((handlers, targets))
+}
+
+/// Resolve all types before selecting the command's public/private world, as
+/// `Lean.Elab.Deriving.Basic.elabDeriving` does. A private member makes the
+/// entire group private. Section variables are not global deriving targets.
+pub fn prepare_existing(
+    syntax: &Syntax,
+    environment: &Environment,
+    kernel: Budget,
+    scope: &SourceScope,
+) -> Result<ExistingDeriving, NatDefinitionElabError> {
+    let (classes, types) = command_parts(syntax)?;
+    let mut context = Context::scoped(environment, kernel, scope)?;
+    context.txn.lctx = LocalContext::new();
+    let mut resolve = |syntax: &Syntax| {
+        context.tick()?;
+        let Syntax::Ident { val, .. } = syntax else {
+            return Err(NatDefinitionElabError::UnexpectedSyntax {
+                expected: "a global deriving class or inductive name",
+            });
+        };
+        context
+            .resolve_identifier_name(syntax)?
+            .0
+            .ok_or_else(|| failure(SourceInferenceError::UnknownConstant(val.clone())))
+    };
+    let mut handlers = Vec::new();
+    for (index, class) in classes.iter().enumerate() {
+        if index % 2 == 1 {
+            expect_atom(class, ",", "deriving separator")?;
+            continue;
+        }
+        let class = expect_node(
+            class,
+            &parser_kind(&["Command", "derivingClass"]),
+            2,
+            "deriving handler",
+        )?;
+        expect_empty_null(&class[0], "unsupported deriving attributes")?;
+        // Keep the exact global lookup when the handler enters another world;
+        // a same-named section variable or local namespace cannot recapture it.
+        handlers.push(named("_root_").append_core(&resolve(&class[1])?));
+    }
+    let structures = crate::records::imported::ImportedStructures::read(environment)
+        .map_err(|error| failure(SourceInferenceError::Record(error)))?;
+    let mut targets = Vec::new();
+    let mut private = false;
+    for (index, target) in types.iter().enumerate() {
+        if index % 2 == 1 {
+            expect_atom(target, ",", "deriving target separator")?;
+            continue;
+        }
+        let name = resolve(target)?;
+        if !matches!(environment.find(&name), Some(ConstantInfo::Induct(_))) {
+            // Delta deriving of definitions is a different pin protocol; never
+            // unfold an arbitrary declaration and pretend it was an inductive.
+            return Err(unsupported(&name));
+        }
+        let mut prefix = name.clone();
+        while !prefix.is_anonymous() {
+            private |= prefix == named("_private");
+            prefix = prefix.parent();
+        }
+        targets.push(DerivingTarget {
+            is_record: structures.get(&name).is_some(),
+            name,
+        });
+    }
+    let mut scope = scope.clone();
+    scope.public_declarations = !private;
+    scope.expose_definitions = !private;
+    if private && scope.private_module.is_none() {
+        scope.private_module = scope.source_module.clone();
+        if scope.private_module.is_none() {
+            return Err(NatDefinitionElabError::UnexpectedSyntax {
+                expected: "a module identity for private derived instances",
+            });
+        }
+    }
+    Ok(ExistingDeriving {
+        handlers,
+        targets,
+        scope,
+    })
+}
+
 pub fn prepare(syntax: &Syntax) -> Result<Option<DerivingRequest>, NatDefinitionElabError> {
     let is_record = super::is_record(syntax);
     if !is_record && !super::is_inductive(syntax) {
@@ -496,7 +627,31 @@ pub fn elaborate_handler(
     kernel: Budget,
     scope: &SourceScope,
 ) -> Result<DerivedInstance, NatDefinitionElabError> {
+    elaborate_handler_with_names(
+        handler,
+        type_name,
+        is_record,
+        environment,
+        None,
+        kernel,
+        scope,
+    )
+}
+
+/// Elaborate against one semantic world while reserving generated names from
+/// its complete predecessor. The extra environment has no role in resolution,
+/// instance synthesis, reduction, or checking of the proposed declarations.
+pub fn elaborate_handler_with_names(
+    handler: &Name,
+    type_name: &Name,
+    is_record: bool,
+    environment: &Environment,
+    names: Option<&Environment>,
+    kernel: Budget,
+    scope: &SourceScope,
+) -> Result<DerivedInstance, NatDefinitionElabError> {
     let mut context = Context::scoped(environment, kernel, scope)?;
+    context.generated_name_environment = names.cloned();
     let handler_name = context.resolve_source_name(handler)?;
     let is_repr = handler_name.as_ref() == Some(&named("Repr"));
     let is_beq = handler_name.as_ref() == Some(&named("BEq"));

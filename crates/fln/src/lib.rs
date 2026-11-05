@@ -3444,10 +3444,27 @@ impl Engine {
                     Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
                 }
             } else {
-                None
+                grammar
+                    .enter(|| source_records::parse_deriving_command(command_source))
+                    .map_err(|error| EngineExecutionError::BatchCommand {
+                        index: command_index,
+                        error: Box::new(error),
+                        at: Some(original_offset),
+                    })?
+                    .map(|parsed| ProgramCommandSyntax::Deriving(parsed.syntax().clone()))
             };
             let mut scope = if public.is_some() {
                 let scope = match &expanded {
+                    Some(ProgramCommandSyntax::Deriving(syntax)) => {
+                        fln_elab::source::deriving::prepare_existing(
+                            syntax,
+                            engine.environment(),
+                            limits.kernel,
+                            &scopes.current,
+                        )
+                        .map(|request| request.scope)
+                        .map_err(DefinitionFrontendError::Elaborate)
+                    }
                     Some(ProgramCommandSyntax::Mutual(members)) => scopes
                         .current
                         .for_mutual_declarations(members)
@@ -3671,8 +3688,8 @@ impl Engine {
                 );
                 continue;
             }
-            let mutual = match &expanded {
-                Some(ProgramCommandSyntax::Mutual(_)) => true,
+            let admission_batch = match &expanded {
+                Some(ProgramCommandSyntax::Mutual(_) | ProgramCommandSyntax::Deriving(_)) => true,
                 Some(ProgramCommandSyntax::Single(_)) => false,
                 None => grammar
                     .enter(|| fln_parse::command_scope::mutual::parse(command_source))
@@ -3685,8 +3702,8 @@ impl Engine {
                     })?
                     .is_some(),
             };
-            if mutual {
-                // Keep the whole mutual block on the existing two-checker
+            if admission_batch {
+                // Keep complete mutual and standalone deriving groups on the existing two-checker
                 // admission path. Never publish members sequentially or treat
                 // declarations as VM executions merely to advance the stream.
                 let admission = match grammar
@@ -3732,9 +3749,9 @@ impl Engine {
             }
             let parsed = match expanded.take() {
                 Some(ProgramCommandSyntax::Single(parsed)) => *parsed,
-                Some(ProgramCommandSyntax::Mutual(_)) => {
+                Some(ProgramCommandSyntax::Mutual(_) | ProgramCommandSyntax::Deriving(_)) => {
                     return Err(EngineExecutionError::UnexpectedPublication {
-                        detail: "an expanded mutual command escaped batch admission",
+                        detail: "an expanded declaration group escaped batch admission",
                     });
                 }
                 None => grammar

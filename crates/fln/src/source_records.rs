@@ -328,6 +328,20 @@ impl Engine {
         scope: &fln_elab::source::scope::SourceScope,
     ) -> Result<Outcome<DeclarationBatchAdmission>, EngineExecutionError> {
         let parsed = match parsed {
+            ScopedCommandSyntax::Deriving(syntax) => {
+                let request =
+                    match elaboration_outcome(fln_elab::source::deriving::prepare_existing(
+                        &syntax,
+                        self.environment(),
+                        limits.kernel,
+                        scope,
+                    ))? {
+                        Outcome::Complete(request) => request,
+                        Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                        Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                    };
+                return self.admit_existing_deriving(&request, None, options, limits);
+            }
             ScopedCommandSyntax::Mutual(members) => {
                 // The group admissions below record no compiler attribute. The pin refuses
                 // `[macro_inline]` on a member of a recursive group (`isValidMacroInline`);
@@ -430,6 +444,43 @@ impl Engine {
         private_scope: &fln_elab::source::scope::SourceScope,
     ) -> Result<Outcome<PublicSourceAdmission>, EngineExecutionError> {
         let parsed = match parsed {
+            ScopedCommandSyntax::Deriving(syntax) => {
+                // Resolve in the complete predecessor before entering the
+                // export world. A private alias may name a public target, but
+                // private instance history must not affect its public helpers.
+                let mut request =
+                    match elaboration_outcome(fln_elab::source::deriving::prepare_existing(
+                        &syntax,
+                        self.environment(),
+                        limits.kernel,
+                        private_scope,
+                    ))? {
+                        Outcome::Complete(request) => request,
+                        Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                        Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                    };
+                if !request.scope.public_declarations {
+                    return Err(EngineExecutionError::UnexpectedPublication {
+                        detail: "a private deriving group entered public admission",
+                    });
+                }
+                request.scope = public_scope.clone();
+                return Ok(
+                    match public.admit_existing_deriving(
+                        &request,
+                        Some(self.environment()),
+                        options,
+                        limits,
+                    )? {
+                        Outcome::Complete(public) => Outcome::Complete(PublicSourceAdmission {
+                            public,
+                            private_implementation: None,
+                        }),
+                        Outcome::Inconclusive(reason) => Outcome::Inconclusive(reason),
+                        Outcome::InternalFault(fault) => Outcome::InternalFault(fault),
+                    },
+                );
+            }
             ScopedCommandSyntax::Definition(parsed)
                 if fln_elab::source::is_definition_body(parsed.syntax())
                     && !public_scope
@@ -1312,7 +1363,7 @@ impl Engine {
         let Some(request) = request.filter(|request| !request.handlers.is_empty()) else {
             return Ok(result);
         };
-        let mut batch = match result {
+        let batch = match result {
             Outcome::Complete(batch) => batch,
             Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
@@ -1325,55 +1376,118 @@ impl Engine {
         let type_name = scope
             .declaration_name(&request.type_name)
             .map_err(|error| frontend(fln_elab::source::SourceInferenceError::NameScope(error)))?;
-        for handler in &request.handlers {
-            let derived = match elaboration_outcome(fln_elab::source::deriving::elaborate_handler(
-                handler,
-                &type_name,
-                request.is_record,
-                batch.engine.environment(),
-                limits.kernel,
-                scope,
-            ))? {
-                Outcome::Complete(derived) => derived,
-                Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
-                Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
-            };
-            let mut successor = match batch
-                .engine
-                .admit_declarations(&derived.declarations, options, limits)
-                .map_err(EngineExecutionError::from)?
-            {
-                Outcome::Complete(successor) => successor,
-                Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
-                Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
-            };
-            successor.engine.environment = fln_elab::instances::register_instance(
-                successor.engine.environment(),
-                &derived.instance,
-                1000,
-            )
-            .map_err(|error| {
-                frontend(fln_elab::source::SourceInferenceError::InstanceRegistry(
-                    error,
-                ))
-            })?;
-            successor.engine.environment = fln_elab::reducibility::register(
-                successor.engine.environment(),
-                &derived.instance,
-                fln_elab::reducibility::Reducibility::ImplicitReducible,
-            )
-            .map_err(|error| {
-                frontend(fln_elab::source::SourceInferenceError::Unification(
-                    Box::new(fln_elab::constraint::unify::UnificationError::Reducibility(
+        self.finish_deriving_handlers(
+            batch,
+            (
+                &request.handlers,
+                &[fln_elab::source::deriving::DerivingTarget {
+                    name: type_name,
+                    is_record: request.is_record,
+                }],
+            ),
+            None,
+            options,
+            limits,
+            scope,
+        )
+    }
+
+    fn admit_existing_deriving(
+        &self,
+        request: &fln_elab::source::deriving::ExistingDeriving,
+        names: Option<&Environment>,
+        options: &KVMap,
+        limits: EngineAdmissionLimits,
+    ) -> Result<Outcome<DeclarationBatchAdmission>, EngineExecutionError> {
+        let root = self.logical_root(options);
+        self.finish_deriving_handlers(
+            DeclarationBatchAdmission {
+                engine: self.clone(),
+                base_logical_root: root,
+                result_logical_root: root,
+                admissions: Vec::new(),
+                local_instance: None,
+            },
+            (&request.handlers, &request.targets),
+            names,
+            options,
+            limits,
+            &request.scope,
+        )
+    }
+
+    fn finish_deriving_handlers(
+        &self,
+        mut batch: DeclarationBatchAdmission,
+        group: (&[Name], &[fln_elab::source::deriving::DerivingTarget]),
+        names: Option<&Environment>,
+        options: &KVMap,
+        limits: EngineAdmissionLimits,
+        scope: &fln_elab::source::scope::SourceScope,
+    ) -> Result<Outcome<DeclarationBatchAdmission>, EngineExecutionError> {
+        let (handlers, targets) = group;
+        let frontend = |reason| {
+            EngineExecutionError::Frontend(DefinitionFrontendError::Elaborate(
+                fln_elab::NatDefinitionElabError::Inference(reason),
+            ))
+        };
+        // `applyDerivingHandlers` processes each handler over the complete
+        // target group. The caller publishes only this complete successor;
+        // failure of any later helper, target, or handler drops the prefix.
+        for handler in handlers {
+            for target in targets {
+                let derived = match elaboration_outcome(
+                    fln_elab::source::deriving::elaborate_handler_with_names(
+                        handler,
+                        &target.name,
+                        target.is_record,
+                        batch.engine.environment(),
+                        names,
+                        limits.kernel,
+                        scope,
+                    ),
+                )? {
+                    Outcome::Complete(derived) => derived,
+                    Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                    Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                };
+                let mut successor = match batch
+                    .engine
+                    .admit_declarations(&derived.declarations, options, limits)
+                    .map_err(EngineExecutionError::from)?
+                {
+                    Outcome::Complete(successor) => successor,
+                    Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
+                    Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
+                };
+                successor.engine.environment = fln_elab::instances::register_instance(
+                    successor.engine.environment(),
+                    &derived.instance,
+                    1000,
+                )
+                .map_err(|error| {
+                    frontend(fln_elab::source::SourceInferenceError::InstanceRegistry(
                         error,
-                    )),
-                ))
-            })?;
-            // Include every checked helper and dictionary in the ordinary
-            // admission stream. Module export/replay must see the whole command.
-            batch.admissions.extend(successor.admissions);
-            batch.engine = successor.engine;
-            batch.result_logical_root = batch.engine.logical_root(options);
+                    ))
+                })?;
+                successor.engine.environment = fln_elab::reducibility::register(
+                    successor.engine.environment(),
+                    &derived.instance,
+                    fln_elab::reducibility::Reducibility::ImplicitReducible,
+                )
+                .map_err(|error| {
+                    frontend(fln_elab::source::SourceInferenceError::Unification(
+                        Box::new(fln_elab::constraint::unify::UnificationError::Reducibility(
+                            error,
+                        )),
+                    ))
+                })?;
+                // Include every checked helper and dictionary in the ordinary
+                // admission stream. Module export/replay must see the whole command.
+                batch.admissions.extend(successor.admissions);
+                batch.engine = successor.engine;
+                batch.result_logical_root = batch.engine.logical_root(options);
+            }
         }
         Ok(Outcome::Complete(batch))
     }
@@ -1385,6 +1499,8 @@ pub(crate) enum ScopedCommandSyntax {
     Mutual(Vec<fln_syntax::tree::Syntax>),
     /// An `example`, checked and discarded.
     Example(fln_parse::ParsedSourceCommand),
+    /// Derive instances for an already admitted group of inductive types.
+    Deriving(fln_syntax::tree::Syntax),
     /// Every other declaration command.
     Definition(fln_parse::ParsedDefinition),
 }
@@ -1395,6 +1511,7 @@ impl ScopedCommandSyntax {
         match self {
             Self::Mutual(members) => members.iter().collect(),
             Self::Example(parsed) => vec![parsed.syntax()],
+            Self::Deriving(syntax) => vec![syntax],
             Self::Definition(parsed) => vec![parsed.syntax()],
         }
     }
@@ -1420,6 +1537,26 @@ pub(crate) fn parse_scoped_command_without_expansion(
     parse_scoped_command_with_expansion(source, false)
 }
 
+/// Detect the standalone command without imposing a second full parse on
+/// ordinary declarations. The byte search is only a prefilter: the parser's
+/// exact command kind, including comments and escaped identifiers, decides.
+pub(crate) fn parse_deriving_command(
+    source: &[u8],
+) -> Result<Option<fln_parse::ParsedSourceCommand>, EngineExecutionError> {
+    if !source
+        .windows(b"deriving".len())
+        .any(|part| part == b"deriving")
+    {
+        return Ok(None);
+    }
+    let Ok(parsed) = fln_parse::parse_source_command(source) else {
+        // A different command, such as a mutual group with a deriving suffix,
+        // may contain this token. Its ordinary parser owns any diagnostic.
+        return Ok(None);
+    };
+    Ok(fln_elab::source::deriving::is_command(parsed.syntax()).then_some(parsed))
+}
+
 fn parse_scoped_command_with_expansion(
     source: &[u8],
     expand_templates: bool,
@@ -1429,6 +1566,9 @@ fn parse_scoped_command_with_expansion(
         .map_err(EngineExecutionError::Frontend)?
     {
         return Ok(ScopedCommandSyntax::Mutual(members));
+    }
+    if let Some(parsed) = parse_deriving_command(source)? {
+        return Ok(ScopedCommandSyntax::Deriving(parsed.syntax().clone()));
     }
     // Under an entered grammar (`source_check::grammar`), the file's notations are expanded
     // before the elaborator reads the tree.
