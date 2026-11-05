@@ -268,7 +268,7 @@ impl Deprecations {
             return Err(DeprecationError::Limit);
         }
         let mut entries = BTreeMap::new();
-        for row in extension.entries() {
+        for (row, validation) in env.metadata_validation_entries(&journal_name()) {
             if row.payload.len() > MAX_ENTRY_BYTES {
                 return Err(DeprecationError::Limit);
             }
@@ -290,7 +290,7 @@ impl Deprecations {
             }
             for _ in 0..count {
                 let entry = decode(&mut bytes)?;
-                if !env.contains(&entry.declaration) {
+                if !validation.contains(&entry.declaration) {
                     return Err(DeprecationError::UnknownDeclaration(entry.declaration));
                 }
                 if entries.contains_key(&entry.declaration) {
@@ -302,6 +302,7 @@ impl Deprecations {
                 return Err(DeprecationError::Malformed);
             }
         }
+        entries.retain(|name, _| env.contains(name));
         Ok(Self { entries })
     }
 

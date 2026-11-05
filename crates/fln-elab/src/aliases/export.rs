@@ -77,7 +77,10 @@ pub fn registrations(
         bytes: 0,
     };
     let mut entries = Vec::new();
-    for (index, row) in current.entries().enumerate() {
+    for (index, (row, validation)) in result
+        .metadata_validation_entries(&extension_name())
+        .enumerate()
+    {
         meter.charge(1)?;
         if index < inherited_count {
             let old = inherited
@@ -103,7 +106,7 @@ pub fn registrations(
         if !bytes.is_empty() || alias.is_anonymous() || declaration.is_anonymous() {
             return Err(AliasError::Malformed);
         }
-        if !result.contains(&declaration) {
+        if !validation.contains(&declaration) {
             return Err(AliasError::UnknownDeclaration(declaration));
         }
         if index >= inherited_count {

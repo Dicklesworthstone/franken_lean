@@ -242,7 +242,7 @@ impl ReducibilityTable {
             return Err(ReducibilityError::Limit);
         }
         let mut table = Self::default();
-        for entry in extension.entries() {
+        for (entry, validation) in env.metadata_validation_entries(&extension_name()) {
             if entry.payload.len() > MAX_ENTRY_BYTES {
                 return Err(ReducibilityError::Limit);
             }
@@ -256,7 +256,7 @@ impl ReducibilityTable {
                 return Err(ReducibilityError::Malformed);
             };
             let status = Reducibility::from_tag(*tag).ok_or(ReducibilityError::Malformed)?;
-            if !env.contains(&declaration) {
+            if !validation.contains(&declaration) {
                 return Err(ReducibilityError::UnknownDeclaration(declaration));
             }
             if status == Reducibility::Irreducible {
@@ -266,6 +266,8 @@ impl ReducibilityTable {
             }
             table.statuses.insert(declaration, status);
         }
+        table.statuses.retain(|name, _| env.contains(name));
+        table.opaque_definitions.retain(|name| env.contains(name));
         Ok(table)
     }
 
@@ -316,39 +318,26 @@ impl ReducibilityTable {
     }
 }
 
-/// What [`ReducibilityTable::effective`] reads: the reducibility journal, the
-/// instance registry's journals, and the constant count it validates against.
-type CacheKey = (
-    Option<[u8; 32]>,
-    (Option<[u8; 32]>, Option<[u8; 32]>),
-    usize,
-);
-
 thread_local! {
     /// One thread's last table. Unification consults statuses on every unfold,
     /// so the table is re-read only when what it reads can have changed. A failed
     /// read is never kept.
-    static LAST: std::cell::RefCell<Option<(CacheKey, Arc<ReducibilityTable>)>> =
+    static LAST: std::cell::RefCell<Option<(Environment, Arc<ReducibilityTable>)>> =
         const { std::cell::RefCell::new(None) };
 }
 
 /// The environment's effective table, read once per change of what it reads.
 pub fn table(env: &Environment) -> Result<Arc<ReducibilityTable>, ReducibilityError> {
-    let key = (
-        journal_digest(env),
-        crate::instances::registry_identity(env),
-        env.len(),
-    );
     if let Some(table) = LAST.with(|last| {
         last.borrow()
             .as_ref()
-            .filter(|(cached, _)| *cached == key)
+            .filter(|(cached, _)| cached == env)
             .map(|(_, table)| Arc::clone(table))
     }) {
         return Ok(table);
     }
     let table = Arc::new(ReducibilityTable::effective(env)?);
-    LAST.with(|last| *last.borrow_mut() = Some((key, Arc::clone(&table))));
+    LAST.with(|last| *last.borrow_mut() = Some((env.clone(), Arc::clone(&table))));
     Ok(table)
 }
 

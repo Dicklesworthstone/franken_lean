@@ -293,13 +293,13 @@ impl ExternTable {
         }
         charge(extension.len()).map_err(ExternReadError::Budget)?;
         let mut table = Self::default();
-        for entry in extension.entries() {
+        for (entry, validation) in env.metadata_validation_entries(&journal_name()) {
             if entry.payload.len() > MAX_ENTRY_BYTES {
                 return Err(ExternError::Limit.into());
             }
             charge(entry.payload.len()).map_err(ExternReadError::Budget)?;
             let (declaration, entries) = decode_entry(&entry.payload)?;
-            if !env.contains(&declaration) {
+            if !validation.contains(&declaration) {
                 return Err(ExternError::UnknownDeclaration(declaration).into());
             }
             table
@@ -308,6 +308,7 @@ impl ExternTable {
                 .map_err(|_| ExternError::Limit)?;
             table.entries.insert(declaration, entries);
         }
+        table.entries.retain(|name, _| env.contains(name));
         Ok(table)
     }
 

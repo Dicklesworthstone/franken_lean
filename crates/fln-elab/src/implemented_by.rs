@@ -199,13 +199,13 @@ impl ImplementedByTable {
         }
         spend(extension.len())?;
         let mut table = Self::default();
-        for entry in extension.entries() {
+        for (entry, validation) in env.metadata_validation_entries(&journal_name()) {
             if entry.payload.len() > MAX_ENTRY_BYTES {
                 return Err(ImplementedByError::Limit.into());
             }
             spend(entry.payload.len())?;
             let (declaration, implementation) = decode_entry(&entry.payload)?;
-            signature::validate(env, &declaration, &implementation, &mut spend)?;
+            signature::validate(validation, &declaration, &implementation, &mut spend)?;
             table
                 .entries
                 .try_reserve(1)
@@ -213,6 +213,8 @@ impl ImplementedByTable {
             table.entries.insert(declaration, implementation);
         }
         table.resolve_chains(&mut spend)?;
+        table.entries.retain(|name, _| env.contains(name));
+        table.resolved.retain(|name, _| env.contains(name));
         Ok(table)
     }
 

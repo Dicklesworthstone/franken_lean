@@ -125,7 +125,7 @@ impl AliasTable {
             return Err(AliasError::Limit);
         }
         let mut table = Self::default();
-        for entry in extension.entries() {
+        for (entry, validation) in env.metadata_validation_entries(&extension_name()) {
             if entry.payload.len() > MAX_ENTRY_BYTES {
                 return Err(AliasError::Limit);
             }
@@ -139,8 +139,11 @@ impl AliasTable {
             if !bytes.is_empty() {
                 return Err(AliasError::Malformed);
             }
-            if !env.contains(&declaration) {
+            if !validation.contains(&declaration) {
                 return Err(AliasError::UnknownDeclaration(declaration));
+            }
+            if !env.contains(&declaration) {
+                continue;
             }
             let targets = table.targets.entry(alias).or_default();
             if !targets.contains(&declaration) {
@@ -168,26 +171,22 @@ impl AliasTable {
 }
 
 /// One elaboration's alias table, re-read only when what [`AliasTable::read`]
-/// reads can have changed: the alias journal, or the constants it validates
-/// against (by count). A failed read is never kept.
+/// reads can have changed, including the exact imported validation context and
+/// the logical declarations whose aliases it may select. A failed read is never kept.
 #[derive(Clone, Default)]
 pub(crate) struct AliasCache {
-    last: std::cell::RefCell<Option<(CacheKey, std::sync::Arc<AliasTable>)>>,
+    last: std::cell::RefCell<Option<(Environment, std::sync::Arc<AliasTable>)>>,
 }
-
-/// The alias journal's digest (if any) and the environment's constant count.
-type CacheKey = (Option<[u8; 32]>, usize);
 
 impl AliasCache {
     pub(crate) fn read(&self, env: &Environment) -> Result<std::sync::Arc<AliasTable>, AliasError> {
-        let key = (journal_digest(env), env.len());
         if let Some((cached, table)) = self.last.borrow().as_ref()
-            && *cached == key
+            && cached == env
         {
             return Ok(std::sync::Arc::clone(table));
         }
         let table = std::sync::Arc::new(AliasTable::read(env)?);
-        *self.last.borrow_mut() = Some((key, std::sync::Arc::clone(&table)));
+        *self.last.borrow_mut() = Some((env.clone(), std::sync::Arc::clone(&table)));
         Ok(table)
     }
 }
@@ -239,6 +238,49 @@ mod tests {
             register(&env, &Name::anonymous(), &n("A.x")),
             Err(AliasError::Malformed)
         );
+    }
+
+    #[test]
+    fn checked_imported_aliases_validate_hidden_rows_without_selecting_them() {
+        let complete = with_axiom(&with_axiom(&Environment::new(), "Public"), "Private");
+        let complete = register(&complete, &n("choice"), &n("Private")).unwrap();
+        let complete = register(&complete, &n("choice"), &n("Public")).unwrap();
+        let mut projected = Environment::new()
+            .with_entry(complete.entry(&n("Public")).unwrap())
+            .unwrap();
+        let state = complete.extension(&extension_name()).unwrap();
+        projected = projected
+            .register_extension(state.descriptor.clone())
+            .unwrap();
+        for entry in state.entries() {
+            projected = projected
+                .push_extension_entry(&extension_name(), std::sync::Arc::clone(&entry.payload))
+                .unwrap();
+        }
+        let cache = AliasCache::default();
+        assert!(cache.read(&projected).is_err());
+        let bound = projected.with_imported_metadata_validation(&complete);
+        assert_eq!(
+            cache.read(&bound).unwrap().targets(&n("choice")),
+            [n("Public")]
+        );
+        assert!(!bound.contains(&n("Private")));
+        assert!(
+            cache.read(&projected).is_err(),
+            "the validation context is part of the cache key"
+        );
+        assert_eq!(
+            AliasTable::read(&complete).unwrap().targets(&n("choice")),
+            [n("Private"), n("Public")]
+        );
+        let copied_private_row = state.entries().next().unwrap().payload.clone();
+        let forged_suffix = bound
+            .push_extension_entry(&extension_name(), copied_private_row)
+            .unwrap();
+        assert!(matches!(
+            AliasTable::read(&forged_suffix),
+            Err(AliasError::UnknownDeclaration(name)) if name == n("Private")
+        ));
     }
 
     #[test]

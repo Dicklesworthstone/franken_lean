@@ -430,7 +430,7 @@ impl Context {
         let (Some(index), Some(entry)) = (index, simp_rule_entry(rule)) else {
             return true;
         };
-        self.with_simp_key(&entry, index.environment, &index.table, side, |key| {
+        self.with_simp_key(&entry, &index.environment, &index.table, side, |key| {
             key.is_none_or(|key| index.admits(key))
         })
     }
@@ -441,16 +441,16 @@ impl Context {
     fn with_simp_key<R>(
         &self,
         entry: &scope::simp::SimpEntry,
-        environment: SimpKeyEnvironment,
+        environment: &SimpKeyEnvironment,
         table: &crate::reducibility::ReducibilityTable,
         side: SimpKeySide,
         read: impl FnOnce(Option<&SimpKey>) -> R,
     ) -> R {
         let cache = Arc::clone(&self.simp_key_cache.0);
         let mut memo = cache.lock().unwrap_or_else(PoisonError::into_inner);
-        if memo.environment.as_ref() != Some(&environment) {
+        if memo.environment.as_ref() != Some(environment) {
             *memo = SimpKeyMemo {
-                environment: Some(environment),
+                environment: Some(environment.clone()),
                 ..SimpKeyMemo::default()
             };
         }
@@ -486,7 +486,7 @@ impl Context {
         })?;
         let environment = simp_key_environment(&self.txn.env);
         Ok(
-            self.with_simp_key(&entry, environment, &table, SimpKeySide::Rewrite, |key| {
+            self.with_simp_key(&entry, &environment, &table, SimpKeySide::Rewrite, |key| {
                 key.cloned()
             }),
         )
@@ -1876,18 +1876,10 @@ impl SimpTargetIndex {
 }
 
 /// What a rule's key depends on: the declarations and reducibility statuses.
-type SimpKeyEnvironment = (
-    Option<[u8; 32]>,
-    (Option<[u8; 32]>, Option<[u8; 32]>),
-    usize,
-);
+type SimpKeyEnvironment = Environment;
 
 fn simp_key_environment(env: &Environment) -> SimpKeyEnvironment {
-    (
-        crate::reducibility::journal_digest(env),
-        crate::instances::registry_identity(env),
-        env.len(),
-    )
+    env.clone()
 }
 
 /// Registered rules' keys, a pure function of the environment they were read in.

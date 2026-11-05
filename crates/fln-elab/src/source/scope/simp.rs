@@ -866,14 +866,14 @@ fn read_state(env: &Environment) -> Result<SimpState, SimpSetError> {
     let mut active: BTreeMap<Name, BTreeMap<Option<Name>, SimpEntry>> = BTreeMap::new();
     let mut unfold_theorems: BTreeMap<Name, Vec<Name>> = BTreeMap::new();
     let mut erase_work = MAX_JOURNAL_BYTES;
-    for (order, row) in extension.entries().enumerate() {
+    for (order, (row, validation)) in env.metadata_validation_entries(&expected.name).enumerate() {
         match decode_entry(&row.payload, order)? {
             JournalEntry::Add { entry, .. } if entry.proof.is_none() => {
-                validate(env, &entry.declaration, entry.reverse)?;
+                validate(validation, &entry.declaration, entry.reverse)?;
                 active.insert(entry.declaration.clone(), BTreeMap::from([(None, entry)]));
             }
             JournalEntry::Erase(declaration) => {
-                if !env.contains(&declaration) {
+                if !validation.contains(&declaration) {
                     return Err(SimpSetError::UnknownDeclaration(declaration));
                 }
                 let mut pending = vec![declaration];
@@ -893,17 +893,17 @@ fn read_state(env: &Environment) -> Result<SimpState, SimpSetError> {
                 declaration,
                 theorems,
             } => {
-                imports::validate_unfold_theorems(env, &declaration, &theorems)?;
+                imports::validate_unfold_theorems(validation, &declaration, &theorems)?;
                 // Like the pin, keep the association after erasure. Re-adding
                 // an equation origin must still be erased by the definition.
                 unfold_theorems.insert(declaration, theorems);
             }
             JournalEntry::Add { entry, .. } => {
                 let proof = entry.proof.as_ref().ok_or(SimpSetError::Malformed)?;
-                if !env.contains(&entry.declaration) {
+                if !validation.contains(&entry.declaration) {
                     return Err(SimpSetError::UnknownDeclaration(entry.declaration));
                 }
-                imports::validate_proof(env, proof)?;
+                imports::validate_proof(validation, proof)?;
                 // A persisted theorem group replaces a prior ordinary source
                 // selection, but its auxiliary lemmas coexist with each other.
                 let group = active.entry(entry.declaration.clone()).or_default();
@@ -915,7 +915,15 @@ fn read_state(env: &Environment) -> Result<SimpState, SimpSetError> {
     let mut rows: Vec<SimpEntry> = active
         .into_values()
         .flat_map(BTreeMap::into_values)
+        .filter(|entry| {
+            env.contains(&entry.declaration)
+                && entry.proof.as_ref().is_none_or(|proof| env.contains(proof))
+        })
         .collect();
+    unfold_theorems.retain(|name, theorems| {
+        theorems.retain(|theorem| env.contains(theorem));
+        env.contains(name)
+    });
     rows.sort_by(|a, b| {
         b.priority
             .cmp(&a.priority)

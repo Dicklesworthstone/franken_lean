@@ -207,6 +207,14 @@ impl RecordParents {
     }
 
     pub fn read(env: &Environment) -> Result<Self, RecordError> {
+        let mut registry = Self::read_all(env)?;
+        registry.rows.retain(|name, _| env.contains(name));
+        Ok(registry)
+    }
+
+    /// Retain inaccessible imported rows while cross-validating the exact
+    /// structure journals. They are not offered by the public traversal view.
+    pub(super) fn read_all(env: &Environment) -> Result<Self, RecordError> {
         let Some(extension) = env.extension(&extension_name()) else {
             return Ok(Self::default());
         };
@@ -219,12 +227,12 @@ impl RecordParents {
         let mut bytes_left = MAX_BYTES;
         let mut remaining = RecordBudget::default().max_nodes;
         let mut registry = Self::default();
-        for entry in extension.entries() {
+        for (entry, validation) in env.metadata_validation_entries(&extension_name()) {
             bytes_left = bytes_left
                 .checked_sub(entry.payload.len())
                 .ok_or(RecordError::ResourceLimit)?;
             let row = decode(&entry.payload)?;
-            validate(env, &row, &mut remaining)?;
+            validate(validation, &row, &mut remaining)?;
             registry.insert(row)?;
         }
         Ok(registry)
@@ -271,7 +279,7 @@ pub(super) struct Registration {
 
 impl Registration {
     pub(super) fn read(env: &Environment) -> Result<Self, RecordError> {
-        let registry = RecordParents::read(env)?;
+        let registry = RecordParents::read_all(env)?;
         let count: usize = registry.rows.values().map(Vec::len).sum();
         let rows_left = MAX_ROWS
             .checked_sub(count)

@@ -64,7 +64,10 @@ pub fn registrations(
     let mut exported = Registrations::default();
     let (imported_classes, imported_bytes) = imported::export_classes(result, &mut remaining)?;
     exported.bytes_examined = imported_bytes;
-    for (order, entry) in current.entries().enumerate() {
+    for (order, (entry, validation)) in result
+        .metadata_validation_entries(&extension_name())
+        .enumerate()
+    {
         tick(&mut remaining)?;
         let owned = order >= start;
         if !owned {
@@ -101,7 +104,7 @@ pub fn registrations(
             if !bytes.is_empty() || !classes.insert(class.clone()) {
                 return Err(InstanceRegistryError::Malformed);
             }
-            validate_class(result, &class)?;
+            validate_class(validation, &class)?;
             if owned {
                 if base.contains(&class) {
                     return Ok(None);
@@ -120,7 +123,7 @@ pub fn registrations(
                     name: class,
                     parameters,
                 });
-            } else if !base.contains(&class) {
+            } else if !base.contains(&class) && std::ptr::eq(validation, result) {
                 return Err(InstanceRegistryError::Malformed);
             }
             continue;
@@ -142,14 +145,14 @@ pub fn registrations(
         if !bytes.is_empty()
             || declaration.is_anonymous()
             || scope.as_ref().is_some_and(Name::is_anonymous)
-            || !result.contains(&declaration)
+            || !validation.contains(&declaration)
         {
             return Err(InstanceRegistryError::Malformed);
         }
         if owned && base.contains(&declaration) {
             return Ok(None);
         }
-        if !owned && !base.contains(&declaration) {
+        if !owned && !base.contains(&declaration) && std::ptr::eq(validation, result) {
             return Err(InstanceRegistryError::Malformed);
         }
         if let Some((old_class, old_scope)) = positions.get(&declaration) {

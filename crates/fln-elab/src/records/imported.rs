@@ -487,6 +487,12 @@ impl ImportedStructures {
     }
 
     pub fn read(env: &Environment) -> Result<Self, RecordError> {
+        let mut registry = Self::read_all(env)?;
+        registry.entries.retain(|name, _| env.contains(name));
+        Ok(registry)
+    }
+
+    fn read_all(env: &Environment) -> Result<Self, RecordError> {
         let Some(extension) = env.extension(&extension_name()) else {
             return Ok(Self::default());
         };
@@ -500,8 +506,8 @@ impl ImportedStructures {
         let mut bytes_left = MAX_BYTES;
         let mut cells_left = MAX_CELLS;
         let mut entries = BTreeMap::new();
-        let native = RecordParents::read(env)?;
-        for payload in extension.entries() {
+        let native = RecordParents::read_all(env)?;
+        for (payload, validation) in env.metadata_validation_entries(&extension_name()) {
             if payload.payload.len() > MAX_PAYLOAD {
                 return Err(RecordError::ResourceLimit);
             }
@@ -510,7 +516,7 @@ impl ImportedStructures {
                 .ok_or(RecordError::ResourceLimit)?;
             let mut bytes: &[u8] = payload.payload.as_ref();
             let row = decode(&mut bytes, &mut cells_left)?;
-            let parents = validate(env, &row, &mut remaining)?;
+            let parents = validate(validation, &row, &mut remaining)?;
             if native.parents(&row.name) != parents.as_slice() {
                 return Err(RecordError::InvalidTelescope);
             }
@@ -548,7 +554,7 @@ pub(crate) struct Activation {
 
 impl Activation {
     pub(crate) fn read(env: &Environment) -> Result<Self, RecordError> {
-        let registry = ImportedStructures::read(env)?;
+        let registry = ImportedStructures::read_all(env)?;
         let native = super::inheritance::Registration::read(env)?;
         let mut cells_left = MAX_CELLS;
         let mut bytes_left = MAX_BYTES;
