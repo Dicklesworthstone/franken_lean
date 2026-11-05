@@ -14,7 +14,7 @@
 
 use super::{
     ErasedOperands, GeneratedExternRow, IrDecl, IrExecutionError, IrParam, IrType, Name, Ownership,
-    array_proofs, erased_type_runtime_arity, extern_row, primitives,
+    array_proofs, erased_type_runtime_arity, extern_row, primitives, state_runtime_arity,
 };
 
 /// Recognize the compiler's structural suffix, not a dotted-name string or
@@ -29,7 +29,9 @@ pub(in crate::imported_ir) fn boxed_row(name: &Name) -> Option<&'static Generate
 
 #[derive(Clone, Copy)]
 pub(in crate::imported_ir) struct BoxedNative {
-    operands: ErasedOperands,
+    erased_prefix: usize,
+    erased_suffix: usize,
+    world_suffix: bool,
     parameters: &'static [IrType],
     result: &'static IrType,
 }
@@ -40,13 +42,37 @@ impl BoxedNative {
     ) -> Result<Option<Self>, IrExecutionError> {
         if let Some(signature) = primitives::signature(row)? {
             return Ok(Some(Self {
-                operands: ErasedOperands {
-                    runtime: signature.parameters.len(),
-                    type_prefix: false,
-                    proof_suffix: 0,
-                },
+                erased_prefix: 0,
+                erased_suffix: 0,
+                world_suffix: false,
                 parameters: signature.parameters,
                 result: signature.result,
+            }));
+        }
+        if let Some(runtime) = state_runtime_arity(row)? {
+            // Init.System.ST retains sigma, alpha and the world in its IR
+            // telescope. ExplicitBoxing keeps all of them in the closure;
+            // LCNF.Types boxes the Void world as Tagged, not TObject.
+            let parameters: &'static [IrType] = match runtime {
+                1 => &[IrType::TObject],
+                2 => &[IrType::TObject, IrType::TObject],
+                _ => {
+                    return Err(IrExecutionError::NativeContract {
+                        declaration: Name::from_components(row.name.split('.')),
+                        detail: "state primitive has no reviewed native IR types".to_owned(),
+                    });
+                }
+            };
+            return Ok(Some(Self {
+                erased_prefix: 2,
+                erased_suffix: 0,
+                world_suffix: true,
+                parameters,
+                result: if row.id == "extern:ST.Prim.Ref.set" {
+                    &IrType::Tagged
+                } else {
+                    &IrType::TObject
+                },
             }));
         }
         // Void.mk's inert-world convention belongs to the separate state
@@ -127,25 +153,31 @@ impl BoxedNative {
             });
         }
         Ok(Some(Self {
-            operands,
+            erased_prefix: usize::from(operands.type_prefix),
+            erased_suffix: operands.proof_suffix,
+            world_suffix: false,
             parameters,
             result,
         }))
     }
 
     pub(in crate::imported_ir) fn arity(self) -> usize {
-        self.operands.runtime + usize::from(self.operands.type_prefix) + self.operands.proof_suffix
+        self.parameters.len()
+            + self.erased_prefix
+            + self.erased_suffix
+            + usize::from(self.world_suffix)
     }
 
     pub(in crate::imported_ir) fn runtime_parameters(self) -> std::ops::Range<usize> {
-        let start = usize::from(self.operands.type_prefix);
-        start..start + self.operands.runtime
+        self.erased_prefix..self.erased_prefix + self.parameters.len()
     }
 
     fn parameter_type(self, index: usize) -> &'static IrType {
         let runtime = self.runtime_parameters();
         if runtime.contains(&index) {
             &self.parameters[index - runtime.start]
+        } else if self.world_suffix && index == self.arity() - 1 {
+            &IrType::Void
         } else {
             &IrType::Erased
         }
@@ -161,7 +193,7 @@ impl BoxedNative {
         result: &IrType,
     ) -> Result<(), IrExecutionError> {
         let ownership = Ownership::parse(row.ownership)
-            .and_then(|ownership| ownership.argument_ownership(self.operands.runtime))
+            .and_then(|ownership| ownership.argument_ownership(self.parameters.len()))
             .map_err(|error| IrExecutionError::NativeContract {
                 declaration: Name::from_components(row.name.split('.')),
                 detail: error.to_string(),
@@ -215,7 +247,7 @@ impl BoxedNative {
 fn boxed_type(ty: &IrType) -> &IrType {
     match ty {
         IrType::Erased | IrType::USize | IrType::UInt32 => &IrType::TObject,
-        IrType::UInt8 | IrType::UInt16 => &IrType::Tagged,
+        IrType::Void | IrType::UInt8 | IrType::UInt16 => &IrType::Tagged,
         IrType::UInt64 | IrType::Float | IrType::Float32 => &IrType::Object,
         _ => ty,
     }

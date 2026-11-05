@@ -81,7 +81,11 @@ fn compile_module(
         .decls
         .iter()
         .filter_map(|declaration| match declaration {
-            IrDecl::Function { name, .. } if native_row(name).is_none() => Some(name.clone()),
+            IrDecl::Function { name, .. }
+                if native_row(name).is_none() && native_signature::boxed_row(name).is_none() =>
+            {
+                Some(name.clone())
+            }
             _ => None,
         })
         .collect();
@@ -402,5 +406,6 @@ fn local_state_preparation_is_bounded_and_does_not_mutate_input_ir() {
     assert_nat_replay(&prepare(&module), "42");
 }
 
+mod boxed;
 mod reference;
 mod take;

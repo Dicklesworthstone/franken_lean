@@ -66,3 +66,42 @@ public section
   update fun value => value + n
   update fun value => value + 1
   r.get
+
+-- Keep the primitive itself first class. These helpers deliberately prevent
+-- specialization from replacing a primitive closure with a direct extern call.
+@[noinline, nospecialize] def localStateRunAction {σ α : Type}
+    (action : ST σ α) : ST σ α := action
+
+@[noinline, nospecialize] def localStateUseAllocator {σ : Type}
+    (allocate : Nat → ST σ (ST.Ref σ Nat)) (n : Nat) : ST σ (ST.Ref σ Nat) :=
+  allocate n
+
+@[noinline, nospecialize] def localStateUseSetter {σ : Type}
+    (write : Nat → ST σ Unit) (first second : Nat) : ST σ Unit := do
+  write first
+  write second
+
+@[noinline, nospecialize] def localStateUseSwap {σ : Type}
+    (exchange : Nat → ST σ Nat) (first second : Nat) : ST σ Nat := do
+  let old ← exchange first
+  let next ← exchange second
+  return old + next
+
+@[noinline] def localStateBoxedAnswer (n : Nat) : Nat := runST fun σ => do
+  let r ← localStateUseAllocator (σ := σ) ST.Prim.mkRef n
+  let read := ST.Prim.Ref.get r
+  let before ← localStateRunAction read
+  localStateUseSetter (ST.Prim.Ref.set r) (n + 1) (n + 2)
+  let previous ← localStateUseSwap (ST.Prim.Ref.swap r) (n + 3) (n + 4)
+  let current ← localStateRunAction read
+  return before + previous + current
+
+@[noinline] unsafe def localStateBoxedTakeAnswer (n : Nat) : Nat := runST fun σ => do
+  let r ← localStateUseAllocator (σ := σ) ST.Prim.mkRef n
+  let take := ST.Prim.Ref.take r
+  let first ← localStateRunAction take
+  localStateUseSetter (ST.Prim.Ref.set r) (n + 1) (n + 2)
+  let second ← localStateRunAction take
+  ST.Prim.Ref.set r (n + 3)
+  let current ← localStateRunAction (ST.Prim.Ref.get r)
+  return first + second + current

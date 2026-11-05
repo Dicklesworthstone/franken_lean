@@ -372,19 +372,88 @@ fn native_boxed_proof_arguments_never_hide_bad_scope_arity_or_bounds() {
         ),
         Err(IrExecutionError::IrValidation(_))
     ));
-    for arguments in [vec![var(7)], vec![var(7), IrArg::Erased, IrArg::Erased]] {
-        let compiled = read(vec![IrArg::Erased, var(4)], arguments, 0).unwrap();
-        assert!(matches!(
-            compiled.execute(ExecutionLimits::default(), None).outcome,
-            Outcome::Complete(VmExit::Refused {
-                refusal: VmRefusal::ApplyResultOwnershipMismatch {
-                    expected: flbc::CallableResultOwnership::Owned,
-                    actual: flbc::CallableResultOwnership::Erased,
-                    ..
-                },
+    let overapplied = read(
+        vec![IrArg::Erased, var(4)],
+        vec![var(7), IrArg::Erased, IrArg::Erased],
+        0,
+    )
+    .unwrap();
+    assert!(matches!(
+        overapplied
+            .execute(ExecutionLimits::default(), None)
+            .outcome,
+        Outcome::Complete(VmExit::Refused {
+            refusal: VmRefusal::ApplyResultOwnershipMismatch {
+                expected: flbc::CallableResultOwnership::Owned,
+                actual: flbc::CallableResultOwnership::Erased,
                 ..
-            })
-        ));
+            },
+            ..
+        })
+    ));
+    for index in [0, 1] {
+        // Applying only the index leaves the erased proof pending. Neither a
+        // successful read nor an out-of-bounds read may execute at this stage.
+        let pending = read(vec![IrArg::Erased, var(4)], vec![var(7)], index).unwrap();
+        let bytes = flbc::encode_canonical(pending.program.program(), flbc::CodecLimits::default())
+            .unwrap();
+        let replay = flbc::decode_canonical(&bytes, flbc::CodecLimits::default()).unwrap();
+        for program in [pending.program.program(), &replay] {
+            let outcome = execute(program, ExecutionLimits::default(), None);
+            let Outcome::Complete(VmExit::Returned(completed)) = outcome else {
+                panic!("pending proof at index {index}: {outcome:?}");
+            };
+            let (arity, captures) = completed.value.closure_shell_parts().unwrap();
+            assert_eq!(arity, 5, "target word plus the four-operand telescope");
+            assert_eq!(captures.len(), 4, "target, type, array and index only");
+            assert_eq!(
+                nat_decimal(&captures[3]).as_deref(),
+                Some(if index == 0 { "0" } else { "1" })
+            );
+        }
+
+        let mut stmts = array_setup(false, index);
+        stmts.extend([
+            bind(
+                8,
+                IrExpr::Pap {
+                    function: name("Array.getInternal._boxed"),
+                    args: vec![IrArg::Erased, var(4)],
+                },
+            ),
+            bind(
+                9,
+                IrExpr::Ap {
+                    x: 8,
+                    args: vec![var(7)],
+                },
+            ),
+            bind(
+                10,
+                IrExpr::Ap {
+                    x: 9,
+                    args: vec![IrArg::Erased],
+                },
+            ),
+        ]);
+        let completed = compile_declarations(vec![entry(stmts, 10)]).unwrap();
+        if index == 0 {
+            assert_nat(&completed, "19");
+        } else {
+            let bytes =
+                flbc::encode_canonical(completed.program.program(), flbc::CodecLimits::default())
+                    .unwrap();
+            let replay = flbc::decode_canonical(&bytes, flbc::CodecLimits::default()).unwrap();
+            for program in [completed.program.program(), &replay] {
+                assert!(matches!(
+                    execute(program, ExecutionLimits::default(), None),
+                    Outcome::Complete(VmExit::Refused {
+                        refusal: VmRefusal::ArrayIndexOutOfBounds { index: 1, size: 1 },
+                        ..
+                    })
+                ));
+            }
+        }
     }
     let out_of_bounds = read(vec![IrArg::Erased, var(4)], vec![var(7), IrArg::Erased], 1).unwrap();
     assert!(matches!(

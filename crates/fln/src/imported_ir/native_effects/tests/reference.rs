@@ -98,6 +98,28 @@ fn live_pinned_local_state_matches_reference_and_canonical_replay() {
             _ => None,
         })
         .collect();
+    let boxed_partials: BTreeSet<_> = module
+        .decls
+        .iter()
+        .flat_map(|declaration| match declaration {
+            IrDecl::Function { body, .. } => body.bodies(),
+            IrDecl::Extern { .. } => Vec::new(),
+        })
+        .flat_map(|body| &body.stmts)
+        .filter_map(|statement| match statement {
+            IrStmt::VDecl {
+                expr: IrExpr::Pap { function, .. },
+                ..
+            } => Some(function.clone()),
+            _ => None,
+        })
+        .collect();
+    for operation in CELL_ROWS.into_iter().chain(["ST.Prim.Ref.take"]) {
+        assert!(
+            boxed_partials.contains(&Name::str(name(operation), "_boxed")),
+            "{operation} partial application optimized away; {dir:?}"
+        );
+    }
     let modules = [module, state_module];
 
     let cases = [
@@ -112,6 +134,12 @@ fn live_pinned_local_state_matches_reference_and_canonical_replay() {
         ("localStateArrayModifyAnswer", 42),
         ("localStateModifyClosureAnswer", 19),
         ("localStateModifyClosureAnswer", u64::MAX),
+        ("localStateBoxedAnswer", 0),
+        ("localStateBoxedAnswer", 19),
+        ("localStateBoxedAnswer", u64::MAX),
+        ("localStateBoxedTakeAnswer", 0),
+        ("localStateBoxedTakeAnswer", 23),
+        ("localStateBoxedTakeAnswer", u64::MAX),
     ];
     let mut oracle_source = source.to_owned();
     for (entry, value) in cases {
@@ -156,6 +184,15 @@ fn live_pinned_local_state_matches_reference_and_canonical_replay() {
         )
         .unwrap_or_else(|error| panic!("{entry} {value}: {error:?}; artifacts {dir:?}"));
         assert_nat_replay(&compiled, expected);
+        assert!(compiled.reference_functions().iter().all(|function| {
+            CELL_ROWS
+                .into_iter()
+                .chain(["ST.Prim.Ref.take"])
+                .all(|operation| {
+                    function.name != name(operation)
+                        && function.name != Name::str(name(operation), "_boxed")
+                })
+        }));
         let stopped = compiled.execute(
             ExecutionLimits {
                 max_steps: 0,
