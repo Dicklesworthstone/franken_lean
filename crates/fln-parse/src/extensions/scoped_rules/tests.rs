@@ -58,6 +58,15 @@ fn namespace_activation_snapshots_and_temporary_views_are_independent() {
 }
 
 #[test]
+fn malformed_snapshot_order_is_refused_instead_of_exposing_imported_fallbacks() {
+    let mut file = base();
+    let original = file.active_template_snapshot().unwrap();
+    file.rule_scopes.get_mut(&key()).unwrap().clear();
+    assert!(file.active_template_snapshot().is_err());
+    assert_eq!(original.rules[&key()].cases().count(), 1);
+}
+
+#[test]
 fn malformed_imported_scope_metadata_is_rejected_before_any_mutation() {
     let module = scoped().export_native().unwrap();
     for shape in 0..3 {

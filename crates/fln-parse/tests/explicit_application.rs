@@ -48,6 +48,56 @@ fn missing_explicit_heads_are_not_repaired_and_nat_only_stays_narrow() {
     assert!(parse_nat_definition(b"def x : Nat := @f Nat 7").is_err());
 }
 
+#[test]
+fn no_implicit_lambda_wraps_one_max_precedence_term() {
+    let text = "def x := no_implicit_lambda% f a";
+    let parsed = parse_definition(text.as_bytes()).unwrap();
+    assert_eq!(parsed.reconstruct_original(), text.as_bytes());
+    assert_eq!(parsed.reconstruct_normalized().unwrap(), text.as_bytes());
+    let app = term_args(parsed.syntax(), "app");
+    let wrapper = term_args(&app[0], "noImplicitLambda");
+    assert_eq!(wrapper.len(), 2);
+    assert!(matches!(&wrapper[0], Syntax::Atom { val, .. } if val == "no_implicit_lambda%"));
+    assert!(
+        matches!(&wrapper[1], Syntax::Ident { val, .. } if val == &Name::from_components(["f"]))
+    );
+    let Syntax::Node { args, .. } = &app[1] else {
+        panic!("application arguments");
+    };
+    assert_eq!(args.len(), 1);
+    assert!(matches!(&args[0], Syntax::Ident { val, .. } if val == &Name::from_components(["a"])));
+
+    let text = "def x := no_implicit_lambda% -- one operand\r\n (f a)\r\n";
+    let parsed = parse_definition(text.as_bytes()).unwrap();
+    assert_eq!(parsed.reconstruct_original(), text.as_bytes());
+    let wrapper = term_args(parsed.syntax(), "noImplicitLambda");
+    assert!(matches!(&wrapper[1], Syntax::Node { kind, .. }
+        if kind == &Name::from_components(["Lean", "Parser", "Term", "paren"])));
+    assert_eq!(term_args(&wrapper[1], "app").len(), 2);
+}
+
+#[test]
+fn no_implicit_lambda_requires_an_operand_and_keeps_escaped_names() {
+    for source in [
+        "def x := no_implicit_lambda%",
+        "def x := (no_implicit_lambda%)",
+        "def x := no_implicit_lambda% + 1",
+    ] {
+        assert!(parse_definition(source.as_bytes()).is_err(), "{source}");
+    }
+    let parsed = parse_definition("def x := «no_implicit_lambda%»".as_bytes()).unwrap();
+    let mut pending = vec![parsed.syntax()];
+    while let Some(syntax) = pending.pop() {
+        if let Syntax::Node { kind, args, .. } = syntax {
+            assert_ne!(
+                kind,
+                &Name::from_components(["Lean", "Parser", "Term", "noImplicitLambda"])
+            );
+            pending.extend(args);
+        }
+    }
+}
+
 fn term_args<'a>(syntax: &'a Syntax, name: &str) -> &'a [Syntax] {
     let target = Name::from_components(["Lean", "Parser", "Term", name]);
     let mut pending = vec![syntax];

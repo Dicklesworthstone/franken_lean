@@ -47,7 +47,7 @@ use crate::Environment;
 use fln_core::name::Name;
 use fln_elab::source::scope::SourceScope;
 use fln_parse::command_scope::ScopeCommand;
-use fln_parse::extensions::{FileGrammar, NotationRule, with_grammar};
+use fln_parse::extensions::{FileGrammar, NotationRule, TemplateSnapshot, with_grammar};
 use fln_syntax::tree::Syntax;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -280,9 +280,16 @@ impl SourceGrammar {
         &self,
         environment: &Environment,
     ) -> Result<Environment, EngineExecutionError> {
+        let exported = self
+            .file
+            .export_native_for_replay()
+            .map_err(|feature| EngineExecutionError::NotImplemented { feature })?;
+        if self.module_system && !exported.is_empty() {
+            return Err(Self::module_phase_refusal());
+        }
         journal::publish(
             environment,
-            &self.export_native()?,
+            &exported,
             &self.rule_sources,
             self.declared_syntax,
         )
@@ -302,8 +309,17 @@ impl SourceGrammar {
     /// The exact lexical template view for the imported MacroM dispatcher.
     /// The dispatcher performs root expansion inside its ordinary traversal;
     /// no independent native expansion pass runs before or after it.
-    pub(crate) fn templates(&self) -> Arc<BTreeMap<Name, Arc<NotationRule>>> {
-        self.file.active_template_rules()
+    pub(crate) fn templates(&self) -> Result<TemplateSnapshot, EngineExecutionError> {
+        self.file
+            .active_template_snapshot()
+            .map_err(|feature| EngineExecutionError::NotImplemented { feature })
+    }
+
+    pub(crate) fn bind_imported_macros(
+        &mut self,
+        registry: &crate::imported_macros::registrations::RegisteredMacros,
+    ) {
+        registry.bind_source_grammar(&mut self.file);
     }
 
     /// The notations active here, as a printer applies them

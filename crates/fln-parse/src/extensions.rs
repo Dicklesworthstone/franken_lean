@@ -83,6 +83,7 @@ mod macro_rules;
 mod modules;
 mod quotation;
 mod scoped_rules;
+pub use scoped_rules::{TemplateClauseOrder, TemplateSnapshot};
 mod template_dispatch;
 mod unexpanders;
 pub use artifacts::{ImportedSyntaxEntry, ImportedSyntaxModule};
@@ -1222,6 +1223,11 @@ pub struct FileGrammar {
     local_rule_depths: BTreeMap<Name, Vec<Option<usize>>>,
     /// Clause-aligned namespace visibility and registration epochs.
     rule_scopes: BTreeMap<Name, Vec<scoped_rules::RuleScope>>,
+    /// Syntax kinds dispatched by an explicitly bound imported MacroM registry.
+    /// This does not install parsers or authorize an executable macro body.
+    runtime_macro_kinds: BTreeSet<Name>,
+    runtime_macro_namespaces: BTreeSet<Name>,
+    initial_macro_scopes: BTreeSet<Name>,
     /// Imported string interpolation whose native expansion is implemented below. The syntax
     /// still comes from the census and is available only through its declaring module.
     interpolation_kinds: Arc<BTreeSet<Name>>,
@@ -1332,6 +1338,9 @@ impl FileGrammar {
             rules: Arc::new(BTreeMap::new()),
             local_rule_depths: BTreeMap::new(),
             rule_scopes: BTreeMap::new(),
+            runtime_macro_kinds: BTreeSet::new(),
+            runtime_macro_namespaces: BTreeSet::new(),
+            initial_macro_scopes: BTreeSet::new(),
             interpolation_kinds: Arc::new(interpolation_kinds),
             expansions: Rc::new(Cell::new(0)),
             imports_entered: true,
@@ -1409,6 +1418,7 @@ impl FileGrammar {
             .keys()
             .chain(self.native_scoped.keys())
             .chain(self.artifact.namespaces.iter())
+            .chain(self.runtime_macro_namespaces.iter())
             .chain(self.scoped_declared.keys())
             .chain(
                 self.rule_scopes
@@ -1913,9 +1923,41 @@ impl FileGrammar {
             }
             _ => return Ok(None),
         };
+        if rule.is_none()
+            && parts.as_slice() == ["Lean", "Parser", "Command", "macro"]
+            && !self.runtime_macro_kinds.is_empty()
+        {
+            let name = self.syntax_name(&declaration)?;
+            let full_name = self.top().namespace.append_core(&name);
+            let kind = if declaration.attr_kind == AttrKind::Local {
+                private_name(
+                    self.module
+                        .as_ref()
+                        .ok_or("a local declaration with no module name")?,
+                    &full_name,
+                )
+            } else {
+                full_name
+            };
+            if self.runtime_macro_kinds.contains(&kind) {
+                return Err("an unsupported macro declaration for an imported runtime syntax kind");
+            }
+        }
         self.generation += 1;
+        let local = declaration.attr_kind == AttrKind::Local;
         let decl = self.elab_syntax(declaration)?;
         if let Some(rule) = rule {
+            self.rule_scopes.insert(
+                decl.decl.clone(),
+                vec![scoped_rules::RuleScope {
+                    namespace: decl.scope.clone(),
+                    registered: self.generation,
+                }],
+            );
+            if local {
+                self.local_rule_depths
+                    .insert(decl.decl.clone(), vec![Some(self.scopes.len())]);
+            }
             Arc::make_mut(&mut self.rules).insert(decl.decl.clone(), Arc::new(rule));
         }
         Ok(Some(decl))
@@ -1984,6 +2026,33 @@ impl FileGrammar {
     /// that dispatcher's completed tree. Scope exits leave older snapshots intact.
     pub fn active_template_rules(&self) -> Arc<BTreeMap<Name, Arc<NotationRule>>> {
         self.active_rules(&self.top().trail)
+    }
+
+    /// Bind the exact imported macro inventory before reading source commands.
+    /// Kinds need their ordinary parser independently. Namespace anchors let
+    /// the grammar retain the same activation chronology as the runtime, even
+    /// when a namespace contains macros but no parser declarations.
+    pub fn bind_runtime_macros(
+        &mut self,
+        kinds: impl IntoIterator<Item = Name>,
+        namespaces: impl IntoIterator<Item = Name>,
+        initially_active: impl IntoIterator<Item = Name>,
+    ) {
+        self.runtime_macro_kinds.extend(kinds);
+        self.runtime_macro_namespaces.extend(namespaces);
+        for namespace in initially_active {
+            self.initial_macro_scopes.insert(namespace.clone());
+            if !self.top().is_active(&namespace) {
+                self.top_mut().trail.push(Trail::Namespace(namespace, 0, 0));
+            }
+        }
+    }
+
+    /// Active templates and their lexical precedence in the imported MacroM
+    /// registry. Unlike a bare rule map, this preserves source registrations
+    /// before/after scoped activation and reports malformed ordering metadata.
+    pub fn active_template_snapshot(&self) -> Result<TemplateSnapshot, &'static str> {
+        self.template_snapshot(&self.top().trail)
     }
 
     /// `elabDeclareSyntaxCat`: the category, under the name as written, with its identifier
@@ -2062,21 +2131,10 @@ impl FileGrammar {
     }
 
     /// `elabSyntax` (`Lean/Elab/Syntax.lean`).
-    fn elab_syntax(&mut self, declaration: Declaration) -> Result<Arc<SyntaxDecl>, &'static str> {
-        let behavior = *self
-            .categories
-            .get(&declaration.category)
-            .ok_or("an unknown syntax category")?;
-        let prec = declaration.precedence.unwrap_or_else(|| {
-            if atom_like_seq(&declaration.items) {
-                MAX_PREC
-            } else {
-                LEAD_PREC
-            }
-        });
+    fn syntax_name(&self, declaration: &Declaration) -> Result<Name, &'static str> {
         let namespace = self.top().namespace.clone();
-        let name = match declaration.name {
-            Some(name) => name,
+        Ok(match &declaration.name {
+            Some(name) => name.clone(),
             None => {
                 let base = format!(
                     "{}{}",
@@ -2091,7 +2149,23 @@ impl FileGrammar {
                 }
                 name
             }
-        };
+        })
+    }
+
+    fn elab_syntax(&mut self, declaration: Declaration) -> Result<Arc<SyntaxDecl>, &'static str> {
+        let behavior = *self
+            .categories
+            .get(&declaration.category)
+            .ok_or("an unknown syntax category")?;
+        let prec = declaration.precedence.unwrap_or_else(|| {
+            if atom_like_seq(&declaration.items) {
+                MAX_PREC
+            } else {
+                LEAD_PREC
+            }
+        });
+        let namespace = self.top().namespace.clone();
+        let name = self.syntax_name(&declaration)?;
         let context = Context {
             category: declaration.category.clone(),
             first: true,

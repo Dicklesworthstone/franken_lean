@@ -2962,6 +2962,7 @@ impl Engine {
         )?;
         if let Some(session) = macros.as_deref() {
             grammar.import_artifact(session.parsers())?;
+            grammar.bind_imported_macros(&session.registry());
         }
         grammar.extend_scopes(&mut scopes);
         let mut queue: std::collections::VecDeque<Step<'_>> = commands
@@ -3052,7 +3053,7 @@ impl Engine {
                 grammar.extend_scopes(&mut scopes);
             }
             if let Some(session) = macros.as_deref_mut() {
-                session.set_templates(grammar.templates());
+                session.set_templates(grammar.templates()?);
             }
             let local_stderr_capture = scopes.current.options.get_bool(
                 &Name::from_components(["stderrAsMessages"]),

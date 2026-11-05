@@ -538,3 +538,293 @@ fn admission_root_includes_the_default_registration_and_helpers() {
             .contains(&Name::from_components(["Count", "mk", "_flat_ctor"]))
     );
 }
+
+#[test]
+fn child_defaults_override_inherited_fields_without_changing_the_parent_layout() {
+    let checked = check(
+        &engine(),
+        r#"
+structure Parent where
+  value : Nat := 3
+  method (n : Nat) : Nat := n + value
+structure Child extends Parent where
+  value := offset + 1
+  method n := n + offset
+  offset : Nat := 41
+def original : Parent := {}
+def inherited : Child := {}
+def explicit : Child := { value := 9, offset := 5 }
+def parentValue : Child := { toParent := { value := 8 }, offset := 2 }
+def updated : Child := { inherited with offset := 100 }
+example : original.value = 3 := by rfl
+example : original.method 2 = 5 := by rfl
+example : inherited.value = 42 := by rfl
+example : inherited.method 2 = 43 := by rfl
+example : explicit.value = 9 := by rfl
+example : explicit.method 2 = 7 := by rfl
+example : parentValue.value = 8 := by rfl
+example : parentValue.method 2 = 10 := by rfl
+example : updated.offset = 100 := by rfl
+example : updated.value = 42 := by rfl
+example : updated.method 2 = 43 := by rfl
+"#,
+    );
+    let environment = checked.engine.environment();
+    let Some(fln::ConstantInfo::Ctor(constructor)) =
+        environment.find(&Name::from_components(["Child", "mk"]))
+    else {
+        panic!("missing checked Child constructor");
+    };
+    // Overrides change defaults; the constructor still takes toParent and offset.
+    assert_eq!(constructor.num_fields, 2);
+    for field in ["value", "method"] {
+        let helper = helper_name(
+            &Name::from_components(["Child"]),
+            &Name::from_components([field]),
+        );
+        let Some(fln::ConstantInfo::Defn(definition)) = environment.find(&helper) else {
+            panic!("missing checked override helper {helper:?}");
+        };
+        for expression in [&definition.base.type_, &definition.value] {
+            assert!(!expression.has_expr_mvar());
+            assert!(!expression.has_level_mvar());
+            assert!(!expression.has_fvar());
+            assert!(!expression.has_loose_bvars());
+        }
+    }
+}
+
+#[test]
+fn inherited_overrides_capture_default_only_sections_parameters_and_universes() {
+    check(
+        &engine(),
+        r#"
+structure Parent where
+  value : Nat
+section
+variable (fallback : Nat)
+structure WithFallback extends Parent where
+  value := fallback
+end
+def sectionValue : WithFallback 23 := {}
+example : sectionValue.value = 23 := by rfl
+
+universe u
+structure Holder (A : Type u) where
+  value : A
+structure Filled (A : Type u) (fallback : A) extends Holder A where
+  value := fallback
+def natural : Filled Nat 17 := {}
+def text : Filled String "chosen" := {}
+def higher : Filled Type Nat := {}
+example : natural.value = (17 : Nat) := by rfl
+example : text.value = "chosen" := by rfl
+example : higher.value = Nat := by rfl
+"#,
+    );
+}
+
+#[test]
+fn copied_and_transitive_fields_keep_the_child_declared_default() {
+    check(
+        &engine(),
+        r#"
+structure First where
+  x : Nat := 1
+structure Second where
+  x : Nat := 2
+  y : Nat := 3
+structure Diamond extends First, Second where
+  x := 9
+  y := 7
+structure Bottom extends Diamond
+def first : First := {}
+def second : Second := {}
+def diamond : Diamond := {}
+def bottom : Bottom := {}
+def explicit : Bottom := { x := 11, y := 13 }
+example : first.x = 1 := by rfl
+example : second.x = 2 := by rfl
+example : second.y = 3 := by rfl
+example : diamond.x = 9 := by rfl
+example : diamond.y = 7 := by rfl
+example : bottom.x = 9 := by rfl
+example : bottom.y = 7 := by rfl
+example : explicit.x = 11 := by rfl
+example : explicit.y = 13 := by rfl
+"#,
+    );
+}
+
+#[test]
+fn override_elaboration_keeps_independent_fields_and_hides_recursive_dependencies() {
+    let base = check(
+        &engine(),
+        r#"
+structure Parent where
+  value : Nat
+structure Grandchild extends Parent
+structure Carrier where
+  carrier : Type
+structure FunctionParent where
+  method : Nat → Nat
+"#,
+    )
+    .engine;
+    check(
+        &base,
+        r#"
+structure Later extends Parent where
+  value := (by guard_expr offset = offset; exact offset)
+  offset : Nat := 8
+def later : Later := {}
+example : later.value = 8 := by rfl
+structure TypedShadow (n : Nat) extends FunctionParent where
+  method (n : Nat) := n
+structure BareShadow (n : Nat) extends FunctionParent where
+  method n := n
+def typed : TypedShadow 2 := {}
+def bare : BareShadow 3 := {}
+example : typed.method 4 = 4 := by rfl
+example : bare.method 4 = 4 := by rfl
+"#,
+    );
+    let root = base.logical_root(&KVMap::new());
+    for source in [
+        "structure Invalid extends Parent where\n  value := value",
+        // guard_expr discards its compared expressions, so inspecting only the
+        // resulting default term would miss this forbidden read of the field.
+        "structure Invalid extends Parent where\n  value := (by guard_expr value = value; exact Nat.zero)",
+        "structure Invalid extends Parent where\n  value := toParent.value",
+        // witness's type depends on carrier; it must be hidden with carrier.
+        "structure Invalid extends Carrier where\n  carrier := (by guard_expr witness = witness; exact Nat)\n  witness : carrier",
+        "structure Invalid extends Parent where\n  value : Bool := Bool.false",
+        "structure Invalid extends Parent where\n  value : Nat",
+        "structure Invalid extends Parent where\n  value := 1\n  value := 2",
+        "structure Invalid extends Parent where\n  toParent := { value := 0 }",
+        "structure Invalid extends Grandchild where\n  toParent := { value := 0 }",
+        // Leading typeless bracketed binders request a header binder update at
+        // the pin. Overrides cannot change header parameters' binder kinds.
+        "structure Invalid (n : Nat) extends FunctionParent where\n  method (n) := n",
+        "section\nvariable (n : Nat)\nstructure Invalid extends FunctionParent where\n  method (n) := n\nend",
+    ] {
+        let result = base.check_source_files(
+            &[source.as_bytes()],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits()),
+        );
+        assert!(result.is_err(), "{source}\n{result:?}");
+        assert_eq!(base.logical_root(&KVMap::new()), root);
+        assert!(
+            !base
+                .environment()
+                .contains(&Name::from_components(["Invalid"]))
+        );
+    }
+    check(
+        &base,
+        "structure Valid extends Parent where\n  value := 17\ndef valid : Valid := {}\nexample : valid.value = 17 := by rfl",
+    );
+}
+
+#[test]
+fn parent_syntax_cannot_replace_a_child_override_with_an_ancestor_default() {
+    let base = check(
+        &engine(),
+        r#"
+structure A where
+  x : Nat := 1
+structure B where
+  y : Nat := 2
+structure Combined extends A, B where
+  x := 9
+structure Child extends A where
+  x := 9
+structure Transitive extends Child, B
+"#,
+    )
+    .engine;
+    check(
+        &base,
+        r#"
+def supplied : Combined := { toA := { x := 7 }, toB := { y := 8 } }
+def flat : Combined := { y := 8 }
+example : supplied.x = 7 := by rfl
+example : supplied.y = 8 := by rfl
+example : flat.x = 9 := by rfl
+example : flat.y = 8 := by rfl
+def inherited : Transitive := {}
+def suppliedTransitive : Transitive := { toChild := { x := 7 }, toB := { y := 8 } }
+def flatTransitive : Transitive := { y := 8 }
+example : inherited.x = 9 := by rfl
+example : inherited.y = 2 := by rfl
+example : suppliedTransitive.x = 7 := by rfl
+example : suppliedTransitive.y = 8 := by rfl
+example : flatTransitive.x = 9 := by rfl
+example : flatTransitive.y = 8 := by rfl
+"#,
+    );
+    let root = base.logical_root(&KVMap::new());
+    // Mixed parent syntax does not yet rebuild an omitted overridden leaf.
+    // Refuse this boundary instead of silently taking A's default x = 1.
+    for source in [
+        "def omitted : Combined := { toB := { y := 8 } }",
+        "def omitted : Transitive := { toB := { y := 8 } }",
+    ] {
+        let result = base.check_source_files(
+            &[source.as_bytes()],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits()),
+        );
+        assert!(result.is_err(), "{source}\n{result:?}");
+        assert_eq!(base.logical_root(&KVMap::new()), root);
+        assert!(
+            !base
+                .environment()
+                .contains(&Name::from_components(["omitted"]))
+        );
+    }
+}
+
+#[test]
+fn proof_override_and_frozen_helpers_remain_checked_semireducible_definitions() {
+    let checked = check(
+        &engine(),
+        r#"
+structure ProofBase where
+  value : Nat := 7
+  proof : value = value
+structure ProofChild extends ProofBase where
+  proof := rfl
+structure ProofGrandchild extends ProofChild
+def child : ProofChild := {}
+def grandchild : ProofGrandchild := {}
+example : child.value = 7 := by rfl
+example : grandchild.value = 7 := by rfl
+example : child.value = child.value := child.proof
+example : grandchild.value = grandchild.value := grandchild.proof
+"#,
+    );
+    let environment = checked.engine.environment();
+    for (record, suffix) in [
+        ("ProofChild", "_default"),
+        ("ProofGrandchild", "_inherited_default"),
+    ] {
+        let name = Name::from_components([record, "proof", suffix]);
+        let Some(fln::ConstantInfo::Defn(definition)) = environment.find(&name) else {
+            panic!("a checked proof default must remain a definition: {name:?}");
+        };
+        assert_eq!(definition.safety, fln::DefinitionSafety::Safe);
+        assert_eq!(definition.hints, fln::ReducibilityHints::Abbrev);
+        assert_eq!(
+            fln_elab::reducibility::known_status(environment, &name).unwrap(),
+            Some(fln_elab::reducibility::Reducibility::Semireducible),
+        );
+        for expression in [&definition.base.type_, &definition.value] {
+            assert!(!expression.has_expr_mvar());
+            assert!(!expression.has_level_mvar());
+            assert!(!expression.has_fvar());
+            assert!(!expression.has_loose_bvars());
+        }
+    }
+}

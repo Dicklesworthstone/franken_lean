@@ -43,7 +43,6 @@ use fln_syntax::tree::Syntax;
 use fln_syntax::view::SourceView;
 use fln_vm::interpreter::{CancellationProbe, ExecutionUsage};
 use fln_vm::macro_native::MacroLookup;
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
 /// Explicit invocation state and ceilings for one source query. Reuse an
@@ -252,7 +251,7 @@ pub(crate) struct FileSession<'a> {
     cancellation: Option<&'a dyn CancellationProbe>,
     progress: Progress,
     tactics: Option<Arc<ImportedTactics>>,
-    templates: Arc<BTreeMap<Name, Arc<fln_parse::extensions::NotationRule>>>,
+    templates: fln_parse::extensions::TemplateSnapshot,
 }
 
 /// Internal observations consumed by a containing file/module transaction.
@@ -326,7 +325,7 @@ impl<'a> FileSession<'a> {
             limits: invocation.limits,
             cancellation: invocation.cancellation,
             tactics: None,
-            templates: Arc::new(BTreeMap::new()),
+            templates: fln_parse::extensions::TemplateSnapshot::default(),
             progress: Progress {
                 state: None,
                 attempts: Vec::new(),
@@ -438,10 +437,7 @@ impl<'a> FileSession<'a> {
         &self.parsers
     }
 
-    pub(crate) fn set_templates(
-        &mut self,
-        templates: Arc<BTreeMap<Name, Arc<fln_parse::extensions::NotationRule>>>,
-    ) {
+    pub(crate) fn set_templates(&mut self, templates: fln_parse::extensions::TemplateSnapshot) {
         self.templates = templates;
     }
 
@@ -832,7 +828,7 @@ impl<'a> FileSession<'a> {
         // parse_source_command has read this through the entered source
         // grammar's command category. Its own quoted rule is a valid producer
         // too; no artifact parser or checked macro owner is fabricated.
-        if self.templates.contains_key(kind) {
+        if self.templates.rules.contains_key(kind) {
             return true;
         }
         if registry.declarations(kind).next().is_none() {
@@ -1101,9 +1097,13 @@ impl Engine {
     /// use the same expansion pass. Native scope controls retain their ordinary
     /// semantics without command-root macro dispatch. Active source quotations
     /// join the same candidate registry, including its callback and tactic
-    /// boundaries. Atomic source templates and collisions with imported macros
-    /// on the same kind retain explicit capability refusals. Artifact parser
-    /// installation and module-system visibility remain separate capabilities.
+    /// boundaries. Current-file registrations on an imported kind merge by
+    /// registration and scoped-activation chronology. Atomic source templates
+    /// and independently imported native/artifact chains without a shared order
+    /// retain explicit capability refusals. Persistent mixed-override exports
+    /// also require that shared import order; local overrides can publish their
+    /// checked declarations. Artifact parser installation and module-system
+    /// visibility remain separate capabilities.
     pub fn check_source_files_with_imported_macros(
         &self,
         sources: &[&[u8]],

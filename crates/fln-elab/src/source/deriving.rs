@@ -8,6 +8,7 @@ mod beq;
 mod decidable_eq;
 mod hashable;
 mod nonempty;
+mod ord;
 mod repr;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19,6 +20,7 @@ pub enum DerivingError {
     CannotDeriveDecidableEq(Name),
     CannotDeriveHashable(Name),
     CannotDeriveNonempty(Name),
+    CannotDeriveOrd(Name),
     CannotDeriveRepr(Name),
 }
 
@@ -67,6 +69,11 @@ impl std::fmt::Display for DerivingError {
             Self::CannotDeriveNonempty(name) => write!(
                 f,
                 "failed to generate Nonempty instance for {}",
+                name.to_display_string()
+            ),
+            Self::CannotDeriveOrd(name) => write!(
+                f,
+                "failed to generate Ord instance for {}",
                 name.to_display_string()
             ),
         }
@@ -738,11 +745,13 @@ pub fn elaborate_handler_with_names(
     let is_decidable_eq = handler_name.as_ref() == Some(&named("DecidableEq"));
     let is_hashable = handler_name.as_ref() == Some(&named("Hashable"));
     let is_nonempty = handler_name.as_ref() == Some(&named("Nonempty"));
+    let is_ord = handler_name.as_ref() == Some(&named("Ord"));
     if !is_repr
         && !is_beq
         && !is_decidable_eq
         && !is_hashable
         && !is_nonempty
+        && !is_ord
         && handler_name.as_ref() != Some(&named("Inhabited"))
     {
         return Err(failure(SourceInferenceError::Deriving(
@@ -829,6 +838,14 @@ pub fn elaborate_handler_with_names(
         return match hashable::elaborate(&mut context, family, &parameters, &target) {
             Err(error) if normal_failure(&error) => Err(failure(SourceInferenceError::Deriving(
                 DerivingError::CannotDeriveHashable(type_name.clone()),
+            ))),
+            result => result,
+        };
+    }
+    if is_ord {
+        return match ord::elaborate(&mut context, family, &parameters, &target) {
+            Err(error) if normal_failure(&error) => Err(failure(SourceInferenceError::Deriving(
+                DerivingError::CannotDeriveOrd(type_name.clone()),
             ))),
             result => result,
         };

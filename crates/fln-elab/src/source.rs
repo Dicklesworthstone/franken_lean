@@ -3167,6 +3167,26 @@ impl Context {
                                     tasks.push(Task::Visit(&parts[1], None, true));
                                     continue;
                                 }
+                                if kind == &parser_kind(&["Term", "noImplicitLambda"]) {
+                                    // `elabNoImplicitLambda` (the pinned BuiltinTerm.lean)
+                                    // annotates only this term's expected type. Retain the
+                                    // caller's finishing policy when the wrapper is a callee.
+                                    let parts = expect_node(syntax, kind, 2, "no implicit lambda")?;
+                                    expect_atom(
+                                        &parts[0],
+                                        "no_implicit_lambda%",
+                                        "no implicit lambda keyword",
+                                    )?;
+                                    tasks.push(Task::RestoreImplicitLambda(
+                                        self.no_implicit_lambda_types.len(),
+                                    ));
+                                    if let Some(type_) = &expected {
+                                        let type_ = self.instantiate(type_)?;
+                                        self.no_implicit_lambda_types.push(type_);
+                                    }
+                                    tasks.push(Task::Visit(&parts[1], expected, finish));
+                                    continue;
+                                }
                                 if kind == &parser_kind(&["Term", "typeAscription"]) {
                                     let parts = expect_node(syntax, kind, 5, "term ascription")?;
                                     expect_atom(&parts[2], ":", "ascription colon")?;

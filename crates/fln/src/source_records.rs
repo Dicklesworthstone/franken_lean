@@ -1235,10 +1235,7 @@ impl Engine {
             for (index, admission) in batch.admissions.iter().enumerate() {
                 if let Declaration::Defn(definition) = &admission.declaration
                     && definition.base.name != record.flat_constructor
-                    && !record
-                        .defaults
-                        .iter()
-                        .any(|default| default.helper == definition.base.name)
+                    && !record.default_helpers.contains(&definition.base.name)
                 {
                     let theorem = Declaration::Thm(TheoremVal {
                         base: definition.base.clone(),
@@ -1299,10 +1296,7 @@ impl Engine {
                     } else if definition.base.name == record.flat_constructor {
                         fln_elab::reducibility::Reducibility::Reducible
                     } else if record.is_class
-                        || record
-                            .defaults
-                            .iter()
-                            .any(|default| default.helper == definition.base.name)
+                        || record.default_helpers.contains(&definition.base.name)
                     {
                         fln_elab::reducibility::Reducibility::Semireducible
                     } else {

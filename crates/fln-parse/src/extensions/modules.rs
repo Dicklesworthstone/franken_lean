@@ -40,7 +40,11 @@ impl FileGrammar {
         let mut rule_scopes = BTreeMap::new();
         for (kind, rule) in self.rules.iter() {
             let inherited = self.native_rule_counts.get(kind).copied();
-            if !exported_names.contains(kind) && inherited.is_none() && !atoms::is_kind(kind) {
+            if !exported_names.contains(kind)
+                && inherited.is_none()
+                && !atoms::is_kind(kind)
+                && !self.runtime_macro_kinds.contains(kind)
+            {
                 continue;
             }
             let Some(rule) = self.exportable_rule(kind, rule)? else {
@@ -64,6 +68,23 @@ impl FileGrammar {
             rules,
             rule_scopes,
         })
+    }
+
+    /// A persistent journal must be replayable independently of invocation-local
+    /// MacroM bindings. Their same-kind source overrides need a shared import
+    /// chronology before a source module can publish them for its successors.
+    pub fn export_native_for_replay(&self) -> Result<NativeSyntaxModule, &'static str> {
+        let module = self.export_native()?;
+        if module
+            .rules
+            .keys()
+            .any(|kind| self.runtime_macro_kinds.contains(kind))
+        {
+            return Err(
+                "native source module export of runtime macro overrides requires shared import registration order",
+            );
+        }
+        Ok(module)
     }
 
     /// Replay an exact predecessor's grammar product, in the import graph's
