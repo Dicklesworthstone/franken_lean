@@ -8,6 +8,7 @@ on:
       - 'crates/fln-elab/**'
       - 'crates/fln/src/**'
       - 'crates/fln/tests/source*decis*.rs'
+      - 'crates/fln/tests/source_deriving_ord.rs'
       - 'crates/fln-cli/src/**'
       - 'crates/fln-cli/tests/source_equality_decisions.rs'
       - 'Cargo.toml'
@@ -33,6 +34,8 @@ jobs:
           set -euo pipefail
           channel="$(python3 -I -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("rust-toolchain.toml").read_text())["toolchain"]["channel"])')"
           rustup toolchain install "$channel" --profile minimal --component rustfmt --component clippy
+      - name: Check derived ordering through both checkers and serialized bytecode
+        run: cargo test --locked -p fln --test source_deriving_ord
       - name: Check native and polymorphic equality decisions through both engines
         run: |
           cargo test --locked -p fln --test source_equality_decisions --test source_generic_decisions --test source_decisions --test source_decision_tactics
