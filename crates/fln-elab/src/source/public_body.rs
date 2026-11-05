@@ -73,11 +73,8 @@ impl Context {
                 expected: "a public definition with a hidden implementation",
             });
         }
-        let mut context = Self::scoped(worlds.public, kernel, &scope);
-        context.private_proof_body = Some((
-            worlds.private.clone(),
-            worlds.private_scope.instance_scopes.clone(),
-        ));
+        let mut context = Self::scoped(worlds.public, kernel, &scope)?;
+        context.private_proof_body = Some((worlds.private.clone(), worlds.private_scope.clone()));
         context.private_definition_body = true;
         Ok(context)
     }
