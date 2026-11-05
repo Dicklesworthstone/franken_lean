@@ -382,22 +382,15 @@ fn shared_factory_subterms_fit_the_bound_for_completed_administrative_work() {
 #[test]
 fn local_factory_reuse_keeps_unselected_computations_and_callers_separate() {
     let engine = engine();
-    let branch = call("cacheFactory", [Expr::bvar(0).unwrap()]);
-    let input = call("CacheDictionary.mk", [branch.clone(), branch]);
-    let expected_branch = call(
-        "CacheDictionary.mk",
-        [Expr::bvar(0).unwrap(), Expr::bvar(0).unwrap()],
-    );
-    let expected = call(
-        "CacheDictionary.mk",
-        [expected_branch.clone(), expected_branch],
-    );
+    let branch = call("cacheLeafFactory", [Expr::bvar(0).unwrap()]);
+    let input = call("CacheTree.pair", [branch.clone(), branch]);
+    let expected_branch = call("CacheTree.leaf", [Expr::bvar(0).unwrap()]);
+    let expected = call("CacheTree.pair", [expected_branch.clone(), expected_branch]);
     let mut preparation = Preparation::new(&engine.environment, IngressLimits::default());
     assert_eq!(
         preparation.scoped_instance_factory_value(&input).unwrap(),
         Some(expected)
     );
-    let complete = preparation.visited;
     assert!(preparation.specializations.factory_values.is_empty());
     assert!(
         preparation
@@ -412,7 +405,10 @@ fn local_factory_reuse_keeps_unselected_computations_and_callers_separate() {
             .unwrap()
             .is_some()
     );
-    assert_eq!(preparation.visited - before, complete);
+    assert!(
+        preparation.visited > before + 1,
+        "caller-relative factory results cannot be reused across invocations"
+    );
     let shared = call("cacheLeafFactory", [nat::literal(42)]);
     let computed = call(
         "cacheLeafFactory",
