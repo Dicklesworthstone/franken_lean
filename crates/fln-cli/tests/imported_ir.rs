@@ -617,3 +617,137 @@ fn installed_named_globals_execute_their_dependency_closure_only_when_requested(
         );
     }
 }
+
+fn fixture_name_key(name: &fln::Name) -> String {
+    let mut components = Vec::new();
+    let mut cursor = name.clone();
+    while !cursor.is_anonymous() {
+        components.push(match cursor.leaf_view() {
+            fln::LeafView::Str(part) => {
+                // Rust's debug quoting is JSON-compatible for these printable
+                // ASCII fixture names, including embedded dots and quotes.
+                assert!(part.is_ascii() && !part.bytes().any(|byte| byte.is_ascii_control()));
+                format!("/s{part:?}")
+            }
+            fln::LeafView::Num(part) => format!("/n{part}"),
+            fln::LeafView::Anonymous => unreachable!("the loop excludes anonymous names"),
+        });
+        cursor = cursor.parent();
+    }
+    let key = format!("a{}", components.into_iter().rev().collect::<String>());
+    assert_eq!(
+        fln::imported_ir::parse_name_key(&key, 16 * 1024, 128).unwrap(),
+        *name
+    );
+    key
+}
+
+#[test]
+fn installed_module_startup_preserves_journal_order_and_exact_user_names() {
+    let Some(policy) = partition() else {
+        assert!(
+            std::env::var_os("FLN_REQUIRE_REFERENCE").is_none(),
+            "the pinned execution census is required for installed module startup"
+        );
+        return;
+    };
+    let Some(reference) = live_output_reference() else {
+        eprintln!("SKIP installed module startup: requires the pinned Reference");
+        return;
+    };
+    let root = module_root();
+    let source = format!(
+        r#"{}
+@[noinline] def «cli.startup.output» : IO Unit := do
+  let answer ← startupAnswer
+  let stdout ← IO.getStdout
+  stdout.putStr (if answer == 93 then "93\n" else "wrong\n")
+"#,
+        include_str!("../../fln-olean/fixtures/ir/ModuleStartup.lean")
+    );
+    std::fs::write(root.join("ModuleStartupCli.lean"), source).unwrap();
+    let generated = Command::new(&reference)
+        .current_dir(&root)
+        .args(["-o", "ModuleStartupCli.olean", "ModuleStartupCli.lean"])
+        .output()
+        .unwrap();
+    assert!(
+        generated.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&generated.stdout),
+        String::from_utf8_lossy(&generated.stderr)
+    );
+    let artifact = root.join("ModuleStartupCli.ir");
+    let module =
+        fln::decode_ir_artifact(&std::fs::read(&artifact).unwrap(), 32 * 1024 * 1024).unwrap();
+    assert_eq!(module.initializers.len(), 4);
+    let users: Vec<_> = module
+        .decls
+        .iter()
+        .filter_map(|declaration| match declaration {
+            fln_olean::ir::IrDecl::Function { name, .. } => Some(fixture_name_key(name)),
+            _ => None,
+        })
+        .collect();
+    // Standalone actions have generated private names with numeric components;
+    // the quoted public entry also keeps its dots inside one string component.
+    assert!(users.iter().any(|key| key.contains("/n")));
+    let entry_key = fixture_name_key(&fln::Name::from_components(["cli.startup.output"]));
+    assert!(users.contains(&entry_key));
+    let run = |extra: &[&str]| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_fln"));
+        command
+            .args(["ir", "run", "--json", "--entry-key"])
+            .arg(&entry_key)
+            .arg("--partition")
+            .arg(&policy)
+            .args(["--erased", "--capture-output", "3"])
+            .args(extra)
+            .arg(&artifact)
+            .stdin(std::process::Stdio::null());
+        for key in &users {
+            command.arg("--user-key").arg(key);
+        }
+        command.output().unwrap()
+    };
+
+    let complete = run(&["--initialize-modules"]);
+    assert!(
+        complete.status.success(),
+        "{}",
+        String::from_utf8_lossy(&complete.stderr)
+    );
+    assert!(complete.stderr.is_empty());
+    let stdout = String::from_utf8(complete.stdout).unwrap();
+    for expected in [
+        "\"outcome\":\"complete\"",
+        "\"initializeModules\":true",
+        "\"initializationFailure\":null",
+        "\"data\":\"93\\n\"",
+        "\"byteLength\":3,\"maxBytes\":3",
+        "\"authority\":false",
+    ] {
+        assert!(stdout.contains(expected), "{expected}: {stdout}");
+    }
+    for entry in &module.initializers {
+        let initializer = entry.initializer.as_ref().unwrap_or(&entry.declaration);
+        let expected = format!(
+            "\"name\":{:?},\"producer\":\"reference\"",
+            initializer.to_display_string()
+        );
+        assert!(stdout.contains(&expected), "{expected}: {stdout}");
+    }
+
+    let denied = run(&[]);
+    assert_eq!(denied.status.code(), Some(3));
+    assert!(denied.stdout.is_empty());
+    assert!(!String::from_utf8_lossy(&denied.stderr).contains("\"outcome\":\"complete\""));
+
+    let stopped = run(&["--initialize-modules", "--fln-max-steps", "0"]);
+    assert_eq!(stopped.status.code(), Some(3));
+    assert!(stopped.stdout.is_empty());
+    let error = String::from_utf8(stopped.stderr).unwrap();
+    assert!(error.contains("\"outcome\":\"inconclusive\""), "{error}");
+    assert!(error.contains("\"initializeModules\":true"), "{error}");
+    assert!(error.contains("\"data\":\"\",\"byteLength\":0"), "{error}");
+}

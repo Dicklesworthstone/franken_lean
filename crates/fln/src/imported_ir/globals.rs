@@ -1,6 +1,7 @@
-//! Preparation and result handling for explicitly selected initialized globals.
+//! Preparation and result handling for explicitly authorized initialization.
 //!
-//! This is a closed executable dependency graph, not module startup. Every
+//! Selected globals use a closed executable dependency graph. Full journal
+//! replay instead preserves the supplied import and declaration order. Every
 //! initializer is selected and checked by the ordinary imported-code policy.
 //! Dependency discovery includes all branches and partial applications, so a
 //! callback cannot hide a forward global read. Cycles remain typed refusals.
@@ -15,13 +16,33 @@ pub(super) struct InitializedGlobal {
     pub initializer: Name,
 }
 
+#[derive(Clone, Debug)]
+pub(super) struct InitializationStep {
+    pub declaration: Name,
+    pub initializer: Name,
+    pub global_slot: Option<usize>,
+}
+
 #[derive(Clone, Debug, Default)]
 pub(super) struct InitializationPlan {
     pub globals: Vec<InitializedGlobal>,
+    pub steps: Vec<InitializationStep>,
+}
+
+impl InitializationPlan {
+    fn push_global(&mut self, global: InitializedGlobal) {
+        self.steps.push(InitializationStep {
+            declaration: global.declaration.clone(),
+            initializer: global.initializer.clone(),
+            global_slot: Some(self.globals.len()),
+        });
+        self.globals.push(global);
+    }
 }
 
 pub(super) struct InitializerIndex {
     pub named: BTreeMap<Name, Name>,
+    pub journal: Vec<(Name, Option<Name>)>,
     order: BTreeMap<Name, usize>,
     has_standalone_actions: bool,
 }
@@ -40,6 +61,7 @@ pub(super) fn index(
     let mut named = BTreeMap::new();
     let mut order = BTreeMap::new();
     let mut seen = BTreeSet::new();
+    let mut journal = Vec::new();
     let mut has_standalone_actions = false;
     for module in modules {
         has_standalone_actions |= module
@@ -56,6 +78,7 @@ pub(super) fn index(
                     "anonymous or repeated initialized declaration",
                 ));
             }
+            journal.push((entry.declaration.clone(), entry.initializer.clone()));
             if let Some(initializer) = &entry.initializer {
                 if initializer.is_anonymous() {
                     return Err(contract(&entry.declaration, "anonymous named initializer"));
@@ -67,6 +90,7 @@ pub(super) fn index(
     }
     Ok(InitializerIndex {
         named,
+        journal,
         order,
         has_standalone_actions,
     })
@@ -78,11 +102,12 @@ pub(super) fn validate_global(
     initializer: &Name,
     declarations: &BTreeMap<Name, &IrDecl>,
     index: &InitializerIndex,
+    full_journal: bool,
 ) -> Result<(), IrExecutionError> {
     // A standalone action in another supplied module can mutate this global
     // even when no function from that module is in the static call closure.
-    // Without a complete startup interpreter, never silently omit that action.
-    if index.has_standalone_actions {
+    // Without the full-journal capability, never silently omit that action.
+    if index.has_standalone_actions && !full_journal {
         return Err(contract(
             name,
             "supplied modules also require standalone initialization actions",
@@ -98,7 +123,28 @@ pub(super) fn validate_global(
         ));
     }
     check_type(name, result)?;
+    validate_initializer(name, initializer, declarations)
+}
+
+pub(super) fn validate_actions(
+    index: &InitializerIndex,
+    declarations: &BTreeMap<Name, &IrDecl>,
+) -> Result<(), IrExecutionError> {
+    for (name, initializer) in &index.journal {
+        if initializer.is_none() {
+            validate_initializer(name, name, declarations)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_initializer(
+    name: &Name,
+    initializer: &Name,
+    declarations: &BTreeMap<Name, &IrDecl>,
+) -> Result<(), IrExecutionError> {
     if native_row(initializer).is_some()
+        || native_signature::boxed_row(initializer).is_some()
         || fln_vm::macro_native::row_for_name(initializer).is_some()
     {
         return Err(contract(
@@ -138,48 +184,12 @@ pub(super) fn plan(
         .filter(|(name, _)| selected.contains_key(*name))
         .map(|(name, initializer)| (name.clone(), initializer.clone()))
         .collect();
-    let mut work = 0u64;
-    let edges: BTreeMap<_, Vec<_>> = selected
-        .iter()
-        // Global declarations are replaced by generated getters. Their
-        // placeholder bodies are neither executed nor dependency sources.
-        .filter(|(name, _)| !globals.contains_key(*name))
-        .map(|(name, declaration)| {
-            (
-                name.clone(),
-                declaration.callees().into_iter().cloned().collect(),
-            )
-        })
-        .collect();
+    let reads = initializer_reads(index, selected, limits)?;
     let mut dependencies = BTreeMap::new();
     let mut dependents: BTreeMap<Name, BTreeSet<Name>> = BTreeMap::new();
-    for (global, initializer) in &globals {
-        let mut pending = vec![initializer.clone()];
-        let mut seen = BTreeSet::new();
-        let mut reads = BTreeSet::new();
-        while let Some(name) = pending.pop() {
-            work = work.saturating_add(1);
-            if work > limits.ir.max_work {
-                return Err(IrExecutionError::Limit("initializer dependency graph"));
-            }
-            if !seen.insert(name.clone()) {
-                continue;
-            }
-            if globals.contains_key(&name) {
-                reads.insert(name);
-                continue;
-            }
-            if let Some(callees) = edges.get(&name) {
-                work = work.saturating_add(callees.len() as u64);
-                if work > limits.ir.max_work {
-                    return Err(IrExecutionError::Limit("initializer dependency graph"));
-                }
-                for callee in callees {
-                    pending.push(callee.clone());
-                }
-            }
-        }
-        for dependency in &reads {
+    for global in globals.keys() {
+        let reads = &reads[global];
+        for dependency in reads {
             dependents
                 .entry(dependency.clone())
                 .or_default()
@@ -197,7 +207,7 @@ pub(super) fn plan(
         .collect();
     let mut result = InitializationPlan::default();
     while let Some((_, name)) = ready.pop_first() {
-        result.globals.push(InitializedGlobal {
+        result.push_global(InitializedGlobal {
             declaration: name.clone(),
             initializer: globals[&name].clone(),
         });
@@ -220,6 +230,97 @@ pub(super) fn plan(
             .unwrap()
             .0;
         return Err(contract(name, "cyclic initialized-global dependency"));
+    }
+    Ok(result)
+}
+
+/// Full startup cannot reorder effects to satisfy a forward read. Unlike the
+/// selected-global capability, it retains every journal member and validates
+/// its reads against the already initialized prefix, including captured code.
+pub(super) fn plan_journals(
+    index: &InitializerIndex,
+    selected: &BTreeMap<Name, &IrDecl>,
+    limits: IrExecutionLimits,
+) -> Result<InitializationPlan, IrExecutionError> {
+    let reads = initializer_reads(index, selected, limits)?;
+    let mut ready = BTreeSet::new();
+    let mut result = InitializationPlan::default();
+    for (name, initializer) in &index.journal {
+        let dependencies = reads
+            .get(name)
+            .ok_or_else(|| IrExecutionError::MissingDeclaration(name.clone()))?;
+        if !dependencies.is_subset(&ready) {
+            return Err(contract(
+                name,
+                "module initializer reads a global before its journal entry",
+            ));
+        }
+        if let Some(initializer) = initializer {
+            result.push_global(InitializedGlobal {
+                declaration: name.clone(),
+                initializer: initializer.clone(),
+            });
+            ready.insert(name.clone());
+        } else {
+            result.steps.push(InitializationStep {
+                declaration: name.clone(),
+                initializer: name.clone(),
+                global_slot: None,
+            });
+        }
+    }
+    Ok(result)
+}
+
+fn initializer_reads(
+    index: &InitializerIndex,
+    selected: &BTreeMap<Name, &IrDecl>,
+    limits: IrExecutionLimits,
+) -> Result<BTreeMap<Name, BTreeSet<Name>>, IrExecutionError> {
+    let mut work = 0u64;
+    let edges: BTreeMap<_, Vec<_>> = selected
+        .iter()
+        // Global declarations are replaced by generated getters. Their
+        // placeholder bodies are neither executed nor dependency sources.
+        .filter(|(name, _)| !index.named.contains_key(*name))
+        .map(|(name, declaration)| {
+            (
+                name.clone(),
+                declaration.callees().into_iter().cloned().collect(),
+            )
+        })
+        .collect();
+    let mut result = BTreeMap::new();
+    for (name, initializer) in &index.journal {
+        if !selected.contains_key(name) {
+            continue;
+        }
+        let mut pending = vec![initializer.as_ref().unwrap_or(name).clone()];
+        let mut seen = BTreeSet::new();
+        let mut reads = BTreeSet::new();
+        while let Some(name) = pending.pop() {
+            work = work.saturating_add(1);
+            if work > limits.ir.max_work {
+                return Err(IrExecutionError::Limit("initializer dependency graph"));
+            }
+            if !seen.insert(name.clone()) {
+                continue;
+            }
+            if index.named.contains_key(&name) {
+                reads.insert(name);
+                continue;
+            }
+            if let Some(callees) = edges.get(&name) {
+                work = work.saturating_add(callees.len() as u64);
+                if work > limits.ir.max_work {
+                    return Err(IrExecutionError::Limit("initializer dependency graph"));
+                }
+                for callee in callees {
+                    pending.push(callee.clone());
+                }
+            }
+        }
+        result.insert(name.clone(), reads);
     }
     Ok(result)
 }
@@ -264,7 +365,7 @@ pub(super) fn finish(
     else {
         return bad_envelope();
     };
-    let Some(global) = plan.globals.get(slot) else {
+    let Some(global) = plan.steps.get(slot) else {
         return bad_envelope();
     };
     let Some(result) = value.try_ctor_child(1) else {

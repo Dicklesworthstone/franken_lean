@@ -181,7 +181,10 @@ fn private_records_inductives_recursion_and_simp_rules_work_locally() {
     }
     let imported = checked(
         &initial,
-        &[("Main", "module\npublic import Lib"), ("Lib", source)],
+        &[
+            ("Main", "module\nprelude\npublic import Lib"),
+            ("Lib", source),
+        ],
     );
     assert_eq!(
         fln_elab::source::scope::simp::read(imported.checked.engine.environment()).unwrap(),

@@ -168,6 +168,44 @@ fn root_and_import_order_cannot_change_code_identity() {
     assert_eq!(first.module_names(), second.module_names());
     assert_eq!(first.modules(), second.modules());
     assert_eq!(replay(&first), replay(&second));
+    assert_eq!(
+        first.initialization_order,
+        ["Dependency", "Right", "Left", "Root"].map(name)
+    );
+    assert_eq!(
+        second.initialization_order,
+        ["Dependency", "Left", "Right", "Root"].map(name)
+    );
+}
+
+#[test]
+fn initialization_order_preserves_effectful_import_order_and_requires_complete_code() {
+    let graph = graph();
+    let loaded = resolve(&graph, &[name("Root")], ModuleLoadLimits::default()).unwrap();
+    assert!(matches!(loaded.into_modules_in_initialization_order(),
+        Err(ModuleLoadError::Resolve { module, detail })
+        if module == name("Left") && detail == "module initialization requires every .ir companion"
+    ));
+    let mut loaded = resolve(&graph, &[name("Root")], ModuleLoadLimits::default()).unwrap();
+    // Distinguishable decoded journals let this assertion exercise the
+    // consuming reorder, independently of the traversal's name report.
+    for (module, name) in loaded.modules.iter_mut().zip(&loaded.names) {
+        module
+            .initializers
+            .push(fln_olean::initializers::InitEntry {
+                declaration: name.clone(),
+                initializer: None,
+            });
+    }
+    loaded.missing_ir.clear();
+    let ordered = loaded.into_modules_in_initialization_order().unwrap();
+    assert_eq!(
+        ordered
+            .iter()
+            .map(|module| module.initializers[0].declaration.clone())
+            .collect::<Vec<_>>(),
+        ["Dependency", "Right", "Left", "Root"].map(name)
+    );
 }
 
 #[test]

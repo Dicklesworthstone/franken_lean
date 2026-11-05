@@ -183,6 +183,7 @@ fn live_pinned_named_globals_share_state_replay_and_recover_after_resource_stops
             limits: IrExecutionLimits::default(),
             capture_output_bytes: None,
             initialize_globals: true,
+            initialize_modules: false,
         },
     )
     .unwrap_or_else(|error| panic!("actual initialized globals: {error:?}; {dir:?}"));
@@ -255,4 +256,154 @@ fn live_pinned_named_globals_share_state_replay_and_recover_after_resource_stops
         compiled.execute(ExecutionLimits::default(), None).outcome,
         "167",
     );
+}
+
+#[test]
+fn live_pinned_module_journals_preserve_standalone_effects_and_named_snapshots() {
+    let reference = std::env::var_os("FLN_REFERENCE_LEAN")
+        .map(PathBuf::from)
+        .or_else(|| {
+            let lib = PathBuf::from(std::env::var_os("FLN_REFERENCE_LIB")?);
+            Some(lib.parent()?.parent()?.join("bin/lean"))
+        });
+    let Some(reference) = reference else {
+        assert!(
+            std::env::var_os("FLN_REQUIRE_REFERENCE").is_none(),
+            "the pinned Reference is required"
+        );
+        eprintln!("SKIP: live module startup requires the pinned Reference");
+        return;
+    };
+    let pin = include_str!("../../../../../../SUITE.lock")
+        .lines()
+        .find(|line| line.starts_with("reference "))
+        .and_then(|line| {
+            line.split_whitespace()
+                .find_map(|part| part.strip_prefix("commit="))
+        })
+        .unwrap();
+    let hash = Command::new(&reference).arg("--githash").output().unwrap();
+    assert!(hash.status.success());
+    assert_eq!(String::from_utf8(hash.stdout).unwrap().trim(), pin);
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::var_os("FLN_IR_REFERENCE_ARTIFACTS")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir)
+        .join(format!("module-startup-{}-{unique}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("ModuleStartup.lean"),
+        include_str!("../../../../../fln-olean/fixtures/ir/ModuleStartup.lean"),
+    )
+    .unwrap();
+    let generated = Command::new(&reference)
+        .current_dir(&dir)
+        .args(["-o", "ModuleStartup.olean", "ModuleStartup.lean"])
+        .output()
+        .unwrap();
+    std::fs::write(dir.join("compile.stdout"), &generated.stdout).unwrap();
+    std::fs::write(dir.join("compile.stderr"), &generated.stderr).unwrap();
+    assert!(
+        generated.status.success(),
+        "Reference compilation in {dir:?}: {}{}",
+        String::from_utf8_lossy(&generated.stdout),
+        String::from_utf8_lossy(&generated.stderr)
+    );
+    let module = crate::decode_ir_artifact(
+        &std::fs::read(dir.join("ModuleStartup.ir")).unwrap(),
+        32 * 1024 * 1024,
+    )
+    .unwrap();
+    assert_eq!(module.initializers.len(), 4);
+    assert_eq!(
+        module
+            .initializers
+            .iter()
+            .map(|entry| entry.initializer.is_some())
+            .collect::<Vec<_>>(),
+        [true, false, true, false]
+    );
+    std::fs::write(
+        dir.join("Oracle.lean"),
+        "import ModuleStartup\n#eval startupAnswer\n",
+    )
+    .unwrap();
+    let oracle = Command::new(&reference)
+        .current_dir(&dir)
+        .env("LEAN_PATH", &dir)
+        .arg("Oracle.lean")
+        .output()
+        .unwrap();
+    std::fs::write(dir.join("oracle.stdout"), &oracle.stdout).unwrap();
+    std::fs::write(dir.join("oracle.stderr"), &oracle.stderr).unwrap();
+    assert!(
+        oracle.status.success(),
+        "Reference oracle in {dir:?}: {}{}",
+        String::from_utf8_lossy(&oracle.stdout),
+        String::from_utf8_lossy(&oracle.stderr)
+    );
+    assert_eq!(oracle.stdout, b"93\n");
+
+    let partition = VerifiedPartition {
+        partition: CensusPartition::parse("constant_count\t0\n", GraphArchiveLimits::default())
+            .unwrap(),
+    };
+    let users: BTreeSet<_> = module
+        .decls
+        .iter()
+        .filter_map(|declaration| match declaration {
+            IrDecl::Function { name, .. } if native_row(name).is_none() => Some(name.clone()),
+            _ => None,
+        })
+        .collect();
+    let options = IrExecutionOptions {
+        initialize_modules: true,
+        ..IrExecutionOptions::default()
+    };
+    let compiled = compile_with_options(
+        std::slice::from_ref(&module),
+        &name("startupAnswer"),
+        &[EntryArgument::Erased],
+        &partition,
+        &users,
+        options,
+    )
+    .unwrap_or_else(|error| panic!("actual module startup: {error:?}; {dir:?}"));
+    let mut steps = 0;
+    for _ in 0..2 {
+        let report = compiled.execute(ExecutionLimits::default(), None);
+        assert!(report.initialization_failure.is_none());
+        steps = assert_io_nat(report.outcome, "93");
+    }
+    for entry in &module.initializers {
+        let initializer = entry.initializer.as_ref().unwrap_or(&entry.declaration);
+        assert!(compiled.reference_functions().iter().any(|function|
+            &function.name == initializer && function.producer() == "reference"));
+    }
+    let bytes =
+        flbc::encode_canonical(compiled.program.program(), flbc::CodecLimits::default()).unwrap();
+    let replay = flbc::decode_canonical(&bytes, flbc::CodecLimits::default()).unwrap();
+    let (outcome, failure) = super::super::finish(
+        execute(&replay, ExecutionLimits::default(), None),
+        compiled.initialization.as_ref().unwrap(),
+    );
+    assert!(failure.is_none());
+    assert_io_nat(outcome, "93");
+    for max_steps in [0, steps / 2, steps - 1] {
+        let stopped = compiled.execute(
+            ExecutionLimits {
+                max_steps,
+                ..ExecutionLimits::default()
+            },
+            None,
+        );
+        assert!(matches!(stopped.outcome, Outcome::Inconclusive(_)));
+        assert_io_nat(
+            compiled.execute(ExecutionLimits::default(), None).outcome,
+            "93",
+        );
+    }
 }

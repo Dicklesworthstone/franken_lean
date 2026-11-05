@@ -102,6 +102,7 @@ impl std::error::Error for ModuleLoadError {}
 pub struct LoadedModules {
     names: Vec<Name>,
     modules: Vec<IrModule>,
+    initialization_order: Vec<Name>,
     missing_ir: Vec<Name>,
     bytes_read: usize,
 }
@@ -125,6 +126,24 @@ impl LoadedModules {
 
     pub fn into_modules(self) -> Vec<IrModule> {
         self.modules
+    }
+
+    /// Preserve the original root/import order, with dependencies before their
+    /// consumers, for effectful startup. A missing companion cannot silently
+    /// stand for an empty initialization journal.
+    pub fn into_modules_in_initialization_order(self) -> Result<Vec<IrModule>, ModuleLoadError> {
+        if let Some(module) = self.missing_ir.first() {
+            return Err(ModuleLoadError::Resolve {
+                module: module.clone(),
+                detail: "module initialization requires every .ir companion".to_owned(),
+            });
+        }
+        let mut modules: BTreeMap<_, _> = self.names.into_iter().zip(self.modules).collect();
+        Ok(self
+            .initialization_order
+            .into_iter()
+            .map(|name| modules.remove(&name).expect("loaded initialization module"))
+            .collect())
     }
 }
 
@@ -169,18 +188,19 @@ pub fn load(
         Enter(Name),
         Leave(Name),
     }
-    let roots: BTreeSet<_> = roots.iter().cloned().collect();
-    let mut pending: Vec<_> = roots.into_iter().rev().map(Work::Enter).collect();
+    let mut pending: Vec<_> = roots.iter().rev().cloned().map(Work::Enter).collect();
     let mut active = BTreeSet::new();
     let mut modules = BTreeMap::new();
     let mut missing_ir = BTreeSet::new();
     let mut bytes_read = 0usize;
     let mut imports_read = 0usize;
     let mut declarations_read = 0usize;
+    let mut initialization_order = Vec::new();
     while let Some(work) = pending.pop() {
         let name = match work {
             Work::Leave(name) => {
                 active.remove(&name);
+                initialization_order.push(name);
                 continue;
             }
             Work::Enter(name) => name,
@@ -252,15 +272,16 @@ pub fn load(
         modules.insert(name.clone(), module);
         active.insert(name.clone());
         pending.push(Work::Leave(name));
-        // Sort only discovery, never statements or declaration bodies. Repeated
-        // edges were charged above even though their target is loaded once.
-        let imports: BTreeSet<_> = imports.into_iter().collect();
+        // Startup follows the import table's order. The ordinary result remains
+        // sorted by structural name, so pure code selection retains its stable
+        // identity. Repeated edges are charged but each module runs only once.
         pending.extend(imports.into_iter().rev().map(Work::Enter));
     }
     let (names, modules) = modules.into_iter().unzip();
     Ok(LoadedModules {
         names,
         modules,
+        initialization_order,
         missing_ir: missing_ir.into_iter().collect(),
         bytes_read,
     })
