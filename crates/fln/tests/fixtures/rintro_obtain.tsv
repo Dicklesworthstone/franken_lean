@@ -50,3 +50,14 @@ rintro_clear_removes_evidence	reject	theorem f (p : Prop) : p → p := by rintro
 obtain_clear_removes_original	reject	theorem f (p : Prop) (h : p) : p := by obtain - := h; exact h
 obtain_rfl_removes_right_name	reject	theorem f (n m : Nat) (h : n = m) : m = m := by obtain rfl := h; exact Eq.refl m
 obtain_rfl_witness_requires_variable	reject	theorem f : True := by obtain rfl : 0 = 0; rfl; exact True.intro
+obtain_multiple_pairs	accept	theorem f (p q r : Prop) (h : p ∧ q) (k : q ∧ r) : p ∧ r := by obtain ⟨⟨hp, hq⟩, ⟨hq2, hr⟩⟩ := h, k; exact And.intro hp hr
+obtain_multiple_branch_product	accept	theorem f (p q : Prop) (h : p ∨ p) (k : q ∨ q) : p ∧ q := by obtain ⟨hp | hp, hq | hq⟩ := h, k; exact And.intro hp hq; exact And.intro hp hq; exact And.intro hp hq; exact And.intro hp hq
+obtain_multiple_computed_dependencies	accept	inductive Holds : Nat → Prop where | mk (n : Nat) : Holds n\ntheorem f (n : Nat) : Holds (Nat.succ n) := by obtain ⟨k, h⟩ := (Nat.succ n), (Holds.mk (Nat.succ n)); exact h
+obtain_multiple_rfl_then_cases	accept	theorem f (n : Nat) (h : n = 0) (k : (n = 0) ∧ True) : n = 0 := by obtain ⟨rfl, ⟨hz, ht⟩⟩ := h, k; exact hz
+obtain_multiple_tail_patterns	accept	theorem f (p q r : Prop) (hp : p) (h : q ∧ r) : q ∧ r := by obtain ⟨_, hq, hr⟩ := hp, h; exact And.intro hq hr
+rintro_clear_through_indexed_cases	accept	inductive ZeroOnly : Nat → Prop where | mk : ZeroOnly 0\ntheorem f : (n : Nat) → ZeroOnly n → True := by rintro - ⟨⟩; exact True.intro
+rintro_clear_through_indexed_field	accept	inductive Holds : Nat → Prop where | mk (n : Nat) : Holds n\ntheorem f : (n : Nat) → Holds n → True := by rintro - ⟨k⟩; exact True.intro
+obtain_multiple_later_target_checked	reject	theorem f (h : False) : True := by obtain ⟨⟨⟩, _⟩ := h, missing
+obtain_multiple_pattern_not_in_value_scope	reject	theorem f (p q : Prop) (h : p ∧ q) : q := by obtain ⟨⟨hp, hq⟩, _⟩ := h, hq; exact hq
+obtain_multiple_bad_later_annotation	reject	theorem f (h : False) (k : True) : True := by obtain ⟨⟨⟩, (_ : Nat)⟩ := h, k
+rintro_indexed_clear_hides_field	reject	inductive Holds : Nat → Prop where | mk (n : Nat) : Holds n\ntheorem f (p : Prop) (use : Nat → p) : (n : Nat) → Holds n → p := by rintro - ⟨k⟩; exact use k

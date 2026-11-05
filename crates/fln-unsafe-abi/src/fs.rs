@@ -506,11 +506,12 @@ pub(crate) unsafe fn prim_hard_link(
 /// with one trailing slash trimmed when the path is longer than root —
 /// libuv's exact probe order and trim rule.
 fn os_tmpdir() -> Vec<u8> {
-    use std::os::unix::ffi::OsStrExt;
+    // The encoded view preserves raw Unix bytes, including non-UTF-8 paths,
+    // while allowing this Linux/glibc runtime module to type-check elsewhere.
     let mut dir = ["TMPDIR", "TMP", "TEMP", "TEMPDIR"]
         .iter()
         .find_map(|v| std::env::var_os(v).filter(|s| !s.is_empty()))
-        .map_or_else(|| b"/tmp".to_vec(), |s| s.as_bytes().to_vec());
+        .map_or_else(|| b"/tmp".to_vec(), |s| s.as_encoded_bytes().to_vec());
     if dir.len() > 1 && dir.last() == Some(&b'/') {
         dir.pop();
     }

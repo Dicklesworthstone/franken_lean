@@ -355,10 +355,24 @@ impl Context {
     pub(super) fn substitute_proof_goal_preserving_names(
         &mut self,
         proof: &mut ProofState<'_>,
-        mut goal: ProofGoal,
+        goal: ProofGoal,
         name: &Name,
         aliases: bool,
     ) -> Result<(), NatDefinitionElabError> {
+        self.substitute_proof_goal_with_substitutions(proof, goal, name, aliases)
+            .map(|_| ())
+    }
+
+    /// Preserve the exact context maps of both heterogeneous transport stages.
+    /// A dependent local recreated by the first stage can be substituted by the
+    /// second; callers must apply the steps in order, without name lookup.
+    pub(super) fn substitute_proof_goal_with_substitutions(
+        &mut self,
+        proof: &mut ProofState<'_>,
+        mut goal: ProofGoal,
+        name: &Name,
+        aliases: bool,
+    ) -> Result<Vec<eliminate::CaseSubstitution>, NatDefinitionElabError> {
         self.txn.lctx = goal.lctx.clone();
         self.resolve_instances(false)?;
         self.flush(false)?;
@@ -371,8 +385,14 @@ impl Context {
         if heterogeneous_target(&type_).is_none() {
             return self
                 .substitute_homogeneous_proof_goal(proof, goal, name, None, aliases, false)
-                .map(|_| ());
+                .map(|replacements| {
+                    vec![eliminate::CaseSubstitution {
+                        eliminated: 1,
+                        replacements,
+                    }]
+                });
         }
+        let mut substitutions = Vec::new();
         // At most two dependent transports: first identify local endpoint
         // types, then identify their values. Arbitrary equations between type
         // applications are not assumed injective and remain unsupported.
@@ -444,7 +464,7 @@ impl Context {
                     .clone(),
             );
             goal.lctx = self.txn.lctx.clone();
-            let _ = self.substitute_homogeneous_proof_goal(
+            let replacements = self.substitute_homogeneous_proof_goal(
                 proof,
                 goal,
                 &derived_name,
@@ -452,8 +472,12 @@ impl Context {
                 aliases,
                 false,
             )?;
+            substitutions.push(eliminate::CaseSubstitution {
+                eliminated: 1,
+                replacements,
+            });
             if same_type {
-                return Ok(());
+                return Ok(substitutions);
             }
             let Some(Work::Goal(child)) = proof.work.pop() else {
                 return Err(error(TacticError::MalformedScript));

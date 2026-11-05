@@ -35,6 +35,25 @@ pub(super) enum EliminationSyntax<'a> {
         original: Name,
     },
 }
+
+/// One checked context transformation. The leading entries eliminate locals;
+/// the remaining entries recreate their dependent declarations. Keeping these
+/// steps ordered also preserves substitutions whose range is changed later.
+pub(super) struct CaseSubstitution {
+    pub(super) eliminated: usize,
+    pub(super) replacements: Vec<(FVarId, Expr)>,
+}
+
+/// Exact identities produced by cases, before applying the recorded checked
+/// substitutions. Consumers never have to recover a field by its user name.
+pub(super) struct CaseBranch {
+    pub(super) constructor: Name,
+    pub(super) fields: Vec<Expr>,
+    pub(super) substitutions: Vec<CaseSubstitution>,
+}
+
+pub(super) type CaseBranches = HashMap<MVarId, CaseBranch>;
+
 struct EliminationContext<'a> {
     parameters: &'a [Expr],
     levels: &'a [Level],
@@ -47,6 +66,7 @@ struct EliminationContext<'a> {
     recursive_source: bool,
     source_match: bool,
     empty_fields: Option<&'a [Name]>,
+    track_substitutions: bool,
 }
 
 /// The pinned `elimTarget` production retains an optional equation binder and
@@ -336,7 +356,7 @@ impl Context {
         context: &EliminationContext<'_>,
         alternative: Option<&Alternative<'_>>,
         hypotheses: &mut Vec<(Name, Name)>,
-    ) -> Result<ProofGoal, NatDefinitionElabError> {
+    ) -> Result<(ProofGoal, Option<CaseBranch>), NatDefinitionElabError> {
         let &EliminationContext {
             parameters,
             levels,
@@ -349,6 +369,7 @@ impl Context {
             recursive_source,
             source_match,
             empty_fields,
+            track_substitutions,
         } = context;
         let names = alternative.map_or(empty_fields.unwrap_or(&[]), |alt| alt.names.as_slice());
         let explicit_fields = alternative.is_some_and(|alt| alt.explicit_fields);
@@ -360,6 +381,7 @@ impl Context {
         }
         let mut used = 0;
         let mut recursive_fields = Vec::new();
+        let mut fields = Vec::new();
         for recursive_field in self.constructor_recursive_fields(constructor)? {
             self.tick()?;
             let consumes_name = !explicit_fields
@@ -384,7 +406,11 @@ impl Context {
             if recursive_field {
                 recursive_fields.push(local.clone());
             }
-            ctor = Expr::app(ctor, Expr::fvar(local.id));
+            let value = Expr::fvar(local.id);
+            if track_substitutions {
+                fields.push(value.clone());
+            }
+            ctor = Expr::app(ctor, value);
         }
         for child in recursive_fields {
             self.tick()?;
@@ -485,7 +511,15 @@ impl Context {
             self.bind_record_matrix_projections(&mut branch.introduced)?;
         }
         branch.lctx = self.txn.lctx.clone();
-        Ok(branch)
+        let tracked = track_substitutions.then(|| CaseBranch {
+            constructor: constructor.base.name.clone(),
+            fields,
+            substitutions: vec![CaseSubstitution {
+                eliminated: indices.len() + 1,
+                replacements,
+            }],
+        });
+        Ok((branch, tracked))
     }
 
     pub(in crate::source) fn eliminate_proof_term<'a>(
@@ -722,6 +756,21 @@ impl Context {
         selected: Option<&FVarId>,
         equations: Option<&index_equations::IndexEquations>,
     ) -> Result<(), NatDefinitionElabError> {
+        self.eliminate_proof_goal_with_substitutions(
+            proof, goal, input, induction, selected, equations,
+        )
+        .map(|_| ())
+    }
+
+    pub(super) fn eliminate_proof_goal_with_substitutions<'a>(
+        &mut self,
+        proof: &mut ProofState<'a>,
+        goal: ProofGoal,
+        input: &EliminationSyntax<'a>,
+        induction: bool,
+        selected: Option<&FVarId>,
+        equations: Option<&index_equations::IndexEquations>,
+    ) -> Result<CaseBranches, NatDefinitionElabError> {
         let (target_name, explicit, scoped, rows) = match input {
             EliminationSyntax::Tactic(args) => {
                 let parts = tactic_parts(args, induction)?;
@@ -1225,6 +1274,7 @@ impl Context {
             return Err(error(TacticError::EliminationCoverage));
         }
         let mut branches = Vec::new();
+        let mut tracked_branches = CaseBranches::new();
         let mut fallback_used = false;
         let mut seen = HashSet::new();
         // The pin's `cases`/`induction` tag each branch `appendTag tag minor` with the minor
@@ -1274,7 +1324,7 @@ impl Context {
             let script = scripts.remove(&rule.ctor);
             let alternative = script.as_ref().or(fallback.as_ref());
             let mut hypotheses = Vec::new();
-            let branch = self.elimination_branch(
+            let (branch, mut tracked) = self.elimination_branch(
                 branch,
                 &constructor,
                 &EliminationContext {
@@ -1301,17 +1351,22 @@ impl Context {
                         }
                         _ => None,
                     },
+                    track_substitutions: matches!(input, EliminationSyntax::RCases(_)),
                 },
                 alternative,
                 &mut hypotheses,
             )?;
             let work_start = proof.work.len();
-            let branch = if let Some(equations) = equations {
+            let (branch, substitutions) = if let Some(equations) = equations {
                 self.refine_index_branch(proof, branch, &equations.names)?
             } else {
-                Some(branch)
+                (Some(branch), Vec::new())
             };
             if let Some(mut branch) = branch {
+                if let Some(mut tracked) = tracked.take() {
+                    tracked.substitutions.extend(substitutions);
+                    tracked_branches.insert(branch.id.clone(), tracked);
+                }
                 if recursive_source {
                     self.register_constrained_recursive_branch(
                         &mut branch,
@@ -1412,6 +1467,6 @@ impl Context {
         for branch in branches.into_iter().rev() {
             proof.work.extend(branch);
         }
-        Ok(())
+        Ok(tracked_branches)
     }
 }

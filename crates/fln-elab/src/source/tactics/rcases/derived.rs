@@ -122,6 +122,7 @@ impl Context {
                     },
                     pattern,
                     rename: true,
+                    expected: None,
                 }],
                 clears,
                 false,
@@ -162,8 +163,8 @@ impl Context {
             [assignment, values] => {
                 expect_atom(assignment, ":=", "obtain assignment")?;
                 let targets = separated(values, ",")?;
-                if targets.len() != 1 {
-                    return Err(error(TacticError::UnsupportedTactic(kind(&["obtain"]))));
+                if targets.is_empty() {
+                    return Err(malformed());
                 }
                 let pattern = pattern.cloned().unwrap_or_else(|| {
                     Syntax::node(kind(&["rcasesPat", "ignore"]), vec![atom("_")])
@@ -179,12 +180,20 @@ impl Context {
                         type_.clone(),
                     ],
                 );
+                let mut arguments = Vec::new();
+                for target in targets {
+                    self.tick()?;
+                    if !arguments.is_empty() {
+                        arguments.push(atom(","));
+                    }
+                    arguments.push(Syntax::node(
+                        kind(&["elimTarget"]),
+                        vec![null(vec![]), target.clone()],
+                    ));
+                }
                 let args = vec![
                     atom("rcases"),
-                    null(vec![Syntax::node(
-                        kind(&["elimTarget"]),
-                        vec![null(vec![]), targets[0].clone()],
-                    )]),
+                    null(arguments),
                     null(vec![atom("with"), pattern]),
                 ];
                 self.rcases_proof_goal(proof, goal, &args)
@@ -232,6 +241,7 @@ impl Context {
                         },
                         pattern,
                         rename: false,
+                        expected: None,
                     }],
                     Vec::new(),
                     true,

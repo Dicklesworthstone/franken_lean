@@ -5,6 +5,7 @@ use super::*;
 use fln_env::constants::ConstantInfo;
 use std::collections::{HashMap, HashSet};
 mod derived;
+mod generalize;
 
 #[derive(Clone)]
 enum Pattern<'a> {
@@ -35,6 +36,9 @@ struct Subject {
     local: TrackedLocal,
     pattern: usize,
     rename: bool,
+    /// A top-level target annotation is elaborated before any pattern binds a
+    /// name. Nested annotations still elaborate in their constructor context.
+    expected: Option<Expr>,
 }
 
 enum Step<'a> {
@@ -94,41 +98,6 @@ fn pattern_tuple(arena: &[Pattern<'_>], mut index: usize) -> (bool, Vec<usize>) 
             _ => return (explicit, vec![index]),
         }
     }
-}
-
-/// The case compiler preserves dependent locals' names while recreating their
-/// identities. Pending constructor fields have fresh names until their own
-/// patterns run. Refuse ambiguous fallback names instead of selecting a shadow.
-fn case_local(
-    before: &LocalContext,
-    after: &ProofGoal,
-    tracked: &TrackedLocal,
-) -> Option<TrackedLocal> {
-    let ExprNode::FVar { id } = tracked.value.node() else {
-        return Some(tracked.clone());
-    };
-    if after.lctx.find(id).is_some() {
-        return Some(tracked.clone());
-    }
-    let original = before.find(id)?;
-    let unique = |context: &LocalContext| {
-        context
-            .decls()
-            .iter()
-            .filter(|local| local.user_name == original.user_name)
-            .take(2)
-            .count()
-            == 1
-    };
-    if original.user_name.is_anonymous() || !unique(before) || !unique(&after.lctx) {
-        return None;
-    }
-    after
-        .lctx
-        .find_by_user_name(&original.user_name)
-        .map(|local| TrackedLocal {
-            value: Expr::fvar(local.id.clone()),
-        })
 }
 
 impl Context {
@@ -263,31 +232,9 @@ impl Context {
         expect_atom(keyword, "rcases", "rcases keyword")?;
         self.require_declared_tactic(&["Lean", "Parser", "Tactic", "rcases"])?;
         let targets = separated(targets, ",")?;
-        let [target] = targets.as_slice() else {
-            return Err(error(TacticError::UnsupportedTactic(kind(&["rcases"]))));
-        };
-        let [equation, expression] =
-            expect_node(target, &kind(&["elimTarget"]), 2, "rcases target")?
-        else {
+        if targets.is_empty() {
             return Err(malformed());
-        };
-        let equation = match expect_null_args(equation, "rcases equation")? {
-            [] => None,
-            [binder, colon] => {
-                expect_atom(colon, ":", "rcases equation")?;
-                let [Syntax::Ident { val, .. }] = expect_node(
-                    binder,
-                    &Name::from_components(["Lean", "binderIdent"]),
-                    1,
-                    "rcases equation name",
-                )?
-                else {
-                    return Err(malformed());
-                };
-                Some(val.clone())
-            }
-            _ => return Err(malformed()),
-        };
+        }
         let mut arena = vec![Pattern::One(None)];
         let pattern = match expect_null_args(with, "rcases pattern")? {
             [] => {
@@ -301,53 +248,96 @@ impl Context {
             }
             _ => return Err(malformed()),
         };
-        self.txn.lctx = goal.lctx.clone();
-        let expected = match &arena[pattern] {
-            Pattern::Typed(_, type_) => Some(self.type_term(type_)?),
-            _ => None,
-        };
-        let term = self.term(expression, expected)?;
-        self.resolve_instances_with_defaults()?;
-        self.flush(false)?;
-        let term = Typed {
-            value: self.instantiate(&term.value)?,
-            type_: self.instantiate(&term.type_)?,
-        };
-        self.require_resolved(&[term.value.clone(), term.type_.clone()])?;
-        let local = if equation.is_none()
-            && let ExprNode::FVar { id } = term.value.node()
-        {
-            goal.lctx
-                .find(id)
-                .cloned()
-                .ok_or_else(|| error(TacticError::EliminationLocal))?
+        // The pin distributes the tuple over targets exactly as over fields:
+        // missing patterns are wildcards; excess patterns belong to the last
+        // target. The synthetic target tuple has no implicit binders.
+        let patterns = if targets.len() == 1 {
+            vec![pattern]
         } else {
-            let name = match pattern_name(&arena, pattern) {
-                Some(name) => name,
-                None => self.fresh_name()?,
-            };
-            let (child, id) = self.generalized_proof_goal(proof, goal, name, equation, term)?;
-            goal = child;
-            goal.lctx
-                .find(&id)
-                .cloned()
-                .ok_or_else(|| error(TacticError::EliminationLocal))?
+            let (_, supplied) = pattern_tuple(&arena, pattern);
+            let mut patterns = Vec::new();
+            for index in 0..targets.len() {
+                self.tick()?;
+                let pattern = if index + 1 == targets.len() && supplied.len() > index + 1 {
+                    let next = arena.len();
+                    arena.push(Pattern::Tuple(supplied[index..].to_vec()));
+                    next
+                } else {
+                    supplied.get(index).copied().unwrap_or(0)
+                };
+                patterns.push(pattern);
+            }
+            patterns
         };
-        self.run_rcases_patterns(
-            proof,
-            goal,
-            arena,
-            vec![Subject {
-                local: TrackedLocal {
-                    value: Expr::fvar(local.id),
-                },
+        let mut subjects = Vec::new();
+        let mut generalized = Vec::new();
+        let mut positions = Vec::new();
+        // Elaborate every target in the original context, including targets
+        // following an impossible one. Earlier pattern names are not in scope.
+        for (target, pattern) in targets.into_iter().zip(patterns) {
+            self.tick()?;
+            self.txn.lctx = goal.lctx.clone();
+            let [equation, expression] =
+                expect_node(target, &kind(&["elimTarget"]), 2, "rcases target")?
+            else {
+                return Err(malformed());
+            };
+            let equation = match expect_null_args(equation, "rcases equation")? {
+                [] => None,
+                [binder, colon] => {
+                    expect_atom(colon, ":", "rcases equation")?;
+                    let [Syntax::Ident { val, .. }] = expect_node(
+                        binder,
+                        &Name::from_components(["Lean", "binderIdent"]),
+                        1,
+                        "rcases equation name",
+                    )?
+                    else {
+                        return Err(malformed());
+                    };
+                    Some(val.clone())
+                }
+                _ => return Err(malformed()),
+            };
+            let expected = match &arena[pattern] {
+                Pattern::Typed(_, type_) => Some(self.type_term(type_)?),
+                _ => None,
+            };
+            let term = self.term(expression, expected.clone())?;
+            self.resolve_instances_with_defaults()?;
+            self.flush(false)?;
+            let term = Typed {
+                value: self.instantiate(&term.value)?,
+                type_: self.instantiate(&term.type_)?,
+            };
+            self.require_resolved(&[term.value.clone(), term.type_.clone()])?;
+            let value = term.value.clone();
+            if equation.is_some() || !matches!(value.node(), ExprNode::FVar { .. }) {
+                let name = match pattern_name(&arena, pattern) {
+                    Some(name) => name,
+                    None => self.fresh_name()?,
+                };
+                positions.push(subjects.len());
+                generalized.push((name, equation, term));
+            }
+            subjects.push(Subject {
+                local: TrackedLocal { value },
                 pattern,
                 rename: false,
-            }],
-            Vec::new(),
-            true,
-        )
-        .map(|_| ())
+                expected,
+            });
+        }
+        if !generalized.is_empty() {
+            let (child, ids) = self.generalize_rcases_targets(proof, goal, generalized)?;
+            goal = child;
+            for (position, id) in positions.into_iter().zip(ids) {
+                self.tick()?;
+                subjects[position].local.value = Expr::fvar(id);
+            }
+        }
+        subjects.reverse();
+        self.run_rcases_patterns(proof, goal, arena, subjects, Vec::new(), true)
+            .map(|_| ())
     }
 
     fn update_rcases_local(
@@ -391,6 +381,55 @@ impl Context {
     ) -> Result<(), NatDefinitionElabError> {
         tracked.value = self.specialize_locals(&tracked.value, substitutions)?;
         Ok(())
+    }
+
+    fn remap_rcases_subject(
+        &mut self,
+        subject: &mut Subject,
+        substitutions: &[eliminate::CaseSubstitution],
+    ) -> Result<(), NatDefinitionElabError> {
+        for step in substitutions {
+            self.tick()?;
+            if let ExprNode::FVar { id } = subject.local.value.node() {
+                for (eliminated, _) in step.replacements.iter().take(step.eliminated) {
+                    self.tick()?;
+                    if id == eliminated {
+                        // A replacement local retains its own name. Recreated
+                        // dependent fields still receive their pending pattern.
+                        subject.rename = false;
+                        break;
+                    }
+                }
+            }
+            self.remap_rcases_local(&mut subject.local, &step.replacements)?;
+        }
+        Ok(())
+    }
+
+    /// Annotation conversion may determine a literal's carrier and then need
+    /// its pending OfNat instance in the same comparison. Keep ordinary tactic
+    /// transparency and failure handling, but give synthesis its existing
+    /// source owner instead of prematurely defaulting the annotation to Nat.
+    fn rcases_annotation_matches(
+        &mut self,
+        actual: &Expr,
+        expected: &Expr,
+    ) -> Result<bool, NatDefinitionElabError> {
+        self.flush(false)?;
+        let budget = self.ambient_budget(UnificationTransparency::Abbreviations);
+        match self.unify_pending(&[(actual.clone(), expected.clone())], budget)? {
+            Ok(report) => {
+                assert!(report.awakened.is_empty(), "private source queue");
+                Ok(true)
+            }
+            Err(UnificationError::Deferred(_)) => Ok(false),
+            Err(UnificationError::AssignmentCheck { outcome, .. })
+                if matches!(*outcome, Outcome::Complete(Verdict::Rejected { .. })) =>
+            {
+                Ok(false)
+            }
+            Err(error) => Err(failure(SourceInferenceError::Unification(Box::new(error)))),
+        }
     }
 
     /// Match the pin's `tryClearMany'`: defer deletion until all patterns and
@@ -489,32 +528,31 @@ impl Context {
                         return Err(malformed());
                     };
                     self.txn.lctx = child.lctx.clone();
+                    let steps = [eliminate::CaseSubstitution {
+                        eliminated: 1,
+                        replacements: substitutions,
+                    }];
                     for subject in &mut subjects {
-                        self.tick()?;
-                        if substitutions.first().is_some_and(|(variable, _)| {
-                            matches!(subject.local.value.node(), ExprNode::FVar { id } if id == variable)
-                        }) {
-                            // The eliminated field's name disappears with it;
-                            // a replacement variable keeps its original name.
-                            subject.rename = false;
-                        }
-                        self.remap_rcases_local(&mut subject.local, &substitutions)?;
+                        self.remap_rcases_subject(subject, &steps)?;
                     }
                     for clear in &mut clears {
-                        self.remap_rcases_local(clear, &substitutions)?;
+                        self.remap_rcases_local(clear, &steps[0].replacements)?;
                     }
                     pending.extend(proof.work.split_off(start).into_iter().map(Step::Emit));
                     pending.push(Step::Match(child, subjects, clears));
                 }
                 Pattern::Typed(inner, syntax) => {
-                    let type_ = self.type_term(syntax)?;
+                    let type_ = match &subject.expected {
+                        Some(type_) => type_.clone(),
+                        None => self.type_term(syntax)?,
+                    };
                     let actual = match &local {
                         Some(local) => local.type_.clone(),
                         None => self
                             .known_type(&subject.local.value)?
                             .ok_or_else(|| error(TacticError::EliminationLocal))?,
                     };
-                    if !self.proof_types_match(&actual, &type_)? {
+                    if !self.rcases_annotation_matches(&actual, &type_)? {
                         return Err(error(TacticError::ApplyMismatch));
                     }
                     if let Some(local) = local {
@@ -522,6 +560,7 @@ impl Context {
                     }
                     subjects.push(Subject {
                         pattern: inner,
+                        expected: None,
                         ..subject
                     });
                     pending.push(Step::Match(goal, subjects, clears));
@@ -546,7 +585,7 @@ impl Context {
                         _ => vec![subject.pattern],
                     };
                     let mut field_names = HashMap::new();
-                    let mut field_plans = Vec::new();
+                    let mut field_plans = HashMap::new();
                     for (index, constructor) in family.ctors.iter().enumerate() {
                         self.tick()?;
                         let selected = alternatives.get(index).copied().unwrap_or(0);
@@ -573,6 +612,7 @@ impl Context {
                         }
                         let mut consumed = 0;
                         let mut names = Vec::new();
+                        let mut plans = Vec::new();
                         for field in 0..ctor.num_fields {
                             self.tick()?;
                             let ExprNode::ForallE {
@@ -601,14 +641,14 @@ impl Context {
                             };
                             telescope = body.clone();
                             let name = self.fresh_name()?;
-                            names.push(name.clone());
-                            field_plans.push((name, pattern));
+                            names.push(name);
+                            plans.push(pattern);
                         }
                         field_names.insert(constructor.clone(), names);
+                        field_plans.insert(constructor.clone(), plans);
                     }
                     let start = proof.work.len();
-                    let previous = goal.lctx.clone();
-                    self.eliminate_proof_goal_with_indices(
+                    let mut branches = self.eliminate_proof_goal_with_substitutions(
                         proof,
                         goal,
                         &eliminate::EliminationSyntax::RCases(field_names),
@@ -619,36 +659,32 @@ impl Context {
                     for work in proof.work.split_off(start) {
                         pending.push(match work {
                             Work::Goal(child) => {
+                                let branch = branches.remove(&child.id).ok_or_else(malformed)?;
                                 let mut next = subjects.clone();
                                 for subject in &mut next {
-                                    self.tick()?;
-                                    subject.local =
-                                        case_local(&previous, &child, &subject.local)
-                                            .ok_or_else(|| error(TacticError::EliminationLocal))?;
+                                    self.remap_rcases_subject(subject, &branch.substitutions)?;
                                 }
-                                let mut next_clears = Vec::new();
-                                for clear in &clears {
-                                    self.tick()?;
-                                    // Indexed refinement can replace an index by
-                                    // a constructor expression or another field.
-                                    // Until that compiler exposes its complete
-                                    // substitution map, do not silently lose a
-                                    // requested clear whose identity disappeared.
-                                    let clear = case_local(&previous, &child, clear)
-                                        .ok_or_else(|| error(TacticError::UnsupportedEliminator))?;
-                                    next_clears.push(clear);
-                                }
-                                for (name, pattern) in field_plans.iter().rev() {
-                                    self.tick()?;
-                                    if let Some(local) = child.lctx.find_by_user_name(name) {
-                                        next.push(Subject {
-                                            local: TrackedLocal {
-                                                value: Expr::fvar(local.id.clone()),
-                                            },
-                                            pattern: *pattern,
-                                            rename: true,
-                                        });
+                                let mut next_clears = clears.clone();
+                                for clear in &mut next_clears {
+                                    for step in &branch.substitutions {
+                                        self.remap_rcases_local(clear, &step.replacements)?;
                                     }
+                                }
+                                let plans =
+                                    field_plans.get(&branch.constructor).ok_or_else(malformed)?;
+                                if plans.len() != branch.fields.len() {
+                                    return Err(malformed());
+                                }
+                                for (value, pattern) in branch.fields.into_iter().zip(plans).rev() {
+                                    self.tick()?;
+                                    let mut subject = Subject {
+                                        local: TrackedLocal { value },
+                                        pattern: *pattern,
+                                        rename: true,
+                                        expected: None,
+                                    };
+                                    self.remap_rcases_subject(&mut subject, &branch.substitutions)?;
+                                    next.push(subject);
                                 }
                                 Step::Match(child, next, next_clears)
                             }
