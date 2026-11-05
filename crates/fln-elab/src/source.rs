@@ -641,7 +641,7 @@ struct Context {
     // Public proof declarations fix their signatures in the exported world
     // before their bodies may see private imports. Both environments remain
     // untrusted elaborator inputs; complete bodies require ordinary admission.
-    private_proof_body: Option<(Environment, crate::instances::scoped::ActiveScopes)>,
+    private_proof_body: Option<(Environment, SourceScope)>,
     public_theorem_signature: Option<ConstantVal>,
     private_definition_body: bool,
     public_definition_header: Option<public_body::Header>,
@@ -5716,7 +5716,7 @@ fn probe_header_visibility(
     kernel: Budget,
     scope: &SourceScope,
 ) -> Result<bool, NatDefinitionElabError> {
-    let mut context = Context::scoped(environment, kernel, scope);
+    let mut context = Context::scoped(environment, kernel, scope)?;
     // There is no final candidate admission after a header-only query. Rigid
     // typing failures must be observed before revealing a private body context.
     context.attempt_depth = 1;
@@ -5766,11 +5766,8 @@ impl Context {
                 expected: "a public theorem in a module file",
             });
         }
-        let mut context = Self::scoped(worlds.public, kernel, &scope);
-        context.private_proof_body = Some((
-            worlds.private.clone(),
-            worlds.private_scope.instance_scopes.clone(),
-        ));
+        let mut context = Self::scoped(worlds.public, kernel, &scope)?;
+        context.private_proof_body = Some((worlds.private.clone(), worlds.private_scope.clone()));
         Ok(context)
     }
 
@@ -5785,11 +5782,8 @@ impl Context {
                 expected: "a public instance in a module file",
             });
         }
-        let mut context = Self::scoped(worlds.public, kernel, &scope);
-        context.private_proof_body = Some((
-            worlds.private.clone(),
-            worlds.private_scope.instance_scopes.clone(),
-        ));
+        let mut context = Self::scoped(worlds.public, kernel, &scope)?;
+        context.private_proof_body = Some((worlds.private.clone(), worlds.private_scope.clone()));
         Ok(context)
     }
 
@@ -5839,14 +5833,22 @@ impl Context {
     }
 
     fn enter_private_proof(&mut self) -> Result<(), NatDefinitionElabError> {
-        let (environment, instance_scopes) =
+        let (environment, scope) =
             self.private_proof_body
                 .take()
                 .ok_or(NatDefinitionElabError::UnexpectedSyntax {
                     expected: "separate public and private predecessors for a hidden proof body",
                 })?;
-        self.txn.env = environment;
-        self.source_scope.instance_scopes = instance_scopes;
+        self.txn.env = scope
+            .local_reducibility
+            .environment(&environment)
+            .map_err(|error| {
+                failure(SourceInferenceError::Unification(Box::new(
+                    UnificationError::Reducibility(error),
+                )))
+            })?;
+        self.source_scope.instance_scopes = scope.instance_scopes;
+        self.source_scope.local_reducibility = scope.local_reducibility;
         self.registry_cache = crate::instances::RegistryCache::default();
         self.alias_cache = crate::aliases::AliasCache::default();
         self.protected_cache = crate::protected_names::ProtectedCache::default();
@@ -5916,7 +5918,7 @@ fn definition_scoped_elaboration(
     native: bool,
 ) -> Result<ElaboratedDeclaration, NatDefinitionElabError> {
     let scope = scope.for_declaration(syntax)?;
-    let mut context = Context::scoped(environment, kernel, &scope);
+    let mut context = Context::scoped(environment, kernel, &scope)?;
     if native {
         context.native = scope.native.clone();
     }
@@ -7268,7 +7270,7 @@ pub(super) fn query_scoped(
     query_in(
         syntax,
         name,
-        Context::scoped(environment, kernel, scope),
+        Context::scoped(environment, kernel, scope)?,
         evaluate,
     )
 }

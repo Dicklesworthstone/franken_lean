@@ -57,9 +57,10 @@ impl ElaboratedPartial {
         if !self.scope.noncomputable_section {
             return Err(failure(SourceInferenceError::Scope));
         }
-        let mut context = Context::scoped(admitted, self.kernel, &self.scope);
+        let mut context = Context::scoped(admitted, self.kernel, &self.scope)?;
         context.txn.budget = self.budget.clone();
         context.validate_codegen_metadata()?;
+        let mut recorded = Vec::new();
         for declaration in &self.declarations {
             context.tick()?;
             let definitions = match declaration {
@@ -104,10 +105,22 @@ impl ElaboratedPartial {
                                 }
                                 other => failure(SourceInferenceError::NoncomputableJournal(other)),
                             })?;
+                    recorded.push(definition.base.name.clone());
                 }
             }
         }
-        Ok(context.txn.env)
+        // The context may contain lexical reducibility overrides. Only the
+        // checked code-generation tags belong to the durable successor.
+        recorded
+            .into_iter()
+            .try_fold(admitted.clone(), |env, name| {
+                crate::noncomputable::register(&env, &name).map_err(|error| match error {
+                    crate::noncomputable::NoncomputableError::Limit => {
+                        failure(SourceInferenceError::ResourceLimit)
+                    }
+                    other => failure(SourceInferenceError::NoncomputableJournal(other)),
+                })
+            })
     }
 }
 
@@ -223,7 +236,7 @@ pub fn elaborate(
 ) -> Result<ElaboratedPartial, NatDefinitionElabError> {
     validate(syntax)?;
     let scope = scope.for_declaration(syntax)?;
-    let mut context = Context::scoped(environment, kernel, &scope);
+    let mut context = Context::scoped(environment, kernel, &scope)?;
     context.partial = Some(State::default());
     let candidate = definition_in_context(syntax, &mut context)?;
     let Declaration::Mutual(ref definitions) = candidate else {
@@ -258,7 +271,7 @@ pub fn elaborate(
         .and_then(|state| state.reference.as_ref())
         .ok_or_else(|| failure(SourceInferenceError::Scope))?;
     let name = reference.name.clone();
-    let mut inhabitant_context = Context::scoped(environment, kernel, &scope);
+    let mut inhabitant_context = Context::scoped(environment, kernel, &scope)?;
     inhabitant_context.level_params = implementation.base.level_params.clone();
     // Both phases consume the same declaration budget, not independent fresh
     // allowances. The companion's original body is checked at batch admission.

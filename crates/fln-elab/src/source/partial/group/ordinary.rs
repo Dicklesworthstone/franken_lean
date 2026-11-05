@@ -78,7 +78,7 @@ pub fn elaborate_ordinary_group(
         environment,
         kernel,
         scope,
-        Context::scoped(environment, kernel, scope),
+        Context::scoped(environment, kernel, scope)?,
     )
 }
 
@@ -154,7 +154,7 @@ fn elaborate_with_meter(
     };
     let mut headers = Vec::new();
     for syntax in members {
-        let mut context = Context::scoped(environment, kernel, scope);
+        let mut context = Context::scoped(environment, kernel, scope)?;
         context.txn.budget = meter.txn.budget.clone();
         context.partial = Some(State {
             kind: Kind::Unsafe,
@@ -182,7 +182,7 @@ fn elaborate_with_meter(
     let mut hints = Vec::new();
     let theorem = proof_group == Some(true);
     for syntax in members {
-        let mut context = Context::scoped(environment, kernel, scope);
+        let mut context = Context::scoped(environment, kernel, scope)?;
         context.txn.budget = meter.txn.budget.clone();
         context.partial = Some(State {
             kind: Kind::Unsafe,
@@ -472,7 +472,7 @@ fn mutual_structural(
     let mut last = None;
     for decreasing in fixed..candidates {
         let attempt = (|| {
-            let mut planner = Context::scoped(environment, kernel, scope);
+            let mut planner = Context::scoped(environment, kernel, scope)?;
             planner.txn.budget = meter.txn.budget.clone();
             let planned = planner.mutual_structural_plan(
                 names.clone(),
@@ -487,7 +487,7 @@ fn mutual_structural(
             let mut wrappers = Vec::new();
             let mut pieces = Vec::new();
             for (position, &index) in component.iter().enumerate() {
-                let mut context = Context::scoped(environment, kernel, scope);
+                let mut context = Context::scoped(environment, kernel, scope)?;
                 context.txn.budget = meter.txn.budget.clone();
                 context.partial = Some(State {
                     kind: Kind::Unsafe,
@@ -536,7 +536,7 @@ fn mutual_structural(
                     &parts.bodies[index],
                 )?);
             }
-            let mut assembler = Context::scoped(environment, kernel, scope);
+            let mut assembler = Context::scoped(environment, kernel, scope)?;
             assembler.txn.budget = meter.txn.budget.clone();
             let assembled = assembler.assemble_mutual_structural(&plan, &pieces, &obligations);
             meter.txn.budget = assembler.txn.budget;
@@ -845,7 +845,7 @@ fn mutual_well_founded(
         .iter()
         .map(|member| meter.close_mutual_fixed(&member.measure, &captures, true))
         .collect::<Result<_, _>>()?;
-    let mut planner = Context::scoped(environment, kernel, scope);
+    let mut planner = Context::scoped(environment, kernel, scope)?;
     planner.txn.budget = meter.txn.budget.clone();
     let plan = std::sync::Arc::new(planner.mutual_well_founded_plan(
         component_names.clone(),
@@ -860,7 +860,7 @@ fn mutual_well_founded(
     let mut pieces = Vec::new();
     for (position, &index) in component.iter().enumerate() {
         let member = &members[index];
-        let mut context = Context::scoped(environment, kernel, scope);
+        let mut context = Context::scoped(environment, kernel, scope)?;
         context.txn.budget = meter.txn.budget.clone();
         // Termination proofs run after MutualClosure. Unused section locals
         // are no longer in scope, even when their names could solve a goal.
@@ -906,7 +906,7 @@ fn mutual_well_founded(
         wrappers.push(wrapper);
         pieces.push(piece);
     }
-    let mut assembler = Context::scoped(environment, kernel, scope);
+    let mut assembler = Context::scoped(environment, kernel, scope)?;
     assembler.txn.budget = meter.txn.budget.clone();
     let mutual = assembler.assemble_mutual_well_founded(&plan, &pieces)?;
     meter.txn.budget = assembler.txn.budget;
@@ -963,7 +963,7 @@ mod tests {
         let used = control.budget.heartbeats_consumed;
         assert!(used > 3);
         for allowed in [1, used / 4, used / 2, used - 1] {
-            let mut meter = Context::scoped(&env, kernel, &scope);
+            let mut meter = Context::scoped(&env, kernel, &scope).unwrap();
             meter.txn.budget.max_heartbeats = allowed;
             let stopped = elaborate_with_meter(&members, &env, kernel, &scope, meter);
             let exhausted = match stopped.as_ref().err() {

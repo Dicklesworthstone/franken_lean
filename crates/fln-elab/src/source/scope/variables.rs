@@ -340,7 +340,7 @@ fn elaborate_command(
     scope: &SourceScope,
     kernel_check: bool,
 ) -> Result<SectionVariables, NatDefinitionElabError> {
-    let mut context = Context::scoped(env, kernel, scope);
+    let mut context = Context::scoped(env, kernel, scope)?;
     context.declare_levels(&Syntax::node(Name::from_components(["null"]), vec![]))?;
     context.infer_level_params = true;
     let syntax = if kernel_check {

@@ -208,7 +208,7 @@ pub(super) fn elaborate_record_scoped(
         "record signature",
     )?;
     let own = super::own_short_name(name);
-    let mut context = Context::scoped(environment, kernel, &scope);
+    let mut context = Context::scoped(environment, kernel, &scope)?;
     let name = &context.enter_declaration(name)?;
     context.declare_levels(&id[1])?;
     context.infer_level_params = true;

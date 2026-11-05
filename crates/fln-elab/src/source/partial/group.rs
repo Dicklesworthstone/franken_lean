@@ -114,7 +114,7 @@ pub fn elaborate_group(
     } else {
         Kind::Partial
     };
-    let mut meter = Context::scoped(environment, kernel, scope);
+    let mut meter = Context::scoped(environment, kernel, scope)?;
     // Section locals have one meaning throughout the group. Their universes
     // cannot be independently instantiated at a peer occurrence. Declaration-
     // local polymorphism remains fresh at each occurrence as before.
@@ -179,7 +179,7 @@ pub fn elaborate_group(
     };
     let mut headers = Vec::new();
     for (member, scope) in members.iter().zip(&scopes) {
-        let mut context = Context::scoped(environment, kernel, scope);
+        let mut context = Context::scoped(environment, kernel, scope)?;
         context.txn.budget = meter.txn.budget.clone();
         context.partial = Some(State {
             kind,
@@ -209,7 +209,7 @@ pub fn elaborate_group(
     let mut universes = Vec::new();
     let mut failed_codegen = Vec::new();
     for (member, scope) in members.iter().zip(&scopes) {
-        let mut context = Context::scoped(environment, kernel, scope);
+        let mut context = Context::scoped(environment, kernel, scope)?;
         context.txn.budget = meter.txn.budget.clone();
         context.partial = Some(State {
             kind,
@@ -332,7 +332,7 @@ pub fn elaborate_group(
                 ) {
                     return Err(refusal("a function type for recursive partial def"));
                 }
-                let mut inhabitant = Context::scoped(environment, kernel, &scopes[index]);
+                let mut inhabitant = Context::scoped(environment, kernel, &scopes[index])?;
                 inhabitant.txn.budget = meter.txn.budget.clone();
                 inhabitant.level_params = definition.base.level_params.clone();
                 let value = inhabitant.partial_inhabitant(&definition.base.type_)?;

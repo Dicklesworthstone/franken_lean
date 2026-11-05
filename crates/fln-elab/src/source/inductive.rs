@@ -477,7 +477,7 @@ fn header<'a>(
     if ctors.len() > budget.max_binders {
         return Err(failure(SourceInferenceError::ResourceLimit));
     }
-    let mut context = Context::scoped(env, kernel, &scope);
+    let mut context = Context::scoped(env, kernel, &scope)?;
     let short_name = name.clone();
     let name = context.enter_declaration(name)?;
     if env.contains(&name) {

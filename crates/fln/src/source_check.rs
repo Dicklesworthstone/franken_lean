@@ -279,7 +279,7 @@ pub(crate) fn classify(error: &EngineExecutionError) -> (&'static str, bool, u8)
 /// The non-expanding source controls have identical meaning in check-only and
 /// executable files. Every metadata command publishes a whole successor only
 /// after its names and registrations succeed; variables live solely in the
-/// lexical scope. `file_base` prevents attributes from rewriting imported
+/// lexical scope. `file_base` prevents global attributes from rewriting imported
 /// declarations' reducibility, including when the file executes on Golem.
 pub(crate) fn apply_control_command(
     engine: &mut Engine,
@@ -632,6 +632,24 @@ pub(crate) fn apply_module_control_command(
             )
             .map_err(|error| error.into_source(file, command, offset))?;
         return Ok(Outcome::Complete(Vec::new()));
+    }
+    // Local transparency belongs to the lexical scope, including a private
+    // module body's scope. It must never be published as a public journal
+    // suffix. The same handler validates all names before replacing the scope.
+    if matches!(
+        &control,
+        ScopeCommand::Reducibility(attribute)
+            if attribute.scope == fln_parse::command_scope::reducibility::AttributeScope::Local
+    ) {
+        return apply_control_command(
+            engine,
+            &mut scopes.current,
+            file_base,
+            control,
+            limits,
+            position,
+            options,
+        );
     }
     // `attribute [local instance] x`: selected until the enclosing scope ends, as a `local
     // instance` declaration is; nothing is written to the persistent registration journal.

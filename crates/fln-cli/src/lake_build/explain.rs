@@ -93,6 +93,17 @@ fn target_name(text: &str) -> std::result::Result<Name, Failure> {
 }
 
 fn explain_report(directory: &Path, target: Option<&str>) -> std::result::Result<Report, Refusal> {
+    let macro_config =
+        source_check::build_macro_config().map_err(|(class, detail, authority)| Failure {
+            class,
+            detail,
+            authority,
+        })?;
+    if macro_config.is_some() {
+        return Err(Refusal::Unavailable(
+            MACRO_EXPLANATION_UNAVAILABLE.to_owned(),
+        ));
+    }
     let root = directory
         .canonicalize()
         .map_err(|error| Failure::io(directory, error))?;
@@ -124,6 +135,11 @@ fn explain_report(directory: &Path, target: Option<&str>) -> std::result::Result
                 relative(&path)
             ))
         })?;
+    if recorded.records == MACRO_RECORDS_UNAVAILABLE {
+        return Err(Refusal::Unavailable(
+            MACRO_EXPLANATION_UNAVAILABLE.to_owned(),
+        ));
+    }
     let (libraries, recorded_entries) = plan(&root, &config, &recorded.targets)?;
     let entries = match target {
         Some(text) => {

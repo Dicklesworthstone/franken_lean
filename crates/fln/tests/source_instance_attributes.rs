@@ -558,18 +558,22 @@ fn standalone_instance_attributes_preserve_reducibility_until_explicitly_changed
 }
 
 #[test]
-fn local_reducibility_is_explicitly_refused_without_persisting_the_override() {
+fn local_reducibility_restores_without_persisting_the_override() {
     let base = engine();
     let before = base.logical_root(&KVMap::new());
-    let error = base
-        .check_source_files(
-            &[b"def value : Nat := 4\nattribute [local irreducible] value"],
-            &KVMap::new(),
-            limits(),
-        )
-        .unwrap_err();
-    assert!(error.to_string().contains("lexical restoration"), "{error}");
-    assert_eq!(error.disposition(), ("input", false, 1));
+    let result = checked(
+        &base,
+        "def value : Nat := 4\nsection\nattribute [local irreducible] value\n\
+         theorem inside : value = value := rfl\nend\n\
+         theorem outside : value = 4 := rfl",
+    );
+    assert!(result.environment().contains(&n("inside")));
+    assert!(result.environment().contains(&n("outside")));
+    assert_eq!(
+        fln_elab::reducibility::known_status(result.environment(), &n("value")),
+        Ok(None),
+        "a local override must not create a persistent status entry"
+    );
     assert_eq!(before, base.logical_root(&KVMap::new()));
 }
 

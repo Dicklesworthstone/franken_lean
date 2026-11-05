@@ -23,6 +23,142 @@ pub(super) fn load_build_base(
 
 pub(crate) use imports::{external_inputs, module_records, posture_json, posture_sentence};
 
+pub(super) fn build_macro_config() -> Result<Option<ImportedMacroConfig>, BuildBaseFailure> {
+    ImportedMacroConfig::from_environment()
+        .map_err(|error| (error.class, error.detail, error.authority))
+}
+
+/// A single external world retained across requested Lake targets. Ordinary
+/// builds keep their checked source cache; macro builds retain only the admitted
+/// import receipt and captured executable inputs, never source cache authority.
+pub(super) struct ModuleBuildContext {
+    kind: ModuleBuildKind,
+}
+
+enum ModuleBuildKind {
+    Ordinary(Box<fln::source_check::modules::SourceModuleSession>),
+    ImportedMacros {
+        base: Box<imports::MacroBuildBase>,
+        limits: fln::source_check::modules::SourceModuleCheckLimits,
+    },
+}
+
+pub(super) struct ModuleMacroReport {
+    pub(super) json: String,
+    pub(super) sentence: String,
+}
+
+impl ModuleBuildContext {
+    pub(super) fn load(
+        roots: &[fln::Name],
+        source_root: &Path,
+        jobs: std::num::NonZeroUsize,
+        posture: ImportPosture,
+        limits: fln::source_check::modules::SourceModuleCheckLimits,
+        macros: Option<&ImportedMacroConfig>,
+    ) -> Result<(Self, Option<ImportPostureReport>), BuildBaseFailure> {
+        if let Some(config) = macros {
+            let (base, report) =
+                imports::load_macro_build_base(roots, source_root, jobs, posture, config)
+                    .map_err(|error| (error.class, error.detail, error.authority))?;
+            return Ok((
+                Self {
+                    kind: ModuleBuildKind::ImportedMacros {
+                        base: Box::new(base),
+                        limits,
+                    },
+                },
+                Some(report),
+            ));
+        }
+        use fln::source_check::modules::{SourceModuleCacheLimits, SourceModuleSession};
+        let (session, report) = match load_build_base(roots, source_root, jobs, posture)? {
+            Some((receipt, report)) => (
+                SourceModuleSession::from_imports(
+                    receipt,
+                    fln::KVMap::new(),
+                    limits,
+                    SourceModuleCacheLimits::default(),
+                ),
+                Some(report),
+            ),
+            None => (
+                SourceModuleSession::new(
+                    fln::Engine::from_environment(fln::Environment::new()),
+                    fln::KVMap::new(),
+                    limits,
+                    SourceModuleCacheLimits::default(),
+                ),
+                None,
+            ),
+        };
+        Ok((
+            Self {
+                kind: ModuleBuildKind::Ordinary(Box::new(session)),
+            },
+            report,
+        ))
+    }
+
+    pub(super) fn compile(
+        &mut self,
+        modules: &[fln::SourceModuleInput<'_>],
+        entry: &fln::Name,
+        write_budget: fln::OleanWriteBudget,
+        records: Option<fln::source_check::modules::persisted::PersistedModules<'_>>,
+    ) -> Result<
+        fln::Outcome<(
+            fln::source_check::modules::SourceModuleBuild,
+            Option<ModuleMacroReport>,
+        )>,
+        BuildBaseFailure,
+    > {
+        let failure = |error: fln::source_check::modules::SourceModuleBuildError| {
+            let (class, authority, _) = error.disposition();
+            (class, error.to_string(), authority)
+        };
+        match &mut self.kind {
+            ModuleBuildKind::Ordinary(session) => session
+                .compile_with_records(modules, entry, write_budget, records, None)
+                .map(|outcome| outcome.map_complete(|built| (built, None)))
+                .map_err(failure),
+            ModuleBuildKind::ImportedMacros { base, limits } => {
+                let result = base
+                    .receipt
+                    .compile_source_modules_with_deferred_imported_macros(
+                        modules,
+                        entry,
+                        &fln::KVMap::new(),
+                        *limits,
+                        base.input.clone(),
+                        write_budget,
+                        None,
+                    );
+                let report = imports::macros::Report::from_attempts(
+                    base.ir_bytes,
+                    &result.attempts,
+                    result.completed_vm_usage.steps,
+                    result.tree_usage.visits,
+                )
+                .map_err(|error| (error.class, error.detail, error.authority))?;
+                imports::macros::result(result.outcome)
+                    .map(|outcome| {
+                        outcome.map_complete(|built| {
+                            (
+                                built,
+                                Some(ModuleMacroReport {
+                                    json: report.json(),
+                                    sentence: report.sentence(),
+                                }),
+                            )
+                        })
+                    })
+                    .map_err(failure)
+            }
+        }
+    }
+}
+
 /// Explicit import programs use their admitted module worlds. `None` keeps the
 /// existing headerless and ordinary local-source `fln run` contract.
 pub(super) fn run_imported(

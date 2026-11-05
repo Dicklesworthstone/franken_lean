@@ -22,9 +22,13 @@ structure CacheDictionary where
 def cacheFactory (n : Nat) : CacheDictionary := CacheDictionary.mk n n
 def cacheRuntimeWork (n : Nat) : Nat := n + 1
 inductive CacheTree where
-  | leaf : Nat → CacheTree
-  | pair : CacheTree → CacheTree → CacheTree
+  | leaf : Nat -> CacheTree
+  | pair : CacheTree -> CacheTree -> CacheTree
 def cacheLeafFactory (n : Nat) : CacheTree := CacheTree.leaf n
+structure CacheLayer (A : Type) where
+  first : A
+  second : A
+def cacheLayer (A : Type) (x : A) : CacheLayer A := { first := x, second := x }
 "#],
             &KVMap::new(),
             SourceCheckLimits::new(limits),
@@ -161,6 +165,164 @@ fn unfinished_factory_evaluation_does_not_publish_and_can_retry() {
     assert_eq!(limited.specializations.factory_values.len(), 1);
 }
 
+fn nested_factory(value: Expr, depth: usize) -> (Expr, Expr, Expr) {
+    let mut type_ = c("Nat");
+    let mut input = value.clone();
+    let mut expected = value;
+    for _ in 0..depth {
+        input = call("cacheLayer", [type_.clone(), input]);
+        expected = call("CacheLayer.mk", [type_.clone(), expected.clone(), expected]);
+        type_ = call("CacheLayer", [type_]);
+    }
+    (input, expected, type_)
+}
+
+#[test]
+fn nested_factories_reuse_completed_operands_with_bounded_work() {
+    let engine = engine();
+    let root = engine.logical_root(&KVMap::new());
+    // Each source-admitted factory duplicates an inert dictionary. Without
+    // local reuse, beta reduction makes the evaluator validate the same tree
+    // twice at every layer, even though every operand was already checked.
+    for (leaf, scoped) in [
+        (nat::literal(42), false),
+        (nat::literal(42), true),
+        (Expr::bvar(0).unwrap(), true),
+        (Expr::bvar(3).unwrap(), true),
+    ] {
+        let (input, expected, _) = nested_factory(leaf, 16);
+        let original = input.clone();
+        let mut preparation = Preparation::new(
+            &engine.environment,
+            IngressLimits {
+                max_nodes: 20_000,
+                ..IngressLimits::default()
+            },
+        );
+        let result = if scoped {
+            preparation.scoped_instance_factory_value(&input)
+        } else {
+            preparation.instance_factory_value(&input)
+        };
+        assert_eq!(result.unwrap(), Some(expected));
+        assert_eq!(input, original);
+        if scoped {
+            assert!(preparation.specializations.factory_values.is_empty());
+        }
+        assert!(preparation.specializations.instances.is_empty());
+        assert!(preparation.specializations.definitions.is_empty());
+    }
+    assert_eq!(engine.logical_root(&KVMap::new()), root);
+}
+
+#[test]
+fn scoped_factory_reuse_has_identical_fuel_for_shared_and_rebuilt_syntax() {
+    let engine = engine();
+    let (operand, result, type_) = nested_factory(Expr::bvar(2).unwrap(), 8);
+    let shared = call("CacheLayer.mk", [type_.clone(), operand.clone(), operand]);
+    let rebuilt = call(
+        "CacheLayer.mk",
+        [
+            type_.clone(),
+            nested_factory(Expr::bvar(2).unwrap(), 8).0,
+            nested_factory(Expr::bvar(2).unwrap(), 8).0,
+        ],
+    );
+    let expected = call("CacheLayer.mk", [type_, result.clone(), result]);
+    for budget in [0, 64, 1_000, 20_000] {
+        let limits = IngressLimits {
+            max_nodes: budget,
+            ..IngressLimits::default()
+        };
+        let mut left = Preparation::new(&engine.environment, limits);
+        let mut right = Preparation::new(&engine.environment, limits);
+        let left_result = left.scoped_instance_factory_value(&shared);
+        let right_result = right.scoped_instance_factory_value(&rebuilt);
+        assert_eq!(left_result, right_result);
+        assert_eq!(left.visited, right.visited);
+        if budget == 20_000 {
+            assert_eq!(left_result.unwrap(), Some(expected.clone()));
+        }
+        assert!(left.specializations.factory_values.is_empty());
+        assert!(right.specializations.factory_values.is_empty());
+    }
+}
+
+#[test]
+fn local_factory_reuse_keeps_different_captures_and_computed_siblings_distinct() {
+    let engine = engine();
+    let mut preparation = Preparation::new(&engine.environment, IngressLimits::default());
+    let (first, first_value, type_) = nested_factory(Expr::bvar(0).unwrap(), 8);
+    let (second, second_value, _) = nested_factory(Expr::bvar(1).unwrap(), 8);
+    let input = call("CacheLayer.mk", [type_.clone(), first.clone(), second]);
+    assert_eq!(
+        preparation.scoped_instance_factory_value(&input).unwrap(),
+        Some(call(
+            "CacheLayer.mk",
+            [type_.clone(), first_value, second_value]
+        ))
+    );
+
+    // The first field populates the invocation-local table. The second has
+    // the same returned dictionary but a computed initializer; its complete
+    // syntax differs, and reusing the first result must not erase that work.
+    let computed = Expr::let_e(
+        name("unused"),
+        c("Nat"),
+        call("cacheRuntimeWork", [nat::literal(0)]),
+        first.clone(),
+        false,
+    );
+    let input = call("CacheLayer.mk", [type_, first, computed]);
+    assert!(
+        preparation
+            .scoped_instance_factory_value(&input)
+            .unwrap()
+            .is_none()
+    );
+    assert!(preparation.specializations.factory_values.is_empty());
+    assert!(preparation.specializations.instances.is_empty());
+    assert!(preparation.specializations.definitions.is_empty());
+}
+
+#[test]
+fn interrupted_scoped_factory_evaluation_can_retry_without_publishing_partial_values() {
+    let engine = engine();
+    let (input, expected, _) = nested_factory(Expr::bvar(1).unwrap(), 8);
+    let mut complete = Preparation::new(&engine.environment, IngressLimits::default());
+    assert_eq!(
+        complete.scoped_instance_factory_value(&input).unwrap(),
+        Some(expected.clone())
+    );
+    let limit = complete.visited / 2;
+    assert!(limit > 0);
+    let mut limited = Preparation::new(
+        &engine.environment,
+        IngressLimits {
+            max_nodes: limit,
+            ..IngressLimits::default()
+        },
+    );
+    assert!(matches!(
+        limited.scoped_instance_factory_value(&input),
+        Err(IngressError::ResourceLimit {
+            resource: IngressResource::Nodes,
+            limit: actual,
+            observed,
+        }) if actual == limit && observed == limit + 1
+    ));
+    assert!(limited.specializations.factory_values.is_empty());
+    assert!(limited.specializations.instances.is_empty());
+    assert!(limited.specializations.definitions.is_empty());
+
+    limited.limits = IngressLimits::default();
+    assert_eq!(
+        limited.scoped_instance_factory_value(&input).unwrap(),
+        Some(expected)
+    );
+    assert!(limited.specializations.factory_values.is_empty());
+}
+
 #[test]
 fn shared_factory_subterms_fit_the_bound_for_completed_administrative_work() {
     fn tree(mut leaf: Expr) -> Expr {
@@ -237,18 +399,39 @@ fn local_factory_reuse_keeps_unselected_computations_and_callers_separate() {
     );
     let complete = preparation.visited;
     assert!(preparation.specializations.factory_values.is_empty());
-    assert!(preparation.instance_factory_value(&input).unwrap().is_none());
+    assert!(
+        preparation
+            .instance_factory_value(&input)
+            .unwrap()
+            .is_none()
+    );
     let before = preparation.visited;
     assert!(
-        preparation.scoped_instance_factory_value(&input).unwrap().is_some()
+        preparation
+            .scoped_instance_factory_value(&input)
+            .unwrap()
+            .is_some()
     );
     assert_eq!(preparation.visited - before, complete);
     let shared = call("cacheLeafFactory", [nat::literal(42)]);
-    let computed = call("cacheLeafFactory", [call("cacheRuntimeWork", [nat::literal(0)])]);
+    let computed = call(
+        "cacheLeafFactory",
+        [call("cacheRuntimeWork", [nat::literal(0)])],
+    );
     let input = call(
         "CacheTree.pair",
         [shared.clone(), call("CacheTree.pair", [shared, computed])],
     );
-    assert!(preparation.instance_factory_value(&input).unwrap().is_none());
-    assert!(!preparation.specializations.factory_values.contains_key(&input));
+    assert!(
+        preparation
+            .instance_factory_value(&input)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        !preparation
+            .specializations
+            .factory_values
+            .contains_key(&input)
+    );
 }

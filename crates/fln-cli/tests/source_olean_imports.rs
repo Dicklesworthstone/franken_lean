@@ -909,6 +909,30 @@ impl ImportedMacroProject {
         std::env::join_paths([self.root.join("objects"), self.library.clone()]).unwrap()
     }
 
+    fn lake(
+        &self,
+        targets: &[&str],
+        macros: bool,
+        syntax_modules: &[&str],
+    ) -> std::process::Output {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_lake"));
+        command
+            .args(["--json", "build"])
+            .args(targets)
+            .current_dir(self.root.join("client"))
+            .env("LEAN_PATH", self.search_path())
+            .env("FLN_IMPORT_REUSE_DIR", self.root.join("records"))
+            .env_remove("FLN_MACRO_PARTITION")
+            .env_remove("FLN_SYNTAX_MODULES");
+        if macros {
+            command.env("FLN_MACRO_PARTITION", &self.partition);
+        }
+        if !syntax_modules.is_empty() {
+            command.env("FLN_SYNTAX_MODULES", syntax_modules.join(","));
+        }
+        command.output().unwrap()
+    }
+
     fn oracle(&self, source: &str) -> std::process::Output {
         Command::new(&self.reference)
             .arg(self.source(source))
@@ -2034,5 +2058,175 @@ fn installed_custom_categories_keep_the_generated_quotation_journal() {
     assert!(
         !refused_product.exists(),
         "malformed category syntax published an executable prefix"
+    );
+}
+
+#[test]
+fn installed_lake_builds_imported_macro_expansions_and_reimports_the_checked_artifacts() {
+    let Some(project) =
+        ImportedMacroProject::prepare_with_source(&imported_syntax_provider_source())
+    else {
+        return;
+    };
+    let client = project.root.join("client");
+    std::fs::write(
+        client.join("lakefile.toml"),
+        "name = \"macro_build\"\n[[lean_lib]]\nname = \"Client\"\nroots = [\"Main\", \"Other\", \"Bad\"]\n",
+    )
+    .unwrap();
+    let main = concat!(
+        "prelude\nimport AdmittedSourceMacro\n",
+        "def compiledMacroValue : Nat := admittedWrap% (11 : Bool) endWrap%\n",
+        "theorem compiledMacroValue_eq : Eq compiledMacroValue 11 := Eq.refl compiledMacroValue\n",
+    );
+    let other = concat!(
+        "prelude\nimport AdmittedSourceMacro\n",
+        "def otherMacroValue : Nat := admittedWrap% (13 : Bool) endWrap%\n",
+    );
+    let oracle = project.oracle(main);
+    assert!(oracle.status.success(), "{oracle:?}; {:?}", project.root);
+    assert!(oracle.stdout.is_empty(), "{oracle:?}");
+    assert!(oracle.stderr.is_empty(), "{oracle:?}");
+    std::fs::write(client.join("Other.lean"), other).unwrap();
+    let output = client.join(".lake/build/lib/lean");
+    let main_artifact = output.join("Main.olean");
+    let other_artifact = output.join("Other.olean");
+    let selected = ["AdmittedSourceMacro"];
+
+    // Neither ordinary parsing nor macro registration without the selected
+    // artifact grammar may silently give custom source a different meaning.
+    for refused in [
+        project.lake(&["+Main:olean"], false, &[]),
+        project.lake(&["+Main:olean"], true, &[]),
+        project.lake(&["+Main:olean"], false, &selected),
+    ] {
+        ImportedMacroProject::refused(refused);
+        assert!(!main_artifact.exists());
+    }
+
+    let built = project.lake(&["+Main:olean", "+Other:olean"], true, &selected);
+    assert!(built.status.success(), "{built:?}; {:?}", project.root);
+    assert!(built.stderr.is_empty(), "{built:?}");
+    let report = String::from_utf8(built.stdout).unwrap();
+    assert!(
+        report.contains("\"schema\":\"fln.lake-build/2\""),
+        "{report}"
+    );
+    assert!(report.contains("\"modules_built\":2"), "{report}");
+    assert!(report.contains("\"module_elaborations\":2"), "{report}");
+    assert!(report.contains("\"module_checks_reused\":0"), "{report}");
+    assert!(report.contains("\"modules_cached\":0"), "{report}");
+    assert!(
+        report.contains("\"module_records\":\"disabled-imported-macros\""),
+        "{report}"
+    );
+    assert!(report.contains("\"importedMacroBuilds\":["), "{report}");
+    assert!(report.contains("\"entry\":\"Main\""), "{report}");
+    assert!(report.contains("\"entry\":\"Other\""), "{report}");
+    assert_eq!(
+        report.matches("\"importedMacros\":{").count(),
+        2,
+        "{report}"
+    );
+    assert_imported_macro_provenance(&report);
+    let main_bytes = std::fs::read(&main_artifact).unwrap();
+    let other_bytes = std::fs::read(&other_artifact).unwrap();
+    assert!(!main_bytes.is_empty());
+    assert!(!other_bytes.is_empty());
+
+    // The produced module is consumed without this package's source files or
+    // imported macro mode. Both native checkers and the pinned Reference must
+    // accept the ordinary theorem about the serialized expansion.
+    let consumer = project.root.join("consumer");
+    std::fs::create_dir(&consumer).unwrap();
+    let use_path = consumer.join("Use.lean");
+    std::fs::write(
+        &use_path,
+        "prelude\nimport Main\ntheorem serializedMacroProof : Eq compiledMacroValue 11 := Eq.refl compiledMacroValue\n",
+    )
+    .unwrap();
+    let search = std::env::join_paths([
+        output.clone(),
+        project.root.join("objects"),
+        project.library.clone(),
+    ])
+    .unwrap();
+    let reimported = Command::new(env!("CARGO_BIN_EXE_fln"))
+        .args(["check-source", "--json", "--jobs", "1"])
+        .arg(&use_path)
+        .current_dir(&consumer)
+        .env("LEAN_PATH", &search)
+        .env("FLN_IMPORT_REUSE_DIR", project.root.join("records"))
+        .env_remove("FLN_MACRO_PARTITION")
+        .env_remove("FLN_SYNTAX_MODULES")
+        .output()
+        .unwrap();
+    assert!(reimported.status.success(), "{reimported:?}");
+    assert!(reimported.stderr.is_empty(), "{reimported:?}");
+    let reimported = String::from_utf8(reimported.stdout).unwrap();
+    assert!(reimported.contains("\"authority\":true"), "{reimported}");
+    assert!(!reimported.contains("\"importedMacros\""), "{reimported}");
+    let oracle = Command::new(&project.reference)
+        .arg(&use_path)
+        .current_dir(&consumer)
+        .env("LEAN_PATH", &search)
+        .output()
+        .unwrap();
+    assert!(oracle.status.success(), "{oracle:?}; {:?}", project.root);
+    assert!(oracle.stdout.is_empty(), "{oracle:?}");
+    assert!(oracle.stderr.is_empty(), "{oracle:?}");
+
+    // A warm invocation still expands every source and never uses ordinary
+    // source records whose identity omits macro IR and the selected grammar.
+    let repeated = project.lake(&["+Main:olean", "+Other:olean"], true, &selected);
+    assert!(repeated.status.success(), "{repeated:?}");
+    let repeated = String::from_utf8(repeated.stdout).unwrap();
+    assert!(repeated.contains("\"module_elaborations\":2"), "{repeated}");
+    assert!(repeated.contains("\"modules_cached\":0"), "{repeated}");
+    assert_imported_macro_provenance(&repeated);
+    assert_eq!(std::fs::read(&main_artifact).unwrap(), main_bytes);
+    assert_eq!(std::fs::read(&other_artifact).unwrap(), other_bytes);
+
+    // Code is captured again on each invocation. An earlier successful source
+    // artifact cannot conceal a now-corrupt imported executable companion.
+    let ir = project.root.join("objects/AdmittedSourceMacro.ir");
+    let ir_bytes = std::fs::read(&ir).unwrap();
+    std::fs::write(&ir, b"invalid imported macro IR").unwrap();
+    ImportedMacroProject::refused(project.lake(&["+Main:olean"], true, &selected));
+    assert_eq!(std::fs::read(&main_artifact).unwrap(), main_bytes);
+    std::fs::write(&ir, ir_bytes).unwrap();
+
+    // A late false theorem withholds all products of the invocation, including
+    // the already compiled changed sibling and a newly requested module.
+    std::fs::write(client.join("Other.lean"), other.replace("13", "17")).unwrap();
+    std::fs::write(
+        client.join("Bad.lean"),
+        concat!(
+            "prelude\nimport AdmittedSourceMacro\n",
+            "def badMacroValue : Nat := admittedWrap% (19 : Bool) endWrap%\n",
+            "theorem falseMacroProof : Eq badMacroValue 20 := Eq.refl badMacroValue\n",
+        ),
+    )
+    .unwrap();
+    ImportedMacroProject::refused(project.lake(&["+Other:olean", "+Bad:olean"], true, &selected));
+    assert_eq!(std::fs::read(&main_artifact).unwrap(), main_bytes);
+    assert_eq!(std::fs::read(&other_artifact).unwrap(), other_bytes);
+    assert!(!output.join("Bad.olean").exists());
+
+    // The snapshot records that its macro inputs are not yet a rebuild model.
+    // It cannot claim an up-to-date build, even after opting out of macro mode.
+    let explanation = Command::new(env!("CARGO_BIN_EXE_fln"))
+        .args(["build", "explain", "--json"])
+        .current_dir(&client)
+        .env("LEAN_PATH", project.search_path())
+        .env_remove("FLN_MACRO_PARTITION")
+        .env_remove("FLN_SYNTAX_MODULES")
+        .output()
+        .unwrap();
+    assert_eq!(explanation.status.code(), Some(5), "{explanation:?}");
+    let explanation = String::from_utf8(explanation.stderr).unwrap();
+    assert!(
+        explanation.contains("do not yet bind executable IR"),
+        "{explanation}"
     );
 }

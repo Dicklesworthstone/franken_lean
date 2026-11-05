@@ -15,7 +15,7 @@ use fln_env::environment::Environment;
 use fln_env::extensions::{
     CheckpointSemantics, ExtensionDescriptor, MergeSemantics, PayloadProvenance,
 };
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 pub mod export;
@@ -140,6 +140,85 @@ pub fn register(
     }
     env.push_extension_entry(&extension_name(), payload)
         .map_err(|_| ReducibilityError::Malformed)
+}
+
+/// Lexical transparency overrides. They live in a source scope, never in the
+/// admitted environment's journal or a module's exported extension suffix.
+/// An elaboration receives a temporary environment with these statuses, so
+/// unification, instance selection and simplification read one coherent table.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LocalReducibility {
+    statuses: BTreeMap<Name, Reducibility>,
+}
+
+impl LocalReducibility {
+    const MAX_DECLARATIONS: usize = 4096;
+
+    /// Stage one already resolved definition. Validation of the requested
+    /// transition belongs to the source attribute handler; this boundary also
+    /// validates embedders' names, declaration kinds and retained-state bounds.
+    pub fn with_status(
+        &self,
+        env: &Environment,
+        declaration: &Name,
+        status: Reducibility,
+    ) -> Result<Self, ReducibilityError> {
+        match env.find(declaration) {
+            Some(fln_env::constants::ConstantInfo::Defn(_)) => {}
+            Some(_) => return Err(ReducibilityError::Malformed),
+            None => return Err(ReducibilityError::UnknownDeclaration(declaration.clone())),
+        }
+        if !self.statuses.contains_key(declaration) && self.statuses.len() >= Self::MAX_DECLARATIONS
+        {
+            return Err(ReducibilityError::Limit);
+        }
+        // Use the persistent codec's exact name and payload limits, without
+        // publishing the validation snapshot.
+        register(env, declaration, status)?;
+        let mut next = self.clone();
+        next.statuses.insert(declaration.clone(), status);
+        Ok(next)
+    }
+
+    /// The subset meaningful in a public module world. Private declarations
+    /// and opaque public interfaces have no unfoldable body in that world.
+    pub fn visible_in(&self, env: &Environment) -> Self {
+        Self {
+            statuses: self
+                .statuses
+                .iter()
+                .filter(|(name, _)| {
+                    matches!(
+                        env.find(name),
+                        Some(fln_env::constants::ConstantInfo::Defn(_))
+                    )
+                })
+                .map(|(name, status)| (name.clone(), *status))
+                .collect(),
+        }
+    }
+
+    /// Apply this scope only to an elaboration snapshot. The caller retains
+    /// its original environment for admission and publication. Reapplying the
+    /// same scope to a child context does not grow the temporary journal.
+    pub fn environment(&self, env: &Environment) -> Result<Environment, ReducibilityError> {
+        if self.statuses.is_empty() {
+            return Ok(env.clone());
+        }
+        let current = table(env)?;
+        let mut next = env.clone();
+        for (name, status) in &self.statuses {
+            match env.find(name) {
+                Some(fln_env::constants::ConstantInfo::Defn(_)) => {}
+                Some(_) => return Err(ReducibilityError::Malformed),
+                None => return Err(ReducibilityError::UnknownDeclaration(name.clone())),
+            }
+            if current.status(name) != *status {
+                next = register(&next, name, *status)?;
+            }
+        }
+        Ok(next)
+    }
 }
 
 /// Every recorded status, the last entry for a declaration winning.

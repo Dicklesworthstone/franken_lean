@@ -3,9 +3,7 @@
 use super::*;
 use fln::source_check::modules::persisted::{ModuleProvenance, PersistedModules};
 use fln::source_check::modules::reuse::{ImportPosture, ImportPostureReport};
-use fln::source_check::modules::{
-    SourceModuleCacheLimits, SourceModuleCheckLimits, SourceModuleSession, parse_source_header,
-};
+use fln::source_check::modules::{SourceModuleCheckLimits, parse_source_header};
 use fln::{Name, Outcome};
 use fln_lake::{LakeConfig, TargetKind};
 use std::path::Component;
@@ -19,6 +17,10 @@ pub(crate) use explain::explain;
 const MAX_MODULES: usize = 256;
 const MAX_IMPORTS: usize = 4096;
 const MAX_ARTIFACT_BYTES: usize = 64 * 1024 * 1024;
+/// Ordinary source records and rebuild explanations do not bind macro code,
+/// its census policy or selected syntax. Preserve that distinction durably.
+const MACRO_RECORDS_UNAVAILABLE: &str = "disabled-imported-macros";
+const MACRO_EXPLANATION_UNAVAILABLE: &str = "imported-macro build explanations do not yet bind executable IR, census policy and syntax selection";
 
 struct Failure {
     class: &'static str,
@@ -46,16 +48,20 @@ impl Failure {
         self.render_as(json, "fln.lake-build/2", "lake build")
     }
     fn render_as(self, json: bool, schema: &str, command: &str) -> MultiplexerOutput {
+        // Resource stops and internal faults are nonanswers on both command
+        // surfaces, never ordinary source/build rejection (FL-INV-07).
+        let (status, exit) = match self.class {
+            "resource" | "inconclusive" => ("inconclusive", 3),
+            "internal-fault" => ("internal-fault", 4),
+            "unsupported" => ("unsupported", 1),
+            _ => ("error", 1),
+        };
         let detail = BoundedText::new(self.detail);
         let output = if json {
             format!(
                 "{{\"schema\":{},\"status\":{},\"class\":{},\"authority\":{},\"error\":{},\"detailTruncated\":{}}}\n",
                 json_string(schema),
-                json_string(if self.class == "unsupported" {
-                    "unsupported"
-                } else {
-                    "error"
-                }),
+                json_string(status),
                 json_string(self.class),
                 self.authority,
                 json_string(detail.text()),
@@ -69,7 +75,7 @@ impl Failure {
         } else {
             format!("{command}: {}: {}\n", self.class, detail.text())
         };
-        MultiplexerOutput::failure(output, 1)
+        MultiplexerOutput::failure(output, exit)
     }
 }
 impl From<BoundedReadFailure> for Failure {
@@ -340,6 +346,7 @@ struct Compilation {
     modules: Vec<ModuleProvenance>,
     /// One per external `.olean` closure obtained, in the order obtained.
     imports: Vec<ImportPostureReport>,
+    macro_reports: Vec<(Name, source_check::ModuleMacroReport)>,
 }
 
 fn compile(
@@ -349,31 +356,36 @@ fn compile(
     jobs: std::num::NonZeroUsize,
     posture: ImportPosture,
     records: Option<PersistedModules<'_>>,
+    macro_config: Option<&source_check::ImportedMacroConfig>,
 ) -> Result<Compilation, Failure> {
     let mut artifacts = BTreeMap::new();
     let mut imports = Vec::new();
+    let mut macro_reports = Vec::new();
     let mut elaborated_modules = 0usize;
     let mut reused_modules = 0usize;
     let mut cached_modules = 0usize;
     let mut provenance: Vec<ModuleProvenance> = Vec::new();
     // Retain only one external world, never one large engine per target. Target
     // order is observable on failure and is not rearranged to manufacture hits.
-    let mut active: Option<(Vec<Name>, SourceModuleSession)> = None;
+    let mut active: Option<(Vec<Name>, source_check::ModuleBuildContext)> = None;
     let admission = fln::EngineAdmissionLimits::new(fln::Budget::for_stack_bytes(
         SOURCE_RUN_KERNEL_STACK_BYTES,
     ));
     let limits = SourceModuleCheckLimits::new(fln::SourceCheckLimits::new(admission));
-    // Refuse unparseable source before any import closure is admitted; that
-    // admission is the expensive step, and a parse refusal needs no environment.
-    for (name, module) in modules {
-        fln::source_check::preflight_source_module(name, &module.source).map_err(|error| {
-            let (class, authority, _) = error.disposition();
-            Failure {
-                class,
-                detail: error.to_string(),
-                authority,
-            }
-        })?;
+    // Ordinary sources can be parsed before expensive import admission.
+    // Imported syntax needs its receipt-bound grammar before parsing bodies;
+    // the loader has already validated their headers and bounded their bytes.
+    if macro_config.is_none() {
+        for (name, module) in modules {
+            fln::source_check::preflight_source_module(name, &module.source).map_err(|error| {
+                let (class, authority, _) = error.disposition();
+                Failure {
+                    class,
+                    detail: error.to_string(),
+                    authority,
+                }
+            })?;
+        }
     }
     let mut artifact_bytes = 0usize;
     for entry in entries {
@@ -400,31 +412,23 @@ fn compile(
         // The exact ordered external roots bind this invocation's immutable
         // import snapshot. Disk outputs never become checked cache entries.
         if active.as_ref().is_none_or(|(roots, _)| roots != &external) {
-            let base = source_check::load_build_base(&external, root, jobs, posture).map_err(
-                |(class, detail, authority)| Failure {
-                    class,
-                    detail,
-                    authority,
-                },
-            )?;
-            let session = match base {
-                Some((base, report)) => {
-                    imports.push(report);
-                    SourceModuleSession::from_imports(
-                        base,
-                        fln::KVMap::new(),
-                        limits,
-                        SourceModuleCacheLimits::default(),
-                    )
-                }
-                None => SourceModuleSession::new(
-                    fln::Engine::from_environment(fln::Environment::new()),
-                    fln::KVMap::new(),
-                    limits,
-                    SourceModuleCacheLimits::default(),
-                ),
-            };
-            active = Some((external, session));
+            let (context, report) = source_check::ModuleBuildContext::load(
+                &external,
+                root,
+                jobs,
+                posture,
+                limits,
+                macro_config,
+            )
+            .map_err(|(class, detail, authority)| Failure {
+                class,
+                detail,
+                authority,
+            })?;
+            if let Some(report) = report {
+                imports.push(report);
+            }
+            active = Some((external, context));
         }
         let inputs: Vec<_> = closure
             .iter()
@@ -441,16 +445,13 @@ fn compile(
             .as_mut()
             .expect("the current external context is installed")
             .1
-            .compile_with_records(&inputs, entry, budget, records, None)
-            .map_err(|error| {
-                let (class, authority, _) = error.disposition();
-                Failure {
-                    class,
-                    detail: error.to_string(),
-                    authority,
-                }
+            .compile(&inputs, entry, budget, records)
+            .map_err(|(class, detail, authority)| Failure {
+                class,
+                detail,
+                authority,
             })?;
-        let built = match built {
+        let (built, macro_report) = match built {
             Outcome::Complete(built) => built,
             Outcome::Inconclusive(reason) => {
                 return Err(Failure::new(
@@ -465,6 +466,9 @@ fn compile(
                 ));
             }
         };
+        if let Some(report) = macro_report {
+            macro_reports.push((entry.clone(), report));
+        }
         elaborated_modules += built.elaborated_modules;
         reused_modules += built.reused_modules;
         cached_modules += built.persisted_modules;
@@ -504,6 +508,7 @@ fn compile(
         cached_modules,
         modules: provenance,
         imports,
+        macro_reports,
     })
 }
 
@@ -613,6 +618,12 @@ fn build(
     let root = directory
         .canonicalize()
         .map_err(|error| Failure::io(&directory, error))?;
+    let macro_config =
+        source_check::build_macro_config().map_err(|(class, detail, authority)| Failure {
+            class,
+            detail,
+            authority,
+        })?;
     let (config, configuration_imports) = if root.join("lakefile.toml").is_file() {
         (config(&root)?, None)
     } else {
@@ -635,7 +646,12 @@ fn build(
     };
     let (libraries, entries) = plan(&root, &config, &targets)?;
     let modules = load_sources(&root, &libraries, &entries)?;
-    let records = source_check::module_records(posture);
+    let records = macro_config
+        .is_none()
+        .then(|| source_check::module_records(posture));
+    let records_state = records
+        .as_ref()
+        .map_or(MACRO_RECORDS_UNAVAILABLE, |records| records.state());
     let Compilation {
         artifacts,
         elaborated_modules,
@@ -643,13 +659,15 @@ fn build(
         cached_modules,
         modules: provenance,
         imports,
+        macro_reports,
     } = compile(
         &root,
         &entries,
         &modules,
         jobs,
         posture,
-        records.persisted(),
+        records.as_ref().and_then(|records| records.persisted()),
+        macro_config.as_ref(),
     )?;
     let output_dir = root.join(&config.build_dir).join("lib/lean");
     let paths = publish(&root, &output_dir, &artifacts)?;
@@ -663,7 +681,7 @@ fn build(
         &output_dir,
         &provenance,
         posture,
-        records.state(),
+        records_state,
     );
     let output = if json {
         let paths = paths
@@ -707,9 +725,26 @@ fn build(
             .collect::<Vec<_>>()
             .join(",");
         let unavailable = records
-            .unavailable()
+            .as_ref()
+            .and_then(|records| records.unavailable())
             .map(|reason| format!(",\"module_records_reason\":{}", json_string(reason)))
             .unwrap_or_default();
+        let macro_json = if macro_reports.is_empty() {
+            String::new()
+        } else {
+            let reports = macro_reports
+                .iter()
+                .map(|(entry, report)| {
+                    format!(
+                        "{{\"entry\":{}{}}}",
+                        json_string(&entry.to_display_string()),
+                        report.json
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            format!(",\"importedMacroBuilds\":[{reports}]")
+        };
         let snapshot = match &snapshot {
             Ok(()) => "\"snapshot\":\"written\"".to_owned(),
             Err(reason) => format!(
@@ -718,11 +753,11 @@ fn build(
             ),
         };
         format!(
-            "{{\"schema\":\"fln.lake-build/2\",\"status\":\"success\",\"package\":{},\"facet\":\"olean\",\"modules_built\":{},\"modules_cached\":{cached_modules},\"module_elaborations\":{elaborated_modules},\"module_checks_reused\":{reused_modules},\"artifacts\":[{paths}],\"admission\":\"K1+independent-checker\",\"import_posture\":{},\"imports\":[{imports}]{configuration_imports},\"module_records\":{}{unavailable},\"modules\":[{rows}],{snapshot}}}\n",
+            "{{\"schema\":\"fln.lake-build/2\",\"status\":\"success\",\"package\":{},\"facet\":\"olean\",\"modules_built\":{},\"modules_cached\":{cached_modules},\"module_elaborations\":{elaborated_modules},\"module_checks_reused\":{reused_modules},\"artifacts\":[{paths}],\"admission\":\"K1+independent-checker\",\"import_posture\":{},\"imports\":[{imports}]{configuration_imports},\"module_records\":{}{unavailable},\"modules\":[{rows}]{macro_json},{snapshot}}}\n",
             json_string(&config.name),
             artifacts.len(),
             json_string(posture.as_str()),
-            json_string(records.state()),
+            json_string(records_state),
         )
     } else {
         let imports = imports
@@ -738,12 +773,16 @@ fn build(
                 )
             })
             .unwrap_or_default();
+        let macros = macro_reports
+            .iter()
+            .map(|(entry, report)| format!(" {}: {}", entry.to_display_string(), report.sentence))
+            .collect::<String>();
         let snapshot = match &snapshot {
             Ok(()) => String::new(),
             Err(reason) => format!(" The build snapshot was not written: {reason}."),
         };
         format!(
-            "Built {} checked .olean modules for {} ({elaborated_modules} elaborated, {cached_modules} re-admitted from verified records; {reused_modules} module checks reused).{imports}{configuration_imports}{snapshot}\n",
+            "Built {} checked .olean modules for {} ({elaborated_modules} elaborated, {cached_modules} re-admitted from verified records; {reused_modules} module checks reused).{imports}{configuration_imports}{macros}{snapshot}\n",
             artifacts.len(),
             config.name
         )

@@ -673,6 +673,54 @@ pub(super) fn load_build_base(
         .map(|(_, base)| base.map(|base| (base.receipt, base.report)))
 }
 
+/// Immutable macro compilation inputs captured from the same artifacts as the
+/// checked receipt. Source module records do not include these executable
+/// inputs and therefore cannot be consulted by this build path.
+pub(super) struct MacroBuildBase {
+    pub(super) receipt: SourceOleanImport,
+    pub(super) input: fln::source_check::modules::SourceModuleDeferredMacroInputs,
+    pub(super) ir_bytes: usize,
+}
+
+pub(super) fn load_macro_build_base(
+    roots: &[Name],
+    source_root: &Path,
+    jobs: std::num::NonZeroUsize,
+    posture: ImportPosture,
+    config: &macros::Config,
+) -> Result<(MacroBuildBase, ImportPostureReport), Failure> {
+    let loaded = Loaded {
+        inputs: Inputs::Files(Vec::new()),
+        total_bytes: 0,
+        oleans: load_olean_closure(roots, source_root)?,
+        olean_roots: roots.to_vec(),
+    };
+    // Capture code beside the selected artifacts before admission. No later
+    // search-path lookup can substitute a different module's executable bytes.
+    let prepared = loaded.prepare_artifact_macros(config)?;
+    let (_, base) = loaded.base_engine(
+        || {
+            Err(Failure::input(
+                "imported macros require an admitted artifact receipt",
+            ))
+        },
+        jobs,
+        posture,
+    )?;
+    let mut base =
+        base.ok_or_else(|| Failure::input("imported macros require an admitted artifact receipt"))?;
+    prepared.enable_syntax(&mut base.receipt)?;
+    let (input, ir_bytes) = prepared.into_inputs(&base.receipt, None)?;
+    Ok((
+        MacroBuildBase {
+            receipt: base.receipt,
+            input,
+            ir_bytes,
+        },
+        base.report,
+    ))
+}
+
 /// An editor session's `.olean` import world (bead `fln-uyuz`): the closure as
 /// `check-source` resolves it, read afresh, with an identity over every byte.
 pub(in crate::source_check) struct EditorWorld {
