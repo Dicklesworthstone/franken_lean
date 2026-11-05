@@ -133,8 +133,9 @@ fn compare(
     )
 }
 
-/// The checked eliminator implementing Ordering.then. Keeping the next
-/// comparison in its eq branch preserves lexicographic short-circuiting.
+/// The checked eliminator implementing Ordering.then. Its fallback returns the
+/// original discriminant, preserving the pin's symbolic term as well as values.
+/// Bind that discriminant once, and keep the next comparison in its eq branch.
 fn then(context: &mut Context, first: Typed, next: Typed) -> Result<Typed, NatDefinitionElabError> {
     let recursor = named("Ordering.rec");
     let Some(ConstantInfo::Rec(metadata)) = context.txn.env.find(&recursor).cloned() else {
@@ -148,6 +149,19 @@ fn then(context: &mut Context, first: Typed, next: Typed) -> Result<Typed, NatDe
     {
         return Err(unsupported(&named("Ordering")));
     }
+    context.constrain_type(&first.type_, &ordering())?;
+    let saved = context.txn.lctx.clone();
+    let id = FVarId(context.fresh_name()?);
+    let first_local = context
+        .txn
+        .lctx
+        .add_let(
+            id.clone(),
+            Name::anonymous(),
+            ordering(),
+            first.value.clone(),
+        )
+        .clone();
     let motive = typed(
         context,
         Expr::lam(
@@ -166,13 +180,29 @@ fn then(context: &mut Context, first: Typed, next: Typed) -> Result<Typed, NatDe
         let branch = if rule.ctor == named("Ordering.eq") {
             next.clone()
         } else if rule.ctor == named("Ordering.lt") || rule.ctor == named("Ordering.gt") {
-            context.constant(&rule.ctor)?
+            value(&first_local)
         } else {
             return Err(unsupported(&named("Ordering")));
         };
         function = context.match_apply(function, branch)?;
     }
-    context.match_apply(function, first)
+    let result = context.match_apply(function, value(&first_local))?;
+    context.constrain_type(&result.type_, &ordering())?;
+    let body = Expr::let_e(
+        Name::anonymous(),
+        ordering(),
+        first.value,
+        result
+            .value
+            .abstract_fvar(&id, 0)
+            .map_err(|_| failure(SourceInferenceError::Scope))?,
+        false,
+    );
+    context.txn.lctx = saved;
+    context.finish(Typed {
+        value: body,
+        type_: ordering(),
+    })
 }
 
 struct Minor {
@@ -246,6 +276,41 @@ fn recursor(
         ),
     )?;
     context.match_apply(function, motive)
+}
+
+/// CtorIdx.lean constructs raw Nat literals through the checked cases eliminator.
+/// The native source pipeline does not necessarily publish a named ctorIdx helper.
+fn enum_index(
+    context: &mut Context,
+    family: &InductiveVal,
+    metadata: &RecursorVal,
+    target: &Expr,
+    receiver: &LocalDecl,
+) -> Result<Typed, NatDefinitionElabError> {
+    let nat = Expr::const_(named("Nat"), Vec::new());
+    let mut function = recursor(context, family, &[], target, nat.clone())?;
+    for rule in &metadata.rules {
+        context.tick()?;
+        let constructor = constructor(context, family, &rule.ctor, rule.nfields)?;
+        if constructor.num_fields != 0 {
+            return Err(unsupported(&family.base.name));
+        }
+        let ordinal = Typed {
+            value: Expr::lit(Literal::Nat(fln_core::expr::NatLit::from_u64(u64::from(
+                constructor.cidx,
+            )))),
+            type_: nat.clone(),
+        };
+        // The pin's one-constructor index is constant even for a symbolic value.
+        if metadata.rules.len() == 1 {
+            return Ok(ordinal);
+        }
+        function = context.match_apply(function, ordinal)?;
+    }
+    let mut result = context.match_apply(function, value(receiver))?;
+    context.constrain_type(&result.type_, &nat)?;
+    result.type_ = nat;
+    Ok(result)
 }
 
 fn minor_type(context: &mut Context, function: &Typed) -> Result<Expr, NatDefinitionElabError> {
@@ -330,11 +395,7 @@ pub(super) fn elaborate(
     target: &Expr,
 ) -> Result<DerivedInstance, NatDefinitionElabError> {
     check_exposure(context, family)?;
-    if family.is_rec
-        || family.num_indices != 0
-        || family.all.len() != 1
-        || family.num_nested != 0
-    {
+    if family.is_rec || family.num_indices != 0 || family.all.len() != 1 || family.num_nested != 0 {
         return Err(unsupported(&family.base.name));
     }
     let recursor_name = Name::str(family.base.name.clone(), "rec");
@@ -393,9 +454,8 @@ pub(super) fn elaborate(
     let body = if enum_type {
         // The pin does not hard-code the enum's ordering: a scoped Ord Nat can
         // change the comparison of its constructor indices at derivation time.
-        let index = Name::str(family.base.name.clone(), "ctorIdx");
-        let first = call(context, &index, &[value(&left)])?;
-        let second = call(context, &index, &[value(&right)])?;
+        let first = enum_index(context, family, &metadata, target, &left)?;
+        let second = enum_index(context, family, &metadata, target, &right)?;
         compare(context, first, second)?
     } else {
         let result = Expr::forall_e(
