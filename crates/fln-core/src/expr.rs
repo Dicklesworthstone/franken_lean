@@ -1007,18 +1007,20 @@ impl Expr {
     /// peeled parameters (`fun n => first n` becomes `fun n y => first n y`).
     /// Iterative: a 400-deep open nest is a legal term, and the recursive
     /// form blew the host stack the same way convert's pre-bound walks did.
+    /// Memoization uses exact syntax and binder depth, so independently
+    /// allocated equal subterms require the same transformation work as sharing.
     pub fn lift_loose(&self, cutoff: u32, amount: u32) -> Result<Expr, TooManyBoundVars> {
         if amount == 0 || self.loose_bvar_range() <= cutoff {
             return Ok(self.clone());
         }
-        let mut done: HashMap<(usize, u32), Expr> = HashMap::new();
+        let mut done: HashMap<(Expr, u32), Expr> = HashMap::new();
         let mut stack = vec![(self.clone(), cutoff, false)];
         while let Some((current, cut, exit)) = stack.pop() {
             if amount == 0 || current.loose_bvar_range() <= cut {
-                done.insert((current.allocation_identity(), cut), current);
+                done.insert((current.clone(), cut), current);
                 continue;
             }
-            let key = (current.allocation_identity(), cut);
+            let key = (current.clone(), cut);
             if done.contains_key(&key) {
                 continue;
             }
@@ -1119,7 +1121,7 @@ impl Expr {
             };
             done.insert(key, lifted);
         }
-        done.get(&(self.allocation_identity(), cutoff))
+        done.get(&(self.clone(), cutoff))
             .cloned()
             .ok_or(TooManyBoundVars { range: u32::MAX })
     }
@@ -1130,19 +1132,21 @@ impl Expr {
     /// Iterative: admit's restore step instantiates open templates, and a
     /// 400-deep nest is legal. The recursive form was depth-guarded at 2048
     /// — a host-stack bound, not a Lean covenant (FL-INV-07).
+    /// Equal syntax at the same cutoff shares completed work, regardless of
+    /// allocation identity; the ordered replacements are fixed for this call.
     pub fn subst_loose(&self, k: u32, substs: &[Expr]) -> Result<Expr, TooManyBoundVars> {
         let n = u32::try_from(substs.len()).map_err(|_| TooManyBoundVars { range: u32::MAX })?;
         if n == 0 || self.loose_bvar_range() <= k {
             return Ok(self.clone());
         }
-        let mut done: HashMap<(usize, u32), Expr> = HashMap::new();
+        let mut done: HashMap<(Expr, u32), Expr> = HashMap::new();
         let mut stack = vec![(self.clone(), k, false)];
         while let Some((current, cut, exit)) = stack.pop() {
             if current.loose_bvar_range() <= cut {
-                done.insert((current.allocation_identity(), cut), current);
+                done.insert((current.clone(), cut), current);
                 continue;
             }
-            let key = (current.allocation_identity(), cut);
+            let key = (current.clone(), cut);
             if done.contains_key(&key) {
                 continue;
             }
@@ -1250,7 +1254,7 @@ impl Expr {
             };
             done.insert(key, substed);
         }
-        done.get(&(self.allocation_identity(), k))
+        done.get(&(self.clone(), k))
             .cloned()
             .ok_or(TooManyBoundVars { range: u32::MAX })
     }
@@ -1262,14 +1266,14 @@ impl Expr {
         if !self.has_fvar() {
             return Ok(self.clone());
         }
-        let mut done: HashMap<(usize, u32), Expr> = HashMap::new();
+        let mut done: HashMap<(Expr, u32), Expr> = HashMap::new();
         let mut stack = vec![(self.clone(), k, false)];
         while let Some((current, cut, exit)) = stack.pop() {
             if !current.has_fvar() {
-                done.insert((current.allocation_identity(), cut), current);
+                done.insert((current.clone(), cut), current);
                 continue;
             }
-            let key = (current.allocation_identity(), cut);
+            let key = (current.clone(), cut);
             if done.contains_key(&key) {
                 continue;
             }
@@ -1365,7 +1369,7 @@ impl Expr {
             };
             done.insert(key, abstracted);
         }
-        done.get(&(self.allocation_identity(), k))
+        done.get(&(self.clone(), k))
             .cloned()
             .ok_or(TooManyBoundVars { range: u32::MAX })
     }
@@ -1447,11 +1451,11 @@ impl Expr {
 }
 
 fn lifted_child(
-    done: &HashMap<(usize, u32), Expr>,
+    done: &HashMap<(Expr, u32), Expr>,
     child: &Expr,
     cut: u32,
 ) -> Result<Expr, TooManyBoundVars> {
-    done.get(&(child.allocation_identity(), cut))
+    done.get(&(child.clone(), cut))
         .cloned()
         .ok_or(TooManyBoundVars { range: u32::MAX })
 }
@@ -1542,6 +1546,73 @@ mod tests {
 
     fn u() -> Level {
         Level::param(name("u"))
+    }
+
+    #[test]
+    fn scope_transforms_reuse_equal_syntax_across_distinct_allocations() {
+        fn leaf() -> Expr {
+            Expr::app(Expr::bvar(0).unwrap(), Expr::bvar(1).unwrap())
+        }
+        fn assert_shared_children(value: &Expr) {
+            let ExprNode::App { f, a } = value.node() else {
+                panic!("expected the transformed pair");
+            };
+            assert_eq!(f, a);
+            assert!(
+                f.allocation_identity() == a.allocation_identity(),
+                "equal subterms must share completed transformation"
+            );
+        }
+        let input = Expr::app(leaf(), leaf());
+        let ExprNode::App { f, a } = input.node() else {
+            unreachable!();
+        };
+        assert!(f.allocation_identity() != a.allocation_identity());
+        let lifted = input.lift_loose(0, 1).unwrap();
+        let expected = Expr::app(Expr::bvar(1).unwrap(), Expr::bvar(2).unwrap());
+        assert_eq!(lifted, Expr::app(expected.clone(), expected));
+        assert_shared_children(&lifted);
+        let replacement = Expr::const_(name("value"), vec![]);
+        let substituted = input
+            .subst_loose(0, std::slice::from_ref(&replacement))
+            .unwrap();
+        let expected = Expr::app(replacement, Expr::bvar(0).unwrap());
+        assert_eq!(substituted, Expr::app(expected.clone(), expected));
+        assert_shared_children(&substituted);
+        let id = FVarId(name("x"));
+        let input = Expr::app(
+            Expr::app(Expr::fvar(id.clone()), Expr::bvar(0).unwrap()),
+            Expr::app(Expr::fvar(id.clone()), Expr::bvar(0).unwrap()),
+        );
+        let abstracted = input.abstract_fvar(&id, 0).unwrap();
+        let expected = Expr::app(Expr::bvar(0).unwrap(), Expr::bvar(0).unwrap());
+        assert_eq!(abstracted, Expr::app(expected.clone(), expected));
+        assert_shared_children(&abstracted);
+    }
+
+    #[test]
+    fn scope_transforms_keep_equal_syntax_at_different_binder_depths_distinct() {
+        let leaf = Expr::app(Expr::bvar(0).unwrap(), Expr::bvar(1).unwrap());
+        let input = Expr::app(
+            leaf.clone(),
+            Expr::lam(
+                name("x"),
+                Expr::sort(Level::zero()),
+                leaf,
+                BinderInfo::Default,
+            ),
+        );
+        let replacement = Expr::const_(name("value"), vec![]);
+        let expected = Expr::app(
+            Expr::app(replacement.clone(), Expr::bvar(0).unwrap()),
+            Expr::lam(
+                name("x"),
+                Expr::sort(Level::zero()),
+                Expr::app(Expr::bvar(0).unwrap(), replacement.clone()),
+                BinderInfo::Default,
+            ),
+        );
+        assert_eq!(input.subst_loose(0, &[replacement]).unwrap(), expected);
     }
 
     #[test]

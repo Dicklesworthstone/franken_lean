@@ -11,6 +11,93 @@ fn limits(nodes: usize) -> IngressLimits {
         ..IngressLimits::default()
     }
 }
+
+#[test]
+fn repeated_open_subterms_fit_the_bound_for_the_work_actually_reused() {
+    fn diamond(mut leaf: Expr) -> Expr {
+        for _ in 0..25 {
+            leaf = Expr::app(leaf.clone(), leaf);
+        }
+        leaf
+    }
+    let environment = Environment::new();
+    let replacement = Expr::const_(name("Nat.zero"), vec![]);
+    let leaf = diamond(b(0));
+    let shared = Expr::app(leaf.clone(), leaf);
+    let separate = Expr::app(diamond(b(0)), diamond(b(0)));
+    let expected = diamond(replacement.clone());
+    let expected = Expr::app(expected.clone(), expected);
+    let mut left = Preparation::new(&environment, limits(128));
+    let mut right = Preparation::new(&environment, limits(128));
+    assert_eq!(left.substitution(&shared, &replacement).unwrap(), expected);
+    assert_eq!(
+        right.substitution(&separate, &replacement).unwrap(),
+        expected
+    );
+    assert_eq!(left.visited, right.visited);
+    let mut bounded = Preparation::new(&environment, limits(10));
+    assert!(matches!(
+        bounded.substitution(&separate, &replacement),
+        Err(IngressError::ResourceLimit {
+            resource: IngressResource::Nodes,
+            limit: 10,
+            observed: 11
+        })
+    ));
+    let before = bounded.visited;
+    bounded.limits = limits(128);
+    assert_eq!(
+        bounded.substitution(&separate, &replacement).unwrap(),
+        expected
+    );
+    assert!(
+        bounded.visited > before + 1,
+        "failed work cannot become a cache hit"
+    );
+}
+
+#[test]
+fn substitution_and_replacement_lifting_have_distinct_memo_domains() {
+    let environment = Environment::new();
+    let replacement = Expr::app(b(0), b(1));
+    let source = Expr::app(
+        replacement.clone(),
+        Expr::lam(name("x"), nat(), b(1), BinderInfo::Default),
+    );
+    let expected = Expr::app(
+        Expr::app(replacement.clone(), b(0)),
+        Expr::lam(name("x"), nat(), Expr::app(b(1), b(2)), BinderInfo::Default),
+    );
+    let mut envelope = Preparation::new(&environment, limits(20));
+    charge(&mut envelope, &source, Operation::Substitute(&replacement)).unwrap();
+    assert_eq!(envelope.visited, 20);
+    let mut preparation = Preparation::new(&environment, limits(22));
+    assert_eq!(
+        preparation.substitution(&source, &replacement).unwrap(),
+        expected
+    );
+    assert_eq!(preparation.visited, 22);
+    let mut bounded = Preparation::new(&environment, limits(21));
+    assert!(matches!(
+        bounded.substitution(&source, &replacement),
+        Err(IngressError::ResourceLimit {
+            resource: IngressResource::Nodes,
+            limit: 21,
+            observed: 22
+        })
+    ));
+    let before = bounded.visited;
+    bounded.limits = limits(128);
+    assert_eq!(
+        bounded.substitution(&source, &replacement).unwrap(),
+        expected
+    );
+    assert!(
+        bounded.visited > before + 1,
+        "failed publication cannot become a cache hit"
+    );
+}
+
 #[test]
 fn replacement_lifting_is_charged_at_its_actual_binder_depth() {
     let environment = Environment::new();

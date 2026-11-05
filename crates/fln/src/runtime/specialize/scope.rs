@@ -7,9 +7,10 @@
 //!
 //! This envelope follows the same cutoff rules as Expr::{subst,lift}_loose.
 //! Every enter/exit is charged before the core runs; replacement lifts are
-//! preflighted too. We deliberately count presentations, even for shared DAGs:
-//! core memoization can only make the actual work smaller, and fuel never
-//! depends on allocation identity or hash-table iteration order.
+//! preflighted too. Reuse completed compound substitution templates by exact
+//! syntax and binder depth, as the core does. Variable occurrences and their
+//! replacement lifts retain the conservative per-occurrence charge; lifting
+//! itself still counts presentations. Fuel never depends on allocation identity.
 use super::*;
 
 #[derive(Clone, Copy)]
@@ -24,12 +25,27 @@ pub(super) fn charge<'a>(
     operation: Operation<'a>,
 ) -> Result<(), IngressError> {
     let mut work = vec![(source, 0u32, operation)];
+    let mut seen = HashSet::new();
     while let Some((current, cutoff, operation)) = work.pop() {
         preparation.tick()?;
         // The core returns a clone without walking this subtree. This is a
         // syntactic scope test, never permission to erase runtime computation.
         if current.loose_bvar_range() <= cutoff || matches!(operation, Operation::Lift(0)) {
             continue;
+        }
+        if matches!(operation, Operation::Substitute(_))
+            && !matches!(current.node(), ExprNode::BVar { .. })
+        {
+            let key = (current.clone(), cutoff);
+            if seen.contains(&key) {
+                continue;
+            }
+            seen.try_reserve(1)
+                .map_err(|_| IngressError::AllocationFailure {
+                    resource: IngressResource::Nodes,
+                    requested: seen.len().saturating_add(1),
+                })?;
+            seen.insert(key);
         }
         preparation.tick()?; // reconstruction/exit; memo hits are cheaper
         let mut push = |child, cut, op| -> Result<(), IngressError> {
