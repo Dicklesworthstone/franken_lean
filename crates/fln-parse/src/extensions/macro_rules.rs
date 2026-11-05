@@ -27,7 +27,7 @@ pub(super) fn declare(file: &mut FileGrammar, args: &[Syntax]) -> Result<(), &'s
             let mut namespace = file.top().namespace.clone();
             loop {
                 let candidate = namespace.append_core(&name);
-                let registered = atoms::is_kind(&candidate) || file.imported.iter().chain(&file.native_imported)
+                let registered = atoms::is_kind(&candidate) || file.runtime_macro_kinds.contains(&candidate) || file.imported.iter().chain(&file.native_imported)
                 .chain(&file.declared).chain(file.scoped.values().flatten())
                 .chain(file.native_scoped.values().flatten())
                 .any(|decl| matches!(&decl.descr, Descr::Node { kind, .. } if *kind == candidate));
@@ -136,7 +136,13 @@ pub(super) fn declare(file: &mut FileGrammar, args: &[Syntax]) -> Result<(), &'s
     // Unknown local code must not leak an erasure outside its lexical boundary;
     // atomic code must not restore a builtin meaning by dropping its chain.
     // Validate all affected kinds before mutating any of them.
-    if local || scoped || affected.iter().any(atoms::is_kind) {
+    if local
+        || scoped
+        || affected.iter().any(atoms::is_kind)
+        || affected
+            .iter()
+            .any(|kind| file.runtime_macro_kinds.contains(kind))
+    {
         if alternatives.is_none() || malformed || !refused.is_empty() {
             return Err("an unsupported local macro_rules registration");
         }
@@ -146,7 +152,8 @@ pub(super) fn declare(file: &mut FileGrammar, args: &[Syntax]) -> Result<(), &'s
         // installed or erase the global rule a local command meant to extend.
         for kind in &affected {
             let owned = atoms::is_kind(kind) || file.declared.iter().any(|decl| decl.decl == *kind);
-            let native = file.native_rule_counts.contains_key(kind);
+            let native = file.native_rule_counts.contains_key(kind)
+                || file.runtime_macro_kinds.contains(kind);
             if (!owned && !native) || file.interpolation_kinds.contains(kind) {
                 return Err("local macro_rules requires native source syntax");
             }
@@ -172,7 +179,8 @@ pub(super) fn declare(file: &mut FileGrammar, args: &[Syntax]) -> Result<(), &'s
     for kind in affected {
         let interpolation = Arc::make_mut(&mut file.interpolation_kinds).remove(&kind);
         let owned = atoms::is_kind(&kind) || file.declared.iter().any(|decl| decl.decl == kind);
-        let native = file.native_rule_counts.contains_key(&kind);
+        let native =
+            file.native_rule_counts.contains_key(&kind) || file.runtime_macro_kinds.contains(&kind);
         if interpolation || (!owned && !native && file.constants.contains(&kind)) {
             file.native_export_refusal =
                 Some("source module export of macro_rules for imported syntax");

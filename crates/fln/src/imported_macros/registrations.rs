@@ -252,6 +252,7 @@ impl MacroCode {
 struct RegisteredMacro {
     module: Name,
     declaration: Name,
+    scope: Option<Name>,
     compiled: Arc<MacroCode>,
     no_fallback: bool,
 }
@@ -497,8 +498,8 @@ impl RegisteredMacros {
                         );
                         callable
                     };
-                let table = match row.scope {
-                    Some(namespace) => scoped.entry(namespace).or_default(),
+                let table = match &row.scope {
+                    Some(namespace) => scoped.entry(namespace.clone()).or_default(),
                     None => &mut candidates,
                 };
                 let chain = table.entry(row.key).or_default();
@@ -509,6 +510,7 @@ impl RegisteredMacros {
                     module: module.clone(),
                     no_fallback: no_fallback.contains(&row.declaration),
                     declaration: row.declaration,
+                    scope: row.scope,
                     compiled: callable,
                 });
             }

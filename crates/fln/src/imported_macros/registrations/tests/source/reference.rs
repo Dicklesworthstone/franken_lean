@@ -251,5 +251,96 @@ fn live_imported_ir_changes_source_checks_with_the_pins_order_and_scoped_behavio
     let helper = admitted(&helper);
     assert!(helper.admission.admissions.len() >= 2);
     assert_declared_value(&helper.admission.engine, "nativeDeclaredHelper 7", 11);
+
+    // The provider is unchanged pinned user MacroM code, loaded from its
+    // emitted journal and IR above. These source registrations target the SAME
+    // kind and must interleave with its scoped activation, not replace the
+    // imported fallback table or receive unconditional precedence over it.
+    let client = "macro_rules | `(7 + 11) => `(23)\n\
+        def mixedSourceFirst : Nat := 7 + 11\n\
+        def mixedImportedFallback : Nat := 0 + 13\n\
+        section\n\
+        open scoped SourceScoped\n\
+        def mixedImportedLater : Nat := 7 + 11\n\
+        macro_rules | `(7 + 11) => `(41)\n\
+        def mixedSourceLater : Nat := 7 + 11\n\
+        open scoped SourceScoped\n\
+        def mixedRepeated : Nat := 7 + 11\n\
+        section\n\
+        local macro_rules | `(7 + 11) => `(43)\n\
+        def mixedLocal : Nat := 7 + 11\n\
+        end\n\
+        def mixedLocalRestored : Nat := 7 + 11\n\
+        end\n\
+        def mixedGlobalSurvives : Nat := 7 + 11\n\
+        open scoped SourceScoped in def mixedTemporary : Nat := 7 + 11\n\
+        def mixedTemporaryRestored : Nat := 7 + 11\n\
+        namespace SourceScoped\n\
+        scoped macro_rules | `(7 + 11) => `(53)\n\
+        def mixedScopedSource : Nat := 7 + 11\n\
+        end SourceScoped\n\
+        def mixedScopedInactive : Nat := 7 + 11\n\
+        open scoped SourceScoped\n\
+        def mixedSourceWithinActivation : Nat := 7 + 11\n";
+    let expected = [
+        ("mixedSourceFirst", 23),
+        ("mixedImportedFallback", 13),
+        ("mixedImportedLater", 7),
+        ("mixedSourceLater", 41),
+        ("mixedRepeated", 41),
+        ("mixedLocal", 43),
+        ("mixedLocalRestored", 41),
+        ("mixedGlobalSurvives", 41),
+        ("mixedTemporary", 7),
+        ("mixedTemporaryRestored", 41),
+        ("SourceScoped.mixedScopedSource", 53),
+        ("mixedScopedInactive", 41),
+        ("mixedSourceWithinActivation", 53),
+    ];
+    let mut oracle = format!("import NativeSourceMacroModule\n{client}");
+    for (declaration, _) in expected {
+        oracle.push_str(&format!("#eval {declaration}\n"));
+    }
+    std::fs::write(dir.join("SameKindSourceClient.lean"), oracle).unwrap();
+    let result = Command::new(&reference)
+        .current_dir(&dir)
+        .env("LEAN_PATH", &dir)
+        .arg("SameKindSourceClient.lean")
+        .output()
+        .unwrap();
+    std::fs::write(dir.join("same-kind.stdout"), &result.stdout).unwrap();
+    std::fs::write(dir.join("same-kind.stderr"), &result.stderr).unwrap();
+    assert!(
+        result.status.success(),
+        "{dir:?}: {}{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let expected_output: String = expected
+        .iter()
+        .map(|(_, value)| format!("{value}\n"))
+        .collect();
+    assert_eq!(result.stdout, expected_output.as_bytes(), "{dir:?}");
+    assert!(result.stderr.is_empty());
+    let report = engine.check_source_files_with_imported_macros(
+        &[client.as_bytes()],
+        &KVMap::new(),
+        crate::source_check::SourceCheckLimits::new(admission()),
+        SourceMacroInvocation {
+            registry: &registry,
+            context: &context(),
+            state: MacroState::default(),
+            lookup: None,
+            limits: MacroTreeLimits::default(),
+            cancellation: None,
+        },
+    );
+    let Outcome::Complete(Ok(checked)) = &report.outcome else {
+        panic!("{dir:?}: {report:?}")
+    };
+    assert!(report.state.is_some());
+    for (declaration, value) in expected {
+        assert_declared_value(&checked.engine, declaration, value);
+    }
     assert_eq!(engine.logical_root(&KVMap::new()), before);
 }

@@ -739,6 +739,225 @@ fn imported_macro_batches_interleave_source_templates_without_replaying_expansio
 }
 
 #[test]
+fn mixed_source_rules_extend_imported_kinds_with_registration_and_clause_fallback() {
+    let (engine, registry) = artifact_fixture();
+    let before = engine.logical_root(&KVMap::new());
+    let source = b"def importedBefore : Nat := 1 + 9\n\
+        macro_rules | `(1 + $rhs) => `(101) | `(2 + $rhs) => `(102)\n\
+        macro_rules | `(3 + $rhs) => `(103)\n\
+        def firstClause : Nat := 1 + 9\n\
+        def secondClause : Nat := 2 + 9\n\
+        def newestRegistration : Nat := 3 + 9\n\
+        def importedFallback : Nat := 4 + 9";
+    let report = batch(
+        &engine,
+        &registry,
+        &[source],
+        MacroTreeLimits::default(),
+        None,
+    );
+    let checked = succeeded(&report);
+    for (declaration, value) in [
+        ("importedBefore", 9),
+        ("firstClause", 101),
+        ("secondClause", 102),
+        ("newestRegistration", 103),
+        ("importedFallback", 9),
+    ] {
+        assert_declared_value(&checked.engine, declaration, value);
+    }
+    // Older clauses share one registration attempt/scope. Only an unsupported
+    // registration advances to the next source registration or imported body.
+    assert_eq!(report.attempts.len(), 11);
+    assert_eq!(report.state.as_ref().unwrap().macro_scope, 28);
+    let fallback: Vec<_> = report.attempts[7..]
+        .iter()
+        .map(|attempt| attempt.declaration.clone())
+        .collect();
+    assert_eq!(fallback[2], name("SourceLibrary.skip"));
+    assert_eq!(fallback[3], name("SourceLibrary.right"));
+    assert_eq!(engine.logical_root(&KVMap::new()), before);
+    let retry = batch(
+        &engine,
+        &registry,
+        &[b"def originalRegistry : Nat := 1 + 9"],
+        MacroTreeLimits::default(),
+        None,
+    );
+    assert_declared_value(&succeeded(&retry).engine, "originalRegistry", 9);
+}
+
+#[test]
+fn mixed_same_kind_scopes_follow_activation_and_registration_chronology() {
+    let (engine, registry) = artifact_fixture();
+    let source = b"macro_rules | `(7 + 11) => `(23)\n\
+        def sourceFirst : Nat := 7 + 11\n\
+        section\n\
+        open scoped SourceScoped\n\
+        def importedLater : Nat := 7 + 11\n\
+        macro_rules | `(7 + 11) => `(41)\n\
+        def sourceLater : Nat := 7 + 11\n\
+        open scoped SourceScoped\n\
+        def repeatedActivation : Nat := 7 + 11\n\
+        section\n\
+        local macro_rules | `(7 + 11) => `(43)\n\
+        def localFirst : Nat := 7 + 11\n\
+        end\n\
+        def localRestored : Nat := 7 + 11\n\
+        end\n\
+        def globalSurvives : Nat := 7 + 11\n\
+        open scoped SourceScoped in def temporarilyImported : Nat := 7 + 11\n\
+        def temporaryRestored : Nat := 7 + 11\n\
+        namespace SourceScoped\n\
+        scoped macro_rules | `(7 + 11) => `(53)\n\
+        def scopedSourceLater : Nat := 7 + 11\n\
+        end SourceScoped\n\
+        def scopedSourceInactive : Nat := 7 + 11\n\
+        open scoped SourceScoped\n\
+        def sourceBeforeImportedWithinActivation : Nat := 7 + 11";
+    let report = batch(
+        &engine,
+        &registry,
+        &[source],
+        MacroTreeLimits::default(),
+        None,
+    );
+    let checked = succeeded(&report);
+    for (declaration, value) in [
+        ("sourceFirst", 23),
+        ("importedLater", 7),
+        ("sourceLater", 41),
+        ("repeatedActivation", 41),
+        ("localFirst", 43),
+        ("localRestored", 41),
+        ("globalSurvives", 41),
+        ("temporarilyImported", 7),
+        ("temporaryRestored", 41),
+        ("SourceScoped.scopedSourceLater", 53),
+        ("scopedSourceInactive", 41),
+        ("sourceBeforeImportedWithinActivation", 53),
+    ] {
+        assert_declared_value(&checked.engine, declaration, value);
+    }
+    assert_eq!(report.attempts.len(), 12);
+    assert_eq!(
+        report
+            .attempts
+            .iter()
+            .filter(|attempt| { attempt.declaration == name("SourceLibrary.left") })
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn mixed_source_rules_preserve_scopes_already_active_at_the_call_boundary() {
+    let (engine, registry) = artifact_fixture();
+    let active = registry.activate_scoped(&name("SourceScoped")).unwrap();
+    let report = batch(
+        &engine,
+        &active,
+        &[b"macro_rules | `(7 + 11) => `(23)\n\
+            def sourceAfterInitialActivation : Nat := 7 + 11\n\
+            open scoped SourceScoped\n\
+            def stillSource : Nat := 7 + 11"],
+        MacroTreeLimits::default(),
+        None,
+    );
+    let checked = succeeded(&report);
+    for declaration in ["sourceAfterInitialActivation", "stillSource"] {
+        assert_declared_value(&checked.engine, declaration, 23);
+    }
+    assert_eq!(report.attempts.len(), 2);
+}
+
+#[test]
+fn mixed_same_kind_fallback_keeps_diagnostics_budgets_and_failed_transactions() {
+    let (engine, registry) = artifact_fixture();
+    let before = engine.logical_root(&KVMap::new());
+    let source = b"def checkedPrefix : Nat := 8\n\
+        macro_rules | `(3 + $rhs) => `(103)\n\
+        def importedFallback : Nat := 4 + 9";
+    let mut limits = MacroTreeLimits::default();
+    limits.dispatch.max_attempts = 1;
+    let limited = batch(&engine, &registry, &[source], limits, None);
+    assert!(
+        matches!(limited.outcome, Outcome::Inconclusive(_)),
+        "{limited:?}"
+    );
+    assert_eq!(limited.attempts.len(), 1);
+    assert!(limited.state.is_none());
+    let recovered = batch(
+        &engine,
+        &registry,
+        &[source],
+        MacroTreeLimits::default(),
+        None,
+    );
+    assert_declared_value(&succeeded(&recovered).engine, "importedFallback", 9);
+    assert_eq!(recovered.attempts.len(), 3);
+
+    let source = b"def checkedPrefix : Nat := 8\n\
+        macro_rules | `($lhs - 7) => `(99)\n\
+        def refused : Nat := 0 - 11";
+    let refused = batch(
+        &engine,
+        &registry,
+        &[source],
+        MacroTreeLimits::default(),
+        None,
+    );
+    assert!(
+        matches!(&refused.outcome,
+        Outcome::Complete(Err(SourceCheckError::ImportedMacro { error, .. }))
+            if matches!(error.as_ref(), SourceMacroError::Diagnostic { declaration, .. }
+                if *declaration == name("SourceLibrary.diagnostic"))),
+        "{refused:?}"
+    );
+    assert_eq!(refused.attempts.len(), 2);
+    assert!(refused.state.is_none());
+
+    let malformed = batch(
+        &engine,
+        &registry,
+        &[b"def checkedPrefix : Nat := 8\n\
+            macro_rules | `(1 + $rhs) => `(101)\n\
+            macro_rules | `(1 + $rhs) => do pure `(102)\n\
+            def mustNotFallBack : Nat := 1 + 9"],
+        MacroTreeLimits::default(),
+        None,
+    );
+    assert!(
+        matches!(malformed.outcome, Outcome::Complete(Err(_))),
+        "{malformed:?}"
+    );
+    assert!(malformed.state.is_none());
+    let unsupported_macro = batch(
+        &engine,
+        &registry,
+        &["def checkedPrefix : Nat := 8\n\
+           macro (name := «term_+_») \"unsupportedAdd \" lhs:term:max rhs:term:max : term => do pure rhs\n\
+           def mustNotFallBack : Nat := unsupportedAdd 1 9"
+            .as_bytes()],
+        MacroTreeLimits::default(),
+        None,
+    );
+    let Outcome::Complete(Err(error)) = &unsupported_macro.outcome else {
+        panic!("{unsupported_macro:?}")
+    };
+    assert!(
+        format!("{error:?}").contains("unsupported macro declaration"),
+        "{unsupported_macro:?}"
+    );
+    assert!(unsupported_macro.state.is_none());
+    assert!(unsupported_macro.attempts.is_empty());
+    assert_eq!(engine.logical_root(&KVMap::new()), before);
+    for declaration in ["checkedPrefix", "refused", "mustNotFallBack"] {
+        assert!(!engine.environment().contains(&name(declaration)));
+    }
+}
+
+#[test]
 fn mixed_macro_batches_restore_native_and_imported_scopes_together() {
     let (engine, registry) = artifact_fixture();
     let source = b"syntax \"localValue\" : term\n\
@@ -1026,14 +1245,14 @@ fn mixed_source_templates_keep_specialized_metadata_refusals_explicit() {
 }
 
 #[test]
-fn mixed_macro_kind_collisions_are_refused_without_guessing_registration_order() {
+fn mixed_source_syntax_registration_supersedes_an_imported_macro_of_the_same_kind() {
     let (engine, registry) =
         artifact_fixture_with_extra_rows(&[("nativeLiteral", "SourceLibrary.right", None)]);
     let before = engine.logical_root(&KVMap::new());
     let source = b"def checkedPrefix : Nat := 7 + 11\n\
         syntax (name := nativeLiteral) \"clashValue\" : term\n\
         macro_rules | `(clashValue) => `(11)\n\
-        def ambiguous : Nat := clashValue";
+        def sourceOverride : Nat := clashValue";
     let report = batch(
         &engine,
         &registry,
@@ -1041,19 +1260,120 @@ fn mixed_macro_kind_collisions_are_refused_without_guessing_registration_order()
         MacroTreeLimits::default(),
         None,
     );
-    assert!(
-        matches!(&report.outcome,
-            Outcome::Complete(Err(SourceCheckError::ImportedMacro { error, .. }))
-                if matches!(error.as_ref(), SourceMacroError::Binding(error)
-                    if matches!(error.as_ref(), MacroRegistrationError::Owner { declaration, reason, .. }
-                        if *declaration == name("nativeLiteral")
-                            && reason.contains("registration order")))),
-        "{report:?}"
-    );
-    assert_eq!(report.attempts.len(), 2);
-    assert!(report.state.is_none());
+    let checked = succeeded(&report);
+    assert_declared_value(&checked.engine, "checkedPrefix", 11);
+    assert_declared_value(&checked.engine, "sourceOverride", 11);
+    assert_eq!(report.attempts.len(), 3);
     assert_eq!(engine.logical_root(&KVMap::new()), before);
     assert!(!engine.environment().contains(&name("checkedPrefix")));
+}
+
+#[test]
+fn mixed_imported_native_journals_still_refuse_an_unknown_cross_import_order() {
+    use fln_parse::extensions::{FileGrammar, with_grammar};
+
+    let (_, registry) =
+        artifact_fixture_with_extra_rows(&[("nativeLiteral", "SourceLibrary.right", None)]);
+    let mut provider = FileGrammar::new(false, &[], Some(name("TemplateProvider")))
+        .unwrap()
+        .own_syntax_only();
+    for source in [
+        "syntax (name := nativeLiteral) \"clashValue\" : term",
+        "macro_rules | `(clashValue) => `(11)",
+    ] {
+        let command = with_grammar(&provider.grammar(), || {
+            fln_parse::parse_source_command(source.as_bytes())
+        })
+        .unwrap();
+        provider.declare(command.syntax()).unwrap();
+    }
+    let journal = provider.export_native().unwrap();
+    let mut consumer = FileGrammar::new(false, &[], Some(name("TemplateConsumer"))).unwrap();
+    consumer.import_native(&journal).unwrap();
+    registry.bind_source_grammar(&mut consumer);
+    let error = registry
+        .with_source_templates(
+            &consumer.active_template_snapshot().unwrap(),
+            &name("TemplateConsumer"),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(error, MacroRegistrationError::Owner { declaration, reason, .. }
+            if declaration == name("nativeLiteral")
+                && reason.contains("no shared registration order")),
+    );
+}
+
+#[test]
+fn mixed_runtime_overrides_publish_local_effects_and_refuse_unordered_global_exports() {
+    let (imported, code) = artifact_import_fixture();
+    let before = imported.engine.logical_root(&KVMap::new());
+    let report = super::modules::check(
+        &imported,
+        &code,
+        &[
+            (
+                "Lib",
+                "prelude\nimport SourceLibrary\n\
+                 macro_rules | `(7 + 11) => `(23)\n\
+                 def unpublishedOverride : Nat := 7 + 11",
+            ),
+            (
+                "Main",
+                "prelude\nimport Lib\ndef unpublishedSuccessor : Nat := unpublishedOverride",
+            ),
+        ],
+        MacroTreeLimits::default(),
+        None,
+    );
+    let Outcome::Complete(Err(error)) = &report.outcome else {
+        panic!("{report:?}")
+    };
+    assert!(
+        format!("{error:?}").contains("requires shared import registration order"),
+        "{report:?}"
+    );
+    assert_eq!(report.attempts.len(), 1);
+    assert!(report.states.is_none());
+    assert_eq!(imported.engine.logical_root(&KVMap::new()), before);
+    assert!(
+        !imported
+            .engine
+            .environment()
+            .contains(&name("unpublishedOverride"))
+    );
+    assert!(
+        !imported
+            .engine
+            .environment()
+            .contains(&name("unpublishedSuccessor"))
+    );
+
+    let local = super::modules::check(
+        &imported,
+        &code,
+        &[
+            (
+                "Lib",
+                "prelude\nimport SourceLibrary\n\
+                 section\nlocal macro_rules | `(7 + 11) => `(23)\n\
+                 def fromLocalOverride : Nat := 7 + 11\nend",
+            ),
+            (
+                "Main",
+                "prelude\nimport Lib\n\
+                 def importedLocalResult : Nat := fromLocalOverride\n\
+                 def importedMacroRestored : Nat := 7 + 11",
+            ),
+        ],
+        MacroTreeLimits::default(),
+        None,
+    );
+    let checked = super::modules::succeeded(&local);
+    assert_declared_value(&checked.checked.engine, "importedLocalResult", 23);
+    assert_declared_value(&checked.checked.engine, "importedMacroRestored", 11);
+    assert_eq!(local.attempts.len(), 3);
+    assert_eq!(imported.engine.logical_root(&KVMap::new()), before);
 }
 
 #[test]

@@ -942,3 +942,154 @@ fn a_declared_notation_expands_hygienically() {
 fn name_of(text: &str) -> Name {
     Name::from_components([text])
 }
+
+fn apply_runtime_command(file: &mut FileGrammar, source: &str) {
+    let grammar = file.grammar();
+    if let Some(control) =
+        with_grammar(&grammar, || command_scope::parse(source.as_bytes())).unwrap()
+    {
+        file.apply(&control);
+    } else {
+        let command = with_grammar(&grammar, || parse_source_command(source.as_bytes())).unwrap();
+        file.declare(command.syntax()).unwrap();
+    }
+}
+
+#[test]
+fn runtime_macro_snapshot_retains_source_and_activation_order_without_parser_rows() {
+    let mut file = grammar_after(&[], &[]).own_syntax_only();
+    let plus = name_of("term_+_");
+    let namespace = name("ImportedScope");
+    file.bind_runtime_macros([plus.clone()], [namespace.clone()], []);
+    apply_runtime_command(
+        &mut file,
+        "macro_rules | `(1 + $rhs) => `(11) | `(2 + $rhs) => `(22)",
+    );
+    let before = file.active_template_snapshot().unwrap();
+    assert_eq!(before.orders[&plus].len(), 2);
+    assert_eq!(before.orders[&plus][0], before.orders[&plus][1]);
+    assert!(!before.orders[&plus][0].imported);
+    assert!(before.activations.is_empty());
+    assert!(file.export_native().unwrap().rules.contains_key(&plus));
+    assert!(
+        file.export_native_for_replay()
+            .unwrap_err()
+            .contains("requires shared import registration order")
+    );
+    apply_runtime_command(&mut file, "section");
+    apply_runtime_command(&mut file, "open scoped ImportedScope");
+    let active = file.active_template_snapshot().unwrap();
+    assert!(active.activations[&namespace] > active.orders[&plus][0].precedence);
+    apply_runtime_command(&mut file, "macro_rules | `(3 + $rhs) => `(33)");
+    let newer = file.active_template_snapshot().unwrap();
+    assert!(newer.orders[&plus][0].precedence > newer.activations[&namespace]);
+    assert_eq!(&newer.orders[&plus][1..], before.orders[&plus]);
+    apply_runtime_command(&mut file, "open scoped ImportedScope");
+    let repeated = file.active_template_snapshot().unwrap();
+    assert_eq!(repeated.activations, newer.activations);
+    assert_eq!(repeated.orders, newer.orders);
+    apply_runtime_command(&mut file, "end");
+    let restored = file.active_template_snapshot().unwrap();
+    assert!(restored.activations.is_empty());
+    assert_eq!(restored.orders, newer.orders);
+    assert_eq!(before.orders[&plus].len(), 2);
+    apply_runtime_command(&mut file, "namespace ImportedScope");
+    apply_runtime_command(&mut file, "scoped macro_rules | `(1 + $rhs) => `(44)");
+    let scoped = file.active_template_snapshot().unwrap();
+    assert_eq!(scoped.orders[&plus].len(), 4);
+    assert!(scoped.orders[&plus][0].precedence > scoped.activations[&namespace]);
+    apply_runtime_command(&mut file, "end ImportedScope");
+    assert_eq!(
+        file.active_template_snapshot().unwrap().orders,
+        newer.orders
+    );
+    apply_runtime_command(&mut file, "open scoped ImportedScope");
+    let reactivated = file.active_template_snapshot().unwrap();
+    assert_eq!(
+        reactivated.orders[&plus][0].precedence,
+        reactivated.activations[&namespace]
+    );
+    assert_eq!(&reactivated.orders[&plus][1..], newer.orders[&plus]);
+}
+
+#[test]
+fn initially_active_runtime_macro_scopes_keep_their_existing_order() {
+    let mut file = grammar_after(&[], &[]).own_syntax_only();
+    let plus = name_of("term_+_");
+    let namespaces = [name("ZScope"), name("AScope")];
+    file.bind_runtime_macros([plus.clone()], namespaces.clone(), namespaces.clone());
+    let initial = file.active_template_snapshot().unwrap();
+    assert_eq!(
+        initial.activations[&namespaces[0]],
+        initial.activations[&namespaces[1]]
+    );
+    apply_runtime_command(&mut file, "macro_rules | `(7 + 11) => `(23)");
+    let registered = file.active_template_snapshot().unwrap();
+    assert!(registered.orders[&plus][0].precedence > initial.activations[&namespaces[0]]);
+    apply_runtime_command(&mut file, "open scoped ZScope AScope");
+    let repeated = file.active_template_snapshot().unwrap();
+    assert_eq!(repeated.activations, initial.activations);
+    assert_eq!(repeated.orders, registered.orders);
+}
+
+#[test]
+fn unsupported_runtime_macro_bodies_preserve_the_previous_snapshot() {
+    for source in [
+        "macro (name := picked) \"unsupported! \" x:term:max : term => do pure x",
+        "macro \"runtimeGap! \" x:term : term => do pure x",
+    ] {
+        let mut file = grammar_after(&[], &[]).own_syntax_only();
+        file.bind_runtime_macros([name("picked"), name_of("termRuntimeGap!_")], [], []);
+        let before = file.grammar();
+        let snapshot = file.active_template_snapshot().unwrap();
+        let command = with_grammar(&before, || parse_source_command(source.as_bytes())).unwrap();
+        let error = file.declare(command.syntax()).unwrap_err();
+        assert!(error.contains("unsupported macro declaration"), "{error}");
+        assert!(file.declared().is_empty());
+        let after = file.active_template_snapshot().unwrap();
+        assert_eq!(after.rules, snapshot.rules);
+        assert_eq!(after.orders, snapshot.orders);
+        assert_eq!(after.activations, snapshot.activations);
+        assert!(std::rc::Rc::ptr_eq(&file.grammar(), &before));
+    }
+}
+
+#[test]
+fn local_runtime_macro_overrides_do_not_enter_persistent_exports() {
+    let mut file = grammar_after(&[], &[]).own_syntax_only();
+    let plus = name_of("term_+_");
+    file.bind_runtime_macros([plus.clone()], [], []);
+    apply_runtime_command(&mut file, "section");
+    apply_runtime_command(&mut file, "local macro_rules | `(7 + 11) => `(23)");
+    assert!(
+        file.active_template_snapshot()
+            .unwrap()
+            .rules
+            .contains_key(&plus)
+    );
+    assert!(file.export_native_for_replay().unwrap().is_empty());
+    apply_runtime_command(&mut file, "end");
+    assert!(
+        !file
+            .active_template_snapshot()
+            .unwrap()
+            .rules
+            .contains_key(&plus)
+    );
+    assert!(file.export_native_for_replay().unwrap().is_empty());
+
+    // A source-owned parser does not provide the missing ordering relative to
+    // an independently imported macro that uses that same dispatch kind.
+    file.bind_runtime_macros([name("runtimeDeclared")], [], []);
+    apply_runtime_command(
+        &mut file,
+        "syntax (name := runtimeDeclared) \"runtimeValue\" : term",
+    );
+    apply_runtime_command(&mut file, "macro_rules | `(runtimeValue) => `(31)");
+    assert_eq!(file.export_native().unwrap().declarations.len(), 1);
+    assert!(
+        file.export_native_for_replay()
+            .unwrap_err()
+            .contains("requires shared import registration order")
+    );
+}

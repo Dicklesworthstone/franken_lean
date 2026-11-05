@@ -11,6 +11,28 @@ pub(super) struct RuleScope {
     pub registered: usize,
 }
 
+/// One clause's precedence in an exact source grammar snapshot. A registration
+/// and all its clauses share the same order. Lexicographic comparison gives
+/// registration/activation chronology; ties retain the original clause order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TemplateClauseOrder {
+    pub precedence: [usize; 3],
+    /// Native import journals do not yet identify their position among
+    /// independently imported MacroM registrations. A mixed dispatcher must
+    /// refuse an unresolved tie instead of choosing an arbitrary winner.
+    pub imported: bool,
+}
+
+/// Immutable source rules plus the chronology needed to merge them with
+/// imported macros. This is invocation state, never serialized module data.
+#[derive(Debug, Clone, Default)]
+pub struct TemplateSnapshot {
+    pub rules: Arc<BTreeMap<Name, Arc<NotationRule>>>,
+    pub orders: BTreeMap<Name, Vec<TemplateClauseOrder>>,
+    pub activations: BTreeMap<Name, [usize; 3]>,
+    pub initially_active: BTreeSet<Name>,
+}
+
 impl FileGrammar {
     pub(super) fn prepended_rule_scopes(
         &self,
@@ -20,9 +42,6 @@ impl FileGrammar {
         namespace: Option<Name>,
     ) -> Result<Option<Vec<RuleScope>>, &'static str> {
         let older = self.rule_scopes.get(kind);
-        if namespace.is_none() && older.is_none() {
-            return Ok(None);
-        }
         if older.is_some_and(|scopes| scopes.len() != previous) {
             return Err("native scoped macro metadata does not match its clause chain");
         }
@@ -110,7 +129,12 @@ impl FileGrammar {
             .enumerate()
             .filter_map(|(position, entry)| match entry {
                 Trail::Namespace(namespace, _, generation) => {
-                    Some((namespace, (*generation, 1, position)))
+                    let rank = if self.initial_macro_scopes.contains(namespace) {
+                        (0, 1, 0)
+                    } else {
+                        (*generation, 1, position)
+                    };
+                    Some((namespace, rank))
                 }
                 Trail::Decl(_) => None,
             })
@@ -149,6 +173,74 @@ impl FileGrammar {
             }
         }
         rules
+    }
+
+    pub(super) fn template_snapshot(
+        &self,
+        trail: &[Trail],
+    ) -> Result<TemplateSnapshot, &'static str> {
+        let activations: BTreeMap<_, _> = trail
+            .iter()
+            .enumerate()
+            .filter_map(|(position, entry)| match entry {
+                Trail::Namespace(namespace, _, generation) => {
+                    let rank = if self.initial_macro_scopes.contains(namespace) {
+                        [0, 1, 0]
+                    } else {
+                        [*generation, 1, position]
+                    };
+                    Some((namespace.clone(), rank))
+                }
+                Trail::Decl(_) => None,
+            })
+            .collect();
+        let mut rules = BTreeMap::new();
+        let mut orders = BTreeMap::new();
+        for (kind, rule) in self.rules.iter() {
+            let scopes = self.rule_scopes.get(kind);
+            if scopes.is_some_and(|scopes| scopes.len() != rule.cases().count()) {
+                return Err("native scoped macro metadata does not match its clause chain");
+            }
+            let mut cases = Vec::new();
+            for (index, case) in rule.cases().enumerate() {
+                let scope = scopes.and_then(|scopes| scopes.get(index));
+                let registered = scope.map_or(0, |scope| scope.registered);
+                let mut precedence = [registered, 0, 0];
+                if let Some(namespace) = scope.and_then(|scope| scope.namespace.as_ref()) {
+                    let Some(activation) = activations.get(namespace) else {
+                        continue;
+                    };
+                    precedence = precedence.max(*activation);
+                }
+                cases.push((
+                    TemplateClauseOrder {
+                        precedence,
+                        imported: registered == 0,
+                    },
+                    case,
+                ));
+            }
+            // This is the same stable order as active_rules: newer registrations
+            // and later activations first, clauses within one registration intact.
+            cases.sort_by_key(|(order, _)| std::cmp::Reverse(order.precedence));
+            if cases.is_empty() {
+                continue;
+            }
+            orders.insert(
+                kind.clone(),
+                cases.iter().map(|(order, _)| *order).collect(),
+            );
+            let mut cases = cases.into_iter().map(|(_, case)| modules::flat_case(case));
+            let mut head = cases.next().expect("nonempty active macro clause chain");
+            head.fallbacks = cases.collect();
+            rules.insert(kind.clone(), Arc::new(head));
+        }
+        Ok(TemplateSnapshot {
+            rules: Arc::new(rules),
+            orders,
+            activations,
+            initially_active: self.initial_macro_scopes.clone(),
+        })
     }
 }
 

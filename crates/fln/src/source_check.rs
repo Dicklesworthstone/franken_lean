@@ -881,6 +881,7 @@ impl Engine {
                 grammar
                     .import_artifact(session.parsers())
                     .map_err(|error| command_error(file, count, fln_parse::BytePos(0), error))?;
+                grammar.bind_imported_macros(&session.registry());
             }
             grammar.extend_scopes(&mut scopes);
             let commands = grammar.enter(|| partition_commands(source, file, count))?;
@@ -935,7 +936,11 @@ impl Engine {
                 scopes.current.source_site =
                     Some(site.at_offset(fln_parse::BytePos(source_offset.0 + start.0)));
                 if let Some(session) = macros.as_deref_mut() {
-                    session.set_templates(grammar.templates());
+                    session.set_templates(
+                        grammar
+                            .templates()
+                            .map_err(|error| command_error(file, count, start, error))?,
+                    );
                 }
                 let control =
                     grammar.enter(|| parse_control_command(command, start, file, count))?;
