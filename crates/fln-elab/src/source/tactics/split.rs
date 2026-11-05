@@ -9,9 +9,10 @@
 //! A conditional is the pin's `ite`/`dite`, or what this engine elaborates a source `if` to:
 //! `Decidable.rec` with a constant motive, its dictionary let-bound as elaborated or bare once
 //! unfolded, and for `if b` on a `Bool` the let-bound `Bool.rec`, which the pin reads as
-//! `if b = true`. A `match` (the pin's matcher, or this engine's compiled recursor) is refused:
-//! the pin splits it with the matcher's splitter (vendored src/Lean/Meta/Tactic/Split.lean),
-//! which is not implemented here.
+//! `if b = true`. An exhaustive source `match` with explicit constructor alternatives is
+//! split through its admitted recursor. Its transparent source annotation retains the written
+//! alternative order and field names that recursor lowering otherwise loses. Indexed,
+//! overlapping, matrix and unannotated imported matches retain a typed refusal.
 //!
 //! The proof is not the pin's. The case split is `Decidable.rec` on the selected dictionary, as
 //! `byCasesDec` cases on it; each reduction eliminates one decided dictionary (or `Bool`) with
@@ -27,6 +28,7 @@ use crate::lctx::LocalContext;
 use fln_core::expr::BinderInfo;
 use fln_env::constants::ConstantInfo;
 use std::collections::{HashMap, HashSet};
+mod matches;
 
 /// Reductions in one case: each eliminates one decided dictionary or `Bool`.
 const MAX_REDUCTIONS: usize = 256;
@@ -67,7 +69,7 @@ struct Conditional {
 
 enum Candidate {
     Conditional(Conditional),
-    Match,
+    Match(Expr),
 }
 
 /// Where the reduction rewrites a subterm.
@@ -108,11 +110,16 @@ struct Case {
     transports: Vec<Expr>,
 }
 
-struct Plan {
+struct ConditionalPlan {
     condition: Expr,
     dictionary: Expr,
     yes: Case,
     no: Case,
+}
+
+enum Plan {
+    Conditional(ConditionalPlan),
+    Match(matches::MatchPlan),
 }
 
 fn name(components: &[&str]) -> Name {
@@ -466,20 +473,6 @@ impl Context {
         };
         expect_atom(keyword, "split", "split keyword")?;
         self.require_declared_tactic(&["Lean", "Parser", "Tactic", "split"])?;
-        // What the case split and the reductions are built from.
-        for required in [
-            &["Decidable", "rec"][..],
-            &["Bool", "rec"],
-            &["absurd"],
-            &["ne_true_of_eq_false"],
-            &["Eq", "refl"],
-        ] {
-            if !self.txn.env.contains(&name(required)) {
-                return Err(failure(SourceInferenceError::UnknownConstant(name(
-                    required,
-                ))));
-            }
-        }
         self.txn.lctx = goal.lctx.clone();
         let located = !expect_null_args(location, "split location")?.is_empty();
         match expect_null_args(term, "split term")? {
@@ -633,9 +626,28 @@ impl Context {
         };
         let selected = match self.split_find(&subject_type)? {
             None => return Ok(None),
-            Some(Candidate::Match) => return Err(error(TacticError::SplitMatchUnsupported)),
+            Some(Candidate::Match(selected)) => {
+                return self
+                    .split_match_plan(goal, subject, &selected)
+                    .map(|plan| Some(Plan::Match(plan)));
+            }
             Some(Candidate::Conditional(selected)) => selected,
         };
+        // What conditional case splits and their reductions are built from.
+        // Constructor matches use their own admitted recursor instead.
+        for required in [
+            &["Decidable", "rec"][..],
+            &["Bool", "rec"],
+            &["absurd"],
+            &["ne_true_of_eq_false"],
+            &["Eq", "refl"],
+        ] {
+            if !self.txn.env.contains(&name(required)) {
+                return Err(failure(SourceInferenceError::UnknownConstant(name(
+                    required,
+                ))));
+            }
+        }
         let condition = selected.condition;
         let dictionary = match selected.decision {
             Decision::Dictionary(dictionary) => dictionary,
@@ -676,12 +688,12 @@ impl Context {
         if yes.transports.is_empty() && no.transports.is_empty() {
             return Ok(None);
         }
-        Ok(Some(Plan {
+        Ok(Some(Plan::Conditional(ConditionalPlan {
             condition,
             dictionary,
             yes,
             no,
-        }))
+        })))
     }
 
     /// `findSplit?`: the first candidate, by the pin's `FindSplitImpl.visit` order; for a
@@ -693,7 +705,7 @@ impl Context {
             self.tick()?;
             match self.split_find_in(&current)? {
                 None => return Ok(found.map(Candidate::Conditional)),
-                Some(Candidate::Match) => return Ok(Some(Candidate::Match)),
+                Some(Candidate::Match(selected)) => return Ok(Some(Candidate::Match(selected))),
                 Some(Candidate::Conditional(selected)) => {
                     current = selected.condition.clone();
                     found = Some(selected);
@@ -723,8 +735,10 @@ impl Context {
                 if !condition.has_loose_bvars() {
                     return Ok(Some(Candidate::Conditional(found.clone())));
                 }
-            } else if is_match(&self.txn.env, &expr) {
-                return Ok(Some(Candidate::Match));
+            } else if matches::has_annotation(&self.txn.env, &expr)
+                || is_match(&self.txn.env, &expr)
+            {
+                return Ok(Some(Candidate::Match(expr)));
             }
             // Candidates are not looked for in proofs.
             if !expr.has_loose_bvars() && self.is_proof(&expr)? {
@@ -1420,6 +1434,19 @@ impl Context {
         goal: ProofGoal,
         subject: &Subject,
         plan: Plan,
+    ) -> Result<(), NatDefinitionElabError> {
+        match plan {
+            Plan::Conditional(plan) => self.split_apply_conditional(proof, goal, subject, plan),
+            Plan::Match(plan) => self.split_apply_match(proof, goal, subject, plan),
+        }
+    }
+
+    fn split_apply_conditional(
+        &mut self,
+        proof: &mut ProofState<'_>,
+        goal: ProofGoal,
+        subject: &Subject,
+        plan: ConditionalPlan,
     ) -> Result<(), NatDefinitionElabError> {
         self.txn.lctx = goal.lctx.clone();
         let target = self.instantiate(&goal.target)?;

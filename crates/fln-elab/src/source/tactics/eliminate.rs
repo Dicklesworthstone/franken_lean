@@ -28,6 +28,12 @@ pub(super) enum EliminationSyntax<'a> {
     EmptyMatrix(HashMap<Name, Vec<Name>>),
     /// Recursive tactic patterns retain the ordinary cases removal semantics.
     RCases(HashMap<Name, Vec<Name>>),
+    /// A source match's splitter keeps an inaccessible copy of the original input, while
+    /// the target and its dependency cone are specialized at each constructor.
+    SplitMatch {
+        fields: HashMap<Name, Vec<Name>>,
+        original: Name,
+    },
 }
 struct EliminationContext<'a> {
     parameters: &'a [Expr],
@@ -729,9 +735,9 @@ impl Context {
             EliminationSyntax::Match(_) | EliminationSyntax::RecursiveMatch(_) => {
                 (Name::anonymous(), &[][..], true, &[][..])
             }
-            EliminationSyntax::EmptyMatrix(_) | EliminationSyntax::RCases(_) => {
-                (Name::anonymous(), &[][..], false, &[][..])
-            }
+            EliminationSyntax::EmptyMatrix(_)
+            | EliminationSyntax::RCases(_)
+            | EliminationSyntax::SplitMatch { .. } => (Name::anonymous(), &[][..], false, &[][..]),
         };
         self.resolve_instances(false)?;
         self.flush(false)?;
@@ -993,6 +999,12 @@ impl Context {
         for local in goal.lctx.decls() {
             if !removed.contains(&local.id) {
                 add_local(&mut retained, local);
+            } else if local.id == major.id
+                && let EliminationSyntax::SplitMatch { original, .. } = input
+            {
+                let mut original_local = local.clone();
+                original_local.user_name = original.clone();
+                add_local(&mut retained, &original_local);
             } else if rec.num_motives > 1 && (local.id == major.id || index_ids.contains(&local.id))
             {
                 // Sibling motives may mention the original input in R -> R.
@@ -1277,11 +1289,14 @@ impl Context {
                     recursive_source,
                     source_match: !matches!(
                         input,
-                        EliminationSyntax::Tactic(_) | EliminationSyntax::RCases(_)
+                        EliminationSyntax::Tactic(_)
+                            | EliminationSyntax::RCases(_)
+                            | EliminationSyntax::SplitMatch { .. }
                     ),
                     empty_fields: match input {
                         EliminationSyntax::EmptyMatrix(fields)
-                        | EliminationSyntax::RCases(fields) => {
+                        | EliminationSyntax::RCases(fields)
+                        | EliminationSyntax::SplitMatch { fields, .. } => {
                             fields.get(&rule.ctor).map(Vec::as_slice)
                         }
                         _ => None,

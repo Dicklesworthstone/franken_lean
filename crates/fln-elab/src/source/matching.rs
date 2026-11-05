@@ -12,6 +12,7 @@ use std::collections::{HashMap, HashSet};
 mod conditional_order;
 mod mutual;
 mod nomatch;
+pub(in crate::source) mod split_info;
 pub(super) use conditional_order::{ConditionalBuild, ConditionalStep};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -118,6 +119,8 @@ impl MatchParts<'_> {
 pub(super) struct MatchPatterns<'a> {
     pub(super) constructors: HashMap<Name, (Vec<Option<Name>>, &'a Syntax)>,
     pub(super) fallback: Option<(Option<Name>, &'a Syntax)>,
+    /// Written constructor order and field names, which recursor argument order loses.
+    split_info: Option<KVMap>,
 }
 pub(super) enum MatchStart<'a> {
     Conditional(Box<ConditionalBuild<'a>>),
@@ -150,6 +153,7 @@ pub(super) struct MatchBuild<'a> {
     levels: Vec<Level>,
     recursor: Typed,
     branches: std::collections::VecDeque<Branch<'a>>,
+    split_info: Option<KVMap>,
 }
 pub(super) struct BranchBinders {
     // Old indices whose direct field patterns lack an index-equation witness.
@@ -643,6 +647,7 @@ impl Context {
                     // Replaced by the checked body before completion.
                     recursor: major,
                     branches: std::collections::VecDeque::new(),
+                    split_info: None,
                 });
             }
         }
@@ -792,7 +797,10 @@ impl Context {
         let MatchPatterns {
             constructors: mut patterns,
             fallback,
+            split_info,
         } = self.match_patterns(parts, name, &family.ctors, &family_type)?;
+        let split_info =
+            split_info.filter(|_| !recursive && family.num_indices == 0 && rec.num_motives == 1);
         let mut branches = std::collections::VecDeque::new();
         let mut seen = HashSet::new();
         for rule in &rec.rules {
@@ -842,6 +850,7 @@ impl Context {
             levels: levels.clone(),
             recursor,
             branches,
+            split_info,
         })
     }
 
@@ -964,6 +973,7 @@ impl Context {
             levels: Vec::new(),
             recursor: major.clone(),
             branches: std::collections::VecDeque::new(),
+            split_info: None,
         }))
     }
 
@@ -1040,9 +1050,11 @@ impl Context {
             return Ok(MatchPatterns {
                 constructors: patterns,
                 fallback: None,
+                split_info: None,
             });
         }
         let mut fallback = None;
+        let mut order = Vec::new();
         for (index, syntax) in parts.alternatives.iter().enumerate() {
             self.tick()?;
             let alt = expect_node(
@@ -1280,6 +1292,7 @@ impl Context {
                 {
                     return Err(error(MatchError::DuplicateVariable));
                 }
+                order.push(constructor_name.clone());
                 if patterns
                     .insert(constructor_name, (fields, &alt[3]))
                     .is_some()
@@ -1307,9 +1320,18 @@ impl Context {
                 return Err(error(MatchError::DuplicateConstructor));
             }
         }
+        let split_info =
+            (!parts.generated && parts.equation.is_none() && fallback.is_none()).then(|| {
+                split_info::encode(
+                    order
+                        .iter()
+                        .map(|constructor| (constructor, patterns[constructor].0.as_slice())),
+                )
+            });
         Ok(MatchPatterns {
             constructors: patterns,
             fallback,
+            split_info,
         })
     }
 
@@ -1508,6 +1530,9 @@ impl Context {
                     result.value,
                     false,
                 );
+            }
+            if let Some(info) = &state.split_info {
+                result.value = Expr::mdata(info.clone(), result.value);
             }
             return Ok(MatchStep::Complete(
                 self.finish_term(result, Some(&state.target))?,

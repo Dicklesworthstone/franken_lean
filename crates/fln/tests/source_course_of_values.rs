@@ -256,7 +256,7 @@ fn nested_history_refuses_the_original_major_other_values_and_unused_bad_calls()
         )
     };
     check(&format!(
-        "{}example : loop (.leaf 0) (.child (.some (.leaf 42))) = 42 := rfl\n",
+        "{}theorem loop_ground : loop (.leaf 0) (.child (.some (.leaf 42))) = 42 := rfl\n",
         program("loop other subtree")
     ));
     for body in [

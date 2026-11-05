@@ -3,9 +3,9 @@
 //! of the goal, or of one hypothesis, by cases on its decision (`SplitIf.splitIfAt?`, vendored
 //! `Lean/Meta/Tactic/SplitIf.lean:261-271`), tagging the cases `isTrue` and `isFalse` and naming
 //! the hypothesis `h✝`, then reduces in each case every conditional a hypothesis decides
-//! (`simpIfTarget`/`simpIfLocalDecl` under `backward.split`, lines 284-313). A `match` is split
-//! with its matcher's splitter (vendored `Lean/Meta/Tactic/Split.lean`), which this engine
-//! refuses, typed.
+//! (`simpIfTarget`/`simpIfLocalDecl` under `backward.split`, lines 284-313). Exhaustive source
+//! constructor matches use checked recursor splitters in their written alternative order.
+//! Overlapping/matrix and unrecorded matchers retain a typed refusal.
 //!
 //! Every program was run through the pinned `lean` v4.32.0 with the same header first
 //! (2026-10-23), and its output is compared with the pinned binary's again when that is present.
@@ -298,8 +298,97 @@ const REFUSED: &[(&str, &str, &str, &str)] = &[
     ),
 ];
 
-/// A `match` the pin splits (`case h_1`, `case h_2`) and this engine refuses.
+/// A catch-all `match` whose second splitter branch needs an exclusion premise, rather than
+/// a successor constructor. This remains outside the explicit-constructor implementation.
 const MATCH: &str = "prelude\nimport Init.SimpLemmas\nexample (x : Nat) : (match x with | 0 => 1 | _ => 2) > 0 := by\n  split\n  all_goals sorry\n";
+
+const CONSTRUCTOR_MATCHES: &str = r#"prelude
+import Init.SimpLemmas
+set_option linter.unusedVariables false
+example (x : Nat) : (match x with | Nat.zero => 1 | Nat.succ y => y + 2) > 0 := by
+  split
+  trace_state
+  all_goals sorry
+example (b : Bool) : (match b with | true => 7 | false => 3) > 0 := by
+  split
+  trace_state
+  all_goals sorry
+example (x : Option Nat) : (match x with | .some y => y + 1 | .none => 3) > 0 := by
+  split
+  trace_state
+  all_goals sorry
+example (x : Nat) (h : (match x with | Nat.zero => 1 | Nat.succ y => y + 2) = 0) : False := by
+  split at h
+  trace_state
+  all_goals sorry
+"#;
+
+const CONSTRUCTOR_MATCHES_EXPECTED: &str = r#"case h_1
+x✝ : Nat
+⊢ 1 > 0
+
+case h_2
+x✝ y✝ : Nat
+⊢ y✝ + 2 > 0
+ConstructorMatches.lean:4:0: warning: declaration uses `sorry`
+case h_1
+b✝ : Bool
+⊢ 7 > 0
+
+case h_2
+b✝ : Bool
+⊢ 3 > 0
+ConstructorMatches.lean:8:0: warning: declaration uses `sorry`
+case h_1
+x✝ : Option Nat
+y✝ : Nat
+⊢ y✝ + 1 > 0
+
+case h_2
+x✝ : Option Nat
+⊢ 3 > 0
+ConstructorMatches.lean:12:0: warning: declaration uses `sorry`
+case h_1
+x✝ : Nat
+h : 1 = 0
+⊢ False
+
+case h_2
+x✝ y✝ : Nat
+h : y✝ + 2 = 0
+⊢ False
+ConstructorMatches.lean:16:0: warning: declaration uses `sorry`
+"#;
+
+const CONSTRUCTOR_PROOFS: &str = r#"prelude
+import Init.SimpLemmas
+set_option linter.unusedVariables false
+theorem split_nat_reconstruction (x : Nat) : (match x with | Nat.zero => 0 | Nat.succ n => n.succ) = x := by
+  split <;> rfl
+theorem split_function_valued_match (b : Bool) (f g : Nat → Nat) (x : Nat) :
+    (match b with | true => f | false => g) x =
+      (match b with | true => f x | false => g x) := by
+  split <;> rfl
+theorem split_option_some_first (x : Option Nat) (h : match x with | .some n => n = 0 | .none => False) :
+    x = Option.some 0 := by
+  split at h
+  next n => cases h; rfl
+  next => exact False.elim h
+theorem split_option_none_first (x : Option Nat) (h : match x with | .none => False | .some n => n = 0) :
+    x = Option.some 0 := by
+  split at *
+  next => exact False.elim h
+  next n => cases h; rfl
+theorem split_polymorphic_option {α : Type} (x : Option α) (p : α → Prop) (hp : ∀ a, p a) :
+    match x with | .none => True | .some a => p a := by
+  split
+  next => exact True.intro
+  next a => exact hp a
+inductive Side where
+  | right | left | center
+theorem split_enumeration_source_order (s : Side) : match s with | .left => True | .center => True | .right => True := by
+  split <;> exact True.intro
+"#;
 
 /// Source conditionals must have the same heads as the imported conditional lemmas.
 /// A recursor with equivalent evaluation cannot replace `ite`/`dite` here: `simp only`
@@ -490,6 +579,97 @@ fn split_cases_on_an_imported_ite_as_the_pin_does() {
 }
 
 #[test]
+fn split_constructor_matches_preserves_source_order_and_goal_contexts() {
+    let Some(lib) = pinned_lib() else {
+        return;
+    };
+    let root = workspace();
+    accepted(
+        &lib,
+        &root,
+        "ConstructorMatches.lean",
+        CONSTRUCTOR_MATCHES,
+        CONSTRUCTOR_MATCHES_EXPECTED,
+    );
+    accepted(
+        &lib,
+        &root,
+        "ConstructorProofs.lean",
+        CONSTRUCTOR_PROOFS,
+        "",
+    );
+}
+
+/// The same complete proofs also run over the native admitted seed, independently of the
+/// installed library and its import cache. Both failing programs must reach real split goals.
+#[test]
+fn split_constructor_matches_checks_native_seed_proofs_and_every_branch() {
+    let limits = fln::SourceCheckLimits::new(fln::EngineAdmissionLimits::new(
+        fln::Budget::for_stack_bytes(8 * 1024 * 1024),
+    ));
+    let options = fln::KVMap::new();
+    let base = fln::Engine::with_source_seed(limits.admission)
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let root = base.logical_root(&options);
+    let program = CONSTRUCTOR_PROOFS
+        .strip_prefix("prelude\nimport Init.SimpLemmas\nset_option linter.unusedVariables false\n")
+        .expect("the shared proof fixture has only its import header removed");
+    let checked = base
+        .check_source_files(&[program.as_bytes()], &options, limits)
+        .unwrap_or_else(|error| panic!("{program}\n{error:?}"))
+        .into_complete()
+        .unwrap();
+    assert_eq!(checked.theorems, 6, "every theorem checks an actual proof");
+    assert_eq!(base.logical_root(&options), root);
+
+    for program in [
+        "example (b : Bool) : (match b with | true => True | false => False) := by\n  split <;> exact True.intro\n",
+        "example (b : Bool) : (match b with | true => True | false => True) := by\n  split\n  exact True.intro\n",
+    ] {
+        let error = base
+            .check_source_files(&[program.as_bytes()], &options, limits)
+            .expect_err("a false or unfinished split branch must reject the theorem");
+        assert!(
+            !format!("{error:?}").contains("SplitMatchUnsupported"),
+            "the negative control must split the match: {error:?}"
+        );
+        assert_eq!(base.logical_root(&options), root);
+    }
+}
+
+#[test]
+fn split_constructor_matches_keeps_every_branch_as_a_checked_obligation() {
+    let Some(lib) = pinned_lib() else {
+        return;
+    };
+    let root = workspace();
+    for (name, body) in [
+        (
+            "FalseBranch.lean",
+            "example (b : Bool) : (match b with | true => True | false => False) := by\n  split <;> exact True.intro\n",
+        ),
+        (
+            "MissingBranch.lean",
+            "example (b : Bool) : (match b with | true => True | false => True) := by\n  split\n  exact True.intro\n",
+        ),
+    ] {
+        let program = format!("prelude\nimport Init.SimpLemmas\n{body}");
+        std::fs::write(root.join(name), program).unwrap();
+        if let Some((code, stdout)) = pinned(&lib, &root, name) {
+            assert_eq!(code, 1, "{name}: the pin moved: {stdout}");
+        }
+        let (code, stdout, stderr) = ours(&lib, &root, name);
+        assert_eq!(code, 1, "{name}: {stdout}{stderr}");
+        assert!(
+            !stderr.contains("split on a `match` expression is not implemented"),
+            "{stderr}"
+        );
+    }
+}
+
+#[test]
 fn source_conditionals_use_imported_ite_and_dite_lemmas() {
     let Some(lib) = pinned_lib() else {
         return;
@@ -584,8 +764,8 @@ fn split_is_refused_where_the_pin_refuses_it() {
     }
 }
 
-/// The pin splits a `match` with its matcher's splitter; this engine refuses it, typed, rather
-/// than split something else or claim the goals the pin makes.
+/// A catch-all needs the matcher's overlap/exclusion evidence. Constructor splitting must not
+/// silently replace that goal by a narrower successor-constructor goal.
 #[test]
 fn split_on_a_match_is_refused_typed() {
     let Some(lib) = pinned_lib() else {
