@@ -2,6 +2,41 @@
 use super::*;
 
 impl Preparation<'_> {
+    /// Reading a field of an already-bound ordinary record is inert. The
+    /// receiver's construction has already run; retaining this scoped syntax
+    /// cannot discard an initializer or evaluate a method. Nested receivers
+    /// reached here have passed the same check at their own projection frame.
+    pub(super) fn inert_bound_record_projection(
+        &mut self,
+        family: &Name,
+        index: u64,
+        receiver: &Expr,
+    ) -> Result<bool, IngressError> {
+        self.tick()?;
+        if !matches!(
+            receiver.node(),
+            ExprNode::BVar { .. } | ExprNode::Proj { .. }
+        ) || self.st_ref_record_forbidden(family)?
+            || self.array_record_forbidden(family)?
+            || self.thunk_record_forbidden(family)?
+            || self.task_record_forbidden(family)?
+        {
+            return Ok(false);
+        }
+        let Some(ConstantInfo::Induct(record)) = self.environment.find(family) else {
+            return Ok(false);
+        };
+        if record.is_unsafe || record.num_indices != 0 || record.ctors.len() != 1 {
+            return Ok(false);
+        }
+        let Some(ConstantInfo::Ctor(constructor)) = self.environment.find(&record.ctors[0]) else {
+            return Ok(false);
+        };
+        Ok(!constructor.is_unsafe
+            && constructor.induct == *family
+            && index < u64::from(constructor.num_fields))
+    }
+
     pub(in crate::runtime) fn instance_factory_field(
         &mut self,
         family: &Name,

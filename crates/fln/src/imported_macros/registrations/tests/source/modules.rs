@@ -2,7 +2,7 @@
 //! constructed compiler inputs test native integration, not Reference parity.
 use super::*;
 use crate::SourceModuleInput;
-use crate::source_check::modules::imported::SourceOleanImport;
+use crate::source_check::modules::imported::{SourceOleanImport, SourceOleanImportLimits};
 use crate::source_check::modules::{
     SourceMacroModuleCheck, SourceModuleCheck, SourceModuleCheckError, SourceModuleCheckLimits,
     SourceModuleDeferredMacroInputs, SourceModuleMacroInputs,
@@ -1805,7 +1805,7 @@ pub(super) fn compile_deferred(
 
 #[test]
 fn imported_macro_builds_emit_recheckable_artifacts_with_real_implicit_imports() {
-    let (imported, code) = batches::artifact_import_fixture();
+    let (imported, code, library_bytes) = batches::artifact_build_fixture();
     let before = imported.engine.logical_root(&KVMap::new());
     let declarations = users(&code);
     let compilation =
@@ -1841,7 +1841,7 @@ fn imported_macro_builds_emit_recheckable_artifacts_with_real_implicit_imports()
     assert_eq!(built.states.as_ref().unwrap().len(), 3);
     assert_declared_value(&product.checked.checked.engine, "first", 11);
     assert_declared_value(&product.checked.checked.engine, "second", 17);
-    let imports: Vec<_> = product
+    let mut imports: Vec<_> = product
         .artifacts
         .iter()
         .map(|artifact| crate::OleanModuleInput {
@@ -1851,12 +1851,23 @@ fn imported_macro_builds_emit_recheckable_artifacts_with_real_implicit_imports()
             private_artifact: None,
         })
         .collect();
-    let rechecked = imported
-        .engine
-        .check_olean_modules(
+    let library_name = name("SourceLibrary");
+    imports.push(crate::OleanModuleInput {
+        name: &library_name,
+        artifact: &library_bytes,
+        server_artifact: None,
+        private_artifact: None,
+    });
+    let rechecked = Engine::builder()
+        .build_empty()
+        .import_olean_modules_for_source(
             &imports,
+            &[name("Main")],
             &KVMap::new(),
-            crate::OleanCheckLimits::new(4 * 1024 * 1024, admission().kernel),
+            SourceOleanImportLimits::new(crate::OleanCheckLimits::new(
+                4 * 1024 * 1024,
+                admission().kernel,
+            )),
         )
         .unwrap()
         .into_complete()
@@ -1893,7 +1904,7 @@ fn imported_macro_builds_emit_recheckable_artifacts_with_real_implicit_imports()
 
 #[test]
 fn imported_macro_build_failures_withhold_artifacts_and_states_and_recover() {
-    let (imported, code) = batches::artifact_import_fixture();
+    let (imported, code, _) = batches::artifact_build_fixture();
     let before = imported.engine.logical_root(&KVMap::new());
     let declarations = users(&code);
     let compilation =
@@ -2006,7 +2017,7 @@ fn cancellation_at_macro_artifact_publication_withholds_all_module_states() {
             count >= self.stop_at
         }
     }
-    let (imported, code) = batches::artifact_import_fixture();
+    let (imported, code, _) = batches::artifact_build_fixture();
     let before = imported.engine.logical_root(&KVMap::new());
     let declarations = users(&code);
     let compilation =

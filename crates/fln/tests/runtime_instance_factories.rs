@@ -82,6 +82,84 @@ def forwardString (n : Nat) : String := consume (n := n) "a" "xyz"
 }
 
 #[test]
+fn scoped_polymorphic_dictionaries_can_capture_fields_of_bound_records() {
+    let source = r#"
+structure ProjectionSettings where
+  choice : Nat
+structure ProjectionWrapper where
+  settings : ProjectionSettings
+class ProjectedPick (n : Nat) where
+  pick : {A : Type} -> A -> A -> A
+instance projectedPick (n : Nat) : ProjectedPick n :=
+  { pick := fun x y => match n with | 0 => x | _ + 1 => y }
+def consumeProjected {n : Nat} {A : Type} [ProjectedPick n] (x y : A) : A :=
+  ProjectedPick.pick (n := n) x y
+def forwardProjected (settings : ProjectionSettings) : Nat :=
+  consumeProjected (n := settings.choice) 41 42
+def forwardNestedProjection (wrapper : ProjectionWrapper) : Nat :=
+  consumeProjected (n := wrapper.settings.choice) 41 42
+"#;
+    for (body, expected) in [
+        ("forwardProjected (ProjectionSettings.mk 0)", "41"),
+        ("forwardProjected (ProjectionSettings.mk 1)", "42"),
+        (
+            "forwardNestedProjection (ProjectionWrapper.mk (ProjectionSettings.mk 0))",
+            "41",
+        ),
+        (
+            "forwardNestedProjection (ProjectionWrapper.mk (ProjectionSettings.mk 1))",
+            "42",
+        ),
+    ] {
+        execute(&format!("{source}#eval {body}"), expected);
+    }
+}
+
+#[test]
+fn scoped_projection_inputs_preserve_strict_record_initializers() {
+    let source = r#"
+structure StrictProjectionSettings where
+  choice : Nat
+  unused : Nat
+class StrictProjectedPick (n : Nat) where
+  pick : {A : Type} -> A -> A -> A
+instance strictProjectedPick (n : Nat) : StrictProjectedPick n :=
+  { pick := fun x y => match n with | 0 => x | _ + 1 => y }
+def consumeStrictProjected {n : Nat} [StrictProjectedPick n] : Nat :=
+  StrictProjectedPick.pick (n := n) 41 42
+def projectionWork (n : Nat) : Nat :=
+  match n with | 0 => 0 | k + 1 => projectionWork k + 1
+def strictProjection (cost : Nat) : Nat :=
+  let settings := StrictProjectionSettings.mk 1 (projectionWork cost)
+  consumeStrictProjected (n := settings.choice)
+"#;
+    let short = execute(&format!("{source}#eval strictProjection 1"), "42");
+    let long = execute(&format!("{source}#eval strictProjection 40"), "42");
+    assert!(long > short, "the unused record field must still execute");
+}
+
+#[test]
+fn scoped_dictionary_factories_retain_erased_theorem_applications() {
+    let source = r#"
+def proofArgumentWork (n : Nat) : Nat :=
+  match n with | 0 => 0 | k + 1 => proofArgumentWork k + 1
+theorem factoryWitness (unused : Nat) : True := True.intro
+class ProofSelected (n : Nat) where
+  pick : {A : Type} -> A -> A -> A
+  witness : True
+instance proofSelected (n : Nat) : ProofSelected n :=
+  { pick := fun x y => match n with | 0 => x | _ + 1 => y,
+    witness := factoryWitness (proofArgumentWork n) }
+def consumeProofSelected {n : Nat} [ProofSelected n] : Nat :=
+  ProofSelected.pick (n := n) 41 42
+def forwardProofSelected (n : Nat) : Nat := consumeProofSelected (n := n)
+"#;
+    execute(&format!("{source}#eval forwardProofSelected 0"), "41");
+    execute(&format!("{source}#eval forwardProofSelected 1"), "42");
+    execute(&format!("{source}#eval forwardProofSelected 40"), "42");
+}
+
+#[test]
 fn scoped_polymorphic_dictionary_specialization_keeps_computed_siblings_strict() {
     let source = r#"
 class PickAt (n : Nat) where

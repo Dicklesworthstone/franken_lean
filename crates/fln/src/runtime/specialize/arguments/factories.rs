@@ -136,6 +136,16 @@ impl Preparation<'_> {
                             continue;
                         }
                         match self.environment.find(name) {
+                            Some(ConstantInfo::Thm(theorem))
+                                if levels.len() == theorem.base.level_params.len() =>
+                            {
+                                // A checked theorem is erased proof syntax,
+                                // including its arguments. Unfolding a factory
+                                // may expose it after the caller's erasure pass.
+                                // Retain it without reading or executing its body.
+                                values.push(expression);
+                                continue;
+                            }
                             Some(ConstantInfo::Axiom(axiom))
                                 if !axiom.is_unsafe
                                     && levels.len() == axiom.base.level_params.len() =>
@@ -351,8 +361,14 @@ impl Preparation<'_> {
                     let value = values
                         .pop()
                         .ok_or_else(|| unsupported("instance factory projection receiver"))?;
-                    let Some(field) = self.instance_factory_field(&family, index, &value)? else {
-                        return Ok(None);
+                    let field = match self.instance_factory_field(&family, index, &value)? {
+                        Some(field) => field,
+                        None if allow_bound_locals
+                            && self.inert_bound_record_projection(&family, index, &value)? =>
+                        {
+                            Expr::proj(family, index, value)
+                        }
+                        None => return Ok(None),
                     };
                     values.push(field);
                 }

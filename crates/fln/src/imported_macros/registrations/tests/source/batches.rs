@@ -38,6 +38,13 @@ pub(super) fn artifact_import_fixture() -> (SourceOleanImport, Vec<IrModule>) {
     artifact_import_fixture_with_extra_rows(&[])
 }
 
+/// Artifact export requires every base declaration to be represented by the
+/// import receipt. Carry the constructed seed in the library artifact and
+/// admit the complete world from an empty engine, without ambient declarations.
+pub(super) fn artifact_build_fixture() -> (SourceOleanImport, Vec<IrModule>, Vec<u8>) {
+    artifact_import_fixture_inner(&[], &[], &[], &[], None, true)
+}
+
 pub(super) fn artifact_import_fixture_with_extra_rows(
     extra_rows: &[(&str, &str, Option<&str>)],
 ) -> (SourceOleanImport, Vec<IrModule>) {
@@ -70,6 +77,25 @@ pub(super) fn artifact_import_fixture_with_parser_dependency(
     extra_ir: &[IrDecl],
     dependency: Option<(&str, &[ConstantInfo], &[Obj])>,
 ) -> (SourceOleanImport, Vec<IrModule>) {
+    let (imported, code, _) = artifact_import_fixture_inner(
+        extra_rows,
+        extra_constants,
+        parser_rows,
+        extra_ir,
+        dependency,
+        false,
+    );
+    (imported, code)
+}
+
+fn artifact_import_fixture_inner(
+    extra_rows: &[(&str, &str, Option<&str>)],
+    extra_constants: &[ConstantInfo],
+    parser_rows: &[Obj],
+    extra_ir: &[IrDecl],
+    dependency: Option<(&str, &[ConstantInfo], &[Obj])>,
+    bind_seed: bool,
+) -> (SourceOleanImport, Vec<IrModule>, Vec<u8>) {
     let seed = Engine::with_source_seed(admission())
         .unwrap()
         .into_complete()
@@ -103,11 +129,19 @@ pub(super) fn artifact_import_fixture_with_parser_dependency(
         "SourceLibrary.preresolved",
         "SourceLibrary.attributeProbe",
     ];
-    let mut constants = vec![definition(
+    let mut constants: Vec<_> = if bind_seed {
+        seed.environment()
+            .constants()
+            .map(|(_, constant)| constant.clone())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    constants.push(definition(
         "Lean.Macro",
         Expr::sort(Level::zero().succ().unwrap()),
         macro_type,
-    )];
+    ));
     constants.extend(owners.iter().map(|label| {
         definition(
             label,
@@ -220,7 +254,12 @@ pub(super) fn artifact_import_fixture_with_parser_dependency(
         private_artifact: None,
     });
     let total_bytes = bytes.len() + dependency_bytes.as_ref().map_or(0, Vec::len);
-    let imported = seed
+    let origin = if bind_seed {
+        Engine::builder().build_empty()
+    } else {
+        seed.clone()
+    };
+    let imported = origin
         .import_olean_modules_for_source(
             &inputs,
             std::slice::from_ref(&module),
@@ -254,7 +293,7 @@ pub(super) fn artifact_import_fixture_with_parser_dependency(
         function("SourceLibrary.attributeProbe", Behavior::Unsupported),
     ];
     declarations.extend_from_slice(extra_ir);
-    (imported, code(declarations))
+    (imported, code(declarations), bytes)
 }
 
 /// Preserve the left identifier's spelling and exact backing source, but bind

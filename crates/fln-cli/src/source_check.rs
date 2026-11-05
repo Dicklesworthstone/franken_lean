@@ -39,7 +39,7 @@ enum ModuleBuildKind {
     Ordinary(Box<fln::source_check::modules::SourceModuleSession>),
     ImportedMacros {
         base: Box<imports::MacroBuildBase>,
-        limits: fln::source_check::modules::SourceModuleCheckLimits,
+        limits: Box<fln::source_check::modules::SourceModuleCheckLimits>,
     },
 }
 
@@ -65,7 +65,7 @@ impl ModuleBuildContext {
                 Self {
                     kind: ModuleBuildKind::ImportedMacros {
                         base: Box::new(base),
-                        limits,
+                        limits: Box::new(limits),
                     },
                 },
                 Some(report),
@@ -129,7 +129,7 @@ impl ModuleBuildContext {
                         modules,
                         entry,
                         &fln::KVMap::new(),
-                        *limits,
+                        **limits,
                         base.input.clone(),
                         write_budget,
                         None,
