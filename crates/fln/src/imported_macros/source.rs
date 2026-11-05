@@ -12,11 +12,12 @@
 //! and dual-check admission as `Engine::check_source_command`; raw evaluations
 //! then use the ordinary compiler, codec and Golem execution path.
 //!
-//! Recursive expansion follows `Lean.expandMacros`, including its tactic
-//! boundary. Atomic macro dispatch belongs to term elaboration: owned file and
-//! module sessions bind a runtime provider that expands identifiers and atoms
-//! only when the elaborator visits a term, preserving declaration and binder
-//! names. Generated terms and tactic expansions use that same provider.
+//! Compound-node expansion follows `Lean.expandMacros`, including its tactic
+//! boundary. Owned file and module sessions defer atomic nodes to a runtime
+//! provider at actual term and literal-pattern visits, preserving declaration
+//! and binder names, universe levels and projection indices. Generated terms
+//! and tactic expansions use that same provider. Literal-pattern replacements
+//! that require a different pattern shape retain an explicit capability boundary.
 //! Standalone APIs and borrowed lookup/cancellation overrides retain an
 //! explicit refusal at these boundaries rather than extending borrowed
 //! authority lifetimes.
@@ -1098,9 +1099,15 @@ impl Engine {
     /// semantics without command-root macro dispatch. Active source quotations
     /// join the same candidate registry, including its callback and tactic
     /// boundaries. Current-file registrations on an imported kind merge by
-    /// registration and scoped-activation chronology. Atomic source templates
-    /// and independently imported native/artifact chains without a shared order
-    /// retain explicit capability refusals. Persistent mixed-override exports
+    /// registration and scoped-activation chronology. Atomic templates dispatch
+    /// at native term and literal-pattern visits; a literal pattern rewritten
+    /// to a nonliteral shape retains an explicit refusal. Dependent application
+    /// prechecks still lack observations of deferred atomic argument expansions
+    /// and may refuse such applications before their term visits.
+    /// Borrowed lookup/cancellation
+    /// sessions without an owned provider and independently imported native/
+    /// artifact chains without a shared order retain explicit capability
+    /// refusals. Persistent mixed-override exports
     /// also require that shared import order; local overrides can publish their
     /// checked declarations. Artifact parser installation and module-system
     /// visibility remain separate capabilities.
@@ -1540,7 +1547,7 @@ fn expand_syntax_in_scope(
         &scope.explicit_opens,
     );
     let lookup = lookup.or(Some(&engine_lookup as &dyn MacroLookup));
-    let expanded = registry.expand_tree_with_context(
+    let expanded = registry.expand_source_tree_with_context(
         input,
         MacroDispatchInvocation {
             source,
@@ -1667,6 +1674,14 @@ fn deferred_candidate(
         let kind = match syntax {
             Syntax::Node { kind, args, .. } => {
                 let in_tactic = in_tactic || *kind == tactic;
+                if !runtime_macros
+                    && fln_parse::extensions::is_atomic_macro_kind(kind)
+                    && registry.declarations(kind).next().is_some()
+                {
+                    return Ok(Some(SourceMacroError::AtomicExpansion {
+                        kind: kind.clone(),
+                    }));
+                }
                 if in_tactic
                     && (!runtime_macros || *kind == tactic)
                     && registry.declarations(kind).next().is_some()

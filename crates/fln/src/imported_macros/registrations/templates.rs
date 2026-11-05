@@ -38,16 +38,6 @@ impl RegisteredMacros {
                 declaration: kind.clone(),
                 reason,
             };
-            if ["num", "str", "ident", "char", "scientific", "name"]
-                .iter()
-                .any(|atomic| *kind == Name::from_components([*atomic]))
-            {
-                return Err(MacroRegistrationError::Owner {
-                    module: module.clone(),
-                    declaration: kind.clone(),
-                    reason: "atomic source templates require term-position dispatch in the mixed macro tree",
-                });
-            }
             let Some(orders) = snapshot.orders.get(kind) else {
                 return Err(invalid("source macro clause ordering is absent"));
             };

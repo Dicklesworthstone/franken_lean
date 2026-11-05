@@ -117,29 +117,6 @@ impl Context {
         if self.tactic_macro_depth >= MAX_OWNED_FRAMES {
             return Err(frame_limit());
         }
-        let prepared;
-        let syntax = if builtin {
-            syntax
-        } else {
-            self.check_preresolved_syntax(syntax)?;
-            prepared = self.lower_pattern_matrices(syntax)?;
-            &prepared
-        };
-        let mut proof = ProofState {
-            extent: original.extent.clone(),
-            saved: original.saved.clone(),
-            target: original.target.clone(),
-            root: original.root.clone(),
-            instructions: vec![syntax],
-            cursor: 0,
-            work: Vec::new(),
-            controls: Vec::new(),
-            owned_frame: Some(OwnedFrame {
-                builtin: builtin.then_some(syntax),
-                entered: false,
-            }),
-        };
-        proof.put_frontier(frontier.to_vec());
         let depth = self.tactic_macro_depth;
         let terms = self.tactic_macro_terms;
         let attempts = self.attempt_depth;
@@ -151,7 +128,34 @@ impl Context {
         self.tactic_macro_terms += 1;
         // The expansion is provisional until all of this candidate succeeds.
         self.attempt_depth += 1;
-        let result = self.term_prepared_scoped(syntax, None, Some(proof), None, true);
+        let result = (|| {
+            // Patterns in a generated tactic belong to this owned expansion
+            // before the tactic worklist starts visiting its terms.
+            let prepared;
+            let syntax = if builtin {
+                syntax
+            } else {
+                self.check_preresolved_syntax(syntax)?;
+                prepared = self.lower_pattern_matrices(syntax)?;
+                &prepared
+            };
+            let mut proof = ProofState {
+                extent: original.extent.clone(),
+                saved: original.saved.clone(),
+                target: original.target.clone(),
+                root: original.root.clone(),
+                instructions: vec![syntax],
+                cursor: 0,
+                work: Vec::new(),
+                controls: Vec::new(),
+                owned_frame: Some(OwnedFrame {
+                    builtin: builtin.then_some(syntax),
+                    entered: false,
+                }),
+            };
+            proof.put_frontier(frontier.to_vec());
+            self.term_prepared_scoped(syntax, None, Some(proof), None, true)
+        })();
         self.tactic_macro_depth = depth;
         self.tactic_macro_terms = terms;
         self.attempt_depth = attempts;
@@ -285,20 +289,53 @@ impl Context {
         expected: Option<Expr>,
         finish: bool,
     ) -> Result<Option<Typed>, NatDefinitionElabError> {
-        // The source pass expands nodes, but deliberately leaves atoms and
-        // identifiers for actual term positions. In particular, a declaration
-        // name or binder must never be rewritten by an `ident` registration.
-        // Generated terms have not passed through that source pass, so their
-        // nodes must also dispatch here. Missing syntax is handled directly by
-        // the term elaborator, as in the pin's elabTermAux.
-        if matches!(syntax, Syntax::Missing)
-            || (self.tactic_macro_terms == 0 && matches!(syntax, Syntax::Node { .. }))
-        {
-            return Ok(None);
+        if syntax.kind().is_some_and(|kind| {
+            matches!(
+                kind.leaf_view(),
+                fln_core::name::LeafView::Str("flnPreparedPatternLiteral")
+            ) && *kind == parser_kind(&["Term", "flnPreparedPatternLiteral"])
+        }) {
+            let prepared_kind = parser_kind(&["Term", "flnPreparedPatternLiteral"]);
+            let parts = expect_node(syntax, &prepared_kind, 1, "prepared pattern literal")?;
+            let literal = &parts[0];
+            if !literal.kind().is_some_and(|kind| {
+                ["num", "str", "char"]
+                    .iter()
+                    .any(|name| *kind == Name::from_components([*name]))
+            }) {
+                return Err(NatDefinitionElabError::UnexpectedSyntax {
+                    expected: "prepared pattern literal",
+                });
+            }
+            // The matrix has already decoded this value, including any source
+            // macro expansion. Its comparison operand must retain that value;
+            // internal predecessors must not become new user macro inputs.
+            // Only builtin literal syntax can cross this boundary, and it
+            // still goes through ordinary elaboration and kernel checking.
+            let provider = self.source_scope.tactic_macros.take();
+            let result = self.term_prepared_scoped(literal, expected, None, None, finish);
+            self.source_scope.tactic_macros = provider;
+            return match result? {
+                super::super::TermResult::Term(term) => Ok(Some(term)),
+                super::super::TermResult::Tactic(_) => Err(failure(SourceInferenceError::Scope)),
+            };
         }
         let Some(provider) = self.source_scope.tactic_macros.clone() else {
             return Ok(None);
         };
+        // The source pass expands compound nodes, but deliberately leaves
+        // literal nodes and identifiers for actual term positions. A binder,
+        // universe level or projection index must never be rewritten here.
+        // Generated terms have not passed through that source pass, so their
+        // nodes must also dispatch here. Missing syntax is handled directly by
+        // the term elaborator, as in the pin's elabTermAux.
+        if matches!(syntax, Syntax::Missing)
+            || (self.tactic_macro_terms == 0
+                && matches!(syntax, Syntax::Node { kind, .. }
+                    if !fln_parse::extensions::is_atomic_macro_kind(kind)))
+        {
+            return Ok(None);
+        }
         let Some(expanded) = provider
             .0
             .expand_term(
@@ -314,11 +351,6 @@ impl Context {
         if self.tactic_macro_depth >= MAX_OWNED_FRAMES {
             return Err(frame_limit());
         }
-        self.check_preresolved_syntax(&expanded)?;
-        if let Some(expected) = &expected {
-            self.check_application_typing(&expanded, expected)?;
-        }
-        let expanded = self.lower_pattern_matrices(&expanded)?;
         let depth = self.tactic_macro_depth;
         let terms = self.tactic_macro_terms;
         let options = self.txn.options.clone();
@@ -326,7 +358,17 @@ impl Context {
         let pending_arguments = self.pending_source_arguments;
         self.tactic_macro_depth += 1;
         self.tactic_macro_terms += 1;
-        let result = self.term_prepared_scoped(&expanded, expected, None, None, finish);
+        // Generated literal patterns dispatch while their matrix is prepared,
+        // before the ordinary term worklist. They belong to this expansion's
+        // depth too, and every preparation error must restore the owned frame.
+        let result = (|| {
+            self.check_preresolved_syntax(&expanded)?;
+            if let Some(expected) = &expected {
+                self.check_application_typing(&expanded, expected)?;
+            }
+            let expanded = self.lower_pattern_matrices(&expanded)?;
+            self.term_prepared_scoped(&expanded, expected, None, None, finish)
+        })();
         self.tactic_macro_depth = depth;
         self.tactic_macro_terms = terms;
         self.txn.options = options;

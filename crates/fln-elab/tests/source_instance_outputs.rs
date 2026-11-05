@@ -340,3 +340,94 @@ fn recursive_output_cycles_do_not_evade_detection_with_fresh_holes() {
     assert!(has_constant(&value.value, "high"));
     assert!(!has_constant(&value.value, "looping"));
 }
+
+#[test]
+fn local_function_domains_are_inferred_after_dependent_parameters() {
+    let env = fln_elab::seed::bootstrap_nat_environment(budget()).unwrap();
+    // The missing domain is captured over both A and x : A before the call infers Nat.
+    accepted(
+        "def inferred : Nat :=
+          let keep (A : Type) (x : A) (value : _) := value
+          keep Nat 3 7",
+        &env,
+    );
+}
+
+fn dependent_pair() -> Environment {
+    let mut env = fln_elab::seed::bootstrap_nat_environment(budget()).unwrap();
+    let mut locals = LocalContext::new();
+    let parameter = locals
+        .add_param(
+            FVarId(n("_dependent_field.A")),
+            n("A"),
+            Expr::sort(Level::one()),
+            BinderInfo::Default,
+        )
+        .clone();
+    let first = locals
+        .add_param(
+            FVarId(n("_dependent_field.first")),
+            n("first"),
+            Expr::fvar(parameter.id.clone()),
+            BinderInfo::Default,
+        )
+        .clone();
+    let second = locals
+        .add_param(
+            FVarId(n("_dependent_field.second")),
+            n("second"),
+            c("Nat"),
+            BinderInfo::Default,
+        )
+        .clone();
+    let spec = RecordSpec {
+        name: n("Pair"),
+        level_params: vec![],
+        parameters: vec![parameter],
+        fields: vec![first, second],
+        result_level: Level::one(),
+        is_class: false,
+    };
+    for declaration in record_declarations(&spec, RecordBudget::default()).unwrap() {
+        env = publish(&env, declaration);
+    }
+    env
+}
+
+#[test]
+fn dependent_postponed_fields_infer_the_receiver_across_a_local_function() {
+    accepted(
+        "def inferred (A : Type) (pair : Pair A) : Nat :=
+          let getSecond (x : _) := x.2
+          getSecond pair",
+        &dependent_pair(),
+    );
+}
+
+#[test]
+fn dependent_postponed_fields_infer_a_helper_called_with_a_concrete_type() {
+    accepted(
+        "def inferred (pair : Pair Nat) : Nat :=
+          let project (A : Type) (x : _) := x.2
+          project Nat pair",
+        &dependent_pair(),
+    );
+}
+
+#[test]
+fn dependent_postponed_fields_do_not_specialize_a_generic_result() {
+    let result = check_definition_source(
+        b"def invalid (pair : Pair Nat) : Nat :=
+          let project (A : Type) (x : _) : A := x.2
+          project Nat pair",
+        &dependent_pair(),
+        budget(),
+    );
+    if let Ok(checked) = result {
+        assert!(
+            matches!(checked.outcome, Outcome::Complete(Verdict::Rejected { .. })),
+            "a helper returning an arbitrary A must be refused: {:?}",
+            checked.outcome,
+        );
+    }
+}

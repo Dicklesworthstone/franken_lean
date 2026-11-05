@@ -798,6 +798,7 @@ impl Context {
         &mut self,
         syntax: &'a Syntax,
         arena: &mut Vec<Pattern<'a>>,
+        rewritten: &mut HashMap<*const Syntax, Syntax>,
     ) -> Result<usize, NatDefinitionElabError> {
         enum Task<'a> {
             Visit(&'a Syntax),
@@ -896,6 +897,12 @@ impl Context {
                     if let Some(literal) = self.decode_pattern_literal(head)? {
                         if !arguments.is_empty() || ellipsis {
                             return Err(invalid());
+                        }
+                        if let Some(expanded) = literal.expanded_syntax() {
+                            rewritten.insert(
+                                std::ptr::from_ref(head),
+                                self.copy_pattern_syntax(expanded)?,
+                            );
                         }
                         values.push(arena.len());
                         arena.push(Pattern::Literal(literal));
@@ -1017,6 +1024,7 @@ impl Context {
         }
         let mut arena = vec![Pattern::Bind(None)];
         let mut rows = Vec::new();
+        let mut rewritten = HashMap::new();
         for alt in alts {
             self.tick()?;
             let alt = expect_node(alt, &parser_kind(&["Term", "matchAlt"]), 4, "alternative")?;
@@ -1030,7 +1038,7 @@ impl Context {
             let start = arena.len();
             let patterns = columns
                 .into_iter()
-                .map(|column| self.matrix_pattern(column, &mut arena))
+                .map(|column| self.matrix_pattern(column, &mut arena, &mut rewritten))
                 .collect::<Result<Vec<_>, _>>()?;
             let mut bound = HashSet::new();
             for pattern in &arena[start..] {
@@ -1119,14 +1127,28 @@ impl Context {
                 self.tick()?;
                 let parts =
                     expect_node(alt, &parser_kind(&["Term", "matchAlt"]), 4, "alternative")?;
+                let mut pattern = self.copy_pattern_syntax(&parts[1])?;
+                // The typing model must observe the same expanded literal
+                // values as the decision matrix, including dependent indices.
+                // These identities refer only to this immutable input tree.
+                if !rewritten.is_empty() {
+                    let mut pending = vec![(&parts[1], &mut pattern)];
+                    while let Some((original, copied)) = pending.pop() {
+                        self.tick()?;
+                        if let Some(expanded) = rewritten.get(&std::ptr::from_ref(original)) {
+                            *copied = self.copy_pattern_syntax(expanded)?;
+                        } else if let (
+                            Syntax::Node { args: from, .. },
+                            Syntax::Node { args: to, .. },
+                        ) = (original, copied)
+                        {
+                            pending.extend(from.iter().zip(to.iter_mut()));
+                        }
+                    }
+                }
                 patterns.push(Syntax::node(
                     parser_kind(&["Term", "matchAlt"]),
-                    vec![
-                        parts[0].clone(),
-                        self.copy_pattern_syntax(&parts[1])?,
-                        parts[2].clone(),
-                        wildcard(),
-                    ],
+                    vec![parts[0].clone(), pattern, parts[2].clone(), wildcard()],
                 ));
             }
             self.pattern_typing_checks.insert(

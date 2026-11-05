@@ -532,12 +532,16 @@ impl ElabTxn {
 
 #[cfg(test)]
 mod tests {
+    use super::unify::UnificationDeferred;
     use super::*;
     use crate::lctx::LocalContext;
     use crate::mvar::MetavarKind;
+    use fln_core::expr::{BinderInfo, ExprNode, Literal, NatLit};
     use fln_core::level::Level;
     use fln_core::name::Name;
     use fln_core::options::KVMap;
+    use fln_core::outcome::Outcome;
+    use fln_kernel::verdict::Verdict;
 
     fn mvar(name: &str) -> MVarId {
         MVarId(Name::from_components([name]))
@@ -716,6 +720,311 @@ mod tests {
         let id = mvar("type_hole");
         declare(&mut txn.mvars, &id);
         (txn, budget, id)
+    }
+
+    fn nat() -> Expr {
+        Expr::const_(Name::from_components(["Nat"]), vec![])
+    }
+
+    fn numeral(value: u64) -> Expr {
+        Expr::lit(Literal::Nat(NatLit::from_u64(value)))
+    }
+
+    fn pi(domain: Expr, body: Expr) -> Expr {
+        Expr::forall_e(
+            Name::from_components(["argument"]),
+            domain,
+            body,
+            BinderInfo::Default,
+        )
+    }
+
+    fn scope_function(txn: &mut ElabTxn, type_: Expr, arguments: Option<usize>) -> MVarId {
+        let id = mvar("scope_function");
+        txn.mvars.declare(
+            id.clone(),
+            id.0.clone(),
+            type_,
+            txn.lctx.clone(),
+            MetavarKind::Natural,
+            0,
+            None,
+        );
+        if let Some(arguments) = arguments {
+            txn.mvars.set_scope_args(&id, arguments).unwrap();
+        }
+        id
+    }
+
+    fn lambda_parts(value: &Expr) -> (&Expr, &Expr) {
+        let ExprNode::Lam {
+            binder_type, body, ..
+        } = value.node()
+        else {
+            panic!("expected a synthesized lambda: {value:?}");
+        };
+        (binder_type, body)
+    }
+
+    fn assert_solver_rollback(actual: &ElabTxn, before: &ElabTxn) {
+        let mut semantic_state = actual.clone();
+        semantic_state.budget = before.budget.clone();
+        assert_eq!(&semantic_state, before);
+        assert!(actual.budget.heartbeats_consumed > before.budget.heartbeats_consumed);
+    }
+
+    #[test]
+    fn dependent_scope_suffixes_construct_checked_general_functions() {
+        let (mut txn, budget, _) = solver_transaction();
+        let function = scope_function(
+            &mut txn,
+            pi(Expr::sort(Level::one()), pi(Expr::bvar(0).unwrap(), nat())),
+            Some(2),
+        );
+        let lhs = Expr::app(Expr::app(Expr::mvar(function.clone()), nat()), numeral(3));
+        let report = txn.unify(&lhs, &numeral(7), budget).unwrap();
+        assert_eq!(report.kernel_checks, 2);
+        let value = txn.mvars.get_assigned_expr(&function).unwrap();
+        let (domain, body) = lambda_parts(value);
+        assert_eq!(domain, &Expr::sort(Level::one()));
+        let (domain, body) = lambda_parts(body);
+        assert_eq!(domain, &Expr::bvar(0).unwrap());
+        assert_eq!(body, &numeral(7));
+        assert!(!value.has_fvar());
+        assert!(!value.has_loose_bvars());
+        assert!(txn.lctx.is_empty());
+    }
+
+    #[test]
+    fn dependent_scope_suffixes_keep_prefix_variables_and_repeated_arguments_separate() {
+        let (mut txn, budget, _) = solver_transaction();
+        let function = scope_function(
+            &mut txn,
+            pi(
+                nat(),
+                pi(
+                    Expr::sort(Level::one()),
+                    pi(Expr::sort(Level::one()), pi(Expr::bvar(0).unwrap(), nat())),
+                ),
+            ),
+            Some(4),
+        );
+        let seed = FVarId(Name::from_components(["seed"]));
+        let carrier = FVarId(Name::from_components(["A"]));
+        let element = FVarId(Name::from_components(["element"]));
+        txn.lctx
+            .add_param(seed.clone(), seed.0.clone(), nat(), BinderInfo::Default);
+        txn.lctx.add_param(
+            carrier.clone(),
+            carrier.0.clone(),
+            Expr::sort(Level::one()),
+            BinderInfo::Default,
+        );
+        txn.lctx.add_param(
+            element.clone(),
+            element.0.clone(),
+            Expr::fvar(carrier.clone()),
+            BinderInfo::Default,
+        );
+        let lhs = [
+            Expr::fvar(seed.clone()),
+            Expr::fvar(carrier.clone()),
+            Expr::fvar(carrier),
+            Expr::fvar(element),
+        ]
+        .into_iter()
+        .fold(Expr::mvar(function.clone()), Expr::app);
+        txn.unify(&lhs, &Expr::fvar(seed), budget).unwrap();
+        let value = txn.mvars.get_assigned_expr(&function).unwrap();
+        let (_, body) = lambda_parts(value);
+        let (_, body) = lambda_parts(body);
+        let (_, body) = lambda_parts(body);
+        let (domain, body) = lambda_parts(body);
+        assert_eq!(domain, &Expr::bvar(0).unwrap());
+        assert_eq!(body, &Expr::bvar(3).unwrap());
+        assert!(!value.has_fvar());
+        assert!(!value.has_loose_bvars());
+    }
+
+    #[test]
+    fn dependent_scope_suffixes_preserve_universe_parameters_and_binder_styles() {
+        let (mut txn, budget, _) = solver_transaction();
+        let universe = Level::param(Name::from_components(["u"]));
+        let carrier = FVarId(Name::from_components(["carrier"]));
+        let element = FVarId(Name::from_components(["element"]));
+        txn.lctx.add_param(
+            carrier.clone(),
+            carrier.0.clone(),
+            Expr::sort(universe.clone()),
+            BinderInfo::Default,
+        );
+        txn.lctx.add_param(
+            element.clone(),
+            element.0.clone(),
+            Expr::fvar(carrier.clone()),
+            BinderInfo::Default,
+        );
+        let type_ = Expr::forall_e(
+            Name::from_components(["A"]),
+            Expr::sort(universe.clone()),
+            Expr::forall_e(
+                Name::from_components(["value"]),
+                Expr::bvar(0).unwrap(),
+                nat(),
+                BinderInfo::Implicit,
+            ),
+            BinderInfo::StrictImplicit,
+        );
+        let function = scope_function(&mut txn, type_, Some(2));
+        let locals = txn.lctx.clone();
+        let lhs = Expr::app(
+            Expr::app(Expr::mvar(function.clone()), Expr::fvar(carrier)),
+            Expr::fvar(element),
+        );
+        txn.unify(&lhs, &numeral(7), budget).unwrap();
+        assert_eq!(txn.lctx, locals);
+        assert_eq!(
+            txn.mvars.get_assigned_expr(&function),
+            Some(&Expr::lam(
+                Name::from_components(["A"]),
+                Expr::sort(universe),
+                Expr::lam(
+                    Name::from_components(["value"]),
+                    Expr::bvar(0).unwrap(),
+                    numeral(7),
+                    BinderInfo::Implicit,
+                ),
+                BinderInfo::StrictImplicit,
+            )),
+        );
+    }
+
+    #[test]
+    fn dependent_scope_suffixes_constrain_the_applied_result_type() {
+        let (mut txn, budget, _) = solver_transaction();
+        let family = mvar("result_family");
+        txn.mvars.declare(
+            family.clone(),
+            family.0.clone(),
+            pi(Expr::sort(Level::one()), Expr::sort(Level::one())),
+            txn.lctx.clone(),
+            MetavarKind::Natural,
+            0,
+            None,
+        );
+        let carrier = FVarId(Name::from_components(["carrier"]));
+        let element = FVarId(Name::from_components(["element"]));
+        txn.lctx.add_param(
+            carrier.clone(),
+            carrier.0.clone(),
+            Expr::sort(Level::one()),
+            BinderInfo::Default,
+        );
+        txn.lctx.add_param(
+            element.clone(),
+            element.0.clone(),
+            Expr::fvar(carrier.clone()),
+            BinderInfo::Default,
+        );
+        // The actual carrier is in the function hole's context, but not the family's.
+        // The result constraint must infer `family := fun _ => Nat` in that original scope.
+        let function = scope_function(
+            &mut txn,
+            pi(
+                Expr::sort(Level::one()),
+                pi(
+                    Expr::bvar(0).unwrap(),
+                    Expr::app(Expr::mvar(family.clone()), Expr::bvar(1).unwrap()),
+                ),
+            ),
+            Some(2),
+        );
+        let lhs = Expr::app(
+            Expr::app(Expr::mvar(function.clone()), Expr::fvar(carrier)),
+            Expr::fvar(element),
+        );
+        let report = txn.unify(&lhs, &numeral(7), budget).unwrap();
+        let family_value = txn.mvars.get_assigned_expr(&family).unwrap();
+        let (domain, body) = lambda_parts(family_value);
+        assert_eq!(domain, &Expr::sort(Level::one()));
+        assert_eq!(body, &nat());
+        assert!(!family_value.has_fvar());
+        assert!(report.expression_assignments.contains(&function));
+        assert!(report.expression_assignments.contains(&family));
+        assert!(report.kernel_checks >= 4);
+    }
+
+    #[test]
+    fn dependent_scope_suffixes_require_an_exact_scope_argument_count() {
+        for scope_args in [None, Some(1), Some(3)] {
+            let (mut txn, budget, _) = solver_transaction();
+            let function = scope_function(
+                &mut txn,
+                pi(Expr::sort(Level::one()), pi(Expr::bvar(0).unwrap(), nat())),
+                scope_args,
+            );
+            let lhs = Expr::app(Expr::app(Expr::mvar(function), nat()), numeral(3));
+            let before = txn.clone();
+            assert!(matches!(
+                txn.unify(&lhs, &numeral(7), budget),
+                Err(UnificationError::Deferred(UnificationDeferred::NotAPattern)),
+            ));
+            assert_solver_rollback(&txn, &before);
+        }
+    }
+
+    #[test]
+    fn dependent_scope_suffixes_cannot_specialize_a_universal_result() {
+        for (type_, arguments) in [
+            (
+                pi(Expr::sort(Level::one()), Expr::bvar(0).unwrap()),
+                vec![nat()],
+            ),
+            (
+                pi(
+                    Expr::sort(Level::one()),
+                    pi(Expr::bvar(0).unwrap(), Expr::bvar(1).unwrap()),
+                ),
+                vec![nat(), numeral(3)],
+            ),
+        ] {
+            let (mut txn, budget, _) = solver_transaction();
+            let function = scope_function(&mut txn, type_, Some(arguments.len()));
+            let lhs = arguments
+                .into_iter()
+                .fold(Expr::mvar(function.clone()), Expr::app);
+            let before = txn.clone();
+            let error = txn.unify(&lhs, &numeral(7), budget).unwrap_err();
+            let UnificationError::AssignmentCheck { id, outcome } = error else {
+                panic!("the real kernel must veto the generalized assignment: {error:?}");
+            };
+            assert_eq!(id, function);
+            assert!(matches!(
+                *outcome,
+                Outcome::Complete(Verdict::Rejected { .. })
+            ));
+            assert_solver_rollback(&txn, &before);
+        }
+    }
+
+    #[test]
+    fn dependent_scope_suffixes_roll_back_when_the_budget_ends() {
+        let (mut txn, mut budget, _) = solver_transaction();
+        let function = scope_function(
+            &mut txn,
+            pi(Expr::sort(Level::one()), pi(Expr::bvar(0).unwrap(), nat())),
+            Some(2),
+        );
+        let lhs = Expr::app(Expr::app(Expr::mvar(function), nat()), numeral(3));
+        let mut complete = txn.clone();
+        let report = complete.unify(&lhs, &numeral(7), budget).unwrap();
+        budget.max_steps = report.unifier_steps.checked_sub(1).unwrap();
+        let before = txn.clone();
+        assert!(matches!(
+            txn.unify(&lhs, &numeral(7), budget),
+            Err(UnificationError::StepLimit { .. }),
+        ));
+        assert_solver_rollback(&txn, &before);
     }
 
     #[test]
