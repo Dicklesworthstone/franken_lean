@@ -341,6 +341,21 @@ impl Loaded {
                 "--imported-macros requires one source entry with an external .olean import",
             ));
         }
+        self.prepare_artifact_macros(config)
+    }
+
+    /// Build front doors already hold a separately validated source graph. They
+    /// need the same policy and exact companion paths without manufacturing a
+    /// second source entry just to load its external executable inputs.
+    pub(in crate::source_check) fn prepare_artifact_macros(
+        &self,
+        config: &Config,
+    ) -> Result<Prepared, Failure> {
+        if self.oleans.is_empty() {
+            return Err(Failure::input(
+                "imported macros require an external .olean import",
+            ));
+        }
         let bytes = read_bounded(
             &config.partition,
             MAX_PARTITION_BYTES,
