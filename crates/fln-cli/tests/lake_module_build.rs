@@ -277,7 +277,13 @@ fn cycles_leaked_sibling_declarations_and_resource_overflow_never_publish() {
     );
     assert!(failure(&package.build(&["+Lib.Top:olean"])).contains("Lib.Sibling"));
     package.write("Lib/Base.lean", vec![b' '; 1024 * 1024 + 1]);
-    assert!(failure(&package.build(&["+Lib.Base:olean"])).contains("resource"));
+    let exhausted = package.build(&["+Lib.Base:olean"]);
+    assert_eq!(exhausted.status.code(), Some(3), "{exhausted:?}");
+    assert!(exhausted.stdout.is_empty(), "{exhausted:?}");
+    let error = String::from_utf8(exhausted.stderr).unwrap();
+    assert!(error.contains("\"status\":\"inconclusive\""), "{error}");
+    assert!(error.contains("\"class\":\"resource\""), "{error}");
+    assert!(error.contains("\"authority\":false"), "{error}");
     assert!(!package.0.join(".lake").exists());
 }
 
