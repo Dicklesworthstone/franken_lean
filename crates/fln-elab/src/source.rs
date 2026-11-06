@@ -3605,8 +3605,8 @@ impl Context {
                             let term = match self.atom(syntax, expected.as_ref()) {
                                 Ok(term) => term,
                                 Err(error) => {
-                                    // An identifier naming more than one declaration is
-                                    // overloaded: the pin's `elabAtom` -> `elabAppAux`.
+                                    // Ordinary and dotted names with several resolutions
+                                    // use the pin's `elabAtom` -> `elabAppAux` trials.
                                     if finish
                                         && let Some((name, candidates)) =
                                             overload::ambiguous_head(&error, syntax)
@@ -4275,6 +4275,19 @@ impl Context {
                                     {
                                         Ok(function) => function,
                                         Err(problem) => {
+                                            if !explicit
+                                                && let Some((name, candidates)) =
+                                                    overload::ambiguous_head(&problem, head)
+                                            {
+                                                values.push(self.overloaded(
+                                                    head,
+                                                    Some(arguments),
+                                                    &name,
+                                                    &candidates,
+                                                    expected.as_ref(),
+                                                )?);
+                                                continue;
+                                            }
                                             blocked_application = self.notation_type_unavailable(
                                                 &problem,
                                                 expected.as_ref(),

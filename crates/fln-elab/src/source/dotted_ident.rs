@@ -18,12 +18,12 @@
 //!    reported here.
 //!
 //! A sort head is the pin's "Not supported on type universe" and any other head its "not of
-//! the form `C ...`". Several resolutions are an overload the pin elaborates by trying each;
-//! that is refused, never approximated.
+//! the form `C ...`". Several resolutions enter the same speculative elaboration as an
+//! overloaded identifier, against the arguments and expected type of the whole application.
 use super::*;
 use fln_env::constants::ConstantInfo;
 
-/// Why `.c` was refused. All but the last are the pin's own errors, in its words.
+/// A `.c` resolution error, or its candidates for the application overload handler.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DottedIdentError {
     NotAtomic {
@@ -40,8 +40,9 @@ pub enum DottedIdentError {
         name: Name,
         id: Name,
     },
-    /// More than one global candidate: the pin elaborates each as an overload.
-    OverloadUnsupported {
+    /// More than one global candidate. Resolution has succeeded; the containing
+    /// atom or application must elaborate these interpretations before choosing.
+    Overloaded {
         id: Name,
         candidates: Vec<Name>,
     },
@@ -75,9 +76,9 @@ impl std::fmt::Display for DottedIdentError {
                 name.to_display_string(),
                 id.to_display_string()
             ),
-            Self::OverloadUnsupported { id, candidates } => write!(
+            Self::Overloaded { id, candidates } => write!(
                 f,
-                "`.{}` resolves to {} constants ({}); overloaded dotted identifiers are not implemented",
+                "`.{}` resolves to {} constants ({})",
                 id.to_display_string(),
                 candidates.len(),
                 candidates
@@ -142,6 +143,12 @@ impl Context {
                     }
                     return Ok(term);
                 }
+                // The pin stops resolving as soon as it finds any candidates.
+                // Ambiguity is handled by elabAppFnResolutions, not by unfolding
+                // the expected type and trying a different namespace.
+                Err(overloaded @ DottedIdentError::Overloaded { .. }) => {
+                    return Err(refuse(overloaded));
+                }
                 Err(error) => {
                     let first = first.get_or_insert(error).clone();
                     match self.unfold_head_definition(&result)? {
@@ -203,7 +210,7 @@ impl Context {
             Ok(Some(name)) => return Ok(Ok(self.constant(&name)?)),
             Ok(None) => {}
             Err(scope::ScopeError::Ambiguous(_, candidates)) => {
-                return Ok(Err(DottedIdentError::OverloadUnsupported {
+                return Ok(Err(DottedIdentError::Overloaded {
                     id: id.clone(),
                     candidates,
                 }));
