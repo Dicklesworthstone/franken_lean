@@ -42,6 +42,7 @@ inductive Ordering where
   | lt
   | eq
   | gt
+deriving Inhabited
 class Ord.{u} (A : Type u) where
   compare : A -> A -> Ordering
 def naturalCompare (left right : Nat) : Ordering :=
@@ -170,6 +171,94 @@ theorem marker : Ord.compare Marker.mk Marker.mk = Ordering.eq := by rfl
     );
 }
 
+#[test]
+fn recursive_ordering_uses_checked_opaque_helpers_and_executes_children_lexicographically() {
+    let base = engine();
+    let source = r#"
+inductive Tree where
+  | leaf (value : Nat)
+  | node (tag : Nat) (left right : Tree)
+deriving Ord
+inductive Chain.{u} (A : Type u) where
+  | nil
+  | cons (head : A) (tail : Chain A)
+deriving Ord
+inductive Evidence where
+  | done
+  | step (n : Nat) (proof : n = n) (tail : Evidence)
+deriving Ord
+"#;
+    let result = checked(&base, source);
+    for instance in ["instOrdTree", "instOrdChain", "instOrdEvidence"] {
+        let helper = name(&format!("{instance}.ord"));
+        let executable = name(&format!("{instance}.ord._unsafe_rec"));
+        let Some(ConstantInfo::Opaque(logical)) = result.environment().find(&helper) else {
+            panic!("recursive ordering must keep its opaque logical helper: {helper:?}");
+        };
+        let Some(ConstantInfo::Defn(implementation)) = result.environment().find(&executable)
+        else {
+            panic!("missing checked executable companion: {executable:?}");
+        };
+        assert!(!logical.is_unsafe);
+        assert_eq!(implementation.safety, DefinitionSafety::Partial);
+        assert_eq!(logical.base.type_, implementation.base.type_);
+        assert_eq!(logical.base.level_params, implementation.base.level_params);
+        assert_eq!(logical.all, vec![helper.clone()]);
+        assert_eq!(implementation.all, vec![executable.clone()]);
+        for value in [&logical.value, &implementation.value] {
+            assert!(!value.has_expr_mvar());
+            assert!(!value.has_level_mvar());
+            assert!(!value.has_fvar());
+            assert!(!value.has_loose_bvars());
+        }
+        assert!(!base.environment().contains(&helper));
+        assert!(!base.environment().contains(&executable));
+    }
+    assert_eq!(
+        result.logical_root(&KVMap::new()),
+        checked(&base, source).logical_root(&KVMap::new())
+    );
+    execute_and_replay(
+        &result,
+        r#"
+#eval orderingCode (Ord.compare (Tree.leaf 9) (Tree.node 0 (.leaf 0) (.leaf 0)))
+#eval orderingCode (Ord.compare (Tree.node 0 (.leaf 0) (.leaf 0)) (Tree.leaf 9))
+#eval orderingCode (Ord.compare (Tree.node 0 (.leaf 7) (.leaf 1)) (Tree.node 0 (.leaf 7) (.leaf 2)))
+#eval orderingCode (Ord.compare (Tree.node 0 (.leaf 8) (.leaf 0)) (Tree.node 0 (.leaf 7) (.leaf 9)))
+#eval orderingCode (Ord.compare (Tree.node 0 (.leaf 7) (.leaf 2)) (Tree.node 0 (.leaf 7) (.leaf 2)))
+#eval orderingCode (Ord.compare (Chain.cons 3 .nil) (Chain.cons 4 .nil))
+#eval orderingCode (Ord.compare (Chain.cons 3 .nil) (Chain.cons 3 (.cons 1 .nil)))
+#eval orderingCode (Ord.compare (Chain.cons 3 (.cons 2 .nil)) (Chain.cons 3 (.cons 1 .nil)))
+#eval orderingCode (Ord.compare (Chain.cons 3 (.cons 1 .nil)) (Chain.cons 3 (.cons 1 .nil)))
+#eval orderingCode (Ord.compare (Evidence.step 1 rfl .done) (Evidence.step 1 (Eq.refl 1) .done))
+"#,
+        &["0", "2", "0", "2", "1", "0", "0", "2", "1", "1"],
+        EngineExecutionLimits::new(limits().kernel),
+    );
+    let before = result.logical_root(&KVMap::new());
+    for source in [
+        // These computed results are true, but the pin's partial helper is
+        // opaque to safe reduction. Turning it into a structural definition
+        // would incorrectly accept both proofs.
+        "theorem leaked : Ord.compare (Tree.leaf 1) (Tree.leaf 2) = Ordering.lt := by rfl",
+        "theorem leaked : Ord.compare (Tree.leaf 1) (Tree.leaf 1) = Ordering.eq := by rfl",
+        "def leaked : Ordering := instOrdTree.ord._unsafe_rec (Tree.leaf 1) (Tree.leaf 2)",
+    ] {
+        assert!(
+            result
+                .check_source_files(
+                    &[source.as_bytes()],
+                    &KVMap::new(),
+                    SourceCheckLimits::new(limits()),
+                )
+                .is_err(),
+            "the safe source boundary must refuse: {source}"
+        );
+        assert_eq!(result.logical_root(&KVMap::new()), before);
+        assert!(!result.environment().contains(&name("leaked")));
+    }
+}
+
 fn alpha_type(expression: &Expr) -> Expr {
     match expression.node() {
         ExprNode::ForallE {
@@ -291,7 +380,7 @@ fn suffix_standalone_and_combined_instances_survive_module_replay() {
     let modules = [
         SourceModuleInput {
             name: &library,
-            source: b"namespace Data\ninductive Choice (A : Type) where\n | empty\n | value (a : A)\nderiving Inhabited, Ord\ninductive Direction where\n | south\n | north\nderiving instance Ord for Direction\nend Data",
+            source: b"namespace Data\ninductive Choice (A : Type) where\n | empty\n | value (a : A)\nderiving Inhabited, Ord\ninductive Direction where\n | south\n | north\nderiving instance Ord for Direction\ninductive Path where\n | done\n | step (value : Nat) (tail : Path)\nderiving Ord\nend Data",
         },
         SourceModuleInput {
             name: &main,
@@ -313,6 +402,9 @@ fn suffix_standalone_and_combined_instances_survive_module_replay() {
         "Data.instOrdChoice.ord",
         "Data.instOrdDirection",
         "Data.instOrdDirection.ord",
+        "Data.instOrdPath",
+        "Data.instOrdPath.ord",
+        "Data.instOrdPath.ord._unsafe_rec",
         "imported_less",
         "imported_equal",
         "standalone",
@@ -328,8 +420,8 @@ fn suffix_standalone_and_combined_instances_survive_module_replay() {
     }
     execute_and_replay(
         &result.checked.engine,
-        "#eval orderingCode (Ord.compare chosen (Data.Choice.value 7))\n#eval orderingCode (Ord.compare Data.Direction.north Data.Direction.south)",
-        &["0", "2"],
+        "#eval orderingCode (Ord.compare chosen (Data.Choice.value 7))\n#eval orderingCode (Ord.compare Data.Direction.north Data.Direction.south)\n#eval orderingCode (Ord.compare (Data.Path.step 3 .done) (Data.Path.step 3 (.step 1 .done)))",
+        &["0", "2", "0"],
         EngineExecutionLimits::new(limits().kernel),
     );
 }
@@ -344,10 +436,10 @@ fn false_results_missing_dictionaries_and_failed_batches_publish_nothing() {
         "structure Missing where\n run : Nat -> Nat\nderiving Ord",
         "structure Dependent where\n carrier : Type\n value : carrier\nderiving Ord",
         "structure Point where\n value : Nat\nderiving Ord, UnknownHandler",
-        // The pin uses opaque partial helpers for recursive Ord. Until that
-        // boundary is implemented, this slice must refuse rather than publish
-        // a transparent structural helper with different proof behavior.
-        "inductive Recursive where\n | leaf\n | node (child : Recursive)\nderiving Ord",
+        // Function-valued recursive fields need their own field dictionary;
+        // an induction hypothesis alone cannot compare the functions.
+        "inductive Recursive where\n | leaf\n | node (child : Nat -> Recursive)\nderiving Ord",
+        "inductive RecursiveMissing where\n | leaf (run : Nat -> Nat)\n | node (child : RecursiveMissing)\nderiving Ord",
         // The pin uses casesOnSameCtor for large non-enum families. This
         // native slice leaves that distinct construction explicitly refused.
         "inductive Large where\n | a (n : Nat)\n | b\n | c\n | d\n | e\n | f\n | g\n | h\n | i\n | j\nderiving Ord",
@@ -370,6 +462,7 @@ fn false_results_missing_dictionaries_and_failed_batches_publish_nothing() {
         "Dependent",
         "Point",
         "Recursive",
+        "RecursiveMissing",
         "Large",
         "instOrdPoint",
         "instOrdPoint.ord",
@@ -396,17 +489,40 @@ structure Guarded where
   tag : Nat
   payload : Slow
 deriving Ord
+inductive GuardedChain where
+  | nil
+  | cons (tag : Nat) (payload : Slow) (tail : GuardedChain)
+deriving Ord
+inductive GuardedTree where
+  | leaf (payload : Slow)
+  | node (tag : Nat) (left right : GuardedTree)
+deriving Ord
+@[noinline] def sharedTree (depth : Nat) : GuardedTree :=
+  match depth with
+  | .zero => .leaf (Slow.mk 100000)
+  | .succ n =>
+    let child := sharedTree n
+    .node 0 child child
+@[noinline] def compareGuardedTrees (left right : GuardedTree) : Nat :=
+  orderingCode (Ord.compare left right)
 "#,
     );
     let mut execution_limits = EngineExecutionLimits::new(limits().kernel);
+    // Each sharedTree has only 21 allocated nodes. Evaluating the unused
+    // recursor hypotheses would instead visit more than a million branches.
+    // The noinline wrapper keeps its discriminants unknown during codegen.
     execution_limits.vm.max_steps = 5000;
     execute_and_replay(
         &base,
         r#"
 #eval orderingCode (Ord.compare (Guarded.mk 0 (Slow.mk 100000)) (Guarded.mk 1 (Slow.mk 100000)))
 #eval orderingCode (Ord.compare (Guarded.mk 1 (Slow.mk 100000)) (Guarded.mk 0 (Slow.mk 100000)))
+#eval orderingCode (Ord.compare (GuardedChain.cons 0 (Slow.mk 100000) .nil) (GuardedChain.cons 1 (Slow.mk 100000) .nil))
+#eval orderingCode (Ord.compare (GuardedChain.cons 2 (Slow.mk 0) (.cons 1 (Slow.mk 100000) .nil)) (GuardedChain.cons 2 (Slow.mk 0) (.cons 0 (Slow.mk 100000) .nil)))
+#eval let child := sharedTree 20; compareGuardedTrees (GuardedTree.node 0 child child) (GuardedTree.node 1 child child)
+#eval let child := sharedTree 20; compareGuardedTrees (GuardedTree.node 1 child child) (GuardedTree.node 0 child child)
 "#,
-        &["0", "2"],
+        &["0", "2", "0", "2", "0", "2"],
         execution_limits,
     );
     let would_run = base
