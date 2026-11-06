@@ -1,12 +1,20 @@
 //! Executable macros retain identifier metadata instead of rewriting or reparsing names.
 //! Resolution must use that metadata while preserving the pin's local-name priority.
 #![forbid(unsafe_code)]
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
+
 use fln_core::expr::{BinderInfo, Expr, ExprNode, Literal, NatLit};
 use fln_core::level::Level;
 use fln_core::name::Name;
 use fln_core::outcome::Outcome;
 use fln_elab::source::SourceInferenceError;
 use fln_elab::source::scope::SourceScope;
+use fln_elab::tactic_macros::{
+    TacticMacroError, TacticMacroExpander, TacticMacroExpansion, TacticMacroProvider,
+};
 use fln_elab::{NatDefinitionElabError, elaborate_definition_in_scope_with_budget};
 use fln_env::constants::{ConstantVal, DefinitionSafety, DefinitionVal, ReducibilityHints};
 use fln_env::environment::{DeclarationBudget, DeclarationCommitted, Environment};
@@ -15,6 +23,7 @@ use fln_kernel::capability::{Published, admit};
 use fln_kernel::council::{Council, CouncilOutcome, convene};
 use fln_kernel::verdict::{Budget, Verdict};
 use fln_kernel::{Declaration, check};
+use fln_syntax::source::{ByteSpan, SourceInfo};
 use fln_syntax::tree::{Preresolved, Syntax};
 
 fn n(text: &str) -> Name {
@@ -32,16 +41,17 @@ fn publish(env: &Environment, declaration: Declaration) -> Environment {
     let CouncilOutcome::Agreed(checked) = convene(&Council::nobody_was_asked(), admitted) else {
         panic!("declaration not accepted");
     };
-    let Outcome::Complete(Published::Committed(DeclarationCommitted::Published(result))) = checked
-        .publish(
-            DeclarationBudget::default(),
-            CollisionBudget::default(),
-            None,
-        )
-    else {
-        panic!("declaration not published");
-    };
-    result.environment
+    match checked.publish(
+        DeclarationBudget::default(),
+        CollisionBudget::default(),
+        None,
+    ) {
+        Outcome::Complete(Published::Committed(DeclarationCommitted::Published(result))) => {
+            result.environment
+        }
+        Outcome::Complete(Published::BlockCommitted(result)) => result.environment,
+        other => panic!("declaration not published: {other:?}"),
+    }
 }
 
 fn definition(name: &str, type_: Expr, value: Expr, levels: Vec<Name>) -> Declaration {
@@ -340,4 +350,197 @@ fn exact_tactic_terms_preserve_declaration_metadata_and_local_priority() {
             }
         ))
     ));
+}
+
+/// Deferred literal macros can introduce identifiers after the declaration's
+/// initial metadata scan. Exercise that real provider boundary rather than
+/// annotating the original source tree, which the earlier tests already cover.
+struct PatternProvider {
+    replacement: Syntax,
+    rewrite_list_cons: bool,
+    literal_expansions: AtomicU64,
+    constructor_expansions: AtomicU64,
+}
+
+impl PatternProvider {
+    fn new(replacement: Syntax, rewrite_list_cons: bool) -> Arc<Self> {
+        Arc::new(Self {
+            replacement,
+            rewrite_list_cons,
+            literal_expansions: AtomicU64::new(0),
+            constructor_expansions: AtomicU64::new(0),
+        })
+    }
+}
+
+impl TacticMacroExpander for PatternProvider {
+    fn contains(&self, kind: &Name) -> bool {
+        *kind == n("num") || (self.rewrite_list_cons && *kind == n("Lean.Parser.Term.app"))
+    }
+
+    fn enter_tactic(&self, _: usize) -> Result<u64, TacticMacroError> {
+        Ok(0)
+    }
+
+    fn expand_tactic(
+        &self,
+        _: &Syntax,
+        _: usize,
+        _: u64,
+        _: usize,
+        _: &Environment,
+        _: &SourceScope,
+    ) -> Result<TacticMacroExpansion, TacticMacroError> {
+        Ok(TacticMacroExpansion::Exhausted)
+    }
+
+    fn expand_term(
+        &self,
+        syntax: &Syntax,
+        _: usize,
+        _: &Environment,
+        _: &SourceScope,
+    ) -> Result<Option<Syntax>, TacticMacroError> {
+        let Syntax::Node { kind, args, .. } = syntax else {
+            return Ok(None);
+        };
+        if *kind == n("num") && matches!(args.as_slice(), [Syntax::Atom { val, .. }] if val == "37")
+        {
+            self.literal_expansions.fetch_add(1, Ordering::Relaxed);
+            return Ok(Some(self.replacement.clone()));
+        }
+        if self.rewrite_list_cons
+            && *kind == n("Lean.Parser.Term.app")
+            && matches!(args.first(), Some(Syntax::Ident { val, .. })
+                if val.erase_macro_scopes() == n("_root_.List.cons"))
+        {
+            self.constructor_expansions.fetch_add(1, Ordering::Relaxed);
+            return Ok(Some(pattern_identifier("_root_.List.nil", Vec::new())));
+        }
+        Ok(None)
+    }
+}
+
+fn pattern_identifier(spelling: &str, metadata: Vec<Preresolved>) -> Syntax {
+    Syntax::Ident {
+        info: SourceInfo::None,
+        raw_val: ByteSpan::default().into(),
+        val: n(spelling),
+        preresolved: metadata,
+    }
+}
+
+fn pattern_environment() -> Environment {
+    let mut env = Environment::new();
+    for declaration in fln_elab::seed::source_seed_declarations() {
+        env = publish(&env, declaration);
+    }
+    env
+}
+
+fn elaborate_pattern(
+    source: &str,
+    env: &Environment,
+    provider: Arc<PatternProvider>,
+) -> Result<Declaration, NatDefinitionElabError> {
+    let parsed = fln_parse::parse_definition(source.as_bytes()).unwrap();
+    let scope = SourceScope {
+        tactic_macros: Some(TacticMacroProvider(provider)),
+        ..scope()
+    };
+    elaborate_definition_in_scope_with_budget(parsed.syntax(), env, budget(), &scope)
+}
+
+fn check_pattern_result(env: &Environment, source: &str) {
+    let syntax = fln_parse::parse_definition(source.as_bytes()).unwrap();
+    let declaration =
+        elaborate_definition_in_scope_with_budget(syntax.syntax(), env, budget(), &scope())
+            .unwrap_or_else(|error| panic!("{source}: {error:?}"));
+    assert!(
+        matches!(
+            check(env, &declaration, budget()),
+            Outcome::Complete(Verdict::Accepted { .. })
+        ),
+        "{source}: {declaration:?}"
+    );
+}
+
+#[test]
+fn generated_pattern_metadata_cannot_silently_fall_back_to_constructor_spelling() {
+    let env = pattern_environment();
+    let source = "def chosen (x : Nat) : Nat := match x with | 37 => 13 | _ => 99";
+    for spelling in ["Nat.zero", "_root_.Nat.zero"] {
+        let provider =
+            PatternProvider::new(pattern_identifier(spelling, target("Nat.succ")), false);
+        let result = elaborate_pattern(source, &env, Arc::clone(&provider));
+        assert!(
+            matches!(&result,
+                Err(NatDefinitionElabError::Inference(SourceInferenceError::PreresolvedReference {
+                    name, feature: "pre-resolved identifiers in pattern or tactic syntax"
+                })) if *name == n(spelling)),
+            "{spelling}: {result:?}"
+        );
+        assert_eq!(provider.literal_expansions.load(Ordering::Relaxed), 1);
+    }
+}
+
+#[test]
+fn generated_pattern_metadata_accepts_a_matching_anchored_constructor_once() {
+    let env = pattern_environment();
+    let provider = PatternProvider::new(
+        pattern_identifier("_root_.Nat.zero", target("Nat.zero")),
+        false,
+    );
+    let declaration = elaborate_pattern(
+        "def chosen (x : Nat) : Nat := match x with | 37 => 13 | _ => 99",
+        &env,
+        Arc::clone(&provider),
+    )
+    .unwrap();
+    let checked_env = publish(&env, declaration);
+    assert_eq!(provider.literal_expansions.load(Ordering::Relaxed), 1);
+    check_pattern_result(
+        &checked_env,
+        "theorem hit : Eq (chosen Nat.zero) 13 := Eq.refl 13",
+    );
+    check_pattern_result(
+        &checked_env,
+        "theorem miss : Eq (chosen (Nat.succ Nat.zero)) 99 := Eq.refl 99",
+    );
+}
+
+#[test]
+fn generated_collection_patterns_dispatch_the_lowered_constructor_root() {
+    let env = pattern_environment();
+    let template = fln_parse::parse_definition(b"def replacement := [Nat.zero]").unwrap();
+    let mut pending = vec![template.syntax()];
+    let list = loop {
+        let node = pending.pop().expect("parsed list notation");
+        if node.kind() == Some(&n("term[_]")) {
+            break node.clone();
+        }
+        if let Syntax::Node { args, .. } = node {
+            pending.extend(args.iter().rev());
+        }
+    };
+    let provider = PatternProvider::new(list, true);
+    let declaration = elaborate_pattern(
+        "def chosen (xs : List Nat) : Nat := match xs with | 37 => 13 | _ => 99",
+        &env,
+        Arc::clone(&provider),
+    )
+    .unwrap();
+    let checked_env = publish(&env, declaration);
+    // The replacement is a singleton, so its only cons is the lowering's
+    // root. Visiting only the root's children cannot satisfy this control.
+    assert_eq!(provider.literal_expansions.load(Ordering::Relaxed), 1);
+    assert_eq!(provider.constructor_expansions.load(Ordering::Relaxed), 1);
+    check_pattern_result(
+        &checked_env,
+        "theorem emptyHit : Eq (chosen []) 13 := Eq.refl 13",
+    );
+    check_pattern_result(
+        &checked_env,
+        "theorem singletonMiss : Eq (chosen [Nat.zero]) 99 := Eq.refl 99",
+    );
 }

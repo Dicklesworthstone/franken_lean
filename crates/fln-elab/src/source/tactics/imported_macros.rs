@@ -356,6 +356,7 @@ impl Context {
         let options = self.txn.options.clone();
         let implicit = self.no_implicit_lambda_types.len();
         let pending_arguments = self.pending_source_arguments;
+        let observations = self.application_syntax.depth();
         self.tactic_macro_depth += 1;
         self.tactic_macro_terms += 1;
         // Generated literal patterns dispatch while their matrix is prepared,
@@ -363,12 +364,26 @@ impl Context {
         // depth too, and every preparation error must restore the owned frame.
         let result = (|| {
             self.check_preresolved_syntax(&expanded)?;
-            if let Some(expected) = &expected {
-                self.check_application_typing(&expanded, expected)?;
-            }
+            let check = expected
+                .as_ref()
+                .map(|expected| self.begin_application_typing(&expanded, expected))
+                .transpose()?
+                .flatten();
             let expanded = self.lower_pattern_matrices(&expanded)?;
-            self.term_prepared_scoped(&expanded, expected, None, None, finish)
+            if let Some(check) = &check {
+                self.bind_application_typing(&expanded, check)?;
+            }
+            let observation = self.begin_macro_application_observation(syntax, &expanded)?;
+            let term = self.term_prepared_scoped(&expanded, expected, None, None, finish)?;
+            if let Some(observation) = observation {
+                self.finish_macro_application_observation(syntax, &expanded, observation)?;
+            }
+            if let Some(check) = check {
+                self.finish_application_typing(&expanded, check)?;
+            }
+            Ok::<_, NatDefinitionElabError>(term)
         })();
+        self.application_syntax.truncate(observations);
         self.tactic_macro_depth = depth;
         self.tactic_macro_terms = terms;
         self.txn.options = options;

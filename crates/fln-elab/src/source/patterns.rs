@@ -798,7 +798,6 @@ impl Context {
         &mut self,
         syntax: &'a Syntax,
         arena: &mut Vec<Pattern<'a>>,
-        rewritten: &mut HashMap<*const Syntax, Syntax>,
     ) -> Result<usize, NatDefinitionElabError> {
         enum Task<'a> {
             Visit(&'a Syntax),
@@ -897,12 +896,6 @@ impl Context {
                     if let Some(literal) = self.decode_pattern_literal(head)? {
                         if !arguments.is_empty() || ellipsis {
                             return Err(invalid());
-                        }
-                        if let Some(expanded) = literal.expanded_syntax() {
-                            rewritten.insert(
-                                std::ptr::from_ref(head),
-                                self.copy_pattern_syntax(expanded)?,
-                            );
                         }
                         values.push(arena.len());
                         arena.push(Pattern::Literal(literal));
@@ -1022,13 +1015,26 @@ impl Context {
         if alts.is_empty() || alts.len() > 256 || discriminants.len() > 64 {
             return Err(failure(SourceInferenceError::ResourceLimit));
         }
-        let mut arena = vec![Pattern::Bind(None)];
-        let mut rows = Vec::new();
-        let mut rewritten = HashMap::new();
+        // Keep each expansion alive for the whole compilation. Both the
+        // decision matrix and its independent pattern-typing witness borrow
+        // these exact trees; neither re-executes a stateful macro or continues
+        // reasoning about the literal that the macro replaced.
+        let mut expanded_patterns = Vec::with_capacity(alts.len());
         for alt in alts {
             self.tick()?;
             let alt = expect_node(alt, &parser_kind(&["Term", "matchAlt"]), 4, "alternative")?;
-            let [row] = expect_null_args(&alt[1], "one pattern row")? else {
+            let expanded = self.expand_pattern_macros(&alt[1])?;
+            if matches!(expanded, Cow::Owned(_)) {
+                self.check_preresolved_pattern_syntax(&expanded)?;
+            }
+            expanded_patterns.push(expanded);
+        }
+        let mut arena = vec![Pattern::Bind(None)];
+        let mut rows = Vec::new();
+        for (alt, expanded) in alts.iter().zip(&expanded_patterns) {
+            self.tick()?;
+            let alt = expect_node(alt, &parser_kind(&["Term", "matchAlt"]), 4, "alternative")?;
+            let [row] = expect_null_args(expanded, "one pattern row")? else {
                 return Err(invalid());
             };
             let columns = sequence(row)?;
@@ -1038,7 +1044,7 @@ impl Context {
             let start = arena.len();
             let patterns = columns
                 .into_iter()
-                .map(|column| self.matrix_pattern(column, &mut arena, &mut rewritten))
+                .map(|column| self.matrix_pattern(column, &mut arena))
                 .collect::<Result<Vec<_>, _>>()?;
             let mut bound = HashSet::new();
             for pattern in &arena[start..] {
@@ -1123,29 +1129,11 @@ impl Context {
             && let Some((last, _)) = inputs.last()
         {
             let mut patterns = Vec::new();
-            for alt in alts {
+            for (alt, expanded) in alts.iter().zip(&expanded_patterns) {
                 self.tick()?;
                 let parts =
                     expect_node(alt, &parser_kind(&["Term", "matchAlt"]), 4, "alternative")?;
-                let mut pattern = self.copy_pattern_syntax(&parts[1])?;
-                // The typing model must observe the same expanded literal
-                // values as the decision matrix, including dependent indices.
-                // These identities refer only to this immutable input tree.
-                if !rewritten.is_empty() {
-                    let mut pending = vec![(&parts[1], &mut pattern)];
-                    while let Some((original, copied)) = pending.pop() {
-                        self.tick()?;
-                        if let Some(expanded) = rewritten.get(&std::ptr::from_ref(original)) {
-                            *copied = self.copy_pattern_syntax(expanded)?;
-                        } else if let (
-                            Syntax::Node { args: from, .. },
-                            Syntax::Node { args: to, .. },
-                        ) = (original, copied)
-                        {
-                            pending.extend(from.iter().zip(to.iter_mut()));
-                        }
-                    }
-                }
+                let pattern = self.copy_pattern_syntax(expanded)?;
                 patterns.push(Syntax::node(
                     parser_kind(&["Term", "matchAlt"]),
                     vec![parts[0].clone(), pattern, parts[2].clone(), wildcard()],

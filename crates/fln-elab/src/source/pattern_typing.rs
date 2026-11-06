@@ -98,6 +98,255 @@ struct Variables {
     types: Vec<(Name, Expr)>,
 }
 
+/// Observations belong only to live source/expansion trees. Addresses are
+/// identities, never dereferenced: each frame watches the nodes of its own
+/// borrowed tree and is removed before that tree leaves the evaluator. An
+/// owned macro expansion is collapsed into its caller's observation before
+/// its nodes can be reused by a later expansion.
+#[derive(Clone, Default)]
+pub(super) struct ApplicationSyntax {
+    frames: Vec<SyntaxFrame>,
+}
+
+#[derive(Clone, Default)]
+struct SyntaxFrame {
+    nodes: HashSet<usize>,
+    replacements: HashMap<usize, Syntax>,
+}
+
+pub(super) struct ApplicationCheck {
+    context: Box<Context>,
+    expected: Expr,
+    frame: usize,
+}
+
+impl ApplicationSyntax {
+    pub(super) fn depth(&self) -> usize {
+        self.frames.len()
+    }
+
+    pub(super) fn truncate(&mut self, depth: usize) {
+        self.frames.truncate(depth);
+    }
+}
+
+fn syntax_address(syntax: &Syntax) -> usize {
+    std::ptr::from_ref(syntax).addr()
+}
+
+impl Context {
+    fn observe_application_syntax(
+        &mut self,
+        syntax: &Syntax,
+    ) -> Result<usize, NatDefinitionElabError> {
+        let mut frame = SyntaxFrame::default();
+        let mut pending = vec![syntax];
+        while let Some(syntax) = pending.pop() {
+            self.tick()?;
+            frame.nodes.insert(syntax_address(syntax));
+            if let Syntax::Node { args, .. } = syntax {
+                pending.extend(args);
+            }
+        }
+        let index = self.application_syntax.frames.len();
+        self.application_syntax.frames.push(frame);
+        Ok(index)
+    }
+
+    fn take_application_syntax(
+        &mut self,
+        index: usize,
+    ) -> Result<SyntaxFrame, NatDefinitionElabError> {
+        if self.application_syntax.frames.len() != index + 1 {
+            return Err(failure(SourceInferenceError::Scope));
+        }
+        self.application_syntax
+            .frames
+            .pop()
+            .ok_or_else(|| failure(SourceInferenceError::Scope))
+    }
+
+    fn observed_application_syntax(
+        &mut self,
+        syntax: &Syntax,
+        frame: &SyntaxFrame,
+    ) -> Result<Syntax, NatDefinitionElabError> {
+        enum Task<'a> {
+            Visit(&'a Syntax),
+            Build(&'a Syntax, usize),
+        }
+        let mut pending = vec![Task::Visit(syntax)];
+        let mut values = Vec::new();
+        while let Some(task) = pending.pop() {
+            self.tick()?;
+            match task {
+                Task::Visit(syntax) => {
+                    if let Some(replacement) = frame.replacements.get(&syntax_address(syntax)) {
+                        // Descendant observations were already folded into this
+                        // replacement while its owned expansion was still alive.
+                        values.push(self.copy_pattern_syntax(replacement)?);
+                    } else if let Syntax::Node { args, .. } = syntax {
+                        pending.push(Task::Build(syntax, values.len()));
+                        pending.extend(args.iter().rev().map(Task::Visit));
+                    } else {
+                        values.push(syntax.clone());
+                    }
+                }
+                Task::Build(syntax, start) => {
+                    let Syntax::Node { info, kind, .. } = syntax else {
+                        return Err(failure(SourceInferenceError::Scope));
+                    };
+                    let args = values.split_off(start);
+                    values.push(Syntax::Node {
+                        info: *info,
+                        kind: kind.clone(),
+                        args,
+                    });
+                }
+            }
+        }
+        values
+            .pop()
+            .ok_or_else(|| failure(SourceInferenceError::Scope))
+    }
+
+    /// Preserve the original rejection model, but let normal term visits
+    /// decide the syntax a macro actually produces. Calling the provider here
+    /// would execute stateful macros twice or ahead of an earlier argument.
+    pub(super) fn begin_application_typing(
+        &mut self,
+        syntax: &Syntax,
+        expected: &Expr,
+    ) -> Result<Option<ApplicationCheck>, NatDefinitionElabError> {
+        let mut head = syntax;
+        while let Some(inner) = parenthesized_inner(head)? {
+            head = inner;
+        }
+        let application = head.kind() == Some(&parser_kind(&["Term", "app"]));
+        let mut deferred = false;
+        if application && let Some(provider) = self.source_scope.tactic_macros.clone() {
+            let ident = Name::from_components(["ident"]);
+            let mut pending = vec![syntax];
+            while let Some(node) = pending.pop() {
+                self.tick()?;
+                let kind = match node {
+                    Syntax::Ident { .. } => Some(&ident),
+                    Syntax::Node { kind, .. }
+                        if self.tactic_macro_terms != 0
+                            || fln_parse::extensions::is_atomic_macro_kind(kind) =>
+                    {
+                        Some(kind)
+                    }
+                    _ => None,
+                };
+                if kind.is_some_and(|kind| provider.0.contains(kind)) {
+                    deferred = true;
+                    break;
+                }
+                if let Syntax::Node { args, .. } = node {
+                    pending.extend(args);
+                }
+            }
+        }
+        if !deferred {
+            self.check_application_typing(syntax, expected)?;
+            return Ok(None);
+        }
+        let expected = self.instantiate(expected)?;
+        if expected.has_expr_mvar() || expected.has_loose_bvars() {
+            // The rejection model already declines unresolved expected types.
+            // Do not freeze a later, more constrained type in their place.
+            return Ok(None);
+        }
+        let mut context = Box::new(self.clone());
+        // The replay reads the original locals and metavariables, not later
+        // assignments made while checking the completed application. Its
+        // observation identities must not outlive their borrowed trees.
+        context.application_syntax = ApplicationSyntax::default();
+        let frame = self.observe_application_syntax(syntax)?;
+        Ok(Some(ApplicationCheck {
+            context,
+            expected,
+            frame,
+        }))
+    }
+
+    pub(super) fn finish_application_typing(
+        &mut self,
+        syntax: &Syntax,
+        mut check: ApplicationCheck,
+    ) -> Result<(), NatDefinitionElabError> {
+        let frame = self.take_application_syntax(check.frame)?;
+        let observed = self.observed_application_syntax(syntax, &frame)?;
+        // Speculation never refunds work. The independent replay consumes the
+        // same declaration budget as the actual elaboration that preceded it.
+        check.context.txn.budget.heartbeats_consumed = self.txn.budget.heartbeats_consumed;
+        let result = check
+            .context
+            .check_application_typing(&observed, &check.expected);
+        self.txn.budget.heartbeats_consumed = check.context.txn.budget.heartbeats_consumed;
+        result
+    }
+
+    /// Pattern preparation may own a rewritten copy of the source. Keep the
+    /// pre-preparation typing snapshot, but observe the tree the worklist will
+    /// actually visit. No provider is called while rebinding these identities.
+    pub(super) fn bind_application_typing(
+        &mut self,
+        syntax: &Syntax,
+        check: &ApplicationCheck,
+    ) -> Result<(), NatDefinitionElabError> {
+        self.take_application_syntax(check.frame)?;
+        let frame = self.observe_application_syntax(syntax)?;
+        if frame != check.frame {
+            return Err(failure(SourceInferenceError::Scope));
+        }
+        Ok(())
+    }
+
+    pub(super) fn begin_macro_application_observation(
+        &mut self,
+        source: &Syntax,
+        expanded: &Syntax,
+    ) -> Result<Option<usize>, NatDefinitionElabError> {
+        let address = syntax_address(source);
+        if self
+            .application_syntax
+            .frames
+            .iter()
+            .any(|frame| frame.nodes.contains(&address))
+        {
+            self.observe_application_syntax(expanded).map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+
+    pub(super) fn finish_macro_application_observation(
+        &mut self,
+        source: &Syntax,
+        expanded: &Syntax,
+        index: usize,
+    ) -> Result<(), NatDefinitionElabError> {
+        let frame = self.take_application_syntax(index)?;
+        let observed = self.observed_application_syntax(expanded, &frame)?;
+        let address = syntax_address(source);
+        for index in 0..self.application_syntax.frames.len() {
+            self.tick()?;
+            if self.application_syntax.frames[index]
+                .nodes
+                .contains(&address)
+            {
+                let observed = self.copy_pattern_syntax(&observed)?;
+                self.application_syntax.frames[index]
+                    .replacements
+                    .insert(address, observed);
+            }
+        }
+        Ok(())
+    }
+}
+
 impl Context {
     /// Refuse a match the pin refuses for its patterns' types (module docs). `discriminants`
     /// are the elaborated discriminants (value, type) in order, `alternatives` its
@@ -1566,7 +1815,10 @@ impl Model<'_> {
             }
             return Ok(Argument::Other);
         }
-        let Syntax::Ident { val, .. } = syntax else {
+        let Syntax::Ident {
+            val, preresolved, ..
+        } = syntax
+        else {
             return Ok(Argument::Other);
         };
         if let Some(decl) = self.cx.txn.lctx.find_by_user_name(val).cloned() {
@@ -1576,15 +1828,39 @@ impl Model<'_> {
             }
             return Ok(Argument::Typed(Expr::fvar(decl.id), type_));
         }
-        let display = val.to_display_string();
-        if display == "true" || display == "false" {
-            let (_, explicit_target) = self.cx.resolve_identifier_name(syntax)?;
-            if explicit_target {
-                return Ok(Argument::Other);
-            }
-            let bool_ = Name::from_components(["Bool"]);
+        // Macro quotations preserve definition-site resolution and hygiene.
+        // Their Boolean constants are the same rigid values as source `true`
+        // and `false`; spelling alone must not select a use-site namesake.
+        let bool_ = Name::from_components(["Bool"]);
+        let bool_values = [
+            Name::str(bool_.clone(), "true"),
+            Name::str(bool_.clone(), "false"),
+        ];
+        let unscoped = val.erase_macro_scopes();
+        let bare = ["true", "false"]
+            .into_iter()
+            .find(|label| unscoped == Name::from_components([*label]));
+        let exact = preresolved.iter().any(|target| {
+            matches!(target, fln_syntax::tree::Preresolved::Decl { name, .. }
+                if bool_values.contains(name))
+        });
+        let rooted = bool_values
+            .iter()
+            .any(|value| unscoped == Name::from_components(["_root_"]).append_core(value));
+        if bare.is_none() && !bool_values.contains(&unscoped) && !rooted && !exact {
+            return Ok(Argument::Other);
+        }
+        let (resolved, explicit_target) = self.cx.resolve_unambiguous_identifier_name(syntax)?;
+        let resolved = resolved.or_else(|| {
+            (!explicit_target)
+                .then(|| bare.map(|label| Name::str(bool_.clone(), label)))
+                .flatten()
+        });
+        if let Some(resolved) = resolved
+            && bool_values.contains(&resolved)
+        {
             return Ok(Argument::Typed(
-                Expr::const_(bool_.append_core(val), vec![]),
+                Expr::const_(resolved, vec![]),
                 Expr::const_(bool_, vec![]),
             ));
         }
