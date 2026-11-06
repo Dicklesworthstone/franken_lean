@@ -2,8 +2,9 @@
 #![forbid(unsafe_code)]
 use fln::source_check::modules::imported::SourceOleanImportLimits;
 use fln::{
-    Budget, ClosedVmValue, Engine, EngineExecutionLimits, Environment, KVMap, Name,
-    OleanCheckLimits, OleanModuleInput,
+    Budget, ClosedVmValue, ConstantInfo, Declaration, Engine, EngineAdmissionLimits,
+    EngineExecutionLimits, Environment, Expr, ExprNode, KVMap, Name, OleanCheckLimits,
+    OleanModuleInput,
 };
 use std::{
     path::{Path, PathBuf},
@@ -18,7 +19,7 @@ const STACK: usize = 256 * 1024 * 1024;
 const COUNT: &str = "def count : List Nat -> Nat\n | [] => 0\n | [_] => 1\n | _ :: _ :: t => count t + 2\ntermination_by structural xs => xs\n";
 const SPIN: &str = "partial def spin (n : Nat) : Nat := spin n\n";
 
-fn with_fixture(test: impl FnOnce(&Engine, &Path) + Send + 'static) {
+fn with_native_fixture(test: impl FnOnce(&Engine, &Path) + Send + 'static) {
     std::thread::Builder::new()
         .stack_size(STACK)
         .spawn(move || {
@@ -53,14 +54,6 @@ fn with_fixture(test: impl FnOnce(&Engine, &Path) + Send + 'static) {
                     return None;
                 };
                 let compiler = library.parent().unwrap().parent().unwrap().join("bin/lean");
-                let version = Command::new(&compiler).arg("--version").output().unwrap();
-                let text = String::from_utf8(version.stdout).unwrap();
-                assert!(
-                    version.status.success()
-                        && text.contains(field("tag=").trim_start_matches('v'))
-                        && text.contains(field("commit=")),
-                    "{text}"
-                );
                 let path = library.join("Init/Prelude.olean");
                 let parts = [
                     std::fs::read(&path).unwrap(),
@@ -97,6 +90,32 @@ fn with_fixture(test: impl FnOnce(&Engine, &Path) + Send + 'static) {
         .unwrap()
         .join()
         .unwrap();
+}
+
+fn with_fixture(test: impl FnOnce(&Engine, &Path) + Send + 'static) {
+    with_native_fixture(move |engine, compiler| {
+        static VERIFIED: OnceLock<()> = OnceLock::new();
+        VERIFIED.get_or_init(|| {
+            let row = include_str!("../../../SUITE.lock")
+                .lines()
+                .find(|line| line.starts_with("reference leanprover/lean4 "))
+                .unwrap();
+            let field = |key: &str| {
+                row.split_whitespace()
+                    .find_map(|x| x.strip_prefix(key))
+                    .unwrap()
+            };
+            let version = Command::new(compiler).arg("--version").output().unwrap();
+            let text = String::from_utf8(version.stdout).unwrap();
+            assert!(
+                version.status.success()
+                    && text.contains(field("tag=").trim_start_matches('v'))
+                    && text.contains(field("commit=")),
+                "{text}"
+            );
+        });
+        test(engine, compiler);
+    });
 }
 
 fn reference(compiler: &Path, source: &str, expected: Option<&str>) {
@@ -159,6 +178,93 @@ fn execute(engine: &Engine, compiler: &Path, source: &str, expected: ClosedVmVal
         second.batch.executions.last().unwrap().flbc_artifact
     );
     assert_eq!(engine.logical_root(&options), root);
+}
+
+#[test]
+fn unfolded_pinned_list_history_runs_through_the_public_engine() {
+    with_native_fixture(|engine, _| {
+        let name = |label: &str| Name::from_components(label.split('.'));
+        let Some(ConstantInfo::Defn(go)) = engine.environment().find(&name("List.brecOn.go"))
+        else {
+            panic!("admitted pinned List.brecOn.go")
+        };
+        let Some(ConstantInfo::Defn(brec)) = engine.environment().find(&name("List.brecOn")) else {
+            panic!("admitted pinned List.brecOn")
+        };
+        // Reuse the actual imported body at its original universes. Moving
+        // its first projection under the four leading lambdas reproduces the
+        // unfolded scaffold without a private compiler API or a model copy.
+        assert_eq!(go.base.level_params, brec.base.level_params);
+        let mut body = go.value.clone();
+        let mut binders = Vec::new();
+        for _ in 0..4 {
+            let ExprNode::Lam {
+                binder_name,
+                binder_type,
+                body: inner,
+                binder_info,
+            } = body.node()
+            else {
+                panic!("pinned List.brecOn.go parameter telescope")
+            };
+            binders.push((binder_name.clone(), binder_type.clone(), *binder_info));
+            body = inner.clone();
+        }
+        body = Expr::proj(name("PProd"), 0, body);
+        for (binder, type_, info) in binders.into_iter().rev() {
+            body = Expr::lam(binder, type_, body, info);
+        }
+        let mut unfolded = brec.clone();
+        unfolded.base.name = name("nativeUnfoldedList");
+        unfolded.all = vec![unfolded.base.name.clone()];
+        unfolded.value = body;
+        let options = KVMap::new();
+        let engine = engine
+            .admit_declaration(
+                Declaration::Defn(unfolded),
+                &options,
+                EngineAdmissionLimits::new(Budget::for_stack_bytes(STACK)),
+            )
+            .unwrap()
+            .into_complete()
+            .unwrap()
+            .engine;
+        let root = engine.logical_root(&options);
+        let source = b"def fromUnfolded (base : Nat) (xs : List Nat) : Nat :=\n\
+            @nativeUnfoldedList Nat (fun _ => Nat) xs (fun ys h =>\n\
+              List.rec (motive := fun zs => @List.below Nat (fun _ => Nat) zs -> Nat)\n\
+                (fun _ => base) (fun _ _ _ previous => Nat.succ previous.1) ys h)\n\
+            #eval fromUnfolded 7 []\n\
+            #eval fromUnfolded 40 [10, 20]\n\
+            #eval fromUnfolded 39 [10, 20, 30]\n";
+        let run = engine
+            .execute_source_commands_with_checks(
+                source,
+                &options,
+                EngineExecutionLimits::new(Budget::for_stack_bytes(STACK)),
+            )
+            .unwrap()
+            .into_complete()
+            .unwrap();
+        assert_eq!(run.batch.source_evaluation_indices.len(), 3);
+        for (index, expected) in run.batch.source_evaluation_indices.iter().zip([7, 42, 42]) {
+            let execution = &run.batch.executions[*index];
+            assert_eq!(
+                fln::closed_vm_value(&execution.exit).unwrap(),
+                Some(ClosedVmValue::Scalar(expected))
+            );
+            let replay =
+                fln::execute_flbc_artifact(&execution.flbc_artifact, &options, Default::default())
+                    .unwrap()
+                    .into_complete()
+                    .unwrap();
+            assert_eq!(
+                fln::closed_vm_value(&replay).unwrap(),
+                Some(ClosedVmValue::Scalar(expected))
+            );
+        }
+        assert_eq!(engine.logical_root(&options), root);
+    });
 }
 
 #[test]

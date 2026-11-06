@@ -440,7 +440,7 @@ impl Preparation<'_> {
                         expr: receiver,
                         ..
                     } = expr.node()
-                        && let Some(refolded) = self.nat_history_refold(*idx, receiver)?
+                        && let Some(refolded) = self.history_projection_refold(*idx, receiver)?
                     {
                         reserve(&mut work, self.limits.max_nodes)?;
                         work.push(Frame::Visit(refolded, expected));

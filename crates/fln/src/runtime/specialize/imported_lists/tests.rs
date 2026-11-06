@@ -115,6 +115,357 @@ fn declaration(label: &str, type_: Expr, value: Expr) -> Declaration {
     })
 }
 
+fn unfolded_history(engine: &Engine, major: Expr, functional: Expr) -> Expr {
+    let Some(ConstantInfo::Defn(definition)) = engine.environment().find(&name("List.brecOn.go"))
+    else {
+        panic!("admitted List course-of-values scaffold")
+    };
+    let mut preparation = Preparation::new(engine.environment(), IngressLimits::default());
+    let mut body = preparation
+        .universe_instance(
+            &definition.value,
+            &definition.base.level_params,
+            &[Level::one(), Level::zero()],
+        )
+        .unwrap();
+    for argument in [constant("Nat"), motive(), major, functional] {
+        let ExprNode::Lam { body: inner, .. } = body.node() else {
+            panic!("List.brecOn.go parameter telescope")
+        };
+        body = preparation.substitution(inner, &argument).unwrap();
+    }
+    Expr::proj(name("PProd"), 0, body)
+}
+
+fn counting_functional(initial: Expr) -> Expr {
+    type Local = (FVarId, Expr);
+    fn local(label: &str, type_: Expr) -> Local {
+        (FVarId(name(label)), type_)
+    }
+    fn value(local: &Local) -> Expr {
+        Expr::fvar(local.0.clone())
+    }
+    fn bind(locals: &[Local], mut body: Expr, lambda: bool) -> Expr {
+        for (id, type_) in locals.iter().rev() {
+            body = body.lift_loose(0, 1).unwrap().abstract_fvar(id, 0).unwrap();
+            body = if lambda {
+                Expr::lam(id.0.clone(), type_.clone(), body, BinderInfo::Default)
+            } else {
+                Expr::forall_e(id.0.clone(), type_.clone(), body, BinderInfo::Default)
+            };
+        }
+        body
+    }
+    let major = local("major", list_type());
+    let previous = local("previous", history(value(&major)));
+    let case_motive = bind(
+        std::slice::from_ref(&major),
+        bind(std::slice::from_ref(&previous), constant("Nat"), false),
+        true,
+    );
+    let first = bind(&[local("empty_history", history(list(&[])))], initial, true);
+    let head = local("head", constant("Nat"));
+    let tail = local("tail", list_type());
+    let unused = local("unused", Expr::app(case_motive.clone(), value(&tail)));
+    let cons = application(
+        Expr::const_(name("List.cons"), vec![Level::zero()]),
+        [constant("Nat"), value(&head), value(&tail)],
+    );
+    let step_history = local("step_history", history(cons));
+    let next = Expr::app(
+        constant("Nat.succ"),
+        Expr::proj(name("PProd"), 0, value(&step_history)),
+    );
+    let step = bind(&[head, tail, unused, step_history], next, true);
+    let selected = application(
+        Expr::const_(name("List.rec"), vec![Level::one(), Level::zero()]),
+        [
+            constant("Nat"),
+            case_motive,
+            first,
+            step,
+            value(&major),
+            value(&previous),
+        ],
+    );
+    bind(&[major, previous], selected, true)
+}
+
+#[test]
+fn unfolded_list_history_executes_at_literal_and_variable_majors() {
+    let engine = admitted_scaffold(None);
+    let options = KVMap::new();
+    let root = engine.logical_root(&options);
+    for (items, initial, expected) in [(vec![], 7, 7), (vec![10, 20], 40, 42)] {
+        let body = unfolded_history(&engine, list(&items), counting_functional(nat(initial)));
+        let result = engine
+            .execute_definition(
+                declaration("unfoldedList", constant("Nat"), body),
+                &options,
+                EngineExecutionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024)),
+            )
+            .unwrap()
+            .into_complete()
+            .unwrap();
+        assert_eq!(
+            closed_vm_value(&result.exit).unwrap(),
+            Some(ClosedVmValue::Scalar(expected))
+        );
+        assert_eq!(root, engine.logical_root(&options));
+    }
+    let body = unfolded_history(
+        &engine,
+        Expr::bvar(0).unwrap(),
+        counting_functional(Expr::bvar(1).unwrap()),
+    );
+    let engine = engine
+        .admit_declaration(
+            declaration(
+                "fromUnfoldedHistory",
+                Expr::forall_e(
+                    Name::anonymous(),
+                    constant("Nat"),
+                    Expr::forall_e(
+                        Name::anonymous(),
+                        list_type(),
+                        constant("Nat"),
+                        BinderInfo::Default,
+                    ),
+                    BinderInfo::Default,
+                ),
+                Expr::lam(
+                    Name::anonymous(),
+                    constant("Nat"),
+                    Expr::lam(Name::anonymous(), list_type(), body, BinderInfo::Default),
+                    BinderInfo::Default,
+                ),
+            ),
+            &options,
+            EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024)),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap()
+        .engine;
+    let result = engine
+        .execute_definition(
+            declaration(
+                "variableUnfoldedList",
+                constant("Nat"),
+                application(
+                    constant("fromUnfoldedHistory"),
+                    [nat(39), list(&[10, 20, 30])],
+                ),
+            ),
+            &options,
+            EngineExecutionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024)),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!(
+        closed_vm_value(&result.exit).unwrap(),
+        Some(ClosedVmValue::Scalar(42))
+    );
+}
+
+#[test]
+fn list_history_refolding_requires_the_exact_admitted_scaffold() {
+    let engine = admitted_scaffold(None);
+    let functional = counting_functional(nat(7));
+    let unfolded = unfolded_history(&engine, list(&[10, 20]), functional.clone());
+    let ExprNode::Proj { expr: receiver, .. } = unfolded.node() else {
+        unreachable!()
+    };
+    let mut preparation = Preparation::new(engine.environment(), IngressLimits::default());
+    assert_eq!(
+        preparation.list_history_refold(0, receiver).unwrap(),
+        Some(application(
+            Expr::const_(name("List.brecOn"), vec![Level::one(), Level::zero()]),
+            [constant("Nat"), motive(), list(&[10, 20]), functional],
+        ))
+    );
+    assert_eq!(preparation.list_history_refold(1, receiver).unwrap(), None);
+
+    // Even a definitionally equal alteration of the administrative history
+    // field is not the admitted go body; do not infer a new refolding rule.
+    let (recursor, mut arguments) = preparation.spine(receiver).unwrap();
+    let (constructor, mut fields) = preparation.spine(&arguments[2]).unwrap();
+    fields[3] = Expr::app(
+        Expr::lam(
+            Name::anonymous(),
+            Expr::const_(name("PUnit"), vec![Level::one()]),
+            Expr::bvar(0).unwrap(),
+            BinderInfo::Default,
+        ),
+        fields[3].clone(),
+    );
+    arguments[2] = application(constructor, fields);
+    assert_eq!(
+        preparation
+            .list_history_refold(0, &application(recursor, arguments))
+            .unwrap(),
+        None
+    );
+    for label in ["List.below", "List.brecOn.go", "List.brecOn"] {
+        let changed = admitted_scaffold(Some(label));
+        assert_eq!(
+            Preparation::new(changed.environment(), IngressLimits::default())
+                .list_history_refold(0, receiver)
+                .unwrap(),
+            None,
+            "changed admitted dependency {label}"
+        );
+    }
+    assert!(matches!(
+        Preparation::new(
+            engine.environment(),
+            IngressLimits {
+                max_nodes: 1,
+                ..IngressLimits::default()
+            },
+        )
+        .list_history_refold(0, receiver),
+        Err(IngressError::ResourceLimit {
+            resource: IngressResource::Nodes,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn list_history_refolding_never_selects_a_replacement_or_extern() {
+    let engine = admitted_scaffold(None);
+    let unfolded = unfolded_history(&engine, list(&[10, 20]), counting_functional(nat(7)));
+    let ExprNode::Proj { expr: receiver, .. } = unfolded.node() else {
+        unreachable!()
+    };
+    assert!(
+        Preparation::new(engine.environment(), IngressLimits::default())
+            .list_history_refold(0, receiver)
+            .unwrap()
+            .is_some()
+    );
+    let source = name("List.brecOn");
+    let Some(ConstantInfo::Defn(original)) = engine.environment().find(&source) else {
+        unreachable!()
+    };
+    let mut replacement = original.clone();
+    replacement.base.name = name("replacementListBrecOn");
+    replacement.all = vec![replacement.base.name.clone()];
+    let target = replacement.base.name.clone();
+    let replaced = engine
+        .admit_declaration(
+            Declaration::Defn(replacement),
+            &KVMap::new(),
+            EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024)),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap()
+        .engine;
+    let environment =
+        fln_elab::implemented_by::register(replaced.environment(), &source, &target).unwrap();
+    assert_eq!(
+        Preparation::new(&environment, IngressLimits::default())
+            .list_history_refold(0, receiver)
+            .unwrap(),
+        None
+    );
+    let environment = fln_elab::externs::register(
+        engine.environment(),
+        &source,
+        vec![fln_elab::externs::ExternEntry::Opaque],
+    )
+    .unwrap();
+    assert!(matches!(
+        Preparation::new(&environment, IngressLimits::default()).list_history_refold(0, receiver),
+        Err(IngressError::UnsupportedNode {
+            kind: "native extern attribute does not match the supported ABI"
+        })
+    ));
+}
+
+#[test]
+fn list_history_reduction_keeps_explicit_implementations_and_extern_contracts() {
+    let engine = admitted_scaffold(None);
+    let type_ = Expr::forall_e(
+        Name::anonymous(),
+        list_type(),
+        Expr::forall_e(
+            Name::anonymous(),
+            history(Expr::bvar(0).unwrap()),
+            constant("Nat"),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
+    let mut engine = engine;
+    for (label, initial) in [("listFunctional", 7), ("replacementListFunctional", 40)] {
+        engine = engine
+            .admit_declaration(
+                declaration(label, type_.clone(), counting_functional(nat(initial))),
+                &KVMap::new(),
+                EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024)),
+            )
+            .unwrap()
+            .into_complete()
+            .unwrap()
+            .engine;
+    }
+    let source = name("listFunctional");
+    let helper = constant("listFunctional");
+    let marker = FVarId(name("history_marker"));
+    assert!(
+        Preparation::new(engine.environment(), IngressLimits::default())
+            .list_history_step(&helper, &marker)
+            .unwrap()
+            .is_some()
+    );
+    let environment = fln_elab::implemented_by::register(
+        engine.environment(),
+        &source,
+        &name("replacementListFunctional"),
+    )
+    .unwrap();
+    let mut preparation = Preparation::new(&environment, IngressLimits::default());
+    assert!(!preparation.list_history_inert(&helper).unwrap());
+    assert!(
+        preparation
+            .list_history_step(&helper, &marker)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        preparation.list_history_reduce(&helper, &marker).unwrap(),
+        helper
+    );
+    for label in ["listFunctional", "List.brecOn", "List.rec"] {
+        let environment = fln_elab::externs::register(
+            engine.environment(),
+            &name(label),
+            vec![fln_elab::externs::ExternEntry::Opaque],
+        )
+        .unwrap();
+        let helper = Expr::const_(
+            name(label),
+            if label == "listFunctional" {
+                vec![]
+            } else {
+                vec![Level::one(), Level::zero()]
+            },
+        );
+        let mut preparation = Preparation::new(&environment, IngressLimits::default());
+        assert!(matches!(
+            preparation.list_history_step(&helper, &marker),
+            Err(IngressError::UnsupportedNode {
+                kind: "native extern attribute does not match the supported ABI"
+            })
+        ));
+        assert!(preparation.list_history_inert(&helper).is_err());
+    }
+}
+
 #[test]
 fn complete_list_scaffold_is_dual_admitted_and_preserves_actual_functionals() {
     let engine = admitted_scaffold(None);
@@ -278,8 +629,35 @@ fn list_history_administration_preserves_strict_arguments_and_initializers() {
         ),
         computation.clone(),
     );
+    let minor = Expr::lam(
+        Name::anonymous(),
+        constant("Nat"),
+        Expr::lam(
+            Name::anonymous(),
+            list_type(),
+            Expr::lam(
+                Name::anonymous(),
+                constant("Nat"),
+                Expr::bvar(0).unwrap(),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        ),
+        BinderInfo::Default,
+    );
+    let paid_minor = Expr::let_e(
+        Name::anonymous(),
+        constant("Nat"),
+        computation.clone(),
+        minor,
+        false,
+    );
+    let discarded_minor = application(
+        Expr::const_(name("List.rec"), vec![Level::one(), Level::zero()]),
+        [constant("Nat"), motive(), nat(7), paid_minor, list(&[])],
+    );
     let marker = FVarId(name("forbiddenHistory"));
-    for source in [strict_let, strict_beta] {
+    for source in [strict_let, strict_beta, discarded_minor] {
         engine
             .admit_declaration(
                 declaration("strictAnswer", constant("Nat"), source.clone()),

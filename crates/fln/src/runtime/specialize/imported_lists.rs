@@ -32,6 +32,129 @@ fn variable(index: u32) -> Result<Expr, IngressError> {
 }
 
 impl Preparation<'_> {
+    fn list_history_model(&mut self) -> Result<bool, IngressError> {
+        if !self.specializations.list_recursion_checked {
+            if !crate::source_intrinsics::imported_list_recursion_matches(
+                self.environment,
+                &mut self.visited,
+                self.limits,
+            )? {
+                return Ok(false);
+            }
+            self.specializations.list_recursion_checked = true;
+        }
+        Ok(true)
+    }
+
+    /// Instantiate only the leading binders of an admitted history definition.
+    /// This takes no delta, beta, or iota steps inside the substituted body.
+    fn list_history_body(
+        &mut self,
+        label: &str,
+        levels: &[Level],
+        arguments: &[Expr],
+    ) -> Result<Option<Expr>, IngressError> {
+        let Some(definition) = self.definition(&named(label)) else {
+            return Ok(None);
+        };
+        if definition.base.level_params.len() != levels.len() {
+            return Ok(None);
+        }
+        let mut body =
+            self.universe_instance(&definition.value, &definition.base.level_params, levels)?;
+        for argument in arguments {
+            self.tick()?;
+            let ExprNode::Lam { body: inner, .. } = body.node() else {
+                return Ok(None);
+            };
+            body = self.substitution(inner, argument)?;
+        }
+        Ok(Some(body))
+    }
+
+    /// Delta reduction can expose `(List.brecOn.go α M xs F).1` as a List.rec
+    /// whose result retains the dependent List.below carrier. Refold only the
+    /// exact admitted body, so the ordinary course-of-values lowering can keep
+    /// the observable result without assigning a runtime layout to its history.
+    pub(in crate::runtime) fn list_history_refold(
+        &mut self,
+        index: u64,
+        receiver: &Expr,
+    ) -> Result<Option<Expr>, IngressError> {
+        if index != 0 {
+            return Ok(None);
+        }
+        let (head, args) = self.spine(receiver)?;
+        if !matches!(head.node(), ExprNode::Const { name, levels }
+            if name == &named("List.rec") && levels.len() == 2)
+            || args.len() != 5
+        {
+            return Ok(None);
+        }
+        let ExprNode::Lam { body: pair, .. } = args[1].node() else {
+            return Ok(None);
+        };
+        let (_, components) = self.spine(pair)?;
+        let [_, history] = components.as_slice() else {
+            return Ok(None);
+        };
+        let (below, below_args) = self.spine(history)?;
+        let ExprNode::Const {
+            name: below_name,
+            levels,
+        } = below.node()
+        else {
+            return Ok(None);
+        };
+        let [_, motive, _] = below_args.as_slice() else {
+            return Ok(None);
+        };
+        if below_name != &named("List.below") || levels.len() != 2 || motive.has_loose_bvar(0) {
+            return Ok(None);
+        }
+        // The major binder is absent from M; substitution only lowers M's
+        // outer variables to the receiver's original scope.
+        let motive = self.substitution(motive, &args[4])?;
+        let (_, first_fields) = self.spine(&args[2])?;
+        let [_, _, first, _] = first_fields.as_slice() else {
+            return Ok(None);
+        };
+        let ExprNode::App { f: partial, .. } = first.node() else {
+            return Ok(None);
+        };
+        let ExprNode::App { f: functional, .. } = partial.node() else {
+            return Ok(None);
+        };
+        // The original expression does not call List.brecOn: refolding must
+        // never introduce its implemented_by replacement or an extern effect.
+        if !self.nat_history_logical_constant(&named("List.brecOn"))?
+            || !self.list_history_model()?
+        {
+            return Ok(None);
+        }
+        let arguments = [args[0].clone(), motive, args[4].clone(), functional.clone()];
+        if self
+            .list_history_body("List.brecOn.go", levels, &arguments)?
+            .as_ref()
+            != Some(receiver)
+        {
+            return Ok(None);
+        }
+        let go = application(
+            constant("List.brecOn.go", levels.clone()),
+            arguments.clone(),
+        );
+        if self.list_history_body("List.brecOn", levels, &arguments)?
+            != Some(Expr::proj(named("PProd"), 0, go))
+        {
+            return Ok(None);
+        }
+        Ok(Some(application(
+            constant("List.brecOn", levels.clone()),
+            arguments,
+        )))
+    }
+
     pub(in crate::runtime) fn imported_list_recursion(
         &mut self,
         head: &Expr,
@@ -52,15 +175,8 @@ impl Preparation<'_> {
         {
             return Ok(None);
         }
-        if !self.specializations.list_recursion_checked {
-            if !crate::source_intrinsics::imported_list_recursion_matches(
-                self.environment,
-                &mut self.visited,
-                self.limits,
-            )? {
-                return Ok(None);
-            }
-            self.specializations.list_recursion_checked = true;
+        if !self.list_history_model()? {
+            return Ok(None);
         }
         let family = Expr::app(constant("List", vec![levels[1].clone()]), args[0].clone());
         // Static element types can carry metadata from a caller. Compare both
@@ -161,6 +277,19 @@ impl Preparation<'_> {
         while let Some(expression) = work.pop() {
             self.tick()?;
             let (head, args) = self.spine(&expression)?;
+            if let ExprNode::Const { name, .. } = head.node()
+                && !self.nat_history_logical_constant(name)?
+            {
+                // Keep a verified native callback as a reference to its
+                // selected contract, never as evidence from its logical body.
+                if args.is_empty()
+                    && !self.has_implementation(name)?
+                    && self.inert_native_function(&head)?
+                {
+                    continue;
+                }
+                return Ok(false);
+            }
             match head.node() {
                 ExprNode::BVar { .. }
                 | ExprNode::FVar { .. }
@@ -291,7 +420,16 @@ impl Preparation<'_> {
         let ExprNode::Const { name, levels } = head.node() else {
             return Ok(None);
         };
+        if !self.nat_history_logical_constant(name)? {
+            return Ok(None);
+        }
         if name == &named("List.rec") && levels.len() == 2 && args.len() >= 5 {
+            // Both minor arguments are evaluated before the recursor runs.
+            // Selecting a known constructor cannot discard a strict producer
+            // of the other minor or of fields in the selected result.
+            if !self.list_history_inert(&args[2])? || !self.list_history_inert(&args[3])? {
+                return Ok(None);
+            }
             let (constructor, fields) = self.spine(&args[4])?;
             if let ExprNode::Const {
                 name: ctor,
