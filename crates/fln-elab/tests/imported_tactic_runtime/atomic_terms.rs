@@ -1,5 +1,6 @@
 //! Actual quoted templates at the production term/pattern provider boundary.
 //! Artifact admission and shared VM limits are exercised by fln's batch tests.
+#![forbid(unsafe_code)]
 use super::*;
 use fln_core::{
     expr::{BinderInfo, Expr, FVarId},
