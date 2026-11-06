@@ -1,7 +1,7 @@
 //! Ordinary mutual predefinitions, following MutualDef's header/body boundary
 //! and dependency partition. Headers are private candidate data, never
 //! temporary environment axioms. Same-family structural components share one
-//! course-of-values recursor; components with Nat `termination_by` measures
+//! course-of-values recursor; components with explicit `termination_by` measures
 //! share one well-founded fixpoint. Unsupported components are never downgraded
 //! to partial logical definitions.
 use super::*;
@@ -675,7 +675,7 @@ fn mutual_implementations(
     Ok(implementations)
 }
 
-/// A recursive component of two or more definitions, all with Nat measures:
+/// A recursive component of two or more definitions with explicit measures:
 /// the pin's `wfRecursion` over the component (see
 /// `recursion::well_founded::mutual`). Returns `<first>._mutual`, the members'
 /// wrappers in SCC order, and their `_unsafe_rec` executable companions.
@@ -735,29 +735,10 @@ fn mutual_well_founded(
             MemberHint::Structural => return Err(unsupported("structural mutual recursion")),
         }
     }
-    // `checkCodomains` (WF/Rel.lean): one measure type for the whole group.
-    if let Some(position) = measured.iter().position(|member| !member.nat) {
-        if measured.iter().any(|member| member.nat) {
-            let first = measured.iter().position(|member| member.nat).unwrap_or(0);
-            let (first, other) = if first < position {
-                (first, position)
-            } else {
-                (position, first)
-            };
-            return Err(failure(SourceInferenceError::Recursion(
-                recursion::RecursionError::MutualMeasureTypeMismatch {
-                    first: names[component[first]].clone(),
-                    other: names[component[other]].clone(),
-                },
-            )));
-        }
-        return Err(unsupported("measures of a type other than Nat"));
-    }
-    if measured.iter().any(|member| !member.natural) {
-        return Err(unsupported(
-            "a Nat measure under a WellFoundedRelation other than Nat.lt_wfRel",
-        ));
-    }
+    // Codomains and the selected relation are checked by the shared planner,
+    // after the group's fixed parameters have been identified and opened.
+    // This admits lexicographic and user-selected well-founded measures without
+    // treating their executable companions as logical termination evidence.
     let captures = group
         .shared
         .as_ref()

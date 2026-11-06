@@ -1,12 +1,14 @@
-//! Real imported identifier macros at the native term-elaboration boundary.
-//! The provider is compiled by the exact pin; only its artifacts are visible
-//! to the client. Every imported declaration passes the ordinary council.
+//! Atomic macros at the native term-elaboration boundary. Native cases use
+//! actual source quotations; imported cases require the exact pin's compiled
+//! provider with only its artifacts visible to the client. Every imported
+//! declaration passes the ordinary council.
 #![forbid(unsafe_code)]
 
 use fln::imported_ir::VerifiedPartition;
 use fln::imported_macros::registrations::{
-    MacroCompilationInputs, MacroRegistryLimits, MacroTreeLimits,
+    MacroCompilationInputs, MacroRegistryLimits, MacroTreeLimits, RegisteredMacros,
 };
+use fln::imported_macros::source::{SourceMacroFileCheck, SourceMacroInvocation};
 use fln::imported_macros::{MacroContext, MacroState};
 use fln::imported_parsers::ParserRegistryLimits;
 use fln::source_check::modules::execution::SourceProgramLimits;
@@ -31,6 +33,186 @@ const HEADER: &str = "prelude\nimport AdmittedAtomicMacro\n";
 
 fn name(text: &str) -> Name {
     Name::from_components(text.split('.'))
+}
+
+// These native-only cases exercise the public FileSession/ImportedTactics
+// provider with real source quotations. They grant no artifact-code authority;
+// the separate tests below retain their actual pinned artifact requirements.
+fn native_templates(source: &str, limits: MacroTreeLimits) -> SourceMacroFileCheck {
+    let admission = EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024));
+    let engine = Engine::with_source_seed(admission)
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let options = KVMap::new();
+    let before = engine.logical_root(&options);
+    let registry = RegisteredMacros::empty();
+    let context = MacroContext {
+        quotation_context: name("Main"),
+        current_macro_scope: 0,
+        current_recursion_depth: 0,
+        max_recursion_depth: 1000,
+    };
+    let report = engine.check_source_files_with_imported_macros(
+        &[source.as_bytes()],
+        &options,
+        SourceCheckLimits::new(admission),
+        SourceMacroInvocation {
+            registry: &registry,
+            context: &context,
+            state: MacroState {
+                macro_scope: 17,
+                ..MacroState::default()
+            },
+            lookup: None,
+            limits,
+            cancellation: None,
+        },
+    );
+    assert_eq!(engine.logical_root(&options), before);
+    report
+}
+
+fn native_succeeded(report: &SourceMacroFileCheck) -> &fln::SourceFileCheck {
+    let Outcome::Complete(Ok(checked)) = &report.outcome else {
+        panic!("{report:?}")
+    };
+    assert!(report.state.is_some());
+    assert!(
+        report.attempts.iter().any(|attempt| {
+            attempt
+                .native_functions
+                .iter()
+                .any(|function| function == "source-template:quoted")
+        }),
+        "source quotations must execute through the production macro provider"
+    );
+    checked
+}
+
+#[test]
+fn native_atomic_provider_checks_generated_constructor_record_and_list_patterns() {
+    let source = r#"
+structure AtomicPair where
+  fst : Nat
+  snd : Nat
+section
+local macro_rules | `(1) => `(_root_.Nat.succ (_root_.Nat.succ _root_.Nat.zero))
+def constructorPattern (n : Nat) : Nat := match n with | 1 => 7 | _ => 0
+end
+section
+local macro_rules | `(1) => `({ fst := 2, snd := _ })
+def recordPattern (p : AtomicPair) : Nat := match p with | 1 => 11 | _ => 0
+end
+section
+local macro_rules | `(1) => `([2])
+def listPattern (xs : List Nat) : Nat := match xs with | 1 => 13 | _ => 0
+end
+theorem constructorHit : Eq (constructorPattern 2) 7 := Eq.refl 7
+theorem originalMiss : Eq (constructorPattern 1) 0 := Eq.refl 0
+theorem recordHit : Eq (recordPattern { fst := 2, snd := 9 }) 11 := Eq.refl 11
+theorem recordMiss : Eq (recordPattern { fst := 3, snd := 9 }) 0 := Eq.refl 0
+theorem listHit : Eq (listPattern [2]) 13 := Eq.refl 13
+theorem listMiss : Eq (listPattern [1]) 0 := Eq.refl 0
+"#;
+    let report = native_templates(source, MacroTreeLimits::default());
+    assert_eq!(native_succeeded(&report).theorems, 6);
+
+    for replacement in ["_root_.Bool.true", "_root_.Nat.add"] {
+        let source = format!(
+            "macro_rules | `(1) => `({replacement})\n\
+             def invalidPattern (n : Nat) : Nat := match n with | 1 => 7 | _ => 0"
+        );
+        let refused = native_templates(&source, MacroTreeLimits::default());
+        assert!(matches!(refused.outcome, Outcome::Complete(Err(_))));
+        assert!(refused.state.is_none());
+    }
+}
+
+#[test]
+fn native_atomic_provider_preserves_dependent_application_guards_and_backtracking() {
+    let source = r#"
+inductive W (P : Nat -> Type) : (n : Nat) -> P n -> Type where
+  | mk (n : Nat) (v : P n) : W P n v
+section
+local macro_rules | `(true) => `(_)
+def direct : W (fun _ => Bool) 3 Bool.true := W.mk 3 true
+def tactic : W (fun _ => Bool) 3 Bool.true := by exact W.mk 3 true
+end
+section
+local macro_rules | `(1) => `(2)
+local macro_rules | `(2) => `(3)
+local macro_rules | `(true) => `(_)
+def chained : W (fun _ => Bool) 3 Bool.true := W.mk 1 true
+end
+section
+local macro_rules | `(magic) => `(_root_.Bool.true)
+def recovered : W (fun _ => Bool) 3 Bool.true := by
+  first
+  | exact W.mk 3 magic
+  | exact W.mk (P := fun _ => Bool) 3 Bool.true
+end
+theorem directChecked : Eq direct (@W.mk (fun _ => Bool) 3 Bool.true) := Eq.refl direct
+theorem tacticChecked : Eq tactic direct := Eq.refl direct
+theorem chainedChecked : Eq chained direct := Eq.refl direct
+theorem recoveredChecked : Eq recovered direct := Eq.refl direct
+"#;
+    let report = native_templates(source, MacroTreeLimits::default());
+    assert_eq!(native_succeeded(&report).theorems, 4);
+
+    for (replacement, body) in [
+        ("true", "W.mk 3 magic"),
+        ("_root_.Bool.true", "W.mk 3 magic"),
+        ("true", "by exact W.mk 3 magic"),
+    ] {
+        let source = format!(
+            "inductive W (P : Nat -> Type) : (n : Nat) -> P n -> Type where\n  | mk (n : Nat) (v : P n) : W P n v\n\
+             macro_rules | `(magic) => `({replacement})\n\
+             def rejected : W (fun _ => Bool) 3 Bool.true := {body}"
+        );
+        let refused = native_templates(&source, MacroTreeLimits::default());
+        let Outcome::Complete(Err(error)) = &refused.outcome else {
+            panic!("expanded dependent argument bypassed the guard: {refused:?}")
+        };
+        assert!(format!("{error:?}").contains("TypeMismatch"), "{error:?}");
+        assert!(refused.state.is_none());
+    }
+}
+
+#[test]
+fn native_atomic_provider_keeps_exact_macro_budgets_and_recovers_after_a_stop() {
+    let source = r#"
+inductive W (P : Nat -> Type) : (n : Nat) -> P n -> Type where
+  | mk (n : Nat) (v : P n) : W P n v
+section
+local macro_rules | `(true) => `(_)
+def checked : W (fun _ => Bool) 3 Bool.true := W.mk 3 true
+end
+theorem checkedValue : Eq checked (@W.mk (fun _ => Bool) 3 Bool.true) := Eq.refl checked
+"#;
+    let complete = native_templates(source, MacroTreeLimits::default());
+    let root = native_succeeded(&complete).result_logical_root;
+    assert!(!complete.attempts.is_empty());
+    let mut exact = MacroTreeLimits::default();
+    exact.dispatch.max_attempts = complete.attempts.len() as u64;
+    let repeated = native_templates(source, exact);
+    assert_eq!(native_succeeded(&repeated).result_logical_root, root);
+    assert_eq!(repeated.state, complete.state);
+    assert_eq!(repeated.tree_usage, complete.tree_usage);
+    assert_eq!(repeated.attempts.len(), complete.attempts.len());
+
+    let mut short = exact;
+    short.dispatch.max_attempts -= 1;
+    let stopped = native_templates(source, short);
+    assert!(
+        matches!(stopped.outcome, Outcome::Inconclusive(_)),
+        "{stopped:?}"
+    );
+    assert!(stopped.state.is_none());
+    let recovered = native_templates(source, exact);
+    assert_eq!(native_succeeded(&recovered).result_logical_root, root);
+    assert_eq!(recovered.state, complete.state);
+    assert_eq!(recovered.tree_usage, complete.tree_usage);
 }
 
 struct Fixture {

@@ -577,8 +577,25 @@ impl Context {
         &mut self,
         syntax: &Syntax,
     ) -> Result<(), NatDefinitionElabError> {
+        self.check_preresolved_syntax_from(syntax, false)
+    }
+
+    /// Deferred macros can generate a pattern after the whole-source metadata
+    /// check. Preserve the specialized pattern consumer's exact-name boundary.
+    pub(super) fn check_preresolved_pattern_syntax(
+        &mut self,
+        syntax: &Syntax,
+    ) -> Result<(), NatDefinitionElabError> {
+        self.check_preresolved_syntax_from(syntax, true)
+    }
+
+    fn check_preresolved_syntax_from(
+        &mut self,
+        syntax: &Syntax,
+        specialized: bool,
+    ) -> Result<(), NatDefinitionElabError> {
         use fln_syntax::tree::Preresolved;
-        let mut pending = vec![(syntax, false)];
+        let mut pending = vec![(syntax, specialized)];
         while let Some((syntax, specialized)) = pending.pop() {
             self.tick()?;
             match syntax {

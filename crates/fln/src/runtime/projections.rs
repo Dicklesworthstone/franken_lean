@@ -47,6 +47,17 @@ enum ProjectionFrame {
 }
 
 impl Preparation<'_> {
+    pub(super) fn history_projection_refold(
+        &mut self,
+        index: u64,
+        receiver: &Expr,
+    ) -> Result<Option<Expr>, IngressError> {
+        if let Some(refolded) = self.nat_history_refold(index, receiver)? {
+            return Ok(Some(refolded));
+        }
+        self.list_history_refold(index, receiver)
+    }
+
     /// Unfold an admitted record projection without creating a callable
     /// wrapper around its selected field. Type/index arguments occur only in
     /// metadata; the receiver occurs exactly once and retains its evaluation.
@@ -202,12 +213,12 @@ impl Preparation<'_> {
         }
         let field = if let Some(field) = self.static_projection(family, index, receiver)? {
             field
-        } else if let Some(refolded) = self.nat_history_refold(index, receiver)? {
-            // Index refinement can expose an unfolded Nat course-of-values
+        } else if let Some(refolded) = self.history_projection_refold(index, receiver)? {
+            // Index refinement can expose an unfolded course-of-values
             // scaffold under an existing projection, including a receiver
             // kept verbatim as a static argument (an equality endpoint). Its
             // history component has no runtime layout at any major; refold
-            // the observed component to the `Nat.brecOn` it unfolds.
+            // the observed component to the admitted brecOn it unfolds.
             refolded
         } else {
             return Ok(None);

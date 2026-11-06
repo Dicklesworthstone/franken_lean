@@ -1,12 +1,14 @@
-//! Native ordering for nonrecursive algebraic data, built from checked recursors.
+//! Native ordering for algebraic data, built from checked recursors.
 //!
 //! The pin's Deriving/Ord.lean orders constructors and compares their non-proof
 //! fields lexicographically. Its enum path compares constructor indices through
-//! the active Ord Nat dictionary. Recursive, nested and mutual families need
-//! the pin's partial helpers; they remain refused rather than becoming
-//! transparently reducible through a different logical implementation.
+//! the active Ord Nat dictionary. Recursive families retain the pin's opaque
+//! logical helper and checked Partial executable companion. Recursive calls
+//! stay inside the selected lexicographic branch, so an earlier unequal field
+//! never traverses the remaining children. Nested and mutual families still
+//! require their own mutually recursive dictionaries.
 use super::*;
-use fln_env::constants::{ConstructorVal, RecursorVal};
+use fln_env::constants::{ConstructorVal, OpaqueVal, RecursorVal};
 
 fn typed(context: &mut Context, value: Expr) -> Result<Typed, NatDefinitionElabError> {
     let type_ = context
@@ -208,6 +210,8 @@ fn then(context: &mut Context, first: Typed, next: Typed) -> Result<Typed, NatDe
 struct Minor {
     ordinal: u32,
     fields: Vec<LocalDecl>,
+    recursive: Vec<bool>,
+    binders: Vec<LocalDecl>,
     result: Expr,
 }
 
@@ -234,6 +238,7 @@ fn constructor(
 fn open_minor(
     context: &mut Context,
     constructor: &ConstructorVal,
+    target: &Expr,
     result: &Expr,
     type_: &Expr,
 ) -> Result<Minor, NatDefinitionElabError> {
@@ -245,12 +250,27 @@ fn open_minor(
     for _ in 0..constructor.num_fields {
         fields.push(open_binder(context, &mut cursor)?);
     }
-    // No recursive hypotheses are silently dropped. The caller refuses
-    // recursive families before reaching this nonrecursive telescope.
+    let recursive = context.constructor_recursive_fields(constructor)?;
+    let mut binders = fields.clone();
+    for (field, recursive) in fields.iter().zip(&recursive) {
+        if *recursive {
+            // Immediate recursive children use the partial comparison below.
+            // Consume the checked recursor's hypothesis without evaluating it;
+            // a structural fold would eagerly traverse unused left children.
+            // Function-valued recursion needs a separate field dictionary and
+            // is deliberately outside this immediate-child construction.
+            context.constrain_type(&field.type_, target)?;
+            let hypothesis = open_binder(context, &mut cursor)?;
+            context.constrain_type(&hypothesis.type_, result)?;
+            binders.push(hypothesis);
+        }
+    }
     context.constrain_type(&cursor, result)?;
     Ok(Minor {
         ordinal: constructor.cidx,
         fields,
+        recursive,
+        binders,
         result: cursor,
     })
 }
@@ -327,16 +347,17 @@ fn compare_constructor(
     metadata: &RecursorVal,
     parameters: &[LocalDecl],
     target: &Expr,
-    left: &Minor,
-    right: &LocalDecl,
+    receivers: (&Minor, &LocalDecl),
+    recursive: Option<&LocalDecl>,
 ) -> Result<Typed, NatDefinitionElabError> {
+    let (left, right) = receivers;
     let mut function = recursor(context, family, parameters, target, ordering())?;
     for rule in &metadata.rules {
         context.tick()?;
         let constructor = constructor(context, family, &rule.ctor, rule.nfields)?;
         let type_ = minor_type(context, &function)?;
         let saved = context.txn.lctx.clone();
-        let branch = open_minor(context, &constructor, &ordering(), &type_)?;
+        let branch = open_minor(context, &constructor, target, &ordering(), &type_)?;
         let body = match left.ordinal.cmp(&branch.ordinal) {
             std::cmp::Ordering::Less => context.constant(&named("Ordering.lt"))?,
             std::cmp::Ordering::Greater => context.constant(&named("Ordering.gt"))?,
@@ -355,7 +376,14 @@ fn compare_constructor(
                         .fields
                         .get(index)
                         .ok_or_else(|| unsupported(&family.base.name))?;
-                    comparisons.push(compare(context, value(field), value(rhs))?);
+                    let comparison = if left.recursive[index] {
+                        let recursive = recursive.ok_or_else(|| unsupported(&family.base.name))?;
+                        let function = context.match_apply(value(recursive), value(field))?;
+                        context.match_apply(function, value(rhs))?
+                    } else {
+                        compare(context, value(field), value(rhs))?
+                    };
+                    comparisons.push(comparison);
                 }
                 // The final eq is part of the pin's generated term, including
                 // when the last field's comparison itself remains symbolic.
@@ -367,7 +395,7 @@ fn compare_constructor(
             }
         };
         context.constrain_type(&body.type_, &branch.result)?;
-        let branch = bind(context, body, &branch.fields)?;
+        let branch = bind(context, body, &branch.binders)?;
         function = context.match_apply(function, branch)?;
         context.txn.lctx = saved;
     }
@@ -395,7 +423,7 @@ pub(super) fn elaborate(
     target: &Expr,
 ) -> Result<DerivedInstance, NatDefinitionElabError> {
     check_exposure(context, family)?;
-    if family.is_rec || family.num_indices != 0 || family.all.len() != 1 || family.num_nested != 0 {
+    if family.num_indices != 0 || family.all.len() != 1 || family.num_nested != 0 {
         return Err(unsupported(&family.base.name));
     }
     let recursor_name = Name::str(family.base.name.clone(), "rec");
@@ -422,6 +450,13 @@ pub(super) fn elaborate(
     let class = class_type(context, target)?;
     let instance = context.generated_instance_name(parameters, &class.value)?;
     let helper = Name::str(instance.clone(), "ord");
+    let levels: Vec<_> = family
+        .base
+        .level_params
+        .iter()
+        .cloned()
+        .map(Level::param)
+        .collect();
     let mut header = parameters.to_vec();
     // Deriving.Util.mkHeader retains every type-correct parameter dictionary,
     // including a phantom parameter. The actual fields use these local instances.
@@ -449,9 +484,29 @@ pub(super) fn elaborate(
             Err(error) => return Err(error),
         }
     }
+    // Keep the recursive reference local until its complete executable header
+    // has been closed. Like source partial definitions, no provisional axiom or
+    // unverified recursive constant enters the environment.
+    let logical_scope = context.txn.lctx.clone();
+    let recursive = if family.is_rec {
+        let type_ = Expr::forall_e(
+            named("x"),
+            target.clone(),
+            Expr::forall_e(named("y"), target.clone(), ordering(), BinderInfo::Default),
+            BinderInfo::Default,
+        );
+        Some(local(
+            context,
+            Name::anonymous(),
+            type_,
+            BinderInfo::Default,
+        )?)
+    } else {
+        None
+    };
     let left = local(context, named("x"), target.clone(), BinderInfo::Default)?;
     let right = local(context, named("y"), target.clone(), BinderInfo::Default)?;
-    let body = if enum_type {
+    let mut body = if enum_type {
         // The pin does not hard-code the enum's ordering: a scoped Ord Nat can
         // change the comparison of its constructor indices at derivation time.
         let first = enum_index(context, family, &metadata, target, &left)?;
@@ -470,31 +525,42 @@ pub(super) fn elaborate(
             let constructor = constructor(context, family, &rule.ctor, rule.nfields)?;
             let type_ = minor_type(context, &function)?;
             let saved = context.txn.lctx.clone();
-            let mut branch = open_minor(context, &constructor, &result, &type_)?;
+            let mut branch = open_minor(context, &constructor, target, &result, &type_)?;
             let receiver = open_binder(context, &mut branch.result)?;
             context.constrain_type(&receiver.type_, target)?;
             let body = compare_constructor(
-                context, family, &metadata, parameters, target, &branch, &receiver,
+                context,
+                family,
+                &metadata,
+                parameters,
+                target,
+                (&branch, &receiver),
+                recursive.as_ref(),
             )?;
             context.constrain_type(&body.type_, &branch.result)?;
-            branch.fields.push(receiver);
-            let branch = bind(context, body, &branch.fields)?;
+            branch.binders.push(receiver);
+            let branch = bind(context, body, &branch.binders)?;
             function = context.match_apply(function, branch)?;
             context.txn.lctx = saved;
         }
         let function = context.match_apply(function, value(&left))?;
         context.match_apply(function, value(&right))?
     };
+    let executable = Name::str(helper.clone(), "_unsafe_rec");
+    if let Some(recursive) = recursive {
+        let reference = header.iter().fold(
+            Expr::const_(executable.clone(), levels.clone()),
+            |function, parameter| Expr::app(function, Expr::fvar(parameter.id.clone())),
+        );
+        let abstracted = body
+            .value
+            .abstract_fvar(&recursive.id, 0)
+            .map_err(|_| failure(SourceInferenceError::Scope))?;
+        body.value = context.substitute(&abstracted, &reference)?;
+    }
     let mut helper_header = header.clone();
     helper_header.extend([left, right]);
     let helper_term = close(context, body, &helper_header)?;
-    let levels = family
-        .base
-        .level_params
-        .iter()
-        .cloned()
-        .map(Level::param)
-        .collect();
     let mut helper_call = Typed {
         value: Expr::const_(helper.clone(), levels),
         type_: helper_term.type_.clone(),
@@ -519,11 +585,42 @@ pub(super) fn elaborate(
             all: vec![name],
         })
     };
+    let mut declarations = if family.is_rec {
+        // The ordinary partial-definition witness search cannot see the
+        // recursive marker, and both halves still pass the full council. The
+        // same exact telescope/universes link codegen to this companion while
+        // safe reduction continues to respect the opaque logical interface.
+        context.txn.lctx = logical_scope;
+        let value = context.partial_inhabitant(&helper_term.type_)?;
+        let base = ConstantVal {
+            name: helper.clone(),
+            level_params: family.base.level_params.clone(),
+            type_: helper_term.type_.clone(),
+        };
+        vec![
+            Declaration::Opaque(OpaqueVal {
+                base: base.clone(),
+                value,
+                is_unsafe: false,
+                all: vec![helper],
+            }),
+            Declaration::Mutual(vec![DefinitionVal {
+                base: ConstantVal {
+                    name: executable.clone(),
+                    ..base
+                },
+                value: helper_term.value,
+                hints: ReducibilityHints::Opaque,
+                safety: DefinitionSafety::Partial,
+                all: vec![executable],
+            }]),
+        ]
+    } else {
+        vec![definition(helper, helper_term)]
+    };
+    declarations.push(definition(instance.clone(), instance_term));
     Ok(DerivedInstance {
-        declarations: vec![
-            definition(helper, helper_term),
-            definition(instance.clone(), instance_term),
-        ],
+        declarations,
         instance,
     })
 }

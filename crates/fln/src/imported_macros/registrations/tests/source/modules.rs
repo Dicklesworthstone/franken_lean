@@ -667,6 +667,128 @@ fn mixed_macro_module_checks_forward_templates_through_empty_modules() {
 }
 
 #[test]
+fn mixed_dependent_application_guards_observe_actual_argument_expansions() {
+    let (imported, code) = batches::artifact_import_fixture();
+    let before = imported.engine.logical_root(&KVMap::new());
+    let files = [(
+        "Main",
+        "prelude\nimport SourceLibrary\n\
+         inductive W (P : Nat -> Type) : (n : Nat) -> P n -> Type where\n  | mk (n : Nat) (v : P n) : W P n v\n\
+         section\nlocal macro_rules | `(true) => `(_)\n\
+         def direct : W (fun _ => Bool) 3 Bool.true := W.mk 3 true\n\
+         def tactic : W (fun _ => Bool) 3 Bool.true := by exact W.mk 3 true\n\
+         end\nsection\n\
+         local macro_rules | `(1) => `(5 + 2)\n\
+         local macro_rules | `(2) => `(3)\n\
+         local macro_rules | `(true) => `(_)\n\
+         def chained : W (fun _ => Bool) 3 Bool.true := W.mk 1 true\n\
+         end\n\
+         theorem directChecked : Eq direct (@W.mk (fun _ => Bool) 3 Bool.true) := Eq.refl direct\n\
+         theorem tacticChecked : Eq tactic direct := Eq.refl direct\n\
+         theorem chainedChecked : Eq chained direct := Eq.refl direct",
+    )];
+    let report = check(&imported, &code, &files, MacroTreeLimits::default(), None);
+    let checked = succeeded(&report);
+    assert_eq!(checked.checked.theorems, 3);
+    assert_eq!(
+        report
+            .attempts
+            .iter()
+            .filter(|attempt| attempt.declaration == name("SourceLibrary.right"))
+            .count(),
+        1,
+        "the argument chain runs its admitted artifact macro once"
+    );
+    let repeated = check(&imported, &code, &files, MacroTreeLimits::default(), None);
+    assert_eq!(
+        succeeded(&repeated).checked.result_logical_root,
+        checked.checked.result_logical_root
+    );
+    assert_eq!(repeated.states, report.states);
+    assert_eq!(repeated.completed_vm_usage, report.completed_vm_usage);
+    assert_eq!(imported.engine.logical_root(&KVMap::new()), before);
+}
+
+#[test]
+fn mixed_dependent_application_guards_reject_expanded_rigid_arguments() {
+    use fln_elab::{NatDefinitionElabError, source::SourceInferenceError};
+
+    let (imported, code) = batches::artifact_import_fixture();
+    let before = imported.engine.logical_root(&KVMap::new());
+    for body in ["W.mk 3 magic", "by exact W.mk 3 magic"] {
+        let source = format!(
+            "prelude\nimport SourceLibrary\n\
+             inductive W (P : Nat -> Type) : (n : Nat) -> P n -> Type where\n  | mk (n : Nat) (v : P n) : W P n v\n\
+             macro_rules | `(magic) => `(true)\n\
+             def rejected : W (fun _ => Bool) 3 Bool.true := {body}"
+        );
+        let report = check(
+            &imported,
+            &code,
+            &[("Main", source.as_str())],
+            MacroTreeLimits::default(),
+            None,
+        );
+        let Outcome::Complete(Err(SourceModuleCheckError::Source {
+            module,
+            error: SourceCheckError::Command { error, .. },
+        })) = &report.outcome
+        else {
+            panic!("expanded dependent argument bypassed the guard: {report:?}")
+        };
+        assert_eq!(module, &name("Main"));
+        assert!(
+            matches!(
+                error.as_ref(),
+                crate::EngineExecutionError::Frontend(
+                    crate::NatDefinitionFrontendError::Elaborate(
+                        NatDefinitionElabError::Inference(
+                            SourceInferenceError::TypeMismatch { .. }
+                        )
+                    )
+                )
+            ),
+            "{body}: {error:?}"
+        );
+        assert!(!report.attempts.is_empty());
+        assert!(report.states.is_none());
+        assert_eq!(imported.engine.logical_root(&KVMap::new()), before);
+        assert!(!imported.engine.environment().contains(&name("rejected")));
+    }
+}
+
+#[test]
+fn mixed_dependent_application_guard_failures_allow_tactic_backtracking() {
+    let (imported, code) = batches::artifact_import_fixture();
+    let files = [(
+        "Main",
+        "prelude\nimport SourceLibrary\n\
+         inductive W (P : Nat -> Type) : (n : Nat) -> P n -> Type where\n  | mk (n : Nat) (v : P n) : W P n v\n\
+         section\nlocal macro_rules | `(magic) => `(true)\n\
+         def recovered : W (fun _ => Bool) 3 Bool.true := by\n  first\n  | exact W.mk 3 magic\n  | exact W.mk (P := fun _ => Bool) 3 Bool.true\n\
+         end\n\
+         theorem recoveredChecked : Eq recovered (@W.mk (fun _ => Bool) 3 Bool.true) := Eq.refl recovered",
+    )];
+    let report = check(&imported, &code, &files, MacroTreeLimits::default(), None);
+    let checked = succeeded(&report);
+    assert_eq!(checked.checked.theorems, 1);
+    assert!(
+        report
+            .attempts
+            .iter()
+            .any(|attempt| attempt.declaration.parent() == name("_fln.sourceTemplate.ident")),
+        "the failed tactic candidate retains its macro work"
+    );
+    let repeated = check(&imported, &code, &files, MacroTreeLimits::default(), None);
+    assert_eq!(
+        succeeded(&repeated).checked.result_logical_root,
+        checked.checked.result_logical_root
+    );
+    assert_eq!(repeated.states, report.states);
+    assert_eq!(repeated.attempts.len(), report.attempts.len());
+}
+
+#[test]
 fn mixed_program_grammar_declarations_do_not_bypass_active_atomic_macros() {
     let (imported, code) = batches::artifact_import_fixture_with_extra_rows(&[(
         "ident",

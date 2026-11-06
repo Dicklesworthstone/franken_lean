@@ -310,6 +310,21 @@ struct ExpansionContext<'a> {
 }
 
 impl RegisteredMacros {
+    /// A registry with no imported macro registrations.
+    ///
+    /// Source-checking sessions can still register their own quoted templates.
+    pub fn empty() -> Self {
+        let global = Arc::new(BTreeMap::new());
+        Self {
+            candidates: global.clone(),
+            global,
+            scoped: Arc::new(BTreeMap::new()),
+            active_scopes: BTreeSet::new(),
+            modules: Arc::new(BTreeMap::new()),
+            owners: Arc::new(BTreeMap::new()),
+        }
+    }
+
     /// Prepare a supplied registration subset in actual dependency-first import
     /// order. Dependencies absent from this subset contribute no registrations;
     /// dependencies present in it must precede their consumers. This does not

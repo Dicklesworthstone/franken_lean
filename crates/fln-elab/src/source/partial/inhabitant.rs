@@ -6,7 +6,7 @@ use super::*;
 impl Context {
     /// Synthesize WITHOUT the recursive local. Only the closed candidate and
     /// spent work escape this search; its providers and trial assignments do not.
-    pub(super) fn partial_inhabitant(
+    pub(in crate::source) fn partial_inhabitant(
         &mut self,
         type_: &Expr,
     ) -> Result<Expr, NatDefinitionElabError> {

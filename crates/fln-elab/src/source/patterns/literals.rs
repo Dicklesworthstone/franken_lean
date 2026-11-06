@@ -23,63 +23,113 @@ fn literal_kind(kind: &Name) -> bool {
         .any(|literal| *kind == Name::from_components([*literal]))
 }
 
+fn pattern_macro_depth(depth: usize) -> Result<usize, NatDefinitionElabError> {
+    depth.checked_add(1).ok_or_else(|| {
+        tactics::imported_macros::macro_error(TacticMacroError::Inconclusive(Box::new(
+            fln_core::outcome::Inconclusive::dependency_unavailable(
+                "pattern macro recursion depth overflow",
+            ),
+        )))
+    })
+}
+
 pub(super) struct LiteralPattern<'a> {
     value: Value,
     syntax: Cow<'a, Syntax>,
 }
 
-impl LiteralPattern<'_> {
-    pub(super) fn expanded_syntax(&self) -> Option<&Syntax> {
-        match &self.syntax {
-            Cow::Owned(syntax) => Some(syntax),
-            Cow::Borrowed(_) => None,
-        }
-    }
-}
-
 impl Context {
+    /// Expand deferred literals before classifying any pattern in the row.
+    /// `Term.expandMacrosInPatterns` uses `Lean.expandMacros`: macro results
+    /// may be arbitrary pattern syntax, nodes expand before their children,
+    /// and identifier leaves (including pattern binders) are never dispatched.
+    /// Original compound nodes already passed through the source expansion
+    /// pass; only generated compound nodes need that work again.
+    pub(super) fn expand_pattern_macros<'a>(
+        &mut self,
+        syntax: &'a Syntax,
+    ) -> Result<Cow<'a, Syntax>, NatDefinitionElabError> {
+        let Some(provider) = self.source_scope.tactic_macros.clone() else {
+            return Ok(Cow::Borrowed(syntax));
+        };
+        enum Task {
+            Visit(Syntax, usize, bool),
+            Finish(Syntax, usize),
+        }
+        let mut pending = vec![Task::Visit(
+            self.copy_pattern_syntax(syntax)?,
+            self.tactic_macro_depth,
+            false,
+        )];
+        let mut built = Vec::new();
+        let tactic = parser_kind(&["Term", "byTactic"]);
+        while let Some(task) = pending.pop() {
+            self.tick()?;
+            match task {
+                Task::Finish(mut node, start) => {
+                    let Syntax::Node { args, .. } = &mut node else {
+                        unreachable!("only pattern nodes have finish tasks");
+                    };
+                    *args = built.split_off(start);
+                    built.push(node);
+                }
+                Task::Visit(mut node, depth, generated) => {
+                    let Some(kind) = node.kind() else {
+                        built.push(node);
+                        continue;
+                    };
+                    if *kind == tactic {
+                        built.push(node);
+                        continue;
+                    }
+                    if (generated || literal_kind(kind))
+                        && let Some(expanded) = provider
+                            .0
+                            .expand_term(&node, depth, &self.txn.env, &self.source_scope)
+                            .map_err(tactics::imported_macros::macro_error)?
+                    {
+                        pending.push(Task::Visit(expanded, pattern_macro_depth(depth)?, true));
+                        continue;
+                    }
+                    // A quotation may introduce native list/tuple notation
+                    // after the ordinary source lowering pass has visited it.
+                    // Reuse that lowering; it only constructs source syntax.
+                    if generated && collections::is_notation(&node) {
+                        pending.push(Task::Visit(
+                            self.expand_collection_node(node, true)?,
+                            pattern_macro_depth(depth)?,
+                            true,
+                        ));
+                        continue;
+                    }
+                    let Syntax::Node { args, .. } = &mut node else {
+                        built.push(node);
+                        continue;
+                    };
+                    let children = std::mem::take(args);
+                    let child_depth = if generated {
+                        pattern_macro_depth(depth)?
+                    } else {
+                        depth
+                    };
+                    pending.push(Task::Finish(node, built.len()));
+                    pending.extend(
+                        children
+                            .into_iter()
+                            .rev()
+                            .map(|child| Task::Visit(child, child_depth, generated)),
+                    );
+                }
+            }
+        }
+        Ok(Cow::Owned(built.pop().ok_or_else(invalid)?))
+    }
+
     pub(super) fn decode_pattern_literal<'a>(
         &mut self,
         syntax: &'a Syntax,
     ) -> Result<Option<LiteralPattern<'a>>, NatDefinitionElabError> {
-        // Match.expandMacrosInPatterns expands literal nodes before pattern
-        // decoding, while leaving identifier pattern binders alone. The source
-        // pass defers these atoms, so use the same owned provider, Macro.State
-        // and budgets as term visits. Matrix storage owns any replacement.
-        let mut syntax = Cow::Borrowed(syntax);
-        if let Some(provider) = self.source_scope.tactic_macros.clone() {
-            if !syntax.kind().is_some_and(literal_kind) {
-                return Ok(None);
-            }
-            let mut depth = self.tactic_macro_depth;
-            loop {
-                self.tick()?;
-                let Some(expanded) = provider
-                    .0
-                    .expand_term(syntax.as_ref(), depth, &self.txn.env, &self.source_scope)
-                    .map_err(tactics::imported_macros::macro_error)?
-                else {
-                    break;
-                };
-                if !expanded.kind().is_some_and(literal_kind) {
-                    return Err(tactics::imported_macros::macro_error(
-                        TacticMacroError::Unsupported(
-                            "literal macros producing nonliteral patterns require general pattern expansion"
-                                .into(),
-                        ),
-                    ));
-                }
-                syntax = Cow::Owned(expanded);
-                depth = depth.checked_add(1).ok_or_else(|| {
-                    tactics::imported_macros::macro_error(TacticMacroError::Inconclusive(Box::new(
-                        fln_core::outcome::Inconclusive::dependency_unavailable(
-                            "pattern macro recursion depth overflow",
-                        ),
-                    )))
-                })?;
-            }
-        }
-        let Syntax::Node { kind, args, .. } = syntax.as_ref() else {
+        let Syntax::Node { kind, args, .. } = syntax else {
             return Ok(None);
         };
         let natural = kind == &Name::from_components(["num"]);
@@ -108,7 +158,10 @@ impl Context {
         } else {
             Value::Char(super::super::character::decode_character(val)?)
         };
-        Ok(Some(LiteralPattern { value, syntax }))
+        Ok(Some(LiteralPattern {
+            value,
+            syntax: Cow::Borrowed(syntax),
+        }))
     }
 
     fn same_pattern_literal(

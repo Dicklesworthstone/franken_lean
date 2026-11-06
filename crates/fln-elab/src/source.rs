@@ -667,6 +667,9 @@ struct Context {
     tactic_macro_depth: usize,
     // Term macro dispatch is active inside by proofs, including native tactics.
     tactic_macro_terms: usize,
+    // Rejection-model checks observe actual macro expansions without executing
+    // providers ahead of the ordinary term worklist or retaining borrowed trees.
+    application_syntax: pattern_typing::ApplicationSyntax,
     // Opaque assertions remain parameter assumptions until their continuations
     // have been checked. Visibility comes from lctx, including after rollback.
     opaque_locals: std::collections::HashSet<FVarId>,
@@ -885,6 +888,7 @@ impl Context {
             attempt_depth: 0,
             tactic_macro_depth: 0,
             tactic_macro_terms: 0,
+            application_syntax: pattern_typing::ApplicationSyntax::default(),
             opaque_locals: std::collections::HashSet::new(),
             deferred_local_functions: Vec::new(),
             local_function_lifting: local_functions::lifting::Lifting::default(),
@@ -2114,12 +2118,25 @@ impl Context {
         // An application whose argument the pin postpones and then refuses (`pattern_typing`,
         // R1 of franken_lean-z8j.1.6.3).
         self.check_preresolved_syntax(syntax)?;
-        if let Some(expected) = &expected {
-            self.check_application_typing(syntax, expected)?;
-        }
-        let syntax = self.lower_pattern_matrices(syntax)?;
-        self.block_root_implicit_lambda = !implicit_lambda;
-        let result = self.term_prepared(&syntax, expected);
+        let observations = self.application_syntax.depth();
+        let result = (|| {
+            let check = expected
+                .as_ref()
+                .map(|expected| self.begin_application_typing(syntax, expected))
+                .transpose()?
+                .flatten();
+            let syntax = self.lower_pattern_matrices(syntax)?;
+            if let Some(check) = &check {
+                self.bind_application_typing(&syntax, check)?;
+            }
+            self.block_root_implicit_lambda = !implicit_lambda;
+            let term = self.term_prepared(&syntax, expected)?;
+            if let Some(check) = check {
+                self.finish_application_typing(&syntax, check)?;
+            }
+            Ok(term)
+        })();
+        self.application_syntax.truncate(observations);
         self.block_root_implicit_lambda = false;
         result
     }
@@ -2174,6 +2191,28 @@ impl Context {
     }
 
     fn term_prepared_scoped<'a>(
+        &mut self,
+        syntax: &'a Syntax,
+        expected: Option<Expr>,
+        initial_proof: Option<tactics::ProofState<'a>>,
+        initial_field: Option<record_terms::FieldApplication<'a>>,
+        initial_finish: bool,
+    ) -> Result<TermResult, NatDefinitionElabError> {
+        let observations = self.application_syntax.depth();
+        let result = self.term_prepared_scoped_inner(
+            syntax,
+            expected,
+            initial_proof,
+            initial_field,
+            initial_finish,
+        );
+        // A failed proof alternative or suspended argument can abandon a
+        // queued check. Its syntax identities expire with this worklist.
+        self.application_syntax.truncate(observations);
+        result
+    }
+
+    fn term_prepared_scoped_inner<'a>(
         &mut self,
         syntax: &'a Syntax,
         expected: Option<Expr>,
@@ -2239,6 +2278,7 @@ impl Context {
         enum Task<'a> {
             RestoreOptions(KVMap),
             RestoreMacroTerms(usize),
+            ApplicationTyping(&'a Syntax, pattern_typing::ApplicationCheck),
             DoJoinValue(Name, &'a Syntax, Option<Expr>),
             DoBindJoinStart(Name, &'a Syntax, &'a Syntax, Expr, bool),
             DoBindJoinBody(LocalContext, FVarId, Name, &'a Syntax, Expr),
@@ -2409,6 +2449,7 @@ impl Context {
                                 | Task::ProofTerm(..)
                                 | Task::MatchTerm(..)
                                 | Task::RefineTerm(..)
+                                | Task::ApplicationTyping(..)
                         )
                     ) || matches!(tasks.last(), Some(Task::ConditionalBranch(state))
                         if state.closes_scope());
@@ -2489,6 +2530,7 @@ impl Context {
                             | Task::ProofTerm(..)
                             | Task::MatchTerm(..)
                             | Task::RefineTerm(..)
+                            | Task::ApplicationTyping(..)
                     ) || matches!(&task, Task::ConditionalBranch(state) if state.closes_scope())
                     {
                         // Every still-unresolved argument keeps its original
@@ -2498,6 +2540,9 @@ impl Context {
                     }
                     match task {
                         Task::RestoreOptions(options) => self.txn.options = options,
+                        Task::ApplicationTyping(syntax, check) => {
+                            self.finish_application_typing(syntax, check)?;
+                        }
                         Task::DoPureValue(expected) => {
                             let argument = values.pop().expect("do return value visit");
                             let monad = match &expected {
@@ -4071,8 +4116,11 @@ impl Context {
                                     self.constrain(&proxy, &expected)?;
                                     expected = proxy;
                                 }
-                                self.check_application_typing(syntax, &expected)?;
+                                let check = self.begin_application_typing(syntax, &expected)?;
                                 tasks.push(Task::MatchTerm(proof, goal));
+                                if let Some(check) = check {
+                                    tasks.push(Task::ApplicationTyping(syntax, check));
+                                }
                                 tasks.push(Task::Visit(syntax, Some(expected), true));
                             }
                             tactics::ProofAction::Term {
@@ -4088,9 +4136,11 @@ impl Context {
                                 self.txn.lctx = goal.lctx.clone();
                                 // `exact e` elaborates `e` against the goal, as a definition
                                 // body against its type (`pattern_typing`, R1).
-                                if let Some(target) = &expected {
-                                    self.check_application_typing(syntax, target)?;
-                                }
+                                let check = expected
+                                    .as_ref()
+                                    .map(|target| self.begin_application_typing(syntax, target))
+                                    .transpose()?
+                                    .flatten();
                                 // Written arguments can insert implicit dictionaries
                                 // before apply starts opening the remaining telescope.
                                 let instance_start = apply.then_some(self.instance_goals.len());
@@ -4102,6 +4152,9 @@ impl Context {
                                     instance_start,
                                     refinement_depth,
                                 ));
+                                if let Some(check) = check {
+                                    tasks.push(Task::ApplicationTyping(syntax, check));
+                                }
                                 tasks.push(if no_implicit_lambda && expected.is_some() {
                                     Task::VisitWithoutImplicitLambda(syntax, expected)
                                 } else {

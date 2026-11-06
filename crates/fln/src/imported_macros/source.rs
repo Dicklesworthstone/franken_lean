@@ -17,7 +17,8 @@
 //! provider at actual term and literal-pattern visits, preserving declaration
 //! and binder names, universe levels and projection indices. Generated terms
 //! and tactic expansions use that same provider. Literal-pattern replacements
-//! that require a different pattern shape retain an explicit capability boundary.
+//! enter the ordinary constructor/record pattern compiler, with one retained
+//! expansion shared by decision lowering and pattern-typing checks.
 //! Standalone APIs and borrowed lookup/cancellation overrides retain an
 //! explicit refusal at these boundaries rather than extending borrowed
 //! authority lifetimes.
@@ -1100,17 +1101,19 @@ impl Engine {
     /// join the same candidate registry, including its callback and tactic
     /// boundaries. Current-file registrations on an imported kind merge by
     /// registration and scoped-activation chronology. Atomic templates dispatch
-    /// at native term and literal-pattern visits; a literal pattern rewritten
-    /// to a nonliteral shape retains an explicit refusal. Dependent application
-    /// prechecks still lack observations of deferred atomic argument expansions
-    /// and may refuse such applications before their term visits.
-    /// Borrowed lookup/cancellation
-    /// sessions without an owned provider and independently imported native/
-    /// artifact chains without a shared order retain explicit capability
-    /// refusals. Persistent mixed-override exports
-    /// also require that shared import order; local overrides can publish their
-    /// checked declarations. Artifact parser installation and module-system
-    /// visibility remain separate capabilities.
+    /// at native term and literal-pattern visits; generated constructor, record
+    /// and collection patterns use the ordinary checked pattern compiler.
+    /// Generated pattern identifiers with pre-resolved names require matching
+    /// anchored spellings; mixed quotation templates can use explicit `_root_`
+    /// names to retain their definition-site constructors.
+    /// Dependent application guards observe actual argument expansions and
+    /// check the resulting syntax in the original typing context without
+    /// executing macros again. Borrowed lookup/cancellation sessions without an
+    /// owned provider and independently imported native/artifact chains without
+    /// a shared order retain explicit capability refusals. Persistent mixed
+    /// override exports also require that shared import order; local overrides
+    /// can publish their checked declarations. Artifact parser installation and
+    /// module-system visibility remain separate capabilities.
     pub fn check_source_files_with_imported_macros(
         &self,
         sources: &[&[u8]],

@@ -1556,29 +1556,200 @@ fn mixed_atomic_generated_terms_share_macro_state_and_resource_limits() {
 }
 
 #[test]
-fn mixed_atomic_patterns_refuse_nonliteral_replacements_without_publishing_a_prefix() {
+fn mixed_atomic_patterns_compile_constructor_replacements_and_generated_children() {
     let (engine, registry) = artifact_fixture();
     let before = engine.logical_root(&KVMap::new());
     let report = batch(
         &engine,
         &registry,
-        &[b"def checkedPrefix : Nat := 5 + 7\n\
-            macro_rules | `(1) => `(Nat.succ Nat.zero)\n\
-            def unsupported : Nat -> Nat | 1 => 7 | _ => 0"],
+        &[br#"
+def magic : Nat := 3
+section
+local macro_rules | `(1) => `(_root_.Nat.succ _root_.Nat.zero)
+local macro_rules | `(2) => `(_root_.Nat.succ 1)
+local macro_rules | `(magic) => `(7)
+def choose : Nat -> Nat
+  | 1 => 41
+  | 2 => 42
+  | magic => magic
+end
+def first : Nat := choose 1
+def second : Nat := choose 2
+def fallback : Nat := choose 8
+theorem firstChecked : Eq first 41 := Eq.refl first
+theorem secondChecked : Eq second 42 := Eq.refl second
+theorem fallbackChecked : Eq fallback 7 := Eq.refl fallback
+"#],
         MacroTreeLimits::default(),
         None,
     );
-    assert!(
-        matches!(report.outcome, Outcome::Complete(Err(_))),
-        "{report:?}"
-    );
-    assert!(
-        format!("{:?}", report.outcome).contains("nonliteral patterns"),
-        "{report:?}"
-    );
-    assert!(report.state.is_none());
+    let checked = succeeded(&report);
+    for (declaration, value) in [("first", 41), ("second", 42), ("fallback", 7)] {
+        assert_declared_value(&checked.engine, declaration, value);
+    }
     assert_eq!(engine.logical_root(&KVMap::new()), before);
-    assert!(!engine.environment().contains(&name("checkedPrefix")));
+}
+
+#[test]
+fn mixed_atomic_patterns_compile_records_and_named_constructor_fields() {
+    let (engine, registry) = artifact_fixture();
+    let report = batch(
+        &engine,
+        &registry,
+        &[br#"
+structure PatternBox where
+  value : Nat
+  tag : Nat
+inductive PatternChoice where
+  | left (value : Nat)
+  | right
+section
+local macro_rules | `('a') => `({ value := _root_.Nat.zero, tag := _ })
+local macro_rules | `("left") => `(_root_.PatternChoice.left (value := _root_.Nat.zero))
+local macro_rules | `("yes") => `(_root_.Bool.true)
+def recordChoice : PatternBox -> Nat
+  | 'a' => 41
+  | _ => 42
+def namedChoice : PatternChoice -> Nat
+  | "left" => 43
+  | _ => 44
+def boolChoice : Bool -> Nat
+  | "yes" => 45
+  | false => 46
+end
+def recordHit : Nat := recordChoice { value := 0, tag := 5 }
+def recordMiss : Nat := recordChoice { value := 1, tag := 5 }
+def namedHit : Nat := namedChoice (.left 0)
+def namedMiss : Nat := namedChoice (.left 2)
+def boolHit : Nat := boolChoice true
+def boolMiss : Nat := boolChoice false
+"#],
+        MacroTreeLimits::default(),
+        None,
+    );
+    let checked = succeeded(&report);
+    for (declaration, value) in [
+        ("recordHit", 41),
+        ("recordMiss", 42),
+        ("namedHit", 43),
+        ("namedMiss", 44),
+        ("boolHit", 45),
+        ("boolMiss", 46),
+    ] {
+        assert_declared_value(&checked.engine, declaration, value);
+    }
+}
+
+#[test]
+fn mixed_atomic_constructor_patterns_replay_from_native_module_journals() {
+    let (imported, code) = artifact_import_fixture();
+    let before = imported.engine.logical_root(&KVMap::new());
+    let report = super::modules::check(
+        &imported,
+        &code,
+        &[
+            (
+                "Lib",
+                "prelude\nimport SourceLibrary\n\
+                 macro_rules | `(1) => `(_root_.Nat.succ _root_.Nat.zero)\n\
+                 def libraryChoice : Nat -> Nat | 1 => 42 | _ => 0",
+            ),
+            (
+                "Main",
+                "prelude\nimport Lib\n\
+                 def clientChoice : Nat -> Nat | 1 => 43 | _ => 0\n\
+                 def libraryHit : Nat := libraryChoice (Nat.succ Nat.zero)\n\
+                 def clientHit : Nat := clientChoice (Nat.succ Nat.zero)\n\
+                 theorem checkedLibrary : Eq libraryHit 42 := Eq.refl libraryHit\n\
+                 theorem checkedClient : Eq clientHit 43 := Eq.refl clientHit",
+            ),
+        ],
+        MacroTreeLimits::default(),
+        None,
+    );
+    let checked = super::modules::succeeded(&report);
+    assert_declared_value(&checked.checked.engine, "libraryHit", 42);
+    assert_declared_value(&checked.checked.engine, "clientHit", 43);
+    assert_eq!(imported.engine.logical_root(&KVMap::new()), before);
+}
+
+#[test]
+fn mixed_atomic_generated_pattern_trees_share_the_batch_budget_and_recover() {
+    let (engine, registry) = artifact_fixture();
+    let before = engine.logical_root(&KVMap::new());
+    let source = br#"
+def checkedPrefix : Nat := 5 + 7
+macro_rules | `(1) => `(_root_.Nat.succ (_root_.Nat.succ _root_.Nat.zero))
+def choose : Nat -> Nat | 1 => 42 | _ => 0
+def result : Nat := choose (Nat.succ (Nat.succ Nat.zero))
+"#;
+    let report = batch(
+        &engine,
+        &registry,
+        &[source],
+        MacroTreeLimits::default(),
+        None,
+    );
+    assert_declared_value(&succeeded(&report).engine, "result", 42);
+    assert!(report.completed_vm_usage.steps > 0, "{report:?}");
+    let mut exact = MacroTreeLimits::default();
+    exact.dispatch.max_attempts = report.attempts.len() as u64;
+    exact.dispatch.execution.vm.max_steps = report.completed_vm_usage.steps;
+    exact.max_visits = report.tree_usage.visits;
+    exact.generation.max_nodes = report.tree_usage.generated_nodes;
+    exact.generation.max_bytes = report.tree_usage.generated_bytes;
+    for resource in ["attempts", "steps", "visits", "nodes", "bytes"] {
+        let mut limits = exact;
+        match resource {
+            "attempts" => limits.dispatch.max_attempts -= 1,
+            "steps" => limits.dispatch.execution.vm.max_steps -= 1,
+            "visits" => limits.max_visits -= 1,
+            "nodes" => limits.generation.max_nodes -= 1,
+            "bytes" => limits.generation.max_bytes -= 1,
+            _ => unreachable!(),
+        }
+        let stopped = batch(&engine, &registry, &[source], limits, None);
+        assert!(
+            matches!(stopped.outcome, Outcome::Inconclusive(_)),
+            "{resource}: {stopped:?}"
+        );
+        assert!(stopped.state.is_none());
+        assert_eq!(engine.logical_root(&KVMap::new()), before);
+        assert!(!engine.environment().contains(&name("checkedPrefix")));
+    }
+    let recovered = batch(&engine, &registry, &[source], exact, None);
+    assert_eq!(recovered.state, report.state);
+    assert_eq!(
+        succeeded(&recovered).result_logical_root,
+        succeeded(&report).result_logical_root
+    );
+}
+
+#[test]
+fn mixed_atomic_patterns_reject_invalid_generated_patterns_without_publishing_a_prefix() {
+    let (engine, registry) = artifact_fixture();
+    let before = engine.logical_root(&KVMap::new());
+    for replacement in ["Nat.add Nat.zero Nat.zero", "Bool.true", "fun x => x"] {
+        let source = format!(
+            "def checkedPrefix : Nat := 5 + 7\n\
+             macro_rules | `(1) => `({replacement})\n\
+             def invalid : Nat -> Nat | 1 => 7 | _ => 0"
+        );
+        let report = batch(
+            &engine,
+            &registry,
+            &[source.as_bytes()],
+            MacroTreeLimits::default(),
+            None,
+        );
+        assert!(
+            matches!(report.outcome, Outcome::Complete(Err(_))),
+            "{replacement}: {report:?}"
+        );
+        assert!(report.state.is_none());
+        assert_eq!(engine.logical_root(&KVMap::new()), before);
+        assert!(!engine.environment().contains(&name("checkedPrefix")));
+    }
 }
 
 #[test]

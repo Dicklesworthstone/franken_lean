@@ -17,6 +17,7 @@ struct Templates {
     scopes: AtomicU64,
     calls: AtomicU64,
     depths: Mutex<Vec<(String, usize)>>,
+    expansions: Mutex<Vec<String>>,
 }
 
 impl Templates {
@@ -57,6 +58,7 @@ impl Templates {
                 scopes: AtomicU64::new(100),
                 calls: AtomicU64::new(0),
                 depths: Mutex::new(Vec::new()),
+                expansions: Mutex::new(Vec::new()),
             }),
             grammar.grammar(),
         )
@@ -129,13 +131,26 @@ impl TacticMacroExpander for Templates {
                 Inconclusive::dependency_unavailable("test template attempt bound"),
             )));
         }
-        rule.expand_root(
-            syntax,
-            &Name::from_components(["Main"]),
-            self.scopes.fetch_add(1, Ordering::Relaxed),
-            syntax.info(),
-        )
-        .map_err(|error| TacticMacroError::Unsupported(format!("{error:?}")))
+        let expanded = rule
+            .expand_root(
+                syntax,
+                &Name::from_components(["Main"]),
+                self.scopes.fetch_add(1, Ordering::Relaxed),
+                syntax.info(),
+            )
+            .map_err(|error| TacticMacroError::Unsupported(format!("{error:?}")))?;
+        if expanded.is_some() {
+            let input = match syntax {
+                Syntax::Ident { val, .. } => val.erase_macro_scopes().to_display_string(),
+                Syntax::Node { kind, args, .. } => match args.as_slice() {
+                    [Syntax::Atom { val, .. }] => val.clone(),
+                    _ => kind.to_display_string(),
+                },
+                _ => unreachable!("term provider selects only node or identifier rules"),
+            };
+            self.expansions.lock().unwrap().push(input);
+        }
+        Ok(expanded)
     }
 }
 
@@ -412,14 +427,34 @@ fn expanded_literal_patterns_reach_dependent_index_typing_checks() {
 
 #[test]
 fn atomic_pattern_shape_changes_and_loops_never_use_the_original_literal() {
-    let error = checked(
+    let environment = environment();
+    let declaration = checked_in(
         "def pattern (n : Nat) : Nat := match n with | 1 => 7 | _ => 0",
-        Templates::new(&["macro_rules | `(1) => `(Nat.succ Nat.zero)"]),
+        Templates::new(&["macro_rules | `(1) => `(Nat.succ (Nat.succ Nat.zero))"]),
+        &environment,
     )
-    .unwrap_err();
-    assert!(matches!(error,
-        NatDefinitionElabError::Inference(SourceInferenceError::TacticMacro(TacticMacroError::Unsupported(message)))
-            if message.contains("nonliteral patterns")));
+    .unwrap();
+    let environment = publish(&environment, declaration);
+    for source in [
+        "theorem replacementMatches : Eq (pattern 2) 7 := Eq.refl 7",
+        "theorem originalDoesNotMatch : Eq (pattern 1) 0 := Eq.refl 0",
+    ] {
+        checked_in(source, Templates::new(&[]), &environment)
+            .unwrap_or_else(|error| panic!("{source}: {error:?}"));
+    }
+    for rule in [
+        "macro_rules | `(1) => `(Bool.true)",
+        "macro_rules | `(1) => `(Nat.add)",
+    ] {
+        assert!(
+            checked(
+                "def invalidPattern (n : Nat) : Nat := match n with | 1 => 7 | _ => 0",
+                Templates::new(&[rule]),
+            )
+            .is_err(),
+            "a generated pattern must still have the subject's constructor type: {rule}"
+        );
+    }
     for source in [
         "def termLoop : Nat := 1",
         "def patternLoop (n : Nat) : Nat := match n with | 1 => 7 | _ => 0",
@@ -432,4 +467,131 @@ fn atomic_pattern_shape_changes_and_loops_never_use_the_original_literal() {
             ))
         ));
     }
+}
+
+fn dependent_application_environment() -> Environment {
+    let environment = environment();
+    let parsed = fln_parse::parse_definition(
+        b"inductive W (P : Nat -> Type) : (n : Nat) -> P n -> Type where\n  | mk (n : Nat) (v : P n) : W P n v",
+    )
+    .unwrap();
+    let declaration = fln_elab::source::scope::elaborate_inductive(
+        parsed.syntax(),
+        &environment,
+        budget(),
+        RecordBudget::default(),
+        &SourceScope::default(),
+    )
+    .unwrap();
+    publish(&environment, declaration)
+}
+
+#[test]
+fn dependent_application_typing_uses_the_actual_atomic_expansion_once() {
+    let environment = dependent_application_environment();
+    for source in [
+        "def inferred : W (fun _ => Bool) 3 Bool.true := W.mk 3 true",
+        "def inferred : W (fun _ => Bool) 3 Bool.true := by exact W.mk 3 true",
+        "def inferred (b : Bool) : W (fun _ => Bool) 3 Bool.true := match b with | true => W.mk 3 true | false => W.mk 3 true",
+    ] {
+        let provider = Templates::new(&["macro_rules | `(true) => `(_)"]);
+        checked_in(source, provider.clone(), &environment)
+            .unwrap_or_else(|error| panic!("{source}: {error:?}"));
+        let expansions = provider.expansions.lock().unwrap();
+        let expected = if source.contains("match b") { 2 } else { 1 };
+        assert_eq!(
+            expansions.iter().filter(|input| *input == "true").count(),
+            expected,
+            "the guard must not expand arguments speculatively or replay the provider"
+        );
+    }
+}
+
+#[test]
+fn dependent_application_typing_keeps_rejections_after_macro_observation() {
+    let environment = dependent_application_environment();
+    for (rule, body) in [
+        ("macro_rules | `(unrelated) => `(_)", "W.mk 3 true"),
+        ("macro_rules | `(unrelated) => `(_)", "W.mk 3 Bool.true"),
+        (
+            "macro_rules | `(unrelated) => `(_)",
+            "W.mk 3 _root_.Bool.true",
+        ),
+        ("macro_rules | `(magic) => `(true)", "W.mk 3 magic"),
+        ("macro_rules | `(magic) => `(true)", "by exact W.mk 3 magic"),
+        (
+            "macro_rules | `(magic) => `(_root_.Bool.true)",
+            "W.mk 3 magic",
+        ),
+        ("macro_rules | `(magic) => `((true : Bool))", "W.mk 3 magic"),
+    ] {
+        let source = format!("def rejected : W (fun _ => Bool) 3 Bool.true := {body}");
+        let error = checked_in(&source, Templates::new(&[rule]), &environment).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                NatDefinitionElabError::Inference(SourceInferenceError::TypeMismatch { .. })
+            ),
+            "{source}: {error:?}"
+        );
+    }
+    let error = checked_in(
+        "def rejected : W (fun _ => Bool) 3 Bool.true := W.mk 3 magic",
+        Templates::new(&["macro_rules | `(magic) => `(\"wrong type\")"]),
+        &environment,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(error, NatDefinitionElabError::Inference(_)),
+        "an observed expansion never manufactures an expected-type value: {error:?}"
+    );
+}
+
+#[test]
+fn dependent_application_macro_observations_follow_chains_and_tactic_rollback() {
+    let environment = dependent_application_environment();
+    let provider = Templates::new(&[
+        "macro_rules | `(true) => `(intermediate)",
+        "macro_rules | `(intermediate) => `(_)",
+    ]);
+    checked_in(
+        "def inferred : W (fun _ => Bool) 3 Bool.true := W.mk 3 true",
+        provider.clone(),
+        &environment,
+    )
+    .unwrap();
+    assert_eq!(
+        *provider.expansions.lock().unwrap(),
+        ["true", "intermediate"],
+        "nested observations must collapse without rerunning a macro"
+    );
+
+    let provider = Templates::new(&[
+        "macro_rules | `(1) => `(3)",
+        "macro_rules | `(true) => `(_)",
+    ]);
+    checked_in(
+        "def ordered : W (fun _ => Bool) 3 Bool.true := W.mk 1 true",
+        provider.clone(),
+        &environment,
+    )
+    .unwrap();
+    assert_eq!(
+        *provider.expansions.lock().unwrap(),
+        ["1", "true"],
+        "only the actual left-to-right argument visits may advance macro state"
+    );
+
+    let provider = Templates::new(&["macro_rules | `(magic) => `(true)"]);
+    checked_in(
+        "def recovered : W (fun _ => Bool) 3 Bool.true := by first | exact W.mk 3 magic | exact W.mk (P := fun _ => Bool) 3 Bool.true",
+        provider.clone(),
+        &environment,
+    )
+    .unwrap();
+    assert_eq!(
+        *provider.expansions.lock().unwrap(),
+        ["magic"],
+        "a failed candidate drops syntax observations without refunding its macro effects"
+    );
 }

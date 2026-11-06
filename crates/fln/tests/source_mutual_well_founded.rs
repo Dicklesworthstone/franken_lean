@@ -3,7 +3,8 @@
 //! The pin (`Lean/Elab/PreDefinition/WF/Main.lean`, `Mutual.lean`, `PackMutual.lean`)
 //! packs a recursive group's varying arguments into a right-nested `PSum` of each
 //! member's `PSigma` pack, in SCC order, defines `<first>._mutual` by one
-//! `WellFounded.Nat.fix`, and makes each member an `@[irreducible]` wrapper
+//! checked fixpoint (`WellFounded.Nat.fix` for the canonical Nat relation),
+//! and makes each member an `@[irreducible]` wrapper
 //! `fun xs => <first>._mutual fixed (PSum.inl ⟨xs⟩)` etc. Every program below is
 //! first run through the pinned `lean`; its exit code is the verdict to match.
 #![forbid(unsafe_code)]
@@ -117,7 +118,14 @@ fn oracle(source: &str, accepted: bool) -> String {
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join(format!("{}.lean", NEXT.fetch_add(1, Ordering::Relaxed)));
     std::fs::write(&path, source).unwrap();
-    let output = Command::new(reference).arg(&path).output().unwrap();
+    // Container CPU quotas can be much smaller than the advertised hardware
+    // concurrency. One reference worker preserves the verdict without an
+    // oversized task pool for every differential example.
+    let output = Command::new(reference)
+        .arg("-j1")
+        .arg(&path)
+        .output()
+        .unwrap();
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),
@@ -133,33 +141,47 @@ fn oracle(source: &str, accepted: bool) -> String {
 
 /// One shared import of the closure the single-function suite uses for omega and
 /// the default decreasing tactic. Built on a large stack, then shared read-only.
+fn load_base(modules: &'static [&'static str]) -> Option<Engine> {
+    let Some(lib) = pinned_lib() else {
+        eprintln!("SKIP: pinned Reference lib/lean absent (set FLN_REQUIRE_REFERENCE=1 to fail)");
+        return None;
+    };
+    reference()?;
+    let started = std::time::Instant::now();
+    let engine = std::thread::Builder::new()
+        .stack_size(STACK)
+        .spawn(move || import_closure(&lib, modules))
+        .expect("spawn import thread")
+        .join()
+        .expect("the import closure loads");
+    eprintln!("imported {modules:?} in {:?}", started.elapsed());
+    Some(engine)
+}
+
 fn base() -> Option<&'static Engine> {
     static BASE: OnceLock<Option<Engine>> = OnceLock::new();
-    BASE.get_or_init(|| {
-        let Some(lib) = pinned_lib() else {
-            eprintln!(
-                "SKIP: pinned Reference lib/lean absent (set FLN_REQUIRE_REFERENCE=1 to fail)"
-            );
-            return None;
-        };
-        reference()?;
-        let started = std::time::Instant::now();
-        let engine = std::thread::Builder::new()
-            .stack_size(STACK)
-            .spawn(move || {
-                import_closure(&lib, &["Init.WFTactics", "Init.Omega", "Init.WFComputable"])
-            })
-            .expect("spawn import thread")
-            .join()
-            .expect("the import closure loads");
-        eprintln!("imported the closure in {:?}", started.elapsed());
-        Some(engine)
-    })
-    .as_ref()
+    BASE.get_or_init(|| load_base(&["Init.WFTactics", "Init.Omega", "Init.WFComputable"]))
+        .as_ref()
 }
 
 fn on_large_stack(test: impl FnOnce(&'static Engine) + Send + 'static) {
-    let Some(base) = base() else {
+    on_stack(base(), test);
+}
+
+/// Explicit proofs need only the checked fixpoint library. Keep the Omega
+/// closure for the existing tactic regressions instead of importing it for
+/// every focused general-relation test run.
+fn on_generic_stack(test: impl FnOnce(&'static Engine) + Send + 'static) {
+    static BASE: OnceLock<Option<Engine>> = OnceLock::new();
+    on_stack(
+        BASE.get_or_init(|| load_base(&["Init.WFComputable"]))
+            .as_ref(),
+        test,
+    );
+}
+
+fn on_stack(base: Option<&'static Engine>, test: impl FnOnce(&'static Engine) + Send + 'static) {
+    let Some(base) = base else {
         return;
     };
     std::thread::Builder::new()
@@ -268,6 +290,10 @@ fn assert_member(engine: &Engine, name: &str, all: &[&str], wrapper: &str) {
 }
 
 fn assert_auxiliary(engine: &Engine, name: &str) {
+    assert_auxiliary_fix(engine, name, "WellFounded.Nat.fix");
+}
+
+fn assert_auxiliary_fix(engine: &Engine, name: &str, fix: &str) {
     let auxiliary = definition(engine, name);
     assert_eq!(auxiliary.safety, DefinitionSafety::Safe);
     assert_eq!(auxiliary.all, vec![n(name)]);
@@ -281,10 +307,16 @@ fn assert_auxiliary(engine: &Engine, name: &str) {
         body = next;
     }
     assert!(
-        shape(body).starts_with("(WellFounded.Nat.fix "),
-        "{name} is a Nat.fix: {}",
+        shape(body).starts_with(&format!("({fix} ")),
+        "{name} uses {fix}: {}",
         shape(body)
     );
+    if fix == "WellFounded.fix" {
+        assert!(
+            shape(body).contains("Lean.opaqueId"),
+            "the well-founded proof stays opaque, as at the pin"
+        );
+    }
     // `fun x a => PSum.casesOn (motive := …) x alt₀ … a`, as the pin prints it.
     let ExprNode::App { a: functional, .. } = body.node() else {
         panic!("{name} applies the fixpoint to its functional");
@@ -600,6 +632,202 @@ end Ex2
     });
 }
 
+#[test]
+fn generic_mutual_measures_prove_and_execute_both_lexicographic_coordinates() {
+    let source = r#"mutual
+def lexLeft (n m : Nat) : Nat :=
+  if hm : 0 < m then lexRight n (m - 1) + 1
+  else if hn : 0 < n then lexRight (n - 1) 2 + 1 else 0
+termination_by (n, m)
+decreasing_by
+  exact Prod.Lex.right n (Nat.sub_lt hm (Nat.succ_pos 0))
+  exact Prod.Lex.left 2 m (Nat.sub_lt hn (Nat.succ_pos 0))
+def lexRight (n m : Nat) : Nat :=
+  if hm : 0 < m then lexLeft n (m - 1) + 1
+  else if hn : 0 < n then lexLeft (n - 1) 2 + 1 else 0
+termination_by (n, m)
+decreasing_by
+  exact Prod.Lex.right n (Nat.sub_lt hm (Nat.succ_pos 0))
+  exact Prod.Lex.left 2 m (Nat.sub_lt hn (Nat.succ_pos 0))
+end
+"#;
+    on_generic_stack(move |base| {
+        let printed = oracle(
+            &format!("{source}\n#eval lexLeft 3 4\n#eval lexRight 2 5"),
+            true,
+        );
+        assert_eq!(printed, "13\n11\n");
+        let engine = check(base, source);
+        assert_auxiliary_fix(&engine, "lexLeft._mutual", "WellFounded.fix");
+        assert_companions(&engine, &["lexLeft", "lexRight"]);
+        for (query, expected) in [("lexLeft 3 4", 13), ("lexRight 2 5", 11)] {
+            assert_eq!(
+                evaluate(&engine, &format!("#eval {query}")),
+                ClosedVmValue::Scalar(expected),
+            );
+        }
+        // The wrappers must not acquire structural recursion's reducibility.
+        let proof = "example : lexLeft 0 0 = 0 := rfl";
+        oracle(&format!("{source}\n{proof}"), false);
+        refuse(&engine, proof);
+    });
+}
+
+#[test]
+fn generic_mutual_nat_measures_honor_a_custom_well_founded_relation() {
+    let source = r#"local instance : WellFoundedRelation Nat :=
+  invImage (fun n : Nat => 2 - n) Nat.lt_wfRel
+mutual
+def growLeft (n : Nat) : Nat :=
+  if h : 0 < 2 - n then growRight 2 + 20 else 0
+termination_by n
+decreasing_by exact h
+def growRight (n : Nat) : Nat :=
+  if h : 0 < 2 - n then growLeft 2 + 22 else 0
+termination_by n
+decreasing_by exact h
+end
+"#;
+    on_generic_stack(move |base| {
+        assert_eq!(
+            oracle(
+                &format!("{source}\n#eval growLeft 0\n#eval growRight 0"),
+                true
+            ),
+            "20\n22\n"
+        );
+        let engine = check(base, source);
+        assert_auxiliary_fix(&engine, "growLeft._mutual", "WellFounded.fix");
+        for (query, expected) in [("growLeft 0", 20), ("growRight 0", 22)] {
+            assert_eq!(
+                evaluate(&engine, &format!("#eval {query}")),
+                ClosedVmValue::Scalar(expected),
+            );
+        }
+    });
+}
+
+#[test]
+fn generic_mutual_measure_types_may_depend_on_fixed_parameters() {
+    let source = r#"local instance (bound : Nat) : WellFoundedRelation (Fin bound) :=
+  invImage (fun p : Fin bound => p.val) Nat.lt_wfRel
+mutual
+def finLeft (bound : Nat) (p : Fin (Nat.succ bound)) : Nat :=
+  if h : 0 < p.val then finRight bound (Fin.mk 0 (Nat.succ_pos bound)) + 20 else 0
+termination_by p
+decreasing_by exact h
+def finRight (bound : Nat) (p : Fin (Nat.succ bound)) : Nat :=
+  if h : 0 < p.val then finLeft bound (Fin.mk 0 (Nat.succ_pos bound)) + 22 else 0
+termination_by p
+decreasing_by exact h
+end
+"#;
+    on_generic_stack(move |base| {
+        assert_eq!(
+            oracle(
+                &format!(
+                    "{source}\n#eval finLeft 7 (Fin.mk 3 (by decide))\n#eval finRight 4 (Fin.mk 2 (by decide))"
+                ),
+                true,
+            ),
+            "20\n22\n"
+        );
+        let engine = check(base, source);
+        assert_auxiliary_fix(&engine, "finLeft._mutual", "WellFounded.fix");
+        for (query, expected) in [
+            ("finLeft 7 (Fin.mk 3 (by decide))", 20),
+            ("finRight 4 (Fin.mk 2 (by decide))", 22),
+        ] {
+            assert_eq!(
+                evaluate(&engine, &format!("#eval {query}")),
+                ClosedVmValue::Scalar(expected),
+            );
+        }
+    });
+}
+
+#[test]
+fn generic_mutual_relations_use_fixed_instance_parameters() {
+    let source = r#"mutual
+def fixedDictLeft [r : WellFoundedRelation Nat]
+    (step : ∀ n, 0 < 2 - n → r.rel 2 n) (n : Nat) : Nat :=
+  if h : 0 < 2 - n then fixedDictRight step 2 + 20 else 0
+termination_by n
+decreasing_by exact step n h
+def fixedDictRight [r : WellFoundedRelation Nat]
+    (step : ∀ n, 0 < 2 - n → r.rel 2 n) (n : Nat) : Nat :=
+  if h : 0 < 2 - n then fixedDictLeft step 2 + 22 else 0
+termination_by n
+decreasing_by exact step n h
+end
+"#;
+    on_generic_stack(move |base| {
+        let arguments = "(invImage (fun n : Nat => 2 - n) Nat.lt_wfRel) (fun n h => by change 0 < 2 - n; exact h) 0";
+        let left = format!("#eval @fixedDictLeft {arguments}");
+        let right = format!("#eval @fixedDictRight {arguments}");
+        assert_eq!(
+            oracle(&format!("{source}\n{left}\n{right}"), true),
+            "20\n22\n"
+        );
+        let engine = check(base, source);
+        assert_auxiliary_fix(&engine, "fixedDictLeft._mutual", "WellFounded.fix");
+        assert_eq!(evaluate(&engine, &left), ClosedVmValue::Scalar(20));
+        assert_eq!(evaluate(&engine, &right), ClosedVmValue::Scalar(22));
+    });
+}
+
+#[test]
+fn generic_mutual_relations_ignore_unused_section_instances() {
+    let source = r#"section
+variable [r : WellFoundedRelation Nat]
+mutual
+def scopeLeft (n : Nat) : Nat := if h : n = 0 then 0 else scopeRight (n - 1) + 1
+termination_by n
+decreasing_by exact Nat.sub_lt (Nat.pos_of_ne_zero h) (Nat.succ_pos 0)
+def scopeRight (n : Nat) : Nat := if h : n = 0 then 1 else scopeLeft (n - 1) + 2
+termination_by n
+decreasing_by exact Nat.sub_lt (Nat.pos_of_ne_zero h) (Nat.succ_pos 0)
+end
+end
+"#;
+    on_generic_stack(move |base| {
+        assert_eq!(oracle(&format!("{source}\n#eval scopeLeft 2"), true), "3\n");
+        let engine = check(base, source);
+        assert_auxiliary(&engine, "scopeLeft._mutual");
+        assert_eq!(
+            evaluate(&engine, "#eval scopeLeft 2"),
+            ClosedVmValue::Scalar(3)
+        );
+    });
+}
+
+#[test]
+fn generic_mutual_measure_types_cannot_depend_on_varying_parameters() {
+    let source = r#"mutual
+def badLeft (n : Nat) (p : Fin (Nat.succ n)) : Nat :=
+  badRight (n + 1) (Fin.mk 0 (Nat.succ_pos (n + 1)))
+termination_by p
+def badRight (n : Nat) (p : Fin (Nat.succ n)) : Nat :=
+  badLeft (n + 1) (Fin.mk 0 (Nat.succ_pos (n + 1)))
+termination_by p
+end
+"#;
+    on_generic_stack(move |base| {
+        let printed = oracle(source, false);
+        assert!(printed.contains("varying parameters"), "{printed}");
+        let refusal = refuse(base, source);
+        assert!(refusal.contains("varying parameters"), "{refusal}");
+        for name in [
+            "badLeft",
+            "badRight",
+            "badLeft._mutual",
+            "badLeft._unsafe_rec",
+        ] {
+            assert!(!base.environment().contains(&n(name)));
+        }
+    });
+}
+
 /// The pin reports "incomplete set of termination hints" (exit 1) and then still
 /// defines the group by GuessLex. We refuse the whole group: the exit code agrees,
 /// but GuessLex across a group is not implemented, so this is not parity.
@@ -884,16 +1112,6 @@ termination_by n
 
 end
 ";
-    // A lexicographic measure; the pin accepts (`Prod.Lex`).
-    let lexicographic = "mutual
-def f (n : Nat) (b : Bool) : Nat := if b then f n false else if h : n = 0 then 0 else g (n - 1)
-termination_by (n, if b then 1 else 0)
-decreasing_by all_goals sorry
-def g (n : Nat) : Nat := f n true
-termination_by (n, 2)
-decreasing_by all_goals sorry
-end
-";
     // `vendor/lean4-src/tests/elab_fail/mutwf1.lean`: the pin refuses both groups.
     let failing = "namespace Ex2
 mutual
@@ -913,7 +1131,7 @@ end
 end Ex2
 ";
     on_large_stack(move |base| {
-        for (source, accepted) in [(universe, true), (lexicographic, true), (failing, false)] {
+        for (source, accepted) in [(universe, true), (failing, false)] {
             oracle(source, accepted);
             let root = base.logical_root(&KVMap::new());
             let error = base

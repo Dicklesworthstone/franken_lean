@@ -20,6 +20,7 @@ pub(in crate::extensions) fn checked(
             if !sequence_slot {
                 return Err("a bracketed repetition splice outside its sequence");
             }
+            iteration.body_variables(antiquotation_name, &mut visited)?;
             pending.push((iteration.body, false));
             continue;
         }
@@ -127,8 +128,7 @@ fn replace_antiquotations(contents: &Syntax) -> Result<Syntax, &'static str> {
 
 fn instantiate_iteration_body(
     syntax: &Syntax,
-    variable: &Name,
-    element: &Syntax,
+    bound: &BTreeMap<&Name, &Syntax>,
     context: &Name,
     scope: u64,
     visited: &mut usize,
@@ -136,7 +136,7 @@ fn instantiate_iteration_body(
 ) -> Result<Syntax, &'static str> {
     charge(visited)?;
     match syntax {
-        Syntax::Ident { val, .. } if val == variable => copy_capture(element, visited),
+        Syntax::Ident { val, .. } if bound.contains_key(val) => copy_capture(bound[val], visited),
         Syntax::Ident { .. } if raw => Ok(syntax.clone()),
         ident @ Syntax::Ident { val, .. } if val.is_anonymous() => Ok(ident.clone()),
         Syntax::Ident {
@@ -156,8 +156,7 @@ fn instantiate_iteration_body(
             for (index, child) in args.iter().enumerate() {
                 built.push(instantiate_iteration_body(
                     child,
-                    variable,
-                    element,
+                    bound,
                     context,
                     scope,
                     visited,
@@ -234,20 +233,53 @@ pub(in crate::extensions) fn instantiate_rhs(
                 }
             }
             Step::Iteration(iteration) => {
-                let variable = iteration.body_variable(&bound)?;
-                let value = bound
-                    .get(&variable)
-                    .map(AsRef::as_ref)
-                    .ok_or("an unbound bracketed repetition capture")?;
-                let values = iteration.values(value, &mut visited)?;
-                let Some([body]) = null_args(iteration.body) else {
-                    return Err("a bracketed template iteration outside the single-body subset");
+                let variables = iteration.body_variables(
+                    |syntax| match syntax {
+                        Syntax::Ident { val, .. } if bound.contains_key(val) => Some(val.clone()),
+                        _ => None,
+                    },
+                    &mut visited,
+                )?;
+                let values = variables
+                    .iter()
+                    .map(|name| {
+                        let value = bound
+                            .get(name)
+                            .map(AsRef::as_ref)
+                            .ok_or("an unbound bracketed repetition capture")?;
+                        iteration
+                            .values(value, &mut visited)
+                            .map(|items| (name, items))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let Some(body) = null_args(iteration.body) else {
+                    return Err("a bracketed template body outside a sequence");
                 };
+                if !iteration.is_optional() && body.len() != 1 {
+                    return Err("a bracketed template iteration outside the single-body subset");
+                }
+                // Quotation.quoteSyntax zips all captured arrays before mapping
+                // the body, so an empty or shorter capture truncates every one.
+                // Optional captures have at most one element each: emit every
+                // body node exactly when all options are present, otherwise none.
+                let count = values
+                    .iter()
+                    .map(|(_, items)| items.len())
+                    .min()
+                    .ok_or("a bracketed template iteration without a bound capture")?;
                 let mut elements = Vec::new();
-                for (index, element) in values.into_iter().enumerate() {
+                for index in 0..count {
+                    let bindings = values
+                        .iter()
+                        .map(|(name, items)| {
+                            charge(&mut visited)?;
+                            Ok((*name, items[index]))
+                        })
+                        .collect::<Result<BTreeMap<_, _>, &'static str>>()?;
                     if index > 0
                         && let Some(separator) = iteration.separator()
                     {
+                        charge(&mut visited)?;
                         let info = match iteration.suffix_node {
                             Syntax::Node { args, .. } => args
                                 .get(1)
@@ -260,15 +292,16 @@ pub(in crate::extensions) fn instantiate_rhs(
                         };
                         elements.push(Syntax::atom(info, separator));
                     }
-                    elements.push(instantiate_iteration_body(
-                        body,
-                        &variable,
-                        element,
-                        context,
-                        scope,
-                        &mut visited,
-                        false,
-                    )?);
+                    for part in body {
+                        elements.push(instantiate_iteration_body(
+                            part,
+                            &bindings,
+                            context,
+                            scope,
+                            &mut visited,
+                            false,
+                        )?);
+                    }
                 }
                 built.push(null_node(elements));
             }
@@ -358,21 +391,22 @@ pub(in crate::extensions) fn instantiate_rhs(
 mod tests {
     use super::*;
 
+    fn antiquot(name: &str) -> Syntax {
+        Syntax::node(
+            Name::from_components(["num", "antiquot"]),
+            vec![
+                Syntax::atom(SourceInfo::None, "$"),
+                null_node(vec![]),
+                synthetic_ident(Name::from_components([name])),
+                null_node(vec![]),
+            ],
+        )
+    }
+
     fn splice(name: &str) -> Syntax {
         Syntax::node(
             Name::from_components(["many", "antiquot_suffix_splice"]),
-            vec![
-                Syntax::node(
-                    Name::from_components(["num", "antiquot"]),
-                    vec![
-                        Syntax::atom(SourceInfo::None, "$"),
-                        null_node(vec![]),
-                        synthetic_ident(Name::from_components([name])),
-                        null_node(vec![]),
-                    ],
-                ),
-                Syntax::atom(SourceInfo::None, "*"),
-            ],
+            vec![antiquot(name), Syntax::atom(SourceInfo::None, "*")],
         )
     }
 
@@ -388,6 +422,209 @@ mod tests {
             starts_registration: true,
             fallbacks: vec![],
         }
+    }
+
+    fn iteration_template(captures: Vec<Syntax>) -> Syntax {
+        null_node(vec![Syntax::node(
+            Name::from_components(["many", "antiquot_scope"]),
+            vec![
+                null_node(vec![Syntax::node(
+                    Name::from_components(["pair"]),
+                    captures,
+                )]),
+                Syntax::atom(SourceInfo::None, "*"),
+            ],
+        )])
+    }
+
+    fn zipped_rule() -> NotationRule {
+        let variables = ["xs", "ys"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, name)| (vec![index], macro_variable(&Name::from_components([name]))))
+            .collect::<Vec<_>>();
+        let rhs = iteration_template(vec![antiquot("xs"), antiquot("ys")]);
+        NotationRule {
+            rhs: checked(&rhs, &variables).unwrap(),
+            variables,
+            prechecked: false,
+            pattern: None,
+            source: None,
+            starts_registration: true,
+            fallbacks: vec![],
+        }
+    }
+
+    #[test]
+    fn zipped_iterations_copy_nested_captures_without_extra_scopes() {
+        let rule = zipped_rule();
+        let xs = [
+            Syntax::node(
+                Name::from_components(["nested"]),
+                vec![synthetic_ident(Name::from_components(["caller"]))],
+            ),
+            null_node(vec![Syntax::Missing]),
+            Syntax::Missing,
+        ];
+        let ys = [Syntax::atom(SourceInfo::None, "first"), Syntax::Missing];
+        let result = instantiate(
+            &rule,
+            &[null_node(xs.to_vec()), null_node(ys.to_vec())],
+            &Name::from_components(["definition"]),
+            9,
+        )
+        .unwrap();
+        let expected = null_node(
+            xs.iter()
+                .zip(&ys)
+                .map(|(x, y)| {
+                    Syntax::node(Name::from_components(["pair"]), vec![x.clone(), y.clone()])
+                })
+                .collect(),
+        );
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn zipped_iterations_bound_all_capture_scans_and_duplicated_subtrees() {
+        let rule = zipped_rule();
+        for args in [
+            [
+                null_node(vec![Syntax::Missing; MAX_TEMPLATE_NODES / 2]),
+                null_node(vec![Syntax::Missing; MAX_TEMPLATE_NODES / 2]),
+            ],
+            [
+                null_node(vec![Syntax::node(
+                    Name::from_components(["large"]),
+                    vec![Syntax::Missing; MAX_TEMPLATE_NODES / 2],
+                )]),
+                null_node(vec![Syntax::node(
+                    Name::from_components(["large"]),
+                    vec![Syntax::Missing; MAX_TEMPLATE_NODES / 2],
+                )]),
+            ],
+            [
+                null_node(vec![]),
+                null_node(vec![Syntax::Missing; MAX_TEMPLATE_NODES]),
+            ],
+        ] {
+            let reason = instantiate(&rule, &args, &Name::anonymous(), 1).unwrap_err();
+            assert!(reason.contains("budget"), "{reason}");
+        }
+        assert!(
+            instantiate(
+                &rule,
+                &[null_node(vec![]), Syntax::Missing],
+                &Name::anonymous(),
+                1,
+            )
+            .is_err(),
+            "an empty capture must not hide an invalid second binding"
+        );
+        assert_eq!(
+            instantiate(
+                &rule,
+                &[null_node(vec![]), null_node(vec![Syntax::Missing])],
+                &Name::anonymous(),
+                1,
+            )
+            .unwrap(),
+            null_node(vec![])
+        );
+    }
+
+    #[test]
+    fn duplicate_iteration_captures_refuse_during_checking_and_journal_replay() {
+        let mut rule = zipped_rule();
+        for names in [["xs", "xs"].as_slice(), ["xs", "ys", "xs"].as_slice()] {
+            let rhs = iteration_template(names.iter().map(|name| antiquot(name)).collect());
+            assert_eq!(
+                checked(&rhs, &rule.variables),
+                Err(repetition::DUPLICATE_ITERATION_CAPTURE)
+            );
+            // A journal can carry an already-compiled tree. Runtime validation
+            // must retain the same rejection even if it bypasses `checked`.
+            rule.rhs = replace_antiquotations(&rhs).unwrap();
+            assert_eq!(
+                instantiate(
+                    &rule,
+                    &[
+                        null_node(vec![Syntax::Missing]),
+                        null_node(vec![Syntax::Missing]),
+                    ],
+                    &Name::anonymous(),
+                    1,
+                ),
+                Err(repetition::DUPLICATE_ITERATION_CAPTURE)
+            );
+        }
+    }
+
+    #[test]
+    fn optional_iterations_emit_the_whole_body_only_when_every_capture_exists() {
+        let mut rule = zipped_rule();
+        let rhs = null_node(vec![Syntax::node(
+            Name::from_components(["optional", "antiquot_scope"]),
+            vec![
+                null_node(vec![
+                    Syntax::atom(SourceInfo::None, "value"),
+                    Syntax::node(
+                        Name::from_components(["pair"]),
+                        vec![antiquot("xs"), antiquot("ys")],
+                    ),
+                ]),
+                Syntax::atom(SourceInfo::None, "?"),
+            ],
+        )]);
+        rule.rhs = checked(&rhs, &rule.variables).unwrap();
+        let x = synthetic_ident(Name::from_components(["caller"]));
+        let y = Syntax::atom(SourceInfo::None, "original");
+        let some_x = null_node(vec![x.clone()]);
+        let some_y = null_node(vec![y.clone()]);
+        let none = null_node(vec![]);
+        assert_eq!(
+            instantiate(
+                &rule,
+                &[some_x.clone(), some_y.clone()],
+                &Name::anonymous(),
+                1
+            )
+            .unwrap(),
+            null_node(vec![
+                Syntax::atom(SourceInfo::None, "value"),
+                Syntax::node(Name::from_components(["pair"]), vec![x, y]),
+            ])
+        );
+        for args in [
+            [none.clone(), some_y],
+            [some_x, none.clone()],
+            [none.clone(), none.clone()],
+        ] {
+            assert_eq!(
+                instantiate(&rule, &args, &Name::anonymous(), 1).unwrap(),
+                none
+            );
+        }
+        for invalid in [Syntax::Missing, null_node(vec![Syntax::Missing; 2])] {
+            assert!(
+                instantiate(&rule, &[none.clone(), invalid], &Name::anonymous(), 1).is_err(),
+                "an absent option must not hide an invalid second binding"
+            );
+        }
+        let large = null_node(vec![Syntax::node(
+            Name::from_components(["large"]),
+            vec![Syntax::Missing; MAX_TEMPLATE_NODES],
+        )]);
+        assert!(
+            instantiate(
+                &rule,
+                &[null_node(vec![Syntax::Missing]), large],
+                &Name::anonymous(),
+                1,
+            )
+            .unwrap_err()
+            .contains("budget")
+        );
     }
 
     #[test]
