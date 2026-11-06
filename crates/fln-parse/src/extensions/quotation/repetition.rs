@@ -9,6 +9,9 @@ use super::*;
 #[cfg(test)]
 mod slice_tests;
 
+pub(in crate::extensions) const DUPLICATE_ITERATION_CAPTURE: &str =
+    "a repeated capture in one bracketed template iteration";
+
 #[derive(Clone, Copy)]
 pub(super) struct Iteration<'a> {
     pub(super) body: &'a Syntax,
@@ -32,8 +35,10 @@ pub(super) fn iteration(syntax: &Syntax) -> Result<Option<Iteration<'_>>, &'stat
         suffix
             .strip_suffix('*')
             .is_some_and(|separator| !separator.is_empty())
+    } else if parent == Name::from_components(["many"]) {
+        suffix == "*"
     } else {
-        parent == Name::from_components(["many"]) && suffix == "*"
+        parent == Name::from_components(["optional"]) && suffix == "?"
     };
     if !valid {
         return Err("an unsupported bracketed repetition splice");
@@ -54,8 +59,8 @@ pub(in super::super) struct Sequence<'a> {
     elementwise: bool,
 }
 
-/// A sole suffix capture binds the whole sequence. Mixed template parts are
-/// constructed separately; bracketed `$[...]*` has no native interpreter yet.
+/// A sole suffix capture binds the whole sequence. Mixed and bracketed template
+/// parts are constructed separately by the bounded quotation interpreter.
 pub(in super::super) fn whole(syntax: &Syntax) -> Result<Option<Sequence<'_>>, &'static str> {
     let Some([suffix_node]) = null_args(syntax) else {
         return Ok(None);
@@ -113,6 +118,10 @@ pub(super) fn suffix(suffix_node: &Syntax) -> Result<Option<Sequence<'_>>, &'sta
 }
 
 impl Iteration<'_> {
+    pub(super) fn is_optional(&self) -> bool {
+        self.kind.parent() == Name::from_components(["optional"])
+    }
+
     pub(super) fn separator(&self) -> Option<&str> {
         (self.kind.parent() == Name::from_components(["sepBy"]))
             .then(|| &self.suffix[..self.suffix.len() - 1])
@@ -132,6 +141,9 @@ impl Iteration<'_> {
         if *visited > MAX_TEMPLATE_NODES {
             return Err("quoted repetition past the node budget");
         }
+        if self.is_optional() && items.len() > 1 {
+            return Err("a bracketed optional binding with more than one element");
+        }
         if let Some(separator) = self.separator() {
             if items
                 .iter()
@@ -147,26 +159,35 @@ impl Iteration<'_> {
         }
     }
 
-    pub(super) fn body_variable(
+    /// The pin's `getAntiquotationIds` puts every occurrence in a tuple pattern;
+    /// a repeated name is an invalid binder, including under nested syntax.
+    /// Inspect raw antiquotations during checking and compiled names on replay.
+    pub(super) fn body_variables(
         &self,
-        bound: &BTreeMap<&Name, std::borrow::Cow<'_, Syntax>>,
-    ) -> Result<Name, &'static str> {
+        mut capture: impl FnMut(&Syntax) -> Option<Name>,
+        visited: &mut usize,
+    ) -> Result<BTreeSet<Name>, &'static str> {
         let mut pending = vec![self.body];
-        let mut found = None;
-        let mut visited = 0;
+        let mut found = BTreeSet::new();
         while let Some(syntax) = pending.pop() {
-            templates::charge(&mut visited)?;
-            match syntax {
-                Syntax::Ident { val, .. } if bound.contains_key(val) => match &found {
-                    None => found = Some(val.clone()),
-                    Some(name) if *name == *val => {}
-                    Some(_) => return Err("multiple captures in one bracketed template iteration"),
-                },
-                Syntax::Node { args, .. } => pending.extend(args.iter()),
-                _ => {}
+            templates::charge(visited)?;
+            if let Some(name) = capture(syntax) {
+                if !found.insert(name) {
+                    return Err(DUPLICATE_ITERATION_CAPTURE);
+                }
+                continue;
+            }
+            if let Syntax::Node { args, .. } = syntax {
+                if args.len() > MAX_TEMPLATE_NODES.saturating_sub(*visited) {
+                    return Err("a macro template past the node budget");
+                }
+                pending.extend(args.iter());
             }
         }
-        found.ok_or("a bracketed template iteration without a bound capture")
+        if found.is_empty() {
+            return Err("a bracketed template iteration without a bound capture");
+        }
+        Ok(found)
     }
 }
 

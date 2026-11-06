@@ -1900,17 +1900,25 @@ impl FileGrammar {
                     .ok_or("a macro's right-hand side")?;
                 // A template this does not translate leaves the syntax without a rule: its uses
                 // reach the elaborator unexpanded and are refused there.
-                rule = macro_template(template, &category, &variables)
-                    .ok()
-                    .map(|rhs| NotationRule {
-                        variables,
-                        rhs,
-                        prechecked: false,
-                        pattern: None,
-                        source: None,
-                        starts_registration: true,
-                        fallbacks: Vec::new(),
-                    });
+                let translated = macro_template(template, &category, &variables).and_then(|rhs| {
+                    quotation::capture_kinds::direct(&rhs, &variables, &items)?;
+                    Ok(rhs)
+                });
+                let translated = match translated {
+                    Err(reason) if quotation::capture_kinds::registration_error(reason) => {
+                        return Err(reason);
+                    }
+                    translated => translated,
+                };
+                rule = translated.ok().map(|rhs| NotationRule {
+                    variables,
+                    rhs,
+                    prechecked: false,
+                    pattern: None,
+                    source: None,
+                    starts_registration: true,
+                    fallbacks: Vec::new(),
+                });
                 Declaration {
                     attr_kind: attr_kind_of(attr_kind)?,
                     precedence: optional_precedence(precedence)?,

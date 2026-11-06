@@ -6,6 +6,7 @@
 //! This is a bounded quotation interpreter, not execution of arbitrary MacroM.
 use super::*;
 
+pub(super) mod capture_kinds;
 pub(super) mod repetition;
 pub(super) mod templates;
 

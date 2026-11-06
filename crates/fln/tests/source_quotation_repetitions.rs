@@ -190,6 +190,171 @@ fn bracketed_repetition_templates_map_fixed_syntax_over_captured_elements() {
     );
 }
 
+const ZIP: &str = r#"syntax "zipSeq!" "[" term,* "]" "[" term,* "]" : term
+macro_rules | `(zipSeq![$xs,*][$ys,*]) => `([$[Nat.add $xs $ys],*])
+"#;
+
+#[test]
+fn zipped_bracketed_templates_stop_at_the_shortest_capture_and_execute() {
+    let source = format!(
+        "{ZIP}\n\
+        theorem full : zipSeq![1, 2][10, 20] = [11, 22] := rfl\n\
+        theorem shortLeft : zipSeq![1][10, 20, 30] = [11] := rfl\n\
+        theorem shortRight : zipSeq![1, 2, 3][10] = [11] := rfl\n\
+        theorem emptyLeft : zipSeq![][10] = ([] : List Nat) := rfl\n\
+        theorem emptyRight : zipSeq![1][] = ([] : List Nat) := rfl\n\
+        theorem emptyBoth : zipSeq![][] = ([] : List Nat) := rfl"
+    );
+    assert_eq!(check(&source).unwrap_or_else(|e| panic!("{e}")).theorems, 6);
+    let checked = engine()
+        .execute_source_commands_with_checks(
+            format!("{source}\n#eval List.foldl (fun n x => n * 10 + x) 0 (zipSeq![1, 2][3, 0])")
+                .as_bytes(),
+            &KVMap::new(),
+            EngineExecutionLimits::new(limits().kernel),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let fln::VmExit::Returned(result) = &checked.batch.executions.last().unwrap().exit else {
+        panic!("expected native return");
+    };
+    assert_eq!(
+        fln_vm::interpreter::nat_decimal(&result.value).as_deref(),
+        Some("42")
+    );
+}
+
+#[test]
+fn zipped_templates_bind_three_distinct_captures_inside_nested_syntax() {
+    let source = r#"syntax "zipThree!" "[" term,* "]" "[" term,* "]" "[" term,* "]" : term
+macro_rules
+  | `(zipThree![$xs,*][$ys,*][$zs,*]) => `([$[[$xs, Nat.add $ys $zs]],*])
+theorem full : zipThree![1, 2][10, 20, 30][2, 4] = [[1, 12], [2, 24]] := rfl
+theorem shortMiddle : zipThree![1, 2][10][2, 4, 6] = [[1, 12]] := rfl
+theorem emptyMiddle : zipThree![1][][2] = ([] : List (List Nat)) := rfl
+"#;
+    assert_eq!(check(source).unwrap_or_else(|e| panic!("{e}")).theorems, 3);
+    assert!(check(&source.replace("[[1, 12], [2, 24]]", "[[1, 14], [2, 22]]")).is_err());
+}
+
+#[test]
+fn duplicate_bracketed_captures_are_rejected_even_without_a_macro_call() {
+    for source in [
+        r#"macro "duplicateSeq!" "[" xs:term,* "]" : term => `([$[Nat.add $xs $xs],*])"#,
+        r#"macro "duplicateZip!" "[" xs:term,* "]" "[" ys:term,* "]" : term => `([$[[$xs, $ys, $xs]],*])"#,
+        r#"syntax "duplicateRule!" "[" term,* "]" : term
+macro_rules | `(duplicateRule![$xs,*]) => `([$[Nat.add $xs $xs],*])"#,
+        r#"syntax "duplicateZipRule!" "[" term,* "]" "[" term,* "]" : term
+macro_rules | `(duplicateZipRule![$xs,*][$ys,*]) => `([$[[$xs, $ys, $xs]],*])"#,
+    ] {
+        assert!(check(source).is_err(), "{source}");
+    }
+}
+
+#[test]
+fn zipped_templates_preserve_hygiene_through_module_imports() {
+    use fln::source_check::modules::SourceModuleCheckLimits;
+    use fln::{Name, SourceModuleInput};
+    let library = r#"namespace ZipLibrary
+def edge : Nat := 40
+syntax "zipScoped!" "[" term,* "]" "[" term,* "]" : term
+macro_rules
+  | `(zipScoped![$xs,*][$ys,*]) => `([$[let x := edge; Nat.add (Nat.add $xs $ys) x],*])
+end ZipLibrary
+"#;
+    let main = r#"import ZipLibrary
+def edge : Nat := 99
+theorem hygienic (x : Nat) : zipScoped![x][2] = [Nat.add (Nat.add x 2) 40] := rfl
+theorem fixedName : zipScoped![1, 2][3, 4] = [44, 46] := rfl
+"#;
+    let names = ["ZipLibrary", "Main"].map(|n| Name::from_components([n]));
+    let inputs = [
+        SourceModuleInput {
+            name: &names[0],
+            source: library.as_bytes(),
+        },
+        SourceModuleInput {
+            name: &names[1],
+            source: main.as_bytes(),
+        },
+    ];
+    let exported = engine()
+        .check_source_modules(
+            &inputs,
+            &names[1],
+            &KVMap::new(),
+            SourceModuleCheckLimits::new(SourceCheckLimits::new(limits())),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap()
+        .checked
+        .engine;
+    let replay =
+        "theorem replay (x : Nat) : zipScoped![x, 1][2] = [Nat.add (Nat.add x 2) 40] := rfl";
+    assert_eq!(
+        exported
+            .check_source_files(
+                &[replay.as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits()),
+            )
+            .unwrap()
+            .into_complete()
+            .unwrap()
+            .theorems,
+        1
+    );
+    assert!(
+        exported
+            .check_source_files(
+                &[replay.replace("x 2) 40", "x 2) 99").as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits()),
+            )
+            .is_err()
+    );
+}
+
+#[test]
+fn invalid_zipped_templates_refuse_without_fallback_or_partial_publication() {
+    assert!(check(ZIP).is_ok(), "the registration must be supported");
+    let base = engine();
+    let root = base.logical_root(&KVMap::new());
+    for tail in [
+        "theorem wrong : zipSeq![1, 2][10, 20] = [12, 21] := rfl",
+        "def wrong : List Nat := zipSeq![true][2]",
+        "macro \"scalarZip!\" x:term:max \"[\" ys:term,* \"]\" : term => `([$[Nat.add $x $ys],*])\ndef wrong := scalarZip! 4 [2]",
+        "macro \"unboundZip!\" \"[\" xs:term,* \"]\" : term => `([$[Nat.add $xs $missing],*])\ndef wrong := unboundZip![1]",
+        "syntax \"noZipFallback!\" term:max \"[\" term,* \"]\" : term\nmacro_rules | `(noZipFallback! $x [$ys,*]) => `((7 : Nat))\nmacro_rules | `(noZipFallback! $x [$ys,*]) => `([$[Nat.add $x $ys],*])\ndef wrong := noZipFallback! 4 [2]",
+    ] {
+        let source = format!("{ZIP}\ndef unpublished : Nat := 3\n{tail}");
+        assert!(
+            base.check_source_files(
+                &[source.as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits()),
+            )
+            .is_err(),
+            "{tail}"
+        );
+        assert_eq!(base.logical_root(&KVMap::new()), root);
+    }
+    assert_eq!(
+        base.check_source_files(
+            &[format!("{ZIP}\ntheorem recovered : zipSeq![40][2] = [42] := rfl").as_bytes()],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits()),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap()
+        .theorems,
+        1
+    );
+}
+
 const SUM: &str = "syntax \"sumSeq!\" \"[\" num* \"]\" : term\n\
     macro_rules\n\
     | `(sumSeq![]) => `((0 : Nat))\n\
@@ -313,8 +478,8 @@ fn invalid_composed_capture_uses_do_not_fall_back_or_publish_partial_results() {
         macro_rules | `(badCompose! $x) => `((42 : Nat))\n\
         macro_rules | `(badCompose! $x) => `([0, $x,*])\n";
     assert!(
-        check(declarations).is_ok(),
-        "an unused translated rule is legal"
+        check(declarations).is_err(),
+        "a scalar capture is not an array, even in an unused macro"
     );
     let base = engine();
     let root = base.logical_root(&KVMap::new());

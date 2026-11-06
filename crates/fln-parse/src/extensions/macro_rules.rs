@@ -82,18 +82,24 @@ pub(super) fn declare(file: &mut FileGrammar, args: &[Syntax]) -> Result<(), &'s
             continue;
         }
         let translated = quotation::variables(&children).and_then(|variables| {
-            macro_rule_template(rhs, &variables).map(|rhs| NotationRule {
-                variables,
-                rhs,
-                prechecked: false,
-                pattern: Some(Syntax::node(kind.clone(), children)),
-                source: None,
-                starts_registration: false,
-                fallbacks: Vec::new(),
+            macro_rule_template(rhs, &variables).and_then(|rhs| {
+                quotation::capture_kinds::pattern(&rhs, &variables, &children)?;
+                Ok(NotationRule {
+                    variables,
+                    rhs,
+                    prechecked: false,
+                    pattern: Some(Syntax::node(kind.clone(), children)),
+                    source: None,
+                    starts_registration: false,
+                    fallbacks: Vec::new(),
+                })
             })
         });
         match translated {
             Ok(rule) => groups.entry(kind).or_default().push(rule),
+            Err(reason) if quotation::capture_kinds::registration_error(reason) => {
+                return Err(reason);
+            }
             Err(_) => {
                 refused.insert(kind);
             }

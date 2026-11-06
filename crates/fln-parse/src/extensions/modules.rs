@@ -138,6 +138,15 @@ impl FileGrammar {
                 return Err("an imported macro has a nested or oversized fallback chain");
             }
             let scopes = module.rule_scopes.get(kind);
+            let descr = module
+                .declarations
+                .iter()
+                .chain(&self.native_imported)
+                .chain(&self.declared)
+                .chain(self.scoped.values().flatten())
+                .chain(self.native_scoped.values().flatten())
+                .find(|decl| decl.decl == *kind)
+                .map(|decl| &decl.descr);
             let mut previous_scope = None;
             for (index, rule) in rule.cases().enumerate() {
                 let scope = scopes.and_then(|scopes| scopes[index].as_ref());
@@ -165,6 +174,7 @@ impl FileGrammar {
                 } else if atoms::is_kind(kind) {
                     return Err("an imported atomic macro has no quoted pattern");
                 }
+                quotation::capture_kinds::imported(rule, descr)?;
             }
         }
         // Prepare all chains before mutation. Imports arrive in dependency
