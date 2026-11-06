@@ -23,6 +23,7 @@ fn engine() -> Engine {
 def headKeep (A : Type) (value : A) : A := value
 structure HeadBox (A : Type) where
   value : A
+def headFixed (A : Type) : HeadBox Nat := @HeadBox.mk Nat 42
 structure HeadPayload where
   flag : Bool
   value : if flag then Nat else String
@@ -235,6 +236,7 @@ fn memo_capacity_failure_retains_completed_rows_and_stale_replacement_is_bounded
     let mut entries = HashMap::new();
     let entry = |generation, result| Entry {
         generation,
+        stable: false,
         limits: Limits::from(IngressLimits::default()),
         result,
     };
@@ -270,5 +272,69 @@ fn successful_head_syntax_survives_unrelated_representation_rollback() {
     let before = preparation.visited;
     preparation.limits.max_nodes = before + 1;
     assert_eq!(preparation.type_head(&source).unwrap(), result);
+    assert_eq!(preparation.visited, before + 1);
+}
+
+#[test]
+fn completed_heads_remain_reusable_while_unrelated_specializations_are_added() {
+    let engine = engine();
+    let source = app(c("headKeep"), [c("Nat"), nat::literal(42)]);
+    let mut preparation = Preparation::new(&engine.environment, IngressLimits::default());
+    assert_eq!(preparation.type_head(&source).unwrap(), nat::literal(42));
+    let first = preparation.visited;
+    for type_ in [c("Nat"), c("Bool"), c("String")] {
+        preparation.limits.max_nodes = IngressLimits::default().max_nodes;
+        preparation
+            .specialize_call(&c("headKeep"), &[type_])
+            .unwrap()
+            .unwrap();
+        let before = preparation.visited;
+        preparation.limits.max_nodes = before + 1;
+        assert_eq!(preparation.type_head(&source).unwrap(), nat::literal(42));
+        assert_eq!(preparation.visited, before + 1);
+    }
+    assert!(
+        first > 1,
+        "the repeated lookup must save real reduction work"
+    );
+}
+
+#[test]
+fn completed_constant_heads_keep_their_unevaluated_arguments_after_specialization() {
+    let engine = engine();
+    let value = app(c("HeadBox.mk"), [c("Nat"), b(2)]);
+    let source = app(
+        c("headKeep"),
+        [Expr::app(c("HeadBox"), c("Nat")), value.clone()],
+    );
+    let mut preparation = Preparation::new(&engine.environment, IngressLimits::default());
+    assert_eq!(preparation.type_head(&source).unwrap(), value);
+    preparation
+        .specialize_call(&c("headKeep"), &[c("Bool")])
+        .unwrap()
+        .unwrap();
+    let before = preparation.visited;
+    preparation.limits.max_nodes = before + 1;
+    assert_eq!(preparation.type_head(&source).unwrap(), value);
+    assert_eq!(preparation.visited, before + 1);
+}
+
+#[test]
+fn unresolved_projection_heads_are_reduced_after_their_receiver_becomes_available() {
+    let engine = engine();
+    let mut preparation = Preparation::new(&engine.environment, IngressLimits::default());
+    let future = Expr::const_(Name::num(name("_fln_runtime_specialization"), 0), vec![]);
+    let source = Expr::proj(name("HeadBox"), 0, future.clone());
+    assert_eq!(preparation.type_head(&source).unwrap(), source);
+    assert_eq!(
+        preparation
+            .specialize_call(&c("headFixed"), &[c("Bool")])
+            .unwrap(),
+        Some(future),
+    );
+    assert_eq!(preparation.type_head(&source).unwrap(), nat::literal(42));
+    let before = preparation.visited;
+    preparation.limits.max_nodes = before + 1;
+    assert_eq!(preparation.type_head(&source).unwrap(), nat::literal(42));
     assert_eq!(preparation.visited, before + 1);
 }

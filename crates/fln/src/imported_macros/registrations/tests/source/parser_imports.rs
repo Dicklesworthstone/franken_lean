@@ -84,6 +84,32 @@ fn descriptor(kind: &str, token: &str, unsupported: bool) -> Expr {
     )
 }
 
+fn bounded_descriptor(kind: &str, token: &str, precedence: u32) -> Expr {
+    let sequence = |left, right| {
+        apply(
+            "Lean.ParserDescr.binary",
+            [literal_name("andthen"), left, right],
+        )
+    };
+    apply(
+        "Lean.ParserDescr.node",
+        [
+            literal_name(kind),
+            natural(1022),
+            sequence(
+                apply("Lean.ParserDescr.symbol", [string(token)]),
+                sequence(
+                    apply(
+                        "Lean.ParserDescr.cat",
+                        [literal_name("term"), natural(u64::from(precedence))],
+                    ),
+                    apply("Lean.ParserDescr.symbol", [string("done!")]),
+                ),
+            ),
+        ],
+    )
+}
+
 pub(super) fn scope(row: Obj, namespace: Option<&str>) -> Obj {
     match namespace {
         None => Obj::mk_ctor(wire::SCOPE_GLOBAL, vec![row], &[]),
@@ -139,6 +165,14 @@ fn unselected_fixture_with_dependency(
     fault: Fault,
     with_dependency: bool,
 ) -> (SourceOleanImport, Vec<IrModule>) {
+    unselected_fixture_with_operand(fault, with_dependency, None)
+}
+
+fn unselected_fixture_with_operand(
+    fault: Fault,
+    with_dependency: bool,
+    operand_precedence: Option<u32>,
+) -> (SourceOleanImport, Vec<IrModule>) {
     let mut constants = Vec::new();
     for declaration in crate::imported_parsers::fixture_declarations() {
         match declaration {
@@ -175,7 +209,10 @@ fn unselected_fixture_with_dependency(
         definition(
             "SourceLibrary.chooseParser",
             constant(wire::PARSER_DESCR_TYPE),
-            descriptor("SourceLibrary.choose", "choose!", false),
+            operand_precedence.map_or_else(
+                || descriptor("SourceLibrary.choose", "choose!", false),
+                |precedence| bounded_descriptor("SourceLibrary.choose", "choose!", precedence),
+            ),
         ),
         definition(
             "SourceLibrary.scopedParser",
@@ -203,6 +240,12 @@ fn unselected_fixture_with_dependency(
         "choose!",
         None,
     );
+    if operand_precedence.is_some() {
+        rows.push(scope(
+            Obj::mk_ctor(wire::PARSER_ENTRY_TOKEN, vec![Obj::mk_string("done!")], &[]),
+            None,
+        ));
+    }
     rows.extend(parser_rows(
         "SourceLibrary.scopedChoice",
         "SourceLibrary.scopedParser",
@@ -349,6 +392,71 @@ fn artifact_syntax_without_local_declaration_expands_and_kernel_checks_values_an
     assert_eq!(false_proof.attempts.len(), 1);
     assert!(false_proof.states.is_none());
     assert_eq!(imported.engine.logical_root(&KVMap::new()), before);
+}
+
+#[test]
+fn artifact_operand_precedence_survives_codec_admission_reexport_and_macro_expansion() {
+    for precedence in [65, 66] {
+        let (mut imported, code) =
+            unselected_fixture_with_operand(Fault::None, false, Some(precedence));
+        imported
+            .enable_imported_syntax(&[name("SourceLibrary")], ParserRegistryLimits::default())
+            .unwrap();
+        let before = imported.engine.logical_root(&KVMap::new());
+        let source = if precedence == 65 {
+            "prelude\nimport Forward\n\
+             def chosen : Nat := choose! 7 + 42 done!\n\
+             theorem chosen_ok : chosen = 42 := by rfl"
+        } else {
+            "prelude\nimport Forward\n\
+             def chosen : Nat := choose! (7 + 42) done!\n\
+             theorem chosen_ok : chosen = 42 := by rfl"
+        };
+        let report = check(
+            &imported,
+            &code,
+            &[
+                ("Main", source),
+                ("Forward", "prelude\nimport SourceLibrary"),
+            ],
+            MacroTreeLimits::default(),
+            None,
+        );
+        // This fixture's independently registered '+' macro selects its right
+        // operand. Reaching 42 witnesses both expansion layers and the checked
+        // proof, rather than treating the parser's output as an admitted term.
+        let checked = succeeded(&report);
+        assert_declared_value(&checked.checked.engine, "chosen", 42);
+        assert!(
+            checked
+                .checked
+                .engine
+                .environment()
+                .contains(&name("chosen_ok"))
+        );
+        assert_eq!(imported.engine.logical_root(&KVMap::new()), before);
+
+        if precedence == 66 {
+            let rejected = check(
+                &imported,
+                &code,
+                &[(
+                    "Main",
+                    "prelude\nimport SourceLibrary\ndef prefix : Nat := 7\n\
+                     def bad : Nat := choose! 7 + 42 done!",
+                )],
+                MacroTreeLimits::default(),
+                None,
+            );
+            assert!(
+                matches!(rejected.outcome, Outcome::Complete(Err(_))),
+                "{rejected:?}"
+            );
+            assert!(rejected.states.is_none());
+            assert!(!imported.engine.environment().contains(&name("prefix")));
+            assert_eq!(imported.engine.logical_root(&KVMap::new()), before);
+        }
+    }
 }
 
 #[test]

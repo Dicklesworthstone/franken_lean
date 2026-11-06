@@ -1,10 +1,11 @@
-//! Reuse completed head reductions against the same declaration generation.
+//! Reuse completed head reductions against immutable declarations.
 //!
 //! This reducer reads no caller telescope: relative variables and metadata are
 //! part of the exact expression key. The admitted environment is immutable,
 //! and private canonical definitions are appended with fresh names. Growing
-//! that table can give a previously opaque head a body, so every cached result
-//! is guarded by its generation. Native type bridges retain their checked
+//! that table can give a previously opaque head a body. Those results and
+//! unresolved projections remain guarded by their generation; completed
+//! terminal heads survive unrelated additions. Native type bridges retain their checked
 //! carriers for the entire preparation; results contain no closure-table IDs.
 
 use super::*;
@@ -26,6 +27,7 @@ impl From<IngressLimits> for Limits {
 
 struct Entry {
     generation: usize,
+    stable: bool,
     limits: Limits,
     result: Expr,
 }
@@ -33,6 +35,30 @@ struct Entry {
 #[derive(Default)]
 pub(super) struct Store {
     entries: HashMap<Expr, Entry>,
+}
+
+/// Adding a fresh private definition cannot change a completed head whose
+/// identity already exists, or a nonconstant terminal. A stuck projection is
+/// deliberately conservative: its unchanged receiver may hide an unresolved
+/// name behind an unfolded definition, so it still needs the generation guard.
+/// Only the returned head matters; its unevaluated arguments and lambda bodies
+/// were never part of this reduction and retain their exact original syntax.
+fn stable_head(preparation: &mut Preparation<'_>, result: &Expr) -> Result<bool, IngressError> {
+    let mut head = result;
+    loop {
+        preparation.tick()?;
+        match head.node() {
+            ExprNode::App { f, .. } => head = f,
+            ExprNode::Const { name, .. } => {
+                return Ok(preparation.environment.contains(name)
+                    || preparation.specializations.definitions.contains_key(name));
+            }
+            ExprNode::Proj { .. } | ExprNode::MData { .. } | ExprNode::LetE { .. } => {
+                return Ok(false);
+            }
+            _ => return Ok(true),
+        }
+    }
 }
 
 fn remember(
@@ -85,7 +111,7 @@ pub(super) fn type_head(
     let generation = preparation.specializations.definitions.len();
     let limits = Limits::from(preparation.limits);
     if let Some(entry) = preparation.specializations.heads.entries.get(source)
-        && entry.generation == generation
+        && (entry.stable || entry.generation == generation)
         && entry.limits == limits
     {
         return Ok(entry.result.clone());
@@ -95,12 +121,14 @@ pub(super) fn type_head(
     // this check also prevents an in-flight result from being published under
     // a newer generation if that changes in a later compiler extension.
     if preparation.specializations.definitions.len() == generation {
+        let stable = stable_head(preparation, &result)?;
         preparation.tick()?;
         remember(
             &mut preparation.specializations.heads.entries,
             source.clone(),
             Entry {
                 generation,
+                stable,
                 limits,
                 result: result.clone(),
             },
