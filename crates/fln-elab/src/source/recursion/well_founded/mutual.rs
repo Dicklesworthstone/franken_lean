@@ -7,7 +7,7 @@
 //! Lean/Elab/PreDefinition/Main.lean `partitionPreDefs`), becomes:
 //!
 //! * `<first>._mutual : fixed → (x : D₀ ⊕' D₁ ⊕' …) → C x`, a
-//!   `WellFounded.Nat.fix` over the right-nested `PSum` of each member's
+//!   checked well-founded fixpoint over the right-nested `PSum` of each member's
 //!   `PSigma`-packed varying arguments (`Mutual.packType`, `Unary.packType`);
 //! * each member `fun params => <first>._mutual fixed (PSum.inl ⟨varying⟩)`
 //!   etc. (`Mutual.pack`, `preDefsFromUnaryNonRec`), marked `@[irreducible]`.
@@ -18,8 +18,10 @@
 //! tactic) proves the goals of the calls in its own body
 //! (`groupGoalsByFunction`, WF/Fix.lean).
 //!
-//! Supported: Nat-valued measures with the canonical relation (so the fixpoint
-//! is `WellFounded.Nat.fix`), fixed parameters forming one common unreordered
+//! Explicit measures share one codomain and its selected `WellFoundedRelation`.
+//! The canonical Nat relation retains `WellFounded.Nat.fix`; other relations use
+//! the checked `invImage` and `WellFounded.fix` construction. Fixed parameters
+//! form one common unreordered
 //! prefix (`fixedArePrefix`), including the common section closure, and identical
 //! written universe parameters. Every other recursive component is a typed refusal, never a
 //! partial or unsafe fallback.
@@ -49,10 +51,6 @@ pub(in crate::source) struct Measured {
     /// body-derived section closure is applied after dependency partitioning.
     pub measure: Expr,
     pub section_captures: Vec<FVarId>,
-    /// `T` is `Nat` at default transparency.
-    pub nat: bool,
-    /// ... and its active `WellFoundedRelation` is `Nat.lt_wfRel` (`isNatLtWF`).
-    pub natural: bool,
 }
 
 /// The shared construction of one recursive component, closed over its fixed
@@ -69,8 +67,9 @@ pub(in crate::source) struct Plan {
     /// Each member's closed header type.
     pub types: Vec<Expr>,
     domain: Expr,
-    codomain: Expr,
-    measure: Expr,
+    fix: Expr,
+    fix_type: Expr,
+    natural: bool,
     domains: Vec<Expr>,
 }
 
@@ -404,19 +403,6 @@ impl Context {
         self.open_recursive_lambdas(syntax, expected, &mut parameters)?;
         let measure = self.well_founded_measure(hint, &parameters, header_parameters)?;
         let value = self.instantiate(&measure.value)?;
-        let type_ = self.instantiate(&measure.type_)?;
-        let nat_type = Expr::const_(Name::from_components(["Nat"]), Vec::new());
-        let nat = self.well_founded_default_conversion(&type_, &nat_type)?;
-        let natural = nat
-            && self
-                .select_well_founded_relation(
-                    Typed {
-                        value: value.clone(),
-                        type_: nat_type,
-                    },
-                    &parameters,
-                )?
-                .natural;
         let mut value = self.instantiate(&value)?;
         for parameter in parameters.iter().rev() {
             self.tick()?;
@@ -438,8 +424,6 @@ impl Context {
             arity: parameters.len(),
             measure: value,
             section_captures: captures.into_iter().map(|capture| capture.id).collect(),
-            nat,
-            natural,
         })
     }
 
@@ -983,21 +967,13 @@ impl Context {
             .value)
     }
 
-    /// `WellFounded.Nat.fix D C measure`, the pin's `isNatLtWF` specialization.
-    fn mutual_fix(
-        &mut self,
-        domain: Expr,
-        codomain: Expr,
-        measure: Expr,
-    ) -> Result<Typed, NatDefinitionElabError> {
-        let name = Name::from_components(["WellFounded", "Nat", "fix"]);
-        if !matches!(
-            self.txn.env.find(&name),
-            Some(ConstantInfo::Defn(definition)) if definition.safety == DefinitionSafety::Safe
-        ) {
-            return Err(failure(SourceInferenceError::UnknownConstant(name)));
-        }
-        self.mutual_apply(&["WellFounded", "Nat", "fix"], [domain, codomain, measure])
+    /// Reopen the checked fixpoint prefix and its type in a member's own fixed
+    /// context. The relation was selected once for the entire component.
+    fn mutual_fix(&mut self, plan: &Plan, fixed: &[Expr]) -> Result<Typed, NatDefinitionElabError> {
+        Ok(Typed {
+            value: self.open_mutual_closed(&plan.fix, fixed)?,
+            type_: self.open_mutual_closed(&plan.fix_type, fixed)?,
+        })
     }
 
     /// Build the shared domain, codomain and measure of a component, closed over
@@ -1015,10 +991,16 @@ impl Context {
         self.explicit_levels = level_params.len();
         let saved = self.txn.lctx.clone();
         let result = (|| {
+            // MutualClosure has already closed the headers and measures over
+            // the section variables actually used by the bodies. An unused
+            // section instance must not influence relation synthesis here.
+            self.txn.lctx = LocalContext::new();
             let fixed_locals = self.open_mutual_fixed(&types[0], fixed)?;
             let mut domains = Vec::new();
             let mut codomains = Vec::new();
             let mut packed_measures = Vec::new();
+            let mut measure_type: Option<Expr> = None;
+            let fixed_ids: HashSet<_> = fixed_locals.iter().map(|local| local.id.clone()).collect();
             let mut sort: Option<Level> = None;
             for (index, type_) in types.iter().enumerate() {
                 let before = self.txn.lctx.clone();
@@ -1094,13 +1076,38 @@ impl Context {
                     let next = self.substitute(body, &Expr::fvar(local.id.clone()))?;
                     measure = next;
                 }
-                let nat = Expr::const_(Name::from_components(["Nat"]), Vec::new());
+                let actual_type = self
+                    .known_type(&measure)?
+                    .ok_or_else(|| failure(SourceInferenceError::ExpectedType))?;
+                let actual_type = self.instantiate(&actual_type)?;
+                // `checkCodomains` compares every member in the common fixed
+                // context. A varying argument cannot escape into the measure
+                // type used by the shared PSum function or its dictionary.
+                if self
+                    .elimination_reads(&actual_type)?
+                    .iter()
+                    .any(|id| !fixed_ids.contains(id))
+                {
+                    return Err(unsupported(
+                        "a termination measure type depending on varying parameters",
+                    ));
+                }
+                if let Some(previous) = &measure_type {
+                    if !self.well_founded_default_conversion(previous, &actual_type)? {
+                        return Err(error(RecursionError::MutualMeasureTypeMismatch {
+                            first: names[0].clone(),
+                            other: names[index].clone(),
+                        }));
+                    }
+                } else {
+                    measure_type = Some(actual_type.clone());
+                }
                 packed_measures.push(
                     self.uncurry_well_founded_value(
                         &varying,
                         Typed {
                             value: measure,
-                            type_: nat,
+                            type_: actual_type,
                         },
                     )?
                     .value,
@@ -1115,8 +1122,11 @@ impl Context {
             }
             let sort = sort.ok_or_else(scope)?;
             let codomain = self.mutual_function_of_sum(&domain, Expr::sort(sort), &codomains)?;
-            let nat = Expr::const_(Name::from_components(["Nat"]), Vec::new());
-            let measure = self.mutual_function_of_sum(&domain, nat, &packed_measures)?;
+            let measure_type = measure_type.ok_or_else(scope)?;
+            let relation =
+                self.select_well_founded_relation_type(measure_type.clone(), &fixed_locals)?;
+            let measure = self.mutual_function_of_sum(&domain, measure_type, &packed_measures)?;
+            let fix = self.well_founded_fix(domain.clone(), codomain, measure, &relation)?;
             let mut closed_domains = Vec::new();
             for part in &domains {
                 closed_domains.push(self.close_mutual_fixed(part, &fixed_locals, true)?);
@@ -1129,11 +1139,12 @@ impl Context {
                 arities: arities.clone(),
                 types: types.clone(),
                 domain: self.close_mutual_fixed(&domain, &fixed_locals, true)?,
-                codomain: self.close_mutual_fixed(&codomain, &fixed_locals, true)?,
-                measure: self.close_mutual_fixed(&measure, &fixed_locals, true)?,
+                fix: self.close_mutual_fixed(&fix.value, &fixed_locals, true)?,
+                fix_type: self.close_mutual_fixed(&fix.type_, &fixed_locals, true)?,
+                natural: relation.natural,
                 domains: closed_domains,
             };
-            for term in [&plan.domain, &plan.codomain, &plan.measure]
+            for term in [&plan.domain, &plan.fix, &plan.fix_type]
                 .into_iter()
                 .chain(&plan.domains)
             {
@@ -1233,8 +1244,6 @@ impl Context {
             .map(|parameter| Expr::fvar(parameter.id.clone()))
             .collect();
         let domain = self.open_mutual_closed(&plan.domain, &fixed_values)?;
-        let codomain = self.open_mutual_closed(&plan.codomain, &fixed_values)?;
-        let measure = self.open_mutual_closed(&plan.measure, &fixed_values)?;
         let mut domains = Vec::new();
         for part in &plan.domains {
             domains.push(self.open_mutual_closed(part, &fixed_values)?);
@@ -1243,7 +1252,7 @@ impl Context {
             .pack_well_founded_arguments(&domains[index], &varying_values)?
             .value;
         let current = self.inject_mutual_argument(&domain, index, plan.names.len(), packed)?;
-        let fix = self.mutual_fix(domain, codomain, measure)?;
+        let fix = self.mutual_fix(&plan, &fixed_values)?;
         let saved = self.txn.lctx.clone();
         let fix_type = self.whnf(&fix.type_)?;
         let ExprNode::ForallE {
@@ -1319,7 +1328,7 @@ impl Context {
                 .enumerate()
                 .collect(),
             measure_captures: HashSet::new(),
-            natural_measure: true,
+            natural_measure: plan.natural,
             continuation: continuation.clone(),
             proof_inaccessible: parameters[header_parameters..]
                 .iter()
@@ -1421,7 +1430,7 @@ impl Context {
         )
     }
 
-    /// `<first>._mutual := fun fixed => WellFounded.Nat.fix D C measure
+    /// `<first>._mutual := fun fixed => fix D C relation
     /// (fun x a => PSum.casesOn (motive := fun x => FT x → C x) x alt₀ … a)`.
     pub(in crate::source) fn assemble_mutual_well_founded(
         &mut self,
@@ -1438,13 +1447,11 @@ impl Context {
                 .map(|local| Expr::fvar(local.id.clone()))
                 .collect();
             let domain = self.open_mutual_closed(&plan.domain, &fixed_values)?;
-            let codomain = self.open_mutual_closed(&plan.codomain, &fixed_values)?;
-            let measure = self.open_mutual_closed(&plan.measure, &fixed_values)?;
             let mut alternatives = Vec::new();
             for piece in pieces {
                 alternatives.push(self.open_mutual_closed(piece, &fixed_values)?);
             }
-            let fix = self.mutual_fix(domain.clone(), codomain, measure)?;
+            let fix = self.mutual_fix(plan, &fixed_values)?;
             let fix_type = self.whnf(&fix.type_)?;
             let ExprNode::ForallE {
                 binder_type: functional_type,

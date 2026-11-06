@@ -9,6 +9,14 @@ mod cleanup;
 
 pub(super) struct Measure {
     pub value: Typed,
+    pub relation: MeasureRelation,
+}
+
+/// A relation selected for the measure's codomain. Keeping this independent of
+/// a particular measure value lets mutual recursion select it once, after all
+/// members have agreed on their codomain in the shared fixed-parameter scope.
+pub(super) struct MeasureRelation {
+    type_: Expr,
     dictionary: Expr,
     pub natural: bool,
     pub captures: HashSet<usize>,
@@ -36,8 +44,17 @@ impl Context {
         value: Typed,
         parameters: &[LocalDecl],
     ) -> Result<Measure, NatDefinitionElabError> {
+        let relation = self.select_well_founded_relation_type(value.type_.clone(), parameters)?;
+        Ok(Measure { value, relation })
+    }
+
+    pub(super) fn select_well_founded_relation_type(
+        &mut self,
+        type_: Expr,
+        parameters: &[LocalDecl],
+    ) -> Result<MeasureRelation, NatDefinitionElabError> {
         let target = self
-            .well_founded_application(&["WellFoundedRelation"], [value.type_.clone()])?
+            .well_founded_application(&["WellFoundedRelation"], [type_.clone()])?
             .value;
         let dictionary = self
             .coercion_instance(target)?
@@ -51,7 +68,7 @@ impl Context {
         let mut trial = self.clone();
         let natural = (|| {
             let nat = Expr::const_(Name::from_components(["Nat"]), Vec::new());
-            if !trial.well_founded_default_conversion(&value.type_, &nat)? {
+            if !trial.well_founded_default_conversion(&type_, &nat)? {
                 return Ok(false);
             }
             trial.well_founded_default_conversion(
@@ -68,7 +85,7 @@ impl Context {
         // tentatively captured now and checked at EVERY recursive call before
         // it may be omitted from the pack. This permits Fin n with fixed n,
         // without admitting a family whose n changes during recursion.
-        let mut roots = self.elimination_reads(&value.type_)?;
+        let mut roots = self.elimination_reads(&type_)?;
         if !natural {
             // The canonical Nat specialization discards this dictionary
             // after conversion, so its incidental reads are not captures.
@@ -82,8 +99,8 @@ impl Context {
             .enumerate()
             .filter_map(|(index, parameter)| used.contains(&parameter.id).then_some(index))
             .collect();
-        Ok(Measure {
-            value,
+        Ok(MeasureRelation {
+            type_,
             dictionary,
             natural,
             captures,
@@ -95,7 +112,7 @@ impl Context {
         domain: Expr,
         motive: Expr,
         measure_fn: Expr,
-        measure: &Measure,
+        measure: &MeasureRelation,
     ) -> Result<Typed, NatDefinitionElabError> {
         let fix_name = if measure.natural {
             Name::from_components(["WellFounded", "Nat", "fix"])
@@ -119,7 +136,7 @@ impl Context {
                 &["invImage"],
                 [
                     domain.clone(),
-                    measure.value.type_.clone(),
+                    measure.type_.clone(),
                     measure_fn,
                     measure.dictionary.clone(),
                 ],

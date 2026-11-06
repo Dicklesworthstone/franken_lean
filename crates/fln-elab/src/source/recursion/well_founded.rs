@@ -768,7 +768,7 @@ impl Context {
         let measure = self.select_well_founded_relation(measure, parameters)?;
         let snapshot = self.clone();
         let mut varying: Vec<_> = (0..parameters.len())
-            .filter(|index| !measure.captures.contains(index))
+            .filter(|index| !measure.relation.captures.contains(index))
             .collect();
         loop {
             let result = self.well_founded_attempt(
@@ -837,7 +837,7 @@ impl Context {
             .map(|parameter| Expr::fvar(parameter.id.clone()))
             .collect();
         let current = self.pack_well_founded_arguments(&domain, &current_arguments)?;
-        let fix = self.well_founded_fix(domain, motive, measure_fn.value, measure)?;
+        let fix = self.well_founded_fix(domain, motive, measure_fn.value, &measure.relation)?;
         let fix_type = self.whnf(&fix.type_)?;
         let ExprNode::ForallE {
             binder_type: functional_type,
@@ -907,8 +907,8 @@ impl Context {
                 .filter(|(index, _)| !varying.contains(index))
                 .map(|(index, parameter)| (index, parameter.clone()))
                 .collect(),
-            measure_captures: measure.captures.clone(),
-            natural_measure: measure.natural,
+            measure_captures: measure.relation.captures.clone(),
+            natural_measure: measure.relation.natural,
             continuation: continuation.clone(),
             proof_inaccessible: parameters[header_parameters..]
                 .iter()
@@ -2155,7 +2155,10 @@ impl Context {
                             .ok_or_else(|| failure(SourceInferenceError::ExpectedType))?;
                         retain = matches!(
                             self.whnf(&type_type)?.node(),
-                            ExprNode::Sort { level } if level == &Level::zero()
+                            // Reconstructed forall sorts retain raw imax
+                            // levels. A quantified proof can still be Prop
+                            // without its level being the literal Zero node.
+                            ExprNode::Sort { level } if level.is_always_zero()
                         );
                     }
                     if retain {
