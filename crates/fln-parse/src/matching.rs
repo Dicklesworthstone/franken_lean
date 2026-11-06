@@ -17,6 +17,28 @@ use do_scopes::DoScopes;
 pub(super) struct Splices {
     pub(super) terms: HashMap<usize, (usize, Syntax)>,
     pub(super) argument_floor: Option<(usize, NatDefinitionExpectation)>,
+    /// Only this outer range has a requested Pratt minimum. Planned branches,
+    /// binder bodies and parenthesized terms retain their own precedences.
+    pub(super) prefix: Option<TermPrefix>,
+}
+
+pub(super) struct TermPrefix {
+    pub(super) range: Range<usize>,
+    pub(super) minimum: u32,
+    pub(super) next: usize,
+}
+
+impl Splices {
+    fn with_minimum(range: &Range<usize>, minimum: Option<u32>) -> Self {
+        Self {
+            prefix: minimum.map(|minimum| TermPrefix {
+                range: range.clone(),
+                minimum,
+                next: range.end,
+            }),
+            ..Self::default()
+        }
+    }
 }
 struct Alternative {
     pipe: usize,
@@ -1417,7 +1439,7 @@ fn pattern(
                     }
                 } else if let Some((notation, end)) = (!dot)
                     .then(|| {
-                        crate::extensions::leading_term(leaves, view, tokens, cursor, range.end)
+                        crate::extensions::leading_term(leaves, view, tokens, cursor, range.end, 0)
                     })
                     .flatten()
                 {
@@ -1772,7 +1794,32 @@ pub(super) fn parse(
     range: Range<usize>,
     grammar: DefinitionGrammar,
 ) -> Result<Syntax, NatDefinitionParseError> {
-    parse_planned(leaves, view, tokens, range, grammar, false)
+    parse_planned(leaves, view, tokens, range, grammar, false, None).map(|(syntax, _)| syntax)
+}
+
+/// Read the longest term admitted by the requested category precedence. The
+/// returned cursor belongs to the descriptor that follows this operand.
+pub(super) fn parse_at_precedence(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    range: Range<usize>,
+    minimum: u32,
+) -> Result<(Syntax, usize), NatDefinitionParseError> {
+    let start = range.start;
+    let (syntax, next) = parse_planned(
+        leaves,
+        view,
+        tokens,
+        range,
+        DefinitionGrammar::Scalar,
+        false,
+        Some(minimum),
+    )?;
+    if !term_leading_admits(&syntax, minimum) {
+        return Err(refuse(view, tokens, start));
+    }
+    Ok((syntax, next))
 }
 
 /// Declaration equations own their original pipes, patterns and bodies. The
@@ -1788,11 +1835,12 @@ pub(super) fn declaration_equations(
     if grammar != DefinitionGrammar::Scalar || !is_symbol(tokens, range.start, "|") {
         return Err(refuse(view, tokens, range.start));
     }
-    parse_planned(leaves, view, tokens, range, grammar, true)
+    parse_planned(leaves, view, tokens, range, grammar, true, None).map(|(syntax, _)| syntax)
 }
 
 // Keep match construction's temporaries off the ordinary-term call stack:
 // tactic arguments reenter this dispatcher while their enclosing term is live.
+#[allow(clippy::too_many_arguments)]
 fn parse_planned(
     leaves: &Leaves,
     view: &SourceView,
@@ -1800,13 +1848,14 @@ fn parse_planned(
     range: Range<usize>,
     grammar: DefinitionGrammar,
     equations: bool,
-) -> Result<Syntax, NatDefinitionParseError> {
+    minimum: Option<u32>,
+) -> Result<(Syntax, usize), NatDefinitionParseError> {
     if grammar == DefinitionGrammar::Scalar && is_symbol(tokens, range.start, "by") {
         let (proof, end) = proofs::parse(leaves, view, tokens, range.start, range.end)?;
         if end != range.end {
             return Err(refuse(view, tokens, end));
         }
-        return Ok(proof);
+        return Ok((proof, end));
     }
     // Tactic blocks own their pipes; their bounded arguments reenter here. A bare
     // pipe needs the planner only as a refutable do binding's failure branch, so it
@@ -1827,11 +1876,13 @@ fn parse_planned(
                         && is_symbol(tokens, at + 1, "|"))
             }))
     {
-        return parse_compound(leaves, view, tokens, range, grammar, equations);
+        return parse_compound(leaves, view, tokens, range, grammar, equations, minimum);
     }
-    let mut splices = Splices::default();
+    let mut splices = Splices::with_minimum(&range, minimum);
     let updates = record_terms::update_openers(tokens, range.clone());
-    branch_value(leaves, view, tokens, range, grammar, &mut splices, &updates)
+    let end = range.end;
+    let syntax = branch_value(leaves, view, tokens, range, grammar, &mut splices, &updates)?;
+    Ok((syntax, splices.prefix.map_or(end, |prefix| prefix.next)))
 }
 
 // Do not retain both match and conditional construction temporaries while a
@@ -2375,6 +2426,7 @@ fn build_match(
     Ok(None)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn parse_compound(
     leaves: &Leaves,
     view: &SourceView,
@@ -2382,8 +2434,9 @@ fn parse_compound(
     range: Range<usize>,
     grammar: DefinitionGrammar,
     equations: bool,
-) -> Result<Syntax, NatDefinitionParseError> {
-    let mut splices = Splices::default();
+    minimum: Option<u32>,
+) -> Result<(Syntax, usize), NatDefinitionParseError> {
+    let mut splices = Splices::with_minimum(&range, minimum);
     let updates: HashSet<_> = record_terms::update_openers(tokens, range.clone());
     for planned in plan(view, tokens, range.clone(), equations)? {
         match planned {
@@ -2408,16 +2461,18 @@ fn parse_compound(
                     &mut splices,
                     &updates,
                 )? {
-                    return Ok(equations);
+                    return Ok((equations, range.end));
                 }
             }
         }
     }
+    let end = range.end;
     let result = branch_value(leaves, view, tokens, range, grammar, &mut splices, &updates)?;
-    if !splices.terms.is_empty() {
+    let next = splices.prefix.map_or(end, |prefix| prefix.next);
+    if splices.terms.keys().any(|start| *start < next) {
         return Err(refuse(view, tokens, 0));
     }
-    Ok(result)
+    Ok((result, next))
 }
 
 #[cfg(test)]

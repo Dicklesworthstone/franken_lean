@@ -174,6 +174,10 @@ fn local_clause_limit_refuses_without_erasing_the_global_chain() {
     let mut many = single.clone();
     many.fallbacks = vec![single; MAX_TEMPLATE_NODES - 1];
     Arc::make_mut(&mut g.rules).insert(key(), Arc::new(many));
+    // Keep every copied global clause's scope provenance aligned so the
+    // fixture reaches the clause budget instead of failing metadata validation.
+    let scope = g.rule_scopes[&key()][0].clone();
+    g.rule_scopes.insert(key(), vec![scope; MAX_TEMPLATE_NODES]);
     let exported = g.export_native().unwrap();
     refused_without_mutation(&mut g, "local macro_rules | `(select! 0) => `(10)");
     assert_eq!(g.export_native().unwrap(), exported);

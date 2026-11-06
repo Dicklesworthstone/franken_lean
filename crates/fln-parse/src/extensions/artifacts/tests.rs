@@ -3,6 +3,7 @@
 use super::*;
 
 mod abbreviations;
+mod precedence;
 mod tactics;
 
 fn name(label: &str) -> Name {
@@ -830,7 +831,8 @@ fn unsupported_aliases_contextual_checks_and_nested_shapes_never_install() {
             Box::new(symbol("left")),
             Box::new(symbol("right")),
         ),
-        Descr::Cat(name("term"), 65),
+        Descr::Cat(name("term"), MAX_PREC + 1),
+        Descr::Cat(name("term"), u32::MAX),
         Descr::Cat(name("unknownCategory"), 0),
         Descr::NodeWithAntiquot(" ".into(), name("Library.piece"), Box::new(symbol("piece"))),
         Descr::NodeWithAntiquot("piece".into(), Name::anonymous(), Box::new(symbol("piece"))),

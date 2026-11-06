@@ -158,7 +158,9 @@ impl FileGrammar {
     /// disjoint reserved first tokens, atom-bounded leading `term` syntax, ordinary
     /// symbol/term infix syntax, and leading/trailing custom-category syntax.
     /// A lone primitive production (such as `num`) is supported in a custom
-    /// category. Unknown closures/aliases, scoped categories, ambiguous heads,
+    /// category. Term operands admit every minimum through `max`; intermediate
+    /// minima use the scalar Pratt parser's application and operator boundaries.
+    /// Unknown closures/aliases, scoped categories, ambiguous heads,
     /// contextual column checks and unsupported precedence forms are refused.
     /// The exact category quotation shape emitted by `declare_syntax_cat` uses
     /// the native quotation parser, with its original envelope and captures.
@@ -720,9 +722,6 @@ fn descriptor(
                     || categories.contains(category))
             {
                 return Err("artifact parser references an unavailable category or precedence");
-            }
-            if builtin.as_deref() == Some("term") && !matches!(*precedence, 0 | 1023 | 1024) {
-                return Err("artifact term operands require zero, argument or maximum precedence");
             }
             if builtin.as_deref() == Some("command") && *precedence != 0 {
                 return Err("artifact command operands require zero precedence");

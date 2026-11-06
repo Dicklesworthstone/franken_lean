@@ -792,8 +792,9 @@ pub struct ActiveGrammar {
     /// registration alone must never enable a hand-written parser alternative.
     artifact_kinds: BTreeSet<Name>,
     /// Leading `term` declarations of the prefix shape `node k p (andthen (symbol s) (cat term
-    /// q))` (`notation:25 "⊢ₛ " p:25`): by symbol, the kind and the operand's precedence `q`.
-    prefixes: BTreeMap<String, (Name, u8)>,
+    /// q))` (`notation:25 "⊢ₛ " p:25`): by symbol, the kind, operand precedence
+    /// `q`, and the leading parser's own precedence `p`.
+    prefixes: BTreeMap<String, (Name, u8, u32)>,
     /// Leading `attr` declarations by the text of their first atom.
     attrs: BTreeMap<String, Vec<usize>>,
     /// Leading `command` declarations by the text of their first atom.
@@ -854,9 +855,9 @@ impl ActiveGrammar {
         let tactic = Name::from_components(["tactic"]);
         let attr = Name::from_components(["attr"]);
         let command = Name::from_components(["command"]);
-        let mut prefixes: BTreeMap<String, Vec<(Name, u8)>> = BTreeMap::new();
+        let mut prefixes: BTreeMap<String, Vec<(Name, u8, u32)>> = BTreeMap::new();
         for decl in &decls {
-            if let (Some(category), true, Descr::Node { kind, body, .. }) =
+            if let (Some(category), true, Descr::Node { kind, prec, body }) =
                 (&decl.category, decl.leading, &decl.descr)
                 && *category == term
                 && let Descr::Binary(andthen, left, right) = body.as_ref()
@@ -867,10 +868,11 @@ impl ActiveGrammar {
                 && *rbp < 256
                 && !builtin_tokens().contains(head.trim())
             {
-                prefixes
-                    .entry(head.trim().to_string())
-                    .or_default()
-                    .push((kind.clone(), *rbp as u8));
+                prefixes.entry(head.trim().to_string()).or_default().push((
+                    kind.clone(),
+                    *rbp as u8,
+                    *prec,
+                ));
             }
         }
         // One reading per symbol: two prefix notations on one symbol are the pin's `choice`, not
@@ -3827,6 +3829,7 @@ pub(crate) fn leading_term(
     tokens: &[LexedToken],
     index: usize,
     end: usize,
+    minimum: u32,
 ) -> Option<(Syntax, usize)> {
     let grammar = active()?;
     let head = token_text(tokens.get(index)?)?;
@@ -3840,6 +3843,9 @@ pub(crate) fn leading_term(
     let mut tied = false;
     for &candidate in candidates {
         let descr = &grammar.decls[candidate].descr;
+        if matches!(descr, Descr::Node { prec, .. } if *prec < minimum) {
+            continue;
+        }
         let Some((items, next)) = run.parse(descr, index, end, &Follow::End, 0) else {
             continue;
         };
@@ -3861,7 +3867,19 @@ pub(crate) fn leading_term(
 /// The prefix notation of the active grammar spelled `symbol`: its kind and the precedence its
 /// operand is read at.
 pub(crate) fn prefix(symbol: &str) -> Option<(Name, u8)> {
-    active()?.prefixes.get(symbol).cloned()
+    active()?
+        .prefixes
+        .get(symbol)
+        .map(|(kind, operand, _)| (kind.clone(), *operand))
+}
+
+/// The actual selected prefix parser's leading precedence. Its syntax kind
+/// can also be built by another declaration with a different precedence.
+pub(crate) fn prefix_leading_precedence(symbol: &str) -> Option<u32> {
+    active()?
+        .prefixes
+        .get(symbol)
+        .map(|(_, _, leading)| *leading)
 }
 
 /// The `attr` syntax the census declares for an attribute named `head`, under a grammar that
@@ -4149,7 +4167,14 @@ impl Run<'_> {
 
     /// Where a term starting at `at` ends: at the first depth-zero token `follow` stops at,
     /// else at `end`; for a term at `max`/`arg` precedence, after one atom or bracket.
-    fn term_end(&self, at: usize, end: usize, prec: u32, follow: &Follow) -> Option<usize> {
+    fn term_end(
+        &self,
+        at: usize,
+        end: usize,
+        prec: u32,
+        follow: &Follow,
+        infix_follow: bool,
+    ) -> Option<usize> {
         if at >= end {
             return None;
         }
@@ -4197,7 +4222,18 @@ impl Run<'_> {
         for index in at..end {
             let text = self.text(index).unwrap_or_default();
             if depth == 0 && index > at && stops.is_some_and(|stops| stops.contains(&text)) {
-                return Some(index);
+                // An infix spelling after a bounded term is not necessarily a
+                // delimiter. Let the Pratt parser decide whether this minimum
+                // or an open prefix body consumes it before the next descriptor.
+                let pratt_operand = infix_follow
+                    && crate::bounded_infix(
+                        Some(&self.tokens[index].kind),
+                        DefinitionGrammar::Scalar,
+                    )
+                    .is_some();
+                if !pratt_operand {
+                    return Some(index);
+                }
             }
             if OPENERS.contains(&text.as_str()) || crate::quotations::opens(&text) {
                 depth += 1;
@@ -4352,8 +4388,22 @@ impl Run<'_> {
                 if active().is_some_and(|g| g.source_categories.contains(category)) {
                     return self.category(category, *prec, at, end, follow, depth + 1);
                 }
-                let stop = self.term_end(at, end, *prec, follow)?;
-                let syntax = match simple(category).as_deref() {
+                let category_name = simple(category);
+                let infix_follow =
+                    category_name.as_deref() == Some("term") && (1..1023).contains(prec);
+                let stop = self.term_end(at, end, *prec, follow, infix_follow)?;
+                let syntax = match category_name.as_deref() {
+                    Some("term") if (1..1023).contains(prec) => {
+                        let (syntax, next) = crate::bounded_term_at_precedence(
+                            self.leaves,
+                            self.view,
+                            self.tokens,
+                            at..stop,
+                            *prec,
+                        )
+                        .ok()?;
+                        return Some((vec![syntax], next));
+                    }
                     Some("term") => {
                         let syntax = crate::bounded_term(
                             self.leaves,
@@ -4616,7 +4666,7 @@ impl Run<'_> {
                 at + 1,
             )),
             ("tacticSeq", _) => {
-                let stop = self.term_end(at, end, 0, follow)?;
+                let stop = self.term_end(at, end, 0, follow, false)?;
                 let sequence =
                     crate::proofs::tactic_seq(self.leaves, self.view, self.tokens, at..stop)
                         .ok()?;

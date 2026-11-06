@@ -545,10 +545,32 @@ impl BoundedInfix {
     /// The precedence an operator waiting for its right operand holds against the next one.
     const fn right_precedence(self) -> u16 {
         match self {
+            Self::Extension(operator) => operator.rhs_prec,
             _ if self.is_range() => 0,
             // Each pattern is a `term:51`.
             Self::Matches | Self::MatchesBar => 51,
             _ => self.precedence() as u16,
+        }
+    }
+
+    const fn right_operand_minimum(self) -> u16 {
+        match self {
+            Self::Extension(operator) => operator.rhs_prec,
+            _ if self.is_range() => 0,
+            Self::Matches | Self::MatchesBar => 51,
+            _ => self.precedence() as u16 + !self.is_right_associative() as u16,
+        }
+    }
+
+    /// `trailingNode` checks the completed left term independently of the
+    /// precedence used to dispatch this operator.
+    const fn minimum_left_precedence(self) -> u16 {
+        match self {
+            Self::Extension(operator) => operator.lhs_prec,
+            _ if self.is_range() => 0,
+            Self::Arrow | Self::Subst | Self::PipeLeft | Self::PipeProj | Self::Dollar => 0,
+            Self::Matches => 51,
+            _ => self.precedence() as u16 + self.has_strict_left_operand() as u16,
         }
     }
 
@@ -2446,6 +2468,19 @@ fn push_bounded_infix(
     index: usize,
     syntax: Syntax,
 ) -> Result<(), NatDefinitionParseError> {
+    let refuse = || NatDefinitionParseError::OutsideSeedGrammar {
+        at: original_position(view, tokens, index),
+        expected: NatDefinitionExpectation::EndOfCommand,
+    };
+    if let [(left, start)] = frame.application.as_slice()
+        && let Some(TokenKind::Symbol(symbol)) = tokens.get(*start).map(|token| &token.kind)
+        && let Some((kind, _)) = extensions::prefix(symbol)
+        && left.kind() == Some(&kind)
+        && extensions::prefix_leading_precedence(symbol)
+            .is_some_and(|precedence| precedence < u32::from(operator.minimum_left_precedence()))
+    {
+        return Err(refuse());
+    }
     // `atomic(" $" ws)`: a `$` touching the next token is an antiquotation, not `<|`'s spelling.
     if operator == BoundedInfix::Dollar
         && tokens
@@ -2476,12 +2511,32 @@ fn push_bounded_infix(
         }
         push_bounded_operand(view, tokens, frame, grammar, index)?;
     }
+    if operator.minimum_left_precedence() > 1022
+        && frame
+            .operands
+            .last()
+            .is_some_and(|(left, _)| left.kind() == Some(&parser_kind(&["Term", "app"])))
+    {
+        return Err(refuse());
+    }
+    let mut reduced_precedence = None;
     while frame
         .operators
         .last()
         .is_some_and(|previous| previous.operator.right_precedence() > operator.left_precedence())
     {
+        reduced_precedence = frame.operators.last().map(|previous| {
+            if previous.operator.is_range() {
+                1024
+            } else {
+                u16::from(previous.operator.precedence())
+            }
+        });
         reduce_bounded_infix(view, tokens, frame, grammar)?;
+    }
+    if reduced_precedence.is_some_and(|precedence| precedence < operator.minimum_left_precedence())
+    {
+        return Err(refuse());
     }
     // At equal precedence a non-associative operator reads `term:p+1` on both sides. The one before
     // cannot be continued, except by the arrow, a trailing parser with no left precedence
@@ -2489,7 +2544,8 @@ fn push_bounded_infix(
     // left-associative operator's result (`a <*> b >> c`); parentheses raise that result's
     // precedence. A right-associative predecessor admits nesting (`a >> b <*> c`).
     if frame.operators.last().is_some_and(|previous| {
-        previous.operator.right_precedence() == operator.left_precedence()
+        !matches!(previous.operator, BoundedInfix::Extension(_))
+            && previous.operator.right_precedence() == operator.left_precedence()
             && ((previous.operator.is_non_associative() && operator != BoundedInfix::Arrow)
                 || (operator.has_strict_left_operand()
                     && !previous.operator.is_right_associative()))
@@ -2504,7 +2560,10 @@ fn push_bounded_infix(
     // `(a |> f) <| x`); a right-associative one reads `term:p`, so this operator nests inside
     // it (`a <| b |> c` is `a <| (b |> c)`).
     while frame.operators.last().is_some_and(|previous| {
-        previous.operator.right_precedence() == operator.left_precedence()
+        // An extension stores the actual operand minimum, so equality admits
+        // this trailing parser inside its RHS even for non-mixfix descriptors.
+        !matches!(previous.operator, BoundedInfix::Extension(_))
+            && previous.operator.right_precedence() == operator.left_precedence()
             && !previous.operator.is_right_associative()
     }) {
         reduce_bounded_infix(view, tokens, frame, grammar)?;
@@ -3221,6 +3280,134 @@ fn bounded_term(
     matching::parse(leaves, view, tokens, range, grammar)
 }
 
+/// The bounded descriptor bridge below `arg` precedence. Atom-only operands
+/// retain their existing path; these operands may also contain applications
+/// and infix operators, and report the first token outside their Pratt parse.
+fn bounded_term_at_precedence(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    range: std::ops::Range<usize>,
+    minimum: u32,
+) -> Result<(Syntax, usize), NatDefinitionParseError> {
+    if matches!(tokens.get(range.start).map(|token| &token.kind), Some(TokenKind::Symbol(symbol)) if symbol == "open")
+    {
+        let end = range.end;
+        return open_term(leaves, view, tokens, range, DefinitionGrammar::Scalar)
+            .map(|syntax| (syntax, end));
+    }
+    matching::parse_at_precedence(leaves, view, tokens, range, minimum)
+}
+
+/// A leading parser checks the category minimum before it can be extended by
+/// a trailing parser. Most builtin leading terms admit every minimum below
+/// `arg`; the dependent arrow has precedence 25. Extension candidates check
+/// their own precedence before parsing, independently of the resulting kind.
+fn term_leading_admits(syntax: &Syntax, minimum: u32) -> bool {
+    minimum <= 25 || syntax.kind() != Some(&parser_kind(&["Term", "depArrow"]))
+}
+
+/// Check the first leading parser before an application or projection can
+/// wrap its node. Prefix descriptors must pass before their body is entered.
+fn check_term_leading_minimum(
+    view: &SourceView,
+    tokens: &[LexedToken],
+    frames: &[BoundedTermFrame],
+    index: usize,
+    minimum: u32,
+) -> Result<(), NatDefinitionParseError> {
+    let Some(frame) = frames.last() else {
+        return Ok(());
+    };
+    let minimum = if let Some(operator) = frame.operators.last() {
+        u32::from(operator.operator.right_operand_minimum())
+    } else if let Some(prefix) = frame.negation {
+        u32::from(prefix_precedence(&tokens[prefix]))
+    } else if frames.len() == 1 {
+        minimum
+    } else {
+        0
+    };
+    let admitted = if let Some((syntax, _)) = frame.application.first() {
+        term_leading_admits(syntax, minimum)
+    } else if let Some(TokenKind::Symbol(symbol)) = tokens.get(index).map(|token| &token.kind) {
+        extensions::prefix_leading_precedence(symbol).is_none_or(|precedence| precedence >= minimum)
+    } else {
+        true
+    };
+    if admitted {
+        Ok(())
+    } else {
+        Err(NatDefinitionParseError::OutsideSeedGrammar {
+            at: original_position(view, tokens, index),
+            expected: NatDefinitionExpectation::ScalarValue,
+        })
+    }
+}
+
+/// Whether the next infix belongs outside a descriptor's term operand. Prefix
+/// bodies close at their own right binding powers before the outer minimum is
+/// consulted. An already-open right operand can be looser than its enclosing
+/// category (in particular the right bound of a range).
+#[inline(never)]
+fn term_precedence_boundary(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    frames: &mut Vec<BoundedTermFrame>,
+    index: usize,
+    minimum: u32,
+) -> Result<bool, NatDefinitionParseError> {
+    let Some(operator) = bounded_infix(
+        tokens.get(index).map(|token| &token.kind),
+        DefinitionGrammar::Scalar,
+    ) else {
+        return Ok(false);
+    };
+    while frames
+        .last()
+        .and_then(|frame| frame.negation)
+        .is_some_and(|prefix| {
+            operator.left_precedence() < u16::from(prefix_precedence(&tokens[prefix]))
+        })
+    {
+        finish_negation_frame(
+            leaves,
+            view,
+            tokens,
+            frames,
+            DefinitionGrammar::Scalar,
+            index,
+        )?;
+    }
+    let [frame] = frames.as_slice() else {
+        return Ok(false);
+    };
+    // A prefix minus at the beginning of an operand is not a trailing parser.
+    let Some((leading, _)) = frame.application.first() else {
+        return Ok(false);
+    };
+    if frame.operators.is_empty() && !term_leading_admits(leading, minimum) {
+        return Err(NatDefinitionParseError::OutsideSeedGrammar {
+            at: original_position(view, tokens, index),
+            expected: NatDefinitionExpectation::ScalarValue,
+        });
+    }
+    let precedence = if operator.is_range() {
+        1024
+    } else {
+        u32::from(operator.precedence())
+    };
+    if precedence >= minimum {
+        return Ok(false);
+    }
+    let within_right_operand = frame.operators.iter().any(|pending| {
+        let right = u32::from(pending.operator.right_operand_minimum());
+        right <= precedence
+    });
+    Ok(!within_right_operand)
+}
+
 /// `Term.open := "open " openDecl withOpenDecl(" in " term)`: the declaration up to the `in`, then
 /// the term after it. Out of line, off every ordinary term's frame.
 #[inline(never)]
@@ -3745,6 +3932,11 @@ fn bounded_term_frames(
     updates: &std::collections::HashSet<usize>,
     sequence: bool,
 ) -> Result<Syntax, NatDefinitionParseError> {
+    let minimum = splices
+        .prefix
+        .as_ref()
+        .filter(|prefix| prefix.range == range)
+        .map(|prefix| prefix.minimum);
     let arrows = term_binders::arrow_openers(tokens, range.clone());
     let mut lists = collections::Lists::default();
     let (mut frames, mut cursor) = initial_bounded_frames(view, tokens, range.clone(), sequence)?;
@@ -3754,6 +3946,9 @@ fn bounded_term_frames(
     while cursor < range.end {
         let index = cursor;
         cursor += 1;
+        if let Some(minimum) = minimum {
+            check_term_leading_minimum(view, tokens, &frames, index, minimum)?;
+        }
         if let Some(next) = bounded_term_layout(
             leaves,
             view,
@@ -3770,6 +3965,12 @@ fn bounded_term_frames(
             cursor = next;
             continue;
         }
+        if let Some(minimum) = minimum
+            && term_precedence_boundary(leaves, view, tokens, &mut frames, index, minimum)?
+        {
+            cursor = index;
+            break;
+        }
         cursor = bounded_term_token(
             leaves,
             view,
@@ -3784,15 +3985,25 @@ fn bounded_term_frames(
             cursor,
         )?;
     }
-    finish_lambda_frames(leaves, view, tokens, &mut frames, grammar, range.end, true)?;
+    finish_lambda_frames(leaves, view, tokens, &mut frames, grammar, cursor, true)?;
     if frames.len() != 1 {
         return Err(NatDefinitionParseError::OutsideSeedGrammar {
-            at: original_position(view, tokens, range.end),
+            at: original_position(view, tokens, cursor),
             expected: NatDefinitionExpectation::ClosingParenthesis,
         });
     }
     let frame = frames.pop().expect("the bounded term has a root frame");
-    finish_bounded_frame(view, tokens, frame, grammar, range.end)
+    let syntax = finish_bounded_frame(view, tokens, frame, grammar, cursor)?;
+    if let Some(minimum) = minimum {
+        if !term_leading_admits(&syntax, minimum) {
+            return Err(NatDefinitionParseError::OutsideSeedGrammar {
+                at: original_position(view, tokens, range.start),
+                expected: NatDefinitionExpectation::ScalarValue,
+            });
+        }
+        splices.prefix.as_mut().expect("selected term prefix").next = cursor;
+    }
+    Ok(syntax)
 }
 
 // The term driver's per-token steps live in their own frames: a step that parses a nested range
@@ -4637,9 +4848,18 @@ fn bounded_term_compound_token(
             }
             // An atom-like notation of the entered grammar (`extensions`), as an operand; as an
             // application's argument only at `arg` precedence or above.
+            let minimum = splices
+                .prefix
+                .as_ref()
+                .filter(|prefix| {
+                    prefix.range == *range
+                        && matches!(frames.as_slice(), [frame]
+                            if frame.application.is_empty() && frame.operators.is_empty())
+                })
+                .map_or(0, |prefix| prefix.minimum);
             if grammar == DefinitionGrammar::Scalar
                 && let Some((term, end)) =
-                    extensions::leading_term(leaves, view, tokens, index, range.end)
+                    extensions::leading_term(leaves, view, tokens, index, range.end, minimum)
             {
                 let frame = frames.last_mut().expect("root term frame");
                 if !frame.application.is_empty()
