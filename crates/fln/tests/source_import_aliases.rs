@@ -676,3 +676,148 @@ fn imported_overloads_are_ambiguous_unless_the_type_chooses_as_at_the_pin() {
         .join()
         .expect("the checking thread completes");
 }
+
+/// Dotted identifiers share the pin's overload trials after the expected type
+/// has supplied their namespace. These cases need the imported coercion registry
+/// to establish that each nonchosen interpretation actually fails.
+#[test]
+fn imported_dotted_overloads_use_the_whole_application() {
+    let Some(lib) = pinned_lib() else {
+        eprintln!("SKIP: pinned Reference lib/lean absent (set FLN_REQUIRE_REFERENCE=1 to fail)");
+        return;
+    };
+    std::thread::Builder::new()
+        .stack_size(STACK)
+        .spawn(move || {
+            let (engine, _) = import_pinned(&lib, INIT_CORE);
+            let limits =
+                SourceCheckLimits::new(EngineAdmissionLimits::new(Budget::for_stack_bytes(STACK)));
+            let root = engine.logical_root(&KVMap::new());
+            for (source, declaration, chosen) in [
+                (
+                    "def P.Nat.pick : Nat := 1\n\
+                     def Q.Nat.pick : Bool := true\n\
+                     open P Q\n\
+                     def bar : Nat := .pick\n\
+                     theorem computes : bar = 1 := rfl",
+                    "bar",
+                    "P.Nat.pick",
+                ),
+                // Swap the candidate types to exercise committing the successful
+                // trial both before and after visiting a failed interpretation.
+                (
+                    "def P.Nat.pick : Bool := true\n\
+                     def Q.Nat.pick : Nat := 2\n\
+                     open P Q\n\
+                     def bar : Nat := .pick\n\
+                     theorem computes : bar = 2 := rfl",
+                    "bar",
+                    "Q.Nat.pick",
+                ),
+                (
+                    "def P.Nat.pick (n : Nat) : Nat := n\n\
+                     def Q.Nat.pick (_n : Nat) : Bool := true\n\
+                     open P Q\n\
+                     def bar : Nat := .pick 42\n\
+                     theorem computes : bar = 42 := rfl",
+                    "bar",
+                    "P.Nat.pick",
+                ),
+                // Both functions return Nat; only the argument distinguishes
+                // them, so resolving just the result type would be ambiguous.
+                (
+                    "def P.Nat.pick (n : Nat) : Nat := n\n\
+                     def Q.Nat.pick (_b : Bool) : Nat := 0\n\
+                     open P Q\n\
+                     def bar (n : Nat) : Nat := .pick n\n\
+                     theorem computes : bar 42 = 42 := rfl",
+                    "bar",
+                    "P.Nat.pick",
+                ),
+                (
+                    "def P.Nat.pick (n : Nat) : Nat := n\n\
+                     def Q.Nat.pick (_b : Bool) : Nat := 0\n\
+                     open P Q\n\
+                     def bar : Nat -> Nat := .pick\n\
+                     theorem computes : bar 42 = 42 := rfl",
+                    "bar",
+                    "P.Nat.pick",
+                ),
+                // A genuine lookup miss still unfolds the type alias before
+                // trying the candidates found in the underlying namespace.
+                (
+                    "def Alias := Nat\n\
+                     def P.Nat.pick : Nat := 1\n\
+                     def Q.Nat.pick : Bool := true\n\
+                     open P Q\n\
+                     def bar : Alias := .pick\n\
+                     theorem computes : bar = (1 : Nat) := rfl",
+                    "bar",
+                    "P.Nat.pick",
+                ),
+                // A trial's exact declaration cannot be redirected by the
+                // namespace of the surrounding declaration.
+                (
+                    "def P.Nat.pick : Nat := 1\n\
+                     def Q.Nat.pick : Bool := true\n\
+                     open P Q\n\
+                     namespace Shadow\n\
+                     def P.Nat.pick : Nat := 99\n\
+                     def bar : Nat := .pick\n\
+                     end Shadow\n\
+                     theorem computes : Shadow.bar = 1 := rfl",
+                    "Shadow.bar",
+                    "P.Nat.pick",
+                ),
+            ] {
+                let checked = engine
+                    .check_source_files(&[source.as_bytes()], &KVMap::new(), limits)
+                    .unwrap_or_else(|error| panic!("{source}: {error:?}"))
+                    .into_complete()
+                    .expect("dotted overload elaboration completes");
+                let Some(fln_env::constants::ConstantInfo::Defn(definition)) = checked
+                    .engine
+                    .environment()
+                    .find(&Name::from_components(declaration.split('.')))
+                else {
+                    panic!("{declaration} must be admitted as a definition");
+                };
+                let other = if chosen == "P.Nat.pick" {
+                    "Q.Nat.pick"
+                } else {
+                    "P.Nat.pick"
+                };
+                assert!(
+                    mentions(&definition.value, &Name::from_components(chosen.split('.')))
+                        && !mentions(&definition.value, &Name::from_components(other.split('.'))),
+                    "{source}: the elaborated term must select {chosen}"
+                );
+            }
+            for source in [
+                "def P.Nat.pick : Bool := true\n\
+                 def Q.Nat.pick : Bool := false\n\
+                 open P Q\n\
+                 def bar : Nat := .pick",
+                // Existing candidates that all fail must not cause the alias
+                // to unfold and select an unrelated Nat.pick implementation.
+                "def Alias := Nat\n\
+                 def P.Alias.pick : Bool := true\n\
+                 def Q.Alias.pick : Bool := false\n\
+                 def Nat.pick : Nat := 42\n\
+                 open P Q\n\
+                 def bar : Alias := .pick",
+            ] {
+                let refused = engine
+                    .check_source_files(&[source.as_bytes()], &KVMap::new(), limits)
+                    .expect_err(source);
+                assert!(
+                    refused.to_string().contains("overloaded `pick`, errors:"),
+                    "{source}: {refused}"
+                );
+            }
+            assert_eq!(engine.logical_root(&KVMap::new()), root);
+        })
+        .expect("spawn the checking thread")
+        .join()
+        .expect("the checking thread completes");
+}

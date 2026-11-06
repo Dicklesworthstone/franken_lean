@@ -1,4 +1,4 @@
-//! Overloaded identifiers (bead `fln-wh2j`): the pin's `elabAppAux` (vendored
+//! Overloaded identifiers (beads `fln-wh2j`, `fln-qb5`): the pin's `elabAppAux` (vendored
 //! `src/Lean/Elab/App.lean:2201-2219`, with `elabAppFnResolutions` at 1926-1945).
 //!
 //! When name resolution (`scope.rs`, the pin's `resolveGlobalName`) yields more than
@@ -13,6 +13,8 @@
 //! Each interpretation is elaborated here in a speculative copy of the context, from
 //! the same syntax with its head written `_root_.<candidate>`, which names exactly
 //! that declaration. The spent budget carries over from one copy to the next.
+//! Dotted identifiers enter these same trials after resolving their namespace from
+//! the expected type; finding several candidates does not unfold that type further.
 //!
 //! An interpretation counts as a success only when it elaborates and its type is the
 //! expected one: the trial has already run `coerce_expected` (this crate's
@@ -174,17 +176,41 @@ impl Context {
 /// ambiguous: the identifier the pin elaborates as overloaded, its candidates in the
 /// order the pin tries them. Name resolution is the first thing elaborating an
 /// identifier does, so nothing but budget has been spent when this error arises.
+/// A dotted identifier first reads the namespace from the expected type; its
+/// candidate set belongs to this same head, before any arguments are elaborated.
 pub(super) fn ambiguous_head(
     error: &NatDefinitionElabError,
     head: &Syntax,
 ) -> Option<(Name, Vec<Name>)> {
-    let Syntax::Ident { val, .. } = head else {
+    let Some(Syntax::Ident { val, .. }) = head_identifier(head) else {
         return None;
     };
     match error {
         NatDefinitionElabError::Inference(SourceInferenceError::NameScope(
             scope::ScopeError::Ambiguous(name, candidates),
-        )) if name == val => Some((name.clone(), candidates.clone())),
+        )) if matches!(head, Syntax::Ident { .. }) && name == val => {
+            Some((name.clone(), candidates.clone()))
+        }
+        NatDefinitionElabError::Inference(SourceInferenceError::DottedIdent(
+            dotted_ident::DottedIdentError::Overloaded { id, candidates },
+        )) if head.kind() == Some(&parser_kind(&["Term", "dotIdent"])) && id == val => {
+            Some((id.clone(), candidates.clone()))
+        }
+        _ => None,
+    }
+}
+
+/// The source location of an ordinary or dotted overloaded name. Rewriting only
+/// this identifier retains the user's span while replacing the resolved head.
+fn head_identifier(head: &Syntax) -> Option<&Syntax> {
+    match head {
+        Syntax::Ident { .. } => Some(head),
+        Syntax::Node { kind, args, .. } if kind == &parser_kind(&["Term", "dotIdent"]) => {
+            let [Syntax::Atom { val, .. }, id @ Syntax::Ident { .. }] = args.as_slice() else {
+                return None;
+            };
+            (val == ".").then_some(id)
+        }
         _ => None,
     }
 }
@@ -213,7 +239,7 @@ fn interpretation_syntax(
     candidate: &Name,
     scope: &scope::SourceScope,
 ) -> Result<Syntax, NatDefinitionElabError> {
-    let Syntax::Ident { info, raw_val, .. } = head else {
+    let Some(Syntax::Ident { info, raw_val, .. }) = head_identifier(head) else {
         return Err(failure(SourceInferenceError::Scope));
     };
     let head = Syntax::Ident {

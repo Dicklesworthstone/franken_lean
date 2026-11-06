@@ -156,7 +156,7 @@ pub(in crate::source) fn recoverable(problem: &NatDefinitionElabError) -> bool {
         NatDefinitionElabError::Inference(SourceInferenceError::DottedIdent(reason)) => {
             !matches!(
                 reason,
-                dotted_ident::DottedIdentError::OverloadUnsupported { .. }
+                dotted_ident::DottedIdentError::Overloaded { .. }
             )
         }
         NatDefinitionElabError::Inference(
