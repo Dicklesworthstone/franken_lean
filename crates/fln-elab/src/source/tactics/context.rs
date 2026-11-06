@@ -35,6 +35,33 @@ impl Context {
         equality: Option<Name>,
         term: Typed,
     ) -> Result<(ProofGoal, FVarId), NatDefinitionElabError> {
+        self.generalized_proof_goal_with(
+            proof,
+            goal,
+            name,
+            equality,
+            term,
+            |context, target, expression, marker| {
+                context
+                    .rewrite_template(target, expression, marker)
+                    .map(|(target, _)| target)
+            },
+        )
+    }
+
+    /// Generalize a consumer-selected set of occurrences. `split` abstracts only matcher
+    /// discriminants, while ordinary `generalize` abstracts every matching occurrence.
+    /// Both paths check the complete universal statement and specialize it with the actual
+    /// expression and reflexivity; a transformation never grants an unchecked equality.
+    pub(super) fn generalized_proof_goal_with(
+        &mut self,
+        proof: &mut ProofState<'_>,
+        goal: ProofGoal,
+        name: Name,
+        equality: Option<Name>,
+        term: Typed,
+        transform: impl FnOnce(&mut Self, &Expr, &Expr, &Expr) -> Result<Expr, NatDefinitionElabError>,
+    ) -> Result<(ProofGoal, FVarId), NatDefinitionElabError> {
         self.tick()?;
         if name.is_anonymous()
             || equality
@@ -54,8 +81,7 @@ impl Context {
         let target = self.instantiate(&goal.target)?;
         self.require_resolved(&[expression.clone(), domain.clone(), target.clone()])?;
         let marker = FVarId(self.fresh_name()?);
-        let (mut target, _) =
-            self.rewrite_template(&target, &expression, &Expr::fvar(marker.clone()))?;
+        let mut target = transform(self, &target, &expression, &Expr::fvar(marker.clone()))?;
         let mut reflexivity = None;
         if let Some(equality) = &equality {
             let sort = self
@@ -208,6 +234,20 @@ impl Context {
                 return Err(error(TacticError::InvalidGeneralization));
             }
         }
+        let (child, _) = self.reverted_proof_goal(proof, goal, removed)?;
+        proof.work.push(Work::Goal(child));
+        Ok(())
+    }
+
+    /// Revert selected locals and their full dependency cone, returning the closed telescope
+    /// for consumers that perform another checked transformation before reintroducing it.
+    pub(super) fn reverted_proof_goal(
+        &mut self,
+        proof: &mut ProofState<'_>,
+        goal: ProofGoal,
+        mut removed: HashSet<FVarId>,
+    ) -> Result<(ProofGoal, Vec<LocalDecl>), NatDefinitionElabError> {
+        self.txn.lctx = goal.lctx.clone();
         // Types AND let values contribute forward dependencies. Context order
         // is already topological, so one charged pass computes the whole cone.
         let mut reverted = Vec::new();
@@ -247,17 +287,16 @@ impl Context {
         self.txn.lctx = retained;
         let (mut value, child) = self.proof_goal(target)?;
         self.inherit_goal_tag(&goal, &child);
-        for local in reverted {
+        for local in &reverted {
             self.tick()?;
             if local.value.is_none() {
-                value = Expr::app(value, Expr::fvar(local.id));
+                value = Expr::app(value, Expr::fvar(local.id.clone()));
             }
         }
         // Delaying the parent closure preserves earlier `intro`/`have` frames
         // and makes failure inside `first`/`try` use the ordinary rollback path.
         proof.work.push(Work::Close(goal, value));
-        proof.work.push(Work::Goal(child));
-        Ok(())
+        Ok((child, reverted))
     }
 
     /// `clear h₁ … hₙ` (`evalClear`, vendored src/Lean/Elab/Tactic/BuiltinTactic.lean): the

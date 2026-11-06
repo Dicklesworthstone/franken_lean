@@ -390,6 +390,75 @@ theorem split_enumeration_source_order (s : Side) : match s with | .left => True
   split <;> exact True.intro
 "#;
 
+/// Computed discriminants are generalized only at their matcher applications. The ordinary
+/// occurrences in branch bodies, the rest of the target and existing hypotheses stay fixed;
+/// the generated equality is the evidence relating each constructor to the original term.
+const COMPUTED_MATCH_PROOFS: &str = r#"prelude
+import Init.SimpLemmas
+set_option linter.unusedVariables false
+theorem split_computed_reconstruction (f : Nat → Nat) (x : Nat) :
+    (match f x with | Nat.zero => 0 | Nat.succ n => n.succ) = f x := by
+  split
+  next h => symm; exact h
+  next n h => symm; exact h
+theorem split_computed_branch_occurrences (f : Nat → Nat) (x : Nat) :
+    (match f x with | Nat.zero => f x | Nat.succ n => f x) = f x := by
+  split
+  all_goals change f x = f x
+  all_goals rfl
+theorem split_computed_existing_hypothesis (f : Nat → Nat) (x : Nat)
+    (p : Nat → Prop) (hp : p (f x)) :
+    match f x with | Nat.zero => p (f x) | Nat.succ n => p (f x) := by
+  split <;> exact hp
+theorem split_computed_under_binder (f : Nat → Nat) (x : Nat) :
+    ∀ y : Nat, (match f x with | Nat.zero => 0 | Nat.succ n => n.succ) = f x := by
+  split
+  next h => intro y; symm; exact h
+  next n h => intro y; symm; exact h
+theorem split_computed_hypothesis (f : Nat → Option Nat) (x : Nat)
+    (h : match f x with | .some n => n = 0 | .none => False) : f x = Option.some 0 := by
+  split at h
+  next n heq => cases h; exact heq
+  next heq => exact False.elim h
+theorem split_computed_wildcard (f : Nat → Option Nat) (x : Nat)
+    (h : match f x with | .none => False | .some n => n = 0) : f x = Option.some 0 := by
+  split at *
+  next heq => exact False.elim h
+  next n heq => cases h; exact heq
+theorem split_computed_let_argument (f : Nat → Nat) (x : Nat) : True := by
+  let y := x
+  have h : (match f y with | Nat.zero => 0 | Nat.succ n => n.succ) = f y := by
+    split
+    next h => symm; exact h
+    next n h => symm; exact h
+  exact True.intro
+"#;
+
+/// The last field distinguishes false/incomplete proofs that must reach branch obligations
+/// from a direct let-bound discriminant, which the pin's splitter itself refuses.
+const COMPUTED_MATCH_REFUSALS: &[(&str, &str, bool)] = &[
+    (
+        "ComputedFalseBranch.lean",
+        "example (f : Nat → Bool) (x : Nat) : (match f x with | true => True | false => False) := by\n  split <;> exact True.intro\n",
+        true,
+    ),
+    (
+        "ComputedMissingBranch.lean",
+        "example (f : Nat → Bool) (x : Nat) : (match f x with | true => True | false => True) := by\n  split\n  exact True.intro\n",
+        true,
+    ),
+    (
+        "ComputedWrongEquality.lean",
+        "example (f : Nat → Nat) (x : Nat) : (match f x with | Nat.zero => 1 | Nat.succ n => n.succ) = f x := by\n  split\n  next h => symm; exact h\n  next n h => symm; exact h\n",
+        true,
+    ),
+    (
+        "DirectLetDiscriminant.lean",
+        "example (f : Nat → Nat) (x : Nat) : True := by\n  let y := f x\n  have h : (match y with | Nat.zero => 0 | Nat.succ n => n.succ) = y := by\n    split <;> rfl\n  exact True.intro\n",
+        false,
+    ),
+];
+
 /// Source conditionals must have the same heads as the imported conditional lemmas.
 /// A recursor with equivalent evaluation cannot replace `ite`/`dite` here: `simp only`
 /// and `rw` select the imported lemmas by their actual applications.
@@ -636,6 +705,71 @@ fn split_constructor_matches_checks_native_seed_proofs_and_every_branch() {
             "the negative control must split the match: {error:?}"
         );
         assert_eq!(base.logical_root(&options), root);
+    }
+}
+
+#[test]
+fn split_computed_discriminants_checks_native_proofs_and_every_branch() {
+    let limits = fln::SourceCheckLimits::new(fln::EngineAdmissionLimits::new(
+        fln::Budget::for_stack_bytes(8 * 1024 * 1024),
+    ));
+    let options = fln::KVMap::new();
+    let base = fln::Engine::with_source_seed(limits.admission)
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let root = base.logical_root(&options);
+    let program = COMPUTED_MATCH_PROOFS
+        .strip_prefix("prelude\nimport Init.SimpLemmas\nset_option linter.unusedVariables false\n")
+        .expect("only the shared fixture's import header is removed");
+    let checked = base
+        .check_source_files(&[program.as_bytes()], &options, limits)
+        .unwrap_or_else(|error| panic!("{program}\n{error:?}"))
+        .into_complete()
+        .unwrap();
+    assert_eq!(checked.theorems, 7, "every branch supplies a checked proof");
+    assert_eq!(base.logical_root(&options), root);
+    for (name, program, must_split) in COMPUTED_MATCH_REFUSALS {
+        let error = base
+            .check_source_files(&[program.as_bytes()], &options, limits)
+            .expect_err("false or unfinished computed branches must reject the theorem");
+        if *must_split {
+            assert!(
+                !format!("{error:?}").contains("SplitMatchUnsupported"),
+                "{name} must reach the generated proof obligations: {error:?}"
+            );
+        }
+        assert_eq!(base.logical_root(&options), root);
+    }
+}
+
+#[test]
+fn split_computed_discriminants_matches_the_pin() {
+    let Some(lib) = pinned_lib() else {
+        return;
+    };
+    let root = workspace();
+    accepted(
+        &lib,
+        &root,
+        "ComputedMatches.lean",
+        COMPUTED_MATCH_PROOFS,
+        "",
+    );
+    for (name, body, must_split) in COMPUTED_MATCH_REFUSALS {
+        let program = format!("prelude\nimport Init.SimpLemmas\n{body}");
+        std::fs::write(root.join(name), program).unwrap();
+        if let Some((code, stdout)) = pinned(&lib, &root, name) {
+            assert_eq!(code, 1, "{name}: the pin moved: {stdout}");
+        }
+        let (code, stdout, stderr) = ours(&lib, &root, name);
+        assert_eq!(code, 1, "{name}: {stdout}{stderr}");
+        if *must_split {
+            assert!(
+                !stderr.contains("split on a `match` expression is not implemented"),
+                "{stderr}"
+            );
+        }
     }
 }
 

@@ -13,6 +13,8 @@
 //! split through its admitted recursor. Its transparent source annotation retains the written
 //! alternative order and field names that recursor lowering otherwise loses. Indexed,
 //! overlapping, matrix and unannotated imported matches retain a typed refusal.
+//! Computed discriminants are generalized only in their matcher applications, with checked
+//! equations relating the original terms to each constructor; other occurrences stay fixed.
 //!
 //! The proof is not the pin's. The case split is `Decidable.rec` on the selected dictionary, as
 //! `byCasesDec` cases on it; each reduction eliminates one decided dictionary (or `Bool`) with
