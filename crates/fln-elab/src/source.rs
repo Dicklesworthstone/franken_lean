@@ -7607,21 +7607,17 @@ fn query_elaboration(
             &parts[arity - 1]
         }
         None => {
-            let parts = expect_node(
-                syntax,
-                &parser_kind(&["Command", if evaluate { "eval" } else { "check" }]),
-                2,
-                if evaluate {
-                    "Lean.Parser.Command.eval"
+            let (command, keyword, expected) = if evaluate {
+                if syntax.kind() == Some(&parser_kind(&["Command", "evalBang"])) {
+                    ("evalBang", "#eval!", "Lean.Parser.Command.evalBang")
                 } else {
-                    "Lean.Parser.Command.check"
-                },
-            )?;
-            expect_atom(
-                &parts[0],
-                if evaluate { "#eval" } else { "#check" },
-                "query keyword",
-            )?;
+                    ("eval", "#eval", "Lean.Parser.Command.eval")
+                }
+            } else {
+                ("check", "#check", "Lean.Parser.Command.check")
+            };
+            let parts = expect_node(syntax, &parser_kind(&["Command", command]), 2, expected)?;
+            expect_atom(&parts[0], keyword, "query keyword")?;
             &parts[1]
         }
     };

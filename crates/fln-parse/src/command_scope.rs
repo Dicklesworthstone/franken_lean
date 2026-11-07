@@ -521,6 +521,7 @@ fn declaration(s: &str) -> bool {
             | "inductive"
             | "#check"
             | "#eval"
+            | "#eval!"
             | "#guard"
             | "#synth"
             | "#reduce"

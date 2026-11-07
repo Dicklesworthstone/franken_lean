@@ -3602,7 +3602,7 @@ impl Engine {
                     // The pin lints every command; a query's term (`#check`, `#eval`, `#reduce`)
                     // binds variables as a declaration does.
                     Ok(parsed)
-                        if ["declaration", "check", "eval"].iter().any(|kind| {
+                        if ["declaration", "check", "eval", "evalBang"].iter().any(|kind| {
                             parsed.syntax().kind()
                                 == Some(&unused_variables::parser_kind(&["Command", kind]))
                         }) || unused_variables::is_reduce(parsed.syntax()) =>
@@ -4300,9 +4300,12 @@ impl Engine {
                 });
             }
             // `#eval` refuses an expression that depends on `sorry` before compiling or running it.
+            // `#eval!` explicitly opts out of that check, retaining the same execution pipeline.
             // `#guard` evaluates through `evalExpr`, which has no such check
             // (vendored `Lean/Meta/Eval.lean`).
             if is_evaluation
+                && parsed.syntax().kind()
+                    != Some(&Name::from_components(["Lean", "Parser", "Command", "evalBang"]))
                 && !matches!(
                     evaluation_presentation,
                     Some(EvaluationResultPresentation::Guard)

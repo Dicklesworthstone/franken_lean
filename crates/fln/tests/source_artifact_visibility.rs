@@ -727,3 +727,54 @@ def eraseEvidence (_ : Claim) : Token := Token.left
         );
     }
 }
+
+#[test]
+fn forced_evaluation_ignores_only_sorry_and_keeps_ordinary_queries_guarded() {
+    let source = r#"prelude
+inductive Bool where
+| false
+| true
+inductive Claim : Prop where
+| proof
+inductive Token where
+| left
+| right
+axiom sorryAx.{u} (A : Sort u) (synthetic : Bool) : A
+theorem evidence : Claim := sorryAx Claim Bool.false
+def eraseEvidence (_ : Claim) : Token := Token.left
+def taintedValue : Token := eraseEvidence evidence
+def eraseGuard (_ : Claim) : Bool := Bool.true
+def taintedGuard : Bool := eraseGuard evidence
+"#;
+    let receipt = import(&compile(&[("ForcedEvaluation", source)]), "ForcedEvaluation");
+    let engine = &receipt.engine;
+    let before = engine.logical_root(&KVMap::new());
+    refuse_sorry(engine, "taintedValue");
+    let completed = engine
+        .execute_source_commands_with_checks(
+            b"#eval! taintedValue\n#guard taintedGuard\n",
+            &KVMap::new(),
+            EngineExecutionLimits::new(limits().source.admission.kernel),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let index = completed.batch.source_evaluation_indices[0];
+    returned_tag(&completed.batch.executions[index].exit, 0);
+    // Force mode belongs to this command only, including in its successor.
+    refuse_sorry(&completed.batch.engine, "taintedValue");
+    assert_eq!(engine.logical_root(&KVMap::new()), before);
+    assert_eq!(completed.batch.engine.logical_root(&KVMap::new()), before);
+
+    let mut bounded = EngineExecutionLimits::new(limits().source.admission.kernel);
+    bounded.ingress.max_nodes = 0;
+    let error = engine
+        .execute_source_commands_with_checks(b"#eval! taintedValue\n", &KVMap::new(), bounded)
+        .expect_err("force mode still enforces compiler resource limits");
+    assert!(
+        matches!(evaluation_error(&error), fln::EngineExecutionError::Ingress(error)
+            if error.is_resource_exhaustion()),
+        "{error:?}"
+    );
+    refuse_sorry(engine, "taintedValue");
+}

@@ -578,6 +578,13 @@ fn sorry_dependencies_refuse_io_before_effects_and_leave_the_capture_usable() {
             assert_format(&completed.batch.executions[index], "7", None);
             assert_eq!(std::fs::read(&sentinel).unwrap(), b"unchanged\neffect\n");
             assert_eq!(engine.logical_root(&KVMap::new()), before);
+
+            let forced = action("ioTaintedValue").replacen("#eval", "#eval!", 1);
+            let completed = run(&engine, &forced);
+            let index = completed.batch.source_evaluation_indices[0];
+            assert_format(&completed.batch.executions[index], "7", None);
+            assert_eq!(std::fs::read(&sentinel).unwrap(), b"unchanged\neffect\neffect\n");
+            assert_eq!(engine.logical_root(&KVMap::new()), before);
         })
         .unwrap()
         .join()

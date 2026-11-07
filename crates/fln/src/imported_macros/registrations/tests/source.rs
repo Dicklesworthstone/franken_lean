@@ -889,6 +889,90 @@ fn expanded_evaluations_refuse_actual_sorry_dependencies_before_execution() {
     assert_eq!(engine.logical_root(&KVMap::new()), before);
 }
 
+#[test]
+fn forced_imported_macro_evaluation_preserves_its_wrapper_and_only_bypasses_sorry() {
+    let (mut engine, registry, _) = fixture();
+    for source in [
+        "axiom sorryAx.{u} (A : Sort u) (synthetic : Bool) : A",
+        "theorem forcedEvidence : True := @sorryAx True false",
+        "def eraseForcedEvidence (_ : True) : Nat := 42",
+        "def sorryDependent : Nat := eraseForcedEvidence forcedEvidence",
+    ] {
+        engine = engine
+            .admit_source_declaration(source.as_bytes(), &KVMap::new(), admission())
+            .unwrap_or_else(|error| panic!("{source}: {error:?}"))
+            .into_complete()
+            .unwrap()
+            .engine;
+    }
+    let before = engine.logical_root(&KVMap::new());
+    let ordinary = evaluate(
+        &engine,
+        &registry,
+        b"#eval 7 + sorryDependent",
+        MacroTreeLimits::default(),
+        execution_limits(),
+        None,
+    );
+    assert!(
+        matches!(&ordinary.outcome, Outcome::Complete(Err(SourceMacroError::Frontend(error)))
+            if matches!(error.as_ref(), crate::EngineExecutionError::EvaluationDependsOnSorry)),
+        "{ordinary:?}"
+    );
+    assert_eq!(ordinary.attempts.len(), 2);
+    assert!(ordinary.state.is_none());
+
+    let source = "-- λ🦀\r\n#eval! 7 + sorryDependent\r\n".as_bytes();
+    let report = evaluate(
+        &engine,
+        &registry,
+        source,
+        MacroTreeLimits::default(),
+        execution_limits(),
+        None,
+    );
+    let result = evaluated_nat(&report, 42);
+    let fln_syntax::tree::Syntax::Node { kind, args, .. } = result.parsed.syntax() else {
+        panic!("the forced evaluation wrapper must survive term expansion")
+    };
+    assert_eq!(kind, &name("Lean.Parser.Command.evalBang"));
+    assert_eq!(args.len(), 2);
+    assert!(matches!(&args[0], fln_syntax::tree::Syntax::Atom { val, .. } if val == "#eval!"));
+    assert_eq!(result.parsed.reconstruct_original(), source);
+    assert_eq!(report.attempts.len(), 2);
+    assert_eq!(report.attempts[0].declaration, name("SourceLibrary.skip"));
+    assert_eq!(report.attempts[1].declaration, name("SourceLibrary.right"));
+    assert_eq!(report.state.as_ref().unwrap().macro_scope, 19);
+
+    let mut stopped_limits = execution_limits();
+    stopped_limits.vm.max_steps = 0;
+    let stopped = evaluate(
+        &engine,
+        &registry,
+        source,
+        MacroTreeLimits::default(),
+        stopped_limits,
+        None,
+    );
+    assert!(
+        matches!(stopped.outcome, Outcome::Inconclusive(_)),
+        "{stopped:?}"
+    );
+    assert!(stopped.state.is_none());
+    evaluated_nat(
+        &evaluate(
+            &engine,
+            &registry,
+            b"#eval 7 + 42",
+            MacroTreeLimits::default(),
+            execution_limits(),
+            None,
+        ),
+        42,
+    );
+    assert_eq!(engine.logical_root(&KVMap::new()), before);
+}
+
 fn checked_constant<'a>(report: &'a SourceMacroCheck, expected: &str) -> &'a crate::SourceCheck {
     let Outcome::Complete(Ok(checked)) = &report.outcome else {
         panic!("{report:?}")
