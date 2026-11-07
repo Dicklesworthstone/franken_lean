@@ -316,7 +316,7 @@ fn forced_evaluation_preserves_erased_sorry_dependencies_through_local_macros() 
         "axiom sorryAx.{u} (A : Sort u) (synthetic : Bool) : A\n"
     };
     let declarations = format!(
-        "{axiom}theorem forcedEvidence : True := @sorryAx True false\ndef eraseEvidence (_ : True) : Nat := 42\n"
+        "{axiom}theorem forcedEvidence : True := @sorryAx True false\ndef eraseEvidence (_ : True) : Nat := 42\ndef guardEvidence (_ : True) : Bool := true\n"
     );
     let base = base
         .check_source_files(
@@ -374,6 +374,25 @@ end
     assert!(
         matches!(inner, fln::EngineExecutionError::EvaluationDependsOnSorry),
         "{error:?}"
+    );
+    // Unlike the prelude-only artifact fixture, this ordinary source environment
+    // imports the grammar that declares #guard. It retains its existing evaluator,
+    // which accepts an erased proof dependency without an explicit force flag.
+    let guarded = base
+        .execute_source_commands_with_presentation(
+            b"#guard guardEvidence forcedEvidence\n",
+            &KVMap::new(),
+            fln::EngineExecutionLimits::new(limits().kernel),
+            fln::EvaluationPresentation::Lean,
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!(guarded.batch.source_evaluation_indices.len(), 1);
+    let index = guarded.batch.source_evaluation_indices[0];
+    assert_eq!(
+        guarded.batch.executions[index].evaluation_presentation(),
+        Some(fln::EvaluationResultPresentation::Guard)
     );
     assert_eq!(base.logical_root(&KVMap::new()), before);
 }

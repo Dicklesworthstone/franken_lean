@@ -743,8 +743,6 @@ axiom sorryAx.{u} (A : Sort u) (synthetic : Bool) : A
 theorem evidence : Claim := sorryAx Claim Bool.false
 def eraseEvidence (_ : Claim) : Token := Token.left
 def taintedValue : Token := eraseEvidence evidence
-def eraseGuard (_ : Claim) : Bool := Bool.true
-def taintedGuard : Bool := eraseGuard evidence
 "#;
     let receipt = import(
         &compile(&[("ForcedEvaluation", source)]),
@@ -755,7 +753,7 @@ def taintedGuard : Bool := eraseGuard evidence
     refuse_sorry(engine, "taintedValue");
     let completed = engine
         .execute_source_commands_with_checks(
-            b"#eval! taintedValue\n#guard taintedGuard\n",
+            b"#eval! taintedValue\n",
             &KVMap::new(),
             EngineExecutionLimits::new(limits().source.admission.kernel),
         )
@@ -767,7 +765,12 @@ def taintedGuard : Bool := eraseGuard evidence
     // Force mode belongs to this command only, including in its successor.
     refuse_sorry(&completed.batch.engine, "taintedValue");
     assert_eq!(engine.logical_root(&KVMap::new()), before);
-    assert_eq!(completed.batch.engine.logical_root(&KVMap::new()), before);
+    // The raw embedding API retains its generated unsafe auxiliary in the
+    // successor, as ordinary raw #eval does; it never gains proof authority.
+    assert_eq!(
+        completed.batch.executions[index].checker.ground,
+        fln::CheckerAdmissionGround::UnsafeQuarantine
+    );
 
     let mut bounded = EngineExecutionLimits::new(limits().source.admission.kernel);
     bounded.ingress.max_nodes = 0;
