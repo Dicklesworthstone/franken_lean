@@ -3602,10 +3602,13 @@ impl Engine {
                     // The pin lints every command; a query's term (`#check`, `#eval`, `#reduce`)
                     // binds variables as a declaration does.
                     Ok(parsed)
-                        if ["declaration", "check", "eval", "evalBang"].iter().any(|kind| {
-                            parsed.syntax().kind()
-                                == Some(&unused_variables::parser_kind(&["Command", kind]))
-                        }) || unused_variables::is_reduce(parsed.syntax()) =>
+                        if ["declaration", "check", "eval", "evalBang"]
+                            .iter()
+                            .any(|kind| {
+                                parsed.syntax().kind()
+                                    == Some(&unused_variables::parser_kind(&["Command", kind]))
+                            })
+                            || unused_variables::is_reduce(parsed.syntax()) =>
                     {
                         (vec![(fln_parse::BytePos(0), parsed.syntax().clone())], None)
                     }
@@ -4305,7 +4308,9 @@ impl Engine {
             // (vendored `Lean/Meta/Eval.lean`).
             if is_evaluation
                 && parsed.syntax().kind()
-                    != Some(&Name::from_components(["Lean", "Parser", "Command", "evalBang"]))
+                    != Some(&Name::from_components([
+                        "Lean", "Parser", "Command", "evalBang",
+                    ]))
                 && !matches!(
                     evaluation_presentation,
                     Some(EvaluationResultPresentation::Guard)

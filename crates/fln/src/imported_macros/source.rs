@@ -637,7 +637,9 @@ impl<'a> FileSession<'a> {
             SourceCommandKind::Check => "check",
             SourceCommandKind::Evaluation
                 if parsed.syntax().kind()
-                    == Some(&Name::from_components(["Lean", "Parser", "Command", "evalBang"])) =>
+                    == Some(&Name::from_components([
+                        "Lean", "Parser", "Command", "evalBang",
+                    ])) =>
             {
                 "evalBang"
             }
@@ -1417,7 +1419,9 @@ fn expand_in_scope(
         SourceCommandKind::Definition | SourceCommandKind::Example => "declaration",
         SourceCommandKind::Evaluation
             if parsed.syntax().kind()
-                == Some(&Name::from_components(["Lean", "Parser", "Command", "evalBang"])) =>
+                == Some(&Name::from_components([
+                    "Lean", "Parser", "Command", "evalBang",
+                ])) =>
         {
             "evalBang"
         }
@@ -1639,7 +1643,9 @@ fn evaluate(
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
         };
         if parsed.syntax().kind()
-            != Some(&Name::from_components(["Lean", "Parser", "Command", "evalBang"]))
+            != Some(&Name::from_components([
+                "Lean", "Parser", "Command", "evalBang",
+            ]))
             && crate::source_execution::evaluation_depends_on_sorry(
                 engine,
                 std::iter::once(&declaration),

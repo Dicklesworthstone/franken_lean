@@ -746,7 +746,10 @@ def taintedValue : Token := eraseEvidence evidence
 def eraseGuard (_ : Claim) : Bool := Bool.true
 def taintedGuard : Bool := eraseGuard evidence
 "#;
-    let receipt = import(&compile(&[("ForcedEvaluation", source)]), "ForcedEvaluation");
+    let receipt = import(
+        &compile(&[("ForcedEvaluation", source)]),
+        "ForcedEvaluation",
+    );
     let engine = &receipt.engine;
     let before = engine.logical_root(&KVMap::new());
     refuse_sorry(engine, "taintedValue");

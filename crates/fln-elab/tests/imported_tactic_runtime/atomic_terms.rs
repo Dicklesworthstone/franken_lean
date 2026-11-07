@@ -11,6 +11,10 @@ use fln_elab::{
     records::{RecordBudget, RecordSpec, record_declarations},
 };
 use fln_parse::extensions::{FileGrammar, NotationRule, with_grammar};
+use fln_syntax::{
+    source::{BytePos, ByteSpan},
+    tree::{Preresolved, RawIdentifier},
+};
 use std::collections::BTreeMap;
 
 struct Templates {
@@ -234,6 +238,153 @@ fn checked_syntax_in(
         "{source}: {declaration:?}"
     );
     Ok(declaration)
+}
+
+fn quoted_identifier(spelling: &str, preresolved: Vec<Preresolved>) -> Syntax {
+    let constant = Name::from_components(spelling.split('.'));
+    let val = fln_core::name::hygiene::add_macro_scope(
+        &Name::from_components(["Definition", "Site"]),
+        &constant,
+        37,
+    )
+    .unwrap();
+    assert!(val.has_macro_scopes());
+    Syntax::Ident {
+        info: SourceInfo::None,
+        raw_val: RawIdentifier::owned(
+            Arc::from(spelling),
+            ByteSpan::new(BytePos(0), BytePos(spelling.len())).unwrap(),
+        )
+        .unwrap(),
+        val,
+        preresolved,
+    }
+}
+
+fn declaration_reference(declaration: &str) -> Preresolved {
+    Preresolved::Decl {
+        name: Name::from_components(declaration.split('.')),
+        fields: Vec::new(),
+    }
+}
+
+fn quoted_apply(spelling: &str, preresolved: Vec<Preresolved>) -> Syntax {
+    Syntax::Node {
+        info: SourceInfo::None,
+        kind: Name::from_components(["Lean", "Parser", "Tactic", "apply"]),
+        args: vec![
+            Syntax::Atom {
+                info: SourceInfo::None,
+                val: "apply".to_owned(),
+            },
+            quoted_identifier(spelling, preresolved),
+        ],
+    }
+}
+
+#[test]
+fn generated_apply_resolves_hygienic_constructor_prereferences_as_terms() {
+    for (constructor, source) in [
+        ("True.intro", "theorem quotedTrue : True := by skip"),
+        (
+            "And.intro",
+            "theorem quotedAnd (P Q : Prop) (hp : P) (hq : Q) : And P Q := by skip; assumption; assumption",
+        ),
+    ] {
+        let provider = Provider::new(vec![Candidate::Expansion(quoted_apply(
+            constructor,
+            vec![declaration_reference(constructor)],
+        ))]);
+        // The parent helper checks every closed declaration with the kernel.
+        super::elaborate(source, provider.clone())
+            .unwrap_or_else(|error| panic!("{constructor}: {error:?}"));
+        assert_eq!(provider.calls.lock().unwrap().len(), 1);
+    }
+    let provider = Provider::new(vec![Candidate::Expansion(quoted_apply(
+        "True.intro",
+        vec![declaration_reference("True.intro")],
+    ))]);
+    assert!(matches!(
+        super::elaborate("theorem falseConstructor : False := by skip", provider),
+        Err(NatDefinitionElabError::Inference(
+            SourceInferenceError::Tactic(fln_elab::source::TacticError::ApplyMismatch)
+        ))
+    ));
+}
+
+#[test]
+fn generated_apply_rejects_unavailable_overloaded_and_field_prereferences() {
+    for (references, expected) in [
+        (
+            vec![declaration_reference("Missing.constructor")],
+            "an available exact declaration target",
+        ),
+        (
+            vec![
+                declaration_reference("True.intro"),
+                declaration_reference("And.intro"),
+            ],
+            "overloaded pre-resolved declarations",
+        ),
+        (
+            vec![Preresolved::Decl {
+                name: Name::from_components(["True", "intro"]),
+                fields: vec!["field".to_owned()],
+            }],
+            "pre-resolved field projections",
+        ),
+    ] {
+        let provider = Provider::new(vec![Candidate::Expansion(quoted_apply(
+            "True.intro",
+            references,
+        ))]);
+        let result = super::elaborate("theorem rejectedMetadata : True := by skip", provider);
+        assert!(
+            matches!(
+                &result,
+                Err(NatDefinitionElabError::Inference(SourceInferenceError::PreresolvedReference {
+                    feature,
+                    ..
+                })) if *feature == expected
+            ),
+            "{expected}: {result:?}"
+        );
+    }
+}
+
+#[test]
+fn generated_clear_keeps_specialized_prereference_refusal() {
+    let clear = Syntax::Node {
+        info: SourceInfo::None,
+        kind: Name::from_components(["Lean", "Parser", "Tactic", "clear"]),
+        args: vec![
+            Syntax::Atom {
+                info: SourceInfo::None,
+                val: "clear".to_owned(),
+            },
+            Syntax::Node {
+                info: SourceInfo::None,
+                kind: Name::from_components(["null"]),
+                args: vec![quoted_identifier(
+                    "h",
+                    vec![declaration_reference("True.intro")],
+                )],
+            },
+        ],
+    };
+    let provider = Provider::new(vec![Candidate::Expansion(clear)]);
+    assert!(matches!(
+        super::elaborate(
+            "theorem retained (h : True) : True := by skip; exact h",
+            provider
+        ),
+        Err(NatDefinitionElabError::Inference(
+            SourceInferenceError::PreresolvedReference {
+                feature: "pre-resolved identifiers in pattern or tactic syntax",
+                ..
+            }
+        ))
+    ));
 }
 
 #[test]

@@ -32,13 +32,22 @@ pub(super) enum NativeTacticMacro {
     InferInstance,
     Try,
     NoFun,
+    Rwa,
+    Rw,
+    AndThen,
+    TrivialAssumption,
+    TrivialRfl,
+    TrivialContradiction,
+    TrivialDecide,
+    TrivialTrue,
+    TrivialAnd,
 }
 
 impl NativeTacticMacro {
     // Exact registrations from REFERENCE_GRAMMAR_CENSUS.txt, not spellings
     // inferred from a caller's syntax kind. The partition and checked module
     // owner remain mandatory before any candidate receives native execution.
-    const ALL: [Self; 8] = [
+    const ALL: [Self; 17] = [
         Self::ApplyRfl,
         Self::EqRefl,
         Self::ExactHEq,
@@ -47,6 +56,15 @@ impl NativeTacticMacro {
         Self::InferInstance,
         Self::Try,
         Self::NoFun,
+        Self::Rwa,
+        Self::Rw,
+        Self::AndThen,
+        Self::TrivialAssumption,
+        Self::TrivialRfl,
+        Self::TrivialContradiction,
+        Self::TrivialDecide,
+        Self::TrivialTrue,
+        Self::TrivialAnd,
     ];
 
     pub(super) fn identify(
@@ -94,6 +112,33 @@ impl NativeTacticMacro {
             Self::NoFun => {
                 "Lean.Parser.Tactic._aux_Init_Tactics___macroRules_Lean_Parser_Tactic_tacticNofun_1"
             }
+            Self::Rwa => {
+                "Lean.Parser.Tactic._aux_Init_Tactics___macroRules_Lean_Parser_Tactic_tacticRwa___1"
+            }
+            Self::Rw => {
+                "Lean.Parser.Tactic._aux_Init_Tactics___macroRules_Lean_Parser_Tactic_rwSeq_1"
+            }
+            Self::AndThen => {
+                "Lean.Parser.Tactic._aux_Init_Tactics___macroRules_Lean_Parser_Tactic_tactic_<;>__1"
+            }
+            Self::TrivialAssumption => {
+                "Lean.Parser.Tactic._aux_Init_Tactics___macroRules_Lean_Parser_Tactic_tacticTrivial_1"
+            }
+            Self::TrivialRfl => {
+                "Lean.Parser.Tactic._aux_Init_Tactics___macroRules_Lean_Parser_Tactic_tacticTrivial_2"
+            }
+            Self::TrivialContradiction => {
+                "Lean.Parser.Tactic._aux_Init_Tactics___macroRules_Lean_Parser_Tactic_tacticTrivial_3"
+            }
+            Self::TrivialDecide => {
+                "Lean.Parser.Tactic._aux_Init_Tactics___macroRules_Lean_Parser_Tactic_tacticTrivial_4"
+            }
+            Self::TrivialTrue => {
+                "Lean.Parser.Tactic._aux_Init_Tactics___macroRules_Lean_Parser_Tactic_tacticTrivial_5"
+            }
+            Self::TrivialAnd => {
+                "Lean.Parser.Tactic._aux_Init_Tactics___macroRules_Lean_Parser_Tactic_tacticTrivial_6"
+            }
         }
     }
 
@@ -121,6 +166,33 @@ impl NativeTacticMacro {
             Self::NoFun => {
                 "mirror:Lean.Parser.Tactic._aux_Init_Tactics___macroRules_Lean_Parser_Tactic_tacticNofun_1"
             }
+            Self::Rwa => {
+                "mirror:Lean.Parser.Tactic._aux_Init_Tactics___macroRules_Lean_Parser_Tactic_tacticRwa___1"
+            }
+            Self::Rw => {
+                "mirror:Lean.Parser.Tactic._aux_Init_Tactics___macroRules_Lean_Parser_Tactic_rwSeq_1"
+            }
+            Self::AndThen => {
+                "mirror:Lean.Parser.Tactic._aux_Init_Tactics___macroRules_Lean_Parser_Tactic_tactic_<;>__1"
+            }
+            Self::TrivialAssumption => {
+                "mirror:Lean.Parser.Tactic._aux_Init_Tactics___macroRules_Lean_Parser_Tactic_tacticTrivial_1"
+            }
+            Self::TrivialRfl => {
+                "mirror:Lean.Parser.Tactic._aux_Init_Tactics___macroRules_Lean_Parser_Tactic_tacticTrivial_2"
+            }
+            Self::TrivialContradiction => {
+                "mirror:Lean.Parser.Tactic._aux_Init_Tactics___macroRules_Lean_Parser_Tactic_tacticTrivial_3"
+            }
+            Self::TrivialDecide => {
+                "mirror:Lean.Parser.Tactic._aux_Init_Tactics___macroRules_Lean_Parser_Tactic_tacticTrivial_4"
+            }
+            Self::TrivialTrue => {
+                "mirror:Lean.Parser.Tactic._aux_Init_Tactics___macroRules_Lean_Parser_Tactic_tacticTrivial_5"
+            }
+            Self::TrivialAnd => {
+                "mirror:Lean.Parser.Tactic._aux_Init_Tactics___macroRules_Lean_Parser_Tactic_tacticTrivial_6"
+            }
         }
     }
 
@@ -131,7 +203,25 @@ impl NativeTacticMacro {
             Self::InferInstance => "tacticInfer_instance",
             Self::Try => "tacticTry_",
             Self::NoFun => "tacticNofun",
+            Self::Rwa => "tacticRwa__",
+            Self::Rw => "rwSeq",
+            Self::AndThen => "tactic_<;>_",
+            Self::TrivialAssumption
+            | Self::TrivialRfl
+            | Self::TrivialContradiction
+            | Self::TrivialDecide
+            | Self::TrivialTrue
+            | Self::TrivialAnd => "tacticTrivial",
         }
+    }
+
+    fn matches(self, input: &Syntax) -> bool {
+        if input.kind() != Some(&Name::str(name("Lean.Parser.Tactic"), self.input_kind())) {
+            return false;
+        }
+        // rw's body performs a second quotation-pattern match on its rule
+        // sequence; the other candidates only match their input node kind.
+        self != Self::Rw || argument(input, 2).kind() == Some(&name("Lean.Parser.Tactic.rwRuleSeq"))
     }
 
     /// Quote the pin's RHS, preserving antiquotation children verbatim. The
@@ -157,6 +247,22 @@ impl NativeTacticMacro {
             info,
             kind: Name::str(name("Lean.Parser.Tactic"), kind),
             args,
+        };
+        let sequence = |rows| {
+            tactic(
+                "tacticSeq",
+                vec![tactic("tacticSeq1Indented", vec![node("null", rows)])],
+            )
+        };
+        let parenthesized = |body| tactic("paren", vec![atom("("), body, atom(")")]);
+        let optional = |capture: Syntax| {
+            let args = match &capture {
+                Syntax::Node { kind, args, .. } if *kind == name("null") && args.len() == 1 => {
+                    args.clone()
+                }
+                _ => Vec::new(),
+            };
+            node("null", args)
         };
         let identifier = |declaration: &str| {
             let constant = name(declaration);
@@ -187,6 +293,25 @@ impl NativeTacticMacro {
             Self::EqRefl => tactic("eqRefl", vec![atom("eq_refl")]),
             Self::ExactHEq => tactic("exact", vec![atom("exact"), identifier("HEq.rfl")?]),
             Self::ExactIff => tactic("exact", vec![atom("exact"), identifier("Iff.rfl")?]),
+            Self::TrivialAssumption => tactic("assumption", vec![atom("assumption")]),
+            Self::TrivialRfl => tactic("tacticRfl", vec![atom("rfl")]),
+            Self::TrivialContradiction => tactic("contradiction", vec![atom("contradiction")]),
+            Self::TrivialDecide => tactic(
+                "decide",
+                vec![
+                    atom("decide"),
+                    tactic("optConfig", vec![node("null", Vec::new())]),
+                ],
+            ),
+            Self::TrivialTrue => tactic("apply", vec![atom("apply"), identifier("True.intro")?]),
+            Self::TrivialAnd => tactic(
+                "tactic_<;>_",
+                vec![
+                    tactic("apply", vec![atom("apply"), identifier("And.intro")?]),
+                    atom("<;>"),
+                    tactic("tacticTrivial", vec![atom("trivial")]),
+                ],
+            ),
             Self::InferInstance => {
                 tactic("exact", vec![atom("exact"), identifier("inferInstance")?])
             }
@@ -242,6 +367,81 @@ impl NativeTacticMacro {
                     ],
                 )
             }
+            Self::Rwa => parenthesized(sequence(vec![
+                tactic(
+                    "rwSeq",
+                    vec![
+                        atom("rw"),
+                        tactic("optConfig", vec![node("null", Vec::new())]),
+                        argument(input, 1),
+                        optional(argument(input, 2)),
+                    ],
+                ),
+                atom(";"),
+                tactic("assumption", vec![atom("assumption")]),
+            ])),
+            Self::Rw => {
+                let rules = argument(input, 2);
+                let entries = match &argument(&rules, 1) {
+                    Syntax::Node { args, .. } => args.clone(),
+                    _ => Vec::new(),
+                };
+                let close = parenthesized(sequence(vec![tactic(
+                    "tacticTry_",
+                    vec![
+                        atom("try"),
+                        sequence(vec![parenthesized(sequence(vec![tactic(
+                            "withReducible",
+                            vec![
+                                atom("with_reducible"),
+                                sequence(vec![tactic("tacticRfl", vec![atom("rfl")])]),
+                            ],
+                        )]))]),
+                    ],
+                )]));
+                parenthesized(sequence(vec![
+                    tactic(
+                        "rewriteSeq",
+                        vec![
+                            atom("rewrite"),
+                            argument(input, 1),
+                            tactic(
+                                "rwRuleSeq",
+                                vec![atom("["), node("null", entries), atom("]")],
+                            ),
+                            optional(argument(input, 3)),
+                        ],
+                    ),
+                    atom(";"),
+                    tactic(
+                        "withAnnotateState",
+                        vec![atom("with_annotate_state"), argument(&rules, 2), close],
+                    ),
+                ]))
+            }
+            Self::AndThen => tactic(
+                "focus",
+                vec![
+                    atom("focus"),
+                    sequence(vec![
+                        argument(input, 0),
+                        node("null", Vec::new()),
+                        tactic(
+                            "withAnnotateState",
+                            vec![
+                                atom("with_annotate_state"),
+                                argument(input, 1),
+                                tactic("skip", vec![atom("skip")]),
+                            ],
+                        ),
+                        node("null", Vec::new()),
+                        tactic(
+                            "allGoals",
+                            vec![atom("all_goals"), sequence(vec![argument(input, 2)])],
+                        ),
+                    ]),
+                ],
+            ),
         })
     }
 
@@ -263,7 +463,7 @@ impl NativeTacticMacro {
             let mut budget = StateBudget::new(limits.syntax);
             budget.inject_name(&invocation.context.quotation_context)?;
             let state = inject_state(invocation.state, &mut budget)?;
-            if input.kind() != Some(&Name::str(name("Lean.Parser.Tactic"), self.input_kind())) {
+            if !self.matches(input) {
                 return Ok(make_ctor(
                     layout::RESULT_ERROR,
                     vec![Obj::mk_nat(layout::EXCEPTION_UNSUPPORTED_TAG), state],
@@ -309,6 +509,14 @@ impl NativeTacticMacro {
             reference_functions: Vec::new(),
             native_functions: vec![self.id().to_owned()],
         }
+    }
+}
+
+/// Syntax.getArg returns `missing` for absent children and non-node syntax.
+fn argument(syntax: &Syntax, index: usize) -> Syntax {
+    match syntax {
+        Syntax::Node { args, .. } => args.get(index).cloned().unwrap_or(Syntax::Missing),
+        _ => Syntax::Missing,
     }
 }
 
