@@ -1,4 +1,4 @@
-//! Native counterparts for the pin's four registered `rfl` macros.
+//! Native counterparts for selected registered Init tactic macros.
 //!
 //! These are individual registry candidates, not an aggregate reflexivity
 //! tactic. Their checked owners and exact census names select native quotation
@@ -28,9 +28,27 @@ pub(super) enum NativeTacticMacro {
     EqRefl,
     ExactHEq,
     ExactIff,
+    Exfalso,
+    InferInstance,
+    Try,
+    NoFun,
 }
 
 impl NativeTacticMacro {
+    // Exact registrations from REFERENCE_GRAMMAR_CENSUS.txt, not spellings
+    // inferred from a caller's syntax kind. The partition and checked module
+    // owner remain mandatory before any candidate receives native execution.
+    const ALL: [Self; 8] = [
+        Self::ApplyRfl,
+        Self::EqRefl,
+        Self::ExactHEq,
+        Self::ExactIff,
+        Self::Exfalso,
+        Self::InferInstance,
+        Self::Try,
+        Self::NoFun,
+    ];
+
     pub(super) fn identify(
         module: &Name,
         declaration: &Name,
@@ -39,7 +57,7 @@ impl NativeTacticMacro {
         if partition.classify(declaration) != Some(GraphClass::ToolchainApi) {
             return None;
         }
-        [Self::ApplyRfl, Self::EqRefl, Self::ExactHEq, Self::ExactIff]
+        Self::ALL
             .into_iter()
             .find(|candidate| {
                 *module == name(candidate.module()) && *declaration == name(candidate.declaration())
@@ -66,6 +84,18 @@ impl NativeTacticMacro {
                 "Lean.Parser.Tactic._aux_Init_Tactics___macroRules_Lean_Parser_Tactic_tacticRfl_3"
             }
             Self::ExactIff => "_aux_Init_Core___macroRules_Lean_Parser_Tactic_tacticRfl_1",
+            Self::Exfalso => {
+                "Lean.Parser.Tactic._aux_Init_Tactics___macroRules_Lean_Parser_Tactic_tacticExfalso_1"
+            }
+            Self::InferInstance => {
+                "Lean.Parser.Tactic._aux_Init_Tactics___macroRules_Lean_Parser_Tactic_tacticInfer_instance_1"
+            }
+            Self::Try => {
+                "Lean.Parser.Tactic._aux_Init_Tactics___macroRules_Lean_Parser_Tactic_tacticTry__1"
+            }
+            Self::NoFun => {
+                "Lean.Parser.Tactic._aux_Init_Tactics___macroRules_Lean_Parser_Tactic_tacticNofun_1"
+            }
         }
     }
 
@@ -81,7 +111,137 @@ impl NativeTacticMacro {
                 "mirror:Lean.Parser.Tactic._aux_Init_Tactics___macroRules_Lean_Parser_Tactic_tacticRfl_3"
             }
             Self::ExactIff => "mirror:_aux_Init_Core___macroRules_Lean_Parser_Tactic_tacticRfl_1",
+            Self::Exfalso => {
+                "mirror:Lean.Parser.Tactic._aux_Init_Tactics___macroRules_Lean_Parser_Tactic_tacticExfalso_1"
+            }
+            Self::InferInstance => {
+                "mirror:Lean.Parser.Tactic._aux_Init_Tactics___macroRules_Lean_Parser_Tactic_tacticInfer_instance_1"
+            }
+            Self::Try => {
+                "mirror:Lean.Parser.Tactic._aux_Init_Tactics___macroRules_Lean_Parser_Tactic_tacticTry__1"
+            }
+            Self::NoFun => {
+                "mirror:Lean.Parser.Tactic._aux_Init_Tactics___macroRules_Lean_Parser_Tactic_tacticNofun_1"
+            }
         }
+    }
+
+    fn input_kind(self) -> &'static str {
+        match self {
+            Self::ApplyRfl | Self::EqRefl | Self::ExactHEq | Self::ExactIff => "tacticRfl",
+            Self::Exfalso => "tacticExfalso",
+            Self::InferInstance => "tacticInfer_instance",
+            Self::Try => "tacticTry_",
+            Self::NoFun => "tacticNofun",
+        }
+    }
+
+    /// Quote the pin's RHS, preserving antiquotation children verbatim. The
+    /// generated matcher checks the kind only: absent arguments are `missing`,
+    /// and neither token spelling nor extra children are inspected. See
+    /// Lean/Elab/Quotation.lean's `HeadCheck.shape` and `quoteSyntax`.
+    fn quote(
+        self,
+        input: &Syntax,
+        context: &super::MacroContext,
+        info: SourceInfo,
+    ) -> Result<Syntax, SyntaxConversionError> {
+        let atom = |text: &str| Syntax::Atom {
+            info,
+            val: text.to_owned(),
+        };
+        let node = |kind: &str, args| Syntax::Node {
+            info,
+            kind: name(kind),
+            args,
+        };
+        let tactic = |kind: &str, args| Syntax::Node {
+            info,
+            kind: Name::str(name("Lean.Parser.Tactic"), kind),
+            args,
+        };
+        let identifier = |declaration: &str| {
+            let constant = name(declaration);
+            let value = add_macro_scope(
+                &context.quotation_context,
+                &constant,
+                context.current_macro_scope,
+            )
+            .map_err(|_| SyntaxConversionError::Malformed("native tactic quotation hygiene"))?;
+            let raw = RawIdentifier::owned(
+                Arc::from(declaration),
+                ByteSpan::new(BytePos(0), BytePos(declaration.len()))
+                    .expect("fixed native identifier range"),
+            )
+            .expect("fixed native identifier UTF-8 range");
+            Ok::<_, SyntaxConversionError>(Syntax::Ident {
+                info,
+                raw_val: raw,
+                val: value,
+                preresolved: vec![Preresolved::Decl {
+                    name: constant,
+                    fields: Vec::new(),
+                }],
+            })
+        };
+        Ok(match self {
+            Self::ApplyRfl => tactic("applyRfl", vec![atom("apply_rfl")]),
+            Self::EqRefl => tactic("eqRefl", vec![atom("eq_refl")]),
+            Self::ExactHEq => tactic("exact", vec![atom("exact"), identifier("HEq.rfl")?]),
+            Self::ExactIff => tactic("exact", vec![atom("exact"), identifier("Iff.rfl")?]),
+            Self::InferInstance => {
+                tactic("exact", vec![atom("exact"), identifier("inferInstance")?])
+            }
+            Self::NoFun => tactic(
+                "exact",
+                vec![atom("exact"), node("Lean.Parser.Term.nofun", vec![atom("nofun")])],
+            ),
+            Self::Exfalso => tactic(
+                "refine",
+                vec![
+                    atom("refine"),
+                    node(
+                        "Lean.Parser.Term.app",
+                        vec![
+                            identifier("False.elim")?,
+                            node(
+                                "null",
+                                vec![node(
+                                    "Lean.Parser.Term.syntheticHole",
+                                    vec![atom("?"), atom("_")],
+                                )],
+                            ),
+                        ],
+                    ),
+                ],
+            ),
+            Self::Try => {
+                let body = match input {
+                    Syntax::Node { args, .. } => args.get(1).cloned().unwrap_or(Syntax::Missing),
+                    _ => Syntax::Missing,
+                };
+                let skip = tactic(
+                    "tacticSeq",
+                    vec![tactic(
+                        "tacticSeq1Indented",
+                        vec![node("null", vec![tactic("skip", vec![atom("skip")])])],
+                    )],
+                );
+                tactic(
+                    "first",
+                    vec![
+                        atom("first"),
+                        node(
+                            "null",
+                            vec![
+                                node("group", vec![atom("|"), body]),
+                                node("group", vec![atom("|"), skip]),
+                            ],
+                        ),
+                    ],
+                )
+            }
+        })
     }
 
     pub(super) fn execute(
@@ -102,54 +262,14 @@ impl NativeTacticMacro {
             let mut budget = StateBudget::new(limits.syntax);
             budget.inject_name(&invocation.context.quotation_context)?;
             let state = inject_state(invocation.state, &mut budget)?;
-            if input.kind() != Some(&name("Lean.Parser.Tactic.tacticRfl")) {
+            if input.kind() != Some(&Name::str(name("Lean.Parser.Tactic"), self.input_kind())) {
                 return Ok(make_ctor(
                     layout::RESULT_ERROR,
                     vec![Obj::mk_nat(layout::EXCEPTION_UNSUPPORTED_TAG), state],
                 ));
             }
-            // The pin checks only isOfKind. getArg 0 is read but its value and
-            // even its presence are not tested by these four macro bodies.
             let info = info_from_reference(reference);
-            let (kind, keyword, declaration) = match self {
-                Self::ApplyRfl => ("applyRfl", "apply_rfl", None),
-                Self::EqRefl => ("eqRefl", "eq_refl", None),
-                Self::ExactHEq => ("exact", "exact", Some("HEq.rfl")),
-                Self::ExactIff => ("exact", "exact", Some("Iff.rfl")),
-            };
-            let mut args = vec![Syntax::Atom {
-                info,
-                val: keyword.to_owned(),
-            }];
-            if let Some(declaration) = declaration {
-                let constant = name(declaration);
-                let value = add_macro_scope(
-                    &invocation.context.quotation_context,
-                    &constant,
-                    invocation.context.current_macro_scope,
-                )
-                .map_err(|_| SyntaxConversionError::Malformed("native tactic quotation hygiene"))?;
-                let raw = RawIdentifier::owned(
-                    Arc::from(declaration),
-                    ByteSpan::new(BytePos(0), BytePos(declaration.len()))
-                        .expect("fixed native identifier range"),
-                )
-                .expect("fixed native identifier UTF-8 range");
-                args.push(Syntax::Ident {
-                    info,
-                    raw_val: raw,
-                    val: value,
-                    preresolved: vec![Preresolved::Decl {
-                        name: constant,
-                        fields: Vec::new(),
-                    }],
-                });
-            }
-            let output = Syntax::Node {
-                info,
-                kind: Name::str(name("Lean.Parser.Tactic"), kind),
-                args,
-            };
+            let output = self.quote(input, invocation.context, info)?;
             let output = syntax::inject(&output, invocation.source, limits.syntax)?;
             Ok::<_, SyntaxConversionError>(make_ctor(layout::RESULT_OK, vec![output, state]))
         })();
