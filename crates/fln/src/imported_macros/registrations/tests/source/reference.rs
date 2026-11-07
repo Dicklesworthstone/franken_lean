@@ -29,7 +29,9 @@ fn live_pinned_composite_tactics_admit_source_from_complete_import_journals() {
 
 fn composite_tactics_from_actual_imports(reference: PathBuf, library: PathBuf, partition: PathBuf) {
     use crate::imported_macros::registrations::MacroCompilationInputs;
+    use crate::imported_macros::source::SourceMacroFileCheck;
     use crate::source_check::modules::imported::SourceOleanImportLimits;
+    use crate::source_check::{SourceCheckError, SourceCheckLimits};
     use crate::{Budget, OleanCheckLimits, OleanModuleInput};
 
     let version = Command::new(&reference)
@@ -204,23 +206,90 @@ fn composite_tactics_from_actual_imports(reference: PathBuf, library: PathBuf, p
     );
     let engine = &imported.engine;
     let before = engine.logical_root(&options);
-    for (label, accepted, source) in cases {
-        let report = admit(
-            engine,
-            &registry,
-            source.as_bytes(),
-            MacroTreeLimits::default(),
-            admission(),
-            None,
+
+    // The declaration-only adapter deliberately refuses runtime tactic
+    // dispatch; the owned file session installs that provider during checking.
+    let node_only = admit(
+        engine,
+        &registry,
+        cases[0].2.as_bytes(),
+        MacroTreeLimits::default(),
+        admission(),
+        None,
+    );
+    assert!(matches!(
+        &node_only.outcome,
+        Outcome::Complete(Err(SourceMacroError::TacticExpansion { kind }))
+            if *kind == name("Lean.Parser.Tactic.tacticRwa__")
+    ));
+    assert!(node_only.state.is_none());
+    assert!(node_only.attempts.is_empty());
+    assert_eq!(node_only.completed_vm_usage.steps, 0);
+
+    let run =
+        |source: &[u8], limits: MacroTreeLimits, cancellation: Option<&dyn CancellationProbe>| {
+            engine.check_source_files_with_imported_macros(
+                &[source],
+                &options,
+                SourceCheckLimits::new(admission()),
+                SourceMacroInvocation {
+                    registry: &registry,
+                    context: &context(),
+                    state: MacroState {
+                        macro_scope: 17,
+                        ..MacroState::default()
+                    },
+                    lookup: None,
+                    limits,
+                    cancellation,
+                },
+            )
+        };
+    fn assert_checked(engine: &Engine, report: &SourceMacroFileCheck, label: &str) {
+        let Outcome::Complete(Ok(checked)) = &report.outcome else {
+            panic!("{label}: {report:?}")
+        };
+        assert!(report.state.is_some());
+        assert_eq!(
+            (checked.files, checked.commands, checked.theorems),
+            (1, 1, 1)
         );
+        assert_eq!(
+            checked.base_logical_root,
+            engine.logical_root(&KVMap::new())
+        );
+        assert_ne!(checked.result_logical_root, checked.base_logical_root);
+        let Some(ConstantInfo::Thm(theorem)) = checked.engine.environment().find(&name(label))
+        else {
+            panic!("{label}: the checked source did not publish its theorem")
+        };
+        // Recheck the returned closed proof against the original imports, so
+        // the integration assertion retains the exact body-checking ground.
+        let admitted = engine
+            .admit_declaration(
+                crate::Declaration::Thm(theorem.clone()),
+                &KVMap::new(),
+                admission(),
+            )
+            .unwrap()
+            .into_complete()
+            .unwrap();
+        assert_eq!(
+            admitted.checker.ground,
+            crate::CheckerAdmissionGround::BodyCheckedAgainstDeclaredType
+        );
+    }
+
+    for (label, accepted, source) in cases {
+        let report = run(source.as_bytes(), MacroTreeLimits::default(), None);
         if accepted {
-            let result = admitted(&report);
-            assert!(result.admission.engine.environment().contains(&name(label)));
+            assert_checked(engine, &report, label);
         } else {
             assert!(
                 matches!(
-                    report.outcome,
-                    Outcome::Complete(Err(SourceMacroError::Frontend(_)))
+                    &report.outcome,
+                    Outcome::Complete(Err(SourceCheckError::Command { error, .. }))
+                        if matches!(error.as_ref(), crate::EngineExecutionError::Frontend(_))
                 ),
                 "{label}: {report:?}; {dir:?}"
             );
@@ -266,31 +335,18 @@ fn composite_tactics_from_actual_imports(reference: PathBuf, library: PathBuf, p
     let source = cases[8].2.as_bytes();
     let mut limited = MacroTreeLimits::default();
     limited.dispatch.max_attempts = 1;
-    let stopped = admit(engine, &registry, source, limited, admission(), None);
+    let stopped = run(source, limited, None);
     assert!(
         matches!(stopped.outcome, Outcome::Inconclusive(_)),
         "{stopped:?}"
     );
     assert!(stopped.state.is_none());
     assert!(stopped.completed_vm_usage.steps > 0);
-    let cancelled = admit(
-        engine,
-        &registry,
-        source,
-        MacroTreeLimits::default(),
-        admission(),
-        Some(&|| true),
-    );
+    let cancelled = run(source, MacroTreeLimits::default(), Some(&|| true));
     assert!(matches!(cancelled.outcome, Outcome::Inconclusive(_)));
     assert!(cancelled.state.is_none());
-    admitted(&admit(
-        engine,
-        &registry,
-        source,
-        MacroTreeLimits::default(),
-        admission(),
-        None,
-    ));
+    let recovered = run(source, MacroTreeLimits::default(), None);
+    assert_checked(engine, &recovered, cases[8].0);
     assert_eq!(engine.logical_root(&options), before);
 }
 
