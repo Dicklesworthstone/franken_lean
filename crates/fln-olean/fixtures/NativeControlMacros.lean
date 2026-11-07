@@ -1,6 +1,6 @@
 module
 
-import Lean
+import Init
 import all Init.Prelude -- inspect the complete Macro.State, including private fields
 
 open Lean
@@ -87,8 +87,8 @@ meta def runControlMacros : IO Unit := do
       for reference in controlReferences do
         for input in controlInputs kind do
           match macroFn input { context with ref := reference } state with
-          | .ok syntax next =>
-            IO.println ("ok:" ++ controlSyntax syntax ++ s!":{controlStateExact next}")
+          | .ok stx next =>
+            IO.println ("ok:" ++ controlSyntax stx ++ s!":{controlStateExact next}")
           | .error _ _ => IO.println "unexpected-error"
     for input in [Syntax.missing, .atom .none "wrong", .node .none `User.tactic #[]] do
       match macroFn input ⟨default, `Client.Scope, 17, 3, 512, .missing⟩ state with

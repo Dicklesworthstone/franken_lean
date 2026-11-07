@@ -600,11 +600,14 @@ impl Context {
             self.tick()?;
             match syntax {
                 Syntax::Node { kind, args, .. } => {
-                    // `exact` sends its complete operand to the ordinary term
+                    // `exact` and `apply` send their complete operands to the ordinary term
                     // elaborator, which preserves declaration metadata and
-                    // local-name priority. It is not one of the tactic paths
-                    // which extracts identifier spelling without resolution.
-                    if kind == &parser_kind(&["Tactic", "exact"]) && args.len() == 2 {
+                    // local-name priority. Neither extracts identifier spelling
+                    // without resolution.
+                    if (kind == &parser_kind(&["Tactic", "exact"])
+                        || kind == &parser_kind(&["Tactic", "apply"]))
+                        && args.len() == 2
+                    {
                         pending.push((&args[0], true));
                         pending.push((&args[1], false));
                         continue;

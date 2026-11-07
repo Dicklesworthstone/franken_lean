@@ -259,7 +259,7 @@ fn type_index_selected_callbacks_keep_direct_partial_and_object_interfaces() {
 }
 
 #[test]
-fn type_index_selected_callback_initializers_stay_strict_and_shared() {
+fn type_index_selected_callbacks_discard_dead_initializers_and_share_live_ones() {
     let prefix = format!(
         "{SELECTED}def work (n : Nat) : Nat := Nat.rec (motive := fun _ => Nat) 0 (fun k ih => ih) n\n\
          def build (n : Nat) : Nat -> Nat := let offset := work n; fun x => offset + x\n"
@@ -270,9 +270,14 @@ fn type_index_selected_callback_initializers_stay_strict_and_shared() {
         )
     };
     let direct = |n| format!("{prefix}#eval let f := build {n}; f 21 + f 21");
+    let live_work = run(&direct(80), "42") - run(&direct(0), "42");
+    assert!(
+        live_work > 80,
+        "the live initializer must perform real runtime work"
+    );
     assert_eq!(
         run(&selected(80), "42") - run(&selected(0), "42"),
-        run(&direct(80), "42") - run(&direct(0), "42"),
+        live_work,
         "restoring a callback interface must not duplicate its initializer"
     );
     let unused = |n| {
@@ -281,9 +286,9 @@ fn type_index_selected_callback_initializers_stay_strict_and_shared() {
         )
     };
     assert_eq!(
-        run(&unused(80), "42") - run(&unused(0), "42"),
-        run(&direct(80), "42") - run(&direct(0), "42"),
-        "a selected callback's initializer must run even when the callback is unused"
+        run(&unused(80), "42"),
+        run(&unused(0), "42"),
+        "the original unused selected callback must not execute its initializer"
     );
 
     let base = engine();
@@ -307,7 +312,7 @@ fn type_index_selected_callback_initializers_stay_strict_and_shared() {
 }
 
 #[test]
-fn selected_callback_stages_run_before_partial_results_are_discarded() {
+fn selected_callback_stages_discard_dead_results_and_share_live_work() {
     let prefix = format!(
         "{SELECTED}def work (n : Nat) : Nat := Nat.rec (motive := fun _ => Nat) 0 (fun k ih => ih) n\n\
          def staged (cost : Nat) : Nat -> Nat -> Nat := fun x => let paid := work cost; fun y => x + y + paid\n"
@@ -323,12 +328,20 @@ fn selected_callback_stages_run_before_partial_results_are_discarded() {
         format!("{prefix}#eval let f : Nat -> Nat -> Nat := {value}; {body}")
     };
     let discarded = "let g := f 20; 42";
-    let delta = run(&source(80, false, discarded), "42") - run(&source(0, false, discarded), "42");
+    for selected in [false, true] {
+        assert_eq!(
+            run(&source(80, selected, discarded), "42"),
+            run(&source(0, selected, discarded), "42"),
+            "the original discarded partial result must remove its producer: selected={selected}"
+        );
+    }
+    let used = "let g := f 20; g 22";
+    let delta = run(&source(80, false, used), "42") - run(&source(0, false, used), "42");
     assert!(
         delta > 80,
         "the direct first stage must perform real runtime work"
     );
-    for body in [discarded, "let g := f 20; g 1 + g 1"] {
+    for body in [used, "let g := f 20; g 1 + g 1"] {
         assert_eq!(
             run(&source(80, true, body), "42") - run(&source(0, true, body), "42"),
             delta,

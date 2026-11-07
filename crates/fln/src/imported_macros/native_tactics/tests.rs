@@ -561,8 +561,14 @@ fn native_try_keeps_captured_syntax_and_caller_hygiene_intact() {
 
 #[test]
 fn native_control_macros_preserve_refusals_limits_and_recovery() {
-    for candidate in CONTROL_CANDIDATES {
-        let input = control_inputs(candidate)[2].clone();
+    let candidates = CONTROL_CANDIDATES
+        .into_iter()
+        .map(|candidate| (candidate, control_inputs(candidate)[2].clone()))
+        .chain(COMPOSITE_CANDIDATES.into_iter().map(|candidate| {
+            let input = composite_inputs(candidate).pop().unwrap();
+            (candidate, input)
+        }));
+    for (candidate, input) in candidates {
         let baseline = expanded_control(candidate, &input);
         for invalid in [
             Syntax::Missing,
@@ -890,4 +896,267 @@ fn live_pinned_control_candidates_match_complete_quotations_and_state() {
     assert_eq!(String::from_utf8(result.stdout).unwrap(), native, "{dir:?}");
     assert!(result.stderr.is_empty());
     eprintln!("native and pinned control macros: 128 exact quotations, 12 unsupported inputs");
+}
+
+const COMPOSITE_CANDIDATES: [NativeTacticMacro; 9] = [
+    NativeTacticMacro::Rwa,
+    NativeTacticMacro::Rw,
+    NativeTacticMacro::AndThen,
+    NativeTacticMacro::TrivialAssumption,
+    NativeTacticMacro::TrivialRfl,
+    NativeTacticMacro::TrivialContradiction,
+    NativeTacticMacro::TrivialDecide,
+    NativeTacticMacro::TrivialTrue,
+    NativeTacticMacro::TrivialAnd,
+];
+
+fn composite_inputs(candidate: NativeTacticMacro) -> Vec<Syntax> {
+    let kind = format!("Lean.Parser.Tactic.{}", candidate.input_kind());
+    let wrong = || atom(SourceInfo::None, "wrong");
+    let extra = || atom(SourceInfo::None, "extra");
+    vec![
+        node(&kind, vec![]),
+        node(&kind, vec![wrong()]),
+        node(&kind, vec![wrong(), control_body()]),
+        node(&kind, vec![wrong(), Syntax::Missing, extra()]),
+        node(&kind, vec![wrong(), control_body(), node("null", vec![])]),
+        node(
+            &kind,
+            vec![wrong(), control_body(), node("null", vec![control_body()])],
+        ),
+        node(
+            &kind,
+            vec![
+                wrong(),
+                control_body(),
+                node("null", vec![control_body(), Syntax::Missing]),
+            ],
+        ),
+        node(
+            &kind,
+            vec![
+                wrong(),
+                control_body(),
+                node("Other.optional", vec![control_body()]),
+            ],
+        ),
+        node(
+            &kind,
+            vec![
+                wrong(),
+                control_body(),
+                node("Lean.Parser.Tactic.rwRuleSeq", vec![]),
+                node("null", vec![control_body()]),
+            ],
+        ),
+        node(
+            &kind,
+            vec![
+                wrong(),
+                control_body(),
+                node(
+                    "Lean.Parser.Tactic.rwRuleSeq",
+                    vec![
+                        wrong(),
+                        node(
+                            "Other.separated",
+                            vec![control_body(), atom(SourceInfo::None, ","), Syntax::Missing],
+                        ),
+                        control_body(),
+                        extra(),
+                    ],
+                ),
+                node("null", vec![control_body()]),
+                extra(),
+            ],
+        ),
+    ]
+}
+
+#[test]
+fn native_rwa_preserves_rules_and_only_a_single_optional_location() {
+    let inputs = composite_inputs(NativeTacticMacro::Rwa);
+    let without = expanded_control(NativeTacticMacro::Rwa, &inputs[4]);
+    for index in [2, 6, 7] {
+        assert_eq!(
+            expanded_control(NativeTacticMacro::Rwa, &inputs[index]),
+            without,
+            "a capture is optional only for a null node with exactly one child"
+        );
+    }
+    let with = expanded_control(NativeTacticMacro::Rwa, &inputs[5]);
+    for (output, count) in [(&without, 1), (&with, 2)] {
+        let mut pending = vec![output];
+        let mut captures = Vec::new();
+        while let Some(syntax) = pending.pop() {
+            if syntax.kind() == Some(&name("Client.body")) {
+                captures.push(syntax);
+            }
+            if let Syntax::Node { args, .. } = syntax {
+                pending.extend(args);
+            }
+        }
+        assert_eq!(captures, vec![&control_body(); count]);
+    }
+}
+
+#[test]
+fn native_rw_nested_rule_pattern_refuses_without_losing_macro_state() {
+    for input in composite_inputs(NativeTacticMacro::Rw).into_iter().take(8) {
+        let execution = control_execute(
+            NativeTacticMacro::Rw,
+            &input,
+            &contexts()[0],
+            &Syntax::Missing,
+            MacroLimits::default(),
+            None,
+        );
+        assert!(matches!(
+            execution.outcome,
+            Outcome::Complete(Ok(MacroResult::Unsupported { state: next })) if next == state()
+        ));
+    }
+    for input in composite_inputs(NativeTacticMacro::Rw).into_iter().skip(8) {
+        expanded_control(NativeTacticMacro::Rw, &input);
+    }
+}
+
+#[test]
+fn live_pinned_composite_candidates_match_complete_quotations_and_state() {
+    use std::path::PathBuf;
+    use std::process::Command;
+
+    let Some(reference) = std::env::var_os("FLN_REFERENCE_LEAN").map(PathBuf::from) else {
+        assert!(
+            std::env::var_os("FLN_REQUIRE_REFERENCE").is_none(),
+            "pinned Reference required for native composite tactic comparison"
+        );
+        eprintln!("SKIP: native composite quotations require FLN_REFERENCE_LEAN");
+        return;
+    };
+    let version = Command::new(&reference)
+        .args(["-j1", "--githash"])
+        .output()
+        .unwrap();
+    assert!(version.status.success());
+    assert_eq!(
+        String::from_utf8(version.stdout).unwrap().trim(),
+        fln_olean::format::PIN_COMMIT
+    );
+    let partition_path = std::env::var_os("FLN_REFERENCE_PARTITION")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            fln_core::checked_workspace_root!().join("contracts/builtin_partition.tsv")
+        });
+    let partition =
+        VerifiedPartition::from_pinned_tsv(&std::fs::read_to_string(partition_path).unwrap())
+            .unwrap();
+    for candidate in COMPOSITE_CANDIDATES {
+        assert_eq!(
+            NativeTacticMacro::identify(
+                &name(candidate.module()),
+                &name(candidate.declaration()),
+                &partition,
+            ),
+            Some(candidate)
+        );
+        for (module, declaration) in [
+            (name("User"), name(candidate.declaration())),
+            (
+                name(candidate.module()),
+                Name::str(Name::anonymous(), candidate.declaration()),
+            ),
+            (
+                name(candidate.module()),
+                Name::str(name(candidate.declaration()), "_redArg"),
+            ),
+        ] {
+            assert_eq!(
+                NativeTacticMacro::identify(&module, &declaration, &partition),
+                None
+            );
+        }
+    }
+    let root = std::env::var_os("FLN_IR_REFERENCE_ARTIFACTS")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = root.join(format!("native-composite-{}-{unique}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("NativeCompositeTacticMacros.lean"),
+        include_str!("../../../../fln-olean/fixtures/NativeCompositeTacticMacros.lean"),
+    )
+    .unwrap();
+    let result = Command::new(&reference)
+        .current_dir(&dir)
+        .args(["-j1", "NativeCompositeTacticMacros.lean"])
+        .output()
+        .unwrap();
+    std::fs::write(dir.join("oracle.stdout"), &result.stdout).unwrap();
+    std::fs::write(dir.join("oracle.stderr"), &result.stderr).unwrap();
+    assert!(
+        result.status.success(),
+        "{dir:?}: {}{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let mut native = String::new();
+    let mut expanded = 0;
+    let mut unsupported = 0;
+    for candidate in COMPOSITE_CANDIDATES {
+        let mut cases = Vec::new();
+        for context in contexts() {
+            for (reference, _) in references() {
+                for input in composite_inputs(candidate) {
+                    cases.push((input, context.clone(), reference.clone()));
+                }
+            }
+        }
+        for input in [
+            Syntax::Missing,
+            atom(SourceInfo::None, "wrong"),
+            node("User.tactic", vec![]),
+        ] {
+            cases.push((input, contexts()[0].clone(), Syntax::Missing));
+        }
+        for (input, context, reference) in cases {
+            let execution = control_execute(
+                candidate,
+                &input,
+                &context,
+                &reference,
+                MacroLimits::default(),
+                None,
+            );
+            assert!(execution.reference_functions.is_empty());
+            assert_eq!(execution.native_functions, vec![candidate.id()]);
+            match execution.outcome {
+                Outcome::Complete(Ok(MacroResult::Expanded {
+                    syntax,
+                    state: next,
+                })) => {
+                    native.push_str(&format!(
+                        "ok:{}:{}\n",
+                        control_syntax(&syntax),
+                        next == state()
+                    ));
+                    expanded += 1;
+                }
+                Outcome::Complete(Ok(MacroResult::Unsupported { state: next })) => {
+                    native.push_str(&format!("unsupported:{}\n", next == state()));
+                    unsupported += 1;
+                }
+                other => panic!("{candidate:?}: {other:?}"),
+            }
+        }
+    }
+    assert_eq!((expanded, unsupported), (656, 91));
+    std::fs::write(dir.join("native.stdout"), &native).unwrap();
+    assert_eq!(String::from_utf8(result.stdout).unwrap(), native, "{dir:?}");
+    assert!(result.stderr.is_empty());
+    eprintln!("native and pinned composite tactics: 656 exact quotations, 91 unsupported inputs");
 }

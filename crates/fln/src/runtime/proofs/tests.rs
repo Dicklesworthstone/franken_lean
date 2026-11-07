@@ -28,6 +28,117 @@ def preserveTypeFamily (A : Nat -> Type) (n : Nat) : Nat := n
 }
 
 #[test]
+fn dead_source_lets_preserve_outer_scopes_and_remove_transitive_aliases() {
+    let engine = engine();
+    let nat = Expr::const_(name("Nat"), vec![]);
+    let variable = |index| Expr::bvar(index).unwrap();
+    let add = |left, right| {
+        Expr::app(
+            Expr::app(Expr::const_(name("Nat.add"), vec![]), left),
+            right,
+        )
+    };
+    let lambda = |body| Expr::lam(name("n"), nat.clone(), body, BinderInfo::Default);
+    let local = |value, body| Expr::let_e(name("local"), nat.clone(), value, body, false);
+    let source = lambda(local(
+        add(variable(0), nat::literal(9)),
+        lambda(local(
+            add(variable(0), variable(2)),
+            add(variable(0), variable(0)),
+        )),
+    ));
+    let expected = lambda(lambda(local(
+        add(variable(0), variable(1)),
+        add(variable(0), variable(0)),
+    )));
+    let root = engine.logical_root(&KVMap::new());
+    let mut measured = Preparation::new(&engine.environment, IngressLimits::default());
+    assert_eq!(measured.erase_proofs(&source, None).unwrap(), expected);
+    assert!(measured.lambdas.is_empty());
+    let required = measured.visited;
+    assert!(required > 1);
+    for max_nodes in [0, required - 1] {
+        let mut bounded = Preparation::new(
+            &engine.environment,
+            IngressLimits {
+                max_nodes,
+                ..IngressLimits::default()
+            },
+        );
+        assert!(matches!(
+            bounded.erase_proofs(&source, None),
+            Err(IngressError::ResourceLimit {
+                resource: IngressResource::Nodes,
+                limit,
+                ..
+            }) if limit == max_nodes
+        ));
+        assert!(bounded.lambdas.is_empty());
+        bounded.limits.max_nodes = IngressLimits::default().max_nodes;
+        assert_eq!(bounded.erase_proofs(&source, None).unwrap(), expected);
+    }
+    let mut shallow = Preparation::new(
+        &engine.environment,
+        IngressLimits {
+            max_context_depth: 1,
+            ..IngressLimits::default()
+        },
+    );
+    assert!(matches!(
+        shallow.erase_proofs(&source, None),
+        Err(IngressError::ResourceLimit {
+            resource: IngressResource::ContextDepth,
+            limit: 1,
+            ..
+        })
+    ));
+    let aliases = local(
+        add(nat::literal(20), nat::literal(22)),
+        local(variable(0), nat::literal(42)),
+    );
+    let mut preparation = Preparation::new(&engine.environment, IngressLimits::default());
+    assert_eq!(
+        preparation.erase_proofs(&aliases, None).unwrap(),
+        nat::literal(42)
+    );
+    assert_eq!(engine.logical_root(&KVMap::new()), root);
+}
+
+#[test]
+fn dead_source_initializers_still_validate_noncomputable_dependencies() {
+    let limits = EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024));
+    let engine = engine()
+        .check_source_files(
+            &[b"noncomputable def unavailableValue : Nat := 7"],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap()
+        .engine;
+    let nat = Expr::const_(name("Nat"), vec![]);
+    let unavailable = Expr::const_(name("unavailableValue"), vec![]);
+    for (type_, value) in [
+        (nat.clone(), unavailable.clone()),
+        (
+            Expr::forall_e(name("n"), nat.clone(), nat.clone(), BinderInfo::Default),
+            Expr::lam(name("n"), nat, unavailable, BinderInfo::Default),
+        ),
+    ] {
+        let source = Expr::let_e(name("unused"), type_, value, nat::literal(42), false);
+        let mut preparation = Preparation::new(&engine.environment, IngressLimits::default());
+        assert!(matches!(
+            preparation.erase_proofs(&source, None),
+            Err(IngressError::UnsupportedNode {
+                kind: "noncomputable runtime dependency"
+            })
+        ));
+        assert!(preparation.lambdas.is_empty());
+    }
+}
+
+#[test]
 fn captured_proposition_indices_remain_metadata_with_bounded_erasure() {
     let engine = metadata_engine();
     let original_root = engine.logical_root(&KVMap::new());
@@ -270,7 +381,7 @@ fn closed_erasure_memo_never_reuses_an_open_variable_in_another_scope() {
 }
 
 #[test]
-fn closed_erasure_memo_preserves_strict_nonreturning_runtime_calls() {
+fn closed_erasure_memo_preserves_used_nonreturning_runtime_calls() {
     use fln_env::constants::{ConstantVal, ReducibilityHints};
     let limits = EngineExecutionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024));
     let nat = Expr::const_(name("Nat"), vec![]);
@@ -325,15 +436,28 @@ fn closed_erasure_memo_preserves_strict_nonreturning_runtime_calls() {
     let root = engine.logical_root(&KVMap::new());
     let mut bounded = limits;
     bounded.vm.max_steps = 200;
-    let outcome = engine
+    let discarded = engine
         .execute_source_definitions(
             &[b"#eval let ignored : Nat := Nat.add (spin 0) (spin 0); 42"],
             &KVMap::new(),
             bounded,
         )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!(
+        closed_vm_value(&discarded.executions.last().unwrap().exit).unwrap(),
+        Some(ClosedVmValue::Scalar(42))
+    );
+    let outcome = engine
+        .execute_source_definitions(
+            &[b"#eval let used : Nat := Nat.add (spin 0) (spin 0); used"],
+            &KVMap::new(),
+            bounded,
+        )
         .unwrap();
     let Outcome::Inconclusive(stopped) = outcome else {
-        panic!("strict repeated calls must execute before the unused binding is discarded")
+        panic!("used repeated calls must execute before returning their result")
     };
     assert!(matches!(
         stopped.cause,

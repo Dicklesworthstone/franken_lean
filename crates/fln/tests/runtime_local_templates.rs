@@ -116,17 +116,28 @@ fn named_staged_helpers_and_aliases_reach_known_callback_specialization() {
 }
 
 #[test]
-fn unused_callback_results_still_run_their_required_first_stage() {
+fn unused_callback_results_are_cheap_and_used_results_keep_their_first_stage() {
     let definitions = format!(
-        "{SPEND}def ignorePartial (f : Nat -> Nat -> Nat) (n : Nat) : Nat := let unused : Nat -> Nat := f n; 42\n"
+        "{SPEND}def ignorePartial (f : Nat -> Nat -> Nat) (n : Nat) : Nat := let unused : Nat -> Nat := f n; 42\n\
+         def usePartial (f : Nat -> Nat -> Nat) (n : Nat) : Nat := let action : Nat -> Nat := f n; action 42\n"
     );
-    let program = |cost| {
+    let program = |cost, used| {
+        let (body, consumer) = if used {
+            ("paid + y", "usePartial")
+        } else {
+            ("y", "ignorePartial")
+        };
         format!(
-            "{definitions}#eval let stage (n : Nat) : Nat -> Nat := let paid : Nat := spend n; fun (y : Nat) => y; ignorePartial stage {cost}"
+            "{definitions}#eval let stage (n : Nat) : Nat -> Nat := let paid : Nat := spend n; fun (y : Nat) => {body}; {consumer} stage {cost}"
         )
     };
-    let idle = execute(&program(0), "42");
-    let busy = execute(&program(30), "42");
+    assert_eq!(
+        execute(&program(0, false), "42"),
+        execute(&program(30, false), "42"),
+        "the original unused callback result must not execute its producer"
+    );
+    let idle = execute(&program(0, true), "42");
+    let busy = execute(&program(30, true), "72");
     assert!(
         busy > idle + 30,
         "required stage disappeared: {idle} vs {busy}"

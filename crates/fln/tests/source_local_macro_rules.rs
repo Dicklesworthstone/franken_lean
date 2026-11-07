@@ -303,3 +303,96 @@ theorem global_value : interpret [stop] = (0 : Nat) := rfl
 "#;
     assert_eq!(check(source).unwrap(), 2);
 }
+
+#[test]
+fn forced_evaluation_preserves_erased_sorry_dependencies_through_local_macros() {
+    let base = engine();
+    let axiom = if base
+        .environment()
+        .contains(&fln::Name::from_components(["sorryAx"]))
+    {
+        ""
+    } else {
+        "axiom sorryAx.{u} (A : Sort u) (synthetic : Bool) : A\n"
+    };
+    let declarations = format!(
+        "{axiom}theorem forcedEvidence : True := @sorryAx True false\ndef eraseEvidence (_ : True) : Nat := 42\ndef guardEvidence (_ : True) : Bool := true\n"
+    );
+    let base = base
+        .check_source_files(
+            &[declarations.as_bytes()],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits()),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap()
+        .engine;
+    let before = base.logical_root(&KVMap::new());
+    let source = r#"
+syntax "erasedProof!" : term
+section
+local macro_rules | `(erasedProof!) => `(eraseEvidence forcedEvidence)
+#eval! erasedProof!
+end
+#eval 7
+"#;
+    let checked = base
+        .execute_source_commands_with_checks(
+            source.as_bytes(),
+            &KVMap::new(),
+            fln::EngineExecutionLimits::new(limits().kernel),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let results: Vec<_> = checked
+        .batch
+        .source_evaluation_indices
+        .iter()
+        .map(|&index| fln::closed_vm_value(&checked.batch.executions[index].exit).unwrap())
+        .collect();
+    assert_eq!(
+        results,
+        vec![
+            Some(fln::ClosedVmValue::Scalar(42)),
+            Some(fln::ClosedVmValue::Scalar(7))
+        ]
+    );
+    let ordinary = source.replace("#eval! erasedProof!", "#eval erasedProof!");
+    let error = base
+        .execute_source_commands_with_checks(
+            ordinary.as_bytes(),
+            &KVMap::new(),
+            fln::EngineExecutionLimits::new(limits().kernel),
+        )
+        .expect_err("ordinary evaluation retains the transitive axiom check");
+    let mut inner = &error;
+    while let fln::EngineExecutionError::BatchCommand { error, .. } = inner {
+        inner = error;
+    }
+    assert!(
+        matches!(inner, fln::EngineExecutionError::EvaluationDependsOnSorry),
+        "{error:?}"
+    );
+    // Unlike the prelude-only artifact fixture, this ordinary source environment
+    // imports the grammar that declares #guard. It retains its existing evaluator,
+    // which accepts an erased proof dependency without an explicit force flag.
+    let guarded = base
+        .execute_source_commands_with_presentation(
+            b"#guard guardEvidence forcedEvidence\n",
+            &KVMap::new(),
+            fln::EngineExecutionLimits::new(limits().kernel),
+            fln::EvaluationPresentation::Lean,
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!(guarded.batch.source_evaluation_indices.len(), 1);
+    let index = guarded.batch.source_evaluation_indices[0];
+    assert_eq!(
+        guarded.batch.executions[index].evaluation_presentation(),
+        Some(fln::EvaluationResultPresentation::Guard)
+    );
+    assert_eq!(base.logical_root(&KVMap::new()), before);
+}

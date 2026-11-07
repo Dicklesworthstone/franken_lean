@@ -64,10 +64,15 @@ fn flat_returned_callbacks_underapply_through_their_existing_suffix_interfaces()
 }
 
 #[test]
-fn unused_intermediate_result_does_not_delay_the_call_that_computed_it() {
-    let source = |n| {
+fn dead_intermediate_results_are_cheap_and_live_results_run_the_producer() {
+    let source = |n, used| {
+        let body = if used {
+            "result (fun n => n + 42)"
+        } else {
+            "42"
+        };
         format!(
-            "def spend (n : Nat) : Nat := match n with | .zero => 0 | .succ k => spend k + 1\n{PIPELINE}\n#eval let result : (Nat -> Nat) -> Nat := pipeline {n} spend; 42"
+            "def spend (n : Nat) : Nat := match n with | .zero => 0 | .succ k => spend k + 1\n{PIPELINE}\n#eval let result : (Nat -> Nat) -> Nat := pipeline {n} spend; {body}"
         )
     };
     let base = engine();
@@ -76,14 +81,32 @@ fn unused_intermediate_result_does_not_delay_the_call_that_computed_it() {
     let mut bounded = limits();
     bounded.vm.max_steps = 2000;
     bounded.vm.max_stack_depth = 128;
-    let expensive = source(100000);
+    let mut dead_steps = None;
+    for cost in [0, 100000] {
+        let discarded = source(cost, false);
+        let completed = base
+            .execute_source_definitions(&[discarded.as_bytes()], &options, bounded)
+            .unwrap()
+            .into_complete()
+            .expect("the original discarded result must fit the same VM bound");
+        let VmExit::Returned(value) = &completed.executions.last().unwrap().exit else {
+            panic!("discarded intermediate result did not return");
+        };
+        assert_eq!(fln::nat_decimal(&value.value).as_deref(), Some("42"));
+        if let Some(idle) = dead_steps {
+            assert_eq!(value.usage.steps, idle, "dead source work consumed VM fuel");
+        }
+        dead_steps = Some(value.usage.steps);
+    }
+    let expensive = source(100000, true);
     assert!(matches!(
         base.execute_source_definitions(&[expensive.as_bytes()], &options, bounded)
             .unwrap(),
         fln::Outcome::Inconclusive(_)
     ));
     assert_eq!(base.logical_root(&options), root);
-    execute(&source(0), "42");
+    execute(&source(0, true), "42");
+    execute(&source(30, true), "72");
 }
 
 #[test]

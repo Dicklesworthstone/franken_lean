@@ -126,7 +126,7 @@ impl std::fmt::Display for SourceMacroError {
                 kind.to_display_string()
             ),
             Self::EvaluationRequired => {
-                write!(f, "source macro evaluation requires one ordinary #eval")
+                write!(f, "source macro evaluation requires one #eval or #eval!")
             }
             Self::DeclarationRequired => {
                 write!(f, "source macro admission requires one named declaration")
@@ -635,6 +635,14 @@ impl<'a> FileSession<'a> {
         );
         let command = match expected {
             SourceCommandKind::Check => "check",
+            SourceCommandKind::Evaluation
+                if parsed.syntax().kind()
+                    == Some(&Name::from_components([
+                        "Lean", "Parser", "Command", "evalBang",
+                    ])) =>
+            {
+                "evalBang"
+            }
             SourceCommandKind::Evaluation => "eval",
             SourceCommandKind::Definition | SourceCommandKind::Example => "declaration",
         };
@@ -1285,7 +1293,7 @@ impl Engine {
         }
     }
 
-    /// Expand an ordinary standalone `#eval` with the same checked imported
+    /// Expand a standalone `#eval` or `#eval!` with the same checked imported
     /// table as the source-check door, then use the Engine's raw evaluation
     /// elaborator, dual-check admission, compiler, canonical codec and Golem.
     /// No printed expansion is reparsed. This is the raw embedding surface:
@@ -1409,7 +1417,15 @@ fn expand_in_scope(
     let command = match expected {
         SourceCommandKind::Check => "check",
         SourceCommandKind::Definition | SourceCommandKind::Example => "declaration",
-        _ => "eval",
+        SourceCommandKind::Evaluation
+            if parsed.syntax().kind()
+                == Some(&Name::from_components([
+                    "Lean", "Parser", "Command", "evalBang",
+                ])) =>
+        {
+            "evalBang"
+        }
+        SourceCommandKind::Evaluation => "eval",
     };
     let Syntax::Node { kind, args, .. } = parsed.syntax() else {
         return wrong_command(expected);
@@ -1626,10 +1642,15 @@ fn evaluate(
             Outcome::Inconclusive(reason) => return Ok(Outcome::Inconclusive(reason)),
             Outcome::InternalFault(fault) => return Ok(Outcome::InternalFault(fault)),
         };
-        if crate::source_execution::evaluation_depends_on_sorry(
-            engine,
-            std::iter::once(&declaration),
-        )? {
+        if parsed.syntax().kind()
+            != Some(&Name::from_components([
+                "Lean", "Parser", "Command", "evalBang",
+            ]))
+            && crate::source_execution::evaluation_depends_on_sorry(
+                engine,
+                std::iter::once(&declaration),
+            )?
+        {
             return Err(EngineExecutionError::EvaluationDependsOnSorry);
         }
         engine.execute_definition_entry(

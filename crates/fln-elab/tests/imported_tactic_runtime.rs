@@ -181,9 +181,16 @@ fn elaborate(source: &str, provider: Arc<Provider>) -> Result<Declaration, NatDe
         tactic_macros: Some(TacticMacroProvider(provider)),
         ..SourceScope::default()
     };
+    elaborate_syntax(&syntax, &scope)
+}
+
+fn elaborate_syntax(
+    syntax: &Syntax,
+    scope: &SourceScope,
+) -> Result<Declaration, NatDefinitionElabError> {
     let environment = environment();
     let declaration =
-        elaborate_definition_in_scope_with_budget(&syntax, &environment, budget(), &scope)?;
+        elaborate_definition_in_scope_with_budget(syntax, &environment, budget(), scope)?;
     assert!(matches!(
         fln_kernel::check(&environment, &declaration, budget()),
         Outcome::Complete(Verdict::Accepted { .. })
@@ -245,6 +252,161 @@ fn generated_constructor_and_nested_goal_controls_keep_all_goals() {
         provider,
     )
     .unwrap();
+}
+
+fn annotated(body: Syntax) -> Syntax {
+    Syntax::Node {
+        info: SourceInfo::None,
+        kind: Name::from_components(["Lean", "Parser", "Tactic", "withAnnotateState"]),
+        args: vec![
+            Syntax::Atom {
+                info: SourceInfo::None,
+                val: "with_annotate_state".into(),
+            },
+            // This is deliberately executable failing syntax: the reference
+            // is source metadata and must never run as a tactic.
+            expansion("fail"),
+            body,
+        ],
+    }
+}
+
+#[test]
+fn state_annotations_preserve_the_complete_frontier_and_outer_continuation() {
+    for (source, body) in [
+        (
+            "theorem result (P : Prop) : P → P := by skip; exact h",
+            "intro h",
+        ),
+        (
+            "theorem result (P : Prop) (h : P) : And P P := by skip; all_goals exact h",
+            "constructor",
+        ),
+        (
+            "theorem result (P : Prop) (h : P) : And P P := by constructor; skip",
+            "all_goals assumption",
+        ),
+    ] {
+        let provider = Provider::new(vec![Candidate::Expansion(annotated(expansion(body)))]);
+        elaborate(source, provider).unwrap_or_else(|error| panic!("{source}: {error:?}"));
+    }
+}
+
+#[test]
+fn state_annotations_execute_the_body_even_when_the_frontier_is_empty() {
+    for (body, succeeds) in [
+        ("skip", true),
+        ("(skip)", true),
+        ("(try rfl)", true),
+        ("(all_goals fail)", true),
+        ("fail", false),
+        ("(fail)", false),
+        ("rfl", false),
+        ("(rfl)", false),
+    ] {
+        let mut generated = expansion("rfl");
+        let Syntax::Node { args, .. } = &mut generated else {
+            panic!("sequence")
+        };
+        args.push(annotated(expansion(body)));
+        let provider = Provider::new(vec![Candidate::Expansion(generated)]);
+        let result = elaborate("theorem result (n : Nat) : Eq n n := by skip", provider);
+        assert_eq!(result.is_ok(), succeeds, "{body}: {result:?}");
+    }
+}
+
+#[test]
+fn failed_annotated_candidates_restore_locals_and_goal_assignments() {
+    let provider = Provider::new(vec![
+        Candidate::Expansion(annotated(expansion("intro abandoned; fail"))),
+        Candidate::Expansion(annotated(expansion("intro h"))),
+    ]);
+    elaborate(
+        "theorem result (P : Prop) : P → P := by skip; exact h",
+        provider.clone(),
+    )
+    .unwrap();
+    let calls = provider.calls.lock().unwrap();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0].1, calls[1].1);
+}
+
+#[test]
+fn state_annotations_follow_get_arg_semantics_for_generated_syntax() {
+    // The pin's builtin reads only children 1 and 2. A missing body is a
+    // no-op; neither an altered keyword nor surplus children are executed.
+    for retained in 0..3 {
+        let mut generated = annotated(expansion("fail"));
+        let Syntax::Node { args, .. } = &mut generated else {
+            panic!("annotation")
+        };
+        args.truncate(retained);
+        let provider = Provider::new(vec![Candidate::Expansion(generated)]);
+        elaborate(
+            "theorem result (n : Nat) : Eq n n := by skip; rfl",
+            provider,
+        )
+        .unwrap();
+    }
+    let mut generated = annotated(expansion("rfl"));
+    let Syntax::Node { args, .. } = &mut generated else {
+        panic!("annotation")
+    };
+    args[0] = expansion("fail");
+    args.push(expansion("fail"));
+    let provider = Provider::new(vec![Candidate::Expansion(generated)]);
+    elaborate("theorem result (n : Nat) : Eq n n := by skip", provider).unwrap();
+}
+
+#[test]
+fn state_annotations_and_generic_syntax_execute_without_a_macro_provider() {
+    fn replace_skip(syntax: &mut Syntax, replacement: &Syntax) {
+        if syntax.kind() == Some(&Name::from_components(["Lean", "Parser", "Tactic", "skip"])) {
+            *syntax = replacement.clone();
+        } else if let Syntax::Node { args, .. } = syntax {
+            for argument in args {
+                replace_skip(argument, replacement);
+            }
+        }
+    }
+
+    let empty = Syntax::Node {
+        info: SourceInfo::None,
+        kind: Name::from_components(["null"]),
+        args: Vec::new(),
+    };
+    let mut cases = vec![
+        (annotated(Syntax::Missing), "skip; rfl", true),
+        (annotated(expansion("rfl")), "skip", true),
+        (annotated(Syntax::Missing), "rfl; skip", true),
+        (annotated(empty), "rfl; skip", true),
+        (annotated(expansion("fail")), "rfl; skip", false),
+    ];
+    for retained in 0..3 {
+        let mut generated = annotated(expansion("fail"));
+        let Syntax::Node { args, .. } = &mut generated else {
+            panic!("annotation")
+        };
+        args.truncate(retained);
+        cases.push((generated, "skip; rfl", true));
+    }
+    for (replacement, script, succeeds) in cases {
+        let source = format!("theorem result (n : Nat) : Eq n n := by {script}");
+        let parsed = fln_parse::parse_definition(source.as_bytes()).unwrap();
+        let mut syntax = parsed.syntax().clone();
+        replace_skip(&mut syntax, &replacement);
+        let result = elaborate_syntax(&syntax, &SourceScope::default());
+        if succeeds {
+            result.unwrap_or_else(|error| panic!("{replacement:?}: {error:?}"));
+        } else {
+            assert!(matches!(
+                result,
+                Err(NatDefinitionElabError::Inference(
+                    SourceInferenceError::Tactic(fln_elab::source::TacticError::ExplicitFailure)
+                ))
+            ));
+        }
+    }
 }
 
 #[test]

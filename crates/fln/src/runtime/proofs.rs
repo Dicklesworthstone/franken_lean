@@ -765,7 +765,20 @@ impl Preparation<'_> {
                 Frame::LetBody(name, type_, value, nondep) => {
                     context.pop();
                     let body = values.pop().ok_or_else(|| unsupported("proof let body"))?;
-                    values.push(Expr::let_e(name, type_, value, body, nondep));
+                    // Validate the original initializer before removing a dead
+                    // source binding: noncomputable dependencies still refuse.
+                    // Doing this after the body also removes transitive dead
+                    // aliases. Native IO/diagnostic sequencing is introduced
+                    // later, outside this source-erasure traversal, and keeps
+                    // its strict lets even when an ABI result is unused.
+                    if self.local_absent(&body)? {
+                        // Absence includes type annotations. This inert value
+                        // is never inserted; substitution only decrements the
+                        // indices of the surviving outer captures.
+                        values.push(self.substitution(&body, &erased_value())?);
+                    } else {
+                        values.push(Expr::let_e(name, type_, value, body, nondep));
+                    }
                 }
                 Frame::Projection(name, index) => {
                     let expr = values

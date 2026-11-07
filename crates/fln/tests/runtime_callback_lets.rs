@@ -1,5 +1,4 @@
-//! Callback annotations follow strict let prefixes without moving their work
-//! into the returned closure or discarding an unused initializer.
+//! Callback annotations preserve live let prefixes and discard dead source work.
 #![forbid(unsafe_code)]
 use fln::{Budget, Engine, EngineAdmissionLimits, EngineExecutionLimits, KVMap, Outcome, VmExit};
 
@@ -69,20 +68,46 @@ const SPEND: &str =
     "def spend (n : Nat) : Nat := match n with | .zero => 0 | .succ k => spend k + 1\n";
 
 #[test]
-fn unused_callback_initializers_remain_strict_and_retryable() {
+fn dead_callback_initializers_are_cheap_and_live_initializers_remain_bounded() {
     let base = engine();
     let options = KVMap::new();
     let root = base.logical_root(&options);
     let consumers = [
-        "def ignore (f : Nat -> Nat) : Nat := 42\n\
-         def run (cost : Nat) : Nat := ignore (let paid := spend cost; fun x => x)\n",
-        "def withConsumer (consume : (Nat -> Nat) -> Nat) (cost : Nat) : Nat := consume (let paid := spend cost; fun x => x)\n\
-         def run (cost : Nat) : Nat := withConsumer (fun f => 42) cost\n",
+        (
+            "def ignore (f : Nat -> Nat) : Nat := 42\n\
+             def run (cost : Nat) : Nat := ignore (let paid := spend cost; fun x => x)\n",
+            "def consume (f : Nat -> Nat) : Nat := f 42\n\
+             def run (cost : Nat) : Nat := consume (let paid := spend cost; fun x => paid + x)\n",
+        ),
+        (
+            "def withConsumer (consume : (Nat -> Nat) -> Nat) (cost : Nat) : Nat := consume (let paid := spend cost; fun x => x)\n\
+             def run (cost : Nat) : Nat := withConsumer (fun f => 42) cost\n",
+            "def withConsumer (consume : (Nat -> Nat) -> Nat) (cost : Nat) : Nat := consume (let paid := spend cost; fun x => paid + x)\n\
+             def run (cost : Nat) : Nat := withConsumer (fun f => f 42) cost\n",
+        ),
     ];
     let mut bounded = limits();
     bounded.vm.max_steps = 2000;
     bounded.vm.max_stack_depth = 256;
-    for consumer in consumers {
+    for (discarded, consumer) in consumers {
+        let mut dead_steps = None;
+        for cost in [0, 100000] {
+            let source = format!("{SPEND}{discarded}#eval run {cost}");
+            let completed = base
+                .execute_source_definitions(&[source.as_bytes()], &options, bounded)
+                .unwrap_or_else(|error| panic!("{source}\n{error:?}"))
+                .into_complete()
+                .expect("the original discarded initializer must fit the same VM bound");
+            let VmExit::Returned(value) = &completed.executions.last().unwrap().exit else {
+                panic!("discarded callback did not return: {source}");
+            };
+            assert_eq!(fln::nat_decimal(&value.value).as_deref(), Some("42"));
+            if let Some(idle) = dead_steps {
+                assert_eq!(value.usage.steps, idle, "dead source work consumed VM fuel");
+            }
+            dead_steps = Some(value.usage.steps);
+        }
+        execute(&format!("{SPEND}{consumer}#eval run 30"), "72");
         let expensive = format!("{SPEND}{consumer}#eval run 100000");
         assert!(matches!(
             base.execute_source_definitions(&[expensive.as_bytes()], &options, bounded)

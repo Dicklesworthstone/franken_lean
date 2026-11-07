@@ -98,6 +98,43 @@ impl Engine {
         self.checked_runtime_imports.is_some()
     }
 
+    /// Inspect a reached execution dependency in its complete checked view.
+    /// Public module interfaces can hide definition and theorem bodies, so
+    /// dependency checks such as `#eval`'s axiom walk must read the same private
+    /// implementation that execution will use. This never changes the logical
+    /// environment or grants a private name to source elaboration.
+    ///
+    /// Reuse the overlay's exact declaration-identity and collision rules on
+    /// the reached name. Unrelated imported declarations need not be scanned
+    /// again for every dependency query.
+    pub(crate) fn execution_dependency(
+        &self,
+        name: &Name,
+    ) -> Result<Option<&ConstantInfo>, IngressError> {
+        let logical = self.environment.find(name);
+        let Some(imports) = &self.checked_runtime_imports else {
+            return Ok(logical);
+        };
+        let private = imports.private.environment.find(name);
+        if let Some(imported) = imports.public.find(name) {
+            let Some(logical) = logical else {
+                return Err(unsupported("removed checked runtime import declaration"));
+            };
+            if !std::ptr::eq(imported, logical) {
+                return Err(unsupported("changed checked runtime import declaration"));
+            }
+            return private
+                .map(Some)
+                .ok_or_else(|| unsupported("missing checked runtime import implementation"));
+        }
+        if logical.is_some() && private.is_some() {
+            return Err(unsupported(
+                "local declaration collides with a private runtime import",
+            ));
+        }
+        Ok(logical.or(private))
+    }
+
     /// `public_base` is the exact projected import prefix of `self`; `private`
     /// is the independently checked complete implementation of that same
     /// selected transitive closure. No receipt's unrelated roots belong here.

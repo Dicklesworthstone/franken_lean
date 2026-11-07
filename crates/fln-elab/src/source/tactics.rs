@@ -1264,6 +1264,57 @@ impl Context {
         Ok(())
     }
 
+    /// The pin's `with_annotate_state ref tactic` executes the tactic on the
+    /// entire visible frontier, including an empty one. Its reference is
+    /// source metadata, not a second tactic to execute. Preserve the existing
+    /// observer's initial-state query at that reference; the instruction
+    /// barrier keeps all resulting goals available to the outer continuation.
+    fn start_annotated_tactic<'a>(
+        &mut self,
+        proof: &mut ProofState<'a>,
+        args: &'a [Syntax],
+    ) -> Result<(), NatDefinitionElabError> {
+        // The builtin uses Syntax.getArg, not a quotation pattern. Missing
+        // children therefore become missing syntax; the keyword and any
+        // surplus children are not interpreted.
+        static MISSING: Syntax = Syntax::Missing;
+        let reference = args.get(1).unwrap_or(&MISSING);
+        let body = args.get(2).unwrap_or(&MISSING);
+        if self.observes_goal(Some(reference), proof.extent.as_deref())? {
+            let mut goals = Vec::new();
+            for work in proof.work.iter().rev() {
+                self.tick()?;
+                match work {
+                    Work::EndScript(..)
+                    | Work::EndControl(_)
+                    | Work::EndAttempt(_)
+                    | Work::EndOptions(_) => break,
+                    Work::Goal(goal) if !self.txn.mvars.is_assigned(&goal.id) => {
+                        goals.push(goal.clone());
+                    }
+                    _ => {}
+                }
+            }
+            self.observe_goals(&goals)?;
+        }
+        proof.cursor += 1;
+        self.start_macro_scope(proof, vec![body])
+    }
+
+    fn start_parenthesized_tactic<'a>(
+        &mut self,
+        proof: &mut ProofState<'a>,
+        args: &'a [Syntax],
+    ) -> Result<(), NatDefinitionElabError> {
+        let [open, body, close] = args else {
+            return Err(error(TacticError::MalformedScript));
+        };
+        expect_atom(open, "(", "parenthesized tactic opening")?;
+        expect_atom(close, ")", "parenthesized tactic closing")?;
+        let body = self.proof_instructions(body)?;
+        self.start_macro_scope(proof, body)
+    }
+
     pub(super) fn advance_proof<'a>(
         &mut self,
         proof: &mut ProofState<'a>,
@@ -1313,6 +1364,19 @@ impl Context {
                     }
                     if instruction.kind() == Some(&parser_kind(&["Tactic", "fail"])) {
                         return Err(error(TacticError::ExplicitFailure));
+                    }
+                    if let Syntax::Node { kind, args, .. } = instruction
+                        && kind == &parser_kind(&["Tactic", "paren"])
+                    {
+                        proof.cursor += 1;
+                        self.start_parenthesized_tactic(proof, args)?;
+                        continue;
+                    }
+                    if let Syntax::Node { kind, args, .. } = instruction
+                        && kind == &parser_kind(&["Tactic", "withAnnotateState"])
+                    {
+                        self.start_annotated_tactic(proof, args)?;
+                        continue;
                     }
                     if let Syntax::Node { kind, args, .. } = instruction
                         && control::is_scope(kind)
@@ -1446,6 +1510,13 @@ impl Context {
                 return Err(failure(SourceInferenceError::Scope));
             };
             if let Syntax::Node { kind, args, .. } = instruction
+                && kind == &parser_kind(&["Tactic", "withAnnotateState"])
+            {
+                proof.work.push(Work::Goal(goal));
+                self.start_annotated_tactic(proof, args)?;
+                continue;
+            }
+            if let Syntax::Node { kind, args, .. } = instruction
                 && control::is_scope(kind)
             {
                 // Finish the preceding tactic's queued branches and close
@@ -1464,14 +1535,8 @@ impl Context {
             } else if conv::is_conv_kind(kind) {
                 self.conv_instruction(proof, goal, instruction)?;
             } else if kind == &parser_kind(&["Tactic", "paren"]) {
-                let [open, body, close] = args.as_slice() else {
-                    return Err(error(TacticError::MalformedScript));
-                };
-                expect_atom(open, "(", "parenthesized tactic opening")?;
-                expect_atom(close, ")", "parenthesized tactic closing")?;
-                let body = self.proof_instructions(body)?;
                 proof.work.push(Work::Goal(goal));
-                self.start_macro_scope(proof, body)?;
+                self.start_parenthesized_tactic(proof, args)?;
             } else if kind == &parser_kind(&["Tactic", "skip"]) {
                 proof.work.push(Work::Goal(goal));
             } else if kind == &parser_kind(&["Tactic", "traceState"])

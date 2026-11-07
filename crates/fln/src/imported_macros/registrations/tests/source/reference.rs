@@ -1,9 +1,298 @@
 //! Actual pinned Lean source macros, decoded from their emitted attribute
-//! journal and executed as imported IR before the Engine's ordinary checker.
+//! journal and executed by native counterparts or imported user IR before the
+//! Engine's ordinary checker.
 use super::*;
 use fln_olean::region::{OleanView, WalkBudget};
 use std::path::PathBuf;
 use std::process::Command;
+
+#[test]
+fn live_pinned_composite_tactics_admit_source_from_complete_import_journals() {
+    let reference = std::env::var_os("FLN_REFERENCE_LEAN").map(PathBuf::from);
+    let library = std::env::var_os("FLN_REFERENCE_LIB").map(PathBuf::from);
+    let partition = std::env::var_os("FLN_REFERENCE_PARTITION").map(PathBuf::from);
+    let (Some(reference), Some(library), Some(partition)) = (reference, library, partition) else {
+        assert!(
+            std::env::var_os("FLN_REQUIRE_REFERENCE").is_none(),
+            "native composite source tactics require the pinned executable, library and partition"
+        );
+        eprintln!("SKIP: set FLN_REFERENCE_LEAN, FLN_REFERENCE_LIB and FLN_REFERENCE_PARTITION");
+        return;
+    };
+    std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(move || composite_tactics_from_actual_imports(reference, library, partition))
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+fn composite_tactics_from_actual_imports(reference: PathBuf, library: PathBuf, partition: PathBuf) {
+    use crate::imported_macros::registrations::MacroCompilationInputs;
+    use crate::source_check::modules::imported::SourceOleanImportLimits;
+    use crate::{Budget, OleanCheckLimits, OleanModuleInput};
+
+    let version = Command::new(&reference)
+        .args(["-j1", "--githash"])
+        .output()
+        .unwrap();
+    assert!(version.status.success());
+    assert_eq!(
+        String::from_utf8(version.stdout).unwrap().trim(),
+        format::PIN_COMMIT
+    );
+    let root = std::env::var_os("FLN_IR_REFERENCE_ARTIFACTS")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = root.join(format!("composite-source-{}-{unique}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let cases = [
+        (
+            "rwaTarget",
+            true,
+            "theorem rwaTarget (P : Nat → Prop) (n m : Nat) (h : Eq n m) (hm : P m) : P n := by rwa [h]",
+        ),
+        (
+            "rwaReverse",
+            true,
+            "theorem rwaReverse (P : Nat → Prop) (n m : Nat) (h : Eq n m) (hn : P n) : P m := by rwa [← h]",
+        ),
+        (
+            "rwaHyp",
+            true,
+            "theorem rwaHyp (P : Nat → Prop) (n m : Nat) (h : Eq n m) (hn : P n) : P m := by rwa [h] at hn",
+        ),
+        (
+            "trivialTrue",
+            true,
+            "theorem trivialTrue : True := by trivial",
+        ),
+        (
+            "trivialAssumption",
+            true,
+            "theorem trivialAssumption (P : Prop) (h : P) : P := by trivial",
+        ),
+        (
+            "trivialRefl",
+            true,
+            "theorem trivialRefl (α : Type) (x : α) : Eq x x := by trivial",
+        ),
+        (
+            "trivialContradiction",
+            true,
+            "theorem trivialContradiction (P : Prop) (h : False) : P := by trivial",
+        ),
+        (
+            "trivialDecide",
+            true,
+            "theorem trivialDecide : Eq Nat.zero Nat.zero := by trivial",
+        ),
+        (
+            "trivialAnd",
+            true,
+            "theorem trivialAnd (P : Prop) (h : P) : And P True := by trivial",
+        ),
+        (
+            "rwaRecover",
+            true,
+            "theorem rwaRecover (P : Nat → Prop) (n m : Nat) (h : Eq n m) (hn : P n) : P n := by first | (rwa [h]; fail) | exact hn",
+        ),
+        (
+            "falseTrivial",
+            false,
+            "theorem falseTrivial : False := by trivial",
+        ),
+        (
+            "falseRwa",
+            false,
+            "theorem falseRwa (P : Nat → Prop) (n m : Nat) (h : Eq n m) : P n := by rwa [h]",
+        ),
+    ];
+    for (label, accepted, source) in cases {
+        let filename = format!("{label}.lean");
+        std::fs::write(
+            dir.join(&filename),
+            format!("prelude\nimport Init.Core\n{source}\n"),
+        )
+        .unwrap();
+        let oracle = Command::new(&reference)
+            .current_dir(&dir)
+            .args(["-j1", &filename])
+            .output()
+            .unwrap();
+        std::fs::write(dir.join(format!("{label}.stdout")), &oracle.stdout).unwrap();
+        std::fs::write(dir.join(format!("{label}.stderr")), &oracle.stderr).unwrap();
+        assert_eq!(
+            oracle.status.success(),
+            accepted,
+            "{label}: {oracle:?}; {dir:?}"
+        );
+    }
+
+    // Discover and admit the real closure. No caller-forged checked owners,
+    // source seed or filtered macro journal supplies native execution authority.
+    let target = name("Init.Core");
+    let mut pending = vec![target.clone()];
+    let mut seen = BTreeSet::new();
+    let mut loaded = Vec::new();
+    while let Some(module) = pending.pop() {
+        if !seen.insert(module.clone()) {
+            continue;
+        }
+        let base = library.join(module.to_display_string().replace('.', "/"));
+        let parts = ["olean", "olean.server", "olean.private"]
+            .map(|extension| std::fs::read(base.with_extension(extension)).unwrap());
+        pending.extend(
+            crate::olean_module_imports(&parts[0], OleanDecodeLimits::new(parts[0].len())).unwrap(),
+        );
+        loaded.push((module, parts));
+    }
+    let inputs: Vec<_> = loaded
+        .iter()
+        .map(|(name, parts)| OleanModuleInput {
+            name,
+            artifact: &parts[0],
+            server_artifact: Some(&parts[1]),
+            private_artifact: Some(&parts[2]),
+        })
+        .collect();
+    let options = KVMap::new();
+    let imported = Engine::from_environment(Environment::new())
+        .import_olean_modules_for_source(
+            &inputs,
+            std::slice::from_ref(&target),
+            &options,
+            SourceOleanImportLimits::new(OleanCheckLimits::new(
+                1 << 30,
+                Budget::for_stack_bytes(64 * 1024 * 1024),
+            )),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!(imported.checked.modules.len(), loaded.len());
+    assert_eq!(imported.engine.imported_modules().len(), loaded.len());
+    let partition =
+        VerifiedPartition::from_pinned_tsv(&std::fs::read_to_string(partition).unwrap()).unwrap();
+    let registry = imported
+        .prepare_imported_macros_deferred(
+            MacroCompilationInputs::new(Vec::new(), partition, BTreeSet::new()),
+            MacroRegistryLimits::default(),
+        )
+        .unwrap();
+    let trivial_kind = name("Lean.Parser.Tactic.tacticTrivial");
+    let expected_order: Vec<_> = (1..=6)
+        .rev()
+        .map(|index| {
+            name(&format!(
+                "Lean.Parser.Tactic._aux_Init_Tactics___macroRules_Lean_Parser_Tactic_tacticTrivial_{index}"
+            ))
+        })
+        .collect();
+    assert_eq!(
+        registry
+            .declarations(&trivial_kind)
+            .cloned()
+            .collect::<Vec<_>>(),
+        expected_order,
+        "the complete imported journal determines fallback order"
+    );
+    let engine = &imported.engine;
+    let before = engine.logical_root(&options);
+    for (label, accepted, source) in cases {
+        let report = admit(
+            engine,
+            &registry,
+            source.as_bytes(),
+            MacroTreeLimits::default(),
+            admission(),
+            None,
+        );
+        if accepted {
+            let result = admitted(&report);
+            assert!(result.admission.engine.environment().contains(&name(label)));
+        } else {
+            assert!(
+                matches!(
+                    report.outcome,
+                    Outcome::Complete(Err(SourceMacroError::Frontend(_)))
+                ),
+                "{label}: {report:?}; {dir:?}"
+            );
+            assert!(report.state.is_none());
+        }
+        assert!(
+            !report.attempts.is_empty(),
+            "{label} bypassed imported macros"
+        );
+        assert!(report.attempts.iter().all(|attempt| {
+            attempt.reference_functions.is_empty() && !attempt.native_functions.is_empty()
+        }));
+        assert!(report.completed_vm_usage.steps > 0);
+        let trivial_order: Option<&[usize]> = match label {
+            "trivialTrue" => Some(&[6, 5]),
+            "trivialAssumption" => Some(&[6, 5, 4, 3, 2, 1]),
+            "trivialRefl" => Some(&[6, 5, 4, 3, 2]),
+            "trivialContradiction" => Some(&[6, 5, 4, 3]),
+            "trivialDecide" => Some(&[6, 5, 4]),
+            "trivialAnd" => Some(&[6, 6, 5, 4, 3, 2, 1, 6, 5]),
+            _ => None,
+        };
+        if let Some(order) = trivial_order {
+            let actual: Vec<_> = report
+                .attempts
+                .iter()
+                .filter(|attempt| expected_order.contains(&attempt.declaration))
+                .map(|attempt| attempt.declaration.clone())
+                .collect();
+            let expected: Vec<_> = order
+                .iter()
+                .map(|index| expected_order[6 - index].clone())
+                .collect();
+            assert_eq!(
+                actual, expected,
+                "{label}: native candidates must succeed before builtin fallback"
+            );
+        }
+        assert_eq!(engine.logical_root(&options), before);
+        assert!(!engine.environment().contains(&name(label)));
+    }
+
+    let source = cases[8].2.as_bytes();
+    let mut limited = MacroTreeLimits::default();
+    limited.dispatch.max_attempts = 1;
+    let stopped = admit(engine, &registry, source, limited, admission(), None);
+    assert!(
+        matches!(stopped.outcome, Outcome::Inconclusive(_)),
+        "{stopped:?}"
+    );
+    assert!(stopped.state.is_none());
+    assert!(stopped.completed_vm_usage.steps > 0);
+    let cancelled = admit(
+        engine,
+        &registry,
+        source,
+        MacroTreeLimits::default(),
+        admission(),
+        Some(&|| true),
+    );
+    assert!(matches!(cancelled.outcome, Outcome::Inconclusive(_)));
+    assert!(cancelled.state.is_none());
+    admitted(&admit(
+        engine,
+        &registry,
+        source,
+        MacroTreeLimits::default(),
+        admission(),
+        None,
+    ));
+    assert_eq!(engine.logical_root(&options), before);
+}
 
 #[test]
 fn live_imported_ir_changes_source_checks_with_the_pins_order_and_scoped_behavior() {

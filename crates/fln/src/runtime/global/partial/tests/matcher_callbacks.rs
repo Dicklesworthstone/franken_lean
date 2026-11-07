@@ -197,27 +197,37 @@ fn changed_callback_in_a_checked_matcher_minor_refuses_without_a_variant() {
 }
 
 #[test]
-fn checked_matcher_exposure_keeps_unused_computed_arguments_strict() {
+fn checked_matcher_exposure_keeps_live_computed_arguments_strict() {
     let engine = engine(false, true);
     let original = engine.logical_root(&KVMap::new());
     let mut bounded = limits();
     bounded.vm.max_steps = 500;
-    for source in [
-        b"#eval let ignored : Nat -> Nat := matchedStage (fun n => let saved := Nat.add 10 n; fun state => Nat.add saved state) 0; 42".as_slice(),
-        b"#eval matchedStage (fun n => let saved := Nat.add 10 n; fun state => Nat.add saved state) 0 5".as_slice(),
-    ] {
-        assert!(matches!(
-            engine.execute_source_definitions(&[source], &KVMap::new(), bounded).unwrap(),
-            Outcome::Inconclusive(stop)
-                if matches!(
-                    stop.cause,
-                    fln_core::outcome::InconclusiveCause::ResourceExhausted { ref usage }
-                        if usage.reason == fln_core::diag::ResourceReason::ExecutionSteps
-                            && usage.allowed == 500
-                            && usage.observed == 501
-                )
-        ));
-        assert_eq!(engine.logical_root(&KVMap::new()), original);
-    }
+    let discarded = engine
+        .execute_source_definitions(
+            &[b"#eval let ignored : Nat -> Nat := matchedStage (fun n => let saved := Nat.add 10 n; fun state => Nat.add saved state) 0; 42"],
+            &KVMap::new(),
+            bounded,
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!(
+        crate::closed_vm_value(&discarded.executions.last().unwrap().exit).unwrap(),
+        Some(crate::ClosedVmValue::Scalar(42))
+    );
+    assert_eq!(engine.logical_root(&KVMap::new()), original);
+    let source = b"#eval matchedStage (fun n => let saved := Nat.add 10 n; fun state => Nat.add saved state) 0 5";
+    assert!(matches!(
+        engine.execute_source_definitions(&[source], &KVMap::new(), bounded).unwrap(),
+        Outcome::Inconclusive(stop)
+            if matches!(
+                stop.cause,
+                fln_core::outcome::InconclusiveCause::ResourceExhausted { ref usage }
+                    if usage.reason == fln_core::diag::ResourceReason::ExecutionSteps
+                        && usage.allowed == 500
+                        && usage.observed == 501
+            )
+    ));
+    assert_eq!(engine.logical_root(&KVMap::new()), original);
     returned(&engine, b"#eval 42", &["42"]);
 }

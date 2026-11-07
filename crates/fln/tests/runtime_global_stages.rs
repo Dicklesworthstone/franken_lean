@@ -127,6 +127,7 @@ fn interleaved_specialization_preserves_the_concrete_function_return_stage() {
 }
 
 const SPEND: &str = "def spend (n : Nat) : Nat := match n with | .zero => 0 | .succ k => spend k + 1\ndef make (n : Nat) : Nat -> Nat := let paid : Nat := spend n; fun (x : Nat) => x\n";
+const USED_SPEND: &str = "def spend (n : Nat) : Nat := match n with | .zero => 0 | .succ k => spend k + 1\ndef make (n : Nat) : Nat -> Nat := let paid : Nat := spend n; fun (x : Nat) => paid + x\n";
 
 #[test]
 fn admitted_producers_and_aliases_retain_the_source_expression_stages() {
@@ -156,7 +157,7 @@ fn admitted_producers_and_aliases_retain_the_source_expression_stages() {
         panic!("make must bind its source parameter");
     };
     let ExprNode::LetE { value, body, .. } = body.node() else {
-        panic!("make must compute its initializer before returning the next lambda");
+        panic!("the admitted source must retain its let before the returned lambda");
     };
     assert_eq!(
         value,
@@ -181,27 +182,41 @@ fn admitted_producers_and_aliases_retain_the_source_expression_stages() {
 }
 
 #[test]
-fn unused_function_aliases_preserve_strict_initializers() {
+fn unused_function_aliases_discard_work_and_used_aliases_keep_it() {
     for (declarations, initializer) in [
         ("def alias := make\n", "alias {n}"),
         ("def ready : Nat -> Nat := make {n}\n", "ready"),
     ] {
-        let program = |n: u32| {
-            let source =
-                format!("{SPEND}{declarations}#eval let ignored : Nat -> Nat := {initializer}; 42");
+        let program = |n: u32, used| {
+            let definitions = if used { USED_SPEND } else { SPEND };
+            let body = if used { "ignored 42" } else { "42" };
+            let source = format!(
+                "{definitions}{declarations}#eval let ignored : Nat -> Nat := {initializer}; {body}"
+            );
             source.replace("{n}", &n.to_string())
         };
-        let idle = execute(&program(0), "42");
-        let busy = execute(&program(30), "42");
+        assert_eq!(
+            execute(&program(0, false), "42"),
+            execute(&program(30, false), "42"),
+            "the original unused alias must not run its producer: {initializer}"
+        );
+        let idle = execute(&program(0, true), "42");
+        let busy = execute(&program(30, true), "72");
         assert!(busy > idle + 30, "{initializer}: {idle} vs {busy}");
     }
 }
 
 #[test]
-fn ignoring_a_returned_closure_does_not_skip_its_strict_producer() {
-    let program = |n| format!("{SPEND}#eval let ignored : Nat -> Nat := make {n}; 42");
-    let idle = execute(&program(0), "42");
-    let busy = execute(&program(30), "42");
+fn discarded_closures_are_cheap_but_used_producers_keep_fuel_and_retry_bounds() {
+    let program = |n, used| {
+        let definitions = if used { USED_SPEND } else { SPEND };
+        let body = if used { "ignored 42" } else { "42" };
+        format!("{definitions}#eval let ignored : Nat -> Nat := make {n}; {body}")
+    };
+    let dead_idle = execute(&program(0, false), "42");
+    assert_eq!(execute(&program(30, false), "42"), dead_idle);
+    let idle = execute(&program(0, true), "42");
+    let busy = execute(&program(30, true), "72");
     assert!(busy > idle + 30, "producer was delayed: {idle} vs {busy}");
     let base = engine();
     let options = KVMap::new();
@@ -209,14 +224,25 @@ fn ignoring_a_returned_closure_does_not_skip_its_strict_producer() {
     let mut bounded = limits();
     bounded.vm.max_steps = 2000;
     bounded.vm.max_stack_depth = 128;
-    let expensive = program(100000);
+    let discarded = program(100000, false);
+    let completed = base
+        .execute_source_definitions(&[discarded.as_bytes()], &options, bounded)
+        .unwrap()
+        .into_complete()
+        .expect("the original discarded closure must fit the same VM bound");
+    let VmExit::Returned(value) = &completed.executions.last().unwrap().exit else {
+        panic!("discarded closure did not return");
+    };
+    assert_eq!(fln::nat_decimal(&value.value).as_deref(), Some("42"));
+    assert_eq!(value.usage.steps, dead_idle);
+    let expensive = program(100000, true);
     assert!(matches!(
         base.execute_source_definitions(&[expensive.as_bytes()], &options, bounded)
             .unwrap(),
         Outcome::Inconclusive(_)
     ));
     assert_eq!(base.logical_root(&options), root);
-    let cheap = program(0);
+    let cheap = program(0, true);
     let run = || {
         base.execute_source_definitions(&[cheap.as_bytes()], &options, bounded)
             .unwrap()
@@ -260,7 +286,7 @@ fn checked_partial_producers_keep_stages_through_safe_consumers() {
 }
 
 #[test]
-fn checked_partial_callback_prefix_work_is_strict_and_shared() {
+fn used_partial_callback_prefix_work_is_strict_and_shared() {
     let declarations = r#"
 def callbackWork (n : Nat) : Nat :=
   Nat.rec (motive := fun _ => Nat) 0 (fun _ ih => ih) n
@@ -277,7 +303,20 @@ def callbackRepeat (f : Nat -> Nat -> Nat) (n : Nat) : Nat :=
   let action := f n
   action 20 + action 22
 "#;
-    let direct = |cost| format!("{declarations}#eval let action := callbackBuild {cost} 3; 42");
+    let discarded = |cost| format!("{declarations}#eval let action := callbackBuild {cost} 3; 42");
+    assert_eq!(
+        execute(&discarded(80), "42"),
+        execute(&discarded(0), "42"),
+        "the original unused producer result must not consume runtime work"
+    );
+    let ignored = |cost| format!("{declarations}#eval callbackDiscard (callbackBuild {cost}) 3");
+    assert_eq!(
+        execute(&ignored(80), "42"),
+        execute(&ignored(0), "42"),
+        "discarding the result inside a consumer must also remove the producer"
+    );
+    let direct =
+        |cost| format!("{declarations}#eval let action := callbackBuild {cost} 3; action 42");
     let direct_zero = execute(&direct(0), "42");
     let direct_many = execute(&direct(80), "42");
     assert!(
@@ -285,16 +324,14 @@ def callbackRepeat (f : Nat -> Nat -> Nat) (n : Nat) : Nat :=
         "the direct producer must perform measurable work before returning its callback"
     );
     let prefix_work = direct_many - direct_zero;
-    for consumer in ["callbackDiscard", "callbackRepeat"] {
-        let source = |cost| format!("{declarations}#eval {consumer} (callbackBuild {cost}) 3");
-        let zero = execute(&source(0), "42");
-        let many = execute(&source(80), "42");
-        assert_eq!(
-            many - zero,
-            prefix_work,
-            "the consumer must neither defer nor duplicate callback prefix work: {consumer}"
-        );
-    }
+    let repeated = |cost| format!("{declarations}#eval callbackRepeat (callbackBuild {cost}) 3");
+    let zero = execute(&repeated(0), "42");
+    let many = execute(&repeated(80), "42");
+    assert_eq!(
+        many - zero,
+        prefix_work,
+        "calling the returned closure twice must not duplicate callback prefix work"
+    );
 }
 
 #[test]

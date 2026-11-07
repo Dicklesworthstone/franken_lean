@@ -862,7 +862,7 @@ impl ParsedSourceCommand {
         &self.syntax
     }
 
-    /// Replace only the term of an ordinary `#check` or `#eval` after an external macro
+    /// Replace only the term of a `#check`, `#eval` or `#eval!` after an external macro
     /// expander has produced native Syntax. The command wrapper, source view,
     /// query span and identifier-as-written flag remain the parser's originals.
     /// No source text is rendered or reparsed, so hygiene and source coordinates
@@ -870,6 +870,11 @@ impl ParsedSourceCommand {
     pub fn with_expanded_query_term(mut self, term: Syntax) -> Option<Self> {
         let command = match self.kind {
             SourceCommandKind::Check => "check",
+            SourceCommandKind::Evaluation
+                if self.syntax.kind() == Some(&parser_kind(&["Command", "evalBang"])) =>
+            {
+                "evalBang"
+            }
             SourceCommandKind::Evaluation => "eval",
             _ => return None,
         };
@@ -5553,6 +5558,7 @@ pub fn parse_source_command(source: &[u8]) -> Result<ParsedSourceCommand, Defini
             }
             TokenKind::Symbol(symbol)
                 if symbol == "#eval"
+                    || symbol == "#eval!"
                     || symbol == "#check"
                     || symbol == "#guard"
                     || symbol == "#synth"
@@ -5566,6 +5572,7 @@ pub fn parse_source_command(source: &[u8]) -> Result<ParsedSourceCommand, Defini
                 // `Init/Notation.lean:766`), which prints its term's normal form.
                 let (kind, command_kind) = match symbol.as_str() {
                     "#eval" => (SourceCommandKind::Evaluation, "eval"),
+                    "#eval!" => (SourceCommandKind::Evaluation, "evalBang"),
                     "#guard" => (SourceCommandKind::Evaluation, "guardCmd"),
                     "#synth" => (SourceCommandKind::Check, "synth"),
                     "#reduce" => (SourceCommandKind::Check, "reduce"),
@@ -6757,6 +6764,7 @@ pub fn partition_definition_commands(
                 || symbol == "example"
                 || symbol == "instance"
                 || symbol == "#eval"
+                || symbol == "#eval!"
                 || symbol == "#guard"
                 || symbol == "#check" =>
             {
@@ -7296,6 +7304,67 @@ mod nat_definition_tests {
     }
 
     #[test]
+    fn forced_evaluation_keeps_its_command_kind_through_term_expansion() {
+        let source = b"-- leading trivia\r\n#eval! let x : Nat := 40; Nat.add x 2\r\n";
+        let parsed = parse_source_command(source).expect("the forced evaluation command parses");
+        let kind = parser_kind(&["Command", "evalBang"]);
+        assert_eq!(parsed.kind(), SourceCommandKind::Evaluation);
+        assert_eq!(parsed.syntax().kind(), Some(&kind));
+        assert_eq!(parsed.reconstruct_original(), source);
+        assert_eq!(
+            parsed.reconstruct_normalized().as_deref(),
+            Some(b"-- leading trivia\n#eval! let x : Nat := 40; Nat.add x 2\n".as_slice())
+        );
+        assert_eq!(
+            parsed.query_term_normalized(),
+            Some("let x : Nat := 40; Nat.add x 2")
+        );
+
+        let replacement = parse_source_command(b"#eval 42").unwrap();
+        let Syntax::Node { args, .. } = replacement.syntax() else {
+            panic!("canonical query node");
+        };
+        let term = args[1].clone();
+        let expanded = parsed
+            .with_expanded_query_term(term.clone())
+            .expect("expansion changes the term without changing force mode");
+        let Syntax::Node { args, .. } = expanded.syntax() else {
+            panic!("canonical query node");
+        };
+        assert_eq!(expanded.syntax().kind(), Some(&kind));
+        assert_eq!(args.len(), 2);
+        assert!(matches!(&args[0], Syntax::Atom { val, .. } if val == "#eval!"));
+        assert_eq!(expanded.reconstruct_original(), source);
+        assert_eq!(args[1], term);
+    }
+
+    #[test]
+    fn forced_evaluation_partitions_with_ordinary_queries_and_scopes() {
+        let source = b"def value : Nat := 42\r\n#eval! value\r\n#eval value\r\n";
+        for commands in [
+            partition_definition_commands(source).unwrap(),
+            command_scope::partition(source).unwrap(),
+        ] {
+            assert_eq!(commands.len(), 3);
+            assert_eq!(commands[1].0, BytePos(23));
+            assert_eq!(
+                parse_source_command(commands[1].1).unwrap().syntax().kind(),
+                Some(&parser_kind(&["Command", "evalBang"]))
+            );
+            assert_eq!(
+                commands
+                    .iter()
+                    .flat_map(|(_, bytes)| bytes.iter().copied())
+                    .collect::<Vec<_>>(),
+                source
+            );
+        }
+        for source in [b"#eval!".as_slice(), b"#eval! 1 2".as_slice()] {
+            assert!(parse_source_command(source).is_err());
+        }
+    }
+
+    #[test]
     fn source_command_bom_rejection_matches_pinned_reference_files() {
         let Some(reference) = std::env::var_os("FLN_REFERENCE_LEAN") else {
             assert_ne!(
@@ -7335,6 +7404,7 @@ mod nat_definition_tests {
         for (query, command, kind) in [
             ("check", "#check Nat", SourceCommandKind::Check),
             ("eval", "#eval 11", SourceCommandKind::Evaluation),
+            ("eval-bang", "#eval! 11", SourceCommandKind::Evaluation),
         ] {
             for imported in [false, true] {
                 for (label, prefix, accepted) in [

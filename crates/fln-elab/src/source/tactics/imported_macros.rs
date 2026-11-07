@@ -200,13 +200,16 @@ impl Context {
                 return Ok(false);
             }
         }
-        let Some(provider) = self.source_scope.tactic_macros.clone() else {
-            return Ok(false);
+        let invocation = match self.source_scope.tactic_macros.clone() {
+            Some(provider) => {
+                let scope = provider
+                    .0
+                    .enter_tactic(self.tactic_macro_depth)
+                    .map_err(macro_error)?;
+                Some((provider, scope))
+            }
+            None => None,
         };
-        let macro_scope = provider
-            .0
-            .enter_tactic(self.tactic_macro_depth)
-            .map_err(macro_error)?;
         // evalTactic treats a null node as a sequence before consulting macros.
         if let Syntax::Node { kind, args, .. } = instruction
             && kind == &Name::from_components(["null"])
@@ -221,6 +224,9 @@ impl Context {
             proof.cursor += 1;
             return Ok(true);
         }
+        let Some((provider, macro_scope)) = invocation else {
+            return Ok(false);
+        };
         let Some(kind) = instruction.kind() else {
             return Ok(false);
         };

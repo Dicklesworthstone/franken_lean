@@ -131,27 +131,18 @@ pub(super) fn uses_sorry(declaration: &Declaration) -> Result<bool, EngineExecut
 /// an axiom's, a constructor's and a recursor's type, a definition's, theorem's and opaque's type
 /// and value, and an inductive's type and constructors (`Lean/Util/CollectAxioms.lean:52-61`).
 ///
-/// An imported constant is a leaf while every imported module belongs to the pinned library
-/// (`Init`, `Std`, `Lean`, `Lake`). None of that library's 212,919 constants mentions `sorryAx`: the
-/// pinned v4.32.0 under `import Lean` and `import Lake`, opaque values included, measured
-/// 2026-10-22. Any other import is walked like this file's own constants. Unbudgeted, as
-/// [`uses_sorry`] is.
+/// Inspect reached imported bodies as well as local ones. A module name is not
+/// evidence of its axiom dependencies, and a public interface may hide a body
+/// that execution reads from its separately checked private import. The visited
+/// set belongs to this immutable engine snapshot and this walk only, so neither
+/// recursive dependencies nor repeated references cause repeated traversal, and
+/// a similarly named declaration in another environment cannot reuse a result.
+/// Unbudgeted, as [`uses_sorry`] is; compiler limits still apply at ingress.
 pub(super) fn evaluation_depends_on_sorry<'a>(
     engine: &Engine,
     declarations: impl IntoIterator<Item = &'a Declaration>,
 ) -> Result<bool, EngineExecutionError> {
     let sorry = Name::from_components(["sorryAx"]);
-    let library_only = engine.imported_modules().iter().all(|module| {
-        let mut root = module.clone();
-        while !root.parent().is_anonymous() {
-            root = root.parent();
-        }
-        ["Init", "Std", "Lean", "Lake"]
-            .iter()
-            .any(|library| root == Name::from_components([*library]))
-    });
-    let imported = engine.imported_environment();
-    let environment = engine.environment();
     let mut spent = 0;
     let mut pending = Vec::new();
     let mut references = |expr: &Expr, pending: &mut Vec<Name>| {
@@ -187,12 +178,13 @@ pub(super) fn evaluation_depends_on_sorry<'a>(
         if name == sorry {
             return Ok(true);
         }
-        if !seen.insert(name.clone())
-            || (library_only && imported.is_some_and(|imported| imported.contains(&name)))
-        {
+        if !seen.insert(name.clone()) {
             continue;
         }
-        match environment.find(&name) {
+        match engine
+            .execution_dependency(&name)
+            .map_err(EngineExecutionError::Ingress)?
+        {
             Some(
                 ConstantInfo::Axiom(fln_env::constants::AxiomVal { base, .. })
                 | ConstantInfo::Ctor(fln_env::constants::ConstructorVal { base, .. })

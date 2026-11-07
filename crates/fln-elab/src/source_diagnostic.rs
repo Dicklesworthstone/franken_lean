@@ -38,8 +38,13 @@ pub(super) fn evaluation(
     if !name.parent().is_anonymous() || !matches!(name.leaf_view(), LeafView::Num(_)) {
         return None;
     }
-    let parts = expect_node(syntax, &parser_kind(&["Command", "eval"]), 2, "evaluation").ok()?;
-    expect_atom(&parts[0], "#eval", "evaluation keyword").ok()?;
+    let (command, keyword) = if syntax.kind() == Some(&parser_kind(&["Command", "evalBang"])) {
+        ("evalBang", "#eval!")
+    } else {
+        ("eval", "#eval")
+    };
+    let parts = expect_node(syntax, &parser_kind(&["Command", command]), 2, "evaluation").ok()?;
+    expect_atom(&parts[0], keyword, "evaluation keyword").ok()?;
     let value = elaborate_term(&parts[1], &[], &nat_const(), true, Some(env)).ok()?;
     let type_ = infer_expr_type(&value, &[], Some(env))
         .filter(|ty| acceptable_inferred(ty, true))

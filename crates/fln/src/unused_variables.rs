@@ -503,7 +503,7 @@ fn scoped(command: &Syntax) -> Option<&Syntax> {
     // A query's term (`#check`, `#eval`, `#reduce`) is read whole. One that runs a tactic (a
     // block, `‹…›`, or an unproved `xs[i]`) is left undecided: how the pin reads the binders
     // around it there is not measured.
-    if ["check", "eval"]
+    if ["check", "eval", "evalBang"]
         .iter()
         .any(|kind| is_kind(command, &["Command", kind]))
         || is_reduce(command)
