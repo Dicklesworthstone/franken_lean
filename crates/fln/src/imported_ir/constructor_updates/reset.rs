@@ -39,15 +39,15 @@ pub(super) fn normalize(
         apply(body, choice, meter)?;
         return Ok(true);
     }
-    let Some((receiver, info)) = object_candidate(body, scope, meter)? else {
+    let Some((receiver, info)) = layout_candidate(body, scope, meter)? else {
         return Ok(false);
     };
     // The fresh allocation is a candidate, never evidence about the input.
     // Prove the entire reset/reuse region under that conditional layout, then
     // establish it with an executable guard before moving any common work.
     let mut guarded_scope = meter.scope(scope)?;
-    let mut candidate =
-        Shape::object_only(&info).expect("candidate is an object-only heap constructor");
+    let mut candidate = Shape::without_padding(&info)
+        .expect("candidate is a heap constructor without scalar padding");
     // The cold allocation fixes the OUTPUT tag. First leave the input tag
     // unknown: equivalence then requires every consuming hot path to replace
     // it. If that cannot be proved, retain the original tag-sensitive guard.
@@ -143,11 +143,11 @@ fn apply(body: &mut IrBody, choice: Choice, meter: &mut Meter) -> Result<()> {
     Ok(())
 }
 
-/// Infer only a prospective object-only layout from one cold allocation.
-/// Packed layouts are excluded: aligned allocation size cannot distinguish a
-/// short scalar payload from padding. The existing equivalence checker still
+/// Infer a prospective allocation extent from one cold allocation. The scalar
+/// payload must fill whole LP64 words: allocation headers cannot distinguish a
+/// shorter logical payload from padding. The existing equivalence checker still
 /// verifies all stores, unchanged projections, captures and continuations.
-fn object_candidate(
+fn layout_candidate(
     body: &IrBody,
     scope: &Scope,
     meter: &mut Meter,
@@ -184,7 +184,7 @@ fn object_candidate(
                     expr: IrExpr::Ctor { info, .. },
                     ..
                 } = stmt
-                    && Shape::object_only(info).is_some()
+                    && Shape::without_padding(info).is_some()
                 {
                     return Ok(Some((*receiver, info.clone())));
                 }

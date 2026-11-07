@@ -119,6 +119,48 @@ fn live_pinned_recursive_updates_match_reference_and_canonical_replay() {
         "the pin emitted no common packed initialization; inspect {dir:?}"
     );
 
+    for function in ["resetPackedRecordUpdate", "resetScalarRecordUpdate"] {
+        let body = module
+            .decls
+            .iter()
+            .find_map(|declaration| match declaration {
+                IrDecl::Function { name, body, .. }
+                    if *name == Name::from_components(function.split('.')) =>
+                {
+                    Some(body)
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing {function}; inspect {dir:?}"));
+        let bodies = body.bodies();
+        assert!(
+            bodies.iter().any(|body| {
+                body.stmts.iter().any(|stmt| {
+                    matches!(
+                        stmt,
+                        IrStmt::VDecl {
+                            expr: IrExpr::IsShared { .. },
+                            ..
+                        }
+                    )
+                })
+            }),
+            "{function} contains no reset/reuse guard; inspect {dir:?}"
+        );
+        assert!(
+            bodies.iter().all(|body| {
+                !matches!(
+                    body.terminal.as_ref(),
+                    IrTerminal::Case {
+                        x_type: IrType::Object | IrType::TObject,
+                        ..
+                    }
+                )
+            }),
+            "{function} already has an incoming constructor witness; inspect {dir:?}"
+        );
+    }
+
     let cases = [
         ("resetAnswer", 0),
         ("resetAnswer", 7),
@@ -130,6 +172,14 @@ fn live_pinned_recursive_updates_match_reference_and_canonical_replay() {
         ("resetPackedAnswer", 257),
         ("resetPackedAnswer", u64::MAX),
         ("resetPackedSharedAnswer", 7),
+        ("resetPackedRecordAnswer", 0),
+        ("resetPackedRecordAnswer", 7),
+        ("resetPackedRecordAnswer", u64::MAX),
+        ("resetPackedRecordSharedAnswer", 7),
+        ("resetPackedRecordSharedAnswer", u64::MAX),
+        ("resetScalarRecordAnswer", 0),
+        ("resetScalarRecordAnswer", 7),
+        ("resetScalarRecordAnswer", u64::MAX),
     ];
     let mut oracle_source = source.to_owned();
     for (entry, value) in cases {

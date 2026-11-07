@@ -10,8 +10,8 @@ use fln_core::expr::{BinderInfo, Expr, ExprNode, Literal, NatLit};
 use fln_core::level::Level;
 use fln_core::name::Name;
 use fln_core::outcome::Outcome;
-use fln_elab::source::SourceInferenceError;
 use fln_elab::source::scope::SourceScope;
+use fln_elab::source::{SourceInferenceError, trace};
 use fln_elab::tactic_macros::{
     TacticMacroError, TacticMacroExpander, TacticMacroExpansion, TacticMacroProvider,
 };
@@ -356,7 +356,7 @@ fn exact_tactic_terms_preserve_declaration_metadata_and_local_priority() {
 /// initial metadata scan. Exercise that real provider boundary rather than
 /// annotating the original source tree, which the earlier tests already cover.
 struct PatternProvider {
-    replacement: Syntax,
+    replacements: Vec<Syntax>,
     rewrite_list_cons: bool,
     literal_expansions: AtomicU64,
     constructor_expansions: AtomicU64,
@@ -364,8 +364,13 @@ struct PatternProvider {
 
 impl PatternProvider {
     fn new(replacement: Syntax, rewrite_list_cons: bool) -> Arc<Self> {
+        Self::with_replacements(vec![replacement], rewrite_list_cons)
+    }
+
+    fn with_replacements(replacements: Vec<Syntax>, rewrite_list_cons: bool) -> Arc<Self> {
+        assert!(!replacements.is_empty());
         Arc::new(Self {
-            replacement,
+            replacements,
             rewrite_list_cons,
             literal_expansions: AtomicU64::new(0),
             constructor_expansions: AtomicU64::new(0),
@@ -406,8 +411,13 @@ impl TacticMacroExpander for PatternProvider {
         };
         if *kind == n("num") && matches!(args.as_slice(), [Syntax::Atom { val, .. }] if val == "37")
         {
-            self.literal_expansions.fetch_add(1, Ordering::Relaxed);
-            return Ok(Some(self.replacement.clone()));
+            let index = self.literal_expansions.fetch_add(1, Ordering::Relaxed) as usize;
+            let replacement = self
+                .replacements
+                .get(index)
+                .or(self.replacements.last())
+                .expect("at least one replacement");
+            return Ok(Some(replacement.clone()));
         }
         if self.rewrite_list_cons
             && *kind == n("Lean.Parser.Term.app")
@@ -506,6 +516,57 @@ fn generated_pattern_metadata_accepts_a_matching_anchored_constructor_once() {
     check_pattern_result(
         &checked_env,
         "theorem miss : Eq (chosen (Nat.succ Nat.zero)) 99 := Eq.refl 99",
+    );
+}
+
+#[test]
+fn equation_capture_retains_each_stateful_pattern_occurrence() {
+    let env = pattern_environment();
+    let provider = PatternProvider::with_replacements(
+        vec![
+            pattern_identifier("_root_.Nat.zero", target("Nat.zero")),
+            Syntax::node(n("num"), vec![Syntax::atom(SourceInfo::None, "1")]),
+        ],
+        false,
+    );
+    let source = "def chosen (x y : Nat) : Nat := match x, y with | 37, 37 => 13 | _, _ => 99";
+    let parsed = fln_parse::parse_definition(source.as_bytes()).unwrap();
+    let actual_scope = SourceScope {
+        tactic_macros: Some(TacticMacroProvider(provider.clone())),
+        ..scope()
+    };
+    let actual = trace::elaborate_definition(parsed.syntax(), &env, budget(), &actual_scope)
+        .unwrap()
+        .candidate;
+    assert_eq!(provider.literal_expansions.load(Ordering::Relaxed), 2);
+    let written = fln_parse::parse_definition(
+        b"def chosen (x y : Nat) : Nat := match x, y with | Nat.zero, 1 => 13 | _, _ => 99",
+    )
+    .unwrap();
+    let expected = trace::elaborate_definition(written.syntax(), &env, budget(), &scope())
+        .unwrap()
+        .candidate;
+    let actual_record = actual
+        .equation_info
+        .as_ref()
+        .expect("prepared equation rows");
+    let expected_record = expected
+        .equation_info
+        .as_ref()
+        .expect("written equation rows");
+    assert_eq!(actual_record, expected_record);
+    let checked_env = publish(&env, actual.declaration);
+    check_pattern_result(
+        &checked_env,
+        "theorem orderedHit : Eq (chosen Nat.zero 1) 13 := Eq.refl 13",
+    );
+    check_pattern_result(
+        &checked_env,
+        "theorem distinctMiss : Eq (chosen Nat.zero Nat.zero) 99 := Eq.refl 99",
+    );
+    check_pattern_result(
+        &checked_env,
+        "theorem originalMiss : Eq (chosen 37 37) 99 := Eq.refl 99",
     );
 }
 

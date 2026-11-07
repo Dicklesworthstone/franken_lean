@@ -242,6 +242,92 @@ fn user_calls_and_captured_closures_share_code_identity_across_modules() {
 }
 
 #[test]
+fn imported_erased_closures_accept_overapplication_across_returned_functions() {
+    let first = module(vec![
+        function(
+            "User.first",
+            1,
+            vec![binding(
+                2,
+                IrExpr::Pap {
+                    function: name("User.second"),
+                    args: vec![IrArg::Var(1)],
+                },
+            )],
+            IrArg::Var(2),
+        ),
+        function(
+            "User.second",
+            2,
+            vec![binding(
+                3,
+                IrExpr::Pap {
+                    function: name("User.sum"),
+                    args: vec![IrArg::Var(1), IrArg::Var(2)],
+                },
+            )],
+            IrArg::Var(3),
+        ),
+        function(
+            "User.sum",
+            3,
+            vec![call(4, "Nat.add", &[1, 2]), call(5, "Nat.add", &[4, 3])],
+            IrArg::Var(5),
+        ),
+    ]);
+    let second = module(vec![function(
+        "User.main",
+        3,
+        vec![
+            binding(
+                4,
+                IrExpr::Pap {
+                    function: name("User.first"),
+                    args: vec![],
+                },
+            ),
+            binding(
+                5,
+                IrExpr::Ap {
+                    x: 4,
+                    args: vec![IrArg::Var(1), IrArg::Var(2), IrArg::Var(3)],
+                },
+            ),
+        ],
+        IrArg::Var(5),
+    )]);
+    let users = BTreeSet::from([
+        name("User.first"),
+        name("User.second"),
+        name("User.sum"),
+        name("User.main"),
+    ]);
+    let compiled = compile(
+        &[first, second],
+        &name("User.main"),
+        &[nat(7), nat(13), nat(22)],
+        &bounded_partition(&[]),
+        &users,
+        IrExecutionLimits::default(),
+    )
+    .unwrap();
+    assert!(compiled.program.program().functions().iter().any(|f| {
+        f.code.iter().any(|instruction| {
+            matches!(
+                instruction,
+                flbc::Instruction::Apply { args, result_ownership, .. }
+                    | flbc::Instruction::TailApply { args, result_ownership, .. }
+                    if args.len() == 3
+                        && *result_ownership == flbc::CallableResultOwnership::Erased
+            )
+        })
+    }));
+    assert_eq!(compiled.reference_functions().len(), 4);
+    assert_eq!(compiled.native_externs(), ["extern:Nat.add"]);
+    assert_native_owned_result(&compiled, "42");
+}
+
+#[test]
 fn toolchain_api_unknown_names_and_wrappers_cannot_be_reclassified() {
     let policy = bounded_partition(&[
         ("Lean.Elab.Term.elabTerm", "toolchain-api"),

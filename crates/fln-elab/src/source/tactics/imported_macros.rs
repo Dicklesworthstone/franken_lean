@@ -8,8 +8,9 @@
 use super::*;
 use crate::tactic_macros::{TacticMacroError, TacticMacroExpansion};
 
-// Each owned expansion runs a native evaluator on the host stack. Keep this
-// independent of Lean's reader depth and fail typed before exhausting it.
+// Nested owned evaluators retain a bounded reader depth. Consecutive root
+// expansions use heap frames before entering the term evaluator, so a cycle
+// reaches this typed limit without consuming a native evaluator stack per step.
 const MAX_OWNED_FRAMES: usize = 8;
 
 #[derive(Clone)]
@@ -46,6 +47,15 @@ fn frame_limit() -> NatDefinitionElabError {
         })
         .with_progress("imported macro owned evaluator depth"),
     )))
+}
+
+fn prepared_pattern_literal(syntax: &Syntax) -> bool {
+    syntax.kind().is_some_and(|kind| {
+        matches!(
+            kind.leaf_view(),
+            fln_core::name::LeafView::Str("flnPreparedPatternLiteral")
+        ) && *kind == parser_kind(&["Term", "flnPreparedPatternLiteral"])
+    })
 }
 
 impl ProofState<'_> {
@@ -289,12 +299,7 @@ impl Context {
         expected: Option<Expr>,
         finish: bool,
     ) -> Result<Option<Typed>, NatDefinitionElabError> {
-        if syntax.kind().is_some_and(|kind| {
-            matches!(
-                kind.leaf_view(),
-                fln_core::name::LeafView::Str("flnPreparedPatternLiteral")
-            ) && *kind == parser_kind(&["Term", "flnPreparedPatternLiteral"])
-        }) {
+        if prepared_pattern_literal(syntax) {
             let prepared_kind = parser_kind(&["Term", "flnPreparedPatternLiteral"]);
             let parts = expect_node(syntax, &prepared_kind, 1, "prepared pattern literal")?;
             let literal = &parts[0];
@@ -348,38 +353,120 @@ impl Context {
         else {
             return Ok(None);
         };
-        if self.tactic_macro_depth >= MAX_OWNED_FRAMES {
-            return Err(frame_limit());
+        struct TermFrame {
+            // A box keeps every observation address stable while the frame
+            // vector grows and earlier root expansions remain live.
+            syntax: Box<Syntax>,
+            check: Option<super::super::pattern_typing::ApplicationCheck>,
+            observation: Option<usize>,
+            caller_locals: Option<LocalContext>,
+            depth: usize,
+            terms: usize,
+            options: KVMap,
+            implicit: usize,
+            pending_arguments: bool,
+            observations: usize,
         }
+
         let depth = self.tactic_macro_depth;
         let terms = self.tactic_macro_terms;
         let options = self.txn.options.clone();
         let implicit = self.no_implicit_lambda_types.len();
         let pending_arguments = self.pending_source_arguments;
         let observations = self.application_syntax.depth();
-        self.tactic_macro_depth += 1;
-        self.tactic_macro_terms += 1;
-        // Generated literal patterns dispatch while their matrix is prepared,
-        // before the ordinary term worklist. They belong to this expansion's
-        // depth too, and every preparation error must restore the owned frame.
         let result = (|| {
-            self.check_preresolved_syntax(&expanded)?;
-            let check = expected
-                .as_ref()
-                .map(|expected| self.begin_application_typing(&expanded, expected))
-                .transpose()?
-                .flatten();
-            let expanded = self.lower_pattern_matrices(&expanded)?;
-            if let Some(check) = &check {
-                self.bind_application_typing(&expanded, check)?;
-            }
-            let observation = self.begin_macro_application_observation(syntax, &expanded)?;
-            let term = self.term_prepared_scoped(&expanded, expected, None, None, finish)?;
-            if let Some(observation) = observation {
-                self.finish_macro_application_observation(syntax, &expanded, observation)?;
-            }
-            if let Some(check) = check {
-                self.finish_application_typing(&expanded, check)?;
+            let mut frames: Vec<TermFrame> = Vec::new();
+            let mut expanded = expanded;
+            let mut caller_locals = None;
+            let term = loop {
+                if self.tactic_macro_depth >= MAX_OWNED_FRAMES {
+                    return Err(frame_limit());
+                }
+                let depth = self.tactic_macro_depth;
+                let terms = self.tactic_macro_terms;
+                let options = self.txn.options.clone();
+                let implicit = self.no_implicit_lambda_types.len();
+                let pending_arguments = self.pending_source_arguments;
+                let observations = self.application_syntax.depth();
+                self.tactic_macro_depth += 1;
+                self.tactic_macro_terms += 1;
+                // Pattern macros belong to this root's reader depth, just as
+                // they did when each root used a nested evaluator call.
+                self.check_preresolved_syntax(&expanded)?;
+                let check = expected
+                    .as_ref()
+                    .map(|expected| self.begin_application_typing(&expanded, expected))
+                    .transpose()?
+                    .flatten();
+                let prepared = Box::new(match self.lower_pattern_matrices(&expanded)? {
+                    std::borrow::Cow::Borrowed(_) => expanded,
+                    std::borrow::Cow::Owned(prepared) => prepared,
+                });
+                if let Some(check) = &check {
+                    self.bind_application_typing(&prepared, check)?;
+                }
+                let source = frames.last().map_or(syntax, |frame| &*frame.syntax);
+                let observation = self.begin_macro_application_observation(source, &prepared)?;
+                frames.push(TermFrame {
+                    syntax: prepared,
+                    check,
+                    observation,
+                    caller_locals,
+                    depth,
+                    terms,
+                    options,
+                    implicit,
+                    pending_arguments,
+                    observations,
+                });
+                let root = &*frames.last().expect("owned expansion frame").syntax;
+                if prepared_pattern_literal(root) {
+                    break self
+                        .term_prepared_scoped(root, expected.clone(), None, None, finish)
+                        .and_then(super::super::TermResult::term)?;
+                }
+                caller_locals = self.observes_term(root).then(|| self.txn.lctx.clone());
+                let next = if matches!(root, Syntax::Missing) {
+                    None
+                } else {
+                    provider
+                        .0
+                        .expand_term(
+                            root,
+                            self.tactic_macro_depth,
+                            &self.txn.env,
+                            &self.source_scope,
+                        )
+                        .map_err(macro_error)?
+                };
+                if let Some(next) = next {
+                    expanded = next;
+                    continue;
+                }
+                // The terminal lookup has already run once. Starting with an
+                // Elaborate task preserves that result while descendants keep
+                // their ordinary dispatch, expected types and postponement.
+                break self
+                    .term_prepared_expansion(root, expected.clone(), finish)
+                    .and_then(super::super::TermResult::term)?;
+            };
+            while let Some(frame) = frames.pop() {
+                let source = frames.last().map_or(syntax, |frame| &*frame.syntax);
+                if let Some(observation) = frame.observation {
+                    self.finish_macro_application_observation(source, &frame.syntax, observation)?;
+                }
+                if let Some(check) = frame.check {
+                    self.finish_application_typing(&frame.syntax, check)?;
+                }
+                self.application_syntax.truncate(frame.observations);
+                self.tactic_macro_depth = frame.depth;
+                self.tactic_macro_terms = frame.terms;
+                self.txn.options = frame.options;
+                self.no_implicit_lambda_types.truncate(frame.implicit);
+                self.pending_source_arguments = frame.pending_arguments;
+                if let Some(locals) = frame.caller_locals {
+                    self.observe_term(source, term.clone(), locals)?;
+                }
             }
             Ok::<_, NatDefinitionElabError>(term)
         })();
@@ -389,9 +476,6 @@ impl Context {
         self.txn.options = options;
         self.no_implicit_lambda_types.truncate(implicit);
         self.pending_source_arguments = pending_arguments;
-        match result? {
-            super::super::TermResult::Term(term) => Ok(Some(term)),
-            super::super::TermResult::Tactic(_) => Err(failure(SourceInferenceError::Scope)),
-        }
+        result.map(Some)
     }
 }

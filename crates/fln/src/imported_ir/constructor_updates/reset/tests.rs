@@ -859,6 +859,292 @@ fn an_unknown_packed_layout_is_not_inferred_from_allocation_padding() {
     );
 }
 
+// A plain structure has no incoming constructor case. Its reset region must
+// establish the object/scalar extent itself before selecting the fresh path.
+// Preserve one machine word and one Float by projection, and replace a UInt64.
+fn packed_region(objects: bool, deferred: bool, retag: bool) -> IrBody {
+    let mut region = if retag {
+        retag_region(deferred)
+    } else if deferred {
+        deferred_region()
+    } else {
+        region()
+    };
+    let fields = if objects { 2 } else { 0 };
+    if !objects {
+        arm(&mut region, 0).stmts.clear();
+        arm(&mut region, 1).stmts.remove(0); // No object field to retain.
+    }
+    let common = continuation(&mut region);
+    common.stmts.insert(
+        2,
+        IrStmt::VDecl {
+            x: 71,
+            ty: IrType::UInt64,
+            expr: IrExpr::Fap {
+                function: name("UInt64.ofNat"),
+                args: vec![var(14)],
+            },
+        },
+    );
+    let reuse = if deferred {
+        common
+            .stmts
+            .iter_mut()
+            .find_map(|stmt| match stmt {
+                IrStmt::JDecl { j: 60, value, .. } => Some(value),
+                _ => None,
+            })
+            .unwrap()
+    } else {
+        common
+    };
+    let hot = arm(reuse, 0);
+    if !objects {
+        hot.stmts.retain(|stmt| !matches!(stmt, IrStmt::Set { .. }));
+    }
+    hot.stmts.push(IrStmt::SSet {
+        x: 11,
+        i: fields + 1,
+        offset: 0,
+        y: 71,
+        ty: IrType::UInt64,
+    });
+    let cold = arm(reuse, 1);
+    let IrStmt::VDecl {
+        expr: IrExpr::Ctor { info, args },
+        ..
+    } = &mut cold.stmts[0]
+    else {
+        panic!("cold allocation")
+    };
+    info.size = fields;
+    info.usize = 1;
+    info.ssize = 16;
+    if !objects {
+        args.clear();
+    }
+    cold.stmts.extend([
+        IrStmt::USet {
+            x: 22,
+            i: fields,
+            y: 70,
+        },
+        IrStmt::SSet {
+            x: 22,
+            i: fields + 1,
+            offset: 0,
+            y: 71,
+            ty: IrType::UInt64,
+        },
+        IrStmt::SSet {
+            x: 22,
+            i: fields + 1,
+            offset: 8,
+            y: 72,
+            ty: IrType::Float,
+        },
+    ]);
+    if !objects {
+        region.stmts.remove(0); // No projection of an object field.
+    }
+    region.stmts.splice(
+        0..0,
+        [
+            IrStmt::VDecl {
+                x: 70,
+                ty: IrType::USize,
+                expr: IrExpr::UProj { i: fields, x: 1 },
+            },
+            IrStmt::VDecl {
+                x: 72,
+                ty: IrType::Float,
+                expr: IrExpr::SProj {
+                    n: fields + 1,
+                    offset: 8,
+                    x: 1,
+                },
+            },
+        ],
+    );
+    region
+}
+
+#[test]
+fn inferred_packed_records_preserve_shared_scalar_bits_and_check_the_full_extent() {
+    for objects in [false, true] {
+        let fields = if objects { 2 } else { 0 };
+        for deferred in [false, true] {
+            for retag in [false, true] {
+                let module = unshaped_fixture(packed_region(objects, deferred, retag));
+                let compiled = callable(&module);
+                let bytes =
+                    flbc::encode_canonical(compiled.program(), flbc::CodecLimits::default())
+                        .unwrap();
+                let replay = flbc::decode_canonical(&bytes, flbc::CodecLimits::default()).unwrap();
+                let entry = compiled
+                    .reference_functions()
+                    .iter()
+                    .find(|function| function.name == name("Reset.update"))
+                    .unwrap()
+                    .function;
+                for program in [compiled.program(), &replay] {
+                    assert!(
+                        program
+                            .functions()
+                            .iter()
+                            .flat_map(|f| &f.code)
+                            .any(|instruction| match instruction {
+                                flbc::Instruction::CtorShapeTest {
+                                    expected_fields,
+                                    expected_scalar_bytes: 24,
+                                    ..
+                                } => retag && *expected_fields == fields,
+                                flbc::Instruction::CtorLayoutTest {
+                                    expected_tag: 1,
+                                    expected_fields,
+                                    expected_scalar_bytes: 24,
+                                    ..
+                                } => !retag && *expected_fields == fields,
+                                _ => false,
+                            })
+                    );
+                    let children = || {
+                        if objects {
+                            vec![Obj::mk_nat(19), Obj::mk_nat(23)]
+                        } else {
+                            vec![]
+                        }
+                    };
+                    for bits in [0x8000_0000_0000_0000u64, 0x7ff8_1234_5678_9abc] {
+                        let mut scalars = Vec::new();
+                        for value in [u64::MAX, (1 << 63) + 17, bits] {
+                            scalars.extend_from_slice(&value.to_le_bytes());
+                        }
+                        let tag = if retag { 2 } else { 1 };
+                        let original = Obj::mk_ctor(tag, children(), &scalars);
+                        let outcome = execute_function(
+                            program,
+                            entry,
+                            vec![original.clone_ref(), Obj::mk_nat(42)],
+                            ExecutionLimits::default(),
+                            None,
+                        );
+                        let Outcome::Complete(VmExit::Returned(result)) = outcome else {
+                            panic!("{outcome:?}");
+                        };
+                        assert_eq!(result.value.header().tag, 1);
+                        assert_eq!(original.header().tag, tag);
+                        if objects {
+                            assert_eq!(
+                                nat_decimal(&result.value.ctor_child(0)).as_deref(),
+                                Some("43")
+                            );
+                            assert_eq!(
+                                nat_decimal(&result.value.ctor_child(1)).as_deref(),
+                                Some("23")
+                            );
+                            assert_eq!(nat_decimal(&original.ctor_child(0)).as_deref(), Some("19"));
+                        }
+                        let start = usize::from(fields) * 8;
+                        for (index, expected) in [u64::MAX, 43, bits].into_iter().enumerate() {
+                            assert_eq!(
+                                result.value.try_ctor_scalar_u64(start + index * 8),
+                                Some(expected)
+                            );
+                        }
+                        assert_eq!(
+                            original.try_ctor_scalar_u64(start + 8),
+                            Some((1 << 63) + 17)
+                        );
+                        assert_eq!(original.try_ctor_scalar_u64(start + 16), Some(bits));
+                    }
+                    let mut malformed = vec![
+                        Obj::mk_ctor(1, children(), &[0; 16]),
+                        Obj::mk_ctor(1, children(), &[0; 32]),
+                    ];
+                    let mut extra_field = children();
+                    extra_field.push(Obj::mk_nat(0));
+                    malformed.push(Obj::mk_ctor(1, extra_field, &[0; 24]));
+                    if !retag {
+                        malformed.push(Obj::mk_ctor(2, children(), &[0; 24]));
+                    }
+                    for input in malformed {
+                        let outcome = execute_function(
+                            program,
+                            entry,
+                            vec![input, Obj::mk_nat(42)],
+                            ExecutionLimits::default(),
+                            None,
+                        );
+                        assert!(
+                            matches!(
+                                outcome,
+                                Outcome::Complete(VmExit::Panicked { .. } | VmExit::Refused { .. })
+                            ),
+                            "{outcome:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn packed_layout_inference_cannot_hide_missing_overlapping_or_different_stores() {
+    for mutation in ["missing", "overlapping", "different"] {
+        let mut region = packed_region(true, false, false);
+        let common = region
+            .stmts
+            .iter_mut()
+            .find_map(|stmt| match stmt {
+                IrStmt::JDecl { j: 10, value, .. } => Some(value),
+                _ => None,
+            })
+            .unwrap();
+        match mutation {
+            "missing" => {
+                arm(common, 1).stmts.remove(1);
+            }
+            "overlapping" => {
+                let IrStmt::SSet { offset, .. } = &mut arm(common, 1).stmts[3] else {
+                    panic!("Float initialization")
+                };
+                *offset = 0;
+            }
+            "different" => {
+                common.stmts.insert(
+                    3,
+                    IrStmt::VDecl {
+                        x: 73,
+                        ty: IrType::UInt64,
+                        expr: IrExpr::Fap {
+                            function: name("UInt64.ofNat"),
+                            args: vec![var(2)],
+                        },
+                    },
+                );
+                let IrStmt::SSet { y, .. } = arm(common, 0).stmts.last_mut().unwrap() else {
+                    panic!("UInt64 update")
+                };
+                *y = 73;
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            compile_module(
+                &unshaped_fixture(region),
+                "Reset.main",
+                &[],
+                IrExecutionLimits::default(),
+            )
+            .is_err(),
+            "{mutation}"
+        );
+    }
+}
+
 #[test]
 fn reset_and_reuse_guards_accept_either_boolean_default_and_order() {
     for outer_default in [0, 1] {

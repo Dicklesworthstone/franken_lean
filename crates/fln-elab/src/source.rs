@@ -844,6 +844,11 @@ struct Context {
     /// The definition's root `match`, read for its equation theorems
     /// (`equation_theorems::capture`), once the definition is elaborated.
     equation_info: Option<equation_theorems::journal::Record>,
+    /// Only the definition body's root match is watched. Its borrowed syntax
+    /// stays alive through equation capture, and the watch is cleared before
+    /// definition elaboration returns. No owned macro allocation is registered.
+    equation_pattern_source: Option<usize>,
+    equation_patterns: Option<std::sync::Arc<Vec<Syntax>>>,
 }
 
 fn failure(reason: SourceInferenceError) -> NatDefinitionElabError {
@@ -954,6 +959,8 @@ impl Context {
             native_axioms: Vec::new(),
             aux_names: None,
             equation_info: None,
+            equation_pattern_source: None,
+            equation_patterns: None,
         }
     }
 
@@ -2205,9 +2212,24 @@ impl Context {
             initial_proof,
             initial_field,
             initial_finish,
+            true,
         );
         // A failed proof alternative or suspended argument can abandon a
         // queued check. Its syntax identities expire with this worklist.
+        self.application_syntax.truncate(observations);
+        result
+    }
+
+    /// A generated root whose macro alternatives have already been exhausted.
+    /// Descendants still use ordinary macro dispatch.
+    fn term_prepared_expansion(
+        &mut self,
+        syntax: &Syntax,
+        expected: Option<Expr>,
+        finish: bool,
+    ) -> Result<TermResult, NatDefinitionElabError> {
+        let observations = self.application_syntax.depth();
+        let result = self.term_prepared_scoped_inner(syntax, expected, None, None, finish, false);
         self.application_syntax.truncate(observations);
         result
     }
@@ -2219,6 +2241,7 @@ impl Context {
         initial_proof: Option<tactics::ProofState<'a>>,
         initial_field: Option<record_terms::FieldApplication<'a>>,
         initial_finish: bool,
+        expand_root: bool,
     ) -> Result<TermResult, NatDefinitionElabError> {
         use application::postponed;
         let without_implicit_lambda = std::mem::take(&mut self.block_root_implicit_lambda);
@@ -2321,7 +2344,7 @@ impl Context {
             /// pin resolves an application head without expanding its macros.
             Elaborate(&'a Syntax, Option<Expr>, bool),
             /// `no_implicit_lambda% e`: `e`, its expected type marked for as long as it is visited.
-            VisitWithoutImplicitLambda(&'a Syntax, Option<Expr>),
+            VisitWithoutImplicitLambda(&'a Syntax, Option<Expr>, bool),
             RestoreImplicitLambda(usize),
             Observe(&'a Syntax, LocalContext),
             Function(&'a [Syntax], Option<Expr>, bool),
@@ -2411,9 +2434,10 @@ impl Context {
             match initial_proof {
                 Some(proof) => Task::Proof(proof),
                 None if without_implicit_lambda => {
-                    Task::VisitWithoutImplicitLambda(syntax, expected)
+                    Task::VisitWithoutImplicitLambda(syntax, expected, expand_root)
                 }
-                None => Task::Visit(syntax, expected, initial_finish),
+                None if expand_root => Task::Visit(syntax, expected, initial_finish),
+                None => Task::Elaborate(syntax, expected, initial_finish),
             }
         }];
         enum Attempt<'a> {
@@ -2706,7 +2730,7 @@ impl Context {
                             let value = values.pop().expect("contextual match visit");
                             values.push(self.capture_recursive_context(value)?);
                         }
-                        Task::VisitWithoutImplicitLambda(syntax, expected) => {
+                        Task::VisitWithoutImplicitLambda(syntax, expected, expand_macro) => {
                             tasks.push(Task::RestoreImplicitLambda(
                                 self.no_implicit_lambda_types.len(),
                             ));
@@ -2714,7 +2738,11 @@ impl Context {
                                 let type_ = self.instantiate(type_)?;
                                 self.no_implicit_lambda_types.push(type_);
                             }
-                            tasks.push(Task::Visit(syntax, expected, true));
+                            tasks.push(if expand_macro {
+                                Task::Visit(syntax, expected, true)
+                            } else {
+                                Task::Elaborate(syntax, expected, true)
+                            });
                         }
                         Task::RestoreImplicitLambda(length) => {
                             self.no_implicit_lambda_types.truncate(length);
@@ -4025,7 +4053,7 @@ impl Context {
                                 let no_implicit_lambda = goal.no_implicit_lambda;
                                 tasks.push(Task::RefineTerm(proof, goal, depth));
                                 tasks.push(if no_implicit_lambda {
-                                    Task::VisitWithoutImplicitLambda(syntax, Some(expected))
+                                    Task::VisitWithoutImplicitLambda(syntax, Some(expected), true)
                                 } else {
                                     Task::Visit(syntax, Some(expected), true)
                                 });
@@ -4156,7 +4184,7 @@ impl Context {
                                     tasks.push(Task::ApplicationTyping(syntax, check));
                                 }
                                 tasks.push(if no_implicit_lambda && expected.is_some() {
-                                    Task::VisitWithoutImplicitLambda(syntax, expected)
+                                    Task::VisitWithoutImplicitLambda(syntax, expected, true)
                                 } else {
                                     Task::Visit(syntax, expected, true)
                                 });
@@ -6452,7 +6480,10 @@ fn definition_in_context_named(
     if deprecated::deprecated_registration(syntax)?.is_some() {
         context.check_deprecated = false;
     }
-    let declaration = definition_elaboration(syntax, context, generated_name)?;
+    let declaration = definition_elaboration(syntax, context, generated_name);
+    context.equation_pattern_source = None;
+    context.equation_patterns = None;
+    let declaration = declaration?;
     context.publish_deprecated_uses()?;
     Ok(declaration)
 }
@@ -6986,6 +7017,7 @@ fn definition_elaboration(
     } else {
         body
     };
+    context.watch_equation_patterns(body);
     let mut term = context.definition_body(
         name,
         &parameters,

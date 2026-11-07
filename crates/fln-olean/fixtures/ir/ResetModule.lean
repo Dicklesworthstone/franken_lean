@@ -69,3 +69,61 @@ inductive PackedResetChain where
   let xs := resetPackedInput
   let ys := resetPackedMap delta xs
   resetPackedSum ys + resetPackedSum xs
+
+-- A single-constructor structure has no case establishing its incoming
+-- layout. These payloads fill whole words, so a checked allocation extent can
+-- witness the reset/reuse layout without treating trailing padding as data.
+structure ResetPackedRecord where
+  count : Nat
+  wide : UInt64
+  word : USize
+  floating : Float
+
+@[noinline] def resetPackedRecordUpdate (delta : Nat) (input : ResetPackedRecord) :
+    ResetPackedRecord :=
+  { input with
+    count := input.count + delta
+    wide := input.wide + UInt64.ofNat delta
+    word := input.word + USize.ofNat delta }
+
+@[noinline] def resetPackedRecordRead (input : ResetPackedRecord) : Nat :=
+  input.count + input.wide.toNat + input.word.toNat + input.floating.toBits.toNat
+
+@[noinline] def resetPackedRecordInput : ResetPackedRecord :=
+  { count := 19, wide := 9223372036854775825, word := 18446744073709551615,
+    floating := Float.ofBits 0x7ff8123456789abc }
+
+@[noinline] def resetPackedRecordApply
+    (f : ResetPackedRecord → ResetPackedRecord) (input : ResetPackedRecord) : ResetPackedRecord :=
+  f input
+
+@[noinline] def resetPackedRecordAnswer (delta : Nat) : Nat :=
+  resetPackedRecordRead (resetPackedRecordUpdate delta resetPackedRecordInput)
+
+@[noinline] def resetPackedRecordSharedAnswer (delta : Nat) : Nat :=
+  let input := resetPackedRecordInput
+  let updated := resetPackedRecordApply (resetPackedRecordUpdate delta) input
+  resetPackedRecordRead updated + resetPackedRecordRead input
+
+-- Also retain heap constructors with no object fields and negative zero's
+-- exact representation. A zero object-field count does not make this scalar.
+structure ResetScalarRecord where
+  wide : UInt64
+  word : USize
+  floating : Float
+
+@[noinline] def resetScalarRecordUpdate (delta : Nat) (input : ResetScalarRecord) :
+    ResetScalarRecord :=
+  { input with
+    wide := input.wide + UInt64.ofNat delta
+    word := input.word + USize.ofNat delta }
+
+@[noinline] def resetScalarRecordRead (input : ResetScalarRecord) : Nat :=
+  input.wide.toNat + input.word.toNat + input.floating.toBits.toNat
+
+@[noinline] def resetScalarRecordAnswer (delta : Nat) : Nat :=
+  let input : ResetScalarRecord :=
+    { wide := 18446744073709551615, word := 9223372036854775825,
+      floating := Float.ofBits 0x8000000000000000 }
+  let updated := resetScalarRecordUpdate delta input
+  resetScalarRecordRead updated + resetScalarRecordRead input

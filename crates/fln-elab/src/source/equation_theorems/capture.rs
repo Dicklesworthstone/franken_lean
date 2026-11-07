@@ -100,6 +100,16 @@ fn wildcard() -> Name {
 }
 
 impl Context {
+    /// Register only the body that definition elaboration keeps alive until
+    /// capture. Nested owned macro trees cannot populate this observation.
+    pub(in crate::source) fn watch_equation_patterns(&mut self, body: &Syntax) {
+        let body = under_lambdas(body);
+        self.equation_pattern_source = (self.source_scope.tactic_macros.is_some()
+            && body.kind() == Some(&parser_kind(&["Term", "match"])))
+        .then_some(std::ptr::from_ref(body).addr());
+        self.equation_patterns = None;
+    }
+
     /// The equation information of `definition`, whose value `body` elaborated, or `None` when
     /// its body is not a `match` this models. Its first `sections` parameters are the section
     /// variables it is closed over.
@@ -109,7 +119,22 @@ impl Context {
         body: &Syntax,
         sections: usize,
     ) -> Option<Record> {
-        let (discriminants, alternatives) = match_parts(under_lambdas(body))?;
+        let body = under_lambdas(body);
+        let (discriminants, mut alternatives) = match_parts(body)?;
+        let prepared = (self.equation_pattern_source == Some(std::ptr::from_ref(body).addr()))
+            .then_some(self.equation_patterns.as_deref())
+            .flatten();
+        if let Some(rows) = prepared {
+            if rows.len() != alternatives.len() {
+                return None;
+            }
+            for ((patterns, _), row) in alternatives.iter_mut().zip(rows) {
+                let [row] = null_args(row)? else {
+                    return None;
+                };
+                *patterns = separated(null_args(row)?)?;
+            }
+        }
         // The definition is not admitted yet, and nothing here may admit it: its own name
         // is bound to a local while the alternatives elaborate (see `capture`).
         let mut scope = self.source_scope.clone();
@@ -117,9 +142,15 @@ impl Context {
         let mut cx = Context::scoped(&self.txn.env, self.kernel, &scope).ok()?;
         cx.txn.lctx = LocalContext::new();
         cx.level_params = definition.base.level_params.clone();
-        cx.capture(definition, &discriminants, &alternatives, sections)
-            .ok()
-            .flatten()
+        cx.capture(
+            definition,
+            &discriminants,
+            &alternatives,
+            sections,
+            prepared.is_some(),
+        )
+        .ok()
+        .flatten()
     }
 
     fn capture(
@@ -128,6 +159,7 @@ impl Context {
         discriminants: &[&Name],
         alternatives: &[(Vec<&Syntax>, &Syntax)],
         sections: usize,
+        prepared: bool,
     ) -> Result<Option<Record>, NatDefinitionElabError> {
         // The definition's value lambdas, opened with their binder names.
         let mut value = definition.value.clone();
@@ -223,8 +255,14 @@ impl Context {
             if patterns.len() != positions.len() {
                 return Ok(None);
             }
-            let Some(alternative) =
-                self.capture_alternative(&parameters, &positions, patterns, rhs, &result)?
+            let Some(alternative) = self.capture_alternative(
+                &parameters,
+                &positions,
+                patterns,
+                rhs,
+                &result,
+                prepared,
+            )?
             else {
                 self.txn.lctx.truncate(opened);
                 return Ok(None);
@@ -327,6 +365,7 @@ impl Context {
         patterns: &[&Syntax],
         rhs: &Syntax,
         result: &Expr,
+        prepared: bool,
     ) -> Result<Option<Alternative>, NatDefinitionElabError> {
         let mut builder = Builder::default();
         let mut elaborated: Vec<Expr> = Vec::new();
@@ -346,7 +385,19 @@ impl Context {
                 };
                 expected = replaced;
             }
-            let Some(pattern) = self.pattern(&mut builder, syntax, &expected, &wildcard())? else {
+            // These are the actual rows the matrix compiled. Replaying their
+            // macros here would advance state twice and could record a different
+            // equation from the definition that was checked.
+            let provider = if prepared {
+                self.source_scope.tactic_macros.take()
+            } else {
+                None
+            };
+            let pattern = self.pattern(&mut builder, syntax, &expected, &wildcard());
+            if prepared {
+                self.source_scope.tactic_macros = provider;
+            }
+            let Some(pattern) = pattern? else {
                 return Ok(None);
             };
             elaborated.push(pattern);

@@ -1607,9 +1607,8 @@ impl<'a> Builder<'a> {
             && (scalar
                 || arms.len() != 1
                 || !matches!(default, Some(body) if body.stmts.is_empty() && matches!(body.terminal.as_ref(), IrTerminal::Unreachable))
-                || arms[0].0.size == 0
-                || arms[0].0.usize != 0
-                || arms[0].0.ssize != 0)
+                || fieldless_constructor(arms[0].0)
+                || !arms[0].0.ssize.is_multiple_of(8))
         {
             return Err(unsupported(
                 self.name,
@@ -1661,13 +1660,19 @@ impl<'a> Builder<'a> {
         let condition = if shape_only {
             let fields = u16::try_from(info.size)
                 .map_err(|_| IrExecutionError::Limit("constructor fields"))?;
+            let scalar_bytes = self.packed_offset(info.usize, info.ssize)?;
+            if usize::from(fields) >= fln_rt::abi::MAX_CTOR_FIELDS
+                || usize::from(scalar_bytes) >= fln_rt::abi::MAX_CTOR_SCALARS_SIZE
+            {
+                return Err(unsupported(self.name, "constructor layout"));
+            }
             self.emit(
                 block,
                 ValueType::Bool,
                 Operation::CtorShapeTest {
                     value,
                     expected_fields: fields,
-                    expected_scalar_bytes: 0,
+                    expected_scalar_bytes: scalar_bytes,
                 },
             )?
         } else {
