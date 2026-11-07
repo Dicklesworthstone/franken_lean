@@ -1,5 +1,5 @@
 //! Real module-system artifacts retain separate checked logical and executable
-//! views. These fixtures need no prelude seed, unsafe axiom, or Reference files.
+//! views. These fixtures need no prelude seed or Reference files.
 #![forbid(unsafe_code)]
 
 use fln::source_check::modules::execution::SourceProgramLimits;
@@ -556,5 +556,174 @@ fn checked_private_bodies_keep_noncomputable_and_bodyless_dependencies_unavailab
     }
     for result in check(&format!("{prefix}def use : Token := localOnly\n")) {
         assert_eq!(dependency(result.unwrap_err()), n("localOnly"));
+    }
+}
+
+fn evaluation_error(mut error: &fln::EngineExecutionError) -> &fln::EngineExecutionError {
+    while let fln::EngineExecutionError::BatchCommand { error: inner, .. } = error {
+        error = inner;
+    }
+    error
+}
+
+fn refuse_sorry(engine: &Engine, constant: &str) {
+    let source = format!("#eval {constant}\n");
+    let error = engine
+        .execute_source_commands_with_checks(
+            source.as_bytes(),
+            &KVMap::new(),
+            EngineExecutionLimits::new(limits().source.admission.kernel),
+        )
+        .expect_err("evaluation must inspect the complete checked axiom closure");
+    assert!(
+        matches!(
+            evaluation_error(&error),
+            fln::EngineExecutionError::EvaluationDependsOnSorry
+        ),
+        "{constant}: {error:?}"
+    );
+}
+
+fn evaluate_token(engine: &Engine, constant: &str) {
+    let source = format!("#eval {constant}\n");
+    let completed = engine
+        .execute_source_commands_with_checks(
+            source.as_bytes(),
+            &KVMap::new(),
+            EngineExecutionLimits::new(limits().source.admission.kernel),
+        )
+        .unwrap_or_else(|error| panic!("{constant}: {error:?}"))
+        .into_complete()
+        .unwrap();
+    assert_eq!(completed.batch.source_evaluation_indices.len(), 1);
+    let index = completed.batch.source_evaluation_indices[0];
+    returned_tag(&completed.batch.executions[index].exit, 0);
+}
+
+#[test]
+fn evaluation_checks_real_imported_axiom_closures_even_under_library_names() {
+    const LIBRARY: &str = r#"prelude
+inductive Bool where
+| false
+| true
+inductive Claim : Prop where
+| proof
+inductive Token where
+| left
+| right
+axiom sorryAx.{u} (A : Sort u) (synthetic : Bool) : A
+def eraseEvidence (_ : Claim) : Token := Token.left
+theorem taintedEvidence : Claim := sorryAx Claim Bool.false
+def taintedValue : Token := eraseEvidence taintedEvidence
+opaque taintedOpaque : Token := eraseEvidence taintedEvidence
+def cleanValue : Token := eraseEvidence Claim.proof
+"#;
+    for module in [
+        "Init.Custom",
+        "Std.Custom",
+        "Lean.Custom",
+        "Lake.Custom",
+        "User.Custom",
+    ] {
+        let receipt = import(&compile(&[(module, LIBRARY)]), module);
+        let engine = &receipt.engine;
+        assert!(engine.imported_modules().contains(&n(module)));
+        assert!(
+            engine
+                .imported_environment()
+                .unwrap()
+                .contains(&n("taintedValue"))
+        );
+        let before = engine.logical_root(&KVMap::new());
+        for constant in ["taintedValue", "taintedOpaque"] {
+            refuse_sorry(engine, constant);
+        }
+        // An unrelated sorry-bearing declaration in the same admitted artifact
+        // must not prevent evaluation of an independent value.
+        evaluate_token(engine, "cleanValue");
+        assert_eq!(engine.logical_root(&KVMap::new()), before);
+
+        let mut bounded = EngineExecutionLimits::new(limits().source.admission.kernel);
+        bounded.ingress.max_nodes = 0;
+        let error = engine
+            .execute_source_commands_with_checks(b"#eval cleanValue\n", &KVMap::new(), bounded)
+            .expect_err("the ordinary compiler resource limit still applies");
+        assert!(
+            matches!(evaluation_error(&error), fln::EngineExecutionError::Ingress(error)
+                if error.is_resource_exhaustion()),
+            "{error:?}"
+        );
+        assert_eq!(engine.logical_root(&KVMap::new()), before);
+        evaluate_token(engine, "cleanValue");
+    }
+}
+
+#[test]
+fn evaluation_reads_checked_private_proofs_without_exposing_them_to_source() {
+    const BASE: &str = r#"module
+prelude
+@[expose] public section
+inductive Bool where
+| false
+| true
+inductive Claim : Prop where
+| proof
+inductive Token where
+| left
+| right
+axiom sorryAx.{u} (A : Sort u) (synthetic : Bool) : A
+def eraseEvidence (_ : Claim) : Token := Token.left
+"#;
+    // Reuse the same module and declaration names across distinct immutable
+    // import snapshots; only the actual checked private proof determines taint.
+    for tainted in [true, false, true] {
+        let proof = if tainted {
+            "sorryAx Claim Bool.false"
+        } else {
+            "Claim.proof"
+        };
+        let producer = format!(
+            "module\nprelude\npublic import Base\nprivate theorem hiddenEvidence : Claim := {proof}\npublic def taintedValue : Token := eraseEvidence hiddenEvidence\npublic opaque taintedOpaque : Token := eraseEvidence hiddenEvidence\npublic def cleanValue : Token := eraseEvidence Claim.proof\n"
+        );
+        let receipt = import(
+            &compile(&[("Init.Custom", &producer), ("Base", BASE)]),
+            "Init.Custom",
+        );
+        let main = n("Main");
+        let checked = complete(receipt.check_source_modules(
+            &[SourceModuleInput {
+                name: &main,
+                source: b"module\nprelude\npublic import Init.Custom\n",
+            }],
+            &main,
+            &KVMap::new(),
+            limits(),
+            None,
+        ));
+        let engine = &checked.checked.engine;
+        assert!(matches!(
+            engine.environment().find(&n("taintedValue")),
+            Some(ConstantInfo::Axiom(_))
+        ));
+        assert!(
+            !engine
+                .environment()
+                .contains(&private("Init.Custom", "hiddenEvidence"))
+        );
+        let before = engine.logical_root(&KVMap::new());
+        for constant in ["taintedValue", "taintedOpaque"] {
+            if tainted {
+                refuse_sorry(engine, constant);
+            } else {
+                evaluate_token(engine, constant);
+            }
+        }
+        evaluate_token(engine, "cleanValue");
+        assert_eq!(engine.logical_root(&KVMap::new()), before);
+        assert!(
+            !engine
+                .environment()
+                .contains(&private("Init.Custom", "hiddenEvidence"))
+        );
     }
 }

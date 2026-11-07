@@ -523,3 +523,63 @@ fn admitted_io_printing_refuses_before_effects_and_skips_printers_on_exceptions(
         assert_eq!(engine.logical_root(&KVMap::new()), original);
     }).unwrap().join().unwrap();
 }
+
+#[test]
+fn sorry_dependencies_refuse_io_before_effects_and_leave_the_capture_usable() {
+    std::thread::Builder::new()
+        .stack_size(STACK)
+        .spawn(|| {
+            let Some(base) = imported() else {
+                return;
+            };
+            // The selected IO fixture need not include this unrelated axiom.
+            // When absent, admit its actual polymorphic telescope through both
+            // checkers. It occurs only in a proof that runtime erasure removes.
+            let engine = if base.environment().contains(&name("sorryAx")) {
+                base.clone()
+            } else {
+                checked(base, "axiom sorryAx.{u} (A : Sort u) (synthetic : Bool) : A\n")
+            };
+            let engine = checked(
+                &engine,
+                "theorem ioTaintedEvidence : True := @sorryAx True false\ndef ioEraseEvidence (_ : True) : Nat := 7\ndef ioTaintedValue : Nat := ioEraseEvidence ioTaintedEvidence\n",
+            );
+            let before = engine.logical_root(&KVMap::new());
+            let directory = Directory::new("sorry-before-effects");
+            let sentinel = directory.0.join("sentinel.txt");
+            std::fs::write(&sentinel, b"unchanged\n").unwrap();
+            let action = |value: &str| {
+                format!(
+                    "#eval show IO Nat from do\n  let h ← IO.FS.Handle.mk {} IO.FS.Mode.append\n  h.putStr \"effect\\n\"\n  return {value}\n",
+                    quoted(&sentinel),
+                )
+            };
+            let error = engine
+                .execute_source_commands_with_presentation(
+                    action("ioTaintedValue").as_bytes(),
+                    &KVMap::new(),
+                    limits(),
+                    EvaluationPresentation::Lean,
+                )
+                .expect_err("the axiom check must finish before any IO is executed");
+            assert!(
+                matches!(
+                    inner_error(&error),
+                    fln::EngineExecutionError::EvaluationDependsOnSorry
+                ),
+                "{error:?}"
+            );
+            assert_eq!(std::fs::read(&sentinel).unwrap(), b"unchanged\n");
+            assert_eq!(engine.logical_root(&KVMap::new()), before);
+
+            let completed = run(&engine, &action("7"));
+            assert_eq!(completed.batch.source_evaluation_indices.len(), 1);
+            let index = completed.batch.source_evaluation_indices[0];
+            assert_format(&completed.batch.executions[index], "7", None);
+            assert_eq!(std::fs::read(&sentinel).unwrap(), b"unchanged\neffect\n");
+            assert_eq!(engine.logical_root(&KVMap::new()), before);
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
