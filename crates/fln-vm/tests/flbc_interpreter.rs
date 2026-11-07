@@ -1135,8 +1135,256 @@ fn erased_callable_results_transfer_through_calls_and_terminal_replay() {
     }
 }
 
+fn erased_overapplication(
+    terminal: bool,
+    final_result: CallableResultOwnership,
+    final_argument: ArgumentOwnership,
+) -> ValidatedProgram {
+    let mut code = vec![
+        Instruction::String {
+            dst: r(0),
+            value: "erased-overapplication".to_string(),
+        },
+        Instruction::Nat {
+            dst: r(1),
+            value: 20,
+        },
+        Instruction::Nat {
+            dst: r(2),
+            value: 22,
+        },
+        Instruction::Closure {
+            dst: r(3),
+            function: fid(1),
+            captures: Vec::new(),
+            capture_ownership: Vec::new(),
+        },
+    ];
+    let args = vec![r(0), r(1), r(2)];
+    let argument_ownership = vec![
+        ArgumentOwnership::Owned,
+        ArgumentOwnership::Borrowed,
+        ArgumentOwnership::Borrowed,
+    ];
+    code.push(if terminal {
+        Instruction::TailApply {
+            closure: r(3),
+            args,
+            argument_ownership,
+            result_ownership: CallableResultOwnership::Erased,
+        }
+    } else {
+        Instruction::Apply {
+            dst: r(4),
+            closure: r(3),
+            args,
+            argument_ownership,
+            result_ownership: CallableResultOwnership::Erased,
+        }
+    });
+    if !terminal {
+        code.push(Instruction::Return { src: r(4) });
+    }
+    validated(vec![
+        function_with_callable_result(0, Vec::new(), CallableResultOwnership::Erased, 5, code),
+        function_with_callable_result(
+            1,
+            vec![ArgumentOwnership::Owned],
+            CallableResultOwnership::Erased,
+            2,
+            vec![
+                Instruction::Closure {
+                    dst: r(1),
+                    function: fid(2),
+                    captures: vec![r(0)],
+                    capture_ownership: vec![ArgumentOwnership::Owned],
+                },
+                Instruction::Return { src: r(1) },
+            ],
+        ),
+        function_with_callable_result(
+            2,
+            vec![ArgumentOwnership::Owned, ArgumentOwnership::Borrowed],
+            CallableResultOwnership::Erased,
+            3,
+            vec![
+                Instruction::Closure {
+                    dst: r(2),
+                    function: fid(3),
+                    captures: vec![r(0), r(1)],
+                    capture_ownership: vec![ArgumentOwnership::Owned, ArgumentOwnership::Borrowed],
+                },
+                Instruction::Return { src: r(2) },
+            ],
+        ),
+        function_with_callable_result(
+            3,
+            vec![
+                ArgumentOwnership::Owned,
+                ArgumentOwnership::Borrowed,
+                final_argument,
+            ],
+            final_result,
+            5,
+            vec![
+                intrinsic(r(3), "extern:Nat.add", vec![r(1), r(2)]),
+                Instruction::Ctor {
+                    dst: r(4),
+                    tag: 3,
+                    fields: vec![r(0), r(3)],
+                    scalar_bytes: Vec::new(),
+                },
+                Instruction::Return { src: r(4) },
+            ],
+        ),
+    ])
+}
+
 #[test]
-fn erased_dynamic_contracts_do_not_authorize_mismatches_or_overapplication() {
+fn erased_overapplication_transfers_captures_and_checks_every_returned_closure() {
+    let _guard = lock();
+    for terminal in [false, true] {
+        let source = erased_overapplication(
+            terminal,
+            CallableResultOwnership::Erased,
+            ArgumentOwnership::Borrowed,
+        );
+        let owned = insert_ownership(&source, OwnershipLimits::default()).unwrap();
+        let bytes = encode_canonical(owned.program(), CodecLimits::default()).unwrap();
+        let decoded = decode_canonical(&bytes, CodecLimits::default()).unwrap();
+        let replay = validate_ownership_candidate(
+            &source,
+            decoded,
+            owned.witness().clone(),
+            OwnershipLimits::default(),
+        )
+        .unwrap();
+        for program in [&source, replay.program()] {
+            shadow::enable();
+            let completed = returned(execute(program, ExecutionLimits::default(), None));
+            assert_eq!(value_kind(&completed.value), ValueKind::Ctor(3));
+            assert_eq!(
+                string_contents(&completed.value.ctor_child(0)),
+                "erased-overapplication"
+            );
+            assert_eq!(completed.value.ctor_child(1).unbox(), 42);
+            assert_eq!(completed.usage.peak_stack_depth, 2);
+            let expected_usage = completed.usage;
+            drop(completed);
+
+            let mut caches = InlineCaches::try_new(8).unwrap();
+            for _ in 0..2 {
+                let cached = returned(execute_cached(
+                    program,
+                    ExecutionLimits::default(),
+                    None,
+                    cache_context(1, 11, Mode::Sound),
+                    &mut caches,
+                ));
+                assert_eq!(cached.usage, expected_usage);
+                assert_eq!(value_kind(&cached.value), ValueKind::Ctor(3));
+                assert_eq!(
+                    string_contents(&cached.value.ctor_child(0)),
+                    "erased-overapplication"
+                );
+                assert_eq!(cached.value.ctor_child(1).unbox(), 42);
+            }
+            assert!(caches.stats().hits > 0);
+            let (events, live) = shadow::disable_and_drain();
+            assert_eq!(live, 0, "erased overapplication releases captures");
+            assert!(events.iter().all(|event| !matches!(
+                event.kind,
+                shadow::EventKind::DoubleRelease | shadow::EventKind::ForeignPointer
+            )));
+
+            for max_steps in 0..expected_usage.steps {
+                shadow::enable();
+                assert!(matches!(
+                    execute(
+                        program,
+                        ExecutionLimits {
+                            max_steps,
+                            ..ExecutionLimits::default()
+                        },
+                        None,
+                    ),
+                    Outcome::Inconclusive(_)
+                ));
+                let (events, live) = shadow::disable_and_drain();
+                assert_eq!(live, 0, "terminal={terminal}, max_steps={max_steps}");
+                assert!(events.iter().all(|event| !matches!(
+                    event.kind,
+                    shadow::EventKind::DoubleRelease | shadow::EventKind::ForeignPointer
+                )));
+            }
+            shadow::enable();
+            assert!(matches!(
+                execute(
+                    program,
+                    ExecutionLimits {
+                        max_stack_depth: 1,
+                        ..ExecutionLimits::default()
+                    },
+                    None,
+                ),
+                Outcome::Inconclusive(_)
+            ));
+            let (events, live) = shadow::disable_and_drain();
+            assert_eq!(live, 0, "stack exhaustion releases pending arguments");
+            assert!(events.iter().all(|event| !matches!(
+                event.kind,
+                shadow::EventKind::DoubleRelease | shadow::EventKind::ForeignPointer
+            )));
+        }
+    }
+}
+
+#[test]
+fn erased_overapplication_preserves_the_final_argument_and_result_contracts() {
+    let _guard = lock();
+    for terminal in [false, true] {
+        for (final_result, final_argument) in [
+            (CallableResultOwnership::Owned, ArgumentOwnership::Borrowed),
+            (CallableResultOwnership::Erased, ArgumentOwnership::Owned),
+        ] {
+            let source = erased_overapplication(terminal, final_result, final_argument);
+            let owned = insert_ownership(&source, OwnershipLimits::default()).unwrap();
+            let bytes = encode_canonical(owned.program(), CodecLimits::default()).unwrap();
+            let replay = decode_canonical(&bytes, CodecLimits::default()).unwrap();
+            shadow::enable();
+            for program in [&source, &replay] {
+                let outcome = execute(program, ExecutionLimits::default(), None);
+                if final_result == CallableResultOwnership::Owned {
+                    assert!(matches!(outcome, Outcome::Complete(VmExit::Refused {
+                        refusal: VmRefusal::ApplyResultOwnershipMismatch {
+                            function,
+                            expected: CallableResultOwnership::Owned,
+                            actual: CallableResultOwnership::Erased,
+                        }, ..
+                    }) if function == fid(3)));
+                } else {
+                    assert!(matches!(outcome, Outcome::Complete(VmExit::Refused {
+                        refusal: VmRefusal::ApplyOwnershipMismatch {
+                            function,
+                            argument: 0,
+                            expected: ArgumentOwnership::Owned,
+                            actual: ArgumentOwnership::Borrowed,
+                        }, ..
+                    }) if function == fid(3)));
+                }
+            }
+            let (events, live) = shadow::disable_and_drain();
+            assert_eq!(live, 0, "later contract refusal releases captures and arguments");
+            assert!(events.iter().all(|event| !matches!(
+                event.kind,
+                shadow::EventKind::DoubleRelease | shadow::EventKind::ForeignPointer
+            )));
+        }
+    }
+}
+
+#[test]
+fn erased_dynamic_contracts_refuse_mismatches_and_noncallable_overapplication() {
     let _guard = lock();
     for terminal in [false, true] {
         for (callee_result, call_result, extra_argument, expected, actual) in [
@@ -1225,13 +1473,30 @@ fn erased_dynamic_contracts_do_not_authorize_mismatches_or_overapplication() {
             let replay = decode_canonical(&bytes, CodecLimits::default()).unwrap();
             shadow::enable();
             for program in [&source, &replay] {
-                assert!(matches!(execute(program, ExecutionLimits::default(), None),
-                    Outcome::Complete(VmExit::Refused {
-                        refusal: VmRefusal::ApplyResultOwnershipMismatch {
-                            function, expected: got_expected, actual: got_actual,
-                        }, ..
-                    }) if function == fid(1) && got_expected == expected && got_actual == actual
-                ));
+                let outcome = execute(program, ExecutionLimits::default(), None);
+                if extra_argument {
+                    assert!(matches!(
+                        outcome,
+                        Outcome::Complete(VmExit::Refused {
+                            refusal: VmRefusal::TypeMismatch {
+                                operation: "apply",
+                                argument: 0,
+                                expected: "Golem closure",
+                                actual: ValueKind::String,
+                            },
+                            ..
+                        })
+                    ));
+                } else {
+                    assert!(matches!(outcome,
+                        Outcome::Complete(VmExit::Refused {
+                            refusal: VmRefusal::ApplyResultOwnershipMismatch {
+                                function, expected: got_expected, actual: got_actual,
+                            }, ..
+                        }) if function == fid(1)
+                            && got_expected == expected && got_actual == actual
+                    ));
+                }
             }
             let (events, live) = shadow::disable_and_drain();
             assert_eq!(

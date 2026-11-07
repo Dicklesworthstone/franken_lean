@@ -4261,7 +4261,15 @@ fn validate_inspected_apply(
             actual,
         });
     }
-    if argument_count > required && callee.result_ownership != CallableResultOwnership::Owned {
+    // Erased ABI results may carry owned closures. The return continuation
+    // inspects the actual value and validates every remaining argument
+    // segment before calling it; the final result contract stays exact.
+    if argument_count > required
+        && !matches!(
+            callee.result_ownership,
+            CallableResultOwnership::Owned | CallableResultOwnership::Erased
+        )
+    {
         return Err(VmRefusal::ApplyResultOwnershipMismatch {
             function,
             expected: CallableResultOwnership::Owned,
