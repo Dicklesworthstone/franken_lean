@@ -372,25 +372,37 @@ fn native_boxed_proof_arguments_never_hide_bad_scope_arity_or_bounds() {
         ),
         Err(IrExecutionError::IrValidation(_))
     ));
+    let saturated = read(vec![IrArg::Erased, var(4)], vec![var(7), IrArg::Erased], 0).unwrap();
+    assert_nat(&saturated, "19");
     let overapplied = read(
         vec![IrArg::Erased, var(4)],
         vec![var(7), IrArg::Erased, IrArg::Erased],
         0,
     )
     .unwrap();
-    assert!(matches!(
-        overapplied
-            .execute(ExecutionLimits::default(), None)
-            .outcome,
-        Outcome::Complete(VmExit::Refused {
-            refusal: VmRefusal::ApplyResultOwnershipMismatch {
-                expected: flbc::CallableResultOwnership::Owned,
-                actual: flbc::CallableResultOwnership::Erased,
-                ..
-            },
-            ..
-        })
-    ));
+    let source = overapplied.program.program();
+    let bytes = flbc::encode_canonical(source, flbc::CodecLimits::default()).unwrap();
+    let replay = flbc::decode_canonical(&bytes, flbc::CodecLimits::default()).unwrap();
+    for program in [source, &replay] {
+        // The getter returns 19. Its remaining argument must be refused by
+        // dynamic closure validation, including after canonical bytecode replay.
+        let outcome = execute(program, ExecutionLimits::default(), None);
+        assert!(
+            matches!(
+                outcome,
+                Outcome::Complete(VmExit::Refused {
+                    refusal: VmRefusal::TypeMismatch {
+                        operation: "apply",
+                        argument: 0,
+                        expected: "Golem closure",
+                        actual: fln_vm::interpreter::ValueKind::Scalar,
+                    },
+                    ..
+                })
+            ),
+            "{outcome:?}"
+        );
+    }
     for index in [0, 1] {
         // Applying only the index leaves the erased proof pending. Neither a
         // successful read nor an out-of-bounds read may execute at this stage.
