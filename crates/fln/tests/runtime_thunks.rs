@@ -98,6 +98,10 @@ fn fixture(test: impl FnOnce(&Engine, &Path) + Send + 'static) {
                     .collect();
                 let mut admission =
                     SourceOleanImportLimits::new(OleanCheckLimits::new(STACK, limits().kernel));
+                // The pin's 38-module closure captures 98,317,976 bytes across
+                // its public and private views. Allow a bounded 128 MiB total
+                // while retaining the separate artifact and stack limits.
+                admission.max_capture_bytes = 2 * STACK;
                 admission.jobs.threads = std::num::NonZeroUsize::new(1).unwrap();
                 admission.jobs.worker_stack_bytes = STACK;
                 admission.read_jobs = admission.jobs;
@@ -226,30 +230,36 @@ fn check_native(engine: &Engine, source: &str, trace: &str, expected: ClosedVmVa
 #[test]
 fn checked_thunks_share_forces_keep_allocations_distinct_and_delay_only_the_body() {
     fixture(|engine, compiler| {
-        for (source, trace) in [
+        for (source, trace, constructor) in [
             (
                 r#"#eval let t := Thunk.mk (fun _ => dbg_trace "forced"; 21); t.get + t.get"#,
                 "forced\n",
+                Some("extern:Thunk.mk"),
             ),
             (
                 r#"#eval let t := Thunk.mk (fun _ => dbg_trace "alias"; 21); let pair := (t, t); pair.1.get + pair.2.get"#,
                 "alias\n",
+                Some("extern:Thunk.mk"),
             ),
             (
                 r#"#eval let _t := Thunk.mk (fun _ => dbg_trace "unforced"; 21); 42"#,
                 "",
+                None,
             ),
             (
                 r#"#eval let t := (dbg_trace "producer"; Thunk.mk (fun _ => dbg_trace "body"; 21)); t.get + t.get"#,
                 "producer\nbody\n",
+                Some("extern:Thunk.mk"),
             ),
             (
                 r#"#eval let a := Thunk.mk (fun _ => dbg_trace "allocation a"; 21); let first := a.get; let b := Thunk.mk (fun _ => dbg_trace "allocation b"; first); first + b.get"#,
                 "allocation a\nallocation b\n",
+                Some("extern:Thunk.mk"),
             ),
             (
                 r#"#eval let t := Thunk.pure (dbg_trace "eager"; 21); t.get + t.get"#,
                 "eager\n",
+                Some("extern:Thunk.pure"),
             ),
         ] {
             let artifact = check(
@@ -273,18 +283,15 @@ fn checked_thunks_share_forces_keep_allocations_distinct_and_delay_only_the_body
                     }
                 })
                 .collect();
-            if source.contains("t.get") || source.contains("a.get") || source.contains("pair.1.get")
-            {
-                assert!(rows.contains("extern:Thunk.get"), "{rows:?}");
+            if let Some(constructor) = constructor {
+                assert!(rows.contains(constructor), "{source}\n{rows:?}");
+                assert!(rows.contains("extern:Thunk.get"), "{source}\n{rows:?}");
+            } else {
+                assert!(
+                    rows.is_empty(),
+                    "unused thunk retained intrinsics: {rows:?}"
+                );
             }
-            assert!(
-                rows.contains(if source.contains("Thunk.pure") {
-                    "extern:Thunk.pure"
-                } else {
-                    "extern:Thunk.mk"
-                }),
-                "{rows:?}"
-            );
         }
     });
 }
@@ -411,10 +418,6 @@ fn unused_computed_initializers_disappear_without_reordering_live_closures() {
                 "nested used closure\n",
             ),
             (
-                r#"#eval let saved : String := "retained"; let _unused : Nat -> String := (dbg_trace "unused owned capture"; fun _ => saved); let f : Nat -> Nat := fun n => n + saved.length; f 34"#,
-                "",
-            ),
-            (
                 r#"#eval let before : Nat := (dbg_trace "before"; 20); let _unused : Nat -> Nat := (dbg_trace "unused between"; fun n => n + 1); let after : Nat := (dbg_trace "after"; 22); before + after"#,
                 "before\nafter\n",
             ),
@@ -428,6 +431,14 @@ fn unused_computed_initializers_disappear_without_reordering_live_closures() {
                 "42",
             );
         }
+        check(
+            engine,
+            compiler,
+            r#"#eval let saved : String := "retained"; let _unused : Nat -> String := (dbg_trace "unused owned capture"; fun _ => saved); let f : Nat -> String := fun _ => saved; f 34"#,
+            "",
+            ClosedVmValue::String("retained".to_owned()),
+            "\"retained\"",
+        );
     });
 }
 
@@ -454,12 +465,21 @@ noncomputable def hidden : Nat := unavailable
                     .execute_source_definitions(&[source.as_bytes()], &KVMap::new(), limits())
                     .unwrap_err()
             });
-            assert!(matches!(
-                cause(error),
-                EngineExecutionError::Ingress(fln::IngressError::UnsupportedNode {
-                    kind: "noncomputable runtime dependency"
-                })
-            ));
+            let error = cause(error);
+            // Source admission checks computability before runtime lowering.
+            assert!(
+                matches!(
+                    &error,
+                    EngineExecutionError::Frontend(fln::DefinitionFrontendError::Elaborate(
+                        fln_elab::NatDefinitionElabError::Inference(
+                            fln_elab::source::SourceInferenceError::NoncomputableDependency(
+                                dependency
+                            )
+                        )
+                    )) if dependency == &name("hidden")
+                ),
+                "{source}\n{error:?}"
+            );
             assert!(trace.is_empty());
             assert_eq!(engine.logical_root(&KVMap::new()), root);
         }
