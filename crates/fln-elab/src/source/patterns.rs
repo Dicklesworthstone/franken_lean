@@ -988,6 +988,16 @@ impl Context {
         required: &mut Vec<Name>,
         recursive_column: Option<usize>,
     ) -> Result<Syntax, NatDefinitionElabError> {
+        self.compile_pattern_matrix_recording(syntax, required, recursive_column, None)
+    }
+
+    fn compile_pattern_matrix_recording(
+        &mut self,
+        syntax: &Syntax,
+        required: &mut Vec<Name>,
+        recursive_column: Option<usize>,
+        original: Option<&Syntax>,
+    ) -> Result<Syntax, NatDefinitionElabError> {
         let recursive_root = recursive_column.is_some();
         let parts = expect_node(
             syntax,
@@ -1028,6 +1038,15 @@ impl Context {
                 self.check_preresolved_pattern_syntax(&expanded)?;
             }
             expanded_patterns.push(expanded);
+        }
+        if let Some(original) = original
+            && self.equation_pattern_source == Some(std::ptr::from_ref(original).addr())
+        {
+            let patterns = expanded_patterns
+                .iter()
+                .map(|pattern| self.copy_pattern_syntax(pattern))
+                .collect::<Result<Vec<_>, _>>()?;
+            self.equation_patterns = Some(std::sync::Arc::new(patterns));
         }
         let mut arena = vec![Pattern::Bind(None)];
         let mut rows = Vec::new();
@@ -1866,7 +1885,12 @@ impl Context {
                         } else {
                             None
                         };
-                        self.compile_pattern_matrix(&node, &mut required, column)?
+                        self.compile_pattern_matrix_recording(
+                            &node,
+                            &mut required,
+                            column,
+                            Some(original),
+                        )?
                     } else {
                         node
                     };

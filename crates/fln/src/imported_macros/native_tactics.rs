@@ -57,11 +57,9 @@ impl NativeTacticMacro {
         if partition.classify(declaration) != Some(GraphClass::ToolchainApi) {
             return None;
         }
-        Self::ALL
-            .into_iter()
-            .find(|candidate| {
-                *module == name(candidate.module()) && *declaration == name(candidate.declaration())
-            })
+        Self::ALL.into_iter().find(|candidate| {
+            *module == name(candidate.module()) && *declaration == name(candidate.declaration())
+        })
     }
 
     fn module(self) -> &'static str {
@@ -194,7 +192,10 @@ impl NativeTacticMacro {
             }
             Self::NoFun => tactic(
                 "exact",
-                vec![atom("exact"), node("Lean.Parser.Term.nofun", vec![atom("nofun")])],
+                vec![
+                    atom("exact"),
+                    node("Lean.Parser.Term.nofun", vec![atom("nofun")]),
+                ],
             ),
             Self::Exfalso => tactic(
                 "refine",

@@ -1186,7 +1186,13 @@ fn erased_overapplication(
         code.push(Instruction::Return { src: r(4) });
     }
     validated(vec![
-        function_with_callable_result(0, Vec::new(), CallableResultOwnership::Erased, 5, code),
+        function_with_callable_result(
+            0,
+            Vec::new(),
+            CallableResultOwnership::Erased,
+            5,
+            code,
+        ),
         function_with_callable_result(
             1,
             vec![ArgumentOwnership::Owned],
@@ -1212,7 +1218,10 @@ fn erased_overapplication(
                     dst: r(2),
                     function: fid(3),
                     captures: vec![r(0), r(1)],
-                    capture_ownership: vec![ArgumentOwnership::Owned, ArgumentOwnership::Borrowed],
+                    capture_ownership: vec![
+                        ArgumentOwnership::Owned,
+                        ArgumentOwnership::Borrowed,
+                    ],
                 },
                 Instruction::Return { src: r(2) },
             ],
@@ -1374,7 +1383,10 @@ fn erased_overapplication_preserves_the_final_argument_and_result_contracts() {
                 }
             }
             let (events, live) = shadow::disable_and_drain();
-            assert_eq!(live, 0, "later contract refusal releases captures and arguments");
+            assert_eq!(
+                live, 0,
+                "later contract refusal releases captures and arguments"
+            );
             assert!(events.iter().all(|event| !matches!(
                 event.kind,
                 shadow::EventKind::DoubleRelease | shadow::EventKind::ForeignPointer

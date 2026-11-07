@@ -42,11 +42,10 @@ impl Templates {
             let unbacked: Vec<_> = grammar
                 .rules()
                 .flat_map(|(kind, rule)| {
-                    rule.cases().enumerate().filter_map(move |(index, case)| {
-                        case.source
-                            .is_none()
-                            .then(|| (kind.clone(), index, case.rhs.clone()))
-                    })
+                    rule.cases()
+                        .enumerate()
+                        .filter(|(_, case)| case.source.is_none())
+                        .map(move |(index, case)| (kind.clone(), index, case.rhs.clone()))
                 })
                 .collect();
             for (kind, index, rhs) in unbacked {
@@ -338,9 +337,9 @@ fn atomic_literal_pattern_chains_advance_the_provider_recursion_depth() {
                 .filter(|(spelling, _)| spelling == literal)
                 .count()
         };
-        // Equation-info capture can elaborate the original source pattern
-        // again. Each source expansion chain has its own terminal lookup; the
-        // generated comparison must not add a lookup of that terminal value.
+        // The matrix and equation capture share this occurrence's prepared
+        // row. Neither capture nor a generated comparison adds a lookup.
+        assert_eq!(count("1"), 1);
         assert_eq!(count("11"), count("1"));
     }
     let provider = Templates::new(&[
@@ -424,6 +423,50 @@ fn expanded_literal_patterns_reach_dependent_index_typing_checks() {
         checked_in(source, Templates::new(&[]), &environment)
             .unwrap_or_else(|error| panic!("{source}: {error:?}"));
     }
+}
+
+#[test]
+fn atomic_term_macro_chains_reach_the_bound_without_recursive_evaluators() {
+    let provider = Templates::new(&[
+        "macro_rules | `(1) => `(2)",
+        "macro_rules | `(2) => `(3)",
+        "macro_rules | `(3) => `(4)",
+        "macro_rules | `(4) => `(5)",
+        "macro_rules | `(5) => `(6)",
+        "macro_rules | `(6) => `(7)",
+        "macro_rules | `(7) => `(8)",
+        "macro_rules | `(8) => `(9)",
+    ]);
+    let environment = environment();
+    let declaration = checked_in("def chain : Nat := 1", provider.clone(), &environment).unwrap();
+    assert_eq!(
+        *provider.depths.lock().unwrap(),
+        (1usize..=9)
+            .map(|literal| (literal.to_string(), literal - 1))
+            .collect::<Vec<_>>(),
+        "each root and the terminal lookup runs once at its reader depth"
+    );
+    let environment = publish(&environment, declaration);
+    checked_in(
+        "theorem completedChain : Eq chain 9 := Eq.refl 9",
+        Templates::new(&[]),
+        &environment,
+    )
+    .unwrap();
+
+    let provider = Templates::new(&["macro_rules | `(1) => `(2)", "macro_rules | `(2) => `(1)"]);
+    let error = checked("def cyclic : Nat := 1", provider.clone()).unwrap_err();
+    assert!(matches!(
+        error,
+        NatDefinitionElabError::Inference(SourceInferenceError::TacticMacro(
+            TacticMacroError::Inconclusive(_)
+        ))
+    ));
+    assert_eq!(
+        provider.depths.lock().unwrap().last().map(|(_, depth)| *depth),
+        Some(8),
+        "cycles retain the existing owned-expansion bound"
+    );
 }
 
 #[test]

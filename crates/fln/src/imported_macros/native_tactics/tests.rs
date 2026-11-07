@@ -451,7 +451,9 @@ fn control_body() -> Syntax {
                     .unwrap(),
                 val: Name::num(name("Captured._hyg"), 23),
                 preresolved: vec![
-                    Preresolved::Namespace { ns: name("Imported") },
+                    Preresolved::Namespace {
+                        ns: name("Imported"),
+                    },
                     Preresolved::Decl {
                         name: name("Target"),
                         fields: vec!["field".to_owned()],
@@ -522,7 +524,10 @@ fn expanded_control(candidate: NativeTacticMacro, input: &Syntax) -> Syntax {
     assert!(execution.reference_functions.is_empty());
     assert_eq!(execution.native_functions, vec![candidate.id()]);
     assert_eq!(execution.vm_usage.unwrap().steps, 1);
-    let Outcome::Complete(Ok(MacroResult::Expanded { syntax, state: next })) = execution.outcome
+    let Outcome::Complete(Ok(MacroResult::Expanded {
+        syntax,
+        state: next,
+    })) = execution.outcome
     else {
         panic!("native {candidate:?}: {execution:?}");
     };
@@ -572,24 +577,38 @@ fn native_control_macros_preserve_refusals_limits_and_recovery() {
                 MacroLimits::default(),
                 None,
             );
-            assert!(matches!(execution.outcome,
-                Outcome::Complete(Ok(MacroResult::Unsupported { state: next })) if next == state()));
+            assert!(matches!(
+                execution.outcome,
+                Outcome::Complete(Ok(MacroResult::Unsupported { state: next })) if next == state()
+            ));
         }
         for limits in [
             MacroLimits {
-                vm: ExecutionLimits { max_steps: 0, ..ExecutionLimits::default() },
+                vm: ExecutionLimits {
+                    max_steps: 0,
+                    ..ExecutionLimits::default()
+                },
                 ..MacroLimits::default()
             },
             MacroLimits {
-                vm: ExecutionLimits { max_stack_depth: 0, ..ExecutionLimits::default() },
+                vm: ExecutionLimits {
+                    max_stack_depth: 0,
+                    ..ExecutionLimits::default()
+                },
                 ..MacroLimits::default()
             },
             MacroLimits {
-                syntax: SyntaxLimits { max_nodes: 2, ..SyntaxLimits::default() },
+                syntax: SyntaxLimits {
+                    max_nodes: 2,
+                    ..SyntaxLimits::default()
+                },
                 ..MacroLimits::default()
             },
             MacroLimits {
-                syntax: SyntaxLimits { max_bytes: 32, ..SyntaxLimits::default() },
+                syntax: SyntaxLimits {
+                    max_bytes: 32,
+                    ..SyntaxLimits::default()
+                },
                 ..MacroLimits::default()
             },
         ] {
@@ -601,7 +620,10 @@ fn native_control_macros_preserve_refusals_limits_and_recovery() {
                 limits,
                 None,
             );
-            assert!(matches!(execution.outcome, Outcome::Inconclusive(_)), "{execution:?}");
+            assert!(
+                matches!(execution.outcome, Outcome::Inconclusive(_)),
+                "{execution:?}"
+            );
         }
         let cancelled = control_execute(
             candidate,
@@ -629,8 +651,10 @@ fn native_control_macros_preserve_refusals_limits_and_recovery() {
             MacroLimits::default(),
             None,
         );
-        assert!(matches!(rejected.outcome,
-            Outcome::Complete(Err(super::super::MacroExecutionError::Conversion(_)))));
+        assert!(matches!(
+            rejected.outcome,
+            Outcome::Complete(Err(super::super::MacroExecutionError::Conversion(_)))
+        ));
         assert_eq!(expanded_control(candidate, &input), baseline);
     }
 }
@@ -644,7 +668,11 @@ fn control_name(value: &Name) -> String {
     match value.leaf_view() {
         LeafView::Anonymous => "a".to_owned(),
         LeafView::Str(component) => {
-            format!("s{}{}", control_name(&value.parent()), control_text(component))
+            format!(
+                "s{}{}",
+                control_name(&value.parent()),
+                control_text(component)
+            )
         }
         LeafView::Num(component) => format!("u{}{component};", control_name(&value.parent())),
     }
@@ -657,10 +685,19 @@ fn control_raw(backing: &str, span: ByteSpan) -> String {
 fn control_info(info: SourceInfo) -> String {
     match info {
         SourceInfo::None => "-".to_owned(),
-        SourceInfo::Synthetic { pos, end_pos, canonical } => {
+        SourceInfo::Synthetic {
+            pos,
+            end_pos,
+            canonical,
+        } => {
             format!("s{},{},{};", pos.0, end_pos.0, u8::from(canonical))
         }
-        SourceInfo::Original { leading, pos, trailing, end_pos } => format!(
+        SourceInfo::Original {
+            leading,
+            pos,
+            trailing,
+            end_pos,
+        } => format!(
             "o{}{};{}{};",
             control_raw(source().as_str(), leading),
             pos.0,
@@ -680,19 +717,30 @@ fn control_syntax(syntax: &Syntax) -> String {
             args.iter().map(control_syntax).collect::<String>(),
         ),
         Syntax::Atom { info, val } => format!("A{}{}", control_info(*info), control_text(val)),
-        Syntax::Ident { info, raw_val, val, preresolved } => format!(
+        Syntax::Ident {
+            info,
+            raw_val,
+            val,
+            preresolved,
+        } => format!(
             "I{}{}{}[{}]",
             control_info(*info),
             control_raw(raw_val.backing(&source()), raw_val.span()),
             control_name(val),
-            preresolved.iter().map(|entry| match entry {
-                Preresolved::Namespace { ns } => format!("n{}", control_name(ns)),
-                Preresolved::Decl { name, fields } => format!(
-                    "d{}[{}]",
-                    control_name(name),
-                    fields.iter().map(|field| control_text(field)).collect::<String>(),
-                ),
-            }).collect::<String>(),
+            preresolved
+                .iter()
+                .map(|entry| match entry {
+                    Preresolved::Namespace { ns } => format!("n{}", control_name(ns)),
+                    Preresolved::Decl { name, fields } => format!(
+                        "d{}[{}]",
+                        control_name(name),
+                        fields
+                            .iter()
+                            .map(|field| control_text(field))
+                            .collect::<String>(),
+                    ),
+                })
+                .collect::<String>(),
         ),
     }
 }
@@ -703,68 +751,132 @@ fn live_pinned_control_candidates_match_complete_quotations_and_state() {
     use std::process::Command;
 
     let Some(reference) = std::env::var_os("FLN_REFERENCE_LEAN").map(PathBuf::from) else {
-        assert!(std::env::var_os("FLN_REQUIRE_REFERENCE").is_none(),
-            "pinned Reference required for native control macro comparison");
+        assert!(
+            std::env::var_os("FLN_REQUIRE_REFERENCE").is_none(),
+            "pinned Reference required for native control macro comparison"
+        );
         eprintln!("SKIP: native control quotations require FLN_REFERENCE_LEAN");
         return;
     };
-    let version = Command::new(&reference).args(["-j1", "--githash"]).output().unwrap();
+    let version = Command::new(&reference)
+        .args(["-j1", "--githash"])
+        .output()
+        .unwrap();
     assert!(version.status.success());
-    assert_eq!(String::from_utf8(version.stdout).unwrap().trim(), fln_olean::format::PIN_COMMIT);
+    assert_eq!(
+        String::from_utf8(version.stdout).unwrap().trim(),
+        fln_olean::format::PIN_COMMIT
+    );
     let partition_path = std::env::var_os("FLN_REFERENCE_PARTITION")
         .map(PathBuf::from)
-        .unwrap_or_else(|| fln_core::checked_workspace_root!().join("contracts/builtin_partition.tsv"));
-    let partition = VerifiedPartition::from_pinned_tsv(
-        &std::fs::read_to_string(partition_path).unwrap(),
-    ).unwrap();
+        .unwrap_or_else(|| {
+            fln_core::checked_workspace_root!().join("contracts/builtin_partition.tsv")
+        });
+    let partition =
+        VerifiedPartition::from_pinned_tsv(&std::fs::read_to_string(partition_path).unwrap())
+            .unwrap();
     for candidate in CONTROL_CANDIDATES {
-        assert_eq!(NativeTacticMacro::identify(
-            &name(candidate.module()), &name(candidate.declaration()), &partition,
-        ), Some(candidate));
+        assert_eq!(
+            NativeTacticMacro::identify(
+                &name(candidate.module()),
+                &name(candidate.declaration()),
+                &partition,
+            ),
+            Some(candidate)
+        );
         for (module, declaration) in [
             (name("User"), name(candidate.declaration())),
-            (name(candidate.module()), Name::str(Name::anonymous(), candidate.declaration())),
-            (name(candidate.module()), Name::str(name(candidate.declaration()), "_redArg")),
+            (
+                name(candidate.module()),
+                Name::str(Name::anonymous(), candidate.declaration()),
+            ),
+            (
+                name(candidate.module()),
+                Name::str(name(candidate.declaration()), "_redArg"),
+            ),
         ] {
-            assert_eq!(NativeTacticMacro::identify(&module, &declaration, &partition), None);
+            assert_eq!(
+                NativeTacticMacro::identify(&module, &declaration, &partition),
+                None
+            );
         }
     }
     let root = std::env::var_os("FLN_IR_REFERENCE_ARTIFACTS")
-        .map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
     let unique = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
     let dir = root.join(format!("native-control-{}-{unique}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(dir.join("NativeControlMacros.lean"),
-        include_str!("../../../../fln-olean/fixtures/NativeControlMacros.lean")).unwrap();
-    let result = Command::new(&reference).current_dir(&dir)
-        .args(["-j1", "NativeControlMacros.lean"]).output().unwrap();
+    std::fs::write(
+        dir.join("NativeControlMacros.lean"),
+        include_str!("../../../../fln-olean/fixtures/NativeControlMacros.lean"),
+    )
+    .unwrap();
+    let result = Command::new(&reference)
+        .current_dir(&dir)
+        .args(["-j1", "NativeControlMacros.lean"])
+        .output()
+        .unwrap();
     std::fs::write(dir.join("oracle.stdout"), &result.stdout).unwrap();
     std::fs::write(dir.join("oracle.stderr"), &result.stderr).unwrap();
-    assert!(result.status.success(), "{dir:?}: {}{}",
-        String::from_utf8_lossy(&result.stdout), String::from_utf8_lossy(&result.stderr));
+    assert!(
+        result.status.success(),
+        "{dir:?}: {}{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
     let mut native = String::new();
     let mut cases = 0;
     for candidate in CONTROL_CANDIDATES {
         for context in contexts() {
             for (reference, _) in references() {
                 for input in control_inputs(candidate) {
-                    let execution = control_execute(candidate, &input, &context, &reference,
-                        MacroLimits::default(), None);
+                    let execution = control_execute(
+                        candidate,
+                        &input,
+                        &context,
+                        &reference,
+                        MacroLimits::default(),
+                        None,
+                    );
                     assert!(execution.reference_functions.is_empty());
                     assert_eq!(execution.native_functions, vec![candidate.id()]);
-                    let Outcome::Complete(Ok(MacroResult::Expanded { syntax, state: next })) = execution.outcome
-                    else { panic!("{execution:?}"); };
-                    native.push_str(&format!("ok:{}:{}\n", control_syntax(&syntax), next == state()));
+                    let Outcome::Complete(Ok(MacroResult::Expanded {
+                        syntax,
+                        state: next,
+                    })) = execution.outcome
+                    else {
+                        panic!("{execution:?}");
+                    };
+                    native.push_str(&format!(
+                        "ok:{}:{}\n",
+                        control_syntax(&syntax),
+                        next == state()
+                    ));
                     cases += 1;
                 }
             }
         }
-        for input in [Syntax::Missing, atom(SourceInfo::None, "wrong"), node("User.tactic", vec![])] {
-            let execution = control_execute(candidate, &input, &contexts()[0], &Syntax::Missing,
-                MacroLimits::default(), None);
+        for input in [
+            Syntax::Missing,
+            atom(SourceInfo::None, "wrong"),
+            node("User.tactic", vec![]),
+        ] {
+            let execution = control_execute(
+                candidate,
+                &input,
+                &contexts()[0],
+                &Syntax::Missing,
+                MacroLimits::default(),
+                None,
+            );
             let Outcome::Complete(Ok(MacroResult::Unsupported { state: next })) = execution.outcome
-            else { panic!("{execution:?}"); };
+            else {
+                panic!("{execution:?}");
+            };
             native.push_str(&format!("unsupported:{}\n", next == state()));
         }
     }
