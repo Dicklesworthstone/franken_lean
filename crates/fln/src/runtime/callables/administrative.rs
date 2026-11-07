@@ -204,7 +204,7 @@ impl Preparation<'_> {
                         // position, even if it is an actual computation.
                         value
                     } else if matches!(value.node(), ExprNode::BVar { .. } | ExprNode::Lit { .. })
-                        && self.administrative_local_absent(&body)?
+                        && self.local_absent(&body)?
                     {
                         // Absence includes checked type annotations, so
                         // removing this slot also preserves dependent scopes.
@@ -226,7 +226,10 @@ impl Preparation<'_> {
         Ok(matches!(result.node(), ExprNode::Lam { .. }).then_some(result))
     }
 
-    fn administrative_local_absent(&mut self, body: &Expr) -> Result<bool, IngressError> {
+    /// Bound occurrence analysis in both executable terms and their checked
+    /// type annotations. Absence permits removing a slot structurally; callers
+    /// separately establish whether its initializer may be discarded.
+    pub(in crate::runtime) fn local_absent(&mut self, body: &Expr) -> Result<bool, IngressError> {
         let mut pending = vec![(body.clone(), 0usize)];
         while let Some((expr, depth)) = pending.pop() {
             self.tick()?;

@@ -144,13 +144,17 @@ fn fixture(test: impl FnOnce(&Engine, &Path) + Send + 'static) {
         .unwrap();
 }
 
-fn pin(compiler: &Path, source: &str, trace: &str, printed: &str) {
+fn pin_output(compiler: &Path, source: &str) -> std::process::Output {
     static NEXT: AtomicUsize = AtomicUsize::new(0);
     let directory = std::env::temp_dir().join(format!("fln-source-thunks-{}", std::process::id()));
     std::fs::create_dir_all(&directory).unwrap();
     let path = directory.join(format!("{}.lean", NEXT.fetch_add(1, Ordering::Relaxed)));
     std::fs::write(&path, format!("{HEADER}{source}")).unwrap();
-    let output = Command::new(compiler).arg(path).output().unwrap();
+    Command::new(compiler).arg(path).output().unwrap()
+}
+
+fn pin(compiler: &Path, source: &str, trace: &str, printed: &str) {
+    let output = pin_output(compiler, source);
     let stdout = String::from_utf8(output.stdout).unwrap();
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(output.status.success(), "{source}\n{stdout}{stderr}");
@@ -353,6 +357,120 @@ fn recursive_local_closures_discard_unused_values_and_share_used_values() {
                 &value.to_string(),
             );
         }
+    });
+}
+
+#[test]
+fn unused_computed_initializers_disappear_without_reordering_live_closures() {
+    fixture(|engine, compiler| {
+        for (source, trace) in [
+            (
+                r#"#eval let _unused : Nat -> Nat := (dbg_trace "unused closure"; fun n => n + 1); 42"#,
+                "",
+            ),
+            (
+                r#"#eval let _unused : Nat := (dbg_trace "unused scalar"; 5); 42"#,
+                "",
+            ),
+            (
+                r#"#eval let first : Nat := (dbg_trace "transitively unused"; 5); let _last := first; 42"#,
+                "",
+            ),
+            (
+                r#"def makeDead (n : Nat) : Nat -> Nat := dbg_trace "unused factory"; fun x => n + x
+#eval let _unused : Nat -> Nat := makeDead 1; 42"#,
+                "",
+            ),
+            (
+                r#"#eval let f : Nat -> Nat := (dbg_trace "used closure"; fun n => n + 1); f 41"#,
+                "used closure\n",
+            ),
+            (
+                r#"#eval let f : Nat -> Nat := (dbg_trace "shared closure"; fun n => n + 1); f 20 + f 20"#,
+                "shared closure\n",
+            ),
+            (
+                r#"def makeShared (n : Nat) : Nat -> Nat := dbg_trace "shared factory"; fun x => n + x
+#eval let f : Nat -> Nat := makeShared 20; f 1 + f 1"#,
+                "shared factory\n",
+            ),
+            (
+                r#"#eval let f : Nat -> Nat := (let _unused : Nat := (dbg_trace "unused prefix"; 5); fun n => n + 1); f 41"#,
+                "",
+            ),
+            (
+                r#"#eval let f : Nat -> Nat := (let paid : Nat := (dbg_trace "captured prefix"; 1); fun n => n + paid); f 20 + f 20"#,
+                "captured prefix\n",
+            ),
+            (
+                r#"#eval (fun outer : Nat => let _unused : Nat -> Nat := (dbg_trace "nested unused closure"; fun n => n + outer); outer) 42"#,
+                "",
+            ),
+            (
+                r#"#eval (fun outer : Nat => let f : Nat -> Nat := (dbg_trace "nested used closure"; fun n => n + outer); f 1) 41"#,
+                "nested used closure\n",
+            ),
+            (
+                r#"#eval let saved : String := "retained"; let _unused : Nat -> String := (dbg_trace "unused owned capture"; fun _ => saved); let f : Nat -> Nat := fun n => n + saved.length; f 34"#,
+                "",
+            ),
+            (
+                r#"#eval let before : Nat := (dbg_trace "before"; 20); let _unused : Nat -> Nat := (dbg_trace "unused between"; fun n => n + 1); let after : Nat := (dbg_trace "after"; 22); before + after"#,
+                "before\nafter\n",
+            ),
+        ] {
+            check(
+                engine,
+                compiler,
+                source,
+                trace,
+                ClosedVmValue::Scalar(42),
+                "42",
+            );
+        }
+    });
+}
+
+#[test]
+fn dead_source_initializers_still_require_checked_computable_dependencies() {
+    fixture(|engine, compiler| {
+        let root = engine.logical_root(&KVMap::new());
+        for source in [
+            "axiom unavailable : Nat\nnoncomputable def hidden : Nat := unavailable\n#eval let _unused : Nat := hidden; 42",
+            r#"axiom unavailable : Nat
+noncomputable def hidden : Nat := unavailable
+#eval let _unused : Nat -> Nat := (dbg_trace "MUST_NOT_RUN"; fun _ => hidden); 42"#,
+        ] {
+            let output = pin_output(compiler, source);
+            assert!(!output.status.success(), "{source}");
+            assert!(
+                String::from_utf8(output.stdout)
+                    .unwrap()
+                    .contains("dependsOnNoncomputable"),
+                "{source}"
+            );
+            let (error, trace) = captured(|| {
+                engine
+                    .execute_source_definitions(&[source.as_bytes()], &KVMap::new(), limits())
+                    .unwrap_err()
+            });
+            assert!(matches!(
+                cause(error),
+                EngineExecutionError::Ingress(fln::IngressError::UnsupportedNode {
+                    kind: "noncomputable runtime dependency"
+                })
+            ));
+            assert!(trace.is_empty());
+            assert_eq!(engine.logical_root(&KVMap::new()), root);
+        }
+        let ill_typed = "#eval let _unused : Nat -> Nat := fun (_ : Nat) => true; 42";
+        assert!(!pin_output(compiler, ill_typed).status.success());
+        assert!(
+            engine
+                .execute_source_definitions(&[ill_typed.as_bytes()], &KVMap::new(), limits())
+                .is_err()
+        );
+        assert_eq!(engine.logical_root(&KVMap::new()), root);
     });
 }
 
@@ -745,32 +863,31 @@ fn function_valued_thunks_match_the_pinned_callback_telescope() {
 }
 
 #[test]
-fn discarded_and_repeated_thunk_computations_keep_the_native_optimizer_contract() {
+fn dead_thunks_match_the_pin_and_live_allocations_keep_the_native_optimizer_contract() {
     fixture(|engine, compiler| {
-        // Native FIR deliberately preserves every written computation and its
-        // observable evaluation count (fir/optimize.rs, and the analogous
-        // discarded/repeated panic regression). The pin's CSE and elimDead
-        // have a different diagnostic trace here. Record both explicitly;
-        // memoization within one cell and resulting values still agree.
-        for (source, pin_trace, native_trace) in [
-            (
-                r#"#eval let t := Thunk.mk (fun _ => dbg_trace "unused force"; 21); let _x := t.get; 42"#,
-                "",
-                "unused force\n",
-            ),
-            (
-                r#"#eval let _t := Thunk.pure (dbg_trace "unused pure"; 21); 42"#,
-                "",
-                "unused pure\n",
-            ),
-            (
-                r#"#eval let f := (fun _ : Unit => dbg_trace "shared callback"; 21); let a := Thunk.mk f; let b := Thunk.mk f; a.get + b.get"#,
-                "shared callback\n",
-                "shared callback\nshared callback\n",
-            ),
+        for source in [
+            r#"#eval let t := Thunk.mk (fun _ => dbg_trace "unused force"; 21); let _x := t.get; 42"#,
+            r#"#eval let _t := Thunk.pure (dbg_trace "unused pure"; 21); 42"#,
         ] {
-            pin(compiler, source, pin_trace, "42");
-            check_native(engine, source, native_trace, ClosedVmValue::Scalar(42));
+            check(
+                engine,
+                compiler,
+                source,
+                "",
+                ClosedVmValue::Scalar(42),
+                "42",
+            );
         }
+        // Source dead-let elimination does not change the native FIR's
+        // distinct live allocations. The pin still coalesces these two cells;
+        // native memoization shares forces only within each individual cell.
+        let source = r#"#eval let f := (fun _ : Unit => dbg_trace "shared callback"; 21); let a := Thunk.mk f; let b := Thunk.mk f; a.get + b.get"#;
+        pin(compiler, source, "shared callback\n", "42");
+        check_native(
+            engine,
+            source,
+            "shared callback\nshared callback\n",
+            ClosedVmValue::Scalar(42),
+        );
     });
 }

@@ -176,10 +176,10 @@ fn absent_extern_keeps_the_ordinary_logical_definition() {
 }
 
 #[test]
-fn discarded_and_repeated_panics_are_not_removed_or_coalesced() {
+fn dead_source_panics_disappear_and_used_panics_remain_separate() {
     if parent(
-        "discarded_and_repeated_panics_are_not_removed_or_coalesced",
-        "discarded\nrepeat\nrepeat\n",
+        "dead_source_panics_disappear_and_used_panics_remain_separate",
+        "repeat\nrepeat\n",
     ) {
         return;
     }
@@ -189,6 +189,17 @@ fn discarded_and_repeated_panics_are_not_removed_or_coalesced() {
     );
     assert_eq!(
         fln::closed_vm_value(&result.executions[0].exit).unwrap(),
+        Some(fln::ClosedVmValue::Scalar(42))
+    );
+    // Source dead-let elimination precedes native diagnostic lowering. Once
+    // used values reach the effectful bridge, its strict reporting bindings
+    // must remain separate even though their raw ABI results are discarded.
+    let used = run(
+        &native_panic(),
+        r#"#eval let a : String := panic "repeat"; let b : String := panic "repeat"; 42 + a.length + b.length"#,
+    );
+    assert_eq!(
+        fln::closed_vm_value(&used.executions[0].exit).unwrap(),
         Some(fln::ClosedVmValue::Scalar(42))
     );
 }

@@ -58,16 +58,35 @@ fn proof_lets_and_local_callbacks_keep_capture_indices() {
     );
 }
 #[test]
-fn proof_computation_is_erased_but_unused_runtime_values_are_strict() {
+fn proofs_and_dead_source_values_are_erased_but_used_values_remain_strict() {
     let prefix = "def work (n : Nat) : Nat := match n with | .zero => 0 | .succ k => work k + 1\ndef evidence (n : Nat) : 0 = 0 := let unused : Nat := work n; by rfl\ndef keep (h : 0 = 0) : Nat := 42\n";
     let cheap = run(&format!("{prefix}#eval keep (evidence 0)"), "42");
     let expensive = run(&format!("{prefix}#eval keep (evidence 1000000)"), "42");
     assert_eq!(cheap, expensive, "proof computations reached the VM");
-    let strict = run(
+    let unused = run(
         &format!("{prefix}#eval let unused : Nat := work 60; keep (by rfl)"),
         "42",
     );
-    assert!(strict > cheap + 60, "non-proof computation was erased");
+    let unused_cheap = run(
+        &format!("{prefix}#eval let unused : Nat := work 0; keep (by rfl)"),
+        "42",
+    );
+    assert_eq!(
+        unused, unused_cheap,
+        "dead source computation reached the VM"
+    );
+    let used_cheap = run(
+        &format!("{prefix}#eval let used : Nat := work 0; used + keep (by rfl)"),
+        "42",
+    );
+    let strict = run(
+        &format!("{prefix}#eval let used : Nat := work 60; used + keep (by rfl)"),
+        "102",
+    );
+    assert!(
+        strict > used_cheap + 60,
+        "used non-proof computation was erased"
+    );
 }
 #[test]
 fn partial_and_polymorphic_proof_calls_retain_runtime_arguments() {

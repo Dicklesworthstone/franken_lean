@@ -132,25 +132,35 @@ const SPEND: &str =
     "def spend (n : Nat) : Nat := match n with | .zero => 0 | .succ k => spend k + 1\n";
 
 #[test]
-fn actual_first_stage_computation_survives_discarded_results_and_vm_bounds() {
+fn dead_first_stages_are_cheap_and_used_stages_keep_exact_vm_bounds() {
     let engine = engine();
     let options = KVMap::new();
     let root = engine.logical_root(&options);
-    let source = |cost| {
+    let discarded = |cost| {
         format!(
             "{SPEND}def ignorePartial (f : Nat -> Nat -> Nat) (n : Nat) : Nat := let unused : Nat -> Nat := f n; 42\n#eval ignorePartial (fun n => let paid := spend n; let result : Nat -> Nat := fun y => y; result) {cost}"
         )
     };
-    let run = |cost| {
+    let source = |cost| {
+        format!(
+            "{SPEND}def usePartial (f : Nat -> Nat -> Nat) (n : Nat) : Nat := let action : Nat -> Nat := f n; action 42\n#eval usePartial (fun n => let paid := spend n; let result : Nat -> Nat := fun y => paid + y; result) {cost}"
+        )
+    };
+    let run = |source: &str, expected| {
         let run = engine
-            .execute_source_definitions(&[source(cost).as_bytes()], &options, limits())
-            .unwrap()
+            .execute_source_definitions(&[source.as_bytes()], &options, limits())
+            .unwrap_or_else(|error| panic!("{source}\n{error:?}"))
             .into_complete()
             .unwrap();
-        returned(&run.executions.last().unwrap().exit, "42")
+        returned(&run.executions.last().unwrap().exit, expected)
     };
-    let idle = run(0);
-    let busy = run(30);
+    assert_eq!(
+        run(&discarded(0), "42"),
+        run(&discarded(30), "42"),
+        "the original discarded result must not execute its producer"
+    );
+    let idle = run(&source(0), "42");
+    let busy = run(&source(30), "72");
     assert!(
         busy > idle + 30,
         "the first runtime stage disappeared: {idle} vs {busy}"
@@ -167,7 +177,7 @@ fn actual_first_stage_computation_survives_discarded_results_and_vm_bounds() {
                 if usage.reason == fln_core::diag::ResourceReason::ExecutionSteps
                     && usage.allowed == idle && usage.observed == idle + 1)
     ));
-    assert_eq!(run(0), idle);
+    assert_eq!(run(&source(0), "42"), idle);
     assert_eq!(engine.logical_root(&options), root);
 }
 
@@ -176,21 +186,28 @@ fn a_dynamic_flat_consumer_does_not_cast_a_genuinely_staged_callback() {
     let engine = engine();
     let options = KVMap::new();
     let root = engine.logical_root(&options);
-    let source = format!(
-        "{SPEND}def forwardStrict (consumer : (Bool -> Nat -> Nat) -> Nat) (cost : Nat) : Nat := consumer (fun _ => let paid := spend cost; fun n => n + paid)\n#eval forwardStrict (fun callback => let unused := callback false; 42) 30"
-    );
-    let mut error = engine
-        .execute_source_definitions(&[source.as_bytes()], &options, limits())
-        .unwrap_err();
-    while let EngineExecutionError::BatchCommand { error: inner, .. } = error {
-        error = *inner;
+    for consumer in [
+        "fun callback => let unused := callback false; 42",
+        "fun callback => let used := callback false; used 12",
+    ] {
+        let source = format!(
+            "{SPEND}def forwardStrict (consumer : (Bool -> Nat -> Nat) -> Nat) (cost : Nat) : Nat := consumer (fun _ => let paid := spend cost; fun n => n + paid)\n#eval forwardStrict ({consumer}) 30"
+        );
+        // The declaration itself passes a staged closure to a flat dynamic
+        // consumer and is compiled before either caller can discard work.
+        let mut error = engine
+            .execute_source_definitions(&[source.as_bytes()], &options, limits())
+            .unwrap_err();
+        while let EngineExecutionError::BatchCommand { error: inner, .. } = error {
+            error = *inner;
+        }
+        assert!(
+            matches!(
+                error,
+                EngineExecutionError::Ingress(IngressError::LambdaApplicationArgumentType { .. })
+            ),
+            "an incompatible runtime callback must remain refused: {error:?}"
+        );
+        assert_eq!(engine.logical_root(&options), root);
     }
-    assert!(
-        matches!(
-            error,
-            EngineExecutionError::Ingress(IngressError::LambdaApplicationArgumentType { .. })
-        ),
-        "an incompatible runtime callback must remain refused: {error:?}"
-    );
-    assert_eq!(engine.logical_root(&options), root);
 }

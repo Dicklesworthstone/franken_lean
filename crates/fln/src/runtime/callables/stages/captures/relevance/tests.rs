@@ -334,6 +334,11 @@ def relevanceAlias (cost : Nat) (text : String) : String :=
   let renderer : String -> String := String.append text
   let alias : String -> String := renderer
   String.append (alias "😀") (String.append "\x00" "done")
+def relevanceUsedAlias (cost : Nat) (text : String) : String :=
+  let paid : Nat := relevanceSpend cost
+  let renderer : String -> String := String.append (if Nat.beq paid cost then text else "")
+  let alias : String -> String := renderer
+  String.append (alias "😀") (String.append "\x00" "done")
 def relevanceStages (text : String) : String :=
   let f : String -> String -> String -> String := (by intro x; let a := text ++ x; intro y; let z := a ++ y; intro w; exact z ++ w)
   let g := f "😀"
@@ -384,11 +389,16 @@ def relevanceStages (text : String) : String :=
         assert_eq!(replayed.usage, returned.usage);
         (returned.usage.steps, execution.flbc_artifact.clone())
     };
-    let idle_source = "#eval relevanceAlias 0 \"λ\"";
-    let busy_source = "#eval relevanceAlias 30 \"λ\"";
+    assert_eq!(
+        run("#eval relevanceAlias 0 \"λ\"").0,
+        run("#eval relevanceAlias 30 \"λ\"").0,
+        "an unused source prefix must not reach the VM"
+    );
+    let idle_source = "#eval relevanceUsedAlias 0 \"λ\"";
+    let busy_source = "#eval relevanceUsedAlias 30 \"λ\"";
     let (idle, artifact) = run(idle_source);
     let (busy, _) = run(busy_source);
-    assert!(busy > idle + 30, "unused strict work still executes");
+    assert!(busy > idle + 30, "used strict work still executes");
     assert_eq!(run(idle_source), (idle, artifact));
     let staged = "#eval relevanceStages \"λ\"";
     assert_eq!(run(staged), run(staged));
