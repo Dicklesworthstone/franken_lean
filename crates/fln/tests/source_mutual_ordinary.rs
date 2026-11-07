@@ -299,6 +299,122 @@ fn mutual_structural_members_reduce_and_execute_their_own_components() {
 }
 
 #[test]
+fn mutual_structural_preserves_implicit_and_mixed_major_binders() {
+    use fln_core::expr::{BinderInfo, ExprNode};
+    use fln_env::constants::ConstantInfo;
+
+    // The Reference's getRecArgInfo considers every parameter, including implicit
+    // ones. Binder styles belong to the public members, not the shared dictionary.
+    for (left, right, left_style, right_style, hint) in [
+        (
+            "{n : Nat}",
+            "{n : Nat}",
+            BinderInfo::Implicit,
+            BinderInfo::Implicit,
+            "",
+        ),
+        (
+            "(n : Nat)",
+            "{n : Nat}",
+            BinderInfo::Default,
+            BinderInfo::Implicit,
+            "termination_by structural n",
+        ),
+        (
+            "{n : Nat}",
+            "(n : Nat)",
+            BinderInfo::Implicit,
+            BinderInfo::Default,
+            "termination_by structural n",
+        ),
+        (
+            "⦃n : Nat⦄",
+            "{n : Nat}",
+            BinderInfo::StrictImplicit,
+            BinderInfo::Implicit,
+            "termination_by structural n",
+        ),
+    ] {
+        let source = format!(
+            r#"
+mutual
+ def left {left} (seed : Nat) : Nat := match n with
+  | 0 => seed
+  | k+1 => right (n := k) seed + 1
+ {hint}
+ def right {right} (seed : Nat) : Nat := match n with
+  | 0 => seed + 6
+  | k+1 => left (n := k) seed + 2
+ {hint}
+end
+example : left (n := 4) 7 = 13 := rfl
+example : right (n := 4) 7 = 19 := rfl
+example (n seed : Nat) : left (n := n+1) seed = right (n := n) seed + 1 := rfl
+"#
+        );
+        let base = check(&source);
+        for (label, expected) in [("left", left_style), ("right", right_style)] {
+            let Some(ConstantInfo::Defn(definition)) = base.environment().find(&name(label)) else {
+                panic!("checked structural definition");
+            };
+            let ExprNode::ForallE { binder_info, .. } = definition.base.type_.node() else {
+                panic!("member keeps its major binder");
+            };
+            assert_eq!(*binder_info, expected, "{label}: {source}");
+            let ExprNode::Lam { binder_info, .. } = definition.value.node() else {
+                panic!("member wrapper keeps its major binder");
+            };
+            assert_eq!(*binder_info, expected, "{label}: {source}");
+        }
+        run(&base, "#eval left (n := 4) 7", "13");
+        run(&base, "#eval right (n := 4) 7", "19");
+    }
+}
+
+#[test]
+fn mutual_structural_implicit_majors_do_not_hide_nondecreasing_calls() {
+    let (base, limits) = engine();
+    let root = base.logical_root(&KVMap::new());
+    for source in [
+        r#"
+mutual
+ def badLeft {n : Nat} : Nat := badRight (n := n)
+ termination_by structural n
+ def badRight {n : Nat} : Nat := badLeft (n := n)
+ termination_by structural n
+end
+"#,
+        r#"
+mutual
+ def badLeft (n : Nat) : Nat := match n with
+  | 0 => 0
+  | k+1 => let unused := badRight (n := k+2); badRight (n := k)
+ termination_by structural n
+ def badRight {n : Nat} : Nat := match n with
+  | 0 => 1
+  | k+1 => badLeft k
+ termination_by structural n
+end
+"#,
+    ] {
+        oracle(source, false);
+        assert!(
+            base.check_source_files(
+                &[source.as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits),
+            )
+            .is_err(),
+            "implicit application must preserve termination checks: {source}"
+        );
+        assert_eq!(base.logical_root(&KVMap::new()), root);
+        for label in ["badLeft", "badRight", "badLeft._mutual"] {
+            assert!(!base.environment().contains(&name(label)));
+        }
+    }
+}
+
+#[test]
 fn mutual_structural_product_preserves_distinct_member_result_types() {
     check(
         "mutual\n\

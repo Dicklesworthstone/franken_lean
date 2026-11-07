@@ -228,15 +228,14 @@ impl Context {
             let fixed_locals = &prefix_locals[..fixed];
             let ExprNode::ForallE {
                 binder_type: domain,
-                binder_info,
                 ..
             } = first.node()
             else {
-                return Err(unsupported("an explicit structural argument"));
+                return Err(unsupported("a structural argument"));
             };
-            if *binder_info != BinderInfo::Default {
-                return Err(unsupported("an explicit structural argument"));
-            }
+            // The pin's Structural.getRecArgInfo considers every telescope local,
+            // regardless of binder style. Only the shared motive's major is explicit;
+            // the member types and wrappers retain their original binder information.
             let domain = self.whnf(domain)?;
             let (head, parameters) = self.course_spine(&domain)?;
             let ExprNode::Const {
@@ -313,17 +312,12 @@ impl Context {
                     remainder = self.substitute(body, &Expr::fvar(local.id.clone()))?;
                 }
                 let ExprNode::ForallE {
-                    binder_type,
-                    body,
-                    binder_info,
-                    ..
+                    binder_type, body, ..
                 } = remainder.node()
                 else {
                     return Err(unsupported("a decreasing argument in every member"));
                 };
-                if *binder_info != BinderInfo::Default
-                    || !self.defeq_guarded(binder_type, &domain)?
-                {
+                if !self.defeq_guarded(binder_type, &domain)? {
                     return Err(unsupported("the same structural family in every member"));
                 }
                 components.push(self.substitute(body, &Expr::fvar(major.id.clone()))?);
