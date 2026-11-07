@@ -8,10 +8,11 @@
 //!
 //! Fresh object-field initialization is folded before checking branches.
 //! Object and packed scalar updates require a known incoming constructor
-//! layout and exact field/byte equivalence. An object-only reset/reuse region
-//! can establish its incoming layout with an explicit runtime guard before
-//! entering the proven allocation-equivalent continuation. Arbitrary mutation, observable
-//! sharing flags, and effectful/different alternatives remain unsupported. No
+//! layout and exact field/byte equivalence. A reset/reuse region whose scalar
+//! payload has no trailing padding can establish its incoming layout with an
+//! explicit runtime guard before entering the proven allocation-equivalent
+//! continuation. Arbitrary mutation, observable sharing flags, and
+//! effectful/different alternatives remain unsupported. No
 //! mutable runtime handle, native refcount observation, or new execution
 //! authority is introduced. The original and rewritten IR both undergo type validation.
 
@@ -50,6 +51,17 @@ impl Shape {
 
     fn object_only(info: &IrCtorInfo) -> Option<Self> {
         if info.usize == 0 && info.ssize == 0 {
+            Self::from_info(info)
+        } else {
+            None
+        }
+    }
+
+    // The pinned LP64 allocation rounds scalar payloads to whole words.
+    // Inference must not mistake that padding for logical data. The separate
+    // equivalence proof still requires every payload byte to be initialized.
+    fn without_padding(info: &IrCtorInfo) -> Option<Self> {
+        if info.ssize.is_multiple_of(8) {
             Self::from_info(info)
         } else {
             None
