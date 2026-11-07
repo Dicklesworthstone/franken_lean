@@ -111,7 +111,7 @@ mod tests {
                 let mut context = context();
                 let mut arena = vec![Pattern::Bind(None)];
                 let root = context
-                    .matrix_pattern(&syntax, &mut arena, &mut HashMap::new())
+                    .matrix_pattern(&syntax, &mut arena)
                     .unwrap();
                 assert_eq!(arena.len(), 2050);
                 let body = wildcard();
@@ -161,7 +161,7 @@ mod tests {
         let mut stopped = context();
         stopped.txn.budget.max_heartbeats = 8;
         assert!(matches!(
-            stopped.matrix_pattern(&syntax, &mut vec![], &mut HashMap::new()),
+            stopped.matrix_pattern(&syntax, &mut vec![]),
             Err(NatDefinitionElabError::Inference(
                 SourceInferenceError::ResourceLimit
             ))
@@ -169,7 +169,7 @@ mod tests {
         let mut complete = context();
         let mut arena = Vec::new();
         let root = complete
-            .matrix_pattern(&syntax, &mut arena, &mut HashMap::new())
+            .matrix_pattern(&syntax, &mut arena)
             .unwrap();
         let body = wildcard();
         let mut matrix = Matrix {
