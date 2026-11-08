@@ -15,6 +15,7 @@ mod simpa;
 mod simproc;
 mod suggest;
 mod unfold;
+pub(in crate::source::tactics) use arith::expr_lt as ac_expr_lt;
 
 use super::matching::RigidTypeHead;
 use super::*;

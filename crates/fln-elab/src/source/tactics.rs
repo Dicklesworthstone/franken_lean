@@ -6,6 +6,7 @@
 //! sequences and application continuations use heap worklists instead.
 
 use super::*;
+mod ac;
 pub(in crate::source) mod backtrack;
 mod change;
 mod congruence;
@@ -2192,6 +2193,12 @@ impl Context {
                 };
                 expect_atom(keyword, "rfl", "reflexivity tactic")?;
                 self.rfl_proof_goal(goal)?;
+            } else if kind == &parser_kind(&["Tactic", "acRfl"]) {
+                let [keyword] = args.as_slice() else {
+                    return Err(error(TacticError::MalformedScript));
+                };
+                expect_atom(keyword, "ac_rfl", "associative normalization tactic")?;
+                self.ac_reflexivity(goal)?;
             } else if kind == &parser_kind(&["Tactic", "eqRefl"])
                 || kind == &parser_kind(&["Tactic", "applyRfl"])
             {
