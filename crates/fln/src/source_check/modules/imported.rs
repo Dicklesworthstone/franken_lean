@@ -20,7 +20,6 @@ mod structures;
 
 #[derive(Default)]
 struct ReflexivityTags {
-    payloads: BTreeMap<Vec<u8>, Name>,
     names: BTreeSet<Name>,
     declarations: Vec<Name>,
 }
@@ -32,11 +31,12 @@ impl ReflexivityTags {
         extension: &Name,
         entries: Vec<Vec<u8>>,
         decoder: &mut metadata::Decoder,
+        payloads: &mut BTreeMap<Vec<u8>, Name>,
     ) -> Result<usize> {
         let before = self.declarations.len();
         let mut local = BTreeSet::new();
         for payload in entries {
-            let declaration = if let Some(declaration) = self.payloads.get(&payload) {
+            let declaration = if let Some(declaration) = payloads.get(&payload) {
                 declaration.clone()
             } else {
                 let mut block = OpaqueExtensionBlock {
@@ -58,7 +58,7 @@ impl ReflexivityTags {
                 let payload = block.entries.pop().ok_or(SourceOleanImportError::Internal(
                     "a decoded reflexivity payload disappeared",
                 ))?;
-                self.payloads.insert(payload, declaration.clone());
+                payloads.insert(payload, declaration.clone());
                 declaration
             };
             if !local.insert(declaration.clone()) {
@@ -777,6 +777,10 @@ struct MetadataBudget {
     capture_left: usize,
     entries_left: usize,
     decoder: metadata::Decoder,
+    // Public and private views can contain the same captured Name payload.
+    // Reuse only completed decoding, never a view's visibility or tag set.
+    defeq_payloads: BTreeMap<Vec<u8>, Name>,
+    backward_defeq_payloads: BTreeMap<Vec<u8>, Name>,
 }
 
 struct MetadataModule {
@@ -795,6 +799,8 @@ fn prepare_source_metadata(
         capture_left: limits.max_capture_bytes,
         entries_left: limits.metadata.max_entries,
         decoder: metadata::Decoder::new(limits.metadata),
+        defeq_payloads: BTreeMap::new(),
+        backward_defeq_payloads: BTreeMap::new(),
     };
     let mut private = match prepare_source_metadata_view(
         modules,
@@ -838,7 +844,15 @@ fn prepare_source_metadata(
             })?;
         declarations_left = declarations_left
             .checked_sub(decoded.constants.len())
-            .ok_or(SourceOleanImportError::Limit("exported declarations"))?;
+            .ok_or_else(|| {
+                // Keep the council's structured budget outcome when this
+                // exported-view preflight reaches the same allowance first.
+                SourceOleanImportError::Check(Box::new(OleanCheckError::DeclarationLimit {
+                    observed: (limits.check.max_declarations - declarations_left)
+                        .saturating_add(decoded.constants.len()),
+                    limit: limits.check.max_declarations,
+                }))
+            })?;
         has_module |= decoded.module.is_module;
         private.exported.insert(report.module.clone(), decoded);
     }
@@ -952,6 +966,8 @@ fn prepare_source_metadata_view(
         capture_left,
         entries_left,
         decoder: metadata_decoder,
+        defeq_payloads,
+        backward_defeq_payloads,
     } = budget;
     let mut defeq_tags = ReflexivityTags::default();
     let mut backward_defeq_tags = ReflexivityTags::default();
@@ -1033,14 +1049,19 @@ fn prepare_source_metadata_view(
                     // decoded names, retaining the first module's registration.
                     // Cached byte-identical entries keep their old zero decode
                     // cost; a same-module name repeat still refuses.
-                    let tags = if kind == 14 {
-                        &mut defeq_tags
+                    let (tags, payloads) = if kind == 14 {
+                        (&mut defeq_tags, &mut *defeq_payloads)
                     } else {
-                        &mut backward_defeq_tags
+                        (&mut backward_defeq_tags, &mut *backward_defeq_payloads)
                     };
                     let before = metadata_decoder.remaining_limits().max_entries;
-                    let count =
-                        tags.capture(&module.name, &block.name, entries, metadata_decoder)?;
+                    let count = tags.capture(
+                        &module.name,
+                        &block.name,
+                        entries,
+                        metadata_decoder,
+                        payloads,
+                    )?;
                     *entries_left = entries_left
                         .checked_sub(before - metadata_decoder.remaining_limits().max_entries)
                         .ok_or(SourceOleanImportError::Limit("metadata entries"))?;
@@ -3400,6 +3421,98 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn reflexivity_payload_reuse_keeps_view_membership_and_resource_refusals() {
+        use fln_rt::convert::inject_name;
+        use fln_rt::region::{audit, compact};
+
+        for extension in [
+            metadata::DEFEQ_EXTENSION,
+            metadata::BACKWARD_DEFEQ_EXTENSION,
+        ] {
+            let shared = n("sharedTag");
+            let private_only = n("privateOnlyTag");
+            let entries: Vec<_> = [&shared, &private_only]
+                .map(|name| compact(&inject_name(name), 0).unwrap())
+                .into();
+            let bounds = DecodeLimits {
+                max_entries: entries.len(),
+                max_bytes: entries.iter().map(Vec::len).sum(),
+                max_objects: entries
+                    .iter()
+                    .map(|entry| audit(entry, 0).unwrap().objects)
+                    .sum(),
+                ..DecodeLimits::default()
+            };
+            let mut decoder = metadata::Decoder::new(bounds);
+            let mut payloads = BTreeMap::new();
+            let mut private = ReflexivityTags::default();
+            let extension = n(extension);
+            assert_eq!(
+                private
+                    .capture(
+                        &n("Private"),
+                        &extension,
+                        entries.clone(),
+                        &mut decoder,
+                        &mut payloads
+                    )
+                    .unwrap(),
+                2
+            );
+            assert_eq!(decoder.remaining_limits().max_entries, 0);
+            assert_eq!(decoder.remaining_limits().max_bytes, 0);
+            assert_eq!(decoder.remaining_limits().max_objects, 0);
+
+            let mut public = ReflexivityTags::default();
+            assert_eq!(
+                public
+                    .capture(
+                        &n("Public"),
+                        &extension,
+                        vec![entries[0].clone()],
+                        &mut decoder,
+                        &mut payloads
+                    )
+                    .unwrap(),
+                1
+            );
+            assert_eq!(
+                public.declarations.as_slice(),
+                std::slice::from_ref(&shared)
+            );
+            assert_eq!(private.declarations, [shared, private_only]);
+            assert!(matches!(
+                public.capture(
+                    &n("Public"),
+                    &extension,
+                    vec![entries[0].clone(), entries[0].clone()],
+                    &mut decoder,
+                    &mut payloads
+                ),
+                Err(SourceOleanImportError::Metadata {
+                    reason: "duplicate reflexivity tag in one module",
+                    ..
+                })
+            ));
+            let new_payload = compact(&inject_name(&n("newTag")), 0).unwrap();
+            assert!(matches!(
+                public.capture(
+                    &n("Public"),
+                    &extension,
+                    vec![new_payload],
+                    &mut decoder,
+                    &mut payloads
+                ),
+                Err(SourceOleanImportError::Decode(
+                    metadata::DecodeError::Limit {
+                        resource: "entries"
+                    }
+                ))
+            ));
+        }
+    }
+
+    #[test]
     fn reflexivity_tags_merge_by_name_across_modules_but_not_within_one() {
         use fln_env::constants::{ConstantVal, DefinitionVal, ReducibilityHints};
         use fln_olean::extension_write::{ModuleExtensionInput, encode_module_with_extensions};
@@ -4252,7 +4365,7 @@ pub(super) mod tests {
         };
         assert!(matches!(
             refusal(&inputs(&closure), &tight),
-            OleanCheckError::DeclarationLimit { limit: 100, .. }
+            OleanCheckError::DeclarationLimit { limit: 100, observed } if observed > 100
         ));
 
         // A corrupted member.

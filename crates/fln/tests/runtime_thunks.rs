@@ -411,7 +411,8 @@ fn unused_computed_initializers_disappear_without_reordering_live_closures() {
                 "nested used closure\n",
             ),
             (
-                r#"#eval let saved : String := "retained"; let _unused : Nat -> String := (dbg_trace "unused owned capture"; fun _ => saved); let f : Nat -> Nat := fun n => n + saved.length; f 34"#,
+                // Init.Util exposes the internal primitive, not String.length.
+                r#"#eval let saved : String := "retained"; let _unused : Nat -> String := (dbg_trace "unused owned capture"; fun _ => saved); let f : Nat -> Nat := fun n => n + String.Internal.length saved; f 34"#,
                 "",
             ),
             (
