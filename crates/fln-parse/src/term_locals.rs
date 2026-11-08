@@ -71,6 +71,7 @@ pub(super) struct Assertion {
     colon: Option<usize>,
     annotation: Option<Syntax>,
     assignment: Option<usize>,
+    equations: bool,
     value: Option<Syntax>,
     separator: Option<usize>,
     form: Form,
@@ -203,6 +204,20 @@ pub(super) fn proof_limit(
     } else {
         return end;
     };
+    proof_value_limit(view, tokens, keyword, by, end, do_binding)
+}
+
+/// The same offside proof boundary for a local already identified by the
+/// compound planner. A tactic semicolon stays in the proof; only its layout
+/// or enclosing delimiter ends the local's value.
+pub(super) fn proof_value_limit(
+    view: &SourceView,
+    tokens: &[LexedToken],
+    keyword: usize,
+    by: usize,
+    end: usize,
+    do_binding: bool,
+) -> usize {
     if by + 1 >= end {
         return end;
     }
@@ -351,6 +366,7 @@ impl Prefix {
             colon: None,
             annotation: None,
             assignment: None,
+            equations: false,
             value: None,
             separator: None,
             form,
@@ -405,6 +421,16 @@ impl Prefix {
                 assertion.assignment = Some(*cursor);
                 assertion.phase = Phase::Value;
                 *cursor += 1;
+            } else if *cursor < end
+                && form == Form::Let
+                && assertion.name.is_some()
+                && assertion.pattern.is_none()
+                && word(tokens, *cursor, "|")
+            {
+                // The planner has built these rows on its own heap stack.
+                // Leave the cursor on the first pipe for its exact-range splice.
+                assertion.equations = true;
+                assertion.phase = Phase::Value;
             } else {
                 return Err(refuse(view, tokens, *cursor));
             }
@@ -466,7 +492,13 @@ impl Prefix {
                 Phase::Annotation if !p.form.declares() => {
                     word(tokens, at, "from") || word(tokens, at, "by")
                 }
-                Phase::Annotation => word(tokens, at, ":="),
+                Phase::Annotation => {
+                    word(tokens, at, ":=")
+                        || (p.form == Form::Let
+                            && p.name.is_some()
+                            && p.pattern.is_none()
+                            && word(tokens, at, "|"))
+                }
                 Phase::Value => word(tokens, at, ";"),
                 Phase::Body => false,
             },
@@ -530,11 +562,19 @@ impl Prefix {
                         next = at;
                     }
                 } else {
-                    p.assignment = Some(at);
+                    p.equations = word(tokens, at, "|");
+                    if p.equations {
+                        next = at;
+                    } else {
+                        p.assignment = Some(at);
+                    }
                     p.phase = Phase::Value;
                 }
             }
             Phase::Value => {
+                if p.equations && expression.kind() != Some(&parser_kind(&["Term", "matchAlts"])) {
+                    return Err(refuse(view, tokens, at));
+                }
                 p.value = Some(expression);
                 if word(tokens, at, ";") {
                     p.separator = Some(at);
@@ -632,7 +672,7 @@ impl Prefix {
                 );
                 return Ok((syntax, keyword));
             }
-            Self::Assertion(p) => p,
+            Self::Assertion(p) => *p,
         };
         let syntax = if p.form == Form::Show {
             let separator = p.proof_intro.expect("show proof introducer");
@@ -691,6 +731,7 @@ impl Prefix {
                 ],
             )
         } else {
+            let equations = p.equations;
             let separator = separator(leaves, p.separator)?;
             let name = match p.name {
                 // `_` is a symbol, so its leaf is an atom: the hole `Term.hole`.
@@ -712,21 +753,21 @@ impl Prefix {
             };
             let (kind, lhs) = match p.pattern {
                 Some(pattern) => ("letPatDecl", pattern),
+                None if equations => (
+                    "letEqnsDecl",
+                    Syntax::node(parser_kind(&["Term", "letId"]), vec![name]),
+                ),
                 None => (
                     "letIdDecl",
                     Syntax::node(parser_kind(&["Term", "letId"]), vec![name]),
                 ),
             };
-            let declaration = Syntax::node(
-                parser_kind(&["Term", kind]),
-                vec![
-                    lhs,
-                    null_node(vec![]),
-                    annotation,
-                    leaves.leaf(p.assignment.expect("have assignment"))?,
-                    p.value.expect("have value"),
-                ],
-            );
+            let mut declaration = vec![lhs, null_node(vec![]), annotation];
+            if !equations {
+                declaration.push(leaves.leaf(p.assignment.expect("have assignment"))?);
+            }
+            declaration.push(p.value.expect("have value"));
+            let declaration = Syntax::node(parser_kind(&["Term", kind]), declaration);
             let keyword = p.form.keyword();
             Syntax::node(
                 parser_kind(&["Term", keyword]),

@@ -83,18 +83,24 @@ fn same_column_statement_is_not_invented_as_proof_evidence() {
     // Lean parses the empty proof, then the next do action, and rejects the
     // definition during elaboration. Do not relax the proof's baseline and
     // silently turn that action into a successful `trivial` tactic.
-    let source = "def f : Id Nat := do\n  let h : True := by\n  trivial\n  return 7";
-    let parsed = parse_definition(source.as_bytes()).unwrap();
-    let proofs = nodes(parsed.syntax(), "Term.byTactic");
-    assert_eq!(proofs.len(), 1);
-    let sequences = nodes(proofs[0], "Tactic.tacticSeq1Indented");
-    let [Syntax::Node { args, .. }] = sequences.as_slice() else {
-        panic!("one empty proof sequence expected");
-    };
-    assert!(matches!(args.as_slice(), [Syntax::Node { args, .. }] if args.is_empty()));
-    assert_eq!(nodes(parsed.syntax(), "Term.doExpr").len(), 1);
-    assert_eq!(nodes(parsed.syntax(), "Term.doReturn").len(), 1);
-    assert_eq!(parsed.reconstruct_normalized().unwrap(), source.as_bytes());
+    for source in [
+        "def f : Id Nat := do\n  let h : True := by\n  trivial\n  return 7",
+        // The later match forces compound planning. Its planner must use the
+        // same do-binding proof boundary as the ordinary term frame reader.
+        "def f : Id Nat := do\n  let h : True := by\n  trivial\n  let n := match true with | true => 7 | false => 9\n  return n",
+    ] {
+        let parsed = parse_definition(source.as_bytes()).unwrap();
+        let proofs = nodes(parsed.syntax(), "Term.byTactic");
+        assert_eq!(proofs.len(), 1);
+        let sequences = nodes(proofs[0], "Tactic.tacticSeq1Indented");
+        let [Syntax::Node { args, .. }] = sequences.as_slice() else {
+            panic!("one empty proof sequence expected");
+        };
+        assert!(matches!(args.as_slice(), [Syntax::Node { args, .. }] if args.is_empty()));
+        assert_eq!(nodes(parsed.syntax(), "Term.doExpr").len(), 1);
+        assert_eq!(nodes(parsed.syntax(), "Term.doReturn").len(), 1);
+        assert_eq!(parsed.reconstruct_normalized().unwrap(), source.as_bytes());
+    }
 }
 
 #[test]
