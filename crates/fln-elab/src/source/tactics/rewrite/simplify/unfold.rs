@@ -40,6 +40,7 @@ impl Context {
         match rule {
             SimpRule::Explicit(_) => true,
             SimpRule::Local(_)
+            | SimpRule::Ac
             | SimpRule::Arith
             | SimpRule::Decide
             | SimpRule::Conditional { .. }
@@ -66,6 +67,7 @@ impl Context {
                 self.simp_unfold_selection_for_term(rule.syntax, rule.reverse)
             }
             SimpRule::Local(_)
+            | SimpRule::Ac
             | SimpRule::Arith
             | SimpRule::Decide
             | SimpRule::Conditional { .. }

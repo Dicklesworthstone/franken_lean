@@ -33,6 +33,18 @@ impl Context {
     ) -> Result<Option<(Typed, Expr, bool, SimpPlace)>, NatDefinitionElabError> {
         // A rewrite at a node is already chosen: one beneath a binder or by `+arith` comes later.
         let limited = self.simp_reach_limit.is_some();
+        if matches!(rule, SimpRule::Ac) {
+            if limited {
+                self.simp_reach_limit = None;
+                return Ok(None);
+            }
+            let place = SimpPlace::of(SimpReach::Procedure);
+            let evidence = match self.simp_ac_evidence(target)? {
+                Some(evidence) => Some(evidence),
+                None => self.simp_binder_rule(target, rule, premises)?,
+            };
+            return Ok(evidence.map(|evidence| (evidence, target.clone(), false, place)));
+        }
         if let SimpRule::Conditional { depth } = rule {
             let place = SimpPlace::of(SimpReach::Conditional);
             if let Some((evidence, occurrence)) =
@@ -189,6 +201,14 @@ impl Context {
         // Decision never opens a binder: its walk already reaches every closed proposition.
         if matches!(rule, SimpRule::Decide) {
             return Ok(None);
+        }
+        if matches!(rule, SimpRule::Ac) {
+            let Some(evidence) = self.simp_ac_evidence(body)? else {
+                return Ok(None);
+            };
+            return self
+                .simp_occurrence_equality(body, body, evidence, false)
+                .map(Some);
         }
         if let SimpRule::Conditional { depth } = rule {
             let Some((evidence, occurrence)) =

@@ -2199,6 +2199,15 @@ impl Context {
                 };
                 expect_atom(keyword, "ac_rfl", "associative normalization tactic")?;
                 self.ac_reflexivity(goal)?;
+            } else if kind == &parser_kind(&["Tactic", "acNf0"])
+                || kind == &parser_kind(&["Tactic", "tacticAc_nf_"])
+            {
+                self.ac_normalize_proof_goal(
+                    proof,
+                    goal,
+                    args,
+                    kind == &parser_kind(&["Tactic", "tacticAc_nf_"]),
+                )?;
             } else if kind == &parser_kind(&["Tactic", "eqRefl"])
                 || kind == &parser_kind(&["Tactic", "applyRfl"])
             {
