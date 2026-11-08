@@ -4,11 +4,13 @@
 //!
 //! This engine compiles a `match` to recursor applications, which keep neither the alternatives
 //! nor their right-hand sides apart. So once the definition is elaborated its root `match` is
-//! elaborated a second time, in the definition's scope with the definition itself declared:
+//! reconstructed in the definition's scope with the definition itself declared:
 //! each alternative's patterns against the discriminants' types, its pattern variables as
 //! locals, and its right-hand side against the motive at the patterns, recursive calls then
-//! being applications of the constant, as the pin's equations state them. A match this does
-//! not model is not recorded, and its equations are refused when asked for.
+//! being applications of the constant, as the pin's equations state them. Macro decisions
+//! are replayed from the actual checked row visits, including failed tactic candidates;
+//! reconstruction never invokes a live provider. A match this does not model is not recorded,
+//! and its equations are refused when asked for.
 //!
 //! Modelled: discriminants that are the definition's own parameters (section variables and
 //! `fun x =>` binders included, a recursive call naming the definition with or without its
@@ -108,13 +110,21 @@ impl Context {
             && body.kind() == Some(&parser_kind(&["Term", "match"])))
         .then_some(std::ptr::from_ref(body).addr());
         self.equation_patterns = None;
+        self.equation_macros = self
+            .equation_pattern_source
+            .and_then(|_| match_parts(body))
+            .map(|(_, alternatives)| super::macro_replay::Rows::new(&alternatives));
+        self.equation_macro_work = self
+            .equation_macros
+            .as_ref()
+            .map(|_| std::sync::Arc::new(super::macro_replay::Work::default()));
     }
 
     /// The equation information of `definition`, whose value `body` elaborated, or `None` when
     /// its body is not a `match` this models. Its first `sections` parameters are the section
     /// variables it is closed over.
     pub(in crate::source) fn capture_equation_info(
-        &self,
+        &mut self,
         definition: &DefinitionVal,
         body: &Syntax,
         sections: usize,
@@ -139,18 +149,24 @@ impl Context {
         // is bound to a local while the alternatives elaborate (see `capture`).
         let mut scope = self.source_scope.clone();
         scope.variables = Default::default();
+        scope.tactic_macros = None;
         let mut cx = Context::scoped(&self.txn.env, self.kernel, &scope).ok()?;
+        cx.txn.budget = self.txn.budget.clone();
         cx.txn.lctx = LocalContext::new();
         cx.level_params = definition.base.level_params.clone();
-        cx.capture(
-            definition,
-            &discriminants,
-            &alternatives,
-            sections,
-            prepared.is_some(),
-        )
-        .ok()
-        .flatten()
+        let result = cx
+            .capture(
+                definition,
+                &discriminants,
+                &alternatives,
+                sections,
+                prepared.is_some(),
+                self.equation_macros.as_ref(),
+            )
+            .ok()
+            .flatten();
+        self.txn.budget.heartbeats_consumed = cx.txn.budget.heartbeats_consumed;
+        result
     }
 
     fn capture(
@@ -160,6 +176,7 @@ impl Context {
         alternatives: &[(Vec<&Syntax>, &Syntax)],
         sections: usize,
         prepared: bool,
+        macros: Option<&super::macro_replay::Rows>,
     ) -> Result<Option<Record>, NatDefinitionElabError> {
         // The definition's value lambdas, opened with their binder names.
         let mut value = definition.value.clone();
@@ -251,10 +268,17 @@ impl Context {
         }
         let opened = self.txn.lctx.len();
         let mut elaborated = Vec::new();
-        for (patterns, rhs) in alternatives {
+        for (index, (patterns, rhs)) in alternatives.iter().enumerate() {
             if patterns.len() != positions.len() {
                 return Ok(None);
             }
+            let recorded = match macros {
+                Some(rows) => match rows.get(index) {
+                    Some(row) => Some(row),
+                    None => return Ok(None),
+                },
+                None => None,
+            };
             let Some(alternative) = self.capture_alternative(
                 &parameters,
                 &positions,
@@ -262,6 +286,7 @@ impl Context {
                 rhs,
                 &result,
                 prepared,
+                recorded,
             )?
             else {
                 self.txn.lctx.truncate(opened);
@@ -366,6 +391,7 @@ impl Context {
         rhs: &Syntax,
         result: &Expr,
         prepared: bool,
+        recorded: Option<std::sync::Arc<super::macro_replay::Row>>,
     ) -> Result<Option<Alternative>, NatDefinitionElabError> {
         let mut builder = Builder::default();
         let mut elaborated: Vec<Expr> = Vec::new();
@@ -424,11 +450,20 @@ impl Context {
                 .add_let(id.clone(), name.clone(), type_, value.clone());
             lets.push((id, value.clone()));
         }
-        let Ok(term) = self.term(rhs, Some(expected)) else {
-            return Ok(None);
-        };
-        let Ok(term) = self.finish(term) else {
-            return Ok(None);
+        let term = match recorded {
+            Some(row) => match self.replay_equation_rhs(row, expected)? {
+                Some(term) => term,
+                None => return Ok(None),
+            },
+            None => {
+                let Ok(term) = self.term(rhs, Some(expected)) else {
+                    return Ok(None);
+                };
+                let Ok(term) = self.finish(term) else {
+                    return Ok(None);
+                };
+                term
+            }
         };
         let mut rhs = term.value;
         for (id, value) in lets.iter().rev() {

@@ -849,6 +849,8 @@ struct Context {
     /// definition elaboration returns. No owned macro allocation is registered.
     equation_pattern_source: Option<usize>,
     equation_patterns: Option<std::sync::Arc<Vec<Syntax>>>,
+    equation_macros: Option<equation_theorems::macro_replay::Rows>,
+    equation_macro_work: Option<std::sync::Arc<equation_theorems::macro_replay::Work>>,
 }
 
 fn failure(reason: SourceInferenceError) -> NatDefinitionElabError {
@@ -961,10 +963,13 @@ impl Context {
             equation_info: None,
             equation_pattern_source: None,
             equation_patterns: None,
+            equation_macros: None,
+            equation_macro_work: None,
         }
     }
 
     fn tick(&mut self) -> Result<(), NatDefinitionElabError> {
+        self.charge_equation_macro_work()?;
         self.txn
             .budget
             .check_heartbeat()
@@ -2301,6 +2306,7 @@ impl Context {
         enum Task<'a> {
             RestoreOptions(KVMap),
             RestoreMacroTerms(usize),
+            EquationRhs,
             ApplicationTyping(&'a Syntax, pattern_typing::ApplicationCheck),
             DoJoinValue(Name, &'a Syntax, Option<Expr>),
             DoBindJoinStart(Name, &'a Syntax, &'a Syntax, Expr, bool),
@@ -2474,6 +2480,7 @@ impl Context {
                                 | Task::MatchTerm(..)
                                 | Task::RefineTerm(..)
                                 | Task::ApplicationTyping(..)
+                                | Task::EquationRhs
                         )
                     ) || matches!(tasks.last(), Some(Task::ConditionalBranch(state))
                         if state.closes_scope());
@@ -2555,6 +2562,7 @@ impl Context {
                             | Task::MatchTerm(..)
                             | Task::RefineTerm(..)
                             | Task::ApplicationTyping(..)
+                            | Task::EquationRhs
                     ) || matches!(&task, Task::ConditionalBranch(state) if state.closes_scope())
                     {
                         // Every still-unresolved argument keeps its original
@@ -2563,6 +2571,7 @@ impl Context {
                         pending.close_scope(self)?;
                     }
                     match task {
+                        Task::EquationRhs => self.finish_equation_rhs()?,
                         Task::RestoreOptions(options) => self.txn.options = options,
                         Task::ApplicationTyping(syntax, check) => {
                             self.finish_application_typing(syntax, check)?;
@@ -2752,6 +2761,19 @@ impl Context {
                         }
                         Task::Visit(syntax, expected, finish)
                         | Task::Elaborate(syntax, expected, finish) => {
+                            if let Some((row, body)) =
+                                equation_theorems::macro_replay::parts(syntax)
+                            {
+                                if self.begin_equation_rhs(row, body, finish)? {
+                                    tasks.push(Task::EquationRhs);
+                                }
+                                tasks.push(if expand_macro {
+                                    Task::Visit(body, expected, finish)
+                                } else {
+                                    Task::Elaborate(body, expected, finish)
+                                });
+                                continue;
+                            }
                             if expand_macro {
                                 let locals =
                                     self.observes_term(syntax).then(|| self.txn.lctx.clone());
@@ -6483,6 +6505,9 @@ fn definition_in_context_named(
     let declaration = definition_elaboration(syntax, context, generated_name);
     context.equation_pattern_source = None;
     context.equation_patterns = None;
+    context.clear_equation_macros();
+    context.charge_equation_macro_work()?;
+    context.equation_macro_work = None;
     let declaration = declaration?;
     context.publish_deprecated_uses()?;
     Ok(declaration)
@@ -7270,6 +7295,7 @@ fn definition_elaboration(
         };
         context.equation_info =
             context.capture_equation_info(&definition, body, partial_captures.len());
+        context.tick()?;
         Ok(Declaration::Defn(definition))
     }
 }
