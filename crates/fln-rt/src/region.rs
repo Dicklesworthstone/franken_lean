@@ -401,6 +401,19 @@ fn is_scalar_word(v: u64) -> bool {
     v & 1 == 1
 }
 
+/// Raw payloads need word alignment and a non-wrapping address range, not the
+/// larger mapping alignment of an olean envelope.
+fn check_payload_base(base: u64, len: usize) -> RResult<()> {
+    if !base.is_multiple_of(size_of::<u64>() as u64) {
+        return Err(RegionFault::MisalignedBase { base });
+    }
+    base.checked_add(len as u64)
+        .ok_or(RegionFault::BuildShape {
+            reason: "region address range overflows",
+        })?;
+    Ok(())
+}
+
 fn round8(v: usize) -> usize {
     v.div_ceil(8) * 8
 }
@@ -788,6 +801,8 @@ pub fn relocate(buf: &mut [u8], from: u64, to: u64) -> RResult<RegionReport> {
         return Err(RegionFault::RaggedPayload { len: buf.len() });
     }
     need(buf, 0, 8)?;
+    check_payload_base(from, buf.len())?;
+    check_payload_base(to, buf.len())?;
     let len = buf.len();
     let mut fixed = 0u64;
     fix_word(buf, 0, from, to, len, &mut fixed)?;
@@ -866,6 +881,7 @@ pub fn audit_with_dependencies(
         return Err(RegionFault::RaggedPayload { len: buf.len() });
     }
     need(buf, 0, 8)?;
+    check_payload_base(base, buf.len())?;
     let len = buf.len();
     validate_dependencies(base, len, dependencies)?;
     checked_rel_with_dependencies(buf, 0, base, len, dependencies)?;
@@ -895,7 +911,9 @@ pub fn audit_with_dependencies(
 pub struct SubgraphCapture<'a> {
     regions: Vec<(&'a [u8], u64)>,
     objects: Vec<CaptureObject>,
-    addresses: std::collections::BTreeMap<u64, usize>,
+    // Point lookups only: capture order comes from object indices, never from
+    // address order or the hash table's iteration order.
+    addresses: HashMap<u64, usize>,
 }
 
 struct CaptureObject {
@@ -958,7 +976,7 @@ impl<'a> SubgraphCapture<'a> {
             });
         }
         let mut objects = Vec::new();
-        let mut addresses = std::collections::BTreeMap::new();
+        let mut addresses = HashMap::new();
         for (region, &(bytes, base)) in regions.iter().enumerate() {
             let source = |fault| CaptureRegionFault { region, fault };
             let mut offset = 8;
@@ -1129,6 +1147,7 @@ pub fn canonical_digest(buf: &[u8], base: u64) -> RResult<u64> {
         return Err(RegionFault::RaggedPayload { len: buf.len() });
     }
     need(buf, 0, 8)?;
+    check_payload_base(base, buf.len())?;
     let norm = |v: u64| {
         if is_scalar_word(v) {
             v
@@ -1172,6 +1191,7 @@ pub fn materialize(buf: &[u8], base: u64) -> RResult<Obj> {
         return Err(RegionFault::RaggedPayload { len: buf.len() });
     }
     need(buf, 0, 8)?;
+    check_payload_base(base, buf.len())?;
     let root_word = read_u64(buf, 0);
     if is_scalar_word(root_word) {
         return Ok(Obj::mk_nat(usize::try_from(root_word >> 1).expect("word")));
@@ -1290,6 +1310,7 @@ pub fn materialize(buf: &[u8], base: u64) -> RResult<Obj> {
 /// cell categories (thunk/ref/task, no live read view yet), scalar arrays
 /// (same), and closures (no library table) are typed-unsupported.
 pub fn compact(root: &Obj, base: u64) -> RResult<Vec<u8>> {
+    check_payload_base(base, size_of::<u64>())?;
     let mut out = vec![0u8; 8];
     let mut memo: HashMap<usize, u64> = HashMap::new();
 
@@ -1541,6 +1562,7 @@ pub fn compact(root: &Obj, base: u64) -> RResult<Vec<u8>> {
         base.wrapping_add(memo[&root.identity_token()])
     };
     out[0..8].copy_from_slice(&root_word.to_le_bytes());
+    check_payload_base(base, out.len())?;
     Ok(out)
 }
 

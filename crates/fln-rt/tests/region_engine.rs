@@ -221,6 +221,133 @@ fn opaque_capture_across_three_regions_preserves_shared_graphs_in_load_order() {
 }
 
 #[test]
+fn opaque_capture_keeps_canonical_bytes_across_fresh_address_indexes() {
+    use fln_rt::region::SubgraphCapture;
+    let _g = lock();
+    let shared = Obj::mk_string("shared λ🙂 leaf");
+    let graph = Obj::mk_array(
+        (0..257)
+            .map(|index| Obj::mk_ctor(3, vec![shared.clone_ref(), Obj::mk_nat(index)], &[0xAB; 8]))
+            .collect(),
+    );
+    let expected = compact(&graph, 0).unwrap();
+    for base in [BASE_A, BASE_B] {
+        let bytes = compact(&graph, base).unwrap();
+        let root = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+        for _ in 0..4 {
+            // Each index has a fresh hash seed. Neither relocation nor that
+            // seed may change object order, sharing, padding or byte charges.
+            let capture = SubgraphCapture::new(&bytes, base).unwrap();
+            assert_eq!(capture.capture(root, expected.len()).unwrap(), expected);
+            assert_eq!(
+                capture.captured_size(root, expected.len()).unwrap(),
+                expected.len()
+            );
+            assert_eq!(
+                capture.capture(root, expected.len() - 1),
+                Err(RegionFault::CaptureBudgetExhausted {
+                    required: expected.len(),
+                    limit: expected.len() - 1,
+                })
+            );
+        }
+    }
+}
+
+#[test]
+fn raw_region_entry_points_refuse_misaligned_bases_before_rewriting() {
+    use fln_rt::region::{audit, audit_with_dependencies};
+    let _g = lock();
+    let graph = Obj::mk_string("heap λ🙂");
+    for base in [0, 8, BASE_A, BASE_A + size_of::<u64>() as u64, BASE_B] {
+        // Raw payloads need word alignment, not an envelope's larger mapping
+        // alignment. In particular an aligned offset must remain valid.
+        let bytes = compact(&graph, base).unwrap();
+        audit(&bytes, base).unwrap();
+        let rebuilt = materialize(&bytes, base).unwrap();
+        assert!(!rebuilt.is_scalar());
+        assert_eq!(compact(&rebuilt, base).unwrap(), bytes);
+    }
+    let bytes = compact(&graph, BASE_A).unwrap();
+    for base in 1..8 {
+        let expected = RegionFault::MisalignedBase { base };
+        assert_eq!(compact(&graph, base), Err(expected.clone()));
+        assert_eq!(audit(&bytes, base), Err(expected.clone()));
+        assert_eq!(
+            audit_with_dependencies(
+                &bytes,
+                base,
+                &[fln_rt::region::RegionDependency {
+                    base: BASE_B,
+                    len: 8,
+                }],
+            ),
+            Err(expected.clone())
+        );
+        assert_eq!(canonical_digest(&bytes, base), Err(expected.clone()));
+        assert!(matches!(
+            materialize(&bytes, base),
+            Err(RegionFault::MisalignedBase { base: observed }) if observed == base
+        ));
+        let mut moved = bytes.clone();
+        assert_eq!(relocate(&mut moved, BASE_A, base), Err(expected.clone()));
+        assert_eq!(
+            moved, bytes,
+            "invalid target {base} must not rewrite a pointer"
+        );
+        assert_eq!(relocate(&mut moved, base, BASE_B), Err(expected));
+        assert_eq!(
+            moved, bytes,
+            "invalid source {base} must not rewrite a pointer"
+        );
+    }
+    // Without the base check an odd relocated heap root is mistaken for a Nat
+    // before materialize even inspects the heap object that follows it.
+    let mut odd_image = bytes;
+    odd_image[..8].copy_from_slice(&9u64.to_le_bytes());
+    assert!(matches!(
+        materialize(&odd_image, 1),
+        Err(RegionFault::MisalignedBase { base: 1 })
+    ));
+}
+
+#[test]
+fn raw_region_entry_points_refuse_wrapping_address_ranges() {
+    use fln_rt::region::audit;
+    let _g = lock();
+    let graph = Obj::mk_string("heap λ🙂");
+    let bytes = compact(&graph, BASE_A).unwrap();
+    let expected = RegionFault::BuildShape {
+        reason: "region address range overflows",
+    };
+    for base in [u64::MAX - 7, u64::MAX - 15, u64::MAX - 31] {
+        assert_eq!(compact(&graph, base), Err(expected.clone()));
+        assert_eq!(audit(&bytes, base), Err(expected.clone()));
+        assert_eq!(canonical_digest(&bytes, base), Err(expected.clone()));
+        assert!(matches!(
+            materialize(&bytes, base),
+            Err(RegionFault::BuildShape {
+                reason: "region address range overflows"
+            })
+        ));
+        let mut moved = bytes.clone();
+        assert_eq!(relocate(&mut moved, BASE_A, base), Err(expected.clone()));
+        assert_eq!(moved, bytes);
+        assert_eq!(relocate(&mut moved, base, BASE_B), Err(expected.clone()));
+        assert_eq!(moved, bytes);
+    }
+    // Permit a representable range near the address-space end, including a
+    // scalar region that fits where the larger string region above cannot.
+    let base = u64::MAX - 7 - bytes.len() as u64;
+    let mut moved = bytes;
+    relocate(&mut moved, BASE_A, base).unwrap();
+    assert!(!materialize(&moved, base).unwrap().is_scalar());
+    assert_eq!(compact(&graph, base).unwrap(), moved);
+    let scalar = compact(&Obj::mk_nat(77), u64::MAX - 15).unwrap();
+    assert_eq!(materialize(&scalar, u64::MAX - 15).unwrap().unbox(), 77);
+}
+
+#[test]
 fn opaque_capture_refuses_foreign_interior_forward_and_overlapping_regions() {
     use fln_rt::region::{CaptureRegionFault, SubgraphCapture};
     let _g = lock();
