@@ -24,6 +24,7 @@ use super::*;
 use fln_env::constants::{ConstantInfo, ConstantVal, DefinitionVal, TheoremVal};
 mod capture;
 pub mod journal;
+pub(in crate::source) mod macro_replay;
 mod matched;
 
 /// Which equation-like name was asked for.

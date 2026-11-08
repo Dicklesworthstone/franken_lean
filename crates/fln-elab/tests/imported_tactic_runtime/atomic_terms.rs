@@ -708,6 +708,44 @@ fn dependent_application_typing_uses_the_actual_atomic_expansion_once() {
 }
 
 #[test]
+fn regular_matches_expand_branch_bodies_in_written_order() {
+    for source in [
+        "opaque ordered (b : Bool) : Nat := match b with | true => rhsFirst | false => rhsSecond",
+        "opaque ordered (n : Nat) : Nat := match n with | .succ k => rhsFirst + k | .zero => rhsSecond",
+    ] {
+        let provider = Templates::new(&[
+            "macro_rules | `(rhsFirst) => `(7)",
+            "macro_rules | `(rhsSecond) => `(8)",
+        ]);
+        checked_in(source, provider.clone(), &environment())
+            .unwrap_or_else(|error| panic!("{source}: {error:?}"));
+        assert_eq!(
+            *provider.expansions.lock().unwrap(),
+            ["rhsFirst", "rhsSecond"],
+            "source branch order must be independent of recursor argument order: {source}"
+        );
+    }
+}
+
+#[test]
+fn regular_match_source_order_preserves_unsafe_definition_admission() {
+    let environment = environment();
+    let seed = checked_in(
+        "unsafe def unsafeSeed : Nat := 7",
+        Templates::new(&[]),
+        &environment,
+    )
+    .unwrap();
+    let environment = publish(&environment, seed);
+    checked_in(
+        "unsafe def unsafeChoice (b : Bool) : Nat := match b with | true => unsafeSeed | false => 0",
+        Templates::new(&[]),
+        &environment,
+    )
+    .unwrap();
+}
+
+#[test]
 fn dependent_application_typing_keeps_rejections_after_macro_observation() {
     let environment = dependent_application_environment();
     for (rule, body) in [

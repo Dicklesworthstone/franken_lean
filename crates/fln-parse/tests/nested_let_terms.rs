@@ -83,6 +83,109 @@ fn malformed_nested_bindings_are_never_silently_dropped() {
     }
 }
 
+fn count_kind(syntax: &fln_syntax::tree::Syntax, expected: &str) -> usize {
+    let mut todo = vec![syntax];
+    let mut count = 0;
+    while let Some(node) = todo.pop() {
+        if let fln_syntax::tree::Syntax::Node { kind, args, .. } = node {
+            count += usize::from(kind.to_display_string() == expected);
+            todo.extend(args);
+        }
+    }
+    count
+}
+
+#[test]
+fn nested_local_equations_keep_their_rows_and_continuations() {
+    // These complete declarations are accepted by the pinned 4.32.0 frontend.
+    // Local matchAlts must neither acquire the outer match's arity nor consume
+    // its next branch, local continuation, or closing parenthesis.
+    for (source, equations, matches) in [
+        (
+            "def f (a b : Bool) : Nat :=\n  match a, b with\n  | true, true => 0\n  | _, _ =>\n    let g : Nat → Nat\n      | 0 => 31\n      | Nat.succ n => n\n    g 0",
+            1,
+            1,
+        ),
+        (
+            "def f (b : Bool) : Nat :=\n  match b with\n  | false =>\n    let g : Nat → Nat\n    | 0 => 31\n    | Nat.succ n => n\n    g 0\n  | true => 7",
+            1,
+            1,
+        ),
+        (
+            "def f (b : Bool) : Nat := match b with | false => let g : Nat → Nat | 0 => 31 | _ => 7; g 0 | true => 1",
+            1,
+            1,
+        ),
+        (
+            "def f (b : Bool) : Nat := match b with | false => (let g : Nat → Nat | 0 => 31 | _ => 7; g 0) | true => 1",
+            1,
+            1,
+        ),
+        (
+            "def f (b : Bool) : Nat :=\n  if b then\n    let g : Nat → Nat\n      | 0 => 31\n      | Nat.succ n => n\n    g 0\n  else 7",
+            1,
+            0,
+        ),
+        (
+            "def f (b : Bool) : Nat :=\n  match b with\n  | false => 0\n  | true =>\n    let g : Bool → Nat\n      | false => 1\n      | true =>\n        let h : Nat → Nat\n          | 0 => 31\n          | Nat.succ n => n\n        h 0\n    g true",
+            2,
+            1,
+        ),
+        (
+            "def f (b : Bool) : Nat :=\n  match b with\n  | false =>\n    let g : Nat → Nat\n      | 0 =>\n        match b with\n        | true => 1\n        | false => 31\n      | Nat.succ n => n\n    g 0\n  | true => 7",
+            1,
+            2,
+        ),
+    ] {
+        let parsed = parse_definition(source.as_bytes())
+            .unwrap_or_else(|error| panic!("{source}\n{error:?}"));
+        assert_eq!(parsed.reconstruct_original(), source.as_bytes());
+        assert_eq!(
+            count_kind(parsed.syntax(), "Lean.Parser.Term.letEqnsDecl"),
+            equations,
+            "{source}"
+        );
+        assert_eq!(
+            count_kind(parsed.syntax(), "Lean.Parser.Term.match"),
+            matches,
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn local_equation_proofs_keep_tactic_bars_and_original_trivia() {
+    let source = "def f (b : Bool) : Nat :=\r\n  match b with\r\n  | false =>\r\n    let /- kept -/ g : Nat → Nat\r\n      | 0 => by\r\n        first\r\n        | exact 31\r\n        | exact 7\r\n      | Nat.succ n => n\r\n    --🦀 continuation\r\n    g 0\r\n  | true => 7\r\n";
+    let parsed = parse_definition(source.as_bytes()).unwrap();
+    assert_eq!(parsed.reconstruct_original(), source.as_bytes());
+    assert_eq!(
+        parsed.reconstruct_normalized().unwrap(),
+        source.replace("\r\n", "\n").as_bytes()
+    );
+    assert_eq!(
+        count_kind(parsed.syntax(), "Lean.Parser.Term.letEqnsDecl"),
+        1
+    );
+    assert_eq!(count_kind(parsed.syntax(), "Lean.Parser.Term.matchAlt"), 4);
+    assert_eq!(count_kind(parsed.syntax(), "Lean.Parser.Term.byTactic"), 1);
+}
+
+#[test]
+fn malformed_nested_equations_never_discard_rows_or_the_continuation() {
+    for body in [
+        "let g : Nat → Nat | 0 => ; g 0",
+        "let g : Nat → Nat | 0 31; g 0",
+        "let g : Nat → Nat | => 31; g 0",
+        "let g : Nat → Nat | 0 => 31 | ; g 0",
+        "let g : Nat → Nat | 0 => 31;",
+        "let g : Nat → Nat | 0 => 31",
+    ] {
+        let source =
+            format!("def f (b : Bool) : Nat := match b with | false => ({body}) | true => 7");
+        assert!(parse_definition(source.as_bytes()).is_err(), "{source}");
+    }
+}
+
 #[test]
 fn nested_lets_use_heap_frames_on_a_small_host_stack() {
     std::thread::Builder::new()

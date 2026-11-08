@@ -2665,6 +2665,23 @@ const LOCAL_EQUATIONS: &[Accepted] = &[
     },
 ];
 
+/// Nested term-local equations, captured with the same pinned extraction
+/// script on 2026-11-08. Inner rows retain their local arity and continuation.
+const NESTED_LOCAL_EQUATIONS: &[Accepted] = &[
+    Accepted {
+        source: "def matchLocal (a b : Bool) : Nat :=\n  match a, b with\n  | true, true => 0\n  | _, _ =>\n    let f : Nat → Nat\n      | 0 => 31\n      | Nat.succ n => n\n    f 0",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `matchLocal []) (Command.optDeclSig [(Term.explicitBinder "(" [`a `b] [":" `Bool] [] ")")] [(Term.typeSpec ":" `Nat)]) (Command.declValSimple ":=" (Term.match "match" [] [] [(Term.matchDiscr [] `a) "," (Term.matchDiscr [] `b)] "with" (Term.matchAlts [(Term.matchAlt "|" [[`true "," `true]] "=>" (num "0")) (Term.matchAlt "|" [[(Term.hole "_") "," (Term.hole "_")]] "=>" (Term.let "let" (Term.letConfig []) (Term.letDecl (Term.letEqnsDecl (Term.letId `f) [] [(Term.typeSpec ":" (Term.arrow `Nat "→" `Nat))] (Term.matchAlts [(Term.matchAlt "|" [[(num "0")]] "=>" (num "31")) (Term.matchAlt "|" [[(Term.app `Nat.succ [`n])]] "=>" `n)]))) [] (Term.app `f [(num "0")])))])) (Termination.suffix [] []) []) []))"#,
+    },
+    Accepted {
+        source: "def conditionalLocal (b : Bool) : Nat :=\n  if b then\n    let f : Nat → Nat\n      | 0 => 31\n      | Nat.succ n => n\n    f 0\n  else 7",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `conditionalLocal []) (Command.optDeclSig [(Term.explicitBinder "(" [`b] [":" `Bool] [] ")")] [(Term.typeSpec ":" `Nat)]) (Command.declValSimple ":=" (termIfThenElse "if" `b "then" (Term.let "let" (Term.letConfig []) (Term.letDecl (Term.letEqnsDecl (Term.letId `f) [] [(Term.typeSpec ":" (Term.arrow `Nat "→" `Nat))] (Term.matchAlts [(Term.matchAlt "|" [[(num "0")]] "=>" (num "31")) (Term.matchAlt "|" [[(Term.app `Nat.succ [`n])]] "=>" `n)]))) [] (Term.app `f [(num "0")])) "else" (num "7")) (Termination.suffix [] []) []) []))"#,
+    },
+    Accepted {
+        source: "def nestedLocal (b : Bool) : Nat :=\n  match b with\n  | false => 0\n  | true =>\n    let f : Bool → Nat\n      | false => 1\n      | true =>\n        let g : Nat → Nat\n          | 0 => 31\n          | Nat.succ n => n\n        g 0\n    f true",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `nestedLocal []) (Command.optDeclSig [(Term.explicitBinder "(" [`b] [":" `Bool] [] ")")] [(Term.typeSpec ":" `Nat)]) (Command.declValSimple ":=" (Term.match "match" [] [] [(Term.matchDiscr [] `b)] "with" (Term.matchAlts [(Term.matchAlt "|" [[`false]] "=>" (num "0")) (Term.matchAlt "|" [[`true]] "=>" (Term.let "let" (Term.letConfig []) (Term.letDecl (Term.letEqnsDecl (Term.letId `f) [] [(Term.typeSpec ":" (Term.arrow `Bool "→" `Nat))] (Term.matchAlts [(Term.matchAlt "|" [[`false]] "=>" (num "1")) (Term.matchAlt "|" [[`true]] "=>" (Term.let "let" (Term.letConfig []) (Term.letDecl (Term.letEqnsDecl (Term.letId `g) [] [(Term.typeSpec ":" (Term.arrow `Nat "→" `Nat))] (Term.matchAlts [(Term.matchAlt "|" [[(num "0")]] "=>" (num "31")) (Term.matchAlt "|" [[(Term.app `Nat.succ [`n])]] "=>" `n)]))) [] (Term.app `g [(num "0")])))]))) [] (Term.app `f [`true])))])) (Termination.suffix [] []) []) []))"#,
+    },
+];
+
 /// A term `if let p := e then a else b` (`termIfLet`).
 const TERM_IF_LET: &[Accepted] = &[
     Accepted {
@@ -5389,6 +5406,14 @@ fn empty_where_instances_produce_the_pins_trees() {
 #[test]
 fn local_equations_produce_the_pins_trees() {
     for row in LOCAL_EQUATIONS {
+        let ours = rendered(row.source).unwrap_or_else(|error| panic!("{}: {error:?}", row.source));
+        assert_eq!(ours, row.tree, "{}", row.source);
+    }
+}
+
+#[test]
+fn nested_local_equations_produce_the_pins_trees() {
+    for row in NESTED_LOCAL_EQUATIONS {
         let ours = rendered(row.source).unwrap_or_else(|error| panic!("{}: {error:?}", row.source));
         assert_eq!(ours, row.tree, "{}", row.source);
     }

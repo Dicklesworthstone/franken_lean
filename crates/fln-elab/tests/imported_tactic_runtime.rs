@@ -32,6 +32,10 @@ use fln_syntax::{source::SourceInfo, tree::Syntax};
 
 #[path = "imported_tactic_runtime/atomic_terms.rs"]
 mod atomic_terms;
+#[path = "imported_tactic_runtime/equation_macro_duplicates.rs"]
+mod equation_macro_duplicates;
+#[path = "imported_tactic_runtime/equation_macros.rs"]
+mod equation_macros;
 
 fn budget() -> Budget {
     Budget::for_stack_bytes(2 * 1024 * 1024)

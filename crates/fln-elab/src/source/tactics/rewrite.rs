@@ -6,6 +6,7 @@ mod offset;
 mod simplify;
 pub(in crate::source) use simplify::SimpKeyCache;
 use simplify::SimpRule;
+pub(super) use simplify::ac_expr_lt;
 
 pub(in crate::source) struct RewriteMatch {
     rule: Typed,

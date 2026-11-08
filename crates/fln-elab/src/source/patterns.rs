@@ -1039,8 +1039,9 @@ impl Context {
             }
             expanded_patterns.push(expanded);
         }
-        if let Some(original) = original
-            && self.equation_pattern_source == Some(std::ptr::from_ref(original).addr())
+        if original.is_some_and(|original| {
+            self.equation_pattern_source == Some(std::ptr::from_ref(original).addr())
+        }) || self.equation_root_rows(alts)
         {
             let patterns = expanded_patterns
                 .iter()
@@ -1724,6 +1725,11 @@ impl Context {
         &mut self,
         syntax: &'a Syntax,
     ) -> Result<Cow<'a, Syntax>, NatDefinitionElabError> {
+        if let Some(marked) = self.mark_equation_source(syntax)? {
+            return Ok(Cow::Owned(
+                self.lower_pattern_matrices(&marked)?.into_owned(),
+            ));
+        }
         // A declaration by equations is its `letIdDecl` first, as the pin expands it before its
         // `let` elaborates; the scan below reads every `let rec` declaration as one.
         if let Some(expanded) = self.expand_let_equations(syntax)? {

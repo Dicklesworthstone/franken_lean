@@ -500,7 +500,7 @@ fn divisibility(e: &Expr) -> Option<bool> {
 
 /// `Expr.lt` (vendored `src/library/expr_lt.cpp`, `use_hash = false`): the order `sortExprs`
 /// numbers atoms by, which decides the order of a normal form's monomials.
-fn expr_lt(a: &Expr, b: &Expr) -> bool {
+pub(in crate::source::tactics) fn expr_lt(a: &Expr, b: &Expr) -> bool {
     fn kind(e: &Expr) -> u8 {
         match e.node() {
             ExprNode::BVar { .. } => 0,
