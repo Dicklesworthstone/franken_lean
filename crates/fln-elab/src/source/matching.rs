@@ -5,6 +5,9 @@
 //! minor premise in the generated term. Constrained indices may justify omitted
 //! constructors only through retained contradiction proofs; supplied impossible
 //! alternatives are refused rather than erased. Both checkers validate the term.
+//! Branch bodies elaborate in their written order. Minor types are planned in
+//! recursor order, and the completed bodies are assembled in that same order,
+//! so stateful macros do not observe a constructor-order permutation of source.
 use super::*;
 use fln_env::constants::ConstantInfo;
 use fln_env::constants::ConstructorVal;
@@ -160,6 +163,7 @@ impl MatchParts<'_> {
 pub(super) struct MatchPatterns<'a> {
     pub(super) constructors: HashMap<Name, (Vec<Option<Name>>, &'a Syntax)>,
     pub(super) fallback: Option<(Option<Name>, &'a Syntax)>,
+    order: Vec<Name>,
     /// Written constructor order and field names, which recursor argument order loses.
     split_info: Option<KVMap>,
 }
@@ -173,6 +177,8 @@ struct Branch<'a> {
     fields: Option<Vec<Option<Name>>>,
     whole: Option<Name>,
     syntax: &'a Syntax,
+    minor: usize,
+    minor_type: Expr,
 }
 struct DirectMatch<'a> {
     syntax: Option<&'a Syntax>,
@@ -194,6 +200,7 @@ pub(super) struct MatchBuild<'a> {
     levels: Vec<Level>,
     recursor: Typed,
     branches: std::collections::VecDeque<Branch<'a>>,
+    completed_minors: Vec<Option<Typed>>,
     split_info: Option<KVMap>,
 }
 pub(super) struct BranchBinders {
@@ -204,6 +211,7 @@ pub(super) struct BranchBinders {
     hypotheses: Vec<(FVarId, FVarId)>,
     locals: Vec<LocalDecl>,
     type_: Expr,
+    minor: Option<usize>,
 }
 pub(super) enum MatchStep<'a> {
     Branch {
@@ -705,6 +713,7 @@ impl Context {
                     // Replaced by the checked body before completion.
                     recursor: major,
                     branches: std::collections::VecDeque::new(),
+                    completed_minors: Vec::new(),
                     split_info: None,
                 });
             }
@@ -855,13 +864,21 @@ impl Context {
         let MatchPatterns {
             constructors: mut patterns,
             fallback,
+            order,
             split_info,
         } = self.match_patterns(parts, name, &family.ctors, &family_type)?;
         let split_info =
             split_info.filter(|_| !recursive && family.num_indices == 0 && rec.num_motives == 1);
-        let mut branches = std::collections::VecDeque::new();
+        let fallback_position = order.len();
+        let positions: HashMap<_, _> = order
+            .into_iter()
+            .enumerate()
+            .map(|(index, constructor)| (constructor, index))
+            .collect();
+        let mut branches = Vec::new();
         let mut seen = HashSet::new();
-        for rule in &rec.rules {
+        let mut minor_cursor = recursor.clone();
+        for (minor_index, rule) in rec.rules.iter().enumerate() {
             self.tick()?;
             if !family.ctors.contains(&rule.ctor) || !seen.insert(rule.ctor.clone()) {
                 return Err(error(MatchError::UnsupportedFamily));
@@ -886,13 +903,36 @@ impl Context {
                 } else {
                     return Err(error(MatchError::MissingConstructor));
                 };
-            branches.push_back(Branch {
-                constructor,
-                fields,
-                whole,
-                syntax,
-            });
+            // Open the checked minor telescope in recursor order. These typed
+            // placeholders only determine branch expectations; completed values
+            // later rebuild the original prefix without assigning proof holes.
+            let type_ = self.whnf(&minor_cursor.type_)?;
+            let ExprNode::ForallE { binder_type, .. } = type_.node() else {
+                return Err(error(MatchError::UnsupportedFamily));
+            };
+            let minor = Typed {
+                value: self.hole(binder_type.clone())?,
+                type_: binder_type.clone(),
+            };
+            minor_cursor = self.match_apply(minor_cursor, minor.clone())?;
+            let position = positions
+                .get(&rule.ctor)
+                .copied()
+                .unwrap_or(fallback_position);
+            branches.push((
+                position,
+                Branch {
+                    constructor,
+                    fields,
+                    whole,
+                    syntax,
+                    minor: minor_index,
+                    minor_type: minor.type_,
+                },
+            ));
         }
+        branches.sort_by_key(|(position, _)| *position);
+        let branches = branches.into_iter().map(|(_, branch)| branch).collect();
         Ok(MatchBuild {
             direct: None,
             recursive,
@@ -908,6 +948,7 @@ impl Context {
             levels: levels.clone(),
             recursor,
             branches,
+            completed_minors: vec![None; rec.rules.len()],
             split_info,
         })
     }
@@ -1031,6 +1072,7 @@ impl Context {
             levels: Vec::new(),
             recursor: major.clone(),
             branches: std::collections::VecDeque::new(),
+            completed_minors: Vec::new(),
             split_info: None,
         }))
     }
@@ -1103,11 +1145,13 @@ impl Context {
             {
                 return Err(error(MatchError::UnsupportedFamily));
             }
+            let order = vec![yes.clone(), no.clone()];
             patterns.insert(no, (fields.clone(), conditional.no));
             patterns.insert(yes, (fields, conditional.yes));
             return Ok(MatchPatterns {
                 constructors: patterns,
                 fallback: None,
+                order,
                 split_info: None,
             });
         }
@@ -1389,6 +1433,7 @@ impl Context {
         Ok(MatchPatterns {
             constructors: patterns,
             fallback,
+            order,
             split_info,
         })
     }
@@ -1538,6 +1583,7 @@ impl Context {
                     hypotheses: Vec::new(),
                     locals,
                     type_: state.target.clone(),
+                    minor: None,
                 },
             });
         }
@@ -1546,6 +1592,10 @@ impl Context {
                 return Err(error(MatchError::UnrefinedIndexPattern));
             }
             let mut result = state.recursor.clone();
+            for minor in std::mem::take(&mut state.completed_minors) {
+                let minor = minor.ok_or_else(|| error(MatchError::MissingConstructor))?;
+                result = self.match_apply(result, minor)?;
+            }
             for index in &state.indices {
                 result = self.match_apply(
                     result,
@@ -1602,15 +1652,7 @@ impl Context {
         if branch.constructor.num_fields > 256 {
             return Err(failure(SourceInferenceError::ResourceLimit));
         }
-        let type_ = self.whnf(&state.recursor.type_)?;
-        let ExprNode::ForallE {
-            binder_type: minor_type,
-            ..
-        } = type_.node()
-        else {
-            return Err(error(MatchError::UnsupportedFamily));
-        };
-        let minor_type = minor_type.clone();
+        let minor_type = self.instantiate(&branch.minor_type)?;
         let mut target = minor_type.clone();
         let mut locals = Vec::new();
         let mut constructor =
@@ -1854,6 +1896,7 @@ impl Context {
                 hypotheses,
                 locals,
                 type_: minor_type.clone(),
+                minor: Some(branch.minor),
             },
         })
     }
@@ -1920,11 +1963,20 @@ impl Context {
             };
             return Ok(());
         }
-        let value = Typed {
+        let minor = binders
+            .minor
+            .ok_or_else(|| error(MatchError::UnsupportedFamily))?;
+        let slot = state
+            .completed_minors
+            .get_mut(minor)
+            .ok_or_else(|| error(MatchError::UnsupportedFamily))?;
+        if slot.is_some() {
+            return Err(error(MatchError::DuplicateConstructor));
+        }
+        *slot = Some(Typed {
             value,
             type_: binders.type_,
-        };
-        state.recursor = self.match_apply(state.recursor.clone(), value)?;
+        });
         Ok(())
     }
 }
