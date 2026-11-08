@@ -255,6 +255,54 @@ fn opaque_capture_keeps_canonical_bytes_across_fresh_address_indexes() {
 }
 
 #[test]
+fn opaque_capture_keeps_interleaved_scalar_slots_and_shared_child_positions() {
+    use fln_rt::region::SubgraphCapture;
+    let _g = lock();
+    let shared = Obj::mk_string("shared λ🙂");
+    let nested = Obj::mk_ctor(
+        3,
+        vec![
+            Obj::mk_nat(13),
+            shared.clone_ref(),
+            Obj::mk_nat(0),
+            shared.clone_ref(),
+        ],
+        &[0xAB; 8],
+    );
+    let graph = Obj::mk_array(vec![
+        Obj::mk_nat(11),
+        shared.clone_ref(),
+        Obj::mk_nat(0),
+        nested,
+        Obj::mk_nat(2),
+        shared,
+        Obj::mk_nat(3),
+    ]);
+    let expected = compact(&graph, 0).unwrap();
+    for base in [BASE_A, BASE_B] {
+        let bytes = compact(&graph, base).unwrap();
+        let root = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+        let capture = SubgraphCapture::new(&bytes, base).unwrap();
+        assert_eq!(capture.capture(root, expected.len()).unwrap(), expected);
+        assert_eq!(
+            capture.captured_size(root, expected.len()).unwrap(),
+            expected.len()
+        );
+        assert_eq!(
+            capture.capture(root, expected.len() - 1),
+            Err(RegionFault::CaptureBudgetExhausted {
+                required: expected.len(),
+                limit: expected.len() - 1,
+            })
+        );
+        // A boxed scalar is a root value, never a cached object index.
+        let scalar = compact(&Obj::mk_nat(13), 0).unwrap();
+        let scalar_root = u64::from_le_bytes(scalar[..8].try_into().unwrap());
+        assert_eq!(capture.capture(scalar_root, scalar.len()).unwrap(), scalar);
+    }
+}
+
+#[test]
 fn raw_region_entry_points_refuse_misaligned_bases_before_rewriting() {
     use fln_rt::region::{audit, audit_with_dependencies};
     let _g = lock();

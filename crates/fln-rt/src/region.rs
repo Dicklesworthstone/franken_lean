@@ -919,7 +919,12 @@ pub struct SubgraphCapture<'a> {
 struct CaptureObject {
     region: usize,
     offset: usize,
-    step: WalkStep,
+    /// The validated, word-rounded byte extent.
+    size: usize,
+    /// Non-scalar pointer fields and their already validated child indices.
+    /// Retaining the lookup avoids rehashing every edge for each entry root.
+    pointers: Vec<(usize, usize)>,
+    limb_ptr: Option<usize>,
 }
 
 /// A capture-index failure with its position in the supplied region list.
@@ -983,7 +988,8 @@ impl<'a> SubgraphCapture<'a> {
             while offset < bytes.len() {
                 let step = walk_step(bytes, offset).map_err(source)?;
                 need(bytes, offset, round8(step.size)).map_err(source)?;
-                for &field in &step.ptr_fields {
+                let mut pointers = Vec::new();
+                for field in step.ptr_fields {
                     let pointer = read_u64(bytes, field);
                     if is_scalar_word(pointer) {
                         continue;
@@ -994,12 +1000,13 @@ impl<'a> SubgraphCapture<'a> {
                             ptr: pointer,
                         }));
                     }
-                    if !addresses.contains_key(&pointer) {
-                        return Err(source(RegionFault::PtrOutOfBounds {
+                    let child = addresses.get(&pointer).copied().ok_or_else(|| {
+                        source(RegionFault::PtrOutOfBounds {
                             offset: field,
                             ptr: pointer,
-                        }));
-                    }
+                        })
+                    })?;
+                    pointers.push((field, child));
                 }
                 if let Some(field) = step.limb_ptr {
                     checked_limb_rel(bytes, field, base, offset, step.size).map_err(source)?;
@@ -1009,7 +1016,9 @@ impl<'a> SubgraphCapture<'a> {
                 objects.push(CaptureObject {
                     region,
                     offset,
-                    step,
+                    size,
+                    pointers,
+                    limb_ptr: step.limb_ptr,
                 });
                 offset += size;
             }
@@ -1037,28 +1046,23 @@ impl<'a> SubgraphCapture<'a> {
         for index in reachable {
             let object = &self.objects[index];
             let offset = object.offset;
-            let step = &object.step;
             let bytes = self.regions[object.region].0;
             let new_offset = output.len();
-            output.extend_from_slice(&bytes[offset..offset + round8(step.size)]);
-            for &field in &step.ptr_fields {
-                let pointer = read_u64(bytes, field);
-                if !is_scalar_word(pointer) {
-                    let child = self.addresses[&pointer];
-                    // new() established strict post-order, and reachability
-                    // included every child. Still refuse a broken join.
-                    let target =
-                        relocated
-                            .get(&child)
-                            .copied()
-                            .ok_or(RegionFault::PtrOutOfBounds {
-                                offset: field,
-                                ptr: pointer,
-                            })?;
-                    write_u64(&mut output, new_offset + field - offset, target);
-                }
+            output.extend_from_slice(&bytes[offset..offset + object.size]);
+            for &(field, child) in &object.pointers {
+                // Construction established strict post-order, and reachability
+                // included every child. Still refuse a broken join.
+                let target =
+                    relocated
+                        .get(&child)
+                        .copied()
+                        .ok_or_else(|| RegionFault::PtrOutOfBounds {
+                            offset: field,
+                            ptr: read_u64(bytes, field),
+                        })?;
+                write_u64(&mut output, new_offset + field - offset, target);
             }
-            if let Some(field) = step.limb_ptr {
+            if let Some(field) = object.limb_ptr {
                 write_u64(
                     &mut output,
                     new_offset + field - offset,
@@ -1095,27 +1099,22 @@ impl<'a> SubgraphCapture<'a> {
         if is_scalar_word(root) {
             return Ok((std::collections::BTreeSet::new(), 8));
         }
-        let mut pending = vec![root];
+        let root_index = *self
+            .addresses
+            .get(&root)
+            .ok_or(RegionFault::PtrOutOfBounds {
+                offset: 0,
+                ptr: root,
+            })?;
+        let mut pending = vec![root_index];
         let mut reachable = std::collections::BTreeSet::new();
         let mut total = 8usize;
-        while let Some(pointer) = pending.pop() {
-            if is_scalar_word(pointer) {
-                continue;
-            }
-            let index = *self
-                .addresses
-                .get(&pointer)
-                .ok_or(RegionFault::PtrOutOfBounds {
-                    offset: 0,
-                    ptr: pointer,
-                })?;
+        while let Some(index) = pending.pop() {
             if !reachable.insert(index) {
                 continue;
             }
             let object = &self.objects[index];
-            let step = &object.step;
-            let bytes = self.regions[object.region].0;
-            let required = total.saturating_add(round8(step.size));
+            let required = total.saturating_add(object.size);
             if required > max_bytes {
                 return Err(RegionFault::CaptureBudgetExhausted {
                     required,
@@ -1123,7 +1122,7 @@ impl<'a> SubgraphCapture<'a> {
                 });
             }
             total = required;
-            pending.extend(step.ptr_fields.iter().map(|&field| read_u64(bytes, field)));
+            pending.extend(object.pointers.iter().map(|&(_, child)| child));
         }
         Ok((reachable, total))
     }
