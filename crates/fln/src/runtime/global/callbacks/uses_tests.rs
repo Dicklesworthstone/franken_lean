@@ -89,6 +89,89 @@ fn absence_pruning_preserves_callee_and_value_occurrences() {
 }
 
 #[test]
+fn shared_open_callee_subtrees_do_not_expand_into_a_tree() {
+    fn sum(left: Expr, right: Expr) -> Expr {
+        Expr::app(
+            Expr::app(Expr::const_(name("Nat.add"), Vec::new()), left),
+            right,
+        )
+    }
+    fn sum_dag() -> Expr {
+        let mut value = Expr::app(b(0), nat::literal(0));
+        for _ in 0..25 {
+            value = sum(value.clone(), value);
+        }
+        value
+    }
+    let environment = Environment::new();
+    let child = sum_dag();
+    let source = sum(child.clone(), child);
+    let original = source.clone();
+    let limits = IngressLimits {
+        max_nodes: 256,
+        ..IngressLimits::default()
+    };
+    let mut shared = Preparation::new(&environment, limits);
+    assert!(shared.only_callee_uses(&source).unwrap());
+    // Equal children with different allocations must share the same analysis
+    // within this walk, just as two aliases of the same child do.
+    let independent_source = sum(sum_dag(), sum_dag());
+    let mut independent = Preparation::new(&environment, limits);
+    assert!(independent.only_callee_uses(&independent_source).unwrap());
+    assert_eq!(shared.visited, independent.visited);
+    assert_eq!(source, original);
+    let mut bounded = Preparation::new(
+        &environment,
+        IngressLimits {
+            max_nodes: 16,
+            ..limits
+        },
+    );
+    assert!(matches!(
+        bounded.only_callee_uses(&source),
+        Err(IngressError::ResourceLimit {
+            resource: IngressResource::Nodes,
+            limit: 16,
+            ..
+        })
+    ));
+    bounded.limits = limits;
+    assert!(bounded.only_callee_uses(&source).unwrap());
+}
+
+#[test]
+fn shared_syntax_keeps_lexical_depth_and_callee_position_distinct() {
+    let environment = Environment::new();
+    let call = Expr::app(b(0), nat::literal(0));
+    // keepCallback : Nat -> (Nat -> Nat) -> Nat. Seeing #0 as a
+    // callee first must not hide the later use as a function argument.
+    let leak = Expr::app(
+        Expr::app(Expr::const_(name("keepCallback"), Vec::new()), call),
+        b(0),
+    );
+    assert!(
+        !Preparation::new(&environment, IngressLimits::default())
+            .only_callee_uses(&leak)
+            .unwrap()
+    );
+    // Under the lambda, #1 is the target callback and #0 its Nat operand.
+    // Outside it, #1 takes the target callback as an ordinary argument.
+    let shared = Expr::app(b(1), b(0));
+    let leak = Expr::app(
+        Expr::app(
+            Expr::const_(name("keepCallbackResult"), Vec::new()),
+            lam(nat(), shared.clone()),
+        ),
+        shared,
+    );
+    assert!(
+        !Preparation::new(&environment, IngressLimits::default())
+            .only_callee_uses(&leak)
+            .unwrap()
+    );
+}
+
+#[test]
 fn a_large_absent_subtree_does_not_consume_an_expanded_tree_budget() {
     let environment = Environment::new();
     let add = Expr::const_(name("Nat.add"), Vec::new());

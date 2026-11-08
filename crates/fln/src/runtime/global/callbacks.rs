@@ -327,6 +327,7 @@ impl Preparation<'_> {
 
     fn only_callee_uses(&mut self, body: &Expr) -> Result<bool, IngressError> {
         let mut pending = vec![(body.clone(), 0usize, false)];
+        let mut seen = std::collections::HashSet::new();
         let mut used = false;
         while let Some((expr, depth, callee)) = pending.pop() {
             self.tick()?;
@@ -344,6 +345,19 @@ impl Preparation<'_> {
             {
                 continue;
             }
+            // A shared open subtree has the same answer only at the same
+            // lexical depth and use position. Memoizing syntax alone could
+            // hide an argument use after seeing that variable as a callee.
+            let key = (expr.clone(), depth, callee);
+            if seen.contains(&key) {
+                continue;
+            }
+            seen.try_reserve(1)
+                .map_err(|_| IngressError::AllocationFailure {
+                    resource: IngressResource::Nodes,
+                    requested: seen.len().saturating_add(1),
+                })?;
+            seen.insert(key);
             match expr.node() {
                 ExprNode::BVar { idx } if usize::try_from(*idx).ok() == Some(depth) => {
                     if !callee {
