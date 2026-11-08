@@ -25,6 +25,7 @@ const MAX_TRACE_WORK: u64 = 1_000_000;
 pub(in crate::source) struct Work {
     pending: AtomicU64,
     exhausted: AtomicBool,
+    mismatched: AtomicBool,
 }
 
 impl Work {
@@ -112,7 +113,11 @@ pub(in crate::source) struct Rows {
     sources: HashMap<usize, usize>,
     rows: Vec<Observed>,
     active: Option<Active>,
+    occurrences: Vec<usize>,
+    prefixes: Arc<Mutex<Vec<Vec<Segment>>>>,
 }
+
+type Segment = Arc<Mutex<Vec<Arc<Entry>>>>;
 
 impl Row {
     /// Fresh tactic scopes are allocation identities, not source-row identities.
@@ -190,6 +195,8 @@ impl Rows {
                 .collect(),
             rows: vec![Observed::Missing; alternatives.len()],
             active: None,
+            occurrences: vec![0; alternatives.len()],
+            prefixes: Arc::new(Mutex::new(vec![Vec::new(); alternatives.len()])),
         }
     }
 
@@ -272,6 +279,8 @@ impl Recording {
             match node {
                 Syntax::Node { kind, args, .. } => {
                     self.name(kind, work)?;
+                    // Bound the traversal frontier before retaining its edges.
+                    self.units(args.len() as u64, work)?;
                     pending.extend(args);
                 }
                 Syntax::Atom { val, .. } => self.bytes(val.len(), work)?,
@@ -294,6 +303,7 @@ impl Recording {
                             Preresolved::Namespace { ns } => self.name(ns, work)?,
                             Preresolved::Decl { name, fields } => {
                                 self.name(name, work)?;
+                                self.units(fields.len() as u64, work)?;
                                 for field in fields {
                                     self.bytes(field.len(), work)?;
                                 }
@@ -336,6 +346,8 @@ struct Recorder {
     provider: TacticMacroProvider,
     work: Arc<Work>,
     recording: Mutex<Recording>,
+    prefix: Segment,
+    cursor: Mutex<Cursor>,
 }
 
 impl Recorder {
@@ -344,14 +356,78 @@ impl Recorder {
             self.work.exhausted.store(true, Ordering::Relaxed);
             return;
         };
+        let Ok(mut cursor) = self.cursor.lock() else {
+            self.work.exhausted.store(true, Ordering::Relaxed);
+            return;
+        };
+        let Ok(mut prefix) = self.prefix.lock() else {
+            self.work.exhausted.store(true, Ordering::Relaxed);
+            return;
+        };
+        if cursor.failed || cursor.next != prefix.len() {
+            cursor.failed = true;
+            self.work.mismatched.store(true, Ordering::Relaxed);
+            return;
+        }
         let before = recording.remaining;
         let event = recording
             .charge(&self.work)
             .and_then(|()| make(&mut recording, &self.work));
         if let Some(event) = event {
             let work = before - recording.remaining;
-            recording.entries.push(Arc::new(Entry { event, work }));
+            let entry = Arc::new(Entry { event, work });
+            prefix.push(entry.clone());
+            cursor.next += 1;
+            recording.entries.push(entry);
         }
+    }
+
+    fn ready(&self) -> Result<(), TacticMacroError> {
+        if self.work.mismatched.load(Ordering::Relaxed) {
+            return Err(mismatch());
+        }
+        let remaining = self.recording.lock().map_err(|_| mismatch())?.remaining;
+        if remaining == 0 || self.work.exhausted.load(Ordering::Relaxed) {
+            self.work.exhausted.store(true, Ordering::Relaxed);
+            return Err(trace_limit(0, 1));
+        }
+        Ok(())
+    }
+
+    /// A semantic body retry consumes exactly the calls already executed for
+    /// this physical row occurrence. A failed elaboration leaves its prefix in
+    /// shared state; only its previously unseen suffix reaches the live provider.
+    fn cached<T>(
+        &self,
+        read: impl FnOnce(Event) -> Option<T>,
+    ) -> Result<Option<T>, TacticMacroError> {
+        self.ready()?;
+        let mut recording = self.recording.lock().map_err(|_| mismatch())?;
+        let mut cursor = self.cursor.lock().map_err(|_| mismatch())?;
+        if cursor.failed {
+            return Err(mismatch());
+        }
+        let entry = self
+            .prefix
+            .lock()
+            .map_err(|_| mismatch())?
+            .get(cursor.next)
+            .cloned();
+        let Some(entry) = entry else {
+            return Ok(None);
+        };
+        let remaining = recording.remaining;
+        if recording.units(entry.work, &self.work).is_none() {
+            return Err(trace_limit(remaining, entry.work));
+        }
+        let Some(answer) = read(entry.event.clone()) else {
+            cursor.failed = true;
+            self.work.mismatched.store(true, Ordering::Relaxed);
+            return Err(mismatch());
+        };
+        cursor.next += 1;
+        recording.entries.push(entry);
+        Ok(Some(answer))
     }
 
     fn source_scope(&self, scope: &SourceScope) -> SourceScope {
@@ -363,6 +439,14 @@ impl Recorder {
 
 impl TacticMacroExpander for Recorder {
     fn contains(&self, kind: &Name) -> bool {
+        match self.cached(|event| match event {
+            Event::Contains(recorded, result) if &recorded == kind => Some(result),
+            _ => None,
+        }) {
+            Ok(Some(result)) => return result,
+            Ok(None) => {}
+            Err(_) => return false,
+        }
         let result = self.provider.0.contains(kind);
         self.record(|recording, work| {
             recording.name(kind, work)?;
@@ -372,6 +456,12 @@ impl TacticMacroExpander for Recorder {
     }
 
     fn enter_tactic(&self, depth: usize) -> Result<u64, TacticMacroError> {
+        if let Some(result) = self.cached(|event| match event {
+            Event::Enter(recorded, result) if recorded == depth => Some(result),
+            _ => None,
+        })? {
+            return result;
+        }
         let result = self.provider.0.enter_tactic(depth);
         self.record(|recording, work| {
             Some(Event::Enter(
@@ -394,6 +484,24 @@ impl TacticMacroExpander for Recorder {
         environment: &Environment,
         scope: &SourceScope,
     ) -> Result<TacticMacroExpansion, TacticMacroError> {
+        if let Some(result) = self.cached(|event| match event {
+            Event::Tactic {
+                syntax: recorded,
+                candidate: index,
+                scope: entered,
+                depth: at,
+                result,
+            } if recorded.as_ref() == syntax
+                && index == candidate
+                && entered == macro_scope
+                && at == depth =>
+            {
+                Some(result)
+            }
+            _ => None,
+        })? {
+            return result.map(expansion_result);
+        }
         let result = self.provider.0.expand_tactic(
             syntax,
             candidate,
@@ -424,6 +532,16 @@ impl TacticMacroExpander for Recorder {
         environment: &Environment,
         scope: &SourceScope,
     ) -> Result<Option<Syntax>, TacticMacroError> {
+        if let Some(result) = self.cached(|event| match event {
+            Event::Term {
+                syntax: recorded,
+                depth: at,
+                result,
+            } if recorded.as_ref() == syntax && at == depth => Some(result),
+            _ => None,
+        })? {
+            return result.map(|syntax| syntax.map(|syntax| syntax.as_ref().clone()));
+        }
         let result =
             self.provider
                 .0
@@ -443,6 +561,7 @@ impl TacticMacroExpander for Recorder {
     }
 }
 
+#[derive(Default)]
 struct Cursor {
     next: usize,
     failed: bool,
@@ -456,6 +575,36 @@ struct Replay {
 
 fn mismatch() -> TacticMacroError {
     TacticMacroError::Unsupported("equation capture differs from the checked macro trace".into())
+}
+
+fn trace_limit(allowed: u64, observed: u64) -> TacticMacroError {
+    TacticMacroError::Inconclusive(Box::new(
+        fln_core::outcome::Inconclusive::resource(fln_core::outcome::ResourceUsage {
+            reason: fln_core::diag::ResourceReason::StructuralBudget {
+                unit: fln_core::diag::StructuralUnit::ExpandedWeight,
+            },
+            allowed,
+            observed,
+        })
+        .with_progress("reusing equation RHS macro answers"),
+    ))
+}
+
+fn expansion_result(expansion: Expansion) -> TacticMacroExpansion {
+    match expansion {
+        Expansion::Expanded {
+            syntax,
+            no_fallback,
+        } => TacticMacroExpansion::Expanded {
+            syntax: syntax.as_ref().clone(),
+            no_fallback,
+        },
+        Expansion::Unsupported => TacticMacroExpansion::Unsupported,
+        Expansion::Diagnostic { error, no_fallback } => {
+            TacticMacroExpansion::Diagnostic { error, no_fallback }
+        }
+        Expansion::Exhausted => TacticMacroExpansion::Exhausted,
+    }
 }
 
 impl Replay {
@@ -526,20 +675,7 @@ impl TacticMacroExpander for Replay {
                 && scope == macro_scope
                 && recorded_depth == depth =>
             {
-                result.map(|expansion| match expansion {
-                    Expansion::Expanded {
-                        syntax,
-                        no_fallback,
-                    } => TacticMacroExpansion::Expanded {
-                        syntax: syntax.as_ref().clone(),
-                        no_fallback,
-                    },
-                    Expansion::Unsupported => TacticMacroExpansion::Unsupported,
-                    Expansion::Diagnostic { error, no_fallback } => {
-                        TacticMacroExpansion::Diagnostic { error, no_fallback }
-                    }
-                    Expansion::Exhausted => TacticMacroExpansion::Exhausted,
-                })
+                result.map(expansion_result)
             }
             _ => self.fail(),
         }
@@ -572,53 +708,56 @@ pub(super) fn capture_result<T>(
 ) -> Result<Option<T>, NatDefinitionElabError> {
     match result {
         Ok(value) => Ok(Some(value)),
-        Err(problem) => {
-            let nonanswer = |outcome: &Outcome<Verdict>| {
-                matches!(
-                    outcome,
-                    Outcome::Inconclusive(_) | Outcome::InternalFault(_)
-                )
-            };
-            let stopped = match &problem {
-                NatDefinitionElabError::Inference(
-                    SourceInferenceError::ResourceLimit
-                    | SourceInferenceError::ArithmeticInconclusive(_)
-                    | SourceInferenceError::NativeEvaluationInconclusive(_)
-                    | SourceInferenceError::NativeEvaluation(
-                        crate::native::NativeEvaluationError::Fault(_),
-                    )
-                    | SourceInferenceError::TacticMacro(
-                        TacticMacroError::Inconclusive(_) | TacticMacroError::InternalFault(_),
-                    )
-                    | SourceInferenceError::Universe(
-                        crate::universe::UniverseInstantiationError::VisitLimit { .. }
-                        | crate::universe::UniverseInstantiationError::LevelTooDeep(_),
-                    ),
-                ) => true,
-                NatDefinitionElabError::Inference(SourceInferenceError::TypeObligation(
-                    outcome,
-                )) => nonanswer(outcome),
-                NatDefinitionElabError::Inference(SourceInferenceError::Unification(error)) => {
-                    match error.as_ref() {
-                        UnificationError::Cancelled
-                        | UnificationError::StepLimit { .. }
-                        | UnificationError::NodeLimit { .. }
-                        | UnificationError::AssignmentLimit { .. }
-                        | UnificationError::HeartbeatLimit
-                        | UnificationError::Universe(
-                            crate::universe::UniverseInstantiationError::VisitLimit { .. }
-                            | crate::universe::UniverseInstantiationError::LevelTooDeep(_),
-                        ) => true,
-                        UnificationError::ConversionCheck { outcome }
-                        | UnificationError::AssignmentCheck { outcome, .. }
-                        | UnificationError::ConstraintCheck { outcome, .. } => nonanswer(outcome),
-                        _ => false,
-                    }
-                }
-                _ => false,
-            };
-            if stopped { Err(problem) } else { Ok(None) }
+        Err(problem) if capture_stopped(&problem) => Err(problem),
+        Err(_) => Ok(None),
+    }
+}
+
+/// Preserve an already observed terminal cause when accounting discovers a
+/// second stop. In particular, an oversized cancellation diagnostic must not
+/// be replaced by the resource limit encountered while recording that error.
+pub(in crate::source) fn capture_stopped(problem: &NatDefinitionElabError) -> bool {
+    let nonanswer = |outcome: &Outcome<Verdict>| {
+        matches!(
+            outcome,
+            Outcome::Inconclusive(_) | Outcome::InternalFault(_)
+        )
+    };
+    match problem {
+        NatDefinitionElabError::Inference(
+            SourceInferenceError::ResourceLimit
+            | SourceInferenceError::ArithmeticInconclusive(_)
+            | SourceInferenceError::NativeEvaluationInconclusive(_)
+            | SourceInferenceError::NativeEvaluation(crate::native::NativeEvaluationError::Fault(_))
+            | SourceInferenceError::TacticMacro(
+                TacticMacroError::Inconclusive(_) | TacticMacroError::InternalFault(_),
+            )
+            | SourceInferenceError::Universe(
+                crate::universe::UniverseInstantiationError::VisitLimit { .. }
+                | crate::universe::UniverseInstantiationError::LevelTooDeep(_),
+            ),
+        ) => true,
+        NatDefinitionElabError::Inference(SourceInferenceError::TypeObligation(outcome)) => {
+            nonanswer(outcome)
         }
+        NatDefinitionElabError::Inference(SourceInferenceError::Unification(error)) => {
+            match error.as_ref() {
+                UnificationError::Cancelled
+                | UnificationError::StepLimit { .. }
+                | UnificationError::NodeLimit { .. }
+                | UnificationError::AssignmentLimit { .. }
+                | UnificationError::HeartbeatLimit
+                | UnificationError::Universe(
+                    crate::universe::UniverseInstantiationError::VisitLimit { .. }
+                    | crate::universe::UniverseInstantiationError::LevelTooDeep(_),
+                ) => true,
+                UnificationError::ConversionCheck { outcome }
+                | UnificationError::AssignmentCheck { outcome, .. }
+                | UnificationError::ConstraintCheck { outcome, .. } => nonanswer(outcome),
+                _ => false,
+            }
+        }
+        _ => false,
     }
 }
 
@@ -636,6 +775,18 @@ pub(in crate::source) fn parts(syntax: &Syntax) -> Option<(usize, &Syntax)> {
 }
 
 impl Context {
+    pub(in crate::source) fn begin_equation_macro_pass(&mut self, syntax: &Syntax) {
+        if self.equation_pattern_source
+            == Some(std::ptr::from_ref(super::capture::under_lambdas(syntax)).addr())
+            && let Some(rows) = &mut self.equation_macros
+            && rows.active.is_none()
+        {
+            // A new semantic trial begins at the first physical occurrence of
+            // each row. Copies within this trial still have distinct segments.
+            rows.occurrences.fill(0);
+        }
+    }
+
     /// Mark borrowed source rows before any native preparation can replace the
     /// containing tree. The markers then travel with the actual matrix copies.
     pub(in crate::source) fn mark_equation_source(
@@ -784,10 +935,34 @@ impl Context {
         let syntax = recording.syntax(syntax, &work);
         self.charge_equation_macro_work()?;
         let syntax = syntax.ok_or_else(|| failure(SourceInferenceError::ResourceLimit))?;
+        let rows = self.equation_macros.as_mut().expect("watched rows");
+        let occurrence = rows.occurrences[index];
+        rows.occurrences[index] = occurrence
+            .checked_add(1)
+            .ok_or_else(|| failure(SourceInferenceError::ResourceLimit))?;
+        let prefix = {
+            let mut prefixes = rows
+                .prefixes
+                .lock()
+                .map_err(|_| failure(SourceInferenceError::ResourceLimit))?;
+            let segments = &mut prefixes[index];
+            if occurrence == segments.len() {
+                recording
+                    .charge(&work)
+                    .ok_or_else(|| failure(SourceInferenceError::ResourceLimit))?;
+                segments.push(Arc::new(Mutex::new(Vec::new())));
+            }
+            segments
+                .get(occurrence)
+                .cloned()
+                .ok_or_else(|| failure(SourceInferenceError::Scope))?
+        };
         let recorder = Arc::new(Recorder {
             provider,
             work,
             recording: Mutex::new(recording),
+            prefix,
+            cursor: Mutex::default(),
         });
         let active = Active {
             index,
@@ -816,6 +991,24 @@ impl Context {
             .recording
             .lock()
             .map_err(|_| failure(SourceInferenceError::ResourceLimit))?;
+        let cursor = active
+            .recorder
+            .cursor
+            .lock()
+            .map_err(|_| failure(SourceInferenceError::ResourceLimit))?;
+        let prefix = active
+            .recorder
+            .prefix
+            .lock()
+            .map_err(|_| failure(SourceInferenceError::ResourceLimit))?;
+        if cursor.failed || cursor.next != prefix.len() {
+            active
+                .recorder
+                .work
+                .mismatched
+                .store(true, Ordering::Relaxed);
+            return Err(failure(SourceInferenceError::TacticMacro(mismatch())));
+        }
         let row = Arc::new(Row {
             syntax: active.syntax,
             depth: active.depth,
@@ -871,6 +1064,9 @@ impl Context {
         {
             return Err(failure(SourceInferenceError::ResourceLimit));
         }
+        if work.mismatched.load(Ordering::Relaxed) {
+            return Err(failure(SourceInferenceError::TacticMacro(mismatch())));
+        }
         Ok(())
     }
 
@@ -916,5 +1112,342 @@ impl Context {
             Some(term) if replay.complete() => Some(term),
             _ => None,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    #[derive(Default)]
+    struct Probe(AtomicUsize);
+
+    impl TacticMacroExpander for Probe {
+        fn contains(&self, _: &Name) -> bool {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            false
+        }
+
+        fn enter_tactic(&self, _: usize) -> Result<u64, TacticMacroError> {
+            Ok(self.0.fetch_add(1, Ordering::Relaxed) as u64)
+        }
+
+        fn expand_term(
+            &self,
+            _: &Syntax,
+            _: usize,
+            _: &Environment,
+            _: &SourceScope,
+        ) -> Result<Option<Syntax>, TacticMacroError> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(None)
+        }
+
+        fn expand_tactic(
+            &self,
+            _: &Syntax,
+            _: usize,
+            _: u64,
+            _: usize,
+            _: &Environment,
+            _: &SourceScope,
+        ) -> Result<TacticMacroExpansion, TacticMacroError> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(TacticMacroExpansion::Unsupported)
+        }
+    }
+
+    fn recorder(provider: &Arc<Probe>, prefix: Segment, limit: u64) -> Recorder {
+        Recorder {
+            provider: TacticMacroProvider(provider.clone()),
+            work: Arc::default(),
+            recording: Mutex::new(Recording {
+                remaining: limit,
+                entries: Vec::new(),
+            }),
+            prefix,
+            cursor: Mutex::default(),
+        }
+    }
+
+    fn context(provider: &Arc<Probe>, syntax: &Syntax) -> Context {
+        let mut context = Context::new(
+            &Environment::new(),
+            Budget::for_stack_bytes(2 * 1024 * 1024),
+        );
+        context.source_scope.tactic_macros = Some(TacticMacroProvider(provider.clone()));
+        context.equation_macros = Some(Rows::new(&[(Vec::new(), syntax)]));
+        context.equation_macro_work = Some(Arc::default());
+        context.equation_pattern_source = Some(std::ptr::from_ref(syntax).addr());
+        context
+    }
+
+    #[test]
+    fn semantic_retry_reuses_partial_effects_and_only_executes_the_new_suffix() {
+        let provider = Arc::new(Probe::default());
+        let prefix = Arc::new(Mutex::default());
+        let initial = recorder(&provider, prefix.clone(), 1024);
+        let kind = Name::from_components(["unregistered"]);
+        let environment = Environment::new();
+        let scope = SourceScope::default();
+        assert!(!initial.contains(&kind));
+        assert_eq!(initial.enter_tactic(0).unwrap(), 1);
+        // A failed body can leave its RHS frame unfinished. The retry must
+        // retain the callbacks that already happened before that failure.
+        drop(initial);
+        let retry = recorder(&provider, prefix, 1024);
+        assert!(!retry.contains(&kind));
+        assert_eq!(retry.enter_tactic(0).unwrap(), 1);
+        assert!(
+            retry
+                .expand_term(&Syntax::Missing, 0, &environment, &scope)
+                .unwrap()
+                .is_none()
+        );
+        assert!(matches!(
+            retry
+                .expand_tactic(&Syntax::Missing, 0, 1, 0, &environment, &scope)
+                .unwrap(),
+            TacticMacroExpansion::Unsupported
+        ));
+        assert_eq!(provider.0.load(Ordering::Relaxed), 4);
+
+        let recording = retry.recording.lock().unwrap();
+        let replay = Replay {
+            row: Arc::new(Row {
+                syntax: Arc::new(Syntax::Missing),
+                depth: 0,
+                terms: 0,
+                finish: true,
+                work: 1024 - recording.remaining,
+                entries: recording.entries.clone(),
+            }),
+            work: Arc::default(),
+            cursor: Mutex::default(),
+        };
+        assert!(!replay.contains(&kind));
+        assert_eq!(replay.enter_tactic(0).unwrap(), 1);
+        assert!(
+            replay
+                .expand_term(&Syntax::Missing, 0, &environment, &scope)
+                .unwrap()
+                .is_none()
+        );
+        assert!(matches!(
+            replay
+                .expand_tactic(&Syntax::Missing, 0, 1, 0, &environment, &scope)
+                .unwrap(),
+            TacticMacroExpansion::Unsupported
+        ));
+        assert!(replay.complete());
+        assert_eq!(provider.0.load(Ordering::Relaxed), 4);
+    }
+
+    #[test]
+    fn changed_retry_inputs_latch_without_invoking_the_live_provider() {
+        for contains in [false, true] {
+            let provider = Arc::new(Probe::default());
+            let prefix = Arc::new(Mutex::default());
+            let initial = recorder(&provider, prefix.clone(), 1024);
+            let environment = Environment::new();
+            let scope = SourceScope::default();
+            if contains {
+                assert!(!initial.contains(&Name::from_components(["original"])));
+            } else {
+                initial
+                    .expand_term(&Syntax::Missing, 0, &environment, &scope)
+                    .unwrap();
+            }
+            let retry = recorder(&provider, prefix, 1024);
+            if contains {
+                assert!(!retry.contains(&Name::from_components(["changed"])));
+            } else {
+                let changed = Syntax::atom(SourceInfo::None, "changed");
+                assert!(matches!(
+                    retry.expand_term(&changed, 0, &environment, &scope),
+                    Err(TacticMacroError::Unsupported(_))
+                ));
+            }
+            assert!(retry.work.mismatched.load(Ordering::Relaxed));
+            assert!(matches!(
+                retry.enter_tactic(0),
+                Err(TacticMacroError::Unsupported(_))
+            ));
+            assert_eq!(provider.0.load(Ordering::Relaxed), 1);
+
+            // `contains` has no Result channel. Context rollback must still
+            // expose its exact mismatch before ordinary tactic recovery.
+            let mut context = context(&provider, &Syntax::Missing);
+            context.equation_macro_work = Some(retry.work.clone());
+            let checkpoint = context.clone();
+            for mut state in [context, checkpoint] {
+                assert!(matches!(
+                    state.charge_equation_macro_work(),
+                    Err(NatDefinitionElabError::Inference(
+                        SourceInferenceError::TacticMacro(TacticMacroError::Unsupported(_))
+                    ))
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn a_shorter_successful_retry_cannot_certify_an_equation_row() {
+        let provider = Arc::new(Probe::default());
+        let syntax = Syntax::Missing;
+        let mut context = context(&provider, &syntax);
+        let checkpoint = context.clone();
+        assert!(context.begin_equation_rhs(0, &syntax, true).unwrap());
+        let initial = context.source_scope.tactic_macros.clone().unwrap();
+        assert!(!initial.0.contains(&Name::anonymous()));
+        assert_eq!(initial.0.enter_tactic(0).unwrap(), 1);
+        // Semantic retry restores ordinary context state, while the shared
+        // external-callback prefix survives the abandoned first visit.
+        context = checkpoint;
+        assert!(context.begin_equation_rhs(0, &syntax, true).unwrap());
+        let retry = context.source_scope.tactic_macros.clone().unwrap();
+        assert!(!retry.0.contains(&Name::anonymous()));
+        assert!(matches!(
+            context.finish_equation_rhs(),
+            Err(NatDefinitionElabError::Inference(
+                SourceInferenceError::TacticMacro(TacticMacroError::Unsupported(_))
+            ))
+        ));
+        assert!(context.equation_macros.as_ref().unwrap().get(0).is_none());
+        assert_eq!(provider.0.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn semantic_retries_keep_physical_matrix_occurrences_distinct() {
+        let provider = Arc::new(Probe::default());
+        let syntax = Syntax::Missing;
+        let mut context = context(&provider, &syntax);
+        for _ in 0..2 {
+            context.begin_equation_macro_pass(&syntax);
+            for expected_scope in [1, 3] {
+                assert!(context.begin_equation_rhs(0, &syntax, true).unwrap());
+                // Nested entry during an active row is not a semantic retry.
+                context.begin_equation_macro_pass(&syntax);
+                let current = context.source_scope.tactic_macros.clone().unwrap();
+                assert!(!current.0.contains(&Name::anonymous()));
+                assert_eq!(current.0.enter_tactic(0).unwrap(), expected_scope);
+                context.finish_equation_rhs().unwrap();
+            }
+            let rows = context.equation_macros.as_ref().unwrap();
+            assert_eq!(rows.prefixes.lock().unwrap()[0].len(), 2);
+            assert!(rows.get(0).is_some());
+            assert_eq!(provider.0.load(Ordering::Relaxed), 4);
+        }
+    }
+
+    #[test]
+    fn exhausted_recording_and_cached_work_survive_context_rollback() {
+        let provider = Arc::new(Probe::default());
+        let recording = recorder(&provider, Arc::new(Mutex::default()), 0);
+        assert!(!recording.contains(&Name::anonymous()));
+        assert_eq!(provider.0.load(Ordering::Relaxed), 0);
+        let mut context = context(&provider, &Syntax::Missing);
+        context.equation_macro_work = Some(recording.work.clone());
+        let checkpoint = context.clone();
+        for mut state in [context, checkpoint] {
+            assert!(matches!(
+                state.charge_equation_macro_work(),
+                Err(NatDefinitionElabError::Inference(
+                    SourceInferenceError::ResourceLimit
+                ))
+            ));
+        }
+
+        let prefix = Arc::new(Mutex::default());
+        let initial = recorder(&provider, prefix.clone(), 1024);
+        assert!(!initial.contains(&Name::from_components(["longer"])));
+        let retry = recorder(&provider, prefix, 1);
+        assert!(!retry.contains(&Name::from_components(["longer"])));
+        assert!(retry.work.exhausted.load(Ordering::Relaxed));
+        assert_eq!(retry.recording.lock().unwrap().remaining, 0);
+        assert_eq!(provider.0.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn frozen_tactic_replay_checks_the_exact_candidate_and_scope() {
+        for (candidate, scope) in [(1, 17), (0, 18)] {
+            let replay = Replay {
+                row: Arc::new(Row {
+                    syntax: Arc::new(Syntax::Missing),
+                    depth: 0,
+                    terms: 0,
+                    finish: true,
+                    work: 1,
+                    entries: vec![Arc::new(Entry {
+                        event: Event::Tactic {
+                            syntax: Arc::new(Syntax::Missing),
+                            candidate: 0,
+                            scope: 17,
+                            depth: 0,
+                            result: Ok(Expansion::Unsupported),
+                        },
+                        work: 1,
+                    })],
+                }),
+                work: Arc::default(),
+                cursor: Mutex::default(),
+            };
+            assert!(matches!(
+                replay.expand_tactic(
+                    &Syntax::Missing,
+                    candidate,
+                    scope,
+                    0,
+                    &Environment::new(),
+                    &SourceScope::default()
+                ),
+                Err(TacticMacroError::Unsupported(_))
+            ));
+            assert!(!replay.complete());
+        }
+    }
+
+    #[test]
+    fn retained_syntax_and_traversal_frontiers_have_finite_bounds() {
+        use fln_syntax::{
+            source::{BytePos, ByteSpan},
+            tree::{Preresolved, RawIdentifier},
+        };
+        let backing = Syntax::Ident {
+            info: SourceInfo::None,
+            raw_val: RawIdentifier::owned(
+                Arc::from("x".repeat(1024)),
+                ByteSpan::new(BytePos(0), BytePos(1)).unwrap(),
+            )
+            .unwrap(),
+            val: Name::anonymous(),
+            preresolved: Vec::new(),
+        };
+        let frontier = Syntax::node(Name::anonymous(), vec![Syntax::Missing; 1024]);
+        let empty_fields = Syntax::Ident {
+            info: SourceInfo::None,
+            raw_val: RawIdentifier::default(),
+            val: Name::anonymous(),
+            preresolved: vec![Preresolved::Decl {
+                name: Name::anonymous(),
+                fields: vec![String::new(); 1024],
+            }],
+        };
+        for syntax in [backing, frontier, empty_fields] {
+            let mut recording = Recording {
+                remaining: 8,
+                entries: Vec::new(),
+            };
+            let work = Work::default();
+            assert!(recording.syntax(&syntax, &work).is_none());
+            assert!(work.exhausted.load(Ordering::Relaxed));
+            assert_eq!(recording.remaining, 0);
+            assert_eq!(work.pending.load(Ordering::Relaxed), 8);
+        }
+        let provider = Arc::new(Probe::default());
+        let mut context = context(&provider, &Syntax::Missing);
+        context.txn.budget.max_heartbeats = 0;
+        assert_eq!(context.equation_trace_limit(), MAX_TRACE_WORK);
     }
 }

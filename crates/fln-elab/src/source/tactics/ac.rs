@@ -4,8 +4,9 @@
 //! an operator. `reflection` builds the pin's `Lean.Data.AC.Context.eq_of_norm`
 //! certificate; the normalizer is only a candidate producer. Congruence and the
 //! final `Eq.refl` remain ordinary terms checked with the complete declaration.
-//! Binder bodies and dependent arguments are left opaque in this initial slice.
-//! If they prevent closure, report a capability stop rather than a failed proof.
+//! The fast application pass shares this proof backend with the scoped AC
+//! traversal, which handles binders and permitted dependent-application slots.
+//! Genuinely unsupported transports retain a typed capability stop.
 
 mod reflection;
 
@@ -65,14 +66,42 @@ impl Context {
         self.resolve_instances(false)?;
         self.flush(false)?;
         let target = self.instantiate(&goal.target)?;
-        let exposed = self.whnf(&target)?;
-        if equality_target(&exposed).is_none() {
-            return Err(error(TacticError::ExpectedEquality));
-        }
         if target.has_expr_mvar() || target.has_loose_bvars() {
             return Err(unsupported());
         }
-        let normalized = self.ac_normalize(&target)?;
+        let exposed = self.whnf(&target)?;
+        if equality_target(&exposed).is_none() {
+            // AC normalization can expose an Eq target, for example by removing
+            // an identity in a propositional operation. Closure is still Eq-only.
+            return self.ac_rfl_proof_goal(goal);
+        }
+        let mut normalized = self.ac_normalize(&target)?;
+        if normalized.incomplete {
+            let previous = normalized.value.clone();
+            match self.ac_normalize_expression(&previous) {
+                Ok((next, step)) => {
+                    if let Some(step) = step {
+                        normalized.proof = Some(self.ac_join(
+                            &target,
+                            &previous,
+                            &next,
+                            normalized.proof,
+                            step,
+                        )?);
+                    }
+                    normalized.value = next;
+                    // The scoped pass deliberately leaves neutralConfig's
+                    // opaque lets and fixed dependent arguments unchanged.
+                    // Once it completes, failure to close is an ordinary
+                    // mismatch rather than the fast pass's binder boundary.
+                    normalized.incomplete = false;
+                }
+                Err(problem) if backtrack::recoverable(&problem) => {
+                    return Err(unsupported());
+                }
+                Err(problem) => return Err(problem),
+            }
+        }
         let (witness, child) = self.proof_goal(normalized.value.clone())?;
         if let Err(problem) = self.eq_refl_proof_goal(child, false) {
             return if normalized.incomplete && backtrack::recoverable(&problem) {
@@ -89,6 +118,29 @@ impl Context {
             ),
         };
         self.close_proof_goal(goal, value)
+    }
+
+    /// Shared proof-producing operator normalization for scoped AC traversal and
+    /// the location tactics. The reflected certificate remains the single law
+    /// engine; callers only choose and transport the exact occurrence.
+    pub(in crate::source::tactics) fn ac_operator_evidence(
+        &mut self,
+        term: &Expr,
+    ) -> Result<Option<Typed>, NatDefinitionElabError> {
+        let Some((operator, left, _)) = binary(term) else {
+            return Ok(None);
+        };
+        let Some(laws) = self.ac_laws(operator, left)? else {
+            return Ok(None);
+        };
+        let (next, proof) = self.ac_normalize_operator(term, &laws)?;
+        let Some(value) = proof else {
+            return Ok(None);
+        };
+        Ok(Some(Typed {
+            value,
+            type_: self.ac_equation(term, &next)?,
+        }))
     }
 
     fn ac_instance(&mut self, target: Expr) -> Result<Option<Expr>, NatDefinitionElabError> {
@@ -287,27 +339,58 @@ impl Context {
     }
 
     fn ac_normalize(&mut self, root: &Expr) -> Result<Normalized, NatDefinitionElabError> {
+        // A curried binary application visits its function prefix before its
+        // right argument. Carry occurrence context through that prefix so both
+        // operands can defer normalization to their maximal same-operator tree.
+        // This is not an Expr cache: a shared term visited elsewhere is still
+        // normalized independently. Restrict the optimization to atomic heads,
+        // whose own normalization cannot change the operation during traversal.
+        enum Position {
+            Root,
+            Operand(Expr),
+            Partial(Expr),
+        }
         enum Task {
-            Visit(Expr),
+            Visit {
+                original: Expr,
+                position: Position,
+            },
             Build {
                 original: Expr,
                 children: Vec<Expr>,
                 start: usize,
                 incomplete: bool,
+                deferred: bool,
             },
         }
-        let mut pending = vec![Task::Visit(root.clone())];
+        let mut pending = vec![Task::Visit {
+            original: root.clone(),
+            position: Position::Root,
+        }];
         let mut values: Vec<Normalized> = Vec::new();
         let mut laws: HashMap<Expr, Option<Laws>> = HashMap::new();
         let mut visited = 0usize;
         while let Some(task) = pending.pop() {
             self.tick()?;
             match task {
-                Task::Visit(original) => {
+                Task::Visit { original, position } => {
                     visited += 1;
                     if visited > MAX_AC_NODES {
                         return Err(failure(SourceInferenceError::ResourceLimit));
                     }
+                    let operator = binary(&original)
+                        .map(|(operator, _, _)| operator)
+                        .filter(|operator| {
+                            matches!(
+                                operator.node(),
+                                ExprNode::Const { .. } | ExprNode::FVar { .. }
+                            )
+                        })
+                        .cloned();
+                    let deferred = matches!(
+                        (&position, &operator),
+                        (Position::Operand(parent), Some(operator)) if parent == operator
+                    );
                     let mut incomplete = false;
                     let children = match original.node() {
                         ExprNode::App { f, a } => {
@@ -350,14 +433,28 @@ impl Context {
                         children: children.clone(),
                         start: values.len(),
                         incomplete,
+                        deferred,
                     });
-                    pending.extend(children.into_iter().rev().map(Task::Visit));
+                    for (slot, child) in children.into_iter().enumerate().rev() {
+                        let position = match (&position, &operator, slot) {
+                            (Position::Partial(parent), _, 1) => Position::Operand(parent.clone()),
+                            (Position::Partial(_), _, _) => Position::Root,
+                            (_, Some(operator), 0) => Position::Partial(operator.clone()),
+                            (_, Some(operator), 1) => Position::Operand(operator.clone()),
+                            _ => Position::Root,
+                        };
+                        pending.push(Task::Visit {
+                            original: child,
+                            position,
+                        });
+                    }
                 }
                 Task::Build {
                     original,
                     children,
                     start,
                     mut incomplete,
+                    deferred,
                 } => {
                     let descendants = values.split_off(start);
                     let mut current = original.clone();
@@ -374,7 +471,7 @@ impl Context {
                         proof = Some(self.ac_join(&original, &current, &next, proof, step)?);
                         current = next;
                     }
-                    if let Some((operator, left, _)) = binary(&current) {
+                    if !deferred && let Some((operator, left, _)) = binary(&current) {
                         let operator = operator.clone();
                         if !laws.contains_key(&operator) {
                             let found = self.ac_laws(&operator, left)?;

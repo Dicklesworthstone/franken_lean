@@ -187,6 +187,93 @@ fn malformed_nested_equations_never_discard_rows_or_the_continuation() {
 }
 
 #[test]
+fn ordinary_term_frames_consume_planned_local_equations() {
+    for source in [
+        "def f : Nat → Nat := fun x => let g : Nat → Nat | 0 => x | Nat.succ n => n; g 0",
+        "def f : Nat := (fun x => let g : Nat → Nat | 0 => x | Nat.succ n => n; g 0) 42",
+        "def f : Nat := (fun x : Nat => x + 1) (let g : Nat → Nat | _ => 41; g 0)",
+        "def f : Nat := 1 + (let g : Nat → Nat | _ => 41; g 0)",
+        "def f : Nat → Nat := fun x =>\n  let g : Nat → Nat\n    | 0 => x\n    | Nat.succ n => n\n  g 0",
+        "def f : Nat := (let x := 42; let g : Nat → Nat | _ => x; g 0)",
+        "def f : Nat := (fun x => let g | 0 => x | Nat.succ n => n; g 0) 42",
+        "def f : Nat := (fun h : Nat → Nat => h 0) (let g : Nat → Nat | 0 => 42 | _ => 0; g)",
+    ] {
+        let parsed = parse_definition(source.as_bytes())
+            .unwrap_or_else(|error| panic!("{source}\n{error:?}"));
+        assert_eq!(parsed.reconstruct_original(), source.as_bytes());
+        assert_eq!(
+            count_kind(parsed.syntax(), "Lean.Parser.Term.letEqnsDecl"),
+            1
+        );
+    }
+}
+
+#[test]
+fn ordinary_equation_plans_keep_proof_local_rows_with_the_proof_parser() {
+    for (source, equations) in [
+        (
+            "def f : Nat → Nat := fun x => by\n  let rec g : Nat → Nat\n    | 0 => x\n    | Nat.succ n => g n\n  exact g 0",
+            1,
+        ),
+        (
+            "def f : Nat → Nat := fun x =>\n  let y : Nat := by\n    let rec g : Nat → Nat\n      | 0 => x\n      | Nat.succ n => g n\n    exact g 0\n  let h : Nat → Nat\n    | 0 => y\n    | Nat.succ n => n\n  h 0",
+            2,
+        ),
+    ] {
+        let parsed = parse_definition(source.as_bytes())
+            .unwrap_or_else(|error| panic!("{source}\n{error:?}"));
+        assert_eq!(parsed.reconstruct_original(), source.as_bytes());
+        assert_eq!(
+            count_kind(parsed.syntax(), "Lean.Parser.Term.letEqnsDecl"),
+            equations
+        );
+        assert_eq!(count_kind(parsed.syntax(), "Lean.Parser.Tactic.letrec"), 1);
+        assert_eq!(count_kind(parsed.syntax(), "Lean.Parser.Term.byTactic"), 1);
+    }
+}
+
+#[test]
+fn malformed_equation_values_in_ordinary_frames_are_refused() {
+    for local in [
+        "let g : Nat → Nat | 0 => ; g 0",
+        "let g : Nat → Nat | 0 31; g 0",
+        "let g : Nat → Nat | => 31; g 0",
+        "let g : Nat → Nat | 0 => 31 | ; g 0",
+        "let g : Nat → Nat | 0 => 31;",
+        "let g : Nat → Nat | 0 => 31",
+    ] {
+        for source in [
+            format!("def f : Nat := (fun n => {local}) 0"),
+            format!("def f : Nat := (fun n : Nat => n) ({local})"),
+        ] {
+            assert!(parse_definition(source.as_bytes()).is_err(), "{source}");
+        }
+    }
+}
+
+#[test]
+fn local_equation_telescope_uses_heap_frames_on_a_small_host_stack() {
+    std::thread::Builder::new()
+        .stack_size(128 * 1024)
+        .spawn(|| {
+            let mut source = String::from("def f : Nat → Nat := fun n =>\n");
+            for _ in 0..600 {
+                source.push_str("  let g : Nat → Nat | _ => n;\n");
+            }
+            source.push_str("  g n");
+            let parsed = parse_definition(source.as_bytes()).unwrap();
+            assert_eq!(parsed.reconstruct_original(), source.as_bytes());
+            assert_eq!(
+                count_kind(parsed.syntax(), "Lean.Parser.Term.letEqnsDecl"),
+                600
+            );
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[test]
 fn nested_lets_use_heap_frames_on_a_small_host_stack() {
     std::thread::Builder::new()
         .stack_size(128 * 1024)

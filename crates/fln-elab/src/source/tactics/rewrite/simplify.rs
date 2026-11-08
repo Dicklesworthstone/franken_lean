@@ -3,6 +3,7 @@
 //! An unsuccessful alternative restores its complete elaboration state while
 //! retaining spent work. Every productive step is ordinary Eq.rec transport.
 
+mod ac;
 mod aclt;
 mod arith;
 mod binders;
@@ -40,6 +41,9 @@ pub(in crate::source) enum SimpRule<'a> {
     /// A wildcard selects a proof by local identity, not its display spelling.
     /// Location simplification remaps this identity when replacing the local.
     Local(FVarId),
+    /// The AC tactic's class-directed normalization. It is never part of the
+    /// ordinary simp set and selects no user or registered simp theorems.
+    Ac,
     /// `+arith`'s linear normalization (`arith.rs`), always the last rule: the pin's
     /// `simpArith` runs after `rewritePost` (`Rewrite.lean:542-546`). It rewrites; it never
     /// closes a goal by itself.
@@ -64,6 +68,7 @@ impl SimpRule<'_> {
             Self::Explicit(rule) => rule.reverse,
             Self::Global(rule) => rule.reverse,
             Self::Local(_)
+            | Self::Ac
             | Self::Arith
             | Self::Decide
             | Self::Conditional { .. }
@@ -422,6 +427,7 @@ impl Context {
         if matches!(
             rule,
             SimpRule::Arith
+                | SimpRule::Ac
                 | SimpRule::Decide
                 | SimpRule::Conditional { .. }
                 | SimpRule::Simprocs(_)
@@ -798,6 +804,7 @@ impl Context {
             // Arithmetic normalization, decision and the procedures have no single proof term
             // to select.
             SimpRule::Arith
+            | SimpRule::Ac
             | SimpRule::Decide
             | SimpRule::Conditional { .. }
             | SimpRule::Simprocs(_) => Err(error(TacticError::MalformedScript)),

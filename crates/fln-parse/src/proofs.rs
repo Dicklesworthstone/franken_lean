@@ -373,6 +373,8 @@ pub(crate) fn tactic(
             "specialize",
             "grind",
             "ac_rfl",
+            "ac_nf0",
+            "ac_nf",
             "ext1",
             "conv",
             "infer_instance",
@@ -413,6 +415,8 @@ pub(crate) fn tactic(
         // Do not change the lexer's policy for ordinary declaration names.
         TokenKind::Symbol(symbol) if symbol == "false_or_by_contra" => Some("false_or_by_contra"),
         TokenKind::Symbol(symbol) if symbol == "native_decide" => Some("native_decide"),
+        TokenKind::Symbol(symbol) if symbol == "ac_nf0" => Some("ac_nf0"),
+        TokenKind::Symbol(symbol) if symbol == "ac_nf" => Some("ac_nf"),
         // `suffices` is a keyword token, not an identifier.
         TokenKind::Symbol(symbol) if symbol == "suffices" => Some("suffices"),
         TokenKind::Symbol(symbol) if symbol == "exists" => Some("exists"),
@@ -451,6 +455,7 @@ pub(crate) fn tactic(
             rewrite(leaves, view, tokens, range, atom, keyword)
         }
         "unfold" | "split" | "delta" => located(leaves, view, tokens, range, atom, keyword),
+        "ac_nf0" | "ac_nf" => ac_normalization(leaves, view, tokens, range, atom, keyword),
         "obtain" | "rcases" | "rintro" | "ext" | "ext1" => {
             rcases::tactic(leaves, view, tokens, range, keyword, atom)
         }
@@ -1519,6 +1524,34 @@ fn located(
     ))
 }
 
+/// The pin's `acNf0` syntax and `tacticAc_nf_` macro both take only an optional
+/// location (`Init/Tactics.lean`). Keep that exact shape, including the empty
+/// optional node, so imported macro dispatch and native execution agree.
+fn ac_normalization(
+    leaves: &Leaves,
+    view: &SourceView,
+    tokens: &[LexedToken],
+    range: Range<usize>,
+    keyword: Syntax,
+    form: &str,
+) -> Result<Syntax, NatDefinitionParseError> {
+    let (range, location) = locations::split(leaves, view, tokens, range)?;
+    if range.end != range.start + 1 {
+        return Err(refusal(view, tokens, range.start + 1));
+    }
+    Ok(Syntax::node(
+        parser_kind(&[
+            "Tactic",
+            if form == "ac_nf0" {
+                "acNf0"
+            } else {
+                "tacticAc_nf_"
+            },
+        ]),
+        vec![keyword, location],
+    ))
+}
+
 /// The empty configuration of a tactic that takes `optConfig` (`decide`, `simp`, `simp_all`,
 /// `rw`, `rewrite`; vendored `src/Init/Tactics.lean`): a node of its own in the pin's tree.
 fn default_config() -> Syntax {
@@ -2359,6 +2392,54 @@ mod local_declaration_tests {
 #[cfg(test)]
 mod construction_refinement_tests {
     use super::*;
+
+    #[test]
+    fn ac_normalization_locations_preserve_the_pinned_shape_and_source() {
+        for (word, kind) in [("ac_nf0", "acNf0"), ("ac_nf", "tacticAc_nf_")] {
+            for location in ["", " at h", " at *", " at h₂ ⊢", " at «h.x» |-"] {
+                let source = format!(
+                    "theorem t : True := by\r\n  {word} /- location -/{location}\r\n  assumption\r\n"
+                );
+                let parsed = parse_definition(source.as_bytes())
+                    .unwrap_or_else(|error| panic!("{source}: {error:?}"));
+                assert_eq!(parsed.reconstruct_original(), source.as_bytes());
+                assert_eq!(
+                    parsed.reconstruct_normalized().unwrap(),
+                    source.replace("\r\n", "\n").as_bytes()
+                );
+                let wanted = parser_kind(&["Tactic", kind]);
+                let mut pending = vec![parsed.syntax()];
+                let args = loop {
+                    let node = pending.pop().expect("the pinned tactic node");
+                    if let Syntax::Node { kind, args, .. } = node {
+                        if *kind == wanted {
+                            break args;
+                        }
+                        pending.extend(args);
+                    }
+                };
+                assert_eq!(args.len(), 2);
+                assert!(matches!(&args[0], Syntax::Atom { val, .. } if val == word));
+                let Syntax::Node { kind, args, .. } = &args[1] else {
+                    panic!("the location is an optional null node")
+                };
+                assert_eq!(*kind, Name::from_components(["null"]));
+                assert_eq!(args.len(), usize::from(!location.is_empty()));
+            }
+            let source = format!("def {word} (x : Nat) : Nat := x");
+            assert!(parse_definition(source.as_bytes()).is_ok());
+        }
+    }
+
+    #[test]
+    fn ac_normalization_refuses_arguments_and_malformed_locations() {
+        for word in ["ac_nf0", "ac_nf"] {
+            for suffix in [" h", " [h]", " (config := {})", " at", " at * h", " at 1"] {
+                let source = format!("theorem t : True := by {word}{suffix}");
+                assert!(parse_definition(source.as_bytes()).is_err(), "{source}");
+            }
+        }
+    }
 
     #[test]
     fn construction_and_holes_preserve_original_tokens_and_scopes() {

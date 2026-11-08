@@ -49,6 +49,7 @@ impl Context {
         if matches!(
             rule,
             SimpRule::Local(_)
+                | SimpRule::Ac
                 | SimpRule::Arith
                 | SimpRule::Decide
                 | SimpRule::Conditional { .. }

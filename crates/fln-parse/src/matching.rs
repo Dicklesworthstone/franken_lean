@@ -629,12 +629,27 @@ fn plan(
                 }
             }
             // A `do` owns the `;`s after it as a `by` does (`=> do f x; loop i`).
-            "by" if depth > 0
-                && statement.is_none()
+            "by" if statement.is_none()
                 && active.last().is_none_or(|p| p.depth != depth)
                 && conditionals.last().is_none_or(|p| p.depth != depth) =>
             {
-                proof_end = proofs::block_extent(view, tokens, at, range.end)?;
+                // Ordinary lambda bodies can contain proofs at depth zero.
+                // A proof-valued local ends before its continuation, whose
+                // own equation declarations still need this outer plan.
+                let limit = lets.last().filter(|(d, _, _, _, _)| *d == depth).map_or(
+                    range.end,
+                    |(_, _, _, keyword, is_statement)| {
+                        term_locals::proof_value_limit(
+                            view,
+                            tokens,
+                            *keyword,
+                            at,
+                            range.end,
+                            *is_statement,
+                        )
+                    },
+                );
+                proof_end = proofs::block_extent(view, tokens, at, limit)?;
             }
             "fun" | "λ" => lambda_headers.push((depth, active.len(), conditionals.len())),
             "by" | "do" => {
@@ -1967,28 +1982,23 @@ fn parse_planned(
         return Ok((proof, end));
     }
     // Tactic blocks own their pipes; their bounded arguments reenter here.
-    // A root local value selects the planner from its actual header, never
-    // from a bare pipe or a later tactic-local declaration. Locals in planned
-    // matches/conditionals are discovered by that plan's scoped reader.
-    let mut local_head = range.start;
-    while local_head < range.end && is_symbol(tokens, local_head, "(") {
-        local_head += 1;
-    }
-    let local_equations = is_symbol(tokens, local_head, "let")
-        && local_equation_start(view, &tokens[..range.end], local_head)
-            .is_ok_and(|start| start.is_some());
+    // Local equations select the planner from their actual headers, never
+    // from a bare pipe. The scoped plan skips complete proof blocks before
+    // discovering term-local declarations inside ordinary lambda bodies.
     let opens_do = range.clone().any(|at| term_locals::word(tokens, at, "do"));
     if grammar == DefinitionGrammar::Scalar
         && !is_symbol(tokens, range.start, "by")
         && !is_symbol(tokens, range.start, "calc")
         && (equations
-            || local_equations
             || range.clone().any(|at| {
                 is_symbol(tokens, at, "if")
                     || is_symbol(tokens, at, "bif")
                     || is_symbol(tokens, at, "match")
                     || is_symbol(tokens, at, "try")
                     || (opens_do && is_symbol(tokens, at, "|"))
+                    || (is_symbol(tokens, at, "let")
+                        && local_equation_start(view, &tokens[..range.end], at)
+                            .is_ok_and(|start| start.is_some()))
                     || ((is_symbol(tokens, at, "fun") || is_symbol(tokens, at, "λ"))
                         && is_symbol(tokens, at + 1, "|"))
             }))

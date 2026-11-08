@@ -81,7 +81,12 @@ impl Context {
         let mut found = None;
         for local in goal.lctx.decls().iter().rev() {
             self.tick()?;
-            if !self.is_matrix_hypothesis(local) && subject == Expr::fvar(local.id.clone()) {
+            // Auxiliary self references are hidden from implicit proof search,
+            // but the pin permits a tactic to inspect one explicitly by name.
+            // Actual internal matrix hypotheses retain their protection.
+            if (!self.is_matrix_hypothesis(local) || self.is_private_self(&local.id))
+                && subject == Expr::fvar(local.id.clone())
+            {
                 found = Some(local.clone());
                 break;
             }
@@ -133,12 +138,7 @@ impl Context {
         relation: guard::Relation,
     ) -> Result<bool, NatDefinitionElabError> {
         self.tick()?;
-        let snapshot = self.clone();
-        let result = self.guard_expr_matches(left, right, relation);
-        let spent = self.txn.budget.heartbeats_consumed;
-        *self = snapshot;
-        self.txn.budget.heartbeats_consumed = spent;
-        result
+        self.guard_expr_matches(left, right, relation)
     }
 }
 

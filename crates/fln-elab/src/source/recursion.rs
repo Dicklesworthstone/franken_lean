@@ -356,6 +356,20 @@ pub(super) struct OmittedResult {
     pub(super) reference: Expr,
 }
 
+/// A header is private candidate data, never a temporary environment axiom.
+/// Keep its auxiliary local anonymous so source spellings use normal name
+/// resolution and implicit proof search cannot select the definition itself.
+#[derive(Clone)]
+pub(super) struct Predefinition {
+    name: Name,
+    reference: Typed,
+}
+
+enum InitialBody {
+    Complete(Typed),
+    Recursive,
+}
+
 #[derive(Clone)]
 pub(super) struct Recursion {
     pub(super) name: Name,
@@ -761,7 +775,105 @@ impl Context {
         self.constrain(&omitted.body, &omitted.reference)
     }
 
-    /// Retry only an actual unresolved self-reference. Candidate selection is
+    pub(super) fn predefinition_reference(&self, name: &Name) -> Option<Typed> {
+        self.predefinition
+            .as_ref()
+            .filter(|reference| &reference.name == name)
+            .map(|reference| reference.reference.clone())
+    }
+
+    /// Elaborate the original body with the same typed self binding that the
+    /// pin supplies before choosing tactic alternatives. Only a reference in
+    /// the surviving term selects recursion: a failed or ill-typed alternative
+    /// can discard it without turning the definition into a recursive one.
+    fn bind_predefinition(
+        &mut self,
+        name: &Name,
+        parameters: &[LocalDecl],
+        expected: &Expr,
+    ) -> Result<FVarId, NatDefinitionElabError> {
+        let mut type_ = self.instantiate(&self.reference_result(expected))?;
+        for parameter in parameters.iter().rev() {
+            self.tick()?;
+            type_ = Expr::forall_e(
+                parameter.user_name.clone(),
+                self.instantiate(&parameter.type_)?,
+                type_
+                    .abstract_fvar(&parameter.id, 0)
+                    .map_err(|_| failure(SourceInferenceError::Scope))?,
+                parameter.binder_info,
+            );
+        }
+        let marker = FVarId(self.fresh_name()?);
+        self.txn.lctx.add_param(
+            marker.clone(),
+            Name::anonymous(),
+            type_.clone(),
+            BinderInfo::Default,
+        );
+        self.predefinition = Some(Predefinition {
+            name: name.clone(),
+            reference: Typed {
+                value: Expr::fvar(marker.clone()),
+                type_,
+            },
+        });
+        self.private_self_ids.insert(marker.clone());
+        Ok(marker)
+    }
+
+    fn ordinary_definition_body(
+        &mut self,
+        name: &Name,
+        parameters: &[LocalDecl],
+        syntax: &Syntax,
+        expected: Option<Expr>,
+    ) -> Result<InitialBody, NatDefinitionElabError> {
+        let locals = self.txn.lctx.clone();
+        let previous = self.predefinition.clone();
+        let result = (|| {
+            // Even written lambda domains see a typed auxiliary self. Its
+            // result hole precedes that local, so inference cannot capture it.
+            let omitted = if expected.is_none() {
+                let omitted = self.omitted_result_type(parameters)?;
+                self.omitted_results.push(omitted.clone());
+                // Share the actual header's type with self before the body.
+                // Written lambdas can then constrain its function shape before
+                // an eagerly executed tactic calls the definition.
+                self.constrain(&omitted.body, &omitted.reference)?;
+                Some(omitted)
+            } else {
+                None
+            };
+            let expected = expected
+                .or_else(|| omitted.as_ref().map(|omitted| omitted.body.clone()))
+                .ok_or_else(|| failure(SourceInferenceError::ExpectedType))?;
+            let marker = self.bind_predefinition(name, parameters, &expected)?;
+            // Keep the original root on the ordinary worklist: macro dispatch,
+            // hygienic validation, pattern preparation and application typing
+            // must all precede opening any written lambda.
+            let body = self.term(syntax, Some(expected))?;
+            if let Some(omitted) = omitted {
+                self.settle_omitted_result(&omitted)?;
+            }
+            // Resolve delayed ordinary work before inspecting use. Registered
+            // let-rec closures remain opaque here; their captures are explicit
+            // arguments, so the bounded walk still sees a captured self.
+            let body = self.finish_open_universes(body)?;
+            let recursive = self.elimination_reads(&body.value)?.contains(&marker)
+                || self.elimination_reads(&body.type_)?.contains(&marker);
+            if recursive {
+                Ok(InitialBody::Recursive)
+            } else {
+                Ok(InitialBody::Complete(body))
+            }
+        })();
+        self.predefinition = previous;
+        self.txn.lctx = locals;
+        result
+    }
+
+    /// Retry only a surviving typed self-reference. Candidate selection is
     /// source-ordered and transactional. Failed candidates retain spent work,
     /// but no assignments, generated identities, local facts or matrix state.
     /// Changed earlier arguments expand a candidate's generalization mask;
@@ -831,40 +943,23 @@ impl Context {
             }
             return result;
         }
-        match self.term(syntax, expected.clone()) {
-            Err(NatDefinitionElabError::Inference(SourceInferenceError::UnknownConstant(
-                found,
-            ))) if (&found == name
-                || self.source_scope.declaration_name(&found).as_ref() == Ok(name))
-                && !self.txn.env.contains(name) => {}
-            Ok(body) => {
-                // A resumed callback reports its failure as a delayed source
-                // diagnostic. Let tactic alternatives finish and roll back
-                // first: an explicit `fail` may discard the self reference.
-                // A surviving reference selects the same ordinary recursion
-                // retry before later hole equations can obscure its cause.
-                let mut discovered = false;
-                if !self.txn.env.contains(name) {
-                    for index in snapshot.postponed_application_errors.len()
-                        ..self.postponed_application_errors.len()
-                    {
-                        self.tick()?;
-                        if matches!(
-                            &self.postponed_application_errors[index],
-                            NatDefinitionElabError::Inference(SourceInferenceError::UnknownConstant(found))
-                                if found == name
-                                    || self.source_scope.declaration_name(found).as_ref() == Ok(name)
-                        ) {
-                            discovered = true;
-                            break;
-                        }
-                    }
-                }
-                if !discovered {
-                    return Ok(body);
-                }
+        // Mutual groups already installed their private peer references. A
+        // singleton ordinary declaration needs the same header/body boundary.
+        let initial = if self.partial.is_none() {
+            self.ordinary_definition_body(name, parameters, syntax, expected.clone())
+        } else {
+            self.term(syntax, expected.clone())
+                .map(InitialBody::Complete)
+        };
+        match initial {
+            Ok(InitialBody::Complete(body)) => return Ok(body),
+            Ok(InitialBody::Recursive) => {}
+            Err(problem) => {
+                let spent = self.txn.budget.heartbeats_consumed;
+                *self = snapshot;
+                self.txn.budget.heartbeats_consumed = spent;
+                return Err(problem);
             }
-            result => return result,
         }
         let spent = self.txn.budget.heartbeats_consumed;
         *self = snapshot.clone();
@@ -872,15 +967,6 @@ impl Context {
         // The body refers to the definition itself: whichever lowering follows,
         // this is a recursive definition.
         self.recursive_definition = true;
-        if self.partial.is_some() {
-            let result = self.partial_definition_body(name, parameters, syntax, expected);
-            if result.is_err() {
-                let spent = self.txn.budget.heartbeats_consumed;
-                *self = snapshot;
-                self.txn.budget.heartbeats_consumed = spent;
-            }
-            return result;
-        }
         let mut parameters = parameters.to_vec();
         let result = (|| {
             let (body, expected, lambdas) =
@@ -1655,6 +1741,48 @@ impl Context {
     /// other argument remains in the checked term. No beta reduction is used to
     /// hide an invalid self-call. Memoization preserves DAG sharing and depth.
     pub(super) fn lower_recursive_calls(
+        &mut self,
+        value: &Expr,
+        hypotheses: &[(FVarId, FVarId)],
+    ) -> Result<Expr, NatDefinitionElabError> {
+        self.defer_selected_recursive_lowering(value, |context| {
+            context.lower_recursive_calls_checked(value, hypotheses)
+        })
+    }
+
+    /// Eligibility belongs to the completed predefinition, after source
+    /// alternatives have selected their typed term. A later explicit `fail`
+    /// may still discard that term and its diagnostic through normal rollback.
+    /// Motive discovery and terminal outcomes remain immediate driver signals.
+    fn defer_selected_recursive_lowering(
+        &mut self,
+        value: &Expr,
+        lower: impl FnOnce(&mut Self) -> Result<Expr, NatDefinitionElabError>,
+    ) -> Result<Expr, NatDefinitionElabError> {
+        if self.attempt_depth == 0 {
+            return lower(self);
+        }
+        let checkpoint = self.clone();
+        match lower(self) {
+            Err(
+                problem @ NatDefinitionElabError::Inference(SourceInferenceError::Recursion(
+                    RecursionError::NotDecreasing
+                    | RecursionError::ChangedParameter
+                    | RecursionError::ChangedIndex
+                    | RecursionError::PartialApplication,
+                )),
+            ) => {
+                let spent = self.txn.budget.heartbeats_consumed;
+                *self = checkpoint;
+                self.txn.budget.heartbeats_consumed = spent;
+                self.postponed_application_errors.push(problem);
+                Ok(value.clone())
+            }
+            result => result,
+        }
+    }
+
+    fn lower_recursive_calls_checked(
         &mut self,
         value: &Expr,
         hypotheses: &[(FVarId, FVarId)],

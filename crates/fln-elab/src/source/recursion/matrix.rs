@@ -8,10 +8,21 @@
 use super::*;
 
 impl Context {
+    pub(in crate::source) fn is_private_self(&self, id: &FVarId) -> bool {
+        self.private_self_ids.contains(id)
+            || self
+                .recursion
+                .iter()
+                .chain(&self.enclosing_recursions)
+                .any(|recursion| &recursion.marker == id)
+    }
+
     pub(in crate::source) fn is_matrix_hypothesis(&self, local: &LocalDecl) -> bool {
-        self.well_founded
-            .as_ref()
-            .is_some_and(|state| state.hides(local))
+        self.is_private_self(&local.id)
+            || self
+                .well_founded
+                .as_ref()
+                .is_some_and(|state| state.hides(local))
             || self
                 .mutual_structural_member
                 .as_ref()
@@ -103,7 +114,9 @@ impl Context {
         if recursion.course_name.is_some() {
             arguments.reverse();
             let active = self.recursion.replace(recursion);
-            let result = self.lower_course_call(&arguments);
+            let result = self.defer_selected_recursive_lowering(value, |context| {
+                context.lower_course_call(&arguments)
+            });
             self.recursion = active;
             return result;
         }

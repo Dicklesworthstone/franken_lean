@@ -4084,7 +4084,26 @@ fn bounded_term_layout(
         cursor = next;
         return Ok(Some(cursor));
     }
-    if let Some((end, syntax)) = splices.terms.remove(&index) {
+    let closes_prefix_header = grammar == DefinitionGrammar::Scalar
+        && (!term_locals::word(tokens, index, "|")
+            || splices.terms.get(&index).is_some_and(|(_, syntax)| {
+                syntax.kind() == Some(&parser_kind(&["Term", "matchAlts"]))
+            }))
+        && frames
+            .iter()
+            .rev()
+            .find(|frame| {
+                frame.negation.is_none()
+                    && !frame.prefix.as_ref().is_some_and(|prefix| prefix.body())
+            })
+            .and_then(|frame| frame.prefix.as_ref())
+            .is_some_and(|prefix| prefix.closes_header(tokens, index));
+    // A local equation's first pipe closes its result type before the value
+    // frame can consume the already-planned matchAlts. Keep the splice until
+    // that phase transition; every other splice remains an ordinary operand.
+    if !(closes_prefix_header && term_locals::word(tokens, index, "|"))
+        && let Some((end, syntax)) = splices.terms.remove(&index)
+    {
         if end > range.end {
             return Err(NatDefinitionParseError::OutsideSeedGrammar {
                 at: original_position(view, tokens, index),
@@ -4105,15 +4124,7 @@ fn bounded_term_layout(
             || term_locals::word(tokens, index, "from")
             // A prefix operand (`show ¬k = 0 by …`) and a binder body (`show ∀ a, p by …`) are
             // folded before the header closes, as `finish_lambda_frames` folds them.
-            || frames
-                .iter()
-                .rev()
-                .find(|frame| {
-                    frame.negation.is_none()
-                        && !frame.prefix.as_ref().is_some_and(|prefix| prefix.body())
-                })
-                .and_then(|frame| frame.prefix.as_ref())
-                .is_some_and(|prefix| prefix.closes_header(tokens, index)))
+            || closes_prefix_header)
     {
         finish_lambda_frames(
             leaves,

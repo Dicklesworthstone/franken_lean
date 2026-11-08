@@ -872,6 +872,13 @@ impl Context {
             // field and before the environment, the pin searches the local context for the
             // declaration being defined (`LValResolution.localRec`,
             // `Lean/Elab/App.lean:1557`).
+            if let Some(reference) = self.predefinition_reference(&method) {
+                return Ok(FieldResolution::Method {
+                    function: reference,
+                    receiver,
+                    base,
+                });
+            }
             if let Some(recursion) = &self.recursion
                 && recursion.name == method
             {

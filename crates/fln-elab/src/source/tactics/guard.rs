@@ -1,8 +1,8 @@
 //! `guard_target` (`syntax (name := guardTarget) "guard_target " equal term : tactic`,
 //! Init/Guard.lean:75), as `evalGuardTarget` (Lean/Elab/Tactic/Guard.lean:99-110): the term is
 //! elaborated against the type of the main goal's target, compared with the target by the chosen
-//! relation, and the goal is left as it was. The comparison runs `withoutModifyingState`, so a
-//! unification it makes is undone here too.
+//! relation, and the goal is left as it was. Term elaboration and synthesis retain their
+//! constraints; only the comparison runs `withoutModifyingState`.
 use super::*;
 
 /// `MatchKind` (Lean/Elab/Tactic/Guard.lean:23-28), from the `equal` syntax (`:52-56`).
@@ -47,20 +47,15 @@ fn consume_mdata(mut expr: &Expr) -> &Expr {
 }
 
 impl Context {
-    /// Whether the main goal's target matches `expected` by `relation`. The context is restored
-    /// afterwards (the pin's `withoutModifyingState`); only the spent work is kept.
+    /// Elaborate the expected term before the read-only comparison, as the pin does.
+    /// Constraints from that elaboration remain available to subsequent tactics.
     pub(super) fn guard_target_matches(
         &mut self,
         goal: &ProofGoal,
         relation: Relation,
         expected: &Syntax,
     ) -> Result<bool, NatDefinitionElabError> {
-        let snapshot = self.clone();
-        let result = self.guard_target_check(goal, relation, expected);
-        let spent = self.txn.budget.heartbeats_consumed;
-        *self = snapshot;
-        self.txn.budget.heartbeats_consumed = spent;
-        result
+        self.guard_target_check(goal, relation, expected)
     }
 
     fn guard_target_check(
@@ -88,7 +83,8 @@ impl Context {
     /// `guard_expr a r b` (`evalGuardExpr`, vendored src/Lean/Elab/Tactic/Guard.lean:84-90):
     /// whether `a` and `b`, each elaborated with no expected type, their types then unified and
     /// pending synthesis finished with default instances (`elabAndEvalMatchKind`), match by
-    /// `r`. As for `guard_target`, the context is restored afterwards.
+    /// `r`. Elaboration, type unification and synthesis precede the comparison's
+    /// snapshot: an ascription can constrain the enclosing declaration's header.
     pub(super) fn guard_expr_holds(
         &mut self,
         goal: &ProofGoal,
@@ -96,31 +92,39 @@ impl Context {
         relation: Relation,
         right: &Syntax,
     ) -> Result<bool, NatDefinitionElabError> {
+        self.txn.lctx = goal.lctx.clone();
+        let left = self.term(left, None)?;
+        let right = self.term(right, None)?;
+        // `isDefEqGuarded` on the two types: its answer is not read.
+        let _ = self.proof_types_match(&left.type_, &right.type_)?;
+        self.resolve_instances(false)?;
+        self.flush(false)?;
+        self.resolve_instances_with_defaults()?;
+        self.flush(false)?;
+        let left = self.instantiate(&left.value)?;
+        let right = self.instantiate(&right.value)?;
+        self.guard_expr_matches(&left, &right, relation)
+    }
+
+    /// Only comparison assignments are rolled back. All callers have already
+    /// elaborated and synthesized their terms before entering this boundary.
+    pub(super) fn guard_expr_matches(
+        &mut self,
+        value: &Expr,
+        target: &Expr,
+        relation: Relation,
+    ) -> Result<bool, NatDefinitionElabError> {
         let snapshot = self.clone();
-        let result = (|| {
-            self.txn.lctx = goal.lctx.clone();
-            let left = self.term(left, None)?;
-            let right = self.term(right, None)?;
-            // `isDefEqGuarded` on the two types: its answer is not read.
-            let _ = self.proof_types_match(&left.type_, &right.type_)?;
-            self.resolve_instances(false)?;
-            self.flush(false)?;
-            self.resolve_instances_with_defaults()?;
-            self.flush(false)?;
-            let left = self.instantiate(&left.value)?;
-            let right = self.instantiate(&right.value)?;
-            self.guard_expr_matches(&left, &right, relation)
-        })();
+        let result = self.guard_expr_matches_inner(value, target, relation);
         let spent = self.txn.budget.heartbeats_consumed;
         *self = snapshot;
         self.txn.budget.heartbeats_consumed = spent;
         result
     }
 
-    /// The shared guard comparison. Callers own the snapshot that prevents
-    /// comparison-only assignments from changing the proof state. A definitional match runs
-    /// at the relation's own transparency (`withTransparency red`), whatever the ambient one.
-    pub(super) fn guard_expr_matches(
+    /// A definitional match uses the relation's own transparency, independently
+    /// of the ambient tactic transparency.
+    fn guard_expr_matches_inner(
         &mut self,
         value: &Expr,
         target: &Expr,

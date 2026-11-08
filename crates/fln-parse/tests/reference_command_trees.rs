@@ -2682,6 +2682,23 @@ const NESTED_LOCAL_EQUATIONS: &[Accepted] = &[
     },
 ];
 
+/// Ordinary local equation frames and proof-local ownership, captured with the
+/// pinned extraction script on 2026-11-08.
+const ORDINARY_LOCAL_EQUATIONS: &[Accepted] = &[
+    Accepted {
+        source: "def lambdaLocal : Nat := (fun x => let g : Nat → Nat | 0 => x | Nat.succ n => n; g 0) 42",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `lambdaLocal []) (Command.optDeclSig [] [(Term.typeSpec ":" `Nat)]) (Command.declValSimple ":=" (Term.app (Term.paren (Term.hygienicLParen "(" (hygieneInfo `[anonymous])) (Term.fun "fun" (Term.basicFun [`x] [] "=>" (Term.let "let" (Term.letConfig []) (Term.letDecl (Term.letEqnsDecl (Term.letId `g) [] [(Term.typeSpec ":" (Term.arrow `Nat "→" `Nat))] (Term.matchAlts [(Term.matchAlt "|" [[(num "0")]] "=>" `x) (Term.matchAlt "|" [[(Term.app `Nat.succ [`n])]] "=>" `n)]))) ";" (Term.app `g [(num "0")])))) ")") [(num "42")]) (Termination.suffix [] []) []) []))"#,
+    },
+    Accepted {
+        source: "def argumentLocal : Nat := (fun x : Nat => x + 1) (let g : Nat → Nat | _ => 41; g 0)",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `argumentLocal []) (Command.optDeclSig [] [(Term.typeSpec ":" `Nat)]) (Command.declValSimple ":=" (Term.app (Term.paren (Term.hygienicLParen "(" (hygieneInfo `[anonymous])) (Term.fun "fun" (Term.basicFun [`x] [(Term.typeSpec ":" `Nat)] "=>" («term_+_» `x "+" (num "1")))) ")") [(Term.paren (Term.hygienicLParen "(" (hygieneInfo `[anonymous])) (Term.let "let" (Term.letConfig []) (Term.letDecl (Term.letEqnsDecl (Term.letId `g) [] [(Term.typeSpec ":" (Term.arrow `Nat "→" `Nat))] (Term.matchAlts [(Term.matchAlt "|" [[(Term.hole "_")]] "=>" (num "41"))]))) ";" (Term.app `g [(num "0")])) ")")]) (Termination.suffix [] []) []) []))"#,
+    },
+    Accepted {
+        source: "def proofLocal : Nat → Nat := fun x =>\n  let y : Nat := by\n    let rec g : Nat → Nat\n      | 0 => x\n      | Nat.succ n => g n\n    exact g 0\n  let h : Nat → Nat\n    | 0 => y\n    | Nat.succ n => n\n  h 0",
+        tree: r#"(Command.declaration (Command.declModifiers [] [] [] [] [] [] []) (Command.definition "def" (Command.declId `proofLocal []) (Command.optDeclSig [] [(Term.typeSpec ":" (Term.arrow `Nat "→" `Nat))]) (Command.declValSimple ":=" (Term.fun "fun" (Term.basicFun [`x] [] "=>" (Term.let "let" (Term.letConfig []) (Term.letDecl (Term.letIdDecl (Term.letId `y) [] [(Term.typeSpec ":" `Nat)] ":=" (Term.byTactic "by" (Tactic.tacticSeq (Tactic.tacticSeq1Indented [(Tactic.letrec "let" "rec" (Term.letRecDecls [(Term.letRecDecl [] [] (Term.letDecl (Term.letEqnsDecl (Term.letId `g) [] [(Term.typeSpec ":" (Term.arrow `Nat "→" `Nat))] (Term.matchAlts [(Term.matchAlt "|" [[(num "0")]] "=>" `x) (Term.matchAlt "|" [[(Term.app `Nat.succ [`n])]] "=>" (Term.app `g [`n]))]))) (Termination.suffix [] []))])) [] (Tactic.exact "exact" (Term.app `g [(num "0")]))]))))) [] (Term.let "let" (Term.letConfig []) (Term.letDecl (Term.letEqnsDecl (Term.letId `h) [] [(Term.typeSpec ":" (Term.arrow `Nat "→" `Nat))] (Term.matchAlts [(Term.matchAlt "|" [[(num "0")]] "=>" `y) (Term.matchAlt "|" [[(Term.app `Nat.succ [`n])]] "=>" `n)]))) [] (Term.app `h [(num "0")]))))) (Termination.suffix [] []) []) []))"#,
+    },
+];
+
 /// A term `if let p := e then a else b` (`termIfLet`).
 const TERM_IF_LET: &[Accepted] = &[
     Accepted {
@@ -5414,6 +5431,14 @@ fn local_equations_produce_the_pins_trees() {
 #[test]
 fn nested_local_equations_produce_the_pins_trees() {
     for row in NESTED_LOCAL_EQUATIONS {
+        let ours = rendered(row.source).unwrap_or_else(|error| panic!("{}: {error:?}", row.source));
+        assert_eq!(ours, row.tree, "{}", row.source);
+    }
+}
+
+#[test]
+fn ordinary_local_equations_produce_the_pins_trees() {
+    for row in ORDINARY_LOCAL_EQUATIONS {
         let ours = rendered(row.source).unwrap_or_else(|error| panic!("{}: {error:?}", row.source));
         assert_eq!(ours, row.tree, "{}", row.source);
     }

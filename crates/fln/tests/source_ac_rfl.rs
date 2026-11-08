@@ -42,6 +42,10 @@ const ACCEPT: &[(&str, &str)] = &[
         "theorem under_function {α β : Type} (op : α → α → α) [Std.Associative op] [Std.Commutative op] (f : α → β) (a b : α) : f (op a b) = f (op b a) := by ac_rfl",
     ),
     (
+        "under_binder",
+        "theorem under_binder (a : Nat) : (fun x : Nat => a + x) = (fun x : Nat => x + a) := by ac_rfl",
+    ),
+    (
         "sort_universe",
         "theorem sort_universe {α : Sort u} (op : α → α → α) [Std.Associative op] [Std.Commutative op] (a b : α) : op a b = op b a := by ac_rfl",
     ),
@@ -319,17 +323,32 @@ fn generic_ac_reflection_matches_the_pin_and_checks_every_proof() {
                     failures.push(*label);
                 }
             }
-            let unsupported = base
+            // The scoped traversal now implements this previously unsupported
+            // binder case. ACCEPT also checks it directly, without a hypothesis
+            // or fallback that could conceal a missing AC implementation.
+            let supported = base
                 .check_source_files(
                     &[BINDER_BOUNDARY.as_bytes()],
                     &KVMap::new(),
                     SourceCheckLimits::new(limits()),
                 )
-                .expect_err("an unsupported binder traversal must not fall through to exact h");
+                .expect("the implemented binder traversal accepts the former boundary")
+                .into_complete()
+                .expect("binder congruence passes both checker seats");
+            let Some(ConstantInfo::Thm(theorem)) = supported
+                .engine
+                .environment()
+                .find(&name("binder_boundary"))
+            else {
+                panic!("missing checked binder capability theorem")
+            };
             assert!(
-                unsupported_ac(&unsupported),
-                "binder capability boundary: {unsupported:?}"
+                !theorem.value.has_expr_mvar()
+                    && !theorem.value.has_level_mvar()
+                    && !theorem.value.has_fvar()
             );
+            assert_eq!(supported.theorems, 1);
+            assert_eq!(base.logical_root(&KVMap::new()), before);
             let written = BINDER_BOUNDARY.replace("first | ac_rfl | exact _h", "exact _h");
             base.check_source_files(
                 &[written.as_bytes()],

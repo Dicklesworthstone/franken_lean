@@ -756,6 +756,12 @@ struct Context {
     // notation naming it (`l.size` inside `T.size`) is recognized as a recursive reference
     // before the recursion context exists, as a direct `T.size l` already is.
     defining: Option<Name>,
+    // The initial ordinary body sees the declaration's typed auxiliary local,
+    // before surviving self references select structural/WF compilation.
+    predefinition: Option<recursion::Predefinition>,
+    // Saved metavariable local contexts may outlive the initial auxiliary
+    // binding. Retired self locals remain hidden from implicit proof search.
+    private_self_ids: std::collections::HashSet<FVarId>,
     // Omitted result types of the recursive definitions being elaborated, innermost last
     // (`recursion::omitted_result_type`): each body is checked against its `body` hole in the
     // parameters' context, while its recursive reference uses `reference`, `?F x₁ … xₙ`.
@@ -933,6 +939,8 @@ impl Context {
             refinements: Vec::new(),
             named_refinement_holes: std::collections::HashMap::new(),
             defining: None,
+            predefinition: None,
+            private_self_ids: std::collections::HashSet::new(),
             omitted_results: Vec::new(),
             recursion: None,
             well_founded: None,
@@ -1344,6 +1352,12 @@ impl Context {
                     type_: local.type_.clone(),
                 });
             }
+            let private_reference_allowed = !scope::is_root_qualified(name) && !explicit_target;
+            if private_reference_allowed
+                && let Some(reference) = self.predefinition_reference(&resolved)
+            {
+                return Ok(reference);
+            }
             let name = &resolved;
             if let Some(reference) = self
                 .partial
@@ -1353,12 +1367,14 @@ impl Context {
             {
                 return Ok(reference.term.clone());
             }
-            if let Some(recursion) = &self.recursion
+            if private_reference_allowed
+                && let Some(recursion) = &self.recursion
                 && &recursion.name == name
             {
                 return Ok(recursion.reference.clone());
             }
-            if let Some(recursion) = &self.well_founded
+            if private_reference_allowed
+                && let Some(recursion) = &self.well_founded
                 && let Some(reference) = recursion.target(name)
             {
                 if recursion.proving {
@@ -2129,6 +2145,7 @@ impl Context {
     ) -> Result<Typed, NatDefinitionElabError> {
         // An application whose argument the pin postpones and then refuses (`pattern_typing`,
         // R1 of franken_lean-z8j.1.6.3).
+        self.begin_equation_macro_pass(syntax);
         self.check_preresolved_syntax(syntax)?;
         let observations = self.application_syntax.depth();
         let result = (|| {
@@ -2211,6 +2228,7 @@ impl Context {
         initial_finish: bool,
     ) -> Result<TermResult, NatDefinitionElabError> {
         let observations = self.application_syntax.depth();
+        let provider = self.source_scope.tactic_macros.clone();
         let result = self.term_prepared_scoped_inner(
             syntax,
             expected,
@@ -2219,6 +2237,7 @@ impl Context {
             initial_finish,
             true,
         );
+        self.source_scope.tactic_macros = provider;
         // A failed proof alternative or suspended argument can abandon a
         // queued check. Its syntax identities expire with this worklist.
         self.application_syntax.truncate(observations);
@@ -2234,7 +2253,9 @@ impl Context {
         finish: bool,
     ) -> Result<TermResult, NatDefinitionElabError> {
         let observations = self.application_syntax.depth();
+        let provider = self.source_scope.tactic_macros.clone();
         let result = self.term_prepared_scoped_inner(syntax, expected, None, None, finish, false);
+        self.source_scope.tactic_macros = provider;
         self.application_syntax.truncate(observations);
         result
     }
@@ -5135,6 +5156,15 @@ impl Context {
                 };
                 Ok(TermResult::Term(result.clone()))
             })();
+            // A provider's contains() has no error return. Charge its latched
+            // trace fault before first/try can backtrack past the callback.
+            let work = self.charge_equation_macro_work();
+            if let Err(problem) = &result
+                && equation_theorems::macro_replay::capture_stopped(problem)
+            {
+                return result;
+            }
+            work?;
             match result {
                 Ok(value) => return Ok(value),
                 Err(mut problem) => {

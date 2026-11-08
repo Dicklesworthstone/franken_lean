@@ -89,6 +89,74 @@ fn multiline_lambdas_preserve_nested_initializer_boundaries() {
     );
 }
 #[test]
+fn local_equations_in_lambda_and_application_positions_check_and_execute() {
+    let source = r#"
+def underLambda (offset n : Nat) : Nat :=
+  (fun x : Nat => let g : Nat → Nat | 0 => offset + x | Nat.succ k => x + k; g n) 2
+def inArgument (n : Nat) : Nat :=
+  Nat.succ (let g : Nat → Nat | 0 => 40 | Nat.succ k => k + 7; g n)
+def functionArgument (offset n : Nat) : Nat :=
+  (fun h : Nat → Nat => h n) (let g : Nat → Nat | 0 => offset | Nat.succ k => offset + k + 1; g)
+theorem lambdaZero : underLambda 40 0 = 42 := rfl
+theorem lambdaSuccessor : underLambda 40 5 = 6 := rfl
+theorem argumentZero : inArgument 0 = 41 := rfl
+theorem argumentSuccessor : inArgument 3 = 10 := rfl
+theorem returnedZero : functionArgument 40 0 = 40 := rfl
+theorem returnedSuccessor : functionArgument 40 2 = 42 := rfl
+"#;
+    // The pinned executable accepts the same definitions and equations and
+    // returns these six values. This path parses the complete source normally;
+    // no owned-Syntax substitution stands in for the local declaration grammar.
+    let (base, limits) = engine();
+    let before = base.logical_root(&KVMap::new());
+    let checked = base
+        .check_source_files(
+            &[source.as_bytes()],
+            &KVMap::new(),
+            SourceCheckLimits::new(EngineAdmissionLimits::new(limits.kernel)),
+        )
+        .expect("nested local equations parse and elaborate from source")
+        .into_complete()
+        .expect("both logical checkers admit the equations")
+        .engine;
+    for (expression, expected) in [
+        ("underLambda 40 0", "42"),
+        ("underLambda 40 5", "6"),
+        ("inArgument 0", "41"),
+        ("inArgument 3", "10"),
+        ("functionArgument 40 0", "40"),
+        ("functionArgument 40 2", "42"),
+    ] {
+        let command = format!("#eval {expression}\n");
+        let batch = checked
+            .execute_source_definitions(&[command.as_bytes()], &KVMap::new(), limits)
+            .unwrap_or_else(|error| panic!("{expression}: {error:?}"))
+            .into_complete()
+            .unwrap();
+        let VmExit::Returned(value) = &batch.executions.last().unwrap().exit else {
+            panic!("expected a native result for {expression}")
+        };
+        assert_eq!(
+            fln_vm::interpreter::nat_decimal(&value.value).as_deref(),
+            Some(expected),
+            "{expression}"
+        );
+    }
+    let invalid =
+        "def bad : Nat := (fun x : Nat => let g : Nat → Nat | 0 => x | Nat.succ _ => true; g 0) 42";
+    assert!(
+        base.check_source_files(
+            &[invalid.as_bytes()],
+            &KVMap::new(),
+            SourceCheckLimits::new(EngineAdmissionLimits::new(limits.kernel)),
+        )
+        .is_err(),
+        "an unused local equation branch still has to type-check"
+    );
+    assert_eq!(base.logical_root(&KVMap::new()), before);
+}
+
+#[test]
 fn nested_invalid_annotations_values_and_evidence_are_not_discarded() {
     let (engine, limits) = engine();
     let options = KVMap::new();
@@ -116,9 +184,9 @@ fn nested_invalid_annotations_values_and_evidence_are_not_discarded() {
 }
 
 #[test]
-fn unused_values_stay_strict_but_nested_evidence_is_erased_after_checking() {
+fn dead_values_and_nested_evidence_are_erased_but_live_initializers_execute() {
     let slow = "def slow (n : Nat) : Nat := match n with | 0 => 0 | Nat.succ k => slow k + 1\n";
-    let strict = |n| {
+    let unused = |n| {
         run(
             &format!(
                 "{slow}def use (n : Nat) : Nat := (fun x : Nat => let unused := slow n; x) 42\n#eval use {n}"
@@ -126,12 +194,12 @@ fn unused_values_stay_strict_but_nested_evidence_is_erased_after_checking() {
             "42",
         )
     };
-    let used = |n| {
+    let used = |n: u64| {
         run(
             &format!(
-                "{slow}def use (n : Nat) : Nat := (fun x : Nat => let a := slow n; x + a - a) 42\n#eval use {n}"
+                "{slow}def use (n : Nat) : Nat := (fun x : Nat => let a := slow n; x + a) 42\n#eval use {n}"
             ),
-            "42",
+            &(42 + n).to_string(),
         )
     };
     let erased = |n| {
@@ -142,8 +210,9 @@ fn unused_values_stay_strict_but_nested_evidence_is_erased_after_checking() {
             "42",
         )
     };
-    let delta = strict(20) - strict(0);
-    assert!(delta > 0);
-    assert_eq!(delta, used(20) - used(0));
+    // Lean 4.32.0's trace.Compiler.result compiles the unused case to return
+    // 42, with no call to slow. Live source values still reach the runtime.
+    assert_eq!(unused(0), unused(20));
+    assert!(used(20) > used(0));
     assert_eq!(erased(0), erased(20));
 }
