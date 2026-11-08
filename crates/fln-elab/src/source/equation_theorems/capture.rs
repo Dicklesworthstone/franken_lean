@@ -128,21 +128,26 @@ impl Context {
         definition: &DefinitionVal,
         body: &Syntax,
         sections: usize,
-    ) -> Option<Record> {
+    ) -> Result<Option<Record>, NatDefinitionElabError> {
         let body = under_lambdas(body);
-        let (discriminants, mut alternatives) = match_parts(body)?;
+        let Some((discriminants, mut alternatives)) = match_parts(body) else {
+            return Ok(None);
+        };
         let prepared = (self.equation_pattern_source == Some(std::ptr::from_ref(body).addr()))
             .then_some(self.equation_patterns.as_deref())
             .flatten();
         if let Some(rows) = prepared {
             if rows.len() != alternatives.len() {
-                return None;
+                return Ok(None);
             }
             for ((patterns, _), row) in alternatives.iter_mut().zip(rows) {
-                let [row] = null_args(row)? else {
-                    return None;
+                let Some([row]) = null_args(row) else {
+                    return Ok(None);
                 };
-                *patterns = separated(null_args(row)?)?;
+                let Some(prepared) = null_args(row).and_then(separated) else {
+                    return Ok(None);
+                };
+                *patterns = prepared;
             }
         }
         // The definition is not admitted yet, and nothing here may admit it: its own name
@@ -150,23 +155,22 @@ impl Context {
         let mut scope = self.source_scope.clone();
         scope.variables = Default::default();
         scope.tactic_macros = None;
-        let mut cx = Context::scoped(&self.txn.env, self.kernel, &scope).ok()?;
+        let mut cx = Context::scoped(&self.txn.env, self.kernel, &scope)?;
         cx.txn.budget = self.txn.budget.clone();
         cx.txn.lctx = LocalContext::new();
         cx.level_params = definition.base.level_params.clone();
-        let result = cx
-            .capture(
-                definition,
-                &discriminants,
-                &alternatives,
-                sections,
-                prepared.is_some(),
-                self.equation_macros.as_ref(),
-            )
-            .ok()
-            .flatten();
+        let result = cx.capture(
+            definition,
+            &discriminants,
+            &alternatives,
+            sections,
+            self.equation_macros.as_ref(),
+        );
+        let work = cx.charge_equation_macro_work();
         self.txn.budget.heartbeats_consumed = cx.txn.budget.heartbeats_consumed;
-        result
+        let result = super::macro_replay::capture_result(result)?;
+        work?;
+        Ok(result.flatten())
     }
 
     fn capture(
@@ -175,7 +179,6 @@ impl Context {
         discriminants: &[&Name],
         alternatives: &[(Vec<&Syntax>, &Syntax)],
         sections: usize,
-        prepared: bool,
         macros: Option<&super::macro_replay::Rows>,
     ) -> Result<Option<Record>, NatDefinitionElabError> {
         // The definition's value lambdas, opened with their binder names.
@@ -285,7 +288,6 @@ impl Context {
                 patterns,
                 rhs,
                 &result,
-                prepared,
                 recorded,
             )?
             else {
@@ -390,7 +392,6 @@ impl Context {
         patterns: &[&Syntax],
         rhs: &Syntax,
         result: &Expr,
-        prepared: bool,
         recorded: Option<std::sync::Arc<super::macro_replay::Row>>,
     ) -> Result<Option<Alternative>, NatDefinitionElabError> {
         let mut builder = Builder::default();
@@ -411,19 +412,10 @@ impl Context {
                 };
                 expected = replaced;
             }
-            // These are the actual rows the matrix compiled. Replaying their
-            // macros here would advance state twice and could record a different
-            // equation from the definition that was checked.
-            let provider = if prepared {
-                self.source_scope.tactic_macros.take()
-            } else {
-                None
-            };
-            let pattern = self.pattern(&mut builder, syntax, &expected, &wildcard());
-            if prepared {
-                self.source_scope.tactic_macros = provider;
-            }
-            let Some(pattern) = pattern? else {
+            // Prepared patterns are the rows the matrix actually compiled.
+            // This context has no live provider; RHS replay is installed only
+            // after all pattern binders have been reconstructed.
+            let Some(pattern) = self.pattern(&mut builder, syntax, &expected, &wildcard())? else {
                 return Ok(None);
             };
             elaborated.push(pattern);
@@ -456,10 +448,10 @@ impl Context {
                 None => return Ok(None),
             },
             None => {
-                let Ok(term) = self.term(rhs, Some(expected)) else {
-                    return Ok(None);
-                };
-                let Ok(term) = self.finish(term) else {
+                let result = self
+                    .term(rhs, Some(expected))
+                    .and_then(|term| self.finish(term));
+                let Some(term) = super::macro_replay::capture_result(result)? else {
                     return Ok(None);
                 };
                 term
@@ -549,7 +541,8 @@ impl Context {
             if !self.is_nat(expected)? {
                 return Ok(None);
             }
-            let Ok(term) = self.term(syntax, Some(expected.clone())) else {
+            let result = self.term(syntax, Some(expected.clone()));
+            let Some(term) = super::macro_replay::capture_result(result)? else {
                 return Ok(None);
             };
             return Ok(Some(self.instantiate(&term.value)?));

@@ -274,7 +274,7 @@ fn equation_reconstruction_reuses_failed_tactic_candidates_and_term_chains() {
     );
     let calls = provider.tactic_calls.lock().unwrap();
     assert_eq!(calls.len(), 4);
-    for invocation in calls.chunks_exact(2) {
+    for invocation in calls.as_chunks::<2>().0 {
         assert_eq!(invocation[0].0, 0);
         assert_eq!(invocation[1].0, 1);
         assert_eq!(invocation[0].1, invocation[1].1);

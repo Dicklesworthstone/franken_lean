@@ -114,6 +114,72 @@ pub(in crate::source) struct Rows {
     active: Option<Active>,
 }
 
+impl Row {
+    /// Fresh tactic scopes are allocation identities, not source-row identities.
+    /// A bijection may rename those return values and their request uses only:
+    /// every syntax, expansion result, diagnostic, and other input stays exact.
+    fn same_expansions(&self, other: &Self) -> bool {
+        if self.syntax != other.syntax
+            || self.depth != other.depth
+            || self.terms != other.terms
+            || self.finish != other.finish
+            || self.entries.len() != other.entries.len()
+        {
+            return false;
+        }
+        let mut forward = HashMap::new();
+        let mut backward = HashMap::new();
+        for (left, right) in self.entries.iter().zip(&other.entries) {
+            match (&left.event, &right.event) {
+                (Event::Enter(left_depth, Ok(left)), Event::Enter(right_depth, Ok(right))) => {
+                    if left_depth != right_depth {
+                        return false;
+                    }
+                    if let Some(mapped) = forward.get(left) {
+                        if mapped != right {
+                            return false;
+                        }
+                    } else {
+                        if backward.contains_key(right) {
+                            return false;
+                        }
+                        forward.insert(*left, *right);
+                        backward.insert(*right, *left);
+                    }
+                }
+                (
+                    Event::Tactic {
+                        syntax: left_syntax,
+                        candidate: left_candidate,
+                        scope: left_scope,
+                        depth: left_depth,
+                        result: left_result,
+                    },
+                    Event::Tactic {
+                        syntax: right_syntax,
+                        candidate: right_candidate,
+                        scope: right_scope,
+                        depth: right_depth,
+                        result: right_result,
+                    },
+                ) => {
+                    if left_syntax != right_syntax
+                        || left_candidate != right_candidate
+                        || left_depth != right_depth
+                        || left_result != right_result
+                        || forward.get(left_scope).unwrap_or(left_scope) != right_scope
+                    {
+                        return false;
+                    }
+                }
+                (left, right) if left == right => {}
+                _ => return false,
+            }
+        }
+        true
+    }
+}
+
 impl Rows {
     pub(super) fn new(alternatives: &[(Vec<&Syntax>, &Syntax)]) -> Self {
         Self {
@@ -199,7 +265,7 @@ impl Recording {
         Some(error.clone())
     }
 
-    fn syntax(&mut self, syntax: &Syntax, work: &Work) -> Option<Arc<Syntax>> {
+    fn measure_syntax(&mut self, syntax: &Syntax, work: &Work) -> Option<()> {
         let mut pending = vec![syntax];
         while let Some(node) = pending.pop() {
             self.charge(work)?;
@@ -238,6 +304,11 @@ impl Recording {
                 Syntax::Missing => {}
             }
         }
+        Some(())
+    }
+
+    fn syntax(&mut self, syntax: &Syntax, work: &Work) -> Option<Arc<Syntax>> {
+        self.measure_syntax(syntax, work)?;
         // Syntax's Clone and equality both use heap worklists.
         Some(Arc::new(syntax.clone()))
     }
@@ -494,6 +565,63 @@ impl TacticMacroExpander for Replay {
     }
 }
 
+/// Unsupported reconstruction can decline optional metadata. A resource stop,
+/// cancellation, or internal fault still prevents a completed answer.
+pub(super) fn capture_result<T>(
+    result: Result<T, NatDefinitionElabError>,
+) -> Result<Option<T>, NatDefinitionElabError> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(problem) => {
+            let nonanswer = |outcome: &Outcome<Verdict>| {
+                matches!(
+                    outcome,
+                    Outcome::Inconclusive(_) | Outcome::InternalFault(_)
+                )
+            };
+            let stopped = match &problem {
+                NatDefinitionElabError::Inference(
+                    SourceInferenceError::ResourceLimit
+                    | SourceInferenceError::ArithmeticInconclusive(_)
+                    | SourceInferenceError::NativeEvaluationInconclusive(_)
+                    | SourceInferenceError::NativeEvaluation(
+                        crate::native::NativeEvaluationError::Fault(_),
+                    )
+                    | SourceInferenceError::TacticMacro(
+                        TacticMacroError::Inconclusive(_) | TacticMacroError::InternalFault(_),
+                    )
+                    | SourceInferenceError::Universe(
+                        crate::universe::UniverseInstantiationError::VisitLimit { .. }
+                        | crate::universe::UniverseInstantiationError::LevelTooDeep(_),
+                    ),
+                ) => true,
+                NatDefinitionElabError::Inference(SourceInferenceError::TypeObligation(
+                    outcome,
+                )) => nonanswer(outcome),
+                NatDefinitionElabError::Inference(SourceInferenceError::Unification(error)) => {
+                    match error.as_ref() {
+                        UnificationError::Cancelled
+                        | UnificationError::StepLimit { .. }
+                        | UnificationError::NodeLimit { .. }
+                        | UnificationError::AssignmentLimit { .. }
+                        | UnificationError::HeartbeatLimit
+                        | UnificationError::Universe(
+                            crate::universe::UniverseInstantiationError::VisitLimit { .. }
+                            | crate::universe::UniverseInstantiationError::LevelTooDeep(_),
+                        ) => true,
+                        UnificationError::ConversionCheck { outcome }
+                        | UnificationError::AssignmentCheck { outcome, .. }
+                        | UnificationError::ConstraintCheck { outcome, .. } => nonanswer(outcome),
+                        _ => false,
+                    }
+                }
+                _ => false,
+            };
+            if stopped { Err(problem) } else { Ok(None) }
+        }
+    }
+}
+
 pub(in crate::source) fn parts(syntax: &Syntax) -> Option<(usize, &Syntax)> {
     let Syntax::Node { kind, args, .. } = syntax else {
         return None;
@@ -508,6 +636,99 @@ pub(in crate::source) fn parts(syntax: &Syntax) -> Option<(usize, &Syntax)> {
 }
 
 impl Context {
+    /// Mark borrowed source rows before any native preparation can replace the
+    /// containing tree. The markers then travel with the actual matrix copies.
+    pub(in crate::source) fn mark_equation_source(
+        &mut self,
+        syntax: &Syntax,
+    ) -> Result<Option<Syntax>, NatDefinitionElabError> {
+        if self.equation_macros.is_none() {
+            return Ok(None);
+        }
+        let mut scan = vec![syntax];
+        let mut found = false;
+        while let Some(node) = scan.pop() {
+            self.tick()?;
+            if self.watches_equation_rhs(node) {
+                found = true;
+                break;
+            }
+            if let Syntax::Node { args, .. } = node {
+                scan.extend(args);
+            }
+        }
+        if !found {
+            return Ok(None);
+        }
+        let work = self
+            .equation_macro_work
+            .clone()
+            .ok_or_else(|| failure(SourceInferenceError::Scope))?;
+        let mut measurement = Recording {
+            remaining: self.equation_trace_limit(),
+            entries: Vec::new(),
+        };
+        let measured = measurement.measure_syntax(syntax, &work);
+        self.charge_equation_macro_work()?;
+        measured.ok_or_else(|| failure(SourceInferenceError::ResourceLimit))?;
+        enum Task<'a> {
+            Visit(&'a Syntax),
+            Build(&'a Syntax, usize),
+        }
+        let mut tasks = vec![Task::Visit(syntax)];
+        let mut built = Vec::new();
+        while let Some(task) = tasks.pop() {
+            self.tick()?;
+            match task {
+                Task::Visit(node @ Syntax::Node { args, .. }) => {
+                    tasks.push(Task::Build(node, built.len()));
+                    tasks.extend(args.iter().rev().map(Task::Visit));
+                }
+                Task::Visit(leaf) => built.push(self.mark_equation_rhs(leaf, leaf.clone())),
+                Task::Build(source @ Syntax::Node { info, kind, .. }, start) => {
+                    let node = Syntax::Node {
+                        info: *info,
+                        kind: kind.clone(),
+                        args: built.split_off(start),
+                    };
+                    built.push(self.mark_equation_rhs(source, node));
+                }
+                Task::Build(..) => return Err(failure(SourceInferenceError::Scope)),
+            }
+        }
+        Ok(built.pop())
+    }
+
+    /// The complete ordered marker family identifies the watched root after a
+    /// preparation pass has replaced its allocation. A nested match does not
+    /// have these markers on its alternatives' direct RHSs.
+    pub(in crate::source) fn equation_root_rows(&self, alternatives: &[Syntax]) -> bool {
+        let Some(rows) = &self.equation_macros else {
+            return false;
+        };
+        alternatives.len() == rows.rows.len()
+            && alternatives.iter().enumerate().all(|(index, alternative)| {
+                let Syntax::Node { kind, args, .. } = alternative else {
+                    return false;
+                };
+                kind == &parser_kind(&["Term", "matchAlt"])
+                    && args.len() == 4
+                    && parts(&args[3]).is_some_and(|(row, _)| row == index)
+            })
+    }
+
+    fn equation_trace_limit(&self) -> u64 {
+        if self.txn.budget.max_heartbeats == 0 {
+            MAX_TRACE_WORK
+        } else {
+            self.txn
+                .budget
+                .max_heartbeats
+                .saturating_sub(self.txn.budget.heartbeats_consumed)
+                .min(MAX_TRACE_WORK)
+        }
+    }
+
     pub(in crate::source) fn watches_equation_rhs(&self, syntax: &Syntax) -> bool {
         self.equation_macros.as_ref().is_some_and(|rows| {
             rows.sources
@@ -555,15 +776,7 @@ impl Context {
         let Some(work) = self.equation_macro_work.clone() else {
             return Err(failure(SourceInferenceError::Scope));
         };
-        let remaining = if self.txn.budget.max_heartbeats == 0 {
-            MAX_TRACE_WORK
-        } else {
-            self.txn
-                .budget
-                .max_heartbeats
-                .saturating_sub(self.txn.budget.heartbeats_consumed)
-                .min(MAX_TRACE_WORK)
-        };
+        let remaining = self.equation_trace_limit();
         let mut recording = Recording {
             remaining,
             entries: Vec::new(),
@@ -619,7 +832,7 @@ impl Context {
                 // The same source row can be visited under several refinements.
                 // Never manufacture one equation from incompatible occurrences.
                 active.recorder.work.add(row.work);
-                if previous.as_ref() != row.as_ref() {
+                if !previous.same_expansions(&row) {
                     *observed = Observed::Ambiguous;
                 }
             }
@@ -696,9 +909,11 @@ impl Context {
         self.source_scope.tactic_macros = previous;
         self.tactic_macro_depth = depth;
         self.tactic_macro_terms = terms;
-        self.charge_equation_macro_work()?;
+        let work = self.charge_equation_macro_work();
+        let term = capture_result(term)?;
+        work?;
         Ok(match term {
-            Ok(term) if replay.complete() => Some(term),
+            Some(term) if replay.complete() => Some(term),
             _ => None,
         })
     }

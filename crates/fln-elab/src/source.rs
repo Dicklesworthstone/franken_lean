@@ -6506,9 +6506,10 @@ fn definition_in_context_named(
     context.equation_pattern_source = None;
     context.equation_patterns = None;
     context.clear_equation_macros();
-    context.charge_equation_macro_work()?;
+    let work = context.charge_equation_macro_work();
     context.equation_macro_work = None;
     let declaration = declaration?;
+    work?;
     context.publish_deprecated_uses()?;
     Ok(declaration)
 }
@@ -7294,7 +7295,7 @@ fn definition_elaboration(
             all: vec![name.clone()],
         };
         context.equation_info =
-            context.capture_equation_info(&definition, body, partial_captures.len());
+            context.capture_equation_info(&definition, body, partial_captures.len())?;
         context.tick()?;
         Ok(Declaration::Defn(definition))
     }

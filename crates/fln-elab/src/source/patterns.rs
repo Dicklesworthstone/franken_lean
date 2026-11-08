@@ -1039,8 +1039,9 @@ impl Context {
             }
             expanded_patterns.push(expanded);
         }
-        if let Some(original) = original
-            && self.equation_pattern_source == Some(std::ptr::from_ref(original).addr())
+        if original.is_some_and(|original| {
+            self.equation_pattern_source == Some(std::ptr::from_ref(original).addr())
+        }) || self.equation_root_rows(alts)
         {
             let patterns = expanded_patterns
                 .iter()
@@ -1724,6 +1725,11 @@ impl Context {
         &mut self,
         syntax: &'a Syntax,
     ) -> Result<Cow<'a, Syntax>, NatDefinitionElabError> {
+        if let Some(marked) = self.mark_equation_source(syntax)? {
+            return Ok(Cow::Owned(
+                self.lower_pattern_matrices(&marked)?.into_owned(),
+            ));
+        }
         // A declaration by equations is its `letIdDecl` first, as the pin expands it before its
         // `let` elaborates; the scan below reads every `let rec` declaration as one.
         if let Some(expanded) = self.expand_let_equations(syntax)? {
@@ -1745,8 +1751,7 @@ impl Context {
             mutation |= do_notation::is_mutation(node);
             nested |= node.kind() == Some(&parser_kind(&["Term", "nestedAction"]));
             loops |= do_notation::is_while_loop(node);
-            needed |= self.watches_equation_rhs(node)
-                || complex(node, &self.txn.env)
+            needed |= complex(node, &self.txn.env)
                 || pattern_function(node)
                 || diagnostics::is_diagnostic(node)
                 || collections::is_notation(node)
@@ -1840,7 +1845,7 @@ impl Context {
                         tasks.push(Task::Visit(argument, pattern));
                     }
                 }
-                Task::Visit(leaf, _) => built.push(self.mark_equation_rhs(leaf, leaf.clone())),
+                Task::Visit(leaf, _) => built.push(leaf.clone()),
                 Task::Node(original @ Syntax::Node { info, kind, .. }, start, pattern) => {
                     let node = Syntax::Node {
                         info: *info,
@@ -1897,15 +1902,14 @@ impl Context {
                     };
                     // Coverage belongs to this match's actual elaboration, not
                     // to an unchosen tactic alternative elsewhere in the term.
-                    let node = if required.is_empty() {
+                    built.push(if required.is_empty() {
                         node
                     } else {
                         Syntax::node(
                             parser_kind(&["Term", "matrixScope"]),
                             vec![null(required.into_iter().map(identifier).collect()), node],
                         )
-                    };
-                    built.push(self.mark_equation_rhs(original, node));
+                    });
                 }
                 _ => unreachable!(),
             }
