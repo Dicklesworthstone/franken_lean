@@ -2129,6 +2129,7 @@ impl Context {
     ) -> Result<Typed, NatDefinitionElabError> {
         // An application whose argument the pin postpones and then refuses (`pattern_typing`,
         // R1 of franken_lean-z8j.1.6.3).
+        self.begin_equation_macro_pass(syntax);
         self.check_preresolved_syntax(syntax)?;
         let observations = self.application_syntax.depth();
         let result = (|| {
@@ -2211,6 +2212,7 @@ impl Context {
         initial_finish: bool,
     ) -> Result<TermResult, NatDefinitionElabError> {
         let observations = self.application_syntax.depth();
+        let provider = self.source_scope.tactic_macros.clone();
         let result = self.term_prepared_scoped_inner(
             syntax,
             expected,
@@ -2219,6 +2221,7 @@ impl Context {
             initial_finish,
             true,
         );
+        self.source_scope.tactic_macros = provider;
         // A failed proof alternative or suspended argument can abandon a
         // queued check. Its syntax identities expire with this worklist.
         self.application_syntax.truncate(observations);
@@ -2234,7 +2237,9 @@ impl Context {
         finish: bool,
     ) -> Result<TermResult, NatDefinitionElabError> {
         let observations = self.application_syntax.depth();
+        let provider = self.source_scope.tactic_macros.clone();
         let result = self.term_prepared_scoped_inner(syntax, expected, None, None, finish, false);
+        self.source_scope.tactic_macros = provider;
         self.application_syntax.truncate(observations);
         result
     }
@@ -5135,6 +5140,15 @@ impl Context {
                 };
                 Ok(TermResult::Term(result.clone()))
             })();
+            // A provider's contains() has no error return. Charge its latched
+            // trace fault before first/try can backtrack past the callback.
+            let work = self.charge_equation_macro_work();
+            if let Err(problem) = &result
+                && equation_theorems::macro_replay::capture_stopped(problem)
+            {
+                return result;
+            }
+            work?;
             match result {
                 Ok(value) => return Ok(value),
                 Err(mut problem) => {

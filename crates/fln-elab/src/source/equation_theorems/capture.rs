@@ -1150,7 +1150,7 @@ type Instance<T> = (T, Vec<Level>, Vec<Expr>);
 
 /// `body` under `fun x y =>` binders that are plain identifiers: the definition's value
 /// lambdas, which [`Context::capture`] opens with the parameters.
-fn under_lambdas(mut body: &Syntax) -> &Syntax {
+pub(super) fn under_lambdas(mut body: &Syntax) -> &Syntax {
     while let Some([keyword, basic]) = node_args(body, &parser_kind(&["Term", "fun"])) {
         let Some([binders, type_, arrow, inner]) =
             node_args(basic, &parser_kind(&["Term", "basicFun"]))

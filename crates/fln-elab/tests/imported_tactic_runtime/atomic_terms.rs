@@ -707,6 +707,346 @@ fn dependent_application_typing_uses_the_actual_atomic_expansion_once() {
     }
 }
 
+struct EquationMacros {
+    next: AtomicU64,
+    scopes: AtomicU64,
+    term_expansions: AtomicU64,
+    terminal_literals: Mutex<Vec<u64>>,
+    tactic_candidates: Mutex<Vec<usize>>,
+    fail_first_candidate: bool,
+}
+
+impl EquationMacros {
+    fn new(fail_first_candidate: bool) -> Arc<Self> {
+        Arc::new(Self {
+            next: AtomicU64::new(7),
+            scopes: AtomicU64::new(100),
+            term_expansions: AtomicU64::new(0),
+            terminal_literals: Mutex::new(Vec::new()),
+            tactic_candidates: Mutex::new(Vec::new()),
+            fail_first_candidate,
+        })
+    }
+}
+
+impl TacticMacroExpander for EquationMacros {
+    fn contains(&self, kind: &Name) -> bool {
+        *kind == key() || *kind == Name::from_components(["ident"])
+    }
+
+    fn enter_tactic(&self, _: usize) -> Result<u64, TacticMacroError> {
+        Ok(self.scopes.fetch_add(1, Ordering::Relaxed))
+    }
+
+    fn expand_tactic(
+        &self,
+        _: &Syntax,
+        candidate: usize,
+        _: u64,
+        _: usize,
+        _: &Environment,
+        _: &SourceScope,
+    ) -> Result<TacticMacroExpansion, TacticMacroError> {
+        let successful = usize::from(self.fail_first_candidate);
+        if candidate > successful {
+            return Ok(TacticMacroExpansion::Exhausted);
+        }
+        self.tactic_candidates.lock().unwrap().push(candidate);
+        let script = if candidate < successful {
+            // A real typing failure after expansion, rather than a fabricated
+            // provider refusal: the successful candidate must restore the goal.
+            "exact True.intro".to_owned()
+        } else {
+            format!("exact {}", self.next.fetch_add(1, Ordering::Relaxed))
+        };
+        Ok(TacticMacroExpansion::Expanded {
+            syntax: expansion(&script),
+            no_fallback: false,
+        })
+    }
+
+    fn expand_term(
+        &self,
+        syntax: &Syntax,
+        _: usize,
+        _: &Environment,
+        _: &SourceScope,
+    ) -> Result<Option<Syntax>, TacticMacroError> {
+        if matches!(syntax, Syntax::Ident { val, .. }
+            if *val == Name::from_components(["equationTick"]))
+        {
+            self.term_expansions.fetch_add(1, Ordering::Relaxed);
+            let value = self.next.fetch_add(1, Ordering::Relaxed);
+            return Ok(Some(Syntax::node(
+                Name::from_components(["num"]),
+                vec![Syntax::atom(SourceInfo::None, value.to_string())],
+            )));
+        }
+        if let Syntax::Node { kind, args, .. } = syntax
+            && *kind == Name::from_components(["num"])
+            && let [Syntax::Atom { val, .. }] = args.as_slice()
+            && let Ok(value) = val.parse()
+        {
+            self.terminal_literals.lock().unwrap().push(value);
+        }
+        Ok(None)
+    }
+}
+
+fn equation_fixture(
+    source: &str,
+    environment: &Environment,
+    provider: Arc<EquationMacros>,
+    tactics: bool,
+) -> fln_elab::source::ElaboratedDeclaration {
+    let parsed = fln_parse::parse_definition(source.as_bytes()).unwrap();
+    let mut syntax = parsed.syntax().clone();
+    if tactics {
+        retag(&mut syntax);
+    }
+    fln_elab::source::scope::elaborate_definition_with_effects(
+        &syntax,
+        environment,
+        budget(),
+        &SourceScope {
+            tactic_macros: Some(TacticMacroProvider(provider)),
+            ..SourceScope::default()
+        },
+    )
+    .unwrap_or_else(|error| panic!("{source}: {error:?}"))
+}
+
+fn publish_captured_equations(
+    environment: &Environment,
+    result: fln_elab::source::ElaboratedDeclaration,
+    alternatives: usize,
+) -> Environment {
+    use fln_elab::source::equation_theorems::{self, Request, journal};
+    assert!(result.native_axioms.is_empty());
+    assert!(result.local_functions.is_empty());
+    let record = result
+        .equation_info
+        .expect("successful macro bodies must retain their equation information");
+    assert_eq!(record.alternatives.len(), alternatives);
+    let environment = publish(environment, result.declaration);
+    let mut environment = journal::push(&environment, &record).unwrap();
+    let equations = equation_theorems::realize(
+        &environment,
+        &Request::Equations(Name::from_components(["stateful"])),
+        budget(),
+    )
+    .expect("the captured right-hand sides must prove the actual definition's equations");
+    assert!(!equations.is_empty());
+    for equation in equations {
+        environment = publish(&environment, equation);
+    }
+    environment
+}
+
+fn check_captured_equations(
+    environment: &Environment,
+    result: fln_elab::source::ElaboratedDeclaration,
+    values: [u64; 2],
+) {
+    let environment = publish_captured_equations(environment, result, 2);
+    for (index, (argument, value)) in ["Bool.true", "Bool.false"]
+        .into_iter()
+        .zip(values)
+        .enumerate()
+    {
+        let source = format!(
+            "theorem observed{index} : Eq (stateful {argument}) {value} := stateful.eq_{}",
+            index + 1
+        );
+        checked_in(&source, Templates::new(&[]), &environment).unwrap();
+    }
+}
+
+#[test]
+fn equation_capture_preserves_stateful_term_expansions_and_terminal_lookups() {
+    for source in [
+        "def stateful (b : Bool) : Nat := match b with | true => equationTick | false => equationTick",
+        "def stateful (b : Bool) : Nat := match b with | true => by exact equationTick | false => by exact equationTick",
+    ] {
+        let environment = environment();
+        let provider = EquationMacros::new(false);
+        let result = equation_fixture(source, &environment, provider.clone(), false);
+        assert_eq!(
+            provider.term_expansions.load(Ordering::Relaxed),
+            2,
+            "{source}"
+        );
+        assert_eq!(
+            *provider.terminal_literals.lock().unwrap(),
+            [7, 8],
+            "terminal None lookups belong to the original elaboration, too: {source}"
+        );
+        check_captured_equations(&environment, result, [7, 8]);
+    }
+}
+
+#[test]
+fn equation_capture_preserves_failed_tactic_attempts_without_reexecuting_them() {
+    for (source, failed_candidate, candidates, literals, values) in [
+        (
+            "def stateful (b : Bool) : Nat := match b with | true => by skip | false => by skip",
+            true,
+            vec![0, 1, 0, 1],
+            vec![7, 8],
+            [7, 8],
+        ),
+        (
+            "def stateful (b : Bool) : Nat := match b with\n  | true => by\n      first\n      | (skip; fail)\n      | skip\n  | false => by\n      first\n      | (skip; fail)\n      | skip",
+            false,
+            vec![0, 0, 0, 0],
+            vec![7, 8, 9, 10],
+            [8, 10],
+        ),
+    ] {
+        let environment = environment();
+        let provider = EquationMacros::new(failed_candidate);
+        let result = equation_fixture(source, &environment, provider.clone(), true);
+        assert_eq!(
+            *provider.tactic_candidates.lock().unwrap(),
+            candidates,
+            "{source}"
+        );
+        assert_eq!(
+            *provider.terminal_literals.lock().unwrap(),
+            literals,
+            "{source}"
+        );
+        // Opaque definitions elaborate the same body but do not capture
+        // equations. They independently fix the number of live scope requests.
+        let control_provider = EquationMacros::new(failed_candidate);
+        let control = equation_fixture(
+            &source.replacen("def stateful", "opaque stateful", 1),
+            &environment,
+            control_provider.clone(),
+            true,
+        );
+        assert!(control.equation_info.is_none());
+        assert!(matches!(
+            fln_kernel::check(&environment, &control.declaration, budget()),
+            Outcome::Complete(Verdict::Accepted { .. })
+        ));
+        assert_eq!(
+            provider.scopes.load(Ordering::Relaxed),
+            control_provider.scopes.load(Ordering::Relaxed),
+            "equation capture must not request additional live macro scopes: {source}"
+        );
+        check_captured_equations(&environment, result, values);
+    }
+}
+
+#[test]
+fn equation_capture_retains_pattern_locals_and_structural_recursive_calls() {
+    for (source, successor) in [
+        (
+            "def stateful (n : Nat) : Nat := match n with | .zero => equationTick | .succ k => equationTick + k",
+            "theorem observedSucc (k : Nat) : Eq (stateful (Nat.succ k)) (8 + k) := stateful.eq_2 k",
+        ),
+        (
+            "def stateful (n : Nat) : Nat := match n with | .zero => equationTick | .succ k => stateful k + equationTick",
+            "theorem observedSucc (k : Nat) : Eq (stateful (Nat.succ k)) (stateful k + 8) := stateful.eq_2 k",
+        ),
+    ] {
+        let environment = environment();
+        let provider = EquationMacros::new(false);
+        let result = equation_fixture(source, &environment, provider.clone(), false);
+        assert_eq!(
+            provider.term_expansions.load(Ordering::Relaxed),
+            2,
+            "{source}"
+        );
+        let environment = publish_captured_equations(&environment, result, 2);
+        for proof in [
+            "theorem observedZero : Eq (stateful Nat.zero) 7 := stateful.eq_1",
+            successor,
+        ] {
+            checked_in(proof, Templates::new(&[]), &environment)
+                .unwrap_or_else(|error| panic!("{source}\n{proof}: {error:?}"));
+        }
+    }
+}
+
+#[test]
+fn equation_capture_elaborates_constructor_fields_in_written_order() {
+    let source = "def stateful (n : Nat) : Nat := match n with | .succ k => equationTick + k | .zero => equationTick";
+    let environment = environment();
+    let provider = EquationMacros::new(false);
+    let result = equation_fixture(source, &environment, provider.clone(), false);
+    assert_eq!(provider.term_expansions.load(Ordering::Relaxed), 2);
+    assert_eq!(*provider.terminal_literals.lock().unwrap(), [7, 8]);
+    let environment = publish_captured_equations(&environment, result, 2);
+    for proof in [
+        "theorem observedSucc (k : Nat) : Eq (stateful (Nat.succ k)) (7 + k) := stateful.eq_1 k",
+        "theorem observedZero : Eq (stateful Nat.zero) 8 := stateful.eq_2",
+    ] {
+        checked_in(proof, Templates::new(&[]), &environment)
+            .unwrap_or_else(|error| panic!("{proof}: {error:?}"));
+    }
+}
+
+#[test]
+fn equation_capture_keeps_pure_matrix_rows_with_fresh_tactic_scopes() {
+    let source = "def stateful (x y : Bool) : Nat := match x, y with | true, true => by exact 7 | false, true => by exact 8 | _, false => by exact 9";
+    let environment = environment();
+    let provider = EquationMacros::new(false);
+    let result = equation_fixture(source, &environment, provider.clone(), false);
+    let control_provider = EquationMacros::new(false);
+    let control = equation_fixture(
+        &source.replacen("def stateful", "opaque stateful", 1),
+        &environment,
+        control_provider.clone(),
+        false,
+    );
+    assert!(control.equation_info.is_none());
+    assert!(matches!(
+        fln_kernel::check(&environment, &control.declaration, budget()),
+        Outcome::Complete(Verdict::Accepted { .. })
+    ));
+    assert_eq!(
+        provider.scopes.load(Ordering::Relaxed),
+        control_provider.scopes.load(Ordering::Relaxed),
+        "capturing repeated pure rows must not allocate more live scopes"
+    );
+    let environment = publish_captured_equations(&environment, result, 3);
+    for proof in [
+        "theorem observedFirst : Eq (stateful Bool.true Bool.true) 7 := stateful.eq_1",
+        "theorem observedSecond : Eq (stateful Bool.false Bool.true) 8 := stateful.eq_2",
+        "theorem observedCatchall (x : Bool) : Eq (stateful x Bool.false) 9 := stateful.eq_3 x",
+    ] {
+        checked_in(proof, Templates::new(&[]), &environment)
+            .unwrap_or_else(|error| panic!("{proof}: {error:?}"));
+    }
+}
+
+#[test]
+fn equation_observation_skips_matches_outside_the_metadata_slice() {
+    let source = "def stateful (n : Nat) : Nat := match Nat.succ n, n with | .zero, _ => 7 | .succ _, _ => 8";
+    let environment = environment();
+    let parsed = fln_parse::parse_definition(source.as_bytes()).unwrap();
+    let control = fln_elab::source::scope::elaborate_definition_with_effects(
+        parsed.syntax(),
+        &environment,
+        budget(),
+        &SourceScope::default(),
+    )
+    .unwrap();
+    let observed = equation_fixture(source, &environment, EquationMacros::new(false), false);
+    for result in [control, observed] {
+        assert!(result.equation_info.is_none());
+        let environment = publish(&environment, result.declaration);
+        checked_in(
+            "theorem actualValue (n : Nat) : Eq (stateful n) 8 := Eq.refl 8",
+            Templates::new(&[]),
+            &environment,
+        )
+        .unwrap();
+    }
+}
+
 #[test]
 fn regular_matches_expand_branch_bodies_in_written_order() {
     for source in [
