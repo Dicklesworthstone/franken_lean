@@ -41,32 +41,65 @@ impl Context {
             }
         }
         self.txn.lctx = goal.lctx.clone();
-        let ids = match locations {
-            Some(locations) if locations.all => self.ac_nondependent_propositions(&goal)?,
+        let ids: Vec<(FVarId, Option<Name>)> = match locations {
+            Some(locations) if locations.all => self
+                .ac_nondependent_propositions(&goal)?
+                .into_iter()
+                .map(|id| (id, None))
+                .collect(),
             Some(locations) => {
                 // Resolve every written location before rewriting any of them,
                 // retaining identity even when earlier transports change names.
                 let mut ids = Vec::new();
                 for name in locations.hypotheses {
                     self.tick()?;
-                    let local = goal
-                        .lctx
-                        .find_by_user_name(&name)
-                        .ok_or_else(|| error(TacticError::RewriteLocation))?;
-                    ids.push(local.id.clone());
+                    if let Some(local) = goal.lctx.find_by_user_name(&name) {
+                        ids.push((local.id.clone(), None));
+                        continue;
+                    }
+                    // The pin's getFVarId resolves an auxiliary self explicitly,
+                    // although implicit search and wildcard locations hide it.
+                    // Use ordinary source resolution to retain namespace and
+                    // root-qualified boundaries; globals are never locations.
+                    let syntax = Syntax::Ident {
+                        info: fln_syntax::source::SourceInfo::None,
+                        raw_val: Default::default(),
+                        val: name.clone(),
+                        preresolved: Vec::new(),
+                    };
+                    let reference = self.atom(&syntax, None).map_err(|problem| {
+                        if backtrack::recoverable(&problem) {
+                            error(TacticError::RewriteLocation)
+                        } else {
+                            problem
+                        }
+                    })?;
+                    let ExprNode::FVar { id } = reference.value.node() else {
+                        return Err(error(TacticError::RewriteLocation));
+                    };
+                    if !self.is_private_self(id) || !goal.lctx.contains(id) {
+                        return Err(error(TacticError::RewriteLocation));
+                    }
+                    ids.push((id.clone(), Some(name)));
                 }
                 ids
             }
             None => Vec::new(),
         };
-        for id in ids {
+        for (id, private_name) in ids {
             self.tick()?;
             self.txn.lctx = goal.lctx.clone();
-            let local = goal
+            let mut local = goal
                 .lctx
                 .find(&id)
                 .cloned()
                 .ok_or_else(|| error(TacticError::RewriteLocation))?;
+            if let Some(name) = private_name {
+                // A proof-bearing replacement is an ordinary named hypothesis
+                // at the pin. Its checked transport still retains the original
+                // self identity; an unused replacement may be discarded.
+                local.user_name = name;
+            }
             let original = self.instantiate(&local.type_)?;
             let (normalized, evidence) = self.ac_normalize_expression(&original)?;
             if let Some(value) = evidence {

@@ -220,6 +220,25 @@ fn fatal_macro_stop_survives_equation_recording_cleanup() {
     assert_eq!(provider.calls.lock().unwrap().len(), 1);
 }
 
+fn same_record_statements(
+    left: &equation_theorems::journal::Record,
+    right: &equation_theorems::journal::Record,
+) -> bool {
+    use fln_env::terms::alpha_canonical_digest;
+
+    left.declaration == right.declaration
+        && left.arity == right.arity
+        && left.discriminants == right.discriminants
+        && left.motive_names == right.motive_names
+        && alpha_canonical_digest(&left.key) == alpha_canonical_digest(&right.key)
+        && left.alternatives.len() == right.alternatives.len()
+        && left
+            .alternatives
+            .iter()
+            .zip(&right.alternatives)
+            .all(|(left, right)| alpha_canonical_digest(left) == alpha_canonical_digest(right))
+}
+
 fn check_identical_duplicate_row(source: &str, written: &str) {
     let (base, actual, provider) = elaborate_matrix(source, false);
     assert_eq!(
@@ -234,10 +253,34 @@ fn check_identical_duplicate_row(source: &str, written: &str) {
     let expected = trace::elaborate_definition(&syntax, &base, budget(), &SourceScope::default())
         .unwrap()
         .candidate;
-    assert_eq!(
-        Some(&record),
-        expected.equation_info.as_ref(),
+    // The private typed header consumes a fresh local during actual body
+    // elaboration. Replayed and independently written nested lambdas can then
+    // have different generated binder labels. Compare those labels modulo
+    // alpha-renaming, retaining binder_info, non_dep, metadata, indices and
+    // every free/constant name as well as the exact Record fields and order.
+    assert!(
+        same_record_statements(
+            &record,
+            expected
+                .equation_info
+                .as_ref()
+                .expect("the written expansion retains its equations"),
+        ),
         "the retained statements must match the source with the actual expansion"
+    );
+    let changed = matrix_syntax(&written.replace("31", "32"));
+    let changed = trace::elaborate_definition(&changed, &base, budget(), &SourceScope::default())
+        .unwrap()
+        .candidate;
+    assert!(
+        !same_record_statements(
+            &record,
+            changed
+                .equation_info
+                .as_ref()
+                .expect("changing the RHS literal preserves the equation shape"),
+        ),
+        "alpha comparison must still distinguish a changed captured RHS value"
     );
     let environment = publish(&base, actual.declaration);
     let mut environment = equation_theorems::journal::push(&environment, &record).unwrap();

@@ -587,6 +587,70 @@ impl Context {
         state: &Telescope<'_>,
     ) -> Result<Option<Expr>, NatDefinitionElabError> {
         if state.lambda {
+            if state.expected_body.is_none()
+                && self.predefinition.is_some()
+                && let Some(expected) = &state.expected
+            {
+                let mut remaining = expected.clone();
+                let mut flexible = false;
+                for local in &state.locals {
+                    self.tick()?;
+                    let reduced = self.whnf(&remaining)?;
+                    if let ExprNode::ForallE { body, .. } = reduced.node() {
+                        remaining = self.substitute(body, &Expr::fvar(local.id.clone()))?;
+                        continue;
+                    }
+                    let mut head = &reduced;
+                    while let ExprNode::App { f, .. } = head.node() {
+                        self.tick()?;
+                        head = f;
+                    }
+                    flexible = matches!(head.node(), ExprNode::MVar { .. });
+                    if !flexible {
+                        // A rigid non-function expected type is checked when
+                        // the complete lambda closes. Its body must still run:
+                        // a failed tactic candidate can have macro effects.
+                        return Ok(None);
+                    }
+                    break;
+                }
+                if !flexible {
+                    // A later domain may have constrained the original header
+                    // after an earlier unknown Pi lost ordinary propagation.
+                    return Ok(Some(remaining));
+                }
+                // The pin synthesizes tactic blocks after the enclosing
+                // lambda constrains the predefinition's header. Our worklist
+                // executes them immediately, so establish that same Pi shape
+                // after the real domains have elaborated, before its body.
+                // The original expected type is retained: constraints learned
+                // in a domain must govern later tactic alternatives as well.
+                let locals = self.txn.lctx.clone();
+                let mut outer = LocalContext::new();
+                for local in locals.decls() {
+                    self.tick()?;
+                    if !self.is_private_self(&local.id) {
+                        tactics::eliminate::add_local(&mut outer, local);
+                    }
+                }
+                self.txn.lctx = outer;
+                let omitted = self.omitted_result_type(&state.locals);
+                self.txn.lctx = locals;
+                let omitted = omitted?;
+                self.constrain(&omitted.body, &omitted.reference)?;
+                let mut type_ = omitted.reference.clone();
+                for local in state.locals.iter().rev() {
+                    self.tick()?;
+                    type_ = Expr::forall_e(
+                        local.user_name.clone(),
+                        self.instantiate(&local.type_)?,
+                        type_.abstract_fvar(&local.id, 0).map_err(|_| invalid())?,
+                        local.binder_info,
+                    );
+                }
+                self.constrain_type(&type_, expected)?;
+                return Ok(Some(omitted.body));
+            }
             Ok(state.expected_body.clone())
         } else {
             Ok(Some(self.type_expected()?))

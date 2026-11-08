@@ -33,8 +33,16 @@ impl Templates {
     fn with_parser(
         commands: &[&str],
     ) -> (Arc<Self>, std::rc::Rc<fln_parse::extensions::ActiveGrammar>) {
+        Self::with_runtime_parser(commands, &[])
+    }
+
+    fn with_runtime_parser(
+        commands: &[&str],
+        kinds: &[Name],
+    ) -> (Arc<Self>, std::rc::Rc<fln_parse::extensions::ActiveGrammar>) {
         let mut grammar =
             FileGrammar::new(false, &[], Some(Name::from_components(["Main"]))).unwrap();
+        grammar.bind_runtime_macros(kinds.iter().cloned(), [], []);
         for source in commands {
             let parsed = with_grammar(&grammar.grammar(), || {
                 fln_parse::parse_source_command(source.as_bytes())
@@ -1172,4 +1180,62 @@ fn dependent_application_macro_observations_follow_chains_and_tactic_rollback() 
         ["magic"],
         "a failed candidate drops syntax observations without refunding its macro effects"
     );
+}
+
+#[test]
+fn generated_leading_lambdas_dispatch_macros_before_opening_binders() {
+    // The source driver expands compound source syntax before this boundary.
+    // A generated lambda reaches the owned-term worklist and must dispatch its
+    // registered rule before the predefinition opens any of its binders.
+    for source in [
+        "def f : Nat → Nat := generatedLambda",
+        "def f := generatedLambda",
+    ] {
+        let (provider, _) = Templates::with_runtime_parser(
+            &[
+                "macro_rules | `(generatedLambda) => `(fun (x : Nat) => 0)",
+                "macro_rules | `(fun $binder => 0) => `(Nat.succ)",
+            ],
+            &[Name::from_components(["Lean", "Parser", "Term", "fun"])],
+        );
+        let environment = environment();
+        let declaration = checked_in(source, provider.clone(), &environment)
+            .unwrap_or_else(|error| panic!("{source}: {error:?}"));
+        assert_eq!(
+            *provider.expansions.lock().unwrap(),
+            ["generatedLambda", "Lean.Parser.Term.fun"],
+            "the generated leading lambda must expand exactly once: {source}"
+        );
+        let environment = publish(&environment, declaration);
+        checked_in(
+            "theorem generatedRootValue : Eq (f 0) 1 := Eq.refl 1",
+            Templates::new(&[]),
+            &environment,
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn failed_lambda_candidates_keep_their_body_macro_effects() {
+    let provider = Templates::new(&["macro_rules | `(magic) => `(7)"]);
+    let environment = environment();
+    let declaration = checked_in(
+        "def f : Nat := by first | exact (fun (_n : Nat) => magic) | exact 42",
+        provider.clone(),
+        &environment,
+    )
+    .unwrap();
+    assert_eq!(
+        *provider.expansions.lock().unwrap(),
+        ["magic"],
+        "a rigid non-function expectation rejects the lambda after elaborating its body"
+    );
+    let environment = publish(&environment, declaration);
+    checked_in(
+        "theorem failedLambdaValue : Eq f 42 := Eq.refl 42",
+        Templates::new(&[]),
+        &environment,
+    )
+    .unwrap();
 }

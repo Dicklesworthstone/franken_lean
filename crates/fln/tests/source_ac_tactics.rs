@@ -469,6 +469,62 @@ def dataHypAC {α : Sort u} (op : α → α → α) [Std.Associative op]
 }
 
 #[test]
+fn ac_explicit_locations_resolve_auxiliary_self_and_preserve_scope() {
+    with_fixture(|fixture| {
+        let root = fixture.engine.logical_root(&KVMap::new());
+        check(
+            fixture,
+            r#"
+def explicitSelfLocation : Nat := by
+  first
+  | ac_nf0 at explicitSelfLocation
+    exact 7
+  | exact 42
+theorem exactSelfValue : explicitSelfLocation = 7 := by rfl
+namespace ScopedAC
+def qualified : Nat := by
+  first
+  | ac_nf0 at ScopedAC.qualified
+    exact 7
+  | exact 42
+def rootQualified : Nat := by
+  first
+  | ac_nf0 at _root_.ScopedAC.rootQualified
+    exact 7
+  | exact 42
+end ScopedAC
+def shadowSelf (shadowSelf : Nat) : Nat := by
+  ac_nf0 at shadowSelf
+  guard_hyp shadowSelf : Nat
+  exact shadowSelf
+theorem qualifiedValue : ScopedAC.qualified = 7 := by rfl
+theorem rootValue : ScopedAC.rootQualified = 42 := by rfl
+theorem shadowValue : shadowSelf 9 = 9 := by rfl
+theorem rewritesSelf (a b c : Nat) : (a + b) + c = a + (b + c) := by
+  ac_nf0 at rewritesSelf
+  guard_hyp rewritesSelf :ₛ ∀ (a b c : Nat), a + (b + c) = a + (b + c)
+  ac_rfl
+theorem wildcardSelf (a b c : Nat) : (a + b) + c = a + (b + c) := by
+  ac_nf0 at *
+  guard_hyp wildcardSelf :ₛ ∀ (a b c : Nat), (a + b) + c = a + (b + c)
+  rfl
+"#,
+        );
+        reject(
+            fixture,
+            r#"
+theorem bad (a b c : Nat) : (a + b) + c = a + (b + c) := by
+  ac_nf0 at bad
+  have h := bad a b c
+  ac_nf0
+  exact h
+"#,
+        );
+        assert_eq!(fixture.engine.logical_root(&KVMap::new()), root);
+    });
+}
+
+#[test]
 fn ac_nf_wildcard_skips_dependencies_data_and_let_bound_proofs() {
     with_fixture(|fixture| {
         check(
