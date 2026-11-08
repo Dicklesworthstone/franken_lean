@@ -17,51 +17,10 @@ fn name(text: &str) -> Name {
 }
 
 fn matrix_syntax(source: &str) -> Syntax {
-    if source != LET_SOURCE && source != LET_WRITTEN {
-        return fln_parse::parse_definition(source.as_bytes())
-            .unwrap()
-            .syntax()
-            .clone();
-    }
-    // This suite tests the owned-Syntax elaboration boundary. The source parser's
-    // matching::plan does not yet open a plan for nested let-equation bars, and
-    // matching::let_values refuses equations. Its declaration-leading binding
-    // path does support them, so obtain that real parsed RHS and place it in the
-    // actual matrix row. This makes no claim about nested source-parser support.
-    let value = if source == LET_SOURCE { "magic" } else { "31" };
-    let nested = format!("def nested : Nat :=\n  let f : Nat → Nat\n    | _ => {value}\n  f 0\n");
-    let nested = fln_parse::parse_definition(nested.as_bytes()).unwrap();
-    let mut pending = vec![nested.syntax()];
-    let mut body = None;
-    while let Some(syntax) = pending.pop() {
-        if let Syntax::Node { kind, args, .. } = syntax {
-            if *kind == name("Lean.Parser.Command.declValSimple") {
-                body = Some(args[1].clone());
-                break;
-            }
-            pending.extend(args);
-        }
-    }
-    let body = body.expect("the native parser retains the let-equation RHS");
-    let mut matrix = fln_parse::parse_definition(SOURCE.as_bytes())
+    fln_parse::parse_definition(source.as_bytes())
         .unwrap()
         .syntax()
-        .clone();
-    let mut pending = vec![&mut matrix];
-    let mut replacements = 0;
-    while let Some(syntax) = pending.pop() {
-        if matches!(syntax, Syntax::Ident { val, .. } if *val == name("magic")) {
-            *syntax = body.clone();
-            replacements += 1;
-        } else if let Syntax::Node { args, .. } = syntax {
-            pending.extend(args.iter_mut());
-        }
-    }
-    assert_eq!(
-        replacements, 1,
-        "only the original catchall RHS is replaced"
-    );
-    matrix
+        .clone()
 }
 
 struct MatrixProvider {

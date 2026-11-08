@@ -186,6 +186,73 @@ fn close_conditional(
     Ok(())
 }
 
+/// The first row of a term-local declaration, as opposed to a pipe in its
+/// result type or assigned value. Share the declaration-leading binder reader
+/// and delimiter rules; the surrounding heap plan owns the rows and their
+/// eventual continuation. Stop at the first assignment rather than scanning
+/// ordinary local values for an unrelated later pipe.
+fn local_equation_start(
+    view: &SourceView,
+    tokens: &[LexedToken],
+    keyword: usize,
+) -> Result<Option<usize>, NatDefinitionParseError> {
+    let recursive = term_locals::word(tokens, keyword + 1, "rec");
+    let after_keyword = keyword + 1 + usize::from(recursive);
+    let name = if recursive && is_symbol(tokens, after_keyword, "@[") {
+        command_scope::attributes::inline_end(view, tokens, after_keyword)?
+    } else {
+        after_keyword
+    };
+    // Anonymous/pattern bindings and do-local `mut` declarations have their
+    // own grammar. In particular a named pattern is not a function signature.
+    if !matches!(
+        tokens.get(name).map(|token| &token.kind),
+        Some(TokenKind::Ident(_))
+    ) || named_prefix(tokens, name, tokens.len())
+    {
+        return Ok(None);
+    }
+    let (_, cursor) = signature_binders(view, tokens, name + 1, DefinitionGrammar::Scalar)?;
+    if is_symbol(tokens, cursor, ":") {
+        let mut depth = 0usize;
+        let mut local_assignments = 0usize;
+        for at in cursor + 1..tokens.len() {
+            // A local in the result type owns its own :=, just as in type_end.
+            if depth == 0
+                && ["let", "have", "letI", "haveI"]
+                    .iter()
+                    .any(|word| term_locals::word(tokens, at, word))
+            {
+                local_assignments += 1;
+                continue;
+            }
+            let TokenKind::Symbol(symbol) = &tokens[at].kind else {
+                continue;
+            };
+            match crate::canonical_bracket(symbol) {
+                "match" if depth == 0 => return Ok(None),
+                "|" if depth == 0 => return Ok(Some(at)),
+                ":=" if depth == 0 => {
+                    if local_assignments == 0 {
+                        return Ok(None);
+                    }
+                    local_assignments -= 1;
+                }
+                "(" | "[" | "{" | ".{" | "⦃" | "⟨" => depth += 1,
+                ")" | "]" | "}" | "⦄" | "⟩" => {
+                    let Some(parent) = depth.checked_sub(1) else {
+                        return Ok(None);
+                    };
+                    depth = parent;
+                }
+                _ => {}
+            }
+        }
+        return Ok(None);
+    }
+    Ok(is_symbol(tokens, cursor, "|").then_some(cursor))
+}
+
 fn plan(
     view: &SourceView,
     tokens: &[LexedToken],
@@ -210,6 +277,7 @@ fn plan(
     };
     let mut conditionals: Vec<ConditionalPlan> = Vec::new();
     let mut lets = Vec::new();
+    let mut equation_starts = HashSet::new();
     let mut fallbacks = Vec::new();
     let mut tries = exceptions::Planner::default();
     let mut done = Vec::new();
@@ -344,6 +412,19 @@ fn plan(
         let TokenKind::Symbol(symbol) = &tokens[at].kind else {
             continue;
         };
+        if equation_starts.remove(&at) {
+            active.push(MatchPlan {
+                statement: false,
+                function: false,
+                catch: false,
+                baseline: 0,
+                start: at,
+                depth,
+                with: Some(at),
+                alternatives: Vec::new(),
+                end: range.end,
+            });
+        }
         // A quoted capture is one term fragment. In particular the colon in
         // `$input:term` is part of the capture, not a type ascription that
         // closes the surrounding match/conditional. The term parser below
@@ -528,13 +609,25 @@ fn plan(
                     .pattern_assignment = Some(at);
             }
             // `have k : T := v` annotates like `let`: its `:` does not end the branch.
-            "let" | "have" | "letI" | "haveI" | "suffices" => lets.push((
-                depth,
-                active.len(),
-                conditionals.len(),
-                at,
-                statement.is_some(),
-            )),
+            "let" | "have" | "letI" | "haveI" | "suffices" => {
+                lets.push((
+                    depth,
+                    active.len(),
+                    conditionals.len(),
+                    at,
+                    statement.is_some(),
+                ));
+                // Tactic-local declarations are read by the proof parser, and
+                // a do binding has its own grammar. Only term lets introduce
+                // row plans here; the saved enclosing count excludes them.
+                if symbol == "let"
+                    && !tactic_body
+                    && statement.is_none()
+                    && let Some(pipe) = local_equation_start(view, &tokens[..range.end], at)?
+                {
+                    equation_starts.insert(pipe);
+                }
+            }
             // A `do` owns the `;`s after it as a `by` does (`=> do f x; loop i`).
             "by" if depth > 0
                 && statement.is_none()
@@ -1688,8 +1781,12 @@ fn let_values(
                         NatDefinitionExpectation::LetSeparator,
                     ));
                     let local_value = values.pop().expect("let value precedes its continuation");
-                    // A binding by equations, or with a termination hint, is not read here.
-                    if binding.equations || binding.termination.is_some() {
+                    // Termination annotations keep their separate parser. An
+                    // equation value is already the exact matchAlts splice
+                    // built inside out by the surrounding heap plan.
+                    if binding.termination.is_some()
+                        || (binding.equations && binding.pattern.is_some())
+                    {
                         return Err(refuse(view, tokens, binding.name));
                     }
                     let annotation = match binding.explicit_type {
@@ -1727,6 +1824,18 @@ fn let_values(
                                 null_node(vec![]),
                                 annotation,
                                 leaves.leaf(binding.assignment)?,
+                                local_value,
+                            ],
+                        ),
+                        None if binding.equations => Syntax::node(
+                            parser_kind(&["Term", "letEqnsDecl"]),
+                            vec![
+                                Syntax::node(
+                                    parser_kind(&["Term", "letId"]),
+                                    vec![leaves.leaf(binding.name)?],
+                                ),
+                                null_node(parameters),
+                                annotation,
                                 local_value,
                             ],
                         ),
@@ -1857,15 +1966,23 @@ fn parse_planned(
         }
         return Ok((proof, end));
     }
-    // Tactic blocks own their pipes; their bounded arguments reenter here. A bare
-    // pipe needs the planner only as a refutable do binding's failure branch, so it
-    // counts only in a range that opens a `do`: `have n := 0; by first | a | b`
-    // keeps its tactic alternatives for the proof parser.
+    // Tactic blocks own their pipes; their bounded arguments reenter here.
+    // A root local value selects the planner from its actual header, never
+    // from a bare pipe or a later tactic-local declaration. Locals in planned
+    // matches/conditionals are discovered by that plan's scoped reader.
+    let mut local_head = range.start;
+    while local_head < range.end && is_symbol(tokens, local_head, "(") {
+        local_head += 1;
+    }
+    let local_equations = is_symbol(tokens, local_head, "let")
+        && local_equation_start(view, &tokens[..range.end], local_head)
+            .is_ok_and(|start| start.is_some());
     let opens_do = range.clone().any(|at| term_locals::word(tokens, at, "do"));
     if grammar == DefinitionGrammar::Scalar
         && !is_symbol(tokens, range.start, "by")
         && !is_symbol(tokens, range.start, "calc")
         && (equations
+            || local_equations
             || range.clone().any(|at| {
                 is_symbol(tokens, at, "if")
                     || is_symbol(tokens, at, "bif")
@@ -2212,20 +2329,21 @@ fn build_match(
 ) -> Result<Option<Syntax>, NatDefinitionParseError> {
     let with = plan.with.expect("validated match header");
     let equation_root = equations && plan.start == range.start;
+    let equation_rows = is_symbol(tokens, plan.start, "|");
     let mut discriminators = Vec::new();
-    let (generalizing, first_discriminant) = if equation_root || plan.function || plan.catch {
+    let (generalizing, first_discriminant) = if equation_rows || plan.function || plan.catch {
         (null_node(vec![]), plan.start + 1)
     } else {
         generalizing_parameter(leaves, view, tokens, plan.start + 1, with)?
     };
-    let discriminant_columns = if equation_root || plan.function || plan.catch {
+    let discriminant_columns = if equation_rows || plan.function || plan.catch {
         Vec::new()
     } else {
         columns(tokens, first_discriminant..with)
     };
     let arity = if plan.catch {
         1
-    } else if equation_root || plan.function {
+    } else if equation_rows || plan.function {
         let first = plan.alternatives.first().expect("validated equation row");
         let first_group_end = first
             .shared
@@ -2385,6 +2503,10 @@ fn build_match(
             return Err(refuse(view, tokens, range.start));
         }
         return Ok(Some(alternatives));
+    }
+    if equation_rows {
+        splices.terms.insert(plan.start, (plan.end, alternatives));
+        return Ok(None);
     }
     let syntax = if plan.catch {
         Syntax::node(
