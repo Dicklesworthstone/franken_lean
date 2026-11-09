@@ -111,12 +111,18 @@ impl Context {
     /// with holes. The pin elaborates such a block as a postponed synthetic hole, synthesized after
     /// `elabCalc` has unified the composed relation with the expected type (`ensureHasType`,
     /// vendored `Lean/Elab/Calc.lean`). So in `calc _ < 4 := by decide` against `3 < 5` the tactic
-    /// sees `3 < 4`, not `?a < 4`.
+    /// sees `3 < 4`, not `?a < 4`. The pin's `expandParen` returns the enclosed term, so
+    /// parentheses cannot make its tactic run earlier. Keep the original syntax for replay;
+    /// only classification looks through the validated hygienic parentheses.
     pub(super) fn deferred_calculation_proof(
         &mut self,
         relation: &Expr,
-        proof: &Syntax,
+        mut proof: &Syntax,
     ) -> Result<bool, NatDefinitionElabError> {
+        while let Some(inner) = parenthesized_inner(proof)? {
+            self.tick()?;
+            proof = inner;
+        }
         Ok(proof.kind() == Some(&parser_kind(&["Term", "byTactic"]))
             && self.instantiate(relation)?.has_expr_mvar())
     }
