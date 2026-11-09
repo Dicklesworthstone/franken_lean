@@ -63,6 +63,10 @@ FUNCTIONS = {
     "SOURCE_INFO_FROM_REF": "sourceInfoFromRef",
     "MK_ATOM": "mkAtom",
     "MK_ATOM_FROM": "mkAtomFrom",
+    "MK_IDENT": "mkIdent",
+    "MK_IDENT_FROM": "mkIdentFrom",
+    "MK_CIDENT": "mkCIdent",
+    "MK_CIDENT_FROM": "mkCIdentFrom",
     "REPLACE_REF": "replaceRef",
     "MACRO_THROW_ERROR": "macroThrowError",
     "MACRO_THROW_ERROR_AT": "macroThrowErrorAt",
@@ -78,6 +82,10 @@ FUNCTIONS = {
 }
 
 FORWARDED_FUNCTIONS = {
+    "mkIdent": "Lean.mkIdent",
+    "mkIdentFrom": "Lean.mkIdentFrom",
+    "mkCIdent": "Lean.mkCIdent",
+    "mkCIdentFrom": "Lean.mkCIdentFrom",
     "replaceRef": "Lean.replaceRef",
     "macroThrowError": "Lean.Macro.throwError._redArg",
     "macroThrowErrorAt": "Lean.Macro.throwErrorAt._redArg",

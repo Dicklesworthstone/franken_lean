@@ -169,6 +169,16 @@ def optionNone (_ : Unit) : Option Lean.Syntax := none
 @[noinline] def mkAtomFrom (value : @& Lean.Syntax) (text : String) (canonical : Bool) :
     Lean.Syntax := Lean.mkAtomFrom value text canonical
 
+@[noinline] def mkIdent (value : Lean.Name) : Lean.Syntax := Lean.mkIdent value
+
+@[noinline] def mkIdentFrom (ref : @& Lean.Syntax) (value : Lean.Name) (canonical : Bool) :
+    Lean.Syntax := Lean.mkIdentFrom ref value canonical
+
+@[noinline] def mkCIdent (value : Lean.Name) : Lean.Syntax := Lean.mkCIdent value
+
+@[noinline] def mkCIdentFrom (ref : @& Lean.Syntax) (value : Lean.Name) (canonical : Bool) :
+    Lean.Syntax := Lean.mkCIdentFrom ref value canonical
+
 @[noinline] def replaceRef (value old : Lean.Syntax) : Lean.Syntax :=
   Lean.replaceRef value old
 

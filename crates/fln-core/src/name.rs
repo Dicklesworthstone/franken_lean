@@ -15,6 +15,8 @@
 //! ordinary `num`/`str` constructors per upstream convention; fln-syntax owns those
 //! conventions — this type only guarantees the substrate observables.
 
+pub mod identifier;
+
 use std::sync::Arc;
 
 use crate::lean_hash::{mix_hash, string_hash};
@@ -670,6 +672,7 @@ pub mod hygiene {
     pub type MacroScope = u64;
 
     /// Scope zero is reserved by the Reference; the first frontend scope is one.
+    pub const RESERVED_MACRO_SCOPE: MacroScope = 0;
     pub const FIRST_FRONTEND_MACRO_SCOPE: MacroScope = 1;
 
     #[derive(Debug, Clone, PartialEq, Eq)]

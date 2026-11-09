@@ -3,6 +3,7 @@
 
 use super::{IntrinsicFailure, IntrinsicResult, Obj, VmRefusal, expect_arity, nat_as_usize};
 use crate::macro_native::{MacroLookup, MacroLookupError};
+use fln_core::name::identifier::{NameRenderError, to_identifier_string};
 use fln_core::name::{LeafView, Name};
 use fln_rt::convert::{Conversion, ConvertError, inject_name};
 use fln_rt::macro_expansion_abi_generated as expansion_layout;
@@ -37,6 +38,10 @@ pub(super) enum Intrinsic {
     SourceInfoFromRef,
     MkAtom,
     MkAtomFrom,
+    MkIdent,
+    MkIdentFrom,
+    MkCIdent,
+    MkCIdentFrom,
     ReplaceRef,
     ThrowError,
     ThrowErrorAt,
@@ -78,6 +83,10 @@ impl Intrinsic {
             "mirror:Lean.SourceInfo.fromRef" => Self::SourceInfoFromRef,
             "mirror:Lean.mkAtom" => Self::MkAtom,
             "mirror:Lean.mkAtomFrom" => Self::MkAtomFrom,
+            "mirror:Lean.mkIdent" => Self::MkIdent,
+            "mirror:Lean.mkIdentFrom" => Self::MkIdentFrom,
+            "mirror:Lean.mkCIdent" => Self::MkCIdent,
+            "mirror:Lean.mkCIdentFrom" => Self::MkCIdentFrom,
             "mirror:Lean.replaceRef" => Self::ReplaceRef,
             "mirror:Lean.Macro.throwError._redArg" => Self::ThrowError,
             "mirror:Lean.Macro.throwErrorAt._redArg" => Self::ThrowErrorAt,
@@ -134,6 +143,8 @@ impl Intrinsic {
                 | Self::ResolveGlobalName
                 | Self::SetArg
                 | Self::MkAtomFrom
+                | Self::MkIdentFrom
+                | Self::MkCIdentFrom
                 | Self::ThrowError
                 | Self::ExpandMacro => 3,
                 Self::ThrowErrorAt => 4,
@@ -402,6 +413,73 @@ impl Intrinsic {
                 Ok(IntrinsicResult::raw_object(Obj::mk_ctor(
                     layout::SYNTAX_ATOM.tag,
                     vec![info, text.clone_ref()],
+                    &[],
+                )))
+            }
+            Self::MkIdent | Self::MkIdentFrom | Self::MkCIdent | Self::MkCIdentFrom => {
+                let from_ref = matches!(self, Self::MkIdentFrom | Self::MkCIdentFrom);
+                let constant = matches!(self, Self::MkCIdent | Self::MkCIdentFrom);
+                let original = &args[usize::from(from_ref)];
+                let info = if from_ref {
+                    let operation = if constant {
+                        "Lean.mkCIdentFrom"
+                    } else {
+                        "Lean.mkIdentFrom"
+                    };
+                    let canonical = super::bool_value(&args[2], operation, 2)?;
+                    source_info_from_ref(&args[0], canonical)?
+                } else {
+                    Obj::mk_nat(layout::SOURCE_NONE_TAG)
+                };
+                let value = if constant {
+                    // The reserved scope prevents a source local from capturing
+                    // a constant. It is independent of the caller's fresh scope.
+                    attach_scope(
+                        &inject_name(&Name::from_components(["_internal"])),
+                        original,
+                        &Obj::mk_nat(fln_core::name::hygiene::RESERVED_MACRO_SCOPE as usize),
+                    )?
+                } else {
+                    original.clone_ref()
+                };
+                let text = to_identifier_string(&name(&value)?, MAX_NAME_BYTES as usize).map_err(
+                    |error| match error {
+                        NameRenderError::OverflowedComponent => {
+                            IntrinsicFailure::Refused(VmRefusal::InvalidCtorObject)
+                        }
+                        NameRenderError::ByteBudgetExceeded { limit, observed } => {
+                            IntrinsicFailure::MirrorResource {
+                                resource: "identifier spelling bytes",
+                                allowed: limit as u64,
+                                observed: observed as u64,
+                            }
+                        }
+                    },
+                )?;
+                let raw = Obj::mk_ctor(
+                    layout::SUBSTRING_RAW.tag,
+                    vec![
+                        Obj::mk_string(&text),
+                        Obj::mk_nat(0),
+                        Obj::mk_nat(text.len()),
+                    ],
+                    &[],
+                );
+                let preresolved = if constant {
+                    cons(
+                        Obj::mk_ctor(
+                            layout::PRERESOLVED_DECL.tag,
+                            vec![original.clone_ref(), Obj::mk_nat(layout::LIST_NIL_TAG)],
+                            &[],
+                        ),
+                        Obj::mk_nat(layout::LIST_NIL_TAG),
+                    )
+                } else {
+                    Obj::mk_nat(layout::LIST_NIL_TAG)
+                };
+                Ok(IntrinsicResult::raw_object(Obj::mk_ctor(
+                    layout::SYNTAX_IDENT.tag,
+                    vec![info, raw, value, preresolved],
                     &[],
                 )))
             }

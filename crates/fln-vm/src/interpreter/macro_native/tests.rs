@@ -5,6 +5,7 @@ use super::super::{
 use super::*;
 use fln_comp::flbc;
 
+mod identifiers;
 mod lookup;
 mod syntax_editing;
 
@@ -53,6 +54,10 @@ fn invoke(intrinsic: Intrinsic, args: &[Obj]) -> Obj {
         Intrinsic::SourceInfoFromRef => "mirror:Lean.SourceInfo.fromRef",
         Intrinsic::MkAtom => "mirror:Lean.mkAtom",
         Intrinsic::MkAtomFrom => "mirror:Lean.mkAtomFrom",
+        Intrinsic::MkIdent => "mirror:Lean.mkIdent",
+        Intrinsic::MkIdentFrom => "mirror:Lean.mkIdentFrom",
+        Intrinsic::MkCIdent => "mirror:Lean.mkCIdent",
+        Intrinsic::MkCIdentFrom => "mirror:Lean.mkCIdentFrom",
         Intrinsic::ReplaceRef => "mirror:Lean.replaceRef",
         Intrinsic::ThrowError => "mirror:Lean.Macro.throwError._redArg",
         Intrinsic::ThrowErrorAt => "mirror:Lean.Macro.throwErrorAt._redArg",
