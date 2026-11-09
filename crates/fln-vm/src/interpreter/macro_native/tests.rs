@@ -8,6 +8,7 @@ use fln_comp::flbc;
 mod identifiers;
 mod literals;
 mod lookup;
+mod numbers;
 mod syntax_editing;
 
 fn atom(text: &str) -> Obj {
@@ -64,6 +65,11 @@ fn invoke(intrinsic: Intrinsic, args: &[Obj]) -> Obj {
         Intrinsic::IsLit => "mirror:Lean.Syntax.isLit?",
         Intrinsic::IsStrLit => "mirror:Lean.Syntax.isStrLit?",
         Intrinsic::GetString => "mirror:Lean.TSyntax.getString",
+        Intrinsic::MkNumLit => "mirror:Lean.Syntax.mkNumLit",
+        Intrinsic::MkNatLit => "mirror:Lean.Syntax.mkNatLit",
+        Intrinsic::IsNatLit => "mirror:Lean.Syntax.isNatLit?",
+        Intrinsic::GetNat => "mirror:Lean.TSyntax.getNat",
+        Intrinsic::NatReprFast => "mirror:Nat.reprFast",
         Intrinsic::ReplaceRef => "mirror:Lean.replaceRef",
         Intrinsic::ThrowError => "mirror:Lean.Macro.throwError._redArg",
         Intrinsic::ThrowErrorAt => "mirror:Lean.Macro.throwErrorAt._redArg",

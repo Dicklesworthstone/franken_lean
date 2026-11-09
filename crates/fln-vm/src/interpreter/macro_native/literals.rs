@@ -76,7 +76,7 @@ fn option(value: Option<Obj>) -> Obj {
     )
 }
 
-fn literal_value(kind: &Name, value: &Obj) -> Result<Option<Obj>, IntrinsicFailure> {
+pub(super) fn literal_value(kind: &Name, value: &Obj) -> Result<Option<Obj>, IntrinsicFailure> {
     if !matches!(syntax_kind(value)?, SyntaxKind::Node) || name(&child(value, 1)?)? != *kind {
         return Ok(None);
     }
@@ -101,7 +101,7 @@ fn decoded_value(value: &Obj) -> Result<Option<Obj>, IntrinsicFailure> {
     Ok(decode(literal_text(&text)?)?.map(|decoded| Obj::mk_string(&decoded)))
 }
 
-fn literal_text(value: &Obj) -> Result<&str, IntrinsicFailure> {
+pub(super) fn literal_text(value: &Obj) -> Result<&str, IntrinsicFailure> {
     let (_, _, _, bytes) = value
         .try_borrow_string_view()
         .ok_or(VmRefusal::InvalidStringObject)?;

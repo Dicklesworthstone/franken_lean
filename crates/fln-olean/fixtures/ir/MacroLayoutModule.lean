@@ -142,6 +142,18 @@ def optionNone (_ : Unit) : Option Lean.Syntax := none
 
 @[noinline] def tSyntaxGetString (value : @& Lean.StrLit) : String := value.getString
 
+@[noinline] def syntaxMkNumLit (value : String) (info : Lean.SourceInfo) : Lean.Syntax :=
+  (Lean.Syntax.mkNumLit value info).raw
+
+@[noinline] def syntaxMkNatLit (value : Nat) (info : Lean.SourceInfo) : Lean.Syntax :=
+  (Lean.Syntax.mkNatLit value info).raw
+
+@[noinline] def syntaxIsNatLit (value : @& Lean.Syntax) : Option Nat := value.isNatLit?
+
+@[noinline] def tSyntaxGetNat (value : @& Lean.NumLit) : Nat := value.getNat
+
+@[noinline] def natReprFast (value : Nat) : String := Nat.reprFast value
+
 @[noinline] def syntaxGetKind (value : Lean.Syntax) : Lean.Name := value.getKind
 
 @[noinline] def syntaxSetKind (value : Lean.Syntax) (kind : Lean.Name) : Lean.Syntax :=

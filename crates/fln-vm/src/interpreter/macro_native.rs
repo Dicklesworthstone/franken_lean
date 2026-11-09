@@ -14,6 +14,7 @@ const MAX_NAME_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_SYNTAX_NODES: u64 = 1_000_000;
 
 mod literals;
+mod numbers;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum Intrinsic {
@@ -49,6 +50,11 @@ pub(super) enum Intrinsic {
     IsLit,
     IsStrLit,
     GetString,
+    MkNumLit,
+    MkNatLit,
+    IsNatLit,
+    GetNat,
+    NatReprFast,
     ReplaceRef,
     ThrowError,
     ThrowErrorAt,
@@ -99,6 +105,11 @@ impl Intrinsic {
             "mirror:Lean.Syntax.isLit?" => Self::IsLit,
             "mirror:Lean.Syntax.isStrLit?" => Self::IsStrLit,
             "mirror:Lean.TSyntax.getString" => Self::GetString,
+            "mirror:Lean.Syntax.mkNumLit" => Self::MkNumLit,
+            "mirror:Lean.Syntax.mkNatLit" => Self::MkNatLit,
+            "mirror:Lean.Syntax.isNatLit?" => Self::IsNatLit,
+            "mirror:Lean.TSyntax.getNat" => Self::GetNat,
+            "mirror:Nat.reprFast" => Self::NatReprFast,
             "mirror:Lean.replaceRef" => Self::ReplaceRef,
             "mirror:Lean.Macro.throwError._redArg" => Self::ThrowError,
             "mirror:Lean.Macro.throwErrorAt._redArg" => Self::ThrowErrorAt,
@@ -116,12 +127,18 @@ impl Intrinsic {
         })
     }
 
+    #[cfg(test)]
     pub(super) fn invoke(
         self,
         row: &str,
         args: &[Obj],
     ) -> Result<IntrinsicResult, IntrinsicFailure> {
-        self.invoke_with_lookup(row, args, None)
+        self.invoke_with_lookup(
+            row,
+            args,
+            None,
+            super::ExecutionLimits::default().max_nat_magnitude_bytes,
+        )
     }
 
     pub(super) fn invoke_with_lookup(
@@ -129,7 +146,10 @@ impl Intrinsic {
         row: &str,
         args: &[Obj],
         lookup: Option<&dyn MacroLookup>,
+        max_nat_magnitude_bytes: u64,
     ) -> Result<IntrinsicResult, IntrinsicFailure> {
+        let max_nat_magnitude_bytes =
+            max_nat_magnitude_bytes.min((fln_bignum::nat::MAX_LIMBS as u64).saturating_mul(8));
         expect_arity(
             row,
             args,
@@ -148,6 +168,8 @@ impl Intrinsic {
                 | Self::SourceInfoFromRef
                 | Self::ReplaceRef
                 | Self::MkStrLit
+                | Self::MkNumLit
+                | Self::MkNatLit
                 | Self::IsLit
                 | Self::GetCurrNamespace => 2,
                 Self::AddMacroScope
@@ -510,6 +532,18 @@ impl Intrinsic {
             Self::IsLit => literals::is_lit(&args[0], &args[1]).map(IntrinsicResult::raw_object),
             Self::IsStrLit => literals::is_str_lit(&args[0]).map(IntrinsicResult::raw_object),
             Self::GetString => literals::get_string(&args[0]).map(IntrinsicResult::raw_object),
+            Self::MkNumLit => {
+                numbers::mk_num_lit(&args[0], &args[1]).map(IntrinsicResult::raw_object)
+            }
+            Self::MkNatLit => numbers::mk_nat_lit(&args[0], &args[1], max_nat_magnitude_bytes)
+                .map(IntrinsicResult::raw_object),
+            Self::IsNatLit => numbers::is_nat_lit(&args[0], max_nat_magnitude_bytes)
+                .map(IntrinsicResult::raw_object),
+            Self::GetNat => {
+                numbers::get_nat(&args[0], max_nat_magnitude_bytes).map(IntrinsicResult::raw_object)
+            }
+            Self::NatReprFast => numbers::nat_repr_fast(&args[0], max_nat_magnitude_bytes)
+                .map(IntrinsicResult::raw_object),
             Self::ThrowUnsupported => {
                 check_layout(&args[0], layout::MACRO_STATE)?;
                 Ok(IntrinsicResult::raw_object(Obj::mk_ctor(

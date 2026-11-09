@@ -3204,6 +3204,7 @@ fn run(
                                 plan.row,
                                 &values,
                                 macro_methods.and_then(|methods| methods.lookup),
+                                limits.max_nat_magnitude_bytes,
                             ),
                         implementation => invoke_intrinsic(
                             implementation,
@@ -5096,7 +5097,9 @@ fn dispatch_intrinsic(
             .saturating_mul(8),
     );
     match implementation {
-        IntrinsicImplementation::MacroNative(intrinsic) => intrinsic.invoke(row, args),
+        IntrinsicImplementation::MacroNative(intrinsic) => {
+            intrinsic.invoke_with_lookup(row, args, None, max_nat_magnitude_bytes)
+        }
         IntrinsicImplementation::PanicCore => diagnostics::panic(row, args),
         IntrinsicImplementation::ArrayConstruction(intrinsic) => intrinsic.invoke(row, args),
         IntrinsicImplementation::ArrayExtra(_)

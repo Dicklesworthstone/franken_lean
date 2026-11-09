@@ -10,6 +10,7 @@ use fln_syntax::tree::Preresolved;
 mod identifiers_reference;
 #[cfg(test)]
 mod lookup_reference;
+mod numbers_reference;
 mod reference;
 mod strings_reference;
 
