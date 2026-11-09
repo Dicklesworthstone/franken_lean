@@ -28,6 +28,11 @@ pub(crate) enum Operation {
     Flush,
     CurrentDir,
     RealPath,
+    CreateDir,
+    RemoveDir,
+    RemoveFile,
+    Rename,
+    HardLink,
 }
 
 impl Operation {
@@ -42,6 +47,11 @@ impl Operation {
             Self::Flush,
             Self::CurrentDir,
             Self::RealPath,
+            Self::CreateDir,
+            Self::RemoveDir,
+            Self::RemoveFile,
+            Self::Rename,
+            Self::HardLink,
         ]
         .into_iter()
         .find(|operation| requested == &operation.source_name())
@@ -58,6 +68,11 @@ impl Operation {
             Self::Flush => "IO.FS.Handle.flush",
             Self::CurrentDir => "IO.currentDir",
             Self::RealPath => "IO.FS.realPath",
+            Self::CreateDir => "IO.FS.createDir",
+            Self::RemoveDir => "IO.FS.removeDir",
+            Self::RemoveFile => "IO.FS.removeFile",
+            Self::Rename => "IO.FS.rename",
+            Self::HardLink => "IO.FS.hardLink",
         };
         Name::from_components(label.split('.'))
     }
@@ -65,9 +80,26 @@ impl Operation {
     pub(crate) fn source_arity(self) -> usize {
         match self {
             Self::CurrentDir => 0,
-            Self::GetLine | Self::ReadDir | Self::Flush | Self::RealPath => 1,
+            Self::GetLine
+            | Self::ReadDir
+            | Self::Flush
+            | Self::RealPath
+            | Self::CreateDir
+            | Self::RemoveDir
+            | Self::RemoveFile => 1,
             _ => 2,
         }
+    }
+
+    pub(crate) fn is_path_mutation(self) -> bool {
+        matches!(
+            self,
+            Self::CreateDir | Self::RemoveDir | Self::RemoveFile | Self::Rename | Self::HardLink
+        )
+    }
+
+    pub(crate) fn is_path_operation(self) -> bool {
+        self.is_path_mutation() || matches!(self, Self::ReadDir | Self::CurrentDir | Self::RealPath)
     }
 
     pub(crate) fn private_name(self) -> Name {
@@ -112,10 +144,7 @@ pub(crate) fn primitive_matches(
     )? {
         return Ok(false);
     }
-    if (!matches!(
-        operation,
-        Operation::ReadDir | Operation::CurrentDir | Operation::RealPath
-    ) && !handle_matches(environment, externs, visited, limits)?)
+    if (!operation.is_path_operation() && !handle_matches(environment, externs, visited, limits)?)
         || !results::contract_matches(environment, externs, visited, limits)?
     {
         return Err(IngressError::UnsupportedNode {
@@ -134,7 +163,9 @@ pub(crate) fn primitive_matches(
         // String alone cannot authorize a different checked logical layout.
         models.extend(crate::source_intrinsics::string_internal::scalar_records());
     }
-    if matches!(operation, Operation::CurrentDir | Operation::RealPath) {
+    if operation.is_path_mutation()
+        || matches!(operation, Operation::CurrentDir | Operation::RealPath)
+    {
         models.extend(model::path_layout());
     }
     if operation == Operation::Read {
@@ -178,6 +209,11 @@ pub(crate) fn assert_pin_models(environment: &Environment) {
             model::primitive(Operation::Flush),
             model::primitive(Operation::CurrentDir),
             model::primitive(Operation::RealPath),
+            model::primitive(Operation::CreateDir),
+            model::primitive(Operation::RemoveDir),
+            model::primitive(Operation::RemoveFile),
+            model::primitive(Operation::Rename),
+            model::primitive(Operation::HardLink),
         ])
     {
         assert!(

@@ -208,6 +208,12 @@ pub(super) fn primitive(operation: Operation) -> ConstantInfo {
         Operation::Flush => (vec![c("IO.FS.Handle")], c("Unit")),
         Operation::CurrentDir => (vec![], c("System.FilePath")),
         Operation::RealPath => (vec![c("System.FilePath")], c("System.FilePath")),
+        Operation::CreateDir | Operation::RemoveDir | Operation::RemoveFile => {
+            (vec![c("System.FilePath")], c("Unit"))
+        }
+        Operation::Rename | Operation::HardLink => {
+            (vec![c("System.FilePath"), c("System.FilePath")], c("Unit"))
+        }
         Operation::GetLine => (vec![c("IO.FS.Handle")], c("String")),
         Operation::Read => (vec![c("IO.FS.Handle"), c("USize")], c("ByteArray")),
         Operation::Write => (vec![c("IO.FS.Handle"), c("ByteArray")], c("Unit")),
@@ -227,8 +233,11 @@ pub(super) fn primitive(operation: Operation) -> ConstantInfo {
     let type_ = domains.iter().rev().fold(action.clone(), |body, domain| {
         pi(domain.clone(), body, BinderInfo::Default)
     });
-    let value = if operation == Operation::ReadDir {
-        // The pin declares readDir's entire function type after the colon.
+    let value = if matches!(
+        operation,
+        Operation::ReadDir | Operation::CreateDir | Operation::RemoveDir
+    ) {
+        // The pin declares these entire function types after the colon.
         // Its opaque default therefore inhabits that function through Pi,
         // rather than lambda-wrapping the result default as Handle methods do.
         let domain = c("System.FilePath");

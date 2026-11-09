@@ -21,6 +21,7 @@ const READ_TRANSPORT: &str = "_fln_runtime_fs_read_result";
 const BYTES_TRANSPORT: &str = "_fln_runtime_fs_bytes_result";
 const DIRECTORY_TRANSPORT: &str = "_fln_runtime_fs_directory_result";
 const PATH_TRANSPORT: &str = "_fln_runtime_fs_path_result";
+const PATH_UNIT_TRANSPORT: &str = "_fln_runtime_fs_path_unit_result";
 
 #[derive(Default)]
 pub(super) struct Store {
@@ -32,6 +33,7 @@ pub(super) struct Store {
     bytes_layout: Option<Layout>,
     directory_layout: Option<Layout>,
     path_layout: Option<Layout>,
+    path_unit_layout: Option<Layout>,
     word: Option<bytes::WordLayout>,
     word_repr_checked: bool,
     word_platform_checked: bool,
@@ -172,15 +174,17 @@ impl Preparation<'_> {
             Operation::Read => &self.fs.bytes_layout,
             Operation::ReadDir => &self.fs.directory_layout,
             Operation::CurrentDir | Operation::RealPath => &self.fs.path_layout,
+            Operation::CreateDir
+            | Operation::RemoveDir
+            | Operation::RemoveFile
+            | Operation::Rename
+            | Operation::HardLink => &self.fs.path_unit_layout,
             _ => &self.fs.layout,
         };
         if let Some(layout) = cached {
             return Ok(layout.clone());
         }
-        let receiver = if matches!(
-            operation,
-            Operation::ReadDir | Operation::CurrentDir | Operation::RealPath
-        ) {
+        let receiver = if operation.is_path_operation() {
             c("String")
         } else {
             self.fs_handle()?
@@ -196,6 +200,11 @@ impl Preparation<'_> {
             Operation::Read => BYTES_TRANSPORT,
             Operation::ReadDir => DIRECTORY_TRANSPORT,
             Operation::CurrentDir | Operation::RealPath => PATH_TRANSPORT,
+            Operation::CreateDir
+            | Operation::RemoveDir
+            | Operation::RemoveFile
+            | Operation::Rename
+            | Operation::HardLink => PATH_UNIT_TRANSPORT,
             _ => TRANSPORT,
         };
         let transport = self.io_private_record(
@@ -224,6 +233,11 @@ impl Preparation<'_> {
             Operation::CurrentDir | Operation::RealPath => {
                 self.fs.path_layout = Some(layout.clone())
             }
+            Operation::CreateDir
+            | Operation::RemoveDir
+            | Operation::RemoveFile
+            | Operation::Rename
+            | Operation::HardLink => self.fs.path_unit_layout = Some(layout.clone()),
             _ => self.fs.layout = Some(layout.clone()),
         }
         Ok(layout)
@@ -281,9 +295,15 @@ impl Preparation<'_> {
                     vec![layout.receiver.clone(), bytes.packed],
                 )
             }
-            Operation::ReadDir | Operation::RealPath => {
-                (vec![ValueType::String], vec![layout.receiver.clone()])
-            }
+            Operation::ReadDir
+            | Operation::RealPath
+            | Operation::CreateDir
+            | Operation::RemoveDir
+            | Operation::RemoveFile => (vec![ValueType::String], vec![layout.receiver.clone()]),
+            Operation::Rename | Operation::HardLink => (
+                vec![ValueType::String, ValueType::String],
+                vec![layout.receiver.clone(), layout.receiver.clone()],
+            ),
             Operation::CurrentDir => (vec![], vec![]),
         };
         self.fs.bindings.insert(
@@ -338,7 +358,14 @@ impl Preparation<'_> {
             // The error-arm placeholder is never projected as a Handle.
             // Only the safe native open producer authorizes this payload.
             Operation::Open => field(layout, 0)?,
-            Operation::PutStr | Operation::Write | Operation::Flush => {
+            Operation::PutStr
+            | Operation::Write
+            | Operation::Flush
+            | Operation::CreateDir
+            | Operation::RemoveDir
+            | Operation::RemoveFile
+            | Operation::Rename
+            | Operation::HardLink => {
                 Expr::const_(layout.error.unit_constructor.clone(), Vec::new())
             }
             // The native producer validates canonical String success. The
@@ -425,7 +452,14 @@ impl Preparation<'_> {
         let primitive = self.fs_bind_primitive(operation, &layout)?;
         let result_type = match operation {
             Operation::Open => c("IO.FS.Handle"),
-            Operation::PutStr | Operation::Write | Operation::Flush => c("Unit"),
+            Operation::PutStr
+            | Operation::Write
+            | Operation::Flush
+            | Operation::CreateDir
+            | Operation::RemoveDir
+            | Operation::RemoveFile
+            | Operation::Rename
+            | Operation::HardLink => c("Unit"),
             Operation::GetLine => c("String"),
             Operation::Read => c("ByteArray"),
             Operation::ReadDir => directory::result_type(),
@@ -488,7 +522,11 @@ impl Preparation<'_> {
                 vec![layout.receiver.clone(), c("ByteArray")],
                 vec![b(2)?, self.fs_native_write_bytes(b(1)?)?],
             ),
-            Operation::ReadDir | Operation::RealPath => {
+            Operation::ReadDir
+            | Operation::RealPath
+            | Operation::CreateDir
+            | Operation::RemoveDir
+            | Operation::RemoveFile => {
                 let path = self.io_checked_shape(c("System.FilePath"))?;
                 if path.constructors.len() != 1 || path.constructors[0].fields != [c("String")] {
                     return Err(unsupported("directory checked FilePath layout"));
@@ -496,6 +534,20 @@ impl Preparation<'_> {
                 (
                     vec![path.source.clone()],
                     vec![Expr::proj(path.projection(&path.constructors[0]), 0, b(1)?)],
+                )
+            }
+            Operation::Rename | Operation::HardLink => {
+                let path = self.io_checked_shape(c("System.FilePath"))?;
+                if path.constructors.len() != 1 || path.constructors[0].fields != [c("String")] {
+                    return Err(unsupported("filesystem checked FilePath layout"));
+                }
+                let projection = path.projection(&path.constructors[0]);
+                (
+                    vec![path.source.clone(), path.source.clone()],
+                    vec![
+                        Expr::proj(projection.clone(), 0, b(2)?),
+                        Expr::proj(projection, 0, b(1)?),
+                    ],
                 )
             }
             Operation::CurrentDir => (vec![], vec![]),

@@ -898,6 +898,11 @@ enum IntrinsicImplementation {
     FilePathReadDir,
     IoCurrentDir,
     FileRealPath,
+    FileCreateDir,
+    FileRemoveDir,
+    FileRemoveFile,
+    FileRename,
+    FileHardLink,
     IoGetEnv,
     IoGetTaskState,
     IoWait,
@@ -1282,6 +1287,11 @@ impl IntrinsicImplementation {
             "extern:System.FilePath.readDir" => Self::FilePathReadDir,
             "extern:IO.currentDir" => Self::IoCurrentDir,
             "extern:IO.FS.realPath" => Self::FileRealPath,
+            "extern:IO.FS.createDir" => Self::FileCreateDir,
+            "extern:IO.FS.removeDir" => Self::FileRemoveDir,
+            "extern:IO.FS.removeFile" => Self::FileRemoveFile,
+            "extern:IO.FS.rename" => Self::FileRename,
+            "extern:IO.FS.hardLink" => Self::FileHardLink,
             "extern:IO.getEnv" => Self::IoGetEnv,
             "extern:IO.getTaskState" => Self::IoGetTaskState,
             "extern:IO.wait" => Self::IoWait,
@@ -7523,6 +7533,32 @@ fn dispatch_intrinsic(
                 .map(IntrinsicResult::owned)
                 .map_err(|error| VmRefusal::NativeFileIo { error }.into())
         }
+        IntrinsicImplementation::FileCreateDir
+        | IntrinsicImplementation::FileRemoveDir
+        | IntrinsicImplementation::FileRemoveFile => {
+            expect_arity(row, args, 1)?;
+            let world = Obj::mk_nat(0);
+            let result = match implementation {
+                IntrinsicImplementation::FileCreateDir => Obj::try_create_dir(&args[0], &world),
+                IntrinsicImplementation::FileRemoveDir => Obj::try_remove_dir(&args[0], &world),
+                _ => Obj::try_remove_file(&args[0], &world),
+            };
+            result
+                .map(IntrinsicResult::owned)
+                .map_err(|error| VmRefusal::NativeFileIo { error }.into())
+        }
+        IntrinsicImplementation::FileRename | IntrinsicImplementation::FileHardLink => {
+            expect_arity(row, args, 2)?;
+            let world = Obj::mk_nat(0);
+            let result = if implementation == IntrinsicImplementation::FileRename {
+                Obj::try_rename(&args[0], &args[1], &world)
+            } else {
+                Obj::try_hard_link(&args[0], &args[1], &world)
+            };
+            result
+                .map(IntrinsicResult::owned)
+                .map_err(|error| VmRefusal::NativeFileIo { error }.into())
+        }
         IntrinsicImplementation::IoGetEnv => {
             expect_arity(row, args, 1)?;
             Obj::try_get_env(&args[0], &Obj::mk_nat(0))
@@ -8177,6 +8213,11 @@ fn closure_intrinsic_application(
         | IntrinsicImplementation::FilePathReadDir
         | IntrinsicImplementation::IoCurrentDir
         | IntrinsicImplementation::FileRealPath
+        | IntrinsicImplementation::FileCreateDir
+        | IntrinsicImplementation::FileRemoveDir
+        | IntrinsicImplementation::FileRemoveFile
+        | IntrinsicImplementation::FileRename
+        | IntrinsicImplementation::FileHardLink
         | IntrinsicImplementation::IoGetEnv
         | IntrinsicImplementation::IoGetTaskState
         | IntrinsicImplementation::IoWait

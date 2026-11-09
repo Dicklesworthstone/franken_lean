@@ -57,9 +57,52 @@ pub enum FileIoError {
     MalformedDirectoryResult,
     MalformedPathResult,
     MalformedEnvironmentResult,
+    MalformedPathMutationResult,
 }
 
 impl Obj {
+    /// Create one directory through the epoch's native primitive. Both the
+    /// filename and world are validated before effects; an existing path is
+    /// an ordinary IO error, not an idempotent success.
+    pub fn try_create_dir(filename: &Obj, world: &Obj) -> Result<Obj, FileIoError> {
+        path_mutation(&[filename], world, || {
+            Obj(crate::export::export_lean_io_create_dir(filename.0))
+        })
+    }
+
+    /// Remove one empty directory. This preserves the native nonempty/missing
+    /// path errors and does not recursively remove its contents.
+    pub fn try_remove_dir(filename: &Obj, world: &Obj) -> Result<Obj, FileIoError> {
+        path_mutation(&[filename], world, || {
+            Obj(crate::export::export_lean_io_remove_dir(filename.0))
+        })
+    }
+
+    /// Unlink one file through the epoch primitive, preserving its libuv-style
+    /// error code and filename rather than substituting a host Rust error.
+    pub fn try_remove_file(filename: &Obj, world: &Obj) -> Result<Obj, FileIoError> {
+        path_mutation(&[filename], world, || {
+            Obj(crate::export::export_lean_io_remove_file(filename.0))
+        })
+    }
+
+    /// Rename a borrowed source path to a borrowed destination path. Both are
+    /// checked before the native call, whose replacement and error semantics
+    /// are retained, including the synthesized two-path error filename.
+    pub fn try_rename(from: &Obj, to: &Obj, world: &Obj) -> Result<Obj, FileIoError> {
+        path_mutation(&[from, to], world, || {
+            Obj(crate::export::export_lean_io_rename(from.0, to.0))
+        })
+    }
+
+    /// Create a hard link through the epoch primitive. The source path owns
+    /// error attribution; a successful result does not copy file contents.
+    pub fn try_hard_link(from: &Obj, to: &Obj, world: &Obj) -> Result<Obj, FileIoError> {
+        path_mutation(&[from, to], world, || {
+            Obj(crate::export::export_lean_io_hard_link(from.0, to.0))
+        })
+    }
+
     /// Observe the process working directory at the point the world action is
     /// executed. The native String or IO.Error is validated into the same
     /// neutral packet as file reads; it never supplies a logical FilePath.
@@ -221,6 +264,26 @@ impl Obj {
         let result = Obj(result);
         file_result_transport(&result, false).ok_or(FileIoError::MalformedFlushResult)
     }
+}
+
+fn path_mutation(
+    filenames: &[&Obj],
+    world: &Obj,
+    call: impl FnOnce() -> Obj,
+) -> Result<Obj, FileIoError> {
+    if !world.is_scalar() || world.unbox() != 0 {
+        return Err(FileIoError::InvalidWorld);
+    }
+    if filenames
+        .iter()
+        .any(|filename| !canonical_stdio_string(filename))
+    {
+        return Err(FileIoError::InvalidFilename);
+    }
+    // Existing safe ABI exports borrow every filename. Embedded NUL is still
+    // passed to their checked path parser, which returns the pin's IO error.
+    let result = call();
+    file_result_transport(&result, false).ok_or(FileIoError::MalformedPathMutationResult)
 }
 
 fn file_result_transport(result: &Obj, handle_success: bool) -> Option<Obj> {
