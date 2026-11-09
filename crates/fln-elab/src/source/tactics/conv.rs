@@ -622,6 +622,7 @@ impl Context {
             "clear" => self.conv_clear(proof, goal, args),
             "simp" => self.conv_simp(proof, goal, args, false),
             "dsimp" => self.conv_simp(proof, goal, args, true),
+            "delta" => self.conv_delta(proof, goal, args),
             "unfold" => self.conv_unfold(proof, goal, args),
             "calc" => self.conv_calc(proof, goal, args),
             "lhs" | "rhs" | "convLeft" | "convRight" | "arg" | "congr" | "convArgs" | "fun"
@@ -1211,6 +1212,107 @@ impl Context {
         };
         proof.work.push(Work::Goal(next));
         Ok(())
+    }
+
+    /// `delta f₁ … fₙ` (`Conv.evalDelta`, vendored `Lean/Elab/Tactic/Conv/Delta.lean`):
+    /// expand the selected global definitions throughout the instantiated left-hand side,
+    /// then replace it by definitional equality. Unlike ordinary tactic `delta`, conversion
+    /// succeeds when nothing changes. The shared reducer preserves opaque/theorem bodies,
+    /// instantiates universe parameters and beta-reduces each selected application.
+    fn conv_delta(
+        &mut self,
+        proof: &mut ProofState<'_>,
+        goal: ProofGoal,
+        args: &[Syntax],
+    ) -> Result<(), NatDefinitionElabError> {
+        let [keyword, names] = args else {
+            return Err(error(TacticError::MalformedScript));
+        };
+        expect_atom(keyword, "delta", "conv delta keyword")?;
+        let mut declarations = Vec::new();
+        for name in expect_null_args(names, "conv delta declarations")? {
+            self.tick()?;
+            declarations.push(self.conv_delta_name(name)?);
+        }
+        if declarations.is_empty() {
+            return Err(error(TacticError::MalformedScript));
+        }
+        let (_, _, lhs, _) = self.conv_sides(&goal)?;
+        let lhs = self.instantiate(&lhs)?;
+        let expanded = self.delta_expand(&declarations, &lhs)?;
+        let next = self.conv_change_lhs(goal, expanded)?;
+        proof.work.push(Work::Goal(next));
+        Ok(())
+    }
+
+    /// `realizeGlobalConstNoOverloadWithInfo` does not consult local bindings.
+    /// Preserve the global resolver's namespace, alias, and protection policies
+    /// even when a local or recursive reference has the selected spelling.
+    /// Field-free declaration metadata supplies exact targets before lookup;
+    /// namespace and field-projection metadata are ignored, as at the pin.
+    fn conv_delta_name(&mut self, syntax: &Syntax) -> Result<Name, NatDefinitionElabError> {
+        use fln_syntax::tree::Preresolved;
+        let Syntax::Ident {
+            val: name,
+            preresolved,
+            ..
+        } = syntax
+        else {
+            return Err(error(TacticError::MalformedScript));
+        };
+        let mut targets = Vec::new();
+        for entry in preresolved {
+            self.tick()?;
+            if let Preresolved::Decl { name, fields } = entry
+                && fields.is_empty()
+            {
+                targets.push(name.clone());
+            }
+        }
+        if targets.len() > 1 {
+            return Err(failure(SourceInferenceError::NameScope(
+                scope::ScopeError::Ambiguous(name.clone(), targets),
+            )));
+        }
+        if let Some(target) = targets.pop() {
+            return self
+                .txn
+                .env
+                .contains(&target)
+                .then_some(target.clone())
+                .ok_or_else(|| failure(SourceInferenceError::UnknownConstant(target)));
+        }
+        for _ in 0..self
+            .source_scope
+            .opened
+            .len()
+            .saturating_add(
+                scope::components(&self.source_scope.namespace)
+                    .map_err(|error| failure(SourceInferenceError::NameScope(error)))?
+                    .len(),
+            )
+            .saturating_add(1)
+        {
+            self.tick()?;
+        }
+        let aliases = self
+            .alias_cache
+            .read(&self.txn.env)
+            .map_err(|_| failure(SourceInferenceError::Scope))?;
+        let protected = self
+            .protected_cache
+            .read(&self.txn.env)
+            .map_err(|_| failure(SourceInferenceError::Scope))?;
+        self.source_scope
+            .resolve_with_aliases(
+                &name.erase_macro_scopes(),
+                |candidate| self.txn.env.contains(candidate),
+                &aliases,
+                &protected,
+            )
+            .map_err(|error| failure(SourceInferenceError::NameScope(error)))?
+            .filter(|resolved| self.txn.env.contains(resolved))
+            .ok_or_else(|| failure(SourceInferenceError::UnknownConstant(name.clone())))
     }
 
     /// `unfold f₁ … fₙ` (`Conv.evalUnfold`): each name unfolded in `lhs` in turn, never failing

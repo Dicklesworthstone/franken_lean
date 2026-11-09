@@ -11,7 +11,7 @@
 //! indices, names and patterns, `congr` (with its case tags, over-applied functions and
 //! implications), `ext`/`intro` into `∀`, `fun` and `let`, `pattern` (one occurrence, a list,
 //! `*`) and `conv in`, `conv at h`, `rw`/`rewrite`, `change`, `zeta`, `unfold`, `simp only`,
-//! `dsimp only`, `simp`, `clear`, `apply`, `tactic =>`, `rfl`, `skip`, `done`, `·`, `{ }`,
+//! `dsimp only`, `simp`, `delta`, `clear`, `apply`, `tactic =>`, `rfl`, `skip`, `done`, `·`, `{ }`,
 //! `( )`, `first`, `try`, `repeat`, `fail_if_success`, nested `conv =>` blocks, `calc` (with a
 //! first step that has no proof), `rw` abstracting as the pin's `kabstract`, and goal display
 //! through `trace_state`; then failures the pin reports, and a conv tactic this engine refuses,
@@ -144,7 +144,7 @@ fn conv_failures_are_refused_as_the_pin_reports_them() {
     }
 }
 
-/// `delta` is a conv tactic the pin runs and this engine does not: it is refused, typed, rather
+/// `reduce` is a conv tactic the pin runs and this engine does not: it is refused, typed, rather
 /// than approximated by another unfolding.
 #[test]
 fn an_unimplemented_conv_tactic_is_refused_typed() {
@@ -152,17 +152,60 @@ fn an_unimplemented_conv_tactic_is_refused_typed() {
         return;
     };
     let root = workspace("unsupported");
-    let name = "Delta.lean";
-    std::fs::write(root.join(name), DELTA).unwrap();
+    let name = "Reduce.lean";
+    std::fs::write(root.join(name), REDUCE).unwrap();
     if let Some((code, stdout)) = pinned(&lib, &root, name) {
         assert_eq!((code, stdout.as_str()), (0, ""), "the pin moved");
     }
     let (code, stdout, stderr) = ours(&lib, &root, name);
     assert_eq!(code, 1, "{stdout}{stderr}");
     assert!(
-        stderr.contains("unsupported tactic `Lean.Parser.Tactic.Conv.delta`"),
+        stderr.contains("unsupported tactic `Lean.Parser.Tactic.Conv.reduce`"),
         "{stderr}"
     );
+}
+
+/// `Conv.evalDelta` uses `deltaExpand`, then `changeLhs`: selected definitions
+/// unfold recursively, whereas a selected opaque/theorem or an absent occurrence
+/// is a successful no-op. Trace output distinguishes that result from `unfold`
+/// or a tactic that ignores its selection; every program is judged by the pin.
+#[test]
+fn conv_delta_uses_selected_bodies_with_reference_semantics() {
+    let Some(lib) = pinned_lib() else {
+        return;
+    };
+    let root = workspace("delta");
+    for (name, program, expected) in DELTA_ACCEPTED {
+        std::fs::write(root.join(name), program).unwrap();
+        if let Some((code, stdout)) = pinned(&lib, &root, name) {
+            assert_eq!(
+                (code, stdout.as_str()),
+                (0, *expected),
+                "{name}: the pin moved"
+            );
+        }
+        let (code, stdout, stderr) = ours(&lib, &root, name);
+        assert_eq!(code, 0, "{name}: {stdout}{stderr}");
+        assert_eq!(stdout, *expected, "{name}: {stderr}");
+    }
+}
+
+#[test]
+fn conv_delta_cannot_expose_opaque_values_or_ignore_unknown_names() {
+    let Some(lib) = pinned_lib() else {
+        return;
+    };
+    let root = workspace("delta-refused");
+    for (name, program, pin_message, native_message) in DELTA_REFUSED {
+        std::fs::write(root.join(name), program).unwrap();
+        if let Some((code, stdout)) = pinned(&lib, &root, name) {
+            assert_eq!(code, 1, "{name}: the pin moved: {stdout}");
+            assert!(stdout.contains(pin_message), "{name}: {stdout}");
+        }
+        let (code, stdout, stderr) = ours(&lib, &root, name);
+        assert_eq!(code, 1, "{name}: {stdout}{stderr}");
+        assert!(stderr.contains(native_message), "{name}: {stdout}{stderr}");
+    }
 }
 
 /// Conv `rw` selects and abstracts occurrences as `rw` does, by the pin's `kabstract` (conv
@@ -243,18 +286,155 @@ example (m n : Nat) (h : m = n) : m + 0 = n := by
     ),
 ];
 
-const DELTA: &str = r#"prelude
+const REDUCE: &str = r#"prelude
 import Init.Conv
 import Init.Data.Nat.Basic
 import Init.SimpLemmas
 import Init.NotationExtra
-def double (n : Nat) : Nat := n + n
 
+example : (fun n : Nat => n) 7 = 7 := by
+  conv =>
+    lhs
+    reduce
+"#;
+
+const DELTA_ACCEPTED: &[(&str, &str, &str)] = &[
+    (
+        "Delta.lean",
+        r#"prelude
+import Init.Conv
+import Init.Data.Nat.Basic
+def double (n : Nat) : Nat := n + n
 example (a : Nat) : double a = a + a := by
   conv =>
     lhs
     delta double
-"#;
+"#,
+        "",
+    ),
+    (
+        "DeltaSelection.lean",
+        r#"prelude
+import Init.Conv
+def wrap.{u} {α : Sort u} (a : α) : α := a
+def alias.{u} {α : Sort u} (a : α) : α := wrap a
+example (n : Nat) : alias n = n := by
+  conv =>
+    lhs
+    delta wrap alias
+    trace_state
+example (α : Type) : wrap α = α := by
+  conv =>
+    lhs
+    delta wrap
+example (p : Prop) : wrap p = p := by
+  conv =>
+    lhs
+    delta wrap
+"#,
+        "n : Nat\n| n\n",
+    ),
+    (
+        "DeltaBinders.lean",
+        r#"prelude
+import Init.Conv
+def wrap (n : Nat) : Nat := n
+example : (fun n : Nat => wrap (wrap n)) = (fun n : Nat => n) := by
+  conv =>
+    lhs
+    ext n
+    delta wrap
+    trace_state
+example (n m : Nat) (h : wrap n = m) : n = m := by
+  conv at h =>
+    lhs
+    delta wrap
+  exact h
+example : ∀ n : Nat, wrap n = n := by
+  conv => delta wrap
+  intro n
+  rfl
+"#,
+        "n : Nat\n| n\n",
+    ),
+    (
+        "DeltaUnchanged.lean",
+        r#"prelude
+import Init.Conv
+opaque sealed : Nat := 7
+theorem witnessed : True := True.intro
+example : sealed = sealed := by
+  conv =>
+    lhs
+    delta sealed
+    trace_state
+example : witnessed = witnessed := by
+  conv =>
+    lhs
+    delta witnessed
+    trace_state
+example (n : Nat) : n = n := by
+  conv =>
+    lhs
+    delta Nat Nat.succ
+"#,
+        "| sealed\n| witnessed\n",
+    ),
+    (
+        "DeltaIrreducible.lean",
+        r#"prelude
+import Init.Conv
+@[irreducible] def hidden (n : Nat) : Nat := n
+example (n : Nat) : hidden n = n := by
+  conv =>
+    lhs
+    delta hidden
+    trace_state
+namespace DeltaNames
+def wrapped (n : Nat) : Nat := n
+example (n : Nat) : wrapped n = n := by
+  conv => delta wrapped
+example (wrapped : Nat) : DeltaNames.wrapped wrapped = wrapped := by
+  conv => delta wrapped
+end DeltaNames
+open DeltaNames
+example (n : Nat) : wrapped n = n := by
+  conv => delta wrapped
+example (wrapped : Nat) : DeltaNames.wrapped wrapped = wrapped := by
+  conv => delta wrapped
+example (hidden : Nat) : _root_.hidden hidden = hidden := by
+  conv => delta _root_.hidden
+"#,
+        "n : Nat\n| n\n",
+    ),
+];
+
+const DELTA_REFUSED: &[(&str, &str, &str, &str)] = &[
+    (
+        "DeltaOpaque.lean",
+        r#"prelude
+import Init.Conv
+opaque sealed : Nat := 7
+example : sealed = 7 := by
+  conv =>
+    lhs
+    delta sealed
+"#,
+        "unsolved goals",
+        "proof script left 1 unsolved goals",
+    ),
+    (
+        "DeltaUnknown.lean",
+        r#"prelude
+import Init.Conv
+def wrapped (n : Nat) : Nat := n
+example (n : Nat) : wrapped n = n := by
+  conv => delta wrapped missingDefinition
+"#,
+        "Unknown constant `missingDefinition`",
+        "Unknown identifier `missingDefinition`",
+    ),
+];
 
 const ACCEPTED: &[(&str, &str, &str)] = &[
     (
