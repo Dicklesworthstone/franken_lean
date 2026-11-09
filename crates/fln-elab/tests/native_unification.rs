@@ -1511,6 +1511,298 @@ fn symbolic_nat_offset_resource_stops_roll_back_prior_assignments() {
         .unwrap();
 }
 
+fn class_offset_transaction() -> ElabTxn {
+    static ENV: std::sync::OnceLock<fln_env::environment::Environment> = std::sync::OnceLock::new();
+    let environment = ENV.get_or_init(|| {
+        let mut txn = arithmetic_transaction();
+        // The numeric seed's prefix through Nat addition contains the ordinary
+        // OfNat, Add and HAdd records, projections and instance definitions.
+        for declaration in fln_elab::instances::numeric::declarations()
+            .unwrap()
+            .declarations
+        {
+            let last = matches!(
+                &declaration,
+                fln_kernel::Declaration::Defn(value) if value.base.name == name("instAddNat")
+            );
+            publish_in(&mut txn, declaration);
+            if last {
+                break;
+            }
+        }
+        for declaration in ["Nat.add", "instAddNat", "instHAdd"] {
+            txn.env = fln_elab::reducibility::register(
+                &txn.env,
+                &Name::from_components(declaration.split('.')),
+                fln_elab::reducibility::Reducibility::ImplicitReducible,
+            )
+            .unwrap();
+        }
+        txn.env
+    });
+    ElabTxn::new(environment.clone(), KVMap::new(), 17)
+}
+
+fn class_offset_budget() -> UnificationBudget {
+    let mut result = budget();
+    result.offset_constraints = true;
+    result
+}
+
+fn add_dictionary_type() -> Expr {
+    Expr::app(Expr::const_(name("Add"), vec![Level::zero()]), nat())
+}
+
+fn publish_add_dictionary(
+    txn: &mut ElabTxn,
+    text: &str,
+    value: Expr,
+    status: fln_elab::reducibility::Reducibility,
+) -> Expr {
+    use fln_env::constants::{ConstantVal, DefinitionSafety, DefinitionVal, ReducibilityHints};
+    publish_in(
+        txn,
+        fln_kernel::Declaration::Defn(DefinitionVal {
+            base: ConstantVal {
+                name: name(text),
+                level_params: vec![],
+                type_: add_dictionary_type(),
+            },
+            value,
+            hints: ReducibilityHints::Regular(1),
+            safety: DefinitionSafety::Safe,
+            all: vec![name(text)],
+        }),
+    );
+    txn.env = fln_elab::reducibility::register(&txn.env, &name(text), status).unwrap();
+    Expr::const_(name(text), vec![])
+}
+
+fn hadd_dictionary(dictionary: Expr, level: Level) -> Expr {
+    Expr::app(
+        Expr::app(Expr::const_(name("instHAdd"), vec![level]), nat()),
+        dictionary,
+    )
+}
+
+fn class_add(dictionary: Expr, base: Expr, heterogeneous: bool) -> Expr {
+    let (path, levels, mut arguments) = if heterogeneous {
+        (["HAdd", "hAdd"], vec![Level::zero(); 3], vec![nat(); 3])
+    } else {
+        (["Add", "add"], vec![Level::zero()], vec![nat()])
+    };
+    arguments.extend([dictionary, base, numeral(1)]);
+    arguments.into_iter().fold(
+        Expr::const_(Name::from_components(path), levels),
+        Expr::app,
+    )
+}
+
+#[test]
+fn class_offsets_compare_instance_aliases_at_instances_transparency() {
+    use fln_elab::reducibility::Reducibility;
+    for status in [Reducibility::Reducible, Reducibility::ImplicitReducible] {
+        let mut initial = class_offset_transaction();
+        let alias = publish_add_dictionary(
+            &mut initial,
+            "alternateAdd",
+            Expr::const_(name("instAddNat"), vec![]),
+            status,
+        );
+        let base = local(&mut initial, "aliasBase", nat());
+        for heterogeneous in [false, true] {
+            let dictionary = if heterogeneous {
+                hadd_dictionary(alias.clone(), Level::zero())
+            } else {
+                alias.clone()
+            };
+            let left = class_add(dictionary, base.clone(), heterogeneous);
+            let right = successor(base.clone());
+            for (left, right) in [(&left, &right), (&right, &left)] {
+                let mut txn = initial.clone();
+                let report = txn.unify(left, right, class_offset_budget()).unwrap();
+                assert!(report.expression_assignments.is_empty());
+                assert!(report.universe_assignments.is_empty());
+                assert_semantics_unchanged(&txn, &initial);
+            }
+        }
+    }
+}
+
+#[test]
+fn class_offsets_refuse_noncanonical_and_opaque_dictionaries() {
+    use fln_elab::reducibility::Reducibility;
+    let wrong = Expr::app(
+        Expr::app(
+            Expr::const_(Name::from_components(["Add", "mk"]), vec![Level::zero()]),
+            nat(),
+        ),
+        Expr::lam(
+            name("a"),
+            nat(),
+            Expr::lam(name("b"), nat(), bvar(1), BinderInfo::Default),
+            BinderInfo::Default,
+        ),
+    );
+    for (value, status) in [
+        (wrong, Reducibility::ImplicitReducible),
+        (
+            Expr::const_(name("instAddNat"), vec![]),
+            Reducibility::Semireducible,
+        ),
+        (
+            Expr::const_(name("instAddNat"), vec![]),
+            Reducibility::Irreducible,
+        ),
+    ] {
+        let mut initial = class_offset_transaction();
+        let dictionary = publish_add_dictionary(&mut initial, "closedAdd", value, status);
+        let base = local(&mut initial, "closedBase", nat());
+        for heterogeneous in [false, true] {
+            let dictionary = if heterogeneous {
+                hadd_dictionary(dictionary.clone(), Level::zero())
+            } else {
+                dictionary.clone()
+            };
+            let mut txn = initial.clone();
+            assert!(matches!(
+                txn.unify(
+                    &class_add(dictionary, base.clone(), heterogeneous),
+                    &successor(base.clone()),
+                    class_offset_budget(),
+                ),
+                Err(UnificationError::Deferred(_))
+            ));
+            assert_semantics_unchanged(&txn, &initial);
+        }
+    }
+}
+
+#[test]
+fn class_offset_instance_queries_freeze_existing_expression_and_universe_holes() {
+    let mut initial = class_offset_transaction();
+    let base = local(&mut initial, "frozenBase", nat());
+    let dictionary = natural(&mut initial, "frozenDictionary", add_dictionary_type());
+    let universe = LMVarId(name("frozenUniverse"));
+    for left in [
+        class_add(Expr::mvar(dictionary), base.clone(), false),
+        class_add(
+            hadd_dictionary(
+                Expr::const_(name("instAddNat"), vec![]),
+                Level::mvar(universe.clone()),
+            ),
+            base.clone(),
+            true,
+        ),
+    ] {
+        let mut txn = initial.clone();
+        assert!(matches!(
+            txn.unify(&left, &successor(base.clone()), class_offset_budget()),
+            Err(UnificationError::Deferred(_))
+        ));
+        assert_semantics_unchanged(&txn, &initial);
+        assert!(txn.universes.get_assignment(&universe).is_none());
+    }
+    let alias = publish_add_dictionary(
+        &mut initial,
+        "ignoresExistingHole",
+        Expr::const_(name("instAddNat"), vec![]),
+        fln_elab::reducibility::Reducibility::ImplicitReducible,
+    );
+    let ignored = natural(&mut initial, "ignoredArgument", nat());
+    let dictionary = Expr::app(
+        Expr::lam(name("ignored"), nat(), alias, BinderInfo::Default),
+        Expr::mvar(ignored),
+    );
+    let mut txn = initial.clone();
+    let report = txn
+        .unify(
+            &class_add(dictionary, base.clone(), false),
+            &successor(base),
+            class_offset_budget(),
+        )
+        .unwrap();
+    assert!(report.expression_assignments.is_empty());
+    assert!(report.universe_assignments.is_empty());
+    assert_semantics_unchanged(&txn, &initial);
+}
+
+#[test]
+fn class_offset_instance_queries_propagate_resource_stops_and_roll_back() {
+    let mut initial = class_offset_transaction();
+    let canonical = Expr::const_(name("instAddNat"), vec![]);
+    let mut alias = canonical.clone();
+    for index in 0..8 {
+        alias = publish_add_dictionary(
+            &mut initial,
+            &format!("meteredAdd{index}"),
+            alias,
+            fln_elab::reducibility::Reducibility::ImplicitReducible,
+        );
+    }
+    let base = local(&mut initial, "meteredBase", nat());
+    let assigned = natural(&mut initial, "beforeDictionaryQuery", nat());
+    let equations = |dictionary| {
+        [
+            (Expr::mvar(assigned.clone()), numeral(8)),
+            (
+                class_add(dictionary, base.clone(), false),
+                successor(base.clone()),
+            ),
+        ]
+    };
+    let calls = Cell::new(0_u64);
+    let canonical_report = initial
+        .clone()
+        .unify_many_with(&equations(canonical), class_offset_budget(), &|| {
+            calls.set(calls.get() + 1);
+            false
+        })
+        .unwrap();
+    let stop_at = calls.get();
+    let equations = equations(alias);
+    let report = initial
+        .clone()
+        .unify_many_with(&equations, class_offset_budget(), &|| false)
+        .unwrap();
+    assert_eq!(report.expression_assignments, vec![assigned]);
+    assert!(report.universe_assignments.is_empty());
+    assert!(report.unifier_steps > canonical_report.unifier_steps);
+    assert!(report.visited_nodes > canonical_report.visited_nodes);
+    let mut step_limit = class_offset_budget();
+    step_limit.max_steps = canonical_report.unifier_steps;
+    let mut node_limit = class_offset_budget();
+    node_limit.max_visited_nodes = canonical_report.visited_nodes;
+    for limits in [step_limit, node_limit] {
+        let mut txn = initial.clone();
+        assert!(matches!(
+            txn.unify_many_with(&equations, limits, &|| false),
+            Err(UnificationError::StepLimit { .. } | UnificationError::NodeLimit { .. })
+        ));
+        assert_semantics_unchanged(&txn, &initial);
+    }
+    let mut txn = initial.clone();
+    txn.budget.max_heartbeats = canonical_report.unifier_steps;
+    assert!(matches!(
+        txn.unify_many_with(&equations, class_offset_budget(), &|| false),
+        Err(UnificationError::HeartbeatLimit)
+    ));
+    assert_semantics_unchanged(&txn, &initial);
+    calls.set(0);
+    let mut txn = initial.clone();
+    assert!(matches!(
+        txn.unify_many_with(&equations, class_offset_budget(), &|| {
+            calls.set(calls.get() + 1);
+            calls.get() == stop_at
+        }),
+        Err(UnificationError::Cancelled)
+    ));
+    assert_semantics_unchanged(&txn, &initial);
+    initial
+        .unify_many_with(&equations, class_offset_budget(), &|| false)
+        .unwrap();
+}
+
 /// A lambda applied to all its arguments is instantiated in one substitution, as the pin's
 /// `betaRev` does: one walk of the result, not one of every intermediate term.
 #[test]

@@ -823,20 +823,22 @@ impl Engine<'_> {
 
     /// The pin's `isDefEqOffset` (vendored Lean/Meta/Offset.lean:116-161), on the sides
     /// as they stand: an offset `s + k` (`isOffset?`) or a literal (`evalNat`) on either
-    /// side cancels against the other side's, and two literals are compared. Instances are
-    /// tested structurally, a subset of the pin's `matchesInstance`.
+    /// side cancels against the other side's, and two literals are compared. Offset
+    /// dictionaries use the pin's read-only `matchesInstance` conversion; `evalNat`
+    /// retains its separate structural instance tests.
     pub(in crate::constraint::unify) fn class_offset_equation(
         &mut self,
         left: &Expr,
         right: &Expr,
+        locals: &LocalContext,
     ) -> Result<ClassOffset, UnificationError> {
         if !self.has_nat_literals()? {
             return Ok(ClassOffset::Undecided);
         }
         let left = self.instantiate(left)?;
         let right = self.instantiate(right)?;
-        let step = match self.class_offset(&left)? {
-            Some((s, k1)) => match self.class_offset(&right)? {
+        let step = match self.class_offset(&left, locals)? {
+            Some((s, k1)) => match self.class_offset(&right, locals)? {
                 Some((t, k2)) => match k1.cmp(&k2) {
                     std::cmp::Ordering::Equal => Some((s, t)),
                     std::cmp::Ordering::Less => {
@@ -858,7 +860,7 @@ impl Engine<'_> {
                 },
             },
             None => match self.class_nat_value(&left)? {
-                Some(v1) => match self.class_offset(&right)? {
+                Some(v1) => match self.class_offset(&right, locals)? {
                     Some((t, k2)) if v1 >= k2 => {
                         let difference = self.combine_nat_offsets(&v1, &k2, true)?;
                         self.class_numeral(difference)?.map(|s| (s, t))
@@ -879,12 +881,83 @@ impl Engine<'_> {
         })
     }
 
+    /// `matchesInstance` fixes `instances` transparency even inside
+    /// `with_reducible`, and its fresh metavariable depth freezes existing
+    /// holes. A child solver gives this query the same read-only boundary:
+    /// assignments are prohibited and no child state is ever committed.
+    fn offset_instance_matches(
+        &mut self,
+        dictionary: &Expr,
+        heterogeneous: bool,
+        locals: &LocalContext,
+    ) -> Result<bool, UnificationError> {
+        for _ in 0..5 {
+            self.meter.node()?;
+        }
+        let instance = Expr::const_(Name::from_components(["instAddNat"]), Vec::new());
+        let expected = if heterogeneous {
+            Expr::app(
+                Expr::app(
+                    Expr::const_(Name::from_components(["instHAdd"]), vec![Level::zero()]),
+                    Expr::const_(Name::from_components(["Nat"]), Vec::new()),
+                ),
+                instance,
+            )
+        } else {
+            instance
+        };
+        if same_terms(dictionary, &expected, &mut self.meter)? {
+            return Ok(true);
+        }
+        // A dictionary comparison can itself expose an offset in a field.
+        // Reuse the solver's existing bound on nested comparison trials.
+        if self.congruence_depth >= super::super::application_congruence::MAX_CONGRUENCE_DEPTH {
+            return Ok(false);
+        }
+        // Charge the mutable stores before cloning; immutable environment data
+        // are shared. The child starts with no assignment or wake-up products.
+        for _ in 0..self.work.mvars.len().saturating_add(self.work.universes.len()) {
+            self.meter.node()?;
+        }
+        let mut budget = self.budget;
+        budget.transparency = UnificationTransparency::Instances;
+        budget.max_assignments = 0;
+        let mut trial = self.work.engine(budget, self.meter.cancelled, None);
+        trial.meter = Meter {
+            steps: self.meter.steps,
+            nodes: self.meter.nodes,
+            max_steps: self.meter.max_steps,
+            max_nodes: self.meter.max_nodes,
+            heartbeat_bound: self.meter.heartbeat_bound,
+            cancelled: self.meter.cancelled,
+        };
+        trial.congruence_depth = self.congruence_depth + 1;
+        trial.nat_literals_valid = self.nat_literals_valid;
+        let result = trial.solve(&[(dictionary.clone(), expected, locals.clone())], &[], &[]);
+        // Both successful and unsuccessful queries spend the parent's budget.
+        // In particular, cancellation and resource exhaustion stay nonanswers.
+        self.meter = trial.meter;
+        self.kernel_checks += trial.kernel_checks;
+        match result {
+            Ok(()) => Ok(true),
+            Err(UnificationError::Deferred(_))
+            // This zero is the query's deliberate freeze, not exhaustion of
+            // the caller's assignment allowance.
+            | Err(UnificationError::AssignmentLimit { limit: 0 })
+            | Err(UnificationError::Metavariable(MetavarError::OccursCheckFailed { .. })) => {
+                Ok(false)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     /// The pin's `isOffset?` (Offset.lean:87-106): `succ`, `Nat.add`, `Add.add` and
     /// `HAdd.hAdd` at Nat's canonical instances, with an evaluable right operand, peeled
     /// until the base is none of them. `None` unless at least one layer is peeled.
     fn class_offset(
         &mut self,
         expression: &Expr,
+        locals: &LocalContext,
     ) -> Result<Option<(Expr, NatLit)>, UnificationError> {
         let mut base = expression.clone();
         let mut total = NatLit::from_u64(0);
@@ -901,12 +974,12 @@ impl Engine<'_> {
                 (arguments[0].clone(), Some(arguments[1].clone()))
             } else if add(&["Add", "add"])
                 && arguments.len() == 4
-                && is_class_instance(arguments[1], &["instAddNat"], 0, &[])
+                && self.offset_instance_matches(arguments[1], false, locals)?
             {
                 (arguments[2].clone(), Some(arguments[3].clone()))
             } else if add(&["HAdd", "hAdd"])
                 && arguments.len() == 6
-                && is_class_instance(arguments[3], &["instHAdd"], 2, &[(1, &["instAddNat"])])
+                && self.offset_instance_matches(arguments[3], true, locals)?
             {
                 (arguments[4].clone(), Some(arguments[5].clone()))
             } else {
