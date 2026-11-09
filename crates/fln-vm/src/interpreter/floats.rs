@@ -11,7 +11,8 @@
 //! plane (§6.8, D21): bit-identical across hosts by construction, never the
 //! platform libm the pin's extern symbols name. `scaleB` preserves the pin's
 //! scalar-Int versus mpz branches and rounds finite binary scaling once.
-//! `frExp` (pair result) remains unsupported.
+//! `frExp` returns the pin's owned pair of a boxed significand and an Int
+//! exponent, using the same owned numerics plane for exact decomposition.
 
 use super::{IntrinsicFailure, IntrinsicResult, Obj, VmRefusal, expect_arity, type_mismatch};
 
@@ -146,6 +147,7 @@ enum Operation {
     // The pin declares `Float.atan2 (y x : Float)`: the first argument is y.
     Atan2,
     ScaleB,
+    FrExp,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -159,7 +161,7 @@ pub(super) struct Intrinsic {
 macro_rules! evaluate {
     ($this:ident, $row:ident, $args:ident, $type:ty, $argument:ident, $result:ident,
      $bits_result:path, $converted:ident, $nan_bits:ident, $unary:ident, $pow:ident,
-     $atan2:ident) => {{
+     $atan2:ident, $frexp:path) => {{
         let operation = $this.operation;
         if let Operation::FromInteger(integer) = operation {
             let value = &$args[0];
@@ -247,6 +249,21 @@ macro_rules! evaluate {
             Operation::Pow => $result($pow(value, $argument(&$args[1], 1)?)),
             // `value` is the pin's first argument, y; the second is x.
             Operation::Atan2 => $result($atan2(value, $argument(&$args[1], 1)?)),
+            Operation::FrExp => {
+                let (fraction, exponent) = $frexp(value);
+                // object.cpp's lean_float{32}_frexp returns Prod tag 0,
+                // with the boxed float first and signed Int second. The
+                // owned decomposition preserves signed zero and returns
+                // exponent zero for every nonfinite input, as the pin does.
+                IntrinsicResult::owned(Obj::mk_ctor(
+                    0,
+                    vec![
+                        $result(fraction).into_object(),
+                        Obj::mk_int(i64::from(exponent)),
+                    ],
+                    &[],
+                ))
+            }
             Operation::ToInteger(integer) => match integer {
                 // Rust float-to-int casts match lean.h's NaN-to-zero,
                 // saturation, and truncation rules. Cast at the destination
@@ -310,6 +327,7 @@ impl Intrinsic {
             "pow" => Operation::Pow,
             "atan2" => Operation::Atan2,
             "scaleB" => Operation::ScaleB,
+            "frExp" => Operation::FrExp,
             _ => match UnaryMath::from_method(method) {
                 Some(op) => Operation::Unary(op),
                 None => Operation::ToInteger(Integer::from_name(method.strip_prefix("to")?)?),
@@ -355,7 +373,8 @@ impl Intrinsic {
                     QUIET_NAN64_BITS,
                     unary_math64,
                     pow64,
-                    atan2_64
+                    atan2_64,
+                    fln_libm::frexp
                 )
             }
             Width::Binary32 => {
@@ -371,7 +390,8 @@ impl Intrinsic {
                     QUIET_NAN32_BITS,
                     unary_math32,
                     pow32,
-                    atan2_32
+                    atan2_32,
+                    fln_libm::f32::frexp
                 )
             }
         }
