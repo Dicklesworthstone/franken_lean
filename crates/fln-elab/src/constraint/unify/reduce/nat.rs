@@ -916,7 +916,12 @@ impl Engine<'_> {
         }
         // Charge the mutable stores before cloning; immutable environment data
         // are shared. The child starts with no assignment or wake-up products.
-        for _ in 0..self.work.mvars.len().saturating_add(self.work.universes.len()) {
+        for _ in 0..self
+            .work
+            .mvars
+            .len()
+            .saturating_add(self.work.universes.len())
+        {
             self.meter.node()?;
         }
         let mut budget = self.budget;

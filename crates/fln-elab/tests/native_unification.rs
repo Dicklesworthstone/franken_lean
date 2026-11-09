@@ -1592,10 +1592,9 @@ fn class_add(dictionary: Expr, base: Expr, heterogeneous: bool) -> Expr {
         (["Add", "add"], vec![Level::zero()], vec![nat()])
     };
     arguments.extend([dictionary, base, numeral(1)]);
-    arguments.into_iter().fold(
-        Expr::const_(Name::from_components(path), levels),
-        Expr::app,
-    )
+    arguments
+        .into_iter()
+        .fold(Expr::const_(Name::from_components(path), levels), Expr::app)
 }
 
 #[test]

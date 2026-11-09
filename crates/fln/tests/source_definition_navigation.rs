@@ -398,16 +398,31 @@ fn document_outline_bounds_replay_work_inside_temporary_scopes() {
         source: b"open Nat in def value : Nat := 1",
     }];
     assert!(matches!(
-        session().document_symbols_with_limits(&inputs, &main, DocumentSymbolLimits {
-            max_commands: 1,
-            ..DocumentSymbolLimits::default()
-        }),
-        Err(SourceModuleCheckError::Limit { resource: "document symbol commands", limit: 1 })
+        session().document_symbols_with_limits(
+            &inputs,
+            &main,
+            DocumentSymbolLimits {
+                max_commands: 1,
+                ..DocumentSymbolLimits::default()
+            }
+        ),
+        Err(SourceModuleCheckError::Limit {
+            resource: "document symbol commands",
+            limit: 1
+        })
     ));
-    let symbols = session().document_symbols_with_limits(&inputs, &main, DocumentSymbolLimits {
-        max_commands: 2,
-        ..DocumentSymbolLimits::default()
-    }).unwrap().into_complete().unwrap();
+    let symbols = session()
+        .document_symbols_with_limits(
+            &inputs,
+            &main,
+            DocumentSymbolLimits {
+                max_commands: 2,
+                ..DocumentSymbolLimits::default()
+            },
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
     assert_eq!(symbols.len(), 1);
     assert_eq!(symbols[0].name, name("value"));
 }

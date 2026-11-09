@@ -465,9 +465,9 @@ fn mutual_structural(
         return Err(refusal("fresh distinct ordinary mutual names"));
     }
     // An indexed family's major follows its varying index binders. Try each source
-    // position in order; a candidate must account for every preceding varying binder
-    // as one of that family's independent indices. Each attempt has fresh contexts,
-    // and failed attempts still charge the shared budget.
+    // position in order; preceding varying binders are either independent family
+    // indices or arguments generalized within each component. Each attempt has fresh
+    // contexts, and failed attempts still charge the shared budget.
     let candidates = arities.iter().copied().min().unwrap_or(0);
     let mut last = None;
     for decreasing in fixed..candidates {
