@@ -898,6 +898,9 @@ impl Context {
         muts: &[Name],
         looped: bool,
     ) -> Result<Syntax, NatDefinitionElabError> {
+        if is(&value, "doTry") {
+            return self.mutable_exception_action(value, muts, looped);
+        }
         if !(is(&value, "doIf")
             || is(&value, "doMatch")
             || is(&value, "doUnless")
@@ -916,6 +919,85 @@ impl Context {
             return Ok(term("doExpr", vec![self.stateful_term(value, muts, None)?]));
         }
         self.mutable_branches(value, muts, None, false)
+    }
+
+    /// A bound exception region keeps the surrounding mutable names in scope. Check each
+    /// handler binder and rewrite its local declarations independently, without treating
+    /// ordinary reads of an outer variable as shadowing. Transporting changed outer state
+    /// through an exception remains outside this pass's supported joins.
+    fn mutable_exception_action(
+        &mut self,
+        value: Syntax,
+        muts: &[Name],
+        looped: bool,
+    ) -> Result<Syntax, NatDefinitionElabError> {
+        self.tick()?;
+        self.txn
+            .budget
+            .enter_rec()
+            .map_err(|_| failure(SourceInferenceError::ResourceLimit))?;
+        let result = self.mutable_exception_action_inner(value, muts, looped);
+        self.txn.budget.exit_rec();
+        result
+    }
+
+    fn mutable_exception_action_inner(
+        &mut self,
+        value: Syntax,
+        muts: &[Name],
+        looped: bool,
+    ) -> Result<Syntax, NatDefinitionElabError> {
+        let facts = facts(&value);
+        if muts.iter().any(|name| facts.reassigned.contains(name)) {
+            return Err(refused());
+        }
+        let mut parts = node(value, "doTry", 4)?;
+        let body = std::mem::replace(&mut parts[1], Syntax::Missing);
+        parts[1] = self.mutable_sequence(body, muts, None, false, looped)?;
+        let catches = children(std::mem::replace(&mut parts[2], Syntax::Missing))?;
+        let mut rebuilt = Vec::with_capacity(catches.len());
+        for handler in catches {
+            self.tick()?;
+            if is(&handler, "doCatchMatch") {
+                let mut handler = node(handler, "doCatchMatch", 2)?;
+                let mut alternatives =
+                    node(handler.pop().expect("catch alternatives"), "matchAlts", 1)?;
+                let rows = children(alternatives.pop().expect("catch rows"))?;
+                let mut rebuilt_rows = Vec::with_capacity(rows.len());
+                for row in rows {
+                    self.tick()?;
+                    let mut row = node(row, "matchAlt", 4)?;
+                    if shadows(&row[1], muts) {
+                        return Err(refused());
+                    }
+                    let body = row.pop().expect("catch alternative body");
+                    row.push(self.mutable_sequence(body, muts, None, false, looped)?);
+                    rebuilt_rows.push(term("matchAlt", row));
+                }
+                handler.push(term("matchAlts", vec![null(rebuilt_rows)]));
+                rebuilt.push(term("doCatchMatch", handler));
+            } else {
+                let mut handler = node(handler, "doCatch", 5)?;
+                if shadows(&handler[1], muts) {
+                    return Err(refused());
+                }
+                let body = handler.pop().expect("catch body");
+                handler.push(self.mutable_sequence(body, muts, None, false, looped)?);
+                rebuilt.push(term("doCatch", handler));
+            }
+        }
+        parts[2] = null(rebuilt);
+        let finally = children(std::mem::replace(&mut parts[3], Syntax::Missing))?;
+        let mut rebuilt = Vec::with_capacity(finally.len());
+        for finalizer in finally {
+            self.tick()?;
+            let mut finalizer = node(finalizer, "doFinally", 2)?;
+            let body = finalizer.pop().expect("finally body");
+            finalizer.push(self.mutable_sequence(body, muts, None, false, looped)?);
+            rebuilt.push(term("doFinally", finalizer));
+        }
+        parts[3] = null(rebuilt);
+        Ok(term("doTry", parts))
     }
 
     /// `let x : T ← branches` for one variable; `let s ← branches; let x := s.1; …` for several.
@@ -1256,4 +1338,84 @@ fn loop_binders(declarations: &Syntax) -> Vec<&Syntax> {
         })
         .flatten()
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bound_region(depth: usize) -> Syntax {
+        let action = || term("doExpr", vec![root(&["action"])]);
+        let mut body = action();
+        for _ in 0..depth {
+            let region = term(
+                "doTry",
+                vec![
+                    atom("try"),
+                    sequence_of(vec![body], false),
+                    null(vec![term(
+                        "doCatch",
+                        vec![
+                            atom("catch"),
+                            named(&Name::from_components(["error"])),
+                            null(vec![]),
+                            atom("=>"),
+                            sequence_of(vec![action()], false),
+                        ],
+                    )]),
+                    null(vec![term(
+                        "doFinally",
+                        vec![atom("finally"), sequence_of(vec![action()], false)],
+                    )]),
+                ],
+            );
+            body = bind_element(
+                named(&Name::from_components(["value"])),
+                null(vec![]),
+                region,
+            );
+        }
+        let mut declaration = node(body, "doLetArrow", 4).unwrap();
+        let mut declaration = node(declaration.pop().unwrap(), "doIdDecl", 4).unwrap();
+        declaration.pop().unwrap()
+    }
+
+    fn context() -> Context {
+        Context::new(
+            &Environment::new(),
+            Budget::for_stack_bytes(2 * 1024 * 1024),
+        )
+    }
+
+    #[test]
+    fn bound_exception_mutation_charges_and_restores_the_recursion_budget() {
+        let mut context = context();
+        context.txn.budget = crate::txn::ElabBudget::new(1000, 2);
+        assert!(matches!(
+            context.mutable_action(bound_region(8), &[], false),
+            Err(NatDefinitionElabError::Inference(
+                SourceInferenceError::ResourceLimit
+            ))
+        ));
+        assert_eq!(context.txn.budget.current_rec_depth, 0);
+        let charged = context.txn.budget.heartbeats_consumed;
+        assert!(charged > 0);
+        context.mutable_action(bound_region(2), &[], false).unwrap();
+        assert_eq!(context.txn.budget.current_rec_depth, 0);
+        assert!(context.txn.budget.heartbeats_consumed > charged);
+    }
+
+    #[test]
+    fn bound_exception_mutation_preserves_heartbeat_exhaustion_and_unwinds_depth() {
+        let mut context = context();
+        context.txn.budget = crate::txn::ElabBudget::new(1, 8);
+        assert!(matches!(
+            context.mutable_action(bound_region(1), &[], false),
+            Err(NatDefinitionElabError::Inference(
+                SourceInferenceError::ResourceLimit
+            ))
+        ));
+        assert_eq!(context.txn.budget.current_rec_depth, 0);
+        assert!(context.txn.budget.heartbeats_consumed > context.txn.budget.max_heartbeats);
+    }
 }

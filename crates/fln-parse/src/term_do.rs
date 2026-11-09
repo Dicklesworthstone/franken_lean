@@ -180,11 +180,12 @@ fn do_element(mut value: Syntax) -> Syntax {
     }
 }
 
-/// A `doIf` or `doMatch` the planner read right after a `←` (`leftArrow doElemParser`) is already
-/// a do element; any other term is a `doExpr`.
+/// A `doIf`, `doMatch` or `doTry` the planner read right after a `←`
+/// (`leftArrow doElemParser`) is already a do element; any other term is a `doExpr`.
 pub(super) fn arrow_element(value: Syntax) -> Syntax {
     if value.kind() == Some(&parser_kind(&["Term", "doIf"]))
         || value.kind() == Some(&parser_kind(&["Term", "doMatch"]))
+        || value.kind() == Some(&parser_kind(&["Term", "doTry"]))
     {
         value
     } else {

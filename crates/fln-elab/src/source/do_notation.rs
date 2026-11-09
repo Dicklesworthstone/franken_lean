@@ -426,16 +426,17 @@ impl Context {
         if syntax.kind() == Some(&parser_kind(&["Term", "doIf"])) {
             return nest_else_ifs(syntax);
         }
-        // `leftArrow doElemParser` with a `doIf`/`doMatch` (`let x ← if …`, `x ← match …`): the
-        // pin compiles that element as the one-element sequence of `let x ← do if …`
-        // (`doSeqToCode [doElem]`), so it becomes that nested sequence, which shares the
-        // surrounding control scope.
+        // `leftArrow doElemParser`: the pin compiles a compound element as a one-element
+        // nested sequence (`doSeqToCode [doElem]`), sharing the surrounding control scope.
+        // This pass is postorder: an ordinary try has already become `doExpr`, whereas a
+        // try containing a return or loop exit retains the `nativeDoTry` control marker.
         if (syntax.kind() == Some(&parser_kind(&["Term", "doIdDecl"]))
             || syntax.kind() == Some(&parser_kind(&["Term", "doPatDecl"])))
             && matches!(&syntax, Syntax::Node { args, .. }
             if args.get(3).is_some_and(|element| {
                 element.kind() == Some(&parser_kind(&["Term", "doIf"]))
                     || element.kind() == Some(&parser_kind(&["Term", "doMatch"]))
+                    || element.kind() == Some(&parser_kind(&["Term", "nativeDoTry"]))
             }))
         {
             if pattern {

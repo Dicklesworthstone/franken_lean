@@ -79,6 +79,46 @@ def continues : Logged Nat := do
 }
 
 #[test]
+fn bound_try_loop_values_keep_cleanup_order_and_refuse_unimplemented_exit_packets() {
+    let engine = base();
+    execute(
+        &engine,
+        r#"
+def boundValues : Logged Nat := do
+  for n in items do
+    let value ← try
+      note n
+      succeed (n + 3)
+    catch e =>
+      succeed e
+    finally
+      note 3
+    note value
+  return 7
+#eval observed boundValues
+"#,
+        &["134235007"],
+    );
+    // The pin accepts these exits, but the native nonreturning loop worklist
+    // still has no distinct normal-value packet for a bound exception region.
+    // Refuse rather than run the bound continuation inside catch/finally.
+    let options = KVMap::new();
+    let root = engine.logical_root(&options);
+    for exit in ["break", "continue"] {
+        let source = format!(
+            "def bad : Logged Nat := do {{ for n in items do {{ let value : Nat ← try {{ note n; {exit} }} finally {{ note 3 }}; note value }}; return 7 }}"
+        );
+        assert!(
+            engine
+                .check_source_files(&[source.as_bytes()], &options, limits())
+                .is_err(),
+            "{source}"
+        );
+        assert_eq!(engine.logical_root(&options), root);
+    }
+}
+
+#[test]
 fn bare_nested_loop_blocks_forward_exits_without_running_the_outer_suffix() {
     execute(
         &base(),
