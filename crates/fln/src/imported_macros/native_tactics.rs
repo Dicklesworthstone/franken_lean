@@ -1,9 +1,11 @@
-//! Native counterparts for selected registered Init tactic macros.
+//! Native counterparts for selected registered Init quotation macros.
 //!
 //! These are individual registry candidates, not an aggregate reflexivity
 //! tactic. Their checked owners and exact census names select native quotation
 //! code; no Reference toolchain body is interpreted. User registrations and
 //! recursive `expandMacro?` calls retain the ordinary candidate order.
+//! Applicative sequencing uses that same dispatch, including when a user macro
+//! asks to expand a term before returning its result to the elaborator.
 
 use super::{
     MacroExecution, MacroInvocation, MacroLimits, StateBudget, SyntaxConversionError,
@@ -41,13 +43,16 @@ pub(super) enum NativeTacticMacro {
     TrivialDecide,
     TrivialTrue,
     TrivialAnd,
+    Seq,
+    SeqLeft,
+    SeqRight,
 }
 
 impl NativeTacticMacro {
     // Exact registrations from REFERENCE_GRAMMAR_CENSUS.txt, not spellings
     // inferred from a caller's syntax kind. The partition and checked module
     // owner remain mandatory before any candidate receives native execution.
-    const ALL: [Self; 17] = [
+    const ALL: [Self; 20] = [
         Self::ApplyRfl,
         Self::EqRefl,
         Self::ExactHEq,
@@ -65,6 +70,9 @@ impl NativeTacticMacro {
         Self::TrivialDecide,
         Self::TrivialTrue,
         Self::TrivialAnd,
+        Self::Seq,
+        Self::SeqLeft,
+        Self::SeqRight,
     ];
 
     pub(super) fn identify(
@@ -81,10 +89,10 @@ impl NativeTacticMacro {
     }
 
     fn module(self) -> &'static str {
-        if self == Self::ExactIff {
-            "Init.Core"
-        } else {
-            "Init.Tactics"
+        match self {
+            Self::ExactIff => "Init.Core",
+            Self::Seq | Self::SeqLeft | Self::SeqRight => "Init.Notation",
+            _ => "Init.Tactics",
         }
     }
 
@@ -139,6 +147,9 @@ impl NativeTacticMacro {
             Self::TrivialAnd => {
                 "Lean.Parser.Tactic._aux_Init_Tactics___macroRules_Lean_Parser_Tactic_tacticTrivial_6"
             }
+            Self::Seq => "_aux_Init_Notation___macroRules_term_<*>__1",
+            Self::SeqLeft => "_aux_Init_Notation___macroRules_term_<*__1",
+            Self::SeqRight => "_aux_Init_Notation___macroRules_term_*>__1",
         }
     }
 
@@ -193,6 +204,9 @@ impl NativeTacticMacro {
             Self::TrivialAnd => {
                 "mirror:Lean.Parser.Tactic._aux_Init_Tactics___macroRules_Lean_Parser_Tactic_tacticTrivial_6"
             }
+            Self::Seq => "mirror:_aux_Init_Notation___macroRules_term_<*>__1",
+            Self::SeqLeft => "mirror:_aux_Init_Notation___macroRules_term_<*__1",
+            Self::SeqRight => "mirror:_aux_Init_Notation___macroRules_term_*>__1",
         }
     }
 
@@ -212,11 +226,21 @@ impl NativeTacticMacro {
             | Self::TrivialDecide
             | Self::TrivialTrue
             | Self::TrivialAnd => "tacticTrivial",
+            Self::Seq => "term_<*>_",
+            Self::SeqLeft => "term_<*_",
+            Self::SeqRight => "term_*>_",
+        }
+    }
+
+    fn syntax_kind(self) -> Name {
+        match self {
+            Self::Seq | Self::SeqLeft | Self::SeqRight => name(self.input_kind()),
+            _ => Name::str(name("Lean.Parser.Tactic"), self.input_kind()),
         }
     }
 
     fn matches(self, input: &Syntax) -> bool {
-        if input.kind() != Some(&Name::str(name("Lean.Parser.Tactic"), self.input_kind())) {
+        if input.kind() != Some(&self.syntax_kind()) {
             return false;
         }
         // rw's body performs a second quotation-pattern match on its rule
@@ -442,6 +466,50 @@ impl NativeTacticMacro {
                     ]),
                 ],
             ),
+            Self::Seq | Self::SeqLeft | Self::SeqRight => {
+                // Init/Notation.lean's registered macros quote an ordinary
+                // application with a Unit thunk. Both constants are resolved
+                // where the macro was declared, while each operand is kept
+                // verbatim as an antiquotation. In particular, neither a
+                // caller-local Unit nor SeqRight may capture the quotation.
+                let function = match self {
+                    Self::Seq => "Seq.seq",
+                    Self::SeqLeft => "SeqLeft.seqLeft",
+                    Self::SeqRight => "SeqRight.seqRight",
+                    _ => unreachable!("matched sequencing quotation"),
+                };
+                let mut unit = identifier("Unit")?;
+                // Unit is both a declaration and a namespace at the macro's
+                // declaration site. Quotation records both resolution paths.
+                if let Syntax::Ident { preresolved, .. } = &mut unit {
+                    preresolved.push(Preresolved::Namespace { ns: name("Unit") });
+                }
+                let thunk = node(
+                    "Lean.Parser.Term.fun",
+                    vec![
+                        atom("fun"),
+                        node(
+                            "Lean.Parser.Term.basicFun",
+                            vec![
+                                node("null", vec![node("Lean.Parser.Term.hole", vec![atom("_")])]),
+                                node(
+                                    "null",
+                                    vec![node("Lean.Parser.Term.typeSpec", vec![atom(":"), unit])],
+                                ),
+                                atom("=>"),
+                                argument(input, 2),
+                            ],
+                        ),
+                    ],
+                );
+                node(
+                    "Lean.Parser.Term.app",
+                    vec![
+                        identifier(function)?,
+                        node("null", vec![argument(input, 0), thunk]),
+                    ],
+                )
+            }
         })
     }
 

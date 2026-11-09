@@ -6,6 +6,418 @@ use fln_olean::region::{OleanView, WalkBudget};
 use std::path::PathBuf;
 use std::process::Command;
 
+const SEQUENCING_OWNERS: [(&str, &str); 3] = [
+    ("term_<*>_", "_aux_Init_Notation___macroRules_term_<*>__1"),
+    ("term_<*_", "_aux_Init_Notation___macroRules_term_<*__1"),
+    ("term_*>_", "_aux_Init_Notation___macroRules_term_*>__1"),
+];
+
+#[test]
+fn pinned_sequencing_registry_binds_authority_and_serves_recursive_user_macros() {
+    let Some(path) = std::env::var_os("FLN_REFERENCE_PARTITION").map(PathBuf::from) else {
+        assert!(
+            std::env::var_os("FLN_REQUIRE_REFERENCE").is_none(),
+            "sequencing registry requires the verified pinned partition"
+        );
+        eprintln!("SKIP: sequencing registry requires FLN_REFERENCE_PARTITION");
+        return;
+    };
+    let partition =
+        VerifiedPartition::from_pinned_tsv(&std::fs::read_to_string(path).unwrap()).unwrap();
+    // These are constructed ownership records, as in the parent registry
+    // tests. They isolate dispatch and authority; actual artifact admission
+    // and checked source meaning are covered by the live import cell below.
+    let constants: Vec<_> = SEQUENCING_OWNERS
+        .iter()
+        .map(|(_, declaration)| owner(declaration))
+        .collect();
+    let native = checked("Init.Notation", &constants, &[]);
+    let client = checked(
+        "SequenceClient",
+        &[owner("SequenceClient.expand")],
+        &["Init.Notation"],
+    );
+    let rows = journal(&SEQUENCING_OWNERS.map(|(kind, declaration)| (kind, declaration, None)));
+    let client_rows = journal(&[("sequenceOuter", "SequenceClient.expand", None)]);
+    let code = code(vec![
+        super::super::recursive::recursive_function_requiring_child("SequenceClient.expand", 0),
+    ]);
+    let registry = RegisteredMacros::prepare(
+        &[
+            MacroRegistrationModule {
+                checked: &native,
+                extensions: &rows,
+            },
+            MacroRegistrationModule {
+                checked: &client,
+                extensions: &client_rows,
+            },
+        ],
+        &environment(&[&native, &client]),
+        &code,
+        &partition,
+        &users(&code),
+        MacroRegistryLimits::default(),
+    )
+    .unwrap();
+    let source = SourceText::from_utf8(b"").unwrap();
+    let dispatch = |input: &Syntax, scope| {
+        registry.expand_root(
+            input,
+            &source,
+            &context(),
+            MacroState {
+                macro_scope: scope,
+                ..MacroState::default()
+            },
+            MacroDispatchLimits::default(),
+            None,
+        )
+    };
+    for (kind, declaration) in SEQUENCING_OWNERS {
+        let child = Syntax::node(
+            name(kind),
+            vec![
+                Syntax::atom(SourceInfo::None, "left operand"),
+                Syntax::atom(SourceInfo::None, "operator"),
+                Syntax::node(
+                    name("unexpandedRhs"),
+                    vec![Syntax::atom(SourceInfo::None, "right operand")],
+                ),
+            ],
+        );
+        let outer = Syntax::node(name("sequenceOuter"), vec![child.clone()]);
+        let nested = dispatch(&outer, 17);
+        // The nested invocation receives the scope after the user macro's
+        // fresh scope. Compare against the same ordinary registry route with
+        // that starting state, including all quotation metadata and captures.
+        let direct = dispatch(&child, 18);
+        let Outcome::Complete(Ok(RegisteredExpansion::Expanded { syntax, state, .. })) =
+            &nested.outcome
+        else {
+            panic!("{nested:?}")
+        };
+        let Outcome::Complete(Ok(RegisteredExpansion::Expanded {
+            syntax: expected, ..
+        })) = &direct.outcome
+        else {
+            panic!("{direct:?}")
+        };
+        assert_eq!(syntax, expected);
+        assert_eq!(syntax.kind(), Some(&name("Lean.Parser.Term.app")));
+        assert_eq!(state.macro_scope, 19);
+        assert_eq!(
+            state.expanded_macro_declarations,
+            vec![name("SequenceClient.expand"), name(declaration)]
+        );
+        assert_eq!(nested.attempts.len(), 2);
+        assert_eq!(
+            nested.attempts[0].declaration,
+            name("SequenceClient.expand")
+        );
+        assert!(
+            nested.attempts[0]
+                .native_functions
+                .iter()
+                .any(|function| { function == "mirror:Lean.Macro.expandMacro?" })
+        );
+        assert_eq!(nested.attempts[1].declaration, name(declaration));
+        assert!(nested.attempts[1].reference_functions.is_empty());
+        assert!(
+            nested.attempts[1]
+                .native_functions
+                .iter()
+                .any(|function| function == &format!("mirror:{declaration}"))
+        );
+    }
+
+    // An exact generated declaration spelling conveys no native authority
+    // without both its checked module identity and census classification.
+    let wrong_module = checked("User.Notation", &constants, &[]);
+    let unclassified = VerifiedPartition::user_fixture();
+    for (module, classification) in [(&wrong_module, &partition), (&native, &unclassified)] {
+        for (kind, declaration) in SEQUENCING_OWNERS {
+            let rows = journal(&[(kind, declaration, None)]);
+            let refused = RegisteredMacros::prepare(
+                &[MacroRegistrationModule {
+                    checked: module,
+                    extensions: &rows,
+                }],
+                &environment(&[module]),
+                &[],
+                classification,
+                &BTreeSet::new(),
+                MacroRegistryLimits::default(),
+            );
+            assert!(
+                matches!(refused, Err(MacroRegistrationError::Compile {
+                    declaration: ref attempted, ..
+                }) if attempted == &name(declaration)),
+                "{declaration}: {refused:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn live_pinned_sequencing_macros_preserve_thunks_hygiene_and_checked_meaning() {
+    let reference = std::env::var_os("FLN_REFERENCE_LEAN").map(PathBuf::from);
+    let library = std::env::var_os("FLN_REFERENCE_LIB").map(PathBuf::from);
+    let partition = std::env::var_os("FLN_REFERENCE_PARTITION").map(PathBuf::from);
+    let (Some(reference), Some(library), Some(partition)) = (reference, library, partition) else {
+        assert!(
+            std::env::var_os("FLN_REQUIRE_REFERENCE").is_none(),
+            "native sequencing requires the pinned executable, library and partition"
+        );
+        eprintln!("SKIP: set FLN_REFERENCE_LEAN, FLN_REFERENCE_LIB and FLN_REFERENCE_PARTITION");
+        return;
+    };
+    std::thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(move || sequencing_from_actual_imports(reference, library, partition))
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+fn sequencing_from_actual_imports(reference: PathBuf, library: PathBuf, partition: PathBuf) {
+    use crate::imported_macros::registrations::MacroCompilationInputs;
+    use crate::source_check::SourceCheckLimits;
+    use crate::source_check::modules::imported::SourceOleanImportLimits;
+    use crate::{Budget, OleanCheckLimits, OleanModuleInput};
+
+    let version = Command::new(&reference)
+        .args(["-j1", "--githash"])
+        .output()
+        .unwrap();
+    assert!(version.status.success());
+    assert_eq!(
+        String::from_utf8(version.stdout).unwrap().trim(),
+        format::PIN_COMMIT
+    );
+    let root = std::env::var_os("FLN_IR_REFERENCE_ARTIFACTS")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = root.join(format!("sequencing-source-{}-{unique}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let source = r#"
+def sequenceFunction (f : Option (Nat → Nat)) (x : Option Nat) : Option Nat := f <*> x
+def sequenceLeft (x y : Option Nat) : Option Nat := x <* y
+def sequenceRight (x y : Option Nat) : Option Nat := x *> y
+def sequenceShadow (Unit : Type) (SeqRight : Nat) (x y : Option Nat) : Option Nat := x *> y
+theorem sequenceFunction_thunk (f : Option (Nat → Nat)) (x : Option Nat) :
+    Eq (sequenceFunction f x) (Seq.seq f (fun _ : Unit => x)) := rfl
+theorem sequenceLeft_thunk (x y : Option Nat) :
+    Eq (sequenceLeft x y) (SeqLeft.seqLeft x (fun _ : Unit => y)) := rfl
+theorem sequenceRight_thunk (x y : Option Nat) :
+    Eq (sequenceRight x y) (SeqRight.seqRight x (fun _ : Unit => y)) := rfl
+theorem sequenceFunction_value :
+    Eq (some (fun n : Nat => Nat.succ n) <*> some 40) (some 41) := rfl
+theorem sequenceAssociation_value :
+    Eq (some (fun a b : Nat => Nat.add a b) <*> some 7 <*> some 11) (some 18) := rfl
+theorem sequenceDirections_value : Eq (some 7 <* some 11 *> some 13) (some 13) := rfl
+theorem sequenceLeft_none : Eq (some 7 <* (none : Option Nat)) none := rfl
+theorem sequenceRight_none : Eq ((none : Option Nat) *> some 7) none := rfl
+theorem sequenceShadow_value : Eq (sequenceShadow Nat 99 (some 7) (some 11)) (some 11) := rfl
+"#;
+    let header = "module\nprelude\npublic import Init.Data.Option.Basic\npublic section\n@[expose] section\n";
+    std::fs::write(dir.join("Sequencing.lean"), format!("{header}{source}")).unwrap();
+    let oracle = Command::new(&reference)
+        .current_dir(&dir)
+        .args(["-j1", "-o", "Sequencing.olean", "Sequencing.lean"])
+        .output()
+        .unwrap();
+    std::fs::write(dir.join("oracle.stdout"), &oracle.stdout).unwrap();
+    std::fs::write(dir.join("oracle.stderr"), &oracle.stderr).unwrap();
+    assert!(oracle.status.success(), "{oracle:?}; {dir:?}");
+    let oracle_parts = ["olean", "olean.server", "olean.private"]
+        .map(|extension| std::fs::read(dir.join(format!("Sequencing.{extension}"))).unwrap());
+    let oracle_module = crate::decode_olean_module_artifacts(
+        &oracle_parts[0],
+        &oracle_parts[1],
+        &oracle_parts[2],
+        OleanDecodeLimits::new(oracle_parts.iter().map(Vec::len).sum()),
+    )
+    .unwrap();
+
+    // Import the actual closure and its entire macro journal. Synthetic owners
+    // or a registry filtered down to the three candidates cannot establish the
+    // ordinary import-to-source route or its candidate ordering.
+    let target = name("Init.Data.Option.Basic");
+    let mut pending = vec![target.clone()];
+    let mut seen = BTreeSet::new();
+    let mut loaded = Vec::new();
+    while let Some(module) = pending.pop() {
+        if !seen.insert(module.clone()) {
+            continue;
+        }
+        let base = library.join(module.to_display_string().replace('.', "/"));
+        let parts = ["olean", "olean.server", "olean.private"]
+            .map(|extension| std::fs::read(base.with_extension(extension)).unwrap());
+        pending.extend(
+            crate::olean_module_imports(&parts[0], OleanDecodeLimits::new(parts[0].len())).unwrap(),
+        );
+        loaded.push((module, parts));
+    }
+    let inputs: Vec<_> = loaded
+        .iter()
+        .map(|(name, parts)| OleanModuleInput {
+            name,
+            artifact: &parts[0],
+            server_artifact: Some(&parts[1]),
+            private_artifact: Some(&parts[2]),
+        })
+        .collect();
+    let options = KVMap::new();
+    let imported = Engine::from_environment(Environment::new())
+        .import_olean_modules_for_source(
+            &inputs,
+            std::slice::from_ref(&target),
+            &options,
+            SourceOleanImportLimits::new(OleanCheckLimits::new(
+                1 << 30,
+                Budget::for_stack_bytes(64 * 1024 * 1024),
+            )),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!(imported.checked.modules.len(), loaded.len());
+    let partition =
+        VerifiedPartition::from_pinned_tsv(&std::fs::read_to_string(partition).unwrap()).unwrap();
+    let registry = imported
+        .prepare_imported_macros_deferred(
+            MacroCompilationInputs::new(Vec::new(), partition, BTreeSet::new()),
+            MacroRegistryLimits::default(),
+        )
+        .unwrap();
+    for (kind, owner) in SEQUENCING_OWNERS {
+        assert_eq!(
+            registry.declarations(&name(kind)).collect::<Vec<_>>(),
+            vec![&name(owner)]
+        );
+    }
+    let engine = &imported.engine;
+    let before = engine.logical_root(&options);
+    let run = |source: &[u8], limits| {
+        engine.check_source_files_with_imported_macros(
+            &[source],
+            &options,
+            SourceCheckLimits::new(admission()),
+            SourceMacroInvocation {
+                registry: &registry,
+                context: &context(),
+                state: MacroState::default(),
+                lookup: None,
+                limits,
+                cancellation: None,
+            },
+        )
+    };
+    let report = run(source.as_bytes(), MacroTreeLimits::default());
+    let Outcome::Complete(Ok(checked)) = &report.outcome else {
+        panic!("sequencing source: {report:?}; {dir:?}");
+    };
+    assert!(report.state.is_some());
+    assert_eq!(
+        (checked.files, checked.commands, checked.theorems),
+        (1, 13, 9)
+    );
+    for (_, owner) in SEQUENCING_OWNERS {
+        assert!(report.attempts.iter().any(|attempt| {
+            attempt.declaration == name(owner)
+                && attempt
+                    .native_functions
+                    .iter()
+                    .any(|id| id == &format!("mirror:{owner}"))
+                && attempt.reference_functions.is_empty()
+        }));
+    }
+    // Compare the actual checked functions to the pin's emitted terms. This
+    // includes the Unit thunk's type and both operands beneath local binders;
+    // merely checking the resulting Option values would miss capture defects.
+    for label in [
+        "sequenceFunction",
+        "sequenceLeft",
+        "sequenceRight",
+        "sequenceShadow",
+    ] {
+        let Some(ConstantInfo::Defn(actual)) = checked.engine.environment().find(&name(label))
+        else {
+            panic!("native checked definition missing: {label}");
+        };
+        let Some(ConstantInfo::Defn(expected)) = oracle_module
+            .constants
+            .iter()
+            .find(|constant| constant.constant_val().name == name(label))
+        else {
+            panic!("oracle definition missing: {label}");
+        };
+        assert_eq!(actual.base.level_params, expected.base.level_params);
+        for (left, right) in [
+            (&actual.base.type_, &expected.base.type_),
+            (&actual.value, &expected.value),
+        ] {
+            let verdict = fln_kernel::check_def_eq(
+                engine.environment(),
+                &actual.base.level_params,
+                left,
+                right,
+                admission().kernel,
+            );
+            assert!(
+                matches!(
+                    verdict,
+                    Outcome::Complete(fln_kernel::verdict::Verdict::Accepted { .. })
+                ),
+                "{label}: {verdict:?}; {dir:?}"
+            );
+        }
+    }
+    for (label, suffix) in [
+        (
+            "wrongFunction",
+            "def wrongFunction : Option Nat := some 7 <*> some 11",
+        ),
+        (
+            "wrongResult",
+            "theorem wrongResult : Eq (some 7 *> some 11) (some 7) := rfl",
+        ),
+    ] {
+        let rejected_source = format!("{source}\n{suffix}\n");
+        let filename = format!("{label}.lean");
+        std::fs::write(dir.join(&filename), format!("{header}{rejected_source}")).unwrap();
+        let rejected = Command::new(&reference)
+            .current_dir(&dir)
+            .args(["-j1", &filename])
+            .output()
+            .unwrap();
+        std::fs::write(dir.join(format!("{label}.stdout")), &rejected.stdout).unwrap();
+        std::fs::write(dir.join(format!("{label}.stderr")), &rejected.stderr).unwrap();
+        assert!(!rejected.status.success(), "{label}: {rejected:?}");
+        let refused = run(rejected_source.as_bytes(), MacroTreeLimits::default());
+        assert!(
+            matches!(refused.outcome, Outcome::Complete(Err(_))),
+            "{label}: {refused:?}"
+        );
+        assert!(refused.state.is_none());
+    }
+    let mut limited = MacroTreeLimits::default();
+    limited.dispatch.max_attempts = 0;
+    let stopped = run(source.as_bytes(), limited);
+    assert!(
+        matches!(stopped.outcome, Outcome::Inconclusive(_)),
+        "{stopped:?}"
+    );
+    assert!(stopped.state.is_none());
+    assert_eq!(engine.logical_root(&options), before);
+    assert!(!engine.environment().contains(&name("sequenceFunction")));
+}
+
 #[test]
 fn live_pinned_composite_tactics_admit_source_from_complete_import_journals() {
     let reference = std::env::var_os("FLN_REFERENCE_LEAN").map(PathBuf::from);

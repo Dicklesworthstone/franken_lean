@@ -567,6 +567,10 @@ fn native_control_macros_preserve_refusals_limits_and_recovery() {
         .chain(COMPOSITE_CANDIDATES.into_iter().map(|candidate| {
             let input = composite_inputs(candidate).pop().unwrap();
             (candidate, input)
+        }))
+        .chain(SEQUENCING_CANDIDATES.into_iter().map(|candidate| {
+            let input = sequencing_inputs(candidate).swap_remove(3);
+            (candidate, input)
         }));
     for (candidate, input) in candidates {
         let baseline = expanded_control(candidate, &input);
@@ -1159,4 +1163,332 @@ fn live_pinned_composite_candidates_match_complete_quotations_and_state() {
     assert_eq!(String::from_utf8(result.stdout).unwrap(), native, "{dir:?}");
     assert!(result.stderr.is_empty());
     eprintln!("native and pinned composite tactics: 656 exact quotations, 91 unsupported inputs");
+}
+
+const SEQUENCING_CANDIDATES: [NativeTacticMacro; 3] = [
+    NativeTacticMacro::Seq,
+    NativeTacticMacro::SeqLeft,
+    NativeTacticMacro::SeqRight,
+];
+
+fn sequencing_inputs(candidate: NativeTacticMacro) -> Vec<Syntax> {
+    let kind = candidate.input_kind();
+    let wrong = || atom(SourceInfo::None, "wrong");
+    let extra = || atom(SourceInfo::None, "extra");
+    let right = || {
+        node(
+            "Client.right",
+            vec![control_body(), atom(SourceInfo::None, "right")],
+        )
+    };
+    vec![
+        node(kind, vec![]),
+        node(kind, vec![wrong()]),
+        node(kind, vec![control_body(), wrong()]),
+        node(kind, vec![control_body(), wrong(), right()]),
+        node(kind, vec![Syntax::Missing, wrong(), right(), extra()]),
+        node(
+            kind,
+            vec![control_body(), Syntax::Missing, right(), extra()],
+        ),
+    ]
+}
+
+#[test]
+fn native_sequencing_quotes_an_explicit_unit_thunk_with_hygienic_constants() {
+    fn children<'a>(syntax: &'a Syntax, expected_kind: &str, info: SourceInfo) -> &'a [Syntax] {
+        let Syntax::Node {
+            info: actual,
+            kind,
+            args,
+        } = syntax
+        else {
+            panic!("expected {expected_kind}, got {syntax:?}");
+        };
+        assert_eq!(*actual, info);
+        assert_eq!(*kind, name(expected_kind));
+        args
+    }
+
+    for candidate in SEQUENCING_CANDIDATES {
+        let input = sequencing_inputs(candidate).swap_remove(3);
+        let Syntax::Node { args: captures, .. } = &input else {
+            unreachable!();
+        };
+        for context in contexts() {
+            for (reference, expected_info) in references() {
+                let execution = control_execute(
+                    candidate,
+                    &input,
+                    &context,
+                    &reference,
+                    MacroLimits::default(),
+                    None,
+                );
+                assert!(execution.reference_functions.is_empty());
+                assert_eq!(execution.native_functions, vec![candidate.id()]);
+                let usage = execution.vm_usage.unwrap();
+                assert_eq!((usage.steps, usage.system_polls), (1, 1));
+                let Outcome::Complete(Ok(MacroResult::Expanded {
+                    syntax,
+                    state: next,
+                })) = execution.outcome
+                else {
+                    panic!("native {candidate:?}: {execution:?}");
+                };
+                assert_eq!(next, state());
+                let check_identifier = |syntax: &Syntax, constant: &str| {
+                    let Syntax::Ident {
+                        info,
+                        raw_val,
+                        val,
+                        preresolved,
+                    } = syntax
+                    else {
+                        panic!("expected resolved {constant}, got {syntax:?}");
+                    };
+                    assert_eq!(*info, expected_info);
+                    assert_eq!(raw_val.owned_backing(), Some(constant));
+                    assert_eq!(raw_val.span(), span(0, constant.len()));
+                    let scope_context =
+                        Name::str(name(constant), "_@").append_core(&context.quotation_context);
+                    assert_eq!(
+                        *val,
+                        Name::num(
+                            Name::str(scope_context, "_hyg"),
+                            context.current_macro_scope
+                        )
+                    );
+                    let mut expected = vec![Preresolved::Decl {
+                        name: name(constant),
+                        fields: Vec::new(),
+                    }];
+                    if constant == "Unit" {
+                        expected.push(Preresolved::Namespace { ns: name("Unit") });
+                    }
+                    assert_eq!(preresolved, &expected);
+                };
+                let app = children(&syntax, "Lean.Parser.Term.app", expected_info);
+                assert_eq!(app.len(), 2);
+                let constant = match candidate {
+                    NativeTacticMacro::Seq => "Seq.seq",
+                    NativeTacticMacro::SeqLeft => "SeqLeft.seqLeft",
+                    NativeTacticMacro::SeqRight => "SeqRight.seqRight",
+                    _ => unreachable!(),
+                };
+                check_identifier(&app[0], constant);
+                let args = children(&app[1], "null", expected_info);
+                assert_eq!(args.len(), 2);
+                assert_eq!(args[0], captures[0]);
+                let thunk = children(&args[1], "Lean.Parser.Term.fun", expected_info);
+                assert_eq!(thunk.len(), 2);
+                assert_eq!(thunk[0], atom(expected_info, "fun"));
+                let body = children(&thunk[1], "Lean.Parser.Term.basicFun", expected_info);
+                assert_eq!(body.len(), 4);
+                let binders = children(&body[0], "null", expected_info);
+                assert_eq!(binders.len(), 1);
+                assert_eq!(
+                    children(&binders[0], "Lean.Parser.Term.hole", expected_info),
+                    &[atom(expected_info, "_")]
+                );
+                let annotation = children(&body[1], "null", expected_info);
+                assert_eq!(annotation.len(), 1);
+                let type_spec =
+                    children(&annotation[0], "Lean.Parser.Term.typeSpec", expected_info);
+                assert_eq!(type_spec.len(), 2);
+                assert_eq!(type_spec[0], atom(expected_info, ":"));
+                check_identifier(&type_spec[1], "Unit");
+                assert_eq!(body[2], atom(expected_info, "=>"));
+                // The right operand remains inside the thunk, including all
+                // its original trivia, caller scopes, and pre-resolved data.
+                assert_eq!(body[3], captures[2]);
+            }
+        }
+    }
+}
+
+#[test]
+fn live_pinned_sequencing_candidates_match_complete_quotations_and_state() {
+    use std::path::PathBuf;
+    use std::process::Command;
+
+    let Some(reference) = std::env::var_os("FLN_REFERENCE_LEAN").map(PathBuf::from) else {
+        assert!(
+            std::env::var_os("FLN_REQUIRE_REFERENCE").is_none(),
+            "pinned Reference required for native sequencing macro comparison"
+        );
+        eprintln!("SKIP: native sequencing quotations require FLN_REFERENCE_LEAN");
+        return;
+    };
+    let version = Command::new(&reference)
+        .args(["-j1", "--githash"])
+        .output()
+        .unwrap();
+    assert!(version.status.success());
+    assert_eq!(
+        String::from_utf8(version.stdout).unwrap().trim(),
+        fln_olean::format::PIN_COMMIT
+    );
+    let partition_path = std::env::var_os("FLN_REFERENCE_PARTITION")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            fln_core::checked_workspace_root!().join("contracts/builtin_partition.tsv")
+        });
+    let partition =
+        VerifiedPartition::from_pinned_tsv(&std::fs::read_to_string(partition_path).unwrap())
+            .unwrap();
+    for candidate in SEQUENCING_CANDIDATES {
+        assert_eq!(
+            NativeTacticMacro::identify(
+                &name(candidate.module()),
+                &name(candidate.declaration()),
+                &partition,
+            ),
+            Some(candidate)
+        );
+        for (module, declaration) in [
+            (name("User"), name(candidate.declaration())),
+            (name("Init.Tactics"), name(candidate.declaration())),
+            (
+                name(candidate.module()),
+                Name::str(name(candidate.declaration()), "other"),
+            ),
+            (
+                name(candidate.module()),
+                Name::str(name(candidate.declaration()), "_redArg"),
+            ),
+        ] {
+            assert_eq!(
+                NativeTacticMacro::identify(&module, &declaration, &partition),
+                None
+            );
+        }
+    }
+    // Reuse the lossless wire and capture fixtures, but execute the actual
+    // pinned Init.Notation registrations rather than a restated quotation.
+    let helpers = include_str!("../../../../fln-olean/fixtures/NativeControlMacros.lean")
+        .strip_suffix("#eval runControlMacros\n")
+        .unwrap();
+    let oracle = r#"
+meta def sequencingCandidates : List (Macro × Name) :=
+  [(«_aux_Init_Notation___macroRules_term_<*>__1», `«term_<*>_»),
+   («_aux_Init_Notation___macroRules_term_<*__1», `«term_<*_»),
+   («_aux_Init_Notation___macroRules_term_*>__1», `«term_*>_»)]
+
+meta def sequencingInputs (kind : Name) : List Syntax :=
+  let wrong := Syntax.atom .none "wrong"
+  let extra := Syntax.atom .none "extra"
+  let right := Syntax.node .none `Client.right #[controlBody, .atom .none "right"]
+  [.node .none kind #[],
+   .node .none kind #[wrong],
+   .node .none kind #[controlBody, wrong],
+   .node .none kind #[controlBody, wrong, right],
+   .node .none kind #[.missing, wrong, right, extra],
+   .node .none kind #[controlBody, .missing, right, extra]]
+
+meta def runSequencingMacros : IO Unit := do
+  let state : Macro.State := ⟨9, [(`Trace, "keep")], [`Prior]⟩
+  for (macroFn, kind) in sequencingCandidates do
+    for context in controlContexts do
+      for reference in controlReferences do
+        for input in sequencingInputs kind do
+          match macroFn input { context with ref := reference } state with
+          | .ok stx next =>
+            IO.println ("ok:" ++ controlSyntax stx ++ s!":{controlStateExact next}")
+          | .error _ _ => IO.println "unexpected-error"
+    for input in [Syntax.missing, .atom .none "wrong", .node .none `User.term #[],
+      .node .none (`Lean.Parser.Term ++ kind) #[]] do
+      match macroFn input ⟨default, `Client.Scope, 17, 3, 512, .missing⟩ state with
+      | .error .unsupportedSyntax next =>
+        IO.println s!"unsupported:{controlStateExact next}"
+      | _ => IO.println "unexpected-result"
+
+#eval runSequencingMacros
+"#;
+    let root = std::env::var_os("FLN_IR_REFERENCE_ARTIFACTS")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = root.join(format!("native-sequencing-{}-{unique}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("NativeSequencingMacros.lean"),
+        format!("{helpers}\n{oracle}"),
+    )
+    .unwrap();
+    let result = Command::new(&reference)
+        .current_dir(&dir)
+        .args(["-j1", "NativeSequencingMacros.lean"])
+        .output()
+        .unwrap();
+    std::fs::write(dir.join("oracle.stdout"), &result.stdout).unwrap();
+    std::fs::write(dir.join("oracle.stderr"), &result.stderr).unwrap();
+    assert!(
+        result.status.success(),
+        "{dir:?}: {}{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let mut native = String::new();
+    let mut expanded = 0;
+    let mut unsupported = 0;
+    for candidate in SEQUENCING_CANDIDATES {
+        let mut cases = Vec::new();
+        for context in contexts() {
+            for (reference, _) in references() {
+                for input in sequencing_inputs(candidate) {
+                    cases.push((input, context.clone(), reference.clone()));
+                }
+            }
+        }
+        for input in [
+            Syntax::Missing,
+            atom(SourceInfo::None, "wrong"),
+            node("User.term", vec![]),
+            node(
+                &format!("Lean.Parser.Term.{}", candidate.input_kind()),
+                vec![],
+            ),
+        ] {
+            cases.push((input, contexts()[0].clone(), Syntax::Missing));
+        }
+        for (input, context, reference) in cases {
+            let execution = control_execute(
+                candidate,
+                &input,
+                &context,
+                &reference,
+                MacroLimits::default(),
+                None,
+            );
+            assert!(execution.reference_functions.is_empty());
+            assert_eq!(execution.native_functions, vec![candidate.id()]);
+            match execution.outcome {
+                Outcome::Complete(Ok(MacroResult::Expanded {
+                    syntax,
+                    state: next,
+                })) => {
+                    native.push_str(&format!(
+                        "ok:{}:{}\n",
+                        control_syntax(&syntax),
+                        next == state()
+                    ));
+                    expanded += 1;
+                }
+                Outcome::Complete(Ok(MacroResult::Unsupported { state: next })) => {
+                    native.push_str(&format!("unsupported:{}\n", next == state()));
+                    unsupported += 1;
+                }
+                other => panic!("{candidate:?}: {other:?}"),
+            }
+        }
+    }
+    assert_eq!((expanded, unsupported), (144, 12));
+    std::fs::write(dir.join("native.stdout"), &native).unwrap();
+    assert_eq!(String::from_utf8(result.stdout).unwrap(), native, "{dir:?}");
+    assert!(result.stderr.is_empty());
+    eprintln!("native and pinned sequencing macros: 144 exact quotations, 12 unsupported inputs");
 }
