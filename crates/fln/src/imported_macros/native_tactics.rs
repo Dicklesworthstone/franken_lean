@@ -46,13 +46,33 @@ pub(super) enum NativeTacticMacro {
     Seq,
     SeqLeft,
     SeqRight,
+    BitOr,
+    BitXor,
+    BitAnd,
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Mod,
+    Pow,
+    Append,
+    Neg,
+    SMul,
+    GeAscii,
+    LeAscii,
+    Le,
+    Lt,
+    Gt,
+    Ge,
+    Eq,
+    BEq,
 }
 
 impl NativeTacticMacro {
     // Exact registrations from REFERENCE_GRAMMAR_CENSUS.txt, not spellings
     // inferred from a caller's syntax kind. The partition and checked module
     // owner remain mandatory before any candidate receives native execution.
-    const ALL: [Self; 20] = [
+    const ALL: [Self; 40] = [
         Self::ApplyRfl,
         Self::EqRefl,
         Self::ExactHEq,
@@ -73,6 +93,26 @@ impl NativeTacticMacro {
         Self::Seq,
         Self::SeqLeft,
         Self::SeqRight,
+        Self::BitOr,
+        Self::BitXor,
+        Self::BitAnd,
+        Self::Add,
+        Self::Sub,
+        Self::Mul,
+        Self::Div,
+        Self::Mod,
+        Self::Pow,
+        Self::Append,
+        Self::Neg,
+        Self::SMul,
+        Self::GeAscii,
+        Self::LeAscii,
+        Self::Le,
+        Self::Lt,
+        Self::Gt,
+        Self::Ge,
+        Self::Eq,
+        Self::BEq,
     ];
 
     pub(super) fn identify(
@@ -91,7 +131,29 @@ impl NativeTacticMacro {
     fn module(self) -> &'static str {
         match self {
             Self::ExactIff => "Init.Core",
-            Self::Seq | Self::SeqLeft | Self::SeqRight => "Init.Notation",
+            Self::Seq
+            | Self::SeqLeft
+            | Self::SeqRight
+            | Self::BitOr
+            | Self::BitXor
+            | Self::BitAnd
+            | Self::Add
+            | Self::Sub
+            | Self::Mul
+            | Self::Div
+            | Self::Mod
+            | Self::Pow
+            | Self::Append
+            | Self::Neg
+            | Self::SMul
+            | Self::GeAscii
+            | Self::LeAscii
+            | Self::Le
+            | Self::Lt
+            | Self::Gt
+            | Self::Ge
+            | Self::Eq
+            | Self::BEq => "Init.Notation",
             _ => "Init.Tactics",
         }
     }
@@ -150,6 +212,26 @@ impl NativeTacticMacro {
             Self::Seq => "_aux_Init_Notation___macroRules_term_<*>__1",
             Self::SeqLeft => "_aux_Init_Notation___macroRules_term_<*__1",
             Self::SeqRight => "_aux_Init_Notation___macroRules_term_*>__1",
+            Self::BitOr => "_aux_Init_Notation___macroRules_term_|||__2",
+            Self::BitXor => "_aux_Init_Notation___macroRules_term_^^^__2",
+            Self::BitAnd => "_aux_Init_Notation___macroRules_term_&&&__2",
+            Self::Add => "_aux_Init_Notation___macroRules_term_+__2",
+            Self::Sub => "_aux_Init_Notation___macroRules_term_-__2",
+            Self::Mul => "_aux_Init_Notation___macroRules_term_*__2",
+            Self::Div => "_aux_Init_Notation___macroRules_term_/__2",
+            Self::Mod => "_aux_Init_Notation___macroRules_term_%__2",
+            Self::Pow => "_aux_Init_Notation___macroRules_term_^__2",
+            Self::Append => "_aux_Init_Notation___macroRules_term_++__2",
+            Self::Neg => "_aux_Init_Notation___macroRules_term-__2",
+            Self::SMul => "_aux_Init_Notation___macroRules_term_•__2",
+            Self::GeAscii => "_aux_Init_Notation___macroRules_term_>=__2",
+            Self::LeAscii => "_aux_Init_Notation___macroRules_term_<=__2",
+            Self::Le => "_aux_Init_Notation___macroRules_term_≤__2",
+            Self::Lt => "_aux_Init_Notation___macroRules_term_<__2",
+            Self::Gt => "_aux_Init_Notation___macroRules_term_>__2",
+            Self::Ge => "_aux_Init_Notation___macroRules_term_≥__2",
+            Self::Eq => "_aux_Init_Notation___macroRules_term_=__2",
+            Self::BEq => "_aux_Init_Notation___macroRules_term_==__2",
         }
     }
 
@@ -207,6 +289,26 @@ impl NativeTacticMacro {
             Self::Seq => "mirror:_aux_Init_Notation___macroRules_term_<*>__1",
             Self::SeqLeft => "mirror:_aux_Init_Notation___macroRules_term_<*__1",
             Self::SeqRight => "mirror:_aux_Init_Notation___macroRules_term_*>__1",
+            Self::BitOr => "mirror:_aux_Init_Notation___macroRules_term_|||__2",
+            Self::BitXor => "mirror:_aux_Init_Notation___macroRules_term_^^^__2",
+            Self::BitAnd => "mirror:_aux_Init_Notation___macroRules_term_&&&__2",
+            Self::Add => "mirror:_aux_Init_Notation___macroRules_term_+__2",
+            Self::Sub => "mirror:_aux_Init_Notation___macroRules_term_-__2",
+            Self::Mul => "mirror:_aux_Init_Notation___macroRules_term_*__2",
+            Self::Div => "mirror:_aux_Init_Notation___macroRules_term_/__2",
+            Self::Mod => "mirror:_aux_Init_Notation___macroRules_term_%__2",
+            Self::Pow => "mirror:_aux_Init_Notation___macroRules_term_^__2",
+            Self::Append => "mirror:_aux_Init_Notation___macroRules_term_++__2",
+            Self::Neg => "mirror:_aux_Init_Notation___macroRules_term-__2",
+            Self::SMul => "mirror:_aux_Init_Notation___macroRules_term_•__2",
+            Self::GeAscii => "mirror:_aux_Init_Notation___macroRules_term_>=__2",
+            Self::LeAscii => "mirror:_aux_Init_Notation___macroRules_term_<=__2",
+            Self::Le => "mirror:_aux_Init_Notation___macroRules_term_≤__2",
+            Self::Lt => "mirror:_aux_Init_Notation___macroRules_term_<__2",
+            Self::Gt => "mirror:_aux_Init_Notation___macroRules_term_>__2",
+            Self::Ge => "mirror:_aux_Init_Notation___macroRules_term_≥__2",
+            Self::Eq => "mirror:_aux_Init_Notation___macroRules_term_=__2",
+            Self::BEq => "mirror:_aux_Init_Notation___macroRules_term_==__2",
         }
     }
 
@@ -229,13 +331,34 @@ impl NativeTacticMacro {
             Self::Seq => "term_<*>_",
             Self::SeqLeft => "term_<*_",
             Self::SeqRight => "term_*>_",
+            Self::BitOr => "term_|||_",
+            Self::BitXor => "term_^^^_",
+            Self::BitAnd => "term_&&&_",
+            Self::Add => "term_+_",
+            Self::Sub => "term_-_",
+            Self::Mul => "term_*_",
+            Self::Div => "term_/_",
+            Self::Mod => "term_%_",
+            Self::Pow => "term_^_",
+            Self::Append => "term_++_",
+            Self::Neg => "term-_",
+            Self::SMul => "term_•_",
+            Self::GeAscii => "term_>=_",
+            Self::LeAscii => "term_<=_",
+            Self::Le => "term_≤_",
+            Self::Lt => "term_<_",
+            Self::Gt => "term_>_",
+            Self::Ge => "term_≥_",
+            Self::Eq => "term_=_",
+            Self::BEq => "term_==_",
         }
     }
 
     fn syntax_kind(self) -> Name {
-        match self {
-            Self::Seq | Self::SeqLeft | Self::SeqRight => name(self.input_kind()),
-            _ => Name::str(name("Lean.Parser.Tactic"), self.input_kind()),
+        if self.module() == "Init.Notation" {
+            name(self.input_kind())
+        } else {
+            Name::str(name("Lean.Parser.Tactic"), self.input_kind())
         }
     }
 
@@ -509,6 +632,66 @@ impl NativeTacticMacro {
                         node("null", vec![argument(input, 0), thunk]),
                     ],
                 )
+            }
+            Self::BitOr
+            | Self::BitXor
+            | Self::BitAnd
+            | Self::Add
+            | Self::Sub
+            | Self::Mul
+            | Self::Div
+            | Self::Mod
+            | Self::Pow
+            | Self::Append
+            | Self::Neg
+            | Self::SMul
+            | Self::GeAscii
+            | Self::LeAscii
+            | Self::Le
+            | Self::Lt
+            | Self::Gt
+            | Self::Ge
+            | Self::Eq
+            | Self::BEq => {
+                // Init.Notation replaces the earlier infix-generated macro
+                // with an expression-tree quotation. The helper kind matters:
+                // it controls coercion propagation and relation elaboration.
+                let (helper, constant) = match self {
+                    Self::BitOr => ("binop", "HOr.hOr"),
+                    Self::BitXor => ("binop", "HXor.hXor"),
+                    Self::BitAnd => ("binop", "HAnd.hAnd"),
+                    Self::Add => ("binop", "HAdd.hAdd"),
+                    Self::Sub => ("binop", "HSub.hSub"),
+                    Self::Mul => ("binop", "HMul.hMul"),
+                    Self::Div => ("binop", "HDiv.hDiv"),
+                    Self::Mod => ("binop", "HMod.hMod"),
+                    Self::Pow => ("rightact", "HPow.hPow"),
+                    Self::Append => ("binop", "HAppend.hAppend"),
+                    Self::Neg => ("unop", "Neg.neg"),
+                    Self::SMul => ("leftact", "HSMul.hSMul"),
+                    Self::GeAscii | Self::Ge => ("binrel", "GE.ge"),
+                    Self::LeAscii | Self::Le => ("binrel", "LE.le"),
+                    Self::Lt => ("binrel", "LT.lt"),
+                    Self::Gt => ("binrel", "GT.gt"),
+                    Self::Eq => ("binrel", "Eq"),
+                    Self::BEq => ("binrel_no_prop", "BEq.beq"),
+                    _ => unreachable!("matched operator quotation"),
+                };
+                let mut function = identifier(constant)?;
+                if self == Self::Eq {
+                    // Like Unit, Eq resolves both as a declaration and as the
+                    // namespace containing its constructors and eliminators.
+                    if let Syntax::Ident { preresolved, .. } = &mut function {
+                        preresolved.push(Preresolved::Namespace { ns: name("Eq") });
+                    }
+                }
+                let mut args = vec![atom(&format!("{helper}%")), function];
+                if self == Self::Neg {
+                    args.push(argument(input, 1));
+                } else {
+                    args.extend([argument(input, 0), argument(input, 2)]);
+                }
+                node(&format!("Lean.Parser.Term.{helper}"), args)
             }
         })
     }

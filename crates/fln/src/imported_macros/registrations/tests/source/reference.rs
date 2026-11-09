@@ -12,14 +12,53 @@ const SEQUENCING_OWNERS: [(&str, &str); 3] = [
     ("term_*>_", "_aux_Init_Notation___macroRules_term_*>__1"),
 ];
 
+const OPERATOR_KINDS: [(&str, &str); 20] = [
+    ("term_|||_", "binop"),
+    ("term_^^^_", "binop"),
+    ("term_&&&_", "binop"),
+    ("term_+_", "binop"),
+    ("term_-_", "binop"),
+    ("term_*_", "binop"),
+    ("term_/_", "binop"),
+    ("term_%_", "binop"),
+    ("term_++_", "binop"),
+    ("term_^_", "rightact"),
+    ("term_•_", "leftact"),
+    ("term-_", "unop"),
+    ("term_>=_", "binrel"),
+    ("term_<=_", "binrel"),
+    ("term_≤_", "binrel"),
+    ("term_<_", "binrel"),
+    ("term_>_", "binrel"),
+    ("term_≥_", "binrel"),
+    ("term_=_", "binrel"),
+    ("term_==_", "binrel_no_prop"),
+];
+
 #[test]
 fn pinned_sequencing_registry_binds_authority_and_serves_recursive_user_macros() {
+    quotation_registry_controls(&SEQUENCING_OWNERS.map(|(kind, owner)| (kind, owner, "app")));
+}
+
+#[test]
+fn pinned_operator_registry_binds_authority_and_serves_recursive_user_macros() {
+    let owners =
+        OPERATOR_KINDS.map(|(kind, _)| format!("_aux_Init_Notation___macroRules_{kind}_2"));
+    let candidates: Vec<_> = OPERATOR_KINDS
+        .iter()
+        .zip(&owners)
+        .map(|(&(kind, helper), owner)| (kind, owner.as_str(), helper))
+        .collect();
+    quotation_registry_controls(&candidates);
+}
+
+fn quotation_registry_controls(candidates: &[(&str, &str, &str)]) {
     let Some(path) = std::env::var_os("FLN_REFERENCE_PARTITION").map(PathBuf::from) else {
         assert!(
             std::env::var_os("FLN_REQUIRE_REFERENCE").is_none(),
-            "sequencing registry requires the verified pinned partition"
+            "quotation registry requires the verified pinned partition"
         );
-        eprintln!("SKIP: sequencing registry requires FLN_REFERENCE_PARTITION");
+        eprintln!("SKIP: quotation registry requires FLN_REFERENCE_PARTITION");
         return;
     };
     let partition =
@@ -27,9 +66,9 @@ fn pinned_sequencing_registry_binds_authority_and_serves_recursive_user_macros()
     // These are constructed ownership records, as in the parent registry
     // tests. They isolate dispatch and authority; actual artifact admission
     // and checked source meaning are covered by the live import cell below.
-    let constants: Vec<_> = SEQUENCING_OWNERS
+    let constants: Vec<_> = candidates
         .iter()
-        .map(|(_, declaration)| owner(declaration))
+        .map(|(_, declaration, _)| owner(declaration))
         .collect();
     let native = checked("Init.Notation", &constants, &[]);
     let client = checked(
@@ -37,7 +76,12 @@ fn pinned_sequencing_registry_binds_authority_and_serves_recursive_user_macros()
         &[owner("SequenceClient.expand")],
         &["Init.Notation"],
     );
-    let rows = journal(&SEQUENCING_OWNERS.map(|(kind, declaration)| (kind, declaration, None)));
+    let rows = journal(
+        &candidates
+            .iter()
+            .map(|&(kind, declaration, _)| (kind, declaration, None))
+            .collect::<Vec<_>>(),
+    );
     let client_rows = journal(&[("sequenceOuter", "SequenceClient.expand", None)]);
     let code = code(vec![
         super::super::recursive::recursive_function_requiring_child("SequenceClient.expand", 0),
@@ -74,17 +118,22 @@ fn pinned_sequencing_registry_binds_authority_and_serves_recursive_user_macros()
             None,
         )
     };
-    for (kind, declaration) in SEQUENCING_OWNERS {
+    for &(kind, declaration, helper) in candidates {
+        let rhs = Syntax::node(
+            name("unexpandedRhs"),
+            vec![Syntax::atom(SourceInfo::None, "right operand")],
+        );
         let child = Syntax::node(
             name(kind),
-            vec![
-                Syntax::atom(SourceInfo::None, "left operand"),
-                Syntax::atom(SourceInfo::None, "operator"),
-                Syntax::node(
-                    name("unexpandedRhs"),
-                    vec![Syntax::atom(SourceInfo::None, "right operand")],
-                ),
-            ],
+            if kind == "term-_" {
+                vec![Syntax::atom(SourceInfo::None, "-"), rhs]
+            } else {
+                vec![
+                    Syntax::atom(SourceInfo::None, "left operand"),
+                    Syntax::atom(SourceInfo::None, "operator"),
+                    rhs,
+                ]
+            },
         );
         let outer = Syntax::node(name("sequenceOuter"), vec![child.clone()]);
         let nested = dispatch(&outer, 17);
@@ -104,7 +153,10 @@ fn pinned_sequencing_registry_binds_authority_and_serves_recursive_user_macros()
             panic!("{direct:?}")
         };
         assert_eq!(syntax, expected);
-        assert_eq!(syntax.kind(), Some(&name("Lean.Parser.Term.app")));
+        assert_eq!(
+            syntax.kind(),
+            Some(&Name::from_components(["Lean", "Parser", "Term", helper]))
+        );
         assert_eq!(state.macro_scope, 19);
         assert_eq!(
             state.expanded_macro_declarations,
@@ -136,7 +188,7 @@ fn pinned_sequencing_registry_binds_authority_and_serves_recursive_user_macros()
     let wrong_module = checked("User.Notation", &constants, &[]);
     let unclassified = VerifiedPartition::user_fixture();
     for (module, classification) in [(&wrong_module, &partition), (&native, &unclassified)] {
-        for (kind, declaration) in SEQUENCING_OWNERS {
+        for &(kind, declaration, _) in candidates {
             let rows = journal(&[(kind, declaration, None)]);
             let refused = RegisteredMacros::prepare(
                 &[MacroRegistrationModule {
@@ -223,6 +275,30 @@ theorem sequenceDirections_value : Eq (some 7 <* some 11 *> some 13) (some 13) :
 theorem sequenceLeft_none : Eq (some 7 <* (none : Option Nat)) none := rfl
 theorem sequenceRight_none : Eq ((none : Option Nat) *> some 7) none := rfl
 theorem sequenceShadow_value : Eq (sequenceShadow Nat 99 (some 7) (some 11)) (some 11) := rfl
+def operatorArithmetic (n : Nat) : Nat := (n + 3) * 5 - 2
+def operatorDivision (n : Nat) : Nat := n / 3 + n % 3
+def operatorPower (n : Nat) : Nat := 2 ^ n
+def operatorBits [HOr Nat Nat Nat] [HXor Nat Nat Nat] [HAnd Nat Nat Nat]
+    (x y : Nat) : Nat := (x ||| y) ^^^ (x &&& y)
+def operatorAppend [HAppend (List Nat) (List Nat) (List Nat)]
+    (xs ys : List Nat) : List Nat := xs ++ ys
+def operatorNegative {α : Type} [Neg α] (x : α) : α := -x
+def operatorScale [HSMul Nat Nat Nat] (n x : Nat) : Nat := n • x
+def operatorEqShadow (Eq : Nat) (x y : Nat) : Prop := x = y
+def operatorBoolean (x y : Nat) : Bool := x == y
+def operatorLess (x y : Nat) : Prop := x < y
+def operatorGreater (x y : Nat) : Prop := x > y
+def operatorLe (x y : Nat) : Prop := x ≤ y
+def operatorGe (x y : Nat) : Prop := x ≥ y
+def operatorLeAscii (x y : Nat) : Prop := x <= y
+def operatorGeAscii (x y : Nat) : Prop := x >= y
+theorem operatorArithmetic_value : operatorArithmetic 7 = 48 := rfl
+theorem operatorDivision_value : operatorDivision 11 = 5 := rfl
+theorem operatorPower_value : operatorPower 3 = 8 := rfl
+theorem operatorBoolean_value : operatorBoolean 7 7 = true := rfl
+theorem operatorEqShadow_value : operatorEqShadow 99 7 7 := rfl
+theorem operatorGreater_direction (x y : Nat) : operatorGreater x y = (y < x) := rfl
+theorem operatorAscii_value (x y : Nat) : operatorLeAscii x y = operatorLe x y := rfl
 "#;
     let header = "module\nprelude\npublic import Init.Data.Option.Basic\npublic section\n@[expose] section\n";
     std::fs::write(dir.join("Sequencing.lean"), format!("{header}{source}")).unwrap();
@@ -245,7 +321,7 @@ theorem sequenceShadow_value : Eq (sequenceShadow Nat 99 (some 7) (some 11)) (so
     .unwrap();
 
     // Import the actual closure and its entire macro journal. Synthetic owners
-    // or a registry filtered down to the three candidates cannot establish the
+    // or a registry filtered down to the new candidates cannot establish the
     // ordinary import-to-source route or its candidate ordering.
     let target = name("Init.Data.Option.Basic");
     let mut pending = vec![target.clone()];
@@ -301,6 +377,16 @@ theorem sequenceShadow_value : Eq (sequenceShadow Nat 99 (some 7) (some 11)) (so
             vec![&name(owner)]
         );
     }
+    for (kind, _) in OPERATOR_KINDS {
+        assert_eq!(
+            registry
+                .declarations(&name(kind))
+                .cloned()
+                .collect::<Vec<_>>(),
+            [2, 1].map(|index| name(&format!("_aux_Init_Notation___macroRules_{kind}_{index}"))),
+            "the complete journal must try the expression-tree rule first: {kind}"
+        );
+    }
     let engine = &imported.engine;
     let before = engine.logical_root(&options);
     let run = |source: &[u8], limits| {
@@ -320,12 +406,12 @@ theorem sequenceShadow_value : Eq (sequenceShadow Nat 99 (some 7) (some 11)) (so
     };
     let report = run(source.as_bytes(), MacroTreeLimits::default());
     let Outcome::Complete(Ok(checked)) = &report.outcome else {
-        panic!("sequencing source: {report:?}; {dir:?}");
+        panic!("notation source: {report:?}; {dir:?}");
     };
     assert!(report.state.is_some());
     assert_eq!(
         (checked.files, checked.commands, checked.theorems),
-        (1, 13, 9)
+        (1, 35, 16)
     );
     for (_, owner) in SEQUENCING_OWNERS {
         assert!(report.attempts.iter().any(|attempt| {
@@ -337,14 +423,54 @@ theorem sequenceShadow_value : Eq (sequenceShadow Nat 99 (some 7) (some 11)) (so
                 && attempt.reference_functions.is_empty()
         }));
     }
+    // ASCII relation spellings can parse to the canonical Unicode syntax
+    // kinds. Their legacy kinds are covered separately by recursive dispatch.
+    for (kind, _) in OPERATOR_KINDS {
+        if matches!(kind, "term_<=_" | "term_>=_") {
+            continue;
+        }
+        let owner = format!("_aux_Init_Notation___macroRules_{kind}_2");
+        assert!(
+            report.attempts.iter().any(|attempt| {
+                attempt.declaration == name(&owner)
+                    && attempt
+                        .native_functions
+                        .iter()
+                        .any(|id| id == &format!("mirror:{owner}"))
+                    && attempt.reference_functions.is_empty()
+            }),
+            "native operator was not exercised: {kind}"
+        );
+    }
+    assert!(!report.attempts.iter().any(|attempt| {
+        OPERATOR_KINDS.iter().any(|(kind, _)| {
+            attempt.declaration == name(&format!("_aux_Init_Notation___macroRules_{kind}_1"))
+        })
+    }));
     // Compare the actual checked functions to the pin's emitted terms. This
-    // includes the Unit thunk's type and both operands beneath local binders;
-    // merely checking the resulting Option values would miss capture defects.
+    // includes the Unit thunk's type, each operator's chosen typeclass method,
+    // and operands beneath local binders. Result values alone would miss
+    // capture defects and operators with deliberately local instances.
     for label in [
         "sequenceFunction",
         "sequenceLeft",
         "sequenceRight",
         "sequenceShadow",
+        "operatorArithmetic",
+        "operatorDivision",
+        "operatorPower",
+        "operatorBits",
+        "operatorAppend",
+        "operatorNegative",
+        "operatorScale",
+        "operatorEqShadow",
+        "operatorBoolean",
+        "operatorLess",
+        "operatorGreater",
+        "operatorLe",
+        "operatorGe",
+        "operatorLeAscii",
+        "operatorGeAscii",
     ] {
         let Some(ConstantInfo::Defn(actual)) = checked.engine.environment().find(&name(label))
         else {
@@ -386,6 +512,14 @@ theorem sequenceShadow_value : Eq (sequenceShadow Nat 99 (some 7) (some 11)) (so
         (
             "wrongResult",
             "theorem wrongResult : Eq (some 7 *> some 11) (some 7) := rfl",
+        ),
+        (
+            "wrongOperatorType",
+            "def wrongOperatorType : Nat := 1 + true",
+        ),
+        (
+            "wrongOperatorValue",
+            "theorem wrongOperatorValue : 2 + 3 * 4 = 20 := rfl",
         ),
     ] {
         let rejected_source = format!("{source}\n{suffix}\n");

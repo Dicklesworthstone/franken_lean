@@ -571,6 +571,10 @@ fn native_control_macros_preserve_refusals_limits_and_recovery() {
         .chain(SEQUENCING_CANDIDATES.into_iter().map(|candidate| {
             let input = sequencing_inputs(candidate).swap_remove(3);
             (candidate, input)
+        }))
+        .chain(OPERATOR_CANDIDATES.into_iter().map(|candidate| {
+            let input = operator_inputs(candidate).swap_remove(3);
+            (candidate, input)
         }));
     for (candidate, input) in candidates {
         let baseline = expanded_control(candidate, &input);
@@ -1307,17 +1311,21 @@ fn native_sequencing_quotes_an_explicit_unit_thunk_with_hygienic_constants() {
     }
 }
 
-#[test]
-fn live_pinned_sequencing_candidates_match_complete_quotations_and_state() {
+fn check_pinned_notation_candidates(
+    candidates: &[NativeTacticMacro],
+    inputs: fn(NativeTacticMacro) -> Vec<Syntax>,
+    label: &str,
+    oracle: &str,
+) {
     use std::path::PathBuf;
     use std::process::Command;
 
     let Some(reference) = std::env::var_os("FLN_REFERENCE_LEAN").map(PathBuf::from) else {
         assert!(
             std::env::var_os("FLN_REQUIRE_REFERENCE").is_none(),
-            "pinned Reference required for native sequencing macro comparison"
+            "pinned Reference required for native {label} macro comparison"
         );
-        eprintln!("SKIP: native sequencing quotations require FLN_REFERENCE_LEAN");
+        eprintln!("SKIP: native {label} quotations require FLN_REFERENCE_LEAN");
         return;
     };
     let version = Command::new(&reference)
@@ -1337,7 +1345,7 @@ fn live_pinned_sequencing_candidates_match_complete_quotations_and_state() {
     let partition =
         VerifiedPartition::from_pinned_tsv(&std::fs::read_to_string(partition_path).unwrap())
             .unwrap();
-    for candidate in SEQUENCING_CANDIDATES {
+    for &candidate in candidates {
         assert_eq!(
             NativeTacticMacro::identify(
                 &name(candidate.module()),
@@ -1363,48 +1371,23 @@ fn live_pinned_sequencing_candidates_match_complete_quotations_and_state() {
                 None
             );
         }
+        if let Some(prefix) = candidate.declaration().strip_suffix('2') {
+            assert_eq!(
+                NativeTacticMacro::identify(
+                    &name(candidate.module()),
+                    &name(&format!("{prefix}1")),
+                    &partition,
+                ),
+                None,
+                "the earlier infix registration is a different quotation"
+            );
+        }
     }
     // Reuse the lossless wire and capture fixtures, but execute the actual
     // pinned Init.Notation registrations rather than a restated quotation.
     let helpers = include_str!("../../../../fln-olean/fixtures/NativeControlMacros.lean")
         .strip_suffix("#eval runControlMacros\n")
         .unwrap();
-    let oracle = r#"
-meta def sequencingCandidates : List (Macro × Name) :=
-  [(«_aux_Init_Notation___macroRules_term_<*>__1», `«term_<*>_»),
-   («_aux_Init_Notation___macroRules_term_<*__1», `«term_<*_»),
-   («_aux_Init_Notation___macroRules_term_*>__1», `«term_*>_»)]
-
-meta def sequencingInputs (kind : Name) : List Syntax :=
-  let wrong := Syntax.atom .none "wrong"
-  let extra := Syntax.atom .none "extra"
-  let right := Syntax.node .none `Client.right #[controlBody, .atom .none "right"]
-  [.node .none kind #[],
-   .node .none kind #[wrong],
-   .node .none kind #[controlBody, wrong],
-   .node .none kind #[controlBody, wrong, right],
-   .node .none kind #[.missing, wrong, right, extra],
-   .node .none kind #[controlBody, .missing, right, extra]]
-
-meta def runSequencingMacros : IO Unit := do
-  let state : Macro.State := ⟨9, [(`Trace, "keep")], [`Prior]⟩
-  for (macroFn, kind) in sequencingCandidates do
-    for context in controlContexts do
-      for reference in controlReferences do
-        for input in sequencingInputs kind do
-          match macroFn input { context with ref := reference } state with
-          | .ok stx next =>
-            IO.println ("ok:" ++ controlSyntax stx ++ s!":{controlStateExact next}")
-          | .error _ _ => IO.println "unexpected-error"
-    for input in [Syntax.missing, .atom .none "wrong", .node .none `User.term #[],
-      .node .none (`Lean.Parser.Term ++ kind) #[]] do
-      match macroFn input ⟨default, `Client.Scope, 17, 3, 512, .missing⟩ state with
-      | .error .unsupportedSyntax next =>
-        IO.println s!"unsupported:{controlStateExact next}"
-      | _ => IO.println "unexpected-result"
-
-#eval runSequencingMacros
-"#;
     let root = std::env::var_os("FLN_IR_REFERENCE_ARTIFACTS")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
@@ -1412,16 +1395,16 @@ meta def runSequencingMacros : IO Unit := do
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let dir = root.join(format!("native-sequencing-{}-{unique}", std::process::id()));
+    let dir = root.join(format!("native-{label}-{}-{unique}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
-        dir.join("NativeSequencingMacros.lean"),
+        dir.join("NativeNotationMacros.lean"),
         format!("{helpers}\n{oracle}"),
     )
     .unwrap();
     let result = Command::new(&reference)
         .current_dir(&dir)
-        .args(["-j1", "NativeSequencingMacros.lean"])
+        .args(["-j1", "NativeNotationMacros.lean"])
         .output()
         .unwrap();
     std::fs::write(dir.join("oracle.stdout"), &result.stdout).unwrap();
@@ -1435,11 +1418,11 @@ meta def runSequencingMacros : IO Unit := do
     let mut native = String::new();
     let mut expanded = 0;
     let mut unsupported = 0;
-    for candidate in SEQUENCING_CANDIDATES {
+    for &candidate in candidates {
         let mut cases = Vec::new();
         for context in contexts() {
             for (reference, _) in references() {
-                for input in sequencing_inputs(candidate) {
+                for input in inputs(candidate) {
                     cases.push((input, context.clone(), reference.clone()));
                 }
             }
@@ -1486,9 +1469,195 @@ meta def runSequencingMacros : IO Unit := do
             }
         }
     }
-    assert_eq!((expanded, unsupported), (144, 12));
+    assert_eq!(
+        (expanded, unsupported),
+        (48 * candidates.len(), 4 * candidates.len())
+    );
     std::fs::write(dir.join("native.stdout"), &native).unwrap();
     assert_eq!(String::from_utf8(result.stdout).unwrap(), native, "{dir:?}");
     assert!(result.stderr.is_empty());
-    eprintln!("native and pinned sequencing macros: 144 exact quotations, 12 unsupported inputs");
+    eprintln!(
+        "native and pinned {label} macros: {expanded} exact quotations, {unsupported} unsupported inputs"
+    );
 }
+
+#[test]
+fn live_pinned_sequencing_candidates_match_complete_quotations_and_state() {
+    let oracle = r#"
+meta def notationCandidates : List (Macro × Name) :=
+  [(«_aux_Init_Notation___macroRules_term_<*>__1», `«term_<*>_»),
+   («_aux_Init_Notation___macroRules_term_<*__1», `«term_<*_»),
+   («_aux_Init_Notation___macroRules_term_*>__1», `«term_*>_»)]
+"#;
+    check_pinned_notation_candidates(
+        &SEQUENCING_CANDIDATES,
+        sequencing_inputs,
+        "sequencing",
+        &format!("{oracle}{NOTATION_ORACLE_INPUTS}"),
+    );
+}
+
+const OPERATOR_CANDIDATES: [NativeTacticMacro; 20] = [
+    NativeTacticMacro::BitOr,
+    NativeTacticMacro::BitXor,
+    NativeTacticMacro::BitAnd,
+    NativeTacticMacro::Add,
+    NativeTacticMacro::Sub,
+    NativeTacticMacro::Mul,
+    NativeTacticMacro::Div,
+    NativeTacticMacro::Mod,
+    NativeTacticMacro::Pow,
+    NativeTacticMacro::Append,
+    NativeTacticMacro::Neg,
+    NativeTacticMacro::SMul,
+    NativeTacticMacro::GeAscii,
+    NativeTacticMacro::LeAscii,
+    NativeTacticMacro::Le,
+    NativeTacticMacro::Lt,
+    NativeTacticMacro::Gt,
+    NativeTacticMacro::Ge,
+    NativeTacticMacro::Eq,
+    NativeTacticMacro::BEq,
+];
+
+fn operator_inputs(candidate: NativeTacticMacro) -> Vec<Syntax> {
+    if candidate != NativeTacticMacro::Neg {
+        return sequencing_inputs(candidate);
+    }
+    let kind = candidate.input_kind();
+    let wrong = || atom(SourceInfo::None, "wrong");
+    let extra = || atom(SourceInfo::None, "extra");
+    vec![
+        node(kind, vec![]),
+        node(kind, vec![wrong()]),
+        node(kind, vec![wrong(), control_body()]),
+        node(
+            kind,
+            vec![
+                Syntax::Missing,
+                node(
+                    "Client.right",
+                    vec![control_body(), atom(SourceInfo::None, "right")],
+                ),
+            ],
+        ),
+        node(kind, vec![wrong(), control_body(), extra()]),
+        node(kind, vec![extra(), Syntax::Missing, control_body()]),
+    ]
+}
+
+#[test]
+fn native_operator_quotes_keep_coercion_helpers_and_capture_positions() {
+    for (candidate, helper) in [
+        (NativeTacticMacro::Add, "binop"),
+        (NativeTacticMacro::Pow, "rightact"),
+        (NativeTacticMacro::SMul, "leftact"),
+        (NativeTacticMacro::Neg, "unop"),
+        (NativeTacticMacro::Eq, "binrel"),
+        (NativeTacticMacro::BEq, "binrel_no_prop"),
+    ] {
+        let input = operator_inputs(candidate).swap_remove(3);
+        let Syntax::Node { args: captures, .. } = &input else {
+            unreachable!();
+        };
+        let syntax = expanded_control(candidate, &input);
+        let Syntax::Node { kind, args, .. } = &syntax else {
+            panic!("operator quotation is not a node: {syntax:?}");
+        };
+        assert_eq!(*kind, Name::str(name("Lean.Parser.Term"), helper));
+        assert_eq!(args[0], atom(SourceInfo::None, &format!("{helper}%")));
+        if candidate == NativeTacticMacro::Neg {
+            assert_eq!(&args[2..], &[captures[1].clone()]);
+        } else {
+            assert_eq!(&args[2..], &[captures[0].clone(), captures[2].clone()]);
+        }
+        if candidate == NativeTacticMacro::Eq {
+            let Syntax::Ident { preresolved, .. } = &args[1] else {
+                panic!("relation quotation lost its resolved Eq: {syntax:?}");
+            };
+            assert_eq!(
+                preresolved,
+                &[
+                    Preresolved::Decl {
+                        name: name("Eq"),
+                        fields: Vec::new()
+                    },
+                    Preresolved::Namespace { ns: name("Eq") },
+                ]
+            );
+        }
+    }
+}
+
+#[test]
+fn live_pinned_operator_candidates_match_complete_quotations_and_state() {
+    let oracle = r#"
+meta def notationCandidates : List (Macro × Name) :=
+  [(«_aux_Init_Notation___macroRules_term_|||__2», `«term_|||_»),
+   («_aux_Init_Notation___macroRules_term_^^^__2», `«term_^^^_»),
+   («_aux_Init_Notation___macroRules_term_&&&__2», `«term_&&&_»),
+   («_aux_Init_Notation___macroRules_term_+__2», `«term_+_»),
+   («_aux_Init_Notation___macroRules_term_-__2», `«term_-_»),
+   («_aux_Init_Notation___macroRules_term_*__2», `«term_*_»),
+   («_aux_Init_Notation___macroRules_term_/__2», `«term_/_»),
+   («_aux_Init_Notation___macroRules_term_%__2», `«term_%_»),
+   («_aux_Init_Notation___macroRules_term_^__2», `«term_^_»),
+   («_aux_Init_Notation___macroRules_term_++__2», `«term_++_»),
+   («_aux_Init_Notation___macroRules_term-__2», `«term-_»),
+   («_aux_Init_Notation___macroRules_term_•__2», `«term_•_»),
+   («_aux_Init_Notation___macroRules_term_>=__2», `«term_>=_»),
+   («_aux_Init_Notation___macroRules_term_<=__2», `«term_<=_»),
+   («_aux_Init_Notation___macroRules_term_≤__2», `«term_≤_»),
+   («_aux_Init_Notation___macroRules_term_<__2», `«term_<_»),
+   («_aux_Init_Notation___macroRules_term_>__2», `«term_>_»),
+   («_aux_Init_Notation___macroRules_term_≥__2», `«term_≥_»),
+   («_aux_Init_Notation___macroRules_term_=__2», `«term_=_»),
+   («_aux_Init_Notation___macroRules_term_==__2», `«term_==_»)]
+"#;
+    check_pinned_notation_candidates(
+        &OPERATOR_CANDIDATES,
+        operator_inputs,
+        "operators",
+        &format!("{oracle}{NOTATION_ORACLE_INPUTS}"),
+    );
+}
+
+const NOTATION_ORACLE_INPUTS: &str = r#"
+meta def notationInputs (kind : Name) : List Syntax :=
+  let wrong := Syntax.atom .none "wrong"
+  let extra := Syntax.atom .none "extra"
+  let right := Syntax.node .none `Client.right #[controlBody, .atom .none "right"]
+  if kind == `«term-_» then
+    [.node .none kind #[],
+     .node .none kind #[wrong],
+     .node .none kind #[wrong, controlBody],
+     .node .none kind #[.missing, right],
+     .node .none kind #[wrong, controlBody, extra],
+     .node .none kind #[extra, .missing, controlBody]]
+  else
+    [.node .none kind #[],
+     .node .none kind #[wrong],
+     .node .none kind #[controlBody, wrong],
+     .node .none kind #[controlBody, wrong, right],
+     .node .none kind #[.missing, wrong, right, extra],
+     .node .none kind #[controlBody, .missing, right, extra]]
+
+meta def runNotationMacros : IO Unit := do
+  let state : Macro.State := ⟨9, [(`Trace, "keep")], [`Prior]⟩
+  for (macroFn, kind) in notationCandidates do
+    for context in controlContexts do
+      for reference in controlReferences do
+        for input in notationInputs kind do
+          match macroFn input { context with ref := reference } state with
+          | .ok stx next =>
+            IO.println ("ok:" ++ controlSyntax stx ++ s!":{controlStateExact next}")
+          | .error _ _ => IO.println "unexpected-error"
+    for input in [Syntax.missing, .atom .none "wrong", .node .none `User.term #[],
+      .node .none (`Lean.Parser.Term ++ kind) #[]] do
+      match macroFn input ⟨default, `Client.Scope, 17, 3, 512, .missing⟩ state with
+      | .error .unsupportedSyntax next =>
+        IO.println s!"unsupported:{controlStateExact next}"
+      | _ => IO.println "unexpected-result"
+
+#eval runNotationMacros
+"#;
