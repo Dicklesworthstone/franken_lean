@@ -5,6 +5,7 @@ use super::{IntrinsicFailure, IntrinsicResult, Obj, VmRefusal, expect_arity, nat
 use crate::macro_native::{MacroLookup, MacroLookupError};
 use fln_core::name::{LeafView, Name};
 use fln_rt::convert::{Conversion, ConvertError, inject_name};
+use fln_rt::macro_expansion_abi_generated as expansion_layout;
 use fln_rt::syntax_abi_generated as layout;
 
 const MAX_NAME_NODES: u64 = 1_000_000;
@@ -29,6 +30,10 @@ pub(super) enum Intrinsic {
     GetAtomVal,
     SetAtomVal,
     GetHeadInfo,
+    SourceInfoGetPos,
+    SourceInfoGetTailPos,
+    GetPos,
+    GetTailPos,
     SetInfo,
     IsMissing,
     IsIdent,
@@ -59,6 +64,10 @@ impl Intrinsic {
             "mirror:Lean.Syntax.getAtomVal" => Self::GetAtomVal,
             "mirror:Lean.Syntax.setAtomVal" => Self::SetAtomVal,
             "mirror:Lean.Syntax.getHeadInfo" => Self::GetHeadInfo,
+            "mirror:Lean.SourceInfo.getPos?" => Self::SourceInfoGetPos,
+            "mirror:Lean.SourceInfo.getTailPos?" => Self::SourceInfoGetTailPos,
+            "mirror:Lean.Syntax.getPos?" => Self::GetPos,
+            "mirror:Lean.Syntax.getTailPos?" => Self::GetTailPos,
             "mirror:Lean.Syntax.setInfo" => Self::SetInfo,
             "mirror:Lean.Syntax.isMissing" => Self::IsMissing,
             "mirror:Lean.Syntax.isIdent" => Self::IsIdent,
@@ -97,6 +106,10 @@ impl Intrinsic {
                 | Self::SetArgs
                 | Self::SetAtomVal
                 | Self::SetInfo
+                | Self::SourceInfoGetPos
+                | Self::SourceInfoGetTailPos
+                | Self::GetPos
+                | Self::GetTailPos
                 | Self::GetCurrNamespace => 2,
                 Self::AddMacroScope
                 | Self::MacroAddMacroScope
@@ -317,6 +330,41 @@ impl Intrinsic {
                 Ok(IntrinsicResult::raw_object(value))
             }
             Self::GetHeadInfo => Ok(IntrinsicResult::raw_object(get_head_info(&args[0])?)),
+            Self::SourceInfoGetPos
+            | Self::SourceInfoGetTailPos
+            | Self::GetPos
+            | Self::GetTailPos => {
+                let operation = match self {
+                    Self::SourceInfoGetPos => "Lean.SourceInfo.getPos?",
+                    Self::SourceInfoGetTailPos => "Lean.SourceInfo.getTailPos?",
+                    Self::GetPos => "Lean.Syntax.getPos?",
+                    Self::GetTailPos => "Lean.Syntax.getTailPos?",
+                    _ => unreachable!(),
+                };
+                let canonical_only = super::bool_value(&args[1], operation, 1)?;
+                let position = if self == Self::GetTailPos {
+                    get_tail_pos(&args[0], canonical_only)?
+                } else {
+                    let info = if self == Self::GetPos {
+                        get_head_info(&args[0])?
+                    } else {
+                        args[0].clone_ref()
+                    };
+                    source_position(
+                        &info,
+                        canonical_only,
+                        self == Self::SourceInfoGetTailPos,
+                        operation,
+                    )?
+                };
+                let value = match position {
+                    Some(position) => {
+                        Obj::mk_ctor(expansion_layout::OPTION_SOME.tag, vec![position], &[])
+                    }
+                    None => Obj::mk_nat(expansion_layout::OPTION_NONE_TAG),
+                };
+                Ok(IntrinsicResult::raw_object(value))
+            }
             Self::SetInfo => {
                 // The pin's telescope takes SourceInfo before Syntax.
                 let kind = syntax_kind(&args[1])?;
@@ -606,6 +654,93 @@ fn get_head_info(value: &Obj) -> Result<Obj, IntrinsicFailure> {
         current = children.array_child(index);
         if index + 1 < size {
             pending.push((children, index + 1, size));
+        }
+    }
+}
+
+/// Project the selected Nat without truncating it to a host byte offset. These
+/// pure Mirror methods can inspect positions outside the caller's source file;
+/// conversion of a returned Syntax tree owns the source-boundary checks.
+fn source_position(
+    info: &Obj,
+    canonical_only: bool,
+    tail: bool,
+    operation: &'static str,
+) -> Result<Option<Obj>, IntrinsicFailure> {
+    if source_info(info)? {
+        return Ok(None);
+    }
+    let field = if info.obj_tag() == usize::from(layout::SOURCE_ORIGINAL.tag) {
+        if tail {
+            layout::SOURCE_ORIGINAL_TAIL_POS_FIELD
+        } else {
+            layout::SOURCE_ORIGINAL_POS_FIELD
+        }
+    } else {
+        let offset = layout::SOURCE_SYNTHETIC_CANONICAL_OBJECT_FIELDS
+            * std::mem::size_of::<usize>()
+            + layout::SOURCE_SYNTHETIC_CANONICAL_BYTE_OFFSET;
+        let flag = info
+            .try_ctor_scalar_u32(offset)
+            .ok_or(VmRefusal::InvalidCtorObject)?
+            .to_ne_bytes()[0];
+        let canonical = match flag {
+            0 => false,
+            1 => true,
+            _ => return Err(VmRefusal::InvalidCtorObject.into()),
+        };
+        if canonical_only && !canonical {
+            return Ok(None);
+        }
+        if tail {
+            layout::SOURCE_SYNTHETIC_TAIL_POS_FIELD
+        } else {
+            layout::SOURCE_SYNTHETIC_POS_FIELD
+        }
+    };
+    let position = child(info, field)?;
+    super::with_nat_view(&position, operation, 0, |_| ())?;
+    Ok(Some(position))
+}
+
+fn get_tail_pos(value: &Obj, canonical_only: bool) -> Result<Option<Obj>, IntrinsicFailure> {
+    let mut current = value.clone_ref();
+    let mut pending = Vec::new();
+    let mut visited = 0u64;
+    loop {
+        visited += 1;
+        limit("syntax tail-position nodes", MAX_SYNTAX_NODES, visited)?;
+        let kind = syntax_kind(&current)?;
+        if !matches!(kind, SyntaxKind::Missing) {
+            let info = child(&current, 0)?;
+            if let Some(position) =
+                source_position(&info, canonical_only, true, "Lean.Syntax.getTailPos?")?
+            {
+                return Ok(Some(position));
+            }
+            if matches!(kind, SyntaxKind::Node) {
+                let children = child(&current, 2)?;
+                let (size, _) = children
+                    .try_array_view()
+                    .ok_or(VmRefusal::InvalidArrayObject)?;
+                if size != 0 {
+                    current = children.array_child(size - 1);
+                    if size > 1 {
+                        pending.push((children, size - 1));
+                    }
+                    continue;
+                }
+            }
+        }
+        // Unlike getPos?, this scans past unpositioned tokens and filtered
+        // synthetic nodes. Keep one sibling cursor per ancestor, in reverse
+        // order, to avoid host recursion and copying wide child arrays.
+        let Some((children, remaining)) = pending.pop() else {
+            return Ok(None);
+        };
+        current = children.array_child(remaining - 1);
+        if remaining > 1 {
+            pending.push((children, remaining - 1));
         }
     }
 }

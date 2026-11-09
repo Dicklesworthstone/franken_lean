@@ -115,8 +115,11 @@ impl MirrorRow {
     pub fn argument_ownership(&self) -> Vec<ArgumentOwnership> {
         self.borrowed
             .iter()
-            .map(|borrowed| {
-                if *borrowed {
+            .zip(self.parameters)
+            .map(|(borrowed, parameter)| {
+                if *parameter == "u8" {
+                    ArgumentOwnership::Scalar
+                } else if *borrowed {
                     ArgumentOwnership::Borrowed
                 } else {
                     ArgumentOwnership::Owned
@@ -248,6 +251,34 @@ pub const ROWS: &[MirrorRow] = &[
         borrowed: generated::SYNTAX_GET_HEAD_INFO_BORROWED,
         parameters: generated::SYNTAX_GET_HEAD_INFO_PARAMETERS,
         result_type: generated::SYNTAX_GET_HEAD_INFO_RESULT,
+    },
+    MirrorRow {
+        id: "mirror:Lean.SourceInfo.getPos?",
+        name: "Lean.SourceInfo.getPos?",
+        borrowed: generated::SOURCE_INFO_GET_POS_BORROWED,
+        parameters: generated::SOURCE_INFO_GET_POS_PARAMETERS,
+        result_type: generated::SOURCE_INFO_GET_POS_RESULT,
+    },
+    MirrorRow {
+        id: "mirror:Lean.SourceInfo.getTailPos?",
+        name: "Lean.SourceInfo.getTailPos?",
+        borrowed: generated::SOURCE_INFO_GET_TAIL_POS_BORROWED,
+        parameters: generated::SOURCE_INFO_GET_TAIL_POS_PARAMETERS,
+        result_type: generated::SOURCE_INFO_GET_TAIL_POS_RESULT,
+    },
+    MirrorRow {
+        id: "mirror:Lean.Syntax.getPos?",
+        name: "Lean.Syntax.getPos?",
+        borrowed: generated::SYNTAX_GET_POS_BORROWED,
+        parameters: generated::SYNTAX_GET_POS_PARAMETERS,
+        result_type: generated::SYNTAX_GET_POS_RESULT,
+    },
+    MirrorRow {
+        id: "mirror:Lean.Syntax.getTailPos?",
+        name: "Lean.Syntax.getTailPos?",
+        borrowed: generated::SYNTAX_GET_TAIL_POS_BORROWED,
+        parameters: generated::SYNTAX_GET_TAIL_POS_PARAMETERS,
+        result_type: generated::SYNTAX_GET_TAIL_POS_RESULT,
     },
     MirrorRow {
         id: "mirror:Lean.Syntax.setInfo",

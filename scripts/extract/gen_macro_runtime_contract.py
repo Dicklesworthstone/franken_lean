@@ -56,6 +56,10 @@ FUNCTIONS = {
     "SYNTAX_GET_ATOM_VAL": "syntaxGetAtomVal",
     "SYNTAX_SET_ATOM_VAL": "syntaxSetAtomVal",
     "SYNTAX_GET_HEAD_INFO": "syntaxGetHeadInfo",
+    "SOURCE_INFO_GET_POS": "sourceInfoGetPos",
+    "SOURCE_INFO_GET_TAIL_POS": "sourceInfoGetTailPos",
+    "SYNTAX_GET_POS": "syntaxGetPos",
+    "SYNTAX_GET_TAIL_POS": "syntaxGetTailPos",
     "SYNTAX_SET_INFO": "syntaxSetInfo",
     "SYNTAX_IS_MISSING": "syntaxIsMissing",
     "SYNTAX_IS_IDENT": "syntaxIsIdent",
@@ -134,6 +138,53 @@ def generate(lean):
         ])
     for constant, tag in scalars.items():
         lines.append(f"pub const {constant}: usize = {tag};")
+    # Derive positional fields from the pin's compiled pattern projections.
+    # SourceInfo positions are erased Nat values, not host-width integers.
+    for function, constant, constructor in [
+        ("sourceOriginalPos", "SOURCE_ORIGINAL_POS_FIELD", "SOURCE_ORIGINAL"),
+        ("sourceOriginalTailPos", "SOURCE_ORIGINAL_TAIL_POS_FIELD", "SOURCE_ORIGINAL"),
+        ("sourceSyntheticPos", "SOURCE_SYNTHETIC_POS_FIELD", "SOURCE_SYNTHETIC"),
+        ("sourceSyntheticTailPos", "SOURCE_SYNTHETIC_TAIL_POS_FIELD", "SOURCE_SYNTHETIC"),
+    ]:
+        getter = re.search(
+            rf"(?m)^    def FrankenLean\.MacroLayout\.{function} \((x_\d+) : @& tobj\) : tobj :=\n"
+            r"(.*?)(?=^    def |^\[|\Z)", trace, re.S,
+        )
+        if getter is None:
+            raise ValueError(f"missing SourceInfo getter: {function}")
+        projection = re.fullmatch(
+            rf"\s*case {re.escape(getter[1])} : tobj of\s*"
+            rf"{re.escape(CONSTRUCTORS[constructor])} →\s*"
+            rf"let (x_\d+) : tobj := proj\[(\d+)\] {re.escape(getter[1])};\s*inc \1;\s*ret \1\s*"
+            r"default →\s*let (x_\d+) : tagged := 0;\s*ret \3\s*", getter[2],
+        )
+        if projection is None:
+            raise ValueError(f"SourceInfo getter is not the reviewed projection: {function}")
+        field = int(projection[2])
+        if field >= layouts[CONSTRUCTORS[constructor]][1]:
+            raise ValueError(f"SourceInfo getter is outside the extracted layout: {function}")
+        lines.extend(["", f"pub const {constant}: usize = {field};"])
+    canonical = re.search(
+        r"(?m)^    def FrankenLean\.MacroLayout\.sourceSyntheticCanonical \((x_\d+) : @& tobj\) : u8 :=\n"
+        r"(.*?)(?=^    def |^\[|\Z)", trace, re.S,
+    )
+    if canonical is None:
+        raise ValueError("missing SourceInfo canonical getter")
+    projection = re.fullmatch(
+        rf"\s*case {re.escape(canonical[1])} : tobj of\s*Lean\.SourceInfo\.synthetic →\s*"
+        rf"let (x_\d+) : u8 := sproj\[(\d+), (\d+)\] {re.escape(canonical[1])};\s*ret \1\s*"
+        r"default →\s*let (x_\d+) : u8 := 0;\s*ret \4\s*", canonical[2],
+    )
+    if projection is None:
+        raise ValueError("SourceInfo canonical getter is not the reviewed scalar projection")
+    objects, offset = int(projection[2]), int(projection[3])
+    _, fields, scalar_bytes = layouts[CONSTRUCTORS["SOURCE_SYNTHETIC"]]
+    if objects != fields or offset >= scalar_bytes:
+        raise ValueError("SourceInfo canonical flag is outside the extracted layout")
+    lines.extend([
+        "", f"pub const SOURCE_SYNTHETIC_CANONICAL_OBJECT_FIELDS: usize = {objects};",
+        f"pub const SOURCE_SYNTHETIC_CANONICAL_BYTE_OFFSET: usize = {offset};",
+    ])
     # The confinement boundary must not hand-copy the opaque field's offset.
     # Require the exact getter emitted by the pin, not an arbitrary projection
     # elsewhere in the trace or a fallback to a remembered source field order.

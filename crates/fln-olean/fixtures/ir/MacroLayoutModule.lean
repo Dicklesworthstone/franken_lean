@@ -15,6 +15,31 @@ def sourceSynthetic (pos endPos : Nat) (canonical : Bool) : Lean.SourceInfo :=
 
 def sourceNone (_ : Unit) : Lean.SourceInfo := .none
 
+@[noinline] def sourceOriginalPos (value : @& Lean.SourceInfo) : Nat :=
+  match value with
+  | .original _ pos _ _ => pos.byteIdx
+  | _ => 0
+
+@[noinline] def sourceOriginalTailPos (value : @& Lean.SourceInfo) : Nat :=
+  match value with
+  | .original _ _ _ endPos => endPos.byteIdx
+  | _ => 0
+
+@[noinline] def sourceSyntheticPos (value : @& Lean.SourceInfo) : Nat :=
+  match value with
+  | .synthetic pos _ _ => pos.byteIdx
+  | _ => 0
+
+@[noinline] def sourceSyntheticTailPos (value : @& Lean.SourceInfo) : Nat :=
+  match value with
+  | .synthetic _ endPos _ => endPos.byteIdx
+  | _ => 0
+
+@[noinline] def sourceSyntheticCanonical (value : @& Lean.SourceInfo) : Bool :=
+  match value with
+  | .synthetic _ _ canonical => canonical
+  | _ => false
+
 def syntaxMissing (_ : Unit) : Lean.Syntax := .missing
 
 def syntaxNode (info : Lean.SourceInfo) (kind : Lean.Name)
@@ -123,6 +148,18 @@ def optionNone (_ : Unit) : Option Lean.Syntax := none
   value.setAtomVal text
 
 @[noinline] def syntaxGetHeadInfo (value : Lean.Syntax) : Lean.SourceInfo := value.getHeadInfo
+
+@[noinline] def sourceInfoGetPos (value : @& Lean.SourceInfo) (canonicalOnly : Bool) :
+    Option String.Pos.Raw := value.getPos? canonicalOnly
+
+@[noinline] def sourceInfoGetTailPos (value : @& Lean.SourceInfo) (canonicalOnly : Bool) :
+    Option String.Pos.Raw := value.getTailPos? canonicalOnly
+
+@[noinline] def syntaxGetPos (value : @& Lean.Syntax) (canonicalOnly : Bool) :
+    Option String.Pos.Raw := value.getPos? canonicalOnly
+
+@[noinline] def syntaxGetTailPos (value : @& Lean.Syntax) (canonicalOnly : Bool) :
+    Option String.Pos.Raw := value.getTailPos? canonicalOnly
 
 @[noinline] def syntaxSetInfo (info : Lean.SourceInfo) (value : Lean.Syntax) : Lean.Syntax :=
   value.setInfo info

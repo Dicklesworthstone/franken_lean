@@ -427,6 +427,146 @@ fn live_pinned_macro_runs_native_syntax_methods_and_matches_complete_subtrees() 
         );
     }
 
+    let positions = prepare(&name("syntaxPositionsMacro"));
+    let canonical_positions = prepare(&name("canonicalSyntaxPositionsMacro"));
+    let info_positions = prepare(&name("infoPositionsMacro"));
+    let canonical_info_positions = prepare(&name("canonicalInfoPositionsMacro"));
+    let noncanonical = SourceInfo::Synthetic {
+        pos: BytePos(0),
+        end_pos: BytePos(4),
+        canonical: false,
+    };
+    let no_info = Syntax::atom(SourceInfo::None, "none");
+    let filtered_node = Syntax::Node {
+        info: noncanonical,
+        kind: name("outer"),
+        args: vec![leaf()],
+    };
+    let position_output = |start: Option<usize>, end: Option<usize>| {
+        let atom = |position: Option<usize>, label| {
+            position.map_or(Syntax::Missing, |position| {
+                Syntax::atom(
+                    SourceInfo::Synthetic {
+                        pos: BytePos(position),
+                        end_pos: BytePos(position),
+                        canonical: true,
+                    },
+                    label,
+                )
+            })
+        };
+        Syntax::node(
+            name("positions"),
+            vec![atom(start, "start"), atom(end, "end")],
+        )
+    };
+    let state = MacroState {
+        macro_scope: 23,
+        trace_messages: vec![(name("Positions"), "preserved".into())],
+        expanded_macro_declarations: vec![name("Earlier.macro")],
+    };
+    for (input, all, canonical, info, canonical_info) in [
+        (
+            leaf(),
+            (Some(1), Some(3)),
+            (Some(1), Some(3)),
+            (Some(1), Some(3)),
+            (Some(1), Some(3)),
+        ),
+        (
+            Syntax::Missing,
+            (None, None),
+            (None, None),
+            (None, None),
+            (None, None),
+        ),
+        (
+            Syntax::atom(noncanonical, "synthetic"),
+            (Some(0), Some(4)),
+            (None, None),
+            (Some(0), Some(4)),
+            (None, None),
+        ),
+        (
+            Syntax::node(
+                name("outer"),
+                vec![Syntax::Missing, leaf(), no_info.clone()],
+            ),
+            (Some(1), Some(3)),
+            (Some(1), Some(3)),
+            (Some(1), Some(3)),
+            (Some(1), Some(3)),
+        ),
+        (
+            Syntax::node(name("outer"), vec![no_info, leaf()]),
+            (None, Some(3)),
+            (None, Some(3)),
+            (None, None),
+            (None, None),
+        ),
+        (
+            filtered_node,
+            (Some(0), Some(4)),
+            (None, Some(3)),
+            (Some(0), Some(4)),
+            (None, None),
+        ),
+    ] {
+        for (compiled, (start, end)) in [
+            (&positions, all),
+            (&canonical_positions, canonical),
+            (&info_positions, info),
+            (&canonical_info_positions, canonical_info),
+        ] {
+            let report = compiled.execute(
+                &input,
+                &source(),
+                &context(),
+                &state,
+                MacroLimits::default(),
+                None,
+            );
+            native_rows.extend(report.native_functions);
+            assert!(
+                report.reference_functions.iter().all(|function| {
+                    function.producer() == "reference"
+                        && !function.name.to_display_string().starts_with("Lean.")
+                }),
+                "toolchain position methods must run natively"
+            );
+            let Outcome::Complete(Ok(MacroResult::Expanded {
+                syntax,
+                state: next,
+            })) = report.outcome
+            else {
+                panic!(
+                    "source positions did not complete for {input:?}: {:?}",
+                    report.outcome
+                );
+            };
+            assert_eq!(
+                syntax,
+                position_output(start, end),
+                "source positions for {input:?}"
+            );
+            assert_eq!(
+                next, state,
+                "position inspection preserves all MacroM state"
+            );
+        }
+    }
+    for row in [
+        "mirror:Lean.SourceInfo.getPos?",
+        "mirror:Lean.SourceInfo.getTailPos?",
+        "mirror:Lean.Syntax.getPos?",
+        "mirror:Lean.Syntax.getTailPos?",
+    ] {
+        assert!(
+            native_rows.contains(row),
+            "actual imported MacroM did not select {row}"
+        );
+    }
+
     let mut exhausted = MacroLimits::default();
     exhausted.vm.max_steps = 0;
     assert!(matches!(
@@ -595,7 +735,7 @@ fn live_pinned_macro_runs_native_syntax_methods_and_matches_complete_subtrees() 
     );
     assert_eq!(
         oracle.stdout,
-        b"[true, true, true, true, true, true, true, true, true, true]\n[true, true, true, true, true, true, true, true, true, true, true, true, true, true, true]\n[true, true, true, true, true]\n"
+        b"[true, true, true, true, true, true, true, true, true, true]\n[true, true, true, true, true, true, true, true, true, true, true, true, true, true, true]\n[true, true, true, true, true]\n[true, true, true, true, true, true]\n"
     );
     assert!(oracle.stderr.is_empty());
 
@@ -804,4 +944,33 @@ def scopeName (counter : Nat) : Lean.Name := .num (.str scopeBase "_hyg") counte
     | .ok (.atom .none "unchanged") state => scopeStateExact 10 state
     | _ => false
   [attached, firstOk, secondOk, changed, atom]
+
+def positionOutputExact (start stop : Option Nat) : Lean.Syntax → Bool
+  | .node .none kind args =>
+    let one (expected : Option Nat) (label : String) (actual : Lean.Syntax) :=
+      match expected, actual with
+      | none, .missing => true
+      | some p, .atom (.synthetic first last canonical) text =>
+        first.byteIdx == p && last.byteIdx == p && canonical && text == label
+      | _, _ => false
+    kind == `positions && args.size == 2 && one start "start" args[0]! && one stop "end" args[1]!
+  | _ => false
+def checkPositions (input : Lean.Syntax)
+    (all canonical info canonicalInfo : Option Nat × Option Nat) : Bool :=
+  inspectResult syntaxPositionsMacro input (positionOutputExact all.1 all.2) &&
+  inspectResult canonicalSyntaxPositionsMacro input (positionOutputExact canonical.1 canonical.2) &&
+  inspectResult infoPositionsMacro input (positionOutputExact info.1 info.2) &&
+  inspectResult canonicalInfoPositionsMacro input (positionOutputExact canonicalInfo.1 canonicalInfo.2)
+#eval show List Bool from
+  let known := (some 1, some 3)
+  let absent := (none, none)
+  let synthetic := (some 0, some 4)
+  let tailOnly := (none, some 3)
+  let noInfo := Lean.Syntax.atom .none "none"
+  [checkPositions sampleLeaf known known known known,
+   checkPositions .missing absent absent absent absent,
+   checkPositions (.atom (.synthetic ⟨0⟩ ⟨4⟩ false) "synthetic") synthetic absent synthetic absent,
+   checkPositions (.node .none `outer #[.missing, sampleLeaf, noInfo]) known known known known,
+   checkPositions (.node .none `outer #[noInfo, sampleLeaf]) tailOnly tailOnly absent absent,
+   checkPositions (.node (.synthetic ⟨0⟩ ⟨4⟩ false) `outer #[sampleLeaf]) synthetic tailOnly synthetic absent]
 "#;

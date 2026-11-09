@@ -58,3 +58,28 @@ macro (name := contextChoose) "contextTerm%" a:term "," b:term : term => do
 
 @[noinline] def freshIdentifierMacro (stx : Lean.Syntax) : Lean.MacroM Lean.Syntax :=
   Lean.Macro.withFreshMacroScope (attachScopeMacro stx)
+
+-- Preserve both optional positions independently: a filtered node can have no
+-- canonical start but still inherit a canonical end from its last child.
+@[noinline] def positionOutput (pos tailPos : Option String.Pos.Raw) : Lean.Syntax :=
+  .node .none (Lean.Name.mkStr1 "positions") #[
+    match pos with
+    | some pos => .atom (.synthetic pos pos true) "start"
+    | none => .missing,
+    match tailPos with
+    | some pos => .atom (.synthetic pos pos true) "end"
+    | none => .missing]
+
+@[noinline] def syntaxPositionsMacro (stx : Lean.Syntax) : Lean.MacroM Lean.Syntax :=
+  pure (positionOutput (stx.getPos? false) (stx.getTailPos? false))
+
+@[noinline] def canonicalSyntaxPositionsMacro (stx : Lean.Syntax) : Lean.MacroM Lean.Syntax :=
+  pure (positionOutput (stx.getPos? true) (stx.getTailPos? true))
+
+@[noinline] def infoPositionsMacro (stx : Lean.Syntax) : Lean.MacroM Lean.Syntax :=
+  let info := stx.getHeadInfo
+  pure (positionOutput (info.getPos? false) (info.getTailPos? false))
+
+@[noinline] def canonicalInfoPositionsMacro (stx : Lean.Syntax) : Lean.MacroM Lean.Syntax :=
+  let info := stx.getHeadInfo
+  pure (positionOutput (info.getPos? true) (info.getTailPos? true))
