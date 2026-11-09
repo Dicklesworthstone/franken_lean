@@ -34,6 +34,9 @@ pub(super) enum Intrinsic {
     SourceInfoGetTailPos,
     GetPos,
     GetTailPos,
+    SourceInfoFromRef,
+    MkAtom,
+    MkAtomFrom,
     SetInfo,
     IsMissing,
     IsIdent,
@@ -68,6 +71,9 @@ impl Intrinsic {
             "mirror:Lean.SourceInfo.getTailPos?" => Self::SourceInfoGetTailPos,
             "mirror:Lean.Syntax.getPos?" => Self::GetPos,
             "mirror:Lean.Syntax.getTailPos?" => Self::GetTailPos,
+            "mirror:Lean.SourceInfo.fromRef" => Self::SourceInfoFromRef,
+            "mirror:Lean.mkAtom" => Self::MkAtom,
+            "mirror:Lean.mkAtomFrom" => Self::MkAtomFrom,
             "mirror:Lean.Syntax.setInfo" => Self::SetInfo,
             "mirror:Lean.Syntax.isMissing" => Self::IsMissing,
             "mirror:Lean.Syntax.isIdent" => Self::IsIdent,
@@ -110,6 +116,7 @@ impl Intrinsic {
                 | Self::SourceInfoGetTailPos
                 | Self::GetPos
                 | Self::GetTailPos
+                | Self::SourceInfoFromRef
                 | Self::GetCurrNamespace => 2,
                 Self::AddMacroScope
                 | Self::MacroAddMacroScope
@@ -117,6 +124,7 @@ impl Intrinsic {
                 | Self::ResolveNamespace
                 | Self::ResolveGlobalName
                 | Self::SetArg
+                | Self::MkAtomFrom
                 | Self::ExpandMacro => 3,
                 _ => 1,
             },
@@ -364,6 +372,27 @@ impl Intrinsic {
                     None => Obj::mk_nat(expansion_layout::OPTION_NONE_TAG),
                 };
                 Ok(IntrinsicResult::raw_object(value))
+            }
+            Self::SourceInfoFromRef => {
+                let canonical = super::bool_value(&args[1], "Lean.SourceInfo.fromRef", 1)?;
+                Ok(IntrinsicResult::raw_object(source_info_from_ref(
+                    &args[0], canonical,
+                )?))
+            }
+            Self::MkAtom | Self::MkAtomFrom => {
+                let (info, text) = if self == Self::MkAtomFrom {
+                    string(&args[1])?;
+                    let canonical = super::bool_value(&args[2], "Lean.mkAtomFrom", 2)?;
+                    (source_info_from_ref(&args[0], canonical)?, &args[1])
+                } else {
+                    string(&args[0])?;
+                    (Obj::mk_nat(layout::SOURCE_NONE_TAG), &args[0])
+                };
+                Ok(IntrinsicResult::raw_object(Obj::mk_ctor(
+                    layout::SYNTAX_ATOM.tag,
+                    vec![info, text.clone_ref()],
+                    &[],
+                )))
             }
             Self::SetInfo => {
                 // The pin's telescope takes SourceInfo before Syntax.
@@ -613,12 +642,19 @@ fn source_info(value: &Obj) -> Result<bool, VmRefusal> {
 }
 
 fn get_head_info(value: &Obj) -> Result<Obj, IntrinsicFailure> {
+    get_head_info_bounded(value, &mut 0, "syntax head-info nodes")
+}
+
+fn get_head_info_bounded(
+    value: &Obj,
+    visited: &mut u64,
+    resource: &'static str,
+) -> Result<Obj, IntrinsicFailure> {
     let mut current = value.clone_ref();
     let mut pending = Vec::new();
-    let mut visited = 0u64;
     loop {
-        visited += 1;
-        limit("syntax head-info nodes", MAX_SYNTAX_NODES, visited)?;
+        *visited += 1;
+        limit(resource, MAX_SYNTAX_NODES, *visited)?;
         match syntax_kind(&current)? {
             SyntaxKind::Missing => {}
             SyntaxKind::Atom | SyntaxKind::Ident => {
@@ -704,12 +740,20 @@ fn source_position(
 }
 
 fn get_tail_pos(value: &Obj, canonical_only: bool) -> Result<Option<Obj>, IntrinsicFailure> {
+    get_tail_pos_bounded(value, canonical_only, &mut 0, "syntax tail-position nodes")
+}
+
+fn get_tail_pos_bounded(
+    value: &Obj,
+    canonical_only: bool,
+    visited: &mut u64,
+    resource: &'static str,
+) -> Result<Option<Obj>, IntrinsicFailure> {
     let mut current = value.clone_ref();
     let mut pending = Vec::new();
-    let mut visited = 0u64;
     loop {
-        visited += 1;
-        limit("syntax tail-position nodes", MAX_SYNTAX_NODES, visited)?;
+        *visited += 1;
+        limit(resource, MAX_SYNTAX_NODES, *visited)?;
         let kind = syntax_kind(&current)?;
         if !matches!(kind, SyntaxKind::Missing) {
             let info = child(&current, 0)?;
@@ -743,6 +787,43 @@ fn get_tail_pos(value: &Obj, canonical_only: bool) -> Result<Option<Obj>, Intrin
             pending.push((children, remaining - 1));
         }
     }
+}
+
+fn source_info_from_ref(value: &Obj, canonical: bool) -> Result<Obj, IntrinsicFailure> {
+    let mut visited = 0;
+    let mut positions = |canonical_only| {
+        let info = get_head_info_bounded(value, &mut visited, "syntax source-info nodes")?;
+        let pos = source_position(&info, canonical_only, false, "Lean.SourceInfo.fromRef")?;
+        // The pin evaluates both endpoints even when the head has no position.
+        let tail = get_tail_pos_bounded(
+            value,
+            canonical_only,
+            &mut visited,
+            "syntax source-info nodes",
+        )?;
+        Ok::<_, IntrinsicFailure>(pos.zip(tail))
+    };
+    if canonical && let Some((pos, tail)) = positions(true)? {
+        return Ok(synthetic_info(pos, tail, true));
+    }
+    // Canonical construction falls back to the complete noncanonical range,
+    // not a mixture of one canonical and one noncanonical endpoint. All walks
+    // share one node budget, including this retry.
+    Ok(match positions(false)? {
+        Some((pos, tail)) => synthetic_info(pos, tail, false),
+        None => Obj::mk_nat(layout::SOURCE_NONE_TAG),
+    })
+}
+
+fn synthetic_info(pos: Obj, tail: Obj, canonical: bool) -> Obj {
+    let mut fields: Vec<_> = (0..layout::SOURCE_SYNTHETIC.object_fields)
+        .map(|_| Obj::mk_nat(0))
+        .collect();
+    fields[layout::SOURCE_SYNTHETIC_POS_FIELD] = pos;
+    fields[layout::SOURCE_SYNTHETIC_TAIL_POS_FIELD] = tail;
+    let mut scalars = vec![0; layout::SOURCE_SYNTHETIC.scalar_bytes];
+    scalars[layout::SOURCE_SYNTHETIC_CANONICAL_BYTE_OFFSET] = u8::from(canonical);
+    Obj::mk_ctor(layout::SOURCE_SYNTHETIC.tag, fields, &scalars)
 }
 
 fn check_layout(value: &Obj, expected: layout::CtorLayout) -> Result<(), VmRefusal> {

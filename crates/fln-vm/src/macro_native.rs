@@ -281,6 +281,27 @@ pub const ROWS: &[MirrorRow] = &[
         result_type: generated::SYNTAX_GET_TAIL_POS_RESULT,
     },
     MirrorRow {
+        id: "mirror:Lean.SourceInfo.fromRef",
+        name: "Lean.SourceInfo.fromRef",
+        borrowed: generated::SOURCE_INFO_FROM_REF_BORROWED,
+        parameters: generated::SOURCE_INFO_FROM_REF_PARAMETERS,
+        result_type: generated::SOURCE_INFO_FROM_REF_RESULT,
+    },
+    MirrorRow {
+        id: "mirror:Lean.mkAtom",
+        name: "Lean.mkAtom",
+        borrowed: generated::MK_ATOM_BORROWED,
+        parameters: generated::MK_ATOM_PARAMETERS,
+        result_type: generated::MK_ATOM_RESULT,
+    },
+    MirrorRow {
+        id: "mirror:Lean.mkAtomFrom",
+        name: "Lean.mkAtomFrom",
+        borrowed: generated::MK_ATOM_FROM_BORROWED,
+        parameters: generated::MK_ATOM_FROM_PARAMETERS,
+        result_type: generated::MK_ATOM_FROM_RESULT,
+    },
+    MirrorRow {
         id: "mirror:Lean.Syntax.setInfo",
         name: "Lean.Syntax.setInfo",
         borrowed: generated::SYNTAX_SET_INFO_BORROWED,

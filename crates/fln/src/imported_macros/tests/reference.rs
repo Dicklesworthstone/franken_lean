@@ -567,6 +567,138 @@ fn live_pinned_macro_runs_native_syntax_methods_and_matches_complete_subtrees() 
         );
     }
 
+    let reference_info = prepare(&name("referenceInfoMacro"));
+    let canonical_reference_info = prepare(&name("canonicalReferenceInfoMacro"));
+    let atom_from = prepare(&name("atomFromMacro"));
+    let canonical_atom_from = prepare(&name("canonicalAtomFromMacro"));
+    let plain_atom = prepare(&name("atomMacro"));
+    for (input, ordinary, preferred) in [
+        (leaf(), Some((1, 3, false)), Some((1, 3, true))),
+        (Syntax::Missing, None, None),
+        (Syntax::atom(SourceInfo::None, "none"), None, None),
+        (
+            Syntax::atom(noncanonical, "synthetic"),
+            Some((0, 4, false)),
+            Some((0, 4, false)),
+        ),
+        (
+            Syntax::Node {
+                info: noncanonical,
+                kind: name("outer"),
+                args: vec![leaf()],
+            },
+            Some((0, 4, false)),
+            Some((0, 4, false)),
+        ),
+        (
+            Syntax::node(
+                name("outer"),
+                vec![Syntax::atom(SourceInfo::None, "no head"), leaf()],
+            ),
+            None,
+            None,
+        ),
+        (
+            Syntax::node(
+                name("outer"),
+                vec![leaf(), Syntax::atom(noncanonical, "last")],
+            ),
+            Some((1, 4, false)),
+            Some((1, 3, true)),
+        ),
+        (
+            Syntax::node(
+                name("outer"),
+                vec![Syntax::atom(noncanonical, "first"), leaf()],
+            ),
+            Some((0, 3, false)),
+            Some((0, 3, false)),
+        ),
+    ] {
+        for (compiled, expected) in [
+            (&reference_info, ordinary),
+            (&canonical_reference_info, preferred),
+            (&atom_from, ordinary),
+            (&canonical_atom_from, preferred),
+        ] {
+            let report = compiled.execute(
+                &input,
+                &source(),
+                &context(),
+                &state,
+                MacroLimits::default(),
+                None,
+            );
+            native_rows.extend(report.native_functions);
+            assert!(
+                report.reference_functions.iter().all(|function| {
+                    function.producer() == "reference"
+                        && !function.name.to_display_string().starts_with("Lean.")
+                }),
+                "source constructors must run natively"
+            );
+            let Outcome::Complete(Ok(MacroResult::Expanded {
+                syntax,
+                state: next,
+            })) = report.outcome
+            else {
+                panic!(
+                    "source construction did not complete for {input:?}: {:?}",
+                    report.outcome
+                );
+            };
+            let info = expected.map_or(SourceInfo::None, |(start, stop, canonical)| {
+                SourceInfo::Synthetic {
+                    pos: BytePos(start),
+                    end_pos: BytePos(stop),
+                    canonical,
+                }
+            });
+            assert_eq!(
+                syntax,
+                Syntax::atom(info, "reference\0λ"),
+                "source construction for {input:?}"
+            );
+            assert_eq!(
+                next, state,
+                "source construction preserves every MacroM state field"
+            );
+        }
+    }
+    for (input, expected) in [
+        (leaf(), ""),
+        (Syntax::atom(noncanonical, "λ\0🙂"), "λ\0🙂"),
+        (Syntax::Missing, ""),
+    ] {
+        let report = plain_atom.execute(
+            &input,
+            &source(),
+            &context(),
+            &state,
+            MacroLimits::default(),
+            None,
+        );
+        native_rows.extend(report.native_functions);
+        assert!(report.reference_functions.iter().all(|function| {
+            function.producer() == "reference"
+                && !function.name.to_display_string().starts_with("Lean.")
+        }));
+        assert!(
+            matches!(report.outcome, Outcome::Complete(Ok(MacroResult::Expanded { syntax, state: next }))
+            if syntax == Syntax::atom(SourceInfo::None, expected) && next == state)
+        );
+    }
+    for row in [
+        "mirror:Lean.SourceInfo.fromRef",
+        "mirror:Lean.mkAtomFrom",
+        "mirror:Lean.mkAtom",
+    ] {
+        assert!(
+            native_rows.contains(row),
+            "actual imported MacroM did not select {row}"
+        );
+    }
+
     let mut exhausted = MacroLimits::default();
     exhausted.vm.max_steps = 0;
     assert!(matches!(
@@ -735,7 +867,7 @@ fn live_pinned_macro_runs_native_syntax_methods_and_matches_complete_subtrees() 
     );
     assert_eq!(
         oracle.stdout,
-        b"[true, true, true, true, true, true, true, true, true, true]\n[true, true, true, true, true, true, true, true, true, true, true, true, true, true, true]\n[true, true, true, true, true]\n[true, true, true, true, true, true]\n"
+        b"[true, true, true, true, true, true, true, true, true, true]\n[true, true, true, true, true, true, true, true, true, true, true, true, true, true, true]\n[true, true, true, true, true]\n[true, true, true, true, true, true]\n[true, true, true, true, true, true, true, true, true]\n"
     );
     assert!(oracle.stderr.is_empty());
 
@@ -973,4 +1105,38 @@ def checkPositions (input : Lean.Syntax)
    checkPositions (.node .none `outer #[.missing, sampleLeaf, noInfo]) known known known known,
    checkPositions (.node .none `outer #[noInfo, sampleLeaf]) tailOnly tailOnly absent absent,
    checkPositions (.node (.synthetic ⟨0⟩ ⟨4⟩ false) `outer #[sampleLeaf]) synthetic tailOnly synthetic absent]
+
+def referenceAtomExact (expected : Option (Nat × Nat × Bool)) : Lean.Syntax → Bool
+  | .atom info text =>
+    text == "reference\x00λ" && match expected, info with
+      | none, .none => true
+      | some (start, stop, canonical), .synthetic actualStart actualStop actualCanonical =>
+        actualStart.byteIdx == start && actualStop.byteIdx == stop && actualCanonical == canonical
+      | _, _ => false
+  | _ => false
+def checkReferenceAtoms (input : Lean.Syntax)
+    (ordinary preferred : Option (Nat × Nat × Bool)) : Bool :=
+  inspectResult referenceInfoMacro input (referenceAtomExact ordinary) &&
+  inspectResult canonicalReferenceInfoMacro input (referenceAtomExact preferred) &&
+  inspectResult atomFromMacro input (referenceAtomExact ordinary) &&
+  inspectResult canonicalAtomFromMacro input (referenceAtomExact preferred)
+def plainAtomExact (expected : String) : Lean.Syntax → Bool
+  | .atom .none text => text == expected
+  | _ => false
+#eval show List Bool from
+  let noncanonical := Lean.SourceInfo.synthetic ⟨0⟩ ⟨4⟩ false
+  let synthetic := some (0, 4, false)
+  [checkReferenceAtoms sampleLeaf (some (1, 3, false)) (some (1, 3, true)),
+   checkReferenceAtoms .missing none none,
+   checkReferenceAtoms (.atom .none "none") none none,
+   checkReferenceAtoms (.atom noncanonical "synthetic") synthetic synthetic,
+   checkReferenceAtoms (.node noncanonical `outer #[sampleLeaf]) synthetic synthetic,
+   checkReferenceAtoms (.node .none `outer #[.atom .none "no head", sampleLeaf]) none none,
+   checkReferenceAtoms (.node .none `outer #[sampleLeaf, .atom noncanonical "last"])
+     (some (1, 4, false)) (some (1, 3, true)),
+   checkReferenceAtoms (.node .none `outer #[.atom noncanonical "first", sampleLeaf])
+     (some (0, 3, false)) (some (0, 3, false)),
+   inspectResult atomMacro sampleLeaf (plainAtomExact "") &&
+   inspectResult atomMacro (.atom noncanonical "λ\x00🙂") (plainAtomExact "λ\x00🙂") &&
+   inspectResult atomMacro .missing (plainAtomExact "")]
 "#;

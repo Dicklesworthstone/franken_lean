@@ -644,3 +644,331 @@ fn position_methods_keep_resource_and_cancellation_stops_outside_option_results(
         );
     }
 }
+
+fn reference_range(info: &Obj) -> Option<(usize, usize, bool)> {
+    if source_info(info).unwrap() {
+        return None;
+    }
+    check_layout(info, layout::SOURCE_SYNTHETIC).unwrap();
+    let offset = layout::SOURCE_SYNTHETIC_CANONICAL_OBJECT_FIELDS * std::mem::size_of::<usize>()
+        + layout::SOURCE_SYNTHETIC_CANONICAL_BYTE_OFFSET;
+    Some((
+        child(info, layout::SOURCE_SYNTHETIC_POS_FIELD)
+            .unwrap()
+            .unbox(),
+        child(info, layout::SOURCE_SYNTHETIC_TAIL_POS_FIELD)
+            .unwrap()
+            .unbox(),
+        info.try_ctor_scalar_u32(offset).unwrap().to_ne_bytes()[0] == 1,
+    ))
+}
+
+#[test]
+fn reference_construction_prefers_canonical_ranges_then_retries_both_endpoints() {
+    let canonical = with_info(&atom("canonical"), &synthetic_info());
+    let noncanonical_info = position_info(Obj::mk_nat(1), Obj::mk_nat(9), 0);
+    let noncanonical = with_info(&ident(noncanonical_info.clone_ref()), &noncanonical_info);
+    let known = Some((2, 7, false));
+    let canonical_known = Some((2, 7, true));
+    for (input, ordinary, preferred) in [
+        (Obj::mk_nat(layout::SYNTAX_MISSING_TAG), None, None),
+        (atom("no source"), None, None),
+        (canonical.clone_ref(), known, canonical_known),
+        (
+            noncanonical.clone_ref(),
+            Some((1, 9, false)),
+            Some((1, 9, false)),
+        ),
+        (
+            with_info(
+                &node(Name::anonymous(), vec![canonical.clone_ref()]),
+                &noncanonical_info,
+            ),
+            Some((1, 9, false)),
+            Some((1, 9, false)),
+        ),
+        (
+            node(
+                Name::anonymous(),
+                vec![canonical.clone_ref(), noncanonical.clone_ref()],
+            ),
+            Some((2, 9, false)),
+            canonical_known,
+        ),
+        (
+            node(Name::anonymous(), vec![noncanonical, canonical.clone_ref()]),
+            Some((1, 7, false)),
+            Some((1, 7, false)),
+        ),
+        (
+            node(
+                Name::anonymous(),
+                vec![atom("no head"), canonical.clone_ref()],
+            ),
+            None,
+            None,
+        ),
+        (
+            node(Name::anonymous(), vec![canonical, atom("no tail")]),
+            known,
+            canonical_known,
+        ),
+    ] {
+        for (flag, expected) in [(0, ordinary), (1, preferred)] {
+            let info = invoke(
+                Intrinsic::SourceInfoFromRef,
+                &[input.clone_ref(), Obj::mk_nat(flag)],
+            );
+            assert_eq!(reference_range(&info), expected);
+            let text = Obj::mk_string("改\0🙂");
+            let output = invoke(
+                Intrinsic::MkAtomFrom,
+                &[input.clone_ref(), text.clone_ref(), Obj::mk_nat(flag)],
+            );
+            check_layout(&output, layout::SYNTAX_ATOM).unwrap();
+            assert_eq!(reference_range(&child(&output, 0).unwrap()), expected);
+            assert_eq!(
+                child(&output, 1).unwrap().identity_token(),
+                text.identity_token()
+            );
+            assert_eq!(string(&child(&output, 1).unwrap()).unwrap(), "改\0🙂");
+        }
+    }
+}
+
+#[test]
+fn atom_construction_preserves_large_positions_and_exact_shared_string_bytes() {
+    let pos = Obj::mk_mpz(&[13, 1], false);
+    let tail = Obj::mk_mpz(&[21, 2], false);
+    let whitespace = Obj::mk_ctor(
+        layout::SUBSTRING_RAW.tag,
+        vec![Obj::mk_string(""), Obj::mk_nat(0), Obj::mk_nat(0)],
+        &[],
+    );
+    let original = Obj::mk_ctor(
+        layout::SOURCE_ORIGINAL.tag,
+        vec![
+            whitespace.clone_ref(),
+            pos.clone_ref(),
+            whitespace,
+            tail.clone_ref(),
+        ],
+        &[],
+    );
+    for input_info in [
+        original,
+        position_info(pos.clone_ref(), tail.clone_ref(), 1),
+    ] {
+        let input = with_info(&atom("unchanged"), &input_info);
+        for canonical in [0, 1] {
+            let info = invoke(
+                Intrinsic::SourceInfoFromRef,
+                &[input.clone_ref(), Obj::mk_nat(canonical)],
+            );
+            for (field, expected) in [
+                (layout::SOURCE_SYNTHETIC_POS_FIELD, &pos),
+                (layout::SOURCE_SYNTHETIC_TAIL_POS_FIELD, &tail),
+            ] {
+                assert_eq!(
+                    child(&info, field).unwrap().identity_token(),
+                    expected.identity_token()
+                );
+            }
+        }
+        assert_eq!(
+            child(&input, 0).unwrap().identity_token(),
+            input_info.identity_token()
+        );
+        assert_eq!(string(&child(&input, 1).unwrap()).unwrap(), "unchanged");
+    }
+    for text in ["", "λ\0🙂", "different length from the source span"] {
+        let value = Obj::mk_string(text);
+        let result = invoke(Intrinsic::MkAtom, &[value.clone_ref()]);
+        check_layout(&result, layout::SYNTAX_ATOM).unwrap();
+        assert_eq!(child(&result, 0).unwrap().unbox(), layout::SOURCE_NONE_TAG);
+        assert_eq!(
+            child(&result, 1).unwrap().identity_token(),
+            value.identity_token()
+        );
+        assert_eq!(string(&child(&result, 1).unwrap()).unwrap(), text);
+    }
+}
+
+#[test]
+fn reference_construction_rejects_bad_shapes_even_after_an_absent_head() {
+    let bad_info = |info| {
+        Obj::mk_ctor(
+            layout::SYNTAX_ATOM.tag,
+            vec![info, Obj::mk_string("bad")],
+            &[],
+        )
+    };
+    for input in [
+        Obj::mk_nat(layout::SYNTAX_MISSING_TAG + 1),
+        Obj::mk_ctor(layout::SYNTAX_NODE.tag, vec![], &[]),
+        bad_info(Obj::mk_ctor(layout::SOURCE_SYNTHETIC.tag, vec![], &[])),
+        bad_info(position_info(Obj::mk_nat(0), Obj::mk_nat(1), 2)),
+        bad_info(position_info(Obj::mk_nat(0), Obj::mk_mpz(&[1], true), 1)),
+        bad_info(position_info(Obj::mk_string("not Nat"), Obj::mk_nat(1), 1)),
+        // A missing start does not make a malformed tail into SourceInfo.none.
+        node(Name::anonymous(), vec![atom("no head"), Obj::mk_nat(999)]),
+    ] {
+        for canonical in [0, 1] {
+            for (operation, row, args) in [
+                (
+                    Intrinsic::SourceInfoFromRef,
+                    "mirror:Lean.SourceInfo.fromRef",
+                    vec![input.clone_ref(), Obj::mk_nat(canonical)],
+                ),
+                (
+                    Intrinsic::MkAtomFrom,
+                    "mirror:Lean.mkAtomFrom",
+                    vec![
+                        input.clone_ref(),
+                        Obj::mk_string("new"),
+                        Obj::mk_nat(canonical),
+                    ],
+                ),
+            ] {
+                assert!(matches!(
+                    operation.invoke(row, &args),
+                    Err(IntrinsicFailure::Refused(_))
+                ));
+            }
+        }
+    }
+    for (operation, row, args) in [
+        (
+            Intrinsic::MkAtom,
+            "mirror:Lean.mkAtom",
+            vec![Obj::mk_nat(0)],
+        ),
+        (
+            Intrinsic::MkAtomFrom,
+            "mirror:Lean.mkAtomFrom",
+            vec![atom("ok"), Obj::mk_nat(0), Obj::mk_nat(0)],
+        ),
+        (
+            Intrinsic::MkAtomFrom,
+            "mirror:Lean.mkAtomFrom",
+            vec![atom("ok"), Obj::mk_string("ok"), Obj::mk_nat(2)],
+        ),
+        (
+            Intrinsic::SourceInfoFromRef,
+            "mirror:Lean.SourceInfo.fromRef",
+            vec![atom("ok"), Obj::mk_nat(2)],
+        ),
+        (
+            Intrinsic::SourceInfoFromRef,
+            "mirror:Lean.SourceInfo.fromRef",
+            vec![atom("ok")],
+        ),
+    ] {
+        assert!(matches!(
+            operation.invoke(row, &args),
+            Err(IntrinsicFailure::Refused(_))
+        ));
+    }
+    assert_eq!(
+        reference_range(&invoke(
+            Intrinsic::SourceInfoFromRef,
+            &[
+                with_info(&atom("recovered"), &synthetic_info()),
+                Obj::mk_nat(1)
+            ],
+        )),
+        Some((2, 7, true))
+    );
+}
+
+#[test]
+fn reference_construction_shares_walk_budget_and_keeps_stops_non_authoritative() {
+    let mut empty = Obj::mk_nat(layout::SYNTAX_MISSING_TAG);
+    for _ in 0..18 {
+        empty = node(Name::anonymous(), vec![empty.clone_ref(), empty]);
+    }
+    let valid = with_info(&atom("ok"), &synthetic_info());
+    let input = node(
+        Name::anonymous(),
+        vec![empty.clone_ref(), valid.clone_ref(), empty],
+    );
+    // Each endpoint alone fits. Constructing the range must charge both walks
+    // to one invocation budget rather than granting each a fresh allowance.
+    assert_eq!(syntax_position(Intrinsic::GetPos, &input, false), Some(2));
+    assert_eq!(
+        syntax_position(Intrinsic::GetTailPos, &input, false),
+        Some(7)
+    );
+    for (operation, row, args) in [
+        (
+            Intrinsic::SourceInfoFromRef,
+            "mirror:Lean.SourceInfo.fromRef",
+            vec![input.clone_ref(), Obj::mk_nat(0)],
+        ),
+        (
+            Intrinsic::MkAtomFrom,
+            "mirror:Lean.mkAtomFrom",
+            vec![input, Obj::mk_string("new"), Obj::mk_nat(0)],
+        ),
+    ] {
+        assert!(
+            matches!(operation.invoke(row, &args), Err(IntrinsicFailure::MirrorResource {
+            resource: "syntax source-info nodes", allowed: MAX_SYNTAX_NODES, observed,
+        }) if observed == MAX_SYNTAX_NODES + 1)
+        );
+        assert!(matches!(
+            execute_function(
+                &lookup::callable_program(row),
+                flbc::FunctionId::new(1),
+                args,
+                ExecutionLimits::default(),
+                None,
+            ),
+            Outcome::Inconclusive(_)
+        ));
+    }
+    for (row, args) in [
+        (
+            "mirror:Lean.SourceInfo.fromRef",
+            vec![valid.clone_ref(), Obj::mk_nat(1)],
+        ),
+        (
+            "mirror:Lean.mkAtomFrom",
+            vec![valid, Obj::mk_string("new"), Obj::mk_nat(1)],
+        ),
+        ("mirror:Lean.mkAtom", vec![Obj::mk_string("new")]),
+    ] {
+        let program = lookup::callable_program(row);
+        for (limits, cancelled) in [
+            (
+                ExecutionLimits {
+                    max_steps: 0,
+                    ..ExecutionLimits::default()
+                },
+                false,
+            ),
+            (ExecutionLimits::default(), true),
+        ] {
+            assert!(matches!(
+                execute_function(
+                    &program,
+                    flbc::FunctionId::new(1),
+                    args.iter().map(Obj::clone_ref).collect(),
+                    limits,
+                    Some(&|| cancelled),
+                ),
+                Outcome::Inconclusive(_)
+            ));
+        }
+        assert!(matches!(
+            execute_function(
+                &program,
+                flbc::FunctionId::new(1),
+                args,
+                ExecutionLimits::default(),
+                None,
+            ),
+            Outcome::Complete(VmExit::Returned(_))
+        ));
+    }
+}

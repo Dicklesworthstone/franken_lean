@@ -83,3 +83,23 @@ macro (name := contextChoose) "contextTerm%" a:term "," b:term : term => do
 @[noinline] def canonicalInfoPositionsMacro (stx : Lean.Syntax) : Lean.MacroM Lean.Syntax :=
   let info := stx.getHeadInfo
   pure (positionOutput (info.getPos? true) (info.getTailPos? true))
+
+-- Programmatic constructors preserve source spans independently of the new
+-- token's byte length. Canonical requests may fall back to synthetic ranges.
+@[noinline] def referenceInfoMacro (stx : Lean.Syntax) : Lean.MacroM Lean.Syntax :=
+  pure (.atom (Lean.SourceInfo.fromRef stx false) "reference\x00λ")
+
+@[noinline] def canonicalReferenceInfoMacro (stx : Lean.Syntax) : Lean.MacroM Lean.Syntax :=
+  pure (.atom (Lean.SourceInfo.fromRef stx true) "reference\x00λ")
+
+@[noinline] def atomFromMacro (stx : Lean.Syntax) : Lean.MacroM Lean.Syntax :=
+  pure (Lean.mkAtomFrom stx "reference\x00λ" false)
+
+@[noinline] def canonicalAtomFromMacro (stx : Lean.Syntax) : Lean.MacroM Lean.Syntax :=
+  pure (Lean.mkAtomFrom stx "reference\x00λ" true)
+
+@[noinline] def atomMacro (stx : Lean.Syntax) : Lean.MacroM Lean.Syntax :=
+  let text := match stx with
+    | .atom _ text => text
+    | _ => ""
+  pure (Lean.mkAtom text)

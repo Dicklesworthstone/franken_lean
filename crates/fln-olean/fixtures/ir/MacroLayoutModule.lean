@@ -161,6 +161,14 @@ def optionNone (_ : Unit) : Option Lean.Syntax := none
 @[noinline] def syntaxGetTailPos (value : @& Lean.Syntax) (canonicalOnly : Bool) :
     Option String.Pos.Raw := value.getTailPos? canonicalOnly
 
+@[noinline] def sourceInfoFromRef (value : @& Lean.Syntax) (canonical : Bool) :
+    Lean.SourceInfo := Lean.SourceInfo.fromRef value canonical
+
+@[noinline] def mkAtom (text : String) : Lean.Syntax := Lean.mkAtom text
+
+@[noinline] def mkAtomFrom (value : @& Lean.Syntax) (text : String) (canonical : Bool) :
+    Lean.Syntax := Lean.mkAtomFrom value text canonical
+
 @[noinline] def syntaxSetInfo (info : Lean.SourceInfo) (value : Lean.Syntax) : Lean.Syntax :=
   value.setInfo info
 
