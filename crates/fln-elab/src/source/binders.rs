@@ -755,6 +755,8 @@ fn exists_kind() -> Name {
 fn binder_notation(kind: &Name) -> Option<(&'static str, Name)> {
     if kind == &exists_kind() {
         Some(("∃", Name::from_components(["Exists"])))
+    } else if kind == &Name::str(Name::anonymous(), "termExists_,_") {
+        Some(("exists", Name::from_components(["Exists"])))
     } else if kind == &Name::str(Name::anonymous(), "termΣ_,_") {
         Some(("Σ", Name::from_components(["_root_", "Sigma"])))
     } else if kind == &Name::str(Name::anonymous(), "termΣ'_,_") {
@@ -819,9 +821,9 @@ impl Context {
         if pattern {
             return Err(invalid());
         }
-        // `Σ` and `Σ'` exist where their declaring module (`Init.NotationExtra`) is imported, as
-        // its `ParserDescr` constant witnesses: without it the pin's parser has no such token
-        // (`prelude` + `import Init.Core` says "expected token").
+        // ASCII `exists`, `Σ` and `Σ'` need their declaring module (`Init.NotationExtra`),
+        // as its `ParserDescr` constant witnesses. The `exists` tactic token alone does
+        // not provide the term notation (`prelude` + `import Init.Core`).
         if word != "∃"
             && !self
                 .txn

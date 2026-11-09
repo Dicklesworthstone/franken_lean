@@ -35,9 +35,40 @@ const OPERATOR_KINDS: [(&str, &str); 20] = [
     ("term_==_", "binrel_no_prop"),
 ];
 
+const BINDER_OWNERS: [(&str, &str); 6] = [
+    (
+        "term∃_,_",
+        "_aux_Init_NotationExtra___macroRules_term∃_,__1",
+    ),
+    (
+        "termExists_,_",
+        "_aux_Init_NotationExtra___macroRules_termExists_,__1",
+    ),
+    (
+        "termΣ_,_",
+        "_aux_Init_NotationExtra___macroRules_termΣ_,__1",
+    ),
+    (
+        "termΣ'_,_",
+        "_aux_Init_NotationExtra___macroRules_termΣ'_,__1",
+    ),
+    (
+        "term_×__1",
+        "_aux_Init_NotationExtra___macroRules_term_×__1_1",
+    ),
+    (
+        "term_×'__1",
+        "_aux_Init_NotationExtra___macroRules_term_×'__1_1",
+    ),
+];
+
 #[test]
 fn pinned_sequencing_registry_binds_authority_and_serves_recursive_user_macros() {
-    quotation_registry_controls(&SEQUENCING_OWNERS.map(|(kind, owner)| (kind, owner, "app")));
+    quotation_registry_controls(
+        "Init.Notation",
+        &SEQUENCING_OWNERS.map(|(kind, owner)| (kind, owner, "app")),
+        operator_input,
+    );
 }
 
 #[test]
@@ -49,10 +80,92 @@ fn pinned_operator_registry_binds_authority_and_serves_recursive_user_macros() {
         .zip(&owners)
         .map(|(&(kind, helper), owner)| (kind, owner.as_str(), helper))
         .collect();
-    quotation_registry_controls(&candidates);
+    quotation_registry_controls("Init.Notation", &candidates, operator_input);
 }
 
-fn quotation_registry_controls(candidates: &[(&str, &str, &str)]) {
+#[test]
+fn pinned_binder_registry_binds_authority_and_serves_recursive_user_macros() {
+    quotation_registry_controls(
+        "Init.NotationExtra",
+        &BINDER_OWNERS.map(|(kind, owner)| (kind, owner, "app")),
+        binder_input,
+    );
+}
+
+fn operator_input(kind: &str) -> Syntax {
+    let rhs = Syntax::node(
+        name("unexpandedRhs"),
+        vec![Syntax::atom(SourceInfo::None, "right operand")],
+    );
+    Syntax::node(
+        name(kind),
+        if kind == "term-_" {
+            vec![Syntax::atom(SourceInfo::None, "-"), rhs]
+        } else {
+            vec![
+                Syntax::atom(SourceInfo::None, "left operand"),
+                Syntax::atom(SourceInfo::None, "operator"),
+                rhs,
+            ]
+        },
+    )
+}
+
+fn binder_input(kind: &str) -> Syntax {
+    let atom = |value| Syntax::atom(SourceInfo::None, value);
+    let null = |args| Syntax::node(name("null"), args);
+    let identifier = Syntax::Ident {
+        info: SourceInfo::None,
+        raw_val: fln_syntax::source::ByteSpan::default().into(),
+        val: name("capturedBinder"),
+        preresolved: Vec::new(),
+    };
+    let binders = null(vec![
+        Syntax::node(name("Lean.binderIdent"), vec![identifier]),
+        Syntax::node(
+            name("Lean.binderIdent"),
+            vec![Syntax::node(name("Lean.Parser.Term.hole"), vec![atom("_")])],
+        ),
+    ]);
+    let domain = Syntax::node(name("capturedDomain"), vec![atom("domain")]);
+    let body = Syntax::node(name("capturedBody"), vec![atom("body")]);
+    if matches!(kind, "term_×__1" | "term_×'__1") {
+        let group = Syntax::node(
+            name("Lean.bracketedExplicitBinders"),
+            vec![atom("("), binders, atom(":"), domain, atom(")")],
+        );
+        Syntax::node(
+            name(kind),
+            vec![
+                group,
+                atom(if kind == "term_×__1" { "×" } else { "×'" }),
+                body,
+            ],
+        )
+    } else {
+        let keyword = match kind {
+            "term∃_,_" => "∃",
+            "termExists_,_" => "exists",
+            "termΣ_,_" => "Σ",
+            "termΣ'_,_" => "Σ'",
+            _ => panic!("unexpected binder notation: {kind}"),
+        };
+        let binders = Syntax::node(
+            name("Lean.explicitBinders"),
+            vec![Syntax::node(
+                name("Lean.unbracketedExplicitBinders"),
+                vec![binders, null(vec![atom(":"), domain])],
+            )],
+        );
+        Syntax::node(name(kind), vec![atom(keyword), binders, atom(","), body])
+    }
+}
+
+fn quotation_registry_controls(
+    module: &str,
+    candidates: &[(&str, &str, &str)],
+    input: fn(&str) -> Syntax,
+) {
     let Some(path) = std::env::var_os("FLN_REFERENCE_PARTITION").map(PathBuf::from) else {
         assert!(
             std::env::var_os("FLN_REQUIRE_REFERENCE").is_none(),
@@ -70,11 +183,11 @@ fn quotation_registry_controls(candidates: &[(&str, &str, &str)]) {
         .iter()
         .map(|(_, declaration, _)| owner(declaration))
         .collect();
-    let native = checked("Init.Notation", &constants, &[]);
+    let native = checked(module, &constants, &[]);
     let client = checked(
         "SequenceClient",
         &[owner("SequenceClient.expand")],
-        &["Init.Notation"],
+        &[module],
     );
     let rows = journal(
         &candidates
@@ -119,22 +232,7 @@ fn quotation_registry_controls(candidates: &[(&str, &str, &str)]) {
         )
     };
     for &(kind, declaration, helper) in candidates {
-        let rhs = Syntax::node(
-            name("unexpandedRhs"),
-            vec![Syntax::atom(SourceInfo::None, "right operand")],
-        );
-        let child = Syntax::node(
-            name(kind),
-            if kind == "term-_" {
-                vec![Syntax::atom(SourceInfo::None, "-"), rhs]
-            } else {
-                vec![
-                    Syntax::atom(SourceInfo::None, "left operand"),
-                    Syntax::atom(SourceInfo::None, "operator"),
-                    rhs,
-                ]
-            },
-        );
+        let child = input(kind);
         let outer = Syntax::node(name("sequenceOuter"), vec![child.clone()]);
         let nested = dispatch(&outer, 17);
         // The nested invocation receives the scope after the user macro's
@@ -299,8 +397,34 @@ theorem operatorBoolean_value : operatorBoolean 7 7 = true := rfl
 theorem operatorEqShadow_value : operatorEqShadow 99 7 7 := rfl
 theorem operatorGreater_direction (x y : Nat) : operatorGreater x y = (y < x) := rfl
 theorem operatorAscii_value (x y : Nat) : operatorLeAscii x y = operatorLe x y := rfl
+def binderExists (P : Nat → Nat → Prop) : Prop := ∃ x y : Nat, P x y
+def binderExistsAscii (P : Nat → Prop) : Prop := exists x, P x
+def binderDependentExists (P : (A : Type) → A → Prop) : Prop := ∃ (A : Type) (x : A), P A x
+def binderAnonymousExists (P : Prop) : Prop := ∃ _ : Nat, P
+def binderExistsShadow (Exists : Nat) (P : Nat → Prop) : Prop := ∃ x, P x
+def binderSigma (P : Nat → Type) : Type := Σ x : Nat, P x
+def binderSigmaInferred (P : Nat → Type) : Type := Σ x, P x
+def binderSigmaGrouped (P : Nat → Nat → Type) : Type := Σ (x y : Nat), P x y
+def binderDependentSigma : Type 1 := Σ (A : Type) (x : A), A
+def binderSigmaShadow (Sigma : Nat) (P : Nat → Type) : Type := Σ x : Nat, P x
+def binderPSigma (P : Prop) : Type := Σ' h : P, Eq h h
+def binderPSigmaShadow (PSigma : Nat) (P : Prop) : Type := Σ' _ : P, Nat
+def binderDependentProduct (P : Nat → Type) : Type := (x : Nat) × P x
+def binderDependentPProduct (P : Prop) : Type := (h : P) ×' Eq h h
+def binderAnonymousSigma (P : Type) : Type := Σ _ : Nat, P
+def binderSigmaValue : binderSigma (fun _ : Nat => Nat) := ⟨7, 11⟩
+theorem binderExists_shape (P : Nat → Nat → Prop) :
+    binderExists P = Exists (fun x : Nat => Exists (fun y : Nat => P x y)) := rfl
+theorem binderExistsAscii_shape (P : Nat → Prop) :
+    binderExistsAscii P = Exists (fun x : Nat => P x) := rfl
+theorem binderExistsShadow_shape (P : Nat → Prop) :
+    binderExistsShadow 99 P = Exists (fun x : Nat => P x) := rfl
+theorem binderSigmaValue_fst : binderSigmaValue.1 = 7 := rfl
+theorem binderSigmaValue_snd : binderSigmaValue.2 = 11 := rfl
+theorem binderExists_intro : ∃ x y : Nat, x = y := ⟨7, 7, rfl⟩
 "#;
-    let header = "module\nprelude\npublic import Init.Data.Option.Basic\npublic section\n@[expose] section\n";
+    let header =
+        "module\nprelude\npublic import Init.NotationExtra\npublic section\n@[expose] section\n";
     std::fs::write(dir.join("Sequencing.lean"), format!("{header}{source}")).unwrap();
     let oracle = Command::new(&reference)
         .current_dir(&dir)
@@ -323,7 +447,7 @@ theorem operatorAscii_value (x y : Nat) : operatorLeAscii x y = operatorLe x y :
     // Import the actual closure and its entire macro journal. Synthetic owners
     // or a registry filtered down to the new candidates cannot establish the
     // ordinary import-to-source route or its candidate ordering.
-    let target = name("Init.Data.Option.Basic");
+    let target = name("Init.NotationExtra");
     let mut pending = vec![target.clone()];
     let mut seen = BTreeSet::new();
     let mut loaded = Vec::new();
@@ -365,12 +489,34 @@ theorem operatorAscii_value (x y : Nat) : operatorLeAscii x y = operatorLe x y :
     assert_eq!(imported.checked.modules.len(), loaded.len());
     let partition =
         VerifiedPartition::from_pinned_tsv(&std::fs::read_to_string(partition).unwrap()).unwrap();
-    let registry = imported
+    let compilation = MacroCompilationInputs::new(Vec::new(), partition, BTreeSet::new());
+    let limited = imported
         .prepare_imported_macros_deferred(
-            MacroCompilationInputs::new(Vec::new(), partition, BTreeSet::new()),
-            MacroRegistryLimits::default(),
+            compilation.clone(),
+            MacroRegistryLimits {
+                max_macros: 256,
+                ..MacroRegistryLimits::default()
+            },
         )
+        .unwrap_err();
+    assert!(
+        matches!(limited, MacroRegistrationError::Limit("compiled macros")),
+        "{limited:?}"
+    );
+    let registry = imported
+        .prepare_imported_macros_deferred(compilation, MacroRegistryLimits::default())
         .unwrap();
+    // The exact pinned census has 284 distinct macro owners in this 51-module
+    // closure. Ordinary defaults must retain its complete table, including
+    // inactive scoped entries, instead of selecting only executable candidates.
+    assert_eq!(registry.owners.len(), 284);
+    let retained: BTreeSet<_> = registry
+        .global
+        .values()
+        .chain(registry.scoped.values().flat_map(|table| table.values()))
+        .flat_map(|chain| chain.iter().map(|entry| &entry.declaration))
+        .collect();
+    assert_eq!(retained, registry.owners.keys().collect());
     for (kind, owner) in SEQUENCING_OWNERS {
         assert_eq!(
             registry.declarations(&name(kind)).collect::<Vec<_>>(),
@@ -385,6 +531,13 @@ theorem operatorAscii_value (x y : Nat) : operatorLeAscii x y = operatorLe x y :
                 .collect::<Vec<_>>(),
             [2, 1].map(|index| name(&format!("_aux_Init_Notation___macroRules_{kind}_{index}"))),
             "the complete journal must try the expression-tree rule first: {kind}"
+        );
+    }
+    for (kind, owner) in BINDER_OWNERS {
+        assert_eq!(
+            registry.declarations(&name(kind)).collect::<Vec<_>>(),
+            vec![&name(owner)],
+            "the complete journal must retain the exact binder owner: {kind}"
         );
     }
     let engine = &imported.engine;
@@ -411,7 +564,7 @@ theorem operatorAscii_value (x y : Nat) : operatorLeAscii x y = operatorLe x y :
     assert!(report.state.is_some());
     assert_eq!(
         (checked.files, checked.commands, checked.theorems),
-        (1, 35, 16)
+        (1, 57, 22)
     );
     for (_, owner) in SEQUENCING_OWNERS {
         assert!(report.attempts.iter().any(|attempt| {
@@ -447,6 +600,19 @@ theorem operatorAscii_value (x y : Nat) : operatorLeAscii x y = operatorLe x y :
             attempt.declaration == name(&format!("_aux_Init_Notation___macroRules_{kind}_1"))
         })
     }));
+    for (kind, owner) in BINDER_OWNERS {
+        assert!(
+            report.attempts.iter().any(|attempt| {
+                attempt.declaration == name(owner)
+                    && attempt
+                        .native_functions
+                        .iter()
+                        .any(|id| id == &format!("mirror:{owner}"))
+                    && attempt.reference_functions.is_empty()
+            }),
+            "native binder notation was not exercised: {kind}"
+        );
+    }
     // Compare the actual checked functions to the pin's emitted terms. This
     // includes the Unit thunk's type, each operator's chosen typeclass method,
     // and operands beneath local binders. Result values alone would miss
@@ -471,6 +637,22 @@ theorem operatorAscii_value (x y : Nat) : operatorLeAscii x y = operatorLe x y :
         "operatorGe",
         "operatorLeAscii",
         "operatorGeAscii",
+        "binderExists",
+        "binderExistsAscii",
+        "binderDependentExists",
+        "binderAnonymousExists",
+        "binderExistsShadow",
+        "binderSigma",
+        "binderSigmaInferred",
+        "binderSigmaGrouped",
+        "binderDependentSigma",
+        "binderSigmaShadow",
+        "binderPSigma",
+        "binderPSigmaShadow",
+        "binderDependentProduct",
+        "binderDependentPProduct",
+        "binderAnonymousSigma",
+        "binderSigmaValue",
     ] {
         let Some(ConstantInfo::Defn(actual)) = checked.engine.environment().find(&name(label))
         else {
@@ -489,7 +671,7 @@ theorem operatorAscii_value (x y : Nat) : operatorLeAscii x y = operatorLe x y :
             (&actual.value, &expected.value),
         ] {
             let verdict = fln_kernel::check_def_eq(
-                engine.environment(),
+                checked.engine.environment(),
                 &actual.base.level_params,
                 left,
                 right,
@@ -520,6 +702,18 @@ theorem operatorAscii_value (x y : Nat) : operatorLeAscii x y = operatorLe x y :
         (
             "wrongOperatorValue",
             "theorem wrongOperatorValue : 2 + 3 * 4 = 20 := rfl",
+        ),
+        (
+            "wrongExistsBody",
+            "def wrongExistsBody : Prop := exists n : Nat, n",
+        ),
+        (
+            "wrongSigmaBody",
+            "def wrongSigmaBody : Type := Σ n : Nat, n",
+        ),
+        (
+            "escapedBinder",
+            "def escapedBinder : Nat := (fun _ : (∃ x : Nat, True) => x) (Exists.intro 7 True.intro)",
         ),
     ] {
         let rejected_source = format!("{source}\n{suffix}\n");

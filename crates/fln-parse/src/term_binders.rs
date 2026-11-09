@@ -12,9 +12,9 @@ pub(super) struct Prefix {
     /// sublanguage of it), built as the pin's `«term∃_,_»` node. The elaborator's
     /// expansion pass rewrites it to nested `Exists fun x => ...`, as the pin's macro.
     exists: bool,
-    /// `Σ xs, b` and `Σ' xs, b` (`Init/NotationExtra.lean`): `∃`'s `explicitBinders` grammar under
-    /// their own node kinds, `«termΣ_,_»` and `«termΣ'_,_»`, with no binder predicate.
-    sigma: Option<&'static str>,
+    /// `exists`, `Σ` and `Σ'` use `∃`'s `explicitBinders` grammar under their own
+    /// node kinds, with no binder predicate (`Init/NotationExtra.lean`).
+    explicit_notation: Option<&'static str>,
     dependent_arrow: bool,
     binders: Vec<Syntax>,
     annotation: Option<(usize, Syntax)>,
@@ -114,10 +114,12 @@ impl Prefix {
             keyword,
             lambda: symbol(tokens, keyword, "fun") || symbol(tokens, keyword, "λ"),
             record_field: false,
-            exists: ["∃", "Σ", "Σ'"]
+            exists: ["∃", "exists", "Σ", "Σ'"]
                 .into_iter()
                 .any(|word| symbol(tokens, keyword, word)),
-            sigma: if symbol(tokens, keyword, "Σ") {
+            explicit_notation: if symbol(tokens, keyword, "exists") {
+                Some("termExists_,_")
+            } else if symbol(tokens, keyword, "Σ") {
                 Some("termΣ_,_")
             } else if symbol(tokens, keyword, "Σ'") {
                 Some("termΣ'_,_")
@@ -151,7 +153,7 @@ impl Prefix {
             lambda: false,
             record_field: true,
             exists: false,
-            sigma: None,
+            explicit_notation: None,
             dependent_arrow: false,
             binders: Vec::new(),
             annotation: None,
@@ -244,7 +246,7 @@ impl Prefix {
                 if self.binders.len() == 1
                     && !self.lambda
                     && !self.record_field
-                    && self.sigma.is_none()
+                    && self.explicit_notation.is_none()
                     && predicate_operator(tokens, *cursor)
                 {
                     self.phase = Phase::Predicate(*cursor);
@@ -465,6 +467,12 @@ impl Prefix {
             Phase::Group(group) => {
                 // The type ended at `:=`: the default runs to the group's own closing bracket.
                 let (close, default) = if symbol(tokens, at, ":=") {
+                    // NotationExtra's bracketedExplicitBinders has no default
+                    // slot. Do not parse a value that explicit_binders would
+                    // later discard when rebuilding the notation's syntax.
+                    if self.exists {
+                        return Err(refuse(view, tokens, at));
+                    }
                     let mut depth = 0usize;
                     let mut close = None;
                     for (index, token) in tokens.iter().enumerate().take(end).skip(at + 1) {
@@ -554,7 +562,10 @@ impl Prefix {
         if self.exists {
             let separator = leaves.leaf(self.separator.expect("completed prefix separator"))?;
             let syntax = Syntax::node(
-                Name::str(Name::anonymous(), self.sigma.unwrap_or("term∃_,_")),
+                Name::str(
+                    Name::anonymous(),
+                    self.explicit_notation.unwrap_or("term∃_,_"),
+                ),
                 vec![
                     leaves.leaf(self.keyword)?,
                     explicit_binders(self.binders, self.annotation, leaves)?,
@@ -931,5 +942,68 @@ mod tests {
         let or = kinds_of_mixed.iter().position(|k| k == "term_||_");
         let and = kinds_of_mixed.iter().position(|k| k == "term_&&_");
         assert!(or < and, "{kinds_of_mixed:?}");
+    }
+
+    #[test]
+    fn ascii_exists_preserves_its_notation_kind_and_import_boundary() {
+        for source in [
+            "def proposition := exists n : Nat, n = 1\r\n",
+            "def proposition := exists x y : Nat, x = y",
+            "def proposition := exists (A : Type) (x : A), x = x",
+            "def proposition (p : Nat → Prop) := exists n, p n",
+            "def proposition := exists _ : Nat, True",
+        ] {
+            let parsed = parse_source_command(source.as_bytes())
+                .unwrap_or_else(|error| panic!("{source}: {error:?}"));
+            assert_eq!(parsed.reconstruct_original(), source.as_bytes());
+            let mut pending = vec![&parsed.syntax];
+            let mut count = 0;
+            while let Some(syntax) = pending.pop() {
+                if let Syntax::Node { kind, args, .. } = syntax {
+                    assert_ne!(kind, &Name::from_components(["term∃_,_"]));
+                    if kind == &Name::from_components(["termExists_,_"]) {
+                        assert!(matches!(&args[0], Syntax::Atom { val, .. } if val == "exists"));
+                        count += 1;
+                    }
+                    pending.extend(args);
+                }
+            }
+            assert_eq!(count, 1, "{source}");
+        }
+        // Init.Core has the tactic's `exists` token, but not this term parser.
+        // Seeing the spelling alone must not make the later notation available.
+        for (module, allowed) in [("Init.Core", false), ("Init.NotationExtra", true)] {
+            let grammar = extensions::FileGrammar::new(
+                true,
+                &[Name::from_components(module.split('.'))],
+                None,
+            )
+            .unwrap();
+            let parsed = extensions::with_grammar(&grammar.grammar(), || {
+                parse_source_command(b"def proposition := exists x : Nat, x = x")
+            });
+            assert_eq!(parsed.is_ok(), allowed, "{module}: {parsed:?}");
+        }
+        for source in [
+            "def proposition := exists n : Nat",
+            "def proposition := exists (n : Nat) m, True",
+            "def proposition := exists {n : Nat}, True",
+            "def proposition := exists (n := 1), True",
+            "def proposition := exists (n : Nat := 1), True",
+            "def proposition := ∃ (n : Nat := 1), True",
+            "def pair := Σ (n : Nat := 1), Nat",
+            "def pair := Σ' (n : Nat := 1), Nat",
+            // BinderPredicates declares its extension only for Unicode ∃.
+            "def proposition := exists n < 3, True",
+        ] {
+            assert!(parse_source_command(source.as_bytes()).is_err(), "{source}");
+        }
+        assert!(
+            parse_source_command("def chosen («exists» : Nat) : Nat := «exists»".as_bytes())
+                .is_ok()
+        );
+        assert!(
+            parse_source_command("def proposition := ∀ (n : Nat := 1), n = n".as_bytes()).is_ok()
+        );
     }
 }

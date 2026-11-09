@@ -575,6 +575,10 @@ fn native_control_macros_preserve_refusals_limits_and_recovery() {
         .chain(OPERATOR_CANDIDATES.into_iter().map(|candidate| {
             let input = operator_inputs(candidate).swap_remove(3);
             (candidate, input)
+        }))
+        .chain(BINDER_CANDIDATES.into_iter().map(|candidate| {
+            let input = binder_inputs(candidate).swap_remove(3);
+            (candidate, input)
         }));
     for (candidate, input) in candidates {
         let baseline = expanded_control(candidate, &input);
@@ -1316,6 +1320,7 @@ fn check_pinned_notation_candidates(
     inputs: fn(NativeTacticMacro) -> Vec<Syntax>,
     label: &str,
     oracle: &str,
+    expected_errors: usize,
 ) {
     use std::path::PathBuf;
     use std::process::Command;
@@ -1384,7 +1389,7 @@ fn check_pinned_notation_candidates(
         }
     }
     // Reuse the lossless wire and capture fixtures, but execute the actual
-    // pinned Init.Notation registrations rather than a restated quotation.
+    // pinned Init registrations rather than a restated quotation.
     let helpers = include_str!("../../../../fln-olean/fixtures/NativeControlMacros.lean")
         .strip_suffix("#eval runControlMacros\n")
         .unwrap();
@@ -1417,7 +1422,9 @@ fn check_pinned_notation_candidates(
     );
     let mut native = String::new();
     let mut expanded = 0;
+    let mut errors = 0;
     let mut unsupported = 0;
+    let mut matching_inputs = 0;
     for &candidate in candidates {
         let mut cases = Vec::new();
         for context in contexts() {
@@ -1425,8 +1432,14 @@ fn check_pinned_notation_candidates(
                 for input in inputs(candidate) {
                     cases.push((input, context.clone(), reference.clone()));
                 }
+                cases.push((
+                    atom(SourceInfo::None, candidate.input_kind()),
+                    context.clone(),
+                    reference.clone(),
+                ));
             }
         }
+        matching_inputs += cases.len();
         for input in [
             Syntax::Missing,
             atom(SourceInfo::None, "wrong"),
@@ -1465,19 +1478,36 @@ fn check_pinned_notation_candidates(
                     native.push_str(&format!("unsupported:{}\n", next == state()));
                     unsupported += 1;
                 }
+                Outcome::Complete(Ok(MacroResult::Error {
+                    reference,
+                    message,
+                    state: next,
+                })) => {
+                    native.push_str(&format!(
+                        "error:{}:{}:{}\n",
+                        control_syntax(&reference),
+                        control_text(&message),
+                        next == state()
+                    ));
+                    errors += 1;
+                }
                 other => panic!("{candidate:?}: {other:?}"),
             }
         }
     }
     assert_eq!(
-        (expanded, unsupported),
-        (48 * candidates.len(), 4 * candidates.len())
+        (expanded, errors, unsupported),
+        (
+            matching_inputs - expected_errors,
+            expected_errors,
+            4 * candidates.len()
+        )
     );
     std::fs::write(dir.join("native.stdout"), &native).unwrap();
     assert_eq!(String::from_utf8(result.stdout).unwrap(), native, "{dir:?}");
     assert!(result.stderr.is_empty());
     eprintln!(
-        "native and pinned {label} macros: {expanded} exact quotations, {unsupported} unsupported inputs"
+        "native and pinned {label} macros: {expanded} exact quotations, {errors} diagnostic errors, {unsupported} unsupported inputs"
     );
 }
 
@@ -1494,6 +1524,7 @@ meta def notationCandidates : List (Macro × Name) :=
         sequencing_inputs,
         "sequencing",
         &format!("{oracle}{NOTATION_ORACLE_INPUTS}"),
+        0,
     );
 }
 
@@ -1619,6 +1650,7 @@ meta def notationCandidates : List (Macro × Name) :=
         operator_inputs,
         "operators",
         &format!("{oracle}{NOTATION_ORACLE_INPUTS}"),
+        0,
     );
 }
 
@@ -1647,7 +1679,7 @@ meta def runNotationMacros : IO Unit := do
   for (macroFn, kind) in notationCandidates do
     for context in controlContexts do
       for reference in controlReferences do
-        for input in notationInputs kind do
+        for input in notationInputs kind ++ [.atom .none (match kind with | .str _ s => s | _ => "")] do
           match macroFn input { context with ref := reference } state with
           | .ok stx next =>
             IO.println ("ok:" ++ controlSyntax stx ++ s!":{controlStateExact next}")
@@ -1660,4 +1692,400 @@ meta def runNotationMacros : IO Unit := do
       | _ => IO.println "unexpected-result"
 
 #eval runNotationMacros
+"#;
+
+const BINDER_CANDIDATES: [NativeTacticMacro; 6] = [
+    NativeTacticMacro::Exists,
+    NativeTacticMacro::ExistsAscii,
+    NativeTacticMacro::Sigma,
+    NativeTacticMacro::PSigma,
+    NativeTacticMacro::DependentPair,
+    NativeTacticMacro::DependentPairSort,
+];
+
+fn binder_root(candidate: NativeTacticMacro, binders: Syntax, body: Syntax) -> Syntax {
+    let wrong = || atom(SourceInfo::None, "wrong");
+    let extra = atom(SourceInfo::None, "extra");
+    let args = if matches!(
+        candidate,
+        NativeTacticMacro::DependentPair | NativeTacticMacro::DependentPairSort
+    ) {
+        vec![binders, wrong(), body, extra]
+    } else {
+        vec![wrong(), binders, wrong(), body, extra]
+    };
+    node(candidate.input_kind(), args)
+}
+
+fn bracketed_binders(kind: &str, identifiers: Vec<Syntax>, domain: Syntax) -> Syntax {
+    let wrong = || atom(SourceInfo::None, "wrong");
+    node(
+        kind,
+        vec![wrong(), node("null", identifiers), wrong(), domain, wrong()],
+    )
+}
+
+fn explicit_binders(identifiers: Vec<Syntax>, annotation: Syntax) -> Syntax {
+    node(
+        "Lean.explicitBinders",
+        vec![node(
+            "Lean.unbracketedExplicitBinders",
+            vec![node("null", identifiers), annotation],
+        )],
+    )
+}
+
+fn binder_inputs(candidate: NativeTacticMacro) -> Vec<Syntax> {
+    let named = || node("Lean.binderIdent", vec![argument(&control_body(), 0)]);
+    let anonymous = || {
+        node(
+            "Lean.binderIdent",
+            vec![Syntax::Node {
+                info: SourceInfo::Synthetic {
+                    pos: BytePos(1),
+                    end_pos: BytePos(8),
+                    canonical: true,
+                },
+                kind: name("Lean.Parser.Term.hole"),
+                args: vec![atom(SourceInfo::None, "captured hole")],
+            }],
+        )
+    };
+    let malformed = || node("Client.binder", vec![control_body()]);
+    let group = |identifiers, domain| {
+        bracketed_binders("Lean.bracketedExplicitBinders", identifiers, domain)
+    };
+    let is_product = matches!(
+        candidate,
+        NativeTacticMacro::DependentPair | NativeTacticMacro::DependentPairSort
+    );
+    let binders = if is_product {
+        vec![
+            Syntax::Missing,
+            group(vec![named()], control_body()),
+            group(vec![named(), anonymous(), malformed()], control_body()),
+            group(
+                vec![anonymous(), named()],
+                node("Client.domain", vec![control_body()]),
+            ),
+            group(Vec::new(), control_body()),
+            node(
+                "Lean.bracketedExplicitBinders",
+                vec![Syntax::Missing, node("null", vec![named()])],
+            ),
+            bracketed_binders("Client.group", vec![named()], control_body()),
+            group(
+                vec![
+                    node("Client.wrapper", vec![argument(&control_body(), 0)]),
+                    malformed(),
+                ],
+                Syntax::Missing,
+            ),
+        ]
+    } else {
+        vec![
+            Syntax::Missing,
+            explicit_binders(vec![named()], node("null", Vec::new())),
+            explicit_binders(
+                vec![named(), anonymous(), malformed()],
+                node("null", vec![atom(SourceInfo::None, ":"), control_body()]),
+            ),
+            node(
+                "Lean.explicitBinders",
+                vec![node(
+                    "null",
+                    vec![
+                        group(vec![named(), anonymous()], control_body()),
+                        group(vec![named()], node("Client.domain", vec![control_body()])),
+                    ],
+                )],
+            ),
+            explicit_binders(
+                Vec::new(),
+                node("null", vec![atom(SourceInfo::None, ":"), control_body()]),
+            ),
+            // isNone only accepts missing or an empty null node. An empty
+            // node of another kind supplies a present, missing type capture.
+            explicit_binders(vec![named()], node("Client.annotation", Vec::new())),
+            node(
+                "Lean.explicitBinders",
+                vec![node("null", vec![Syntax::Missing])],
+            ),
+            explicit_binders(
+                vec![
+                    node("Client.wrapper", vec![argument(&control_body(), 0)]),
+                    malformed(),
+                ],
+                Syntax::Missing,
+            ),
+        ]
+    };
+    let mut inputs = vec![node(candidate.input_kind(), Vec::new())];
+    inputs.extend(
+        binders
+            .into_iter()
+            .map(|binders| binder_root(candidate, binders, control_body())),
+    );
+    inputs
+}
+
+#[test]
+fn native_binder_quotes_preserve_captures_reserved_resolution_and_diagnostics() {
+    for candidate in BINDER_CANDIDATES {
+        for context in contexts() {
+            for (reference, info) in references() {
+                let input = binder_inputs(candidate).swap_remove(3);
+                let execution = control_execute(
+                    candidate,
+                    &input,
+                    &context,
+                    &reference,
+                    MacroLimits::default(),
+                    None,
+                );
+                let Outcome::Complete(Ok(MacroResult::Expanded {
+                    syntax,
+                    state: next,
+                })) = execution.outcome
+                else {
+                    panic!("binder expansion failed: {execution:?}");
+                };
+                assert_eq!(next, state());
+                let target = match candidate {
+                    NativeTacticMacro::Exists | NativeTacticMacro::ExistsAscii => "Exists",
+                    NativeTacticMacro::Sigma | NativeTacticMacro::DependentPair => "Sigma",
+                    NativeTacticMacro::PSigma | NativeTacticMacro::DependentPairSort => "PSigma",
+                    _ => unreachable!(),
+                };
+                let expected_value =
+                    add_macro_scope(&name("_internal"), &name(target), RESERVED_MACRO_SCOPE)
+                        .unwrap();
+                let mut current = &syntax;
+                for index in 0..3 {
+                    let Syntax::Node {
+                        info: actual_info,
+                        kind,
+                        args,
+                    } = current
+                    else {
+                        panic!("binder fold lost its application: {current:?}");
+                    };
+                    assert_eq!(*actual_info, info);
+                    assert_eq!(*kind, name("Lean.Parser.Term.app"));
+                    assert_eq!(args.len(), 2);
+                    let Syntax::Ident {
+                        info: constant_info,
+                        raw_val,
+                        val,
+                        preresolved,
+                    } = &args[0]
+                    else {
+                        panic!("binder combinator was not an identifier");
+                    };
+                    assert_eq!(*constant_info, info);
+                    assert_eq!(*val, expected_value);
+                    assert_eq!(
+                        raw_val.backing(&source()),
+                        format!("{target}._@._internal._hyg.0")
+                    );
+                    assert_eq!(
+                        *preresolved,
+                        vec![Preresolved::Decl {
+                            name: name(target),
+                            fields: Vec::new()
+                        }]
+                    );
+                    let lambda = argument_ref(&args[1], 0);
+                    assert_eq!(lambda.kind(), Some(&name("Lean.Parser.Term.fun")));
+                    let function = argument_ref(lambda, 1);
+                    assert_eq!(function.kind(), Some(&name("Lean.Parser.Term.basicFun")));
+                    let binder = argument_ref(argument_ref(function, 0), 0);
+                    if index == 0 {
+                        assert_eq!(*binder, argument(&control_body(), 0));
+                    } else {
+                        assert_eq!(
+                            *binder,
+                            Syntax::Node {
+                                info,
+                                kind: name("Lean.Parser.Term.hole"),
+                                args: vec![atom(info, "_")],
+                            }
+                        );
+                    }
+                    let annotation = argument_ref(argument_ref(function, 1), 0);
+                    assert_eq!(annotation.kind(), Some(&name("Lean.Parser.Term.typeSpec")));
+                    assert_eq!(*argument_ref(annotation, 1), control_body());
+                    current = argument_ref(function, 3);
+                }
+                assert_eq!(*current, control_body());
+            }
+        }
+        let input = binder_inputs(candidate).swap_remove(7);
+        let reference = references()[1].0.clone();
+        let execution = control_execute(
+            candidate,
+            &input,
+            &contexts()[0],
+            &reference,
+            MacroLimits::default(),
+            None,
+        );
+        if matches!(
+            candidate,
+            NativeTacticMacro::DependentPair | NativeTacticMacro::DependentPairSort
+        ) {
+            assert!(matches!(
+                execution.outcome,
+                Outcome::Complete(Ok(MacroResult::Expanded { .. }))
+            ));
+        } else {
+            assert!(matches!(
+                execution.outcome,
+                Outcome::Complete(Ok(MacroResult::Error {
+                    reference: actual_reference,
+                    message,
+                    state: next,
+                })) if actual_reference == reference
+                    && message == "unexpected explicit binder"
+                    && next == state()
+            ));
+        }
+    }
+}
+
+#[test]
+fn native_binder_type_duplication_obeys_output_budget_and_recovers() {
+    let candidate = NativeTacticMacro::Exists;
+    let input = binder_root(
+        candidate,
+        explicit_binders(
+            vec![node("Lean.binderIdent", vec![Syntax::Missing]); 12],
+            node(
+                "null",
+                vec![
+                    atom(SourceInfo::None, ":"),
+                    atom(SourceInfo::None, &"x".repeat(8192)),
+                ],
+            ),
+        ),
+        Syntax::Missing,
+    );
+    let limits = MacroLimits {
+        syntax: SyntaxLimits {
+            max_bytes: 16384,
+            ..SyntaxLimits::default()
+        },
+        ..MacroLimits::default()
+    };
+    // The input fits; repeating its shared type in each generated lambda does
+    // not. The native fold must stop before constructing that oversized tree.
+    assert!(syntax::inject(&input, &source(), limits.syntax).is_ok());
+    let limited = control_execute(
+        candidate,
+        &input,
+        &contexts()[0],
+        &Syntax::Missing,
+        limits,
+        None,
+    );
+    assert!(
+        matches!(limited.outcome, Outcome::Inconclusive(_)),
+        "{limited:?}"
+    );
+    let recovered = expanded_control(candidate, &input);
+    let mut current = &recovered;
+    for _ in 0..12 {
+        assert_eq!(current.kind(), Some(&name("Lean.Parser.Term.app")));
+        current = argument_ref(
+            argument_ref(argument_ref(argument_ref(current, 1), 0), 1),
+            3,
+        );
+    }
+    assert_eq!(*current, Syntax::Missing);
+}
+
+#[test]
+fn live_pinned_binder_candidates_match_complete_quotations_errors_and_state() {
+    check_pinned_notation_candidates(
+        &BINDER_CANDIDATES,
+        binder_inputs,
+        "binders",
+        BINDER_ORACLE,
+        32,
+    );
+}
+
+const BINDER_ORACLE: &str = r#"
+meta def binderCandidates : List (Macro × Name) :=
+  [(«_aux_Init_NotationExtra___macroRules_term∃_,__1», `«term∃_,_»),
+   («_aux_Init_NotationExtra___macroRules_termExists_,__1», `«termExists_,_»),
+   («_aux_Init_NotationExtra___macroRules_termΣ_,__1», `«termΣ_,_»),
+   («_aux_Init_NotationExtra___macroRules_termΣ'_,__1», `«termΣ'_,_»),
+   («_aux_Init_NotationExtra___macroRules_term_×__1_1», `«term_×__1»),
+   («_aux_Init_NotationExtra___macroRules_term_×'__1_1», `«term_×'__1»)]
+
+meta def binderRoot (kind : Name) (binders body : Syntax) : Syntax :=
+  let wrong := Syntax.atom .none "wrong"
+  let extra := Syntax.atom .none "extra"
+  if kind == `«term_×__1» || kind == `«term_×'__1» then
+    .node .none kind #[binders, wrong, body, extra]
+  else
+    .node .none kind #[wrong, binders, wrong, body, extra]
+
+meta def binderGroup (kind : Name) (ids : Array Syntax) (domain : Syntax) : Syntax :=
+  let wrong := Syntax.atom .none "wrong"
+  .node .none kind #[wrong, .node .none `null ids, wrong, domain, wrong]
+
+meta def binderExplicit (ids : Array Syntax) (annotation : Syntax) : Syntax :=
+  .node .none `Lean.explicitBinders #[.node .none `Lean.unbracketedExplicitBinders
+    #[.node .none `null ids, annotation]]
+
+meta def binderInputs (kind : Name) : List Syntax :=
+  let named := Syntax.node .none `Lean.binderIdent #[controlBody[0]]
+  let anonymous := Syntax.node .none `Lean.binderIdent #[
+    .node (.synthetic ⟨1⟩ ⟨8⟩ true) `Lean.Parser.Term.hole #[.atom .none "captured hole"]]
+  let malformed := Syntax.node .none `Client.binder #[controlBody]
+  let group := binderGroup `Lean.bracketedExplicitBinders
+  let binders : List Syntax :=
+    if kind == `«term_×__1» || kind == `«term_×'__1» then
+      [.missing,
+       group #[named] controlBody,
+       group #[named, anonymous, malformed] controlBody,
+       group #[anonymous, named] (.node .none `Client.domain #[controlBody]),
+       group #[] controlBody,
+       .node .none `Lean.bracketedExplicitBinders #[.missing, .node .none `null #[named]],
+       binderGroup `Client.group #[named] controlBody,
+       group #[.node .none `Client.wrapper #[controlBody[0]], malformed] .missing]
+    else
+      [.missing,
+       binderExplicit #[named] (.node .none `null #[]),
+       binderExplicit #[named, anonymous, malformed] (.node .none `null #[.atom .none ":", controlBody]),
+       .node .none `Lean.explicitBinders #[.node .none `null #[
+         group #[named, anonymous] controlBody,
+         group #[named] (.node .none `Client.domain #[controlBody])]],
+       binderExplicit #[] (.node .none `null #[.atom .none ":", controlBody]),
+       binderExplicit #[named] (.node .none `Client.annotation #[]),
+       .node .none `Lean.explicitBinders #[.node .none `null #[.missing]],
+       binderExplicit #[.node .none `Client.wrapper #[controlBody[0]], malformed] .missing]
+  .node .none kind #[] :: binders.map (binderRoot kind · controlBody)
+
+meta def runBinderMacros : IO Unit := do
+  let state : Macro.State := ⟨9, [(`Trace, "keep")], [`Prior]⟩
+  for (macroFn, kind) in binderCandidates do
+    for context in controlContexts do
+      for reference in controlReferences do
+        for input in binderInputs kind ++ [.atom .none (match kind with | .str _ s => s | _ => "")] do
+          match macroFn input { context with ref := reference } state with
+          | .ok stx next =>
+            IO.println ("ok:" ++ controlSyntax stx ++ s!":{controlStateExact next}")
+          | .error (.error ref msg) next =>
+            IO.println ("error:" ++ controlSyntax ref ++ ":" ++ controlText msg ++ s!":{controlStateExact next}")
+          | .error .unsupportedSyntax next => IO.println s!"unsupported:{controlStateExact next}"
+    for input in [Syntax.missing, .atom .none "wrong", .node .none `User.term #[],
+      .node .none (`Lean.Parser.Term ++ kind) #[]] do
+      match macroFn input ⟨default, `Client.Scope, 17, 3, 512, .missing⟩ state with
+      | .error .unsupportedSyntax next => IO.println s!"unsupported:{controlStateExact next}"
+      | _ => IO.println "unexpected-result"
+
+#eval runBinderMacros
 "#;
