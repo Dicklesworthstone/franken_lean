@@ -2798,6 +2798,22 @@ impl Context {
                             if expand_macro {
                                 let locals =
                                     self.observes_term(syntax).then(|| self.txn.lctx.clone());
+                                if let Some(literal) =
+                                    tactics::imported_macros::prepared_pattern_literal(syntax)?
+                                {
+                                    // The matrix already expanded and decoded this literal.
+                                    // Elaborate its primitive syntax in this worklist: a
+                                    // nested evaluator retains another large native frame.
+                                    // Only num/str/char cross this boundary; their atom
+                                    // elaborators never visit child syntax. Skipping this
+                                    // lookup preserves compact predecessors without
+                                    // disabling macros for deferred sibling arguments.
+                                    if let Some(locals) = locals {
+                                        tasks.push(Task::Observe(syntax, locals));
+                                    }
+                                    tasks.push(Task::Elaborate(literal, expected, finish));
+                                    continue;
+                                }
                                 if let Some(term) =
                                     self.imported_tactic_term(syntax, expected.clone(), finish)?
                                 {

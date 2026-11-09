@@ -612,6 +612,29 @@ impl Context {
                         pending.push((&args[1], false));
                         continue;
                     }
+                    // Match discriminants and alternative bodies reach the
+                    // ordinary term elaborator with their complete identifier
+                    // metadata. Only the discriminant's optional name and the
+                    // alternative's patterns use the specialized name paths.
+                    // Reset this boundary even inside a generated match or
+                    // equation block; nested tactic syntax establishes its own
+                    // restrictions when visited below.
+                    let term_child =
+                        if kind == &parser_kind(&["Term", "matchDiscr"]) && args.len() == 2 {
+                            Some(1)
+                        } else if kind == &parser_kind(&["Term", "matchAlt"]) && args.len() == 4 {
+                            Some(3)
+                        } else {
+                            None
+                        };
+                    if let Some(term_child) = term_child {
+                        pending.extend(
+                            args.iter()
+                                .enumerate()
+                                .map(|(index, arg)| (arg, index != term_child)),
+                        );
+                        continue;
+                    }
                     let specialized = specialized
                         || kind.parent() == parser_kind(&["Tactic"])
                         || kind == &parser_kind(&["Term", "match"])

@@ -49,13 +49,34 @@ fn frame_limit() -> NatDefinitionElabError {
     )))
 }
 
-fn prepared_pattern_literal(syntax: &Syntax) -> bool {
-    syntax.kind().is_some_and(|kind| {
+pub(in crate::source) fn prepared_pattern_literal(
+    syntax: &Syntax,
+) -> Result<Option<&Syntax>, NatDefinitionElabError> {
+    if !syntax.kind().is_some_and(|kind| {
         matches!(
             kind.leaf_view(),
             fln_core::name::LeafView::Str("flnPreparedPatternLiteral")
         ) && *kind == parser_kind(&["Term", "flnPreparedPatternLiteral"])
-    })
+    }) {
+        return Ok(None);
+    }
+    let parts = expect_node(
+        syntax,
+        &parser_kind(&["Term", "flnPreparedPatternLiteral"]),
+        1,
+        "prepared pattern literal",
+    )?;
+    let literal = &parts[0];
+    if !literal.kind().is_some_and(|kind| {
+        ["num", "str", "char"]
+            .iter()
+            .any(|name| *kind == Name::from_components([*name]))
+    }) {
+        return Err(NatDefinitionElabError::UnexpectedSyntax {
+            expected: "prepared pattern literal",
+        });
+    }
+    Ok(Some(literal))
 }
 
 impl ProofState<'_> {
@@ -305,32 +326,6 @@ impl Context {
         expected: Option<Expr>,
         finish: bool,
     ) -> Result<Option<Typed>, NatDefinitionElabError> {
-        if prepared_pattern_literal(syntax) {
-            let prepared_kind = parser_kind(&["Term", "flnPreparedPatternLiteral"]);
-            let parts = expect_node(syntax, &prepared_kind, 1, "prepared pattern literal")?;
-            let literal = &parts[0];
-            if !literal.kind().is_some_and(|kind| {
-                ["num", "str", "char"]
-                    .iter()
-                    .any(|name| *kind == Name::from_components([*name]))
-            }) {
-                return Err(NatDefinitionElabError::UnexpectedSyntax {
-                    expected: "prepared pattern literal",
-                });
-            }
-            // The matrix has already decoded this value, including any source
-            // macro expansion. Its comparison operand must retain that value;
-            // internal predecessors must not become new user macro inputs.
-            // Only builtin literal syntax can cross this boundary, and it
-            // still goes through ordinary elaboration and kernel checking.
-            let provider = self.source_scope.tactic_macros.take();
-            let result = self.term_prepared_scoped(literal, expected, None, None, finish);
-            self.source_scope.tactic_macros = provider;
-            return match result? {
-                super::super::TermResult::Term(term) => Ok(Some(term)),
-                super::super::TermResult::Tactic(_) => Err(failure(SourceInferenceError::Scope)),
-            };
-        }
         let Some(provider) = self.source_scope.tactic_macros.clone() else {
             return Ok(None);
         };
@@ -426,7 +421,7 @@ impl Context {
                     observations,
                 });
                 let root = &*frames.last().expect("owned expansion frame").syntax;
-                if prepared_pattern_literal(root) {
+                if prepared_pattern_literal(root)?.is_some() {
                     break self
                         .term_prepared_scoped(root, expected.clone(), None, None, finish)
                         .and_then(super::super::TermResult::term)?;

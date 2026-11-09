@@ -296,7 +296,6 @@ fn specialized_name_only_paths_refuse_metadata_before_dropping_it() {
     let env = environment();
     for source in [
         "def chosen (x : Nat) : Nat := match x with | shadow => x",
-        "def chosen : Nat := by apply shadow",
         "def chosen : Nat → Nat | shadow => 13",
     ] {
         let syntax = parsed(source, "shadow", target("available"));
@@ -313,43 +312,49 @@ fn specialized_name_only_paths_refuse_metadata_before_dropping_it() {
 }
 
 #[test]
-fn exact_tactic_terms_preserve_declaration_metadata_and_local_priority() {
+fn exact_and_apply_tactic_terms_preserve_declaration_metadata_and_local_priority() {
     let env = environment();
-    let syntax = parsed(
-        "def chosen : Nat := by exact shadow",
-        "shadow",
-        target("available"),
-    );
-    assert_eq!(
-        checked(&syntax, &env).value,
-        Expr::const_(n("available"), vec![])
-    );
+    for tactic in ["exact", "apply"] {
+        let syntax = parsed(
+            &format!("def chosen : Nat := by {tactic} shadow"),
+            "shadow",
+            target("available"),
+        );
+        // `available` is 13, whereas spelling-only resolution in this scope
+        // would choose `Client.shadow`, whose value is 99. Both tactics send
+        // their complete operand through the ordinary identifier resolver.
+        assert_eq!(
+            checked(&syntax, &env).value,
+            Expr::const_(n("available"), vec![]),
+            "{tactic} must use the pre-resolved declaration, not its spelling"
+        );
 
-    // The same metadata still cannot capture a use-site local, and an
-    // unavailable exact declaration is never replaced with namespace lookup.
-    let local = parsed(
-        "def chosen (shadow : Nat) : Nat := by exact shadow",
-        "shadow",
-        target("available"),
-    );
-    let checked_local = checked(&local, &env);
-    assert!(
-        matches!(checked_local.value.node(), ExprNode::Lam { body, .. } if body == &Expr::bvar(0).unwrap())
-    );
-    let missing = parsed(
-        "def chosen : Nat := by exact shadow",
-        "shadow",
-        target("Unavailable"),
-    );
-    assert!(matches!(
-        elaborate_definition_in_scope_with_budget(&missing, &env, budget(), &scope()),
-        Err(NatDefinitionElabError::Inference(
-            SourceInferenceError::PreresolvedReference {
-                feature: "an available exact declaration target",
-                ..
-            }
-        ))
-    ));
+        // The same metadata still cannot capture a use-site local, and an
+        // unavailable exact declaration is never replaced with namespace lookup.
+        let local = parsed(
+            &format!("def chosen (shadow : Nat) : Nat := by {tactic} shadow"),
+            "shadow",
+            target("available"),
+        );
+        let checked_local = checked(&local, &env);
+        assert!(
+            matches!(checked_local.value.node(), ExprNode::Lam { body, .. } if body == &Expr::bvar(0).unwrap())
+        );
+        let missing = parsed(
+            &format!("def chosen : Nat := by {tactic} shadow"),
+            "shadow",
+            target("Unavailable"),
+        );
+        assert!(matches!(
+            elaborate_definition_in_scope_with_budget(&missing, &env, budget(), &scope()),
+            Err(NatDefinitionElabError::Inference(
+                SourceInferenceError::PreresolvedReference {
+                    feature: "an available exact declaration target",
+                    ..
+                }
+            ))
+        ));
+    }
 }
 
 /// Deferred literal macros can introduce identifiers after the declaration's
