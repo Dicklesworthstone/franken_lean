@@ -398,6 +398,26 @@ pub(super) struct Recursion {
     pub(super) equation_goals: HashMap<MVarId, ConstrainedBranch>,
 }
 impl Context {
+    /// Roll back a failed body without losing the editor's terminal observation.
+    /// The observation owns its provisional terms and local context; it is not
+    /// an elaboration success and never grants declaration admission.
+    fn restore_recursion_error(&mut self, snapshot: Self, problem: &NatDefinitionElabError) {
+        let inspection = if matches!(
+            problem,
+            NatDefinitionElabError::Inference(SourceInferenceError::ObservationComplete)
+        ) {
+            self.inspection.take()
+        } else {
+            None
+        };
+        let spent = self.txn.budget.heartbeats_consumed;
+        *self = snapshot;
+        self.txn.budget.heartbeats_consumed = spent;
+        if let Some(inspection) = inspection {
+            self.inspection = Some(inspection);
+        }
+    }
+
     /// Elaborate the measure in the header-plus-alias scope, as the pin's
     /// `TerminationMeasure.elab` does. The result must be the actual free
     /// variable, not merely definitionally equal to one. Restore all speculative
@@ -498,9 +518,13 @@ impl Context {
             }
             Err(error(RecursionError::StructuralMeasureNotParameter))
         })();
-        let spent = self.txn.budget.heartbeats_consumed;
-        *self = snapshot;
-        self.txn.budget.heartbeats_consumed = spent;
+        if let Err(problem) = &result {
+            self.restore_recursion_error(snapshot, problem);
+        } else {
+            let spent = self.txn.budget.heartbeats_consumed;
+            *self = snapshot;
+            self.txn.budget.heartbeats_consumed = spent;
+        }
         result
     }
 
@@ -936,10 +960,8 @@ impl Context {
             // a different successful branch and silently change the program.
             // Mutual groups already register all peer headers before bodies.
             let result = self.partial_definition_body(name, parameters, syntax, expected);
-            if result.is_err() {
-                let spent = self.txn.budget.heartbeats_consumed;
-                *self = snapshot;
-                self.txn.budget.heartbeats_consumed = spent;
+            if let Err(problem) = &result {
+                self.restore_recursion_error(snapshot, problem);
             }
             return result;
         }
@@ -955,9 +977,7 @@ impl Context {
             Ok(InitialBody::Complete(body)) => return Ok(body),
             Ok(InitialBody::Recursive) => {}
             Err(problem) => {
-                let spent = self.txn.budget.heartbeats_consumed;
-                *self = snapshot;
-                self.txn.budget.heartbeats_consumed = spent;
+                self.restore_recursion_error(snapshot, &problem);
                 return Err(problem);
             }
         }
@@ -1074,10 +1094,8 @@ impl Context {
             }
             self.close_recursive_lambdas(&lambdas, body)
         })();
-        if result.is_err() {
-            let spent = self.txn.budget.heartbeats_consumed;
-            *self = snapshot;
-            self.txn.budget.heartbeats_consumed = spent;
+        if let Err(problem) = &result {
+            self.restore_recursion_error(snapshot, problem);
         }
         result
     }
@@ -1211,9 +1229,7 @@ impl Context {
                         break;
                     }
                     Err(problem) => {
-                        let spent = self.txn.budget.heartbeats_consumed;
-                        *self = snapshot;
-                        self.txn.budget.heartbeats_consumed = spent;
+                        self.restore_recursion_error(snapshot, &problem);
                         return Err(problem);
                     }
                 }

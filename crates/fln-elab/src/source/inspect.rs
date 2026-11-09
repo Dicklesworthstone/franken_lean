@@ -338,10 +338,30 @@ impl Context {
     fn observation_locals(
         &mut self,
         source: &LocalContext,
+        roots: &[&Expr],
     ) -> Result<LocalContext, NatDefinitionElabError> {
-        let mut result = LocalContext::new();
-        for local in source.decls() {
+        let mut needed = std::collections::HashSet::new();
+        for root in roots {
+            needed.extend(self.elimination_reads(root)?);
+        }
+        let mut retained = Vec::new();
+        // The predefinition's auxiliary self is not a user hypothesis. Keep it
+        // only when the observed term/goal or a visible local actually uses it.
+        // Local declarations depend on earlier ones, so reverse traversal also
+        // closes dependencies through retained local types and let values.
+        for local in source.decls().iter().rev() {
             self.tick()?;
+            let private_self = self.is_private_self(&local.id)
+                || self
+                    .partial
+                    .as_ref()
+                    .and_then(|partial| partial.reference.as_ref())
+                    .is_some_and(|reference| {
+                        matches!(reference.term.value.node(), ExprNode::FVar { id } if id == &local.id)
+                    });
+            if private_self && !needed.contains(&local.id) {
+                continue;
+            }
             let mut local = local.clone();
             local.type_ = self.instantiate(&local.type_)?;
             local.value = local
@@ -349,6 +369,15 @@ impl Context {
                 .as_ref()
                 .map(|value| self.instantiate(value))
                 .transpose()?;
+            needed.extend(self.elimination_reads(&local.type_)?);
+            if let Some(value) = &local.value {
+                needed.extend(self.elimination_reads(value)?);
+            }
+            retained.push(local);
+        }
+        let mut result = LocalContext::new();
+        for local in retained.into_iter().rev() {
+            self.tick()?;
             if let Some(value) = local.value {
                 result.add_let(local.id, local.user_name, local.type_, value);
             } else {
@@ -405,7 +434,7 @@ impl Context {
             // An invalid selected term still fails rather than inventing info.
             self.flush(true)?;
             let target = self.instantiate(&term.type_)?;
-            let locals = self.observation_locals(&locals)?;
+            let locals = self.observation_locals(&locals, &[&target])?;
             let probe = self.inspection.as_mut().expect("selected term-goal probe");
             probe.result = Some(SourceObservation::Goals {
                 range: probe.site.range().clone(),
@@ -421,7 +450,7 @@ impl Context {
         self.flush(true)?;
         let expression = self.instantiate(&term.value)?;
         let type_ = self.instantiate(&term.type_)?;
-        let locals = self.observation_locals(&locals)?;
+        let locals = self.observation_locals(&locals, &[&expression, &type_])?;
         let probe = self.inspection.as_mut().expect("selected probe");
         probe.result = Some(SourceObservation::Term {
             range: probe.site.range().clone(),
@@ -492,7 +521,7 @@ impl Context {
         let mut observed = Vec::new();
         for goal in goals {
             let target = self.instantiate(&goal.target)?;
-            let locals = self.observation_locals(&goal.lctx)?;
+            let locals = self.observation_locals(&goal.lctx, &[&target])?;
             observed.push(ObservedGoal {
                 id: Some(goal.id.clone()),
                 user_name: self
