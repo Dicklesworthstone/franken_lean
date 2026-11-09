@@ -141,6 +141,76 @@ fn malformed_or_wrong_kind_results_cannot_pass_the_semantic_contract() {
 /// (`dispatch/semantic/completion.rs`, `dispatch/semantic/navigation_tests.rs`).
 const COMPLETION: &str = r#"{"isIncomplete":true,"items":[{"label":"value","kind":21,"insertTextFormat":1,"filterText":"_root_.value","textEdit":{"range":{"start":{"line":1,"character":2},"end":{"line":1,"character":5}},"newText":"_root_.value"}}]}"#;
 const DEFINITION: &str = r#"{"uri":"file:///Lib%20One.lean","range":{"start":{"line":1,"character":3},"end":{"line":1,"character":8}}}"#;
+const DOCUMENT_SYMBOLS: &str = r#"[{"name":"Outer.value","kind":6,"range":{"start":{"line":1,"character":0},"end":{"line":1,"character":20}},"selectionRange":{"start":{"line":1,"character":4},"end":{"line":1,"character":9}}}]"#;
+
+#[test]
+fn native_document_symbols_have_typed_counters_and_distinct_empty_results() {
+    for payload in [DOCUMENT_SYMBOLS, "[]"] {
+        accepted(
+            "textDocument/documentSymbol",
+            &format!(r#""result":{payload}"#),
+            "\"semanticQueryResults\":1",
+        );
+    }
+    accepted(
+        "textDocument/documentSymbol",
+        r#""result":null"#,
+        "\"noInformationQueryResults\":1",
+    );
+    for code in [-32602, -32803, -32800] {
+        accepted(
+            "textDocument/documentSymbol",
+            &format!(r#""error":{{"code":{code},"message":"not a result"}}"#),
+            "\"semanticQueryErrors\":1",
+        );
+    }
+}
+
+#[test]
+fn wrong_document_symbol_answers_fail_the_contract() {
+    let planted = |from: &str, to: &str| {
+        assert!(DOCUMENT_SYMBOLS.contains(from), "plant site {from} is gone");
+        DOCUMENT_SYMBOLS.replacen(from, to, 1)
+    };
+    for payload in [
+        planted(r#""name":"Outer.value""#, r#""name":"""#),
+        planted("Outer.value", r"Outer\nvalue"),
+        planted(r#""kind":6"#, r#""kind":99"#),
+        planted(r#""character":20"#, r#""character":0"#),
+        planted(r#""character":9"#, r#""character":4"#),
+        planted(r#""character":9"#, r#""character":21"#),
+        planted(r#""selectionRange""#, r#""otherRange""#),
+        planted(
+            r#""name":"Outer.value""#,
+            r#""name":"Outer.value","children":[]"#,
+        ),
+        "[null]".to_owned(),
+        "{}".to_owned(),
+        DEFINITION.to_owned(),
+        COMPLETION.to_owned(),
+    ] {
+        let result = join(
+            "textDocument/documentSymbol",
+            &format!(r#""result":{payload}"#),
+        );
+        assert!(
+            !result.status.success(),
+            "accepted invalid outline: {payload}"
+        );
+        assert!(result.stdout.is_empty());
+        assert!(!result.stderr.is_empty());
+    }
+    let symbol = &DOCUMENT_SYMBOLS[1..DOCUMENT_SYMBOLS.len() - 1];
+    let too_many = format!("[{}]", vec![symbol; 4097].join(","));
+    assert!(
+        !join(
+            "textDocument/documentSymbol",
+            &format!(r#""result":{too_many}"#)
+        )
+        .status
+        .success()
+    );
+}
 
 #[test]
 fn native_completion_and_definition_results_have_typed_counters() {
@@ -282,7 +352,7 @@ impl fln_server::dispatch::WorkspaceChecker for Native {
         query: fln_server::dispatch::semantic::Query<'_>,
         _: &[fln_server::dispatch::OpenDocumentSource<'_>],
     ) -> Result<Option<fln_server::dispatch::semantic::Answer>, String> {
-        use fln_server::dispatch::semantic::{Answer, CompletionItem, QueryKind};
+        use fln_server::dispatch::semantic::{Answer, CompletionItem, DocumentSymbol, QueryKind};
         Ok(Some(match query.kind {
             QueryKind::TermGoal => Answer::TermGoal {
                 goal: "x : A\n⊢ A".to_owned(),
@@ -300,6 +370,13 @@ impl fln_server::dispatch::WorkspaceChecker for Native {
                 uri: "file:///Lib.lean".to_owned(),
                 source: "def value := 1".to_owned(),
                 range: 4..9,
+            },
+            QueryKind::DocumentSymbols => Answer::DocumentSymbols {
+                symbols: vec![DocumentSymbol {
+                    name: "val".to_owned(),
+                    range: 0..7,
+                    selection_range: 4..7,
+                }],
             },
             QueryKind::Goals
             | QueryKind::Hover
@@ -361,6 +438,7 @@ fn the_real_dispatchers_answers_pass_and_a_planted_wrong_answer_fails() {
         r#"{"jsonrpc":"2.0","id":"completion","method":"textDocument/completion","params":{"textDocument":{"uri":"file:///Main.lean"},"position":{"line":0,"character":5}}}"#,
         r#"{"jsonrpc":"2.0","id":"definition","method":"textDocument/definition","params":{"textDocument":{"uri":"file:///Main.lean"},"position":{"line":0,"character":3}}}"#,
         r#"{"jsonrpc":"2.0","id":"term","method":"$/lean/plainTermGoal","params":{"textDocument":{"uri":"file:///Main.lean"},"position":{"line":0,"character":3}}}"#,
+        r#"{"jsonrpc":"2.0","id":"symbols","method":"textDocument/documentSymbol","params":{"textDocument":{"uri":"file:///Main.lean"}}}"#,
         r#"{"jsonrpc":"2.0","id":"end","method":"shutdown"}"#,
         r#"{"jsonrpc":"2.0","method":"exit"}"#,
     ]
@@ -389,6 +467,13 @@ fn the_real_dispatchers_answers_pass_and_a_planted_wrong_answer_fails() {
         .expect("the dispatcher answered with a term goal");
     assert!(server[term].contains(r#""start":{"line":0,"character":2}"#));
     assert!(server[term].contains(r#""end":{"line":0,"character":5}"#));
+    let symbols = server
+        .iter()
+        .position(|body| body.contains(r#""id":"symbols","result":[{"name":"val""#))
+        .expect("the dispatcher answered with a document outline");
+    assert!(server[symbols].contains(
+        r#""selectionRange":{"start":{"line":0,"character":2},"end":{"line":0,"character":5}}"#
+    ));
 
     let honest = correlate(&client, &server);
     let receipt = String::from_utf8(honest.stdout).unwrap();
@@ -397,13 +482,14 @@ fn the_real_dispatchers_answers_pass_and_a_planted_wrong_answer_fails() {
         "{receipt}{}",
         String::from_utf8_lossy(&honest.stderr)
     );
-    assert!(receipt.contains("\"semanticQueryResults\":3"), "{receipt}");
+    assert!(receipt.contains("\"semanticQueryResults\":4"), "{receipt}");
     assert!(
         receipt.contains("\"methodContractViolations\":0"),
         "{receipt}"
     );
 
     for (index, from, to) in [
+        (symbols, r#""kind":6"#, r#""kind":99"#),
         (term, r#""character":5}"#, r#""character":2}"#),
         (
             completion,

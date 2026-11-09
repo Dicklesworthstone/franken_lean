@@ -4,6 +4,7 @@
 use super::*;
 mod completion;
 mod navigation;
+mod symbols;
 pub use completion::{CompletionLookupLimits, SourceCompletion, SourceCompletionItem};
 pub use fln_elab::source::inspect::{ObservationKind, ObservedGoal, SourceObservation};
 pub use fln_elab::source::scope::SourceScope;
@@ -11,6 +12,7 @@ use modules::{
     SourceModuleCheckError, SourceModuleCheckLimits, SourceModuleSession, SourceModuleSessionCheck,
 };
 pub use navigation::{DefinitionLookupLimits, SourceDefinition};
+pub use symbols::{DocumentSymbolLimits, SourceDocumentSymbol};
 
 /// The prefix is checked; the observation is provisional elaboration state.
 /// In particular, `Goals { goals: [] }` is not a proof-checking certificate.

@@ -15,8 +15,9 @@
 //! textless saves can re-check the newest valid snapshot; malformed transitions
 //! invalidate stale retained source and close clears push diagnostics.
 //! `$/lean/plainGoal`, `$/lean/plainTermGoal`, `textDocument/hover`,
-//! `textDocument/definition` and `textDocument/completion` use typed read-only
-//! queries through `dispatch::semantic`, with available checked proof states.
+//! `textDocument/definition`, `textDocument/completion` and
+//! `textDocument/documentSymbol` use typed read-only queries through
+//! `dispatch::semantic`, with checked proof states and explicit declaration outlines.
 //! Lean RPC uses bounded document-local sessions for interactive goals, term
 //! goals, diagnostics and presentation matching; other procedures are refused.
 //! Persistent elaboration/import state remains outside this server adapter.

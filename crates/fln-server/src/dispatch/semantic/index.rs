@@ -94,6 +94,7 @@ fn kind(answer: &Answer) -> QueryKind {
         Answer::Hover { .. } => QueryKind::Hover,
         Answer::Definition { .. } => QueryKind::Definition,
         Answer::Completion { .. } => QueryKind::Completion,
+        Answer::DocumentSymbols { .. } => QueryKind::DocumentSymbols,
     }
 }
 
@@ -108,6 +109,10 @@ fn add(total: &mut usize, amount: usize, limit: usize) -> Result<(), IndexRefusa
 fn payload_bytes(answer: &Answer) -> Result<usize, IndexRefusal> {
     let mut total = 0;
     match answer {
+        Answer::DocumentSymbols { symbols } => {
+            return super::symbols::payload_bytes(symbols)
+                .map_err(|_| IndexRefusal::InvalidAnnotation);
+        }
         Answer::InteractiveGoals { .. } | Answer::InteractiveTermGoal(_) => {
             return super::interactive::payload_bytes(answer)
                 .map_err(|_| IndexRefusal::InvalidAnnotation);
@@ -224,6 +229,7 @@ impl SemanticIndex {
                 }
                 Answer::Goals { .. }
                 | Answer::InteractiveGoals { .. }
+                | Answer::DocumentSymbols { .. }
                 | Answer::Definition { .. } => {}
             }
             let sample = Query {

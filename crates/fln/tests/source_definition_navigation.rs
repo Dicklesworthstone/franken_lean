@@ -1,6 +1,6 @@
 //! Real source-to-elaborator-to-origin joins, not a text-matching navigation mock.
 #![forbid(unsafe_code)]
-use fln::source_check::inspect::{DefinitionLookupLimits, SourceDefinition};
+use fln::source_check::inspect::{DefinitionLookupLimits, DocumentSymbolLimits, SourceDefinition};
 use fln::source_check::modules::{
     SourceModuleCacheLimits, SourceModuleCheckError, SourceModuleCheckLimits, SourceModuleSession,
 };
@@ -244,5 +244,292 @@ fn lookup_limits_and_invalid_positions_refuse_instead_of_returning_partial_locat
         session()
             .definition(&inputs, &main, source.find('😀').unwrap() + 1)
             .is_err()
+    );
+}
+
+#[test]
+fn document_outline_uses_checked_qualified_names_and_original_declaration_ranges() {
+    let main = name("Main");
+    let source = "-- 😀\r\nnamespace Outer\r\nnamespace Inner\r\ndef value : Nat := 7\r\ntheorem identity (P : Prop) (h : P) : P := h\r\nend Inner\r\nprivate def hidden : Nat := 8\r\nend Outer\r\ndef «a.b» : Nat := 1\r\n";
+    let symbols = session()
+        .document_symbols(
+            &[SourceModuleInput {
+                name: &main,
+                source: source.as_bytes(),
+            }],
+            &main,
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!(
+        symbols
+            .iter()
+            .map(|symbol| symbol.name.clone())
+            .collect::<Vec<_>>(),
+        [
+            name("Outer.Inner.value"),
+            name("Outer.Inner.identity"),
+            name("Outer.hidden"),
+            Name::from_components(["a.b"]),
+        ]
+    );
+    for (symbol, spelling) in symbols.iter().zip(["value", "identity", "hidden", "«a.b»"]) {
+        assert_eq!(&source[symbol.selection_range.clone()], spelling);
+        assert!(symbol.range.start <= symbol.selection_range.start);
+        assert!(symbol.selection_range.end <= symbol.range.end);
+        assert!(!source[symbol.range.clone()].ends_with('\r'));
+    }
+    assert_eq!(&source[symbols[0].range.clone()], "def value : Nat := 7");
+}
+
+#[test]
+fn document_outline_excludes_imports_locals_and_anonymous_declarations() {
+    let main = name("Main");
+    let lib = name("Lib");
+    let source = "import Lib\ndef localValue (parameter : Nat) : Nat := parameter\nexample : Nat := localValue 4\n";
+    let symbols = session()
+        .document_symbols(
+            &[
+                SourceModuleInput {
+                    name: &main,
+                    source: source.as_bytes(),
+                },
+                SourceModuleInput {
+                    name: &lib,
+                    source: b"def imported : Nat := 1",
+                },
+            ],
+            &main,
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!(symbols.len(), 1);
+    assert_eq!(symbols[0].name, name("localValue"));
+    assert_eq!(&source[symbols[0].selection_range.clone()], "localValue");
+}
+
+#[test]
+fn document_outline_rechecks_replacements_and_never_returns_old_success_on_failure() {
+    let main = name("Main");
+    let mut checker = session();
+    for (source, expected) in [
+        ("def first : Nat := 1", "first"),
+        ("-- relocated\ndef second : Nat := 2", "second"),
+    ] {
+        let symbols = checker
+            .document_symbols(
+                &[SourceModuleInput {
+                    name: &main,
+                    source: source.as_bytes(),
+                }],
+                &main,
+            )
+            .unwrap()
+            .into_complete()
+            .unwrap();
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].name, name(expected));
+        assert_eq!(&source[symbols[0].selection_range.clone()], expected);
+    }
+    assert!(
+        checker
+            .document_symbols(
+                &[SourceModuleInput {
+                    name: &main,
+                    source: b"theorem invalid : False := by exact True.intro",
+                }],
+                &main
+            )
+            .is_err()
+    );
+    let empty = checker
+        .document_symbols(
+            &[SourceModuleInput {
+                name: &main,
+                source: b"-- an empty source outline",
+            }],
+            &main,
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert!(empty.is_empty());
+}
+
+#[test]
+fn document_outline_has_independent_source_command_and_traversal_bounds() {
+    let main = name("Main");
+    let inputs = [SourceModuleInput {
+        name: &main,
+        source: b"def value : Nat := 1",
+    }];
+    for limits in [
+        DocumentSymbolLimits {
+            max_modules: 0,
+            ..DocumentSymbolLimits::default()
+        },
+        DocumentSymbolLimits {
+            max_source_bytes: 1,
+            ..DocumentSymbolLimits::default()
+        },
+        DocumentSymbolLimits {
+            max_commands: 0,
+            ..DocumentSymbolLimits::default()
+        },
+        DocumentSymbolLimits {
+            max_syntax_nodes: 0,
+            ..DocumentSymbolLimits::default()
+        },
+    ] {
+        assert!(matches!(
+            session().document_symbols_with_limits(&inputs, &main, limits),
+            Err(SourceModuleCheckError::Limit { .. })
+        ));
+    }
+}
+
+#[test]
+fn document_outline_bounds_replay_work_inside_temporary_scopes() {
+    let main = name("Main");
+    let inputs = [SourceModuleInput {
+        name: &main,
+        source: b"open Nat in def value : Nat := 1",
+    }];
+    assert!(matches!(
+        session().document_symbols_with_limits(&inputs, &main, DocumentSymbolLimits {
+            max_commands: 1,
+            ..DocumentSymbolLimits::default()
+        }),
+        Err(SourceModuleCheckError::Limit { resource: "document symbol commands", limit: 1 })
+    ));
+    let symbols = session().document_symbols_with_limits(&inputs, &main, DocumentSymbolLimits {
+        max_commands: 2,
+        ..DocumentSymbolLimits::default()
+    }).unwrap().into_complete().unwrap();
+    assert_eq!(symbols.len(), 1);
+    assert_eq!(symbols[0].name, name("value"));
+}
+
+#[test]
+fn document_outline_preserves_each_mutual_member_and_data_declaration_header() {
+    let main = name("Main");
+    let source = "namespace N\r\nmutual\r\n  def first : Nat := 1\r\n  def second : Nat := 2\r\nend\r\ninductive Choice where\r\n  | left\r\n  | right\r\nstructure Box where\r\n  value : Nat\r\naxiom Witness : Prop\r\nend N\r\n";
+    let symbols = session()
+        .document_symbols(
+            &[SourceModuleInput {
+                name: &main,
+                source: source.as_bytes(),
+            }],
+            &main,
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!(
+        symbols
+            .iter()
+            .map(|symbol| symbol.name.clone())
+            .collect::<Vec<_>>(),
+        [
+            name("N.first"),
+            name("N.second"),
+            name("N.Choice"),
+            name("N.Box"),
+            name("N.Witness"),
+        ]
+    );
+    for (symbol, spelling) in symbols
+        .iter()
+        .zip(["first", "second", "Choice", "Box", "Witness"])
+    {
+        assert_eq!(&source[symbol.selection_range.clone()], spelling);
+    }
+    assert_eq!(&source[symbols[0].range.clone()], "def first : Nat := 1");
+    assert_eq!(&source[symbols[1].range.clone()], "def second : Nat := 2");
+}
+
+#[test]
+fn document_outline_replays_imported_syntax_and_file_local_notation() {
+    let main = name("Main");
+    let lib = name("Lib");
+    let source = r#"import Lib
+section
+local notation "⟪" x "⟫" => Nat.add x x
+theorem local_works : ⟪(2 : Nat)⟫ = 4 := rfl
+end
+theorem imported_works : select! (Nat.add 5 6) = (5 : Nat) := rfl
+"#;
+    let library = r#"syntax "select! " term:max : term
+macro_rules | `(select! (Nat.add $x $y)) => `($x)
+"#;
+    let symbols = session()
+        .document_symbols(
+            &[
+                SourceModuleInput {
+                    name: &main,
+                    source: source.as_bytes(),
+                },
+                SourceModuleInput {
+                    name: &lib,
+                    source: library.as_bytes(),
+                },
+            ],
+            &main,
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!(
+        symbols
+            .iter()
+            .map(|symbol| symbol.name.clone())
+            .collect::<Vec<_>>(),
+        [name("local_works"), name("imported_works")]
+    );
+    for (symbol, spelling) in symbols.iter().zip(["local_works", "imported_works"]) {
+        assert_eq!(&source[symbol.selection_range.clone()], spelling);
+    }
+}
+
+#[test]
+fn document_outline_restores_local_grammar_between_declarations() {
+    let main = name("Main");
+    let source = r#"syntax "localValue! " num : term
+macro_rules | `(localValue! $n:num) => `($n)
+section Outer
+local macro_rules | `(localValue! 0) => `((10 : Nat))
+theorem outer_before : localValue! 0 = (10 : Nat) := rfl
+section Inner
+local macro_rules | `(localValue! 0) => `((20 : Nat))
+theorem inner : localValue! 0 = (20 : Nat) := rfl
+end Inner
+theorem outer_after : localValue! 0 = (10 : Nat) := rfl
+end Outer
+theorem outside : localValue! 0 = (0 : Nat) := rfl
+"#;
+    let symbols = session()
+        .document_symbols(
+            &[SourceModuleInput {
+                name: &main,
+                source: source.as_bytes(),
+            }],
+            &main,
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!(
+        symbols
+            .iter()
+            .map(|symbol| symbol.name.clone())
+            .collect::<Vec<_>>(),
+        [
+            name("outer_before"),
+            name("inner"),
+            name("outer_after"),
+            name("outside")
+        ]
     );
 }

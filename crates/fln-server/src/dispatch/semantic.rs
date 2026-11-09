@@ -4,7 +4,9 @@ use super::*;
 use std::ops::Range;
 mod completion;
 pub mod index;
+mod symbols;
 pub use completion::CompletionItem;
+pub use symbols::DocumentSymbol;
 pub(super) mod interactive;
 pub use interactive::{Goal, Hypothesis, TermGoal};
 
@@ -17,6 +19,7 @@ pub enum QueryKind {
     Hover,
     Definition,
     Completion,
+    DocumentSymbols,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -60,6 +63,11 @@ pub enum Answer {
         range: Range<usize>,
         is_incomplete: bool,
     },
+    /// Flat document outline with qualified native declaration names.
+    /// Ranges belong to this exact accepted source, never imported files.
+    DocumentSymbols {
+        symbols: Vec<DocumentSymbol>,
+    },
 }
 
 const MAX_RESULT_BYTES: usize = 1024 * 1024;
@@ -72,7 +80,7 @@ pub(super) fn initialize_response(id: &RequestId) -> String {
     let response = wire::initialize_response(id);
     response.replacen(
         "\"capabilities\":{",
-        "\"capabilities\":{\"experimental\":{\"rpcProvider\":{\"rpcWireFormat\":\"v1\"}},\"hoverProvider\":true,\"definitionProvider\":true,\"completionProvider\":{\"resolveProvider\":false,\"triggerCharacters\":[\".\"]},",
+        "\"capabilities\":{\"experimental\":{\"rpcProvider\":{\"rpcWireFormat\":\"v1\"}},\"hoverProvider\":true,\"definitionProvider\":true,\"documentSymbolProvider\":true,\"completionProvider\":{\"resolveProvider\":false,\"triggerCharacters\":[\".\"]},",
         1,
     )
 }
@@ -103,6 +111,9 @@ pub(super) fn position(text: &str, offset: usize) -> Result<json::Position, &'st
 
 fn result_json(answer: Answer, query: Query<'_>) -> Result<String, &'static str> {
     let result = match (query.kind, answer) {
+        (QueryKind::DocumentSymbols, Answer::DocumentSymbols { symbols }) => {
+            symbols::result(symbols, query)?
+        }
         (
             QueryKind::Completion,
             Answer::Completion {
@@ -248,6 +259,7 @@ pub(super) fn handle(
         "textDocument/hover" => QueryKind::Hover,
         "textDocument/definition" => QueryKind::Definition,
         "textDocument/completion" => QueryKind::Completion,
+        "textDocument/documentSymbol" => QueryKind::DocumentSymbols,
         _ => return write_protocol_message(output, error_response(id, -32601, "method not found")),
     };
     let parsed = (|| {
@@ -257,7 +269,12 @@ pub(super) fn handle(
         if uri.is_empty() {
             return Err("semantic query URI is empty");
         }
-        Ok((uri, json::query_position(params)?))
+        let at = if kind == QueryKind::DocumentSymbols {
+            None
+        } else {
+            Some(json::query_position(params)?)
+        };
+        Ok((uri, at))
     })();
     let (uri, at) = match parsed {
         Ok(parsed) => parsed,
@@ -277,7 +294,7 @@ pub(super) fn handle(
             ),
         );
     };
-    let offset = match json::byte_offset(text, at) {
+    let offset = match at.map_or(Ok(0), |at| json::byte_offset(text, at)) {
         Ok(offset) => offset,
         Err(error) => return write_protocol_message(output, error_response(id, -32602, error)),
     };

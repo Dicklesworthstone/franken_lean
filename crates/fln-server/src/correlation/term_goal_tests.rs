@@ -135,7 +135,7 @@ fn correlates_real_term_goal_shapes_and_retains_null_as_no_information() {
     assert_eq!(stats.semantic_query_errors, 0);
     assert!(
         render_correlation(stats)
-            .contains("\"methodResponseSchema\":\"fln.lsp-method-response/4\"")
+            .contains("\"methodResponseSchema\":\"fln.lsp-method-response/5\"")
     );
 
     let (client, server) = pair(&reply("null"), false);

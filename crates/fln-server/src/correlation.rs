@@ -61,6 +61,7 @@ enum RequestContract {
     Hover,
     Completion,
     Definition,
+    DocumentSymbols,
     RpcConnect,
     RpcCall(crate::json::RpcProcedure),
     UnsupportedRpc,
@@ -77,6 +78,7 @@ impl RequestContract {
             "textDocument/hover" => Self::Hover,
             "textDocument/completion" => Self::Completion,
             "textDocument/definition" => Self::Definition,
+            "textDocument/documentSymbol" => Self::DocumentSymbols,
             "$/lean/plainTermGoal" => Self::PlainTermGoal,
             "$/lean/rpc/connect" => Self::RpcConnect,
             "$/lean/rpc/call" => Self::UnsupportedRpc,
@@ -94,6 +96,7 @@ impl RequestContract {
             Self::Hover => "hover",
             Self::Completion => "completion",
             Self::Definition => "definition",
+            Self::DocumentSymbols => "document-symbols",
             Self::RpcConnect => "rpc-connect",
             Self::RpcCall(_) => "rpc-call",
             Self::UnsupportedRpc => "unsupported-rpc",
@@ -592,7 +595,8 @@ fn classify_method_response(
             | RequestContract::PlainTermGoal
             | RequestContract::Hover
             | RequestContract::Completion
-            | RequestContract::Definition,
+            | RequestContract::Definition
+            | RequestContract::DocumentSymbols,
             ResponseShape::Result(value),
         ) if value.trim() == "null" => Ok(MethodResponseClass::NoInformationQueryResult),
         (RequestContract::PlainGoal, ResponseShape::Result(value))
@@ -623,12 +627,18 @@ fn classify_method_response(
         {
             Ok(MethodResponseClass::SemanticQueryResult)
         }
+        (RequestContract::DocumentSymbols, ResponseShape::Result(value))
+            if crate::json::document_symbols_result(value) =>
+        {
+            Ok(MethodResponseClass::SemanticQueryResult)
+        }
         (
             RequestContract::PlainGoal
             | RequestContract::PlainTermGoal
             | RequestContract::Hover
             | RequestContract::Completion
-            | RequestContract::Definition,
+            | RequestContract::Definition
+            | RequestContract::DocumentSymbols,
             ResponseShape::Error(-32602 | -32803 | -32800),
         ) => Ok(MethodResponseClass::SemanticQueryError),
         (
@@ -636,7 +646,8 @@ fn classify_method_response(
             | RequestContract::PlainTermGoal
             | RequestContract::Hover
             | RequestContract::Completion
-            | RequestContract::Definition,
+            | RequestContract::Definition
+            | RequestContract::DocumentSymbols,
             ResponseShape::Result(value),
         ) => mismatch(
             result_kind(value).to_owned(),
@@ -647,7 +658,8 @@ fn classify_method_response(
             | RequestContract::PlainTermGoal
             | RequestContract::Hover
             | RequestContract::Completion
-            | RequestContract::Definition,
+            | RequestContract::Definition
+            | RequestContract::DocumentSymbols,
             ResponseShape::Error(code),
         ) => mismatch(
             format!("error code {code}"),
@@ -966,7 +978,7 @@ pub fn render_correlation(stats: CorrelationStats) -> String {
             "{{\"schema\":\"fln.lsp-client-server-correlation/7\",",
             "\"clientSessionSchema\":\"fln.lsp-client-session/3\",",
             "\"serverTranscriptSchema\":\"fln.lsp-server-transcript/3\",",
-            "\"methodResponseSchema\":\"fln.lsp-method-response/4\",",
+            "\"methodResponseSchema\":\"fln.lsp-method-response/5\",",
             "\"idPolicy\":\"number-lexeme-string-value-v1\",",
             "\"clientFrames\":{},\"serverFrames\":{},",
             "\"clientRequests\":{},\"serverResponses\":{},",
@@ -1277,7 +1289,7 @@ mod tests {
         assert_eq!(stats.cancellation_target_id_bytes, 0);
         let receipt = render_correlation(stats);
         assert!(receipt.contains("\"schema\":\"fln.lsp-client-server-correlation/7\""));
-        assert!(receipt.contains("\"methodResponseSchema\":\"fln.lsp-method-response/4\""));
+        assert!(receipt.contains("\"methodResponseSchema\":\"fln.lsp-method-response/5\""));
         assert!(receipt.contains("\"clientSessionSchema\":\"fln.lsp-client-session/3\""));
         assert!(receipt.contains("\"serverTranscriptSchema\":\"fln.lsp-server-transcript/3\""));
         assert!(receipt.contains("\"methodContractResponses\":3"));

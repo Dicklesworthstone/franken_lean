@@ -514,6 +514,9 @@ fn inspect_sources(
         QueryKind::Definition => {
             return navigation::definition(session, sources, &inputs, offset);
         }
+        QueryKind::DocumentSymbols => {
+            return navigation::document_symbols(session, sources, &inputs);
+        }
         QueryKind::Completion => {
             return completion::complete(session, sources, &inputs, offset);
         }
