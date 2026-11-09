@@ -8,8 +8,11 @@ use fln::{
 };
 
 const SOURCE: &str = r#"
+class Pure (m : Type -> Type) where
+  pure : {A : Type} -> A -> m A
 class Bind (m : Type -> Type) where
   bind : {A B : Type} -> m A -> (A -> m B) -> m B
+class Monad (m : Type -> Type) extends Pure m, Bind m where
 structure Result (A : Type) where
   value : A
   state : Nat
@@ -18,6 +21,8 @@ def StateAlias (A : Type) : Type := StateLike A
 attribute [reducible] StateAlias
 def nextState {A B : Type} (r : Result A) (next : A -> StateLike B) : Result B := next r.value r.state
 instance stateBind : Bind StateLike := { bind := fun action next state => nextState (action state) next }
+instance statePure : Pure StateLike := { pure := fun value state => { value := value, state := state } }
+instance stateMonad : Monad StateLike := { toPure := statePure, toBind := stateBind }
 def mark (n : Nat) : StateLike Nat := fun state => { value := state, state := state * 10 + n }
 def markAlias := mark
 def finish (value : Nat) : StateLike Nat := fun state => { value := value, state := state }

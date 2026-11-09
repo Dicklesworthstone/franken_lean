@@ -7,6 +7,11 @@ use fln::{
 };
 
 const FIXTURE: &str = r#"
+class Pure (m : Type -> Type) where
+  pure : {A : Type} -> A -> m A
+class Bind (m : Type -> Type) where
+  bind : {A B : Type} -> m A -> (A -> m B) -> m B
+class Monad (m : Type -> Type) extends Pure m, Bind m where
 class MonadExcept (E : outParam Type) (m : Type -> Type) where
   throw : {A : Type} -> E -> m A
   tryCatch : {A : Type} -> m A -> (E -> m A) -> m A
@@ -23,6 +28,15 @@ structure Report (A : Type) where
 def StateExcept (A : Type) : Type := Nat -> Report A
 def StateAlias (A : Type) : Type := StateExcept A
 attribute [reducible] StateAlias
+def stateBind {A B : Type} (x : StateExcept A) (next : A -> StateExcept B) : StateExcept B := fun state =>
+  let report := x state
+  match report.output with
+  | Attempt.ok value => next value report.state
+  | Attempt.error error => Report.mk (Attempt.error error) report.state
+instance stateMonad : Monad StateExcept := {
+  pure := fun value state => Report.mk (Attempt.ok value) state
+  bind := fun action next => stateBind action next
+}
 def stateCatch {A : Type} (x : StateExcept A) (handler : Nat -> StateExcept A) : StateExcept A := fun state =>
   let report := x state
   match report.output with
@@ -119,18 +133,18 @@ def fromAction (action : StateAlias Nat) := do
     action
   catch error =>
     recover error
-def generic {M : Type -> Type} [MonadExcept Nat M] (action : M Nat) := do
+def generic {M : Type -> Type} [Monad M] [MonadExcept Nat M] (action : M Nat) := do
   try
     action
   catch _ =>
     action
 def nested := do
-  try
+  try {
     try
       fail 5
     catch inner =>
       fail (inner + 1)
-  catch outer =>
+  } catch outer =>
     recover outer
 #eval observed inferred
 #eval observed success
@@ -165,6 +179,85 @@ fn inferred_catches_keep_dictionary_and_handler_type_checks() {
     execute(
         &engine,
         "def recovered := do { try { fail 5 } catch error => { recover error } }\n#eval observed recovered",
+        &["312015"],
+    );
+}
+
+#[test]
+fn omitted_result_families_infer_monads_from_value_parameters() {
+    execute(
+        &base(),
+        r#"
+def fromTypeKnown (A : Type) : StateAlias Nat := do
+  try
+    fail 5
+  catch error =>
+    recover error
+def fromParameters (A : Type) (tag : Nat) (action : StateAlias Nat) := do
+  try
+    action
+  catch error =>
+    recover (error + tag)
+def genericResult {A : Type} {M : Type -> Type} [Monad M] [MonadExcept Nat M] (action : M A) := do
+  try
+    action
+  catch _ =>
+    action
+def choose {M : Type -> Type} [Monad M] (action : M Nat) : M Nat := action
+def viaExpected := choose (do succeed 7)
+def concrete : StateAlias Nat := do
+  succeed 7
+theorem parameter_result : observed (fromParameters Bool 2 (fail 5)) = 312017 := rfl
+#eval observed (fromTypeKnown Bool)
+#eval observed (fromParameters Bool 2 (fail 5))
+#eval observed (genericResult (fail 5))
+#eval observed viaExpected
+#eval observed concrete
+"#,
+        &["312015", "312017", "311105", "31007", "31007"],
+    );
+}
+
+#[test]
+fn inferred_do_blocks_still_require_dictionaries_and_written_result_types() {
+    let engine = checked(
+        &base(),
+        r#"
+inductive Bare (A : Type) where
+  | wrap (value : A)
+def bareValue : Bare Nat := Bare.wrap 7
+def choose {M : Type -> Type} [Monad M] (action : M Nat) : M Nat := action
+def boolAction : StateExcept Bool := fun state => Report.mk (Attempt.ok true) state
+"#,
+    );
+    let options = KVMap::new();
+    let root = engine.logical_root(&options);
+    for source in [
+        "def missingKnown : Bare Nat := do bareValue",
+        "def missingUnknown := do bareValue",
+        "def missingParameter (action : Bare Nat) := do action",
+        "def missingTypeParameter (A : Type) := do bareValue",
+        // At the pin, a final type-valued argument is examined before the
+        // unknown-head fallback. This would need a dictionary for the constant
+        // monad `fun A => StateExcept Nat`, which has not been provided.
+        "def inferredTypeParameter (A : Type) := do succeed 7",
+        // The unknown monad in choose's argument is not an omitted result
+        // family: its written Nat parameter must constrain the nested block.
+        "def wrongResult := choose (do boolAction)",
+        "def notMonadic : Nat := do succeed 7",
+    ] {
+        assert!(
+            engine
+                .check_source_files(&[source.as_bytes()], &options, limits())
+                .is_err(),
+            "{source}"
+        );
+        assert_eq!(engine.logical_root(&options), root);
+    }
+    checked(&engine, "def direct : Bare Nat := bareValue");
+    execute(
+        &engine,
+        "def retry (action : StateAlias Nat) := do { try { action } catch error => { recover error } }\n#eval observed (retry (fail 5))",
         &["312015"],
     );
 }

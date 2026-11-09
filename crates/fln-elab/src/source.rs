@@ -2336,6 +2336,7 @@ impl Context {
             DoNestedAnnotation(&'a Syntax, Option<Expr>, bool),
             DoAction(&'a [Syntax], Option<Expr>),
             DoPureValue(Option<Expr>),
+            DoBlockResult(Expr),
             CalcNext(calc::Build<'a>),
             CalcRelation(calc::Build<'a>),
             CalcProof(calc::Build<'a>, Expr),
@@ -2610,6 +2611,12 @@ impl Context {
                             let term = self.match_apply(function, argument)?;
                             values.push(self.finish_application(term, expected.as_ref())?);
                         }
+                        Task::DoBlockResult(expected) => {
+                            let mut term = values.pop().expect("do block body visit");
+                            self.constrain_type(&term.type_, &expected)?;
+                            term.type_ = expected;
+                            values.push(term);
+                        }
                         Task::CheckArgument(syntax, expected, infer_exception_action) => {
                             if let Some(checkpoint) = postponed::Checkpoint::argument(
                                 self,
@@ -2873,26 +2880,23 @@ impl Context {
                                     let [body] = args.as_slice() else {
                                         return Err(failure(SourceInferenceError::Scope));
                                     };
-                                    let expected = match &expected {
-                                        Some(type_) => Some(
-                                            self.do_expected_monad_type(type_)?.ok_or_else(
-                                                || {
-                                                    failure(
-                                                        SourceInferenceError::DoExpectedTypeNotMonad,
-                                                    )
-                                                },
-                                            )?,
-                                        ),
-                                        None => None,
+                                    let original = expected;
+                                    let expected = match &original {
+                                        Some(type_) => self
+                                            .do_expected_monad_type(type_)?
+                                            .ok_or_else(|| {
+                                                failure(
+                                                    SourceInferenceError::DoExpectedTypeNotMonad,
+                                                )
+                                            })?,
+                                        None => self.do_unknown_monad_type()?,
                                     };
                                     // The pin's block always builds `pure` for its result
                                     // (`DoElemCont.mkPure`, then `mkBindUnlessPure`, vendored
                                     // `Lean/Elab/Do/Basic.lean:272-302, 512-525`). That asks for a
                                     // `Pure m` instance even where the bind is then contracted away,
                                     // so a block at a monad without one is refused there.
-                                    if let Some(application) = &expected
-                                        && let Some(monad) = self.do_monad(application)?
-                                    {
+                                    if let Some(monad) = self.do_monad(&expected)? {
                                         let pure = self.do_operation(false, Some(monad))?;
                                         let type_ = self.whnf(&pure.type_)?;
                                         let ExprNode::ForallE {
@@ -2905,7 +2909,14 @@ impl Context {
                                         };
                                         self.instance_hole(binder_type.clone())?;
                                     }
-                                    tasks.push(Task::Visit(body, expected, finish));
+                                    // A fresh monad/result must not erase the original
+                                    // declaration result family. Relate them only after
+                                    // the action determines the monad, so a flex-flex
+                                    // equation cannot select that family as the monad.
+                                    if let Some(original) = original {
+                                        tasks.push(Task::DoBlockResult(original));
+                                    }
+                                    tasks.push(Task::Visit(body, Some(expected), finish));
                                     continue;
                                 }
                                 if kind == &parser_kind(&["Term", "nativeDoForCollection"]) {
