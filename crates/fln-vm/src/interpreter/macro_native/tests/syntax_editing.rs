@@ -972,3 +972,358 @@ fn reference_construction_shares_walk_budget_and_keeps_stops_non_authoritative()
         ));
     }
 }
+
+fn diagnostic_context(reference: &Obj) -> Obj {
+    let mut fields: Vec<_> = (0..layout::MACRO_CONTEXT.object_fields)
+        .map(|_| Obj::mk_nat(0))
+        .collect();
+    // MethodsRef is deliberately opaque: reporting an error requires no
+    // environment or recursive-expansion authority.
+    fields[layout::MACRO_CONTEXT_METHODS_FIELD as usize] = Obj::mk_string("opaque methods");
+    fields[expansion_layout::MACRO_CONTEXT_REF_FIELD] = reference.clone_ref();
+    Obj::mk_ctor(layout::MACRO_CONTEXT.tag, fields, &[])
+}
+
+fn diagnostic_state() -> Obj {
+    let trace = Obj::mk_ctor(
+        layout::PROD.tag,
+        vec![
+            inject_name(&Name::from_components(["Trace"])),
+            Obj::mk_string("λ\0trace"),
+        ],
+        &[],
+    );
+    let list = |value| {
+        Obj::mk_ctor(
+            layout::LIST_CONS.tag,
+            vec![value, Obj::mk_nat(layout::LIST_NIL_TAG)],
+            &[],
+        )
+    };
+    Obj::mk_ctor(
+        layout::MACRO_STATE.tag,
+        vec![
+            Obj::mk_nat(23),
+            list(trace),
+            list(inject_name(&Name::from_components(["Earlier", "macro"]))),
+        ],
+        &[],
+    )
+}
+
+#[test]
+fn reference_replacement_uses_only_the_first_head_position_and_returns_original_objects() {
+    let old = ident(synthetic_info());
+    let positioned = with_info(
+        &atom("zero"),
+        &position_info(Obj::mk_nat(0), Obj::mk_nat(4), 0),
+    );
+    let missing = Obj::mk_nat(layout::SYNTAX_MISSING_TAG);
+    let empty = node(Name::anonymous(), vec![]);
+    for (value, selects_new) in [
+        (missing.clone_ref(), false),
+        (empty.clone_ref(), false),
+        (atom("unpositioned"), false),
+        (
+            node(
+                Name::anonymous(),
+                vec![atom("no head"), positioned.clone_ref()],
+            ),
+            false,
+        ),
+        (
+            node(
+                Name::anonymous(),
+                vec![missing, empty, positioned.clone_ref()],
+            ),
+            true,
+        ),
+        (positioned, true),
+        (ident(synthetic_info()), true),
+        // A tail is irrelevant, including when its foreign representation is
+        // invalid; only the selected head Nat is inspected.
+        (
+            with_info(
+                &atom("large"),
+                &position_info(
+                    Obj::mk_mpz(&[17, 1], false),
+                    Obj::mk_string("unused tail"),
+                    0,
+                ),
+            ),
+            true,
+        ),
+    ] {
+        let output = invoke(Intrinsic::ReplaceRef, &[value.clone_ref(), old.clone_ref()]);
+        assert_eq!(
+            output.identity_token(),
+            if selects_new {
+                value.identity_token()
+            } else {
+                old.identity_token()
+            }
+        );
+    }
+}
+
+#[test]
+fn public_macro_errors_preserve_exact_state_message_and_selected_reference() {
+    let old = ident(synthetic_info());
+    let context = diagnostic_context(&old);
+    let state = diagnostic_state();
+    let message = Obj::mk_string("located\0λ🙂");
+    let noncanonical = with_info(
+        &atom("new"),
+        &position_info(Obj::mk_nat(0), Obj::mk_nat(4), 0),
+    );
+    let no_head = node(
+        Name::anonymous(),
+        vec![atom("none"), noncanonical.clone_ref()],
+    );
+    for (operation, args, expected) in [
+        (
+            Intrinsic::ThrowError,
+            vec![message.clone_ref(), context.clone_ref(), state.clone_ref()],
+            old.clone_ref(),
+        ),
+        (
+            Intrinsic::ThrowErrorAt,
+            vec![
+                noncanonical.clone_ref(),
+                message.clone_ref(),
+                context.clone_ref(),
+                state.clone_ref(),
+            ],
+            noncanonical,
+        ),
+        (
+            Intrinsic::ThrowErrorAt,
+            vec![
+                no_head,
+                message.clone_ref(),
+                context.clone_ref(),
+                state.clone_ref(),
+            ],
+            old.clone_ref(),
+        ),
+    ] {
+        let output = invoke(operation, &args);
+        check_layout(&output, layout::RESULT_ERROR).unwrap();
+        assert_eq!(
+            child(&output, 1).unwrap().identity_token(),
+            state.identity_token()
+        );
+        let exception = child(&output, 0).unwrap();
+        check_layout(&exception, layout::EXCEPTION_ERROR).unwrap();
+        assert_eq!(
+            child(&exception, 0).unwrap().identity_token(),
+            expected.identity_token()
+        );
+        assert_eq!(
+            child(&exception, 1).unwrap().identity_token(),
+            message.identity_token()
+        );
+        assert_eq!(
+            string(&child(&exception, 1).unwrap()).unwrap(),
+            "located\0λ🙂"
+        );
+        assert_eq!(
+            child(&context, expansion_layout::MACRO_CONTEXT_REF_FIELD)
+                .unwrap()
+                .identity_token(),
+            old.identity_token()
+        );
+    }
+    let unsupported = invoke(Intrinsic::ThrowUnsupported, &[state.clone_ref()]);
+    check_layout(&unsupported, layout::RESULT_ERROR).unwrap();
+    assert_eq!(
+        child(&unsupported, 0).unwrap().unbox(),
+        layout::EXCEPTION_UNSUPPORTED_TAG
+    );
+    assert_eq!(
+        child(&unsupported, 1).unwrap().identity_token(),
+        state.identity_token()
+    );
+}
+
+#[test]
+fn public_macro_error_rows_refuse_malformed_inputs_without_becoming_lean_errors() {
+    let old = ident(synthetic_info());
+    let context = diagnostic_context(&old);
+    let state = diagnostic_state();
+    for value in [
+        Obj::mk_nat(999),
+        Obj::mk_ctor(layout::SYNTAX_NODE.tag, vec![], &[]),
+        with_info(
+            &atom("bad"),
+            &position_info(Obj::mk_string("not Nat"), Obj::mk_nat(1), 1),
+        ),
+        with_info(
+            &atom("bad"),
+            &position_info(Obj::mk_mpz(&[1], true), Obj::mk_nat(1), 1),
+        ),
+        with_info(
+            &atom("bad"),
+            &position_info(Obj::mk_nat(0), Obj::mk_nat(1), 2),
+        ),
+    ] {
+        for (operation, row, args) in [
+            (
+                Intrinsic::ReplaceRef,
+                "mirror:Lean.replaceRef",
+                vec![value.clone_ref(), old.clone_ref()],
+            ),
+            (
+                Intrinsic::ThrowErrorAt,
+                "mirror:Lean.Macro.throwErrorAt._redArg",
+                vec![
+                    value,
+                    Obj::mk_string("message"),
+                    context.clone_ref(),
+                    state.clone_ref(),
+                ],
+            ),
+        ] {
+            assert!(matches!(
+                operation.invoke(row, &args),
+                Err(IntrinsicFailure::Refused(_))
+            ));
+        }
+    }
+    for (operation, row, args) in [
+        (
+            Intrinsic::ReplaceRef,
+            "mirror:Lean.replaceRef",
+            vec![old.clone_ref(), Obj::mk_nat(99)],
+        ),
+        (
+            Intrinsic::ThrowError,
+            "mirror:Lean.Macro.throwError._redArg",
+            vec![Obj::mk_nat(0), context.clone_ref(), state.clone_ref()],
+        ),
+        (
+            Intrinsic::ThrowError,
+            "mirror:Lean.Macro.throwError._redArg",
+            vec![Obj::mk_string("m"), Obj::mk_nat(0), state.clone_ref()],
+        ),
+        (
+            Intrinsic::ThrowError,
+            "mirror:Lean.Macro.throwError._redArg",
+            vec![
+                Obj::mk_string("m"),
+                diagnostic_context(&Obj::mk_nat(999)),
+                state.clone_ref(),
+            ],
+        ),
+        (
+            Intrinsic::ThrowError,
+            "mirror:Lean.Macro.throwError._redArg",
+            vec![Obj::mk_string("m"), context, Obj::mk_nat(0)],
+        ),
+        (
+            Intrinsic::ThrowErrorAt,
+            "mirror:Lean.Macro.throwErrorAt._redArg",
+            vec![],
+        ),
+        (
+            Intrinsic::ThrowUnsupported,
+            "mirror:Lean.Macro.throwUnsupported._redArg",
+            vec![Obj::mk_ctor(layout::MACRO_STATE.tag, vec![], &[])],
+        ),
+    ] {
+        assert!(matches!(
+            operation.invoke(row, &args),
+            Err(IntrinsicFailure::Refused(_))
+        ));
+    }
+    check_layout(
+        &invoke(Intrinsic::ThrowUnsupported, &[state]),
+        layout::RESULT_ERROR,
+    )
+    .unwrap();
+}
+
+#[test]
+fn reference_errors_keep_resource_and_cancellation_stops_outside_macro_fallback() {
+    let old = ident(synthetic_info());
+    let context = diagnostic_context(&old);
+    let state = diagnostic_state();
+    let mut costly = Obj::mk_nat(layout::SYNTAX_MISSING_TAG);
+    for _ in 0..20 {
+        costly = node(Name::anonymous(), vec![costly.clone_ref(), costly]);
+    }
+    for (row, args) in [
+        (
+            "mirror:Lean.replaceRef",
+            vec![costly.clone_ref(), old.clone_ref()],
+        ),
+        (
+            "mirror:Lean.Macro.throwErrorAt._redArg",
+            vec![
+                costly,
+                Obj::mk_string("m"),
+                context.clone_ref(),
+                state.clone_ref(),
+            ],
+        ),
+    ] {
+        assert!(matches!(
+            execute_function(
+                &lookup::callable_program(row),
+                flbc::FunctionId::new(1),
+                args,
+                ExecutionLimits::default(),
+                None
+            ),
+            Outcome::Inconclusive(_)
+        ));
+    }
+    for (row, args) in [
+        (
+            "mirror:Lean.replaceRef",
+            vec![old.clone_ref(), old.clone_ref()],
+        ),
+        (
+            "mirror:Lean.Macro.throwError._redArg",
+            vec![Obj::mk_string("m"), context.clone_ref(), state.clone_ref()],
+        ),
+        (
+            "mirror:Lean.Macro.throwErrorAt._redArg",
+            vec![old, Obj::mk_string("m"), context, state.clone_ref()],
+        ),
+        ("mirror:Lean.Macro.throwUnsupported._redArg", vec![state]),
+    ] {
+        let program = lookup::callable_program(row);
+        for (limits, cancelled) in [
+            (
+                ExecutionLimits {
+                    max_steps: 0,
+                    ..ExecutionLimits::default()
+                },
+                false,
+            ),
+            (ExecutionLimits::default(), true),
+        ] {
+            assert!(matches!(
+                execute_function(
+                    &program,
+                    flbc::FunctionId::new(1),
+                    args.iter().map(Obj::clone_ref).collect(),
+                    limits,
+                    Some(&|| cancelled)
+                ),
+                Outcome::Inconclusive(_)
+            ));
+        }
+        assert!(matches!(
+            execute_function(
+                &program,
+                flbc::FunctionId::new(1),
+                args,
+                ExecutionLimits::default(),
+                None
+            ),
+            Outcome::Complete(VmExit::Returned(_))
+        ));
+    }
+}

@@ -103,3 +103,43 @@ macro (name := contextChoose) "contextTerm%" a:term "," b:term : term => do
     | .atom _ text => text
     | _ => ""
   pure (Lean.mkAtom text)
+
+-- Ordinary error branches must not prevent compiling the successful branch.
+-- These use the public APIs, so dependency selection must bind their actual
+-- emitted helpers to native rows instead of interpreting Init.Prelude bodies.
+@[noinline] def referenceScopeMacro (stx : Lean.Syntax) : Lean.MacroM Lean.Syntax := do
+  let before ← Lean.getRef
+  let during ← Lean.withRef stx Lean.getRef
+  let after ← Lean.getRef
+  pure (.node .none (Lean.Name.mkStr1 "refs") #[before, during, after])
+
+@[noinline] def publicErrorMacro (stx : Lean.Syntax) : Lean.MacroM Lean.Syntax :=
+  if stx.isMissing then Lean.Macro.throwError "public\x00λ" else pure stx
+
+@[noinline] def publicErrorAtMacro (stx : Lean.Syntax) : Lean.MacroM Lean.Syntax :=
+  Lean.Macro.throwErrorAt stx "public\x00λ"
+
+@[noinline] def publicUnsupportedMacro (stx : Lean.Syntax) : Lean.MacroM Lean.Syntax :=
+  if stx.isMissing then Lean.Macro.throwUnsupported else pure stx
+
+syntax (name := referenceChoice) "referenceChoice%" term : term
+
+@[macro referenceChoice] meta def referenceFallback : Lean.Macro := fun stx => do
+  if stx.getNumArgs == 0 then Lean.Macro.throwUnsupported
+  else
+    let kind ← Lean.Macro.addMacroScope (Lean.Name.mkStr1 "fallback")
+    pure (.node .none kind #[])
+
+@[macro referenceChoice] meta def referenceGuard : Lean.Macro := fun stx => do
+  let candidate := stx.getArg 1
+  if candidate.isMissing then
+    Lean.Macro.withFreshMacroScope Lean.Macro.throwUnsupported
+  else if candidate.isAtom then
+    Lean.Macro.withFreshMacroScope (Lean.Macro.throwError "outer\x00λ")
+  else
+    Lean.Macro.withFreshMacroScope (Lean.Macro.throwErrorAt candidate "located\x00λ")
+
+syntax (name := referenceOuter) "referenceOuter%" term : term
+@[macro referenceOuter] meta def referenceExpand : Lean.Macro := fun stx => do
+  let _ ← Lean.Macro.expandMacro? (stx.getArg 1)
+  pure stx

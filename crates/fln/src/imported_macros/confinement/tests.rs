@@ -659,3 +659,66 @@ fn a_relay_does_not_authorize_another_methods_use_or_an_unused_projection() {
     assert!(checked(&module(vec![entry(statements, 11)]), 10_000).is_err());
     assert!(checked(&module(vec![entry(relay_context(), methods)]), 10_000).is_err());
 }
+
+#[test]
+fn error_helpers_accept_only_their_exact_context_argument_and_never_methods() {
+    for (method, arguments, context_index) in [
+        ("Lean.Macro.throwError._redArg", vec![0, 1, 2], 1),
+        ("Lean.Macro.throwErrorAt._redArg", vec![0, 0, 1, 2], 2),
+    ] {
+        assert!(
+            checked(
+                &module(vec![entry(vec![bind(3, call(method, &arguments))], 3)]),
+                10_000
+            )
+            .is_ok()
+        );
+        for wrong_index in 0..arguments.len() {
+            if wrong_index == context_index {
+                continue;
+            }
+            let mut wrong = arguments.clone();
+            wrong.swap(context_index, wrong_index);
+            assert!(
+                checked(
+                    &module(vec![entry(vec![bind(3, call(method, &wrong))], 3)]),
+                    10_000
+                )
+                .is_err(),
+                "context escaped into {method} argument {wrong_index}"
+            );
+        }
+        let mut forged = call(method, &arguments);
+        let IrExpr::Fap { function, .. } = &mut forged else {
+            unreachable!()
+        };
+        *function = Name::from_components([method]);
+        assert!(checked(&module(vec![entry(vec![bind(3, forged)], 3)]), 10_000).is_err());
+
+        let mut raw_methods = arguments;
+        raw_methods[context_index] = 3;
+        let statements = vec![
+            bind(
+                3,
+                IrExpr::Proj {
+                    i: layout::MACRO_CONTEXT_METHODS_FIELD,
+                    x: 1,
+                },
+            ),
+            bind(4, call(method, &raw_methods)),
+        ];
+        assert!(checked(&module(vec![entry(statements, 4)]), 10_000).is_err());
+    }
+    for (method, arguments) in [
+        ("Lean.Macro.throwUnsupported._redArg", vec![1]),
+        ("Lean.replaceRef", vec![0, 1]),
+    ] {
+        assert!(
+            checked(
+                &module(vec![entry(vec![bind(3, call(method, &arguments))], 3)]),
+                10_000
+            )
+            .is_err()
+        );
+    }
+}

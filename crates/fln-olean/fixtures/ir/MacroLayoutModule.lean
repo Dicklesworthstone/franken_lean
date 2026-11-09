@@ -169,6 +169,23 @@ def optionNone (_ : Unit) : Option Lean.Syntax := none
 @[noinline] def mkAtomFrom (value : @& Lean.Syntax) (text : String) (canonical : Bool) :
     Lean.Syntax := Lean.mkAtomFrom value text canonical
 
+@[noinline] def replaceRef (value old : Lean.Syntax) : Lean.Syntax :=
+  Lean.replaceRef value old
+
+@[noinline] def macroThrowError (message : String) (context : @& Lean.Macro.Context)
+    (state : Lean.Macro.State) :
+    EStateM.Result Lean.Macro.Exception Lean.Macro.State Lean.Syntax :=
+  Lean.Macro.throwError message context state
+
+@[noinline] def macroThrowErrorAt (value : @& Lean.Syntax) (message : String)
+    (context : @& Lean.Macro.Context) (state : Lean.Macro.State) :
+    EStateM.Result Lean.Macro.Exception Lean.Macro.State Lean.Syntax :=
+  Lean.Macro.throwErrorAt value message context state
+
+@[noinline] def macroThrowUnsupported (state : Lean.Macro.State) :
+    EStateM.Result Lean.Macro.Exception Lean.Macro.State Lean.Syntax :=
+  Lean.Macro.throwUnsupported ⟨default, .anonymous, 0, 0, 0, .missing⟩ state
+
 @[noinline] def syntaxSetInfo (info : Lean.SourceInfo) (value : Lean.Syntax) : Lean.Syntax :=
   value.setInfo info
 

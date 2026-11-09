@@ -63,6 +63,10 @@ FUNCTIONS = {
     "SOURCE_INFO_FROM_REF": "sourceInfoFromRef",
     "MK_ATOM": "mkAtom",
     "MK_ATOM_FROM": "mkAtomFrom",
+    "REPLACE_REF": "replaceRef",
+    "MACRO_THROW_ERROR": "macroThrowError",
+    "MACRO_THROW_ERROR_AT": "macroThrowErrorAt",
+    "MACRO_THROW_UNSUPPORTED": "macroThrowUnsupported",
     "SYNTAX_SET_INFO": "syntaxSetInfo",
     "SYNTAX_IS_MISSING": "syntaxIsMissing",
     "SYNTAX_IS_IDENT": "syntaxIsIdent",
@@ -71,6 +75,13 @@ FUNCTIONS = {
     "MACRO_HAS_DECL": "macroHasDecl",
     "MACRO_RESOLVE_NAMESPACE": "macroResolveNamespace",
     "MACRO_RESOLVE_GLOBAL_NAME": "macroResolveGlobalName",
+}
+
+FORWARDED_FUNCTIONS = {
+    "replaceRef": "Lean.replaceRef",
+    "macroThrowError": "Lean.Macro.throwError._redArg",
+    "macroThrowErrorAt": "Lean.Macro.throwErrorAt._redArg",
+    "macroThrowUnsupported": "Lean.Macro.throwUnsupported._redArg",
 }
 
 
@@ -103,6 +114,23 @@ def generate(lean):
         name_str[3],
     ) is None:
         raise ValueError("Name.str constructor wrapper does not forward the reviewed override")
+    # Generic MacroM error helpers compile to reduced-arity runtime functions.
+    # Require a direct forwarding body with the same parameter order, so the
+    # wrapper's extracted ABI cannot silently describe another callable.
+    for wrapper, callee in FORWARDED_FUNCTIONS.items():
+        forwarded = re.search(
+            rf"(?m)^    def FrankenLean\.MacroLayout\.{wrapper} (.*?) : (\w+) :=\n"
+            r"(.*?)(?=^    def |^\[|\Z)", trace, re.S,
+        )
+        if forwarded is None:
+            raise ValueError(f"missing native forwarding wrapper: {wrapper}")
+        parameters = re.findall(r"\((x_\d+) : (?:@& )?\w+\)", forwarded[1])
+        arguments = " ".join(re.escape(parameter) for parameter in parameters)
+        if not parameters or re.fullmatch(
+            rf"\s*let (x_\d+) : {re.escape(forwarded[2])} := {re.escape(callee)} "
+            rf"{arguments};\s*ret \1\s*", forwarded[3],
+        ) is None:
+            raise ValueError(f"native wrapper is not the reviewed direct forwarder: {wrapper}")
     layouts = {}
     pattern = r"ctor_(\d+)(?:\.(\d+)\.(\d+))?\[([^\]]+)\]([^;\n]*);"
     for match in re.finditer(pattern, trace):

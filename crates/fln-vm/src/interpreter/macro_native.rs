@@ -37,6 +37,10 @@ pub(super) enum Intrinsic {
     SourceInfoFromRef,
     MkAtom,
     MkAtomFrom,
+    ReplaceRef,
+    ThrowError,
+    ThrowErrorAt,
+    ThrowUnsupported,
     SetInfo,
     IsMissing,
     IsIdent,
@@ -74,6 +78,10 @@ impl Intrinsic {
             "mirror:Lean.SourceInfo.fromRef" => Self::SourceInfoFromRef,
             "mirror:Lean.mkAtom" => Self::MkAtom,
             "mirror:Lean.mkAtomFrom" => Self::MkAtomFrom,
+            "mirror:Lean.replaceRef" => Self::ReplaceRef,
+            "mirror:Lean.Macro.throwError._redArg" => Self::ThrowError,
+            "mirror:Lean.Macro.throwErrorAt._redArg" => Self::ThrowErrorAt,
+            "mirror:Lean.Macro.throwUnsupported._redArg" => Self::ThrowUnsupported,
             "mirror:Lean.Syntax.setInfo" => Self::SetInfo,
             "mirror:Lean.Syntax.isMissing" => Self::IsMissing,
             "mirror:Lean.Syntax.isIdent" => Self::IsIdent,
@@ -117,6 +125,7 @@ impl Intrinsic {
                 | Self::GetPos
                 | Self::GetTailPos
                 | Self::SourceInfoFromRef
+                | Self::ReplaceRef
                 | Self::GetCurrNamespace => 2,
                 Self::AddMacroScope
                 | Self::MacroAddMacroScope
@@ -125,7 +134,9 @@ impl Intrinsic {
                 | Self::ResolveGlobalName
                 | Self::SetArg
                 | Self::MkAtomFrom
+                | Self::ThrowError
                 | Self::ExpandMacro => 3,
+                Self::ThrowErrorAt => 4,
                 _ => 1,
             },
         )?;
@@ -391,6 +402,48 @@ impl Intrinsic {
                 Ok(IntrinsicResult::raw_object(Obj::mk_ctor(
                     layout::SYNTAX_ATOM.tag,
                     vec![info, text.clone_ref()],
+                    &[],
+                )))
+            }
+            Self::ReplaceRef => Ok(IntrinsicResult::raw_object(replace_ref(
+                &args[0], &args[1],
+            )?)),
+            Self::ThrowUnsupported => {
+                check_layout(&args[0], layout::MACRO_STATE)?;
+                Ok(IntrinsicResult::raw_object(Obj::mk_ctor(
+                    layout::RESULT_ERROR.tag,
+                    vec![
+                        Obj::mk_nat(layout::EXCEPTION_UNSUPPORTED_TAG),
+                        args[0].clone_ref(),
+                    ],
+                    &[],
+                )))
+            }
+            Self::ThrowError | Self::ThrowErrorAt => {
+                let offset = usize::from(self == Self::ThrowErrorAt);
+                let message = &args[offset];
+                let context = &args[offset + 1];
+                let state = &args[offset + 2];
+                string(message)?;
+                check_layout(context, layout::MACRO_CONTEXT)?;
+                check_layout(state, layout::MACRO_STATE)?;
+                // The current reference is ordinary reader data. MethodsRef
+                // neither supplies nor grants a capability to report errors.
+                let old = child(context, expansion_layout::MACRO_CONTEXT_REF_FIELD)?;
+                syntax_kind(&old)?;
+                let reference = if self == Self::ThrowErrorAt {
+                    replace_ref(&args[0], &old)?
+                } else {
+                    old
+                };
+                let exception = Obj::mk_ctor(
+                    layout::EXCEPTION_ERROR.tag,
+                    vec![reference, message.clone_ref()],
+                    &[],
+                );
+                Ok(IntrinsicResult::raw_object(Obj::mk_ctor(
+                    layout::RESULT_ERROR.tag,
+                    vec![exception, state.clone_ref()],
                     &[],
                 )))
             }
@@ -813,6 +866,19 @@ fn source_info_from_ref(value: &Obj, canonical: bool) -> Result<Obj, IntrinsicFa
         Some((pos, tail)) => synthetic_info(pos, tail, false),
         None => Obj::mk_nat(layout::SOURCE_NONE_TAG),
     })
+}
+
+fn replace_ref(value: &Obj, old: &Obj) -> Result<Obj, IntrinsicFailure> {
+    syntax_kind(old)?;
+    let info = get_head_info(value)?;
+    // withRef accepts a noncanonical position, including zero and large Nat.
+    // It asks only for the head position, never for a tail or complete range.
+    let selected = if source_position(&info, false, false, "Lean.replaceRef")?.is_some() {
+        value
+    } else {
+        old
+    };
+    Ok(selected.clone_ref())
 }
 
 fn synthetic_info(pos: Obj, tail: Obj, canonical: bool) -> Obj {

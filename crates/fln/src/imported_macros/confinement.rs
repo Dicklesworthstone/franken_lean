@@ -121,6 +121,10 @@ fn accepted_native_context_argument(function: &Name, index: usize) -> bool {
             ]
             .into_iter()
             .any(|method| *function == Name::from_components(["Lean", "Macro", method])))
+        || (index == 1
+            && *function == Name::from_components(["Lean", "Macro", "throwError", "_redArg"]))
+        || (index == 2
+            && *function == Name::from_components(["Lean", "Macro", "throwErrorAt", "_redArg"]))
 }
 
 impl Analyzer<'_> {
