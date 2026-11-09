@@ -13,6 +13,8 @@ const MAX_NAME_NODES: u64 = 1_000_000;
 const MAX_NAME_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_SYNTAX_NODES: u64 = 1_000_000;
 
+mod literals;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum Intrinsic {
     NameStr,
@@ -42,6 +44,11 @@ pub(super) enum Intrinsic {
     MkIdentFrom,
     MkCIdent,
     MkCIdentFrom,
+    MkLit,
+    MkStrLit,
+    IsLit,
+    IsStrLit,
+    GetString,
     ReplaceRef,
     ThrowError,
     ThrowErrorAt,
@@ -87,6 +94,11 @@ impl Intrinsic {
             "mirror:Lean.mkIdentFrom" => Self::MkIdentFrom,
             "mirror:Lean.mkCIdent" => Self::MkCIdent,
             "mirror:Lean.mkCIdentFrom" => Self::MkCIdentFrom,
+            "mirror:Lean.Syntax.mkLit" => Self::MkLit,
+            "mirror:Lean.Syntax.mkStrLit" => Self::MkStrLit,
+            "mirror:Lean.Syntax.isLit?" => Self::IsLit,
+            "mirror:Lean.Syntax.isStrLit?" => Self::IsStrLit,
+            "mirror:Lean.TSyntax.getString" => Self::GetString,
             "mirror:Lean.replaceRef" => Self::ReplaceRef,
             "mirror:Lean.Macro.throwError._redArg" => Self::ThrowError,
             "mirror:Lean.Macro.throwErrorAt._redArg" => Self::ThrowErrorAt,
@@ -135,6 +147,8 @@ impl Intrinsic {
                 | Self::GetTailPos
                 | Self::SourceInfoFromRef
                 | Self::ReplaceRef
+                | Self::MkStrLit
+                | Self::IsLit
                 | Self::GetCurrNamespace => 2,
                 Self::AddMacroScope
                 | Self::MacroAddMacroScope
@@ -145,6 +159,7 @@ impl Intrinsic {
                 | Self::MkAtomFrom
                 | Self::MkIdentFrom
                 | Self::MkCIdentFrom
+                | Self::MkLit
                 | Self::ThrowError
                 | Self::ExpandMacro => 3,
                 Self::ThrowErrorAt => 4,
@@ -486,6 +501,15 @@ impl Intrinsic {
             Self::ReplaceRef => Ok(IntrinsicResult::raw_object(replace_ref(
                 &args[0], &args[1],
             )?)),
+            Self::MkLit => {
+                literals::mk_lit(&args[0], &args[1], &args[2]).map(IntrinsicResult::raw_object)
+            }
+            Self::MkStrLit => {
+                literals::mk_str_lit(&args[0], &args[1]).map(IntrinsicResult::raw_object)
+            }
+            Self::IsLit => literals::is_lit(&args[0], &args[1]).map(IntrinsicResult::raw_object),
+            Self::IsStrLit => literals::is_str_lit(&args[0]).map(IntrinsicResult::raw_object),
+            Self::GetString => literals::get_string(&args[0]).map(IntrinsicResult::raw_object),
             Self::ThrowUnsupported => {
                 check_layout(&args[0], layout::MACRO_STATE)?;
                 Ok(IntrinsicResult::raw_object(Obj::mk_ctor(

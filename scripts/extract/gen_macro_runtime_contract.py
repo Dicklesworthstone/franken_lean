@@ -47,6 +47,11 @@ FUNCTIONS = {
     "SYNTAX_IS_OF_KIND": "syntaxIsOfKind",
     "SYNTAX_GET_ARG": "syntaxGetArg",
     "SYNTAX_GET_NUM_ARGS": "syntaxGetNumArgs",
+    "SYNTAX_MK_LIT": "syntaxMkLit",
+    "SYNTAX_MK_STR_LIT": "syntaxMkStrLit",
+    "SYNTAX_IS_LIT": "syntaxIsLit",
+    "SYNTAX_IS_STR_LIT": "syntaxIsStrLit",
+    "TSYNTAX_GET_STRING": "tSyntaxGetString",
     "SYNTAX_GET_KIND": "syntaxGetKind",
     "SYNTAX_SET_KIND": "syntaxSetKind",
     "SYNTAX_GET_ARGS": "syntaxGetArgs",
@@ -82,6 +87,11 @@ FUNCTIONS = {
 }
 
 FORWARDED_FUNCTIONS = {
+    "syntaxMkLit": "Lean.Syntax.mkLit",
+    "syntaxMkStrLit": "Lean.Syntax.mkStrLit",
+    "syntaxIsLit": "Lean.Syntax.isLit?",
+    "syntaxIsStrLit": "Lean.Syntax.isStrLit?",
+    "tSyntaxGetString": "Lean.TSyntax.getString",
     "mkIdent": "Lean.mkIdent",
     "mkIdentFrom": "Lean.mkIdentFrom",
     "mkCIdent": "Lean.mkCIdent",

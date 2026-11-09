@@ -11,6 +11,7 @@ mod identifiers_reference;
 #[cfg(test)]
 mod lookup_reference;
 mod reference;
+mod strings_reference;
 
 fn name(text: &str) -> Name {
     Name::from_components(text.split('.'))

@@ -127,6 +127,21 @@ def optionNone (_ : Unit) : Option Lean.Syntax := none
 
 @[noinline] def syntaxGetNumArgs (value : @& Lean.Syntax) : Nat := value.getNumArgs
 
+@[noinline] def syntaxMkLit (kind : Lean.SyntaxNodeKind) (value : String)
+    (info : Lean.SourceInfo) : Lean.Syntax :=
+  (Lean.Syntax.mkLit kind value info).raw
+
+@[noinline] def syntaxMkStrLit (value : String) (info : Lean.SourceInfo) : Lean.Syntax :=
+  (Lean.Syntax.mkStrLit value info).raw
+
+@[noinline] def syntaxIsLit (kind : @& Lean.SyntaxNodeKind) (value : @& Lean.Syntax) :
+    Option String :=
+  Lean.Syntax.isLit? kind value
+
+@[noinline] def syntaxIsStrLit (value : @& Lean.Syntax) : Option String := value.isStrLit?
+
+@[noinline] def tSyntaxGetString (value : @& Lean.StrLit) : String := value.getString
+
 @[noinline] def syntaxGetKind (value : Lean.Syntax) : Lean.Name := value.getKind
 
 @[noinline] def syntaxSetKind (value : Lean.Syntax) (kind : Lean.Name) : Lean.Syntax :=
