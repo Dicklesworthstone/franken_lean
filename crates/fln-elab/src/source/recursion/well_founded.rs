@@ -10,6 +10,7 @@
 //! simplification, assumptions and omega. A mutual group whose members all
 //! have Nat measures shares one fixpoint (`mutual`); other mutual groups and
 //! arbitrary SizeOf/lexicographic measure inference remain separate work.
+mod fast;
 pub(super) mod mutual;
 mod packing;
 mod relation;
@@ -36,8 +37,17 @@ enum Guess {
     /// Inference may complete the selected measure lexicographically with these Nat
     /// parameters, when it decreases some calls and increases none.
     Solve(Vec<usize>),
-    /// A solution: the lexicographic tuple of these parameters, in order.
-    Tuple(Vec<usize>),
+    /// A solution: the lexicographic tuple of these measures, in order.
+    /// Derived measures still reference only the original parameter context.
+    Tuple(MeasureSolution),
+}
+
+#[derive(Clone)]
+struct MeasureSolution {
+    measures: Vec<Typed>,
+    /// Fixed-parameter analysis already inspected every typed recursive call.
+    /// Replay checks it again but need not first elaborate the larger packing.
+    varying: Vec<usize>,
 }
 
 /// One entry of GuessLex's call matrix: the measure is equal, strictly smaller, or
@@ -47,6 +57,23 @@ enum CallRelation {
     Eq,
     Lt,
     Le,
+}
+
+/// `GuessLexRel.toNatRel` preserves the standard notation dictionaries. Keeping
+/// that spelling avoids a needless `Nat.lt_eq`/`Nat.le_eq` transport in simp.
+fn inferred_nat_relation(strict: bool) -> Expr {
+    let (class, field, instance) = if strict {
+        ("LT", "lt", "instLTNat")
+    } else {
+        ("LE", "le", "instLENat")
+    };
+    Expr::app(
+        Expr::app(
+            Expr::const_(Name::from_components([class, field]), vec![Level::zero()]),
+            Expr::const_(Name::from_components(["Nat"]), Vec::new()),
+        ),
+        Expr::const_(Name::from_components([instance]), Vec::new()),
+    )
 }
 
 impl Hint<'_> {
@@ -113,14 +140,41 @@ enum Attempt {
     /// failure cannot authorize guessing a later measure.
     SelectedFailure(NatDefinitionElabError),
     /// The inferred measure decreases some calls and increases none, and GuessLex's
-    /// `solve` completed it to the lexicographic order of these parameters.
-    Lexicographic(Vec<usize>),
+    /// `solve` completed it to the lexicographic order of these measures.
+    Lexicographic(MeasureSolution),
 }
 
 enum MeasureProbe {
     Strict,
     Unusable(NatDefinitionElabError),
     Lexicographic,
+}
+
+/// A direct measure already inspected in this exact body's call contexts.
+enum InitialMeasure<'a> {
+    Prefix {
+        index: usize,
+        row: &'a [CallRelation],
+    },
+    Unusable {
+        index: usize,
+        row: &'a [CallRelation],
+    },
+}
+
+#[derive(Clone, Copy)]
+enum CachedRelation {
+    Known(CallRelation),
+    Unknown,
+}
+
+/// The pin's lazy call matrix, scoped to one immutable collection of obligations.
+/// Unvisited entries differ from completed `no_idea` results. No proof assignments
+/// or local contexts escape this solve, and selected measures are proved again.
+struct MatrixMeasure {
+    measure: Typed,
+    body: Option<Expr>,
+    calls: std::collections::BTreeMap<usize, CachedRelation>,
 }
 
 #[derive(Clone)]
@@ -471,23 +525,14 @@ impl Context {
                 .ok_or_else(|| failure(SourceInferenceError::Scope));
         }
         if let Guess::Tuple(order) = &hint.guess {
-            // GuessLex's `termination_by x₁ x₂ => (x₁, x₂)`: the right-nested pair of the
-            // selected Nat parameters, each at its own type (every one is in `Type`).
-            let mut coordinates = order.iter().rev().map(|index| {
-                parameters
-                    .get(*index)
-                    .map(|parameter| Typed {
-                        value: Expr::fvar(parameter.id.clone()),
-                        type_: parameter.type_.clone(),
-                    })
-                    .ok_or_else(|| failure(SourceInferenceError::Scope))
-            });
+            // A singleton stays a Nat measure; a longer solution is the right-nested
+            // product used by the pin. All coordinates were checked in this context.
+            let mut coordinates = order.measures.iter().rev().cloned();
             let mut tuple = coordinates
                 .next()
-                .ok_or_else(|| failure(SourceInferenceError::Scope))??;
+                .ok_or_else(|| failure(SourceInferenceError::Scope))?;
             for coordinate in coordinates {
                 self.tick()?;
-                let coordinate = coordinate?;
                 let levels = vec![Level::zero(), Level::zero()];
                 let types = [coordinate.type_.clone(), tuple.type_.clone()];
                 let pair = [
@@ -635,7 +680,7 @@ impl Context {
                     *self = snapshot;
                     self.txn.budget.heartbeats_consumed = spent;
                     self.txn.nat_sub_model_cache = model_cache;
-                    // The solution is checked as `termination_by (x₁, x₂, …)` would be.
+                    // Check the selected expression or tuple as an explicit measure.
                     let selected = Hint {
                         aliases: Vec::new(),
                         measure: None,
@@ -767,7 +812,12 @@ impl Context {
         let measure = self.well_founded_measure(hint, parameters, header_parameters)?;
         let measure = self.select_well_founded_relation(measure, parameters)?;
         let snapshot = self.clone();
-        let mut varying: Vec<_> = (0..parameters.len())
+        let initial = match &hint.guess {
+            Guess::Tuple(solution) => solution.varying.clone(),
+            _ => (0..parameters.len()).collect(),
+        };
+        let mut varying: Vec<_> = initial
+            .into_iter()
             .filter(|index| !measure.relation.captures.contains(index))
             .collect();
         loop {
@@ -993,10 +1043,39 @@ impl Context {
                 if let Some(first) = hint.inferred
                     && !self.single_direct_measure(parameters, varying, &obligations)?
                 {
-                    let (probe, row) = self.check_inferred_measure(&prepared, &goals)?;
+                    let (probe, row) =
+                        self.check_inferred_measure(&prepared, &goals, hint.decreasing.is_none())?;
                     match probe {
                         MeasureProbe::Strict => {}
-                        MeasureProbe::Unusable(problem) => return Err(problem),
+                        MeasureProbe::Unusable(problem) => {
+                            // All supported default-tactic candidates can share this body's
+                            // call matrix. Its stable order still tries every direct measure
+                            // before complex ones. Supplied tactics and unsupported SizeOf
+                            // candidates retain their order-sensitive refusal behavior.
+                            let Guess::Solve(candidates) = &hint.guess else {
+                                return Err(problem);
+                            };
+                            if varying.iter().any(|index| !candidates.contains(index)) {
+                                return Err(problem);
+                            }
+                            let solved = self.solve_lexicographic(
+                                &prepared,
+                                (&goals, &obligations),
+                                parameters,
+                                varying,
+                                InitialMeasure::Unusable {
+                                    index: first,
+                                    row: &row,
+                                },
+                            )?;
+                            return match solved {
+                                Some(order) => Ok(Attempt::Lexicographic(MeasureSolution {
+                                    measures: order,
+                                    varying: varying.to_vec(),
+                                })),
+                                None => Ok(Attempt::SelectedFailure(problem)),
+                            };
+                        }
                         MeasureProbe::Lexicographic => {
                             let Guess::Solve(candidates) = &hint.guess else {
                                 return Ok(Attempt::SelectedFailure(error(
@@ -1013,19 +1092,16 @@ impl Context {
                                 (&goals, &obligations),
                                 parameters,
                                 varying,
-                                (first, &row),
+                                InitialMeasure::Prefix {
+                                    index: first,
+                                    row: &row,
+                                },
                             )?;
                             return Ok(match solved {
-                                Some(order) => Attempt::Lexicographic(order),
-                                // The pin also tries `e₂ - e₁` for a hypothesis `e₁ < e₂`
-                                // at a call, after these measures; this search does not.
-                                None if self
-                                    .complex_measure_possible(&goals, parameters, varying)? =>
-                                {
-                                    Attempt::SelectedFailure(error(
-                                        RecursionError::WellFoundedMeasureOrderUnsupported,
-                                    ))
-                                }
+                                Some(order) => Attempt::Lexicographic(MeasureSolution {
+                                    measures: order,
+                                    varying: varying.to_vec(),
+                                }),
                                 None => Attempt::SelectedFailure(error(
                                     RecursionError::WellFoundedMeasureSearchFailed,
                                 )),
@@ -1347,6 +1423,14 @@ impl Context {
         } else {
             for goal in goals {
                 self.tick()?;
+                if self
+                    .well_founded
+                    .as_ref()
+                    .is_some_and(|state| state.mutual.is_none())
+                    && self.try_fast_decreasing_sub(&goal)?
+                {
+                    continue;
+                }
                 let state = self.start_decreasing_proof(prepared, vec![goal])?;
                 self.run_decreasing_proof(prepared, state)?;
             }
@@ -1465,6 +1549,7 @@ impl Context {
         proof: &Syntax,
         goal: &tactics::ProofGoal,
         target: &Expr,
+        default: bool,
     ) -> Result<Result<CallRelation, NatDefinitionElabError>, NatDefinitionElabError> {
         let mut trial = self.clone();
         trial.txn.lctx = goal.lctx.clone();
@@ -1476,13 +1561,24 @@ impl Context {
         self.txn.nat_sub_model_cache = trial.txn.nat_sub_model_cache.clone();
         let target = target?;
         let (head, arguments) = operators::spine(&target);
-        if !matches!(head.node(), ExprNode::Const { name, .. }
-            if name == &Name::from_components(["Nat", "lt"]))
-            || arguments.len() != 2
-        {
-            return Err(failure(SourceInferenceError::Scope));
-        }
-        let equal = trial.well_founded_default_conversion(&arguments[0], &arguments[1]);
+        let operands = match head.node() {
+            ExprNode::Const { name, .. }
+                if name == &Name::from_components(["Nat", "lt"]) && arguments.len() == 2 =>
+            {
+                &arguments[..]
+            }
+            ExprNode::Const { name, .. }
+                if name == &Name::from_components(["LT", "lt"])
+                    && arguments.len() == 4
+                    && arguments[0] == Expr::const_(Name::from_components(["Nat"]), Vec::new())
+                    && arguments[1]
+                        == Expr::const_(Name::from_components(["instLTNat"]), Vec::new()) =>
+            {
+                &arguments[2..]
+            }
+            _ => return Err(failure(SourceInferenceError::Scope)),
+        };
+        let equal = trial.well_founded_default_conversion(&operands[0], &operands[1]);
         self.txn.budget.heartbeats_consumed = trial.txn.budget.heartbeats_consumed;
         // Repeated call comparisons deliberately roll back term assignments,
         // but the completed immutable model check is still valid and paid for.
@@ -1490,19 +1586,27 @@ impl Context {
         if equal? {
             return Ok(Ok(CallRelation::Eq));
         }
-        let problem = match self.probe_inferred_goal(proof, goal, target) {
+        let problem = match self.probe_inferred_goal(proof, goal, target, default) {
             Ok(()) => return Ok(Ok(CallRelation::Lt)),
             Err(problem) if !tactics::backtrack::recoverable(&problem) => return Err(problem),
             Err(problem) => problem,
         };
+        // Mutual inference keeps its existing proof spelling and cost. Its
+        // candidate search is separate from the single-function matrix here.
+        let weak_relation = if self
+            .well_founded
+            .as_ref()
+            .is_some_and(|state| state.mutual.is_some())
+        {
+            Expr::const_(Name::from_components(["Nat", "le"]), Vec::new())
+        } else {
+            inferred_nat_relation(false)
+        };
         let le = Expr::app(
-            Expr::app(
-                Expr::const_(Name::from_components(["Nat", "le"]), Vec::new()),
-                arguments[0].clone(),
-            ),
-            arguments[1].clone(),
+            Expr::app(weak_relation, operands[0].clone()),
+            operands[1].clone(),
         );
-        match self.probe_inferred_goal(proof, goal, le) {
+        match self.probe_inferred_goal(proof, goal, le, default) {
             Ok(()) => Ok(Ok(CallRelation::Le)),
             Err(stopped) if !tactics::backtrack::recoverable(&stopped) => Err(stopped),
             Err(_) => Ok(Err(problem)),
@@ -1517,11 +1621,12 @@ impl Context {
         &mut self,
         proof: &Syntax,
         goals: &[tactics::ProofGoal],
+        default: bool,
     ) -> Result<(MeasureProbe, Vec<CallRelation>), NatDefinitionElabError> {
         let mut row = Vec::new();
         for goal in goals {
             self.tick()?;
-            match self.classify_call(proof, goal, &goal.target)? {
+            match self.classify_call(proof, goal, &goal.target, default)? {
                 Ok(relation) => row.push(relation),
                 Err(problem) => return Ok((MeasureProbe::Unusable(problem), row)),
             }
@@ -1540,21 +1645,26 @@ impl Context {
         Ok((probe, row))
     }
 
-    /// GuessLex's `solve` after a first measure that decreases some calls and increases
-    /// none: over the calls not yet decreased, take the first unused measure, in telescope
-    /// order, that decreases one of them and increases none, and drop the calls it
-    /// decreases; give up when none does. As the pin evaluates its call matrix, each
-    /// entry reads the call's own arguments, under this body's single elaboration: the
-    /// candidate measure is applied to the packed arguments the selected one compared.
+    /// GuessLex's `solve`: finish a selected direct prefix, or finish searching the
+    /// direct and complex measures in one collected body. Keep telescope order before
+    /// the derived measures' call/context order. Each coordinate decreases some remaining
+    /// call and increases none; its cached entry uses that call's actual argument pack.
     fn solve_lexicographic(
         &mut self,
         proof: &Syntax,
         (goals, obligations): (&[tactics::ProofGoal], &[Obligation]),
         parameters: &[LocalDecl],
         varying: &[usize],
-        (first, row): (usize, &[CallRelation]),
-    ) -> Result<Option<Vec<usize>>, NatDefinitionElabError> {
-        if goals.len() != obligations.len() || row.len() != goals.len() {
+        initial: InitialMeasure<'_>,
+    ) -> Result<Option<Vec<Typed>>, NatDefinitionElabError> {
+        let (first, row, selected) = match initial {
+            InitialMeasure::Prefix { index, row } => (index, row, true),
+            InitialMeasure::Unusable { index, row } => (index, row, false),
+        };
+        if goals.len() != obligations.len()
+            || row.len() > goals.len()
+            || (selected && row.len() != goals.len())
+        {
             return Err(failure(SourceInferenceError::Scope));
         }
         let mut packed = Vec::new();
@@ -1568,46 +1678,93 @@ impl Context {
             .iter()
             .map(|index| parameters[*index].clone())
             .collect();
-        let mut order = vec![first];
-        let mut remaining: Vec<usize> = (0..row.len())
-            .filter(|&call| row[call] != CallRelation::Lt)
+        let direct = |index: usize| Typed {
+            value: Expr::fvar(parameters[index].id.clone()),
+            type_: parameters[index].type_.clone(),
+        };
+        let mut order = if selected {
+            vec![direct(first)]
+        } else {
+            Vec::new()
+        };
+        let mut remaining: Vec<usize> = (0..goals.len())
+            .filter(|&call| !selected || row[call] != CallRelation::Lt)
             .collect();
-        let mut unused: Vec<usize> = varying
+        // A direct candidate unusable on all calls can become usable after a complex
+        // prefix removes the calls where it grows, so retain it for later coordinates.
+        let mut unused: Vec<MatrixMeasure> = Vec::new();
+        for index in varying
             .iter()
             .copied()
-            .filter(|&index| index != first)
-            .collect();
+            .filter(|&index| !selected || index != first)
+        {
+            self.tick()?;
+            let mut calls = std::collections::BTreeMap::new();
+            if !selected && index == first {
+                for (call, &relation) in row.iter().enumerate() {
+                    self.tick()?;
+                    calls.insert(call, CachedRelation::Known(relation));
+                }
+                // A complete row can be unusable because it never decreases
+                // strictly. Only a partial row stopped at a `no_idea` entry.
+                if row.len() < goals.len() {
+                    calls.insert(row.len(), CachedRelation::Unknown);
+                }
+            }
+            unused.push(MatrixMeasure {
+                measure: direct(index),
+                body: None,
+                calls,
+            });
+        }
+        unused.extend(
+            self.complex_nat_measures(obligations, parameters, varying)?
+                .into_iter()
+                .map(|measure| MatrixMeasure {
+                    measure,
+                    body: None,
+                    calls: std::collections::BTreeMap::new(),
+                }),
+        );
         while !remaining.is_empty() {
             let mut chosen = None;
-            'measures: for (slot, &index) in unused.iter().enumerate() {
+            'measures: for (slot, candidate) in unused.iter_mut().enumerate() {
                 self.tick()?;
-                let parameter = &parameters[index];
-                let measure = self.uncurry_well_founded_value(
-                    &varying_parameters,
-                    Typed {
-                        value: Expr::fvar(parameter.id.clone()),
-                        type_: parameter.type_.clone(),
-                    },
-                )?;
-                let measure = self.whnf(&measure.value)?;
-                let ExprNode::Lam { body, .. } = measure.node() else {
-                    return Err(failure(SourceInferenceError::ExpectedFunction));
-                };
                 let mut decreased = Vec::new();
                 for &call in &remaining {
                     self.tick()?;
-                    let (next, current) = &packed[call];
-                    let target = Expr::app(
-                        Expr::app(
-                            Expr::const_(Name::from_components(["Nat", "lt"]), Vec::new()),
-                            self.substitute(body, next)?,
-                        ),
-                        self.substitute(body, current)?,
-                    );
-                    match self.classify_call(proof, &goals[call], &target)? {
-                        Ok(CallRelation::Lt) => decreased.push(call),
-                        Ok(CallRelation::Eq | CallRelation::Le) => {}
-                        Err(_) => continue 'measures,
+                    let classification = if let Some(&classification) = candidate.calls.get(&call) {
+                        classification
+                    } else {
+                        if candidate.body.is_none() {
+                            let measure = self.uncurry_well_founded_value(
+                                &varying_parameters,
+                                candidate.measure.clone(),
+                            )?;
+                            let measure = self.whnf(&measure.value)?;
+                            let ExprNode::Lam { body, .. } = measure.node() else {
+                                return Err(failure(SourceInferenceError::ExpectedFunction));
+                            };
+                            candidate.body = Some(body.clone());
+                        }
+                        let body = candidate.body.as_ref().expect("prepared measure body");
+                        let (next, current) = &packed[call];
+                        let target = Expr::app(
+                            Expr::app(inferred_nat_relation(true), self.substitute(body, next)?),
+                            self.substitute(body, current)?,
+                        );
+                        let classification =
+                            match self.classify_call(proof, &goals[call], &target, true)? {
+                                Ok(relation) => CachedRelation::Known(relation),
+                                Err(_) => CachedRelation::Unknown,
+                            };
+                        candidate.calls.insert(call, classification);
+                        classification
+                    };
+                    match classification {
+                        CachedRelation::Known(CallRelation::Lt) => decreased.push(call),
+                        CachedRelation::Known(CallRelation::Eq | CallRelation::Le) => {}
+                        CachedRelation::Unknown => continue 'measures,
                     }
                 }
                 if !decreased.is_empty() {
@@ -1618,10 +1775,180 @@ impl Context {
             let Some((slot, decreased)) = chosen else {
                 return Ok(None);
             };
-            order.push(unused.remove(slot));
+            order.push(unused.remove(slot).measure);
             remaining.retain(|call| !decreased.contains(call));
         }
         Ok(Some(order))
+    }
+
+    /// The pin's `complexMeasures`: a Nat comparison in a recursive call's original
+    /// context contributes `larger - smaller`, or only `larger` when the smaller side
+    /// is fixed. A candidate may read only the definition's parameters, never a branch
+    /// proof, let or refined pattern variable. Negation swaps the comparison's sides.
+    fn complex_nat_measures(
+        &mut self,
+        obligations: &[Obligation],
+        parameters: &[LocalDecl],
+        varying: &[usize],
+    ) -> Result<Vec<Typed>, NatDefinitionElabError> {
+        let original: HashSet<_> = parameters.iter().map(|local| local.id.clone()).collect();
+        let varying_ids: HashSet<_> = varying
+            .iter()
+            .map(|index| parameters[*index].id.clone())
+            .collect();
+        let varying_parameters: Vec<_> = varying
+            .iter()
+            .map(|index| parameters[*index].clone())
+            .collect();
+        let saved = self.txn.lctx.clone();
+        let result = (|| {
+            let nat = Expr::const_(Name::from_components(["Nat"]), Vec::new());
+            let domain = self.well_founded_domain(&varying_parameters)?;
+            let original_arguments: Vec<_> = varying_parameters
+                .iter()
+                .map(|local| Expr::fvar(local.id.clone()))
+                .collect();
+            let original_pack = self
+                .pack_well_founded_arguments(&domain, &original_arguments)?
+                .value;
+            let mut measures: Vec<Typed> = Vec::new();
+            for obligation in obligations {
+                self.tick()?;
+                self.txn.lctx = obligation.goal.lctx.clone();
+                if parameters
+                    .iter()
+                    .any(|parameter| self.txn.lctx.find(&parameter.id).is_none())
+                {
+                    continue;
+                }
+                let raw_target = self.instantiate(&obligation.raw_target)?;
+                let (_, _, _, current) = self.decreasing_relation_parts(&raw_target)?;
+                // A matcher can retain a name while refining its actual caller argument.
+                // Require the original pack too, matching the pin's all-isFVar condition.
+                if self.reduce_decreasing_operand(&current, false)?
+                    != self.reduce_decreasing_operand(&original_pack, false)?
+                {
+                    continue;
+                }
+                for local in obligation.goal.lctx.decls() {
+                    self.tick()?;
+                    let mut type_ = self.instantiate(&local.type_)?;
+                    let mut reversed = false;
+                    let comparison = loop {
+                        self.tick()?;
+                        let (head, arguments) = operators::spine(&type_);
+                        let ExprNode::Const { name, .. } = head.node() else {
+                            break None;
+                        };
+                        if name == &Name::from_components(["Not"]) && arguments.len() == 1 {
+                            reversed = !reversed;
+                            type_ = arguments[0].clone();
+                            continue;
+                        }
+                        if arguments.len() != 4 {
+                            break None;
+                        }
+                        let direction = if name == &Name::from_components(["LT", "lt"])
+                            || name == &Name::from_components(["LE", "le"])
+                        {
+                            false
+                        } else if name == &Name::from_components(["GT", "gt"])
+                            || name == &Name::from_components(["GE", "ge"])
+                        {
+                            true
+                        } else {
+                            break None;
+                        };
+                        let domain = self.reduce_source_head(
+                            &arguments[0],
+                            UnificationTransparency::Abbreviations,
+                            true,
+                        )?;
+                        if domain != nat {
+                            break None;
+                        }
+                        let pair = if direction ^ reversed {
+                            (arguments[3].clone(), arguments[2].clone())
+                        } else {
+                            (arguments[2].clone(), arguments[3].clone())
+                        };
+                        break Some(pair);
+                    };
+                    let Some((smaller, larger)) = comparison else {
+                        continue;
+                    };
+                    let smaller_reads = self.elimination_reads(&smaller)?;
+                    if !smaller_reads.is_subset(&original)
+                        || !self.elimination_reads(&larger)?.is_subset(&original)
+                        || smaller.has_expr_mvar()
+                        || larger.has_expr_mvar()
+                        || smaller.has_level_mvar()
+                        || larger.has_level_mvar()
+                    {
+                        continue;
+                    }
+                    let body = if smaller_reads.is_disjoint(&varying_ids) {
+                        larger
+                    } else {
+                        // `Lean.mkNatSub` retains the standard notation spine. Omega
+                        // reifies that spine; a primitive `Nat.sub` is an opaque atom
+                        // at the pin and must not be made arithmetic by this search.
+                        let dictionary = Expr::app(
+                            Expr::app(
+                                Expr::const_(
+                                    Name::from_components(["instHSub"]),
+                                    vec![Level::zero()],
+                                ),
+                                nat.clone(),
+                            ),
+                            Expr::const_(Name::from_components(["instSubNat"]), Vec::new()),
+                        );
+                        let mut difference = Expr::const_(
+                            Name::from_components(["HSub", "hSub"]),
+                            vec![Level::zero(); 3],
+                        );
+                        for argument in [
+                            nat.clone(),
+                            nat.clone(),
+                            nat.clone(),
+                            dictionary,
+                            larger,
+                            smaller,
+                        ] {
+                            self.tick()?;
+                            difference = Expr::app(difference, argument);
+                        }
+                        difference
+                    };
+                    if matches!(body.node(), ExprNode::FVar { .. }) {
+                        continue;
+                    }
+                    // Comparison is a private probe: duplicate elimination must not leave
+                    // semantic assignments behind, and it never refunds spent work.
+                    let mut duplicate = false;
+                    for prior in &measures {
+                        self.tick()?;
+                        let mut trial = self.clone();
+                        let equal = trial.well_founded_default_conversion(&prior.value, &body);
+                        self.txn.budget.heartbeats_consumed = trial.txn.budget.heartbeats_consumed;
+                        self.txn.nat_sub_model_cache = trial.txn.nat_sub_model_cache;
+                        if equal? {
+                            duplicate = true;
+                            break;
+                        }
+                    }
+                    if !duplicate {
+                        measures.push(Typed {
+                            value: body,
+                            type_: nat.clone(),
+                        });
+                    }
+                }
+            }
+            Ok(measures)
+        })();
+        self.txn.lctx = saved;
+        result
     }
 
     /// Whether GuessLex's `complexMeasures` could add a measure: some call's context has a
@@ -1687,6 +2014,7 @@ impl Context {
         proof: &Syntax,
         goal: &tactics::ProofGoal,
         target: Expr,
+        default: bool,
     ) -> Result<(), NatDefinitionElabError> {
         let snapshot = self.clone();
         let result = (|| {
@@ -1711,6 +2039,9 @@ impl Context {
                 introduced: Vec::new(),
                 no_implicit_lambda: false,
             };
+            if default && self.try_fast_decreasing_sub(&fresh)? {
+                return Ok(());
+            }
             let state = self.start_decreasing_proof(proof, vec![fresh])?;
             self.run_decreasing_proof(proof, state).map(|_| ())
         })();

@@ -1443,7 +1443,7 @@ impl Context {
                     let complex = self.complex_measure_possible(&goals, &parameters, &varying)?;
                     for goal in &goals {
                         self.tick()?;
-                        match self.classify_call(&prepared, goal, &goal.target)? {
+                        match self.classify_call(&prepared, goal, &goal.target, false)? {
                             Ok(CallRelation::Lt) => strict += 1,
                             Ok(CallRelation::Eq | CallRelation::Le) => {}
                             Err(_) => {

@@ -618,6 +618,31 @@ fn native_well_founded_infers_omitted_result_types() {
         .expect("native omitted-result checks finish");
 }
 
+#[test]
+fn native_well_founded_infers_complex_nat_measures() {
+    let Some(lib) = pinned_lib() else {
+        eprintln!("SKIP: pinned Reference lib/lean absent (set FLN_REQUIRE_REFERENCE=1 to fail)");
+        return;
+    };
+    std::thread::Builder::new()
+        .stack_size(STACK)
+        .spawn(move || {
+            let base =
+                import_closure_for(&lib, &["Init.WFTactics", "Init.Omega", "Init.WFComputable"]);
+            well_founded_inference::assert_complex_measures(&base);
+            // The same matrix search must retain direct selection, supplied-script
+            // behavior, typed search stops and existing lexicographic computations.
+            // Share this real checked import closure across the unchanged assertions.
+            well_founded_inference::assert_automatic_termination(&base);
+            well_founded_inference::assert_search_stops(&base);
+            well_founded_lex::assert_automatic_lexicographic_proofs(&base);
+            well_founded_lex::assert_automatic_lexicographic_refusals(&base);
+        })
+        .expect("spawn native complex-measure checking thread")
+        .join()
+        .expect("native complex-measure checks finish");
+}
+
 /// Product measures, supplied or inferred, in the same closure. A separate test, so a
 /// failure among the single-measure programs above does not hide these.
 #[test]

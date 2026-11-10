@@ -103,6 +103,14 @@ const INFERRED: &[(&str, &str, &str, usize)] = &[
         "nestedLexInferred 2 3 4",
         25,
     ),
+    (
+        "needsDifference",
+        r#"def needsDifference (i n b : Nat) : Nat :=
+  if hb : 0 < b then needsDifference i n (b - 1)
+  else if h : i < n then needsDifference (i + 1) n b else 0"#,
+        "needsDifference 0 40 2",
+        0,
+    ),
 ];
 
 /// The pin infers `termination_by (a, b, c)`. Measured 2026-10-20, inference spent
@@ -128,13 +136,6 @@ const INFERRED_REFUSALS: &[(&str, &str, Option<&str>)] = &[
         r#"def stuck (a b : Nat) : Nat :=
   if h : 0 < a then stuck (a - 1) b + stuck a (b + 1) else 0"#,
         Some("WellFoundedMeasureSearchFailed"),
-    ),
-    (
-        "needsDifference",
-        r#"def needsDifference (i n b : Nat) : Nat :=
-  if hb : 0 < b then needsDifference i n (b - 1)
-  else if h : i < n then needsDifference (i + 1) n b else 0"#,
-        Some("WellFoundedMeasureOrderUnsupported"),
     ),
 ];
 

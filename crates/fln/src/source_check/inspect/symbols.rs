@@ -532,13 +532,15 @@ fn null_args(syntax: &Syntax) -> Option<&[Syntax]> {
 /// Constructor and projection names are admitted children of the exact owner.
 /// Only their authored identifiers receive origins: generated recursors, the
 /// default `mk`, inherited projections and default overrides do not.
+type ExplicitChildOrigin<'a> = (Name, &'a Syntax, Range<usize>);
+
 fn explicit_children<'a>(
     syntax: &'a Syntax,
     owner: &Name,
     environment: &Environment,
     structures: &ImportedStructures,
     budget: &mut SourceOriginBudget,
-) -> Result<Vec<(Name, &'a Syntax, Range<usize>)>, SourceModuleCheckError> {
+) -> Result<Vec<ExplicitChildOrigin<'a>>, SourceModuleCheckError> {
     let mut origins = Vec::new();
     let Some(command) = node_args(syntax, "declaration").and_then(|args| args.get(1)) else {
         return Ok(origins);
