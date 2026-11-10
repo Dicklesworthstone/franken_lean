@@ -27,7 +27,7 @@ pub struct Registrations {
 /// Read the exact inherited prefix and module-owned suffix. Every visited row
 /// and decoded payload byte consumes work before allocation. An unchanged,
 /// shared persistent state returns immediately without inspecting its prefix.
-/// `None` refuses imported-name overrides or a type outside the exact supported
+/// `None` refuses changed imported indexing or a type outside the exact supported
 /// indexing fragment. Scoped entries retain their namespace and remain dormant.
 pub fn registrations(
     base: &Environment,
@@ -149,9 +149,6 @@ pub fn registrations(
         {
             return Err(InstanceRegistryError::Malformed);
         }
-        if owned && base.contains(&declaration) {
-            return Ok(None);
-        }
         if !owned && !base.contains(&declaration) && std::ptr::eq(validation, result) {
             return Err(InstanceRegistryError::Malformed);
         }
@@ -204,9 +201,36 @@ pub fn registrations(
     // Refuse a later class registration that would change an earlier stored
     // path or schedule, rather than letting artifact reimport select a different
     // dictionary. Inherited-name class changes were already refused above.
+    let mut inherited = BTreeSet::new();
+    for row in &exported.instances {
+        tick(&mut remaining)?;
+        if base.contains(&row.declaration) {
+            inherited.insert(row.declaration.clone());
+        }
+    }
+    let (imported_instances, imported_bytes) =
+        imported::export_instances(result, &inherited, &mut remaining)?;
+    exported.bytes_examined += imported_bytes;
     let mut final_models = BTreeMap::new();
     for row in &exported.instances {
         tick(&mut remaining)?;
+        // A source priority update retains an imported instance's original
+        // tree slot, index and synthesis schedule. Emitting a different model
+        // would make physical imports disagree with this checked source graph.
+        // A first registration of an imported, previously ordinary definition
+        // has no stored model and uses the derived registration above.
+        if let Some(previous) = imported_instances.get(&row.declaration) {
+            charge(
+                &mut remaining,
+                previous.keys.len() + previous.synth_order.len(),
+            )?;
+            if previous.keys != row.keys
+                || previous.synth_order != row.synth_order
+                || previous.scope != row.scope
+            {
+                return Ok(None);
+            }
+        }
         if !final_models.contains_key(&row.declaration) {
             let Some(model) = index::derive(
                 result,

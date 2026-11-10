@@ -191,32 +191,128 @@ fn a_diamond_exports_only_each_modules_own_instance_registrations() {
 }
 
 #[test]
-fn imported_instance_overrides_refuse_artifacts_without_changing_the_initial_engine() {
+fn imported_instance_priorities_survive_metadata_only_modules_and_physical_imports() {
     let initial = Engine::builder().build_empty();
     let root = initial.logical_root(&KVMap::new());
     let base = format!("{PICK}\n{CHOICES}");
-    let error = build(
+    let built = build(
         &initial,
         &[
+            ("Main", "prelude\nimport Raised"),
             (
-                "Main",
+                "Raised",
                 "prelude\nimport Base\nattribute [instance 3000] fallback",
             ),
             ("Base", &base),
         ],
         OleanWriteBudget::default(),
     )
-    .unwrap_err();
-    assert!(
-        matches!(
-            error,
-            SourceModuleBuildError::Check(SourceModuleCheckError::Extension { .. })
-        ),
-        "{error:?}"
+    .unwrap()
+    .into_complete()
+    .unwrap();
+    let raised = &built.artifacts[1];
+    assert_eq!(raised.name, name("Raised"));
+    assert_eq!(raised.report.constants, 0);
+    let rows = metadata(&raised.bytes).instances;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].declaration, name("fallback"));
+    assert_eq!(rows[0].priority, 3000);
+    assert!(metadata(&built.artifacts[2].bytes).instances.is_empty());
+    assert_choice(&built.checked.checked.engine, "left");
+    assert_choice(&imported(&built).engine, "left");
+    aliases::reference_import(
+        &built,
+        "prelude\nimport Main\nnoncomputable section\ndef chosen : Token := Pick.value\ntheorem choice (P : Token -> Prop) (h : P Token.left) : P chosen := h",
+        true,
+    );
+    aliases::reference_import(
+        &built,
+        "prelude\nimport Main\nnoncomputable section\ndef chosen : Token := Pick.value\ntheorem wrong (P : Token -> Prop) (h : P Token.right) : P chosen := h",
+        false,
     );
     assert_eq!(initial.logical_root(&KVMap::new()), root);
-    let recovered = compiled(&[("Main", "prelude\nimport Base"), ("Base", &base)]);
-    assert_choice(&imported(&recovered).engine, "right");
+}
+
+#[test]
+fn imported_priority_ties_keep_the_original_slot_through_a_diamond() {
+    let base = format!("{PICK}\n{CHOICES}");
+    let built = compiled(&[
+        ("Main", "prelude\nimport Tied\nimport Other"),
+        (
+            "Tied",
+            "prelude\nimport Raised\nattribute [instance 2000] fallback",
+        ),
+        (
+            "Raised",
+            "prelude\nimport Base\nattribute [instance 3000] fallback",
+        ),
+        ("Other", "prelude\nimport Base"),
+        ("Base", &base),
+    ]);
+    assert_choice(&built.checked.checked.engine, "right");
+    let receipt = imported(&built);
+    assert_choice(&receipt.engine, "right");
+    assert_eq!(
+        receipt
+            .modules
+            .iter()
+            .map(|module| module.instances)
+            .sum::<usize>(),
+        4
+    );
+    aliases::reference_import(
+        &built,
+        "prelude\nimport Main\nnoncomputable section\ndef chosen : Token := Pick.value\ntheorem originalSlot (P : Token -> Prop) (h : P Token.right) : P chosen := h",
+        true,
+    );
+}
+
+#[test]
+fn imported_definitions_can_acquire_global_and_scoped_instance_registrations() {
+    let base = format!(
+        "{PICK}\n{CHOICES}\n@[reducible] def unregistered : Pick := Pick.mk Token.left"
+    );
+    for (registration, scope) in [
+        ("attribute [instance 3000] unregistered", None),
+        (
+            "namespace Regional\nattribute [scoped instance 3000] unregistered\nend Regional",
+            Some("Regional"),
+        ),
+    ] {
+        let adapter = format!("prelude\nimport Base\n{registration}");
+        let built = compiled(&[
+            ("Main", "prelude\nimport Adapter"),
+            ("Adapter", &adapter),
+            ("Base", &base),
+        ]);
+        let adapter = &built.artifacts[1];
+        assert_eq!(adapter.report.constants, 0);
+        let rows = metadata(&adapter.bytes).instances;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].declaration, name("unregistered"));
+        assert_eq!(rows[0].scope, scope.map(name));
+        let receipt = imported(&built);
+        for engine in [&built.checked.checked.engine, &receipt.engine] {
+            assert_choice(engine, if scope.is_some() { "right" } else { "left" });
+            if scope.is_some() {
+                engine.check_source_files(
+                    &[b"open scoped Regional\ndef chosen : Token := Pick.value\ntheorem activated (P : Token -> Prop) (h : P Token.left) : P chosen := h"],
+                    &KVMap::new(), limits().source,
+                ).unwrap().into_complete().unwrap();
+                assert_choice(engine, "right");
+            }
+        }
+        let activation = if scope.is_some() {
+            "open scoped Regional\n"
+        } else {
+            ""
+        };
+        aliases::reference_import(
+            &built,
+            &format!("prelude\nimport Main\nnoncomputable section\n{activation}def chosen : Token := Pick.value\ntheorem choice (P : Token -> Prop) (h : P Token.left) : P chosen := h"),
+            true,
+        );
+    }
 }
 
 #[test]

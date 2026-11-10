@@ -385,7 +385,12 @@ fn unsupported_effects_impossible_binders_and_annotations_publish_no_prefix() {
     );
     let imported = register(&base, "already", c("Pick"));
     let updated = set_instance(&imported, &n("already"), 2000).unwrap();
-    assert_eq!(registrations(&imported, &updated, 1_000_000).unwrap(), None);
+    let (rows, _) = registrations(&imported, &updated, 1_000_000)
+        .unwrap()
+        .unwrap();
+    assert_eq!(rows.instances.len(), 1);
+    assert_eq!(rows.instances[0].declaration, n("already"));
+    assert_eq!(rows.instances[0].priority, 2000);
 
     let data = KVMap::from_entries(vec![(n("noindex"), DataValue::OfBool(true))]);
     let annotated = register(&base, "annotated", Expr::mdata(data, c("Pick")));
@@ -423,15 +428,19 @@ fn scoped_exports_preserve_namespaces_priorities_and_the_owned_suffix() {
         registrations(&base, &env, work - 1),
         Err(InstanceRegistryError::Limit)
     );
-    // An imported scoped entry stays inherited; only the new module's entry is
-    // emitted, and re-registering an imported declaration remains unsupported.
+    // An imported scoped entry stays inherited; only this module's new
+    // registration or priority update is emitted.
     let extended = register(&env, "global", c("Pick"));
     let (rows, _) = registrations(&env, &extended, usize::MAX).unwrap().unwrap();
     assert_eq!(rows.instances.len(), 1);
     assert_eq!(rows.instances[0].declaration, n("global"));
     assert_eq!(rows.instances[0].scope, None);
     let overridden = scoped::register(&env, &n("Scope"), &n("Scope.first"), 3000).unwrap();
-    assert_eq!(registrations(&env, &overridden, usize::MAX).unwrap(), None);
+    let (rows, _) = registrations(&env, &overridden, usize::MAX).unwrap().unwrap();
+    assert_eq!(rows.instances.len(), 1);
+    assert_eq!(rows.instances[0].declaration, n("Scope.first"));
+    assert_eq!(rows.instances[0].scope, Some(n("Scope")));
+    assert_eq!(rows.instances[0].priority, 3000);
 }
 
 #[test]
@@ -545,20 +554,82 @@ fn scoped_export_preserves_registration_history_and_exact_budget_boundaries() {
 }
 
 #[test]
-fn scoped_export_keeps_imported_name_updates_and_scope_changes_unsupported() {
+fn scoped_export_accepts_imported_updates_without_changing_registration_scope() {
     let base = class(&Environment::new(), "Pick", ty());
     let declarations = axiom(&base, "candidate", c("Pick"));
     let scoped = scoped::register(&declarations, &n("First"), &n("candidate"), 1000).unwrap();
     let update = scoped::register(&scoped, &n("First"), &n("candidate"), 2000).unwrap();
-    assert_eq!(registrations(&scoped, &update, 1_000_000).unwrap(), None);
-    assert_eq!(
-        registrations(&declarations, &scoped, 1_000_000).unwrap(),
-        None
-    );
+    let (rows, _) = registrations(&scoped, &update, 1_000_000).unwrap().unwrap();
+    assert_eq!(rows.instances.len(), 1);
+    assert_eq!(rows.instances[0].priority, 2000);
+    let (rows, _) = registrations(&declarations, &scoped, 1_000_000)
+        .unwrap()
+        .unwrap();
+    assert_eq!(rows.instances.len(), 1);
+    assert_eq!(rows.instances[0].scope, Some(n("First")));
     for namespace in ["Second", "First.Inner"] {
         assert!(scoped::register(&scoped, &n(namespace), &n("candidate"), 1000).is_err());
     }
     assert!(set_instance(&scoped, &n("candidate"), 1000).is_err());
+}
+
+#[test]
+fn imported_priority_exports_require_the_live_index_and_prerequisite_schedule() {
+    let base = class(&class(&Environment::new(), "Need", ty()), "Pick", ty());
+    let base = axiom(
+        &base,
+        "candidate",
+        pi(
+            "first",
+            c("Need"),
+            pi("second", c("Need"), c("Pick"), BinderInfo::InstImplicit),
+            BinderInfo::InstImplicit,
+        ),
+    );
+    let model = derive(&base, "candidate").unwrap();
+    assert_eq!(model.synth_order.len(), 2);
+    for changed in 0..3 {
+        let mut parameters = imported::InstanceParameters {
+            priority: 1000,
+            synth_order: model.synth_order.clone(),
+            scope: None,
+            keys: model.keys.clone(),
+        };
+        match changed {
+            1 => parameters.keys = vec![discr_tree::Key::Star],
+            2 => parameters.synth_order.reverse(),
+            _ => {}
+        }
+        let imported = imported::register_instance(&base, &n("candidate"), &parameters).unwrap();
+        let updated = set_instance(&imported, &n("candidate"), 2000).unwrap();
+        let root = updated.logical_root(&KVMap::new());
+        let result = registrations(&imported, &updated, usize::MAX).unwrap();
+        if changed == 0 {
+            let (rows, work) = result.unwrap();
+            assert!(rows.classes.is_empty());
+            assert_eq!(rows.instances.len(), 1);
+            assert_eq!(rows.instances[0].keys, model.keys);
+            assert_eq!(rows.instances[0].synth_order, model.synth_order);
+            assert_eq!(rows.instances[0].priority, 2000);
+            assert!(rows.bytes_examined > 0);
+            for allowance in [0, work - 1] {
+                assert_eq!(
+                    registrations(&imported, &updated, allowance),
+                    Err(InstanceRegistryError::Limit)
+                );
+            }
+            assert_eq!(
+                registrations(&imported, &updated, work).unwrap(),
+                Some((rows, work))
+            );
+        } else {
+            assert_eq!(
+                result, None,
+                "a physical import must not silently change the live source model"
+            );
+        }
+        assert_eq!(updated.logical_root(&KVMap::new()), root);
+    }
 }
 
 fn local_alias_fixture() -> Environment {
