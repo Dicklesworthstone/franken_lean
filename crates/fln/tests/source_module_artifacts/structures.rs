@@ -135,24 +135,123 @@ fn compiled_class_parents_remain_real_instances_after_physical_import() {
 }
 
 #[test]
-fn field_default_effects_remain_an_explicit_refusal_until_their_writer_exists() {
-    let error = build(
-        &Engine::builder().build_empty(),
-        &[(
-            "Main",
-            "prelude\n\
-        inductive Token where | mk\nstructure WithDefault where\n  value : Token := Token.mk\n",
-        )],
-        OleanWriteBudget::default(),
-    )
-    .unwrap_err();
-    assert!(
-        matches!(
-            error,
-            SourceModuleBuildError::Check(SourceModuleCheckError::Extension { .. })
-        ),
-        "{error:?}"
-    );
+fn ordinary_defaults_survive_compiled_modules_with_actual_field_dependencies() {
+    use fln_elab::reducibility::{Reducibility, known_status};
+
+    let base = r#"prelude
+universe u
+inductive Marker where | left | right
+structure Bundle (A : Type u) (fallback : A) where
+  carrier : Type u := A
+  value : carrier
+  copy : carrier := value
+  run (value : carrier) : carrier := value
+  marker : A := fallback
+structure Parent (A : Type u) where
+  first : A
+structure Derived (A : Type u) extends Parent A where
+  copy : A := first
+class Seed (A : Type) where
+  value : A
+structure FromInstance (A : Type) [Seed A] where
+  value : A := Seed.value
+structure Evidence (P : Prop) (witness : P) : Prop where
+  holds : P := witness
+section
+variable {A : Type} (fallback : A)
+structure Scoped where
+  value : A := fallback
+  run (value : A) : A := value
+end
+"#;
+    let child = r#"prelude
+import Base
+universe u
+structure Child (A : Type u) (fallback : A) extends Bundle A fallback where
+  marker := later
+  later : A
+structure Grandchild (A : Type u) (fallback : A) extends Child A fallback
+"#;
+    let built = compiled(&[
+        ("Main", "prelude\nimport Child"),
+        ("Child", child),
+        ("Base", base),
+    ]);
+    let receipt = imported(&built);
+    let probe = r#"def selected : Grandchild Marker Marker.left :=
+  { value := Marker.right, later := Marker.right }
+def explicitCopy : Grandchild Marker Marker.left :=
+  { value := Marker.right, copy := Marker.left, later := Marker.left }
+def updated : Grandchild Marker Marker.left := { selected with value := Marker.left }
+theorem defaultCopied (P : Marker -> Prop) (h : P Marker.right) : P selected.copy := h
+theorem childOverrides (P : Marker -> Prop) (h : P Marker.right) : P selected.marker := h
+theorem methodParameter (P : Marker -> Prop) (h : P Marker.left) :
+  P (selected.run Marker.left) := h
+theorem explicitWins (P : Marker -> Prop) (h : P Marker.left) : P explicitCopy.copy := h
+theorem updateKeepsCopy (P : Marker -> Prop) (h : P Marker.right) : P updated.copy := h
+def parent : Parent Marker := { first := Marker.right }
+def wholeParent : Derived Marker := { toParent := parent }
+theorem wholeParentValue (P : Marker -> Prop) (h : P Marker.right) : P wholeParent.copy := h
+def changedCarrier : Bundle Marker Marker.left :=
+  { carrier := Marker -> Marker, value := fun _ => Marker.right }
+theorem changedValue (P : Marker -> Prop) (h : P Marker.right) :
+  P (changedCarrier.copy Marker.left) := h
+theorem universeChoice (P : Type -> Prop) (h : P Marker) :
+  P (({ value := Marker } : Bundle Type Marker).copy) := h
+instance chosenSeed : Seed Marker := Seed.mk Marker.right
+def fromInstance : FromInstance Marker := {}
+theorem actualDictionary (P : Marker -> Prop) (h : P Marker.right) : P fromInstance.value := h
+def fromSection : Scoped Marker.left := {}
+theorem sectionParameter (P : Marker -> Prop) (h : P Marker.left) : P fromSection.value := h
+theorem scopedMethodParameter (P : Marker -> Prop) (h : P Marker.right) :
+  P (fromSection.run Marker.right) := h
+theorem proofDefault (P : Prop) (witness : P) : P := ({} : Evidence P witness).holds
+"#;
+    let bad = r#"theorem wrong (P : Marker -> Prop) (h : P Marker.left) :
+  P (({ value := Marker.right } : Bundle Marker Marker.left).copy) := h
+"#;
+    for engine in [&built.checked.checked.engine, &receipt.engine] {
+        for helper in [
+            "Bundle.carrier._default",
+            "Bundle.copy._default",
+            "Bundle.run._default",
+            "Derived.copy._default",
+            "FromInstance.value._default",
+            "Scoped.value._default",
+            "Evidence.holds._default",
+            "Grandchild.copy._inherited_default",
+        ] {
+            assert!(matches!(
+                engine.environment().find(&name(helper)),
+                Some(fln::ConstantInfo::Defn(_))
+            ));
+            assert_eq!(
+                known_status(engine.environment(), &name(helper)).unwrap(),
+                Some(Reducibility::Semireducible),
+            );
+        }
+        assert!(
+            fln_elab::records::defaults::RecordDefaults::read(engine.environment())
+                .unwrap()
+                .helper(&name("Bundle"), 2)
+                .is_none(),
+            "ordinary defaults must use checked declarations across the module boundary"
+        );
+        engine
+            .check_source_files(&[probe.as_bytes()], &KVMap::new(), limits().source)
+            .unwrap()
+            .into_complete()
+            .unwrap();
+        let root = engine.logical_root(&KVMap::new());
+        assert!(
+            engine
+                .check_source_files(&[bad.as_bytes()], &KVMap::new(), limits().source)
+                .is_err()
+        );
+        assert_eq!(engine.logical_root(&KVMap::new()), root);
+    }
+    aliases::reference_import(&built, &format!("prelude\nimport Main\n{probe}"), true);
+    aliases::reference_import(&built, &format!("prelude\nimport Main\n{bad}"), false);
 }
 
 #[test]
@@ -179,8 +278,8 @@ fn checked_named_defaults_follow_the_pin_after_a_physical_import() {
 fn inherited_overrides_and_proof_helpers_survive_a_physical_module_roundtrip() {
     use fln_elab::reducibility::{Reducibility, known_status};
 
-    // Every default here overrides an inherited leaf. None needs the native
-    // physical-prefix registry whose artifact writer is still unsupported.
+    // Inherited overrides retain their declared and frozen helper distinction
+    // through ordinary definition serialization, including proof defaults.
     let base = r#"prelude
 inductive Token where | left | right
 structure Parent (A : Type) (P : Prop) where

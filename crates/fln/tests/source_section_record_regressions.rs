@@ -70,11 +70,15 @@ fn default_only_section_values_parameterize_the_record_and_its_helpers() {
         binders(&e, "Config.value._default")[1].1,
         BinderInfo::Implicit
     );
-    assert_eq!(
+    assert!(
         RecordDefaults::read(e.environment())
             .unwrap()
-            .helper(&n("Config"), 0),
-        Some(&helper_name(&n("Config"), &n("value")))
+            .helper(&n("Config"), 0)
+            .is_none()
+    );
+    assert!(
+        e.environment()
+            .contains(&helper_name(&n("Config"), &n("value")))
     );
     assert!(!e.environment().contains(&n("fallback")));
 }
@@ -97,10 +101,7 @@ fn late_default_dependencies_parameterize_every_helper() {
     );
     assert_eq!(names(&e, "Config"), ["offset"]);
     assert_eq!(names(&e, "Config.early._default"), ["offset"]);
-    assert_eq!(
-        names(&e, "Config.run._default"),
-        ["offset", "early", "late", "x"]
-    );
+    assert_eq!(names(&e, "Config.run._default"), ["offset", "late", "x"]);
 }
 
 #[test]
@@ -119,7 +120,7 @@ fn dependent_field_domains_and_methods_close_type_dependencies_in_order() {
     assert_eq!(names(&e, "Witness"), ["A", "P", "x", "tag"]);
     assert_eq!(
         names(&e, "Witness.echo._default"),
-        ["A", "P", "x", "tag", "value", "other"]
+        ["A", "P", "x", "tag", "other"]
     );
     assert_eq!(
         binders(&e, "Witness.echo._default")[3].1,
@@ -154,7 +155,7 @@ fn section_instances_used_by_defaults_become_real_class_parameters() {
     assert_eq!(binders(&e, "Selected.value")[1].1, BinderInfo::Implicit);
     assert_eq!(
         binders(&e, "Selected.value._default")[1].1,
-        BinderInfo::InstImplicit
+        BinderInfo::Implicit
     );
 }
 
@@ -257,7 +258,7 @@ fn dependent_proof_fields_and_method_shadowing_preserve_local_identity() {
     assert_eq!(names(&e, "Outer.Box"), ["A"]);
     assert_eq!(
         names(&e, "Outer.Box.echo._default"),
-        ["A", "value", "unused"]
+        ["A", "unused"]
     );
     assert_eq!(
         e.environment()

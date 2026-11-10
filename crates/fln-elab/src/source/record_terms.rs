@@ -1765,6 +1765,13 @@ impl Context {
                     target: RecordTarget::Constructor(body.clone()),
                 });
             }
+            if let Some(value) = self.physical_record_default(state, binder_name)? {
+                let value = self.finish_term(value, Some(binder_type))?;
+                return Ok(RecordStep::Copy {
+                    value,
+                    target: RecordTarget::Constructor(body.clone()),
+                });
+            }
             return Err(error(RecordTermError::MissingField(binder_name.clone())));
         };
         Ok(RecordStep::Field {

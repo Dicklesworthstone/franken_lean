@@ -201,7 +201,13 @@ impl Context {
             // whose selected default is a flat override, including an inherited one.
             for field in &flat_defaults {
                 self.tick()?;
-                if frame.fields.contains_key(&field.name)
+                // A direct physical leaf can instantiate its named default
+                // from the preceding fields and supplied parent values. An
+                // omitted leaf below another parent still needs flat syntax:
+                // descending that parent's constructor would select its older
+                // default rather than the child's override.
+                if field.path.len() == 1
+                    || frame.fields.contains_key(&field.name)
                     || frame.fields.keys().any(|parent| {
                         frame
                             .parents
@@ -513,6 +519,90 @@ impl Context {
         receiver: &Typed,
         fields: &[(Name, Expr)],
     ) -> Result<Option<Typed>, NatDefinitionElabError> {
+        self.instantiate_record_default_at(helper, &receiver.type_, Some(&receiver.value), fields)
+    }
+
+    /// Use a named flat helper while preserving a supplied parent object in the
+    /// physical constructor path. Only already completed constructor arguments
+    /// are available; a dependency on a later field remains unresolved.
+    pub(super) fn physical_record_default(
+        &mut self,
+        frame: &RecordFrame<'_>,
+        field: &Name,
+    ) -> Result<Option<Typed>, NatDefinitionElabError> {
+        let (head, arguments) = operators::spine(&frame.constructor.value);
+        let ExprNode::Const { name, levels } = head.node() else {
+            return Err(malformed());
+        };
+        let Some(ConstantInfo::Ctor(constructor)) = self.txn.env.find(name).cloned() else {
+            return Err(malformed());
+        };
+        let structures = ImportedStructures::read(&self.txn.env)
+            .map_err(|problem| failure(SourceInferenceError::Record(problem)))?;
+        let Some(structure) = structures.get(&constructor.induct) else {
+            return Ok(None);
+        };
+        if !structure
+            .fields
+            .iter()
+            .any(|entry| &entry.name == field && entry.subobject.is_none())
+        {
+            return Ok(None);
+        }
+        let declared = crate::records::defaults::helper_name(&constructor.induct, field);
+        let inherited = Name::str(constructor.induct.append_core(field), "_inherited_default");
+        let helper = if self.txn.env.contains(&declared) {
+            declared
+        } else if self.txn.env.contains(&inherited) {
+            inherited
+        } else {
+            return Ok(None);
+        };
+        let mut telescope = self.instantiate_params(
+            &constructor.base.type_,
+            &constructor.base.level_params,
+            levels,
+        )?;
+        let mut fields = Vec::new();
+        for (index, argument) in arguments.iter().enumerate() {
+            self.tick()?;
+            let type_ = self.whnf(&telescope)?;
+            let ExprNode::ForallE {
+                binder_name,
+                binder_type,
+                body,
+                ..
+            } = type_.node()
+            else {
+                return Err(malformed());
+            };
+            if index >= constructor.num_params as usize {
+                if let Some(labels) = frame.parents.get(binder_name) {
+                    let receiver = Typed {
+                        value: argument.clone(),
+                        type_: binder_type.clone(),
+                    };
+                    for label in labels {
+                        self.tick()?;
+                        let value = self.record_field(receiver.clone(), label)?;
+                        fields.push((label.clone(), value.value));
+                    }
+                } else {
+                    fields.push((binder_name.clone(), argument.clone()));
+                }
+            }
+            telescope = self.substitute(body, argument)?;
+        }
+        self.instantiate_record_default_at(&helper, &frame.expected, None, &fields)
+    }
+
+    fn instantiate_record_default_at(
+        &mut self,
+        helper: &Name,
+        record_type: &Expr,
+        receiver: Option<&Expr>,
+        fields: &[(Name, Expr)],
+    ) -> Result<Option<Typed>, NatDefinitionElabError> {
         let Some(info) = self.txn.env.find(helper).cloned() else {
             return Ok(None);
         };
@@ -523,7 +613,7 @@ impl Context {
             ConstantInfo::Thm(theorem) => (theorem.base, theorem.value),
             _ => return Err(malformed()),
         };
-        let target = self.whnf(&receiver.type_)?;
+        let target = self.whnf(record_type)?;
         let (head, parameters) = operators::spine(&target);
         let ExprNode::Const { name, levels } = head.node() else {
             return Err(malformed());
@@ -556,13 +646,16 @@ impl Context {
             self.apply_imported_record_body(&mut value, &parameter)?;
         }
         if let Some(prefix) = native {
+            let Some(receiver) = receiver else {
+                return Ok(None);
+            };
             // Stop at the fixed prefix even when the field itself is a function.
             for index in 0..prefix {
                 self.tick()?;
                 let argument = self.reduce_record_projections(&Expr::proj(
                     name.clone(),
                     u64::from(index),
-                    receiver.value.clone(),
+                    receiver.clone(),
                 ))?;
                 self.apply_imported_record_body(&mut value, &argument)?;
             }

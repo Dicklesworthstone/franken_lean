@@ -726,6 +726,7 @@ pub(super) fn elaborate_record_scoped(
         result_level,
         is_class,
     };
+    context.record_flat_defaults(&spec, &inheritance, &mut helpers, &mut defaults, budget)?;
     let mut declarations =
         record_declarations(&spec, budget).map_err(|e| failure(SourceInferenceError::Record(e)))?;
     let flat_constructor = Name::str(Name::str(name.clone(), "mk"), "_flat_ctor");

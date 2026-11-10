@@ -508,11 +508,23 @@ impl Context {
         let type_ = closer
             .close(&dependencies, selected.type_, false, false)
             .map_err(problem)?;
+        // The pin makes every structure parameter an ordinary implicit in a
+        // default helper, including instance and strict implicit parameters.
+        // The caller supplies the actual constructor parameters explicitly.
+        let parameters: Vec<_> = spec
+            .parameters
+            .iter()
+            .map(|parameter| {
+                let mut parameter = parameter.clone();
+                parameter.binder_info = BinderInfo::Implicit;
+                parameter
+            })
+            .collect();
         let value = closer
-            .close(&spec.parameters, value, true, true)
+            .close(&parameters, value, true, false)
             .map_err(problem)?;
         let type_ = closer
-            .close(&spec.parameters, type_, false, true)
+            .close(&parameters, type_, false, false)
             .map_err(problem)?;
         Ok(Declaration::Defn(DefinitionVal {
             base: ConstantVal {
@@ -525,6 +537,90 @@ impl Context {
             safety: DefinitionSafety::Safe,
             all: vec![name],
         }))
+    }
+
+    /// Ordinary source defaults are initially closed over the physical prefix
+    /// while their RHS is elaborated. Publish the pin's named flat dependencies
+    /// instead, so the checked helper needs no private default registry at a
+    /// compiled module boundary. Keep legacy inherited registry rows intact.
+    pub(super) fn record_flat_defaults(
+        &mut self,
+        spec: &RecordSpec,
+        inheritance: &Inheritance,
+        helpers: &mut [Declaration],
+        defaults: &mut Vec<RecordDefault>,
+        budget: RecordBudget,
+    ) -> Result<(), NatDefinitionElabError> {
+        if !defaults.iter().any(|row| {
+            spec.fields
+                .get(row.field as usize)
+                .is_some_and(|field| row.helper == helper_name(&spec.name, &field.user_name))
+        }) {
+            return Ok(());
+        }
+        let saved = self.txn.lctx.clone();
+        let result = (|| {
+            let (fields, constructor) = self.record_flat_fields(spec, inheritance, budget)?;
+            let (_, arguments) = operators::spine(&constructor);
+            if arguments.len() != spec.parameters.len().saturating_add(spec.fields.len()) {
+                return Err(problem(crate::records::RecordError::InvalidTelescope));
+            }
+            let mut closer = crate::records::Builder {
+                remaining: budget.max_nodes,
+            };
+            let mut retained = Vec::new();
+            for row in defaults.iter() {
+                self.tick()?;
+                let field = spec
+                    .fields
+                    .get(row.field as usize)
+                    .ok_or_else(|| problem(crate::records::RecordError::InvalidTelescope))?;
+                if row.helper != helper_name(&spec.name, &field.user_name) {
+                    retained.push(row.clone());
+                    continue;
+                }
+                let declaration = helpers
+                    .iter_mut()
+                    .find(|helper| {
+                        matches!(helper, Declaration::Defn(definition)
+                            if definition.base.name == row.helper)
+                    })
+                    .ok_or_else(|| problem(crate::records::RecordError::InvalidTelescope))?;
+                let Declaration::Defn(definition) = declaration else {
+                    return Err(problem(crate::records::RecordError::InvalidTelescope));
+                };
+                let mut selected = Typed {
+                    value: definition.value.clone(),
+                    type_: definition.base.type_.clone(),
+                };
+                // Stop before method binders: only the record parameters and
+                // preceding physical fields belonged to the old helper prefix.
+                for argument in &arguments[..spec.parameters.len() + row.field as usize] {
+                    self.tick()?;
+                    let ExprNode::Lam { body, .. } = selected.value.node() else {
+                        return Err(problem(crate::records::RecordError::InvalidTelescope));
+                    };
+                    selected.value = self.substitute(body, argument)?;
+                    let ExprNode::ForallE { body, .. } = selected.type_.node() else {
+                        return Err(problem(crate::records::RecordError::InvalidTelescope));
+                    };
+                    selected.type_ = self.substitute(body, argument)?;
+                }
+                selected.value = self.reduce_record_projections(&selected.value)?;
+                selected.type_ = self.reduce_record_projections(&selected.type_)?;
+                *declaration = self.close_record_flat_default(
+                    spec,
+                    &fields,
+                    selected,
+                    row.helper.clone(),
+                    &mut closer,
+                )?;
+            }
+            *defaults = retained;
+            Ok(())
+        })();
+        self.txn.lctx = saved;
+        result
     }
 
     pub(super) fn record_flat_constructor(
