@@ -23,7 +23,9 @@ use std::collections::{HashMap, HashSet};
 pub(super) use well_founded::Executable as WellFoundedExecutable;
 pub(super) use well_founded::State as WellFounded;
 pub(in crate::source) use well_founded::decreasing_tactic_expansion;
-pub(in crate::source) use well_founded::mutual::{MemberHint, MutualMember, strongly_connected};
+pub(in crate::source) use well_founded::mutual::{
+    MemberHint, MutualMember, Plan as WellFoundedPlan, strongly_connected,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RecursionError {
@@ -63,6 +65,14 @@ pub enum RecursionError {
     /// A mutual well-founded group outside the supported slice: Nat measures on
     /// every member, fixed parameters as one common unreordered prefix.
     MutualWellFoundedUnsupported(&'static str),
+    /// Internal result of a discarded mutual GuessLex candidate. No declaration
+    /// is produced until all calls in the component have selected one measure.
+    MutualMeasureProbe {
+        strict: usize,
+        total: usize,
+        unknown: bool,
+        complex: bool,
+    },
     /// A structurally recursive SCC outside the admitted shared-family construction.
     MutualStructuralUnsupported(&'static str),
 }
@@ -86,6 +96,7 @@ impl std::fmt::Display for RecursionError {
             Self::MutualWellFoundedUnsupported(shape) => {
                 return write!(f, "mutual well-founded recursion is not supported here: {shape}");
             }
+            Self::MutualMeasureProbe { .. } => "internal mutual termination-measure probe",
             Self::MutualStructuralUnsupported(shape) => {
                 return write!(f, "mutual structural recursion is not supported here: {shape}");
             }

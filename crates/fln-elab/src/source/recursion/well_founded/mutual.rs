@@ -81,15 +81,24 @@ pub(in crate::source) struct MutualMember {
     index: usize,
     captures: Vec<LocalDecl>,
     piece: Option<Expr>,
+    /// A discarded GuessLex pass classifies each call without manufacturing a
+    /// proof of a weak comparison or publishing an unfinished fixpoint.
+    probing: bool,
 }
 
 impl MutualMember {
-    pub(in crate::source) fn new(plan: Arc<Plan>, index: usize, captures: Vec<LocalDecl>) -> Self {
+    pub(in crate::source) fn new(
+        plan: Arc<Plan>,
+        index: usize,
+        captures: Vec<LocalDecl>,
+        probing: bool,
+    ) -> Self {
         Self {
             plan,
             index,
             captures,
             piece: None,
+            probing,
         }
     }
 
@@ -342,6 +351,54 @@ fn strip_metadata(mut expr: &Expr) -> &Expr {
 }
 
 impl Context {
+    /// GuessLex's direct-Nat `simpleMeasures`, in the varying telescope's
+    /// order. The common fixed prefix has already been computed from all call
+    /// edges. Other SizeOf measures retain their explicit-measure boundary:
+    /// skipping one could select a different earlier lexicographic prefix.
+    pub(in crate::source) fn mutual_nat_measures(
+        &mut self,
+        type_: &Expr,
+        arity: usize,
+        fixed: usize,
+    ) -> Result<Vec<Expr>, NatDefinitionElabError> {
+        let saved = self.txn.lctx.clone();
+        let result = (|| {
+            self.txn.lctx = LocalContext::new();
+            let parameters = self.open_mutual_fixed(type_, arity)?;
+            if !self.native_nat_well_founded_relation()? {
+                return Err(error(RecursionError::WellFoundedRelationUnsupported));
+            }
+            let mut measures = Vec::new();
+            for parameter in parameters.iter().skip(fixed) {
+                self.tick()?;
+                let type_ = self.reduce_source_head(
+                    &parameter.type_,
+                    UnificationTransparency::Abbreviations,
+                    true,
+                )?;
+                if !matches!(type_.node(), ExprNode::Const { name, levels }
+                    if name == &Name::from_components(["Nat"]) && levels.is_empty())
+                    || !self.native_nat_size_measure(parameter)?
+                {
+                    return Err(unsupported(
+                        "inferred measures over non-Nat or nonstandard SizeOf parameters",
+                    ));
+                }
+                measures.push(self.close_mutual_fixed(
+                    &Expr::fvar(parameter.id.clone()),
+                    &parameters,
+                    true,
+                )?);
+            }
+            if measures.is_empty() {
+                return Err(error(RecursionError::WellFoundedMeasureRequired));
+            }
+            Ok(measures)
+        })();
+        self.txn.lctx = saved;
+        result
+    }
+
     /// The group's body pass: record this member's hint. A measure is elaborated
     /// in a discarded probe, at the actual parameters the well-founded engine
     /// would bind; a recoverable failure is kept until the member's component
@@ -1214,12 +1271,14 @@ impl Context {
         if plan.names.get(index) != Some(name) || self.well_founded.is_some() {
             return Err(scope());
         }
-        let Some(TerminationHint::WellFounded {
-            hint,
-            allowed: true,
-        }) = hint
-        else {
-            return Err(scope());
+        let automatic = Hint::automatic();
+        let hint = match hint {
+            Some(TerminationHint::WellFounded {
+                hint,
+                allowed: true,
+            }) => hint,
+            None | Some(TerminationHint::Automatic) => &automatic,
+            _ => return Err(scope()),
         };
         let mut parameters = parameters.to_vec();
         let (body, expected, lambdas) =
@@ -1377,8 +1436,39 @@ impl Context {
                     }
                 };
                 let prepared = self.lower_pattern_matrices(proof)?;
+                if member.probing {
+                    let mut strict = 0;
+                    let mut unknown = false;
+                    let varying: Vec<_> = (plan.fixed..parameters.len()).collect();
+                    let complex = self.complex_measure_possible(&goals, &parameters, &varying)?;
+                    for goal in &goals {
+                        self.tick()?;
+                        match self.classify_call(&prepared, goal, &goal.target)? {
+                            Ok(CallRelation::Lt) => strict += 1,
+                            Ok(CallRelation::Eq | CallRelation::Le) => {}
+                            Err(_) => {
+                                unknown = true;
+                                break;
+                            }
+                        }
+                    }
+                    return Err(error(RecursionError::MutualMeasureProbe {
+                        strict,
+                        total: goals.len(),
+                        unknown,
+                        complex,
+                    }));
+                }
                 self.prove_decreasing_goals(&prepared, goals, hint.decreasing.is_some())?;
                 self.assign_decreasing_transports(obligations)?;
+            }
+            if member.probing {
+                return Err(error(RecursionError::MutualMeasureProbe {
+                    strict: 0,
+                    total: 0,
+                    unknown: false,
+                    complex: false,
+                }));
             }
             let mut value = self.instantiate(&value)?;
             self.require_resolved_terms(std::slice::from_ref(&value))?;

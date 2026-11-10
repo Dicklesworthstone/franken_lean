@@ -1,4 +1,4 @@
-//! Mutually recursive `def`s with `termination_by` measures, judged against the pin.
+//! Mutually recursive `def`s with explicit and inferred measures, judged against the pin.
 //!
 //! The pin (`Lean/Elab/PreDefinition/WF/Main.lean`, `Mutual.lean`, `PackMutual.lean`)
 //! packs a recursive group's varying arguments into a right-nested `PSum` of each
@@ -828,9 +828,116 @@ end
     });
 }
 
+#[test]
+fn inferred_mutual_nat_measures_use_one_checked_fixpoint() {
+    let source = r#"mutual
+def descendLeft (n : Nat) : Nat :=
+  if h : n = 0 then 7 else descendRight (n - 1)
+def descendRight (n : Nat) : Nat :=
+  if h : n = 0 then 9 else descendLeft (n - 1)
+end
+"#;
+    on_large_stack(move |base| {
+        assert_eq!(
+            oracle(
+                &format!("{source}#eval descendLeft 4\n#eval descendLeft 5\n"),
+                true,
+            ),
+            "7\n9\n",
+        );
+        let engine = check(base, source);
+        assert_auxiliary(&engine, "descendLeft._mutual");
+        assert_companions(&engine, &["descendLeft", "descendRight"]);
+        for name in ["descendLeft", "descendRight"] {
+            assert_eq!(
+                table(engine.environment()).unwrap().status(&n(name)),
+                Reducibility::Irreducible,
+            );
+            assert_eq!(definition(&engine, name).safety, DefinitionSafety::Safe);
+        }
+        assert_eq!(evaluate(&engine, "#eval descendLeft 4"), ClosedVmValue::Scalar(7));
+        assert_eq!(evaluate(&engine, "#eval descendLeft 5"), ClosedVmValue::Scalar(9));
+    });
+}
+
+#[test]
+fn inferred_mutual_measures_try_later_and_nonuniform_parameter_positions() {
+    let source = r#"mutual
+def accLeft (a n : Nat) : Nat :=
+  if h : n = 0 then a else accRight (a + 1) (n - 1)
+def accRight (a n : Nat) : Nat :=
+  if h : n = 0 then a else accLeft (a + 2) (n - 1)
+end
+mutual
+def swappedLeft (n a : Nat) : Nat :=
+  if h : n = 0 then a else swappedRight (a + 1) (n - 1)
+def swappedRight (a n : Nat) : Nat :=
+  if h : n = 0 then a else swappedLeft (n - 1) (a + 2)
+end
+"#;
+    on_large_stack(move |base| {
+        assert_eq!(
+            oracle(
+                &format!("{source}#eval accLeft 10 5\n#eval swappedLeft 5 10\n"),
+                true,
+            ),
+            "17\n17\n",
+        );
+        let engine = check(base, source);
+        for expression in ["#eval accLeft 10 5", "#eval swappedLeft 5 10"] {
+            assert_eq!(evaluate(&engine, expression), ClosedVmValue::Scalar(17));
+        }
+        assert_auxiliary(&engine, "accLeft._mutual");
+        assert_auxiliary(&engine, "swappedLeft._mutual");
+    });
+}
+
+#[test]
+fn inferred_mutual_measures_retain_fixed_prefixes_and_decreasing_scripts() {
+    let source = r#"mutual
+def proofLeft (offset n : Nat) : Nat :=
+  if h : n = 0 then offset else proofRight offset (n - 1)
+decreasing_by omega
+def proofRight (offset n : Nat) : Nat :=
+  if h : n = 0 then offset + 1 else proofLeft offset (n - 1)
+decreasing_by omega
+end
+"#;
+    on_large_stack(move |base| {
+        assert_eq!(oracle(&format!("{source}#eval proofLeft 8 5\n"), true), "9\n");
+        let engine = check(base, source);
+        assert_auxiliary(&engine, "proofLeft._mutual");
+        assert_eq!(evaluate(&engine, "#eval proofLeft 8 5"), ClosedVmValue::Scalar(9));
+    });
+}
+
+#[test]
+fn inferred_mutual_measures_refuse_nondecreasing_calls_and_recover() {
+    let source = r#"mutual
+def badLeft (n : Nat) : Nat := badRight (n + 1)
+def badRight (n : Nat) : Nat := badLeft n
+end
+"#;
+    on_large_stack(move |base| {
+        oracle(source, false);
+        refuse(base, source);
+        for name in [
+            "badLeft",
+            "badRight",
+            "badLeft._mutual",
+            "badLeft._unsafe_rec",
+        ] {
+            assert!(!base.environment().contains(&n(name)));
+        }
+        let recovery = "mutual\ndef badLeft (n : Nat) : Nat := if h : n = 0 then 3 else badRight (n - 1)\ndef badRight (n : Nat) : Nat := if h : n = 0 then 5 else badLeft (n - 1)\nend\n";
+        oracle(recovery, true);
+        let engine = check(base, recovery);
+        assert_eq!(evaluate(&engine, "#eval badLeft 1"), ClosedVmValue::Scalar(5));
+    });
+}
+
 /// The pin reports "incomplete set of termination hints" (exit 1) and then still
-/// defines the group by GuessLex. We refuse the whole group: the exit code agrees,
-/// but GuessLex across a group is not implemented, so this is not parity.
+/// defines the group by GuessLex. The source transaction refuses the whole group.
 #[test]
 fn a_member_without_a_measure_is_refused() {
     let source = "mutual
