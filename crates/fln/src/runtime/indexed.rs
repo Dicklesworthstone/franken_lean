@@ -306,6 +306,12 @@ impl Preparation<'_> {
                                 .fold(head.clone(), Expr::app);
                         }
                     }
+                    // Head reduction can rebuild an unchanged application
+                    // spine. Keep its original allocation so an unchanged
+                    // nested argument remains shared with its parent.
+                    if normal == source {
+                        normal = source.clone();
+                    }
                     reserve(&mut work, self.limits.max_nodes)?;
                     work.push(Work::Finish(source, normal.clone()));
                     let mut push = |child: &Expr| -> Result<(), IngressError> {
@@ -348,31 +354,51 @@ impl Preparation<'_> {
                             .cloned()
                             .ok_or_else(|| unsupported("indexed type postorder"))
                     };
-                    let value = match normal.node() {
-                        ExprNode::App { f, a } => Expr::app(child(f)?, child(a)?),
+                    let (value, changed) = match normal.node() {
+                        ExprNode::App { f, a } => {
+                            let function = child(f)?;
+                            let argument = child(a)?;
+                            let changed = function != *f || argument != *a;
+                            let value = if changed {
+                                Expr::app(function, argument)
+                            } else {
+                                normal.clone()
+                            };
+                            (value, changed)
+                        }
                         ExprNode::ForallE {
                             binder_name,
                             binder_type,
                             body,
                             binder_info,
-                        } => Expr::forall_e(
-                            binder_name.clone(),
-                            child(binder_type)?,
-                            child(body)?,
-                            *binder_info,
-                        ),
+                        } => {
+                            let domain = child(binder_type)?;
+                            let result = child(body)?;
+                            let changed = domain != *binder_type || result != *body;
+                            let value = if changed {
+                                Expr::forall_e(binder_name.clone(), domain, result, *binder_info)
+                            } else {
+                                normal.clone()
+                            };
+                            (value, changed)
+                        }
                         ExprNode::Lam {
                             binder_name,
                             binder_type,
                             body,
                             binder_info,
-                        } => Expr::lam(
-                            binder_name.clone(),
-                            child(binder_type)?,
-                            child(body)?,
-                            *binder_info,
-                        ),
-                        _ => normal.clone(),
+                        } => {
+                            let domain = child(binder_type)?;
+                            let result = child(body)?;
+                            let changed = domain != *binder_type || result != *body;
+                            let value = if changed {
+                                Expr::lam(binder_name.clone(), domain, result, *binder_info)
+                            } else {
+                                normal.clone()
+                            };
+                            (value, changed)
+                        }
+                        _ => (normal.clone(), false),
                     };
                     // An earlier type parameter can itself carry an erased
                     // value index. Canonicalizing a later predicate before
@@ -383,7 +409,7 @@ impl Preparation<'_> {
                     // closes those domains before selecting a layout; it
                     // never evaluates the removed index or any dictionary
                     // field, and genuinely value-dependent types stay open.
-                    if value != normal && matches!(value.node(), ExprNode::App { .. }) {
+                    if changed && matches!(value.node(), ExprNode::App { .. }) {
                         let (head, args) = self.spine(&value)?;
                         if let ExprNode::Const { name, .. } = head.node()
                             && let Some(ConstantInfo::Induct(family)) = self.environment.find(name)

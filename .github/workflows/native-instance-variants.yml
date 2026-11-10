@@ -98,7 +98,7 @@ jobs:
           a=${PIPESTATUS[0]}
           cargo test --locked -p fln-elab --no-fail-fast 2>&1 | tee target/instance-variants/elab.log
           b=${PIPESTATUS[0]}
-          cargo test --locked -p fln --test source_instance_polymorphic_tabling --test source_automatic_arithmetic --test source_instance_variants --test source_instance_tabling --test source_instances --test source_proof_search 2>&1 | tee target/instance-variants/engine.log
+          cargo test --locked -p fln --test source_instance_scheduler --test source_instance_variants --test source_instance_tabling --test source_instances --test source_proof_search --no-fail-fast 2>&1 | tee target/instance-variants/engine.log
           c=${PIPESTATUS[0]}
           cargo test --locked -p fln-cli --test instance_variants --test instance_tabling 2>&1 | tee target/instance-variants/cli.log
           d=${PIPESTATUS[0]}

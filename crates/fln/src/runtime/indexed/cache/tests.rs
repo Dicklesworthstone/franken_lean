@@ -126,6 +126,76 @@ fn universe_syntax_needs_one_visit_and_no_cache_row() {
 }
 
 #[test]
+fn unchanged_deep_types_retain_allocation_sharing_and_bounded_work() {
+    // Source admission uses its normal stack; only the heap-backed runtime
+    // traversal and destruction run on the deliberately small worker stack.
+    let engine = engine();
+    std::thread::Builder::new()
+        .stack_size(128 * 1024)
+        .spawn(move || {
+            let depth = 2_048;
+            let budget = depth * 32 + 128;
+            let domain = c("Nat");
+            let family = c("CacheVec");
+            let binder = name("kept");
+            let mut telescope = domain.clone();
+            let mut type_function = domain.clone();
+            let mut data = domain.clone();
+            for _ in 0..depth {
+                telescope = Expr::forall_e(
+                    binder.clone(),
+                    domain.clone(),
+                    telescope,
+                    BinderInfo::Default,
+                );
+                type_function = Expr::lam(
+                    binder.clone(),
+                    domain.clone(),
+                    type_function,
+                    BinderInfo::Default,
+                );
+                // The index has already been erased, as in a runtime layout
+                // key. Head normalization still rebuilds this one-argument
+                // spine unless erasure preserves the original allocation.
+                data = Expr::app(family.clone(), data);
+            }
+            for source in [telescope, type_function, data] {
+                let mut preparation = Preparation::new(
+                    &engine.environment,
+                    IngressLimits {
+                        max_nodes: budget,
+                        ..IngressLimits::default()
+                    },
+                );
+                let result = preparation.erase_data_indices(&source).unwrap();
+                // A visit bound alone misses uncharged equality work. Sharing
+                // proves that equal suffixes were not rebuilt at every level.
+                assert_eq!(result.allocation_identity(), source.allocation_identity());
+                let needed = preparation.visited;
+                let mut limited = Preparation::new(
+                    &engine.environment,
+                    IngressLimits {
+                        max_nodes: needed - 1,
+                        ..IngressLimits::default()
+                    },
+                );
+                nodes_error(limited.erase_data_indices(&source), needed - 1);
+                assert!(limited.specializations.index_types.entries.is_empty());
+                limited.limits.max_nodes = budget * 2 + 1;
+                let retried = limited.erase_data_indices(&source).unwrap();
+                assert_eq!(retried.allocation_identity(), source.allocation_identity());
+                let before = limited.visited;
+                let cached = limited.erase_data_indices(&source).unwrap();
+                assert_eq!(cached.allocation_identity(), source.allocation_identity());
+                assert_eq!(limited.visited, before + 1);
+            }
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[test]
 fn completed_exact_types_reuse_results_without_conflating_static_arguments_or_running_indices() {
     let engine = engine();
     let root = engine.logical_root(&KVMap::new());
