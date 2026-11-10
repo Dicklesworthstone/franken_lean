@@ -58,6 +58,10 @@ pub(in crate::extensions) fn checked(
     replace_antiquotations(contents)
 }
 
+pub(in crate::extensions) fn is_repetition(syntax: &Syntax) -> Result<bool, &'static str> {
+    Ok(repetition::suffix(syntax)?.is_some() || repetition::iteration(syntax)?.is_some())
+}
+
 pub(in crate::extensions) fn charge(visited: &mut usize) -> Result<(), &'static str> {
     *visited = visited
         .checked_add(1)
@@ -70,7 +74,10 @@ pub(in crate::extensions) fn charge(visited: &mut usize) -> Result<(), &'static 
 
 /// Multiple splices may duplicate large subtrees, not merely many top-level
 /// elements. Charge their expanded node weight before allocating each copy.
-pub(super) fn copy_capture(value: &Syntax, visited: &mut usize) -> Result<Syntax, &'static str> {
+pub(in crate::extensions) fn copy_capture(
+    value: &Syntax,
+    visited: &mut usize,
+) -> Result<Syntax, &'static str> {
     let mut pending = vec![value];
     while let Some(node) = pending.pop() {
         charge(visited)?;

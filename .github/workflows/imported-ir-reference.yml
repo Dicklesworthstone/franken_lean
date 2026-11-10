@@ -99,11 +99,16 @@ jobs:
         run: |
           set -uo pipefail
           status=0
-          cargo test --locked -p fln --lib imported_ir:: -- --nocapture \
-            2>&1 | tee target/imported-ir-reference/tests.log || status=1
+          cargo test --locked -p fln-parse --test macro_body_construction -- --nocapture \
+            2>&1 | tee target/imported-ir-reference/macro-construction-parser.log || status=1
+          cargo test --locked --no-fail-fast -p fln \
+            --test source_notation --test source_module_grammar -- --nocapture \
+            2>&1 | tee target/imported-ir-reference/macro-construction-source.log || status=1
           cargo test --locked -p fln --test source_mutual_well_founded \
             inferred_mutual -- --nocapture \
             2>&1 | tee target/imported-ir-reference/mutual-inference.log || status=1
+          cargo test --locked -p fln --lib imported_ir:: -- --nocapture \
+            2>&1 | tee target/imported-ir-reference/tests.log || status=1
           cargo test --locked -p fln --test source_imported_syntax_methods -- --nocapture \
             2>&1 | tee target/imported-ir-reference/syntax-methods.log || status=1
           cargo test --locked -p fln --test source_grind \

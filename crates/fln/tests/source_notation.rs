@@ -261,3 +261,96 @@ theorem v : trip (2 : Nat) = 6 := rfl
     accepted(source);
     refused(&source.replace("= 6 := rfl", "= 4 := rfl"));
 }
+
+#[test]
+fn macro_bodies_compose_returned_captures_and_monadic_quotations() {
+    let source = r#"
+macro "pass! " x:term : term => return x
+macro "increment! " x:term : term => do
+  let saved := x
+  let result ← `(Nat.add $saved 1)
+  return result
+macro "twice! " x:term : term => do
+  let result := `(Nat.add $x $x)
+  result
+def constructed : Nat := increment! (twice! (pass! 20))
+theorem value : constructed = 41 := rfl
+"#;
+    accepted(source);
+    refused(&source.replace("constructed = 41", "constructed = 42"));
+    let limits = EngineAdmissionLimits::new(Budget::for_stack_bytes(2 * 1024 * 1024));
+    let engine = Engine::with_source_seed(limits)
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let source = format!("{source}\n#eval constructed");
+    let result = engine
+        .execute_source_commands_with_checks(
+            source.as_bytes(),
+            &KVMap::new(),
+            EngineExecutionLimits::new(limits.kernel),
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let VmExit::Returned(value) = &result.batch.executions.last().unwrap().exit else {
+        panic!("compiled macro result did not return");
+    };
+    assert_eq!(
+        fln_vm::interpreter::nat_decimal(&value.value).as_deref(),
+        Some("41")
+    );
+}
+
+#[test]
+fn constructed_macro_values_keep_shadowing_and_generated_binder_hygiene() {
+    accepted(
+        r#"
+macro "bindAndUse! " x:term : term => do
+  let saved := x
+  let x ← `(Nat.add $x 1)
+  let output ← `(let saved : Nat := $x; Nat.add saved $saved)
+  return output
+def saved : Nat := 20
+theorem value : bindAndUse! saved = 41 := rfl
+"#,
+    );
+    accepted(
+        r#"
+syntax "chooseBody! " term : term
+macro_rules | `(chooseBody! $x) => do { let output := x; return output }
+macro_rules | `(chooseBody! 0) => do { let output ← `(42); return output }
+theorem value : Nat.add (chooseBody! 0) (chooseBody! 1) = 43 := rfl
+"#,
+    );
+}
+
+#[test]
+fn malformed_or_effectful_macro_bodies_cannot_replace_an_existing_meaning() {
+    for body in [
+        "return `(Nat.add $x 1)",
+        "do { let y ← x; return y }",
+        "do { let y := `(Nat.add $x 1); return y }",
+        "do { Lean.Macro.throwUnsupported; return x }",
+        "do { let mut y := x; return y }",
+        "do { let y ← (do { let privateValue := x; return privateValue }); return privateValue }",
+    ] {
+        refused(&format!(
+            "syntax \"blockedBody! \" term : term\n\
+             macro_rules | `(blockedBody! $x) => `($x)\n\
+             macro_rules | `(blockedBody! $x) => {body}\n\
+             theorem mustNotKeepOldMeaning : blockedBody! (42 : Nat) = 42 := rfl"
+        ));
+    }
+    refused(
+        r#"
+def pure (n : Nat) : Nat := n
+macro "shadowedPure! " x:term : term => pure x
+theorem mustNotRunBuiltinPure : shadowedPure! (42 : Nat) = 42 := rfl
+"#,
+    );
+    accepted(
+        r#"macro "recoveredBody! " x:term : term => do { let y := x; return y }
+theorem recovered : recoveredBody! (42 : Nat) = 42 := rfl"#,
+    );
+}

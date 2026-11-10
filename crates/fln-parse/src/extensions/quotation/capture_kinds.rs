@@ -17,11 +17,12 @@ pub(in crate::extensions) fn registration_error(reason: &str) -> bool {
             | "a quoted macro pattern past the node or depth budget"
             | "a macro template past the node budget"
             | "macro template work overflow"
+            | "a macro syntax construction with incompatible value types"
     )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum CaptureKind {
+pub(in crate::extensions) enum CaptureKind {
     Scalar,
     Optional,
     Many,
@@ -134,7 +135,7 @@ fn validate(
     Ok(())
 }
 
-fn item_kind(
+pub(in crate::extensions) fn item_kind(
     item: &StxItem,
     visited: &mut usize,
     depth: usize,
@@ -173,7 +174,7 @@ pub(in crate::extensions) fn direct(
     })
 }
 
-fn pattern_kind(
+pub(in crate::extensions) fn pattern_kind(
     children: &[Syntax],
     path: &[usize],
     visited: &mut usize,

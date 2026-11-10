@@ -33,8 +33,9 @@
 //! (`fln_parse::extensions`): quoted clauses try in textual order, with newer registrations
 //! before older fallbacks. Nested captures retain the syntax they matched before expansion.
 //! Template names are not prechecked (the pin refuses an unknown one only where it is used).
-//! A `macro` this does not translate (a `do` block, a sequence of tactics, a splice) registers
-//! its syntax without a rule; an unsupported `macro_rules` registration blocks older rules
+//! Pure MacroM bodies compose quotations, captured syntax, immutable lets, and monadic binds.
+//! An effectful body this does not translate registers its syntax without a rule;
+//! an unsupported `macro_rules` registration blocks older rules
 //! rather than silently retaining their meaning. `elab` is not read. Artifact syntax is entered only where its
 //! native expansion is implemented and its module has been admitted. The other census
 //! registrations remain absent: their expansions are not in the census, so their uses would
@@ -358,7 +359,15 @@ impl SourceGrammar {
             return Ok(false);
         }
         self.file
-            .declare(syntax)
+            .declare_with_macro_pure(syntax, &|name| match resolve(name) {
+                Resolution::Global(resolved) => {
+                    resolved == Name::from_components(["Pure", "pure"])
+                }
+                Resolution::Unchecked => ["pure", "Pure.pure", "_root_.Pure.pure"]
+                    .into_iter()
+                    .any(|candidate| *name == Name::from_components(candidate.split('.'))),
+                _ => false,
+            })
             .map_err(|feature| EngineExecutionError::NotImplemented { feature })?;
         let macro_rules = syntax.kind()
             == Some(&Name::from_components([
