@@ -4,6 +4,7 @@
 use super::*;
 
 mod computed;
+mod instances;
 
 impl Preparation<'_> {
     /// A dictionary whose complete construction is inert can be substituted
@@ -473,8 +474,8 @@ impl Preparation<'_> {
         }
     }
 
-    /// Known staged/polymorphic literals and scoped inert dictionaries can be
-    /// substituted into a safe consumer before closure conversion. This does
+    /// Known staged/polymorphic literals and scoped constructor dictionaries can
+    /// be exposed to a safe consumer before closure conversion. This does
     /// not invent a generic runtime ABI or convert between closure interfaces.
     /// Opaque/dynamic callbacks are never reinterpreted, and strict producers
     /// are not inert lambdas. The normal FIR checker still sees every call.
@@ -519,14 +520,14 @@ impl Preparation<'_> {
         for argument in args {
             self.tick()?;
             if self.inert_callable(argument)?.is_some()
-                || (argument.has_loose_bvars()
-                    && matches!(
-                        argument.node(),
-                        ExprNode::App { .. }
-                            | ExprNode::Proj { .. }
-                            | ExprNode::LetE { .. }
-                            | ExprNode::MData { .. }
-                    ))
+                || matches!(
+                    argument.node(),
+                    ExprNode::Const { .. }
+                        | ExprNode::App { .. }
+                        | ExprNode::Proj { .. }
+                        | ExprNode::LetE { .. }
+                        | ExprNode::MData { .. }
+                )
             {
                 candidate = true;
                 break;
@@ -572,9 +573,8 @@ impl Preparation<'_> {
             }
             if !selected
                 && *binder_info == BinderInfo::InstImplicit
-                && argument.has_loose_bvars()
                 && self.value_type(binder_type)?.is_none()
-                && self.inert_instance_constructor(argument)?.is_some()
+                && self.residual_instance_constructor(argument)?.is_some()
             {
                 selected = true;
             }
@@ -648,13 +648,50 @@ impl Preparation<'_> {
             let argument = self.lift(argument, offset)?;
             if *binder_info == BinderInfo::InstImplicit
                 && self.value_type(domain)?.is_none()
-                && let Some(instance) = self.inert_instance_constructor(&argument)?
+                && let Some(instance) = self.residual_instance_constructor(&argument)?
             {
-                // All operands, including unselected fields and initializers,
-                // passed the existing inert-factory check. Copy only that
-                // constructor syntax; ordinary operands keep their strict lets.
-                value = self.substitution(body, &instance)?;
-                type_ = self.substitution(result, &instance)?;
+                // Constructor syntax is now inert, with each ordinary
+                // computation named by a prefix slot. Introduce that prefix
+                // at this argument's position, before any later operand.
+                // Keep the dictionary placeholder while lifting outer captures
+                // across the new slots, then remove only that placeholder.
+                let extra = self.producer_depth(instance.bindings.len())?;
+                let (body, result) = if extra == 0 {
+                    (body.clone(), result.clone())
+                } else {
+                    let value_template = self.lift(
+                        &Expr::lam(
+                            binder_name.clone(),
+                            binder_type.clone(),
+                            body.clone(),
+                            BinderInfo::Default,
+                        ),
+                        extra,
+                    )?;
+                    let type_template = self.lift(
+                        &Expr::forall_e(
+                            Name::anonymous(),
+                            domain.clone(),
+                            result.clone(),
+                            *binder_info,
+                        ),
+                        extra,
+                    )?;
+                    let ExprNode::Lam { body, .. } = value_template.node() else {
+                        return Err(unsupported("instance consumer prefix scope"));
+                    };
+                    let ExprNode::ForallE { body: result, .. } = type_template.node() else {
+                        return Err(unsupported("instance consumer prefix scope"));
+                    };
+                    (body.clone(), result.clone())
+                };
+                self.producer_depth(bindings.len().saturating_add(instance.bindings.len()))?;
+                for binding in instance.bindings {
+                    reserve(&mut bindings, self.limits.max_context_depth)?;
+                    bindings.push(binding);
+                }
+                value = self.substitution(&body, &instance.value)?;
+                type_ = self.substitution(&result, &instance.value)?;
                 consumed += 1;
                 continue;
             }
