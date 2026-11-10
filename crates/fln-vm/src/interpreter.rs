@@ -7307,7 +7307,7 @@ fn dispatch_intrinsic(
                 .into());
             }
             if index < bytes.len() {
-                let mut updated = bytes;
+                let mut updated = bytes.to_vec();
                 updated[index] = value;
                 Ok(IntrinsicResult::owned(mk_byte_array(&updated)))
             } else {
@@ -7326,7 +7326,7 @@ fn dispatch_intrinsic(
                 .into());
             }
             let value = byte_argument(&args[2], "ByteArray.uset", 2)?;
-            let mut updated = bytes;
+            let mut updated = bytes.to_vec();
             updated[index] = value;
             Ok(IntrinsicResult::raw_object(mk_byte_array(&updated)))
         }
@@ -7367,7 +7367,7 @@ fn dispatch_intrinsic(
             let bytes = byte_array_bytes(&args[0], "ByteArray.hash", 0)?;
             // The UInt64 result retains all 64 bits, including the high bit.
             Ok(uint64_result(fln_core::lean_hash::murmur_hash_64a(
-                &bytes, 11,
+                bytes, 11,
             )))
         }
         IntrinsicImplementation::ByteArrayCopySlice => {
@@ -7380,13 +7380,13 @@ fn dispatch_intrinsic(
             // `exact` only shapes the C capacity policy; values are identical.
             bool_value(&args[5], "ByteArray.copySlice", 5)?;
             Ok(IntrinsicResult::owned(mk_byte_array(&copy_slice_bytes(
-                &source, src_off, &dest, dest_off, len,
+                source, src_off, dest, dest_off, len,
             ))))
         }
         IntrinsicImplementation::ByteArrayValidateUtf8 => {
             expect_arity(row, args, 1)?;
             let bytes = byte_array_bytes(&args[0], "ByteArray.validateUTF8", 0)?;
-            let valid = validate_utf8_bytes(&bytes);
+            let valid = validate_utf8_bytes(bytes);
             Ok(IntrinsicResult::owned(Obj::mk_nat(usize::from(valid))))
         }
         IntrinsicImplementation::PlatformNumBits => {
@@ -8862,16 +8862,18 @@ fn string_bytes_exhausted(operation: &str, error: strings::ResourceError, locati
 
 /// The bytes of a Marrow `ByteArray`: a scalar array whose element size is
 /// exactly one. Any other scalar-array element size is a different type and
-/// refuses here rather than aliasing its payload.
-fn byte_array_bytes(
-    value: &Obj,
+/// refuses here rather than aliasing its payload. The live byte slice borrows
+/// the checked owning handle: observing a size or element never copies the
+/// buffer, and scans do not allocate a snapshot of their input.
+fn byte_array_bytes<'a>(
+    value: &'a Obj,
     operation: &'static str,
     argument: usize,
-) -> Result<Vec<u8>, VmRefusal> {
+) -> Result<&'a [u8], VmRefusal> {
     if value_kind(value) != ValueKind::ScalarArray {
         return Err(type_mismatch(operation, argument, "ByteArray", value));
     }
-    let Some((elem_size, _, _, data)) = value.try_sarray_view() else {
+    let Some((elem_size, _, _, data)) = value.try_borrow_sarray_view() else {
         return Err(VmRefusal::InvalidByteArrayObject);
     };
     if elem_size != 1 {
@@ -9803,7 +9805,82 @@ mod tests {
 
     fn ba_bytes(result: Result<Obj, VmRefusal>) -> Vec<u8> {
         let object = result.expect("the intrinsic answers");
-        byte_array_bytes(&object, "test projection", 0).expect("a byte-array result")
+        byte_array_bytes(&object, "test projection", 0)
+            .expect("a byte-array result")
+            .to_vec()
+    }
+
+    #[test]
+    fn byte_array_observation_borrows_live_storage_and_keeps_shared_updates_independent() {
+        let input: Vec<_> = (0..8192).map(|index| (index % 256) as u8).collect();
+        let array = ba(&input);
+        let alias = array.clone_ref();
+        for owner in [&array, &alias] {
+            let source = owner.try_borrow_sarray_view().unwrap().3;
+            let observed = byte_array_bytes(owner, "test borrowed bytes", 0).unwrap();
+            assert!(
+                std::ptr::eq(source, observed),
+                "observing a byte array must borrow its live buffer"
+            );
+            assert_eq!(observed, input.as_slice());
+        }
+        let observed = byte_array_bytes(&array, "test retained bytes", 0).unwrap();
+        for row in [
+            "extern:ByteArray.set",
+            "extern:ByteArray.set!",
+            "extern:ByteArray.uset",
+        ] {
+            let updated = invoke(row, &[alias.clone_ref(), n(1), n(255)]).unwrap();
+            let bytes = byte_array_bytes(&updated, "test updated bytes", 0).unwrap();
+            assert_eq!(bytes.len(), input.len());
+            assert_eq!(bytes[1], 255);
+            assert_eq!(&bytes[2..], &input[2..]);
+            assert_eq!(observed, input.as_slice());
+        }
+        assert_eq!(
+            byte_array_bytes(&alias, "test unchanged alias", 0).unwrap(),
+            input.as_slice()
+        );
+    }
+
+    #[test]
+    fn byte_array_observers_validate_categories_before_exposing_bytes() {
+        let wrong_width = Obj::mk_sarray(2, &[1, 2, 3, 4]);
+        for row in [
+            "extern:ByteArray.size",
+            "extern:ByteArray.usize",
+            "extern:ByteArray.data",
+            "extern:ByteArray.hash",
+            "extern:ByteArray.validateUTF8",
+        ] {
+            assert!(matches!(
+                invoke(row, &[wrong_width.clone_ref()]),
+                Err(VmRefusal::InvalidByteArrayObject)
+            ));
+            assert!(matches!(
+                invoke(row, &[n(0)]),
+                Err(VmRefusal::TypeMismatch {
+                    expected: "ByteArray",
+                    ..
+                })
+            ));
+        }
+        for row in [
+            "extern:ByteArray.get",
+            "extern:ByteArray.get!",
+            "extern:ByteArray.uget",
+        ] {
+            assert!(matches!(
+                invoke(row, &[wrong_width.clone_ref(), n(0)]),
+                Err(VmRefusal::InvalidByteArrayObject)
+            ));
+        }
+        for row in ["extern:ByteArray.beq", "extern:ByteArray.decEq"] {
+            assert!(matches!(
+                invoke(row, &[ba(&[1, 2, 3, 4]), wrong_width.clone_ref()]),
+                Err(VmRefusal::InvalidByteArrayObject)
+            ));
+        }
     }
 
     #[test]

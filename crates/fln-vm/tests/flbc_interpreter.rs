@@ -9783,6 +9783,82 @@ fn generated_byte_array_push_refuses_wrong_categories_and_wide_bytes() {
 }
 
 #[test]
+fn generated_byte_array_reads_replay_and_recover_from_resource_stops() {
+    let _guard = lock();
+    let text = "aλ😀\0z".repeat(257);
+    let expected = text.bytes().map(u64::from).sum::<u64>() + text.len() as u64;
+    let mut code = vec![
+        Instruction::String {
+            dst: r(0),
+            value: text.clone(),
+        },
+        intrinsic(r(0), "extern:String.toByteArray", vec![r(0)]),
+        Instruction::Nat {
+            dst: r(1),
+            value: 0,
+        },
+    ];
+    for index in 0..text.len() {
+        code.push(Instruction::Nat {
+            dst: r(2),
+            value: index as u64,
+        });
+        let row = match index % 3 {
+            0 => "extern:ByteArray.get",
+            1 => "extern:ByteArray.get!",
+            _ => "extern:ByteArray.uget",
+        };
+        code.push(intrinsic(r(3), row, vec![r(0), r(2)]));
+        code.push(intrinsic(r(1), "extern:Nat.add", vec![r(1), r(3)]));
+    }
+    code.extend([
+        intrinsic(r(2), "extern:ByteArray.size", vec![r(0)]),
+        intrinsic(r(1), "extern:Nat.add", vec![r(1), r(2)]),
+        Instruction::Return { src: r(1) },
+    ]);
+    let expected_steps = code.len() as u64;
+    let program = validated(vec![function(0, 0, 4, code)]);
+    let bytes = encode_canonical(&program, CodecLimits::default()).expect("encode byte reads");
+    let program = decode_canonical(&bytes, CodecLimits::default()).expect("decode byte reads");
+
+    shadow::enable();
+    let first = returned(execute(&program, ExecutionLimits::default(), None));
+    assert_eq!(nat_limbs(&first.value), vec![expected]);
+    assert_eq!(first.usage.steps, expected_steps);
+    let expected_usage = first.usage;
+    drop(first);
+    let stopped = execute(
+        &program,
+        ExecutionLimits {
+            max_steps: 10,
+            ..ExecutionLimits::default()
+        },
+        None,
+    );
+    match stopped {
+        Outcome::Inconclusive(inconclusive) => match inconclusive.cause {
+            InconclusiveCause::ResourceExhausted { usage } => {
+                assert_eq!(usage.reason, ResourceReason::ExecutionSteps);
+                assert_eq!(usage.allowed, 10);
+                assert_eq!(usage.observed, 11);
+            }
+            other => panic!("expected byte-read step exhaustion, got {other:?}"),
+        },
+        other => panic!("expected byte-read Inconclusive, got {other:?}"),
+    }
+    let retry = returned(execute(&program, ExecutionLimits::default(), None));
+    assert_eq!(nat_limbs(&retry.value), vec![expected]);
+    assert_eq!(retry.usage, expected_usage);
+    drop(retry);
+    let (events, live) = shadow::disable_and_drain();
+    assert_eq!(live, 0);
+    assert!(events.iter().all(|event| !matches!(
+        event.kind,
+        shadow::EventKind::DoubleRelease | shadow::EventKind::ForeignPointer
+    )));
+}
+
+#[test]
 fn generated_string_bootstrap_aliases_and_comparisons_execute_with_utf8_positions() {
     let _guard = lock();
     let program = validated(vec![function(
