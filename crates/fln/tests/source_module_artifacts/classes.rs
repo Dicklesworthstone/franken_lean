@@ -122,6 +122,271 @@ fn structures_and_explicit_reducibility_survive_a_compiled_module_boundary() {
 }
 
 #[test]
+fn imported_reducibility_overrides_survive_a_compiled_diamond_in_import_order() {
+    use fln_elab::reducibility::{Reducibility, ReducibilityTable};
+    use source_extensions::ReducibilityStatus;
+    const BASE: &str = "prelude\ndef alias (A : Type) : Type := A\nattribute [irreducible] alias";
+    const LEFT: &str = "prelude\nimport Base\nset_option allowUnsafeReducibility true\nattribute [reducible] alias";
+    const RIGHT: &str = "prelude\nimport Base\nset_option allowUnsafeReducibility true\nattribute [semireducible] alias\nattribute [irreducible] alias";
+    for (imports, expected, accepts) in [
+        (
+            "import Left\nimport Right",
+            Reducibility::Irreducible,
+            false,
+        ),
+        ("import Right\nimport Left", Reducibility::Reducible, true),
+    ] {
+        let main = format!("prelude\n{imports}");
+        let built = compiled(&[
+            ("Main", &main),
+            ("Left", LEFT),
+            ("Right", RIGHT),
+            ("Base", BASE),
+        ]);
+        for artifact in &built.artifacts {
+            let decoded = metadata(&artifact.bytes);
+            if artifact.name == name("Base") {
+                assert_eq!(decoded.reducibility.len(), 1);
+                assert!(decoded.reducibility_extra.is_empty());
+            } else {
+                assert!(decoded.reducibility.is_empty());
+            }
+            if artifact.name == name("Right") {
+                assert_eq!(
+                    decoded
+                        .reducibility_extra
+                        .iter()
+                        .map(|row| row.status)
+                        .collect::<Vec<_>>(),
+                    [
+                        ReducibilityStatus::Semireducible,
+                        ReducibilityStatus::Irreducible
+                    ]
+                );
+            }
+            if artifact.name == name("Main") {
+                assert!(decoded.reducibility_extra.is_empty());
+            }
+            assert!(decoded.uninterpreted.is_empty());
+        }
+        let receipt = imported(&built);
+        assert_eq!(
+            receipt
+                .modules
+                .iter()
+                .map(|m| m.reducibility_extra)
+                .sum::<usize>(),
+            3
+        );
+        let before = ReducibilityTable::read(built.checked.checked.engine.environment()).unwrap();
+        let after = ReducibilityTable::read(receipt.engine.environment()).unwrap();
+        assert_eq!(before, after);
+        assert_eq!(after.status(&name("alias")), expected);
+        let checked = receipt.engine.check_source_files(
+            &[b"def useAlias (A : Type) (x : A) : alias A := x"],
+            &KVMap::new(),
+            limits().source,
+        );
+        if accepts {
+            checked.unwrap().into_complete().unwrap();
+        } else {
+            assert!(
+                checked.is_err(),
+                "an imported irreducible override must block unfolding"
+            );
+        }
+        aliases::reference_import(
+            &built,
+            "prelude\nimport Init\nimport Main\nexample (A : Type) (x : A) : alias A := x",
+            accepts,
+        );
+    }
+}
+
+#[test]
+fn extra_reducibility_requires_its_own_import_closure_and_refusal_publishes_no_prefix() {
+    use fln::source_check::modules::imported::SourceOleanImportError;
+    use fln_elab::reducibility::{Reducibility, ReducibilityTable};
+    use fln_olean::write::source::{SourceMetadata, encode_module_with_source_metadata};
+
+    let built = compiled(&[
+        ("Main", "prelude\nimport Base"),
+        (
+            "Base",
+            "prelude\ndef alias (A : Type) : Type := A\nattribute [irreducible] alias",
+        ),
+    ]);
+    let base = built
+        .artifacts
+        .iter()
+        .find(|artifact| artifact.name == name("Base"))
+        .unwrap();
+    let override_name = name("Override");
+    let metadata = SourceMetadata {
+        reducibility_extra: vec![source_extensions::ReducibilityExtraEntry {
+            scope: None,
+            declaration: name("alias"),
+            status: source_extensions::ReducibilityStatus::Reducible,
+        }],
+        ..SourceMetadata::default()
+    };
+    let encode = |imports: &[fln::OleanModuleImport]| {
+        encode_module_with_source_metadata(
+            fln::OleanModuleWriteInput {
+                is_module: false,
+                imports,
+                constants: &[],
+                extra_const_names: &[],
+            },
+            &metadata,
+            fln::OleanWriteHeader {
+                version: fln_olean::format::OLEAN_ACCEPTED_VERSIONS[0],
+                flags: 1,
+                lean_version: fln_olean::format::PIN_TAG.strip_prefix('v').unwrap(),
+                githash: fln_olean::format::PIN_COMMIT,
+                base_addr: 2 * fln_olean::format::REGION_ALIGN as u64,
+            },
+            OleanWriteBudget::default(),
+        )
+        .unwrap()
+        .bytes
+    };
+    let valid = encode(&[fln::OleanModuleImport {
+        module: base.name.clone(),
+        import_all: false,
+        is_exported: true,
+        is_meta: false,
+    }]);
+    // Only the import edge changes. Base remains an independently admitted
+    // root, so merely finding the declaration in the combined world is unsafe.
+    let unrelated = encode(&[]);
+    let initial = Engine::builder().build_empty();
+    let root = initial.logical_root(&KVMap::new());
+    let journal = fln_elab::reducibility::journal_digest(initial.environment());
+    let activate = |artifact: &[u8]| {
+        initial.import_olean_modules_for_source(
+            &[
+                OleanModuleInput {
+                    name: &base.name,
+                    artifact: &base.bytes,
+                    server_artifact: None,
+                    private_artifact: None,
+                },
+                OleanModuleInput {
+                    name: &override_name,
+                    artifact,
+                    server_artifact: None,
+                    private_artifact: None,
+                },
+            ],
+            &[base.name.clone(), override_name.clone()],
+            &KVMap::new(),
+            SourceOleanImportLimits::new(OleanCheckLimits::new(
+                4 * 1024 * 1024,
+                limits().source.admission.kernel,
+            )),
+        )
+    };
+    let accepted = activate(&valid).unwrap().into_complete().unwrap();
+    assert_eq!(
+        ReducibilityTable::read(accepted.engine.environment())
+            .unwrap()
+            .status(&name("alias")),
+        Reducibility::Reducible,
+    );
+    accepted
+        .engine
+        .check_source_files(
+            &[b"def useAlias (A : Type) (x : A) : alias A := x"],
+            &KVMap::new(),
+            limits().source,
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    match activate(&unrelated).unwrap_err() {
+        SourceOleanImportError::Metadata {
+            module,
+            declaration,
+            reason,
+        } => {
+            assert_eq!(module, override_name);
+            assert_eq!(declaration, name("alias"));
+            assert_eq!(
+                reason,
+                "a reducibility override is outside this module's checked import closure"
+            );
+        }
+        other => panic!("unexpected import refusal: {other:?}"),
+    }
+    assert!(initial.environment().is_empty());
+    assert_eq!(initial.logical_root(&KVMap::new()), root);
+    assert_eq!(
+        fln_elab::reducibility::journal_digest(initial.environment()),
+        journal
+    );
+    let recovered = activate(&valid).unwrap().into_complete().unwrap();
+    assert_eq!(
+        recovered.engine.logical_root(&KVMap::new()),
+        accepted.engine.logical_root(&KVMap::new()),
+    );
+}
+
+#[test]
+fn imported_reducibility_artifacts_are_identical_after_cache_reuse() {
+    let mut session = SourceModuleSession::new(
+        Engine::builder().build_empty(),
+        KVMap::new(),
+        limits(),
+        SourceModuleCacheLimits::default(),
+    );
+    let names = [name("Base"), name("Main")];
+    let inputs = [
+        SourceModuleInput {
+            name: &names[0],
+            source: b"prelude\ndef alias (A : Type) : Type := A\nattribute [irreducible] alias",
+        },
+        SourceModuleInput {
+            name: &names[1],
+            source: b"prelude\nimport Base\nset_option allowUnsafeReducibility true\nattribute [reducible] alias\ndef useAlias (A : Type) (x : A) : alias A := x",
+        },
+    ];
+    let cold = session
+        .compile(&inputs, &names[1], OleanWriteBudget::default())
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    let warm = session
+        .compile(&inputs, &names[1], OleanWriteBudget::default())
+        .unwrap()
+        .into_complete()
+        .unwrap();
+    assert_eq!((warm.reused_modules, warm.elaborated_modules), (2, 0));
+    for (cold, warm) in cold.artifacts.iter().zip(&warm.artifacts) {
+        assert_eq!(cold.bytes, warm.bytes);
+    }
+    let receipt = imported(&warm);
+    assert_eq!(
+        receipt
+            .modules
+            .iter()
+            .map(|m| m.reducibility_extra)
+            .sum::<usize>(),
+        1
+    );
+    receipt
+        .engine
+        .check_source_files(
+            &[b"def useAgain (A : Type) (x : A) : alias A := x"],
+            &KVMap::new(),
+            limits().source,
+        )
+        .unwrap()
+        .into_complete()
+        .unwrap();
+}
+
+#[test]
 fn only_owned_class_rows_are_exported_across_a_diamond() {
     let built = compiled(&[
         (

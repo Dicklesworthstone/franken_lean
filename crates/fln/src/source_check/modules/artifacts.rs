@@ -515,27 +515,36 @@ impl ArtifactData {
                 },
             },
         )?;
-        let (statuses, work) = exported.ok_or_else(|| SourceModuleCheckError::Extension {
-            module: name.clone(),
-            extension: fln_elab::reducibility::export::journal_name(),
-            reason: "imported-declaration reducibility overrides require a reducibilityExtra serializer",
-        })?;
-        meter.work(work)?;
-        let mut explicit_statuses = std::collections::BTreeSet::new();
-        for row in statuses {
+        meter.work(exported.work)?;
+        let status = |status| {
             use fln_elab::reducibility::Reducibility;
-            use fln_olean::source_extensions::{ReducibilityEntry, ReducibilityStatus};
+            use fln_olean::source_extensions::ReducibilityStatus;
+            match status {
+                Reducibility::Reducible => ReducibilityStatus::Reducible,
+                Reducibility::Semireducible => ReducibilityStatus::Semireducible,
+                Reducibility::Irreducible => ReducibilityStatus::Irreducible,
+                Reducibility::ImplicitReducible => ReducibilityStatus::ImplicitReducible,
+            }
+        };
+        let mut explicit_statuses = std::collections::BTreeSet::new();
+        for row in exported.owned {
+            use fln_olean::source_extensions::ReducibilityEntry;
             meter.work(1)?;
             explicit_statuses.insert(row.declaration.clone());
             metadata.reducibility.push(ReducibilityEntry {
                 declaration: row.declaration,
-                status: match row.status {
-                    Reducibility::Reducible => ReducibilityStatus::Reducible,
-                    Reducibility::Semireducible => ReducibilityStatus::Semireducible,
-                    Reducibility::Irreducible => ReducibilityStatus::Irreducible,
-                    Reducibility::ImplicitReducible => ReducibilityStatus::ImplicitReducible,
-                },
+                status: status(row.status),
             });
+        }
+        for row in exported.imported {
+            meter.work(1)?;
+            metadata.reducibility_extra.push(
+                fln_olean::source_extensions::ReducibilityExtraEntry {
+                    scope: None,
+                    declaration: row.declaration,
+                    status: status(row.status),
+                },
+            );
         }
         // Native instances have this default in ReducibilityTable::effective.
         // Once imported, their status must come from reducibilityCore instead;

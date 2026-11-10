@@ -14,6 +14,8 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 #[path = "imported/implemented_by.rs"]
 mod implemented_by;
+#[path = "imported/reducibility.rs"]
+mod reducibility;
 mod simp;
 #[path = "imported/structures.rs"]
 mod structures;
@@ -157,6 +159,8 @@ pub struct SourceMetadataReport {
     /// Reducibility statuses (the pin's `reducibilityCore`), activated for the
     /// `instances` transparency instance selection runs at.
     pub reducibility: usize,
+    /// Ordered global overrides from the pin's `reducibilityExtra` map.
+    pub reducibility_extra: usize,
     /// Explicit native-call intentions (the pin's `Lean.externAttr`), retained
     /// only for this module's own admitted declarations.
     pub externs: usize,
@@ -937,6 +941,7 @@ fn prepare_source_metadata_view(
             metadata::namespace_extension_name(),
             Name::from_components(metadata::DEPRECATED_EXTENSION.split('.')),
             Name::from_components(metadata::BACKWARD_DEFEQ_EXTENSION.split('.')),
+            Name::from_components(metadata::REDUCIBILITY_EXTRA_EXTENSION.split('.')),
         ])
         .collect();
     let mut blocks: Vec<_> = selected
@@ -1008,6 +1013,7 @@ fn prepare_source_metadata_view(
             backward_defeq: 0,
             structures: 0,
             reducibility: 0,
+            reducibility_extra: 0,
             externs: 0,
             implemented_by: 0,
             inline: 0,
@@ -1098,6 +1104,7 @@ fn prepare_source_metadata_view(
                     19 => report.namespaces = entries.len(),
                     20 => report.deprecations = entries.len(),
                     21 => report.backward_defeq = entries.len(),
+                    22 => report.reducibility_extra = entries.len(),
                     _ => {
                         return Err(SourceOleanImportError::Internal(
                             "unknown selected metadata kind",
@@ -1273,7 +1280,13 @@ impl Engine {
         let mut pp_nodot = decoded.pp_nodot.into_iter();
         let mut app_unexpanders = decoded.app_unexpanders.into_iter();
         let mut deprecations = decoded.deprecations.into_iter();
+        let mut reducibility_scopes = reducibility::Scopes::new(
+            &checked,
+            &decoded.reducibility_extra,
+            limits.metadata.max_objects,
+        )?;
         let mut reducibility = decoded.reducibility.into_iter();
+        let mut reducibility_extra = decoded.reducibility_extra.into_iter();
         let mut externs = decoded.externs.into_iter();
         let mut implementations = decoded.implemented_by.into_iter();
         let mut inline = decoded.inline.into_iter();
@@ -1701,6 +1714,33 @@ impl Engine {
                         },
                     })?;
             }
+            for _ in 0..report.reducibility_extra {
+                cancelled!("source-olean/reducibility-extra");
+                let row = reducibility_extra
+                    .next()
+                    .ok_or(SourceOleanImportError::Internal(
+                        "reducibility extra count changed during decode",
+                    ))?;
+                if row.scope.is_some() {
+                    return Err(SourceOleanImportError::Metadata {
+                        module: report.module.clone(),
+                        declaration: row.declaration,
+                        reason: "scoped reducibility overrides are not supported",
+                    });
+                }
+                reducibility_scopes.validate(
+                    &checked,
+                    &self.environment,
+                    activation.environment(),
+                    index,
+                    &row.declaration,
+                )?;
+                activation = activation
+                    .register_reducibility(&row.declaration, reducibility_status(row.status))
+                    .map_err(|error| {
+                        reducibility::error(&report.module, &row.declaration, error)
+                    })?;
+            }
             if report.externs != 0 {
                 cancelled!("source-olean/extern-owner-index");
                 let mut owners = AttributeOwners::new(
@@ -1900,6 +1940,7 @@ impl Engine {
             || app_unexpanders.next().is_some()
             || deprecations.next().is_some()
             || reducibility.next().is_some()
+            || reducibility_extra.next().is_some()
             || externs.next().is_some()
             || implementations.next().is_some()
             || inline.next().is_some()

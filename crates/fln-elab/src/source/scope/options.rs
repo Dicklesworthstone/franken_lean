@@ -129,6 +129,13 @@ use Policy::*;
 /// The table, in one place. `maxRecDepth`'s default is `defaultMaxRecDepth`, 512
 /// (`Init/Prelude.lean`).
 pub const ROWS: &[Row] = &[
+    // Read by source reducibility attributes; bypasses the pin's status validation.
+    row(
+        "allowUnsafeReducibility",
+        Bool(false),
+        "Lean/ReducibilityAttrs.lean:121",
+        Honored,
+    ),
     // Read by the default conditional pre-simprocs in tactics/rewrite/simplify.rs.
     row(
         "simprocs",
@@ -1039,6 +1046,7 @@ mod tests {
         assert_eq!(
             honored,
             [
+                "allowUnsafeReducibility",
                 "simprocs",
                 "tactic.skipAssignedInstances",
                 "autoLift",

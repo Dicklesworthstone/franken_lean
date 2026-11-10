@@ -1,8 +1,8 @@
-//! The module-local `reducibilityCore` map written by the pinned Reference.
+//! The pin's module-local `reducibilityCore` and imported `reducibilityExtra`.
 //!
 //! Exporting metadata grants no declaration authority. This reads only the
-//! exact new suffix of the checked module's journal. Changes to an imported
-//! declaration require `reducibilityExtra`, which has no serializer here.
+//! exact new suffix of the checked module's journal. Imported overrides retain
+//! their chronological order in the extra extension; owned statuses form a map.
 use super::*;
 use std::collections::BTreeMap;
 
@@ -10,6 +10,13 @@ use std::collections::BTreeMap;
 pub struct Registration {
     pub declaration: Name,
     pub status: Reducibility,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Statuses {
+    pub owned: Vec<Registration>,
+    pub imported: Vec<Registration>,
+    pub work: usize,
 }
 
 pub fn supports(descriptor_: &ExtensionDescriptor) -> bool {
@@ -20,20 +27,20 @@ pub fn journal_name() -> Name {
     extension_name()
 }
 
-/// Collect this module's final status for each of its own declarations.
-/// `None` refuses an imported-declaration override: encoding it as a local
-/// `reducibilityCore` row would silently change the pinned import semantics.
+/// Split the exact new suffix between owned statuses and imported overrides.
+/// Encoding an imported override as a local `reducibilityCore` row would lose
+/// the extra map's precedence over the declaration's owning module.
 /// Work meters every new payload byte before decoding or retaining its name.
 pub fn statuses(
     base: &Environment,
     result: &Environment,
     max_work: usize,
-) -> Result<Option<(Vec<Registration>, usize)>, ReducibilityError> {
+) -> Result<Statuses, ReducibilityError> {
     let Some(current) = result.extension(&extension_name()) else {
         return if base.extension(&extension_name()).is_some() {
             Err(ReducibilityError::Malformed)
         } else {
-            Ok(Some((Vec::new(), 0)))
+            Ok(Statuses::default())
         };
     };
     if current.descriptor != descriptor() {
@@ -51,7 +58,7 @@ pub fn statuses(
             return Err(ReducibilityError::Malformed);
         }
         if std::ptr::eq(prior, current) {
-            return Ok(Some((Vec::new(), 0)));
+            return Ok(Statuses::default());
         }
         for old in prior.entries() {
             charge(&mut remaining, 1)?;
@@ -69,6 +76,7 @@ pub fn statuses(
         }
     }
     let mut rows = BTreeMap::new();
+    let mut imported = Vec::new();
     for entry in entries {
         charge(&mut remaining, 1)?;
         charge(&mut remaining, entry.payload.len())?;
@@ -91,20 +99,28 @@ pub fn statuses(
             return Err(ReducibilityError::UnknownDeclaration(declaration));
         }
         if base.contains(&declaration) {
-            return Ok(None);
+            // ScopedEnvExtension exports newEntries in chronological order.
+            // Repeated imported updates are valid and their final one wins.
+            imported.push(Registration {
+                declaration,
+                status,
+            });
+        } else {
+            // reducibilityCoreExt.addEntryFn uses NameMap.insert: last wins.
+            rows.insert(declaration, status);
         }
-        // reducibilityCoreExt.addEntryFn uses NameMap.insert: last wins.
-        rows.insert(declaration, status);
     }
-    Ok(Some((
-        rows.into_iter()
+    Ok(Statuses {
+        owned: rows
+            .into_iter()
             .map(|(declaration, status)| Registration {
                 declaration,
                 status,
             })
             .collect(),
-        max_work - remaining,
-    )))
+        imported,
+        work: max_work - remaining,
+    })
 }
 
 fn charge(remaining: &mut usize, count: usize) -> Result<(), ReducibilityError> {
@@ -151,9 +167,10 @@ mod tests {
         let result = register(&result, &n("Local.b"), Reducibility::ImplicitReducible).unwrap();
         let result = register(&result, &n("Local.a"), Reducibility::Irreducible).unwrap();
         let root = result.logical_root(&KVMap::new());
-        let (rows, work) = statuses(&base, &result, usize::MAX).unwrap().unwrap();
+        let exported = statuses(&base, &result, usize::MAX).unwrap();
+        let work = exported.work;
         assert_eq!(
-            rows,
+            exported.owned,
             [
                 Registration {
                     declaration: n("Local.a"),
@@ -165,13 +182,14 @@ mod tests {
                 },
             ]
         );
+        assert!(exported.imported.is_empty());
         assert!(work > 0);
-        assert_eq!(statuses(&base, &result, work).unwrap(), Some((rows, work)));
+        assert_eq!(statuses(&base, &result, work).unwrap(), exported);
         assert_eq!(
             statuses(&base, &result, work - 1),
             Err(ReducibilityError::Limit)
         );
-        assert_eq!(statuses(&base, &base, 0).unwrap(), Some((Vec::new(), 0)));
+        assert_eq!(statuses(&base, &base, 0).unwrap(), Statuses::default());
         assert_eq!(result.logical_root(&KVMap::new()), root);
     }
 
@@ -201,17 +219,44 @@ mod tests {
             statuses(&base, &result, suffix_cost),
             Err(ReducibilityError::Limit)
         );
-        let (rows, work) = statuses(&base, &result, suffix_cost + 1).unwrap().unwrap();
-        assert_eq!(rows.len(), 1);
-        assert_eq!(work, suffix_cost + 1);
-        assert_eq!(statuses(&base, &base, 0).unwrap(), Some((Vec::new(), 0)));
+        let exported = statuses(&base, &result, suffix_cost + 1).unwrap();
+        assert_eq!(exported.owned.len(), 1);
+        assert_eq!(exported.work, suffix_cost + 1);
+        assert_eq!(statuses(&base, &base, 0).unwrap(), Statuses::default());
     }
 
     #[test]
-    fn an_imported_override_requires_the_extra_extension_serializer() {
+    fn imported_overrides_keep_order_without_reexporting_the_imported_prefix() {
         let base = with_axiom(&Environment::new(), "Imported");
+        let base = register(&base, &n("Imported"), Reducibility::Irreducible).unwrap();
         let result = register(&base, &n("Imported"), Reducibility::Reducible).unwrap();
-        assert_eq!(statuses(&base, &result, usize::MAX).unwrap(), None);
+        let result = register(&result, &n("Imported"), Reducibility::Semireducible).unwrap();
+        let result = register(
+            &with_axiom(&result, "Local"),
+            &n("Local"),
+            Reducibility::ImplicitReducible,
+        )
+        .unwrap();
+        let exported = statuses(&base, &result, usize::MAX).unwrap();
+        assert_eq!(
+            exported.imported,
+            [
+                Registration {
+                    declaration: n("Imported"),
+                    status: Reducibility::Reducible,
+                },
+                Registration {
+                    declaration: n("Imported"),
+                    status: Reducibility::Semireducible,
+                },
+            ]
+        );
+        assert_eq!(exported.owned[0].declaration, n("Local"));
+        assert_eq!(statuses(&base, &result, exported.work).unwrap(), exported);
+        assert_eq!(
+            statuses(&base, &result, exported.work - 1),
+            Err(ReducibilityError::Limit)
+        );
     }
 
     #[test]

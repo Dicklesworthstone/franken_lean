@@ -183,6 +183,42 @@ fn imported_definitions_accept_local_overrides_without_changing_their_journal() 
 }
 
 #[test]
+fn explicit_unsafe_reducibility_allows_imported_updates_and_scopes_the_option() {
+    let base = checked_from(&engine(), "@[irreducible] def hidden : Nat := 5");
+    let root = base.logical_root(&KVMap::new());
+    assert!(
+        base.check_source_files(
+            &[b"attribute [reducible] hidden"],
+            &KVMap::new(),
+            SourceCheckLimits::new(limits()),
+        )
+        .is_err()
+    );
+    let checked = checked_from(
+        &base,
+        "set_option allowUnsafeReducibility true in\nattribute [reducible] hidden\n\
+         theorem visible : hidden = 5 := rfl",
+    );
+    assert_eq!(
+        ReducibilityTable::read(checked.environment())
+            .unwrap()
+            .status(&name("hidden")),
+        Reducibility::Reducible,
+    );
+    assert!(base.check_source_files(
+        &[b"set_option allowUnsafeReducibility true in\nattribute [reducible] hidden\nattribute [irreducible] hidden"],
+        &KVMap::new(),
+        SourceCheckLimits::new(limits()),
+    ).is_err(), "the option must not escape its command scope");
+    checked_from(
+        &base,
+        "set_option allowUnsafeReducibility true\nattribute [semireducible] hidden\n\
+         theorem visible : hidden = 5 := rfl\nattribute [irreducible] hidden",
+    );
+    assert_eq!(base.logical_root(&KVMap::new()), root);
+}
+
+#[test]
 fn file_boundaries_restore_local_overrides_inside_one_source_batch() {
     let base = engine();
     let result = base

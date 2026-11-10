@@ -49,11 +49,16 @@ pub(super) fn apply(
         offset,
         message,
     };
+    let allow_unsafe = scope
+        .options
+        .get_bool(&Name::from_components(["allowUnsafeReducibility"]), false);
     let local = match attribute.scope {
         AttributeScope::Local => true,
         AttributeScope::Scoped => {
             return Err(refuse(if scope.namespace.is_anonymous() {
                 "scoped reducibility attributes must be used inside namespaces".into()
+            } else if allow_unsafe {
+                "scoped reducibility attributes are not supported".into()
             } else {
                 "failed to set reducibility status: the scoped modifier is not recommended for this kind of attribute".into()
             }));
@@ -78,13 +83,13 @@ pub(super) fn apply(
                     requested.to_display_string(),
                 ))
             })?;
-        if !matches!(next.find(&name), Some(ConstantInfo::Defn(_))) {
+        if !allow_unsafe && !matches!(next.find(&name), Some(ConstantInfo::Defn(_))) {
             return Err(refuse(format!(
                 "failed to set reducibility status: `{}` is not a definition",
                 name.to_display_string(),
             )));
         }
-        if !local && file_base.contains(&name) {
+        if !allow_unsafe && !local && file_base.contains(&name) {
             return Err(refuse(format!(
                 "failed to set reducibility status: `{}` has not been defined in this file",
                 name.to_display_string(),
@@ -110,7 +115,7 @@ pub(super) fn apply(
             ),
             Reducibility::Semireducible => local && old == Reducibility::Irreducible,
         };
-        if !allowed {
+        if !allow_unsafe && !allowed {
             return Err(refuse(format!(
                 "failed to set reducibility status for `{}`: transition from {old:?} to {status:?} is not permitted",
                 name.to_display_string(),
