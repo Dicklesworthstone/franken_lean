@@ -242,4 +242,19 @@ fn duplicating_construction_is_bounded_and_a_refusal_leaves_the_grammar_reusable
     .unwrap();
     let tree = expanded(&mut file, "def answer := retry! supplied");
     assert!(identifiers(&tree).contains(&name("supplied")));
+
+    // An oversized replacement must also leave an existing macro_rules chain
+    // intact, rather than silently publishing an unsupported-rule barrier.
+    declare(&mut file, r#"syntax "growRule! " term : term"#).unwrap();
+    declare(&mut file, "macro_rules | `(growRule! $x) => return x").unwrap();
+    let before = file.export_native().unwrap();
+    let refused = declare(
+        &mut file,
+        &format!("macro_rules | `(growRule! $x) => {body}"),
+    )
+    .unwrap_err();
+    assert!(refused.contains("budget"), "{refused}");
+    assert_eq!(file.export_native().unwrap(), before);
+    let tree = expanded(&mut file, "def stillUsable := growRule! supplied");
+    assert!(identifiers(&tree).contains(&name("supplied")));
 }

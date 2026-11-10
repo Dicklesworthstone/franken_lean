@@ -16,6 +16,7 @@ pub(in crate::extensions) fn registration_error(reason: &str) -> bool {
             | repetition::DUPLICATE_ITERATION_CAPTURE
             | "a quoted macro pattern past the node or depth budget"
             | "a macro template past the node budget"
+            | "a captured template value past the node budget"
             | "macro template work overflow"
             | "a macro syntax construction with incompatible value types"
     )
