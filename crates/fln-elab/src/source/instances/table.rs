@@ -98,12 +98,17 @@ fn replayable_target(context: &mut Context, frame: &Frame) -> Result<bool, NatDe
     }
 }
 
-fn ground_locals(
-    context: &mut Context,
-    locals: &LocalContext,
-) -> Result<bool, NatDefinitionElabError> {
-    for local in locals.decls() {
+fn ground_locals(context: &mut Context, saved: &Context) -> Result<bool, NatDefinitionElabError> {
+    for local in saved.txn.lctx.decls() {
         context.tick()?;
+        // An inferred declaration's private self parameter has a provisional
+        // type. It is never an instance candidate, so that unsolved type must
+        // not force ordinary source inference back to depth-first search.
+        // The complete local context, including this parameter, stays in the
+        // key; all user locals must still be ground before answers are shared.
+        if saved.is_private_self(&local.id) && local.value.is_none() {
+            continue;
+        }
         if !ground(&local.type_) || local.value.as_ref().is_some_and(|value| !ground(value)) {
             return Ok(false);
         }
@@ -125,7 +130,7 @@ pub(super) fn same_goal(
     if !left.binders.is_empty()
         || !right.binders.is_empty()
         || left.base.txn.lctx != right.base.txn.lctx
-        || !ground_locals(context, &left.base.txn.lctx)?
+        || !ground_locals(context, &left.base)?
     {
         return Ok(false);
     }
@@ -187,7 +192,7 @@ pub(super) fn shared_key(
         || !frame.base.equations.is_empty()
         || frame.base.txn.lctx.len() >= MAX_KEY_UNITS
         || !replayable_target(context, frame)?
-        || !ground_locals(context, &frame.base.txn.lctx)?
+        || !ground_locals(context, &frame.base)?
     {
         return Ok(None);
     }
@@ -231,7 +236,7 @@ fn key(
     if 1 + locals.len() + ancestors.len() > MAX_KEY_UNITS {
         return Ok(None);
     }
-    if !ground_locals(context, locals)? {
+    if !ground_locals(context, &frame.base)? {
         return Ok(None);
     }
     let Some(canonical) = outputs::canonical_with_ancestors(context, frame, ancestors)? else {
@@ -530,6 +535,33 @@ mod tests {
         assert!(table.exhausted(&mut context, &target, &path).is_err());
         assert_eq!(table.entries, 0);
         assert!(table.answers.is_empty());
+    }
+
+    #[test]
+    fn provisional_private_self_types_do_not_disable_shared_queries() {
+        let mut context = context();
+        let mut target = frame("C");
+        let id = FVarId(Name::from_components(["privateSelf"]));
+        let provisional = Expr::mvar(MVarId(Name::from_components(["resultType"])));
+        target.base.txn.lctx.add_param(
+            id.clone(),
+            Name::anonymous(),
+            provisional.clone(),
+            BinderInfo::Default,
+        );
+        assert!(shared_key(&mut context, &target, true).unwrap().is_none());
+        target.base.private_self_ids.insert(id);
+        let stored = shared_key(&mut context, &target, true).unwrap().unwrap();
+        assert_eq!(stored.locals, target.base.txn.lctx);
+        assert!(Some(stored) != shared_key(&mut context, &frame("C"), true).unwrap());
+
+        let user = FVarId(Name::from_components(["user"]));
+        target
+            .base
+            .txn
+            .lctx
+            .add_param(user.clone(), user.0, provisional, BinderInfo::Default);
+        assert!(shared_key(&mut context, &target, true).unwrap().is_none());
     }
 
     #[test]

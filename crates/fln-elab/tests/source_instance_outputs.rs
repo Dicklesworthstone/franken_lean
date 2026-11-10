@@ -376,12 +376,12 @@ fn mutually_recursive_output_queries_reuse_the_original_generator() {
     env = record(&env, "Bridge", vec![output], true);
     env = source(
         &env,
-        "def bridge {b : Type} [dict : Transfer Nat b] : Bridge b := Bridge.mk b",
+        "def bridge {b : Type} [dict : Transfer Nat b] : Bridge b := @Bridge.mk b",
     );
     env = register_instance(&env, &n("bridge"), 3000).unwrap();
     env = source(
         &env,
-        "def returnBridge {b : Type} [dict : Bridge b] : Transfer Nat b := Transfer.mk Nat b",
+        "def returnBridge {b : Type} [dict : Bridge b] : Transfer Nat b := @Transfer.mk Nat b",
     );
     env = register_instance(&env, &n("returnBridge"), 4000).unwrap();
     let value = accepted("def recovered := probe 0", &env);
