@@ -334,7 +334,7 @@ impl Preparation<'_> {
                     let value = done
                         .get(&carrier)
                         .cloned()
-                        .ok_or_else(|| unsupported("quotient type postorder"))?;
+                        .ok_or_else(|| unsupported("indexed type alias postorder"))?;
                     done.try_reserve(1)
                         .map_err(|_| IngressError::AllocationFailure {
                             resource: IngressResource::Nodes,
@@ -372,8 +372,32 @@ impl Preparation<'_> {
                             child(body)?,
                             *binder_info,
                         ),
-                        _ => normal,
+                        _ => normal.clone(),
                     };
+                    // An earlier type parameter can itself carry an erased
+                    // value index. Canonicalizing a later predicate before
+                    // visiting that parameter leaves its domain open, so the
+                    // predicate cannot yet be replaced by its inert closed
+                    // representative. Revisit only a complete data-family
+                    // application whose children changed. The heap worklist
+                    // closes those domains before selecting a layout; it
+                    // never evaluates the removed index or any dictionary
+                    // field, and genuinely value-dependent types stay open.
+                    if value != normal && matches!(value.node(), ExprNode::App { .. }) {
+                        let (head, args) = self.spine(&value)?;
+                        if let ExprNode::Const { name, .. } = head.node()
+                            && let Some(ConstantInfo::Induct(family)) = self.environment.find(name)
+                            && args.len()
+                                == (family.num_params as usize)
+                                    .saturating_add(family.num_indices as usize)
+                        {
+                            reserve(&mut work, self.limits.max_nodes)?;
+                            work.push(Work::Alias(source, value.clone()));
+                            reserve(&mut work, self.limits.max_nodes)?;
+                            work.push(Work::Enter(value));
+                            continue;
+                        }
+                    }
                     done.try_reserve(1)
                         .map_err(|_| IngressError::AllocationFailure {
                             resource: IngressResource::Nodes,

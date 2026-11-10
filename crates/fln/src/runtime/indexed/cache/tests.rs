@@ -31,6 +31,9 @@ inductive CacheVec (A : Type) : Nat -> Type where
   | nil : CacheVec A 0
   | cons (n : Nat) (head : A) (tail : CacheVec A n) : CacheVec A (Nat.succ n)
 def cacheIndexAlias (A : Type) (n : Nat) : Type := CacheVec A n
+class CacheGet (C A : Type) (valid : C -> Nat -> Prop) where
+  get : (xs : C) -> (i : Nat) -> valid xs i -> A
+  unused : Nat
 structure CachePayload where
   flag : Bool
   value : if flag then Nat else String
@@ -194,6 +197,64 @@ fn open_inputs_and_results_do_not_publish_closed_type_evidence() {
         );
     }
     assert!(preparation.specializations.index_types.entries.is_empty());
+}
+
+#[test]
+fn nested_index_erasure_closes_later_predicate_domains_before_layout_selection() {
+    let engine = engine();
+    let root = engine.logical_root(&KVMap::new());
+    let mut preparation = Preparation::new(&engine.environment, IngressLimits::default());
+    let dictionary = |element| {
+        let container = vector(element, b(0));
+        let predicate = Expr::lam(
+            name("xs"),
+            container.clone(),
+            Expr::lam(
+                name("i"),
+                c("Nat"),
+                app(
+                    Expr::const_(name("Eq"), vec![Level::one()]),
+                    [c("Nat"), b(2), b(2)],
+                ),
+                BinderInfo::Default,
+            ),
+            BinderInfo::Default,
+        );
+        app(c("CacheGet"), [container, c("Nat"), predicate])
+    };
+    let source = dictionary(c("Nat"));
+    assert!(source.has_loose_bvars());
+    let erased = preparation.erase_data_indices(&source).unwrap();
+    assert!(!erased.has_loose_bvars(), "{erased:?}");
+    assert!(!erased.has_fvar());
+    assert_eq!(preparation.erase_data_indices(&erased).unwrap(), erased);
+    assert_eq!(
+        preparation.value_type(&source).unwrap(),
+        Some(ValueType::Constructor)
+    );
+    // A real runtime type parameter cannot acquire a guessed carrier through
+    // the same retry. Only the family's proved uniform indices disappear.
+    let unknown = app(c("CacheGet"), [b(0), c("Nat"), b(1)]);
+    assert!(
+        preparation
+            .erase_data_indices(&unknown)
+            .unwrap()
+            .has_loose_bvars()
+    );
+    assert_eq!(preparation.value_type(&unknown).unwrap(), None);
+    // Closing a predicate is not evidence for the carrier's layout. A real
+    // checked record whose payload type varies with a stored Bool still
+    // cannot inhabit a uniform container, even after this same retry closes
+    // its index-dependent predicate.
+    let nonuniform = dictionary(c("CachePayload"));
+    assert!(
+        !preparation
+            .erase_data_indices(&nonuniform)
+            .unwrap()
+            .has_loose_bvars()
+    );
+    assert_eq!(preparation.value_type(&nonuniform).unwrap(), None);
+    assert_eq!(engine.logical_root(&KVMap::new()), root);
 }
 
 #[test]

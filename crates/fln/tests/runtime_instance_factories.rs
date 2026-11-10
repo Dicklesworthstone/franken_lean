@@ -28,6 +28,58 @@ fn execute(source: &str, expected: &str) -> u64 {
     value.usage.steps
 }
 
+fn strict_dictionary(source: &str, caller: &str) {
+    let base = engine();
+    let options = KVMap::new();
+    let root = base.logical_root(&options);
+    let source = |cost| format!("{source}\n#eval {caller} {cost} {{ value := 42 }}");
+    let run = |cost| {
+        base.execute_source_definitions(&[source(cost).as_bytes()], &options, limits())
+            .unwrap_or_else(|error| panic!("{}\n{error:?}", source(cost)))
+            .into_complete()
+            .expect("the complete dictionary has a uniform executable layout")
+    };
+    let idle = run(0);
+    let busy = run(30);
+    let mut steps = Vec::new();
+    for report in [&idle, &busy] {
+        let execution = report.executions.last().unwrap();
+        let VmExit::Returned(value) = &execution.exit else {
+            panic!("dictionary method did not return");
+        };
+        assert_eq!(fln::nat_decimal(&value.value).as_deref(), Some("42"));
+        steps.push(value.usage.steps);
+        let replay =
+            fln::execute_flbc_artifact(&execution.flbc_artifact, &options, Default::default())
+                .unwrap()
+                .into_complete()
+                .unwrap();
+        let VmExit::Returned(value) = replay else {
+            panic!("dictionary artifact did not return");
+        };
+        assert_eq!(fln::nat_decimal(&value.value).as_deref(), Some("42"));
+    }
+    assert!(
+        steps[1] > steps[0] + 30,
+        "the unused dictionary field must still execute: {steps:?}"
+    );
+    let mut bounded = limits();
+    bounded.vm.max_steps = steps[0];
+    assert!(matches!(
+        base.execute_source_definitions(&[source(30).as_bytes()], &options, bounded)
+            .unwrap(),
+        fln::Outcome::Inconclusive(_)
+    ));
+    assert_eq!(base.logical_root(&options), root);
+    let retry = run(30);
+    assert_eq!(
+        busy.executions.last().unwrap().flbc_artifact,
+        retry.executions.last().unwrap().flbc_artifact
+    );
+    assert_eq!(busy.result_logical_root, retry.result_logical_root);
+    assert_eq!(base.logical_root(&options), root);
+}
+
 const ECHO: &str = r#"
 class Echo (K : Type) where
   echo : {A : Type} -> A -> A
@@ -292,9 +344,6 @@ def fromBox (n delta x : Nat) : Nat :=
 
 #[test]
 fn inherited_methods_cannot_discard_a_computed_sibling() {
-    let base = engine();
-    let options = KVMap::new();
-    let root = base.logical_root(&options);
     let source = r#"
 structure IndexedBox (A : Type) (n : Nat) where
   value : A
@@ -308,32 +357,12 @@ instance makeBothAt (n : Nat) {A : Type} : BothAt (IndexedBox A n) A (fun _ _ =>
 def fromBox (n : Nat) (xs : IndexedBox Nat n) : Nat :=
   @GetAt.get (IndexedBox Nat n) Nat (fun _ _ => n = n)
     (@BothAt.toGetAt (IndexedBox Nat n) Nat (fun _ _ => n = n) (makeBothAt n (A := Nat))) xs 0 rfl
-#eval fromBox 30 { value := 42 }
 "#;
-    let error = base
-        .execute_source_definitions(&[source.as_bytes()], &options, limits())
-        .expect_err("an inherited method cannot erase its outer dictionary's strict work");
-    let mut cause = &error;
-    while let fln::EngineExecutionError::BatchCommand { error, .. } = cause {
-        cause = error;
-    }
-    assert!(
-        matches!(
-            cause,
-            fln::EngineExecutionError::Ingress(
-                fln_comp::ingress::IngressError::UnsupportedCallableSignature { name }
-            ) if name.to_display_string().starts_with("_fln_runtime_specialization.")
-        ),
-        "{error:?}"
-    );
-    assert_eq!(base.logical_root(&options), root);
+    strict_dictionary(source, "fromBox");
 }
 
 #[test]
 fn dependent_computed_dictionary_fields_are_not_discarded_as_inert_metadata() {
-    let base = engine();
-    let options = KVMap::new();
-    let root = base.logical_root(&options);
     let source = r#"
 structure IndexedBox (A : Type) (n : Nat) where
   value : A
@@ -347,30 +376,8 @@ instance makeGetAt (n : Nat) {A : Type} :
 def fromIndexedBox (n : Nat) (xs : IndexedBox Nat n) : Nat :=
   @GetAt.get (IndexedBox Nat n) Nat (fun _ _ => n = n)
     (makeGetAt n (A := Nat)) xs 0 rfl
-#eval fromIndexedBox 30 { value := 42 }
 "#;
-    let error = base
-        .execute_source_definitions(&[source.as_bytes()], &options, limits())
-        .expect_err("an unsupported strict dictionary must not become a fabricated inert method");
-    let mut cause = &error;
-    while let fln::EngineExecutionError::BatchCommand { error, .. } = cause {
-        cause = error;
-    }
-    assert!(
-        matches!(
-            cause,
-            fln::EngineExecutionError::Ingress(
-                fln_comp::ingress::IngressError::UnsupportedCallableSignature { name }
-            ) if name.to_display_string().starts_with("_fln_runtime_specialization.")
-        ),
-        "{error:?}"
-    );
-    assert!(
-        error
-            .to_string()
-            .contains("supported ground runtime signature")
-    );
-    assert_eq!(base.logical_root(&options), root);
+    strict_dictionary(source, "fromIndexedBox");
 }
 
 #[test]
