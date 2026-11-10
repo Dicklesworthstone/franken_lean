@@ -628,6 +628,7 @@ pub(super) fn readmit(
     ) else {
         return refuse(ModuleRecordRefusal::Extension);
     };
+    let export = export.for_source_imports();
     if export.require_artifact_support(module).is_err() {
         return refuse(ModuleRecordRefusal::Extension);
     }
@@ -862,6 +863,18 @@ mod tests {
                  def wrap.{u} {A : Sort u} (x : A) : A := x\n\
                  @[simp 900] theorem unwrap.{u} {A : Sort u} (x : A) : wrap x = x := by rfl\n\
                  attribute [irreducible] wrap",
+                "unwrap",
+            ),
+            (
+                "prelude\ndef wrap.{u} {A : Sort u} (x : A) : A := x\n\
+                 attribute [reducible] wrap\nattribute [simp] wrap\nattribute [-simp] wrap",
+                "wrap",
+            ),
+            (
+                "prelude\ninductive Eq.{u} {A : Sort u} : A -> A -> Prop where | refl (a : A) : Eq a a\n\
+                 def wrap.{u} {A : Sort u} (x : A) : A := x\n\
+                 @[simp 900] theorem unwrap.{u} {A : Sort u} (x : A) : wrap x = x := by rfl\n\
+                 attribute [irreducible] wrap\nattribute [-simp] unwrap",
                 "unwrap",
             ),
         ] {

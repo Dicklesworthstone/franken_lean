@@ -685,13 +685,11 @@ impl imported::SourceOleanImport {
                     declarations,
                     &mut meter,
                 )?;
-                exports.insert(
-                    index,
-                    match public_export {
-                        Some(public) => public.with_private(private),
-                        None => private,
-                    },
-                );
+                let export = match public_export {
+                    Some(public) => public.with_private(private),
+                    None => private,
+                };
+                exports.insert(index, export.for_source_imports());
             }
             completed_modules.push(SourceModuleExecution {
                 module: module.name.clone(),

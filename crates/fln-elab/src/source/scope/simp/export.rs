@@ -2,8 +2,8 @@
 //!
 //! ScopedEnvExtension exports additions in source order, not the priority-sorted
 //! active set. Erasure changes its current state without removing exported
-//! entries. Native module replay currently retains erasures, so such suffixes
-//! remain unsupported rather than producing different physical-import results.
+//! entries. The local journal retains erasures for subsequent commands and
+//! exact reuse; completed source modules omit them when replayed as imports.
 use super::*;
 use crate::instances::discr_tree::Key;
 use std::sync::Arc;
@@ -17,6 +17,22 @@ pub fn journal_name() -> Name {
 
 pub fn supports(candidate: &ExtensionDescriptor) -> bool {
     *candidate == descriptor()
+}
+
+/// Whether one checked source-journal operation persists across a module
+/// boundary. Decode the complete payload even when an erasure will be omitted.
+/// Imported suppression events use the same local journal but must be replayed;
+/// callers therefore use this only for a completed source module's own suffix.
+pub fn persistent_source_entry(env: &Environment, payload: &[u8]) -> Result<bool, SimpSetError> {
+    match decode_entry(payload, 0)? {
+        JournalEntry::Erase(declaration) => {
+            if !env.contains(&declaration) {
+                return Err(SimpSetError::UnknownDeclaration(declaration));
+            }
+            Ok(false)
+        }
+        _ => Ok(true),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -430,7 +446,9 @@ pub fn registrations(
                 if !result.contains(&declaration) {
                     return Err(SimpSetError::UnknownDeclaration(declaration));
                 }
-                return Err(SimpSetError::UnsupportedDeclaration(declaration));
+                // ScopedEnvExtension exports its additions. Erasing a rule
+                // changes only this file's active state, not earlier entries.
+                continue;
             }
             JournalEntry::Add { entry, snapshot } => (entry, snapshot),
         };
@@ -879,17 +897,34 @@ mod tests {
     }
 
     #[test]
-    fn erasures_never_silently_change_imported_or_owned_simp_rules() {
+    fn erasures_change_only_local_state_and_still_consume_export_work() {
         let empty = definitions();
         let base = update(&empty, &n("first"), Some((1000, false))).unwrap();
         let erased = update(&base, &n("first"), None).unwrap();
-        for before in [&empty, &base] {
-            assert_eq!(
-                registrations(before, &erased, usize::MAX),
-                Err(SimpSetError::UnsupportedDeclaration(n("first")))
-            );
-        }
+        let owned = registrations(&empty, &erased, usize::MAX).unwrap();
+        assert_eq!(owned.entries, [Kind::Unfold(n("first"))]);
+        let imported = registrations(&base, &erased, usize::MAX).unwrap();
+        assert!(imported.entries.is_empty());
+        assert!(imported.work > 0 && imported.bytes_examined > 0);
+        assert_eq!(registrations(&base, &erased, imported.work).unwrap(), imported);
+        assert_eq!(
+            registrations(&base, &erased, imported.work - 1),
+            Err(SimpSetError::Limit)
+        );
         assert_eq!(read(&base).unwrap().len(), 1);
+        assert!(read(&erased).unwrap().is_empty());
+        let mut payload = source_payload(&n("first"), None).unwrap();
+        assert!(!persistent_source_entry(&erased, &payload).unwrap());
+        payload.push(0);
+        assert_eq!(
+            persistent_source_entry(&erased, &payload),
+            Err(SimpSetError::Malformed)
+        );
+        let payload = source_payload(&n("missing"), None).unwrap();
+        assert_eq!(
+            persistent_source_entry(&erased, &payload),
+            Err(SimpSetError::UnknownDeclaration(n("missing")))
+        );
     }
 
     #[test]

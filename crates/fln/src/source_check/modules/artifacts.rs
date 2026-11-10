@@ -313,7 +313,7 @@ impl ArtifactData {
                     SourceModuleCheckError::Extension {
                         module: name.clone(),
                         extension: fln_elab::source::scope::simp::export::journal_name(),
-                        reason: "simp export requires supported equality proofs, checked equation theorems, or reducible definitions; unsupported equation generation, erasures and imported proof re-registration cannot be serialized",
+                        reason: "simp export requires supported equality proofs, checked equation theorems, or reducible definitions; unsupported equation generation and imported proof re-registration cannot be serialized",
                     }
                 }
                 _ => SourceModuleCheckError::Extension {

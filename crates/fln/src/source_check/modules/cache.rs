@@ -879,7 +879,7 @@ pub(super) fn run_collecting(
                     .map(|world| world.engine().environment().clone());
                 public_scope = public.as_ref().map(|world| world.scope().clone());
                 let public_base = public.as_ref().map(|world| world.file_base().clone());
-                let export = Arc::new(if let Some(public) = public {
+                let export = if let Some(public) = public {
                     let export = public.finish()?;
                     replayed_declarations += export.declarations.len();
                     export.with_private(replay::Export::capture(
@@ -897,7 +897,8 @@ pub(super) fn run_collecting(
                         declarations,
                         &mut meter,
                     )?
-                });
+                };
+                let export = Arc::new(export.for_source_imports());
                 let artifact = if collect_artifacts {
                     export.require_artifact_support(module.name)?;
                     let artifact = Arc::new(artifacts::PendingArtifact::capture(
