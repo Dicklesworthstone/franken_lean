@@ -474,7 +474,7 @@ impl Preparation<'_> {
         }
     }
 
-    /// Known staged/polymorphic literals and scoped constructor dictionaries can
+    /// Known staged/polymorphic literals and scoped constructor records can
     /// be exposed to a safe consumer before closure conversion. This does
     /// not invent a generic runtime ABI or convert between closure interfaces.
     /// Opaque/dynamic callbacks are never reinterpreted, and strict producers
@@ -558,10 +558,7 @@ impl Preparation<'_> {
             let (
                 ExprNode::Lam { body: next, .. },
                 ExprNode::ForallE {
-                    binder_type,
-                    body,
-                    binder_info,
-                    ..
+                    binder_type, body, ..
                 },
             ) = (value.node(), normal.node())
             else {
@@ -572,7 +569,6 @@ impl Preparation<'_> {
                 selected = self.generic_callable_literal(&literal, binder_type)?;
             }
             if !selected
-                && *binder_info == BinderInfo::InstImplicit
                 && self.value_type(binder_type)?.is_none()
                 && self.residual_instance_constructor(argument)?.is_some()
             {
@@ -646,8 +642,7 @@ impl Preparation<'_> {
             }
             let offset = self.producer_depth(bindings.len())?;
             let argument = self.lift(argument, offset)?;
-            if *binder_info == BinderInfo::InstImplicit
-                && self.value_type(domain)?.is_none()
+            if self.value_type(domain)?.is_none()
                 && let Some(instance) = self.residual_instance_constructor(&argument)?
             {
                 // Constructor syntax is now inert, with each ordinary

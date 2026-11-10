@@ -3,9 +3,30 @@
 //! method literals are substituted only in the current consumer's scope.
 use super::*;
 
-pub(super) struct InstancePrefix {
+pub(in crate::runtime) struct InstancePrefix {
     pub(super) bindings: Vec<Binder>,
-    pub(super) value: Expr,
+    pub(in crate::runtime) value: Expr,
+}
+
+impl InstancePrefix {
+    pub(in crate::runtime) fn depth(
+        &self,
+        preparation: &mut Preparation<'_>,
+    ) -> Result<u32, IngressError> {
+        preparation.producer_depth(self.bindings.len())
+    }
+
+    pub(in crate::runtime) fn bind(
+        self,
+        preparation: &mut Preparation<'_>,
+        mut body: Expr,
+    ) -> Result<Expr, IngressError> {
+        for binding in self.bindings.into_iter().rev() {
+            preparation.tick()?;
+            body = Expr::let_e(binding.name, binding.domain, binding.value, body, false);
+        }
+        Ok(body)
+    }
 }
 
 struct Scoped {
@@ -49,11 +70,46 @@ fn push(work: &mut Vec<Work>, task: Work, limit: usize) -> Result<(), IngressErr
 }
 
 impl Preparation<'_> {
+    /// A local generic record is constructor syntax plus shared runtime slots,
+    /// just like a dictionary argument. Keep its original placeholder while
+    /// lifting outer captures across the prefix, then substitute only that slot.
+    pub(in crate::runtime) fn local_record_template(
+        &mut self,
+        name: &Name,
+        type_: &Expr,
+        value: &Expr,
+        body: &Expr,
+    ) -> Result<Option<Expr>, IngressError> {
+        if !self.contains_generic_record(type_)? || self.value_type(type_)?.is_some() {
+            return Ok(None);
+        }
+        let Some(constructor) = self.residual_instance_constructor(value)? else {
+            return Ok(None);
+        };
+        let extra = constructor.depth(self)?;
+        let template = Expr::lam(
+            name.clone(),
+            type_.clone(),
+            body.clone(),
+            BinderInfo::Default,
+        );
+        let template = if extra == 0 {
+            template
+        } else {
+            self.lift(&template, extra)?
+        };
+        let ExprNode::Lam { body, .. } = template.node() else {
+            return Err(unsupported("generic record local scope"));
+        };
+        let body = self.substitution(body, &constructor.value)?;
+        Ok(Some(constructor.bind(self, body)?))
+    }
+
     /// This is a local compiler transform, not the inert factory evaluator.
     /// Every new binding denotes one original operand, in evaluation order;
     /// pending syntax remembers its scope before those bindings were added.
     /// A dynamic generic producer still has no executable representation.
-    pub(super) fn residual_instance_constructor(
+    pub(in crate::runtime) fn residual_instance_constructor(
         &mut self,
         input: &Expr,
     ) -> Result<Option<InstancePrefix>, IngressError> {

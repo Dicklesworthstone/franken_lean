@@ -42,7 +42,10 @@ struct PreparedArguments {
 impl Preparation<'_> {
     /// A runtime callback with a type parameter cannot use a single ground ABI.
     /// Classify its admitted telescope without evaluating the supplied value.
-    fn polymorphic_callback_type(&mut self, input: &Expr) -> Result<bool, IngressError> {
+    pub(in crate::runtime) fn polymorphic_callback_type(
+        &mut self,
+        input: &Expr,
+    ) -> Result<bool, IngressError> {
         let mut type_ = self.type_head(input)?;
         let mut depth = 0usize;
         loop {
