@@ -1241,9 +1241,11 @@ impl Context {
         Err(first_error.unwrap_or_else(|| error(RecursionError::RootMatchRequired)))
     }
 
-    /// A structural candidate must be an actual explicit header parameter, not
-    /// a computed expression. Each input identity is enumerated once; motive
-    /// discovery can retry it with more generalized parameters. The pattern
+    /// A structural candidate must be an actual telescope parameter, not
+    /// a computed expression. Implicit parameters retain their binder kinds
+    /// in the recursive reference and are equally eligible. Each input
+    /// identity is enumerated once; motive discovery can retry it with more
+    /// generalized parameters. The pattern
     /// matrix still checks every source discriminant and every row.
     pub(super) fn recursion_columns(
         &mut self,
@@ -1281,18 +1283,13 @@ impl Context {
                 2,
                 "recursive discriminant",
             )?;
-            let mut value = &parts[1];
-            while let Some(inner) = parenthesized_inner(value)? {
-                self.tick()?;
-                value = inner;
-            }
+            let value = self.structural_discriminant(&parts[1])?;
             if let Syntax::Ident { val, .. } = value
                 && let Some((position_in_header, parameter)) = parameters
                     .iter()
                     .enumerate()
                     .rev()
                     .find(|(_, p)| &p.user_name == val)
-                && parameter.binder_info == BinderInfo::Default
                 && seen.insert(parameter.id.clone())
             {
                 columns.push((position / 2, position_in_header));
@@ -1335,11 +1332,7 @@ impl Context {
             2,
             "recursive discriminant",
         )?;
-        let mut discriminant = &first[1];
-        while let Some(inner) = parenthesized_inner(discriminant)? {
-            self.tick()?;
-            discriminant = inner;
-        }
+        let discriminant = self.structural_discriminant(&first[1])?;
         let Syntax::Ident { val, .. } = discriminant else {
             return Err(error(RecursionError::RootMatchRequired));
         };
@@ -1347,9 +1340,6 @@ impl Context {
             .iter()
             .rposition(|local| &local.user_name == val)
             .ok_or_else(|| error(RecursionError::RootMatchRequired))?;
-        if parameters[decreasing].binder_info != BinderInfo::Default {
-            return Err(error(RecursionError::ExplicitParameterRequired));
-        }
         let reference = self.reference_result(expected);
         let mut full_type = self.instantiate(&reference)?;
         for local in parameters.iter().rev() {

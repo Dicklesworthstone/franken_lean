@@ -138,6 +138,14 @@ fn explicit_pattern_lambdas_and_local_equations_match_implicit_nat_columns() {
 #[test]
 fn recursive_local_equations_open_their_expected_implicit_parameters() {
     accepted(
+        "def implicitCount {n : Nat} : Nat :=
+          match n with | 0 => 0 | k+1 => Nat.succ (@implicitCount k)",
+    );
+    accepted(
+        "def lambdaCount : {n : Nat} -> Nat := @fun n =>
+          match (@n) with | 0 => 0 | k+1 => Nat.succ (@lambdaCount k)",
+    );
+    accepted(
         "def count (n : Nat) : Nat :=
           let rec go : {m : Nat} -> Nat | 0 => 0 | k+1 => Nat.succ (@go k)
           @go n",
