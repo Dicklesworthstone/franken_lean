@@ -342,6 +342,56 @@ fn recursive_output_cycles_do_not_evade_detection_with_fresh_holes() {
 }
 
 #[test]
+fn recursive_output_cycles_preserve_selection_with_a_known_result() {
+    let mut env = fixture(Some("outParam"));
+    env = source(
+        &env,
+        "def looping {b : Type} [dict : Transfer Nat b] : Transfer Nat b := dict",
+    );
+    env = register_instance(&env, &n("looping"), 3000).unwrap();
+    let value = accepted("def recovered : Transfer Nat Nat := probe 0", &env);
+    assert!(has_constant(&value.value, "high"));
+    assert!(!has_constant(&value.value, "looping"));
+    assert!(
+        check_definition_source(
+            b"def incompatible : Transfer Nat Other := probe 0",
+            &env,
+            budget(),
+        )
+        .is_err(),
+        "a known output must still be reconciled after priority-based selection"
+    );
+}
+
+#[test]
+fn mutually_recursive_output_queries_reuse_the_original_generator() {
+    let mut env = fixture(Some("outParam"));
+    let output = Expr::app(
+        Expr::const_(
+            n("outParam"),
+            vec![Level::succ(Level::one()).expect("fixed universe two")],
+        ),
+        Expr::sort(Level::one()),
+    );
+    env = record(&env, "Bridge", vec![output], true);
+    env = source(
+        &env,
+        "def bridge {b : Type} [dict : Transfer Nat b] : Bridge b := Bridge.mk b",
+    );
+    env = register_instance(&env, &n("bridge"), 3000).unwrap();
+    env = source(
+        &env,
+        "def returnBridge {b : Type} [dict : Bridge b] : Transfer Nat b := Transfer.mk Nat b",
+    );
+    env = register_instance(&env, &n("returnBridge"), 4000).unwrap();
+    let value = accepted("def recovered := probe 0", &env);
+    assert_eq!(value.base.type_, transfer(c("Nat")));
+    assert!(has_constant(&value.value, "high"));
+    assert!(!has_constant(&value.value, "returnBridge"));
+    assert!(!has_constant(&value.value, "bridge"));
+}
+
+#[test]
 fn local_function_domains_are_inferred_after_dependent_parameters() {
     let env = fln_elab::seed::bootstrap_nat_environment(budget()).unwrap();
     // The missing domain is captured over both A and x : A before the call infers Nat.

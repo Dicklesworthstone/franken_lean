@@ -251,7 +251,15 @@ impl Context {
                     }
                     argument.clone()
                 }
-                ParameterMode::Output if erase_output => self.hole(binder_type.clone())?,
+                ParameterMode::Output if erase_output => {
+                    // The marker controls selection, not the fresh hole's type.
+                    // A recursive candidate normally declares this parameter
+                    // without `outParam`. Keep both holes at the same reducible
+                    // domain so the typed table recognizes the recursive query
+                    // instead of constructing a second generator for it.
+                    let domain = self.instance_type(binder_type)?;
+                    self.hole(domain)?
+                }
                 ParameterMode::Output => argument.clone(),
                 ParameterMode::SemiOutput => argument.clone(),
             };
