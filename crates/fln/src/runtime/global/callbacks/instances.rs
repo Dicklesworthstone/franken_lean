@@ -444,7 +444,7 @@ instance prefixAmount (n : Nat) : PrefixAmount n :=
                 .unwrap(),
             Some(variable(1).unwrap())
         );
-        assert!(preparation.specializations.factory_values.is_empty());
+        assert!(preparation.specializations.factory_values_is_empty());
         let mut limited = Preparation::new(
             &engine.environment,
             IngressLimits {
@@ -460,7 +460,7 @@ instance prefixAmount (n : Nat) : PrefixAmount n :=
                 observed,
             }) if limit == needed - 1 && observed == needed
         ));
-        assert!(limited.specializations.factory_values.is_empty());
+        assert!(limited.specializations.factory_values_is_empty());
         limited.limits.max_nodes = needed * 2 + 16;
         let retried = limited
             .residual_instance_constructor(&input)

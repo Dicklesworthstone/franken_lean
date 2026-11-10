@@ -207,16 +207,18 @@ def templateRecord (n : Nat) : TemplateRecord :=
             name("argument"),
             c("Nat"),
             Expr::app(
-                Expr::app(
-                    Expr::proj(name("TemplateRecord"), 0, b(1)),
-                    c("Nat"),
-                ),
+                Expr::app(Expr::proj(name("TemplateRecord"), 0, b(1)), c("Nat")),
                 b(0),
             ),
             BinderInfo::Default,
         );
         let exposed = preparation
-            .local_record_template(&name("record"), &c("TemplateRecord"), &value, &consumer_body)
+            .local_record_template(
+                &name("record"),
+                &c("TemplateRecord"),
+                &value,
+                &consumer_body,
+            )
             .unwrap()
             .unwrap();
         let needed = preparation.visited;
@@ -260,7 +262,7 @@ def templateRecord (n : Nat) : TemplateRecord :=
             Some(b(2)),
             "the selected method must read paid, beyond the lambda and sibling slots"
         );
-        assert!(preparation.specializations.factory_values.is_empty());
+        assert!(preparation.specializations.factory_values_is_empty());
         let mut limited = Preparation::new(
             environment,
             IngressLimits {
@@ -280,7 +282,7 @@ def templateRecord (n : Nat) : TemplateRecord :=
                 ..
             })
         ));
-        assert!(limited.specializations.factory_values.is_empty());
+        assert!(limited.specializations.factory_values_is_empty());
         limited.limits.max_nodes = needed * 3 + 32;
         assert_eq!(
             limited

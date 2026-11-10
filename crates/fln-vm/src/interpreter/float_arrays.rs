@@ -7,8 +7,8 @@
 //! payloads are copied as bits, including signed zero and NaN payloads.
 
 use super::{
-    IntrinsicFailure, IntrinsicResult, Obj, VmRefusal, array_value, expect_arity, floats, nat_as_usize,
-    type_mismatch, usize_argument, with_nat_view,
+    IntrinsicFailure, IntrinsicResult, Obj, VmRefusal, array_value, expect_arity, floats,
+    nat_as_usize, type_mismatch, usize_argument, with_nat_view,
 };
 
 const ELEMENT_BYTES: usize = std::mem::size_of::<f64>();
@@ -116,14 +116,17 @@ impl Intrinsic {
                 items
                     .try_reserve_exact(size)
                     .map_err(|_| allocation_limit(requested))?;
-                for word in bytes.chunks_exact(ELEMENT_BYTES) {
+                for word in bytes.as_chunks::<ELEMENT_BYTES>().0 {
                     items.push(Obj::mk_ctor(0, Vec::new(), word));
                 }
                 Ok(IntrinsicResult::owned(Obj::mk_array(items)))
             }
             Self::Push => {
                 let bits = floats::wide_argument(&args[1], operation, 1)?;
-                output_size(size.checked_add(1).ok_or_else(|| allocation_limit(usize::MAX))?)?;
+                output_size(
+                    size.checked_add(1)
+                        .ok_or_else(|| allocation_limit(usize::MAX))?,
+                )?;
                 let array = args.into_iter().next().expect("checked push arity");
                 array
                     .try_float_array_push(f64::from_bits(bits))
