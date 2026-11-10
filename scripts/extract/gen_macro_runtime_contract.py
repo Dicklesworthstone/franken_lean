@@ -42,11 +42,18 @@ SCALARS = {
 FUNCTIONS = {
     "NAME_MK_STR1": "nameMkStr1",
     "NAME_STR": "nameStr",
+    "NAME_HAS_MACRO_SCOPES": "nameHasMacroScopes",
+    "NAME_ERASE_MACRO_SCOPES": "nameEraseMacroScopes",
     "ADD_MACRO_SCOPE": "addMacroScope",
     "MACRO_ADD_MACRO_SCOPE": "macroAddMacroScope",
     "SYNTAX_IS_OF_KIND": "syntaxIsOfKind",
     "SYNTAX_GET_ARG": "syntaxGetArg",
     "SYNTAX_GET_NUM_ARGS": "syntaxGetNumArgs",
+    "SYNTAX_IS_NODE_OF": "syntaxIsNodeOf",
+    "SYNTAX_MATCHES_NULL": "syntaxMatchesNull",
+    "SYNTAX_MATCHES_IDENT": "syntaxMatchesIdent",
+    "SYNTAX_MATCHES_LIT": "syntaxMatchesLit",
+    "SYNTAX_GET_OPTIONAL": "syntaxGetOptional",
     "SYNTAX_MK_LIT": "syntaxMkLit",
     "SYNTAX_MK_STR_LIT": "syntaxMkStrLit",
     "SYNTAX_IS_LIT": "syntaxIsLit",
@@ -92,6 +99,13 @@ FUNCTIONS = {
 }
 
 FORWARDED_FUNCTIONS = {
+    "nameHasMacroScopes": "Lean.Name.hasMacroScopes",
+    "nameEraseMacroScopes": "Lean.Name.eraseMacroScopes",
+    "syntaxIsNodeOf": "Lean.Syntax.isNodeOf",
+    "syntaxMatchesNull": "Lean.Syntax.matchesNull",
+    "syntaxMatchesIdent": "Lean.Syntax.matchesIdent",
+    "syntaxMatchesLit": "Lean.Syntax.matchesLit",
+    "syntaxGetOptional": "Lean.Syntax.getOptional?",
     "syntaxMkLit": "Lean.Syntax.mkLit",
     "syntaxMkStrLit": "Lean.Syntax.mkStrLit",
     "syntaxIsLit": "Lean.Syntax.isLit?",

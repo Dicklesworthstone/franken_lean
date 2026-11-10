@@ -9,6 +9,7 @@ mod identifiers;
 mod literals;
 mod lookup;
 mod numbers;
+mod patterns;
 mod syntax_editing;
 
 fn atom(text: &str) -> Obj {
@@ -35,11 +36,18 @@ fn invoke(intrinsic: Intrinsic, args: &[Obj]) -> Obj {
     let id = match intrinsic {
         Intrinsic::NameStr => "mirror:Lean.Name.str._override",
         Intrinsic::MkStr1 => "mirror:Lean.Name.mkStr1",
+        Intrinsic::NameHasMacroScopes => "mirror:Lean.Name.hasMacroScopes",
+        Intrinsic::NameEraseMacroScopes => "mirror:Lean.Name.eraseMacroScopes",
         Intrinsic::AddMacroScope => "mirror:Lean.addMacroScope",
         Intrinsic::MacroAddMacroScope => "mirror:Lean.Macro.addMacroScope",
         Intrinsic::IsOfKind => "mirror:Lean.Syntax.isOfKind",
         Intrinsic::GetArg => "mirror:Lean.Syntax.getArg",
         Intrinsic::GetNumArgs => "mirror:Lean.Syntax.getNumArgs",
+        Intrinsic::IsNodeOf => "mirror:Lean.Syntax.isNodeOf",
+        Intrinsic::MatchesNull => "mirror:Lean.Syntax.matchesNull",
+        Intrinsic::MatchesIdent => "mirror:Lean.Syntax.matchesIdent",
+        Intrinsic::MatchesLit => "mirror:Lean.Syntax.matchesLit",
+        Intrinsic::GetOptional => "mirror:Lean.Syntax.getOptional?",
         Intrinsic::GetKind => "mirror:Lean.Syntax.getKind",
         Intrinsic::SetKind => "mirror:Lean.Syntax.setKind",
         Intrinsic::GetArgs => "mirror:Lean.Syntax.getArgs",

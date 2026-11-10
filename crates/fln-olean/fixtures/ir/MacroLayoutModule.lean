@@ -111,6 +111,10 @@ def optionNone (_ : Unit) : Option Lean.Syntax := none
 @[noinline] def nameStr (parent : Lean.Name) (value : String) : Lean.Name :=
   .str parent value
 
+@[noinline] def nameHasMacroScopes (value : Lean.Name) : Bool := value.hasMacroScopes
+
+@[noinline] def nameEraseMacroScopes (value : Lean.Name) : Lean.Name := value.eraseMacroScopes
+
 @[noinline] def addMacroScope (context value : Lean.Name) (scope : Nat) : Lean.Name :=
   Lean.addMacroScope context value scope
 
@@ -126,6 +130,21 @@ def optionNone (_ : Unit) : Option Lean.Syntax := none
   value.getArg index
 
 @[noinline] def syntaxGetNumArgs (value : @& Lean.Syntax) : Nat := value.getNumArgs
+
+@[noinline] def syntaxIsNodeOf (value : Lean.Syntax) (kind : Lean.SyntaxNodeKind)
+    (size : Nat) : Bool := value.isNodeOf kind size
+
+@[noinline] def syntaxMatchesNull (value : Lean.Syntax) (size : Nat) : Bool :=
+  value.matchesNull size
+
+@[noinline] def syntaxMatchesIdent (value : Lean.Syntax) (id : Lean.Name) : Bool :=
+  value.matchesIdent id
+
+@[noinline] def syntaxMatchesLit (value : Lean.Syntax) (kind : Lean.SyntaxNodeKind)
+    (text : String) : Bool := value.matchesLit kind text
+
+@[noinline] def syntaxGetOptional (value : Lean.Syntax) : Option Lean.Syntax :=
+  value.getOptional?
 
 @[noinline] def syntaxMkLit (kind : Lean.SyntaxNodeKind) (value : String)
     (info : Lean.SourceInfo) : Lean.Syntax :=

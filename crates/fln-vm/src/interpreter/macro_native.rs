@@ -15,16 +15,24 @@ const MAX_SYNTAX_NODES: u64 = 1_000_000;
 
 mod literals;
 mod numbers;
+mod patterns;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum Intrinsic {
     NameStr,
     MkStr1,
+    NameHasMacroScopes,
+    NameEraseMacroScopes,
     AddMacroScope,
     MacroAddMacroScope,
     IsOfKind,
     GetArg,
     GetNumArgs,
+    IsNodeOf,
+    MatchesNull,
+    MatchesIdent,
+    MatchesLit,
+    GetOptional,
     GetKind,
     SetKind,
     GetArgs,
@@ -75,11 +83,18 @@ impl Intrinsic {
         Some(match row {
             "mirror:Lean.Name.str._override" => Self::NameStr,
             "mirror:Lean.Name.mkStr1" => Self::MkStr1,
+            "mirror:Lean.Name.hasMacroScopes" => Self::NameHasMacroScopes,
+            "mirror:Lean.Name.eraseMacroScopes" => Self::NameEraseMacroScopes,
             "mirror:Lean.addMacroScope" => Self::AddMacroScope,
             "mirror:Lean.Macro.addMacroScope" => Self::MacroAddMacroScope,
             "mirror:Lean.Syntax.isOfKind" => Self::IsOfKind,
             "mirror:Lean.Syntax.getArg" => Self::GetArg,
             "mirror:Lean.Syntax.getNumArgs" => Self::GetNumArgs,
+            "mirror:Lean.Syntax.isNodeOf" => Self::IsNodeOf,
+            "mirror:Lean.Syntax.matchesNull" => Self::MatchesNull,
+            "mirror:Lean.Syntax.matchesIdent" => Self::MatchesIdent,
+            "mirror:Lean.Syntax.matchesLit" => Self::MatchesLit,
+            "mirror:Lean.Syntax.getOptional?" => Self::GetOptional,
             "mirror:Lean.Syntax.getKind" => Self::GetKind,
             "mirror:Lean.Syntax.setKind" => Self::SetKind,
             "mirror:Lean.Syntax.getArgs" => Self::GetArgs,
@@ -156,6 +171,8 @@ impl Intrinsic {
             match self {
                 Self::NameStr
                 | Self::IsOfKind
+                | Self::MatchesNull
+                | Self::MatchesIdent
                 | Self::GetArg
                 | Self::SetKind
                 | Self::SetArgs
@@ -177,6 +194,8 @@ impl Intrinsic {
                 | Self::HasDecl
                 | Self::ResolveNamespace
                 | Self::ResolveGlobalName
+                | Self::IsNodeOf
+                | Self::MatchesLit
                 | Self::SetArg
                 | Self::MkAtomFrom
                 | Self::MkIdentFrom
@@ -214,6 +233,45 @@ impl Intrinsic {
                     text,
                 ))))
             }
+            Self::NameHasMacroScopes => Ok(IntrinsicResult::scalar(Obj::mk_nat(usize::from(
+                name(&args[0])?.has_macro_scopes(),
+            )))),
+            Self::NameEraseMacroScopes => {
+                let value = name(&args[0])?;
+                let erased = if value.has_macro_scopes() {
+                    inject_name(&value.erase_macro_scopes())
+                } else {
+                    args[0].clone_ref()
+                };
+                Ok(IntrinsicResult::raw_object(erased))
+            }
+            Self::IsNodeOf => Ok(IntrinsicResult::scalar(Obj::mk_nat(usize::from(
+                patterns::is_node_of(
+                    &args[0],
+                    &name(&args[1])?,
+                    &args[2],
+                    "Lean.Syntax.isNodeOf",
+                    2,
+                )?,
+            )))),
+            Self::MatchesNull => Ok(IntrinsicResult::scalar(Obj::mk_nat(usize::from(
+                patterns::is_node_of(
+                    &args[0],
+                    &Name::str(Name::anonymous(), "null"),
+                    &args[1],
+                    "Lean.Syntax.matchesNull",
+                    1,
+                )?,
+            )))),
+            Self::MatchesIdent => Ok(IntrinsicResult::scalar(Obj::mk_nat(usize::from(
+                patterns::matches_ident(&args[0], &args[1])?,
+            )))),
+            Self::MatchesLit => Ok(IntrinsicResult::scalar(Obj::mk_nat(usize::from(
+                patterns::matches_lit(&args[0], &args[1], &args[2])?,
+            )))),
+            Self::GetOptional => Ok(IntrinsicResult::raw_object(patterns::get_optional(
+                &args[0],
+            )?)),
             Self::AddMacroScope => Ok(IntrinsicResult::raw_object(attach_scope(
                 &args[0], &args[1], &args[2],
             )?)),
