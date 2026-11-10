@@ -12,6 +12,19 @@ const SEQUENCING_OWNERS: [(&str, &str); 3] = [
     ("term_*>_", "_aux_Init_Notation___macroRules_term_*>__1"),
 ];
 
+const CONDITIONAL_OWNERS: [(&str, &str, &str); 2] = [
+    (
+        "boolIfThenElse",
+        "_aux_Init_Notation___macroRules_boolIfThenElse_1",
+        "app",
+    ),
+    (
+        "termIfLet",
+        "_aux_Init_Notation___macroRules_termIfLet_1",
+        "match",
+    ),
+];
+
 const OPERATOR_KINDS: [(&str, &str); 20] = [
     ("term_|||_", "binop"),
     ("term_^^^_", "binop"),
@@ -69,6 +82,39 @@ fn pinned_sequencing_registry_binds_authority_and_serves_recursive_user_macros()
         &SEQUENCING_OWNERS.map(|(kind, owner)| (kind, owner, "app")),
         operator_input,
     );
+}
+
+#[test]
+fn pinned_conditional_registry_binds_authority_and_serves_recursive_user_macros() {
+    quotation_registry_controls("Init.Notation", &CONDITIONAL_OWNERS, conditional_input);
+}
+
+fn conditional_input(kind: &str) -> Syntax {
+    let atom = |text| Syntax::atom(SourceInfo::None, text);
+    let capture = |label| Syntax::node(name(label), vec![atom("captured operand")]);
+    let args = if kind == "boolIfThenElse" {
+        vec![
+            atom("bif"),
+            capture("Client.condition"),
+            atom("then"),
+            capture("Client.then"),
+            atom("else"),
+            capture("Client.else"),
+        ]
+    } else {
+        vec![
+            atom("if"),
+            atom("let"),
+            capture("Client.pattern"),
+            atom(":="),
+            capture("Client.discriminant"),
+            atom("then"),
+            capture("Client.then"),
+            atom("else"),
+            capture("Client.else"),
+        ]
+    };
+    Syntax::node(name(kind), args)
 }
 
 #[test]
@@ -422,6 +468,17 @@ theorem binderExistsShadow_shape (P : Nat → Prop) :
 theorem binderSigmaValue_fst : binderSigmaValue.1 = 7 := rfl
 theorem binderSigmaValue_snd : binderSigmaValue.2 = 11 := rfl
 theorem binderExists_intro : ∃ x y : Nat, x = y := ⟨7, 7, rfl⟩
+def conditionalBoolean (b : Bool) (yes no : Nat) : Nat := bif b then yes else no
+def conditionalShadow (cond : Nat) (b : Bool) : Nat := bif b then 7 else 11
+def conditionalPattern (x : Option Nat) : Nat := if let some n := x then n else 13
+def conditionalPatternShadow (x : Option Nat) (n : Nat) : Nat :=
+    if let some n := x then n else n
+theorem conditionalBoolean_true : Eq (conditionalBoolean true 7 11) 7 := rfl
+theorem conditionalBoolean_false : Eq (conditionalBoolean false 7 11) 11 := rfl
+theorem conditionalPattern_some : Eq (conditionalPattern (some 7)) 7 := rfl
+theorem conditionalPattern_none : Eq (conditionalPattern none) 13 := rfl
+theorem conditionalPatternShadow_some : Eq (conditionalPatternShadow (some 7) 11) 7 := rfl
+theorem conditionalPatternShadow_none : Eq (conditionalPatternShadow none 11) 11 := rfl
 "#;
     let header =
         "module\nprelude\npublic import Init.NotationExtra\npublic section\n@[expose] section\n";
@@ -523,6 +580,13 @@ theorem binderExists_intro : ∃ x y : Nat, x = y := ⟨7, 7, rfl⟩
             vec![&name(owner)]
         );
     }
+    for (kind, owner, _) in CONDITIONAL_OWNERS {
+        assert_eq!(
+            registry.declarations(&name(kind)).collect::<Vec<_>>(),
+            vec![&name(owner)],
+            "the complete journal must retain the conditional owner: {kind}"
+        );
+    }
     for (kind, _) in OPERATOR_KINDS {
         assert_eq!(
             registry
@@ -564,7 +628,7 @@ theorem binderExists_intro : ∃ x y : Nat, x = y := ⟨7, 7, rfl⟩
     assert!(report.state.is_some());
     assert_eq!(
         (checked.files, checked.commands, checked.theorems),
-        (1, 57, 22)
+        (1, 67, 28)
     );
     for (_, owner) in SEQUENCING_OWNERS {
         assert!(report.attempts.iter().any(|attempt| {
@@ -575,6 +639,19 @@ theorem binderExists_intro : ∃ x y : Nat, x = y := ⟨7, 7, rfl⟩
                     .any(|id| id == &format!("mirror:{owner}"))
                 && attempt.reference_functions.is_empty()
         }));
+    }
+    for (kind, owner, _) in CONDITIONAL_OWNERS {
+        assert!(
+            report.attempts.iter().any(|attempt| {
+                attempt.declaration == name(owner)
+                    && attempt
+                        .native_functions
+                        .iter()
+                        .any(|id| id == &format!("mirror:{owner}"))
+                    && attempt.reference_functions.is_empty()
+            }),
+            "native conditional was not exercised: {kind}"
+        );
     }
     // ASCII relation spellings can parse to the canonical Unicode syntax
     // kinds. Their legacy kinds are covered separately by recursive dispatch.
@@ -653,6 +730,8 @@ theorem binderExists_intro : ∃ x y : Nat, x = y := ⟨7, 7, rfl⟩
         "binderDependentPProduct",
         "binderAnonymousSigma",
         "binderSigmaValue",
+        "conditionalBoolean",
+        "conditionalShadow",
     ] {
         let Some(ConstantInfo::Defn(actual)) = checked.engine.environment().find(&name(label))
         else {
@@ -714,6 +793,18 @@ theorem binderExists_intro : ∃ x y : Nat, x = y := ⟨7, 7, rfl⟩
         (
             "escapedBinder",
             "def escapedBinder : Nat := (fun _ : (∃ x : Nat, True) => x) (Exists.intro 7 True.intro)",
+        ),
+        (
+            "wrongBooleanCondition",
+            "def wrongBooleanCondition : Nat := bif (1 : Nat) then 7 else 11",
+        ),
+        (
+            "wrongPatternResult",
+            "theorem wrongPatternResult : Eq (conditionalPattern (some 7)) 13 := rfl",
+        ),
+        (
+            "escapedPatternBinder",
+            "def escapedPatternBinder (x : Option Nat) : Nat := if let some n := x then n else n",
         ),
     ] {
         let rejected_source = format!("{source}\n{suffix}\n");

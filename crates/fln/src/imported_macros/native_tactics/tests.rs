@@ -1179,6 +1179,238 @@ const SEQUENCING_CANDIDATES: [NativeTacticMacro; 3] = [
     NativeTacticMacro::SeqRight,
 ];
 
+const CONDITIONAL_CANDIDATES: [NativeTacticMacro; 2] =
+    [NativeTacticMacro::BoolIf, NativeTacticMacro::IfLet];
+
+fn conditional_inputs(candidate: NativeTacticMacro) -> Vec<Syntax> {
+    let kind = candidate.input_kind();
+    let wrong = || atom(SourceInfo::None, "wrong");
+    let capture = |label| node(label, vec![control_body()]);
+    let args = if candidate == NativeTacticMacro::BoolIf {
+        vec![
+            wrong(),
+            capture("Client.condition"),
+            wrong(),
+            capture("Client.then"),
+            wrong(),
+            capture("Client.else"),
+        ]
+    } else {
+        vec![
+            wrong(),
+            wrong(),
+            capture("Client.pattern"),
+            wrong(),
+            capture("Client.discriminant"),
+            wrong(),
+            capture("Client.then"),
+            wrong(),
+            capture("Client.else"),
+        ]
+    };
+    let mut missing = args.clone();
+    missing[args.len() - 1] = Syntax::Missing;
+    let mut extra = args.clone();
+    extra.push(atom(SourceInfo::None, "extra"));
+    vec![
+        node(kind, vec![]),
+        node(kind, vec![wrong()]),
+        node(kind, args[..args.len() - 2].to_vec()),
+        node(kind, args),
+        node(kind, missing),
+        node(kind, extra),
+    ]
+}
+
+#[test]
+fn native_conditional_quotes_keep_pattern_scope_branch_order_and_hygiene() {
+    for candidate in CONDITIONAL_CANDIDATES {
+        let input = conditional_inputs(candidate).swap_remove(3);
+        for context in contexts() {
+            for (reference, info) in references() {
+                let execution = control_execute(
+                    candidate,
+                    &input,
+                    &context,
+                    &reference,
+                    MacroLimits::default(),
+                    None,
+                );
+                assert!(execution.reference_functions.is_empty());
+                assert_eq!(execution.native_functions, vec![candidate.id()]);
+                let Outcome::Complete(Ok(MacroResult::Expanded {
+                    syntax,
+                    state: next,
+                })) = execution.outcome
+                else {
+                    panic!("conditional expansion failed: {execution:?}");
+                };
+                assert_eq!(next, state());
+                let Syntax::Node { info: actual, .. } = &syntax else {
+                    panic!("conditional quotation lost its node");
+                };
+                assert_eq!(*actual, info);
+                if candidate == NativeTacticMacro::BoolIf {
+                    assert_eq!(syntax.kind(), Some(&name("Lean.Parser.Term.app")));
+                    let Syntax::Ident {
+                        info: actual,
+                        raw_val,
+                        val,
+                        preresolved,
+                    } = argument_ref(&syntax, 0)
+                    else {
+                        panic!("Boolean conditional did not resolve cond");
+                    };
+                    assert_eq!(*actual, info);
+                    assert_eq!(raw_val.owned_backing(), Some("cond"));
+                    let scoped =
+                        Name::str(name("cond"), "_@").append_core(&context.quotation_context);
+                    assert_eq!(
+                        *val,
+                        Name::num(Name::str(scoped, "_hyg"), context.current_macro_scope)
+                    );
+                    assert_eq!(
+                        preresolved,
+                        &[
+                            Preresolved::Decl {
+                                name: name("cond"),
+                                fields: Vec::new(),
+                            },
+                            Preresolved::Namespace { ns: name("cond") },
+                        ]
+                    );
+                    let arguments = argument_ref(&syntax, 1);
+                    for (position, capture) in [(0, 1), (1, 3), (2, 5)] {
+                        assert_eq!(
+                            argument_ref(arguments, position),
+                            argument_ref(&input, capture)
+                        );
+                    }
+                } else {
+                    assert_eq!(syntax.kind(), Some(&name("Lean.Parser.Term.match")));
+                    let discriminant = argument_ref(argument_ref(&syntax, 3), 0);
+                    assert_eq!(
+                        discriminant.kind(),
+                        Some(&name("Lean.Parser.Term.matchDiscr"))
+                    );
+                    assert_eq!(argument_ref(discriminant, 1), argument_ref(&input, 4));
+                    let alternatives = argument_ref(argument_ref(&syntax, 5), 0);
+                    assert_eq!(arguments(alternatives).len(), 2);
+                    let yes = argument_ref(alternatives, 0);
+                    let no = argument_ref(alternatives, 1);
+                    fn pattern(alternative: &Syntax) -> &Syntax {
+                        argument_ref(argument_ref(argument_ref(alternative, 1), 0), 0)
+                    }
+                    assert_eq!(pattern(yes), argument_ref(&input, 2));
+                    assert_eq!(argument_ref(yes, 3), argument_ref(&input, 6));
+                    assert_eq!(argument_ref(no, 3), argument_ref(&input, 8));
+                    assert_eq!(
+                        pattern(no),
+                        &Syntax::Node {
+                            info,
+                            kind: name("Lean.Parser.Term.hole"),
+                            args: vec![atom(info, "_")],
+                        }
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn native_conditional_resource_stops_do_not_publish_expansions_and_recover() {
+    for candidate in CONDITIONAL_CANDIDATES {
+        let input = conditional_inputs(candidate).swap_remove(3);
+        for limits in [
+            MacroLimits {
+                vm: ExecutionLimits {
+                    max_steps: 0,
+                    ..ExecutionLimits::default()
+                },
+                ..MacroLimits::default()
+            },
+            MacroLimits {
+                syntax: SyntaxLimits {
+                    max_nodes: 1,
+                    ..SyntaxLimits::default()
+                },
+                ..MacroLimits::default()
+            },
+        ] {
+            let stopped = control_execute(
+                candidate,
+                &input,
+                &contexts()[0],
+                &Syntax::Missing,
+                limits,
+                None,
+            );
+            assert!(
+                matches!(stopped.outcome, Outcome::Inconclusive(_)),
+                "{stopped:?}"
+            );
+        }
+        let cancelled = control_execute(
+            candidate,
+            &input,
+            &contexts()[0],
+            &Syntax::Missing,
+            MacroLimits::default(),
+            Some(&|| true),
+        );
+        assert!(matches!(cancelled.outcome, Outcome::Inconclusive(_)));
+        expanded_control(candidate, &input);
+        for input in [Syntax::Missing, node("User.boolIfThenElse", Vec::new())] {
+            let refused = control_execute(
+                candidate,
+                &input,
+                &contexts()[0],
+                &Syntax::Missing,
+                MacroLimits::default(),
+                None,
+            );
+            assert!(matches!(refused.outcome,
+                Outcome::Complete(Ok(MacroResult::Unsupported { state: next })) if next == state()));
+        }
+    }
+}
+
+#[test]
+fn live_pinned_conditional_candidates_match_complete_quotations_and_state() {
+    let oracle = r#"
+meta def notationCandidates : List (Macro × Name) :=
+  [(_aux_Init_Notation___macroRules_boolIfThenElse_1, `boolIfThenElse),
+   (_aux_Init_Notation___macroRules_termIfLet_1, `termIfLet)]
+
+meta def notationInputs (kind : Name) : List Syntax :=
+  let wrong := Syntax.atom .none "wrong"
+  let capture (label : Name) := Syntax.node .none label #[controlBody]
+  let args := if kind == `boolIfThenElse then
+    #[wrong, capture `Client.condition, wrong, capture `Client.then, wrong, capture `Client.else]
+  else
+    #[wrong, wrong, capture `Client.pattern, wrong, capture `Client.discriminant,
+      wrong, capture `Client.then, wrong, capture `Client.else]
+  [.node .none kind #[],
+   .node .none kind #[wrong],
+   .node .none kind (args.extract 0 (args.size - 2)),
+   .node .none kind args,
+   .node .none kind (args.set! (args.size - 1) .missing),
+   .node .none kind (args.push (.atom .none "extra"))]
+"#;
+    let runner = NOTATION_ORACLE_INPUTS
+        .split_once("meta def runNotationMacros")
+        .unwrap()
+        .1;
+    check_pinned_notation_candidates(
+        &CONDITIONAL_CANDIDATES,
+        conditional_inputs,
+        "conditionals",
+        &format!("{oracle}\nmeta def runNotationMacros{runner}"),
+        0,
+    );
+}
+
 fn sequencing_inputs(candidate: NativeTacticMacro) -> Vec<Syntax> {
     let kind = candidate.input_kind();
     let wrong = || atom(SourceInfo::None, "wrong");

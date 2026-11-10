@@ -49,6 +49,8 @@ pub(super) enum NativeTacticMacro {
     Seq,
     SeqLeft,
     SeqRight,
+    BoolIf,
+    IfLet,
     BitOr,
     BitXor,
     BitAnd,
@@ -86,7 +88,7 @@ impl NativeTacticMacro {
     // Exact registrations from REFERENCE_GRAMMAR_CENSUS.txt, not spellings
     // inferred from a caller's syntax kind. The partition and checked module
     // owner remain mandatory before any candidate receives native execution.
-    const ALL: [Self; 46] = [
+    const ALL: [Self; 48] = [
         Self::ApplyRfl,
         Self::EqRefl,
         Self::ExactHEq,
@@ -107,6 +109,8 @@ impl NativeTacticMacro {
         Self::Seq,
         Self::SeqLeft,
         Self::SeqRight,
+        Self::BoolIf,
+        Self::IfLet,
         Self::BitOr,
         Self::BitXor,
         Self::BitAnd,
@@ -154,6 +158,8 @@ impl NativeTacticMacro {
             Self::Seq
             | Self::SeqLeft
             | Self::SeqRight
+            | Self::BoolIf
+            | Self::IfLet
             | Self::BitOr
             | Self::BitXor
             | Self::BitAnd
@@ -238,6 +244,8 @@ impl NativeTacticMacro {
             Self::Seq => "_aux_Init_Notation___macroRules_term_<*>__1",
             Self::SeqLeft => "_aux_Init_Notation___macroRules_term_<*__1",
             Self::SeqRight => "_aux_Init_Notation___macroRules_term_*>__1",
+            Self::BoolIf => "_aux_Init_Notation___macroRules_boolIfThenElse_1",
+            Self::IfLet => "_aux_Init_Notation___macroRules_termIfLet_1",
             Self::BitOr => "_aux_Init_Notation___macroRules_term_|||__2",
             Self::BitXor => "_aux_Init_Notation___macroRules_term_^^^__2",
             Self::BitAnd => "_aux_Init_Notation___macroRules_term_&&&__2",
@@ -321,6 +329,8 @@ impl NativeTacticMacro {
             Self::Seq => "mirror:_aux_Init_Notation___macroRules_term_<*>__1",
             Self::SeqLeft => "mirror:_aux_Init_Notation___macroRules_term_<*__1",
             Self::SeqRight => "mirror:_aux_Init_Notation___macroRules_term_*>__1",
+            Self::BoolIf => "mirror:_aux_Init_Notation___macroRules_boolIfThenElse_1",
+            Self::IfLet => "mirror:_aux_Init_Notation___macroRules_termIfLet_1",
             Self::BitOr => "mirror:_aux_Init_Notation___macroRules_term_|||__2",
             Self::BitXor => "mirror:_aux_Init_Notation___macroRules_term_^^^__2",
             Self::BitAnd => "mirror:_aux_Init_Notation___macroRules_term_&&&__2",
@@ -369,6 +379,8 @@ impl NativeTacticMacro {
             Self::Seq => "term_<*>_",
             Self::SeqLeft => "term_<*_",
             Self::SeqRight => "term_*>_",
+            Self::BoolIf => "boolIfThenElse",
+            Self::IfLet => "termIfLet",
             Self::BitOr => "term_|||_",
             Self::BitXor => "term_^^^_",
             Self::BitAnd => "term_&&&_",
@@ -638,6 +650,69 @@ impl NativeTacticMacro {
                     ]),
                 ],
             ),
+            Self::BoolIf => {
+                let mut function = identifier("cond")?;
+                // cond is both a declaration and a namespace at the macro's
+                // declaration site, so the quotation records both targets.
+                if let Syntax::Ident { preresolved, .. } = &mut function {
+                    preresolved.push(Preresolved::Namespace { ns: name("cond") });
+                }
+                node(
+                    "Lean.Parser.Term.app",
+                    vec![
+                        function,
+                        node(
+                            "null",
+                            vec![argument(input, 1), argument(input, 3), argument(input, 5)],
+                        ),
+                    ],
+                )
+            }
+            Self::IfLet => {
+                // Init.Notation's pattern conditional is a match quotation,
+                // not a Boolean test: the first branch keeps the captured
+                // pattern's binders, and the fallback has its own wildcard.
+                let alternative = |pattern, body| {
+                    node(
+                        "Lean.Parser.Term.matchAlt",
+                        vec![
+                            atom("|"),
+                            node("null", vec![node("null", vec![pattern])]),
+                            atom("=>"),
+                            body,
+                        ],
+                    )
+                };
+                node(
+                    "Lean.Parser.Term.match",
+                    vec![
+                        atom("match"),
+                        node("null", Vec::new()),
+                        node("null", Vec::new()),
+                        node(
+                            "null",
+                            vec![node(
+                                "Lean.Parser.Term.matchDiscr",
+                                vec![node("null", Vec::new()), argument(input, 4)],
+                            )],
+                        ),
+                        atom("with"),
+                        node(
+                            "Lean.Parser.Term.matchAlts",
+                            vec![node(
+                                "null",
+                                vec![
+                                    alternative(argument(input, 2), argument(input, 6)),
+                                    alternative(
+                                        node("Lean.Parser.Term.hole", vec![atom("_")]),
+                                        argument(input, 8),
+                                    ),
+                                ],
+                            )],
+                        ),
+                    ],
+                )
+            }
             Self::Seq | Self::SeqLeft | Self::SeqRight => {
                 // Init/Notation.lean's registered macros quote an ordinary
                 // application with a Unit thunk. Both constants are resolved
