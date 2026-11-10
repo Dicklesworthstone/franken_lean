@@ -19,6 +19,9 @@ mod array_proofs;
 #[path = "tests/array_operations.rs"]
 mod array_operations;
 
+#[path = "tests/float_arrays.rs"]
+mod float_arrays;
+
 #[path = "tests/boxed_primitives.rs"]
 mod boxed_primitives;
 

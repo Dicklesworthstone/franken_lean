@@ -224,6 +224,21 @@ impl Obj {
         )))
     }
 
+    /// Append a Float, preserving exclusive capacity and shared snapshots.
+    ///
+    /// The checked eight-byte element width authenticates the native FloatArray
+    /// representation before the existing COW export consumes this handle.
+    /// Invalid categories and headers return the original owned handle.
+    pub fn try_float_array_push(self, value: f64) -> Result<Obj, Obj> {
+        if !matches!(self.try_borrow_sarray_view(), Some((8, _, _, _))) {
+            return Err(self);
+        }
+        Ok(Obj(export::export_lean_float_array_push(
+            self.into_raw(),
+            value,
+        )))
+    }
+
     /// Closure shell (function pointer dangling; layout/RC suites only). A
     /// shell must never reach [`Obj::apply`] — the callable constructors are
     /// the `mk_closure_fn*` family, where the arity comes from the TYPE.

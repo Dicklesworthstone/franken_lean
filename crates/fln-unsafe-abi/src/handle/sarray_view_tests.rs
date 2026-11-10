@@ -82,3 +82,91 @@ fn borrowed_sarray_view_refuses_categories_and_hostile_headers() {
         Some((2, 2, 2, &b"abcd"[..]))
     );
 }
+
+#[test]
+fn owned_float_array_push_preserves_bits_capacity_and_shared_snapshots() {
+    let _guard = lock();
+    shadow::enable();
+    {
+        let bits = [
+            0,
+            (-0.0f64).to_bits(),
+            1.25f64.to_bits(),
+            f64::INFINITY.to_bits(),
+            f64::NEG_INFINITY.to_bits(),
+            0x7ff8_0000_0000_0123,
+        ];
+        let mut value = Obj::mk_sarray(8, &[]);
+        let mut reused_capacity = false;
+        for index in 0..96 {
+            let (_, size, capacity, _) = value.try_borrow_sarray_view().unwrap();
+            let identity = value.identity_token();
+            value = value
+                .try_float_array_push(f64::from_bits(bits[index % bits.len()]))
+                .unwrap_or_else(|_| panic!("valid FloatArray"));
+            if size < capacity {
+                assert_eq!(value.identity_token(), identity);
+                reused_capacity = true;
+            }
+        }
+        assert!(
+            reused_capacity,
+            "native pushes must retain geometric spare capacity"
+        );
+        let snapshot = value.clone_ref();
+        let original = snapshot.try_borrow_sarray_view().unwrap().3.to_vec();
+        value = value
+            .try_float_array_push(f64::from_bits(1))
+            .unwrap_or_else(|_| panic!("shared FloatArray"));
+        assert_ne!(value.identity_token(), snapshot.identity_token());
+        assert_eq!(snapshot.try_borrow_sarray_view().unwrap().3, original);
+        let (width, size, _, bytes) = value.try_borrow_sarray_view().unwrap();
+        assert_eq!((width, size), (8, 97));
+        for (index, word) in bytes.chunks_exact(8).enumerate() {
+            let expected = if index == 96 {
+                1
+            } else {
+                bits[index % bits.len()]
+            };
+            assert_eq!(u64::from_ne_bytes(word.try_into().unwrap()), expected);
+        }
+    }
+    let (events, live) = shadow::disable_and_drain();
+    assert_eq!(live, 0);
+    assert!(events.iter().all(|event| !matches!(
+        event.kind,
+        EventKind::DoubleRelease | EventKind::ForeignPointer
+    )));
+}
+
+#[test]
+fn owned_float_array_push_refuses_wrong_widths_and_hostile_headers() {
+    let _guard = lock();
+    for value in [
+        Obj::mk_nat(0),
+        Obj::mk_string("float array"),
+        Obj::mk_array(Vec::new()),
+        Obj::mk_sarray(1, &[0; 8]),
+        Obj::mk_sarray(4, &[0; 8]),
+        Obj::mk_sarray(16, &[0; 16]),
+    ] {
+        let identity = value.identity_token();
+        let result = value.try_float_array_push(1.0);
+        let Err(original) = result else {
+            panic!("wrong FloatArray representation was accepted");
+        };
+        assert_eq!(original.identity_token(), identity);
+    }
+    let value = Obj::mk_sarray(8, &1.0f64.to_ne_bytes());
+    let identity = value.identity_token();
+    value.plant_sarray_size(2);
+    let Err(original) = value.try_float_array_push(2.0) else {
+        panic!("inconsistent FloatArray header was accepted");
+    };
+    assert_eq!(original.identity_token(), identity);
+    original.restore_sarray_size(1);
+    assert_eq!(
+        original.try_borrow_sarray_view().unwrap().3,
+        &1.0f64.to_ne_bytes()
+    );
+}

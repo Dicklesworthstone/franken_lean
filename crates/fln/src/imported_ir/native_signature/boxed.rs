@@ -129,6 +129,16 @@ impl BoxedNative {
                 &[IrType::Object, IrType::USize, IrType::TObject],
                 &IrType::Object,
             ),
+            "extern:FloatArray.get" => (&[IrType::Object, IrType::TObject], &IrType::Float),
+            "extern:FloatArray.set" => (
+                &[IrType::Object, IrType::TObject, IrType::Float],
+                &IrType::Object,
+            ),
+            "extern:FloatArray.uget" => (&[IrType::Object, IrType::USize], &IrType::Float),
+            "extern:FloatArray.uset" => (
+                &[IrType::Object, IrType::USize, IrType::Float],
+                &IrType::Object,
+            ),
             "extern:ByteArray.get" => (&[IrType::Object, IrType::TObject], &IrType::UInt8),
             "extern:ByteArray.set" => (
                 &[IrType::Object, IrType::TObject, IrType::UInt8],

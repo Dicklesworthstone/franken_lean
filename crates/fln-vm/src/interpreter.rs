@@ -61,6 +61,7 @@ use std::fmt;
 mod array_construction;
 mod arrays;
 mod diagnostics;
+mod float_arrays;
 mod floats;
 mod macro_native;
 mod packed_constructors;
@@ -926,6 +927,7 @@ enum IntrinsicImplementation {
     TaskBind,
     ArrayConstruction(array_construction::Intrinsic),
     ArrayExtra(arrays::Intrinsic),
+    FloatArray(float_arrays::Intrinsic),
     Unsupported,
 }
 
@@ -1318,6 +1320,7 @@ impl IntrinsicImplementation {
                 .or_else(|| {
                     array_construction::Intrinsic::for_row(row).map(Self::ArrayConstruction)
                 })
+                .or_else(|| float_arrays::Intrinsic::for_row(row).map(Self::FloatArray))
                 .or_else(|| floats::Intrinsic::for_row(row).map(Self::Float))
                 .or_else(|| strings::Intrinsic::for_row(row).map(Self::StringInternal))
                 .or_else(|| string_fold::Intrinsic::for_row(row).map(Self::StringTraversal))
@@ -4716,6 +4719,7 @@ fn finish_intrinsic_result(
     }
     let boxed_integer = floats::boxed_integer_result(row)
         || strings::Intrinsic::for_row(row).is_some_and(strings::Intrinsic::has_wide_result)
+        || float_arrays::Intrinsic::for_row(row).is_some_and(float_arrays::Intrinsic::has_wide_result)
         || matches!(
             row,
             "extern:ByteArray.hash" | "extern:ByteArray.usize" | "extern:Array.usize"
@@ -5063,6 +5067,9 @@ fn invoke_intrinsic(
     if let IntrinsicImplementation::ArrayExtra(intrinsic) = implementation {
         return intrinsic.invoke(row, args);
     }
+    if let IntrinsicImplementation::FloatArray(intrinsic) = implementation {
+        return intrinsic.invoke(row, args);
+    }
     if implementation == IntrinsicImplementation::ByteArrayPush {
         expect_arity(row, &args, 2)?;
         if value_kind(&args[0]) != ValueKind::ScalarArray {
@@ -5103,6 +5110,7 @@ fn dispatch_intrinsic(
         IntrinsicImplementation::PanicCore => diagnostics::panic(row, args),
         IntrinsicImplementation::ArrayConstruction(intrinsic) => intrinsic.invoke(row, args),
         IntrinsicImplementation::ArrayExtra(_)
+        | IntrinsicImplementation::FloatArray(_)
         | IntrinsicImplementation::ArrayPush
         | IntrinsicImplementation::ByteArrayPush
         | IntrinsicImplementation::VoidMk => {
@@ -8241,6 +8249,7 @@ fn closure_intrinsic_application(
         | IntrinsicImplementation::TaskGet
         | IntrinsicImplementation::ArrayConstruction(_)
         | IntrinsicImplementation::ArrayExtra(_)
+        | IntrinsicImplementation::FloatArray(_)
         | IntrinsicImplementation::Float(_)
         | IntrinsicImplementation::StringInternal(_)
         | IntrinsicImplementation::MacroNative(_)

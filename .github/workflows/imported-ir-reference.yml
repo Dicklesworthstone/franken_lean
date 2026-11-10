@@ -99,6 +99,10 @@ jobs:
         run: |
           set -uo pipefail
           status=0
+          cargo test --locked -p fln-vm --test float_arrays -- --nocapture \
+            2>&1 | tee target/imported-ir-reference/float-array-vm.log || status=1
+          cargo test --locked -p fln-vm -p fln-unsafe-abi --lib float_array -- --nocapture \
+            2>&1 | tee target/imported-ir-reference/float-array-boundary.log || status=1
           cargo test --locked -p fln-parse --test macro_body_construction -- --nocapture \
             2>&1 | tee target/imported-ir-reference/macro-construction-parser.log || status=1
           cargo test --locked --no-fail-fast -p fln \
