@@ -4,14 +4,17 @@ use std::process::Command;
 
 use fln_checker::defeq::{DefEqBudget, DefEqMismatch, DefEqOutcome, DefEqStop, def_eq};
 use fln_checker::environment::{
-    ConstantDeclaration, ConstantEntry, ConstantEnvironment, ConstantSafety, DefinitionBody,
-    DefinitionSafety, EnvironmentBudget, EnvironmentOutcome, ReducibilityHint,
+    ConstantDeclaration, ConstantEntry, ConstantEnvironment, ConstantSafety,
+    ConstructorDeclaration, DefinitionBody, DefinitionSafety, EnvironmentBudget,
+    EnvironmentOutcome, InductiveDeclaration, RecursorDeclaration, RecursorRule, ReducibilityHint,
 };
 use fln_checker::string_reduce::{
     StringExpansionBudget, StringExpansionLimit, StringExpansionOutcome, StringExpansionStop,
     expand_string_literal, expand_string_literal_with,
 };
-use fln_checker::whnf::{ProjectionRule, WhnfBudget, WhnfContext, WhnfOutcome, WhnfStop, whnf};
+use fln_checker::whnf::{
+    ProjectionRule, WhnfBudget, WhnfContext, WhnfOutcome, WhnfStop, whnf, whnf_with,
+};
 use fln_checker::wire::{
     DecodeBudget, DecodeOutcome, ExprId, ExprNode, NamePart, WireExpr, WireName, decode_expr,
     decode_name,
@@ -196,6 +199,268 @@ fn string_context() -> WhnfContext {
         )],
         environment,
     )
+}
+
+/// A reduction fixture with a constructor field containing the character list.
+/// As in `string_context`, this isolates KR-314 from the pin's UTF-8 encoder:
+/// the owned literal expansion must pass through the environment's `ofList`
+/// definition before the recursor can find its constructor rule.
+fn string_recursor_context(include_of_list: bool, constructor: Name) -> WhnfContext {
+    let string = Expr::const_(top("String"), Vec::new());
+    let chars = Expr::app(
+        Expr::const_(top("List"), vec![Level::zero()]),
+        Expr::const_(top("Char"), Vec::new()),
+    );
+    let pi = |domain, body| Expr::forall_e(Name::anonymous(), domain, body, BinderInfo::Default);
+    let lam = |domain, body| Expr::lam(Name::anonymous(), domain, body, BinderInfo::Default);
+    let bound = |index| Expr::bvar(index).unwrap();
+    let motive = pi(string.clone(), Expr::sort(Level::param(top("u"))));
+    let minor = pi(
+        chars.clone(),
+        Expr::app(
+            bound(1),
+            Expr::app(Expr::const_(constructor.clone(), Vec::new()), bound(0)),
+        ),
+    );
+    let type_ = pi(
+        motive.clone(),
+        pi(
+            minor.clone(),
+            pi(string.clone(), Expr::app(bound(2), bound(0))),
+        ),
+    );
+    let rhs = lam(
+        motive,
+        lam(minor, lam(chars.clone(), Expr::app(bound(1), bound(0)))),
+    );
+    let recursor = ConstantEntry::new(
+        checker_name(&qualified("String", "rec")),
+        ConstantDeclaration::recursor(
+            vec![checker_name(&top("u"))],
+            decoded(&type_),
+            ConstantSafety::Safe,
+            RecursorDeclaration::new(
+                vec![checker_name(&top("String"))],
+                0,
+                0,
+                1,
+                1,
+                vec![RecursorRule::new(
+                    checker_name(&constructor),
+                    1,
+                    decoded(&rhs),
+                )],
+                false,
+            ),
+        ),
+    );
+    let mut environment = if include_of_list {
+        string_context().constants().clone()
+    } else {
+        ConstantEnvironment::empty()
+    };
+    // Include the whole structure shape: otherwise early structure eta would
+    // be unavailable and could not mask missing literal expansion in this test.
+    for entry in [
+        ConstantEntry::new(
+            checker_name(&top("String")),
+            ConstantDeclaration::inductive(
+                Vec::new(),
+                decoded(&Expr::sort(Level::one())),
+                ConstantSafety::Safe,
+                InductiveDeclaration::new(
+                    0,
+                    0,
+                    vec![checker_name(&top("String"))],
+                    vec![checker_name(&qualified("String", "mk"))],
+                    0,
+                    false,
+                    false,
+                ),
+            ),
+        ),
+        ConstantEntry::new(
+            checker_name(&qualified("String", "mk")),
+            ConstantDeclaration::constructor(
+                Vec::new(),
+                decoded(&pi(chars, string)),
+                ConstantSafety::Safe,
+                ConstructorDeclaration::new(checker_name(&top("String")), 0, 0, 1),
+            ),
+        ),
+        recursor,
+    ] {
+        environment = match environment.extend(entry, EnvironmentBudget::unlimited()) {
+            EnvironmentOutcome::Complete { environment, .. } => environment,
+            other => panic!("String recursor environment did not build: {other:?}"),
+        };
+    }
+    WhnfContext::new(
+        Vec::new(),
+        vec![ProjectionRule::new(
+            checker_name(&top("String")),
+            checker_name(&qualified("String", "mk")),
+            0,
+        )],
+        environment,
+    )
+}
+
+fn string_recursor(major: Expr, minor: Expr) -> Expr {
+    let motive = Expr::lam(
+        Name::anonymous(),
+        Expr::const_(top("String"), Vec::new()),
+        Expr::app(
+            Expr::const_(top("List"), vec![Level::zero()]),
+            Expr::const_(top("Char"), Vec::new()),
+        ),
+        BinderInfo::Default,
+    );
+    [motive, minor, major].into_iter().fold(
+        Expr::const_(qualified("String", "rec"), vec![Level::one()]),
+        Expr::app,
+    )
+}
+
+#[test]
+fn string_recursor_expands_majors_and_preserves_the_minor_and_trailing_arguments() {
+    let context = string_recursor_context(true, qualified("String", "mk"));
+    for text in ["", "aλ🦀\0"] {
+        // A neutral minor keeps its field unevaluated. The returned field must
+        // nevertheless be the expansion's actual list, not a projection of
+        // the original literal manufactured by structure eta.
+        let minor = Expr::const_(top("observe"), Vec::new());
+        for major in [
+            string_literal(text),
+            Expr::let_e(
+                top("s"),
+                Expr::const_(top("String"), Vec::new()),
+                string_literal(text),
+                Expr::bvar(0).unwrap(),
+                false,
+            ),
+            Expr::app(
+                Expr::lam(
+                    top("s"),
+                    Expr::const_(top("String"), Vec::new()),
+                    Expr::bvar(0).unwrap(),
+                    BinderInfo::Default,
+                ),
+                string_literal(text),
+            ),
+        ] {
+            let application = Expr::app(string_recursor(major, minor.clone()), nat_literal(7));
+            let result = match whnf(&decoded(&application), &context, WhnfBudget::unlimited()) {
+                WhnfOutcome::Complete(result) => result,
+                other => panic!("String recursor did not normalize: {other:?}"),
+            };
+            let (head, arguments) = app_spine(&result.term, result.term.root());
+            expect_constant(&result.term, head, &["observe"], 0);
+            assert_eq!(arguments.len(), 2);
+            let expected: Vec<_> = text.chars().map(|c| u64::from(u32::from(c))).collect();
+            assert_eq!(list_codes(&result.term, arguments[0]), expected);
+            assert!(
+                matches!(result.term.node(arguments[1]), Some(ExprNode::NatLiteral { limbs_le }) if limbs_le.as_slice() == [7])
+            );
+            assert_eq!(result.string_progress.code_points, expected.len() as u64);
+            assert_eq!(result.string_progress.generated_arenas, 1);
+            assert!(result.delta_reductions >= 1);
+        }
+    }
+}
+
+#[test]
+fn string_recursor_requires_the_expansion_to_reach_its_own_constructor() {
+    let application = decoded(&string_recursor(
+        string_literal("a"),
+        Expr::const_(top("observe"), Vec::new()),
+    ));
+    for context in [
+        string_recursor_context(false, qualified("String", "mk")),
+        string_recursor_context(true, qualified("Other", "mk")),
+    ] {
+        let result = match whnf(&application, &context, WhnfBudget::unlimited()) {
+            WhnfOutcome::Complete(result) => result,
+            other => panic!("unsupported String recursor context must stay stuck: {other:?}"),
+        };
+        let (head, arguments) = app_spine(&result.term, result.term.root());
+        expect_constant(&result.term, head, &["String", "rec"], 1);
+        assert_eq!(arguments.len(), 3);
+        assert!(
+            matches!(result.term.node(arguments[2]), Some(ExprNode::StringLiteral(value)) if value == "a")
+        );
+        assert_eq!(result.reductions, 0, "failed major work is not progress");
+        assert_eq!(result.string_progress.generated_arenas, 1);
+    }
+}
+
+#[test]
+fn string_recursor_still_uses_structure_eta_for_a_neutral_major() {
+    let context = string_recursor_context(true, qualified("String", "mk"));
+    let application = decoded(&string_recursor(
+        Expr::const_(top("neutralString"), Vec::new()),
+        Expr::const_(top("observe"), Vec::new()),
+    ));
+    let result = match whnf(&application, &context, WhnfBudget::unlimited()) {
+        WhnfOutcome::Complete(result) => result,
+        other => panic!("neutral String major did not eta-reduce: {other:?}"),
+    };
+    let (head, arguments) = app_spine(&result.term, result.term.root());
+    expect_constant(&result.term, head, &["observe"], 0);
+    assert_eq!(arguments.len(), 1);
+    let ExprNode::Projection {
+        structure_name,
+        index,
+        expression,
+    } = result
+        .term
+        .node(arguments[0])
+        .expect("field projection exists")
+    else {
+        panic!("neutral major must produce a projection");
+    };
+    assert!(exact_name(structure_name, &["String"]));
+    assert_eq!(*index, 0);
+    expect_constant(&result.term, *expression, &["neutralString"], 0);
+    assert_eq!(result.string_progress.generated_arenas, 0);
+}
+
+#[test]
+fn string_recursor_limits_and_cancellation_are_recoverable_nonanswers() {
+    let context = string_recursor_context(true, qualified("String", "mk"));
+    let application = decoded(&string_recursor(
+        string_literal("aλ"),
+        Expr::const_(top("observe"), Vec::new()),
+    ));
+    let budget = WhnfBudget::unlimited().with_string(StringExpansionBudget::new(
+        u64::MAX,
+        1,
+        u64::MAX,
+        u64::MAX,
+    ));
+    assert!(matches!(
+        whnf(&application, &context, budget),
+        WhnfOutcome::Inconclusive(WhnfStop::StringExpansion {
+            stop: StringExpansionStop::Resource {
+                limit: StringExpansionLimit::CodePoints,
+                allowed: 1,
+                observed: 2,
+                ..
+            },
+            ..
+        })
+    ));
+    assert!(matches!(
+        whnf_with(&application, &context, WhnfBudget::unlimited(), || true),
+        WhnfOutcome::Inconclusive(_)
+    ));
+    let result = match whnf(&application, &context, WhnfBudget::unlimited()) {
+        WhnfOutcome::Complete(result) => result,
+        other => panic!("String recursor did not recover: {other:?}"),
+    };
+    let (head, arguments) = app_spine(&result.term, result.term.root());
+    expect_constant(&result.term, head, &["observe"], 0);
+    assert_eq!(list_codes(&result.term, arguments[0]), [97, 955]);
 }
 
 #[test]
