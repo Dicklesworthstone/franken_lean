@@ -261,4 +261,49 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn extra_only_modules_preserve_their_serialized_extension_block() {
+        let metadata = SourceMetadata {
+            reducibility_extra: [
+                ReducibilityStatus::Irreducible,
+                ReducibilityStatus::Reducible,
+            ]
+            .into_iter()
+            .map(|status| ReducibilityExtraEntry {
+                scope: None,
+                declaration: Name::from_components(["Imported", "identity"]),
+                status,
+            })
+            .collect(),
+            ..SourceMetadata::default()
+        };
+        for version in [2, 3] {
+            let encoded = encode_module_with_source_metadata(
+                input(),
+                &metadata,
+                header(version),
+                WriteBudget::default(),
+            )
+            .unwrap();
+            let view = crate::region::OleanView::parse(&encoded.bytes).unwrap();
+            let blocks = view
+                .extension_payloads(crate::region::WalkBudget::default(), 1024 * 1024)
+                .unwrap();
+            assert_eq!(
+                blocks.len(),
+                1,
+                "an override-only module still has metadata"
+            );
+            assert_eq!(
+                blocks[0].name,
+                Name::from_components([source_extensions::REDUCIBILITY_EXTRA_EXTENSION]),
+            );
+            assert_eq!(blocks[0].entries.len(), 2);
+            let decoded = source_extensions::decode(&blocks, DecodeLimits::default()).unwrap();
+            assert_eq!(decoded.reducibility_extra, metadata.reducibility_extra);
+            assert!(decoded.reducibility.is_empty());
+            assert!(decoded.uninterpreted.is_empty());
+        }
+    }
 }

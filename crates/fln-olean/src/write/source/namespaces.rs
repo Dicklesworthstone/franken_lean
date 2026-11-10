@@ -122,6 +122,7 @@ pub(super) fn encode(
             && metadata.defeq.is_empty()
             && metadata.backward_defeq.is_empty()
             && metadata.reducibility.is_empty()
+            && metadata.reducibility_extra.is_empty()
             && metadata.inline.is_empty()
             && metadata.implemented_by.is_empty()
             && metadata.externs.is_empty()
