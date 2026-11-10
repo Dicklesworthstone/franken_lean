@@ -175,7 +175,9 @@ impl Preparation<'_> {
                             };
                             if definition.safety != DefinitionSafety::Safe
                                 || definition.base.level_params.len() != levels.len()
-                                || levels.iter().any(|level| level.has_mvar() || level.has_param())
+                                || levels
+                                    .iter()
+                                    .any(|level| level.has_mvar() || level.has_param())
                             {
                                 return Ok(None);
                             }
@@ -253,7 +255,8 @@ impl Preparation<'_> {
                         .pop()
                         .ok_or_else(|| unsupported("instance prefix receiver"))?
                         .reopen(self, depth)?;
-                    let Some(value) = self.instance_factory_field(&family, index, &receiver)? else {
+                    let Some(value) = self.instance_factory_field(&family, index, &receiver)?
+                    else {
                         return Ok(None);
                     };
                     reserve(&mut values, self.limits.max_nodes)?;
@@ -296,8 +299,7 @@ impl Preparation<'_> {
         if constructor.is_unsafe
             || constructor.base.level_params.len() != levels.len()
             || arguments.len()
-                >= (constructor.num_params as usize)
-                    .saturating_add(constructor.num_fields as usize)
+                >= (constructor.num_params as usize).saturating_add(constructor.num_fields as usize)
             || self.has_implementation(name)?
             || self.has_extern_attribute(name)?
             || self.st_ref_record_forbidden(&constructor.induct)?

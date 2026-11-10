@@ -256,10 +256,7 @@ fn dependent_proof_fields_and_method_shadowing_preserve_local_identity() {
         theorem correct : box.echo 42 = 42 := by rfl",
     );
     assert_eq!(names(&e, "Outer.Box"), ["A"]);
-    assert_eq!(
-        names(&e, "Outer.Box.echo._default"),
-        ["A", "unused"]
-    );
+    assert_eq!(names(&e, "Outer.Box.echo._default"), ["A", "unused"]);
     assert_eq!(
         e.environment()
             .find(&n("Outer.Box"))

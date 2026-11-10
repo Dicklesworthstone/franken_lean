@@ -250,7 +250,13 @@ theorem proofDefault (P : Prop) (witness : P) : P := ({} : Evidence P witness).h
         );
         assert_eq!(engine.logical_root(&KVMap::new()), root);
     }
-    aliases::reference_import(&built, &format!("prelude\nimport Main\n{probe}"), true);
+    // Source artifacts contain checked declarations, not the pin's compiled IR.
+    // These probes check the imported defaults through elaboration and proofs.
+    aliases::reference_import(
+        &built,
+        &format!("prelude\nimport Main\nnoncomputable section\n{probe}"),
+        true,
+    );
     aliases::reference_import(&built, &format!("prelude\nimport Main\n{bad}"), false);
 }
 
@@ -346,7 +352,11 @@ theorem proofDefault (P : Prop) (w : P) : P := (selected P w).holds
                 .is_err()
         );
     }
-    aliases::reference_import(&built, &format!("prelude\nimport Main\n{probe}"), true);
+    aliases::reference_import(
+        &built,
+        &format!("prelude\nimport Main\nnoncomputable section\n{probe}"),
+        true,
+    );
     aliases::reference_import(&built, &format!("prelude\nimport Main\n{bad}"), false);
 }
 

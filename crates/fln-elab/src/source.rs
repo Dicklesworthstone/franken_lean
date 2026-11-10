@@ -3991,6 +3991,35 @@ impl Context {
                                 tasks.push(Task::RecordSource(parts, expected, sources));
                                 tasks.push(Task::Visit(syntax, None, true));
                             } else {
+                                // The pin postpones an update before choosing its
+                                // source structure when a later argument can supply
+                                // the expected type. Retain the owning argument's
+                                // transaction; an inferred declaration without that
+                                // owner can infer its record directly from a source.
+                                if !sources.is_empty()
+                                    && let Some(expected) = &expected
+                                    && let Some(id) =
+                                        self.application_type_unavailable(expected)?
+                                {
+                                    let problem = failure(SourceInferenceError::RecordTerm(
+                                        record_terms::RecordTermError::ExpectedRecordType,
+                                    ));
+                                    let blockers = [postponed::Blocker {
+                                        id,
+                                        problem: problem.clone(),
+                                    }];
+                                    for (index, attempt) in attempts.iter().enumerate().rev() {
+                                        self.tick()?;
+                                        if let Attempt::Argument(checkpoint) = attempt
+                                            && let Some(owner) =
+                                                checkpoint.owned_blocker(self, &blockers)?
+                                        {
+                                            blocked_application = Some(owner.id);
+                                            containing_argument = Some(index);
+                                            return Err(problem);
+                                        }
+                                    }
+                                }
                                 let record_expected = expected.clone();
                                 match self.start_record(parts, expected, sources) {
                                     Ok(record) => tasks.push(Task::RecordNext(record)),

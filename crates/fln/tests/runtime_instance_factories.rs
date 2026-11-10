@@ -247,8 +247,8 @@ def forwardAmountTwice (n : Nat) : Nat := amountTwice (n := n)
 #[test]
 fn computed_polymorphic_dictionary_captures_run_once_across_method_uses() {
     let program = |caller, cost| format!("{COMPUTED_AMOUNT}\n#eval {caller} {cost}");
-    let once = execute(&program("forwardAmount", 30), "30")
-        - execute(&program("forwardAmount", 0), "0");
+    let once =
+        execute(&program("forwardAmount", 30), "30") - execute(&program("forwardAmount", 0), "0");
     let twice = execute(&program("forwardAmountTwice", 30), "60")
         - execute(&program("forwardAmountTwice", 0), "0");
     assert!(once > 30, "the live factory capture was not evaluated");
