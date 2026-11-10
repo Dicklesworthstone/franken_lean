@@ -598,9 +598,8 @@ impl Context {
     /// ordinary lowering, which reads a recursive local's root `match` as its recursion.
     ///
     /// The pin writes `@fun`, so an argument also takes a declared type's leading implicit
-    /// binder (`f : {n : Nat} → Nat | _ => 0` matches on `n`). This elaborator has no `@fun`
-    /// yet, so such a declaration gets the implicit lambda first and is refused where the pin
-    /// accepts it.
+    /// binder (`f : {n : Nat} → Nat | _ => 0` matches on `n`). Explicit discriminants likewise
+    /// preserve an argument that is itself an implicitly quantified function.
     fn let_equations_as_value(
         &mut self,
         mut syntax: Syntax,
@@ -625,7 +624,13 @@ impl Context {
             }
             discriminants.push(Syntax::node(
                 parser_kind(&["Term", "matchDiscr"]),
-                vec![null(vec![]), identifier(fresh)],
+                vec![
+                    null(vec![]),
+                    Syntax::node(
+                        parser_kind(&["Term", "explicit"]),
+                        vec![atom("@"), identifier(fresh)],
+                    ),
+                ],
             ));
         }
         let body = Syntax::node(
@@ -649,6 +654,7 @@ impl Context {
                 ),
             ],
         );
+        let value = Syntax::node(parser_kind(&["Term", "explicit"]), vec![atom("@"), value]);
         Ok(Syntax::Node {
             info,
             kind: parser_kind(&["Term", "letIdDecl"]),
@@ -716,7 +722,6 @@ impl Context {
     fn compile_pattern_function(
         &mut self,
         mut syntax: Syntax,
-        required: &mut Vec<Name>,
     ) -> Result<Syntax, NatDefinitionElabError> {
         let Syntax::Node { args, .. } = &mut syntax else {
             return Err(invalid());
@@ -743,7 +748,13 @@ impl Context {
             }
             discriminants.push(Syntax::node(
                 parser_kind(&["Term", "matchDiscr"]),
-                vec![null(vec![]), identifier(name)],
+                vec![
+                    null(vec![]),
+                    Syntax::node(
+                        parser_kind(&["Term", "explicit"]),
+                        vec![atom("@"), identifier(name)],
+                    ),
+                ],
             ));
         }
         let body = Syntax::node(
@@ -757,7 +768,18 @@ impl Context {
                 alternatives,
             ],
         );
-        let body = self.compile_pattern_matrix(&body, required, None)?;
+        let mut required = Vec::new();
+        let body = self.compile_pattern_matrix(&body, &mut required, None)?;
+        // Coverage belongs to the match body. Keeping this scope inside the
+        // lambda also preserves an enclosing `@fun` telescope marker.
+        let body = if required.is_empty() {
+            body
+        } else {
+            Syntax::node(
+                parser_kind(&["Term", "matrixScope"]),
+                vec![null(required.into_iter().map(identifier).collect()), body],
+            )
+        };
         Ok(Syntax::node(
             parser_kind(&["Term", "fun"]),
             vec![
@@ -1881,7 +1903,7 @@ impl Context {
                         // when the local definition is actually elaborated.
                         self.local_recursive_matrices(node)?
                     } else if pattern_function(&node) {
-                        self.compile_pattern_function(node, &mut required)?
+                        self.compile_pattern_function(node)?
                     } else if complex(&node, &self.txn.env) {
                         let column = if std::ptr::eq(original, root) {
                             self.recursion.as_mut().filter(|r| r.pending).map(|r| {

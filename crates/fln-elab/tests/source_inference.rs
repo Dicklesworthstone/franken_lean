@@ -368,6 +368,63 @@ fn lambda_binders_receive_expected_domains() {
     assert_eq!(binder_type, &nat());
     assert_eq!(body, &b(0));
 }
+
+#[test]
+fn explicit_lambda_binders_consume_expected_implicit_parameters() {
+    let result = accepted(
+        "def identity : {A : Type} -> A -> A := @fun A x => x",
+        &env(),
+    );
+    assert_eq!(
+        result.value,
+        Expr::lam(
+            n("A"),
+            Expr::sort(Level::one()),
+            Expr::lam(n("x"), b(0), b(0), BinderInfo::Default),
+            BinderInfo::Default,
+        )
+    );
+}
+
+#[test]
+fn explicit_lambda_calls_still_insert_written_implicit_arguments() {
+    let result = accepted(
+        "def answer : Nat := (@fun {A : Type} (x : A) => x) 37",
+        &env(),
+    );
+    assert_eq!(result.base.type_, nat());
+}
+
+#[test]
+fn explicit_lambda_markers_do_not_suppress_nested_implicit_lambdas() {
+    let result = accepted(
+        "def nested : {A : Type} -> ({B : Type} -> B -> B) := @fun A => fun x => x",
+        &env(),
+    );
+    let ExprNode::Lam {
+        body, binder_info, ..
+    } = result.value.node()
+    else {
+        panic!("explicit outer lambda expected");
+    };
+    assert_eq!(*binder_info, BinderInfo::Default);
+    let ExprNode::Lam {
+        body, binder_info, ..
+    } = body.node()
+    else {
+        panic!("nested implicit lambda expected");
+    };
+    assert_eq!(*binder_info, BinderInfo::Implicit);
+    let ExprNode::Lam {
+        binder_type, body, ..
+    } = body.node()
+    else {
+        panic!("nested value lambda expected");
+    };
+    assert_eq!(binder_type, &b(0));
+    assert_eq!(body, &b(0));
+}
+
 #[test]
 fn lambda_application_infers_an_unannotated_domain() {
     let result = accepted("def answer := (fun x => x) 37", &env());

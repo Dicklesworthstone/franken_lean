@@ -19,11 +19,11 @@ impl Context {
                 syntax = inner;
                 continue;
             }
-            if syntax.kind() != Some(&parser_kind(&["Term", "fun"])) {
+            let Some((lambda, _)) = self.lambda_syntax(syntax)? else {
                 return Ok(syntax);
-            }
+            };
             let parts = expect_node(
-                syntax,
+                lambda,
                 &parser_kind(&["Term", "fun"]),
                 2,
                 "recursive lambda",
@@ -57,11 +57,11 @@ impl Context {
                 syntax = inner;
                 continue;
             }
-            if syntax.kind() != Some(&parser_kind(&["Term", "fun"])) {
+            let Some((lambda, _)) = self.lambda_syntax(syntax)? else {
                 break;
-            }
+            };
             let parts = expect_node(
-                syntax,
+                lambda,
                 &parser_kind(&["Term", "fun"]),
                 2,
                 "recursive lambda",

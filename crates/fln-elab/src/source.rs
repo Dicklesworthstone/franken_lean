@@ -2108,6 +2108,11 @@ impl Context {
             let parts = expect_node(syntax, &kind, 2, "explicit application")?;
             expect_atom(&parts[0], "@", "explicit application prefix")?;
             let head = &parts[1];
+            if self.lambda_syntax(head)?.is_some() {
+                // `@fun` blocks a lambda's automatic prefix, but does not
+                // make calls of that expression explicit applications.
+                return Ok((syntax, false));
+            }
             if !matches!(head, Syntax::Ident { .. })
                 && head.kind() != Some(&parser_kind(&["Term", "explicitUniv"]))
                 && head.kind() != Some(&parser_kind(&["Term", "proj"]))
@@ -2849,6 +2854,17 @@ impl Context {
                             }
                             if let Some(inner) = parenthesized_inner(syntax)? {
                                 tasks.push(Task::Visit(inner, expected, finish));
+                                continue;
+                            }
+                            if syntax.kind() == Some(&parser_kind(&["Term", "explicit"]))
+                                && self.lambda_syntax(syntax)?.is_some()
+                            {
+                                // Unlike a bare explicit constant, a lambda
+                                // needs its expected telescope while its
+                                // written binders are elaborated.
+                                tasks.push(Task::BinderNext(
+                                    self.start_telescope(syntax, expected, true)?,
+                                ));
                                 continue;
                             }
                             let (head, explicit) = self.explicit_application_head(syntax)?;

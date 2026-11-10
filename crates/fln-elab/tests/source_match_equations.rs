@@ -123,3 +123,28 @@ fn unsupported_matrix_annotations_are_not_silently_dropped() {
     refused("def f (n : Nat) : Nat := match h : n with | Nat.zero => 0 | _ => 1");
     refused("def f (n m : Nat) : Nat := match h : n, m with | Nat.zero, Nat.zero => 0 | _, _ => 1");
 }
+
+#[test]
+fn explicit_pattern_lambdas_and_local_equations_match_implicit_nat_columns() {
+    accepted("def fromPattern : {n : Nat} -> Nat := @fun | 0 => 7 | k+1 => k");
+    accepted(
+        "def localPick (n : Nat) : Nat :=
+          let choose : {m : Nat} -> Nat | 0 => 7 | k+1 => k
+          @choose n",
+    );
+    refused("def incomplete : {n : Nat} -> Nat := @fun | 0 => 7");
+}
+
+#[test]
+fn recursive_local_equations_open_their_expected_implicit_parameters() {
+    accepted(
+        "def count (n : Nat) : Nat :=
+          let rec go : {m : Nat} -> Nat | 0 => 0 | k+1 => Nat.succ (@go k)
+          @go n",
+    );
+    refused(
+        "def nondecreasing (n : Nat) : Nat :=
+          let rec go : {m : Nat} -> Nat | k => @go k
+          @go n",
+    );
+}

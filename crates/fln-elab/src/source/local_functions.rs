@@ -348,7 +348,8 @@ impl Context {
         &mut self,
         build: &mut Build<'a>,
     ) -> Result<(), NatDefinitionElabError> {
-        if prepared(self, build.value_syntax)?.kind() != Some(&parser_kind(&["Term", "fun"])) {
+        let syntax = prepared(self, build.value_syntax)?;
+        if self.lambda_syntax(syntax)?.is_none() {
             return Ok(());
         }
         let saved = self.txn.lctx.clone();
