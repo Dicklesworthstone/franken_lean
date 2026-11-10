@@ -109,8 +109,15 @@ fn expansion(script: &str) -> Syntax {
 #[derive(Clone)]
 enum Candidate {
     Expansion(Syntax),
+    DepthExpansion {
+        terminal_depth: usize,
+        recursive: Syntax,
+        terminal: Syntax,
+    },
     Decline,
-    Diagnostic { no_fallback: bool },
+    Diagnostic {
+        no_fallback: bool,
+    },
     Stop(TacticMacroError),
 }
 
@@ -142,7 +149,7 @@ impl TacticMacroExpander for Provider {
         _: &Syntax,
         candidate: usize,
         scope: u64,
-        _: usize,
+        depth: usize,
         _: &Environment,
         _: &SourceScope,
     ) -> Result<TacticMacroExpansion, TacticMacroError> {
@@ -153,6 +160,18 @@ impl TacticMacroExpander for Provider {
         Ok(match action {
             Candidate::Expansion(syntax) => TacticMacroExpansion::Expanded {
                 syntax: syntax.clone(),
+                no_fallback: false,
+            },
+            Candidate::DepthExpansion {
+                terminal_depth,
+                recursive,
+                terminal,
+            } => TacticMacroExpansion::Expanded {
+                syntax: if depth < *terminal_depth {
+                    recursive.clone()
+                } else {
+                    terminal.clone()
+                },
                 no_fallback: false,
             },
             Candidate::Decline => TacticMacroExpansion::Unsupported,
@@ -463,6 +482,54 @@ fn capability_cancellation_and_internal_faults_never_select_another_branch() {
         );
         assert_eq!(provider.calls.lock().unwrap().len(), 1);
     }
+}
+
+#[test]
+fn nested_generated_tactics_fit_two_mib_and_obey_the_owned_frame_limit() {
+    // Pin the actual stack as well as budget(): a larger RUST_MIN_STACK on a
+    // developer's host must not hide native-frame growth in owned expansions.
+    std::thread::Builder::new()
+        .stack_size(2 * 1024 * 1024)
+        .spawn(|| {
+            let source = "theorem result (n : Nat) : Eq n n := by skip";
+            let mut recursive = expansion("exact (by skip)");
+            retag(&mut recursive);
+            for terminal_depth in [6, 7] {
+                let provider = Provider::new(vec![Candidate::DepthExpansion {
+                    terminal_depth,
+                    recursive: recursive.clone(),
+                    terminal: expansion("rfl"),
+                }]);
+                elaborate(source, provider.clone()).unwrap();
+                assert_eq!(provider.calls.lock().unwrap().len(), terminal_depth + 1);
+            }
+
+            // A generated descendant reenters the evaluator on every step.
+            // Root-to-root macro chains alone do not exercise this stack path.
+            let provider = Provider::new(vec![Candidate::Expansion(recursive)]);
+            let error = elaborate(source, provider.clone()).unwrap_err();
+            let NatDefinitionElabError::Inference(SourceInferenceError::TacticMacro(
+                TacticMacroError::Inconclusive(reason),
+            )) = error
+            else {
+                panic!("nested macro cycle must exhaust its owned frame limit: {error:?}");
+            };
+            assert!(matches!(
+                reason.cause,
+                fln_core::outcome::InconclusiveCause::ResourceExhausted { usage }
+                    if matches!(usage.reason,
+                        fln_core::diag::ResourceReason::RecursionDepth { limit: 8 })
+                        && usage.allowed == 8 && usage.observed == 9
+            ));
+            assert_eq!(provider.calls.lock().unwrap().len(), 9);
+
+            let recovered = Provider::new(vec![Candidate::Expansion(expansion("rfl"))]);
+            elaborate(source, recovered.clone()).unwrap();
+            assert_eq!(recovered.calls.lock().unwrap().len(), 1);
+        })
+        .unwrap()
+        .join()
+        .unwrap();
 }
 
 #[test]

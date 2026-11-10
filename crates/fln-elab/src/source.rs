@@ -2329,6 +2329,9 @@ impl Context {
                 matches!(self, Self::LetI | Self::HaveI)
             }
         }
+        // Keep large continuations indirect. Every task otherwise inherits the
+        // largest state's size, including temporaries in this evaluator's
+        // native stack frame when an owned macro expansion reenters it.
         enum Task<'a> {
             RestoreOptions(KVMap),
             RestoreMacroTerms(usize),
@@ -2356,10 +2359,10 @@ impl Context {
             CaptureRecursiveContext,
             MatchDiscriminant(matching::MatchParts<'a>, Option<Expr>),
             NomatchDiscriminant(Arguments<'a>, Vec<Typed>, Option<Expr>),
-            MatchNext(matching::MatchBuild<'a>),
-            MatchBranch(matching::MatchBuild<'a>, matching::BranchBinders),
-            ConditionalNext(matching::ConditionalBuild<'a>),
-            ConditionalBranch(matching::ConditionalBuild<'a>),
+            MatchNext(Box<matching::MatchBuild<'a>>),
+            MatchBranch(Box<matching::MatchBuild<'a>>, matching::BranchBinders),
+            ConditionalNext(Box<matching::ConditionalBuild<'a>>),
+            ConditionalBranch(Box<matching::ConditionalBuild<'a>>),
             Ascription(&'a Syntax, Option<Expr>, bool),
             AscribedValue(Expr, Option<Expr>, bool),
             Noindex,
@@ -2370,8 +2373,11 @@ impl Context {
             RecordType(record_terms::RecordParts<'a>, Option<Expr>),
             RecordPrepare(record_terms::RecordParts<'a>, Option<Expr>, Vec<Typed>),
             RecordSource(record_terms::RecordParts<'a>, Option<Expr>, Vec<Typed>),
-            RecordNext(record_terms::RecordBuild<'a>),
-            RecordField(record_terms::RecordBuild<'a>, record_terms::RecordTarget),
+            RecordNext(Box<record_terms::RecordBuild<'a>>),
+            RecordField(
+                Box<record_terms::RecordBuild<'a>>,
+                record_terms::RecordTarget,
+            ),
             Visit(&'a Syntax, Option<Expr>, bool),
             /// Enter the term elaborators after macro dispatch, or where the
             /// pin resolves an application head without expanding its macros.
@@ -2400,9 +2406,9 @@ impl Context {
             BinderNext(binders::Telescope<'a>),
             BinderDomain(binders::Telescope<'a>),
             BinderBody(binders::Telescope<'a>),
-            LocalFunctionAnnotation(local_functions::Build<'a>),
-            LocalFunctionStart(local_functions::Build<'a>, Option<usize>),
-            LocalFunctionValue(local_functions::Build<'a>, usize),
+            LocalFunctionAnnotation(Box<local_functions::Build<'a>>),
+            LocalFunctionStart(Box<local_functions::Build<'a>>, Option<usize>),
+            LocalFunctionValue(Box<local_functions::Build<'a>>, usize),
             LetAnnotation(Name, &'a Syntax, &'a Syntax, Option<Expr>, LetKind),
             LetValue(Name, Option<Expr>, &'a Syntax, Option<Expr>, LetKind),
             LetBody(LocalContext, FVarId, Name, Typed, LetKind),
@@ -2414,6 +2420,7 @@ impl Context {
                 bool,
             ),
             Proof(tactics::ProofState<'a>),
+            ProofAdvanced(tactics::ProofState<'a>, Box<tactics::ProofAction<'a>>),
             ChangeTarget(tactics::ProofState<'a>, tactics::ProofGoal),
             SimpaTerm(tactics::ProofState<'a>, tactics::ProofGoal, &'a [Syntax]),
             ProofEliminate(
@@ -2481,6 +2488,23 @@ impl Context {
             LocalFunction(Box<local_functions::Checkpoint<'a>>, postponed::Queue<'a>),
             Argument(Box<postponed::Checkpoint<'a>>),
         }
+        // A generated descendant can reenter this evaluator. Return from the
+        // large native task dispatcher before calling either macro boundary;
+        // the queues and checkpoints already keep its continuations on the heap.
+        enum Step<'a> {
+            Complete(TermResult),
+            ExpandTerm {
+                syntax: &'a Syntax,
+                expected: Option<Expr>,
+                finish: bool,
+                locals: Option<LocalContext>,
+            },
+            AdvanceProof(tactics::ProofState<'a>),
+        }
+        #[inline(never)]
+        fn run_native_tasks<T>(run: impl FnOnce() -> T) -> T {
+            run()
+        }
         let mut attempts: Vec<Attempt<'_>> = Vec::new();
         let inherited_pending_arguments = self.pending_source_arguments;
         let mut pending = postponed::Queue::default();
@@ -2490,1063 +2514,1107 @@ impl Context {
             let mut containing_argument = None;
             let mut blocked_initial_application = None;
             let mut escaping_owned_blocker = None;
-            let result = (|| {
-                loop {
-                    self.pending_source_arguments =
-                        inherited_pending_arguments || !pending.is_empty();
-                    let closes_scope = matches!(
-                        tasks.last(),
-                        Some(
-                            Task::BinderBody(..)
-                                | Task::LetBody(..)
-                                | Task::LocalFunctionValue(..)
-                                | Task::MatchBranch(..)
-                                | Task::DoBindJoinBody(..)
-                                | Task::DoBindJoinValue(..)
-                                | Task::ProofTerm(..)
-                                | Task::MatchTerm(..)
-                                | Task::RefineTerm(..)
-                                | Task::ApplicationTyping(..)
-                                | Task::EquationRhs
-                        )
-                    ) || matches!(tasks.last(), Some(Task::ConditionalBranch(state))
+            let mut resume = None;
+            let result = loop {
+                let step = run_native_tasks(|| {
+                    loop {
+                        let resumed = resume.is_some();
+                        let task = if let Some(task) = resume.take() {
+                            // The suspended task already selected pending work,
+                            // consumed its tick and closed any scope. Finish it
+                            // before another argument or default can interleave.
+                            task
+                        } else {
+                            self.pending_source_arguments =
+                                inherited_pending_arguments || !pending.is_empty();
+                            let closes_scope = matches!(
+                                tasks.last(),
+                                Some(
+                                    Task::BinderBody(..)
+                                        | Task::LetBody(..)
+                                        | Task::LocalFunctionValue(..)
+                                        | Task::MatchBranch(..)
+                                        | Task::DoBindJoinBody(..)
+                                        | Task::DoBindJoinValue(..)
+                                        | Task::ProofTerm(..)
+                                        | Task::MatchTerm(..)
+                                        | Task::RefineTerm(..)
+                                        | Task::ApplicationTyping(..)
+                                        | Task::EquationRhs
+                                )
+                            ) || matches!(tasks.last(), Some(Task::ConditionalBranch(state))
                         if state.closes_scope());
-                    let mut ready = pending.take_ready(self)?;
-                    if ready.is_none()
-                        && (tasks.is_empty() || closes_scope)
-                        && pending.has_current_scope(self)?
-                    {
-                        // A let/lambda closes before the overall term worklist
-                        // is empty. Finish inference while captured locals are
-                        // still available, resuming between individual defaults
-                        // so the callback can constrain other pending numerals.
-                        self.resolve_instances(false)?;
-                        self.flush(false)?;
-                        ready = pending.take_ready(self)?;
-                        if ready.is_none() {
-                            let blockers = pending.scope_blockers(self)?;
-                            if !blockers.is_empty() {
-                                for (index, attempt) in attempts.iter().enumerate().rev() {
-                                    self.tick()?;
-                                    if let Attempt::Argument(checkpoint) = attempt
-                                        && let Some(blocker) =
-                                            checkpoint.outer_blocker(self, &blockers)?
+                            let mut ready = pending.take_ready(self)?;
+                            if ready.is_none()
+                                && (tasks.is_empty() || closes_scope)
+                                && pending.has_current_scope(self)?
+                            {
+                                // A let/lambda closes before the overall term worklist
+                                // is empty. Finish inference while captured locals are
+                                // still available, resuming between individual defaults
+                                // so the callback can constrain other pending numerals.
+                                self.resolve_instances(false)?;
+                                self.flush(false)?;
+                                ready = pending.take_ready(self)?;
+                                if ready.is_none() {
+                                    let blockers = pending.scope_blockers(self)?;
+                                    if !blockers.is_empty() {
+                                        for (index, attempt) in attempts.iter().enumerate().rev() {
+                                            self.tick()?;
+                                            if let Attempt::Argument(checkpoint) = attempt
+                                                && let Some(blocker) =
+                                                    checkpoint.outer_blocker(self, &blockers)?
+                                            {
+                                                // Rewind the whole containing argument,
+                                                // not an already-closed inner lambda.
+                                                // The blocker belongs to that snapshot.
+                                                blocked_application = Some(blocker.id);
+                                                containing_argument = Some(index);
+                                                return Err(blocker.problem);
+                                            }
+                                        }
+                                    }
+                                    if self.resolve_next_default_instance()? {
+                                        continue;
+                                    }
+                                    if self.tactic_macro_depth != 0
+                                        && let Some(blocker) = blockers.into_iter().next()
                                     {
-                                        // Rewind the whole containing argument,
-                                        // not an already-closed inner lambda.
-                                        // The blocker belongs to that snapshot.
-                                        blocked_application = Some(blocker.id);
-                                        containing_argument = Some(index);
+                                        // This queue borrows an owned generated tree.
+                                        // Its containing source argument must replay it
+                                        // before a closing scope discards that tree.
+                                        escaping_owned_blocker = Some(blocker.clone());
                                         return Err(blocker.problem);
                                     }
                                 }
                             }
-                            if self.resolve_next_default_instance()? {
-                                continue;
-                            }
-                            if self.tactic_macro_depth != 0
-                                && let Some(blocker) = blockers.into_iter().next()
-                            {
-                                // This queue borrows an owned generated tree.
-                                // Its containing source argument must replay it
-                                // before a closing scope discards that tree.
-                                escaping_owned_blocker = Some(blocker.clone());
-                                return Err(blocker.problem);
-                            }
-                        }
-                    }
-                    if let Some(argument) = ready {
-                        let checkpoint = postponed::Checkpoint::resume(
-                            self,
-                            &pending,
-                            argument,
-                            tasks.len(),
-                            values.len(),
-                        );
-                        let syntax = checkpoint.syntax;
-                        let expected = checkpoint.expected.clone();
-                        checkpoint.enter_options(self);
-                        let index = attempts.len();
-                        attempts.push(Attempt::Argument(Box::new(checkpoint)));
-                        tasks.push(Task::ArgumentComplete(index));
-                        tasks.push(Task::Visit(syntax, Some(expected), true));
-                    }
-                    let Some(task) = tasks.pop() else {
-                        pending.finish(self)?;
-                        break;
-                    };
-                    let expand_macro = matches!(&task, Task::Visit(..));
-                    self.tick()?;
-                    if matches!(
-                        &task,
-                        Task::BinderBody(..)
-                            | Task::LetBody(..)
-                            | Task::LocalFunctionValue(..)
-                            | Task::MatchBranch(..)
-                            | Task::DoBindJoinBody(..)
-                            | Task::DoBindJoinValue(..)
-                            | Task::ProofTerm(..)
-                            | Task::MatchTerm(..)
-                            | Task::RefineTerm(..)
-                            | Task::ApplicationTyping(..)
-                            | Task::EquationRhs
-                    ) || matches!(&task, Task::ConditionalBranch(state) if state.closes_scope())
-                    {
-                        // Every still-unresolved argument keeps its original
-                        // scope. A later assignment cannot enter a lambda or
-                        // structural branch after that scope has been closed.
-                        pending.close_scope(self)?;
-                    }
-                    match task {
-                        Task::EquationRhs => self.finish_equation_rhs()?,
-                        Task::RestoreOptions(options) => self.txn.options = options,
-                        Task::ApplicationTyping(syntax, check) => {
-                            self.finish_application_typing(syntax, check)?;
-                        }
-                        Task::DoPureValue(expected) => {
-                            let argument = values.pop().expect("do return value visit");
-                            let monad = match &expected {
-                                Some(type_) => self.do_monad(type_)?,
-                                None => None,
-                            };
-                            let function = self.do_operation(false, monad)?;
-                            let function = self.do_pure_result(function, expected.as_ref())?;
-                            let function = self
-                                .insert_implicits(function, ImplicitInsertion::ExplicitArgument)?;
-                            let term = self.match_apply(function, argument)?;
-                            values.push(self.finish_application(term, expected.as_ref())?);
-                        }
-                        Task::DoBlockResult(expected) => {
-                            let mut term = values.pop().expect("do block body visit");
-                            self.constrain_type(&term.type_, &expected)?;
-                            term.type_ = expected;
-                            values.push(term);
-                        }
-                        Task::CheckArgument(syntax, expected, infer_exception_action) => {
-                            if let Some(checkpoint) = postponed::Checkpoint::argument(
-                                self,
-                                &pending,
-                                syntax,
-                                expected.clone(),
-                                tasks.len(),
-                                values.len(),
-                            )? {
+                            if let Some(argument) = ready {
+                                let checkpoint = postponed::Checkpoint::resume(
+                                    self,
+                                    &pending,
+                                    argument,
+                                    tasks.len(),
+                                    values.len(),
+                                );
+                                let syntax = checkpoint.syntax;
+                                let expected = checkpoint.expected.clone();
+                                checkpoint.enter_options(self);
                                 let index = attempts.len();
                                 attempts.push(Attempt::Argument(Box::new(checkpoint)));
                                 tasks.push(Task::ArgumentComplete(index));
-                            }
-                            if infer_exception_action {
-                                tasks.push(Task::InferredExceptionArgument(expected));
-                                tasks.push(Task::Visit(syntax, None, true));
-                            } else {
                                 tasks.push(Task::Visit(syntax, Some(expected), true));
                             }
-                        }
-                        Task::InferredExceptionArgument(expected) => {
-                            let action = values.pop().expect("inferred protected action visit");
-                            values.push(self.finish_do_exception_action(action, &expected)?);
-                        }
-                        Task::ArgumentComplete(index) => {
-                            if index + 1 != attempts.len() {
-                                return Err(failure(SourceInferenceError::Scope));
-                            }
-                            let Some(Attempt::Argument(checkpoint)) = attempts.last() else {
-                                return Err(failure(SourceInferenceError::Scope));
+                            let Some(task) = tasks.pop() else {
+                                pending.finish(self)?;
+                                break;
                             };
-                            if checkpoint.tasks != tasks.len()
-                                || checkpoint.values + 1 != values.len()
+                            self.tick()?;
+                            if matches!(
+                                &task,
+                                Task::BinderBody(..)
+                                    | Task::LetBody(..)
+                                    | Task::LocalFunctionValue(..)
+                                    | Task::MatchBranch(..)
+                                    | Task::DoBindJoinBody(..)
+                                    | Task::DoBindJoinValue(..)
+                                    | Task::ProofTerm(..)
+                                    | Task::MatchTerm(..)
+                                    | Task::RefineTerm(..)
+                                    | Task::ApplicationTyping(..)
+                                    | Task::EquationRhs
+                            ) || matches!(&task, Task::ConditionalBranch(state) if state.closes_scope())
                             {
-                                return Err(failure(SourceInferenceError::Scope));
+                                // Every still-unresolved argument keeps its original
+                                // scope. A later assignment cannot enter a lambda or
+                                // structural branch after that scope has been closed.
+                                pending.close_scope(self)?;
                             }
-                            if let Some(hole) = &checkpoint.hole {
-                                let value = values.pop().expect("resumed argument visit");
-                                self.constrain_type(&value.type_, &checkpoint.expected)?;
-                                let ExprNode::MVar { id } = hole.node() else {
+                            task
+                        };
+                        let expand_macro = matches!(&task, Task::Visit(..));
+                        match task {
+                            Task::EquationRhs => self.finish_equation_rhs()?,
+                            Task::RestoreOptions(options) => self.txn.options = options,
+                            Task::ApplicationTyping(syntax, check) => {
+                                self.finish_application_typing(syntax, check)?;
+                            }
+                            Task::DoPureValue(expected) => {
+                                let argument = values.pop().expect("do return value visit");
+                                let monad = match &expected {
+                                    Some(type_) => self.do_monad(type_)?,
+                                    None => None,
+                                };
+                                let function = self.do_operation(false, monad)?;
+                                let function = self.do_pure_result(function, expected.as_ref())?;
+                                let function = self.insert_implicits(
+                                    function,
+                                    ImplicitInsertion::ExplicitArgument,
+                                )?;
+                                let term = self.match_apply(function, argument)?;
+                                values.push(self.finish_application(term, expected.as_ref())?);
+                            }
+                            Task::DoBlockResult(expected) => {
+                                let mut term = values.pop().expect("do block body visit");
+                                self.constrain_type(&term.type_, &expected)?;
+                                term.type_ = expected;
+                                values.push(term);
+                            }
+                            Task::CheckArgument(syntax, expected, infer_exception_action) => {
+                                if let Some(checkpoint) = postponed::Checkpoint::argument(
+                                    self,
+                                    &pending,
+                                    syntax,
+                                    expected.clone(),
+                                    tasks.len(),
+                                    values.len(),
+                                )? {
+                                    let index = attempts.len();
+                                    attempts.push(Attempt::Argument(Box::new(checkpoint)));
+                                    tasks.push(Task::ArgumentComplete(index));
+                                }
+                                if infer_exception_action {
+                                    tasks.push(Task::InferredExceptionArgument(expected));
+                                    tasks.push(Task::Visit(syntax, None, true));
+                                } else {
+                                    tasks.push(Task::Visit(syntax, Some(expected), true));
+                                }
+                            }
+                            Task::InferredExceptionArgument(expected) => {
+                                let action = values.pop().expect("inferred protected action visit");
+                                values.push(self.finish_do_exception_action(action, &expected)?);
+                            }
+                            Task::ArgumentComplete(index) => {
+                                if index + 1 != attempts.len() {
+                                    return Err(failure(SourceInferenceError::Scope));
+                                }
+                                let Some(Attempt::Argument(checkpoint)) = attempts.last() else {
                                     return Err(failure(SourceInferenceError::Scope));
                                 };
-                                self.txn
-                                    .assign_mvar(
-                                        id.clone(),
-                                        value.value,
-                                        AssignmentJustification::SyntheticHole,
-                                    )
-                                    .map_err(|error| {
-                                        failure(SourceInferenceError::Unification(Box::new(
-                                            UnificationError::Metavariable(error),
-                                        )))
-                                    })?;
-                            }
-                            checkpoint.finish_options(self);
-                            attempts.pop();
-                        }
-                        Task::DoAction(arguments, expected) => {
-                            let action = values.pop().expect("do action visit");
-                            let function = self.do_action(action)?;
-                            tasks.push(Task::Apply(
-                                function,
-                                Arguments::Plain(arguments),
-                                expected,
-                                false,
-                            ));
-                        }
-                        Task::CalcNext(mut build) => {
-                            if let Some(&(relation, proof)) = build.steps.get(build.cursor) {
-                                if proof.is_none() {
-                                    tasks.push(Task::CalcStart(build));
-                                    tasks.push(Task::Visit(relation, None, true));
-                                    continue;
-                                }
-                                // The pin elaborates a calc relation with
-                                // `elabType`; its result may inhabit any Sort.
-                                let expected = self.type_expected()?;
-                                tasks.push(Task::CalcRelation(build));
-                                tasks.push(Task::Visit(relation, Some(expected), true));
-                            } else {
-                                let deferred = std::mem::take(&mut build.deferred);
-                                let chain = self.finish_calculation(build)?;
-                                if deferred.is_empty() {
-                                    values.push(chain);
-                                } else {
-                                    tasks.push(Task::CalcDeferredFinish(chain));
-                                    for (hole, proof) in deferred.into_iter().rev() {
-                                        tasks.push(Task::CalcDeferredVisit(hole, proof));
-                                    }
-                                }
-                            }
-                        }
-                        Task::CalcDeferredVisit(hole, proof) => {
-                            let expected = self.deferred_calculation_type(&hole)?;
-                            tasks.push(Task::CalcDeferredAssign(hole));
-                            tasks.push(Task::Visit(proof, Some(expected), true));
-                        }
-                        Task::CalcDeferredAssign(hole) => {
-                            let proof = values.pop().expect("deferred calculation proof visit");
-                            self.assign_calculation_proof(hole, proof)?;
-                        }
-                        Task::CalcDeferredFinish(mut chain) => {
-                            chain.value = self.instantiate(&chain.value)?;
-                            chain.type_ = self.instantiate(&chain.type_)?;
-                            values.push(chain);
-                        }
-                        Task::CalcStart(mut build) => {
-                            let start = values.pop().expect("calculation start visit");
-                            let (relation, proof) = self.calculation_start(start)?;
-                            let relation = self.prepare_calculation_step(&mut build, relation)?;
-                            self.add_calculation_step(&mut build, relation, proof)?;
-                            tasks.push(Task::CalcNext(build));
-                        }
-                        Task::CalcRelation(mut build) => {
-                            let relation = values.pop().expect("calculation relation visit");
-                            let relation = self.prepare_calculation_step(&mut build, relation)?;
-                            let proof = build.steps[build.cursor]
-                                .1
-                                .ok_or_else(|| failure(SourceInferenceError::Scope))?;
-                            if self.deferred_calculation_proof(&relation, proof)? {
-                                self.defer_calculation_proof(&mut build, relation, proof)?;
-                                tasks.push(Task::CalcNext(build));
-                                continue;
-                            }
-                            tasks.push(Task::CalcProof(build, relation.clone()));
-                            tasks.push(Task::Visit(proof, Some(relation), true));
-                        }
-                        Task::CalcProof(mut build, relation) => {
-                            let proof = values.pop().expect("calculation step proof visit");
-                            self.add_calculation_step(&mut build, relation, proof)?;
-                            tasks.push(Task::CalcNext(build));
-                        }
-                        Task::MatrixScope(rows) => {
-                            for row in rows {
-                                self.tick()?;
-                                if !self.matrix_rows.remove(&row) {
-                                    return Err(failure(SourceInferenceError::Match(
-                                        matching::MatchError::UnreachableRow,
-                                    )));
-                                }
-                            }
-                        }
-                        Task::Observe(syntax, locals) => {
-                            let term = values.last().expect("observed term visit");
-                            self.observe_term(syntax, term.clone(), locals)?;
-                        }
-                        Task::CaptureRecursiveContext => {
-                            let value = values.pop().expect("contextual match visit");
-                            values.push(self.capture_recursive_context(value)?);
-                        }
-                        Task::VisitWithoutImplicitLambda(syntax, expected, expand_macro) => {
-                            tasks.push(Task::RestoreImplicitLambda(
-                                self.no_implicit_lambda_types.len(),
-                            ));
-                            if let Some(type_) = &expected {
-                                let type_ = self.instantiate(type_)?;
-                                self.no_implicit_lambda_types.push(type_);
-                            }
-                            tasks.push(if expand_macro {
-                                Task::Visit(syntax, expected, true)
-                            } else {
-                                Task::Elaborate(syntax, expected, true)
-                            });
-                        }
-                        Task::RestoreImplicitLambda(length) => {
-                            self.no_implicit_lambda_types.truncate(length);
-                        }
-                        Task::RestoreMacroTerms(previous) => {
-                            self.tactic_macro_terms = previous;
-                        }
-                        Task::Visit(syntax, expected, finish)
-                        | Task::Elaborate(syntax, expected, finish) => {
-                            if let Some((row, body)) =
-                                equation_theorems::macro_replay::parts(syntax)
-                            {
-                                if self.begin_equation_rhs(row, body, finish)? {
-                                    tasks.push(Task::EquationRhs);
-                                }
-                                tasks.push(if expand_macro {
-                                    Task::Visit(body, expected, finish)
-                                } else {
-                                    Task::Elaborate(body, expected, finish)
-                                });
-                                continue;
-                            }
-                            if expand_macro {
-                                let locals =
-                                    self.observes_term(syntax).then(|| self.txn.lctx.clone());
-                                if let Some(literal) =
-                                    tactics::imported_macros::prepared_pattern_literal(syntax)?
+                                if checkpoint.tasks != tasks.len()
+                                    || checkpoint.values + 1 != values.len()
                                 {
-                                    // The matrix already expanded and decoded this literal.
-                                    // Elaborate its primitive syntax in this worklist: a
-                                    // nested evaluator retains another large native frame.
-                                    // Only num/str/char cross this boundary; their atom
-                                    // elaborators never visit child syntax. Skipping this
-                                    // lookup preserves compact predecessors without
-                                    // disabling macros for deferred sibling arguments.
-                                    if let Some(locals) = locals {
-                                        tasks.push(Task::Observe(syntax, locals));
-                                    }
-                                    tasks.push(Task::Elaborate(literal, expected, finish));
-                                    continue;
+                                    return Err(failure(SourceInferenceError::Scope));
                                 }
-                                if let Some(term) =
-                                    self.imported_tactic_term(syntax, expected.clone(), finish)?
-                                {
-                                    if let Some(locals) = locals {
-                                        self.observe_term(syntax, term.clone(), locals)?;
-                                    }
-                                    values.push(term);
-                                    continue;
+                                if let Some(hole) = &checkpoint.hole {
+                                    let value = values.pop().expect("resumed argument visit");
+                                    self.constrain_type(&value.type_, &checkpoint.expected)?;
+                                    let ExprNode::MVar { id } = hole.node() else {
+                                        return Err(failure(SourceInferenceError::Scope));
+                                    };
+                                    self.txn
+                                        .assign_mvar(
+                                            id.clone(),
+                                            value.value,
+                                            AssignmentJustification::SyntheticHole,
+                                        )
+                                        .map_err(|error| {
+                                            failure(SourceInferenceError::Unification(Box::new(
+                                                UnificationError::Metavariable(error),
+                                            )))
+                                        })?;
                                 }
+                                checkpoint.finish_options(self);
+                                attempts.pop();
                             }
-                            // The pin's implicit lambda (`binders::start_implicit_lambda`). The
-                            // body is this same term against the type that remains.
-                            // elabImplicitLambdaAux enters elabUsingElabFns directly:
-                            // an unsupported macro must not execute a second time.
-                            if finish
-                                && let Some(type_) = &expected
-                                && let Some(state) = self.start_implicit_lambda(syntax, type_)?
-                            {
-                                let expected = self.telescope_body_expected(&state)?;
-                                tasks.push(Task::BinderBody(state));
-                                tasks.push(Task::Elaborate(syntax, expected, true));
-                                continue;
-                            }
-                            if self.observes_term(syntax) {
-                                tasks.push(Task::Observe(syntax, self.txn.lctx.clone()));
-                            }
-                            if let Some(inner) = parenthesized_inner(syntax)? {
-                                tasks.push(Task::Visit(inner, expected, finish));
-                                continue;
-                            }
-                            if syntax.kind() == Some(&parser_kind(&["Term", "explicit"]))
-                                && self.lambda_syntax(syntax)?.is_some()
-                            {
-                                // Unlike a bare explicit constant, a lambda
-                                // needs its expected telescope while its
-                                // written binders are elaborated.
-                                tasks.push(Task::BinderNext(
-                                    self.start_telescope(syntax, expected, true)?,
+                            Task::DoAction(arguments, expected) => {
+                                let action = values.pop().expect("do action visit");
+                                let function = self.do_action(action)?;
+                                tasks.push(Task::Apply(
+                                    function,
+                                    Arguments::Plain(arguments),
+                                    expected,
+                                    false,
                                 ));
-                                continue;
                             }
-                            let (head, explicit) = self.explicit_application_head(syntax)?;
-                            if explicit {
-                                tasks.push(Task::StartApplication(head, &[], expected, true));
-                                continue;
-                            }
-                            if let Syntax::Node { kind, args, .. } = syntax {
-                                if kind == &parser_kind(&["Term", "set_option"]) {
-                                    let (body, options) = self.enter_source_options(args)?;
-                                    tasks.push(Task::RestoreOptions(options));
-                                    tasks.push(Task::Visit(body, expected, finish));
-                                    continue;
-                                }
-                                if kind == &parser_kind(&["Term", "recursiveContextCapture"]) {
-                                    let [body] = args.as_slice() else {
-                                        return Err(failure(SourceInferenceError::Scope));
-                                    };
-                                    tasks.push(Task::CaptureRecursiveContext);
-                                    tasks.push(Task::Visit(body, expected, finish));
-                                    continue;
-                                }
-                                // A whole `do` block (`do_notation::expand_do_node`): a known
-                                // expected type must name a monad application, the pin's
-                                // `extractMonadInfo` (`Lean/Elab/Do/Basic.lean:743-757`), and
-                                // the block is elaborated at that application. An unknown type
-                                // is left to its binds.
-                                if kind == &parser_kind(&["Term", "nativeDoBlock"]) {
-                                    let [body] = args.as_slice() else {
-                                        return Err(failure(SourceInferenceError::Scope));
-                                    };
-                                    let original = expected;
-                                    let expected = match &original {
-                                        Some(type_) => self
-                                            .do_expected_monad_type(type_)?
-                                            .ok_or_else(|| {
-                                                failure(
-                                                    SourceInferenceError::DoExpectedTypeNotMonad,
-                                                )
-                                            })?,
-                                        None => self.do_unknown_monad_type()?,
-                                    };
-                                    // The pin's block always builds `pure` for its result
-                                    // (`DoElemCont.mkPure`, then `mkBindUnlessPure`, vendored
-                                    // `Lean/Elab/Do/Basic.lean:272-302, 512-525`). That asks for a
-                                    // `Pure m` instance even where the bind is then contracted away,
-                                    // so a block at a monad without one is refused there.
-                                    if let Some(monad) = self.do_monad(&expected)? {
-                                        let pure = self.do_operation(false, Some(monad))?;
-                                        let type_ = self.whnf(&pure.type_)?;
-                                        let ExprNode::ForallE {
-                                            binder_type,
-                                            binder_info: BinderInfo::InstImplicit,
-                                            ..
-                                        } = type_.node()
-                                        else {
-                                            return Err(failure(SourceInferenceError::Scope));
-                                        };
-                                        self.instance_hole(binder_type.clone())?;
+                            Task::CalcNext(mut build) => {
+                                if let Some(&(relation, proof)) = build.steps.get(build.cursor) {
+                                    if proof.is_none() {
+                                        tasks.push(Task::CalcStart(build));
+                                        tasks.push(Task::Visit(relation, None, true));
+                                        continue;
                                     }
-                                    // A fresh monad/result must not erase the original
-                                    // declaration result family. Relate them only after
-                                    // the action determines the monad, so a flex-flex
-                                    // equation cannot select that family as the monad.
-                                    if let Some(original) = original {
-                                        tasks.push(Task::DoBlockResult(original));
-                                    }
-                                    tasks.push(Task::Visit(body, Some(expected), finish));
-                                    continue;
-                                }
-                                if kind == &parser_kind(&["Term", "nativeDoForCollection"]) {
-                                    let [collection] = args.as_slice() else {
-                                        return Err(failure(SourceInferenceError::Scope));
-                                    };
-                                    tasks.push(Task::ForCollection(expected));
-                                    tasks.push(Task::Visit(collection, None, true));
-                                    continue;
-                                }
-                                // A reassignment's type: the type of the variable it replaces
-                                // (`do_notation::mutation`).
-                                if kind == &parser_kind(&["Term", "nativeDoTypeOf"]) {
-                                    let [Syntax::Ident { val, .. }] = args.as_slice() else {
-                                        return Err(failure(SourceInferenceError::Scope));
-                                    };
-                                    let local = self
-                                        .txn
-                                        .lctx
-                                        .find_by_user_name(val)
-                                        .ok_or_else(|| failure(SourceInferenceError::Scope))?;
-                                    let value = self.instantiate(&local.type_.clone())?;
-                                    let type_ = self.known_type(&value)?.ok_or_else(|| {
-                                        failure(SourceInferenceError::ExpectedType)
-                                    })?;
-                                    let term = Typed { value, type_ };
-                                    values.push(if finish {
-                                        self.finish_term(term, expected.as_ref())?
+                                    // The pin elaborates a calc relation with
+                                    // `elabType`; its result may inhabit any Sort.
+                                    let expected = self.type_expected()?;
+                                    tasks.push(Task::CalcRelation(build));
+                                    tasks.push(Task::Visit(relation, Some(expected), true));
+                                } else {
+                                    let deferred = std::mem::take(&mut build.deferred);
+                                    let chain = self.finish_calculation(build)?;
+                                    if deferred.is_empty() {
+                                        values.push(chain);
                                     } else {
-                                        term
-                                    });
-                                    continue;
-                                }
-                                if kind == &parser_kind(&["Term", "nativeDoJoin"]) {
-                                    let (name, suffix, body) = do_notation::join_parts(args)?;
-                                    tasks.push(Task::DoJoinValue(name, body, expected.clone()));
-                                    tasks.push(Task::Visit(suffix, expected, true));
-                                    continue;
-                                }
-                                if kind == &parser_kind(&["Term", "nativeDoBindJoin"]) {
-                                    let (name, continuation, body) = do_notation::join_parts(args)?;
-                                    let result_type = match expected {
-                                        Some(expected) => expected,
-                                        None => {
-                                            let sort = self.type_expected()?;
-                                            self.hole(sort)?
+                                        tasks.push(Task::CalcDeferredFinish(chain));
+                                        for (hole, proof) in deferred.into_iter().rev() {
+                                            tasks.push(Task::CalcDeferredVisit(hole, proof));
                                         }
-                                    };
-                                    let annotation = do_notation::bind_join_domain(continuation)?;
-                                    tasks.push(Task::DoBindJoinStart(
-                                        name,
-                                        continuation,
-                                        body,
-                                        result_type,
-                                        annotation.is_some(),
-                                    ));
-                                    if let Some(annotation) = annotation {
-                                        tasks.push(Task::Visit(
-                                            annotation,
-                                            Some(self.type_expected()?),
-                                            true,
-                                        ));
                                     }
+                                }
+                            }
+                            Task::CalcDeferredVisit(hole, proof) => {
+                                let expected = self.deferred_calculation_type(&hole)?;
+                                tasks.push(Task::CalcDeferredAssign(hole));
+                                tasks.push(Task::Visit(proof, Some(expected), true));
+                            }
+                            Task::CalcDeferredAssign(hole) => {
+                                let proof = values.pop().expect("deferred calculation proof visit");
+                                self.assign_calculation_proof(hole, proof)?;
+                            }
+                            Task::CalcDeferredFinish(mut chain) => {
+                                chain.value = self.instantiate(&chain.value)?;
+                                chain.type_ = self.instantiate(&chain.type_)?;
+                                values.push(chain);
+                            }
+                            Task::CalcStart(mut build) => {
+                                let start = values.pop().expect("calculation start visit");
+                                let (relation, proof) = self.calculation_start(start)?;
+                                let relation =
+                                    self.prepare_calculation_step(&mut build, relation)?;
+                                self.add_calculation_step(&mut build, relation, proof)?;
+                                tasks.push(Task::CalcNext(build));
+                            }
+                            Task::CalcRelation(mut build) => {
+                                let relation = values.pop().expect("calculation relation visit");
+                                let relation =
+                                    self.prepare_calculation_step(&mut build, relation)?;
+                                let proof = build.steps[build.cursor]
+                                    .1
+                                    .ok_or_else(|| failure(SourceInferenceError::Scope))?;
+                                if self.deferred_calculation_proof(&relation, proof)? {
+                                    self.defer_calculation_proof(&mut build, relation, proof)?;
+                                    tasks.push(Task::CalcNext(build));
                                     continue;
                                 }
-                                if kind == &parser_kind(&["Term", "nativeDoNestedAnnotation"]) {
-                                    let [annotation, body] = args.as_slice() else {
-                                        return Err(failure(SourceInferenceError::Scope));
-                                    };
-                                    tasks.push(Task::DoNestedAnnotation(body, expected, finish));
-                                    tasks.push(Task::Visit(
-                                        annotation,
-                                        Some(self.type_expected()?),
-                                        true,
-                                    ));
-                                    continue;
-                                }
-                                if kind == &parser_kind(&["Term", "nativeDoRepeatDefault"]) {
-                                    let [normal, fallback] = args.as_slice() else {
-                                        return Err(failure(SourceInferenceError::Scope));
-                                    };
-                                    let body =
-                                        if self.do_repeat_needs_fallback(expected.as_ref())? {
-                                            fallback
-                                        } else {
-                                            normal
-                                        };
-                                    tasks.push(Task::Visit(body, expected, finish));
-                                    continue;
-                                }
-                                let repeat =
-                                    kind == &parser_kind(&["Term", "nativeDoRepeatResult"]);
-                                if repeat {
-                                    let [action, _] = args.as_slice() else {
-                                        return Err(failure(SourceInferenceError::Scope));
-                                    };
-                                    if !self.do_repeat_needs_fallback(expected.as_ref())? {
-                                        tasks.push(Task::Visit(action, expected, finish));
-                                        continue;
-                                    }
-                                }
-                                if repeat
-                                    || kind == &parser_kind(&["Term", "nativeDoBind"])
-                                    || kind == &parser_kind(&["Term", "nativeDoPure"])
-                                    || kind == &parser_kind(&["Term", "nativeDoNestedAction"])
-                                {
-                                    let nested =
-                                        kind == &parser_kind(&["Term", "nativeDoNestedAction"]);
-                                    let bind = repeat
-                                        || nested
-                                        || kind == &parser_kind(&["Term", "nativeDoBind"]);
-                                    if args.len() != if bind { 2 } else { 1 } {
-                                        return Err(failure(SourceInferenceError::Scope));
-                                    }
-                                    if !bind {
-                                        // Check the value before creating Pure's dictionary.
-                                        // Its type can determine the monad's universe, as in
-                                        // `Id.run do return (42 : Nat)`. Keep the written
-                                        // result parameter even for a noninjective monad.
-                                        let value_type =
-                                            self.do_pure_result_type(expected.as_ref())?;
-                                        tasks.push(Task::DoPureValue(expected));
-                                        tasks.push(match value_type {
-                                            Some(type_) => {
-                                                Task::CheckArgument(&args[0], type_, false)
-                                            }
-                                            None => Task::Visit(&args[0], None, true),
-                                        });
-                                        continue;
-                                    }
-                                    let monad = match &expected {
-                                        Some(type_) => self.do_monad(type_)?,
-                                        None => None,
-                                    };
-                                    if bind && monad.is_none() && !nested {
-                                        tasks.push(Task::DoAction(&args[1..], expected));
-                                        tasks.push(Task::Visit(&args[0], None, true));
-                                    } else {
-                                        let function = self.do_operation(bind, monad)?;
-                                        let function = if nested {
-                                            self.do_nested_action_function(function, &args[1])?
-                                        } else {
-                                            function
-                                        };
-                                        tasks.push(Task::Apply(
-                                            function,
-                                            Arguments::Plain(args),
-                                            expected,
-                                            false,
-                                        ));
-                                    }
-                                    continue;
-                                }
-                                if kind == &parser_kind(&["Term", "matrixScope"]) {
-                                    let [rows, body] = args.as_slice() else {
-                                        return Err(failure(SourceInferenceError::Scope));
-                                    };
-                                    let mut names = Vec::new();
-                                    for row in expect_null_args(rows, "pattern coverage witnesses")?
-                                    {
-                                        self.tick()?;
-                                        let Syntax::Ident { val, .. } = row else {
-                                            return Err(failure(SourceInferenceError::Scope));
-                                        };
-                                        names.push(val.clone());
-                                    }
-                                    tasks.push(Task::MatrixScope(names));
-                                    tasks.push(Task::Visit(body, expected, finish));
-                                    continue;
-                                }
-                                if kind == &parser_kind(&["Term", "matrixAlias"]) {
-                                    let [Syntax::Ident { val: name, .. }, subject, body] =
-                                        args.as_slice()
-                                    else {
-                                        return Err(failure(SourceInferenceError::Scope));
-                                    };
-                                    // A name written at a promoted parameter position
-                                    // (`| .done k, _`): the pin's type mismatch.
-                                    if let Syntax::Ident { val: column, .. } = subject
-                                        && self.inaccessible_columns.contains(column)
-                                    {
+                                tasks.push(Task::CalcProof(build, relation.clone()));
+                                tasks.push(Task::Visit(proof, Some(relation), true));
+                            }
+                            Task::CalcProof(mut build, relation) => {
+                                let proof = values.pop().expect("calculation step proof visit");
+                                self.add_calculation_step(&mut build, relation, proof)?;
+                                tasks.push(Task::CalcNext(build));
+                            }
+                            Task::MatrixScope(rows) => {
+                                for row in rows {
+                                    self.tick()?;
+                                    if !self.matrix_rows.remove(&row) {
                                         return Err(failure(SourceInferenceError::Match(
-                                            matching::MatchError::InaccessibleParameter,
+                                            matching::MatchError::UnreachableRow,
                                         )));
                                     }
-                                    let value = self.atom(subject, None)?;
-                                    if !matches!(value.value.node(), ExprNode::FVar { .. }) {
-                                        return Err(failure(SourceInferenceError::Scope));
+                                }
+                            }
+                            Task::Observe(syntax, locals) => {
+                                let term = values.last().expect("observed term visit");
+                                self.observe_term(syntax, term.clone(), locals)?;
+                            }
+                            Task::CaptureRecursiveContext => {
+                                let value = values.pop().expect("contextual match visit");
+                                values.push(self.capture_recursive_context(value)?);
+                            }
+                            Task::VisitWithoutImplicitLambda(syntax, expected, expand_macro) => {
+                                tasks.push(Task::RestoreImplicitLambda(
+                                    self.no_implicit_lambda_types.len(),
+                                ));
+                                if let Some(type_) = &expected {
+                                    let type_ = self.instantiate(type_)?;
+                                    self.no_implicit_lambda_types.push(type_);
+                                }
+                                tasks.push(if expand_macro {
+                                    Task::Visit(syntax, expected, true)
+                                } else {
+                                    Task::Elaborate(syntax, expected, true)
+                                });
+                            }
+                            Task::RestoreImplicitLambda(length) => {
+                                self.no_implicit_lambda_types.truncate(length);
+                            }
+                            Task::RestoreMacroTerms(previous) => {
+                                self.tactic_macro_terms = previous;
+                            }
+                            Task::Visit(syntax, expected, finish)
+                            | Task::Elaborate(syntax, expected, finish) => {
+                                if !resumed
+                                    && let Some((row, body)) =
+                                        equation_theorems::macro_replay::parts(syntax)
+                                {
+                                    if self.begin_equation_rhs(row, body, finish)? {
+                                        tasks.push(Task::EquationRhs);
                                     }
-                                    let saved = self.txn.lctx.clone();
-                                    let id = FVarId(self.fresh_name()?);
-                                    self.txn.lctx.add_let(
-                                        id.clone(),
-                                        name.clone(),
-                                        value.type_.clone(),
-                                        value.value.clone(),
-                                    );
-                                    self.matrix_aliases.insert(id.clone(), value.value.clone());
-                                    tasks.push(Task::LetBody(
-                                        saved,
-                                        id,
-                                        name.clone(),
-                                        value,
-                                        LetKind::Let,
-                                    ));
-                                    tasks.push(Task::Visit(body, expected, finish));
-                                    continue;
-                                }
-                                if kind == &parser_kind(&["Term", "matrixBranch"]) {
-                                    let [Syntax::Ident { val, .. }, body] = args.as_slice() else {
-                                        return Err(failure(SourceInferenceError::Scope));
-                                    };
-                                    self.matrix_rows.insert(val.clone());
-                                    tasks.push(Task::Visit(body, expected, finish));
-                                    continue;
-                                }
-                                if kind == &parser_kind(&["Term", "forall"])
-                                    || kind == &parser_kind(&["Term", "fun"])
-                                    || kind == &parser_kind(&["Term", "depArrow"])
-                                {
-                                    let lambda = kind == &parser_kind(&["Term", "fun"]);
-                                    tasks.push(Task::BinderNext(
-                                        self.start_telescope(syntax, expected, lambda)?,
-                                    ));
-                                    continue;
-                                }
-                                if kind == &parser_kind(&["Term", "nofun"]) {
-                                    tasks.push(Task::Proof(
-                                        self.start_empty_function(syntax, expected)?,
-                                    ));
-                                    continue;
-                                }
-                                if kind == &parser_kind(&["Term", "nomatch"]) {
-                                    let items = self.nomatch_discriminants(syntax)?;
-                                    let arguments = Arguments::Separated(items, &[","]);
-                                    let (first, remaining) =
-                                        arguments.split_first().expect("nonempty discriminants");
-                                    tasks.push(Task::NomatchDiscriminant(
-                                        remaining,
-                                        Vec::new(),
-                                        expected,
-                                    ));
-                                    tasks.push(Task::Visit(first, None, true));
-                                    continue;
-                                }
-                                // The pin's first elaboration of a pattern matrix's atomic
-                                // discriminants (`deprecated.rs`), then its first input.
-                                if kind == &parser_kind(&["Term", deprecated::RECHECK]) {
-                                    let [identifiers, value] = args.as_slice() else {
-                                        return Err(failure(SourceInferenceError::Scope));
-                                    };
-                                    let identifiers =
-                                        expect_null_args(identifiers, "rechecked discriminants")?;
-                                    self.recheck_identifiers(identifiers)?;
-                                    tasks.push(Task::Visit(value, expected, finish));
-                                    continue;
-                                }
-                                if kind == &parser_kind(&["Term", "match"])
-                                    || kind == &parser_kind(&["Term", "matchMatrix"])
-                                    || kind == &parser_kind(&["Term", "ifThenElse"])
-                                    || kind == &Name::from_components(["termIfThenElse"])
-                                    || kind == &Name::from_components(["termDepIfThenElse"])
-                                {
-                                    let parts = self.match_parts(syntax)?;
-                                    self.recheck_written_discriminant(&parts)?;
-                                    let discriminant = parts.discriminant;
-                                    tasks.push(Task::MatchDiscriminant(parts, expected));
-                                    tasks.push(Task::Visit(discriminant, None, true));
-                                    continue;
-                                }
-                                // `bif c then a else b` is `cond c a b` (`Init/Notation.lean`).
-                                if kind == &Name::from_components(["boolIfThenElse"]) {
-                                    let parts =
-                                        expect_node(syntax, kind, 6, "boolean conditional")?;
-                                    expect_atom(&parts[0], "bif", "boolean conditional")?;
-                                    expect_atom(&parts[2], "then", "boolean conditional")?;
-                                    expect_atom(&parts[4], "else", "boolean conditional")?;
-                                    let function =
-                                        self.constant(&Name::from_components(["cond"]))?;
-                                    tasks.push(Task::Apply(
-                                        function,
-                                        Arguments::Separated(&parts[1..], &["then", "else"]),
-                                        expected,
-                                        false,
-                                    ));
-                                    continue;
-                                }
-                                if kind == &parser_kind(&["Term", "subst"]) {
-                                    let term = self.substitution(args, expected.as_ref())?;
-                                    values.push(if finish {
-                                        self.finish_term(term, expected.as_ref())?
+                                    tasks.push(if expand_macro {
+                                        Task::Visit(body, expected, finish)
                                     } else {
-                                        term
+                                        Task::Elaborate(body, expected, finish)
                                     });
                                     continue;
                                 }
-                                // The annotation is transparent to typing, but must survive in
-                                // the term: both native and exported simp indexes read it.
-                                // `Lean/Elab/BuiltinNotation.lean`, `elabNoindex`.
-                                if kind == &parser_kind(&["Term", "noindex"]) {
-                                    let parts = expect_node(syntax, kind, 2, "no_index")?;
-                                    expect_atom(&parts[0], "no_index", "no_index")?;
-                                    tasks.push(Task::Noindex);
-                                    tasks.push(Task::Visit(&parts[1], expected, finish));
-                                    continue;
-                                }
-                                // `e |>.f args` is `(e).f args` (`Term.pipeProj`'s macro,
-                                // `Lean/Elab/BuiltinNotation.lean`).
-                                if kind == &parser_kind(&["Term", "pipeProj"]) {
-                                    let parts =
-                                        expect_node(syntax, kind, 5, "pipeline projection")?;
-                                    expect_atom(&parts[1], "|>.", "pipeline projection")?;
-                                    expect_empty_null(&parts[3], "pipeline projection")?;
-                                    let field = record_terms::projection_field(&parts[2])?;
-                                    let arguments = expect_null_args(
-                                        &parts[4],
-                                        "pipeline projection arguments",
-                                    )?;
-                                    tasks.push(Task::Projection(
-                                        field, &parts[2], arguments, expected, false, finish,
-                                    ));
-                                    tasks.push(Task::Visit(&parts[0], None, true));
-                                    continue;
-                                }
-                                if kind == &parser_kind(&["Term", "proj"]) {
-                                    let parts = expect_node(syntax, kind, 3, "field projection")?;
-                                    expect_atom(&parts[1], ".", "field dot")?;
-                                    let field = record_terms::projection_field(&parts[2])?;
-                                    tasks.push(Task::Projection(
-                                        field,
-                                        &parts[2],
-                                        &[],
-                                        expected,
-                                        false,
-                                        finish,
-                                    ));
-                                    tasks.push(Task::Visit(&parts[0], None, true));
-                                    continue;
-                                }
-                                if kind == &parser_kind(&["Term", "suffices"]) {
-                                    let (name, annotation, witness, continuation) =
-                                        self.suffices_parts(args)?;
-                                    // Backward chaining checks the last source term
-                                    // first. The proposed fact is not in its own scope.
-                                    tasks.push(Task::LetAnnotation(
-                                        name,
-                                        witness,
-                                        continuation,
-                                        expected,
-                                        LetKind::Have,
-                                    ));
-                                    tasks.push(Task::Visit(
-                                        annotation,
-                                        Some(self.type_expected()?),
-                                        true,
-                                    ));
-                                    continue;
-                                }
-                                if kind == &parser_kind(&["Term", "show"]) {
-                                    let parts = expect_node(syntax, kind, 3, "show term")?;
-                                    expect_atom(&parts[0], "show", "show keyword")?;
-                                    let value = if parts[2].kind()
-                                        == Some(&parser_kind(&["Term", "byTactic'"]))
+                                if expand_macro {
+                                    let locals =
+                                        self.observes_term(syntax).then(|| self.txn.lctx.clone());
+                                    if let Some(literal) =
+                                        tactics::imported_macros::prepared_pattern_literal(syntax)?
                                     {
-                                        &parts[2]
-                                    } else {
-                                        let rhs = expect_node(
-                                            &parts[2],
-                                            &parser_kind(&["Term", "fromTerm"]),
-                                            2,
-                                            "show value",
-                                        )?;
-                                        expect_atom(&rhs[0], "from", "show separator")?;
-                                        &rhs[1]
-                                    };
-                                    tasks.push(Task::Ascription(value, expected, true));
-                                    tasks.push(Task::Visit(
-                                        &parts[1],
-                                        Some(self.type_expected()?),
-                                        true,
-                                    ));
-                                    continue;
-                                }
-                                // `↑e` (`elabCoe`, vendored `Lean/Elab/BuiltinNotation.lean:21-27`):
-                                // `e` elaborates without an expected type, then is made to have
-                                // the expected type, a coercion inserted where the types differ.
-                                if kind == &Name::from_components(["coeNotation"]) {
-                                    let parts = expect_node(syntax, kind, 2, "coercion notation")?;
-                                    expect_atom(&parts[0], "↑", "coercion arrow")?;
-                                    tasks.push(Task::Coerced(expected));
-                                    tasks.push(Task::Visit(&parts[1], None, true));
-                                    continue;
-                                }
-                                if kind == &parser_kind(&["Term", "noImplicitLambda"]) {
-                                    // `elabNoImplicitLambda` (the pinned BuiltinTerm.lean)
-                                    // annotates only this term's expected type. Retain the
-                                    // caller's finishing policy when the wrapper is a callee.
-                                    let parts = expect_node(syntax, kind, 2, "no implicit lambda")?;
-                                    expect_atom(
-                                        &parts[0],
-                                        "no_implicit_lambda%",
-                                        "no implicit lambda keyword",
-                                    )?;
-                                    tasks.push(Task::RestoreImplicitLambda(
-                                        self.no_implicit_lambda_types.len(),
-                                    ));
-                                    if let Some(type_) = &expected {
-                                        let type_ = self.instantiate(type_)?;
-                                        self.no_implicit_lambda_types.push(type_);
+                                        // The matrix already expanded and decoded this literal.
+                                        // Elaborate its primitive syntax in this worklist: a
+                                        // nested evaluator retains another large native frame.
+                                        // Only num/str/char cross this boundary; their atom
+                                        // elaborators never visit child syntax. Skipping this
+                                        // lookup preserves compact predecessors without
+                                        // disabling macros for deferred sibling arguments.
+                                        if let Some(locals) = locals {
+                                            tasks.push(Task::Observe(syntax, locals));
+                                        }
+                                        tasks.push(Task::Elaborate(literal, expected, finish));
+                                        continue;
                                     }
-                                    tasks.push(Task::Visit(&parts[1], expected, finish));
+                                    return Ok(Step::ExpandTerm {
+                                        syntax,
+                                        expected,
+                                        finish,
+                                        locals,
+                                    });
+                                }
+                                // The pin's implicit lambda (`binders::start_implicit_lambda`). The
+                                // body is this same term against the type that remains.
+                                // elabImplicitLambdaAux enters elabUsingElabFns directly:
+                                // an unsupported macro must not execute a second time.
+                                if finish
+                                    && let Some(type_) = &expected
+                                    && let Some(state) =
+                                        self.start_implicit_lambda(syntax, type_)?
+                                {
+                                    let expected = self.telescope_body_expected(&state)?;
+                                    tasks.push(Task::BinderBody(state));
+                                    tasks.push(Task::Elaborate(syntax, expected, true));
                                     continue;
                                 }
-                                if kind == &parser_kind(&["Term", "typeAscription"]) {
-                                    let parts = expect_node(syntax, kind, 5, "term ascription")?;
-                                    expect_atom(&parts[2], ":", "ascription colon")?;
-                                    let [annotation] =
-                                        expect_null_args(&parts[3], "ascribed type")?
-                                    else {
-                                        return Err(failure(SourceInferenceError::Scope));
-                                    };
-                                    tasks.push(Task::Ascription(&parts[1], expected, false));
-                                    tasks.push(Task::Visit(
-                                        annotation,
-                                        Some(self.type_expected()?),
-                                        true,
+                                if self.observes_term(syntax) {
+                                    tasks.push(Task::Observe(syntax, self.txn.lctx.clone()));
+                                }
+                                if let Some(inner) = parenthesized_inner(syntax)? {
+                                    tasks.push(Task::Visit(inner, expected, finish));
+                                    continue;
+                                }
+                                if syntax.kind() == Some(&parser_kind(&["Term", "explicit"]))
+                                    && self.lambda_syntax(syntax)?.is_some()
+                                {
+                                    // Unlike a bare explicit constant, a lambda
+                                    // needs its expected telescope while its
+                                    // written binders are elaborated.
+                                    tasks.push(Task::BinderNext(
+                                        self.start_telescope(syntax, expected, true)?,
                                     ));
                                     continue;
                                 }
-                                if kind == &parser_kind(&["Term", "structInst"]) {
-                                    let parts = self.record_parts(syntax)?;
-                                    if let Some(annotation) = parts.annotation {
-                                        tasks.push(Task::RecordType(parts, expected));
-                                        tasks.push(Task::Visit(
-                                            annotation,
-                                            Some(self.type_expected()?),
-                                            true,
-                                        ));
-                                    } else {
-                                        tasks.push(Task::RecordPrepare(
-                                            parts,
-                                            expected,
-                                            Vec::new(),
-                                        ));
+                                let (head, explicit) = self.explicit_application_head(syntax)?;
+                                if explicit {
+                                    tasks.push(Task::StartApplication(head, &[], expected, true));
+                                    continue;
+                                }
+                                if let Syntax::Node { kind, args, .. } = syntax {
+                                    if kind == &parser_kind(&["Term", "set_option"]) {
+                                        let (body, options) = self.enter_source_options(args)?;
+                                        tasks.push(Task::RestoreOptions(options));
+                                        tasks.push(Task::Visit(body, expected, finish));
+                                        continue;
                                     }
-                                    continue;
-                                }
-                                if kind == &Name::from_components(["Lean", "calc"])
-                                    || kind == &Name::from_components(["Lean", "calcTactic"])
-                                {
-                                    tasks.push(Task::CalcNext(
-                                        self.start_calculation(syntax, expected)?,
-                                    ));
-                                    continue;
-                                }
-                                if kind == &parser_kind(&["Term", "byTactic"])
-                                    || kind == &parser_kind(&["Term", "byTactic'"])
-                                {
-                                    tasks.push(Task::RestoreMacroTerms(self.tactic_macro_terms));
-                                    self.tactic_macro_terms += 1;
-                                    tasks.push(Task::Proof(self.start_proof(syntax, expected)?));
-                                    continue;
-                                }
-                                if kind == &parser_kind(&["Term", "let"])
-                                    || kind == &parser_kind(&["Term", "have"])
-                                    || kind == &parser_kind(&["Term", "letrec"])
-                                    || kind == &parser_kind(&["Term", "letI"])
-                                    || kind == &parser_kind(&["Term", "haveI"])
-                                {
-                                    let opaque = kind == &parser_kind(&["Term", "have"])
-                                        || kind == &parser_kind(&["Term", "haveI"]);
-                                    // `letI`/`haveI` elaborate as `let`/`have` and then inline
-                                    // the value (`Lean/Elab/BuiltinNotation.lean`).
-                                    let inline = kind == &parser_kind(&["Term", "letI"])
-                                        || kind == &parser_kind(&["Term", "haveI"]);
-                                    let recursive = kind == &parser_kind(&["Term", "letrec"]);
-                                    let binding = self.let_parts(args, opaque, recursive)?;
-                                    let parameters = !expect_null_args(
-                                        binding.parameters,
-                                        "local function parameters",
-                                    )?
-                                    .is_empty();
-                                    if inline && parameters {
-                                        return Err(NatDefinitionElabError::UnexpectedSyntax {
-                                            expected: "an inlined local without parameters",
+                                    if kind == &parser_kind(&["Term", "recursiveContextCapture"]) {
+                                        let [body] = args.as_slice() else {
+                                            return Err(failure(SourceInferenceError::Scope));
+                                        };
+                                        tasks.push(Task::CaptureRecursiveContext);
+                                        tasks.push(Task::Visit(body, expected, finish));
+                                        continue;
+                                    }
+                                    // A whole `do` block (`do_notation::expand_do_node`): a known
+                                    // expected type must name a monad application, the pin's
+                                    // `extractMonadInfo` (`Lean/Elab/Do/Basic.lean:743-757`), and
+                                    // the block is elaborated at that application. An unknown type
+                                    // is left to its binds.
+                                    if kind == &parser_kind(&["Term", "nativeDoBlock"]) {
+                                        let [body] = args.as_slice() else {
+                                            return Err(failure(SourceInferenceError::Scope));
+                                        };
+                                        let original = expected;
+                                        let expected = match &original {
+                                            Some(type_) => self
+                                                .do_expected_monad_type(type_)?
+                                                .ok_or_else(|| {
+                                                    failure(
+                                                    SourceInferenceError::DoExpectedTypeNotMonad,
+                                                )
+                                                })?,
+                                            None => self.do_unknown_monad_type()?,
+                                        };
+                                        // The pin's block always builds `pure` for its result
+                                        // (`DoElemCont.mkPure`, then `mkBindUnlessPure`, vendored
+                                        // `Lean/Elab/Do/Basic.lean:272-302, 512-525`). That asks for a
+                                        // `Pure m` instance even where the bind is then contracted away,
+                                        // so a block at a monad without one is refused there.
+                                        if let Some(monad) = self.do_monad(&expected)? {
+                                            let pure = self.do_operation(false, Some(monad))?;
+                                            let type_ = self.whnf(&pure.type_)?;
+                                            let ExprNode::ForallE {
+                                                binder_type,
+                                                binder_info: BinderInfo::InstImplicit,
+                                                ..
+                                            } = type_.node()
+                                            else {
+                                                return Err(failure(SourceInferenceError::Scope));
+                                            };
+                                            self.instance_hole(binder_type.clone())?;
+                                        }
+                                        // A fresh monad/result must not erase the original
+                                        // declaration result family. Relate them only after
+                                        // the action determines the monad, so a flex-flex
+                                        // equation cannot select that family as the monad.
+                                        if let Some(original) = original {
+                                            tasks.push(Task::DoBlockResult(original));
+                                        }
+                                        tasks.push(Task::Visit(body, Some(expected), finish));
+                                        continue;
+                                    }
+                                    if kind == &parser_kind(&["Term", "nativeDoForCollection"]) {
+                                        let [collection] = args.as_slice() else {
+                                            return Err(failure(SourceInferenceError::Scope));
+                                        };
+                                        tasks.push(Task::ForCollection(expected));
+                                        tasks.push(Task::Visit(collection, None, true));
+                                        continue;
+                                    }
+                                    // A reassignment's type: the type of the variable it replaces
+                                    // (`do_notation::mutation`).
+                                    if kind == &parser_kind(&["Term", "nativeDoTypeOf"]) {
+                                        let [Syntax::Ident { val, .. }] = args.as_slice() else {
+                                            return Err(failure(SourceInferenceError::Scope));
+                                        };
+                                        let local =
+                                            self.txn.lctx.find_by_user_name(val).ok_or_else(
+                                                || failure(SourceInferenceError::Scope),
+                                            )?;
+                                        let value = self.instantiate(&local.type_.clone())?;
+                                        let type_ = self.known_type(&value)?.ok_or_else(|| {
+                                            failure(SourceInferenceError::ExpectedType)
+                                        })?;
+                                        let term = Typed { value, type_ };
+                                        values.push(if finish {
+                                            self.finish_term(term, expected.as_ref())?
+                                        } else {
+                                            term
                                         });
+                                        continue;
                                     }
-                                    if recursive || parameters {
-                                        let build = self.start_local_function(binding, expected)?;
-                                        if let Some(annotation) = build.binding.annotation {
-                                            tasks.push(Task::LocalFunctionAnnotation(build));
+                                    if kind == &parser_kind(&["Term", "nativeDoJoin"]) {
+                                        let (name, suffix, body) = do_notation::join_parts(args)?;
+                                        tasks.push(Task::DoJoinValue(name, body, expected.clone()));
+                                        tasks.push(Task::Visit(suffix, expected, true));
+                                        continue;
+                                    }
+                                    if kind == &parser_kind(&["Term", "nativeDoBindJoin"]) {
+                                        let (name, continuation, body) =
+                                            do_notation::join_parts(args)?;
+                                        let result_type = match expected {
+                                            Some(expected) => expected,
+                                            None => {
+                                                let sort = self.type_expected()?;
+                                                self.hole(sort)?
+                                            }
+                                        };
+                                        let annotation =
+                                            do_notation::bind_join_domain(continuation)?;
+                                        tasks.push(Task::DoBindJoinStart(
+                                            name,
+                                            continuation,
+                                            body,
+                                            result_type,
+                                            annotation.is_some(),
+                                        ));
+                                        if let Some(annotation) = annotation {
                                             tasks.push(Task::Visit(
                                                 annotation,
                                                 Some(self.type_expected()?),
                                                 true,
                                             ));
-                                        } else if let Some(omitted) = build.omitted.clone() {
-                                            // The omitted result's hole stands in for the
-                                            // annotation the recursive path expects.
-                                            values.push(Typed {
-                                                value: omitted.body,
-                                                type_: omitted.sort,
-                                            });
-                                            tasks.push(Task::LocalFunctionAnnotation(build));
-                                        } else {
-                                            let value = build.binding.value;
-                                            tasks.push(Task::LocalFunctionValue(
-                                                build,
-                                                self.postponed_application_errors.len(),
-                                            ));
-                                            tasks.push(Task::Visit(value, None, true));
                                         }
                                         continue;
                                     }
-                                    let local_functions::Binding {
-                                        name,
-                                        annotation,
-                                        value,
-                                        body,
-                                        ..
-                                    } = binding;
-                                    let binding_kind = match (opaque, inline) {
-                                        (false, false) => LetKind::Let,
-                                        (true, false) => LetKind::Have,
-                                        (false, true) => LetKind::LetI,
-                                        (true, true) => LetKind::HaveI,
-                                    };
-                                    if let Some(annotation) = annotation {
+                                    if kind == &parser_kind(&["Term", "nativeDoNestedAnnotation"]) {
+                                        let [annotation, body] = args.as_slice() else {
+                                            return Err(failure(SourceInferenceError::Scope));
+                                        };
+                                        tasks
+                                            .push(Task::DoNestedAnnotation(body, expected, finish));
+                                        tasks.push(Task::Visit(
+                                            annotation,
+                                            Some(self.type_expected()?),
+                                            true,
+                                        ));
+                                        continue;
+                                    }
+                                    if kind == &parser_kind(&["Term", "nativeDoRepeatDefault"]) {
+                                        let [normal, fallback] = args.as_slice() else {
+                                            return Err(failure(SourceInferenceError::Scope));
+                                        };
+                                        let body =
+                                            if self.do_repeat_needs_fallback(expected.as_ref())? {
+                                                fallback
+                                            } else {
+                                                normal
+                                            };
+                                        tasks.push(Task::Visit(body, expected, finish));
+                                        continue;
+                                    }
+                                    let repeat =
+                                        kind == &parser_kind(&["Term", "nativeDoRepeatResult"]);
+                                    if repeat {
+                                        let [action, _] = args.as_slice() else {
+                                            return Err(failure(SourceInferenceError::Scope));
+                                        };
+                                        if !self.do_repeat_needs_fallback(expected.as_ref())? {
+                                            tasks.push(Task::Visit(action, expected, finish));
+                                            continue;
+                                        }
+                                    }
+                                    if repeat
+                                        || kind == &parser_kind(&["Term", "nativeDoBind"])
+                                        || kind == &parser_kind(&["Term", "nativeDoPure"])
+                                        || kind == &parser_kind(&["Term", "nativeDoNestedAction"])
+                                    {
+                                        let nested =
+                                            kind == &parser_kind(&["Term", "nativeDoNestedAction"]);
+                                        let bind = repeat
+                                            || nested
+                                            || kind == &parser_kind(&["Term", "nativeDoBind"]);
+                                        if args.len() != if bind { 2 } else { 1 } {
+                                            return Err(failure(SourceInferenceError::Scope));
+                                        }
+                                        if !bind {
+                                            // Check the value before creating Pure's dictionary.
+                                            // Its type can determine the monad's universe, as in
+                                            // `Id.run do return (42 : Nat)`. Keep the written
+                                            // result parameter even for a noninjective monad.
+                                            let value_type =
+                                                self.do_pure_result_type(expected.as_ref())?;
+                                            tasks.push(Task::DoPureValue(expected));
+                                            tasks.push(match value_type {
+                                                Some(type_) => {
+                                                    Task::CheckArgument(&args[0], type_, false)
+                                                }
+                                                None => Task::Visit(&args[0], None, true),
+                                            });
+                                            continue;
+                                        }
+                                        let monad = match &expected {
+                                            Some(type_) => self.do_monad(type_)?,
+                                            None => None,
+                                        };
+                                        if bind && monad.is_none() && !nested {
+                                            tasks.push(Task::DoAction(&args[1..], expected));
+                                            tasks.push(Task::Visit(&args[0], None, true));
+                                        } else {
+                                            let function = self.do_operation(bind, monad)?;
+                                            let function = if nested {
+                                                self.do_nested_action_function(function, &args[1])?
+                                            } else {
+                                                function
+                                            };
+                                            tasks.push(Task::Apply(
+                                                function,
+                                                Arguments::Plain(args),
+                                                expected,
+                                                false,
+                                            ));
+                                        }
+                                        continue;
+                                    }
+                                    if kind == &parser_kind(&["Term", "matrixScope"]) {
+                                        let [rows, body] = args.as_slice() else {
+                                            return Err(failure(SourceInferenceError::Scope));
+                                        };
+                                        let mut names = Vec::new();
+                                        for row in
+                                            expect_null_args(rows, "pattern coverage witnesses")?
+                                        {
+                                            self.tick()?;
+                                            let Syntax::Ident { val, .. } = row else {
+                                                return Err(failure(SourceInferenceError::Scope));
+                                            };
+                                            names.push(val.clone());
+                                        }
+                                        tasks.push(Task::MatrixScope(names));
+                                        tasks.push(Task::Visit(body, expected, finish));
+                                        continue;
+                                    }
+                                    if kind == &parser_kind(&["Term", "matrixAlias"]) {
+                                        let [Syntax::Ident { val: name, .. }, subject, body] =
+                                            args.as_slice()
+                                        else {
+                                            return Err(failure(SourceInferenceError::Scope));
+                                        };
+                                        // A name written at a promoted parameter position
+                                        // (`| .done k, _`): the pin's type mismatch.
+                                        if let Syntax::Ident { val: column, .. } = subject
+                                            && self.inaccessible_columns.contains(column)
+                                        {
+                                            return Err(failure(SourceInferenceError::Match(
+                                                matching::MatchError::InaccessibleParameter,
+                                            )));
+                                        }
+                                        let value = self.atom(subject, None)?;
+                                        if !matches!(value.value.node(), ExprNode::FVar { .. }) {
+                                            return Err(failure(SourceInferenceError::Scope));
+                                        }
+                                        let saved = self.txn.lctx.clone();
+                                        let id = FVarId(self.fresh_name()?);
+                                        self.txn.lctx.add_let(
+                                            id.clone(),
+                                            name.clone(),
+                                            value.type_.clone(),
+                                            value.value.clone(),
+                                        );
+                                        self.matrix_aliases.insert(id.clone(), value.value.clone());
+                                        tasks.push(Task::LetBody(
+                                            saved,
+                                            id,
+                                            name.clone(),
+                                            value,
+                                            LetKind::Let,
+                                        ));
+                                        tasks.push(Task::Visit(body, expected, finish));
+                                        continue;
+                                    }
+                                    if kind == &parser_kind(&["Term", "matrixBranch"]) {
+                                        let [Syntax::Ident { val, .. }, body] = args.as_slice()
+                                        else {
+                                            return Err(failure(SourceInferenceError::Scope));
+                                        };
+                                        self.matrix_rows.insert(val.clone());
+                                        tasks.push(Task::Visit(body, expected, finish));
+                                        continue;
+                                    }
+                                    if kind == &parser_kind(&["Term", "forall"])
+                                        || kind == &parser_kind(&["Term", "fun"])
+                                        || kind == &parser_kind(&["Term", "depArrow"])
+                                    {
+                                        let lambda = kind == &parser_kind(&["Term", "fun"]);
+                                        tasks.push(Task::BinderNext(
+                                            self.start_telescope(syntax, expected, lambda)?,
+                                        ));
+                                        continue;
+                                    }
+                                    if kind == &parser_kind(&["Term", "nofun"]) {
+                                        tasks.push(Task::Proof(
+                                            self.start_empty_function(syntax, expected)?,
+                                        ));
+                                        continue;
+                                    }
+                                    if kind == &parser_kind(&["Term", "nomatch"]) {
+                                        let items = self.nomatch_discriminants(syntax)?;
+                                        let arguments = Arguments::Separated(items, &[","]);
+                                        let (first, remaining) = arguments
+                                            .split_first()
+                                            .expect("nonempty discriminants");
+                                        tasks.push(Task::NomatchDiscriminant(
+                                            remaining,
+                                            Vec::new(),
+                                            expected,
+                                        ));
+                                        tasks.push(Task::Visit(first, None, true));
+                                        continue;
+                                    }
+                                    // The pin's first elaboration of a pattern matrix's atomic
+                                    // discriminants (`deprecated.rs`), then its first input.
+                                    if kind == &parser_kind(&["Term", deprecated::RECHECK]) {
+                                        let [identifiers, value] = args.as_slice() else {
+                                            return Err(failure(SourceInferenceError::Scope));
+                                        };
+                                        let identifiers = expect_null_args(
+                                            identifiers,
+                                            "rechecked discriminants",
+                                        )?;
+                                        self.recheck_identifiers(identifiers)?;
+                                        tasks.push(Task::Visit(value, expected, finish));
+                                        continue;
+                                    }
+                                    if kind == &parser_kind(&["Term", "match"])
+                                        || kind == &parser_kind(&["Term", "matchMatrix"])
+                                        || kind == &parser_kind(&["Term", "ifThenElse"])
+                                        || kind == &Name::from_components(["termIfThenElse"])
+                                        || kind == &Name::from_components(["termDepIfThenElse"])
+                                    {
+                                        let parts = self.match_parts(syntax)?;
+                                        self.recheck_written_discriminant(&parts)?;
+                                        let discriminant = parts.discriminant;
+                                        tasks.push(Task::MatchDiscriminant(parts, expected));
+                                        tasks.push(Task::Visit(discriminant, None, true));
+                                        continue;
+                                    }
+                                    // `bif c then a else b` is `cond c a b` (`Init/Notation.lean`).
+                                    if kind == &Name::from_components(["boolIfThenElse"]) {
+                                        let parts =
+                                            expect_node(syntax, kind, 6, "boolean conditional")?;
+                                        expect_atom(&parts[0], "bif", "boolean conditional")?;
+                                        expect_atom(&parts[2], "then", "boolean conditional")?;
+                                        expect_atom(&parts[4], "else", "boolean conditional")?;
+                                        let function =
+                                            self.constant(&Name::from_components(["cond"]))?;
+                                        tasks.push(Task::Apply(
+                                            function,
+                                            Arguments::Separated(&parts[1..], &["then", "else"]),
+                                            expected,
+                                            false,
+                                        ));
+                                        continue;
+                                    }
+                                    if kind == &parser_kind(&["Term", "subst"]) {
+                                        let term = self.substitution(args, expected.as_ref())?;
+                                        values.push(if finish {
+                                            self.finish_term(term, expected.as_ref())?
+                                        } else {
+                                            term
+                                        });
+                                        continue;
+                                    }
+                                    // The annotation is transparent to typing, but must survive in
+                                    // the term: both native and exported simp indexes read it.
+                                    // `Lean/Elab/BuiltinNotation.lean`, `elabNoindex`.
+                                    if kind == &parser_kind(&["Term", "noindex"]) {
+                                        let parts = expect_node(syntax, kind, 2, "no_index")?;
+                                        expect_atom(&parts[0], "no_index", "no_index")?;
+                                        tasks.push(Task::Noindex);
+                                        tasks.push(Task::Visit(&parts[1], expected, finish));
+                                        continue;
+                                    }
+                                    // `e |>.f args` is `(e).f args` (`Term.pipeProj`'s macro,
+                                    // `Lean/Elab/BuiltinNotation.lean`).
+                                    if kind == &parser_kind(&["Term", "pipeProj"]) {
+                                        let parts =
+                                            expect_node(syntax, kind, 5, "pipeline projection")?;
+                                        expect_atom(&parts[1], "|>.", "pipeline projection")?;
+                                        expect_empty_null(&parts[3], "pipeline projection")?;
+                                        let field = record_terms::projection_field(&parts[2])?;
+                                        let arguments = expect_null_args(
+                                            &parts[4],
+                                            "pipeline projection arguments",
+                                        )?;
+                                        tasks.push(Task::Projection(
+                                            field, &parts[2], arguments, expected, false, finish,
+                                        ));
+                                        tasks.push(Task::Visit(&parts[0], None, true));
+                                        continue;
+                                    }
+                                    if kind == &parser_kind(&["Term", "proj"]) {
+                                        let parts =
+                                            expect_node(syntax, kind, 3, "field projection")?;
+                                        expect_atom(&parts[1], ".", "field dot")?;
+                                        let field = record_terms::projection_field(&parts[2])?;
+                                        tasks.push(Task::Projection(
+                                            field,
+                                            &parts[2],
+                                            &[],
+                                            expected,
+                                            false,
+                                            finish,
+                                        ));
+                                        tasks.push(Task::Visit(&parts[0], None, true));
+                                        continue;
+                                    }
+                                    if kind == &parser_kind(&["Term", "suffices"]) {
+                                        let (name, annotation, witness, continuation) =
+                                            self.suffices_parts(args)?;
+                                        // Backward chaining checks the last source term
+                                        // first. The proposed fact is not in its own scope.
                                         tasks.push(Task::LetAnnotation(
                                             name,
-                                            value,
-                                            body,
+                                            witness,
+                                            continuation,
                                             expected,
-                                            binding_kind,
+                                            LetKind::Have,
                                         ));
                                         tasks.push(Task::Visit(
                                             annotation,
                                             Some(self.type_expected()?),
                                             true,
                                         ));
-                                    } else {
-                                        tasks.push(Task::LetValue(
-                                            name,
-                                            None,
-                                            body,
-                                            expected,
-                                            binding_kind,
+                                        continue;
+                                    }
+                                    if kind == &parser_kind(&["Term", "show"]) {
+                                        let parts = expect_node(syntax, kind, 3, "show term")?;
+                                        expect_atom(&parts[0], "show", "show keyword")?;
+                                        let value = if parts[2].kind()
+                                            == Some(&parser_kind(&["Term", "byTactic'"]))
+                                        {
+                                            &parts[2]
+                                        } else {
+                                            let rhs = expect_node(
+                                                &parts[2],
+                                                &parser_kind(&["Term", "fromTerm"]),
+                                                2,
+                                                "show value",
+                                            )?;
+                                            expect_atom(&rhs[0], "from", "show separator")?;
+                                            &rhs[1]
+                                        };
+                                        tasks.push(Task::Ascription(value, expected, true));
+                                        tasks.push(Task::Visit(
+                                            &parts[1],
+                                            Some(self.type_expected()?),
+                                            true,
                                         ));
-                                        tasks.push(Task::Visit(value, None, true));
+                                        continue;
                                     }
-                                    continue;
-                                }
-                                if kind == &parser_kind(&["Term", "arrow"]) {
-                                    let [domain, arrow, codomain] = args.as_slice() else {
-                                        return Err(failure(SourceInferenceError::Scope));
-                                    };
-                                    if !matches!(arrow, Syntax::Atom { val, .. } if val == "->" || val == "→")
-                                    {
-                                        return Err(failure(SourceInferenceError::Scope));
+                                    // `↑e` (`elabCoe`, vendored `Lean/Elab/BuiltinNotation.lean:21-27`):
+                                    // `e` elaborates without an expected type, then is made to have
+                                    // the expected type, a coercion inserted where the types differ.
+                                    if kind == &Name::from_components(["coeNotation"]) {
+                                        let parts =
+                                            expect_node(syntax, kind, 2, "coercion notation")?;
+                                        expect_atom(&parts[0], "↑", "coercion arrow")?;
+                                        tasks.push(Task::Coerced(expected));
+                                        tasks.push(Task::Visit(&parts[1], None, true));
+                                        continue;
                                     }
-                                    tasks.push(Task::Arrow(expected));
-                                    tasks.push(Task::Visit(
-                                        codomain,
-                                        Some(self.type_expected()?),
-                                        true,
-                                    ));
-                                    tasks.push(Task::Visit(
-                                        domain,
-                                        Some(self.type_expected()?),
-                                        true,
-                                    ));
-                                    continue;
-                                }
-                                // Explicit operator elaborators resolve the authored
-                                // identifier, including local functions. Builtin notation
-                                // whose function is absent keeps the seed bridge below.
-                                let notation = operators::pin_notation(kind);
-                                if operators::explicit_operator(kind).is_some()
-                                    || match notation {
-                                        Some(notation) => self.pin_notation_available(notation)?,
-                                        None => false,
-                                    }
-                                {
-                                    let tree = self.operator_tree(syntax, notation)?;
-                                    let leaves = tree.leaves.clone();
-                                    let postponed: Vec<bool> = leaves
-                                        .iter()
-                                        .map(|leaf| operators::postponed_leaf(leaf))
-                                        .collect();
-                                    tasks.push(Task::Operator(tree, expected, postponed.clone()));
-                                    for (leaf, postpone) in leaves.into_iter().zip(postponed).rev()
-                                    {
-                                        if !postpone {
-                                            tasks.push(Task::Visit(leaf, None, true));
+                                    if kind == &parser_kind(&["Term", "noImplicitLambda"]) {
+                                        // `elabNoImplicitLambda` (the pinned BuiltinTerm.lean)
+                                        // annotates only this term's expected type. Retain the
+                                        // caller's finishing policy when the wrapper is a callee.
+                                        let parts =
+                                            expect_node(syntax, kind, 2, "no implicit lambda")?;
+                                        expect_atom(
+                                            &parts[0],
+                                            "no_implicit_lambda%",
+                                            "no implicit lambda keyword",
+                                        )?;
+                                        tasks.push(Task::RestoreImplicitLambda(
+                                            self.no_implicit_lambda_types.len(),
+                                        ));
+                                        if let Some(type_) = &expected {
+                                            let type_ = self.instantiate(type_)?;
+                                            self.no_implicit_lambda_types.push(type_);
                                         }
+                                        tasks.push(Task::Visit(&parts[1], expected, finish));
+                                        continue;
                                     }
-                                    continue;
-                                }
-                                if kind == &parser_kind(&["Term", "anonymousCtor"]) {
-                                    let parts =
-                                        expect_node(syntax, kind, 3, "anonymous constructor")?;
-                                    expect_atom(&parts[0], "⟨", "anonymous constructor opener")?;
-                                    expect_atom(&parts[2], "⟩", "anonymous constructor closer")?;
-                                    let elements = expect_null_args(
-                                        &parts[1],
-                                        "anonymous constructor fields",
-                                    )?;
-                                    for (index, element) in elements.iter().enumerate() {
-                                        if index % 2 == 1 {
-                                            expect_atom(element, ",", "field separator")?;
+                                    if kind == &parser_kind(&["Term", "typeAscription"]) {
+                                        let parts =
+                                            expect_node(syntax, kind, 5, "term ascription")?;
+                                        expect_atom(&parts[2], ":", "ascription colon")?;
+                                        let [annotation] =
+                                            expect_null_args(&parts[3], "ascribed type")?
+                                        else {
+                                            return Err(failure(SourceInferenceError::Scope));
+                                        };
+                                        tasks.push(Task::Ascription(&parts[1], expected, false));
+                                        tasks.push(Task::Visit(
+                                            annotation,
+                                            Some(self.type_expected()?),
+                                            true,
+                                        ));
+                                        continue;
+                                    }
+                                    if kind == &parser_kind(&["Term", "structInst"]) {
+                                        let parts = self.record_parts(syntax)?;
+                                        if let Some(annotation) = parts.annotation {
+                                            tasks.push(Task::RecordType(parts, expected));
+                                            tasks.push(Task::Visit(
+                                                annotation,
+                                                Some(self.type_expected()?),
+                                                true,
+                                            ));
+                                        } else {
+                                            tasks.push(Task::RecordPrepare(
+                                                parts,
+                                                expected,
+                                                Vec::new(),
+                                            ));
                                         }
+                                        continue;
                                     }
-                                    let provided = elements.len().div_ceil(2);
-                                    let function = match self
+                                    if kind == &Name::from_components(["Lean", "calc"])
+                                        || kind == &Name::from_components(["Lean", "calcTactic"])
+                                    {
+                                        tasks.push(Task::CalcNext(
+                                            self.start_calculation(syntax, expected)?,
+                                        ));
+                                        continue;
+                                    }
+                                    if kind == &parser_kind(&["Term", "byTactic"])
+                                        || kind == &parser_kind(&["Term", "byTactic'"])
+                                    {
+                                        tasks
+                                            .push(Task::RestoreMacroTerms(self.tactic_macro_terms));
+                                        self.tactic_macro_terms += 1;
+                                        tasks
+                                            .push(Task::Proof(self.start_proof(syntax, expected)?));
+                                        continue;
+                                    }
+                                    if kind == &parser_kind(&["Term", "let"])
+                                        || kind == &parser_kind(&["Term", "have"])
+                                        || kind == &parser_kind(&["Term", "letrec"])
+                                        || kind == &parser_kind(&["Term", "letI"])
+                                        || kind == &parser_kind(&["Term", "haveI"])
+                                    {
+                                        let opaque = kind == &parser_kind(&["Term", "have"])
+                                            || kind == &parser_kind(&["Term", "haveI"]);
+                                        // `letI`/`haveI` elaborate as `let`/`have` and then inline
+                                        // the value (`Lean/Elab/BuiltinNotation.lean`).
+                                        let inline = kind == &parser_kind(&["Term", "letI"])
+                                            || kind == &parser_kind(&["Term", "haveI"]);
+                                        let recursive = kind == &parser_kind(&["Term", "letrec"]);
+                                        let binding = self.let_parts(args, opaque, recursive)?;
+                                        let parameters = !expect_null_args(
+                                            binding.parameters,
+                                            "local function parameters",
+                                        )?
+                                        .is_empty();
+                                        if inline && parameters {
+                                            return Err(NatDefinitionElabError::UnexpectedSyntax {
+                                                expected: "an inlined local without parameters",
+                                            });
+                                        }
+                                        if recursive || parameters {
+                                            let build = Box::new(
+                                                self.start_local_function(binding, expected)?,
+                                            );
+                                            if let Some(annotation) = build.binding.annotation {
+                                                tasks.push(Task::LocalFunctionAnnotation(build));
+                                                tasks.push(Task::Visit(
+                                                    annotation,
+                                                    Some(self.type_expected()?),
+                                                    true,
+                                                ));
+                                            } else if let Some(omitted) = build.omitted.clone() {
+                                                // The omitted result's hole stands in for the
+                                                // annotation the recursive path expects.
+                                                values.push(Typed {
+                                                    value: omitted.body,
+                                                    type_: omitted.sort,
+                                                });
+                                                tasks.push(Task::LocalFunctionAnnotation(build));
+                                            } else {
+                                                let value = build.binding.value;
+                                                tasks.push(Task::LocalFunctionValue(
+                                                    build,
+                                                    self.postponed_application_errors.len(),
+                                                ));
+                                                tasks.push(Task::Visit(value, None, true));
+                                            }
+                                            continue;
+                                        }
+                                        let local_functions::Binding {
+                                            name,
+                                            annotation,
+                                            value,
+                                            body,
+                                            ..
+                                        } = binding;
+                                        let binding_kind = match (opaque, inline) {
+                                            (false, false) => LetKind::Let,
+                                            (true, false) => LetKind::Have,
+                                            (false, true) => LetKind::LetI,
+                                            (true, true) => LetKind::HaveI,
+                                        };
+                                        if let Some(annotation) = annotation {
+                                            tasks.push(Task::LetAnnotation(
+                                                name,
+                                                value,
+                                                body,
+                                                expected,
+                                                binding_kind,
+                                            ));
+                                            tasks.push(Task::Visit(
+                                                annotation,
+                                                Some(self.type_expected()?),
+                                                true,
+                                            ));
+                                        } else {
+                                            tasks.push(Task::LetValue(
+                                                name,
+                                                None,
+                                                body,
+                                                expected,
+                                                binding_kind,
+                                            ));
+                                            tasks.push(Task::Visit(value, None, true));
+                                        }
+                                        continue;
+                                    }
+                                    if kind == &parser_kind(&["Term", "arrow"]) {
+                                        let [domain, arrow, codomain] = args.as_slice() else {
+                                            return Err(failure(SourceInferenceError::Scope));
+                                        };
+                                        if !matches!(arrow, Syntax::Atom { val, .. } if val == "->" || val == "→")
+                                        {
+                                            return Err(failure(SourceInferenceError::Scope));
+                                        }
+                                        tasks.push(Task::Arrow(expected));
+                                        tasks.push(Task::Visit(
+                                            codomain,
+                                            Some(self.type_expected()?),
+                                            true,
+                                        ));
+                                        tasks.push(Task::Visit(
+                                            domain,
+                                            Some(self.type_expected()?),
+                                            true,
+                                        ));
+                                        continue;
+                                    }
+                                    // Explicit operator elaborators resolve the authored
+                                    // identifier, including local functions. Builtin notation
+                                    // whose function is absent keeps the seed bridge below.
+                                    let notation = operators::pin_notation(kind);
+                                    if operators::explicit_operator(kind).is_some()
+                                        || match notation {
+                                            Some(notation) => {
+                                                self.pin_notation_available(notation)?
+                                            }
+                                            None => false,
+                                        }
+                                    {
+                                        let tree = self.operator_tree(syntax, notation)?;
+                                        let leaves = tree.leaves.clone();
+                                        let postponed: Vec<bool> = leaves
+                                            .iter()
+                                            .map(|leaf| operators::postponed_leaf(leaf))
+                                            .collect();
+                                        tasks.push(Task::Operator(
+                                            tree,
+                                            expected,
+                                            postponed.clone(),
+                                        ));
+                                        for (leaf, postpone) in
+                                            leaves.into_iter().zip(postponed).rev()
+                                        {
+                                            if !postpone {
+                                                tasks.push(Task::Visit(leaf, None, true));
+                                            }
+                                        }
+                                        continue;
+                                    }
+                                    if kind == &parser_kind(&["Term", "anonymousCtor"]) {
+                                        let parts =
+                                            expect_node(syntax, kind, 3, "anonymous constructor")?;
+                                        expect_atom(
+                                            &parts[0],
+                                            "⟨",
+                                            "anonymous constructor opener",
+                                        )?;
+                                        expect_atom(
+                                            &parts[2],
+                                            "⟩",
+                                            "anonymous constructor closer",
+                                        )?;
+                                        let elements = expect_null_args(
+                                            &parts[1],
+                                            "anonymous constructor fields",
+                                        )?;
+                                        for (index, element) in elements.iter().enumerate() {
+                                            if index % 2 == 1 {
+                                                expect_atom(element, ",", "field separator")?;
+                                            }
+                                        }
+                                        let provided = elements.len().div_ceil(2);
+                                        let function = match self
                                         .anonymous_constructor(expected.as_ref(), provided)
                                     {
                                         Err(NatDefinitionElabError::Inference(
@@ -3573,1661 +3641,1805 @@ impl Context {
                                             return Err(problem);
                                         }
                                     };
-                                    tasks.push(Task::Apply(
-                                        function,
-                                        Arguments::Separated(elements, &[","]),
-                                        expected,
-                                        false,
-                                    ));
-                                    continue;
-                                }
-                                if kind == &Name::str(Name::anonymous(), "term¬_") {
-                                    let parts =
-                                        expect_node(syntax, kind, 2, "propositional negation")?;
-                                    expect_atom(&parts[0], "¬", "negation prefix")?;
-                                    let function =
-                                        self.constant(&Name::from_components(["Not"]))?;
-                                    tasks.push(Task::Apply(
-                                        function,
-                                        Arguments::Plain(&parts[1..]),
-                                        expected,
-                                        false,
-                                    ));
-                                    continue;
-                                }
-                                // `"!" b:40 => not b` and `prefix:100 "~~~" => Complement.complement`
-                                // (`Init/Notation.lean`; `not` is `Bool.not`, exported).
-                                let prefix = [
-                                    ("!", ["Bool", "not"]),
-                                    ("~~~", ["Complement", "complement"]),
-                                ]
-                                .into_iter()
-                                .find(|(spelling, _)| {
-                                    kind == &Name::str(
-                                        Name::anonymous(),
-                                        format!("term{spelling}_"),
-                                    )
-                                });
-                                if let Some((spelling, constant)) = prefix {
-                                    let parts = expect_node(syntax, kind, 2, "prefix operator")?;
-                                    expect_atom(&parts[0], spelling, "prefix operator")?;
-                                    let function =
-                                        self.constant(&Name::from_components(constant))?;
-                                    tasks.push(Task::Apply(
-                                        function,
-                                        Arguments::Plain(&parts[1..]),
-                                        expected,
-                                        false,
-                                    ));
-                                    continue;
-                                }
-                                // `postfix:max "⁻¹" => Inv.inv` (`Init/Prelude.lean`).
-                                if kind == &Name::str(Name::anonymous(), "term_⁻¹") {
-                                    let parts = expect_node(syntax, kind, 2, "inverse")?;
-                                    expect_atom(&parts[1], "⁻¹", "inverse postfix")?;
-                                    let function =
-                                        self.constant(&Name::from_components(["Inv", "inv"]))?;
-                                    tasks.push(Task::Apply(
-                                        function,
-                                        Arguments::Plain(&parts[..1]),
-                                        expected,
-                                        false,
-                                    ));
-                                    continue;
-                                }
-                                // The ranges with an unbounded side, in namespace `Std`
-                                // (`Init/Data/Range/Polymorphic/PRange.lean`): `macro_rules`
-                                // makes `*...b` and `*...<b` `Rio.mk b`, `*...=b` `Ric.mk b`,
-                                // `a...*` `Rci.mk a`, `a<...*` `Roi.mk a` and `*...*` `Rii.mk`.
-                                let unbounded = [
-                                    ("term*..._", "*...", "Rio", 1..2),
-                                    ("term*...<_", "*...<", "Rio", 1..2),
-                                    ("term*...=_", "*...=", "Ric", 1..2),
-                                    ("term_...*", "...*", "Rci", 0..1),
-                                    ("term_<...*", "<...*", "Roi", 0..1),
-                                    ("term*...*", "*...*", "Rii", 1..1),
-                                ]
-                                .into_iter()
-                                .find(|(label, ..)| kind == &Name::from_components(["Std", label]));
-                                if let Some((_, spelling, constant, operands)) = unbounded {
-                                    let arity = if operands.is_empty() { 1 } else { 2 };
-                                    let parts =
-                                        expect_node(syntax, kind, arity, "unbounded range")?;
-                                    let symbol = if operands.start == 0 { arity - 1 } else { 0 };
-                                    expect_atom(&parts[symbol], spelling, "unbounded range")?;
-                                    let function = self.constant(&Name::from_components([
-                                        "Std", constant, "mk",
-                                    ]))?;
-                                    tasks.push(Task::Apply(
-                                        function,
-                                        Arguments::Plain(&parts[operands]),
-                                        expected,
-                                        false,
-                                    ));
-                                    continue;
-                                }
-                                if kind == &Name::str(Name::anonymous(), "term-_") {
-                                    let parts =
-                                        expect_node(syntax, kind, 2, "arithmetic negation")?;
-                                    expect_atom(&parts[0], "-", "negation prefix")?;
-                                    let function =
-                                        self.constant(&Name::from_components(["Neg", "neg"]))?;
-                                    tasks.push(Task::Apply(
-                                        function,
-                                        Arguments::Plain(&parts[1..]),
-                                        expected,
-                                        false,
-                                    ));
-                                    continue;
-                                }
-                                if kind == &parser_kind(&["Term", "app"]) {
-                                    let parts = expect_node(syntax, kind, 2, "application")?;
-                                    let arguments =
-                                        expect_null_args(&parts[1], "application arguments")?;
-                                    if arguments.is_empty() {
-                                        return Err(failure(
-                                            SourceInferenceError::ExpectedFunction,
+                                        tasks.push(Task::Apply(
+                                            function,
+                                            Arguments::Separated(elements, &[","]),
+                                            expected,
+                                            false,
                                         ));
-                                    }
-                                    let (head, explicit) =
-                                        self.explicit_application_head(&parts[0])?;
-                                    // A parenthesized head enters elabTerm, unlike a
-                                    // bare identifier resolved by elabAppFnId. Preserve
-                                    // that boundary when no explicit `@` was found.
-                                    let head = if explicit { head } else { &parts[0] };
-                                    tasks.push(Task::StartApplication(
-                                        head, arguments, expected, explicit,
-                                    ));
-                                    continue;
-                                }
-                                // `f <| a` and `a |> f` are the application `f a`
-                                // (`Init/Notation.lean:522`). The pin's macros also flatten
-                                // `f x <| a` and `a |> f x` into `f x a`, which the macro pass
-                                // (`patterns.rs`, `expand_pipeline`) does before this driver;
-                                // one that reaches it unlowered is refused rather than read as
-                                // `(f x) a`.
-                                let pipeline = if kind == &Name::from_components(["term_<|_"]) {
-                                    Some(("<|", 0, 2))
-                                } else if kind == &Name::from_components(["term_$__"]) {
-                                    // `f $ a`, `<|`'s other spelling (`Init/Notation.lean:557`).
-                                    Some(("$", 0, 2))
-                                } else if kind == &Name::from_components(["term_|>_"]) {
-                                    Some(("|>", 2, 0))
-                                } else {
-                                    None
-                                };
-                                if let Some((operator, function, argument)) = pipeline {
-                                    let parts = expect_node(syntax, kind, 3, "pipeline")?;
-                                    expect_atom(&parts[1], operator, "pipeline operator")?;
-                                    if matches!(&parts[function], Syntax::Node { kind, .. }
-                                        if kind == &parser_kind(&["Term", "app"]))
-                                    {
-                                        return Err(NatDefinitionElabError::UnexpectedSyntax {
-                                            expected: "a pipeline whose function is not an application",
-                                        });
-                                    }
-                                    let (head, explicit) =
-                                        self.explicit_application_head(&parts[function])?;
-                                    let head = if explicit { head } else { &parts[function] };
-                                    tasks.push(Task::StartApplication(
-                                        head,
-                                        std::slice::from_ref(&parts[argument]),
-                                        expected,
-                                        explicit,
-                                    ));
-                                    continue;
-                                }
-                                if let Some(intrinsic) = bounded_infix_intrinsic(kind, true) {
-                                    let parts = expect_node(syntax, kind, 3, "scalar infix")?;
-                                    if !intrinsic.spelled_by(&parts[1]) {
-                                        return Err(NatDefinitionElabError::UnexpectedSyntax {
-                                            expected: "scalar operator",
-                                        });
-                                    }
-                                    // `(a : α) × β a` is the pin's dependent pair
-                                    // (`Init/NotationExtra.lean:93`, `Sigma`/`PSigma`), not
-                                    // `Prod` of an ascription.
-                                    if matches!(intrinsic.spelling(), "×" | "×'")
-                                        && matches!(&parts[0], Syntax::Node { kind, .. }
-                                            if kind == &parser_kind(&["Term", "typeAscription"]))
-                                    {
-                                        return Err(NatDefinitionElabError::UnexpectedSyntax {
-                                            expected: "a product of types, not a dependent pair",
-                                        });
-                                    }
-                                    tasks.push(Task::Infix(intrinsic, expected));
-                                    tasks.push(Task::Visit(&parts[2], None, true));
-                                    tasks.push(Task::Visit(&parts[0], None, true));
-                                    continue;
-                                }
-                            }
-                            let term = match self.atom(syntax, expected.as_ref()) {
-                                Ok(term) => term,
-                                Err(error) => {
-                                    // Ordinary and dotted names with several resolutions
-                                    // use the pin's `elabAtom` -> `elabAppAux` trials.
-                                    if finish
-                                        && let Some((name, candidates)) =
-                                            overload::ambiguous_head(&error, syntax)
-                                    {
-                                        values.push(self.overloaded(
-                                            syntax,
-                                            None,
-                                            &name,
-                                            &candidates,
-                                            expected.as_ref(),
-                                        )?);
                                         continue;
                                     }
-                                    blocked_application =
-                                        self.notation_type_unavailable(&error, expected.as_ref())?;
-                                    return Err(error);
-                                }
-                            };
-                            values.push(if finish {
-                                // Numerals in this bounded frontend are Nat terms,
-                                // not an excuse to bypass OfNat by coercing them.
-                                // An explicitly ascribed Nat can still be coerced.
-                                if matches!(
-                                    term.value.node(),
-                                    ExprNode::Lit {
-                                        literal: Literal::Nat(_)
-                                    }
-                                ) {
-                                    if let Some(expected) = &expected {
-                                        self.constrain_type(&term.type_, expected)?;
-                                    }
-                                    self.resolve_instances(false)?;
-                                    term
-                                } else if matches!(syntax, Syntax::Ident { .. })
-                                    || syntax.kind()
-                                        == Some(&parser_kind(&["Term", "explicitUniv"]))
-                                    || syntax.kind() == Some(&parser_kind(&["Term", "dotIdent"]))
-                                {
-                                    self.finish_optional_term(term, expected.as_ref())?
-                                } else {
-                                    self.finish_term(term, expected.as_ref())?
-                                }
-                            } else {
-                                term
-                            });
-                        }
-                        Task::Projection(field, at, arguments, expected, explicit, finish) => {
-                            let receiver = values.pop().expect("receiver precedes projection");
-                            // `x.f ..` has no arguments to process: `hasArgs` counts positional
-                            // and named arguments only (vendored `Lean/Elab/App.lean:1850`), so a
-                            // strict-implicit receiver is not instantiated before the lookup.
-                            match self.resolve_field_path(
-                                receiver,
-                                &field,
-                                !arguments.iter().all(application::is_ellipsis),
-                                Some(at),
-                            )? {
-                                record_terms::FieldResolution::Blocked {
-                                    receiver,
-                                    path,
-                                    at: blocked_at,
-                                } => {
-                                    let term = self.postpone_field_application(
-                                        receiver,
-                                        &path,
-                                        blocked_at.as_ref().unwrap_or(at),
-                                        arguments,
-                                        explicit,
-                                        finish,
-                                    )?;
-                                    values.push(if finish {
-                                        if explicit {
-                                            self.finish_explicit_term(term, expected.as_ref())?
-                                        } else {
-                                            self.finish_optional_term(term, expected.as_ref())?
-                                        }
-                                    } else {
-                                        term
-                                    });
-                                }
-                                record_terms::FieldResolution::Value(term)
-                                    if arguments.is_empty() =>
-                                {
-                                    values.push(if finish {
-                                        if explicit {
-                                            self.finish_explicit_term(term, expected.as_ref())?
-                                        } else {
-                                            self.finish_optional_term(term, expected.as_ref())?
-                                        }
-                                    } else {
-                                        term
-                                    });
-                                }
-                                record_terms::FieldResolution::Value(term) => {
-                                    values.push(term);
-                                    tasks.push(Task::Function(arguments, expected, explicit));
-                                }
-                                record_terms::FieldResolution::Method {
-                                    function,
-                                    receiver,
-                                    base,
-                                } => {
-                                    tasks.push(Task::NamedNext(self.start_field_application(
-                                        function, receiver, &base, arguments, expected, explicit,
-                                    )?));
-                                }
-                            }
-                        }
-                        Task::NomatchDiscriminant(remaining, mut terms, expected) => {
-                            terms.push(values.pop().expect("empty match discriminant visit"));
-                            if let Some((next, rest)) = remaining.split_first() {
-                                tasks.push(Task::NomatchDiscriminant(rest, terms, expected));
-                                tasks.push(Task::Visit(next, None, true));
-                            } else {
-                                tasks.push(Task::Proof(self.start_empty_match(terms, expected)?));
-                            }
-                        }
-                        Task::MatchDiscriminant(parts, expected) => {
-                            let major = values.pop().expect("match discriminant visit");
-                            tasks.push(match self.start_match(parts, major, expected)? {
-                                matching::MatchStart::Regular(state) => Task::MatchNext(*state),
-                                matching::MatchStart::Refined(proof) => Task::Proof(proof),
-                                matching::MatchStart::Conditional(state) => {
-                                    Task::ConditionalNext(*state)
-                                }
-                            });
-                        }
-                        Task::MatchNext(mut state) => match self.next_match_branch(&mut state)? {
-                            matching::MatchStep::Branch {
-                                syntax,
-                                expected,
-                                binders,
-                            } => {
-                                tasks.push(Task::MatchBranch(state, binders));
-                                tasks.push(Task::Visit(syntax, Some(expected), true));
-                            }
-                            matching::MatchStep::Complete(term) => values.push(term),
-                        },
-                        Task::MatchBranch(mut state, binders) => {
-                            let branch = values.pop().expect("match branch visit");
-                            self.accept_match_branch(&mut state, binders, branch)?;
-                            tasks.push(Task::MatchNext(state));
-                        }
-                        Task::ConditionalNext(mut state) => {
-                            match self.next_conditional_branch(&mut state)? {
-                                matching::ConditionalStep::Branch { syntax, expected } => {
-                                    tasks.push(Task::ConditionalBranch(state));
-                                    tasks.push(Task::Visit(syntax, Some(expected), true));
-                                }
-                                matching::ConditionalStep::Complete(term) => values.push(term),
-                            }
-                        }
-                        Task::ConditionalBranch(mut state) => {
-                            let branch = values.pop().expect("conditional branch visit");
-                            self.accept_conditional_branch(&mut state, branch)?;
-                            tasks.push(Task::ConditionalNext(state));
-                        }
-                        Task::Noindex => {
-                            let mut term = values.pop().expect("no_index term visit");
-                            let mut data = KVMap::new();
-                            data.insert(
-                                Name::from_components(["noindex"]),
-                                fln_core::options::DataValue::OfBool(true),
-                            );
-                            term.value = Expr::mdata(data, term.value);
-                            values.push(term);
-                        }
-                        Task::Ascription(syntax, expected, show) => {
-                            let type_ = values.pop().expect("ascription type visit");
-                            self.sort_level(&type_)?;
-                            if show && let Some(expected) = &expected {
-                                self.constrain_result_hint(&type_.value, expected)?;
-                                self.show_result_hint(&type_.value, expected)?;
-                            }
-                            tasks.push(Task::AscribedValue(type_.value.clone(), expected, show));
-                            tasks.push(Task::Visit(syntax, Some(type_.value), true));
-                        }
-                        Task::Coerced(expected) => {
-                            let term = values.pop().expect("coerced term visit");
-                            // The pin postpones `↑e` while its expected type is unknown. When it
-                            // is finally run with the type still a metavariable, the value only
-                            // unifies with it: `def up (n : Nat) := ↑n` is `n`, of type `Nat`,
-                            // and `#check ↑(3 : Nat)` prints `3 : Nat` (pinned v4.32.0). An
-                            // operator's `↑` leaf waits for the type the others give it
-                            // (`operators::postponed_leaf`).
-                            values.push(self.finish_term(term, expected.as_ref())?);
-                        }
-                        Task::AscribedValue(annotation, expected, show) => {
-                            let term = values.pop().expect("ascribed term follows its annotation");
-                            // The value's actual type guides surrounding inference.
-                            // The written annotation still constrains the inner value
-                            // and remains in the checked term even when ignored later.
-                            // Expected types guide inference but closed constraints are
-                            // left to K1. Retain this assertion in the checked term,
-                            // including when the surrounding program ignores its value.
-                            let ascribed = Typed {
-                                value: Expr::let_e(
-                                    Name::anonymous(),
-                                    annotation.clone(),
-                                    term.value,
-                                    Expr::bvar(0).expect("fixed ascription identity binder"),
-                                    show,
-                                ),
-                                // `show` pins the structural result type, not merely
-                                // a definitionally equal inferred type. Rewriters
-                                // consume precisely the equation the user wrote.
-                                type_: if show { annotation } else { term.type_ },
-                            };
-                            // Coerce outside the assertion: its inner annotation
-                            // must remain checked even if a conversion discards it.
-                            values.push(self.finish_term(ascribed, expected.as_ref())?);
-                        }
-                        Task::RecordType(parts, expected) => {
-                            let type_ = values.pop().expect("record type visit");
-                            self.sort_level(&type_)?;
-                            if let Some(expected) = expected {
-                                self.constrain_type(&type_.value, &expected)?;
-                            }
-                            tasks.push(Task::RecordPrepare(parts, Some(type_.value), Vec::new()));
-                        }
-                        Task::RecordPrepare(parts, expected, sources) => {
-                            if let Some(syntax) = parts.sources.get(sources.len()).copied() {
-                                tasks.push(Task::RecordSource(parts, expected, sources));
-                                tasks.push(Task::Visit(syntax, None, true));
-                            } else {
-                                // The pin postpones an update before choosing its
-                                // source structure when a later argument can supply
-                                // the expected type. Retain the owning argument's
-                                // transaction; an inferred declaration without that
-                                // owner can infer its record directly from a source.
-                                if !sources.is_empty()
-                                    && let Some(expected) = &expected
-                                    && let Some(id) =
-                                        self.application_type_unavailable(expected)?
-                                {
-                                    let problem = failure(SourceInferenceError::RecordTerm(
-                                        record_terms::RecordTermError::ExpectedRecordType,
-                                    ));
-                                    let blockers = [postponed::Blocker {
-                                        id,
-                                        problem: problem.clone(),
-                                    }];
-                                    for (index, attempt) in attempts.iter().enumerate().rev() {
-                                        self.tick()?;
-                                        if let Attempt::Argument(checkpoint) = attempt
-                                            && let Some(owner) =
-                                                checkpoint.owned_blocker(self, &blockers)?
-                                        {
-                                            blocked_application = Some(owner.id);
-                                            containing_argument = Some(index);
-                                            return Err(problem);
-                                        }
-                                    }
-                                }
-                                let record_expected = expected.clone();
-                                match self.start_record(parts, expected, sources) {
-                                    Ok(record) => tasks.push(Task::RecordNext(record)),
-                                    Err(problem) => {
-                                        blocked_application = self.notation_type_unavailable(
-                                            &problem,
-                                            record_expected.as_ref(),
-                                        )?;
-                                        return Err(problem);
-                                    }
-                                }
-                            }
-                        }
-                        Task::RecordSource(parts, expected, mut sources) => {
-                            sources.push(values.pop().expect("record update source visit"));
-                            tasks.push(Task::RecordPrepare(parts, expected, sources));
-                        }
-                        Task::RecordNext(mut state) => match self.next_record_field(&mut state)? {
-                            record_terms::RecordStep::Field {
-                                syntax,
-                                domain,
-                                target,
-                            } => {
-                                tasks.push(Task::RecordField(state, target));
-                                tasks.push(Task::Visit(syntax, Some(domain), true));
-                            }
-                            record_terms::RecordStep::Copy { value, target } => {
-                                self.accept_record_field(&mut state, &target, value)?;
-                                tasks.push(Task::RecordNext(state));
-                            }
-                            record_terms::RecordStep::Complete(term) => {
-                                if state.empty_braces()
-                                    && self.empty_braces_ambiguous(&term.type_)?
-                                {
-                                    return Err(failure(
-                                        SourceInferenceError::AmbiguousEmptyBraces,
-                                    ));
-                                }
-                                values.push(term)
-                            }
-                            record_terms::RecordStep::Continue => {
-                                tasks.push(Task::RecordNext(state))
-                            }
-                        },
-                        Task::RecordField(mut state, target) => {
-                            let value = values.pop().expect("record field visit");
-                            self.accept_record_field(&mut state, &target, value)?;
-                            tasks.push(Task::RecordNext(state));
-                        }
-                        Task::ChangeTarget(mut proof, goal) => {
-                            let annotation = values.pop().expect("change target visit");
-                            self.change_proof_goal(&mut proof, goal, annotation)?;
-                            tasks.push(Task::Proof(proof));
-                        }
-                        Task::Proof(mut proof) => match self.advance_proof(&mut proof)? {
-                            tactics::ProofAction::Change { goal, target } => {
-                                self.txn.lctx = goal.lctx.clone();
-                                tasks.push(Task::ChangeTarget(proof, goal));
-                                tasks.push(Task::Visit(target, Some(self.type_expected()?), true));
-                            }
-                            tactics::ProofAction::Simpa { goal, args, using } => {
-                                self.txn.lctx = goal.lctx.clone();
-                                tasks.push(Task::SimpaTerm(proof, goal, args));
-                                tasks.push(Task::Visit(using, None, true));
-                            }
-                            tactics::ProofAction::Eliminate {
-                                goal,
-                                args,
-                                induction,
-                                equation,
-                                expression,
-                            } => {
-                                self.txn.lctx = goal.lctx.clone();
-                                tasks.push(Task::ProofEliminate(
-                                    proof, goal, args, induction, equation,
-                                ));
-                                tasks.push(Task::Visit(expression, None, true));
-                            }
-                            tactics::ProofAction::Cases {
-                                goal,
-                                name,
-                                proposition,
-                            } => {
-                                self.txn.lctx = goal.lctx.clone();
-                                tasks.push(Task::ProofCases(proof, goal, name));
-                                tasks.push(Task::Visit(
-                                    proposition,
-                                    Some(Expr::sort(Level::zero())),
-                                    true,
-                                ));
-                            }
-                            tactics::ProofAction::Attempt(spec) => {
-                                let mut checkpoint = tactics::backtrack::Checkpoint::new(
-                                    self,
-                                    &proof,
-                                    spec,
-                                    tasks.len(),
-                                    values.len(),
-                                );
-                                let branch = checkpoint.begin(self, attempts.len())?;
-                                attempts
-                                    .push(Attempt::Proof(Box::new(checkpoint), pending.clone()));
-                                tasks.push(Task::Proof(branch));
-                            }
-                            tactics::ProofAction::AttemptComplete(index) => {
-                                if index + 1 != attempts.len() {
-                                    return Err(failure(SourceInferenceError::Scope));
-                                }
-                                let Some(Attempt::Proof(checkpoint, _)) = attempts.pop() else {
-                                    return Err(failure(SourceInferenceError::Scope));
-                                };
-                                if checkpoint.tasks != tasks.len()
-                                    || checkpoint.values != values.len()
-                                {
-                                    return Err(failure(SourceInferenceError::Scope));
-                                }
-                                if checkpoint.inverted() {
-                                    // `fail_if_success t` and `t` succeeded: undo it and fail, to
-                                    // the enclosing attempt (whose own checkpoint restores it).
-                                    tasks.truncate(checkpoint.tasks);
-                                    values.truncate(checkpoint.values);
-                                    checkpoint.restore(self);
-                                    return Err(failure(SourceInferenceError::Tactic(
-                                        tactics::TacticError::FailIfSuccessSucceeded,
-                                    )));
-                                }
-                                checkpoint.finish(self, &mut proof);
-                                if let Some(mut next) = checkpoint.next_iteration(self, &proof) {
-                                    proof = next.begin(self, attempts.len())?;
-                                    attempts.push(Attempt::Proof(Box::new(next), pending.clone()));
-                                }
-                                tasks.push(Task::Proof(proof));
-                            }
-                            tactics::ProofAction::Refine {
-                                syntax,
-                                goal,
-                                placeholders,
-                            } => {
-                                self.txn.lctx = goal.lctx.clone();
-                                let expected = goal.target.clone();
-                                let depth = if placeholders {
-                                    self.begin_placeholder_refinement()
-                                } else {
-                                    self.begin_refinement()
-                                };
-                                let no_implicit_lambda = goal.no_implicit_lambda;
-                                tasks.push(Task::RefineTerm(proof, goal, depth));
-                                tasks.push(if no_implicit_lambda {
-                                    Task::VisitWithoutImplicitLambda(syntax, Some(expected), true)
-                                } else {
-                                    Task::Visit(syntax, Some(expected), true)
-                                });
-                            }
-                            tactics::ProofAction::Binding {
-                                goal,
-                                binding,
-                                annotation,
-                                value,
-                            } => {
-                                self.txn.lctx = goal.lctx.clone();
-                                if let Some(annotation) = annotation {
-                                    tasks.push(Task::ProofBindingType(proof, goal, binding, value));
-                                    tasks.push(Task::Visit(
-                                        annotation,
-                                        Some(self.type_expected()?),
-                                        true,
-                                    ));
-                                } else {
-                                    tasks.push(Task::ProofBindingValue(proof, goal, binding, None));
-                                    tasks.push(Task::Visit(value, None, true));
-                                }
-                            }
-                            tactics::ProofAction::Specialize { goal, term } => {
-                                self.txn.lctx = goal.lctx.clone();
-                                tasks.push(Task::ProofSpecialize(proof, goal));
-                                tasks.push(Task::Visit(term, None, true));
-                            }
-                            tactics::ProofAction::Generalize {
-                                goal,
-                                name,
-                                equality,
-                                expression,
-                            } => {
-                                self.txn.lctx = goal.lctx.clone();
-                                tasks.push(Task::ProofGeneralize(proof, goal, name, equality));
-                                tasks.push(Task::Visit(expression, None, true));
-                            }
-                            tactics::ProofAction::Rewrite {
-                                goal,
-                                rule,
-                                remaining,
-                                close,
-                            } => {
-                                self.txn.lctx = goal.lctx.clone();
-                                if let Some((declaration, equations)) =
-                                    self.rewrite_rule_equations(rule.syntax)?
-                                {
-                                    self.rewrite_with_equations(
-                                        &mut proof,
-                                        goal,
-                                        &declaration,
-                                        &equations,
-                                        rule.reverse,
-                                        remaining,
-                                        close,
-                                    )?;
-                                    tasks.push(Task::Proof(proof));
-                                } else {
-                                    tasks.push(Task::RewriteTerm(
-                                        proof,
-                                        goal,
-                                        rule.reverse,
-                                        remaining,
-                                        close,
-                                    ));
-                                    tasks.push(Task::Visit(rule.syntax, None, true));
-                                }
-                            }
-                            tactics::ProofAction::MatchTerm { syntax, goal } => {
-                                self.txn.lctx = goal.lctx.clone();
-                                let mut expected = self.instantiate(&goal.target)?;
-                                let mut head = &expected;
-                                while let ExprNode::App { f, .. } = head.node() {
-                                    self.tick()?;
-                                    head = f;
-                                }
-                                if matches!(head.node(), ExprNode::MVar { .. }) {
-                                    // The pin gives an unresolved match result a fresh
-                                    // branch-local type proxy (`elabMatchAltView`). Relate
-                                    // it before visiting the body so numeric elaboration
-                                    // does not compare sibling scopes directly. Preserve
-                                    // the original sort and the final branch comparison.
-                                    let sort = self.known_type(&expected)?.ok_or_else(|| {
-                                        failure(SourceInferenceError::ExpectedType)
-                                    })?;
-                                    let proxy = self.hole(sort)?;
-                                    self.constrain(&proxy, &expected)?;
-                                    expected = proxy;
-                                }
-                                let check = self.begin_application_typing(syntax, &expected)?;
-                                tasks.push(Task::MatchTerm(proof, goal));
-                                if let Some(check) = check {
-                                    tasks.push(Task::ApplicationTyping(syntax, check));
-                                }
-                                tasks.push(Task::Visit(syntax, Some(expected), true));
-                            }
-                            tactics::ProofAction::Term {
-                                syntax,
-                                goal,
-                                apply,
-                            } => {
-                                let expected = if apply {
-                                    None
-                                } else {
-                                    Some(goal.target.clone())
-                                };
-                                self.txn.lctx = goal.lctx.clone();
-                                // `exact e` elaborates `e` against the goal, as a definition
-                                // body against its type (`pattern_typing`, R1).
-                                let check = expected
-                                    .as_ref()
-                                    .map(|target| self.begin_application_typing(syntax, target))
-                                    .transpose()?
-                                    .flatten();
-                                // Written arguments can insert implicit dictionaries
-                                // before apply starts opening the remaining telescope.
-                                let instance_start = apply.then_some(self.instance_goals.len());
-                                let refinement_depth = (!apply).then(|| self.begin_refinement());
-                                let no_implicit_lambda = goal.no_implicit_lambda;
-                                tasks.push(Task::ProofTerm(
-                                    proof,
-                                    goal,
-                                    instance_start,
-                                    refinement_depth,
-                                ));
-                                if let Some(check) = check {
-                                    tasks.push(Task::ApplicationTyping(syntax, check));
-                                }
-                                tasks.push(if no_implicit_lambda && expected.is_some() {
-                                    Task::VisitWithoutImplicitLambda(syntax, expected, true)
-                                } else {
-                                    Task::Visit(syntax, expected, true)
-                                });
-                            }
-                            tactics::ProofAction::Complete(term) => values.push(term),
-                            tactics::ProofAction::OwnedComplete(result) => {
-                                if !tasks.is_empty() || !values.is_empty() || !attempts.is_empty() {
-                                    return Err(failure(SourceInferenceError::Scope));
-                                }
-                                tactic_result = Some(result);
-                            }
-                        },
-                        Task::SimpaTerm(mut proof, goal, args) => {
-                            let term = values.pop().expect("simpa evidence visit");
-                            self.simpa_proof_term(&mut proof, goal, args, Some(term))?;
-                            tasks.push(Task::Proof(proof));
-                        }
-                        Task::ProofEliminate(mut proof, goal, args, induction, equation) => {
-                            let term = values.pop().expect("elimination expression visit");
-                            self.eliminate_proof_term(
-                                &mut proof, goal, args, induction, equation, term,
-                            )?;
-                            tasks.push(Task::Proof(proof));
-                        }
-                        Task::ProofCases(mut proof, goal, name) => {
-                            let proposition = values.pop().expect("case proposition visit");
-                            self.split_decision_goal(&mut proof, goal, name, proposition)?;
-                            tasks.push(Task::Proof(proof));
-                        }
-                        Task::ProofGeneralize(mut proof, goal, name, equality) => {
-                            let term = values.pop().expect("generalized expression visit");
-                            self.generalize_proof_term(&mut proof, goal, name, equality, term)?;
-                            tasks.push(Task::Proof(proof));
-                        }
-                        Task::ProofBindingType(proof, goal, binding, value) => {
-                            let annotation = values.pop().expect("local proof annotation visit");
-                            self.sort_level(&annotation)?;
-                            tasks.push(Task::ProofBindingValue(
-                                proof,
-                                goal,
-                                binding,
-                                Some(annotation.value.clone()),
-                            ));
-                            tasks.push(Task::Visit(value, Some(annotation.value), true));
-                        }
-                        Task::ProofBindingValue(mut proof, goal, binding, annotation) => {
-                            let mut value = values.pop().expect("local proof value visit");
-                            if let Some(annotation) = annotation {
-                                value.type_ = annotation;
-                            }
-                            self.bind_proof_value(&mut proof, goal, binding, value)?;
-                            tasks.push(Task::Proof(proof));
-                        }
-                        Task::ProofSpecialize(mut proof, goal) => {
-                            let term = values.pop().expect("specialized term visit");
-                            self.specialize_proof_term(&mut proof, goal, term)?;
-                            tasks.push(Task::Proof(proof));
-                        }
-                        Task::RewriteTerm(mut proof, goal, reverse, remaining, close) => {
-                            let term = values.pop().expect("rewrite rule visit");
-                            self.rewrite_proof_term(
-                                &mut proof, goal, term, reverse, remaining, close,
-                            )?;
-                            tasks.push(Task::Proof(proof));
-                        }
-                        Task::RefineTerm(mut proof, goal, depth) => {
-                            let term = values.pop().expect("refinement term visit");
-                            self.finish_refinement(&mut proof, goal, term, depth)?;
-                            tasks.push(Task::Proof(proof));
-                        }
-                        Task::MatchTerm(proof, goal) => {
-                            let term = values.pop().expect("match branch term visit");
-                            self.txn.lctx = goal.lctx.clone();
-                            self.resolve_instances(false)?;
-                            self.flush(false)?;
-                            self.ensure_tactic_term_type(&term.type_, &goal.target)?;
-                            // Holes were registered in the enclosing refine/exact
-                            // frame. Close this branch's telescope, then let that
-                            // owner decide whether its remaining goals may escape.
-                            self.close_proof_goal(goal, term.value)?;
-                            tasks.push(Task::Proof(proof));
-                        }
-                        Task::ProofTerm(mut proof, goal, instance_start, refinement_depth) => {
-                            let term = values.pop().expect("tactic term visit");
-                            if let Some(instance_start) = instance_start {
-                                self.apply_proof_term(&mut proof, goal, term, instance_start)?;
-                            } else {
-                                self.finish_exact_refinement(
-                                    &goal,
-                                    &term,
-                                    refinement_depth.expect("exact refinement frame"),
-                                )?;
-                                // A speculative `exact` must not select an alternative
-                                // merely because its implicit arguments deferred. On
-                                // a fixed goal, validate its candidate before dropping
-                                // the checkpoint so a bad `exact rfl` can fall back.
-                                let target = self.instantiate(&goal.target)?;
-                                if self.attempt_depth != 0
-                                    && self.postponed_application_errors.is_empty()
-                                    && !target.has_expr_mvar()
-                                    && !target.has_level_mvar()
-                                {
-                                    let check = self.hole(target)?;
-                                    let value = self.instantiate(&term.value)?;
-                                    let mut budget = UnificationBudget::new(self.kernel);
-                                    budget.transparency = UnificationTransparency::SafeDefinitions;
-                                    let report = self.txn.unify(&check, &value, budget).map_err(
-                                        |reason| {
-                                            failure(SourceInferenceError::Unification(Box::new(
-                                                reason,
-                                            )))
-                                        },
-                                    )?;
-                                    assert!(report.awakened.is_empty(), "private source queue");
-                                }
-                                self.close_proof_goal(goal, term.value)?;
-                            }
-                            tasks.push(Task::Proof(proof));
-                        }
-                        Task::StartApplication(head, arguments, expected, explicit) => {
-                            let receiver = match self.field_application_receiver(head) {
-                                Ok(receiver) => receiver,
-                                Err(error) => {
-                                    // An overloaded head: every interpretation of the
-                                    // whole application (the pin's `elabAppAux`).
-                                    if !explicit
-                                        && let Some((name, candidates)) =
-                                            overload::ambiguous_head(&error, head)
-                                    {
-                                        values.push(self.overloaded(
-                                            head,
-                                            Some(arguments),
-                                            &name,
-                                            &candidates,
-                                            expected.as_ref(),
-                                        )?);
+                                    if kind == &Name::str(Name::anonymous(), "term¬_") {
+                                        let parts =
+                                            expect_node(syntax, kind, 2, "propositional negation")?;
+                                        expect_atom(&parts[0], "¬", "negation prefix")?;
+                                        let function =
+                                            self.constant(&Name::from_components(["Not"]))?;
+                                        tasks.push(Task::Apply(
+                                            function,
+                                            Arguments::Plain(&parts[1..]),
+                                            expected,
+                                            false,
+                                        ));
                                         continue;
                                     }
-                                    return Err(error);
-                                }
-                            };
-                            match receiver {
-                                Some(record_terms::FieldReceiver::Syntax(receiver, field, at)) => {
-                                    tasks.push(Task::Projection(
-                                        field, at, arguments, expected, explicit, true,
-                                    ));
-                                    tasks.push(Task::Visit(receiver, None, true));
-                                }
-                                Some(record_terms::FieldReceiver::Elaborated(
-                                    receiver,
-                                    field,
-                                    at,
-                                )) => {
-                                    values.push(receiver);
-                                    tasks.push(Task::Projection(
-                                        field, at, arguments, expected, explicit, true,
-                                    ));
-                                }
-                                // `.c a b`: the head resolves against the expected type
-                                // of the whole application (`elabAppFn`'s dotIdent case).
-                                None if head.kind()
-                                    == Some(&parser_kind(&["Term", "dotIdent"])) =>
-                                {
-                                    let Syntax::Node { args, .. } = head else {
-                                        return Err(failure(SourceInferenceError::Scope));
+                                    // `"!" b:40 => not b` and `prefix:100 "~~~" => Complement.complement`
+                                    // (`Init/Notation.lean`; `not` is `Bool.not`, exported).
+                                    let prefix = [
+                                        ("!", ["Bool", "not"]),
+                                        ("~~~", ["Complement", "complement"]),
+                                    ]
+                                    .into_iter()
+                                    .find(|(spelling, _)| {
+                                        kind == &Name::str(
+                                            Name::anonymous(),
+                                            format!("term{spelling}_"),
+                                        )
+                                    });
+                                    if let Some((spelling, constant)) = prefix {
+                                        let parts =
+                                            expect_node(syntax, kind, 2, "prefix operator")?;
+                                        expect_atom(&parts[0], spelling, "prefix operator")?;
+                                        let function =
+                                            self.constant(&Name::from_components(constant))?;
+                                        tasks.push(Task::Apply(
+                                            function,
+                                            Arguments::Plain(&parts[1..]),
+                                            expected,
+                                            false,
+                                        ));
+                                        continue;
+                                    }
+                                    // `postfix:max "⁻¹" => Inv.inv` (`Init/Prelude.lean`).
+                                    if kind == &Name::str(Name::anonymous(), "term_⁻¹") {
+                                        let parts = expect_node(syntax, kind, 2, "inverse")?;
+                                        expect_atom(&parts[1], "⁻¹", "inverse postfix")?;
+                                        let function =
+                                            self.constant(&Name::from_components(["Inv", "inv"]))?;
+                                        tasks.push(Task::Apply(
+                                            function,
+                                            Arguments::Plain(&parts[..1]),
+                                            expected,
+                                            false,
+                                        ));
+                                        continue;
+                                    }
+                                    // The ranges with an unbounded side, in namespace `Std`
+                                    // (`Init/Data/Range/Polymorphic/PRange.lean`): `macro_rules`
+                                    // makes `*...b` and `*...<b` `Rio.mk b`, `*...=b` `Ric.mk b`,
+                                    // `a...*` `Rci.mk a`, `a<...*` `Roi.mk a` and `*...*` `Rii.mk`.
+                                    let unbounded = [
+                                        ("term*..._", "*...", "Rio", 1..2),
+                                        ("term*...<_", "*...<", "Rio", 1..2),
+                                        ("term*...=_", "*...=", "Ric", 1..2),
+                                        ("term_...*", "...*", "Rci", 0..1),
+                                        ("term_<...*", "<...*", "Roi", 0..1),
+                                        ("term*...*", "*...*", "Rii", 1..1),
+                                    ]
+                                    .into_iter()
+                                    .find(|(label, ..)| {
+                                        kind == &Name::from_components(["Std", label])
+                                    });
+                                    if let Some((_, spelling, constant, operands)) = unbounded {
+                                        let arity = if operands.is_empty() { 1 } else { 2 };
+                                        let parts =
+                                            expect_node(syntax, kind, arity, "unbounded range")?;
+                                        let symbol =
+                                            if operands.start == 0 { arity - 1 } else { 0 };
+                                        expect_atom(&parts[symbol], spelling, "unbounded range")?;
+                                        let function = self.constant(&Name::from_components([
+                                            "Std", constant, "mk",
+                                        ]))?;
+                                        tasks.push(Task::Apply(
+                                            function,
+                                            Arguments::Plain(&parts[operands]),
+                                            expected,
+                                            false,
+                                        ));
+                                        continue;
+                                    }
+                                    if kind == &Name::str(Name::anonymous(), "term-_") {
+                                        let parts =
+                                            expect_node(syntax, kind, 2, "arithmetic negation")?;
+                                        expect_atom(&parts[0], "-", "negation prefix")?;
+                                        let function =
+                                            self.constant(&Name::from_components(["Neg", "neg"]))?;
+                                        tasks.push(Task::Apply(
+                                            function,
+                                            Arguments::Plain(&parts[1..]),
+                                            expected,
+                                            false,
+                                        ));
+                                        continue;
+                                    }
+                                    if kind == &parser_kind(&["Term", "app"]) {
+                                        let parts = expect_node(syntax, kind, 2, "application")?;
+                                        let arguments =
+                                            expect_null_args(&parts[1], "application arguments")?;
+                                        if arguments.is_empty() {
+                                            return Err(failure(
+                                                SourceInferenceError::ExpectedFunction,
+                                            ));
+                                        }
+                                        let (head, explicit) =
+                                            self.explicit_application_head(&parts[0])?;
+                                        // A parenthesized head enters elabTerm, unlike a
+                                        // bare identifier resolved by elabAppFnId. Preserve
+                                        // that boundary when no explicit `@` was found.
+                                        let head = if explicit { head } else { &parts[0] };
+                                        tasks.push(Task::StartApplication(
+                                            head, arguments, expected, explicit,
+                                        ));
+                                        continue;
+                                    }
+                                    // `f <| a` and `a |> f` are the application `f a`
+                                    // (`Init/Notation.lean:522`). The pin's macros also flatten
+                                    // `f x <| a` and `a |> f x` into `f x a`, which the macro pass
+                                    // (`patterns.rs`, `expand_pipeline`) does before this driver;
+                                    // one that reaches it unlowered is refused rather than read as
+                                    // `(f x) a`.
+                                    let pipeline = if kind == &Name::from_components(["term_<|_"]) {
+                                        Some(("<|", 0, 2))
+                                    } else if kind == &Name::from_components(["term_$__"]) {
+                                        // `f $ a`, `<|`'s other spelling (`Init/Notation.lean:557`).
+                                        Some(("$", 0, 2))
+                                    } else if kind == &Name::from_components(["term_|>_"]) {
+                                        Some(("|>", 2, 0))
+                                    } else {
+                                        None
                                     };
-                                    let function = match self
-                                        .dotted_identifier(args, expected.as_ref())
+                                    if let Some((operator, function, argument)) = pipeline {
+                                        let parts = expect_node(syntax, kind, 3, "pipeline")?;
+                                        expect_atom(&parts[1], operator, "pipeline operator")?;
+                                        if matches!(&parts[function], Syntax::Node { kind, .. }
+                                        if kind == &parser_kind(&["Term", "app"]))
+                                        {
+                                            return Err(NatDefinitionElabError::UnexpectedSyntax {
+                                                expected: "a pipeline whose function is not an application",
+                                            });
+                                        }
+                                        let (head, explicit) =
+                                            self.explicit_application_head(&parts[function])?;
+                                        let head = if explicit { head } else { &parts[function] };
+                                        tasks.push(Task::StartApplication(
+                                            head,
+                                            std::slice::from_ref(&parts[argument]),
+                                            expected,
+                                            explicit,
+                                        ));
+                                        continue;
+                                    }
+                                    if let Some(intrinsic) = bounded_infix_intrinsic(kind, true) {
+                                        let parts = expect_node(syntax, kind, 3, "scalar infix")?;
+                                        if !intrinsic.spelled_by(&parts[1]) {
+                                            return Err(NatDefinitionElabError::UnexpectedSyntax {
+                                                expected: "scalar operator",
+                                            });
+                                        }
+                                        // `(a : α) × β a` is the pin's dependent pair
+                                        // (`Init/NotationExtra.lean:93`, `Sigma`/`PSigma`), not
+                                        // `Prod` of an ascription.
+                                        if matches!(intrinsic.spelling(), "×" | "×'")
+                                            && matches!(&parts[0], Syntax::Node { kind, .. }
+                                            if kind == &parser_kind(&["Term", "typeAscription"]))
+                                        {
+                                            return Err(NatDefinitionElabError::UnexpectedSyntax {
+                                                expected: "a product of types, not a dependent pair",
+                                            });
+                                        }
+                                        tasks.push(Task::Infix(intrinsic, expected));
+                                        tasks.push(Task::Visit(&parts[2], None, true));
+                                        tasks.push(Task::Visit(&parts[0], None, true));
+                                        continue;
+                                    }
+                                }
+                                let term = match self.atom(syntax, expected.as_ref()) {
+                                    Ok(term) => term,
+                                    Err(error) => {
+                                        // Ordinary and dotted names with several resolutions
+                                        // use the pin's `elabAtom` -> `elabAppAux` trials.
+                                        if finish
+                                            && let Some((name, candidates)) =
+                                                overload::ambiguous_head(&error, syntax)
+                                        {
+                                            values.push(self.overloaded(
+                                                syntax,
+                                                None,
+                                                &name,
+                                                &candidates,
+                                                expected.as_ref(),
+                                            )?);
+                                            continue;
+                                        }
+                                        blocked_application = self
+                                            .notation_type_unavailable(&error, expected.as_ref())?;
+                                        return Err(error);
+                                    }
+                                };
+                                values.push(if finish {
+                                    // Numerals in this bounded frontend are Nat terms,
+                                    // not an excuse to bypass OfNat by coercing them.
+                                    // An explicitly ascribed Nat can still be coerced.
+                                    if matches!(
+                                        term.value.node(),
+                                        ExprNode::Lit {
+                                            literal: Literal::Nat(_)
+                                        }
+                                    ) {
+                                        if let Some(expected) = &expected {
+                                            self.constrain_type(&term.type_, expected)?;
+                                        }
+                                        self.resolve_instances(false)?;
+                                        term
+                                    } else if matches!(syntax, Syntax::Ident { .. })
+                                        || syntax.kind()
+                                            == Some(&parser_kind(&["Term", "explicitUniv"]))
+                                        || syntax.kind()
+                                            == Some(&parser_kind(&["Term", "dotIdent"]))
                                     {
-                                        Ok(function) => function,
-                                        Err(problem) => {
-                                            if !explicit
-                                                && let Some((name, candidates)) =
-                                                    overload::ambiguous_head(&problem, head)
-                                            {
-                                                values.push(self.overloaded(
-                                                    head,
-                                                    Some(arguments),
-                                                    &name,
-                                                    &candidates,
-                                                    expected.as_ref(),
-                                                )?);
-                                                continue;
+                                        self.finish_optional_term(term, expected.as_ref())?
+                                    } else {
+                                        self.finish_term(term, expected.as_ref())?
+                                    }
+                                } else {
+                                    term
+                                });
+                            }
+                            Task::Projection(field, at, arguments, expected, explicit, finish) => {
+                                let receiver = values.pop().expect("receiver precedes projection");
+                                // `x.f ..` has no arguments to process: `hasArgs` counts positional
+                                // and named arguments only (vendored `Lean/Elab/App.lean:1850`), so a
+                                // strict-implicit receiver is not instantiated before the lookup.
+                                match self.resolve_field_path(
+                                    receiver,
+                                    &field,
+                                    !arguments.iter().all(application::is_ellipsis),
+                                    Some(at),
+                                )? {
+                                    record_terms::FieldResolution::Blocked {
+                                        receiver,
+                                        path,
+                                        at: blocked_at,
+                                    } => {
+                                        let term = self.postpone_field_application(
+                                            receiver,
+                                            &path,
+                                            blocked_at.as_ref().unwrap_or(at),
+                                            arguments,
+                                            explicit,
+                                            finish,
+                                        )?;
+                                        values.push(if finish {
+                                            if explicit {
+                                                self.finish_explicit_term(term, expected.as_ref())?
+                                            } else {
+                                                self.finish_optional_term(term, expected.as_ref())?
                                             }
+                                        } else {
+                                            term
+                                        });
+                                    }
+                                    record_terms::FieldResolution::Value(term)
+                                        if arguments.is_empty() =>
+                                    {
+                                        values.push(if finish {
+                                            if explicit {
+                                                self.finish_explicit_term(term, expected.as_ref())?
+                                            } else {
+                                                self.finish_optional_term(term, expected.as_ref())?
+                                            }
+                                        } else {
+                                            term
+                                        });
+                                    }
+                                    record_terms::FieldResolution::Value(term) => {
+                                        values.push(term);
+                                        tasks.push(Task::Function(arguments, expected, explicit));
+                                    }
+                                    record_terms::FieldResolution::Method {
+                                        function,
+                                        receiver,
+                                        base,
+                                    } => {
+                                        tasks.push(Task::NamedNext(self.start_field_application(
+                                            function, receiver, &base, arguments, expected,
+                                            explicit,
+                                        )?));
+                                    }
+                                }
+                            }
+                            Task::NomatchDiscriminant(remaining, mut terms, expected) => {
+                                terms.push(values.pop().expect("empty match discriminant visit"));
+                                if let Some((next, rest)) = remaining.split_first() {
+                                    tasks.push(Task::NomatchDiscriminant(rest, terms, expected));
+                                    tasks.push(Task::Visit(next, None, true));
+                                } else {
+                                    tasks.push(Task::Proof(
+                                        self.start_empty_match(terms, expected)?,
+                                    ));
+                                }
+                            }
+                            Task::MatchDiscriminant(parts, expected) => {
+                                let major = values.pop().expect("match discriminant visit");
+                                tasks.push(match self.start_match(parts, major, expected)? {
+                                    matching::MatchStart::Regular(state) => Task::MatchNext(state),
+                                    matching::MatchStart::Refined(proof) => Task::Proof(proof),
+                                    matching::MatchStart::Conditional(state) => {
+                                        Task::ConditionalNext(state)
+                                    }
+                                });
+                            }
+                            Task::MatchNext(mut state) => {
+                                match self.next_match_branch(&mut state)? {
+                                    matching::MatchStep::Branch {
+                                        syntax,
+                                        expected,
+                                        binders,
+                                    } => {
+                                        tasks.push(Task::MatchBranch(state, binders));
+                                        tasks.push(Task::Visit(syntax, Some(expected), true));
+                                    }
+                                    matching::MatchStep::Complete(term) => values.push(term),
+                                }
+                            }
+                            Task::MatchBranch(mut state, binders) => {
+                                let branch = values.pop().expect("match branch visit");
+                                self.accept_match_branch(&mut state, binders, branch)?;
+                                tasks.push(Task::MatchNext(state));
+                            }
+                            Task::ConditionalNext(mut state) => {
+                                match self.next_conditional_branch(&mut state)? {
+                                    matching::ConditionalStep::Branch { syntax, expected } => {
+                                        tasks.push(Task::ConditionalBranch(state));
+                                        tasks.push(Task::Visit(syntax, Some(expected), true));
+                                    }
+                                    matching::ConditionalStep::Complete(term) => values.push(term),
+                                }
+                            }
+                            Task::ConditionalBranch(mut state) => {
+                                let branch = values.pop().expect("conditional branch visit");
+                                self.accept_conditional_branch(&mut state, branch)?;
+                                tasks.push(Task::ConditionalNext(state));
+                            }
+                            Task::Noindex => {
+                                let mut term = values.pop().expect("no_index term visit");
+                                let mut data = KVMap::new();
+                                data.insert(
+                                    Name::from_components(["noindex"]),
+                                    fln_core::options::DataValue::OfBool(true),
+                                );
+                                term.value = Expr::mdata(data, term.value);
+                                values.push(term);
+                            }
+                            Task::Ascription(syntax, expected, show) => {
+                                let type_ = values.pop().expect("ascription type visit");
+                                self.sort_level(&type_)?;
+                                if show && let Some(expected) = &expected {
+                                    self.constrain_result_hint(&type_.value, expected)?;
+                                    self.show_result_hint(&type_.value, expected)?;
+                                }
+                                tasks.push(Task::AscribedValue(
+                                    type_.value.clone(),
+                                    expected,
+                                    show,
+                                ));
+                                tasks.push(Task::Visit(syntax, Some(type_.value), true));
+                            }
+                            Task::Coerced(expected) => {
+                                let term = values.pop().expect("coerced term visit");
+                                // The pin postpones `↑e` while its expected type is unknown. When it
+                                // is finally run with the type still a metavariable, the value only
+                                // unifies with it: `def up (n : Nat) := ↑n` is `n`, of type `Nat`,
+                                // and `#check ↑(3 : Nat)` prints `3 : Nat` (pinned v4.32.0). An
+                                // operator's `↑` leaf waits for the type the others give it
+                                // (`operators::postponed_leaf`).
+                                values.push(self.finish_term(term, expected.as_ref())?);
+                            }
+                            Task::AscribedValue(annotation, expected, show) => {
+                                let term =
+                                    values.pop().expect("ascribed term follows its annotation");
+                                // The value's actual type guides surrounding inference.
+                                // The written annotation still constrains the inner value
+                                // and remains in the checked term even when ignored later.
+                                // Expected types guide inference but closed constraints are
+                                // left to K1. Retain this assertion in the checked term,
+                                // including when the surrounding program ignores its value.
+                                let ascribed = Typed {
+                                    value: Expr::let_e(
+                                        Name::anonymous(),
+                                        annotation.clone(),
+                                        term.value,
+                                        Expr::bvar(0).expect("fixed ascription identity binder"),
+                                        show,
+                                    ),
+                                    // `show` pins the structural result type, not merely
+                                    // a definitionally equal inferred type. Rewriters
+                                    // consume precisely the equation the user wrote.
+                                    type_: if show { annotation } else { term.type_ },
+                                };
+                                // Coerce outside the assertion: its inner annotation
+                                // must remain checked even if a conversion discards it.
+                                values.push(self.finish_term(ascribed, expected.as_ref())?);
+                            }
+                            Task::RecordType(parts, expected) => {
+                                let type_ = values.pop().expect("record type visit");
+                                self.sort_level(&type_)?;
+                                if let Some(expected) = expected {
+                                    self.constrain_type(&type_.value, &expected)?;
+                                }
+                                tasks.push(Task::RecordPrepare(
+                                    parts,
+                                    Some(type_.value),
+                                    Vec::new(),
+                                ));
+                            }
+                            Task::RecordPrepare(parts, expected, sources) => {
+                                if let Some(syntax) = parts.sources.get(sources.len()).copied() {
+                                    tasks.push(Task::RecordSource(parts, expected, sources));
+                                    tasks.push(Task::Visit(syntax, None, true));
+                                } else {
+                                    // The pin postpones an update before choosing its
+                                    // source structure when a later argument can supply
+                                    // the expected type. Retain the owning argument's
+                                    // transaction; an inferred declaration without that
+                                    // owner can infer its record directly from a source.
+                                    if !sources.is_empty()
+                                        && let Some(expected) = &expected
+                                        && let Some(id) =
+                                            self.application_type_unavailable(expected)?
+                                    {
+                                        let problem = failure(SourceInferenceError::RecordTerm(
+                                            record_terms::RecordTermError::ExpectedRecordType,
+                                        ));
+                                        let blockers = [postponed::Blocker {
+                                            id,
+                                            problem: problem.clone(),
+                                        }];
+                                        for (index, attempt) in attempts.iter().enumerate().rev() {
+                                            self.tick()?;
+                                            if let Attempt::Argument(checkpoint) = attempt
+                                                && let Some(owner) =
+                                                    checkpoint.owned_blocker(self, &blockers)?
+                                            {
+                                                blocked_application = Some(owner.id);
+                                                containing_argument = Some(index);
+                                                return Err(problem);
+                                            }
+                                        }
+                                    }
+                                    let record_expected = expected.clone();
+                                    match self.start_record(parts, expected, sources) {
+                                        Ok(record) => {
+                                            tasks.push(Task::RecordNext(Box::new(record)))
+                                        }
+                                        Err(problem) => {
                                             blocked_application = self.notation_type_unavailable(
                                                 &problem,
-                                                expected.as_ref(),
+                                                record_expected.as_ref(),
                                             )?;
                                             return Err(problem);
                                         }
-                                    };
-                                    values.push(function);
-                                    tasks.push(Task::Function(arguments, expected, explicit));
-                                }
-                                None => {
-                                    tasks.push(Task::Function(arguments, expected, explicit));
-                                    tasks.push(
-                                        if matches!(head, Syntax::Ident { .. })
-                                            || head.kind()
-                                                == Some(&parser_kind(&["Term", "explicitUniv"]))
-                                        {
-                                            Task::Elaborate(head, None, false)
-                                        } else {
-                                            Task::Visit(head, None, false)
-                                        },
-                                    );
-                                }
-                            }
-                        }
-                        Task::Function(arguments, expected, explicit) => {
-                            let function = values.pop().expect("function task follows its visit");
-                            if let Some(info) =
-                                self.eliminator_info(&function, arguments, explicit)?
-                            {
-                                let term = self.eliminator_application(
-                                    function,
-                                    arguments,
-                                    info,
-                                    expected.clone(),
-                                )?;
-                                values.push(self.finish_explicit_term(term, expected.as_ref())?);
-                            } else if application::has_named(arguments) {
-                                tasks.push(Task::NamedNext(self.start_named_application(
-                                    function, arguments, expected, explicit,
-                                )?));
-                            } else {
-                                tasks.push(Task::Apply(
-                                    function,
-                                    Arguments::Plain(arguments),
-                                    expected,
-                                    explicit,
-                                ));
-                            }
-                        }
-                        Task::ForCollection(expected) => {
-                            let collection = values.pop().expect("loop collection visit");
-                            let collection = self.finish_term(collection, expected.as_ref())?;
-                            // Numeric defaults must precede dependent callback
-                            // checking, so the admitted ForIn' dictionary can
-                            // supply the element and membership proof types.
-                            self.resolve_instances_with_defaults()?;
-                            values.push(self.finish_term(collection, expected.as_ref())?);
-                        }
-                        Task::NamedNext(mut state) => {
-                            if state.initial() {
-                                if state.has_arguments()
-                                    && self
-                                        .application_type_unavailable(state.function_type())?
-                                        .is_some()
-                                {
-                                    self.resolve_instances(false)?;
-                                    if let Some(blocker) =
-                                        self.application_type_unavailable(state.function_type())?
-                                    {
-                                        blocked_application = Some(blocker);
-                                        blocked_initial_application = Some(Task::NamedNext(state));
-                                        return Err(failure(
-                                            SourceInferenceError::ExpectedFunction,
-                                        ));
                                     }
                                 }
-                                state.start();
                             }
-                            let next = self.next_named_argument(&mut state);
-                            if matches!(
-                                &next,
-                                Err(NatDefinitionElabError::Inference(
-                                    SourceInferenceError::ExpectedFunction
-                                        | SourceInferenceError::InvalidNamedArgument(_)
-                                ))
-                            ) {
-                                if self.function_coercion_is_absent(state.function_type())? {
-                                    return Err(failure(
-                                        SourceInferenceError::FunctionCoercionAbsent,
+                            Task::RecordSource(parts, expected, mut sources) => {
+                                sources.push(values.pop().expect("record update source visit"));
+                                tasks.push(Task::RecordPrepare(parts, expected, sources));
+                            }
+                            Task::RecordNext(mut state) => {
+                                match self.next_record_field(&mut state)? {
+                                    record_terms::RecordStep::Field {
+                                        syntax,
+                                        domain,
+                                        target,
+                                    } => {
+                                        tasks.push(Task::RecordField(state, target));
+                                        tasks.push(Task::Visit(syntax, Some(domain), true));
+                                    }
+                                    record_terms::RecordStep::Copy { value, target } => {
+                                        self.accept_record_field(&mut state, &target, value)?;
+                                        tasks.push(Task::RecordNext(state));
+                                    }
+                                    record_terms::RecordStep::Complete(term) => {
+                                        if state.empty_braces()
+                                            && self.empty_braces_ambiguous(&term.type_)?
+                                        {
+                                            return Err(failure(
+                                                SourceInferenceError::AmbiguousEmptyBraces,
+                                            ));
+                                        }
+                                        values.push(term)
+                                    }
+                                    record_terms::RecordStep::Continue => {
+                                        tasks.push(Task::RecordNext(state))
+                                    }
+                                }
+                            }
+                            Task::RecordField(mut state, target) => {
+                                let value = values.pop().expect("record field visit");
+                                self.accept_record_field(&mut state, &target, value)?;
+                                tasks.push(Task::RecordNext(state));
+                            }
+                            Task::ChangeTarget(mut proof, goal) => {
+                                let annotation = values.pop().expect("change target visit");
+                                self.change_proof_goal(&mut proof, goal, annotation)?;
+                                tasks.push(Task::Proof(proof));
+                            }
+                            Task::Proof(proof) => return Ok(Step::AdvanceProof(proof)),
+                            Task::ProofAdvanced(mut proof, action) => match *action {
+                                tactics::ProofAction::Change { goal, target } => {
+                                    self.txn.lctx = goal.lctx.clone();
+                                    tasks.push(Task::ChangeTarget(proof, goal));
+                                    tasks.push(Task::Visit(
+                                        target,
+                                        Some(self.type_expected()?),
+                                        true,
                                     ));
                                 }
-                                blocked_application =
-                                    self.application_type_unavailable(state.function_type())?;
-                                if blocked_application.is_some() {
-                                    return Err(failure(SourceInferenceError::ExpectedFunction));
+                                tactics::ProofAction::Simpa { goal, args, using } => {
+                                    self.txn.lctx = goal.lctx.clone();
+                                    tasks.push(Task::SimpaTerm(proof, goal, args));
+                                    tasks.push(Task::Visit(using, None, true));
                                 }
-                            }
-                            if let Some(argument) = next? {
-                                match argument.value {
-                                    application::ApplicationValue::Syntax(syntax) => {
-                                        tasks.push(Task::NamedArgument(state, argument.codomain));
-                                        tasks.push(Task::CheckArgument(
+                                tactics::ProofAction::Eliminate {
+                                    goal,
+                                    args,
+                                    induction,
+                                    equation,
+                                    expression,
+                                } => {
+                                    self.txn.lctx = goal.lctx.clone();
+                                    tasks.push(Task::ProofEliminate(
+                                        proof, goal, args, induction, equation,
+                                    ));
+                                    tasks.push(Task::Visit(expression, None, true));
+                                }
+                                tactics::ProofAction::Cases {
+                                    goal,
+                                    name,
+                                    proposition,
+                                } => {
+                                    self.txn.lctx = goal.lctx.clone();
+                                    tasks.push(Task::ProofCases(proof, goal, name));
+                                    tasks.push(Task::Visit(
+                                        proposition,
+                                        Some(Expr::sort(Level::zero())),
+                                        true,
+                                    ));
+                                }
+                                tactics::ProofAction::Attempt(spec) => {
+                                    let mut checkpoint = tactics::backtrack::Checkpoint::new(
+                                        self,
+                                        &proof,
+                                        spec,
+                                        tasks.len(),
+                                        values.len(),
+                                    );
+                                    let branch = checkpoint.begin(self, attempts.len())?;
+                                    attempts.push(Attempt::Proof(
+                                        Box::new(checkpoint),
+                                        pending.clone(),
+                                    ));
+                                    tasks.push(Task::Proof(branch));
+                                }
+                                tactics::ProofAction::AttemptComplete(index) => {
+                                    if index + 1 != attempts.len() {
+                                        return Err(failure(SourceInferenceError::Scope));
+                                    }
+                                    let Some(Attempt::Proof(checkpoint, _)) = attempts.pop() else {
+                                        return Err(failure(SourceInferenceError::Scope));
+                                    };
+                                    if checkpoint.tasks != tasks.len()
+                                        || checkpoint.values != values.len()
+                                    {
+                                        return Err(failure(SourceInferenceError::Scope));
+                                    }
+                                    if checkpoint.inverted() {
+                                        // `fail_if_success t` and `t` succeeded: undo it and fail, to
+                                        // the enclosing attempt (whose own checkpoint restores it).
+                                        tasks.truncate(checkpoint.tasks);
+                                        values.truncate(checkpoint.values);
+                                        checkpoint.restore(self);
+                                        return Err(failure(SourceInferenceError::Tactic(
+                                            tactics::TacticError::FailIfSuccessSucceeded,
+                                        )));
+                                    }
+                                    checkpoint.finish(self, &mut proof);
+                                    if let Some(mut next) = checkpoint.next_iteration(self, &proof)
+                                    {
+                                        proof = next.begin(self, attempts.len())?;
+                                        attempts
+                                            .push(Attempt::Proof(Box::new(next), pending.clone()));
+                                    }
+                                    tasks.push(Task::Proof(proof));
+                                }
+                                tactics::ProofAction::Refine {
+                                    syntax,
+                                    goal,
+                                    placeholders,
+                                } => {
+                                    self.txn.lctx = goal.lctx.clone();
+                                    let expected = goal.target.clone();
+                                    let depth = if placeholders {
+                                        self.begin_placeholder_refinement()
+                                    } else {
+                                        self.begin_refinement()
+                                    };
+                                    let no_implicit_lambda = goal.no_implicit_lambda;
+                                    tasks.push(Task::RefineTerm(proof, goal, depth));
+                                    tasks.push(if no_implicit_lambda {
+                                        Task::VisitWithoutImplicitLambda(
                                             syntax,
-                                            argument.domain,
-                                            argument.infer_exception_action,
+                                            Some(expected),
+                                            true,
+                                        )
+                                    } else {
+                                        Task::Visit(syntax, Some(expected), true)
+                                    });
+                                }
+                                tactics::ProofAction::Binding {
+                                    goal,
+                                    binding,
+                                    annotation,
+                                    value,
+                                } => {
+                                    self.txn.lctx = goal.lctx.clone();
+                                    if let Some(annotation) = annotation {
+                                        tasks.push(Task::ProofBindingType(
+                                            proof, goal, binding, value,
+                                        ));
+                                        tasks.push(Task::Visit(
+                                            annotation,
+                                            Some(self.type_expected()?),
+                                            true,
+                                        ));
+                                    } else {
+                                        tasks.push(Task::ProofBindingValue(
+                                            proof, goal, binding, None,
+                                        ));
+                                        tasks.push(Task::Visit(value, None, true));
+                                    }
+                                }
+                                tactics::ProofAction::Specialize { goal, term } => {
+                                    self.txn.lctx = goal.lctx.clone();
+                                    tasks.push(Task::ProofSpecialize(proof, goal));
+                                    tasks.push(Task::Visit(term, None, true));
+                                }
+                                tactics::ProofAction::Generalize {
+                                    goal,
+                                    name,
+                                    equality,
+                                    expression,
+                                } => {
+                                    self.txn.lctx = goal.lctx.clone();
+                                    tasks.push(Task::ProofGeneralize(proof, goal, name, equality));
+                                    tasks.push(Task::Visit(expression, None, true));
+                                }
+                                tactics::ProofAction::Rewrite {
+                                    goal,
+                                    rule,
+                                    remaining,
+                                    close,
+                                } => {
+                                    self.txn.lctx = goal.lctx.clone();
+                                    if let Some((declaration, equations)) =
+                                        self.rewrite_rule_equations(rule.syntax)?
+                                    {
+                                        self.rewrite_with_equations(
+                                            &mut proof,
+                                            goal,
+                                            &declaration,
+                                            &equations,
+                                            rule.reverse,
+                                            remaining,
+                                            close,
+                                        )?;
+                                        tasks.push(Task::Proof(proof));
+                                    } else {
+                                        tasks.push(Task::RewriteTerm(
+                                            proof,
+                                            goal,
+                                            rule.reverse,
+                                            remaining,
+                                            close,
+                                        ));
+                                        tasks.push(Task::Visit(rule.syntax, None, true));
+                                    }
+                                }
+                                tactics::ProofAction::MatchTerm { syntax, goal } => {
+                                    self.txn.lctx = goal.lctx.clone();
+                                    let mut expected = self.instantiate(&goal.target)?;
+                                    let mut head = &expected;
+                                    while let ExprNode::App { f, .. } = head.node() {
+                                        self.tick()?;
+                                        head = f;
+                                    }
+                                    if matches!(head.node(), ExprNode::MVar { .. }) {
+                                        // The pin gives an unresolved match result a fresh
+                                        // branch-local type proxy (`elabMatchAltView`). Relate
+                                        // it before visiting the body so numeric elaboration
+                                        // does not compare sibling scopes directly. Preserve
+                                        // the original sort and the final branch comparison.
+                                        let sort =
+                                            self.known_type(&expected)?.ok_or_else(|| {
+                                                failure(SourceInferenceError::ExpectedType)
+                                            })?;
+                                        let proxy = self.hole(sort)?;
+                                        self.constrain(&proxy, &expected)?;
+                                        expected = proxy;
+                                    }
+                                    let check = self.begin_application_typing(syntax, &expected)?;
+                                    tasks.push(Task::MatchTerm(proof, goal));
+                                    if let Some(check) = check {
+                                        tasks.push(Task::ApplicationTyping(syntax, check));
+                                    }
+                                    tasks.push(Task::Visit(syntax, Some(expected), true));
+                                }
+                                tactics::ProofAction::Term {
+                                    syntax,
+                                    goal,
+                                    apply,
+                                } => {
+                                    let expected = if apply {
+                                        None
+                                    } else {
+                                        Some(goal.target.clone())
+                                    };
+                                    self.txn.lctx = goal.lctx.clone();
+                                    // `exact e` elaborates `e` against the goal, as a definition
+                                    // body against its type (`pattern_typing`, R1).
+                                    let check = expected
+                                        .as_ref()
+                                        .map(|target| self.begin_application_typing(syntax, target))
+                                        .transpose()?
+                                        .flatten();
+                                    // Written arguments can insert implicit dictionaries
+                                    // before apply starts opening the remaining telescope.
+                                    let instance_start = apply.then_some(self.instance_goals.len());
+                                    let refinement_depth =
+                                        (!apply).then(|| self.begin_refinement());
+                                    let no_implicit_lambda = goal.no_implicit_lambda;
+                                    tasks.push(Task::ProofTerm(
+                                        proof,
+                                        goal,
+                                        instance_start,
+                                        refinement_depth,
+                                    ));
+                                    if let Some(check) = check {
+                                        tasks.push(Task::ApplicationTyping(syntax, check));
+                                    }
+                                    tasks.push(if no_implicit_lambda && expected.is_some() {
+                                        Task::VisitWithoutImplicitLambda(syntax, expected, true)
+                                    } else {
+                                        Task::Visit(syntax, expected, true)
+                                    });
+                                }
+                                tactics::ProofAction::Complete(term) => values.push(term),
+                                tactics::ProofAction::OwnedComplete(result) => {
+                                    if !tasks.is_empty()
+                                        || !values.is_empty()
+                                        || !attempts.is_empty()
+                                    {
+                                        return Err(failure(SourceInferenceError::Scope));
+                                    }
+                                    tactic_result = Some(result);
+                                }
+                            },
+                            Task::SimpaTerm(mut proof, goal, args) => {
+                                let term = values.pop().expect("simpa evidence visit");
+                                self.simpa_proof_term(&mut proof, goal, args, Some(term))?;
+                                tasks.push(Task::Proof(proof));
+                            }
+                            Task::ProofEliminate(mut proof, goal, args, induction, equation) => {
+                                let term = values.pop().expect("elimination expression visit");
+                                self.eliminate_proof_term(
+                                    &mut proof, goal, args, induction, equation, term,
+                                )?;
+                                tasks.push(Task::Proof(proof));
+                            }
+                            Task::ProofCases(mut proof, goal, name) => {
+                                let proposition = values.pop().expect("case proposition visit");
+                                self.split_decision_goal(&mut proof, goal, name, proposition)?;
+                                tasks.push(Task::Proof(proof));
+                            }
+                            Task::ProofGeneralize(mut proof, goal, name, equality) => {
+                                let term = values.pop().expect("generalized expression visit");
+                                self.generalize_proof_term(&mut proof, goal, name, equality, term)?;
+                                tasks.push(Task::Proof(proof));
+                            }
+                            Task::ProofBindingType(proof, goal, binding, value) => {
+                                let annotation =
+                                    values.pop().expect("local proof annotation visit");
+                                self.sort_level(&annotation)?;
+                                tasks.push(Task::ProofBindingValue(
+                                    proof,
+                                    goal,
+                                    binding,
+                                    Some(annotation.value.clone()),
+                                ));
+                                tasks.push(Task::Visit(value, Some(annotation.value), true));
+                            }
+                            Task::ProofBindingValue(mut proof, goal, binding, annotation) => {
+                                let mut value = values.pop().expect("local proof value visit");
+                                if let Some(annotation) = annotation {
+                                    value.type_ = annotation;
+                                }
+                                self.bind_proof_value(&mut proof, goal, binding, value)?;
+                                tasks.push(Task::Proof(proof));
+                            }
+                            Task::ProofSpecialize(mut proof, goal) => {
+                                let term = values.pop().expect("specialized term visit");
+                                self.specialize_proof_term(&mut proof, goal, term)?;
+                                tasks.push(Task::Proof(proof));
+                            }
+                            Task::RewriteTerm(mut proof, goal, reverse, remaining, close) => {
+                                let term = values.pop().expect("rewrite rule visit");
+                                self.rewrite_proof_term(
+                                    &mut proof, goal, term, reverse, remaining, close,
+                                )?;
+                                tasks.push(Task::Proof(proof));
+                            }
+                            Task::RefineTerm(mut proof, goal, depth) => {
+                                let term = values.pop().expect("refinement term visit");
+                                self.finish_refinement(&mut proof, goal, term, depth)?;
+                                tasks.push(Task::Proof(proof));
+                            }
+                            Task::MatchTerm(proof, goal) => {
+                                let term = values.pop().expect("match branch term visit");
+                                self.txn.lctx = goal.lctx.clone();
+                                self.resolve_instances(false)?;
+                                self.flush(false)?;
+                                self.ensure_tactic_term_type(&term.type_, &goal.target)?;
+                                // Holes were registered in the enclosing refine/exact
+                                // frame. Close this branch's telescope, then let that
+                                // owner decide whether its remaining goals may escape.
+                                self.close_proof_goal(goal, term.value)?;
+                                tasks.push(Task::Proof(proof));
+                            }
+                            Task::ProofTerm(mut proof, goal, instance_start, refinement_depth) => {
+                                let term = values.pop().expect("tactic term visit");
+                                if let Some(instance_start) = instance_start {
+                                    self.apply_proof_term(&mut proof, goal, term, instance_start)?;
+                                } else {
+                                    self.finish_exact_refinement(
+                                        &goal,
+                                        &term,
+                                        refinement_depth.expect("exact refinement frame"),
+                                    )?;
+                                    // A speculative `exact` must not select an alternative
+                                    // merely because its implicit arguments deferred. On
+                                    // a fixed goal, validate its candidate before dropping
+                                    // the checkpoint so a bad `exact rfl` can fall back.
+                                    let target = self.instantiate(&goal.target)?;
+                                    if self.attempt_depth != 0
+                                        && self.postponed_application_errors.is_empty()
+                                        && !target.has_expr_mvar()
+                                        && !target.has_level_mvar()
+                                    {
+                                        let check = self.hole(target)?;
+                                        let value = self.instantiate(&term.value)?;
+                                        let mut budget = UnificationBudget::new(self.kernel);
+                                        budget.transparency =
+                                            UnificationTransparency::SafeDefinitions;
+                                        let report = self
+                                            .txn
+                                            .unify(&check, &value, budget)
+                                            .map_err(|reason| {
+                                                failure(SourceInferenceError::Unification(
+                                                    Box::new(reason),
+                                                ))
+                                            })?;
+                                        assert!(report.awakened.is_empty(), "private source queue");
+                                    }
+                                    self.close_proof_goal(goal, term.value)?;
+                                }
+                                tasks.push(Task::Proof(proof));
+                            }
+                            Task::StartApplication(head, arguments, expected, explicit) => {
+                                let receiver = match self.field_application_receiver(head) {
+                                    Ok(receiver) => receiver,
+                                    Err(error) => {
+                                        // An overloaded head: every interpretation of the
+                                        // whole application (the pin's `elabAppAux`).
+                                        if !explicit
+                                            && let Some((name, candidates)) =
+                                                overload::ambiguous_head(&error, head)
+                                        {
+                                            values.push(self.overloaded(
+                                                head,
+                                                Some(arguments),
+                                                &name,
+                                                &candidates,
+                                                expected.as_ref(),
+                                            )?);
+                                            continue;
+                                        }
+                                        return Err(error);
+                                    }
+                                };
+                                match receiver {
+                                    Some(record_terms::FieldReceiver::Syntax(
+                                        receiver,
+                                        field,
+                                        at,
+                                    )) => {
+                                        tasks.push(Task::Projection(
+                                            field, at, arguments, expected, explicit, true,
+                                        ));
+                                        tasks.push(Task::Visit(receiver, None, true));
+                                    }
+                                    Some(record_terms::FieldReceiver::Elaborated(
+                                        receiver,
+                                        field,
+                                        at,
+                                    )) => {
+                                        values.push(receiver);
+                                        tasks.push(Task::Projection(
+                                            field, at, arguments, expected, explicit, true,
                                         ));
                                     }
-                                    application::ApplicationValue::Elaborated(value) => {
-                                        let value = if argument.infer_exception_action {
-                                            self.finish_do_exception_action(
-                                                value,
-                                                &argument.domain,
-                                            )?
-                                        } else {
-                                            let value =
-                                                self.finish_term(value, Some(&argument.domain))?;
-                                            self.constrain_type(&value.type_, &argument.domain)?;
-                                            value
+                                    // `.c a b`: the head resolves against the expected type
+                                    // of the whole application (`elabAppFn`'s dotIdent case).
+                                    None if head.kind()
+                                        == Some(&parser_kind(&["Term", "dotIdent"])) =>
+                                    {
+                                        let Syntax::Node { args, .. } = head else {
+                                            return Err(failure(SourceInferenceError::Scope));
                                         };
-                                        self.add_named_argument(
-                                            &mut state,
-                                            &argument.codomain,
-                                            value,
-                                        )?;
-                                        tasks.push(Task::NamedNext(state));
+                                        let function =
+                                            match self.dotted_identifier(args, expected.as_ref()) {
+                                                Ok(function) => function,
+                                                Err(problem) => {
+                                                    if !explicit
+                                                        && let Some((name, candidates)) =
+                                                            overload::ambiguous_head(&problem, head)
+                                                    {
+                                                        values.push(self.overloaded(
+                                                            head,
+                                                            Some(arguments),
+                                                            &name,
+                                                            &candidates,
+                                                            expected.as_ref(),
+                                                        )?);
+                                                        continue;
+                                                    }
+                                                    blocked_application = self
+                                                        .notation_type_unavailable(
+                                                            &problem,
+                                                            expected.as_ref(),
+                                                        )?;
+                                                    return Err(problem);
+                                                }
+                                            };
+                                        values.push(function);
+                                        tasks.push(Task::Function(arguments, expected, explicit));
+                                    }
+                                    None => {
+                                        tasks.push(Task::Function(arguments, expected, explicit));
+                                        tasks.push(
+                                            if matches!(head, Syntax::Ident { .. })
+                                                || head.kind()
+                                                    == Some(&parser_kind(&["Term", "explicitUniv"]))
+                                            {
+                                                Task::Elaborate(head, None, false)
+                                            } else {
+                                                Task::Visit(head, None, false)
+                                            },
+                                        );
                                     }
                                 }
-                            } else {
-                                values.push(self.finish_named_application(state)?);
                             }
-                        }
-                        Task::NamedArgument(mut state, codomain) => {
-                            let argument = values.pop().expect("named argument follows its value");
-                            self.add_named_argument(&mut state, &codomain, argument)?;
-                            tasks.push(Task::NamedNext(state));
-                        }
-                        Task::Apply(function, arguments, expected, explicit) => {
-                            if !arguments.is_empty()
-                                && self
-                                    .application_type_unavailable(&function.type_)?
-                                    .is_some()
-                            {
-                                // Known telescopes reach ordinary synthesis in
-                                // coerce_function. Only an unavailable initial
-                                // callee needs an earlier round here.
-                                self.resolve_instances(false)?;
-                                if let Some(blocker) =
-                                    self.application_type_unavailable(&function.type_)?
+                            Task::Function(arguments, expected, explicit) => {
+                                let function =
+                                    values.pop().expect("function task follows its visit");
+                                if let Some(info) =
+                                    self.eliminator_info(&function, arguments, explicit)?
                                 {
-                                    // `elabAppArgs` postpones before consuming
-                                    // arguments. Keep this continuation in its
-                                    // lexical context; defaults can resume it
-                                    // when no containing argument owns the type.
-                                    blocked_application = Some(blocker);
-                                    blocked_initial_application =
-                                        Some(Task::Apply(function, arguments, expected, explicit));
-                                    return Err(failure(SourceInferenceError::ExpectedFunction));
+                                    let term = self.eliminator_application(
+                                        function,
+                                        arguments,
+                                        info,
+                                        expected.clone(),
+                                    )?;
+                                    values
+                                        .push(self.finish_explicit_term(term, expected.as_ref())?);
+                                } else if application::has_named(arguments) {
+                                    tasks.push(Task::NamedNext(self.start_named_application(
+                                        function, arguments, expected, explicit,
+                                    )?));
+                                } else {
+                                    tasks.push(Task::Apply(
+                                        function,
+                                        Arguments::Plain(arguments),
+                                        expected,
+                                        explicit,
+                                    ));
                                 }
                             }
-                            tasks.push(Task::ApplyNext(function, arguments, expected, explicit));
-                        }
-                        Task::ApplyNext(function, arguments, expected, explicit) => {
-                            if let Some((first, rest)) = arguments.split_first() {
-                                let function = if explicit {
-                                    function
-                                } else {
-                                    self.insert_implicits(
-                                        function,
-                                        ImplicitInsertion::ExplicitArgument,
-                                    )?
-                                };
-                                let callee_type = function.type_.clone();
-                                let coerced = self.coerce_function(function);
+                            Task::ForCollection(expected) => {
+                                let collection = values.pop().expect("loop collection visit");
+                                let collection = self.finish_term(collection, expected.as_ref())?;
+                                // Numeric defaults must precede dependent callback
+                                // checking, so the admitted ForIn' dictionary can
+                                // supply the element and membership proof types.
+                                self.resolve_instances_with_defaults()?;
+                                values.push(self.finish_term(collection, expected.as_ref())?);
+                            }
+                            Task::NamedNext(mut state) => {
+                                if state.initial() {
+                                    if state.has_arguments()
+                                        && self
+                                            .application_type_unavailable(state.function_type())?
+                                            .is_some()
+                                    {
+                                        self.resolve_instances(false)?;
+                                        if let Some(blocker) = self
+                                            .application_type_unavailable(state.function_type())?
+                                        {
+                                            blocked_application = Some(blocker);
+                                            blocked_initial_application =
+                                                Some(Task::NamedNext(state));
+                                            return Err(failure(
+                                                SourceInferenceError::ExpectedFunction,
+                                            ));
+                                        }
+                                    }
+                                    state.start();
+                                }
+                                let next = self.next_named_argument(&mut state);
                                 if matches!(
-                                    &coerced,
+                                    &next,
                                     Err(NatDefinitionElabError::Inference(
                                         SourceInferenceError::ExpectedFunction
+                                            | SourceInferenceError::InvalidNamedArgument(_)
                                     ))
                                 ) {
-                                    if self.function_coercion_is_absent(&callee_type)? {
+                                    if self.function_coercion_is_absent(state.function_type())? {
                                         return Err(failure(
                                             SourceInferenceError::FunctionCoercionAbsent,
                                         ));
                                     }
                                     blocked_application =
-                                        self.application_type_unavailable(&callee_type)?;
-                                }
-                                let function = coerced?;
-                                let ExprNode::ForallE {
-                                    binder_type,
-                                    body,
-                                    binder_info,
-                                    ..
-                                } = function.type_.node()
-                                else {
-                                    return Err(failure(SourceInferenceError::ExpectedFunction));
-                                };
-                                let instance = *binder_info == BinderInfo::InstImplicit;
-                                let domain = self.projection_domain(binder_type.clone())?;
-                                let codomain = body.clone();
-                                // Under `@`, a hole, `?x` or `by` never carries the expected
-                                // result into the telescope (`shouldPropagateExpectedTypeFor`).
-                                let propagates = !explicit
-                                    || ![
-                                        ["Term", "hole"],
-                                        ["Term", "syntheticHole"],
-                                        ["Term", "byTactic"],
-                                    ]
-                                    .iter()
-                                    .any(|kind| first.kind() == Some(&parser_kind(kind)));
-                                // Under `@`, the pin propagates the expected result before
-                                // every other written argument until it unifies, once the
-                                // result depends on none of the arguments left
-                                // (`propagateExpectedType`, vendored Lean/Elab/App.lean:563). So
-                                // `@GetElem.getElem _ _ _ _ _ xs i h` fixes its output before
-                                // `xs`, ahead of the instance its holes leave pending.
-                                if explicit
-                                    && propagates
-                                    && !rest.is_empty()
-                                    && let Some(expected) = &expected
-                                    && let Some(result) =
-                                        Self::independent_result(&codomain, rest.len())
-                                    && self.instantiate(expected)? != Expr::sort(Level::zero())
-                                {
-                                    self.constrain_result_hint(&result, expected)?;
-                                }
-                                // Propagate a known result before checking the last
-                                // explicit argument when the codomain does not depend
-                                // on that argument (e.g. Inhabited.mk (fun x => ...)),
-                                // unless it is an instance's output, which the pin
-                                // leaves to the instance (`resultIsOutParamSupport`).
-                                if rest.is_empty()
-                                    && propagates
-                                    && !codomain.has_loose_bvar(0)
-                                    && let Some(expected) = &expected
-                                    && self
-                                        .application_result_out_param(&function, explicit)?
-                                        .is_none()
-                                {
-                                    self.do_operation_result_hint(&function, &codomain, expected)?;
-                                    self.constrain_result_hint(&codomain, expected)?;
-                                }
-                                tasks.push(Task::Argument(
-                                    function, codomain, rest, expected, explicit,
-                                ));
-                                // Under `@`, the pin still synthesizes a bare `_` given for an
-                                // instance parameter (`processInstImplicitArg`, vendored
-                                // Lean/Elab/App.lean:903); `(_)` stays an ordinary hole.
-                                if explicit
-                                    && instance
-                                    && first.kind() == Some(&parser_kind(&["Term", "hole"]))
-                                {
-                                    let value = self.instance_hole(domain.clone())?;
-                                    values.push(Typed {
-                                        value,
-                                        type_: domain,
-                                    });
-                                } else {
-                                    tasks.push(Task::CheckArgument(first, domain, false));
-                                }
-                            } else {
-                                values.push(if explicit {
-                                    self.finish_explicit_term(function, expected.as_ref())?
-                                } else {
-                                    self.settle_result_out_param(&function, explicit)?;
-                                    self.finish_application(function, expected.as_ref())?
-                                });
-                            }
-                        }
-                        Task::Argument(function, codomain, rest, expected, explicit) => {
-                            let argument = values.pop().expect("argument task follows its visit");
-                            let type_ = self.substitute(&codomain, &argument.value)?;
-                            tasks.push(Task::ApplyNext(
-                                Typed {
-                                    value: Expr::app(function.value, argument.value),
-                                    type_,
-                                },
-                                rest,
-                                expected,
-                                explicit,
-                            ));
-                        }
-                        Task::Operator(tree, expected, postponed) => {
-                            let visited = postponed.iter().filter(|postpone| !**postpone).count();
-                            let start = values
-                                .len()
-                                .checked_sub(visited)
-                                .ok_or_else(|| failure(SourceInferenceError::Scope))?;
-                            let mut visited = values.split_off(start).into_iter();
-                            let mut leaves = Vec::with_capacity(postponed.len());
-                            let mut holes = Vec::new();
-                            for (index, postpone) in postponed.iter().enumerate() {
-                                if *postpone {
-                                    // A hole of unknown type stands for the leaf meanwhile.
-                                    let level = self.level()?;
-                                    let type_ = self.hole(Expr::sort(level))?;
-                                    let value = self.hole(type_.clone())?;
-                                    holes.push((tree.leaves[index], value.clone(), type_.clone()));
-                                    leaves.push(Typed { value, type_ });
-                                } else {
-                                    leaves.push(
-                                        visited
-                                            .next()
-                                            .ok_or_else(|| failure(SourceInferenceError::Scope))?,
-                                    );
-                                }
-                            }
-                            let result =
-                                self.finish_operator_tree(tree, leaves, expected.as_ref())?;
-                            if holes.is_empty() {
-                                values.push(result);
-                            } else {
-                                tasks.push(Task::PostponedLeaves(
-                                    result,
-                                    holes.iter().map(|(_, hole, _)| hole.clone()).collect(),
-                                ));
-                                for (syntax, _, type_) in holes.into_iter().rev() {
-                                    let expected = self.instantiate(&type_)?;
-                                    tasks.push(Task::Visit(syntax, Some(expected), true));
-                                }
-                            }
-                        }
-                        Task::PostponedLeaves(result, holes) => {
-                            let start = values
-                                .len()
-                                .checked_sub(holes.len())
-                                .ok_or_else(|| failure(SourceInferenceError::Scope))?;
-                            let leaves = values.split_off(start);
-                            for (hole, leaf) in holes.iter().zip(leaves) {
-                                self.constrain(hole, &leaf.value)?;
-                            }
-                            values.push(result);
-                        }
-                        Task::Infix(intrinsic, expected) => {
-                            let right = values.pop().expect("infix right visit");
-                            let left = values.pop().expect("infix left visit");
-                            self.flush(false)?;
-                            let notation =
-                                match crate::instances::numeric::notation(intrinsic.spelling()) {
-                                    Some((class, method)) if self.has_numeric_class(class)? => {
-                                        Some(Name::from_components([class, method]))
+                                        self.application_type_unavailable(state.function_type())?;
+                                    if blocked_application.is_some() {
+                                        return Err(failure(
+                                            SourceInferenceError::ExpectedFunction,
+                                        ));
                                     }
-                                    _ => None,
-                                };
-                            let negated = matches!(
-                                intrinsic,
-                                BoundedInfixIntrinsic::Membership { negated: true }
-                            );
-                            let swapped =
-                                matches!(intrinsic, BoundedInfixIntrinsic::Membership { .. });
-                            let name = if let Some(name) = notation {
-                                name
-                            } else {
-                                match intrinsic {
-                                    BoundedInfixIntrinsic::Fixed { intrinsic, .. } => intrinsic,
-                                    BoundedInfixIntrinsic::Membership { .. } => {
-                                        Name::from_components(["Membership", "mem"])
-                                    }
-                                    BoundedInfixIntrinsic::ScalarBeq => {
-                                        if self.instantiate(&left.type_)? == string_const()
-                                            && self.instantiate(&right.type_)? == string_const()
-                                        {
-                                            Name::from_components(["String", "decEq"])
-                                        } else {
-                                            Name::from_components(["Nat", "beq"])
+                                }
+                                if let Some(argument) = next? {
+                                    match argument.value {
+                                        application::ApplicationValue::Syntax(syntax) => {
+                                            tasks.push(Task::NamedArgument(
+                                                state,
+                                                argument.codomain,
+                                            ));
+                                            tasks.push(Task::CheckArgument(
+                                                syntax,
+                                                argument.domain,
+                                                argument.infer_exception_action,
+                                            ));
+                                        }
+                                        application::ApplicationValue::Elaborated(value) => {
+                                            let value = if argument.infer_exception_action {
+                                                self.finish_do_exception_action(
+                                                    value,
+                                                    &argument.domain,
+                                                )?
+                                            } else {
+                                                let value = self
+                                                    .finish_term(value, Some(&argument.domain))?;
+                                                self.constrain_type(
+                                                    &value.type_,
+                                                    &argument.domain,
+                                                )?;
+                                                value
+                                            };
+                                            self.add_named_argument(
+                                                &mut state,
+                                                &argument.codomain,
+                                                value,
+                                            )?;
+                                            tasks.push(Task::NamedNext(state));
                                         }
                                     }
+                                } else {
+                                    values.push(self.finish_named_application(state)?);
                                 }
-                            };
-                            let mut function = self.constant(&name)?;
-                            let operands = if swapped {
-                                [right, left]
-                            } else {
-                                [left, right]
-                            };
-                            for argument in operands {
-                                function = self.insert_implicits(
-                                    function,
-                                    ImplicitInsertion::ExplicitArgument,
-                                )?;
-                                let ExprNode::ForallE {
-                                    binder_type, body, ..
-                                } = function.type_.node()
-                                else {
-                                    return Err(failure(SourceInferenceError::ExpectedFunction));
-                                };
-                                let domain = binder_type.clone();
-                                let body = body.clone();
-                                let argument = self.finish_term(argument, Some(&domain))?;
-                                self.constrain_type(&argument.type_, &domain)?;
-                                function.type_ = self.substitute(&body, &argument.value)?;
-                                function.value = Expr::app(function.value, argument.value);
                             }
-                            if negated {
-                                let mut not = self.constant(&Name::from_components(["Not"]))?;
-                                let ExprNode::ForallE {
-                                    binder_type, body, ..
-                                } = not.type_.node()
-                                else {
-                                    return Err(failure(SourceInferenceError::ExpectedFunction));
-                                };
-                                let (domain, body) = (binder_type.clone(), body.clone());
-                                let membership = self.finish_term(function, Some(&domain))?;
-                                self.constrain_type(&membership.type_, &domain)?;
-                                not.type_ = self.substitute(&body, &membership.value)?;
-                                not.value = Expr::app(not.value, membership.value);
-                                function = not;
+                            Task::NamedArgument(mut state, codomain) => {
+                                let argument =
+                                    values.pop().expect("named argument follows its value");
+                                self.add_named_argument(&mut state, &codomain, argument)?;
+                                tasks.push(Task::NamedNext(state));
                             }
-                            values.push(self.finish_term(function, expected.as_ref())?);
-                        }
-                        Task::BinderNext(mut state) => {
-                            if let Some(syntax) = self.next_telescope_domain(&mut state)? {
-                                tasks.push(Task::BinderDomain(state));
-                                tasks.push(Task::Visit(syntax, Some(self.type_expected()?), true));
-                            } else {
-                                let expected = self.telescope_body_expected(&state)?;
-                                let syntax = state.body;
-                                tasks.push(Task::BinderBody(state));
-                                tasks.push(Task::Visit(syntax, expected, true));
+                            Task::Apply(function, arguments, expected, explicit) => {
+                                if !arguments.is_empty()
+                                    && self
+                                        .application_type_unavailable(&function.type_)?
+                                        .is_some()
+                                {
+                                    // Known telescopes reach ordinary synthesis in
+                                    // coerce_function. Only an unavailable initial
+                                    // callee needs an earlier round here.
+                                    self.resolve_instances(false)?;
+                                    if let Some(blocker) =
+                                        self.application_type_unavailable(&function.type_)?
+                                    {
+                                        // `elabAppArgs` postpones before consuming
+                                        // arguments. Keep this continuation in its
+                                        // lexical context; defaults can resume it
+                                        // when no containing argument owns the type.
+                                        blocked_application = Some(blocker);
+                                        blocked_initial_application = Some(Task::Apply(
+                                            function, arguments, expected, explicit,
+                                        ));
+                                        return Err(failure(
+                                            SourceInferenceError::ExpectedFunction,
+                                        ));
+                                    }
+                                }
+                                tasks
+                                    .push(Task::ApplyNext(function, arguments, expected, explicit));
                             }
-                        }
-                        Task::BinderDomain(mut state) => {
-                            let domain = values.pop().expect("telescope domain visit");
-                            self.open_telescope_group(&mut state, Some(domain))?;
-                            tasks.push(Task::BinderNext(state));
-                        }
-                        Task::BinderBody(state) => {
-                            let body = values.pop().expect("telescope body visit");
-                            values.push(self.finish_telescope(state, body)?);
-                        }
-                        Task::Arrow(expected) => {
-                            let right = values.pop().expect("arrow codomain visit");
-                            let left = values.pop().expect("arrow domain visit");
-                            let u = self.sort_level(&left)?;
-                            let v = self.sort_level(&right)?;
-                            let level = Level::imax(u, v)
-                                .map_err(|_| failure(SourceInferenceError::Scope))?;
-                            let body = right
-                                .value
-                                .lift_loose(0, 1)
-                                .map_err(|_| failure(SourceInferenceError::Scope))?;
-                            // The pin's `elabArrow` (vendored Lean/Elab/Binders.lean:299-303)
-                            // names the binder `a` under the reserved macro scope:
-                            // `a._@._internal._hyg.0`. It shows when an index is promoted to a
-                            // parameter (`@F.rec : {a : Nat} → …`).
-                            let term = Typed {
-                                value: Expr::forall_e(
-                                    Name::num(
-                                        Name::from_components(["a", "_@", "_internal", "_hyg"]),
-                                        0,
-                                    ),
-                                    left.value,
-                                    body,
-                                    BinderInfo::Default,
-                                ),
-                                type_: Expr::sort(level),
-                            };
-                            values.push(self.finish_term(term, expected.as_ref())?);
-                        }
-                        Task::LocalFunctionAnnotation(mut build) => {
-                            let annotation = values.pop().expect("local function annotation visit");
-                            self.sort_level(&annotation)?;
-                            build.result_type = Some(annotation.value.clone());
-                            if build.binding.recursive {
-                                let mut checkpoint = local_functions::Checkpoint::new(
-                                    self,
-                                    build,
-                                    tasks.len(),
-                                    values.len(),
-                                )?;
-                                let (build, column) = checkpoint.begin(attempts.len());
-                                attempts.push(Attempt::LocalFunction(
-                                    Box::new(checkpoint),
-                                    pending.clone(),
+                            Task::ApplyNext(function, arguments, expected, explicit) => {
+                                if let Some((first, rest)) = arguments.split_first() {
+                                    let function = if explicit {
+                                        function
+                                    } else {
+                                        self.insert_implicits(
+                                            function,
+                                            ImplicitInsertion::ExplicitArgument,
+                                        )?
+                                    };
+                                    let callee_type = function.type_.clone();
+                                    let coerced = self.coerce_function(function);
+                                    if matches!(
+                                        &coerced,
+                                        Err(NatDefinitionElabError::Inference(
+                                            SourceInferenceError::ExpectedFunction
+                                        ))
+                                    ) {
+                                        if self.function_coercion_is_absent(&callee_type)? {
+                                            return Err(failure(
+                                                SourceInferenceError::FunctionCoercionAbsent,
+                                            ));
+                                        }
+                                        blocked_application =
+                                            self.application_type_unavailable(&callee_type)?;
+                                    }
+                                    let function = coerced?;
+                                    let ExprNode::ForallE {
+                                        binder_type,
+                                        body,
+                                        binder_info,
+                                        ..
+                                    } = function.type_.node()
+                                    else {
+                                        return Err(failure(
+                                            SourceInferenceError::ExpectedFunction,
+                                        ));
+                                    };
+                                    let instance = *binder_info == BinderInfo::InstImplicit;
+                                    let domain = self.projection_domain(binder_type.clone())?;
+                                    let codomain = body.clone();
+                                    // Under `@`, a hole, `?x` or `by` never carries the expected
+                                    // result into the telescope (`shouldPropagateExpectedTypeFor`).
+                                    let propagates = !explicit
+                                        || ![
+                                            ["Term", "hole"],
+                                            ["Term", "syntheticHole"],
+                                            ["Term", "byTactic"],
+                                        ]
+                                        .iter()
+                                        .any(|kind| first.kind() == Some(&parser_kind(kind)));
+                                    // Under `@`, the pin propagates the expected result before
+                                    // every other written argument until it unifies, once the
+                                    // result depends on none of the arguments left
+                                    // (`propagateExpectedType`, vendored Lean/Elab/App.lean:563). So
+                                    // `@GetElem.getElem _ _ _ _ _ xs i h` fixes its output before
+                                    // `xs`, ahead of the instance its holes leave pending.
+                                    if explicit
+                                        && propagates
+                                        && !rest.is_empty()
+                                        && let Some(expected) = &expected
+                                        && let Some(result) =
+                                            Self::independent_result(&codomain, rest.len())
+                                        && self.instantiate(expected)? != Expr::sort(Level::zero())
+                                    {
+                                        self.constrain_result_hint(&result, expected)?;
+                                    }
+                                    // Propagate a known result before checking the last
+                                    // explicit argument when the codomain does not depend
+                                    // on that argument (e.g. Inhabited.mk (fun x => ...)),
+                                    // unless it is an instance's output, which the pin
+                                    // leaves to the instance (`resultIsOutParamSupport`).
+                                    if rest.is_empty()
+                                        && propagates
+                                        && !codomain.has_loose_bvar(0)
+                                        && let Some(expected) = &expected
+                                        && self
+                                            .application_result_out_param(&function, explicit)?
+                                            .is_none()
+                                    {
+                                        self.do_operation_result_hint(
+                                            &function, &codomain, expected,
+                                        )?;
+                                        self.constrain_result_hint(&codomain, expected)?;
+                                    }
+                                    tasks.push(Task::Argument(
+                                        function, codomain, rest, expected, explicit,
+                                    ));
+                                    // Under `@`, the pin still synthesizes a bare `_` given for an
+                                    // instance parameter (`processInstImplicitArg`, vendored
+                                    // Lean/Elab/App.lean:903); `(_)` stays an ordinary hole.
+                                    if explicit
+                                        && instance
+                                        && first.kind() == Some(&parser_kind(&["Term", "hole"]))
+                                    {
+                                        let value = self.instance_hole(domain.clone())?;
+                                        values.push(Typed {
+                                            value,
+                                            type_: domain,
+                                        });
+                                    } else {
+                                        tasks.push(Task::CheckArgument(first, domain, false));
+                                    }
+                                } else {
+                                    values.push(if explicit {
+                                        self.finish_explicit_term(function, expected.as_ref())?
+                                    } else {
+                                        self.settle_result_out_param(&function, explicit)?;
+                                        self.finish_application(function, expected.as_ref())?
+                                    });
+                                }
+                            }
+                            Task::Argument(function, codomain, rest, expected, explicit) => {
+                                let argument =
+                                    values.pop().expect("argument task follows its visit");
+                                let type_ = self.substitute(&codomain, &argument.value)?;
+                                tasks.push(Task::ApplyNext(
+                                    Typed {
+                                        value: Expr::app(function.value, argument.value),
+                                        type_,
+                                    },
+                                    rest,
+                                    expected,
+                                    explicit,
                                 ));
-                                tasks.push(Task::LocalFunctionStart(build, column));
-                            } else {
-                                let value = build.binding.value;
+                            }
+                            Task::Operator(tree, expected, postponed) => {
+                                let visited =
+                                    postponed.iter().filter(|postpone| !**postpone).count();
+                                let start = values
+                                    .len()
+                                    .checked_sub(visited)
+                                    .ok_or_else(|| failure(SourceInferenceError::Scope))?;
+                                let mut visited = values.split_off(start).into_iter();
+                                let mut leaves = Vec::with_capacity(postponed.len());
+                                let mut holes = Vec::new();
+                                for (index, postpone) in postponed.iter().enumerate() {
+                                    if *postpone {
+                                        // A hole of unknown type stands for the leaf meanwhile.
+                                        let level = self.level()?;
+                                        let type_ = self.hole(Expr::sort(level))?;
+                                        let value = self.hole(type_.clone())?;
+                                        holes.push((
+                                            tree.leaves[index],
+                                            value.clone(),
+                                            type_.clone(),
+                                        ));
+                                        leaves.push(Typed { value, type_ });
+                                    } else {
+                                        leaves.push(
+                                            visited.next().ok_or_else(|| {
+                                                failure(SourceInferenceError::Scope)
+                                            })?,
+                                        );
+                                    }
+                                }
+                                let result =
+                                    self.finish_operator_tree(tree, leaves, expected.as_ref())?;
+                                if holes.is_empty() {
+                                    values.push(result);
+                                } else {
+                                    tasks.push(Task::PostponedLeaves(
+                                        result,
+                                        holes.iter().map(|(_, hole, _)| hole.clone()).collect(),
+                                    ));
+                                    for (syntax, _, type_) in holes.into_iter().rev() {
+                                        let expected = self.instantiate(&type_)?;
+                                        tasks.push(Task::Visit(syntax, Some(expected), true));
+                                    }
+                                }
+                            }
+                            Task::PostponedLeaves(result, holes) => {
+                                let start = values
+                                    .len()
+                                    .checked_sub(holes.len())
+                                    .ok_or_else(|| failure(SourceInferenceError::Scope))?;
+                                let leaves = values.split_off(start);
+                                for (hole, leaf) in holes.iter().zip(leaves) {
+                                    self.constrain(hole, &leaf.value)?;
+                                }
+                                values.push(result);
+                            }
+                            Task::Infix(intrinsic, expected) => {
+                                let right = values.pop().expect("infix right visit");
+                                let left = values.pop().expect("infix left visit");
+                                self.flush(false)?;
+                                let notation =
+                                    match crate::instances::numeric::notation(intrinsic.spelling())
+                                    {
+                                        Some((class, method))
+                                            if self.has_numeric_class(class)? =>
+                                        {
+                                            Some(Name::from_components([class, method]))
+                                        }
+                                        _ => None,
+                                    };
+                                let negated = matches!(
+                                    intrinsic,
+                                    BoundedInfixIntrinsic::Membership { negated: true }
+                                );
+                                let swapped =
+                                    matches!(intrinsic, BoundedInfixIntrinsic::Membership { .. });
+                                let name = if let Some(name) = notation {
+                                    name
+                                } else {
+                                    match intrinsic {
+                                        BoundedInfixIntrinsic::Fixed { intrinsic, .. } => intrinsic,
+                                        BoundedInfixIntrinsic::Membership { .. } => {
+                                            Name::from_components(["Membership", "mem"])
+                                        }
+                                        BoundedInfixIntrinsic::ScalarBeq => {
+                                            if self.instantiate(&left.type_)? == string_const()
+                                                && self.instantiate(&right.type_)? == string_const()
+                                            {
+                                                Name::from_components(["String", "decEq"])
+                                            } else {
+                                                Name::from_components(["Nat", "beq"])
+                                            }
+                                        }
+                                    }
+                                };
+                                let mut function = self.constant(&name)?;
+                                let operands = if swapped {
+                                    [right, left]
+                                } else {
+                                    [left, right]
+                                };
+                                for argument in operands {
+                                    function = self.insert_implicits(
+                                        function,
+                                        ImplicitInsertion::ExplicitArgument,
+                                    )?;
+                                    let ExprNode::ForallE {
+                                        binder_type, body, ..
+                                    } = function.type_.node()
+                                    else {
+                                        return Err(failure(
+                                            SourceInferenceError::ExpectedFunction,
+                                        ));
+                                    };
+                                    let domain = binder_type.clone();
+                                    let body = body.clone();
+                                    let argument = self.finish_term(argument, Some(&domain))?;
+                                    self.constrain_type(&argument.type_, &domain)?;
+                                    function.type_ = self.substitute(&body, &argument.value)?;
+                                    function.value = Expr::app(function.value, argument.value);
+                                }
+                                if negated {
+                                    let mut not = self.constant(&Name::from_components(["Not"]))?;
+                                    let ExprNode::ForallE {
+                                        binder_type, body, ..
+                                    } = not.type_.node()
+                                    else {
+                                        return Err(failure(
+                                            SourceInferenceError::ExpectedFunction,
+                                        ));
+                                    };
+                                    let (domain, body) = (binder_type.clone(), body.clone());
+                                    let membership = self.finish_term(function, Some(&domain))?;
+                                    self.constrain_type(&membership.type_, &domain)?;
+                                    not.type_ = self.substitute(&body, &membership.value)?;
+                                    not.value = Expr::app(not.value, membership.value);
+                                    function = not;
+                                }
+                                values.push(self.finish_term(function, expected.as_ref())?);
+                            }
+                            Task::BinderNext(mut state) => {
+                                if let Some(syntax) = self.next_telescope_domain(&mut state)? {
+                                    tasks.push(Task::BinderDomain(state));
+                                    tasks.push(Task::Visit(
+                                        syntax,
+                                        Some(self.type_expected()?),
+                                        true,
+                                    ));
+                                } else {
+                                    let expected = self.telescope_body_expected(&state)?;
+                                    let syntax = state.body;
+                                    tasks.push(Task::BinderBody(state));
+                                    tasks.push(Task::Visit(syntax, expected, true));
+                                }
+                            }
+                            Task::BinderDomain(mut state) => {
+                                let domain = values.pop().expect("telescope domain visit");
+                                self.open_telescope_group(&mut state, Some(domain))?;
+                                tasks.push(Task::BinderNext(state));
+                            }
+                            Task::BinderBody(state) => {
+                                let body = values.pop().expect("telescope body visit");
+                                values.push(self.finish_telescope(state, body)?);
+                            }
+                            Task::Arrow(expected) => {
+                                let right = values.pop().expect("arrow codomain visit");
+                                let left = values.pop().expect("arrow domain visit");
+                                let u = self.sort_level(&left)?;
+                                let v = self.sort_level(&right)?;
+                                let level = Level::imax(u, v)
+                                    .map_err(|_| failure(SourceInferenceError::Scope))?;
+                                let body = right
+                                    .value
+                                    .lift_loose(0, 1)
+                                    .map_err(|_| failure(SourceInferenceError::Scope))?;
+                                // The pin's `elabArrow` (vendored Lean/Elab/Binders.lean:299-303)
+                                // names the binder `a` under the reserved macro scope:
+                                // `a._@._internal._hyg.0`. It shows when an index is promoted to a
+                                // parameter (`@F.rec : {a : Nat} → …`).
+                                let term = Typed {
+                                    value: Expr::forall_e(
+                                        Name::num(
+                                            Name::from_components(["a", "_@", "_internal", "_hyg"]),
+                                            0,
+                                        ),
+                                        left.value,
+                                        body,
+                                        BinderInfo::Default,
+                                    ),
+                                    type_: Expr::sort(level),
+                                };
+                                values.push(self.finish_term(term, expected.as_ref())?);
+                            }
+                            Task::LocalFunctionAnnotation(mut build) => {
+                                let annotation =
+                                    values.pop().expect("local function annotation visit");
+                                self.sort_level(&annotation)?;
+                                build.result_type = Some(annotation.value.clone());
+                                if build.binding.recursive {
+                                    let mut checkpoint = local_functions::Checkpoint::new(
+                                        self,
+                                        *build,
+                                        tasks.len(),
+                                        values.len(),
+                                    )?;
+                                    let (build, column) = checkpoint.begin(attempts.len());
+                                    attempts.push(Attempt::LocalFunction(
+                                        Box::new(checkpoint),
+                                        pending.clone(),
+                                    ));
+                                    tasks.push(Task::LocalFunctionStart(Box::new(build), column));
+                                } else {
+                                    let value = build.binding.value;
+                                    tasks.push(Task::LocalFunctionValue(
+                                        build,
+                                        self.postponed_application_errors.len(),
+                                    ));
+                                    tasks.push(Task::Visit(value, Some(annotation.value), true));
+                                }
+                            }
+                            Task::LocalFunctionStart(mut build, column) => {
+                                self.start_local_function_value(&mut build, column)?;
+                                let value = build.value_syntax;
+                                let expected = build.result_type.clone();
                                 tasks.push(Task::LocalFunctionValue(
                                     build,
                                     self.postponed_application_errors.len(),
                                 ));
+                                tasks.push(Task::Visit(value, expected, true));
+                            }
+                            Task::LocalFunctionValue(build, postponed_start) => {
+                                if build.checkpoint.is_some() {
+                                    // Completed local bodies hand selected errors
+                                    // to their own structural candidate checkpoint.
+                                    self.require_no_postponed_recursion_since(postponed_start)?;
+                                }
+                                let value = values.pop().expect("local function value visit");
+                                if let Some(omitted) = &build.omitted {
+                                    self.settle_omitted_result(omitted)?;
+                                }
+                                let value = self.close_local_function(&build, value)?;
+                                if let Some(index) = build.checkpoint {
+                                    if index + 1 != attempts.len() {
+                                        return Err(failure(SourceInferenceError::Scope));
+                                    }
+                                    let Some(Attempt::LocalFunction(checkpoint, _)) =
+                                        attempts.pop()
+                                    else {
+                                        return Err(failure(SourceInferenceError::Scope));
+                                    };
+                                    if checkpoint.tasks != tasks.len()
+                                        || checkpoint.values != values.len()
+                                    {
+                                        return Err(failure(SourceInferenceError::Scope));
+                                    }
+                                }
+                                let value = if build.binding.recursive {
+                                    self.defer_local_function(value, build.lift_name)?
+                                } else {
+                                    value
+                                };
+                                values.push(value);
+                                // The pin elaborates the rest of the enclosing definition with a
+                                // `let rec` (and so a `where` declaration) as a local without a value:
+                                // it becomes the auxiliary `f.g` only once `f` is complete
+                                // (`elabLetRec`, Lean/Elab/LetRec.lean:140-147: `withAuxLocalDecls`,
+                                // then `registerLetRecsToLift`). Inside `f` it cannot unfold, as a
+                                // `have` cannot. Its closure is an applied lambda, as in the
+                                // pin's `mkAppN (mkLambdaFVars fvars body) mvars`.
+                                let binding_kind = if build.binding.recursive {
+                                    LetKind::LetRec
+                                } else if build.binding.opaque {
+                                    LetKind::Have
+                                } else {
+                                    LetKind::Let
+                                };
+                                tasks.push(Task::LetValue(
+                                    build.binding.name,
+                                    None,
+                                    build.binding.body,
+                                    build.expected,
+                                    binding_kind,
+                                ));
+                            }
+                            Task::LetAnnotation(name, value, body, expected, binding_kind) => {
+                                let annotation = values.pop().expect("let annotation visit");
+                                self.sort_level(&annotation)?;
+                                tasks.push(Task::LetValue(
+                                    name,
+                                    Some(annotation.value.clone()),
+                                    body,
+                                    expected,
+                                    binding_kind,
+                                ));
                                 tasks.push(Task::Visit(value, Some(annotation.value), true));
                             }
-                        }
-                        Task::LocalFunctionStart(mut build, column) => {
-                            self.start_local_function_value(&mut build, column)?;
-                            let value = build.value_syntax;
-                            let expected = build.result_type.clone();
-                            tasks.push(Task::LocalFunctionValue(
-                                build,
-                                self.postponed_application_errors.len(),
-                            ));
-                            tasks.push(Task::Visit(value, expected, true));
-                        }
-                        Task::LocalFunctionValue(build, postponed_start) => {
-                            if build.checkpoint.is_some() {
-                                // Completed local bodies hand selected errors
-                                // to their own structural candidate checkpoint.
-                                self.require_no_postponed_recursion_since(postponed_start)?;
-                            }
-                            let value = values.pop().expect("local function value visit");
-                            if let Some(omitted) = &build.omitted {
-                                self.settle_omitted_result(omitted)?;
-                            }
-                            let value = self.close_local_function(&build, value)?;
-                            if let Some(index) = build.checkpoint {
-                                if index + 1 != attempts.len() {
-                                    return Err(failure(SourceInferenceError::Scope));
-                                }
-                                let Some(Attempt::LocalFunction(checkpoint, _)) = attempts.pop()
-                                else {
-                                    return Err(failure(SourceInferenceError::Scope));
-                                };
-                                if checkpoint.tasks != tasks.len()
-                                    || checkpoint.values != values.len()
-                                {
-                                    return Err(failure(SourceInferenceError::Scope));
-                                }
-                            }
-                            let value = if build.binding.recursive {
-                                self.defer_local_function(value, build.lift_name)?
-                            } else {
-                                value
-                            };
-                            values.push(value);
-                            // The pin elaborates the rest of the enclosing definition with a
-                            // `let rec` (and so a `where` declaration) as a local without a value:
-                            // it becomes the auxiliary `f.g` only once `f` is complete
-                            // (`elabLetRec`, Lean/Elab/LetRec.lean:140-147: `withAuxLocalDecls`,
-                            // then `registerLetRecsToLift`). Inside `f` it cannot unfold, as a
-                            // `have` cannot. Its closure is an applied lambda, as in the
-                            // pin's `mkAppN (mkLambdaFVars fvars body) mvars`.
-                            let binding_kind = if build.binding.recursive {
-                                LetKind::LetRec
-                            } else if build.binding.opaque {
-                                LetKind::Have
-                            } else {
-                                LetKind::Let
-                            };
-                            tasks.push(Task::LetValue(
-                                build.binding.name,
-                                None,
-                                build.binding.body,
-                                build.expected,
-                                binding_kind,
-                            ));
-                        }
-                        Task::LetAnnotation(name, value, body, expected, binding_kind) => {
-                            let annotation = values.pop().expect("let annotation visit");
-                            self.sort_level(&annotation)?;
-                            tasks.push(Task::LetValue(
-                                name,
-                                Some(annotation.value.clone()),
-                                body,
-                                expected,
-                                binding_kind,
-                            ));
-                            tasks.push(Task::Visit(value, Some(annotation.value), true));
-                        }
-                        Task::DoJoinValue(name, body, expected) => {
-                            let value = values.pop().expect("do continuation visit");
-                            // The suffix is checked in the OUTER lexical scope
-                            // against the original expected monad, before alias
-                            // reduction or branch-local binders can obscure it.
-                            let result_type = expected.unwrap_or_else(|| value.type_.clone());
-                            let value = self.do_join_thunk(value, &result_type)?;
-                            // Treat a join as a function parameter while checking
-                            // branches. Expanding its body here would duplicate
-                            // pending dictionaries into dependent local contexts.
-                            // LetBody still emits the actual checked core let.
-                            let saved = self.txn.lctx.clone();
-                            let id = FVarId(self.fresh_name()?);
-                            self.txn.lctx.add_param(
-                                id.clone(),
-                                name.clone(),
-                                value.type_.clone(),
-                                BinderInfo::Default,
-                            );
-                            tasks.push(Task::LetBody(saved, id, name, value, LetKind::Let));
-                            tasks.push(Task::Visit(body, Some(result_type), true));
-                        }
-                        Task::DoBindJoinStart(name, continuation, body, result_type, annotated) => {
-                            let domain = if annotated {
-                                let annotation = values.pop().expect("nested do binder annotation");
-                                self.sort_level(&annotation)?;
-                                annotation.value
-                            } else {
-                                let sort = self.type_expected()?;
-                                self.hole(sort)?
-                            };
-                            let continuation_type = Expr::forall_e(
-                                Name::anonymous(),
-                                domain,
-                                result_type
-                                    .lift_loose(0, 1)
-                                    .map_err(|_| failure(SourceInferenceError::Scope))?,
-                                BinderInfo::Default,
-                            );
-                            // Check normal actions against an opaque parameter
-                            // first: their actual results determine its domain.
-                            // No suffix expression guesses a record receiver type.
-                            let saved = self.txn.lctx.clone();
-                            let id = FVarId(self.fresh_name()?);
-                            self.txn.lctx.add_param(
-                                id.clone(),
-                                name.clone(),
-                                continuation_type.clone(),
-                                BinderInfo::Default,
-                            );
-                            tasks.push(Task::DoBindJoinBody(
-                                saved,
-                                id,
-                                name,
-                                continuation,
-                                continuation_type,
-                            ));
-                            tasks.push(Task::Visit(body, Some(result_type), true));
-                        }
-                        Task::DoBindJoinBody(saved, id, name, continuation, continuation_type) => {
-                            let body = values.pop().expect("nested do body visit");
-                            self.flush(false)?;
-                            self.txn.lctx = saved.clone();
-                            // The suffix sees its original lexical scope and the
-                            // domain inferred from normal actions (or annotation).
-                            tasks.push(Task::DoBindJoinValue(saved, id, name, body));
-                            tasks.push(Task::Visit(continuation, Some(continuation_type), true));
-                        }
-                        Task::DoBindJoinValue(saved, id, name, body) => {
-                            let continuation = values.pop().expect("nested do continuation visit");
-                            values.push(body);
-                            tasks.push(Task::LetBody(saved, id, name, continuation, LetKind::Let));
-                        }
-                        Task::DoNestedAnnotation(body, expected, finish) => {
-                            let annotation =
-                                values.pop().expect("dead nested do binder annotation");
-                            self.sort_level(&annotation)?;
-                            tasks.push(Task::Visit(body, expected, finish));
-                        }
-                        Task::LetValue(name, annotation, body, expected, binding_kind) => {
-                            let mut value = values.pop().expect("let value visit");
-                            if let Some(annotation) = annotation {
-                                value.type_ = annotation;
-                            }
-                            let saved = self.txn.lctx.clone();
-                            let id = FVarId(self.fresh_name()?);
-                            if binding_kind.opaque() {
-                                // A `have` witness is checked, but cannot unfold in
-                                // the continuation's elaboration context.
+                            Task::DoJoinValue(name, body, expected) => {
+                                let value = values.pop().expect("do continuation visit");
+                                // The suffix is checked in the OUTER lexical scope
+                                // against the original expected monad, before alias
+                                // reduction or branch-local binders can obscure it.
+                                let result_type = expected.unwrap_or_else(|| value.type_.clone());
+                                let value = self.do_join_thunk(value, &result_type)?;
+                                // Treat a join as a function parameter while checking
+                                // branches. Expanding its body here would duplicate
+                                // pending dictionaries into dependent local contexts.
+                                // LetBody still emits the actual checked core let.
+                                let saved = self.txn.lctx.clone();
+                                let id = FVarId(self.fresh_name()?);
                                 self.txn.lctx.add_param(
                                     id.clone(),
                                     name.clone(),
                                     value.type_.clone(),
                                     BinderInfo::Default,
                                 );
-                                self.opaque_locals.insert(id.clone());
-                            } else {
-                                self.txn.lctx.add_let(
+                                tasks.push(Task::LetBody(saved, id, name, value, LetKind::Let));
+                                tasks.push(Task::Visit(body, Some(result_type), true));
+                            }
+                            Task::DoBindJoinStart(
+                                name,
+                                continuation,
+                                body,
+                                result_type,
+                                annotated,
+                            ) => {
+                                let domain = if annotated {
+                                    let annotation =
+                                        values.pop().expect("nested do binder annotation");
+                                    self.sort_level(&annotation)?;
+                                    annotation.value
+                                } else {
+                                    let sort = self.type_expected()?;
+                                    self.hole(sort)?
+                                };
+                                let continuation_type = Expr::forall_e(
+                                    Name::anonymous(),
+                                    domain,
+                                    result_type
+                                        .lift_loose(0, 1)
+                                        .map_err(|_| failure(SourceInferenceError::Scope))?,
+                                    BinderInfo::Default,
+                                );
+                                // Check normal actions against an opaque parameter
+                                // first: their actual results determine its domain.
+                                // No suffix expression guesses a record receiver type.
+                                let saved = self.txn.lctx.clone();
+                                let id = FVarId(self.fresh_name()?);
+                                self.txn.lctx.add_param(
                                     id.clone(),
                                     name.clone(),
-                                    value.type_.clone(),
-                                    value.value.clone(),
+                                    continuation_type.clone(),
+                                    BinderInfo::Default,
                                 );
+                                tasks.push(Task::DoBindJoinBody(
+                                    saved,
+                                    id,
+                                    name,
+                                    continuation,
+                                    continuation_type,
+                                ));
+                                tasks.push(Task::Visit(body, Some(result_type), true));
                             }
-                            // Every input of a lowered written match is in scope now.
-                            if let Some((inputs, alternatives)) =
-                                self.pattern_typing_checks.remove(&name)
-                            {
-                                let discriminants = inputs
-                                    .iter()
-                                    .map(|input| {
-                                        self.txn.lctx.find_by_user_name(input).and_then(|decl| {
-                                            Some((decl.value.clone()?, decl.type_.clone()))
-                                        })
-                                    })
-                                    .collect::<Option<Vec<_>>>();
-                                if let Some(discriminants) = discriminants {
-                                    self.check_pattern_typing(&discriminants, &alternatives)?;
-                                }
-                            }
-                            tasks.push(Task::LetBody(saved, id, name, value, binding_kind));
-                            tasks.push(Task::Visit(body, expected, true));
-                        }
-                        Task::LetBody(saved, id, name, value, binding_kind) => {
-                            if binding_kind.opaque() {
-                                // Do not postpone equations over the assertion past the
-                                // context that gives it its opaque interpretation. The
-                                // others stay pending, as at the pin: a numeral's type may
-                                // still be defaulted (`have h : 1 = 1 := rfl`).
+                            Task::DoBindJoinBody(
+                                saved,
+                                id,
+                                name,
+                                continuation,
+                                continuation_type,
+                            ) => {
+                                let body = values.pop().expect("nested do body visit");
                                 self.flush(false)?;
-                                if self.equations_mention(&id)? {
-                                    self.flush(true)?;
-                                }
-                                self.opaque_locals.remove(&id);
+                                self.txn.lctx = saved.clone();
+                                // The suffix sees its original lexical scope and the
+                                // domain inferred from normal actions (or annotation).
+                                tasks.push(Task::DoBindJoinValue(saved, id, name, body));
+                                tasks.push(Task::Visit(
+                                    continuation,
+                                    Some(continuation_type),
+                                    true,
+                                ));
                             }
-                            self.matrix_aliases.remove(&id);
-                            let mut body = values.pop().expect("let body visit");
-                            body.value = self.instantiate(&body.value)?;
-                            body.type_ = self.instantiate(&body.type_)?;
-                            let abstract_body = body
-                                .value
-                                .abstract_fvar(&id, 0)
-                                .map_err(|_| failure(SourceInferenceError::Scope))?;
-                            let abstract_type = body
-                                .type_
-                                .abstract_fvar(&id, 0)
-                                .map_err(|_| failure(SourceInferenceError::Scope))?;
-                            let type_ = self.substitute(&abstract_type, &value.value)?;
-                            let value = if binding_kind.inline() {
-                                // `letI`/`haveI`: the value replaces the variable.
-                                self.substitute(&abstract_body, &value.value)?
-                            } else if matches!(binding_kind, LetKind::LetRec) {
-                                Expr::app(
-                                    Expr::lam(
+                            Task::DoBindJoinValue(saved, id, name, body) => {
+                                let continuation =
+                                    values.pop().expect("nested do continuation visit");
+                                values.push(body);
+                                tasks.push(Task::LetBody(
+                                    saved,
+                                    id,
+                                    name,
+                                    continuation,
+                                    LetKind::Let,
+                                ));
+                            }
+                            Task::DoNestedAnnotation(body, expected, finish) => {
+                                let annotation =
+                                    values.pop().expect("dead nested do binder annotation");
+                                self.sort_level(&annotation)?;
+                                tasks.push(Task::Visit(body, expected, finish));
+                            }
+                            Task::LetValue(name, annotation, body, expected, binding_kind) => {
+                                let mut value = values.pop().expect("let value visit");
+                                if let Some(annotation) = annotation {
+                                    value.type_ = annotation;
+                                }
+                                let saved = self.txn.lctx.clone();
+                                let id = FVarId(self.fresh_name()?);
+                                if binding_kind.opaque() {
+                                    // A `have` witness is checked, but cannot unfold in
+                                    // the continuation's elaboration context.
+                                    self.txn.lctx.add_param(
+                                        id.clone(),
+                                        name.clone(),
+                                        value.type_.clone(),
+                                        BinderInfo::Default,
+                                    );
+                                    self.opaque_locals.insert(id.clone());
+                                } else {
+                                    self.txn.lctx.add_let(
+                                        id.clone(),
+                                        name.clone(),
+                                        value.type_.clone(),
+                                        value.value.clone(),
+                                    );
+                                }
+                                // Every input of a lowered written match is in scope now.
+                                if let Some((inputs, alternatives)) =
+                                    self.pattern_typing_checks.remove(&name)
+                                {
+                                    let discriminants = inputs
+                                        .iter()
+                                        .map(|input| {
+                                            self.txn.lctx.find_by_user_name(input).and_then(
+                                                |decl| {
+                                                    Some((decl.value.clone()?, decl.type_.clone()))
+                                                },
+                                            )
+                                        })
+                                        .collect::<Option<Vec<_>>>();
+                                    if let Some(discriminants) = discriminants {
+                                        self.check_pattern_typing(&discriminants, &alternatives)?;
+                                    }
+                                }
+                                tasks.push(Task::LetBody(saved, id, name, value, binding_kind));
+                                tasks.push(Task::Visit(body, expected, true));
+                            }
+                            Task::LetBody(saved, id, name, value, binding_kind) => {
+                                if binding_kind.opaque() {
+                                    // Do not postpone equations over the assertion past the
+                                    // context that gives it its opaque interpretation. The
+                                    // others stay pending, as at the pin: a numeral's type may
+                                    // still be defaulted (`have h : 1 = 1 := rfl`).
+                                    self.flush(false)?;
+                                    if self.equations_mention(&id)? {
+                                        self.flush(true)?;
+                                    }
+                                    self.opaque_locals.remove(&id);
+                                }
+                                self.matrix_aliases.remove(&id);
+                                let mut body = values.pop().expect("let body visit");
+                                body.value = self.instantiate(&body.value)?;
+                                body.type_ = self.instantiate(&body.type_)?;
+                                let abstract_body = body
+                                    .value
+                                    .abstract_fvar(&id, 0)
+                                    .map_err(|_| failure(SourceInferenceError::Scope))?;
+                                let abstract_type = body
+                                    .type_
+                                    .abstract_fvar(&id, 0)
+                                    .map_err(|_| failure(SourceInferenceError::Scope))?;
+                                let type_ = self.substitute(&abstract_type, &value.value)?;
+                                let value = if binding_kind.inline() {
+                                    // `letI`/`haveI`: the value replaces the variable.
+                                    self.substitute(&abstract_body, &value.value)?
+                                } else if matches!(binding_kind, LetKind::LetRec) {
+                                    Expr::app(
+                                        Expr::lam(
+                                            name,
+                                            value.type_,
+                                            abstract_body,
+                                            BinderInfo::Default,
+                                        ),
+                                        value.value,
+                                    )
+                                } else {
+                                    Expr::let_e(
                                         name,
                                         value.type_,
+                                        value.value,
                                         abstract_body,
-                                        BinderInfo::Default,
-                                    ),
-                                    value.value,
-                                )
-                            } else {
-                                Expr::let_e(
-                                    name,
-                                    value.type_,
-                                    value.value,
-                                    abstract_body,
-                                    binding_kind.opaque(),
-                                )
-                            };
-                            values.push(Typed { value, type_ });
-                            self.txn.lctx = saved;
+                                        binding_kind.opaque(),
+                                    )
+                                };
+                                values.push(Typed { value, type_ });
+                                self.txn.lctx = saved;
+                            }
                         }
                     }
+                    if let Some(result) = tactic_result.take() {
+                        return Ok(Step::Complete(TermResult::Tactic(result)));
+                    }
+                    let [result] = values.as_slice() else {
+                        return Err(failure(SourceInferenceError::Scope));
+                    };
+                    Ok(Step::Complete(TermResult::Term(result.clone())))
+                });
+                match step {
+                    Ok(Step::Complete(result)) => break Ok(result),
+                    Ok(Step::ExpandTerm {
+                        syntax,
+                        expected,
+                        finish,
+                        locals,
+                    }) => match self.imported_tactic_term(syntax, expected.clone(), finish) {
+                        Ok(Some(term)) => {
+                            if let Some(locals) = locals
+                                && let Err(problem) =
+                                    self.observe_term(syntax, term.clone(), locals)
+                            {
+                                break Err(problem);
+                            }
+                            values.push(term);
+                        }
+                        Ok(None) => resume = Some(Task::Elaborate(syntax, expected, finish)),
+                        Err(problem) => break Err(problem),
+                    },
+                    Ok(Step::AdvanceProof(mut proof)) => match self.advance_proof(&mut proof) {
+                        Ok(action) => resume = Some(Task::ProofAdvanced(proof, Box::new(action))),
+                        Err(problem) => break Err(problem),
+                    },
+                    Err(problem) => break Err(problem),
                 }
-                if let Some(result) = tactic_result.take() {
-                    return Ok(TermResult::Tactic(result));
-                }
-                let [result] = values.as_slice() else {
-                    return Err(failure(SourceInferenceError::Scope));
-                };
-                Ok(TermResult::Term(result.clone()))
-            })();
+            };
             // A provider's contains() has no error return. Charge its latched
             // trace fault before first/try can backtrack past the callback.
             let work = self.charge_equation_macro_work();
@@ -5380,7 +5592,7 @@ impl Context {
                                     let (build, column) = checkpoint.begin(attempts.len());
                                     attempts
                                         .push(Attempt::LocalFunction(checkpoint, pending.clone()));
-                                    tasks.push(Task::LocalFunctionStart(build, column));
+                                    tasks.push(Task::LocalFunctionStart(Box::new(build), column));
                                     break;
                                 }
                             }

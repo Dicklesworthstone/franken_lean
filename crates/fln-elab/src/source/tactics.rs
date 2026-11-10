@@ -1510,791 +1510,807 @@ impl Context {
             let Some(Work::Goal(goal)) = proof.work.pop() else {
                 return Err(failure(SourceInferenceError::Scope));
             };
-            if let Syntax::Node { kind, args, .. } = instruction
-                && kind == &parser_kind(&["Tactic", "withAnnotateState"])
-            {
-                proof.work.push(Work::Goal(goal));
-                self.start_annotated_tactic(proof, args)?;
-                continue;
+            if let Some(action) = self.advance_builtin_proof(proof, goal, instruction)? {
+                return Ok(action);
             }
-            if let Syntax::Node { kind, args, .. } = instruction
-                && control::is_scope(kind)
-            {
-                // Finish the preceding tactic's queued branches and close
-                // actions before changing lexical state for this instruction.
-                proof.work.push(Work::Goal(goal));
-                self.start_tactic_scope(proof, kind, args)?;
-                continue;
-            }
-            proof.cursor += 1;
-            let Syntax::Node { kind, args, .. } = instruction else {
+        }
+    }
+
+    /// Imported alternatives run before entering this native dispatch. An owned
+    /// macro callback must not retain the large builtin dispatch's local frame.
+    #[inline(never)]
+    fn advance_builtin_proof<'a>(
+        &mut self,
+        proof: &mut ProofState<'a>,
+        goal: ProofGoal,
+        instruction: &'a Syntax,
+    ) -> Result<Option<ProofAction<'a>>, NatDefinitionElabError> {
+        if let Syntax::Node { kind, args, .. } = instruction
+            && kind == &parser_kind(&["Tactic", "withAnnotateState"])
+        {
+            proof.work.push(Work::Goal(goal));
+            self.start_annotated_tactic(proof, args)?;
+            return Ok(None);
+        }
+        if let Syntax::Node { kind, args, .. } = instruction
+            && control::is_scope(kind)
+        {
+            // Finish the preceding tactic's queued branches and close
+            // actions before changing lexical state for this instruction.
+            proof.work.push(Work::Goal(goal));
+            self.start_tactic_scope(proof, kind, args)?;
+            return Ok(None);
+        }
+        proof.cursor += 1;
+        let Syntax::Node { kind, args, .. } = instruction else {
+            return Err(error(TacticError::MalformedScript));
+        };
+        if let Some(spec) = self.backtrack_instruction(instruction)? {
+            proof.work.push(Work::Goal(goal));
+            return Ok(Some(ProofAction::Attempt(spec)));
+        } else if conv::is_conv_kind(kind) {
+            self.conv_instruction(proof, goal, instruction)?;
+        } else if kind == &parser_kind(&["Tactic", "paren"]) {
+            proof.work.push(Work::Goal(goal));
+            self.start_parenthesized_tactic(proof, args)?;
+        } else if kind == &parser_kind(&["Tactic", "skip"]) {
+            proof.work.push(Work::Goal(goal));
+        } else if kind == &parser_kind(&["Tactic", "traceState"])
+            || kind == &parser_kind(&["Tactic", "traceMessage"])
+        {
+            proof.work.push(Work::Goal(goal));
+            self.trace_proof_state(proof, instruction)?;
+        } else if kind == &parser_kind(&["Tactic", "guardTarget"]) {
+            let [keyword, relation, expected] = args.as_slice() else {
                 return Err(error(TacticError::MalformedScript));
             };
-            if let Some(spec) = self.backtrack_instruction(instruction)? {
-                proof.work.push(Work::Goal(goal));
-                return Ok(ProofAction::Attempt(spec));
-            } else if conv::is_conv_kind(kind) {
-                self.conv_instruction(proof, goal, instruction)?;
-            } else if kind == &parser_kind(&["Tactic", "paren"]) {
-                proof.work.push(Work::Goal(goal));
-                self.start_parenthesized_tactic(proof, args)?;
-            } else if kind == &parser_kind(&["Tactic", "skip"]) {
-                proof.work.push(Work::Goal(goal));
-            } else if kind == &parser_kind(&["Tactic", "traceState"])
-                || kind == &parser_kind(&["Tactic", "traceMessage"])
-            {
-                proof.work.push(Work::Goal(goal));
-                self.trace_proof_state(proof, instruction)?;
-            } else if kind == &parser_kind(&["Tactic", "guardTarget"]) {
-                let [keyword, relation, expected] = args.as_slice() else {
-                    return Err(error(TacticError::MalformedScript));
-                };
-                expect_atom(keyword, "guard_target", "guard_target keyword")?;
-                self.require_declared_tactic(&["Lean", "Parser", "Tactic", "guardTarget"])?;
-                let relation = guard::relation(relation)?;
-                if !self.guard_target_matches(&goal, relation, expected)? {
-                    return Err(error(TacticError::GuardTargetMismatch));
-                }
-                proof.work.push(Work::Goal(goal));
-            } else if kind == &parser_kind(&["Tactic", "guardExpr"]) {
-                let [keyword, left, relation, right] = args.as_slice() else {
-                    return Err(error(TacticError::MalformedScript));
-                };
-                expect_atom(keyword, "guard_expr", "guard_expr keyword")?;
-                self.require_declared_tactic(&["Lean", "Parser", "Tactic", "guardExpr"])?;
-                let relation = guard::relation(relation)?;
-                if !self.guard_expr_holds(&goal, left, relation, right)? {
-                    return Err(error(TacticError::GuardExprMismatch));
-                }
-                proof.work.push(Work::Goal(goal));
-            } else if kind == &parser_kind(&["Tactic", "guardHyp"]) {
-                self.guard_hypothesis(&goal, args)?;
-                proof.work.push(Work::Goal(goal));
-            } else if kind == &parser_kind(&["Tactic", "fail"]) {
-                return Err(error(TacticError::ExplicitFailure));
-            } else if kind == &parser_kind(&["Tactic", "done"]) {
-                // An unsolved goal reaches `done`: it fails, and `first` may catch that.
-                let [keyword] = args.as_slice() else {
-                    return Err(error(TacticError::MalformedScript));
-                };
-                expect_atom(keyword, "done", "done")?;
-                let count = 1 + proof.work.iter().filter(|row| matches!(row, Work::Goal(goal) if !self.txn.mvars.is_assigned(&goal.id))).count();
-                return Err(error(TacticError::UnsolvedGoals { count }));
-            } else if kind == &parser_kind(&["Tactic", "tactic_<;>_"]) {
-                let [left, separator, right] = args.as_slice() else {
-                    return Err(error(TacticError::MalformedScript));
-                };
-                expect_atom(separator, "<;>", "goal sequencing operator")?;
-                self.start_goal_sequence(proof, goal, left, right)?;
-            } else if kind == &parser_kind(&["Tactic", "tacticSeqBracketed"]) {
-                // The pin's `evalTacticSeqBracketed` runs its tactics under `closeUsingOrAdmit`:
-                // on the main goal alone, which they must close, as `·` does.
-                self.start_goal_control(proof, goal, instruction, control::Mode::Solve)?;
-            } else if let Some(mode) = control::mode(kind) {
-                let [keyword, sequence] = args.as_slice() else {
-                    return Err(error(TacticError::MalformedScript));
-                };
-                // `·` is its own `cdotTk` node.
-                let keyword = if control::is_cdot(kind) {
-                    &expect_node(keyword, &Name::from_components(["Lean", "cdotTk"]), 1, "·")?[0]
-                } else {
-                    keyword
-                };
-                // `cdotTk := unicode("· ", ". ")`: the ASCII dot is the same focus.
-                let ascii_cdot = control::is_cdot(kind)
-                    && matches!(keyword, Syntax::Atom { val, .. } if val == ".");
-                if !ascii_cdot {
-                    expect_atom(keyword, mode.keyword(), "goal control keyword")?;
-                }
-                self.start_goal_control(proof, goal, sequence, mode)?;
-            } else if kind == &parser_kind(&["Tactic", "tacticHave__"])
-                || kind == &parser_kind(&["Tactic", "tacticLet__"])
-            {
-                // `"have" letConfig letDecl` and `"let" letConfig letDecl`: one `letIdDecl`
-                // with no binders and the default configuration.
-                let opaque = kind == &parser_kind(&["Tactic", "tacticHave__"]);
-                let [keyword, config, declaration] = args.as_slice() else {
-                    return Err(error(TacticError::MalformedScript));
-                };
-                expect_atom(
-                    keyword,
-                    if opaque { "have" } else { "let" },
-                    "local tactic declaration",
-                )?;
-                let config = expect_node(
-                    config,
-                    &parser_kind(&["Term", "letConfig"]),
-                    1,
-                    "local tactic configuration",
-                )?;
-                expect_empty_null(&config[0], "default local configuration")?;
-                let (name, annotation, value) = local_declaration(declaration, opaque)?;
-                return Ok(ProofAction::Binding {
-                    goal,
-                    binding: LocalBinding {
-                        name,
-                        opaque,
-                        replaces: None,
-                    },
-                    annotation,
-                    value,
-                });
-            } else if kind == &parser_kind(&["Tactic", "replace"]) {
-                // `replace decl` (`evalReplace`, vendored src/Lean/Elab/Tactic/BuiltinTactic.lean)
-                // is `have decl`, after which the hypothesis that had the name is cleared when
-                // nothing still reads it (`tryClearMany`).
-                let [keyword, declaration] = args.as_slice() else {
-                    return Err(error(TacticError::MalformedScript));
-                };
-                expect_atom(keyword, "replace", "replace keyword")?;
-                self.require_declared_tactic(&["Lean", "Parser", "Tactic", "replace"])?;
-                let (name, annotation, value) = local_declaration(declaration, true)?;
-                let replaces = goal
-                    .lctx
-                    .find_by_user_name(&name)
-                    .map(|local| local.id.clone());
-                return Ok(ProofAction::Binding {
-                    goal,
-                    binding: LocalBinding {
-                        name,
-                        opaque: true,
-                        replaces,
-                    },
-                    annotation,
-                    value,
-                });
-            } else if kind == &parser_kind(&["Tactic", "tacticSuffices_"]) {
-                let [keyword, declaration] = args.as_slice() else {
-                    return Err(error(TacticError::MalformedScript));
-                };
-                expect_atom(keyword, "suffices", "suffices keyword")?;
-                self.require_declared_tactic(&["Lean", "Parser", "Tactic", "tacticSuffices_"])?;
-                self.suffices_proof_goal(proof, goal, keyword, declaration)?;
-            } else if kind == &parser_kind(&["Tactic", "specialize"]) {
-                let [keyword, term] = args.as_slice() else {
-                    return Err(error(TacticError::MalformedScript));
-                };
-                expect_atom(keyword, "specialize", "specialize keyword")?;
-                self.require_declared_tactic(&["Lean", "Parser", "Tactic", "specialize"])?;
-                return Ok(ProofAction::Specialize { goal, term });
-            } else if kind == &parser_kind(&["Tactic", "rintro"]) {
-                self.rintro_proof_goal(proof, goal, args)?;
-            } else if kind == &parser_kind(&["Tactic", "obtain"]) {
-                self.obtain_proof_goal(proof, goal, args)?;
-            } else if kind == &parser_kind(&["Tactic", "rcases"]) {
-                self.rcases_proof_goal(proof, goal, args)?;
-            } else if kind == &parser_kind(&["Tactic", "refine"])
-                || kind == &parser_kind(&["Tactic", "refine'"])
-            {
-                let placeholders = kind == &parser_kind(&["Tactic", "refine'"]);
-                let [keyword, term] = args.as_slice() else {
-                    return Err(error(TacticError::MalformedScript));
-                };
-                expect_atom(
-                    keyword,
-                    if placeholders { "refine'" } else { "refine" },
-                    "refinement tactic",
-                )?;
-                if placeholders {
-                    self.require_declared_tactic(&["Lean", "Parser", "Tactic", "refine'"])?;
-                }
-                return Ok(ProofAction::Refine {
-                    syntax: term,
-                    goal,
-                    placeholders,
-                });
-            } else if kind == &Name::from_components(["tacticBy_cases_:_"]) {
-                let [keyword, binder, proposition] = args.as_slice() else {
-                    return Err(error(TacticError::MalformedScript));
-                };
-                expect_atom(keyword, "by_cases", "decidable case split")?;
-                let name = match expect_null_args(binder, "case evidence name")? {
-                    // The pin's unnamed `by_cases p` binds a hygienic `h✝`: usable by
-                    // `assumption`, never by a source `h` ("Unknown identifier `h`").
-                    [] => self.fresh_inaccessible(&Name::from_components(["h"]))?,
-                    [Syntax::Ident { val, .. }, colon]
-                        if !val.is_anonymous() && val.parent().is_anonymous() =>
-                    {
-                        expect_atom(colon, ":", "case evidence annotation")?;
-                        val.clone()
-                    }
-                    _ => return Err(error(TacticError::MalformedScript)),
-                };
-                return Ok(ProofAction::Cases {
-                    goal,
+            expect_atom(keyword, "guard_target", "guard_target keyword")?;
+            self.require_declared_tactic(&["Lean", "Parser", "Tactic", "guardTarget"])?;
+            let relation = guard::relation(relation)?;
+            if !self.guard_target_matches(&goal, relation, expected)? {
+                return Err(error(TacticError::GuardTargetMismatch));
+            }
+            proof.work.push(Work::Goal(goal));
+        } else if kind == &parser_kind(&["Tactic", "guardExpr"]) {
+            let [keyword, left, relation, right] = args.as_slice() else {
+                return Err(error(TacticError::MalformedScript));
+            };
+            expect_atom(keyword, "guard_expr", "guard_expr keyword")?;
+            self.require_declared_tactic(&["Lean", "Parser", "Tactic", "guardExpr"])?;
+            let relation = guard::relation(relation)?;
+            if !self.guard_expr_holds(&goal, left, relation, right)? {
+                return Err(error(TacticError::GuardExprMismatch));
+            }
+            proof.work.push(Work::Goal(goal));
+        } else if kind == &parser_kind(&["Tactic", "guardHyp"]) {
+            self.guard_hypothesis(&goal, args)?;
+            proof.work.push(Work::Goal(goal));
+        } else if kind == &parser_kind(&["Tactic", "fail"]) {
+            return Err(error(TacticError::ExplicitFailure));
+        } else if kind == &parser_kind(&["Tactic", "done"]) {
+            // An unsolved goal reaches `done`: it fails, and `first` may catch that.
+            let [keyword] = args.as_slice() else {
+                return Err(error(TacticError::MalformedScript));
+            };
+            expect_atom(keyword, "done", "done")?;
+            let count = 1 + proof
+                .work
+                .iter()
+                .filter(
+                    |row| matches!(row, Work::Goal(goal) if !self.txn.mvars.is_assigned(&goal.id)),
+                )
+                .count();
+            return Err(error(TacticError::UnsolvedGoals { count }));
+        } else if kind == &parser_kind(&["Tactic", "tactic_<;>_"]) {
+            let [left, separator, right] = args.as_slice() else {
+                return Err(error(TacticError::MalformedScript));
+            };
+            expect_atom(separator, "<;>", "goal sequencing operator")?;
+            self.start_goal_sequence(proof, goal, left, right)?;
+        } else if kind == &parser_kind(&["Tactic", "tacticSeqBracketed"]) {
+            // The pin's `evalTacticSeqBracketed` runs its tactics under `closeUsingOrAdmit`:
+            // on the main goal alone, which they must close, as `·` does.
+            self.start_goal_control(proof, goal, instruction, control::Mode::Solve)?;
+        } else if let Some(mode) = control::mode(kind) {
+            let [keyword, sequence] = args.as_slice() else {
+                return Err(error(TacticError::MalformedScript));
+            };
+            // `·` is its own `cdotTk` node.
+            let keyword = if control::is_cdot(kind) {
+                &expect_node(keyword, &Name::from_components(["Lean", "cdotTk"]), 1, "·")?[0]
+            } else {
+                keyword
+            };
+            // `cdotTk := unicode("· ", ". ")`: the ASCII dot is the same focus.
+            let ascii_cdot =
+                control::is_cdot(kind) && matches!(keyword, Syntax::Atom { val, .. } if val == ".");
+            if !ascii_cdot {
+                expect_atom(keyword, mode.keyword(), "goal control keyword")?;
+            }
+            self.start_goal_control(proof, goal, sequence, mode)?;
+        } else if kind == &parser_kind(&["Tactic", "tacticHave__"])
+            || kind == &parser_kind(&["Tactic", "tacticLet__"])
+        {
+            // `"have" letConfig letDecl` and `"let" letConfig letDecl`: one `letIdDecl`
+            // with no binders and the default configuration.
+            let opaque = kind == &parser_kind(&["Tactic", "tacticHave__"]);
+            let [keyword, config, declaration] = args.as_slice() else {
+                return Err(error(TacticError::MalformedScript));
+            };
+            expect_atom(
+                keyword,
+                if opaque { "have" } else { "let" },
+                "local tactic declaration",
+            )?;
+            let config = expect_node(
+                config,
+                &parser_kind(&["Term", "letConfig"]),
+                1,
+                "local tactic configuration",
+            )?;
+            expect_empty_null(&config[0], "default local configuration")?;
+            let (name, annotation, value) = local_declaration(declaration, opaque)?;
+            return Ok(Some(ProofAction::Binding {
+                goal,
+                binding: LocalBinding {
                     name,
-                    proposition,
-                });
-            } else if kind == &parser_kind(&["Tactic", "falseOrByContra"]) {
-                let [keyword] = args.as_slice() else {
-                    return Err(error(TacticError::MalformedScript));
-                };
-                expect_atom(
-                    keyword,
-                    "false_or_by_contra",
-                    "contradiction preparation tactic",
-                )?;
-                self.false_or_by_contra_proof_goal(proof, goal)?;
-            } else if kind == &parser_kind(&["Tactic", "tacticExfalso"]) {
-                let [keyword] = args.as_slice() else {
-                    return Err(error(TacticError::MalformedScript));
-                };
-                expect_atom(keyword, "exfalso", "exfalso tactic")?;
-                let instance_start = self.instance_goals.len();
-                let term = self.constant(&Name::from_components(["False", "elim"]))?;
-                self.apply_proof_term(proof, goal, term, instance_start)?;
-            } else if kind == &parser_kind(&["Tactic", "tacticInfer_instance"]) {
-                let [keyword] = args.as_slice() else {
-                    return Err(error(TacticError::MalformedScript));
-                };
-                expect_atom(keyword, "infer_instance", "instance synthesis tactic")?;
-                self.txn.lctx = goal.lctx.clone();
-                if let Err(problem) = self.validate_instance_binder(&goal.target) {
-                    if matches!(
-                        problem,
-                        NatDefinitionElabError::Inference(
-                            SourceInferenceError::InvalidInstanceBinder
-                        )
-                    ) {
-                        return Err(error(TacticError::NoMatchingAssumption));
-                    }
-                    return Err(problem);
+                    opaque,
+                    replaces: None,
+                },
+                annotation,
+                value,
+            }));
+        } else if kind == &parser_kind(&["Tactic", "replace"]) {
+            // `replace decl` (`evalReplace`, vendored src/Lean/Elab/Tactic/BuiltinTactic.lean)
+            // is `have decl`, after which the hypothesis that had the name is cleared when
+            // nothing still reads it (`tryClearMany`).
+            let [keyword, declaration] = args.as_slice() else {
+                return Err(error(TacticError::MalformedScript));
+            };
+            expect_atom(keyword, "replace", "replace keyword")?;
+            self.require_declared_tactic(&["Lean", "Parser", "Tactic", "replace"])?;
+            let (name, annotation, value) = local_declaration(declaration, true)?;
+            let replaces = goal
+                .lctx
+                .find_by_user_name(&name)
+                .map(|local| local.id.clone());
+            return Ok(Some(ProofAction::Binding {
+                goal,
+                binding: LocalBinding {
+                    name,
+                    opaque: true,
+                    replaces,
+                },
+                annotation,
+                value,
+            }));
+        } else if kind == &parser_kind(&["Tactic", "tacticSuffices_"]) {
+            let [keyword, declaration] = args.as_slice() else {
+                return Err(error(TacticError::MalformedScript));
+            };
+            expect_atom(keyword, "suffices", "suffices keyword")?;
+            self.require_declared_tactic(&["Lean", "Parser", "Tactic", "tacticSuffices_"])?;
+            self.suffices_proof_goal(proof, goal, keyword, declaration)?;
+        } else if kind == &parser_kind(&["Tactic", "specialize"]) {
+            let [keyword, term] = args.as_slice() else {
+                return Err(error(TacticError::MalformedScript));
+            };
+            expect_atom(keyword, "specialize", "specialize keyword")?;
+            self.require_declared_tactic(&["Lean", "Parser", "Tactic", "specialize"])?;
+            return Ok(Some(ProofAction::Specialize { goal, term }));
+        } else if kind == &parser_kind(&["Tactic", "rintro"]) {
+            self.rintro_proof_goal(proof, goal, args)?;
+        } else if kind == &parser_kind(&["Tactic", "obtain"]) {
+            self.obtain_proof_goal(proof, goal, args)?;
+        } else if kind == &parser_kind(&["Tactic", "rcases"]) {
+            self.rcases_proof_goal(proof, goal, args)?;
+        } else if kind == &parser_kind(&["Tactic", "refine"])
+            || kind == &parser_kind(&["Tactic", "refine'"])
+        {
+            let placeholders = kind == &parser_kind(&["Tactic", "refine'"]);
+            let [keyword, term] = args.as_slice() else {
+                return Err(error(TacticError::MalformedScript));
+            };
+            expect_atom(
+                keyword,
+                if placeholders { "refine'" } else { "refine" },
+                "refinement tactic",
+            )?;
+            if placeholders {
+                self.require_declared_tactic(&["Lean", "Parser", "Tactic", "refine'"])?;
+            }
+            return Ok(Some(ProofAction::Refine {
+                syntax: term,
+                goal,
+                placeholders,
+            }));
+        } else if kind == &Name::from_components(["tacticBy_cases_:_"]) {
+            let [keyword, binder, proposition] = args.as_slice() else {
+                return Err(error(TacticError::MalformedScript));
+            };
+            expect_atom(keyword, "by_cases", "decidable case split")?;
+            let name = match expect_null_args(binder, "case evidence name")? {
+                // The pin's unnamed `by_cases p` binds a hygienic `h✝`: usable by
+                // `assumption`, never by a source `h` ("Unknown identifier `h`").
+                [] => self.fresh_inaccessible(&Name::from_components(["h"]))?,
+                [Syntax::Ident { val, .. }, colon]
+                    if !val.is_anonymous() && val.parent().is_anonymous() =>
+                {
+                    expect_atom(colon, ":", "case evidence annotation")?;
+                    val.clone()
                 }
-                let value = self.instance_hole(goal.target.clone())?;
-                self.resolve_instances(true)?;
-                let value = self.instantiate(&value)?;
-                if value.has_expr_mvar() || value.has_level_mvar() {
-                    return Err(failure(SourceInferenceError::InstanceSynthesisRequired));
+                _ => return Err(error(TacticError::MalformedScript)),
+            };
+            return Ok(Some(ProofAction::Cases {
+                goal,
+                name,
+                proposition,
+            }));
+        } else if kind == &parser_kind(&["Tactic", "falseOrByContra"]) {
+            let [keyword] = args.as_slice() else {
+                return Err(error(TacticError::MalformedScript));
+            };
+            expect_atom(
+                keyword,
+                "false_or_by_contra",
+                "contradiction preparation tactic",
+            )?;
+            self.false_or_by_contra_proof_goal(proof, goal)?;
+        } else if kind == &parser_kind(&["Tactic", "tacticExfalso"]) {
+            let [keyword] = args.as_slice() else {
+                return Err(error(TacticError::MalformedScript));
+            };
+            expect_atom(keyword, "exfalso", "exfalso tactic")?;
+            let instance_start = self.instance_goals.len();
+            let term = self.constant(&Name::from_components(["False", "elim"]))?;
+            self.apply_proof_term(proof, goal, term, instance_start)?;
+        } else if kind == &parser_kind(&["Tactic", "tacticInfer_instance"]) {
+            let [keyword] = args.as_slice() else {
+                return Err(error(TacticError::MalformedScript));
+            };
+            expect_atom(keyword, "infer_instance", "instance synthesis tactic")?;
+            self.txn.lctx = goal.lctx.clone();
+            if let Err(problem) = self.validate_instance_binder(&goal.target) {
+                if matches!(
+                    problem,
+                    NatDefinitionElabError::Inference(SourceInferenceError::InvalidInstanceBinder)
+                ) {
+                    return Err(error(TacticError::NoMatchingAssumption));
                 }
-                self.close_proof_goal(goal, value)?;
-            } else if kind == &parser_kind(&["Tactic", "decide"])
-                || kind == &parser_kind(&["Tactic", "nativeDecide"])
-            {
-                let native_tactic = kind == &parser_kind(&["Tactic", "nativeDecide"]);
-                let [keyword, config] = args.as_slice() else {
-                    return Err(error(TacticError::MalformedScript));
-                };
-                expect_atom(
-                    keyword,
-                    if native_tactic {
-                        "native_decide"
-                    } else {
-                        "decide"
-                    },
-                    "decision proof tactic",
-                )?;
+                return Err(problem);
+            }
+            let value = self.instance_hole(goal.target.clone())?;
+            self.resolve_instances(true)?;
+            let value = self.instantiate(&value)?;
+            if value.has_expr_mvar() || value.has_level_mvar() {
+                return Err(failure(SourceInferenceError::InstanceSynthesisRequired));
+            }
+            self.close_proof_goal(goal, value)?;
+        } else if kind == &parser_kind(&["Tactic", "decide"])
+            || kind == &parser_kind(&["Tactic", "nativeDecide"])
+        {
+            let native_tactic = kind == &parser_kind(&["Tactic", "nativeDecide"]);
+            let [keyword, config] = args.as_slice() else {
+                return Err(error(TacticError::MalformedScript));
+            };
+            expect_atom(
+                keyword,
                 if native_tactic {
-                    // `syntax (name := nativeDecide) "native_decide" optConfig : tactic`
-                    // (`Init/Tactics.lean:1482`). A world whose imports do not reach
-                    // `Init.Tactics` lacks it, and the pin does not read the word as a tactic.
-                    let syntax =
-                        Name::from_components(["Lean", "Parser", "Tactic", "nativeDecide"]);
-                    if !self.txn.env.contains(&syntax) {
-                        return Err(failure(SourceInferenceError::UnknownConstant(syntax)));
-                    }
-                }
-                // Only `native` is read from the configuration; `native_decide` sets it
-                // (`evalNativeDecide`, vendored Lean/Elab/Tactic/Decide.lean:186-189).
-                let native = self.decide_native_config(config)?;
-                if native_tactic {
-                    self.native_decide_proof_goal(goal, "native_decide")?;
-                } else if native {
-                    self.native_decide_proof_goal(goal, "decide")?;
+                    "native_decide"
                 } else {
-                    self.decide_proof_goal(goal)?;
+                    "decide"
+                },
+                "decision proof tactic",
+            )?;
+            if native_tactic {
+                // `syntax (name := nativeDecide) "native_decide" optConfig : tactic`
+                // (`Init/Tactics.lean:1482`). A world whose imports do not reach
+                // `Init.Tactics` lacks it, and the pin does not read the word as a tactic.
+                let syntax = Name::from_components(["Lean", "Parser", "Tactic", "nativeDecide"]);
+                if !self.txn.env.contains(&syntax) {
+                    return Err(failure(SourceInferenceError::UnknownConstant(syntax)));
                 }
-            } else if kind == &parser_kind(&["Tactic", "constructor"])
-                || kind == &parser_kind(&["Tactic", "left"])
-                || kind == &parser_kind(&["Tactic", "right"])
-            {
-                let (keyword, selected) = if kind == &parser_kind(&["Tactic", "left"]) {
-                    ("left", Some(0))
-                } else if kind == &parser_kind(&["Tactic", "right"]) {
-                    ("right", Some(1))
-                } else {
-                    ("constructor", None)
-                };
-                let [actual] = args.as_slice() else {
-                    return Err(error(TacticError::MalformedScript));
-                };
-                expect_atom(actual, keyword, "constructor tactic")?;
-                self.construct_proof_goal(proof, goal, selected)?;
-            } else if kind == &parser_kind(&["Tactic", "contradiction"]) {
-                let [keyword] = args.as_slice() else {
-                    return Err(error(TacticError::MalformedScript));
-                };
-                expect_atom(keyword, "contradiction", "contradiction tactic")?;
-                self.contradict_proof_goal(goal)?;
-            } else if kind == &parser_kind(&["Tactic", "injection"]) {
-                self.inject_proof_goal(proof, goal, args)?;
-            } else if kind == &parser_kind(&["Tactic", "injections"]) {
-                self.injections_proof_goal(proof, goal, args)?;
-            } else if kind == &parser_kind(&["Tactic", "subst"]) {
-                let [keyword, names] = args.as_slice() else {
-                    return Err(error(TacticError::MalformedScript));
-                };
-                expect_atom(keyword, "subst", "substitution tactic")?;
-                let [Syntax::Ident { val, .. }] = expect_null_args(names, "substituted name")?
-                else {
-                    return Err(error(TacticError::MalformedScript));
-                };
-                self.substitute_proof_goal(proof, goal, val)?;
-            } else if kind == &parser_kind(&["Tactic", "cases"])
-                || kind == &parser_kind(&["Tactic", "induction"])
-            {
-                let induction = kind == &parser_kind(&["Tactic", "induction"]);
-                let (expression, binder) = eliminate::target(args, induction)?;
-                let equation = match binder {
-                    None => None,
-                    Some(Syntax::Ident { val, .. }) => Some(val.clone()),
-                    Some(_) => Some(self.fresh_inaccessible(&Name::from_components(["h"]))?),
-                };
-                return Ok(ProofAction::Eliminate {
-                    goal,
-                    args,
-                    induction,
-                    equation,
-                    expression,
-                });
-            } else if kind == &parser_kind(&["Tactic", "simpAll"]) {
-                self.simplify_all_proof_goal(proof, goal, args)?;
-            } else if kind == &parser_kind(&["Tactic", "dsimp"]) {
-                self.dsimplify_proof_goal(proof, goal, args)?;
-            } else if kind == &parser_kind(&["Tactic", "simp"]) {
-                self.simplify_proof_goal(proof, goal, args)?;
-            } else if kind == &parser_kind(&["Tactic", "simpTrace"])
-                || kind == &parser_kind(&["Tactic", "simpAllTrace"])
-                || kind == &parser_kind(&["Tactic", "dsimpTrace"])
-            {
-                self.simp_trace_proof_goal(proof, goal, kind, args)?;
-            } else if kind == &parser_kind(&["Tactic", "simpa"]) {
-                let [keyword, _, _, rest] = args.as_slice() else {
-                    return Err(error(TacticError::MalformedScript));
-                };
-                expect_atom(keyword, "simpa", "simplifying completion")?;
-                let rest = expect_node(
-                    rest,
-                    &parser_kind(&["Tactic", "simpaArgsRest"]),
-                    5,
-                    "simpa arguments",
-                )?;
-                let using = &rest[4];
-                match expect_null_args(using, "optional simpa evidence")? {
-                    [] => self.simpa_proof_term(proof, goal, args, None)?,
-                    [keyword, using] => {
-                        expect_atom(keyword, "using", "simpa evidence keyword")?;
-                        return Ok(ProofAction::Simpa { goal, args, using });
-                    }
-                    _ => return Err(error(TacticError::MalformedScript)),
+            }
+            // Only `native` is read from the configuration; `native_decide` sets it
+            // (`evalNativeDecide`, vendored Lean/Elab/Tactic/Decide.lean:186-189).
+            let native = self.decide_native_config(config)?;
+            if native_tactic {
+                self.native_decide_proof_goal(goal, "native_decide")?;
+            } else if native {
+                self.native_decide_proof_goal(goal, "decide")?;
+            } else {
+                self.decide_proof_goal(goal)?;
+            }
+        } else if kind == &parser_kind(&["Tactic", "constructor"])
+            || kind == &parser_kind(&["Tactic", "left"])
+            || kind == &parser_kind(&["Tactic", "right"])
+        {
+            let (keyword, selected) = if kind == &parser_kind(&["Tactic", "left"]) {
+                ("left", Some(0))
+            } else if kind == &parser_kind(&["Tactic", "right"]) {
+                ("right", Some(1))
+            } else {
+                ("constructor", None)
+            };
+            let [actual] = args.as_slice() else {
+                return Err(error(TacticError::MalformedScript));
+            };
+            expect_atom(actual, keyword, "constructor tactic")?;
+            self.construct_proof_goal(proof, goal, selected)?;
+        } else if kind == &parser_kind(&["Tactic", "contradiction"]) {
+            let [keyword] = args.as_slice() else {
+                return Err(error(TacticError::MalformedScript));
+            };
+            expect_atom(keyword, "contradiction", "contradiction tactic")?;
+            self.contradict_proof_goal(goal)?;
+        } else if kind == &parser_kind(&["Tactic", "injection"]) {
+            self.inject_proof_goal(proof, goal, args)?;
+        } else if kind == &parser_kind(&["Tactic", "injections"]) {
+            self.injections_proof_goal(proof, goal, args)?;
+        } else if kind == &parser_kind(&["Tactic", "subst"]) {
+            let [keyword, names] = args.as_slice() else {
+                return Err(error(TacticError::MalformedScript));
+            };
+            expect_atom(keyword, "subst", "substitution tactic")?;
+            let [Syntax::Ident { val, .. }] = expect_null_args(names, "substituted name")? else {
+                return Err(error(TacticError::MalformedScript));
+            };
+            self.substitute_proof_goal(proof, goal, val)?;
+        } else if kind == &parser_kind(&["Tactic", "cases"])
+            || kind == &parser_kind(&["Tactic", "induction"])
+        {
+            let induction = kind == &parser_kind(&["Tactic", "induction"]);
+            let (expression, binder) = eliminate::target(args, induction)?;
+            let equation = match binder {
+                None => None,
+                Some(Syntax::Ident { val, .. }) => Some(val.clone()),
+                Some(_) => Some(self.fresh_inaccessible(&Name::from_components(["h"]))?),
+            };
+            return Ok(Some(ProofAction::Eliminate {
+                goal,
+                args,
+                induction,
+                equation,
+                expression,
+            }));
+        } else if kind == &parser_kind(&["Tactic", "simpAll"]) {
+            self.simplify_all_proof_goal(proof, goal, args)?;
+        } else if kind == &parser_kind(&["Tactic", "dsimp"]) {
+            self.dsimplify_proof_goal(proof, goal, args)?;
+        } else if kind == &parser_kind(&["Tactic", "simp"]) {
+            self.simplify_proof_goal(proof, goal, args)?;
+        } else if kind == &parser_kind(&["Tactic", "simpTrace"])
+            || kind == &parser_kind(&["Tactic", "simpAllTrace"])
+            || kind == &parser_kind(&["Tactic", "dsimpTrace"])
+        {
+            self.simp_trace_proof_goal(proof, goal, kind, args)?;
+        } else if kind == &parser_kind(&["Tactic", "simpa"]) {
+            let [keyword, _, _, rest] = args.as_slice() else {
+                return Err(error(TacticError::MalformedScript));
+            };
+            expect_atom(keyword, "simpa", "simplifying completion")?;
+            let rest = expect_node(
+                rest,
+                &parser_kind(&["Tactic", "simpaArgsRest"]),
+                5,
+                "simpa arguments",
+            )?;
+            let using = &rest[4];
+            match expect_null_args(using, "optional simpa evidence")? {
+                [] => self.simpa_proof_term(proof, goal, args, None)?,
+                [keyword, using] => {
+                    expect_atom(keyword, "using", "simpa evidence keyword")?;
+                    return Ok(Some(ProofAction::Simpa { goal, args, using }));
                 }
-            } else if kind == &parser_kind(&["Tactic", "unfold"]) {
-                self.unfold_proof_goal(proof, goal, args)?;
-            } else if kind == &parser_kind(&["Tactic", "delta"]) {
-                self.delta_proof_goal(proof, goal, args)?;
-            } else if kind == &parser_kind(&["Tactic", "rwSeq"])
-                || kind == &parser_kind(&["Tactic", "rewriteSeq"])
+                _ => return Err(error(TacticError::MalformedScript)),
+            }
+        } else if kind == &parser_kind(&["Tactic", "unfold"]) {
+            self.unfold_proof_goal(proof, goal, args)?;
+        } else if kind == &parser_kind(&["Tactic", "delta"]) {
+            self.delta_proof_goal(proof, goal, args)?;
+        } else if kind == &parser_kind(&["Tactic", "rwSeq"])
+            || kind == &parser_kind(&["Tactic", "rewriteSeq"])
+        {
+            let close = kind == &parser_kind(&["Tactic", "rwSeq"]);
+            if !self.rewrite_at_locations(proof, &goal, args, close)? {
+                let rules = self.rewrite_rules(args, close)?;
+                proof.work.push(Work::Rewrite(goal, rules, close));
+            }
+        } else if kind == &parser_kind(&["Tactic", "intro"]) {
+            let [keyword, names] = args.as_slice() else {
+                return Err(error(TacticError::MalformedScript));
+            };
+            expect_atom(keyword, "intro", "intro keyword")?;
+            let names = expect_null_args(names, "intro names")?;
+            self.intro_proof_patterns(proof, goal, names)?;
+        } else if kind == &parser_kind(&["Tactic", "intros"]) {
+            let [keyword, names] = args.as_slice() else {
+                return Err(error(TacticError::MalformedScript));
+            };
+            expect_atom(keyword, "intros", "intros keyword")?;
+            let names = expect_null_args(names, "intros names")?;
+            self.intros_proof_goal(proof, goal, names)?;
+        } else if kind == &parser_kind(&["Tactic", "renameI"]) {
+            let [keyword, names] = args.as_slice() else {
+                return Err(error(TacticError::MalformedScript));
+            };
+            expect_atom(keyword, "rename_i", "rename_i keyword")?;
+            self.require_declared_tactic(&["Lean", "Parser", "Tactic", "renameI"])?;
+            let names = expect_null_args(names, "renamed hypotheses")?;
+            if names.is_empty() {
+                return Err(error(TacticError::MalformedScript));
+            }
+            let goal = self.renamed_proof_goal(proof, goal, names)?;
+            proof.work.push(Work::Goal(goal));
+        } else if kind == &parser_kind(&["Tactic", "rename"]) {
+            let goal = self.rename_proof_goal(proof, goal, args)?;
+            proof.work.push(Work::Goal(goal));
+        } else if kind == &parser_kind(&["Tactic", "match"]) {
+            self.match_proof_goal(proof, goal, args)?;
+        } else if kind == &parser_kind(&["Tactic", "letrec"]) {
+            self.let_rec_proof_goal(proof, goal, args)?;
+        } else if kind == &parser_kind(&["Tactic", "tacticAnd_intros"]) {
+            self.and_intros_proof_goal(proof, goal, args)?;
+        } else if kind == &parser_kind(&["Tactic", "tacticExists_,,"]) {
+            self.exists_proof_goal(proof, goal, args)?;
+        } else if let Some((word, expansion)) = self.wf_macro_expansion(kind, &goal)? {
+            let [keyword] = args.as_slice() else {
+                return Err(error(TacticError::MalformedScript));
+            };
+            expect_atom(keyword, word, "well-founded recursion tactic")?;
+            let body = self.proof_instructions(expansion)?;
+            proof.work.push(Work::Goal(goal));
+            self.start_macro_scope(proof, body)?;
+        } else if kind == &parser_kind(&["Tactic", "clear"]) {
+            self.clear_proof_locals(proof, goal, args)?;
+        } else if kind == &parser_kind(&["Tactic", "tacticNext_=>_"]) {
+            // `macro "next " args:(ppSpace binderIdent)* " => " tac:tacticSeq : tactic` is
+            // `case _ args* => tac` (vendored src/Init/Tactics.lean): the main goal, its
+            // inaccessible hypotheses renamed and its tag cleared, must be closed by `tac`
+            // (`evalCase`, vendored src/Lean/Elab/Tactic/BuiltinTactic.lean), as `·` does.
+            let [keyword, names, arrow, body] = args.as_slice() else {
+                return Err(error(TacticError::MalformedScript));
+            };
+            expect_atom(keyword, "next", "next keyword")?;
+            expect_atom(arrow, "=>", "next arrow")?;
+            self.require_declared_tactic(&["Lean", "Parser", "Tactic", "tacticNext_=>_"])?;
+            let names = expect_null_args(names, "next names")?;
+            let goal = self.renamed_proof_goal(proof, goal, names)?;
+            self.goal_tags.remove(&goal.id);
+            self.start_goal_control(proof, goal, body, control::Mode::Solve)?;
+        } else if kind == &parser_kind(&["Tactic", "case"]) {
+            // `"case " sepBy1(caseArg, " | ") " => " tacticSeq` (`evalCase`, vendored
+            // src/Lean/Elab/Tactic/BuiltinTactic.lean): the goal the tag selects, renamed and
+            // untagged, must be closed by the body; the others keep their order.
+            let [keyword, cases, arrow, body] = args.as_slice() else {
+                return Err(error(TacticError::MalformedScript));
+            };
+            expect_atom(keyword, "case", "case keyword")?;
+            expect_atom(arrow, "=>", "case arrow")?;
+            self.require_declared_tactic(&["Lean", "Parser", "Tactic", "case"])?;
+            // The body runs once per `tag | tag`; only one tag is run here.
+            let [case] = expect_null_args(cases, "case arguments")? else {
+                return Err(error(TacticError::UnsupportedTactic(kind.clone())));
+            };
+            let [tag, names] = expect_node(
+                case,
+                &parser_kind(&["Tactic", "caseArg"]),
+                2,
+                "case argument",
+            )?
+            else {
+                return Err(error(TacticError::MalformedScript));
+            };
+            let names = expect_null_args(names, "case names")?;
+            let goal = self.case_goal(proof, goal, tag)?;
+            let goal = self.renamed_proof_goal(proof, goal, names)?;
+            self.goal_tags.remove(&goal.id);
+            self.start_goal_control(proof, goal, body, control::Mode::Solve)?;
+        } else if kind == &parser_kind(&["Tactic", "case'"]) {
+            // `"case' " sepBy1(caseArg, " | ") " => " tacticSeq` (`evalCase'`, vendored
+            // src/Lean/Elab/Tactic/BuiltinTactic.lean): for each tag in turn, the goal it
+            // selects among those no earlier tag took, renamed, runs the body alone, and a
+            // run leaving exactly one goal gives it that tag; what each run leaves comes
+            // first, in order, then the other goals. Unlike `case`, the body need not close
+            // its goal, and the tag is kept.
+            let [keyword, cases, arrow, body] = args.as_slice() else {
+                return Err(error(TacticError::MalformedScript));
+            };
+            expect_atom(keyword, "case'", "case' keyword")?;
+            expect_atom(arrow, "=>", "case' arrow")?;
+            self.require_declared_tactic(&["Lean", "Parser", "Tactic", "case'"])?;
+            let mut tags = Vec::new();
+            for (index, case) in expect_null_args(cases, "case' arguments")?
+                .iter()
+                .enumerate()
             {
-                let close = kind == &parser_kind(&["Tactic", "rwSeq"]);
-                if !self.rewrite_at_locations(proof, &goal, args, close)? {
-                    let rules = self.rewrite_rules(args, close)?;
-                    proof.work.push(Work::Rewrite(goal, rules, close));
+                if index % 2 == 1 {
+                    expect_atom(case, "|", "case' separator")?;
+                    continue;
                 }
-            } else if kind == &parser_kind(&["Tactic", "intro"]) {
-                let [keyword, names] = args.as_slice() else {
-                    return Err(error(TacticError::MalformedScript));
-                };
-                expect_atom(keyword, "intro", "intro keyword")?;
-                let names = expect_null_args(names, "intro names")?;
-                self.intro_proof_patterns(proof, goal, names)?;
-            } else if kind == &parser_kind(&["Tactic", "intros"]) {
-                let [keyword, names] = args.as_slice() else {
-                    return Err(error(TacticError::MalformedScript));
-                };
-                expect_atom(keyword, "intros", "intros keyword")?;
-                let names = expect_null_args(names, "intros names")?;
-                self.intros_proof_goal(proof, goal, names)?;
-            } else if kind == &parser_kind(&["Tactic", "renameI"]) {
-                let [keyword, names] = args.as_slice() else {
-                    return Err(error(TacticError::MalformedScript));
-                };
-                expect_atom(keyword, "rename_i", "rename_i keyword")?;
-                self.require_declared_tactic(&["Lean", "Parser", "Tactic", "renameI"])?;
-                let names = expect_null_args(names, "renamed hypotheses")?;
-                if names.is_empty() {
-                    return Err(error(TacticError::MalformedScript));
-                }
-                let goal = self.renamed_proof_goal(proof, goal, names)?;
-                proof.work.push(Work::Goal(goal));
-            } else if kind == &parser_kind(&["Tactic", "rename"]) {
-                let goal = self.rename_proof_goal(proof, goal, args)?;
-                proof.work.push(Work::Goal(goal));
-            } else if kind == &parser_kind(&["Tactic", "match"]) {
-                self.match_proof_goal(proof, goal, args)?;
-            } else if kind == &parser_kind(&["Tactic", "letrec"]) {
-                self.let_rec_proof_goal(proof, goal, args)?;
-            } else if kind == &parser_kind(&["Tactic", "tacticAnd_intros"]) {
-                self.and_intros_proof_goal(proof, goal, args)?;
-            } else if kind == &parser_kind(&["Tactic", "tacticExists_,,"]) {
-                self.exists_proof_goal(proof, goal, args)?;
-            } else if let Some((word, expansion)) = self.wf_macro_expansion(kind, &goal)? {
-                let [keyword] = args.as_slice() else {
-                    return Err(error(TacticError::MalformedScript));
-                };
-                expect_atom(keyword, word, "well-founded recursion tactic")?;
-                let body = self.proof_instructions(expansion)?;
-                proof.work.push(Work::Goal(goal));
-                self.start_macro_scope(proof, body)?;
-            } else if kind == &parser_kind(&["Tactic", "clear"]) {
-                self.clear_proof_locals(proof, goal, args)?;
-            } else if kind == &parser_kind(&["Tactic", "tacticNext_=>_"]) {
-                // `macro "next " args:(ppSpace binderIdent)* " => " tac:tacticSeq : tactic` is
-                // `case _ args* => tac` (vendored src/Init/Tactics.lean): the main goal, its
-                // inaccessible hypotheses renamed and its tag cleared, must be closed by `tac`
-                // (`evalCase`, vendored src/Lean/Elab/Tactic/BuiltinTactic.lean), as `·` does.
-                let [keyword, names, arrow, body] = args.as_slice() else {
-                    return Err(error(TacticError::MalformedScript));
-                };
-                expect_atom(keyword, "next", "next keyword")?;
-                expect_atom(arrow, "=>", "next arrow")?;
-                self.require_declared_tactic(&["Lean", "Parser", "Tactic", "tacticNext_=>_"])?;
-                let names = expect_null_args(names, "next names")?;
-                let goal = self.renamed_proof_goal(proof, goal, names)?;
-                self.goal_tags.remove(&goal.id);
-                self.start_goal_control(proof, goal, body, control::Mode::Solve)?;
-            } else if kind == &parser_kind(&["Tactic", "case"]) {
-                // `"case " sepBy1(caseArg, " | ") " => " tacticSeq` (`evalCase`, vendored
-                // src/Lean/Elab/Tactic/BuiltinTactic.lean): the goal the tag selects, renamed and
-                // untagged, must be closed by the body; the others keep their order.
-                let [keyword, cases, arrow, body] = args.as_slice() else {
-                    return Err(error(TacticError::MalformedScript));
-                };
-                expect_atom(keyword, "case", "case keyword")?;
-                expect_atom(arrow, "=>", "case arrow")?;
-                self.require_declared_tactic(&["Lean", "Parser", "Tactic", "case"])?;
-                // The body runs once per `tag | tag`; only one tag is run here.
-                let [case] = expect_null_args(cases, "case arguments")? else {
-                    return Err(error(TacticError::UnsupportedTactic(kind.clone())));
-                };
                 let [tag, names] = expect_node(
                     case,
                     &parser_kind(&["Tactic", "caseArg"]),
                     2,
-                    "case argument",
+                    "case' argument",
                 )?
                 else {
                     return Err(error(TacticError::MalformedScript));
                 };
-                let names = expect_null_args(names, "case names")?;
+                tags.push((tag, expect_null_args(names, "case' names")?));
+            }
+            if let [(tag, names)] = tags.as_slice() {
                 let goal = self.case_goal(proof, goal, tag)?;
                 let goal = self.renamed_proof_goal(proof, goal, names)?;
-                self.goal_tags.remove(&goal.id);
-                self.start_goal_control(proof, goal, body, control::Mode::Solve)?;
-            } else if kind == &parser_kind(&["Tactic", "case'"]) {
-                // `"case' " sepBy1(caseArg, " | ") " => " tacticSeq` (`evalCase'`, vendored
-                // src/Lean/Elab/Tactic/BuiltinTactic.lean): for each tag in turn, the goal it
-                // selects among those no earlier tag took, renamed, runs the body alone, and a
-                // run leaving exactly one goal gives it that tag; what each run leaves comes
-                // first, in order, then the other goals. Unlike `case`, the body need not close
-                // its goal, and the tag is kept.
-                let [keyword, cases, arrow, body] = args.as_slice() else {
-                    return Err(error(TacticError::MalformedScript));
-                };
-                expect_atom(keyword, "case'", "case' keyword")?;
-                expect_atom(arrow, "=>", "case' arrow")?;
-                self.require_declared_tactic(&["Lean", "Parser", "Tactic", "case'"])?;
-                let mut tags = Vec::new();
-                for (index, case) in expect_null_args(cases, "case' arguments")?
-                    .iter()
-                    .enumerate()
-                {
-                    if index % 2 == 1 {
-                        expect_atom(case, "|", "case' separator")?;
-                        continue;
+                self.start_case_prime_focus(proof, goal, body)?;
+            } else {
+                // The tags are selected first, as the runs do not change the other goals'
+                // tags; renaming would have to wait for each run, so names are refused.
+                if tags.is_empty() || tags.iter().any(|(_, names)| !names.is_empty()) {
+                    return Err(error(TacticError::UnsupportedTactic(kind.clone())));
+                }
+                let count = tags.len();
+                let goal = self.reorder_visible_goals(proof, goal, kind, |this, mut goals| {
+                    let mut selected = Vec::new();
+                    for (tag, _) in &tags {
+                        let index = this.case_tag_position(&goals, tag)?;
+                        selected.push(goals.remove(index));
                     }
-                    let [tag, names] = expect_node(
-                        case,
-                        &parser_kind(&["Tactic", "caseArg"]),
-                        2,
-                        "case' argument",
+                    selected.extend(goals);
+                    Ok(selected)
+                })?;
+                self.start_limited_all_goals(proof, goal, body, count)?;
+            }
+        } else if kind == &parser_kind(&["Tactic", "rotateLeft"])
+            || kind == &parser_kind(&["Tactic", "rotateRight"])
+        {
+            // `"rotate_left" (ppSpace num)?` (`evalRotateLeft`, vendored
+            // src/Lean/Elab/Tactic/BuiltinTactic.lean): the goal list rotated by `n`, 1 by
+            // default (`List.rotateLeft`, `List.rotateRight`).
+            let left = kind == &parser_kind(&["Tactic", "rotateLeft"]);
+            let [keyword, count] = args.as_slice() else {
+                return Err(error(TacticError::MalformedScript));
+            };
+            expect_atom(
+                keyword,
+                if left { "rotate_left" } else { "rotate_right" },
+                "rotation keyword",
+            )?;
+            self.require_declared_tactic(&[
+                "Lean",
+                "Parser",
+                "Tactic",
+                if left { "rotateLeft" } else { "rotateRight" },
+            ])?;
+            let count = match expect_null_args(count, "rotation count")? {
+                [] => 1,
+                [number] => {
+                    let [Syntax::Atom { val, .. }] = expect_node(
+                        number,
+                        &Name::str(Name::anonymous(), "num"),
+                        1,
+                        "rotation count",
                     )?
                     else {
                         return Err(error(TacticError::MalformedScript));
                     };
-                    tags.push((tag, expect_null_args(names, "case' names")?));
+                    val.parse::<usize>()
+                        .map_err(|_| error(TacticError::UnsupportedTactic(kind.clone())))?
                 }
-                if let [(tag, names)] = tags.as_slice() {
-                    let goal = self.case_goal(proof, goal, tag)?;
-                    let goal = self.renamed_proof_goal(proof, goal, names)?;
-                    self.start_case_prime_focus(proof, goal, body)?;
-                } else {
-                    // The tags are selected first, as the runs do not change the other goals'
-                    // tags; renaming would have to wait for each run, so names are refused.
-                    if tags.is_empty() || tags.iter().any(|(_, names)| !names.is_empty()) {
-                        return Err(error(TacticError::UnsupportedTactic(kind.clone())));
+                _ => return Err(error(TacticError::MalformedScript)),
+            };
+            let goal = self.reorder_visible_goals(proof, goal, kind, |_, mut goals| {
+                let length = goals.len();
+                if length > 1 {
+                    let shift = count % length;
+                    if left {
+                        goals.rotate_left(shift);
+                    } else {
+                        goals.rotate_right(shift);
                     }
-                    let count = tags.len();
-                    let goal =
-                        self.reorder_visible_goals(proof, goal, kind, |this, mut goals| {
-                            let mut selected = Vec::new();
-                            for (tag, _) in &tags {
-                                let index = this.case_tag_position(&goals, tag)?;
-                                selected.push(goals.remove(index));
-                            }
-                            selected.extend(goals);
-                            Ok(selected)
-                        })?;
-                    self.start_limited_all_goals(proof, goal, body, count)?;
                 }
-            } else if kind == &parser_kind(&["Tactic", "rotateLeft"])
-                || kind == &parser_kind(&["Tactic", "rotateRight"])
-            {
-                // `"rotate_left" (ppSpace num)?` (`evalRotateLeft`, vendored
-                // src/Lean/Elab/Tactic/BuiltinTactic.lean): the goal list rotated by `n`, 1 by
-                // default (`List.rotateLeft`, `List.rotateRight`).
-                let left = kind == &parser_kind(&["Tactic", "rotateLeft"]);
-                let [keyword, count] = args.as_slice() else {
-                    return Err(error(TacticError::MalformedScript));
-                };
-                expect_atom(
-                    keyword,
-                    if left { "rotate_left" } else { "rotate_right" },
-                    "rotation keyword",
-                )?;
-                self.require_declared_tactic(&[
-                    "Lean",
-                    "Parser",
-                    "Tactic",
-                    if left { "rotateLeft" } else { "rotateRight" },
-                ])?;
-                let count = match expect_null_args(count, "rotation count")? {
-                    [] => 1,
-                    [number] => {
-                        let [Syntax::Atom { val, .. }] = expect_node(
-                            number,
-                            &Name::str(Name::anonymous(), "num"),
-                            1,
-                            "rotation count",
-                        )?
-                        else {
-                            return Err(error(TacticError::MalformedScript));
-                        };
-                        val.parse::<usize>()
-                            .map_err(|_| error(TacticError::UnsupportedTactic(kind.clone())))?
-                    }
-                    _ => return Err(error(TacticError::MalformedScript)),
-                };
-                let goal = self.reorder_visible_goals(proof, goal, kind, |_, mut goals| {
-                    let length = goals.len();
-                    if length > 1 {
-                        let shift = count % length;
-                        if left {
-                            goals.rotate_left(shift);
-                        } else {
-                            goals.rotate_right(shift);
-                        }
-                    }
-                    Ok(goals)
-                })?;
-                proof.work.push(Work::Goal(goal));
-            } else if kind == &parser_kind(&["Tactic", "revert"]) {
-                self.revert_proof_locals(proof, goal, args)?;
-            } else if kind == &parser_kind(&["Tactic", "generalize"]) {
-                // `"generalize " generalizeArg,+ (location)?`: one argument, at the goal.
-                let [keyword, arguments, location] = args.as_slice() else {
-                    return Err(error(TacticError::MalformedScript));
-                };
-                expect_atom(keyword, "generalize", "generalize keyword")?;
-                expect_empty_null(location, "goal-only generalize location")?;
-                let [argument] = expect_null_args(arguments, "generalize arguments")? else {
-                    return Err(error(TacticError::MalformedScript));
-                };
-                let [
-                    witness,
-                    expression,
-                    equality,
-                    Syntax::Ident { val: name, .. },
-                ] = expect_node(
-                    argument,
-                    &parser_kind(&["Tactic", "generalizeArg"]),
-                    4,
-                    "generalize argument",
-                )?
-                else {
-                    return Err(error(TacticError::MalformedScript));
-                };
-                expect_atom(equality, "=", "generalize equality")?;
-                let equality = match expect_null_args(witness, "generalize witness")? {
-                    [] => None,
-                    [Syntax::Ident { val, .. }, colon] => {
-                        expect_atom(colon, ":", "generalize witness colon")?;
-                        Some(val.clone())
-                    }
-                    _ => return Err(error(TacticError::MalformedScript)),
-                };
-                return Ok(ProofAction::Generalize {
-                    goal,
-                    name: name.clone(),
-                    equality,
-                    expression,
-                });
-            } else if kind == &parser_kind(&["Tactic", "change"]) {
-                let [keyword, target, location] = args.as_slice() else {
-                    return Err(error(TacticError::MalformedScript));
-                };
-                expect_atom(keyword, "change", "target replacement tactic")?;
-                expect_empty_null(location, "goal-only change location")?;
-                return Ok(ProofAction::Change { goal, target });
-            } else if kind == &parser_kind(&["Tactic", "show"]) {
-                // `syntax (name := «show») "show " term : tactic` (`Init/Tactics.lean`): the first
-                // goal whose target unifies with the term becomes the main goal, its target
-                // replaced by it (`Lean/Elab/Tactic/Show.lean`). Only the main goal is tried here;
-                // a later goal the pin would select is refused, never changed.
-                let [keyword, target] = args.as_slice() else {
-                    return Err(error(TacticError::MalformedScript));
-                };
-                expect_atom(keyword, "show", "show tactic")?;
-                let syntax = Name::from_components(["Lean", "Parser", "Tactic", "show"]);
-                if !self.txn.env.contains(&syntax) {
-                    return Err(failure(SourceInferenceError::UnknownConstant(syntax)));
+                Ok(goals)
+            })?;
+            proof.work.push(Work::Goal(goal));
+        } else if kind == &parser_kind(&["Tactic", "revert"]) {
+            self.revert_proof_locals(proof, goal, args)?;
+        } else if kind == &parser_kind(&["Tactic", "generalize"]) {
+            // `"generalize " generalizeArg,+ (location)?`: one argument, at the goal.
+            let [keyword, arguments, location] = args.as_slice() else {
+                return Err(error(TacticError::MalformedScript));
+            };
+            expect_atom(keyword, "generalize", "generalize keyword")?;
+            expect_empty_null(location, "goal-only generalize location")?;
+            let [argument] = expect_null_args(arguments, "generalize arguments")? else {
+                return Err(error(TacticError::MalformedScript));
+            };
+            let [
+                witness,
+                expression,
+                equality,
+                Syntax::Ident { val: name, .. },
+            ] = expect_node(
+                argument,
+                &parser_kind(&["Tactic", "generalizeArg"]),
+                4,
+                "generalize argument",
+            )?
+            else {
+                return Err(error(TacticError::MalformedScript));
+            };
+            expect_atom(equality, "=", "generalize equality")?;
+            let equality = match expect_null_args(witness, "generalize witness")? {
+                [] => None,
+                [Syntax::Ident { val, .. }, colon] => {
+                    expect_atom(colon, ":", "generalize witness colon")?;
+                    Some(val.clone())
                 }
-                return Ok(ProofAction::Change { goal, target });
-            } else if let Some(tactic) = relations::classify(kind) {
-                self.relation_proof_goal(proof, goal, tactic, args)?;
-            } else if kind == &parser_kind(&["Tactic", "tacticSorry"])
-                || kind == &parser_kind(&["Tactic", "tacticAdmit"])
-            {
-                // `macro "sorry" : tactic => `(tactic| exact sorry)` (`Init/Tactics.lean:459`),
-                // and `macro "admit" : tactic => `(tactic| sorry)` beside it. A world whose
-                // imports do not reach `Init.Tactics` lacks the macro, and the pin reads the
-                // word there as an unexpected token.
-                let admit = kind == &parser_kind(&["Tactic", "tacticAdmit"]);
-                let [keyword] = args.as_slice() else {
-                    return Err(error(TacticError::MalformedScript));
-                };
-                expect_atom(
-                    keyword,
-                    if admit { "admit" } else { "sorry" },
-                    "sorry tactic",
-                )?;
-                let macro_syntax = Name::from_components([
-                    "Lean",
-                    "Parser",
-                    "Tactic",
-                    if admit { "tacticAdmit" } else { "tacticSorry" },
-                ]);
-                if !self.txn.env.contains(&macro_syntax) {
-                    return Err(failure(SourceInferenceError::UnknownConstant(macro_syntax)));
-                }
-                let sorry = self.labeled_sorry(instruction, goal.target.clone())?;
-                self.close_proof_goal(goal, sorry.value)?;
-            } else if kind == &parser_kind(&["Tactic", "tacticRfl"]) {
-                let [keyword] = args.as_slice() else {
-                    return Err(error(TacticError::MalformedScript));
-                };
-                expect_atom(keyword, "rfl", "reflexivity tactic")?;
-                self.rfl_proof_goal(goal)?;
-            } else if kind == &parser_kind(&["Tactic", "acRfl"]) {
-                let [keyword] = args.as_slice() else {
-                    return Err(error(TacticError::MalformedScript));
-                };
-                expect_atom(keyword, "ac_rfl", "associative normalization tactic")?;
-                self.ac_reflexivity(goal)?;
-            } else if kind == &parser_kind(&["Tactic", "acNf0"])
-                || kind == &parser_kind(&["Tactic", "tacticAc_nf_"])
-            {
-                self.ac_normalize_proof_goal(
-                    proof,
-                    goal,
-                    args,
-                    kind == &parser_kind(&["Tactic", "tacticAc_nf_"]),
-                )?;
-            } else if kind == &parser_kind(&["Tactic", "eqRefl"])
-                || kind == &parser_kind(&["Tactic", "applyRfl"])
-            {
-                let [keyword] = args.as_slice() else {
-                    return Err(error(TacticError::MalformedScript));
-                };
-                let approximate = kind == &parser_kind(&["Tactic", "applyRfl"]);
-                expect_atom(
-                    keyword,
-                    if approximate { "apply_rfl" } else { "eq_refl" },
-                    "primitive reflexivity tactic",
-                )?;
-                if approximate {
-                    self.apply_rfl_proof_goal(goal)?;
-                } else {
-                    self.eq_refl_proof_goal(goal, false)?;
-                }
-            } else if kind == &parser_kind(&["Tactic", "tacticTrivial"]) {
-                let [keyword] = args.as_slice() else {
-                    return Err(error(TacticError::MalformedScript));
-                };
-                expect_atom(keyword, "trivial", "trivial tactic")?;
-                self.trivial_proof_goal(goal)?;
-            } else if kind == &Name::from_components(["Lean", "calcTactic"]) {
-                // The tactic's steps are read as the term's (`start_calculation`).
-                return Ok(ProofAction::Term {
-                    syntax: instruction,
-                    goal,
-                    apply: false,
-                });
-            } else if kind == &parser_kind(&["Tactic", "split"]) {
-                self.split_proof_goal(proof, goal, args)?;
-            } else if kind == &parser_kind(&["Tactic", "grind"]) {
-                self.grind_proof_goal(goal, args)?;
-            } else if kind == &parser_kind(&["Tactic", "omega"]) {
-                let [keyword, config] = args.as_slice() else {
-                    return Err(error(TacticError::MalformedScript));
-                };
-                expect_atom(keyword, "omega", "linear arithmetic tactic")?;
-                expect_default_config(config, "omega configuration")?;
-                self.omega_proof_goal(goal)?;
-            } else if kind == &parser_kind(&["Tactic", "solveByElim"]) {
-                let selection = search::selection(self, args)?;
-                self.solve_by_elim_selected_proof_state(proof, goal, &selection)?;
-            } else if kind == &parser_kind(&["Tactic", "applyRules"])
-                || kind == &parser_kind(&["Tactic", "applyAssumption"])
-            {
-                self.apply_rule_proof_goal(
-                    proof,
-                    goal,
-                    args,
-                    kind == &parser_kind(&["Tactic", "applyAssumption"]),
-                )?;
-            } else if kind == &parser_kind(&["Tactic", "assumption"]) {
-                let [keyword] = args.as_slice() else {
-                    return Err(error(TacticError::MalformedScript));
-                };
-                expect_atom(keyword, "assumption", "assumption keyword")?;
-                let value = self
-                    .matching_assumption(&goal)?
-                    .ok_or_else(|| error(TacticError::NoMatchingAssumption))?;
-                self.close_proof_goal(goal, value)?;
-            } else {
-                let apply = kind == &parser_kind(&["Tactic", "apply"]);
-                if !apply && kind != &parser_kind(&["Tactic", "exact"]) {
-                    if proof.builtin_root(instruction) {
-                        return Ok(ProofAction::OwnedComplete(
-                            imported_macros::TacticCompletion::NoElaborator,
-                        ));
-                    }
-                    return Err(error(TacticError::UnsupportedTactic(kind.clone())));
-                }
-                let [keyword, term] = args.as_slice() else {
-                    return Err(error(TacticError::MalformedScript));
-                };
-                expect_atom(
-                    keyword,
-                    if apply { "apply" } else { "exact" },
-                    "tactic keyword",
-                )?;
-                return Ok(ProofAction::Term {
-                    syntax: term,
-                    goal,
-                    apply,
-                });
+                _ => return Err(error(TacticError::MalformedScript)),
+            };
+            return Ok(Some(ProofAction::Generalize {
+                goal,
+                name: name.clone(),
+                equality,
+                expression,
+            }));
+        } else if kind == &parser_kind(&["Tactic", "change"]) {
+            let [keyword, target, location] = args.as_slice() else {
+                return Err(error(TacticError::MalformedScript));
+            };
+            expect_atom(keyword, "change", "target replacement tactic")?;
+            expect_empty_null(location, "goal-only change location")?;
+            return Ok(Some(ProofAction::Change { goal, target }));
+        } else if kind == &parser_kind(&["Tactic", "show"]) {
+            // `syntax (name := «show») "show " term : tactic` (`Init/Tactics.lean`): the first
+            // goal whose target unifies with the term becomes the main goal, its target
+            // replaced by it (`Lean/Elab/Tactic/Show.lean`). Only the main goal is tried here;
+            // a later goal the pin would select is refused, never changed.
+            let [keyword, target] = args.as_slice() else {
+                return Err(error(TacticError::MalformedScript));
+            };
+            expect_atom(keyword, "show", "show tactic")?;
+            let syntax = Name::from_components(["Lean", "Parser", "Tactic", "show"]);
+            if !self.txn.env.contains(&syntax) {
+                return Err(failure(SourceInferenceError::UnknownConstant(syntax)));
             }
+            return Ok(Some(ProofAction::Change { goal, target }));
+        } else if let Some(tactic) = relations::classify(kind) {
+            self.relation_proof_goal(proof, goal, tactic, args)?;
+        } else if kind == &parser_kind(&["Tactic", "tacticSorry"])
+            || kind == &parser_kind(&["Tactic", "tacticAdmit"])
+        {
+            // `macro "sorry" : tactic => `(tactic| exact sorry)` (`Init/Tactics.lean:459`),
+            // and `macro "admit" : tactic => `(tactic| sorry)` beside it. A world whose
+            // imports do not reach `Init.Tactics` lacks the macro, and the pin reads the
+            // word there as an unexpected token.
+            let admit = kind == &parser_kind(&["Tactic", "tacticAdmit"]);
+            let [keyword] = args.as_slice() else {
+                return Err(error(TacticError::MalformedScript));
+            };
+            expect_atom(
+                keyword,
+                if admit { "admit" } else { "sorry" },
+                "sorry tactic",
+            )?;
+            let macro_syntax = Name::from_components([
+                "Lean",
+                "Parser",
+                "Tactic",
+                if admit { "tacticAdmit" } else { "tacticSorry" },
+            ]);
+            if !self.txn.env.contains(&macro_syntax) {
+                return Err(failure(SourceInferenceError::UnknownConstant(macro_syntax)));
+            }
+            let sorry = self.labeled_sorry(instruction, goal.target.clone())?;
+            self.close_proof_goal(goal, sorry.value)?;
+        } else if kind == &parser_kind(&["Tactic", "tacticRfl"]) {
+            let [keyword] = args.as_slice() else {
+                return Err(error(TacticError::MalformedScript));
+            };
+            expect_atom(keyword, "rfl", "reflexivity tactic")?;
+            self.rfl_proof_goal(goal)?;
+        } else if kind == &parser_kind(&["Tactic", "acRfl"]) {
+            let [keyword] = args.as_slice() else {
+                return Err(error(TacticError::MalformedScript));
+            };
+            expect_atom(keyword, "ac_rfl", "associative normalization tactic")?;
+            self.ac_reflexivity(goal)?;
+        } else if kind == &parser_kind(&["Tactic", "acNf0"])
+            || kind == &parser_kind(&["Tactic", "tacticAc_nf_"])
+        {
+            self.ac_normalize_proof_goal(
+                proof,
+                goal,
+                args,
+                kind == &parser_kind(&["Tactic", "tacticAc_nf_"]),
+            )?;
+        } else if kind == &parser_kind(&["Tactic", "eqRefl"])
+            || kind == &parser_kind(&["Tactic", "applyRfl"])
+        {
+            let [keyword] = args.as_slice() else {
+                return Err(error(TacticError::MalformedScript));
+            };
+            let approximate = kind == &parser_kind(&["Tactic", "applyRfl"]);
+            expect_atom(
+                keyword,
+                if approximate { "apply_rfl" } else { "eq_refl" },
+                "primitive reflexivity tactic",
+            )?;
+            if approximate {
+                self.apply_rfl_proof_goal(goal)?;
+            } else {
+                self.eq_refl_proof_goal(goal, false)?;
+            }
+        } else if kind == &parser_kind(&["Tactic", "tacticTrivial"]) {
+            let [keyword] = args.as_slice() else {
+                return Err(error(TacticError::MalformedScript));
+            };
+            expect_atom(keyword, "trivial", "trivial tactic")?;
+            self.trivial_proof_goal(goal)?;
+        } else if kind == &Name::from_components(["Lean", "calcTactic"]) {
+            // The tactic's steps are read as the term's (`start_calculation`).
+            return Ok(Some(ProofAction::Term {
+                syntax: instruction,
+                goal,
+                apply: false,
+            }));
+        } else if kind == &parser_kind(&["Tactic", "split"]) {
+            self.split_proof_goal(proof, goal, args)?;
+        } else if kind == &parser_kind(&["Tactic", "grind"]) {
+            self.grind_proof_goal(goal, args)?;
+        } else if kind == &parser_kind(&["Tactic", "omega"]) {
+            let [keyword, config] = args.as_slice() else {
+                return Err(error(TacticError::MalformedScript));
+            };
+            expect_atom(keyword, "omega", "linear arithmetic tactic")?;
+            expect_default_config(config, "omega configuration")?;
+            self.omega_proof_goal(goal)?;
+        } else if kind == &parser_kind(&["Tactic", "solveByElim"]) {
+            let selection = search::selection(self, args)?;
+            self.solve_by_elim_selected_proof_state(proof, goal, &selection)?;
+        } else if kind == &parser_kind(&["Tactic", "applyRules"])
+            || kind == &parser_kind(&["Tactic", "applyAssumption"])
+        {
+            self.apply_rule_proof_goal(
+                proof,
+                goal,
+                args,
+                kind == &parser_kind(&["Tactic", "applyAssumption"]),
+            )?;
+        } else if kind == &parser_kind(&["Tactic", "assumption"]) {
+            let [keyword] = args.as_slice() else {
+                return Err(error(TacticError::MalformedScript));
+            };
+            expect_atom(keyword, "assumption", "assumption keyword")?;
+            let value = self
+                .matching_assumption(&goal)?
+                .ok_or_else(|| error(TacticError::NoMatchingAssumption))?;
+            self.close_proof_goal(goal, value)?;
+        } else {
+            let apply = kind == &parser_kind(&["Tactic", "apply"]);
+            if !apply && kind != &parser_kind(&["Tactic", "exact"]) {
+                if proof.builtin_root(instruction) {
+                    return Ok(Some(ProofAction::OwnedComplete(
+                        imported_macros::TacticCompletion::NoElaborator,
+                    )));
+                }
+                return Err(error(TacticError::UnsupportedTactic(kind.clone())));
+            }
+            let [keyword, term] = args.as_slice() else {
+                return Err(error(TacticError::MalformedScript));
+            };
+            expect_atom(
+                keyword,
+                if apply { "apply" } else { "exact" },
+                "tactic keyword",
+            )?;
+            return Ok(Some(ProofAction::Term {
+                syntax: term,
+                goal,
+                apply,
+            }));
         }
+        Ok(None)
     }
 
     /// The well-founded recursion macros this engine expands as written (vendored
