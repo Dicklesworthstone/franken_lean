@@ -1,6 +1,6 @@
-//! The pin's sorted module-local reducibilityCore map.
+//! The pin's sorted local core map and chronological scoped extra updates.
 use super::*;
-use crate::source_extensions::{ReducibilityEntry, ReducibilityStatus};
+use crate::source_extensions::{ReducibilityEntry, ReducibilityExtraEntry, ReducibilityStatus};
 
 impl Encoder {
     pub(super) fn reducibility_block(&mut self, rows: &[ReducibilityEntry]) -> WResult<Obj> {
@@ -20,25 +20,63 @@ impl Encoder {
         }
         let mut entries = Vec::with_capacity(sorted.len());
         for row in sorted {
-            let name = self.name(&row.declaration)?;
-            let tag = match row.status {
-                ReducibilityStatus::Reducible => layout::REDUCIBILITY_REDUCIBLE,
-                ReducibilityStatus::Semireducible => layout::REDUCIBILITY_SEMIREDUCIBLE,
-                ReducibilityStatus::Irreducible => layout::REDUCIBILITY_IRREDUCIBLE,
-                ReducibilityStatus::ImplicitReducible => layout::REDUCIBILITY_IMPLICIT_REDUCIBLE,
-            };
-            let mut fields = (0..layout::PROD_POINTERS)
-                .map(|_| Obj::mk_nat(0))
-                .collect::<Vec<_>>();
-            fields[layout::PROD_FST] = name;
-            fields[layout::PROD_SND] = Obj::mk_nat(tag);
-            entries.push(self.ctor(0, fields, &[])?);
+            entries.push(self.reducibility_entry(&row.declaration, row.status)?);
         }
         let entries = self.array(entries)?;
         let name = self.name(&Name::from_components(
             layout::REDUCIBILITY_EXTENSION.split('.'),
         ))?;
         self.ctor(0, vec![name, entries], &[])
+    }
+
+    pub(super) fn reducibility_extra_block(
+        &mut self,
+        rows: &[ReducibilityExtraEntry],
+    ) -> WResult<Obj> {
+        self.source_array_bound(rows.len())?;
+        let mut entries = Vec::with_capacity(rows.len());
+        for row in rows {
+            if row.declaration.is_anonymous() || row.scope.as_ref().is_some_and(Name::is_anonymous)
+            {
+                return Err(WriteError::Contract {
+                    what: "anonymous reducibility extra declaration or scope",
+                });
+            }
+            let entry = self.reducibility_entry(&row.declaration, row.status)?;
+            let entry = match &row.scope {
+                None => self.ctor(layout::SCOPE_GLOBAL, vec![entry], &[])?,
+                Some(scope) => {
+                    let scope = self.name(scope)?;
+                    self.ctor(layout::SCOPE_SCOPED, vec![scope, entry], &[])?
+                }
+            };
+            entries.push(entry);
+        }
+        let entries = self.array(entries)?;
+        let name = self.name(&Name::from_components(
+            layout::REDUCIBILITY_EXTRA_EXTENSION.split('.'),
+        ))?;
+        self.ctor(0, vec![name, entries], &[])
+    }
+
+    fn reducibility_entry(
+        &mut self,
+        declaration: &Name,
+        status: ReducibilityStatus,
+    ) -> WResult<Obj> {
+        let name = self.name(declaration)?;
+        let tag = match status {
+            ReducibilityStatus::Reducible => layout::REDUCIBILITY_REDUCIBLE,
+            ReducibilityStatus::Semireducible => layout::REDUCIBILITY_SEMIREDUCIBLE,
+            ReducibilityStatus::Irreducible => layout::REDUCIBILITY_IRREDUCIBLE,
+            ReducibilityStatus::ImplicitReducible => layout::REDUCIBILITY_IMPLICIT_REDUCIBLE,
+        };
+        let mut fields = (0..layout::PROD_POINTERS)
+            .map(|_| Obj::mk_nat(0))
+            .collect::<Vec<_>>();
+        fields[layout::PROD_FST] = name;
+        fields[layout::PROD_SND] = Obj::mk_nat(tag);
+        self.ctor(0, fields, &[])
     }
 }
 
@@ -149,6 +187,78 @@ mod tests {
                 ),
                 Err(WriteError::Contract { .. })
             ));
+        }
+    }
+
+    #[test]
+    fn extra_updates_preserve_scopes_duplicates_and_order_with_exact_budgets() {
+        let mut metadata = metadata();
+        for (scope, status) in [
+            (None, ReducibilityStatus::Irreducible),
+            (Some("Visible"), ReducibilityStatus::ImplicitReducible),
+            (None, ReducibilityStatus::Reducible),
+            (None, ReducibilityStatus::Semireducible),
+        ] {
+            metadata.reducibility_extra.push(ReducibilityExtraEntry {
+                scope: scope.map(|value| Name::from_components([value])),
+                declaration: Name::from_components(["Imported", "identity"]),
+                status,
+            });
+        }
+        for version in [2, 3] {
+            let encoded = encode_module_with_source_metadata(
+                input(),
+                &metadata,
+                header(version),
+                WriteBudget::default(),
+            )
+            .unwrap();
+            let view = crate::region::OleanView::parse(&encoded.bytes).unwrap();
+            let blocks = view
+                .extension_payloads(crate::region::WalkBudget::default(), 1024 * 1024)
+                .unwrap();
+            let decoded = source_extensions::decode(&blocks, DecodeLimits::default()).unwrap();
+            assert_eq!(decoded.reducibility_extra, metadata.reducibility_extra);
+            assert_eq!(decoded.reducibility.len(), metadata.reducibility.len());
+            assert!(decoded.uninterpreted.is_empty());
+            let exact = WriteBudget {
+                max_bytes: encoded.report.file_bytes,
+                max_objects: encoded.report.runtime_objects,
+            };
+            assert_eq!(
+                encode_module_with_source_metadata(input(), &metadata, header(version), exact)
+                    .unwrap()
+                    .bytes,
+                encoded.bytes
+            );
+            for budget in [
+                WriteBudget {
+                    max_bytes: exact.max_bytes - 1,
+                    ..exact
+                },
+                WriteBudget {
+                    max_objects: exact.max_objects - 1,
+                    ..exact
+                },
+            ] {
+                assert!(matches!(
+                    encode_module_with_source_metadata(input(), &metadata, header(version), budget),
+                    Err(WriteError::Budget { .. })
+                ));
+            }
+            assert!(
+                source_extensions::decode(
+                    &blocks,
+                    DecodeLimits {
+                        max_entries: metadata.reducibility.len()
+                            + metadata.reducibility_extra.len()
+                            - 1,
+                        ..DecodeLimits::default()
+                    },
+                )
+                .unwrap_err()
+                .is_resource()
+            );
         }
     }
 }

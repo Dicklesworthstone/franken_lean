@@ -152,6 +152,7 @@ pub const KEY_ARROW: u8 = 5;
 pub const KEY_PROJ: u8 = 6;
 pub const KEY_PROJ_POINTERS: usize = 3;
 pub const REDUCIBILITY_EXTENSION: &str = "reducibilityCore";
+pub const REDUCIBILITY_EXTRA_EXTENSION: &str = "reducibilityExtra";
 pub const REDUCIBILITY_REDUCIBLE: usize = 0;
 pub const REDUCIBILITY_SEMIREDUCIBLE: usize = 1;
 pub const REDUCIBILITY_IRREDUCIBLE: usize = 2;

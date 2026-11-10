@@ -7,8 +7,8 @@ use super::*;
 use crate::source_extension_format as layout;
 use crate::source_extensions::{
     AliasEntry, ClassEntry, DefaultEntry, DiscrTreeKey, ExternAttribute, ExternEntry,
-    ImplementedByEntry, InlineEntry, InstanceEntry, ReducibilityEntry, SimpEntry, SimpKind,
-    SimpTheorem, StructureEntry, StructureField, StructureParent,
+    ImplementedByEntry, InlineEntry, InstanceEntry, ReducibilityEntry, ReducibilityExtraEntry,
+    SimpEntry, SimpKind, SimpTheorem, StructureEntry, StructureField, StructureParent,
 };
 use std::collections::HashSet;
 
@@ -58,6 +58,9 @@ pub struct SourceMetadata {
     /// This module's final status for each owned declaration. The writer sorts
     /// these by Name.quickLt for the pin's per-module binary search.
     pub reducibility: Vec<ReducibilityEntry>,
+    /// Chronological overrides in the pin's scoped extra map. Repeated updates
+    /// remain ordered and are never folded into the owned core map.
+    pub reducibility_extra: Vec<ReducibilityExtraEntry>,
     /// Final inlining kind for each module-owned declaration, written as the
     /// pin's `inlineAttrs` enum map in `Name.quickLt` order.
     pub inline: Vec<InlineEntry>,
@@ -163,6 +166,9 @@ impl Encoder {
         }
         if !metadata.reducibility.is_empty() {
             blocks.push(self.reducibility_block(&metadata.reducibility)?);
+        }
+        if !metadata.reducibility_extra.is_empty() {
+            blocks.push(self.reducibility_extra_block(&metadata.reducibility_extra)?);
         }
         if !metadata.inline.is_empty() {
             blocks.push(self.inline_block(&metadata.inline)?);
