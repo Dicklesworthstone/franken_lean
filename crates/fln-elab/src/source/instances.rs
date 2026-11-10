@@ -1330,6 +1330,40 @@ impl Context {
         Ok(())
     }
 
+    /// Close an answer over the target's telescope before assigning the
+    /// original function-valued goal. Both search strategies use the pin's
+    /// `mkLambdaFVars xs instVal (etaReduce := true)` rule; the fresh target
+    /// locals never become ambient instances or escape into the assignment.
+    fn close_instance_answer(
+        &mut self,
+        frame: &Frame,
+        mut value: Expr,
+    ) -> Result<Expr, NatDefinitionElabError> {
+        for binder in frame.binders.iter().rev() {
+            self.tick()?;
+            let domain = self.instantiate(&binder.type_)?;
+            value = value
+                .abstract_fvar(&binder.id, 0)
+                .map_err(|_| failure(SourceInferenceError::Scope))?;
+            let eta = match value.node() {
+                ExprNode::App { f, a }
+                    if matches!(a.node(), ExprNode::BVar { idx: 0 }) && !f.has_loose_bvar(0) =>
+                {
+                    Some(
+                        f.subst_loose(0, &[Expr::sort(Level::zero())])
+                            .map_err(|_| failure(SourceInferenceError::Scope))?,
+                    )
+                }
+                _ => None,
+            };
+            value = match eta {
+                Some(function) => function,
+                None => Expr::lam(binder.user_name.clone(), domain, value, binder.binder_info),
+            };
+        }
+        Ok(value)
+    }
+
     fn assign_instance_answer(
         &mut self,
         frame: &Frame,
@@ -1543,33 +1577,7 @@ impl Context {
                     Err(error) => return Err(error),
                 }
                 value = self.instantiate(&value)?;
-                for binder in frames[index].binders.iter().rev() {
-                    self.tick()?;
-                    let domain = self.instantiate(&binder.type_)?;
-                    value = value
-                        .abstract_fvar(&binder.id, 0)
-                        .map_err(|_| failure(SourceInferenceError::Scope))?;
-                    // `tryResolve` closes the answer with `mkLambdaFVars xs
-                    // instVal (etaReduce := true)`: `fun x => f x` is `f`.
-                    let eta = match value.node() {
-                        ExprNode::App { f, a }
-                            if matches!(a.node(), ExprNode::BVar { idx: 0 })
-                                && !f.has_loose_bvar(0) =>
-                        {
-                            Some(
-                                f.subst_loose(0, &[Expr::sort(Level::zero())])
-                                    .map_err(|_| failure(SourceInferenceError::Scope))?,
-                            )
-                        }
-                        _ => None,
-                    };
-                    value = match eta {
-                        Some(function) => function,
-                        None => {
-                            Expr::lam(binder.user_name.clone(), domain, value, binder.binder_info)
-                        }
-                    };
-                }
+                value = self.close_instance_answer(&frames[index], value)?;
                 if frames[index].replay_first {
                     frames[index].replay_first = false;
                     self.retry_instance_choice(&mut frames, &mut history)?;

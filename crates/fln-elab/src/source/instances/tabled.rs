@@ -30,6 +30,7 @@ struct Consumer {
 struct Waiter {
     consumer: Rc<Consumer>,
     goal: Rc<Frame>,
+    size_copies: u64,
 }
 
 struct Query {
@@ -59,6 +60,7 @@ struct Search {
     attempts: usize,
     events: usize,
     key_units: usize,
+    root_telescope: Vec<LocalDecl>,
 }
 
 fn restore(context: &mut Context, saved: &Context) {
@@ -77,6 +79,22 @@ impl Search {
         Ok(())
     }
 
+    fn find_query(
+        &self,
+        context: &mut Context,
+        key: &table::Key,
+    ) -> Result<Option<usize>, NatDefinitionElabError> {
+        if let Some(bucket) = self.keys.get(key.bucket()) {
+            for (stored, index) in bucket {
+                context.tick()?;
+                if stored == key {
+                    return Ok(Some(*index));
+                }
+            }
+        }
+        Ok(None)
+    }
+
     fn query(
         &mut self,
         context: &mut Context,
@@ -84,13 +102,8 @@ impl Search {
         key: table::Key,
         depth: usize,
     ) -> Result<Option<usize>, NatDefinitionElabError> {
-        if let Some(bucket) = self.keys.get(key.bucket()) {
-            for (stored, index) in bucket {
-                context.tick()?;
-                if *stored == key {
-                    return Ok(Some(*index));
-                }
-            }
+        if let Some(index) = self.find_query(context, &key)? {
+            return Ok(Some(index));
         }
         if depth >= MAX_SEARCH_DEPTH || self.queries.len() >= MAX_CANDIDATE_ATTEMPTS {
             return Err(failure(SourceInferenceError::ResourceLimit));
@@ -139,18 +152,52 @@ impl Search {
                 continue;
             };
             *context = trial;
+            if !self.root_telescope.is_empty()
+                && !table::independent_ground_target(context, &child, &self.root_telescope)?
+            {
+                return Ok(Progress::Unsupported);
+            }
             let Some(key) = table::shared_key(context, &child, false)? else {
                 return Ok(Progress::Unsupported);
             };
             let child = Rc::new(child);
-            let Some(query) = self.query(context, Rc::clone(&child), key, consumer.depth + 1)?
-            else {
+            // `consume` at the pin tries the complete function type BEFORE
+            // removing unused arguments. A direct recursive root therefore
+            // waits on itself. On a miss, every introduced binder is unused
+            // in this admitted ground fragment, so the child generator uses
+            // the body-only key. Its own descendants no longer carry the
+            // root telescope (`removeUnusedArguments?`, SynthInstance.lean).
+            let existing = if consumer.query == 0 && !self.root_telescope.is_empty() {
+                let full = key.clone().with_root_telescope(&self.root_telescope);
+                self.find_query(context, &full)?
+            } else {
+                None
+            };
+            let previous_queries = self.queries.len();
+            let query = match existing {
+                Some(query) => Some(query),
+                None => self.query(context, Rc::clone(&child), key, consumer.depth + 1)?,
+            };
+            let Some(query) = query else {
                 return Ok(Progress::Unsupported);
+            };
+            // On the first reduced-key miss, the pin prepends a body goal to
+            // the original function goal. Both consume the canonical answer;
+            // later reduced-key hits replay it only once. Retain this cost
+            // even though the ground fragment needs no synthetic transformer.
+            let size_copies = if consumer.query == 0
+                && !self.root_telescope.is_empty()
+                && self.queries.len() > previous_queries
+            {
+                2
+            } else {
+                1
             };
             consumer.context = context.clone();
             let waiter = Rc::new(Waiter {
                 consumer: Rc::new(consumer),
                 goal: child,
+                size_copies,
             });
             self.event(context)?;
             // Existing answers are pushed in discovery order. The last one
@@ -206,6 +253,7 @@ impl Search {
         }
         let value = context.instantiate(&value)?;
         if consumer.query == 0 {
+            let value = context.close_instance_answer(&frame, value)?;
             context.assign_instance_answer(&frame, value)?;
             return Ok(Progress::Finished(SearchResult::Solved));
         }
@@ -255,7 +303,10 @@ impl Search {
                     value: waiter.consumer.value.clone(),
                     subgoals: waiter.consumer.subgoals.clone(),
                     depth: waiter.consumer.depth,
-                    size: waiter.consumer.size.saturating_add(answer.size),
+                    size: waiter
+                        .consumer
+                        .size
+                        .saturating_add(answer.size.saturating_mul(waiter.size_copies)),
                 },
                 registry,
                 ambient,
@@ -323,7 +374,10 @@ impl Context {
         let Some(key) = table::shared_key(self, &first, true)? else {
             return Ok(None);
         };
-        let mut search = Search::default();
+        let mut search = Search {
+            root_telescope: first.binders.clone(),
+            ..Search::default()
+        };
         if search.query(self, Rc::new(first), key, 0)?.is_none() {
             return Ok(None);
         }
