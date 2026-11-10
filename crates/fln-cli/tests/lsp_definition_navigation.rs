@@ -291,3 +291,34 @@ fn both_front_doors_publish_checked_document_outlines_and_recover_after_edits() 
         assert!(response(&messages, 53).contains(r#""result":[]"#));
     }
 }
+
+#[test]
+fn both_front_doors_navigate_data_members_and_include_their_explicit_outline_origins() {
+    let uri = "file:///tmp/franken-lean-data-navigation.lean";
+    let source = "-- 😀\r\nnamespace Domain\r\ninductive Signal where\r\n  | ready\r\nstructure Box where\r\n  value : Nat\r\ndef choose : Signal := Signal.ready\r\ndef project (box : Box) : Nat := box.value\r\nend Domain\r\n";
+    for (binary, arg) in front_doors() {
+        let messages = run(
+            binary,
+            arg,
+            &[
+                open(uri, source),
+                request(60, uri, source, source.rfind("Signal.ready").unwrap()),
+                request(61, uri, source, source.rfind("box.value").unwrap()),
+                outline_request(62, uri),
+            ],
+        );
+        assert_location(&messages, 60, uri, 3, 4);
+        assert_location(&messages, 61, uri, 5, 2);
+        let outline = response(&messages, 62);
+        assert!(
+            outline.contains(r#""name":"Domain.Signal.ready""#),
+            "{outline}"
+        );
+        assert!(
+            outline.contains(r#""name":"Domain.Box.value""#),
+            "{outline}"
+        );
+        assert!(!outline.contains("Domain.Box.mk"), "{outline}");
+        assert!(!outline.contains("Domain.Signal.rec"), "{outline}");
+    }
+}
