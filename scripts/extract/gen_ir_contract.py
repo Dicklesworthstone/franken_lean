@@ -4,8 +4,9 @@
 
 The pin stores a module's compiled code as `Lean.IR.Decl` values in the `.ir`
 file beside its `.olean`. This renders the constructor tags and field slots of
-`Decl` and everything it contains into `crates/fln-olean/src/ir_format.rs`, from
-the vendored declarations. No Lean code executes, and nothing is copied by hand.
+`Decl` and everything it contains, plus the LCNF signatures needed to compile
+calls into imported code, into `crates/fln-olean/src/ir_format.rs`, from the
+vendored declarations. No Lean code executes, and nothing is copied by hand.
 
 Layout rule (the pin's constructor object: a header, then object pointers in
 declaration order, then scalar bytes in declaration order; all scalar fields
@@ -33,21 +34,25 @@ OUTPUT = ROOT / "crates/fln-olean/src/ir_format.rs"
 BASIC = "src/Lean/Compiler/IR/Basic.lean"
 EXTERN = "src/Lean/Compiler/ExternAttr.lean"
 COMPILER_M = "src/Lean/Compiler/IR/CompilerM.lean"
-FILES = [BASIC, EXTERN, COMPILER_M]
+LCNF_BASIC = "src/Lean/Compiler/LCNF/Basic.lean"
+LCNF_PHASE_EXT = "src/Lean/Compiler/LCNF/PhaseExt.lean"
+LEAN_EXPR = "src/Lean/Expr.lean"
+FILES = [BASIC, EXTERN, COMPILER_M, LCNF_BASIC, LCNF_PHASE_EXT, LEAN_EXPR]
 
 # One-field structures the pin represents as the field itself, with that field's type.
 TRANSPARENT = {
-    "VarId": ("idx", "Index"),
-    "JoinPointId": ("idx", "Index"),
-    "DeclInfo": ("sorryDep?", "Option Name"),
-    "ExternAttrData": ("entries", "List ExternEntry"),
+    "VarId": (BASIC, "idx", "Index"),
+    "JoinPointId": (BASIC, "idx", "Index"),
+    "DeclInfo": (BASIC, "sorryDep?", "Option Name"),
+    "ExternAttrData": (EXTERN, "entries", "List ExternEntry"),
+    "FVarId": (LEAN_EXPR, "name", "Name"),
 }
 # Field types stored as an object pointer (a boxed scalar counts as one).
 POINTER = {
     "Nat", "Index", "Name", "FunId", "String", "VarId", "JoinPointId", "IRType", "Arg",
     "LitVal", "CtorInfo", "Expr", "FnBody", "Alt", "DeclInfo", "ExternAttrData",
     "Option Name", "Array IRType", "Array Arg", "Array Param", "Array Alt",
-    "List ExternEntry",
+    "List ExternEntry", "FVarId", "List Name", "Array (Param pu)",
 }
 # Field types stored as one scalar byte after the pointers.
 SCALAR = {"Bool"}
@@ -69,6 +74,10 @@ INDUCTIVES = [
 STRUCTURES = [
     (BASIC, "CtorInfo", "CTOR_INFO"),
     (BASIC, "Param", "PARAM"),
+    # Purity is a type parameter, not a stored field. Requiring this exact
+    # header also refuses a drift to a relevant field or a different index.
+    (LCNF_BASIC, "Param (pu : Purity)", "LCNF_PARAM"),
+    (LCNF_BASIC, "Signature (pu : Purity)", "LCNF_SIGNATURE"),
 ]
 
 
@@ -165,8 +174,7 @@ def render():
         lines.append(f"//! {path}: sha256 {hashlib.sha256(sources[path].encode()).hexdigest()}")
     lines += ["#![allow(dead_code)]", ""]
 
-    for name, (field, ty) in TRANSPARENT.items():
-        path = EXTERN if name == "ExternAttrData" else BASIC
+    for name, (path, field, ty) in TRANSPARENT.items():
         body = declaration(text[path], "structure", name + " where")
         found = re.findall(r"^\s+([\w?]+)\s*:\s*(.+?)(?:\s*:=.*)?$", body, re.M)
         if found != [(field, ty)]:
@@ -219,6 +227,18 @@ def render():
     if not re.search(r"#\[\(declMapExt\.name, irEntries\),", compiler):
         raise ValueError("the .ir export no longer leads with the declaration entries")
     lines.append('pub const DECL_MAP_EXTENSION: &str = "Lean.IR.declMapExt";')
+
+    phase_ext = text[LCNF_PHASE_EXT]
+    namespace = re.search(r"^namespace (Lean\.Compiler\.LCNF)\s*$", phase_ext, re.M)
+    if namespace is None:
+        raise ValueError("namespace moved: Lean.Compiler.LCNF")
+    signature_extension = re.search(
+        r"^builtin_initialize (impureSigExt) : SigExt \.impure\s*←\s*mkSigDeclExt \.impure\s*$",
+        phase_ext, re.M)
+    if signature_extension is None:
+        raise ValueError("extension schema moved: impureSigExt")
+    extension_name = namespace.group(1) + "." + signature_extension.group(1)
+    lines.append(f'pub const LCNF_IMPURE_SIGNATURE_EXTENSION: &str = "{extension_name}";')
     return "\n".join(lines) + "\n"
 
 

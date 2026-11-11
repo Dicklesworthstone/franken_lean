@@ -13,6 +13,7 @@ use crate::source_extensions::{
 use std::collections::HashSet;
 
 mod aliases;
+mod compiler;
 mod defaults;
 mod executable;
 mod inlining;
@@ -21,6 +22,8 @@ mod namespaces;
 mod reducibility;
 mod simp;
 mod structures;
+
+pub use compiler::CompilerSignature;
 
 #[derive(Debug, Clone, Default)]
 pub struct SourceMetadata {
@@ -73,6 +76,10 @@ pub struct SourceMetadata {
     /// Module-owned structure interfaces, including physical parent subobjects.
     /// The writer preserves field/parent order and sorts only the pin's indexes.
     pub structures: Vec<StructureEntry>,
+    /// Exact compiled calling conventions, with opaque IR headers for downstream
+    /// compilation. Empty on declaration-only builds. These are serialized data,
+    /// not evidence of admission, termination, or an executable implementation.
+    pub compiler_signatures: Vec<CompilerSignature>,
 }
 
 /// Encode source journals and the namespaces implied by local declarations.
@@ -149,6 +156,9 @@ impl Encoder {
         }
         if !metadata.structures.is_empty() {
             blocks.push(self.structure_block(&metadata.structures)?);
+        }
+        if !metadata.compiler_signatures.is_empty() {
+            blocks.extend(self.compiler_blocks(&metadata.compiler_signatures)?);
         }
         if !metadata.protected.is_empty() {
             blocks.push(self.tagged_names_block(
