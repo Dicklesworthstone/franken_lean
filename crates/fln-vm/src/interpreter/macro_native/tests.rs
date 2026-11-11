@@ -11,6 +11,7 @@ mod lookup;
 mod numbers;
 mod patterns;
 mod sequences;
+mod source_queries;
 mod syntax_editing;
 
 fn atom(text: &str) -> Obj {
@@ -65,6 +66,11 @@ fn invoke(intrinsic: Intrinsic, args: &[Obj]) -> Obj {
         Intrinsic::GetAtomVal => "mirror:Lean.Syntax.getAtomVal",
         Intrinsic::SetAtomVal => "mirror:Lean.Syntax.setAtomVal",
         Intrinsic::GetHeadInfo => "mirror:Lean.Syntax.getHeadInfo",
+        Intrinsic::GetInfo => "mirror:Lean.Syntax.getInfo?",
+        Intrinsic::GetHeadInfoOptional => "mirror:Lean.Syntax.getHeadInfo?",
+        Intrinsic::GetRange => "mirror:Lean.Syntax.getRange?",
+        Intrinsic::HasMissing => "mirror:Lean.Syntax.hasMissing",
+        Intrinsic::Reprint => "mirror:Lean.Syntax.reprint",
         Intrinsic::SourceInfoGetPos => "mirror:Lean.SourceInfo.getPos?",
         Intrinsic::SourceInfoGetTailPos => "mirror:Lean.SourceInfo.getTailPos?",
         Intrinsic::GetPos => "mirror:Lean.Syntax.getPos?",

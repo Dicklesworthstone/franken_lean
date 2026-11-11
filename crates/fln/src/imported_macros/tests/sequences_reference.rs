@@ -517,7 +517,7 @@ fn lean_info(info: SourceInfo) -> String {
     }
 }
 
-fn lean_syntax(value: &Syntax) -> String {
+pub(super) fn lean_syntax(value: &Syntax) -> String {
     match value {
         Syntax::Missing => "Lean.Syntax.missing".into(),
         Syntax::Atom { info, val } => format!(
@@ -574,7 +574,7 @@ fn lean_syntax(value: &Syntax) -> String {
     }
 }
 
-const ORACLE: &str = r#"
+pub(super) const ORACLE: &str = r#"
 def sameSequenceSubstring (a b : Substring.Raw) : Bool :=
   a.str == b.str && a.startPos == b.startPos && a.stopPos == b.stopPos
 def sameSequenceInfo : Lean.SourceInfo → Lean.SourceInfo → Bool

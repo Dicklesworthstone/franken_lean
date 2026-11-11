@@ -25,6 +25,16 @@ def sourceNone (_ : Unit) : Lean.SourceInfo := .none
   | .original _ _ _ endPos => endPos.byteIdx
   | _ => 0
 
+@[noinline] def sourceOriginalLeading (value : @& Lean.SourceInfo) : Substring.Raw :=
+  match value with
+  | .original leading _ _ _ => leading
+  | _ => "".toRawSubstring
+
+@[noinline] def sourceOriginalTrailing (value : @& Lean.SourceInfo) : Substring.Raw :=
+  match value with
+  | .original _ _ trailing _ => trailing
+  | _ => "".toRawSubstring
+
 @[noinline] def sourceSyntheticPos (value : @& Lean.SourceInfo) : Nat :=
   match value with
   | .synthetic pos _ _ => pos.byteIdx
@@ -50,6 +60,12 @@ def syntaxAtom (info : Lean.SourceInfo) (value : String) : Lean.Syntax := .atom 
 def syntaxIdent (info : Lean.SourceInfo) (raw : Substring.Raw) (value : Lean.Name)
     (preresolved : List Lean.Syntax.Preresolved) : Lean.Syntax :=
   .ident info raw value preresolved
+
+def syntaxRange (start stop : String.Pos.Raw) : Lean.Syntax.Range := ⟨start, stop⟩
+
+@[noinline] def syntaxRangeStart (value : @& Lean.Syntax.Range) : String.Pos.Raw := value.start
+
+@[noinline] def syntaxRangeStop (value : @& Lean.Syntax.Range) : String.Pos.Raw := value.stop
 
 def substringRaw (value : String) (start stop : Nat) : Substring.Raw :=
   ⟨value, ⟨start⟩, ⟨stop⟩⟩
@@ -219,6 +235,18 @@ def optionNone (_ : Unit) : Option Lean.Syntax := none
   value.setAtomVal text
 
 @[noinline] def syntaxGetHeadInfo (value : Lean.Syntax) : Lean.SourceInfo := value.getHeadInfo
+
+@[noinline] def syntaxGetInfo (value : Lean.Syntax) : Option Lean.SourceInfo := value.getInfo?
+
+@[noinline] def syntaxGetHeadInfoOptional (value : Lean.Syntax) : Option Lean.SourceInfo :=
+  value.getHeadInfo?
+
+@[noinline] def syntaxGetRange (value : Lean.Syntax) (canonicalOnly : Bool) :
+    Option Lean.Syntax.Range := value.getRange? canonicalOnly
+
+@[noinline] def syntaxHasMissing (value : Lean.Syntax) : Bool := value.hasMissing
+
+@[noinline] def syntaxReprint (value : Lean.Syntax) : Option String := value.reprint
 
 @[noinline] def sourceInfoGetPos (value : @& Lean.SourceInfo) (canonicalOnly : Bool) :
     Option String.Pos.Raw := value.getPos? canonicalOnly

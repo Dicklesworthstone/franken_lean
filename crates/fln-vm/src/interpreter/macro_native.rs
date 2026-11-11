@@ -17,6 +17,7 @@ mod literals;
 mod numbers;
 mod patterns;
 mod sequences;
+mod source_queries;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum Intrinsic {
@@ -50,6 +51,11 @@ pub(super) enum Intrinsic {
     GetAtomVal,
     SetAtomVal,
     GetHeadInfo,
+    GetInfo,
+    GetHeadInfoOptional,
+    GetRange,
+    HasMissing,
+    Reprint,
     SourceInfoGetPos,
     SourceInfoGetTailPos,
     GetPos,
@@ -119,6 +125,11 @@ impl Intrinsic {
             "mirror:Lean.Syntax.getAtomVal" => Self::GetAtomVal,
             "mirror:Lean.Syntax.setAtomVal" => Self::SetAtomVal,
             "mirror:Lean.Syntax.getHeadInfo" => Self::GetHeadInfo,
+            "mirror:Lean.Syntax.getInfo?" => Self::GetInfo,
+            "mirror:Lean.Syntax.getHeadInfo?" => Self::GetHeadInfoOptional,
+            "mirror:Lean.Syntax.getRange?" => Self::GetRange,
+            "mirror:Lean.Syntax.hasMissing" => Self::HasMissing,
+            "mirror:Lean.Syntax.reprint" => Self::Reprint,
             "mirror:Lean.SourceInfo.getPos?" => Self::SourceInfoGetPos,
             "mirror:Lean.SourceInfo.getTailPos?" => Self::SourceInfoGetTailPos,
             "mirror:Lean.Syntax.getPos?" => Self::GetPos,
@@ -214,6 +225,7 @@ impl Intrinsic {
                 | Self::SourceInfoGetTailPos
                 | Self::GetPos
                 | Self::GetTailPos
+                | Self::GetRange
                 | Self::SourceInfoFromRef
                 | Self::ReplaceRef
                 | Self::MkStrLit
@@ -513,6 +525,23 @@ impl Intrinsic {
                 Ok(IntrinsicResult::raw_object(value))
             }
             Self::GetHeadInfo => Ok(IntrinsicResult::raw_object(get_head_info(&args[0])?)),
+            Self::GetInfo => Ok(IntrinsicResult::raw_object(source_queries::info(&args[0])?)),
+            Self::GetHeadInfoOptional => Ok(IntrinsicResult::raw_object(
+                source_queries::head_info(&args[0])?,
+            )),
+            Self::GetRange => {
+                let canonical_only = super::bool_value(&args[1], "Lean.Syntax.getRange?", 1)?;
+                Ok(IntrinsicResult::raw_object(source_queries::range(
+                    &args[0],
+                    canonical_only,
+                )?))
+            }
+            Self::HasMissing => Ok(IntrinsicResult::scalar(Obj::mk_nat(usize::from(
+                source_queries::has_missing(&args[0])?,
+            )))),
+            Self::Reprint => Ok(IntrinsicResult::raw_object(source_queries::reprint(
+                &args[0],
+            )?)),
             Self::SourceInfoGetPos
             | Self::SourceInfoGetTailPos
             | Self::GetPos
@@ -955,6 +984,15 @@ fn get_head_info_bounded(
     visited: &mut u64,
     resource: &'static str,
 ) -> Result<Obj, IntrinsicFailure> {
+    Ok(get_head_info_optional_bounded(value, visited, resource)?
+        .unwrap_or_else(|| Obj::mk_nat(layout::SOURCE_NONE_TAG)))
+}
+
+fn get_head_info_optional_bounded(
+    value: &Obj,
+    visited: &mut u64,
+    resource: &'static str,
+) -> Result<Option<Obj>, IntrinsicFailure> {
     let mut current = value.clone_ref();
     let mut pending = Vec::new();
     loop {
@@ -967,12 +1005,12 @@ fn get_head_info_bounded(
                 source_info(&info)?;
                 // A token with SourceInfo.none is still the first token.
                 // getHeadInfo? returns `some none`, never searches past it.
-                return Ok(info);
+                return Ok(Some(info));
             }
             SyntaxKind::Node => {
                 let info = child(&current, 0)?;
                 if !source_info(&info)? {
-                    return Ok(info);
+                    return Ok(Some(info));
                 }
                 let children = child(&current, 2)?;
                 let (size, _) = children
@@ -990,7 +1028,7 @@ fn get_head_info_bounded(
         // Keep only each ancestor's next sibling, rather than recursing on
         // the host stack or materializing every child of a wide syntax node.
         let Some((children, index, size)) = pending.pop() else {
-            return Ok(Obj::mk_nat(layout::SOURCE_NONE_TAG));
+            return Ok(None);
         };
         current = children.array_child(index);
         if index + 1 < size {

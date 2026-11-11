@@ -22,6 +22,7 @@ CONSTRUCTORS = {
     "SYNTAX_NODE": "Lean.Syntax.node",
     "SYNTAX_ATOM": "Lean.Syntax.atom",
     "SYNTAX_IDENT": "Lean.Syntax.ident",
+    "SYNTAX_RANGE": "Lean.Syntax.Range.mk",
     "SUBSTRING_RAW": "Substring.Raw.mk",
     "PRERESOLVED_NAMESPACE": "Lean.Syntax.Preresolved.namespace",
     "PRERESOLVED_DECL": "Lean.Syntax.Preresolved.decl",
@@ -80,6 +81,11 @@ FUNCTIONS = {
     "SYNTAX_GET_ATOM_VAL": "syntaxGetAtomVal",
     "SYNTAX_SET_ATOM_VAL": "syntaxSetAtomVal",
     "SYNTAX_GET_HEAD_INFO": "syntaxGetHeadInfo",
+    "SYNTAX_GET_INFO": "syntaxGetInfo",
+    "SYNTAX_GET_HEAD_INFO_OPTIONAL": "syntaxGetHeadInfoOptional",
+    "SYNTAX_GET_RANGE": "syntaxGetRange",
+    "SYNTAX_HAS_MISSING": "syntaxHasMissing",
+    "SYNTAX_REPRINT": "syntaxReprint",
     "SOURCE_INFO_GET_POS": "sourceInfoGetPos",
     "SOURCE_INFO_GET_TAIL_POS": "sourceInfoGetTailPos",
     "SYNTAX_GET_POS": "syntaxGetPos",
@@ -131,6 +137,11 @@ FORWARDED_FUNCTIONS = {
     "syntaxIsNatLit": "Lean.Syntax.isNatLit?",
     "tSyntaxGetNat": "Lean.TSyntax.getNat",
     "natReprFast": "Nat.reprFast",
+    "syntaxGetInfo": "Lean.Syntax.getInfo?",
+    "syntaxGetHeadInfoOptional": "Lean.Syntax.getHeadInfo?",
+    "syntaxGetRange": "Lean.Syntax.getRange?",
+    "syntaxHasMissing": "Lean.Syntax.hasMissing",
+    "syntaxReprint": "Lean.Syntax.reprint",
     "mkIdent": "Lean.mkIdent",
     "mkIdentFrom": "Lean.mkIdentFrom",
     "mkCIdent": "Lean.mkCIdent",
@@ -226,6 +237,27 @@ def generate(lean):
         ])
     for constant, tag in scalars.items():
         lines.append(f"pub const {constant}: usize = {tag};")
+    # Range fields remain arbitrary Nat objects at runtime. Extract their
+    # positions from the compiler's getters rather than assuming source order.
+    for function, constant in [
+        ("syntaxRangeStart", "SYNTAX_RANGE_START_FIELD"),
+        ("syntaxRangeStop", "SYNTAX_RANGE_STOP_FIELD"),
+    ]:
+        getter = re.search(
+            rf"(?m)^    def FrankenLean\.MacroLayout\.{function} \((x_\d+) : @& obj\) : tobj :=\n"
+            r"(.*?)(?=^    def |^\[|\Z)", trace, re.S,
+        )
+        if getter is None:
+            raise ValueError(f"missing Syntax.Range getter: {function}")
+        projection = re.fullmatch(
+            rf"\s*let (x_\d+) : tobj := proj\[(\d+)\] {re.escape(getter[1])};\s*inc \1;\s*ret \1\s*", getter[2],
+        )
+        if projection is None:
+            raise ValueError(f"Syntax.Range getter is not one object projection: {function}")
+        field = int(projection[2])
+        if field >= layouts[CONSTRUCTORS["SYNTAX_RANGE"]][1]:
+            raise ValueError(f"Syntax.Range getter is outside the extracted layout: {function}")
+        lines.extend(["", f"pub const {constant}: usize = {field};"])
     # Derive positional fields from the pin's compiled pattern projections.
     # SourceInfo positions are erased Nat values, not host-width integers.
     for function, constant, constructor in [
@@ -251,6 +283,28 @@ def generate(lean):
         field = int(projection[2])
         if field >= layouts[CONSTRUCTORS[constructor]][1]:
             raise ValueError(f"SourceInfo getter is outside the extracted layout: {function}")
+        lines.extend(["", f"pub const {constant}: usize = {field};"])
+    for function, constant in [
+        ("sourceOriginalLeading", "SOURCE_ORIGINAL_LEADING_FIELD"),
+        ("sourceOriginalTrailing", "SOURCE_ORIGINAL_TRAILING_FIELD"),
+    ]:
+        getter = re.search(
+            rf"(?m)^    def FrankenLean\.MacroLayout\.{function} \((x_\d+) : @& tobj\) : obj :=\n"
+            r"(.*?)(?=^    def |^\[|\Z)", trace, re.S,
+        )
+        if getter is None:
+            raise ValueError(f"missing SourceInfo trivia getter: {function}")
+        projection = re.fullmatch(
+            rf"\s*case {re.escape(getter[1])} : tobj of\s*Lean\.SourceInfo\.original →\s*"
+            rf"let (x_\d+) : obj := proj\[(\d+)\] {re.escape(getter[1])};\s*inc \1;\s*ret \1\s*"
+            r"default →\s*let (x_\d+) : obj := FrankenLean\.MacroLayout\.\w+\._closed_\d+;\s*inc \3;\s*ret \3\s*",
+            getter[2],
+        )
+        if projection is None:
+            raise ValueError(f"SourceInfo trivia getter is not the reviewed projection: {function}")
+        field = int(projection[2])
+        if field >= layouts[CONSTRUCTORS["SOURCE_ORIGINAL"]][1]:
+            raise ValueError(f"SourceInfo trivia getter is outside the extracted layout: {function}")
         lines.extend(["", f"pub const {constant}: usize = {field};"])
     canonical = re.search(
         r"(?m)^    def FrankenLean\.MacroLayout\.sourceSyntheticCanonical \((x_\d+) : @& tobj\) : u8 :=\n"
