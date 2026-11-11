@@ -132,6 +132,76 @@ fn free_template_names_keep_their_declaration_namespace_under_binders() {
 }
 
 #[test]
+fn quoted_overloads_are_deferred_until_use_and_do_not_capture_new_globals() {
+    let declarations = r#"
+namespace FirstChoice
+def choiceValue : Nat := 13
+end FirstChoice
+namespace SecondChoice
+def choiceValue : Nat := 99
+end SecondChoice
+open FirstChoice SecondChoice
+macro "choiceMacro" : term => `(choiceValue)
+notation "choiceNotation" => choiceValue
+"#;
+    accepted(
+        &format!("{declarations}\ntheorem unrelated : 1 = 1 := rfl"),
+        1,
+    );
+    for term in ["choiceMacro", "choiceNotation"] {
+        let source = format!(
+            "{declarations}\nnamespace Client\ndef choiceValue : Nat := 7\n\
+             def selected : Nat := {term}\nend Client"
+        );
+        let error = check(&source).expect_err("both captured declarations remain viable");
+        assert_eq!(error.disposition().0, "elaboration", "{source}: {error}");
+        assert!(
+            error.to_string().contains("Ambiguous term"),
+            "{source}: {error}"
+        );
+        assert!(error.to_string().contains("FirstChoice.choiceValue"));
+        assert!(error.to_string().contains("SecondChoice.choiceValue"));
+        assert!(!error.to_string().contains("Client.choiceValue"));
+    }
+}
+
+#[test]
+fn native_module_journals_preserve_every_captured_overload() {
+    let engine = engine();
+    let library = Name::from_components(["OverloadLibrary"]);
+    let consumer = Name::from_components(["OverloadConsumer"]);
+    let source = br#"
+namespace FirstChoice
+private def choiceValue : Nat := 13
+end FirstChoice
+namespace SecondChoice
+private def choiceValue : Nat := 99
+end SecondChoice
+open FirstChoice SecondChoice
+macro "choiceMacro" : term => `(choiceValue)
+"#;
+    let root = engine.logical_root(&KVMap::new());
+    let result = engine.check_source_modules(
+        &[
+            SourceModuleInput { name: &library, source },
+            SourceModuleInput {
+                name: &consumer,
+                source: b"import OverloadLibrary\nnamespace Client\ndef choiceValue : Nat := 7\ndef selected : Nat := choiceMacro\nend Client",
+            },
+        ],
+        &consumer,
+        &KVMap::new(),
+        SourceModuleCheckLimits::new(SourceCheckLimits::new(limits())),
+    );
+    let error = result.expect_err("replayed quotation still has two viable interpretations");
+    assert!(error.to_string().contains("Ambiguous term"), "{error}");
+    assert!(error.to_string().contains("FirstChoice.choiceValue"));
+    assert!(error.to_string().contains("SecondChoice.choiceValue"));
+    assert!(!error.to_string().contains("Client.choiceValue"));
+    assert_eq!(engine.logical_root(&KVMap::new()), root);
+}
+
+#[test]
 fn unknown_free_names_are_refused_even_when_the_notation_is_unused() {
     for source in [
         "notation \"badFn\" => fun (n : Nat) => missing\ntheorem t : True := True.intro\n",
