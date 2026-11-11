@@ -2,8 +2,8 @@
 //!
 //! The pin stores FloatArray as eight-byte elements (lean.h:1131-1194 and
 //! object.cpp:2608-2645). Observations borrow the live bytes; updates retain
-//! shared snapshots. A consuming push uses the existing native COW export,
-//! so repeated pushes preserve its geometric capacity growth. All floating
+//! shared snapshots. Consuming updates reuse exclusive buffers and a consuming
+//! push uses the native COW export's geometric capacity growth. All floating
 //! payloads are copied as bits, including signed zero and NaN payloads.
 
 use super::{
@@ -168,11 +168,13 @@ impl Intrinsic {
                     }
                     return Err(VmRefusal::ArrayIndexOutOfBounds { index, size }.into());
                 }
-                let mut updated = buffer(output_size(size)?)?;
-                updated.extend_from_slice(bytes);
-                let start = index * ELEMENT_BYTES;
-                updated[start..start + ELEMENT_BYTES].copy_from_slice(&bits.to_ne_bytes());
-                Ok(IntrinsicResult::owned(Obj::mk_sarray(8, &updated)))
+                output_size(size)?;
+                args.into_iter()
+                    .next()
+                    .expect("checked set arity")
+                    .try_sarray_set(index, &bits.to_ne_bytes())
+                    .map(IntrinsicResult::owned)
+                    .map_err(|_| VmRefusal::InvalidArrayObject.into())
             }
             Self::FromArray | Self::Empty => unreachable!("construction returned above"),
         }

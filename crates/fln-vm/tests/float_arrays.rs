@@ -3,15 +3,16 @@
 
 use fln_comp::flbc::{
     self, ArgumentOwnership as A, CallableResultOwnership as C, CodecLimits, Function, FunctionId,
-    Instruction as I, Program, Register, ResultOwnership as R, ValidatedProgram,
+    Instruction as I, OwnershipLimits, Program, Register, ResultOwnership as R, ValidatedProgram,
 };
-use fln_core::outcome::Outcome;
+use fln_core::diag::ResourceReason;
+use fln_core::outcome::{InconclusiveCause, Outcome};
 use fln_rt::obj::{Obj, shadow};
 use fln_vm::extern_row::{
     ArgumentOwnership as ContractArgument, Ownership, ResultOwnership as ContractResult,
 };
 use fln_vm::extern_table_generated::EXTERN_ROWS;
-use fln_vm::interpreter::{ExecutionLimits, VmExit, VmRefusal, execute};
+use fln_vm::interpreter::{ExecutionLimits, VmExit, VmRefusal, execute, execute_function};
 use std::sync::Mutex;
 
 static TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -73,13 +74,54 @@ fn replay(code: Vec<I>) -> ValidatedProgram {
         }],
     ))
     .unwrap();
-    let bytes = flbc::encode_canonical(&validated, CodecLimits::default()).unwrap();
+    canonical(&validated)
+}
+
+fn canonical(validated: &ValidatedProgram) -> ValidatedProgram {
+    let bytes = flbc::encode_canonical(validated, CodecLimits::default()).unwrap();
     let decoded = flbc::decode_canonical(&bytes, CodecLimits::default()).unwrap();
     assert_eq!(
         flbc::encode_canonical(&decoded, CodecLimits::default()).unwrap(),
         bytes
     );
     decoded
+}
+
+fn owned_updates(code: Vec<I>, insert_ownership: bool) -> ValidatedProgram {
+    let program = flbc::validate(Program::new(
+        FunctionId::new(0),
+        vec![
+            Function {
+                id: FunctionId::new(0),
+                arity: 0,
+                parameter_ownership: vec![],
+                result_ownership: C::Scalar,
+                register_count: 1,
+                code: vec![nat(0, 0), I::Return { src: r(0) }],
+            },
+            Function {
+                id: FunctionId::new(1),
+                arity: 1,
+                parameter_ownership: vec![A::Owned],
+                result_ownership: C::Owned,
+                register_count: 4,
+                code,
+            },
+        ],
+    ))
+    .unwrap();
+    if !insert_ownership {
+        return canonical(&program);
+    }
+    let candidate = flbc::insert_ownership(&program, OwnershipLimits::default()).unwrap();
+    flbc::validate_ownership_candidate(
+        &program,
+        candidate.program().clone(),
+        candidate.witness().clone(),
+        OwnershipLimits::default(),
+    )
+    .unwrap();
+    canonical(candidate.program())
 }
 
 fn returned(program: &ValidatedProgram) -> Obj {
@@ -95,8 +137,10 @@ fn packed(value: &Obj) -> Vec<u64> {
     assert_eq!(width, 8);
     assert_eq!(bytes.len(), size * 8);
     bytes
-        .chunks_exact(8)
-        .map(|word| u64::from_ne_bytes(word.try_into().unwrap()))
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|word| u64::from_ne_bytes(*word))
         .collect()
 }
 
@@ -119,7 +163,10 @@ fn assert_clean_shadow() {
 }
 
 fn input(values: &[u64]) -> Vec<I> {
-    let mut code = vec![nat(0, 0), call(1, "extern:FloatArray.emptyWithCapacity", &[0])];
+    let mut code = vec![
+        nat(0, 0),
+        call(1, "extern:FloatArray.emptyWithCapacity", &[0]),
+    ];
     for value in values {
         code.extend([wide(2, *value), call(1, "extern:FloatArray.push", &[1, 2])]);
     }
@@ -127,10 +174,132 @@ fn input(values: &[u64]) -> Vec<I> {
 }
 
 #[test]
+fn generated_float_array_updates_reuse_storage_without_changing_bits_or_aliases() {
+    let _guard = TEST_LOCK.lock().unwrap();
+    shadow::enable();
+    let replacements = [
+        0,
+        (-0.0f64).to_bits(),
+        1,
+        f64::INFINITY.to_bits(),
+        f64::NEG_INFINITY.to_bits(),
+        0x7ff8_0000_0000_0123,
+        0x7ff0_0000_0000_0001,
+    ];
+    for owned in [false, true] {
+        for row in [
+            "extern:FloatArray.set",
+            "extern:FloatArray.set!",
+            "extern:FloatArray.uset",
+        ] {
+            let mut code = Vec::new();
+            for index in 0..64 {
+                code.extend([
+                    if row.ends_with("uset") {
+                        wide(1, index)
+                    } else {
+                        nat(1, index)
+                    },
+                    wide(2, replacements[index as usize % replacements.len()]),
+                    call(0, row, &[0, 1, 2]),
+                ]);
+            }
+            code.push(I::Return { src: r(0) });
+            let program = owned_updates(code, owned);
+            for shared in [false, true] {
+                let input = Obj::mk_sarray(8, &[0; 64 * 8]);
+                let identity = input.identity_token();
+                let snapshot = shared.then(|| input.clone_ref());
+                let outcome = execute_function(
+                    &program,
+                    FunctionId::new(1),
+                    vec![input],
+                    ExecutionLimits::default(),
+                    None,
+                );
+                let Outcome::Complete(VmExit::Returned(result)) = outcome else {
+                    panic!("native consuming FloatArray update failed: {outcome:?}");
+                };
+                assert_eq!(result.value.identity_token() == identity, !shared, "{row}");
+                assert_eq!(
+                    packed(&result.value),
+                    (0..64)
+                        .map(|i| replacements[i % replacements.len()])
+                        .collect::<Vec<_>>()
+                );
+                if let Some(snapshot) = snapshot {
+                    assert_eq!(packed(&snapshot), [0; 64]);
+                }
+            }
+        }
+    }
+    assert_clean_shadow();
+}
+
+#[test]
+fn consuming_float_updates_keep_output_limits_and_release_stopped_inputs() {
+    let _guard = TEST_LOCK.lock().unwrap();
+    shadow::enable();
+    let program = owned_updates(
+        vec![
+            nat(1, 0),
+            wide(2, 1.0f64.to_bits()),
+            call(0, "extern:FloatArray.set", &[0, 1, 2]),
+            I::Return { src: r(0) },
+        ],
+        true,
+    );
+    let limit = 16 * 1024 * 1024;
+    let input = Obj::mk_sarray(8, &vec![0; limit + 8]);
+    let snapshot = input.clone_ref();
+    let outcome = execute_function(
+        &program,
+        FunctionId::new(1),
+        vec![input],
+        ExecutionLimits::default(),
+        None,
+    );
+    assert!(matches!(outcome, Outcome::Inconclusive(ref stop)
+        if matches!(&stop.cause, InconclusiveCause::ResourceExhausted { usage }
+            if usage.reason == ResourceReason::Memory { limit_bytes: limit as u64 }
+                && usage.allowed == limit as u64 && usage.observed == (limit + 8) as u64)));
+    assert!(
+        snapshot
+            .try_borrow_sarray_view()
+            .unwrap()
+            .3
+            .iter()
+            .all(|byte| *byte == 0)
+    );
+    drop(snapshot);
+    for allowed in 0..4 {
+        let input = Obj::mk_sarray(8, &0.0f64.to_ne_bytes());
+        assert!(
+            matches!(execute_function(&program, FunctionId::new(1), vec![input],
+            ExecutionLimits { max_steps: allowed, ..ExecutionLimits::default() }, None),
+            Outcome::Inconclusive(ref stop)
+                if matches!(&stop.cause, InconclusiveCause::ResourceExhausted { usage }
+                    if usage.reason == ResourceReason::ExecutionSteps))
+        );
+    }
+    let input = Obj::mk_sarray(8, &0.0f64.to_ne_bytes());
+    assert!(
+        matches!(execute_function(&program, FunctionId::new(1), vec![input],
+        ExecutionLimits::default(), Some(&|| true)), Outcome::Inconclusive(ref stop)
+            if matches!(stop.cause, InconclusiveCause::Cancelled { .. }))
+    );
+    assert_clean_shadow();
+}
+
+#[test]
 fn float_array_native_rows_preserve_values_aliases_and_owned_pushes() {
     let _guard = TEST_LOCK.lock().unwrap();
     shadow::enable();
-    let original = [(-0.0f64).to_bits(), 1.25f64.to_bits(), 0x7ff8_0000_0000_0123];
+    let original = [
+        (-0.0f64).to_bits(),
+        1.25f64.to_bits(),
+        0x7ff8_0000_0000_0123,
+    ];
     let mut code = input(&original);
     code.extend([
         I::Copy {
@@ -162,7 +331,12 @@ fn float_array_native_rows_preserve_values_aliases_and_owned_pushes() {
         let result = returned(&program);
         let updated = result.array_child(0);
         let snapshot = result.array_child(1);
-        let expected = [original[0], original[1], original[2], f64::INFINITY.to_bits()];
+        let expected = [
+            original[0],
+            original[1],
+            original[2],
+            f64::INFINITY.to_bits(),
+        ];
         assert_eq!(packed(&updated), expected);
         assert_eq!(packed(&snapshot), original);
         assert_ne!(updated.identity_token(), snapshot.identity_token());
@@ -201,11 +375,7 @@ fn float_array_indexed_operations_keep_exact_bits_and_shared_predecessors() {
                     dst: r(3),
                     src: r(1),
                 },
-                if usize_index {
-                    wide(4, 1)
-                } else {
-                    nat(4, 1)
-                },
+                if usize_index { wide(4, 1) } else { nat(4, 1) },
                 wide(5, replacement),
                 call(6, set, &[1, 4, 5]),
                 call(7, get, &[6, 4]),
@@ -221,7 +391,10 @@ fn float_array_indexed_operations_keep_exact_bits_and_shared_predecessors() {
                 packed(&result.array_child(0)),
                 [1.25f64.to_bits(), 2.5f64.to_bits()]
             );
-            assert_eq!(packed(&result.array_child(1)), [1.25f64.to_bits(), replacement]);
+            assert_eq!(
+                packed(&result.array_child(1)),
+                [1.25f64.to_bits(), replacement]
+            );
             assert_eq!(bits(&result.array_child(2)), replacement);
             assert_eq!(bits(&result.array_child(3)), 2.5f64.to_bits());
         }
@@ -323,7 +496,10 @@ fn float_array_rows_refuse_wrong_storage_scalar_kinds_and_ownership() {
             dst: r(1),
             items: vec![],
         }],
-        vec![nat(0, 0), call(1, "extern:ByteArray.emptyWithCapacity", &[0])],
+        vec![
+            nat(0, 0),
+            call(1, "extern:ByteArray.emptyWithCapacity", &[0]),
+        ],
     ] {
         let mut code = bad_input;
         code.extend([
