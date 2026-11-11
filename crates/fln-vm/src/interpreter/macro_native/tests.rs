@@ -10,6 +10,7 @@ mod literals;
 mod lookup;
 mod numbers;
 mod patterns;
+mod sequences;
 mod syntax_editing;
 
 fn atom(text: &str) -> Obj {
@@ -48,14 +49,16 @@ fn invoke(intrinsic: Intrinsic, args: &[Obj]) -> Obj {
         Intrinsic::MatchesIdent => "mirror:Lean.Syntax.matchesIdent",
         Intrinsic::MatchesLit => "mirror:Lean.Syntax.matchesLit",
         Intrinsic::GetOptional => "mirror:Lean.Syntax.getOptional?",
-        Intrinsic::MkSepArray => "mirror:Lean.mkSepArray",
-        Intrinsic::MkSep => "mirror:Lean.Syntax.mkSep",
-        Intrinsic::GetSepArgs => "mirror:Lean.Syntax.getSepArgs",
-        Intrinsic::SepArrayGetElems => "mirror:Lean.Syntax.SepArray.getElems._redArg",
-        Intrinsic::TSepArrayGetElems => "mirror:Lean.Syntax.TSepArray.getElems._redArg",
         Intrinsic::GetKind => "mirror:Lean.Syntax.getKind",
         Intrinsic::SetKind => "mirror:Lean.Syntax.setKind",
         Intrinsic::GetArgs => "mirror:Lean.Syntax.getArgs",
+        Intrinsic::GetSepArgs => "mirror:Lean.Syntax.getSepArgs",
+        Intrinsic::MkSepArray => "mirror:Lean.mkSepArray",
+        Intrinsic::MkSep => "mirror:Lean.Syntax.mkSep",
+        Intrinsic::SepArrayGetElems => "mirror:Lean.Syntax.SepArray.getElems._redArg",
+        Intrinsic::TSepArrayGetElems => "mirror:Lean.Syntax.TSepArray.getElems._redArg",
+        Intrinsic::SepArrayOfElems => "mirror:Lean.Syntax.SepArray.ofElems",
+        Intrinsic::TSepArrayPush => "mirror:Lean.Syntax.TSepArray.push._redArg",
         Intrinsic::SetArgs => "mirror:Lean.Syntax.setArgs",
         Intrinsic::SetArg => "mirror:Lean.Syntax.setArg",
         Intrinsic::IsAtom => "mirror:Lean.Syntax.isAtom",

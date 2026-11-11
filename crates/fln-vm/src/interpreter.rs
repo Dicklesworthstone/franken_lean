@@ -3203,9 +3203,9 @@ fn run(
                             }
                         }
                         IntrinsicImplementation::MacroNative(intrinsic) => intrinsic
-                            .invoke_with_lookup(
+                            .invoke_owned_with_lookup(
                                 plan.row,
-                                &values,
+                                values,
                                 macro_methods.and_then(|methods| methods.lookup),
                                 limits.max_nat_magnitude_bytes,
                             ),
@@ -5070,6 +5070,9 @@ fn invoke_intrinsic(
     }
     if let IntrinsicImplementation::FloatArray(intrinsic) = implementation {
         return intrinsic.invoke(row, args);
+    }
+    if let IntrinsicImplementation::MacroNative(intrinsic) = implementation {
+        return intrinsic.invoke_owned_with_lookup(row, args, None, max_nat_magnitude_bytes);
     }
     if implementation == IntrinsicImplementation::ByteArrayPush {
         expect_arity(row, &args, 2)?;

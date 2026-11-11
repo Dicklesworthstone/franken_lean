@@ -12,6 +12,7 @@ mod identifiers_reference;
 mod lookup_reference;
 mod numbers_reference;
 mod reference;
+mod sequences_reference;
 mod strings_reference;
 
 fn name(text: &str) -> Name {

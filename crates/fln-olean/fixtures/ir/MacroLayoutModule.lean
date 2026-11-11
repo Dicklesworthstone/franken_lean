@@ -146,21 +146,6 @@ def optionNone (_ : Unit) : Option Lean.Syntax := none
 @[noinline] def syntaxGetOptional (value : Lean.Syntax) : Option Lean.Syntax :=
   value.getOptional?
 
-@[noinline] def mkSepArray (values : Array Lean.Syntax) (sep : Lean.Syntax) :
-    Array Lean.Syntax := Lean.mkSepArray values sep
-
-@[noinline] def syntaxMkSep (values : Array Lean.Syntax) (sep : Lean.Syntax) :
-    Lean.Syntax := Lean.Syntax.mkSep values sep
-
-@[noinline] def syntaxGetSepArgs (value : Lean.Syntax) : Array Lean.Syntax :=
-  value.getSepArgs
-
-@[noinline] def sepArrayGetElems (value : Lean.Syntax.SepArray ",") :
-    Array Lean.Syntax := value.getElems
-
-@[noinline] def tSepArrayGetElems (value : Lean.Syntax.TSepArray `term ",") :
-    Array Lean.Syntax := value.getElems.raw
-
 @[noinline] def syntaxMkLit (kind : Lean.SyntaxNodeKind) (value : String)
     (info : Lean.SourceInfo) : Lean.Syntax :=
   (Lean.Syntax.mkLit kind value info).raw
@@ -194,6 +179,31 @@ def optionNone (_ : Unit) : Option Lean.Syntax := none
   value.setKind kind
 
 @[noinline] def syntaxGetArgs (value : Lean.Syntax) : Array Lean.Syntax := value.getArgs
+
+@[noinline] def syntaxGetSepArgs (value : Lean.Syntax) : Array Lean.Syntax := value.getSepArgs
+
+@[noinline] def mkSepArray (values : Array Lean.Syntax) (sep : Lean.Syntax) : Array Lean.Syntax :=
+  Lean.mkSepArray values sep
+
+@[noinline] def syntaxMkSep (values : Array Lean.Syntax) (sep : Lean.Syntax) : Lean.Syntax :=
+  Lean.Syntax.mkSep values sep
+
+@[noinline] def sepArrayGetElems (value : Lean.Syntax.SepArray ",") : Array Lean.Syntax :=
+  value.getElems
+
+@[noinline] def tSepArrayGetElems (value : Lean.Syntax.TSepArray `term ",") : Array (Lean.TSyntax `term) :=
+  value.getElems
+
+@[noinline] def sepArrayOfElems (sep : String) (values : Array Lean.Syntax) : Lean.Syntax.SepArray sep :=
+  Lean.Syntax.SepArray.ofElems values
+
+-- The pin erases this typed wrapper to SepArray.ofElems, not a second native
+-- entry point. The extraction script verifies that forwarding relationship.
+@[noinline] def tSepArrayOfElems (sep : String) (values : Array (Lean.TSyntax `term)) : Lean.Syntax.TSepArray `term sep :=
+  Lean.Syntax.TSepArray.ofElems values
+
+@[noinline] def tSepArrayPush (sep : String) (values : Lean.Syntax.TSepArray `term sep) (value : Lean.TSyntax `term) : Lean.Syntax.TSepArray `term sep :=
+  values.push value
 
 @[noinline] def syntaxSetArgs (value : Lean.Syntax) (args : Array Lean.Syntax) : Lean.Syntax :=
   value.setArgs args
