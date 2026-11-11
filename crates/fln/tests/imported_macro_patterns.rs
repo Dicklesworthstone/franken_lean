@@ -87,6 +87,14 @@ fn live_pinned_quotation_patterns_preserve_hygiene_shapes_metadata_and_state() {
         IrExecutionLimits::default(),
     )
     .unwrap_or_else(|error| panic!("patternServicesMacro: {error}; {dir:?}"));
+    let separated = compile(
+        std::slice::from_ref(&module),
+        &name("separatedServicesMacro"),
+        &partition,
+        &users,
+        IrExecutionLimits::default(),
+    )
+    .unwrap_or_else(|error| panic!("separatedServicesMacro: {error}; {dir:?}"));
     let state = MacroState {
         macro_scope: 23,
         trace_messages: vec![(name("trace"), "trace\0λ".into())],
@@ -147,6 +155,54 @@ fn live_pinned_quotation_patterns_preserve_hygiene_shapes_metadata_and_state() {
             "actual user MacroM IR missed {helper}"
         );
     }
+    let separated_cases = separated_cases();
+    for (input, expected) in &separated_cases {
+        let report = separated.execute(
+            input,
+            &source(),
+            &context(),
+            &state,
+            MacroLimits::default(),
+            None,
+        );
+        rows.extend(report.native_functions);
+        assert!(
+            report
+                .reference_functions
+                .iter()
+                .all(|function| users.contains(&function.name)),
+            "repetition services must execute natively"
+        );
+        let Outcome::Complete(Ok(MacroResult::Expanded {
+            syntax,
+            state: next,
+        })) = report.outcome
+        else {
+            panic!(
+                "separatedServicesMacro on {input:?}: {:?}; {dir:?}",
+                report.outcome
+            );
+        };
+        assert_eq!(syntax, *expected, "input: {input:?}");
+        assert_eq!(next, state);
+        checks.push(format!(
+            "checkSeparated ({}) ({})",
+            lean_syntax(input),
+            lean_syntax(expected)
+        ));
+    }
+    for helper in [
+        "Lean.mkSepArray",
+        "Lean.Syntax.mkSep",
+        "Lean.Syntax.getSepArgs",
+        "Lean.Syntax.SepArray.getElems._redArg",
+        "Lean.Syntax.TSepArray.getElems._redArg",
+    ] {
+        assert!(
+            rows.contains(&format!("mirror:{helper}")),
+            "actual user MacroM IR missed {helper}"
+        );
+    }
     for (vm, cancelled) in [
         (
             ExecutionLimits {
@@ -157,21 +213,26 @@ fn live_pinned_quotation_patterns_preserve_hygiene_shapes_metadata_and_state() {
         ),
         (ExecutionLimits::default(), true),
     ] {
-        let report = compiled.execute(
-            &cases[0].0,
-            &source(),
-            &context(),
-            &state,
-            MacroLimits {
-                vm,
-                ..MacroLimits::default()
-            },
-            Some(&|| cancelled),
-        );
-        assert!(
-            matches!(report.outcome, Outcome::Inconclusive(_)),
-            "{report:?}"
-        );
+        for (compiled, input) in [
+            (&compiled, &cases[0].0),
+            (&separated, &separated_cases[0].0),
+        ] {
+            let report = compiled.execute(
+                input,
+                &source(),
+                &context(),
+                &state,
+                MacroLimits {
+                    vm,
+                    ..MacroLimits::default()
+                },
+                Some(&|| cancelled),
+            );
+            assert!(
+                matches!(report.outcome, Outcome::Inconclusive(_)),
+                "{report:?}"
+            );
+        }
     }
     let resumed = compiled.execute(
         &cases[0].0,
@@ -183,6 +244,17 @@ fn live_pinned_quotation_patterns_preserve_hygiene_shapes_metadata_and_state() {
     );
     assert!(
         matches!(resumed.outcome, Outcome::Complete(Ok(MacroResult::Expanded { syntax, state: next })) if syntax == cases[0].1 && next == state)
+    );
+    let resumed = separated.execute(
+        &separated_cases[0].0,
+        &source(),
+        &context(),
+        &state,
+        MacroLimits::default(),
+        None,
+    );
+    assert!(
+        matches!(resumed.outcome, Outcome::Complete(Ok(MacroResult::Expanded { syntax, state: next })) if syntax == separated_cases[0].1 && next == state)
     );
     std::fs::write(
         dir.join("Oracle.lean"),
@@ -208,7 +280,7 @@ fn live_pinned_quotation_patterns_preserve_hygiene_shapes_metadata_and_state() {
     assert_eq!(observed.stdout, b"true\n", "{dir:?}");
     assert!(observed.stderr.is_empty());
     eprintln!(
-        "native and pinned quotation patterns: {} complete syntax/state cases",
+        "native and pinned quotation patterns/repetitions: {} complete syntax/state cases",
         checks.len()
     );
 }
@@ -265,6 +337,79 @@ fn ident(value: Name) -> Syntax {
         val: value,
         preresolved: vec![],
     }
+}
+
+fn separated_cases() -> Vec<(Syntax, Syntax)> {
+    let marked_separator = Syntax::Atom {
+        info: SourceInfo::Synthetic {
+            pos: BytePos(1),
+            end_pos: BytePos(3),
+            canonical: true,
+        },
+        val: "λ\0".into(),
+    };
+    let cases = [
+        (vec![], Syntax::Missing, Syntax::Missing, vec![]),
+        (vec![leaf()], atom(","), atom("null"), vec![]),
+        (
+            vec![leaf(), atom("b")],
+            marked_separator.clone(),
+            Syntax::node(name("null"), vec![leaf(), atom(","), atom("b")]),
+            vec![leaf(), atom("b")],
+        ),
+        (
+            vec![Syntax::Missing, atom("b"), leaf()],
+            leaf(),
+            Syntax::node(
+                name("arbitrary.node"),
+                vec![leaf(), atom(";"), atom("b"), marked_separator.clone()],
+            ),
+            vec![leaf(), atom("b")],
+        ),
+        (vec![atom("x")], Syntax::Missing, leaf(), vec![]),
+        (
+            vec![],
+            marked_separator.clone(),
+            Syntax::node(name("arbitrary"), vec![Syntax::Missing]),
+            vec![Syntax::Missing],
+        ),
+        (
+            vec![leaf(), Syntax::Missing],
+            Syntax::node(name("separator"), vec![marked_separator]),
+            Syntax::node(name("arbitrary"), vec![leaf(), Syntax::Missing]),
+            vec![leaf()],
+        ),
+    ];
+    cases
+        .into_iter()
+        .map(|(values, separator, candidate, extracted)| {
+            let mut separated = Vec::new();
+            for value in &values {
+                if !separated.is_empty() {
+                    separated.push(separator.clone());
+                }
+                separated.push(value.clone());
+            }
+            let built = Syntax::node(name("null"), separated);
+            let extracted = Syntax::node(name("null"), extracted);
+            (
+                Syntax::node(
+                    name("separatedInput"),
+                    vec![Syntax::node(name("values"), values), separator, candidate],
+                ),
+                Syntax::node(
+                    name("separatedResult"),
+                    vec![
+                        built.clone(),
+                        built,
+                        extracted.clone(),
+                        extracted.clone(),
+                        extracted,
+                    ],
+                ),
+            )
+        })
+        .collect()
 }
 
 struct Shape {
@@ -551,6 +696,15 @@ def checkPattern (input expected : Lean.Syntax) : Bool :=
     | .ok _ state => state
     | .error _ state => state
   match patternServicesMacro input context state with
+  | .ok result next =>
+    result.eqWithInfo expected && next.macroScope == 23 && next.traceMsgs == [(`trace, "trace\x00λ")]
+  | _ => false
+def checkSeparated (input expected : Lean.Syntax) : Bool :=
+  let context : Lean.Macro.Context := ⟨default, `Main, 17, 0, 512, input⟩
+  let state := match (do patternScopes 23; Lean.Macro.trace `trace "trace\x00λ") context default with
+    | .ok _ state => state
+    | .error _ state => state
+  match separatedServicesMacro input context state with
   | .ok result next =>
     result.eqWithInfo expected && next.macroScope == 23 && next.traceMsgs == [(`trace, "trace\x00λ")]
   | _ => false

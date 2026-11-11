@@ -420,3 +420,277 @@ fn pattern_mirror_rows_execute_through_canonical_bytecode() {
         }
     }
 }
+
+#[test]
+fn separated_syntax_preserves_elements_separators_metadata_and_shared_inputs() {
+    let scoped = ident(&Name::num(
+        Name::from_components(["item", "_@", "Main", "_hyg"]),
+        19,
+    ));
+    let info = synthetic_info(Obj::mk_nat(1), Obj::mk_nat(3), true);
+    let marked = invoke(Intrinsic::SetInfo, &[info.clone_ref(), atom("λ\0")]);
+    let values = [scoped, marked, Obj::mk_nat(layout::SYNTAX_MISSING_TAG)];
+    // Separators need not be atoms. The native service must keep an arbitrary
+    // separator tree, including all its source information and children.
+    let separator = invoke(
+        Intrinsic::SetInfo,
+        &[
+            info,
+            node(Name::from_components(["separator"]), vec![atom(";")]),
+        ],
+    );
+    for size in 0..=values.len() {
+        let input = Obj::mk_array(values[..size].iter().map(Obj::clone_ref).collect());
+        let original = input.identity_token();
+        for constructor in [Intrinsic::MkSepArray, Intrinsic::MkSep] {
+            let built = invoke(constructor, &[input.clone_ref(), separator.clone_ref()]);
+            let separated = if constructor == Intrinsic::MkSep {
+                check_layout(&built, layout::SYNTAX_NODE).unwrap();
+                assert_eq!(child(&built, 0).unwrap().unbox(), layout::SOURCE_NONE_TAG);
+                assert_eq!(
+                    name(&child(&built, 1).unwrap()).ok().expect("syntax kind"),
+                    Name::from_components(["null"])
+                );
+                child(&built, 2).unwrap()
+            } else {
+                built
+            };
+            assert_eq!(
+                separated.try_array_view().unwrap().0,
+                size.saturating_mul(2).saturating_sub(1)
+            );
+            for (index, value) in values[..size].iter().enumerate() {
+                assert_eq!(
+                    separated.array_child(index * 2).identity_token(),
+                    value.identity_token()
+                );
+                if index != 0 {
+                    assert_eq!(
+                        separated.array_child(index * 2 - 1).identity_token(),
+                        separator.identity_token()
+                    );
+                }
+            }
+            for extractor in [Intrinsic::SepArrayGetElems, Intrinsic::TSepArrayGetElems] {
+                let extracted = invoke(extractor, &[separated.clone_ref()]);
+                assert_eq!(extracted.try_array_view().unwrap().0, size);
+                for (index, value) in values[..size].iter().enumerate() {
+                    assert_eq!(
+                        extracted.array_child(index).identity_token(),
+                        value.identity_token()
+                    );
+                }
+            }
+        }
+        assert_eq!(input.identity_token(), original);
+        assert_eq!(input.try_array_view().unwrap().0, size);
+    }
+}
+
+#[test]
+fn separated_syntax_extracts_even_positions_without_requiring_a_null_kind() {
+    let values = [
+        atom("first"),
+        atom("separator"),
+        atom("last"),
+        atom("trailing"),
+    ];
+    for size in 0..=values.len() {
+        let input = node(
+            Name::from_components(["arbitrary", "node"]),
+            values[..size].iter().map(Obj::clone_ref).collect(),
+        );
+        let extracted = invoke(Intrinsic::GetSepArgs, &[input]);
+        assert_eq!(extracted.try_array_view().unwrap().0, size.div_ceil(2));
+        for index in (0..size).step_by(2) {
+            assert_eq!(
+                extracted.array_child(index / 2).identity_token(),
+                values[index].identity_token()
+            );
+        }
+    }
+    for value in [
+        atom("null"),
+        ident(&Name::from_components(["null"])),
+        Obj::mk_nat(layout::SYNTAX_MISSING_TAG),
+    ] {
+        assert_eq!(
+            invoke(Intrinsic::GetSepArgs, &[value])
+                .try_array_view()
+                .unwrap()
+                .0,
+            0
+        );
+    }
+}
+
+#[test]
+fn separated_syntax_refuses_malformed_carriers_and_bounds_allocations() {
+    let broken_node = Obj::mk_ctor(
+        layout::SYNTAX_NODE.tag,
+        vec![
+            Obj::mk_nat(layout::SOURCE_NONE_TAG),
+            inject_name(&Name::from_components(["null"])),
+            Obj::mk_nat(0),
+        ],
+        &[],
+    );
+    for (intrinsic, row, arguments) in [
+        (
+            Intrinsic::MkSepArray,
+            "mirror:Lean.mkSepArray",
+            vec![Obj::mk_nat(0), atom(",")],
+        ),
+        (
+            Intrinsic::MkSep,
+            "mirror:Lean.Syntax.mkSep",
+            vec![Obj::mk_array(vec![atom("x")]), Obj::mk_nat(99)],
+        ),
+        (
+            Intrinsic::MkSepArray,
+            "mirror:Lean.mkSepArray",
+            vec![Obj::mk_array(vec![Obj::mk_nat(99)]), atom(",")],
+        ),
+        (
+            Intrinsic::GetSepArgs,
+            "mirror:Lean.Syntax.getSepArgs",
+            vec![broken_node],
+        ),
+        (
+            Intrinsic::SepArrayGetElems,
+            "mirror:Lean.Syntax.SepArray.getElems._redArg",
+            vec![Obj::mk_string("not an array")],
+        ),
+        (
+            Intrinsic::TSepArrayGetElems,
+            "mirror:Lean.Syntax.TSepArray.getElems._redArg",
+            vec![Obj::mk_array(vec![Obj::mk_nat(99)])],
+        ),
+    ] {
+        assert!(matches!(
+            intrinsic.invoke(row, &arguments),
+            Err(IntrinsicFailure::Refused(_))
+        ));
+    }
+    let many = |size: usize| {
+        Obj::mk_array(
+            (0..size)
+                .map(|_| Obj::mk_nat(layout::SYNTAX_MISSING_TAG))
+                .collect(),
+        )
+    };
+    let oversized_result = many(MAX_SYNTAX_NODES as usize / 2 + 1);
+    for (intrinsic, row) in [
+        (Intrinsic::MkSepArray, "mirror:Lean.mkSepArray"),
+        (Intrinsic::MkSep, "mirror:Lean.Syntax.mkSep"),
+    ] {
+        assert!(matches!(
+            intrinsic.invoke(row, &[oversized_result.clone_ref(), atom(",")]),
+            Err(IntrinsicFailure::MirrorResource {
+                resource: "separated syntax argument count",
+                allowed: MAX_SYNTAX_NODES,
+                observed,
+            }) if observed == MAX_SYNTAX_NODES + 1
+        ));
+    }
+    let oversized_input = many(MAX_SYNTAX_NODES as usize + 1);
+    for (intrinsic, row) in [
+        (
+            Intrinsic::SepArrayGetElems,
+            "mirror:Lean.Syntax.SepArray.getElems._redArg",
+        ),
+        (
+            Intrinsic::TSepArrayGetElems,
+            "mirror:Lean.Syntax.TSepArray.getElems._redArg",
+        ),
+    ] {
+        assert!(matches!(
+            intrinsic.invoke(row, &[oversized_input.clone_ref()]),
+            Err(IntrinsicFailure::MirrorResource { .. })
+        ));
+    }
+    // A failed invocation has no sticky state or partially published result.
+    assert_eq!(
+        invoke(
+            Intrinsic::GetSepArgs,
+            &[node(Name::anonymous(), vec![atom("ok")])]
+        )
+        .try_array_view()
+        .unwrap()
+        .0,
+        1
+    );
+}
+
+#[test]
+fn separated_syntax_mirror_rows_execute_through_canonical_bytecode() {
+    let a = atom("a");
+    let b = atom("b");
+    for (row, args, expected_size, wrapped) in [
+        (
+            "mirror:Lean.mkSepArray",
+            vec![Obj::mk_array(vec![a.clone_ref(), b.clone_ref()]), atom(",")],
+            3,
+            false,
+        ),
+        (
+            "mirror:Lean.Syntax.mkSep",
+            vec![Obj::mk_array(vec![a.clone_ref(), b.clone_ref()]), atom(",")],
+            3,
+            true,
+        ),
+        (
+            "mirror:Lean.Syntax.getSepArgs",
+            vec![node(
+                Name::anonymous(),
+                vec![a.clone_ref(), atom(","), b.clone_ref()],
+            )],
+            2,
+            false,
+        ),
+        (
+            "mirror:Lean.Syntax.SepArray.getElems._redArg",
+            vec![Obj::mk_array(vec![a.clone_ref(), atom(","), b.clone_ref()])],
+            2,
+            false,
+        ),
+        (
+            "mirror:Lean.Syntax.TSepArray.getElems._redArg",
+            vec![Obj::mk_array(vec![
+                a.clone_ref(),
+                atom(","),
+                b.clone_ref(),
+                atom(","),
+            ])],
+            2,
+            false,
+        ),
+    ] {
+        let program = lookup::callable_program(row);
+        let bytes = flbc::encode_canonical(&program, flbc::CodecLimits::default()).unwrap();
+        let decoded = flbc::decode_canonical(&bytes, flbc::CodecLimits::default()).unwrap();
+        for program in [&program, &decoded] {
+            let outcome = execute_function(
+                program,
+                flbc::FunctionId::new(1),
+                args.iter().map(Obj::clone_ref).collect(),
+                ExecutionLimits::default(),
+                None,
+            );
+            let Outcome::Complete(VmExit::Returned(result)) = outcome else {
+                panic!("{row}: {outcome:?}");
+            };
+            let result = if wrapped {
+                child(&result.value, 2).unwrap()
+            } else {
+                result.value
+            };
+            assert_eq!(result.try_array_view().unwrap().0, expected_size, "{row}");
+            assert_eq!(result.array_child(0).identity_token(), a.identity_token());
+            assert_eq!(
+                result.array_child(expected_size - 1).identity_token(),
+                b.identity_token()
+            );
+        }
+    }
+}

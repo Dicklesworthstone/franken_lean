@@ -146,6 +146,21 @@ def optionNone (_ : Unit) : Option Lean.Syntax := none
 @[noinline] def syntaxGetOptional (value : Lean.Syntax) : Option Lean.Syntax :=
   value.getOptional?
 
+@[noinline] def mkSepArray (values : Array Lean.Syntax) (sep : Lean.Syntax) :
+    Array Lean.Syntax := Lean.mkSepArray values sep
+
+@[noinline] def syntaxMkSep (values : Array Lean.Syntax) (sep : Lean.Syntax) :
+    Lean.Syntax := Lean.Syntax.mkSep values sep
+
+@[noinline] def syntaxGetSepArgs (value : Lean.Syntax) : Array Lean.Syntax :=
+  value.getSepArgs
+
+@[noinline] def sepArrayGetElems (value : Lean.Syntax.SepArray ",") :
+    Array Lean.Syntax := value.getElems
+
+@[noinline] def tSepArrayGetElems (value : Lean.Syntax.TSepArray `term ",") :
+    Array Lean.Syntax := value.getElems.raw
+
 @[noinline] def syntaxMkLit (kind : Lean.SyntaxNodeKind) (value : String)
     (info : Lean.SourceInfo) : Lean.Syntax :=
   (Lean.Syntax.mkLit kind value info).raw

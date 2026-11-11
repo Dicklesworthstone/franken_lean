@@ -25,3 +25,16 @@ public section
     match optional.getOptional? with
       | some value => value
       | none => .missing])
+
+-- Repetition antiquotations use the same erased array carriers as these
+-- separated-syntax helpers. Keep the calls visible in real imported user IR.
+@[noinline] def separatedServicesMacro (stx : Lean.Syntax) : Lean.MacroM Lean.Syntax := do
+  let values := stx[0].getArgs
+  let separator := stx[1]
+  let candidate := stx[2]
+  pure (.node .none `separatedResult #[
+    Lean.mkNullNode (Lean.mkSepArray values separator),
+    Lean.Syntax.mkSep values separator,
+    Lean.mkNullNode candidate.getSepArgs,
+    Lean.mkNullNode (⟨candidate.getArgs⟩ : Lean.Syntax.SepArray ",").getElems,
+    Lean.mkNullNode (⟨candidate.getArgs⟩ : Lean.Syntax.TSepArray `term ",").getElems.raw])

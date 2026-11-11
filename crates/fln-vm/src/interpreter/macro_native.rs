@@ -33,6 +33,11 @@ pub(super) enum Intrinsic {
     MatchesIdent,
     MatchesLit,
     GetOptional,
+    MkSepArray,
+    MkSep,
+    GetSepArgs,
+    SepArrayGetElems,
+    TSepArrayGetElems,
     GetKind,
     SetKind,
     GetArgs,
@@ -95,6 +100,11 @@ impl Intrinsic {
             "mirror:Lean.Syntax.matchesIdent" => Self::MatchesIdent,
             "mirror:Lean.Syntax.matchesLit" => Self::MatchesLit,
             "mirror:Lean.Syntax.getOptional?" => Self::GetOptional,
+            "mirror:Lean.mkSepArray" => Self::MkSepArray,
+            "mirror:Lean.Syntax.mkSep" => Self::MkSep,
+            "mirror:Lean.Syntax.getSepArgs" => Self::GetSepArgs,
+            "mirror:Lean.Syntax.SepArray.getElems._redArg" => Self::SepArrayGetElems,
+            "mirror:Lean.Syntax.TSepArray.getElems._redArg" => Self::TSepArrayGetElems,
             "mirror:Lean.Syntax.getKind" => Self::GetKind,
             "mirror:Lean.Syntax.setKind" => Self::SetKind,
             "mirror:Lean.Syntax.getArgs" => Self::GetArgs,
@@ -173,6 +183,8 @@ impl Intrinsic {
                 | Self::IsOfKind
                 | Self::MatchesNull
                 | Self::MatchesIdent
+                | Self::MkSepArray
+                | Self::MkSep
                 | Self::GetArg
                 | Self::SetKind
                 | Self::SetArgs
@@ -272,6 +284,34 @@ impl Intrinsic {
             Self::GetOptional => Ok(IntrinsicResult::raw_object(patterns::get_optional(
                 &args[0],
             )?)),
+            Self::MkSepArray | Self::MkSep => {
+                let children = patterns::mk_sep_array(&args[0], &args[1])?;
+                let value = if self == Self::MkSep {
+                    Obj::mk_ctor(
+                        layout::SYNTAX_NODE.tag,
+                        vec![
+                            Obj::mk_nat(layout::SOURCE_NONE_TAG),
+                            inject_name(&Name::str(Name::anonymous(), "null")),
+                            children,
+                        ],
+                        &[],
+                    )
+                } else {
+                    children
+                };
+                Ok(IntrinsicResult::raw_object(value))
+            }
+            Self::GetSepArgs => {
+                let value = if matches!(syntax_kind(&args[0])?, SyntaxKind::Node) {
+                    patterns::sep_elems(&child(&args[0], 2)?)?
+                } else {
+                    Obj::mk_array(Vec::new())
+                };
+                Ok(IntrinsicResult::raw_object(value))
+            }
+            Self::SepArrayGetElems | Self::TSepArrayGetElems => {
+                Ok(IntrinsicResult::raw_object(patterns::sep_elems(&args[0])?))
+            }
             Self::AddMacroScope => Ok(IntrinsicResult::raw_object(attach_scope(
                 &args[0], &args[1], &args[2],
             )?)),

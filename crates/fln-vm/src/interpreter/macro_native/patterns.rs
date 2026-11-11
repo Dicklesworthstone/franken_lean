@@ -1,13 +1,59 @@
-//! Native quotation-pattern predicates from the pinned `Init.Prelude`.
+//! Native quotation-pattern and repetition services from the pinned Init.
 //!
 //! The predicates have deliberately different shape rules: `isNodeOf` accepts
 //! zero-argument pseudo-kinds, `matchesLit` ignores arguments after the first,
 //! and `getOptional?` requires a real null node with exactly one child.
 
 use super::{
-    IntrinsicFailure, Name, Obj, SyntaxKind, VmRefusal, child, expansion_layout, literals, name,
-    nat_as_usize, syntax_kind,
+    IntrinsicFailure, MAX_SYNTAX_NODES, Name, Obj, SyntaxKind, VmRefusal, child, expansion_layout,
+    limit, literals, name, nat_as_usize, syntax_kind,
 };
+
+/// `Init.Meta.Defs`: separators are arbitrary Syntax, inserted only between
+/// elements. Retain their exact handles, including source info and hygiene.
+pub(super) fn mk_sep_array(values: &Obj, separator: &Obj) -> Result<Obj, IntrinsicFailure> {
+    let (size, _) = values
+        .try_array_view()
+        .ok_or(VmRefusal::InvalidArrayObject)?;
+    let result_size = size.saturating_mul(2).saturating_sub(1);
+    limit(
+        "separated syntax argument count",
+        MAX_SYNTAX_NODES,
+        result_size as u64,
+    )?;
+    syntax_kind(separator)?;
+    let mut result = Vec::with_capacity(result_size);
+    for index in 0..size {
+        let value = values.array_child(index);
+        syntax_kind(&value)?;
+        if index != 0 {
+            result.push(separator.clone_ref());
+        }
+        result.push(value);
+    }
+    Ok(Obj::mk_array(result))
+}
+
+/// The pin's separated arrays use `Array.getEvenElems`. No separator spelling
+/// or null-kind check is involved; a trailing separator is simply skipped.
+/// The typed SepArray wrappers erase to this same array carrier.
+pub(super) fn sep_elems(values: &Obj) -> Result<Obj, IntrinsicFailure> {
+    let (size, _) = values
+        .try_array_view()
+        .ok_or(VmRefusal::InvalidArrayObject)?;
+    limit(
+        "separated syntax argument count",
+        MAX_SYNTAX_NODES,
+        size as u64,
+    )?;
+    let mut result = Vec::with_capacity(size.div_ceil(2));
+    for index in (0..size).step_by(2) {
+        let value = values.array_child(index);
+        syntax_kind(&value)?;
+        result.push(value);
+    }
+    Ok(Obj::mk_array(result))
+}
 
 pub(super) fn is_node_of(
     value: &Obj,
