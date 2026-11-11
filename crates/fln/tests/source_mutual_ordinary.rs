@@ -997,14 +997,24 @@ fn polymorphic_forward_references_close_their_universe_parameters() {
 }
 #[test]
 fn every_cycle_is_refused_before_any_declaration_can_be_published() {
-    for source in [
-        "mutual\n def first : Nat := second\n def second : Nat := first\nend",
-        "mutual\n theorem first : False := second\n theorem second : False := first\nend",
-        "mutual\n def independent : Nat := 0\n def first (n : Nat) : Nat := second n\n def second (n : Nat) : Nat := first n\nend",
-        "mutual\n def first (n : Nat) : Nat := first n\nend",
+    for (source, probes_well_founded) in [
+        (
+            "mutual\n def first : Nat := second\n def second : Nat := first\nend",
+            true,
+        ),
+        (
+            "mutual\n theorem first : False := second\n theorem second : False := first\nend",
+            false,
+        ),
+        (
+            "mutual\n def independent : Nat := 0\n def first (n : Nat) : Nat := second n\n def second (n : Nat) : Nat := first n\nend",
+            true,
+        ),
+        ("mutual\n def first (n : Nat) : Nat := first n\nend", false),
     ] {
         oracle(source, false);
         let (base, limits) = engine();
+        assert!(!base.environment().contains(&name("WellFoundedRelation")));
         let before = base.logical_root(&KVMap::new());
         let members = fln_parse::command_scope::mutual::parse(source.as_bytes())
             .unwrap()
@@ -1015,17 +1025,54 @@ fn every_cycle_is_refused_before_any_declaration_can_be_published() {
             limits.kernel,
             &fln_elab::source::scope::SourceScope::default(),
         );
-        assert!(
+        let error = result.err().unwrap_or_else(|| {
+            panic!("a nonterminating group must not produce declarations:\n{source}")
+        });
+        // These two definition cycles reach the well-founded relation probe
+        // before it checks for a varying measure. The bounded seed has no such
+        // class, so instance search rejects that exact target. The theorem and
+        // singleton cycles are refused before this probe. Keep each path exact.
+        let refused = if probes_well_founded {
             matches!(
-                result,
-                Err(fln_elab::NatDefinitionElabError::UnexpectedSyntax {
+                &error,
+                fln_elab::NatDefinitionElabError::Inference(
+                    fln_elab::source::SourceInferenceError::InvalidInstanceBinder
+                )
+            )
+        } else {
+            matches!(
+                &error,
+                fln_elab::NatDefinitionElabError::UnexpectedSyntax {
                     expected: "recursive ordinary mutual component requires termination elaboration"
-                })
-            ),
-            "{source}"
+                }
+            )
+        };
+        assert!(refused, "{source}\nactual refusal: {error:?}");
+        let publication = base
+            .check_source_files(
+                &[source.as_bytes()],
+                &KVMap::new(),
+                SourceCheckLimits::new(limits),
+            )
+            .err()
+            .unwrap_or_else(|| panic!("nontermination must also fail source admission:\n{source}"));
+        assert_eq!(
+            publication.disposition().2,
+            1,
+            "a semantic refusal, not a resource stop or fault: {publication:?}"
         );
         assert_eq!(base.logical_root(&KVMap::new()), before);
-        assert!(!base.environment().contains(&name("independent")));
+        for candidate in [
+            "independent",
+            "first",
+            "second",
+            "first._mutual",
+            "second._mutual",
+            "first._unsafe_rec",
+            "second._unsafe_rec",
+        ] {
+            assert!(!base.environment().contains(&name(candidate)));
+        }
     }
 }
 #[test]

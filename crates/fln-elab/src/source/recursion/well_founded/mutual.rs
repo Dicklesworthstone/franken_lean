@@ -1058,17 +1058,7 @@ impl Context {
             result?
         };
         Ok(self
-            .mutual_apply(
-                &["PSum", "casesOn"],
-                [
-                    left,
-                    right,
-                    motive.clone(),
-                    major.clone(),
-                    first.clone(),
-                    minor,
-                ],
-            )?
+            .well_founded_cases_on("PSum", domain, motive, major, &[first.clone(), minor])?
             .value)
     }
 
@@ -1341,6 +1331,20 @@ impl Context {
                 "a member binding the same parameters in its body pass and its fixpoint",
             ));
         }
+        // Replaying the source header introduces fresh auto-bound universe
+        // metavariables. Bind its entire telescope, including section captures
+        // and leading body lambdas, to the already planned member type before
+        // opening any shared fixpoint terms. Comparing only the result would
+        // leave the Sort of an auto-bound type parameter unconstrained.
+        for level in &plan.level_params {
+            self.tick()?;
+            if !self.level_params.contains(level) {
+                self.level_params.push(level.clone());
+            }
+        }
+        let signature = self.close_mutual_fixed(&expected, &parameters, false)?;
+        self.unify_source_batch(&[(signature, plan.types[index].clone())], true)
+            .map_err(|problem| failure(SourceInferenceError::Unification(Box::new(problem))))?;
         let fixed_values: Vec<_> = parameters[..plan.fixed]
             .iter()
             .map(|parameter| Expr::fvar(parameter.id.clone()))

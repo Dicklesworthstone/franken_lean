@@ -1230,7 +1230,7 @@ fn section_captures_exclude_hint_only_variables_and_nondecreasing_calls() {
 
 #[test]
 fn auto_bound_mutual_universes_preserve_checked_interfaces_and_execution() {
-    on_large_stack(move |base| {
+    on_generic_stack(move |base| {
         let source = format!(
             "{AUTO_UNIVERSE}\
              example : True := fn (fun (_ : True) => True.intro) True.intro 4\n\
@@ -1302,7 +1302,7 @@ def lambdaRight (f : α → α) (a : α) : Nat → α := fun n =>
 termination_by n => n
 end
 ";
-    on_large_stack(move |base| {
+    on_generic_stack(move |base| {
         for (source, member, peer, universes, query, expected) in [
             (
                 independent,
@@ -1339,7 +1339,7 @@ end
 
 #[test]
 fn auto_bound_mutual_universes_reject_bad_bodies_and_preserve_resource_stops() {
-    on_large_stack(move |base| {
+    on_generic_stack(move |base| {
         for source in [
             AUTO_UNIVERSE.replace("gn f (f (f a)) (f a) n", "gn f (f (f a)) (f a) (n+1)"),
             AUTO_UNIVERSE.replace("| 0 => a", "| 0 => true"),
