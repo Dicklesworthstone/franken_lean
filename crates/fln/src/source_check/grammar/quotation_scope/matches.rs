@@ -101,7 +101,9 @@ fn patterns(
                     Resolution::Constructor(global) if !outer.contains(val) => {
                         built.push(global_ident(ident, global)?);
                     }
-                    Resolution::Undetermined => return Err(unsupported_binder()),
+                    Resolution::Overloaded(_) | Resolution::Undetermined => {
+                        return Err(unsupported_binder());
+                    }
                     _ => {
                         bind_pattern(ident, rule, &mut names)?;
                         built.push(ident.clone());

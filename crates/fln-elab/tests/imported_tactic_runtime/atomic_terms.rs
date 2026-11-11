@@ -321,18 +321,11 @@ fn generated_apply_resolves_hygienic_constructor_prereferences_as_terms() {
 }
 
 #[test]
-fn generated_apply_rejects_unavailable_overloaded_and_field_prereferences() {
+fn generated_apply_rejects_unavailable_and_field_prereferences() {
     for (references, expected) in [
         (
             vec![declaration_reference("Missing.constructor")],
             "an available exact declaration target",
-        ),
-        (
-            vec![
-                declaration_reference("True.intro"),
-                declaration_reference("And.intro"),
-            ],
-            "overloaded pre-resolved declarations",
         ),
         (
             vec![Preresolved::Decl {
@@ -358,6 +351,28 @@ fn generated_apply_rejects_unavailable_overloaded_and_field_prereferences() {
             "{expected}: {result:?}"
         );
     }
+}
+
+#[test]
+fn generated_apply_preserves_ambiguity_between_captured_declarations() {
+    let provider = Provider::new(vec![Candidate::Expansion(quoted_apply(
+        "True.intro",
+        vec![
+            declaration_reference("True.intro"),
+            declaration_reference("And.intro"),
+        ],
+    ))]);
+    let result = super::elaborate("theorem ambiguousMetadata : True := by skip", provider);
+    assert!(
+        matches!(&result,
+        Err(NatDefinitionElabError::Inference(SourceInferenceError::AmbiguousTerm {
+            interpretations, ..
+        })) if interpretations == &vec![
+            Name::from_components(["And", "intro"]),
+            Name::from_components(["True", "intro"]),
+        ]),
+        "apply elaborates its overloaded operand before matching the goal: {result:?}"
+    );
 }
 
 #[test]

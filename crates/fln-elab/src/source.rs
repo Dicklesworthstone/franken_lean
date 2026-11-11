@@ -3849,6 +3849,7 @@ impl Context {
                                                 &name,
                                                 &candidates,
                                                 expected.as_ref(),
+                                                false,
                                             )?);
                                             continue;
                                         }
@@ -4537,6 +4538,44 @@ impl Context {
                                 tasks.push(Task::Proof(proof));
                             }
                             Task::StartApplication(head, arguments, expected, explicit) => {
+                                // Quotation metadata fixes the head's declaration
+                                // candidates at its definition site. Resolve it
+                                // before field notation's textual namespace lookup,
+                                // and try the complete application for each overload.
+                                if overload::has_preresolved_head(head) {
+                                    self.observe_completion(head)?;
+                                    match self.atom(head, None) {
+                                        Ok(function) => {
+                                            values.push(function);
+                                            tasks.push(Task::Function(
+                                                arguments, expected, explicit,
+                                            ));
+                                            if self.observes_term(head) {
+                                                tasks.push(Task::Observe(
+                                                    head,
+                                                    self.txn.lctx.clone(),
+                                                ));
+                                            }
+                                        }
+                                        Err(error) => {
+                                            if let Some((name, candidates)) =
+                                                overload::ambiguous_head(&error, head)
+                                            {
+                                                values.push(self.overloaded(
+                                                    head,
+                                                    Some(arguments),
+                                                    &name,
+                                                    &candidates,
+                                                    expected.as_ref(),
+                                                    explicit,
+                                                )?);
+                                            } else {
+                                                return Err(error);
+                                            }
+                                        }
+                                    }
+                                    continue;
+                                }
                                 let receiver = match self.field_application_receiver(head) {
                                     Ok(receiver) => receiver,
                                     Err(error) => {
@@ -4552,6 +4591,7 @@ impl Context {
                                                 &name,
                                                 &candidates,
                                                 expected.as_ref(),
+                                                false,
                                             )?);
                                             continue;
                                         }
@@ -4601,6 +4641,7 @@ impl Context {
                                                             &name,
                                                             &candidates,
                                                             expected.as_ref(),
+                                                            false,
                                                         )?);
                                                         continue;
                                                     }

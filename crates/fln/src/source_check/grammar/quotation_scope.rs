@@ -724,6 +724,23 @@ pub(super) fn preresolve(
                             }],
                         })
                     }
+                    Resolution::Overloaded(candidates) => {
+                        built.push(Syntax::Ident {
+                            info: *info,
+                            raw_val: raw_val.clone(),
+                            val: val.clone(),
+                            // The source resolver returns elaboration order;
+                            // Term.resolveName's mkConsts reverses metadata.
+                            preresolved: candidates
+                                .into_iter()
+                                .rev()
+                                .map(|name| Preresolved::Decl {
+                                    name,
+                                    fields: Vec::new(),
+                                })
+                                .collect(),
+                        });
+                    }
                     Resolution::Unchecked => built.push(ident.clone()),
                     Resolution::SectionVariable => {
                         return Err(EngineExecutionError::NotImplemented {
@@ -738,7 +755,7 @@ pub(super) fn preresolve(
                     }
                     Resolution::Undetermined => {
                         return Err(EngineExecutionError::NotImplemented {
-                            feature: "a notation whose right-hand side names several declarations",
+                            feature: "quotation name resolution with unavailable scope tables",
                         });
                     }
                 }
