@@ -362,6 +362,7 @@ impl fln_server::dispatch::WorkspaceChecker for Native {
                 items: vec![CompletionItem {
                     label: "value".to_owned(),
                     replacement: "_root_.value".to_owned(),
+                    kind: fln_server::dispatch::semantic::CompletionItemKind::Constant,
                 }],
                 range: 4..7,
                 is_incomplete: false,

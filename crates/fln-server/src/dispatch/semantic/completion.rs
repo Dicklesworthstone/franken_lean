@@ -1,10 +1,17 @@
 //! Bounded plain-text completion edits, tied to the accepted source snapshot.
 use super::*;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompletionItemKind {
+    Variable,
+    Constant,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompletionItem {
     pub label: String,
     pub replacement: String,
+    pub kind: CompletionItemKind,
 }
 
 pub(super) fn result(
@@ -51,12 +58,20 @@ pub(super) fn result(
         if index != 0 {
             result.push(',');
         }
-        // The replacement is also the filter spelling so explicitly typed
-        // `_root_.` prefixes remain visible to client-side filtering.
+        // Keep explicitly typed `_root_.` prefixes for globals. Locals use
+        // their unescaped label to filter while the edit preserves identity.
         let replacement = crate::json_string(&item.replacement);
+        let filter = crate::json_string(match item.kind {
+            CompletionItemKind::Variable => &item.label,
+            CompletionItemKind::Constant => &item.replacement,
+        });
+        let kind = match item.kind {
+            CompletionItemKind::Variable => 6,
+            CompletionItemKind::Constant => 21,
+        };
         result.push_str(&format!(
-            "{{\"label\":{},\"kind\":21,\"insertTextFormat\":1,\"filterText\":{},\"textEdit\":{{\"range\":{},\"newText\":{}}}}}",
-            crate::json_string(&item.label), replacement, edit_range, replacement,
+            "{{\"label\":{},\"kind\":{kind},\"insertTextFormat\":1,\"filterText\":{},\"textEdit\":{{\"range\":{},\"newText\":{}}}}}",
+            crate::json_string(&item.label), filter, edit_range, replacement,
         ));
     }
     result.push_str("]}");
@@ -83,6 +98,7 @@ mod tests {
         CompletionItem {
             label: "value".into(),
             replacement: "_root_.value".into(),
+            kind: CompletionItemKind::Constant,
         }
     }
 
@@ -124,6 +140,7 @@ mod tests {
         let special = CompletionItem {
             label: "a\"\\b".into(),
             replacement: "a\"\\b".into(),
+            kind: CompletionItemKind::Variable,
         };
         let out = result(vec![special], 0..1, false, query("x", 1)).unwrap();
         assert!(out.contains(r#""label":"a\"\\b""#));
@@ -131,6 +148,7 @@ mod tests {
         let large = CompletionItem {
             label: "x".repeat(MAX_RESULT_BYTES / 16),
             replacement: "x".into(),
+            kind: CompletionItemKind::Variable,
         };
         assert!(result(vec![large], 0..1, false, query("x", 1)).is_err());
         for replacement in ["", "x\ny", "x\0y"] {
@@ -138,7 +156,8 @@ mod tests {
                 result(
                     vec![CompletionItem {
                         label: "x".into(),
-                        replacement: replacement.into()
+                        replacement: replacement.into(),
+                        kind: CompletionItemKind::Variable,
                     }],
                     0..1,
                     false,

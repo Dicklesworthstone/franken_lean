@@ -5,7 +5,7 @@ use std::ops::Range;
 mod completion;
 pub mod index;
 mod symbols;
-pub use completion::CompletionItem;
+pub use completion::{CompletionItem, CompletionItemKind};
 pub use symbols::DocumentSymbol;
 pub(super) mod interactive;
 pub use interactive::{Goal, Hypothesis, TermGoal};

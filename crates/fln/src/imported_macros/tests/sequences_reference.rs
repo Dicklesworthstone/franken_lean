@@ -174,9 +174,12 @@ fn live_pinned_sequence_builders_preserve_syntax_state_and_generated_terms() {
         );
         rows.extend(report.native_functions);
         assert!(
-            report.reference_functions.iter().all(
-                |function| function.producer() == "reference" && users.contains(&function.name)
-            ),
+            report
+                .reference_functions
+                .iter()
+                .all(|function| function.producer() == "reference"
+                    && users.contains(&function.name)
+                    && !function.name.to_display_string().starts_with("Lean.")),
             "only this user module may run interpreted IR: {entry}"
         );
         let Outcome::Complete(Ok(MacroResult::Expanded {

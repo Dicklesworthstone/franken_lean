@@ -571,6 +571,9 @@ fn inspect_sources(
     };
     Ok(match inspected.observation {
         None => None,
+        Some(SourceObservation::Completion { .. }) => {
+            return Err("completion context reached a different editor query".to_owned());
+        }
         Some(SourceObservation::Goals { range, goals })
             if matches!(
                 kind,

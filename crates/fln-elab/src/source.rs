@@ -2887,6 +2887,7 @@ impl Context {
                                     tasks.push(Task::Elaborate(syntax, expected, true));
                                     continue;
                                 }
+                                self.observe_completion(syntax)?;
                                 if self.observes_term(syntax) {
                                     tasks.push(Task::Observe(syntax, self.txn.lctx.clone()));
                                 }
